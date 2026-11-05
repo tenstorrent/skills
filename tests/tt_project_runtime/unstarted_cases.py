@@ -408,3 +408,71 @@ def test_a_deadline_task_held_by_full_slots_is_raised_only_with_its_resources_fr
     d.cfg["coordinator"]["urgent_slot_wait_min"] = 10
     assert check(start + 200) == [], "a hold restarts its clock"
     assert [e["task"] for e in check(start + 200 + unstarted.READY_URGENT_S + 5)] == [hot]
+
+
+def test_user_ordered_urgent_device_work_not_started_or_stuck_in_ttp_lock_raises_one_high_event_naming_the_holder(
+        env, monkeypatch, tmp_path):
+    """Daemon.check_urgent_start: a fresh `urgent:` task with a machine resource still queued after
+    coordinator.urgent_start_wait_min (5) names what holds it; once running, an open `ttp lock` wait that
+    long names the lock's other holders. One high event per task and run; routine p1, an urgent task
+    without a resource and 0 (off) raise nothing."""
+    import fcntl
+    from ttp import db as dbmod, locks, urgent
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    assert d.cfg["coordinator"]["urgent_start_wait_min"] == urgent.START_WAIT_MIN == 5
+
+    def add(title, spec, labels, priority=3):
+        tid = p.db.add_task(title, spec, kind="work", tier="light", origin="user", priority=priority)
+        p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(labels), tid))
+        return tid
+    hot = add("reset the box", "s\nurgent: the user ordered it", ["resource:box-a"])
+    add("routine p1 on the box", "s", ["resource:box-a"], priority=1)
+    add("urgent, no machine", "s\nurgent: the user ordered it", [])
+    p.db.set_kv(dbmod.PAUSED_RESOURCES_KEY, {"box-a": {"reason": "held", "since": time.time(), "by": "user"}})
+    start = time.time()
+
+    def check(at):
+        monkeypatch.setattr(time, "time", lambda: at)
+        d._urgent_start_checked = at - 60
+        d.check_urgent_start()
+        return p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'urgent_%' ORDER BY id")
+    assert check(start + 4 * 60) == [], "under 5 minutes"
+    got = check(start + 5 * 60 + 5)
+    assert [(e["task"], e["fingerprint"], e["severity"]) for e in got] == [(hot, f"urgent_start:{hot}:0", "high")]
+    assert "held by pause on resource box-a" in got[0]["text"], got[0]["text"]
+    assert len(check(start + 7 * 60)) == 1, "once per task and run"
+
+    # Running, its `ttp lock` wait open: the other project's holder is named; its own hold is not.
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.update_task(hot, status="running")
+    rid = p.db.x("INSERT INTO runs(task, role, provider, status, started, dir) VALUES(?,?,?,?,?,?)",
+                 (hot, "worker", "claude", "running", start + 8 * 60, str(run_dir)))
+    locks.record_wait(run_dir, "42:1.0", start + 8 * 60, None)
+    slot = d._slot_paths("box-a")[0]
+    slot.parent.mkdir(parents=True, exist_ok=True)
+    slot.write_text(json.dumps({"holder": "other #7 (run 9)", "project": "other", "task_id": "7", "run_id": "9"}))
+    fd = os.open(slot, os.O_RDWR)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        assert len(check(start + 12 * 60)) == 1, "a wait under 5 minutes"
+        got = check(start + 13 * 60 + 5)
+        assert got[-1]["fingerprint"] == f"urgent_lock:{hot}:{rid}" and got[-1]["severity"] == "high"
+        assert "box-a: other #7 run 9" in got[-1]["text"] and "in `ttp lock`" in got[-1]["text"]
+        assert len(check(start + 15 * 60)) == 2, "once per run"
+        slot.write_text(json.dumps({"holder": "itself", "project": p.name, "task_id": str(hot), "run_id": str(rid)}))
+        p.db.x("DELETE FROM events WHERE fingerprint LIKE 'urgent_lock:%'")
+        assert len(check(start + 16 * 60)) == 1, "its own hold is no other holder"
+        d.cfg["coordinator"]["urgent_start_wait_min"] = 0
+        p.db.x("DELETE FROM events")
+        slot.write_text(json.dumps({"holder": "other #7 (run 9)", "project": "other", "task_id": "7"}))
+        assert check(start + 20 * 60) == [], "0 turns it off"
+    finally:
+        os.close(fd)
+        locks.record_wait(run_dir, "42:1.0", start + 8 * 60, start + 20 * 60)

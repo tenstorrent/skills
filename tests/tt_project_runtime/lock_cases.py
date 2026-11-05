@@ -1056,6 +1056,25 @@ def test_an_urgent_lock_waiter_goes_ahead_of_routine_ones_and_only_an_urgent_tas
     assert cli._urgent_priority(p, "#12") is None, "only a plain task id"
 
 
+def test_a_user_ordered_p0_lock_waiter_goes_before_an_older_p1_one_in_arrival_and_fair_order(tmp_path):
+    """urgent.queue_priority: a user-ordered urgent task's ticket (ORDERED_PRIORITY, 0) takes the next turn
+    ahead of an older priority-1 waiter, in my_turn's arrival order and in fair_order across groups."""
+    from ttp import locks, urgent
+    q = tmp_path / "q"
+    p1 = locks.enqueue(q, "r", "older p1", priority=1, group="a")
+    routine = locks.enqueue(q, "r", "routine", priority=3, group="a")
+    p0 = locks.enqueue(q, "r", "user-ordered", priority=urgent.ORDERED_PRIORITY, group="b")
+    try:
+        assert locks.my_turn(q, "r", p0, 1) and not locks.my_turn(q, "r", p1, 1)
+        assert locks.my_turn(q, "r", p0, 1, fair=True) and not locks.my_turn(q, "r", p1, 1, fair=True)
+        assert locks.fair_order(q, "r")[:2] == [p0, p1], "p0, then the older p1"
+        assert locks.fair_order(q, "r", urgent_max=2)[:2] == [p0, p1], "urgent turns: p0 first"
+        assert locks.my_turn(q, "r", p1, 2) and not locks.my_turn(q, "r", routine, 2)
+    finally:
+        for t in (p1, routine, p0):
+            locks.dequeue(t)
+
+
 def _fake_pidns_proc(root, procs):
     """A /proc stand-in under `root` with each (pid here, pid namespace, NSpid, state) of `procs`."""
     root.mkdir(exist_ok=True)

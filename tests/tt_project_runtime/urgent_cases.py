@@ -701,3 +701,16 @@ def test_an_urgent_gate_made_only_of_landed_checks_is_a_dependency_and_stays(env
     assert deferral(p.db.task(mixed)) == {}, "a mixed probe follows the why"
     ev = p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'urgent_gate_released:%'")
     assert [e["task"] for e in ev] == [mixed] and "not only landed checks" in ev[0]["text"]
+
+
+def test_queue_priority_ranks_user_ordered_urgent_work_0_other_urgent_work_1_and_routine_none():
+    from ttp import urgent
+    now = time.time()
+    ordered = {"id": 1, "priority": 3, "spec": "s\nurgent: the user ordered it", "created": now}
+    stale = dict(ordered, created=now - urgent.STALE_S - 60)
+    assert urgent.queue_priority(ordered, now) == urgent.ORDERED_PRIORITY == 0
+    assert urgent.queue_priority(stale, now) == urgent.PRIORITY, "a stale line is urgent, not user-ordered"
+    assert urgent.queue_priority({"id": 2, "priority": 1, "spec": "s"}, now) == urgent.PRIORITY
+    assert urgent.queue_priority({"id": 3, "priority": 2, "spec": "s\nurgent: no"}, now) is None
+    assert urgent.queue_priority(None, now) is None
+    assert urgent.queue_priority({"id": 4, "kind": "harness", "title": urgent.UPGRADE_TASK_TITLE}, now) == 0

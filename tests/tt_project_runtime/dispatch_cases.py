@@ -1250,7 +1250,7 @@ def test_a_scalar_config_section_is_refused_never_kept_as_last_good_and_a_missin
 def test_an_urgent_task_starts_first_and_takes_one_extra_slot_past_full_routine_work(
         env, monkeypatch, tmp_path, reap_tmp_processes):
     """The urgent lane (ttp/urgent.py): with every slot taken by routine work, one urgent task starts in
-    budget.urgent_extra_slots (default 1) beyond max_parallel_workers; a second waits; 0 turns it off."""
+    budget.urgent_extra_slots beyond max_parallel_workers; a second waits; 0 turns it off."""
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
     try:
         r1 = p.db.add_task("routine one", "s", kind="work", tier="light", origin="user", priority=3)
@@ -1262,6 +1262,7 @@ def test_an_urgent_task_starts_first_and_takes_one_extra_slot_past_full_routine_
                             tier="light", origin="user", priority=3)
         hot2 = p.db.add_task("another urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
         assert [t["id"] for t in p.db.ready_tasks()] == [hot, hot2, r3], "a stated urgent line first, then p1"
+        d.cfg["budget"]["urgent_preempt"] = False   # the extra slots alone (preemption: its own test)
         d.cfg["budget"]["urgent_extra_slots"] = 0
         d.dispatch()
         assert _slot_tasks(p) == [r1, r2], "0 turns the extra slot off"
@@ -1886,3 +1887,102 @@ def test_a_tripped_coordinator_turn_guard_defers_self_started_turns_and_runs_use
     assert not _turn_within(d, clock, starts, 900, step=30), "a self-started turn ran past the guard"
     p.db.post("in", "what is the status?", chat="c1")
     assert _turn_within(d, clock, starts, 900, step=30), "the user's message got no turn"
+
+
+def test_user_ordered_urgent_work_starts_in_burst_slots_in_one_tick_and_then_preempts_the_lowest_routine_run(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The device-action stall: with every slot taken, a user-ordered urgent task (fresh `urgent:` line) starts
+    in one of budget.urgent_extra_slots (2) burst slots at the same dispatch pass; with those full too, the
+    lowest-priority routine run is stopped with STOP 'preempt' and requeued with no attempt spent."""
+    from ttp import preempt
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        hi = p.db.add_task("routine p2", "s", kind="work", tier="light", origin="user", priority=2)
+        lo = p.db.add_task("routine p3", "s", kind="work", tier="light", origin="user", priority=3)
+        d.dispatch()
+        assert _slot_tasks(p) == [hi, lo]
+        hot = [p.db.add_task(f"device action {i}", "s\nurgent: the user ordered it now", kind="work", tier="light",
+                             origin="user") for i in range(3)]
+        d.dispatch()
+        assert _slot_tasks(p) == [hi, lo] + hot[:2], "both burst slots taken in one pass"
+        before = p.db.task(lo)["attempts"]
+        d.dispatch()
+        lo_run = p.db.one("SELECT * FROM runs WHERE task=? AND status='running'", (lo,))
+        assert (pathlib.Path(lo_run["dir"]) / "STOP").read_text() == preempt.STOP_TEXT, "the lowest-priority run is stopped"
+        assert not (pathlib.Path(p.db.one("SELECT dir FROM runs WHERE task=?", (hi,))["dir"]) / "STOP").exists()
+        assert all(not (pathlib.Path(r["dir"]) / "STOP").exists() for r in p.db.q(
+            "SELECT dir FROM runs WHERE task IN (?,?)", tuple(hot[:2]))), "urgent runs are never preempted"
+        ev = p.db.q("SELECT * FROM events WHERE kind='task_preempted'")
+        assert [e["task"] for e in ev] == [lo] and f"#{hot[2]}" in ev[0]["text"]
+        d.dispatch()
+        assert len(p.db.q("SELECT id FROM events WHERE kind='task_preempted'")) == 1, "a stop under way counts as freeing"
+        deadline = time.monotonic() + 30
+        while p.db.task(lo)["status"] == "running" and time.monotonic() < deadline:
+            d.reap_runs()
+            time.sleep(0.05)
+        t = p.db.task(lo)
+        assert t["status"] == "queued" and t["attempts"] == before, "requeued with no attempt spent"
+        assert t["blocked_reason"] == "preempted for user-ordered urgent work; resumes"
+        d.dispatch()
+        assert sorted(_slot_tasks(p)) == sorted([hi] + hot), "the urgent task takes the freed slot, not the preempted one"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_the_urgent_burst_opens_at_an_orange_zero_slot_gate_but_never_at_red_and_preemption_can_be_turned_off(env):
+    """_start_hold: a user-ordered urgent task takes the burst slots at an orange plan gate of 0 slots
+    (critical work); red holds it; routine priority 1 never bursts. budget.urgent_preempt false: no stop."""
+    import dataclasses
+    from ttp import preempt
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    core = d.cfg.get("core_provider", "claude")
+    hot = p.db.task(p.db.add_task("device action", "s\nurgent: the user ordered it", kind="work", tier="light",
+                                  origin="user"))
+    plain = p.db.task(p.db.add_task("routine p1", "s", kind="work", tier="light", origin="coordinator", priority=1))
+
+    def hold(task, level, allow=True):
+        d.gates[core] = dataclasses.replace(d.gates[core], level=level, max_parallel=0, allow_new_work=allow)
+        return d._start_hold(task, core, {"now": time.time(), "paused": {}, "committed": None, "busy": {core: 0},
+                                          "logged_out": {core: False}})
+    assert hold(hot, "orange") is None, "orange 0-slot gate: the burst is open"
+    assert hold(plain, "orange") == "gate", "priority 1 alone never bursts"
+    assert hold(hot, "red") == "gate" and hold(hot, "red", allow=False) == "gate", "red holds it"
+    assert preempt.enabled(d.cfg) and not preempt.enabled({"budget": {"urgent_preempt": False}})
+    assert not preempt.enabled({"budget": {"urgent_preempt": "off"}})
+
+
+def test_preemption_never_picks_urgent_work_a_review_a_harness_task_a_pushing_task_an_owner_or_a_lock_holder(env):
+    from ttp import preempt
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+
+    def running(title, kind="work", priority=3, status="running", spec="s"):
+        tid = p.db.add_task(title, spec, kind=kind, tier="light", origin="user", priority=priority)
+        p.db.update_task(tid, status=status)
+        p.db.x("INSERT INTO runs(task, role, provider, status, started) VALUES(?,?,?,?,?)",
+               (tid, "worker", "claude", "running", time.time() + tid))
+        return tid, p.db.one("SELECT id FROM runs WHERE task=?", (tid,))["id"]
+    spared = [running("urgent", spec="s\nurgent: ordered"), running("p1", priority=1), running("review", "review"),
+              running("harness", "harness"), running("pushing", status="pushing")]
+    owner = running("owner", priority=4)
+    holder = running("lock holder", priority=5)
+    p2 = running("routine p2", priority=2)
+    p3 = running("routine p3", priority=3)
+    held = {(str(holder[1]), "")}
+    got = preempt.pick(p.db, "claude", {owner[0]: 0}, held)
+    assert got["task"]["id"] == p3[0], "the lowest-priority eligible run"
+    p.db.update_task(p3[0], status="done")
+    assert preempt.pick(p.db, "claude", {owner[0]: 0}, held)["task"]["id"] == p2[0]
+    assert preempt.pick(p.db, "claude", {owner[0]: 0}, held | {("", str(p2[0]))}) is None, \
+        "a lock labelled with its task spares it; nothing else is eligible"
+    assert preempt.pick(p.db, "claude", {}, set())["task"]["id"] == holder[0], "only its lock spared the p5 run"
+    p.db.x("UPDATE tasks SET status='done' WHERE id IN (?,?,?)", (holder[0], owner[0], p2[0]))
+    assert preempt.pick(p.db, "claude", {}, set()) is None, f"never one of {spared}"
