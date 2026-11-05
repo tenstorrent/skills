@@ -832,23 +832,32 @@ _idents_seen: dict[tuple[str, str], dict | None] = {}
 
 
 def _idents(p: Project, tip: str, head: str) -> dict | None:
-    """{(author name, email, author date): (sha, committer time)} of tip..head's commits (merges
-    aside), cached; None when git cannot tell in STACK_GIT_S. A rebase, amend or reword keeps a
-    commit's author ident and moves its committer time (batch._rewritten matches commits the same way)."""
+    """{(author name, email, author date): [(sha, committer time, files, patch-id), ...]} of tip..head's
+    commits (merges aside), cached; None when git cannot tell in STACK_GIT_S. A rebase, amend or reword
+    keeps a commit's author ident and moves its committer time (batch._rewritten matches commits the same
+    way); one author may make several commits within one second, so an ident alone never names one."""
     if (tip, head) in _idents_seen:
         return _idents_seen[(tip, head)]
     try:
-        r = _git(p, "log", "--no-merges", "--format=%H%x00%an%x00%ae%x00%ad%x00%ct", "--date=raw",
-                 f"{tip}..{head}", timeout=STACK_GIT_S)
+        r = _git(p, "log", "--no-merges", "--name-only", "--date=raw",
+                 "--format=%x00%H%x00%an%x00%ae%x00%ad%x00%ct", f"{tip}..{head}", "--", timeout=STACK_GIT_S)
+        patches = _git(p, "log", "-p", "--no-merges", "--no-color", "--no-ext-diff", "--format=commit %H",
+                       f"{tip}..{head}", "--", timeout=STACK_GIT_S) if r.returncode == 0 else r
+        pid = gitmemo.run(["git", "-C", str(p.root), "patch-id", "--stable"], input=patches.stdout, text=True,
+                          capture_output=True, timeout=STACK_GIT_S) if patches.returncode == 0 else patches
     except (OSError, subprocess.SubprocessError):
         return None
-    if r.returncode != 0:
+    if pid.returncode != 0:
         return None
-    out = {}
-    for line in r.stdout.splitlines():
-        f = line.split("\0")
-        if len(f) == 5 and f[4].isdigit():
-            out[(f[1], f[2], f[3])] = (f[0], int(f[4]))
+    pids = {f[1]: f[0] for f in (ln.split() for ln in pid.stdout.splitlines()) if len(f) == 2}
+    out: dict = {}
+    parts = r.stdout.split("\0")[1:]
+    for k in range(0, len(parts) - 4, 5):
+        sha, name, email, date = parts[k:k + 4]
+        ct, _, files = parts[k + 4].partition("\n")
+        if ct.isdigit():
+            out.setdefault((name, email, date), []).append(
+                (sha, int(ct), frozenset(x for x in files.split("\n") if x), pids.get(sha, "")))
     if len(_idents_seen) > 512:
         _idents_seen.clear()
     _idents_seen[(tip, head)] = out
@@ -857,9 +866,10 @@ def _idents(p: Project, tip: str, head: str) -> dict | None:
 
 def overlap_waits(p: Project, rows: list[dict], now: float, tip: str) -> tuple[dict[int, dict], dict[int, int]]:
     """Approvals whose own commits overlap another open change's: (waits, before). An approval
-    carrying an older copy of a commit (same author ident, older committer time) that another open
-    review's head or code task's branch holds a newer rewrite of would conflict with that change's
-    landing and lose its approval each time it lands. If the other is approved too (in `rows`), it
+    carrying an older copy of a commit (same author ident and files, older committer time, another
+    patch-id) that another open review's head or code task's branch holds a newer rewrite of would
+    conflict with that change's landing and lose its approval each time it lands; a same-patch copy (a
+    plain rebase or cherry-pick) cannot, so it holds nothing. If the other is approved too (in `rows`), it
     goes first: before = {row id: that row's id}, and the later one is rebased once onto it. Else
     waits = {row id: {"task", "head", "why"}} until it lands (its commits are then on the tip), it
     ends, or DEP_WAIT_S has passed since the approval. A git answer it cannot get holds nothing."""
@@ -892,7 +902,9 @@ def overlap_waits(p: Project, rows: list[dict], now: float, tip: str) -> tuple[d
             if branch == r["branch"] or o["task"] == r["task"] or o["head"] == r["head"]:
                 continue
             theirs = _idents(p, tip, o["head"]) or {}
-            stale = [k for k, (sha, ct) in mine.items() if k in theirs and theirs[k][0] != sha and theirs[k][1] > ct]
+            stale = [sha for k, cs in mine.items() for sha, ct, files, pid in cs
+                     if any(o_sha != sha and o_ct > ct and o_files == files and o_pid != pid
+                            for o_sha, o_ct, o_files, o_pid in theirs.get(k, ()))]
             if not stale:
                 continue
             if o["row"] is not None:

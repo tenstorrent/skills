@@ -16819,7 +16819,7 @@ def test_a_push_batch_sends_back_the_later_of_two_overlapping_members_once(env, 
 
 def test_an_approval_carrying_an_older_copy_of_another_changes_commits_goes_after_it(env, monkeypatch):
     """The #5784 case: an approval's branch carries an older copy of a commit that another open change
-    holds a newer rewrite (reworded) of. While that change is still under review the approval waits
+    holds a newer rewrite (reworded and changed) of. While that change is still under review the approval waits
     for it to land, rather than conflicting with each of its landings; once both are approved the
     rewrite's goes first in the batch, whatever their priority; DEP_WAIT_S bounds the wait."""
     from ttp import pushq
@@ -16830,7 +16830,8 @@ def test_an_approval_carrying_an_older_copy_of_another_changes_commits_goes_afte
     child_head = _git_out(s.path, "rev-parse", "HEAD")
     sib, sib_path, sib_branch = _code_task(s.p, "sibling", status="waiting")
     _git_out(sib_path, "cherry-pick", shared)
-    sib_head = _rewrite(sib_path, shared, {}, message="shared, reworded", later=120, args=("--amend",))
+    sib_head = _rewrite(sib_path, shared, {"shared.txt": "shared, changed in its review\n"},
+                        message="shared, reworded", later=120, args=("--amend",))
     s.p.db.update_task(s.review, status="pushing")
     with s.p.db.tx():
         [child] = pushq.approve(s.p, s.review, None, {"entries": [{"branch": s.branch, "head": child_head}],
@@ -16848,3 +16849,38 @@ def test_an_approval_carrying_an_older_copy_of_another_changes_commits_goes_afte
     s.p.db.update_task(sib, status="done")
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (sib_row,))
     assert [r["id"] for r in pushq.due(s.p, now + 1)[0]] == [child], "the other change ended"
+
+
+@pytest.mark.parametrize("case", ["same patch", "same author second"])
+def test_an_approval_sharing_only_a_same_patch_copy_or_an_author_second_with_another_change_holds_nothing(
+        env, monkeypatch, case):
+    """A sibling holding a same-patch copy of the approval's commit (a plain rebase or cherry-pick, newer
+    committer time) cannot conflict with it: git rebase skips it. Nor can an unrelated commit the same
+    author made in the same second. Neither holds or orders the approval."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    now = time.time()
+    shared = _commit(s.path, "shared.txt", "shared\n") or _git_out(s.path, "rev-parse", "HEAD")
+    child_head = _git_out(s.path, "rev-parse", "HEAD")
+    sib, sib_path, sib_branch = _code_task(s.p, "sibling", status="waiting")
+    if case == "same patch":
+        _git_out(sib_path, "cherry-pick", shared)
+        sib_head = _rewrite(sib_path, shared, {}, later=120, args=("--amend",))
+    else:   # another file and patch, the same author ident, a newer committer time
+        sib_head = _rewrite(sib_path, shared, {"other.txt": "other\n"}, message="unrelated", later=120)
+    assert sib_head != shared
+    s.p.db.update_task(s.review, status="pushing")
+    with s.p.db.tx():
+        [child] = pushq.approve(s.p, s.review, None, {"entries": [{"branch": s.branch, "head": child_head}],
+                                                      "target": "origin/proj"})
+    got, why = pushq.due(s.p, now + 1)
+    assert [r["id"] for r in got] == [child], why
+    review2 = s.p.db.add_task("review sibling", "r", kind="review", origin="coordinator", priority=9)
+    s.p.db.update_task(review2, status="pushing")
+    s.p.db.update_task(s.review, priority=1)
+    with s.p.db.tx():
+        [sib_row] = pushq.approve(s.p, review2, None, {"entries": [{"branch": sib_branch, "head": sib_head}],
+                                                       "target": "origin/proj"})
+    rows = pushq.due(s.p, now + 1)[0]
+    assert [r["id"] for r in rows] == [child, sib_row], "priority order, nothing reordered"
+    assert pushq.overlap_waits(s.p, rows, now + 1, pushq._tracking_tip(s.p, "origin", "proj")) == ({}, {})
