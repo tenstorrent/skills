@@ -195,3 +195,129 @@ def test_a_respec_citing_the_turns_message_is_no_new_order_and_one_order_keeps_i
                      "resources": ["rig"], "force": True}], messages=[msg])
     first = p.db.one("SELECT id FROM tasks WHERE title='cycle'")["id"]
     assert userorder.active(p.db)["rig"]["task"] == first
+
+
+def _order_run(p, tmp_path, title, spec="s", chat=None, resources=(), ago=600):
+    """A task created `ago` s back with a running worker run; returns (task id, run dir)."""
+    tid = p.db.add_task(title, spec, kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running", reply_chat=chat,
+                     labels=json.dumps([f"resource:{r}" for r in resources]))
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - ago, tid))
+    run_dir = tmp_path / f"run-{tid}"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - ago, "running", str(run_dir)))
+    return tid, run_dir
+
+
+def _order_fanouts(p):
+    from ttp import userorder
+    return [json.loads(r["data"]) | {"text": r["text"]}
+            for r in p.db.q("SELECT text, data FROM events WHERE kind=? ORDER BY id", (userorder.FANOUT_KIND,))]
+
+
+def _order_msg(p, text, chat="c1", ago=60):
+    return p.db.x("INSERT INTO messages(ts,direction,kind,chat,text) VALUES(?,'in','user',?,?)",
+                  (time.time() - ago, chat, text))
+
+
+def test_a_user_order_reaches_its_running_owner_and_tasks_answering_its_chat_once_quoting_the_users_words(
+        env, tmp_path):
+    from ttp import coordinator as coord, obligations
+    p = make(env)
+    owner, owner_dir = _order_run(p, tmp_path, "soak")
+    asker, asker_dir = _order_run(p, tmp_path, "report", chat="c1")
+    other, other_dir = _order_run(p, tmp_path, "unrelated", chat="c2")
+    msg = _order_msg(p, "stop the soak after this cell\nand keep the logs")
+    act = {"type": "obligation", "order": msg, "text": "stop the soak, keep logs", "owners": [owner],
+           "action_class": "read", "supersedes": ["step 3: rerun every cell"]}
+    assert coord.apply(p, [act]) == []
+    steer = (owner_dir / "steer.md").read_text()
+    assert "user's words (verbatim):\n> stop the soak after this cell\n> and keep the logs" in steer, steer
+    assert "step 3: rerun every cell" in steer and "you own it" in steer and f"(turn user-order-{msg}-" in steer
+    assert "you answer its chat" in (asker_dir / "steer.md").read_text()
+    assert not (other_dir / "steer.md").exists(), "a task on another chat naming nothing of the order was told"
+    log = _order_fanouts(p)
+    assert len(log) == 1 and sorted(log[0]["tasks"]) == sorted([owner, asker]) and log[0]["msg"] == msg, log
+    assert any(f"user msg #{msg} reached running #{owner}, #{asker}" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    # The same order again (linked by key, attached once more): no run gets it twice.
+    oid = next(o["id"] for o in obligations.items(p.db) if (o.get("promise") or {}).get("order") == msg)
+    assert coord.apply(p, [act, {"type": "obligation", "key": oid, "order": msg, "owners": [owner]}]) == []
+    for d in (owner_dir, asker_dir):
+        assert (d / "steer.md").read_text().count("user's words (verbatim)") == 1, d
+    # A task created after the message carries the order in its spec: not told.
+    late, late_dir = _order_run(p, tmp_path, "after", chat="c1", ago=5)
+    coord.apply(p, [act])
+    assert not (late_dir / "steer.md").exists()
+
+
+def test_a_user_order_reaches_running_tasks_whose_spec_branch_or_resource_names_what_it_names(
+        env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, overlap
+    p = make(env)
+    by_spec, spec_dir = _order_run(p, tmp_path, "edit", spec="change plugins/x/runtime/ttp/gate.py to log")
+    by_branch, branch_dir = _order_run(p, tmp_path, "branch work")
+    by_res, res_dir = _order_run(p, tmp_path, "rig soak", resources=["rig-device"])
+    other, other_dir = _order_run(p, tmp_path, "docs", spec="edit plugins/x/README.md", resources=["bench"])
+    monkeypatch.setattr(overlap, "branches", lambda p, skip=(): [
+        {"id": by_branch, "branch": "b", "head": "h", "open": True, "files": [("M", "plugins/x/runtime/ttp/gate.py")]},
+        {"id": other, "branch": "o", "head": "h2", "open": True, "files": [("M", "plugins/x/docs/a.md")]}])
+    msg = _order_msg(p, "the gate in runtime/ttp/gate.py must fail open; leave rig alone today")
+    assert coord.apply(p, [{"type": "obligation", "order": msg, "text": "gate fails open",
+                            "action_class": "read"}]) == []
+    assert "your spec names runtime/ttp/gate.py" in (spec_dir / "steer.md").read_text()
+    assert "your branch changes runtime/ttp/gate.py" in (branch_dir / "steer.md").read_text()
+    assert "your resource rig-device" in (res_dir / "steer.md").read_text()
+    assert not (other_dir / "steer.md").exists()
+    assert sorted(_order_fanouts(p)[-1]["tasks"]) == sorted([by_spec, by_branch, by_res])
+
+
+def test_an_order_that_matches_no_running_task_is_logged_and_tells_nobody(env, tmp_path):
+    from ttp import coordinator as coord
+    p = make(env)
+    _, run_dir = _order_run(p, tmp_path, "unrelated", chat="c2")
+    msg = _order_msg(p, "what is the weather")
+    assert coord.apply(p, [{"type": "obligation", "order": msg, "text": "answer", "action_class": "read"}]) == []
+    assert not (run_dir / "steer.md").exists()
+    log = _order_fanouts(p)
+    assert log[-1]["tasks"] == [] and f"user msg #{msg} matched no running task" in log[-1]["text"], log
+
+
+def test_a_restrictions_change_reaches_every_running_run_with_the_users_words_and_is_logged(env, tmp_path):
+    from ttp import coordinator as coord
+    p = make(env)
+    runs = [_order_run(p, tmp_path, f"job {i}", chat=f"c{i}") for i in range(3)]
+    msg = _order_msg(p, "Never push to main.", ago=5)
+    assert coord.apply(p, [{"type": "obligation", "order": msg, "text": "no pushes to main",
+                            "action_class": "read"}]) == []   # job 1 answers its chat: told the order first
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never push to main.",
+                            "source": G}], user_turn=True, messages=[msg]) == []
+    for _, d in runs:
+        steer = (d / "steer.md").read_text()
+        assert "New binding restriction: Never push to main." in steer and "> Never push to main." in steer, steer
+    assert sorted(_order_fanouts(p)[-1]["tasks"]) == sorted(t for t, _ in runs)
+    # A Goals change reaches only the running tasks it touches; a run with no task gets only restrictions.
+    gate, gate_dir = _order_run(p, tmp_path, "gate", spec="edit plugins/x/runtime/ttp/gate.py")
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(NULL,'worker','fake',?,'running',?)",
+           (time.time(), str(bare)))
+    assert coord.apply(p, [{"type": "charter_update", "section": "Goals",
+                            "text": "Make runtime/ttp/gate.py fail open."}]) == []
+    assert "Goals changed (Goals and success criteria): Make runtime/ttp/gate.py fail open." in (gate_dir / "steer.md").read_text()
+    assert all("fail open" not in (d / "steer.md").read_text() for _, d in runs)
+    assert not (bare / "steer.md").exists() and _order_fanouts(p)[-1]["tasks"] == [gate]
+    assert coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "text": "Never reboot rig.",
+                            "source": G}]) == []
+    assert "Never reboot rig." in (bare / "steer.md").read_text()
+
+
+def test_an_order_naming_a_resource_keeps_its_resource_steer_and_is_not_told_twice(env, tmp_path):
+    from ttp import coordinator as coord
+    p, ids, msg, run_dir, other_dir = _ordered(env, tmp_path)
+    steer = (run_dir / "steer.md").read_text()
+    assert "Newer user order" in steer and "ttp lock --probe rig" in steer
+    assert coord.apply(p, [{"type": "obligation", "order": msg, "text": "power-cycle rig",
+                            "owners": [ids["order"]], "action_class": "device"}]) == []
+    assert (run_dir / "steer.md").read_text() == steer, "the run told of the order on rig got it again"
+    assert not (other_dir / "steer.md").exists()

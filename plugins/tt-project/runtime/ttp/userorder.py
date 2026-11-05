@@ -9,15 +9,25 @@ last re-specified before that message is held there, model-free:
 - running ones get one steer.md update naming the order;
 - the coordinator's digest lists them, to re-spec or cancel that turn.
 A spec update by the coordinator after the message clears a task (it saw the order then).
+
+Any recorded order (an `obligation` with `order`) and any Goals or Restrictions change also reach, once,
+every running run they affect (fan_out): the order's owners, tasks answering its chat, tasks whose spec,
+unlanded branch or resources name what it names, and for a Restrictions change every run. Each fan-out,
+or that nobody matched, is logged as a FANOUT_KIND event naming the tasks told.
 """
 from __future__ import annotations
 
+import json
+import re
 import time
+from pathlib import Path
 
 ORDERS_KEY = "user_orders"            # kv: {resource: {"task", "msg", "ts", "at"}}, the latest per resource
 RESPECS_KEY = "user_order_respecs"    # kv: {task id: when the coordinator last changed its spec}
 TERMINAL = ("done", "failed", "cancelled")
 RESPECS_KEPT = 500
+FANOUT_KIND = "user_order_fanout"     # event: who a user order or charter change was told to mid-run
+WORDS_MAX = 1500                      # chars of the user's words quoted in one update
 
 
 def same(cfg: dict | None, a: str, b: str) -> bool:
@@ -183,3 +193,90 @@ def digest_lines(p) -> list[str]:
         return []
     return ["## Newer user orders on a resource (the older open tasks there are held: `ttp lock` refuses "
             "them and dispatch keeps them back. This turn, cancel each or re-spec it to fit the order)"] + out
+
+
+def _words(db, msgs) -> tuple[str, str | None, float | None]:
+    """(the user's verbatim words of messages `msgs`, the first one's chat, the newest one's time)."""
+    rows = [r for m in dict.fromkeys(int(x) for x in msgs or []) if (r := db.one(
+        "SELECT text, chat, ts FROM messages WHERE id=? AND direction='in'", (m,)))]
+    words = "\n".join(str(r["text"] or "").strip() for r in rows).strip()
+    words = words if len(words) <= WORDS_MAX else words[:WORDS_MAX].rstrip() + " [...]"
+    return words, rows[0]["chat"] if rows else None, max((float(r["ts"] or 0) for r in rows), default=None)
+
+
+def _named(names, text: str) -> list[str]:
+    """The resources of `names` that `text` names as a whole word (or the machine of one)."""
+    toks = set(re.findall(r"[A-Za-z0-9][\w.:-]*[A-Za-z0-9]", text or ""))
+    return sorted(r for r in names if any(t == r or r.startswith((t + "-", t + ":")) or t.startswith((r + "-", r + ":"))
+                                          for t in toks))
+
+
+def _told(steer: Path, msg: int, run: int) -> bool:
+    """Whether this run's steer.md already carries order `msg` (fan_out's or steer_running's key)."""
+    try:
+        return re.search(rf"\(turn user-order-(?:\S+-)?{int(msg)}-{int(run)}\)", steer.read_text()) is not None
+    except OSError:
+        return False
+
+
+def fan_out(p, head: str, *, msgs=(), owners=(), chat: str | None = None, text: str = "", supersedes=(),
+            everyone: bool = False, key: str | None = None) -> str:
+    """Tell each running worker run that a user order (user messages `msgs`) or charter change affects, once,
+    through its steer.md, quoting the user's words; log who was told, or that nobody was. Affected: every run
+    when `everyone` (a Restrictions change); else runs whose task is in `owners`, answers `chat` (its
+    reply_chat), or whose spec, unlanded branch or resources name a path or resource `text` names. For an order,
+    a task created after its message is skipped (its spec carries it). Returns a note for the coordinator."""
+    from . import coordinator as coord
+    from . import overlap
+    db = p.db
+    words, msg_chat, at = _words(db, msgs)
+    chat, msg = chat or msg_chat, max((int(m) for m in msgs or []), default=None)
+    runs = db.q("SELECT id, task, dir FROM runs WHERE status='running' AND role!='coordinator' "
+                "AND dir IS NOT NULL ORDER BY id")
+    text = "\n".join(x for x in (text, words) if x)   # what it names: the order's summary and the user's words
+    paths = overlap.spec_paths(text, p.root) if text and runs and not everyone else []
+    files: dict[int, list[str]] = {}
+    if paths:
+        try:
+            files = {b["id"]: [f for _, f in b["files"]] for b in overlap.branches(p)}
+        except Exception:   # no git: specs and resources still match
+            files = {}
+    owners, told, why = {int(t) for t in owners or []}, [], {}
+    for r in runs:
+        t = db.task(r["task"]) if r["task"] is not None else None
+        if everyone:   # a restriction binds every run, a task-less one too
+            t = t or {"id": 0}
+        elif not t or t["status"] in TERMINAL or (msg and at and float(t.get("created") or 0) > at):
+            continue
+        tid = int(t["id"])
+        hits = ["every run (Restrictions)"] if everyone else []
+        hits += ["you own it"] if tid in owners else []
+        hits += ["you answer its chat"] if chat and chat != "all" and t.get("reply_chat") == chat and tid not in owners else []
+        mine = overlap.spec_paths(t.get("spec") or "", p.root) if paths else []
+        hits += [f"your spec names {m}" for m in paths if any(overlap.same(m, x) for x in mine)][:3]
+        hits += [f"your branch changes {m}" for m in paths if any(overlap.same(m, x) for x in files.get(tid, []))][:3]
+        hits += [f"your resource {n}" for n in _named(coord.task_resources(t), text)] if not everyone else []
+        steer = Path(r["dir"]) / "steer.md"
+        if not hits or not Path(r["dir"]).is_dir() or (msg and not everyone and _told(steer, msg, r["id"])):
+            continue
+        body = [head.strip()]
+        if words:
+            body.append("user's words (verbatim):\n" + "\n".join("> " + ln for ln in words.splitlines()))
+        steps = [str(s).strip() for s in supersedes or [] if str(s).strip()]
+        if steps:
+            body.append("It supersedes these older spec steps: " + "; ".join(steps) + ".")
+        if not everyone:
+            body.append(f"You get this because {', '.join(hits)}. Follow it where it touches your task: where your "
+                        "spec conflicts with it, the order wins. Commit what you have and say in your hand-off what "
+                        "you changed for it.")
+        coord._append_update(steer, "\n".join(body), f"user-order-{msg}-{r['id']}" if msg and not everyone else key)
+        if tid:
+            told.append(tid)
+            why[str(tid)] = hits
+    what = f"user msg #{msg}" if msg else head.strip().split(":", 1)[0]
+    note = (f"{what} reached running " + ", ".join(f"#{t}" for t in told) if told
+            else f"{what} matched no running task")
+    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), "coordinator", FANOUT_KIND, "low", note,
+          json.dumps({"msg": msg, "tasks": told, "why": why, "head": head[:300]}), "handled"))
+    return note

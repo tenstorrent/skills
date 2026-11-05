@@ -2264,6 +2264,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     sent: list[tuple[int, str | None, str]] = []
     batch_tasks: dict[int, str | None] = {}
     batch_obls: list[str] = []
+    fan_orders: list[tuple[str | None, int, list]] = []   # (key, message, supersedes) of orders: userorder.fan_out
     delivered: list[tuple[int, str | None, list]] = []   # replies with `delivers` (obligations.deliver)
     explicit: set[int] = set()   # replies naming `owners` or `delivers`: their promise is never auto-attached
     claimed: list[tuple[int, str | None, list]] = []   # (message, chat, claims) of replies and notifies
@@ -3111,7 +3112,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 added = p.add_memory(text, kind=a.get("memory_kind") or "fact", title=a.get("title"), key=key,
                                      end=end, standing=a.get("standing") is True, audience=audience)
                 if (a.get("memory_kind") or "") == "restriction":
-                    _tell_running_workers(db, f"New binding restriction: {a['text'].strip()}", key)
+                    notes.append(_tell_running_workers(p, f"New binding restriction: {a['text'].strip()}", key,
+                                                       messages if user_turn else ()))
                 if a["text"].lstrip().startswith(CORRECTION_PREFIX) and not correction.remember(db, added.stem,
                                                                                                 a["text"].strip()):
                     notes.append(f"memory_add: [{added.stem}] names no corrected value: write it as '<right>, not "
@@ -3343,9 +3345,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                 chat=None, kind="alert", severity="low")
                     if target.lower().startswith("restriction"):
                         if text:
-                            _tell_running_workers(db, f"New binding restriction: {text}", key)
+                            notes.append(_tell_running_workers(p, f"New binding restriction: {text}", key,
+                                                               messages if user_turn else ()))
                         elif quote:
-                            _tell_running_workers(db, f"Binding restriction retired: {quote}", key)
+                            notes.append(_tell_running_workers(p, f"Binding restriction retired: {quote}", key,
+                                                               messages if user_turn else ()))
+                    elif _DATED.sub("", target.lstrip("# ")).lower().startswith("goal"):   # only the tasks it touches
+                        notes.append(_fan(p, f"Goals changed ({target}): {clip(text or quote, 600)}",
+                                          msgs=messages if user_turn else (), text=text or quote, key=key))
                 p.commit_harness([p.charter_path, p.harness / CHARTER_HISTORY], msg)
                 chartertemplate.landed(db, a)   # a refusal alert told to the relayer's chat clears
             elif t == "schedule_set":
@@ -3490,12 +3497,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(obligations.add_order(p, str(a.get("text") or ""), int(a["order"]), owners,
                                                        due=a.get("due"), start_by=a.get("start_by"),
                                                        action_class=a.get("action_class")))
+                    fan_orders.append((None, int(a["order"]), a.get("supersedes") or []))
                 elif a.get("order") is not None:   # `key` stands for the order the message carries
                     with db.tx():
                         notes.append(obligations.link_order(p, oid, int(a["order"])))
                         if owners:
                             obligations.attach(p, oid, owners)
                             batch_obls.append(oid)
+                    fan_orders.append((oid, int(a["order"]), a.get("supersedes") or []))
                 elif a.get("due") not in (None, "") and oid and not owners \
                         and not any(str(a.get(f) or "").strip() for f in ("evidence", "why", "justify")):
                     notes.append(obligations.set_due(p, oid, a["due"]))
@@ -3613,6 +3622,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             restriction_audit.restriction_tools(p, loosened, list(batch_tasks), notes)
         except Exception as e:
             notes.append(f"restriction tools not checked: {type(e).__name__}: {str(e)[:200]}")
+    for oid, msg, steps in fan_orders:   # once its owners are attached: every running task it affects is told
+        try:
+            notes.append(_fan_order(p, oid, msg, steps))
+        except Exception as e:
+            notes.append(f"user msg #{msg} not told to running tasks: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: marking what it delivered never undoes or rejects it
         notes += obligations.deliver(p, delivered)
     except Exception as e:
@@ -5078,12 +5092,35 @@ def _hours_or_none(a: dict, key: str) -> float | None:
     return hours
 
 
-def _tell_running_workers(db, text: str, key: str | None = None) -> None:
+def _tell_running_workers(p: Project, text: str, key: str | None = None, msgs=()) -> str:
     """A new restriction binds work already in flight, not only work started later: it goes to
-    every running worker's update file, which the worker receives mid-run."""
-    for r in db.q("SELECT dir FROM runs WHERE status='running' AND role!='coordinator'"):
-        if r["dir"] and Path(r["dir"]).is_dir():
-            _append_update(Path(r["dir"], "steer.md"), text, key)
+    every running worker's update file, which the worker receives mid-run, with the user's words of
+    `msgs`; logged (userorder.fan_out). Returns its note."""
+    return _fan(p, text, msgs=msgs, everyone=True, key=key)
+
+
+def _fan(p: Project, head: str, **kw) -> str:
+    """userorder.fan_out after its change applied: a failure to tell is a note, never an undone action."""
+    try:
+        return userorder.fan_out(p, head, **kw)
+    except Exception as e:
+        return f"{clip(head, 80)}: running tasks not told: {type(e).__name__}: {str(e)[:200]}"
+
+
+def _fan_order(p: Project, oid: str | None, msg: int, steps) -> str:
+    """Tell the running tasks the order of user message `msg` affects (userorder.fan_out): its obligation's
+    owners (`oid`, else the open order recorded for `msg`), tasks answering its chat, and tasks whose spec,
+    branch or resources name what it names. Returns its note."""
+    o = obligations.get(p.db, oid) if oid else next(
+        (x for x in obligations.items(p.db) if (x.get("promise") or {}).get("order") == int(msg)
+         and not x.get("receipt") and not x.get("dropped")), None)
+    o = o or {}
+    pr = o.get("promise") or {}
+    words = o.get("text") or ""
+    return userorder.fan_out(p, f"User order{' ' + o['id'] if o.get('id') else ''} (user msg #{msg}): {clip(words, 400)}",
+                             msgs=[msg], owners=obligations._owner_ids(o) if o else (),
+                             chat=pr.get("chat") if pr.get("order") == int(msg) else None,
+                             text=words, supersedes=steps)
 
 
 # Words by which a new rule allows what it names, or narrows an old one ("may", "no longer", "except").
