@@ -72,7 +72,7 @@ def check_memory(evidence: dict, problems: list) -> None:
         shortfall(problems, ledger.get("pool_shortfall_reason"), f"KV pool {pool} < concurrency x working set {need}")
 
 
-def check_serving(evidence: dict, problems: list) -> None:
+def check_serving(evidence: dict, stage: str, problems: list) -> None:
     serving = evidence.get("serving") or {}
     if serving.get("prefix_caching") is False:
         shortfall(problems, serving.get("reason"), "prefix caching is disabled for serving")
@@ -85,11 +85,32 @@ def check_serving(evidence: dict, problems: list) -> None:
         elif fraction < MIN_HIT_FRACTION:
             reason = serving.get("reason") or ("live conversations exceeded the pool" if serving.get("pool_bound") else None)
             shortfall(problems, reason, f"cache reuse is {fraction:.0%} of the reusable ceiling")
+    check_growing_contexts(evidence, serving.get("growing_contexts"), problems)
+    if stage == "optimized-vllm":
+        for key in ("prefill_by_length", "host_contention"):
+            if not isinstance(serving.get(key), dict) or not serving[key]:
+                problems.append((2, f"serving.{key} is missing; stage 10 measures it for goal 12"))
     traces = serving.get("trace_captures_after_warmup")
     if not isinstance(traces, dict) or not traces:
         problems.append((2, "serving.trace_captures_after_warmup is missing"))
     elif any(traces.values()):
         shortfall(problems, serving.get("trace_reason"), f"traces rebuilt per request after warm-up: {traces}")
+
+
+def check_growing_contexts(evidence: dict, row, problems: list) -> None:
+    workload = evidence.get("workload") or {}
+    keys = ("concurrency", "final_context_tokens", "late_hit_fraction")
+    if not (isinstance(row, dict) and all(isinstance(row.get(key), (int, float)) for key in keys)):
+        problems.append((2, "serving.growing_contexts needs concurrency, final_context_tokens and late_hit_fraction "
+                            "from conversations growing to the working set"))
+        return
+    reason = row.get("reason")
+    if row["concurrency"] < workload.get("target_concurrency", 0) or \
+            row["final_context_tokens"] < workload.get("working_set_tokens", 0):
+        shortfall(problems, reason, "growing-context traffic stayed below the target concurrency or working set")
+    if row["late_hit_fraction"] < MIN_HIT_FRACTION:
+        shortfall(problems, reason or ("live conversations exceeded the pool" if row.get("pool_bound") else None),
+                  f"cache reuse fell to {row['late_hit_fraction']:.0%} as contexts grew")
 
 
 def number(value) -> bool:
@@ -314,7 +335,7 @@ def main() -> int:
     if evidence:
         check_memory(evidence, problems)
         if args.stage != "full-model":
-            check_serving(evidence, problems)
+            check_serving(evidence, args.stage, problems)
         if args.stage == "agentic-evals":
             carried = sum(1 for level, _ in problems if level == 1)
             check_evals(model_dir, carried, problems)

@@ -8,7 +8,8 @@ description: Optimize a bringup for the agentic serving workload it will actuall
 Follow [model-bringup startup](../model-bringup/SKILL.md#startup). Stages record what this skill
 asks for in `models/autoports/<model>/doc/agentic_serving.json`; `scripts/check_agentic_serving.py`
 gates it. Missing evidence is critical. A measured shortfall is critical unless it carries a reason
-(`copy_reason`, `pool_shortfall_reason`, `serving.reason`, `trace_reason`), which makes it advisory.
+(`copy_reason`, `pool_shortfall_reason`, `serving.reason`, `trace_reason`,
+`growing_contexts.reason`), which makes it advisory.
 Goal 12 must price every such shortfall in suite hours before it ranks its work.
 
 ## Target workload
@@ -61,6 +62,23 @@ fixed-shape benchmarks. Record them under `serving` in stages 09 and 10.
 - `trace_captures_after_warmup`: captures, retirements and evictions per request, all 0.
 - No host work per decode step that scales with steps or pool size.
 - Start-up stays small relative to an eval suite.
+- `growing_contexts`: `target_concurrency` conversations, requests from different conversations
+  interleaved, each growing turn by turn until it holds `working_set_tokens`. Recorded agent
+  histories through `scripts/agent_replay.py` serve when they exist; otherwise build histories of
+  that shape. Record `concurrency`, `final_context_tokens`, `preemptions`, prefilled tokens against
+  the conversations' final context tokens, and `late_hit_fraction`: the hit fraction over the last
+  quarter of requests, when contexts are largest. It should hold 0.9 like the whole-run fraction;
+  a cache that works for short contexts and fails as they grow shows only here.
+
+Stage 10 also records two measurements that goal 12 prices; neither has a pass bar:
+
+- `prefill_by_length`: for prompts of 4096 tokens, `typical_context_tokens` and
+  `working_set_tokens`, one at a time with prefix caching bypassed, the prefill rate (input tokens
+  ÷ time to first token); and the decode rate of other running requests while one
+  `working_set_tokens` prompt prefills.
+- `host_contention`: the same decode load at the largest validated batch, once on an idle host and
+  once with one busy process per host CPU, not pinned. Record output tokens per second and the
+  engine's host time per decode step for both.
 
 Precision is part of this. Short-prompt top-k agreement does not show long-context or free-running
 failures (malformed tool calls, loops to the length cap). Stage 08 also checks agent-shaped long

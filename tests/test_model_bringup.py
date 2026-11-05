@@ -235,7 +235,9 @@ def test_gates_fail_critical_for_malformed_serving_contract(installed, stage, fi
         'workload': {'target_concurrency': 4, 'working_set_tokens': 2000},
         'ledger': {'weights': [{'name': 'all', 'bytes': 2**30}], 'pool_tokens': 8192},
         'serving': {'prefix_caching': True, 'hit_fraction_of_ceiling': 0.95,
-                    'trace_captures_after_warmup': {'captures': 0}}}))
+                    'trace_captures_after_warmup': {'captures': 0},
+                    'growing_contexts': {'concurrency': 4, 'final_context_tokens': 2000,
+                                         'late_hit_fraction': 0.95}}}))
     contract = valid_serving_contract()
     (doc / 'full_model/logprobs.log').write_text('ok')
     path = doc / 'full_model/serving_contract.json'

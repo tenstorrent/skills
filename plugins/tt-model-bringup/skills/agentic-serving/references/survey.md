@@ -23,8 +23,8 @@ Read these on the stage-11 benchmark and the smoke run, and again on every later
 | `eval_validity` | Trajectory audit: fetched fixes, network use, infrastructure failures | No fetched fixes, no infrastructure failures |
 | `accuracy_drift` | KL against HF on long agent prompts | At the noise floor |
 | `generation_share` | Per model call on the smoke: output tokens × served step ÷ call wall, and what fills the rest (tool commands, container round trips, prefill waits) | Known; it bounds what any serving change can save |
-| `prefill_under_load` | Prefilled tokens ÷ the agents' final context tokens, prefill tok/s at real context lengths, decode rate while a long prompt prefills | Prefilled close to the final contexts; decode not stalled |
-| `host_contention` | Engine host time per step against task-container CPU, from a host monitor during the smoke | Flat as task CPU rises |
+| `prefill_under_load` | Prefilled tokens ÷ the agents' final context tokens on the smoke; prefill rate by length and decode rate during a long prefill, from stage 10's `prefill_by_length` | Prefilled close to the final contexts; decode not stalled |
+| `host_contention` | Engine host time per step against task-container CPU, from a host monitor during the smoke, next to stage 10's idle and loaded measurement | Flat as task CPU rises |
 
 Record each as `{"value": ..., "healthy": true|false}`. A check you cannot measure yet records
 `not_measured` with the reason and the test that will measure it.

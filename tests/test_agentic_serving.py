@@ -21,7 +21,11 @@ def evidence():
         'workload': {'target_concurrency': 16, 'working_set_tokens': 20000, 'source': 'estimated'},
         'ledger': {'weights': [{'name': 'attention', 'bytes': 1, 'copies': 1}], 'pool_tokens': 400000},
         'serving': {'prefix_caching': True, 'hit_fraction_of_ceiling': 0.95,
-                    'trace_captures_after_warmup': {'captures': 0, 'retirements': 0}},
+                    'trace_captures_after_warmup': {'captures': 0, 'retirements': 0},
+                    'growing_contexts': {'concurrency': 16, 'final_context_tokens': 20000,
+                                         'late_hit_fraction': 0.93, 'preemptions': 0},
+                    'prefill_by_length': {'4096': {'prefill_tok_s': 1}},
+                    'host_contention': {'idle': {'tok_s': 1}, 'loaded': {'tok_s': 1}}},
     }
 
 
@@ -54,6 +58,10 @@ def test_missing_evidence_is_critical(tmp_path):
     ('vllm', lambda e: e['serving'].update(prefix_caching=False), ('serving', 'reason')),
     ('vllm', lambda e: e['serving'].update(hit_fraction_of_ceiling=0.5), ('serving', 'reason')),
     ('vllm', lambda e: e['serving']['trace_captures_after_warmup'].update(retirements=4), ('serving', 'trace_reason')),
+    ('vllm', lambda e: e['serving']['growing_contexts'].update(late_hit_fraction=0.4),
+     ('serving', 'growing_contexts', 'reason')),
+    ('vllm', lambda e: e['serving']['growing_contexts'].update(final_context_tokens=4000),
+     ('serving', 'growing_contexts', 'reason')),
 ])
 def test_shortfall_is_critical_without_a_reason_and_advisory_with_one(tmp_path, stage, mutate, reason):
     data = evidence()
@@ -428,3 +436,22 @@ def test_plan_mode_must_match_the_operator_inputs(tmp_path):
     goal12(tmp_path)
     code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'full'})
     assert code == 2 and "mode 'full'" in stderr
+
+
+@pytest.mark.parametrize('stage, key', [
+    ('vllm', 'growing_contexts'),
+    ('optimized-vllm', 'growing_contexts'),
+    ('optimized-vllm', 'prefill_by_length'),
+    ('optimized-vllm', 'host_contention'),
+])
+def test_serving_stages_require_their_agent_load_measurements(tmp_path, stage, key):
+    data = evidence()
+    del data['serving'][key]
+    code, stderr = check(tmp_path, stage, data)
+    assert code == 2 and key in stderr
+
+
+def test_vllm_stage_does_not_require_the_stage_10_measurements(tmp_path):
+    data = evidence()
+    del data['serving']['prefill_by_length'], data['serving']['host_contention']
+    assert check(tmp_path, 'vllm', data) == (0, '')
