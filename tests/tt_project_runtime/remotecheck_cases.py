@@ -350,9 +350,11 @@ def test_check_host_settings_are_validated_and_local_keeps_a_check_here():
 
 def _spill_setup(env, tmp_path, monkeypatch, hosts, charter=("check-host-a", "check-host-b", "down")):
     """A checks repo whose project allows `charter` (charter text and machines list), spills to `hosts`
-    after 0.3 s, has one checks lane, and the fake ssh on PATH."""
-    from ttp import machines
+    after 0.3 s, has one checks lane, and the fake ssh on PATH reporting an idle host."""
+    from ttp import checkspill, machines
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    # The fake ssh runs the probe here: read an idle load, not this machine's (a busy test host has none).
+    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("cut -d' ' -f1 /proc/loadavg", "echo 0"))
     p.charter_path.write_text("# Charter\n## Resources\n" + "".join(f"- {h}: a check host\n" for h in charter))
     for h in charter:
         machines.add(h)

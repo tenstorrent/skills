@@ -1381,13 +1381,12 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     first, by arrival, ahead of urgent ones and every turn above, so no waiter waits without a bound.
 
     `urgent_max` URGENT_FIRST: every urgent waiter goes first, whatever its project or the others' arrival
-    (aged ones included), the most urgent priority first, then the oldest (urgent_order); the rest follow
-    in the order above. Accepted gap: a steady stream of urgent runs holds routine ones back."""
+    (aged ones included), the most urgent priority first, then by the turns above among projects; the rest
+    follow in the order above. Accepted gap: a steady stream of urgent runs holds routine ones back."""
     q = queued(locks_dir, resource) if q is None else q
-    if urgent_max == URGENT_FIRST:
-        front = urgent_order([t for t in q if _urgent(t)])
-        return front + fair_order(locks_dir, resource, [t for t in q if t not in front], 0, aged_before)
-    aged = sorted((t for t in q if _arrival(t) <= aged_before), key=_arrival) if aged_before is not None else []
+    first = urgent_max == URGENT_FIRST
+    aged = sorted((t for t in q if _arrival(t) <= aged_before and not (first and _urgent(t))),
+                  key=_arrival) if aged_before is not None else []
     if aged:
         q = [t for t in q if t not in aged]
     groups: dict[str, list[Path]] = {}
@@ -1397,14 +1396,15 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     key = {g: (0, max(served.get(g, 0.0), _arrival(ts[0])), ts[0].name) for g, ts in groups.items()}
     for ts in groups.values():
         ts.sort(key=ticket_priority)   # stable: arrival order within a priority
-    hot = sum(map(_urgent, q)) if urgent_max > 0 else 0
-    cold = len(q) - hot
-    run = _streak(locks_dir, resource) if hot and cold else 0
+    hot = sum(map(_urgent, q)) if urgent_max > 0 or first else 0
+    cold, n_hot = len(q) - hot, hot
+    run = _streak(locks_dir, resource) if hot and cold and not first else 0
     out = []
     while groups:
-        want = run < urgent_max if hot and cold else None   # urgent or not; None: either
-        g = min((g for g, ts in groups.items() if want is None or any(_urgent(t) == want for t in ts)),
-                key=key.__getitem__)
+        want = (True if hot else None) if first else (run < urgent_max if hot and cold else None)  # None: either
+        rank = ((lambda g: (min(ticket_priority(t) for t in groups[g] if _urgent(t)), key[g])) if first and want
+                else key.__getitem__)
+        g = min((g for g, ts in groups.items() if want is None or any(_urgent(t) == want for t in ts)), key=rank)
         ts = groups[g]
         t = ts.pop(0 if want is None else next(i for i, t in enumerate(ts) if _urgent(t) == want))
         out.append(t)
@@ -1416,11 +1416,11 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
             key[g] = (1, len(out), "")
         else:
             del groups[g]
-    return aged + out
+    return out[:n_hot] + aged + out[n_hot:] if first else aged + out
 
 
 URGENT_PRIORITY = 1   # a waiter at this task priority or better is urgent in fair_order with urgent_max
-URGENT_FIRST = -1     # fair_order's urgent_max: urgent waiters always first, by priority then age
+URGENT_FIRST = -1     # fair_order's urgent_max: urgent waiters always first, by priority then project turns
 
 
 def _urgent(ticket: Path) -> bool:

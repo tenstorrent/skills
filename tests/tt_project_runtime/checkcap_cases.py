@@ -6528,10 +6528,12 @@ def test_push_checks_wait_for_the_load_guard_without_a_host_slot(env, monkeypatc
 
 
 def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_arrival(env, monkeypatch):
-    # A routine run that waited past checks.starve_s outranks later urgent (p1) arrivals for the next free
-    # slot; under the bound the bounded urgent turns still put the p1 first.
+    # Under a set checks.priority_turns, a routine run that waited past checks.starve_s outranks later urgent
+    # (p1) arrivals for the next free slot; under the bound the bounded urgent turns still put the p1 first.
+    # The default (locks.URGENT_FIRST) keeps the p1 first past the bound too (#5893).
     from ttp import checkcap, locks, project
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "3")
     held = checkcap.acquire("h")
     now = time.time()
     old = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "old p2", since=now - 120, group="A", priority=2)
@@ -6540,6 +6542,9 @@ def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_ar
         monkeypatch.setenv(checkcap.STARVE_ENV, "600")
         assert checkcap.state()["queued"] == ["new p1", "old p2"], "under the bound: urgent turns first"
         monkeypatch.setenv(checkcap.STARVE_ENV, "60")
+        monkeypatch.delenv("TTP_CHECKS_PRIORITY_TURNS")
+        assert checkcap.state()["queued"] == ["new p1", "old p2"], "urgent first by default, past the bound too"
+        monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "3")
         assert checkcap.state()["queued"] == ["old p2", "new p1"]
         held.close()
         every = checkcap.all_paths(1)
@@ -6919,15 +6924,16 @@ def test_a_precheck_of_a_done_task_whose_review_is_open_is_kept(env, monkeypatch
 
 def test_urgent_first_puts_every_urgent_waiter_of_any_project_ahead_by_priority_then_arrival(tmp_path, monkeypatch):
     """#5893: under locks.URGENT_FIRST (the default checks.priority_turns) urgent checks of another project
-    go ahead of older routine and aged waiters, the most urgent priority first, then the oldest."""
+    go ahead of older routine and aged waiters, the most urgent priority first, then by project turns."""
     from ttp import checkcap, locks, project
     d = tmp_path / "slots"
     for n, (label, g, pr) in enumerate([("b3", "B", 3), ("a2", "A", 2), ("c1", "C", 1), ("b0", "B", 0),
                                         ("a1", "A", 1), ("c4", "C", None)]):
         locks.enqueue(d, "r", label, since=1000.0 + n, group=g, priority=pr)
     names = lambda **k: [x.read_text() for x in locks.fair_order(d, "r", urgent_max=locks.URGENT_FIRST, **k)]
-    assert names()[:3] == ["b0", "c1", "a1"], "priority 0 first, then the priority-1 waiters by arrival"
-    assert names(aged_before=1001.5)[:3] == ["b0", "c1", "a1"], "aged routine waiters stay behind urgent ones"
+    assert names()[:3] == ["b0", "a1", "c1"], "priority 0 first, then the priority-1 waiters by project turn"
+    assert names(aged_before=1001.5)[:3] == ["b0", "c1", "a1"], \
+        "aged routine waiters stay behind urgent ones (project turns by each one's oldest waiter left: c1 now)"
     assert names(aged_before=1001.5)[3:5] == ["b3", "a2"], "then the aged ones by arrival"
     assert sorted(names()[3:]) == ["a2", "b3", "c4"]
     monkeypatch.delenv("TTP_CHECKS_PRIORITY_TURNS", raising=False)

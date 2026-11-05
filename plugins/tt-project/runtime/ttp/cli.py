@@ -4428,10 +4428,9 @@ class _HeadMoved:
 
 def _git_out(top: str, *args: str) -> str:
     try:
-        r = subprocess.run(["git", "-C", top, *args], capture_output=True, text=True, timeout=30)
-    except (OSError, subprocess.TimeoutExpired):
+        return _git(Path(top), *args)
+    except (OSError, subprocess.SubprocessError):
         return ""
-    return r.stdout.strip() if r.returncode == 0 else ""
 
 
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,

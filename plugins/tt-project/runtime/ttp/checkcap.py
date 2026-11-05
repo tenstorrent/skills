@@ -32,7 +32,7 @@ takes one of theirs. It is an OS file lock like the others, so a killed push fre
 
 Checks of urgent tasks (priority 1 or better, an `urgent:` spec line: user-ordered and live-impact work,
 heal self-fixes, interim mitigations, the review of an urgent change) go next: ahead of every routine
-waiter of any project whatever its arrival, the most urgent first, then the oldest (locks.fair_order with
+waiter of any project whatever its arrival, the most urgent first, then by project turns (locks.fair_order with
 locks.URGENT_FIRST, the default PRIORITY_TURNS). `checks.priority_turns` N (TTP_CHECKS_PRIORITY_TURNS)
 instead bounds them to N turns in a row while other checks wait, taking turns by project; 0 serves them
 in the fair order only.
