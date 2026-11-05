@@ -27157,6 +27157,7 @@ DURABLE_EXEMPT = {
     ("checkcap.py", 'open(d / lock, "a")'): "a flock guard file, never written",
     ("checkcap.py", 'os.fdopen(fd, "a+")'): "re-wraps a kept checks slot's flock guard file after a re-exec, never written",
     ("checkcap.py", "os.replace(log, d / old)"): "rotates a bounded checks slot log (waits, grants); a rename lost to a crash leaves the log one generation longer",
+    ("checkcap.py", "_preempt_path(best[0]).write_text("): "an urgent run's preempt request, read only while both live; one lost to a crash only leaves that run waiting as before",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
