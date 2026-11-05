@@ -1607,6 +1607,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.extend(testslots.use_lines())
         lines.extend(checklane.lane_lines(p.name, p.config(), now))
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
+    lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
     if verbose:
         lines.extend(checkspill.status_lines(p.name, now))
         lines.extend(f"checks {x.strip()}" for x in checkjoin.status_lines(p.state, now))

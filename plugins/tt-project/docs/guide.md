@@ -1348,8 +1348,12 @@ nothing running is interrupted:
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
   lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
-  holds it shared while it runs), that ssh reaches and that has a free slot; others
-  are skipped with the reason and the run keeps its place here. The account's pool, `checks.spill_hosts`
+  holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
+  are skipped with the reason and the run keeps its place here. A device job means one of the host's device
+  locks (`<alias>-device`, the device names of its machines-list `shared` entry, `device.locks` names on it)
+  is held, reserved or waited for, or a broker heal check (preset broker) of the project on that machine
+  reports a running job row; a broker status that cannot be read never keeps a run off. Runs already there go
+  on, and `ttp status` and the web app show the skip in one line with the host and the reason. The account's pool, `checks.spill_hosts`
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps

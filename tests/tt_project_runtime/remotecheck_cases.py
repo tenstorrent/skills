@@ -643,6 +643,145 @@ def test_spill_skips_a_host_whose_lock_is_held_and_holds_the_lock_it_runs_under(
     assert checkspill.lock_busy(p, p.config(), "check-host-a") == ""
 
 
+def _device_hold(p, res, where=None, who="task #4 (run 2)"):
+    """Hold lock `res` exclusively (as `ttp lock <res> -- <device job>` does), in `where` (default: where
+    this project's `ttp lock` takes it)."""
+    from ttp import locks, shared
+    cfg = p.config()
+    d = shared.locks_dir(p, res, cfg) if where is None else where
+    got = locks.try_take(locks.slot_paths(d, res, shared.slots(p, res, cfg)), who, "device soak")
+    assert got is not None
+    return got
+
+
+def test_spill_keeps_new_runs_off_a_host_whose_device_lock_is_held_and_shows_why(env, tmp_path, monkeypatch):
+    """A device job holding a pool host's device lock (`<alias>-device`): a new run skips that host and
+    takes the next one (none left: it waits here for the project host's own slots), a run already there
+    goes on, and `ttp status` and the web app show the skip in one line with the host and the reason.
+    Once the lock is free the host takes runs again and the line goes."""
+    from ttp import checkspill, cli, machines, web
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    machines.add("check-host-a", shared=["check-host-a", "check-host-a-device"])
+    cfg = p.config()
+    told: list[str] = []
+    before = checkspill.pick(p, cfg, told.append, "pytest -q")   # a run already on the host
+    assert before is not None and before.host == "check-host-a"
+    dev = _device_hold(p, "check-host-a-device")
+    try:
+        got = checkspill.pick(p, cfg, told.append, "pytest -q")
+        try:
+            assert got is not None and got.host == "check-host-b", told
+            assert "check-host-a (a device job runs there: check-host-a-device: busy (held by" in told[-1], told
+            assert "device soak" not in told[-1] and "task #4" in told[-1]
+            assert [r["host"] for r in checkspill.holders(p.name)].count("check-host-a") == 1, "the run there goes on"
+            assert before.f is not None and not before.f.closed
+            line = "spill host check-host-a takes no new checks: a device job runs there: check-host-a-device: busy"
+            assert [x for x in checkspill.skip_lines() if x.startswith(line)], checkspill.skip_lines()
+            assert line in cli.status_text(p), "shown without --verbose"
+            assert any(line in r["text"] for r in web.slots_feed(time.time(), p))
+            assert not checkspill.skip_lines(time.time() + checkspill.SKIP_SHOW_S + 60), "a stale skip is not shown"
+            p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+            assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None, "no other host: waits here"
+            assert told[-1].startswith("no spill host could take the checks, waiting here: check-host-a (a device job")
+        finally:
+            if got is not None:
+                got.close()
+    finally:
+        dev.close()
+    again = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    try:
+        assert again is not None and again.host == "check-host-a", told
+        assert checkspill.skip_lines() == []
+    finally:
+        again.close()
+        before.close()
+
+
+def test_spill_device_gate_sees_every_device_lock_of_the_host_and_only_that_host(env, tmp_path, monkeypatch):
+    """The gate reads the host's device locks wherever a device job takes them: this project's own
+    `<alias>-device`, one another project holds in the user's shared locks, a reservation of it, and a
+    device.locks name on the host (its canonical lock). A lock of another host, even one whose alias
+    starts with this one's, never keeps a run off."""
+    from ttp import checkspill, locks, shared
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    cfg = p.config()
+    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device"]
+    assert checkspill.device_busy(p, cfg, "check-host-a") == ""
+    for where in (None, shared.root() / "check-host-a-device"):   # own, then another project's shared hold
+        h = _device_hold(p, "check-host-a-device", where)
+        try:
+            assert "check-host-a-device: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a")
+        finally:
+            h.close()
+        assert checkspill.device_busy(p, cfg, "check-host-a") == ""
+    d = shared.locks_dir(p, "check-host-a-device", cfg)
+    d.mkdir(parents=True, exist_ok=True)
+    locks.reserve(locks.reserve_path(d, "check-host-a-device"), "task #5 (run 3)")
+    try:
+        assert "reserved for task #5" in checkspill.device_busy(p, cfg, "check-host-a")
+    finally:
+        locks.unreserve(locks.reserve_path(d, "check-host-a-device"), "task #5 (run 3)")
+    p.set_config("device.locks", ["check-host-a:board", "check-host-a:chip0", "check-host-ab-device"])
+    cfg = p.config()
+    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device", "check-host-a:board"]
+    h = _device_hold(p, "check-host-a:board")
+    try:
+        assert "check-host-a:board: busy" in checkspill.device_busy(p, cfg, "check-host-a")
+    finally:
+        h.close()
+    for other in ("check-host-ab-device", "check-host-b-device"):
+        h = _device_hold(p, other)
+        try:
+            assert checkspill.device_busy(p, cfg, "check-host-a") == "", other
+        finally:
+            h.close()
+
+
+def test_spill_device_gate_reads_a_broker_job_row_and_an_unreadable_broker_never_blocks(env, tmp_path, monkeypatch):
+    """A broker heal check (preset broker) on the pool host: a running job row in its status keeps new
+    runs off the host; a status that fails, is no JSON, times out or lists only queued or finished jobs
+    never does (the lock alone decides), and none fails the pick."""
+    from ttp import checkspill, schedule as sched
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    monkeypatch.setattr(checkspill, "BROKER_TIMEOUT_S", 1.0)
+    status = tmp_path / "broker.json"
+    sched.upsert(p.db, "host-a-broker", "command", "5m", payload={"heal": {
+        "preset": "broker", "status_command": f"cat {status}", "machine": "check-host-a"}})
+    cfg = p.config()
+    status.write_text(json.dumps({"held": False, "jobs": [{"id": "soak-1", "state": "RUNNING"}]}))
+    assert checkspill.device_busy(p, cfg, "check-host-a") == \
+        "a device job runs there: its broker reports running job soak-1"
+    told: list[str] = []
+    assert checkspill.pick(p, cfg, told.append, "pytest -q") is None and "running job soak-1" in told[-1]
+    for text in ("not json", json.dumps({"held": False, "jobs": [{"id": "q", "state": "queued"},
+                                                                 {"id": "d", "status": "done"}]}),
+                 json.dumps({"running": True, "running_jobs": 0, "current_job": None})):
+        status.write_text(text)
+        assert checkspill.device_busy(p, cfg, "check-host-a") == "", text
+    for cmd in (f"cat {tmp_path}/missing", "sleep 5"):
+        sched.upsert(p.db, "host-a-broker", "command", "5m", payload={"heal": {
+            "preset": "broker", "status_command": cmd, "machine": "check-host-a"}})
+        t0 = time.monotonic()
+        got = checkspill.pick(p, p.config(), told.append, "pytest -q")
+        try:
+            assert got is not None and got.host == "check-host-a", (cmd, told)
+            assert time.monotonic() - t0 < 4, "a stuck broker read is bounded"
+        finally:
+            got.close()
+
+
+def test_spill_broker_job_rows_are_read_from_lists_counts_or_one_job():
+    from ttp import checkspill
+    rj = checkspill.running_job
+    assert rj({"running_jobs": [{"job_id": "j7"}]}) == "running job j7"
+    assert rj({"active_jobs": 2}) == "2 running job(s) (active_jobs)"
+    assert rj({"current_job": {"name": "soak"}}) == "running job soak"
+    assert rj({"jobs": [{"id": "a", "status": "in_progress"}]}) == "running job a"
+    for quiet in ({}, [], "x", None, {"jobs": 3}, {"jobs": ["a"]}, {"running": False}, {"active_job": True},
+                  {"running_jobs": []}, {"jobs": [{"id": "a", "state": "failed"}]}):
+        assert rj(quiet) == "", quiet
+
+
 def test_a_spill_run_past_the_wall_cap_or_on_a_stalled_link_runs_again_here(env, tmp_path, monkeypatch):
     """A spill host slower than the wall-time cap (or an ssh link that stalls there) is the host's
     environment, not the change's: the checks run again here, only that result counts, and no task

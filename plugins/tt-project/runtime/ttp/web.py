@@ -608,11 +608,12 @@ def uncommitted_feed(db: DB) -> list[dict]:
 
 def slots_feed(now: float, p=None) -> list[dict]:
     """Feed rows (state 'status': not the top section) for the host's test and build slots in use and
-    project `p`'s checks lanes, the lines `ttp status` prints (testslots.use_lines, checklane.lane_lines)."""
-    from . import checklane, testslots
+    project `p`'s checks lanes and the spill hosts kept off for a device job, the lines `ttp status` prints
+    (testslots.use_lines, checklane.lane_lines, checkspill.skip_lines)."""
+    from . import checklane, checkspill, testslots
     lanes = checklane.lane_lines(p.name, p.config(), now) if p else []
     return [{"id": None, "ts": now, "kind": "slots", "severity": "low", "state": "status", "text": line}
-            for line in testslots.use_lines() + lanes]
+            for line in testslots.use_lines() + lanes + checkspill.skip_lines(now)]
 
 
 def run_wake(note: str | None) -> str | None:

@@ -21,7 +21,14 @@ of the user's projects here set, shared or not: paused_elsewhere), and its machi
 neither held nor reserved by anyone else. The run holds that lock while it runs, shared where the
 resource allows it (several spilled checks share it; an exclusive holder or waiter keeps them off),
 exclusively on a device lock. A host that is not allowed, whose lock is busy, that ssh does not reach,
-that lacks git or tar, or whose slots are full is skipped, never a failure. Its slots:
+that lacks git or tar, or whose slots are full is skipped, never a failure. So is a host where a device job
+runs (device_busy, a lock-based safety gate, never a neighbour or site check): any of its device locks
+(`<alias>-device`, the device names of its machines-list `shared` entry, the project's `device.locks` on it)
+held, reserved or waited for, here or in the user's shared locks, or a running job row in the status of a
+broker this project watches on it (a heal check with preset broker on that machine). A broker whose status
+does not read within BROKER_TIMEOUT_S, or reads no job rows, never keeps a run off: the locks alone decide.
+Runs already on the host go on. The skip shows in one line in `ttp status` and the web app (skip_lines)
+while it is fresh (SKIP_SHOW_S). Its slots:
 the lanes its cores and available memory give (checklane.default_slots) less the remote checks
 running there from any machine (their ttp-check.* folders); this machine also holds one claim file
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
@@ -56,6 +63,12 @@ AFTER_KEY = "checks_spill_after_s"
 SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # set for the local rerun of a run that did not pass on a spill host
 PROBE_TIMEOUT_S = 30
+DEVICE_SUFFIX = "-device"
+BROKER_TIMEOUT_S = 10.0   # one read of a broker's status; past it the device locks alone decide
+SKIP_SHOW_S = 900   # a host skipped for a device job shows in `ttp status` and the web app this long after
+_JOB_LISTS = ("jobs", "running_jobs", "active_jobs", "running")   # broker status: job rows (a list) or a count
+_JOB_ONE = ("current_job", "active_job", "running_job")   # broker status: the one job under way
+_RUNNING = {"running", "active", "started", "in_progress", "in-progress", "busy"}   # a `jobs` row's state that runs
 RUNNING_MAX_AGE_MIN = 720   # a remote ttp-check.* folder older than this is a leftover, not a running check
 _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || exit 3\n"
           "c=$(nproc 2>/dev/null || getconf _NPROCESSORS_ONLN 2>/dev/null || echo 1)\n"
@@ -276,6 +289,133 @@ def lock_busy(p, cfg: dict, alias: str) -> str:
     return "" if rc == 0 else str(said).split(": ", 1)[-1]
 
 
+def device_locks_of(cfg: dict, alias: str, known: dict | None = None) -> list[str]:
+    """The `ttp lock` resources that are `alias`'s device, each as the lock it is held by (locks.canonical):
+    `<alias>-device`, the device names its machines-list `shared` entry gives, and the config's
+    device.locks on it (the alias, `<alias>-...` or `<alias>:...`)."""
+    from . import locks, machines
+    known = machines.load() if known is None else known
+    dev = locks.device_locks(cfg)
+    names = [alias + DEVICE_SUFFIX]
+    got = (known.get(alias) or {}).get("shared")
+    if isinstance(got, list):
+        names += [x for x in got if isinstance(x, str) and x and x != alias and (x.endswith(DEVICE_SUFFIX) or x in dev)]
+    names += sorted(d for d in dev if d == alias or d.startswith((alias + "-", alias + ":")))
+    return list(dict.fromkeys(locks.canonical(cfg, n) for n in names))
+
+
+def _lock_held(p, cfg: dict, res: str) -> str:
+    """"" when nobody holds, reserves or waits for lock `res`, here (where this project's `ttp lock` takes
+    it) or in the user's shared locks (another project that shares it), else the probe's line."""
+    from . import lockprobe, locks, shared
+    dirs = list(dict.fromkeys([shared.locks_dir(p, res, cfg), shared.root() / res]))
+    for d in dirs:
+        paths = list(dict.fromkeys([*locks.slot_paths(d, res, shared.slots(p, res, cfg)),
+                                    *sorted(Path(d).glob(f"{res}.*.lock"))]))
+        if not (locks.probe(d, res, paths, shared=True) and locks.probe(d, res, paths)):
+            return lockprobe.line(res, False, d, res, paths, p)
+    return ""
+
+
+def _job_name(row: Any) -> str:
+    if isinstance(row, dict):
+        row = row.get("id") or row.get("job_id") or row.get("name") or row
+    return str(row)[:80]
+
+
+def running_job(data: Any) -> str:
+    """The first running job a broker's status JSON reports, in a few words, else "". Job rows are a list
+    under jobs, running_jobs, active_jobs or running (a `jobs` row counts only while its state or status
+    says it runs; in the others being there is running), a count above 0 under the last three, or one job
+    under current_job, active_job or running_job."""
+    if not isinstance(data, dict):
+        return ""
+    for k in _JOB_LISTS:
+        v = data.get(k)
+        if k != "jobs" and isinstance(v, int) and not isinstance(v, bool) and v > 0:
+            return f"{v} running job(s) ({k})"
+        for row in v if isinstance(v, list) else []:
+            if k == "jobs" and not (isinstance(row, dict)
+                                    and str(row.get("state") or row.get("status") or "").lower() in _RUNNING):
+                continue
+            return f"running job {_job_name(row)}"
+    for k in _JOB_ONE:
+        if (v := data.get(k)) and not isinstance(v, bool):
+            return f"running job {_job_name(v)}"
+    return ""
+
+
+def broker_job(p, alias: str) -> str:
+    """A running job a broker on `alias` reports (this project's heal checks with preset broker watching
+    that machine), else "". A status that fails, times out (BROKER_TIMEOUT_S) or is no JSON never blocks."""
+    from . import heal
+    try:
+        specs = [s for _, s in heal.checks(p.db) if s.get("preset") == "broker" and heal.machine_of(s) == alias]
+    except Exception:
+        return ""
+    for s in specs:
+        try:
+            rc, out = heal._shell(s["status_command"], str(p.root),
+                                  min(float(s.get("timeout_s") or BROKER_TIMEOUT_S), BROKER_TIMEOUT_S))
+            if rc != 0:
+                continue
+            job = running_job(json.loads(out[out.find("{"):] if "{" in out else out))
+        except Exception:
+            continue
+        if job:
+            return f"its broker reports {job}"
+    return ""
+
+
+def device_busy(p, cfg: dict, alias: str) -> str:
+    """"" when no device job runs on `alias` as far as this machine can tell, else why: a device lock of it
+    held, reserved or waited for (device_locks_of), or a running job its broker reports (broker_job)."""
+    for res in device_locks_of(cfg, alias):
+        try:
+            if said := _lock_held(p, cfg, res):
+                return f"a device job runs there: {said}"
+        except OSError as e:
+            return f"its device lock {res} cannot be read: {e}"
+    return f"a device job runs there: {job}" if (job := broker_job(p, alias)) else ""
+
+
+def skip_dir() -> Path:
+    from . import checkcap
+    return checkcap.slot_dir() / "spill-skips"
+
+
+def _note_skip(alias: str, why: str, project_name: str) -> None:
+    """Record that `alias` took no new checks because of a device job (skip_lines shows it); "" clears it."""
+    f = skip_dir() / f"{alias}.json"
+    try:
+        if not why:
+            f.unlink(missing_ok=True)
+            return
+        f.parent.mkdir(parents=True, exist_ok=True)
+        tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps({"host": alias, "why": why[:300], "at": time.time(), "project": project_name}))
+        os.replace(tmp, f)
+    except OSError:
+        pass
+
+
+def skip_lines(now: float | None = None) -> list[str]:
+    """`ttp status` and web app lines: each spill host the pool skipped for a device job in the last
+    SKIP_SHOW_S, one line each, with the reason."""
+    now = time.time() if now is None else now
+    out = []
+    for f in sorted(skip_dir().glob("*.json")) if skip_dir().is_dir() else []:
+        try:
+            r = json.loads(f.read_text() or "{}")
+            at = float(r.get("at") or 0)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue
+        if r.get("host") and now - at <= SKIP_SHOW_S:
+            out.append(f"spill host {r['host']} takes no new checks: {r.get('why') or 'a device job runs there'}"
+                       f" (seen {max(0, int((now - at) // 60))} min ago)")
+    return out
+
+
 def _hold(p, cfg: dict, alias: str, what: str):
     """The run's hold of `alias`'s machine lock (shared, exclusive on a device lock), or None if taken."""
     from . import hold, locks, shared
@@ -342,6 +482,9 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
     skipped = []
     for alias in hosts(cfg):
         why = allowed(p, cfg, alias) or lock_busy(p, cfg, alias)
+        if not why:
+            why = device_busy(p, cfg, alias)
+            _note_skip(alias, why, p.name)
         free = 0
         if not why:
             free, why = probe(alias)
