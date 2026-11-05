@@ -1135,7 +1135,15 @@ running work is interrupted only by the preemption below:
   or unreadable: the tree alone), and a job using under
   a quarter of its cores, or none of a held device, for `waiting.job_use.window_s` raises one
   `job_underuse` event (one per job: again only after `repeat_s`, 6 h, or once the job restarts or
-  its request changes) and brings its task's next check within `check_cap_s`. `ttp status` and the web
+  its request changes) and brings its task's next check within `check_cap_s`. Once a worker run of the
+  task has ended after that event with the job still running, the worker let it run: the same job
+  raises no second event and pulls in no more checks until it restarts, its request changes or its
+  declared reason is removed. A job that waits on what the sampler cannot see (a remote API, another
+  host) declares it: `ttp detach <name> --idle-ok "<why>" -- <command>`, or `ttp detach --idle-ok
+  "<why>" <name|.rc>` on a running one (`--idle-ok ''` removes it, and its next under-use alarms
+  anew); it raises no alarm, and the reason shows where the job is listed. Checks, deferred tasks,
+  paused resources, a spend cap that stopped the job and a budget gate holding new work also count as
+  idle by design. `ttp status` and the web
   app show requested vs used per job ("unmeasured" where it cannot sample). Each local job's record in
   the run's `detached.json` says `running` (or `queued`) until it is over, then `ended` with its exit
   code and the .rc's time, or `died` (no exit code, with why) once its job lock is free with no .rc;

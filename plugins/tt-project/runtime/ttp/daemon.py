@@ -12338,6 +12338,10 @@ class Daemon:
                     got = with_containers(jobuse.sample(pid, nodes)) if pid else None
                     st = jobuse.assess(was.get("st"), got, req, now, s)[0]
                     entry = {"task": t["id"], "name": j["name"], "req": req, "st": st, "line": jobuse.line(req, st)}
+                    if jobuse.declared(j):
+                        entry["declared"] = True
+                    elif was.get("declared") or was.get("redo"):
+                        entry["redo"] = True   # its declared reason was removed: its next under-use alarms anew
                     if st.get("under") and (why := self._idle_by_design(t, j, now)):
                         # Idle by design (waiting on checks, a deferral, a pause, a spend cap or the budget
                         # gate): shown, no event and no pulled-in check, so no model wakes for it.
@@ -12351,9 +12355,9 @@ class Daemon:
                     if was.get("raised"):
                         entry["raised"] = was["raised"]
                     new[str(rc)] = entry
-                    if st.get("under"):
-                        self._underuse_event(t, entry, rc, now, s)
-                    if st.get("under") and "pulled" not in entry and self._pull_check(t["id"], st["why"], now, s):
+                    let_run = bool(st.get("under")) and self._underuse_event(t, entry, rc, now, s)
+                    if st.get("under") and not let_run and "pulled" not in entry \
+                            and self._pull_check(t["id"], st["why"], now, s):
                         entry["pulled"] = st["under"]
         # A stretch that ended (use recovered, or the job ended) before its pulled-in check: that check
         # follows the probe as usual instead of waking a worker.
@@ -12406,22 +12410,32 @@ class Daemon:
         if keep != raised:
             db.set_kv(PROGRESS_KEY, keep)
 
-    def _underuse_event(self, task: dict, entry: dict, rc: Path, now: float, s: dict) -> None:
+    def _underuse_event(self, task: dict, entry: dict, rc: Path, now: float, s: dict) -> bool:
         """One `job_underuse` event per job and `repeat_s`, keyed on the job (its .rc, its root's start,
         its request), not on the stretch: an under-use stretch that ends and starts again (an unmeasured
         sample, a CPU total that drops as processes exit) raises nothing new. A restarted job or a changed
         request raises again. entry["raised"] (kv job_use) remembers the last one; the events table
-        backs it up."""
+        backs it up. True once a worker let the job run: a worker run of its task started after the event
+        and ended while this same job still runs, so the job raises nothing more (no repeat after
+        `repeat_s`, and the caller pulls in no check). entry["redo"] (its declared idle reason was
+        removed) raises at once."""
         db, st = self.p.db, entry["st"]
         key = hashlib.sha1(json.dumps([str(rc), st.get("start"), entry["req"]], sort_keys=True).encode()).hexdigest()[:12]
-        last = entry.get("raised") or {}
-        if last.get("key") == key and now - float(last.get("at") or 0) < s["repeat_s"]:
-            return
         fp = f"job_underuse:{task['id']}:{entry['name']}:{key}"
-        row = db.one("SELECT ts FROM events WHERE fingerprint=? ORDER BY id DESC LIMIT 1", (fp,))
-        if row and now - float(row["ts"]) < s["repeat_s"]:
-            entry["raised"] = {"key": key, "at": float(row["ts"])}
-            return
+        if not entry.pop("redo", None):
+            last = entry.get("raised") or {}
+            if last.get("key") != key:
+                row = db.one("SELECT ts FROM events WHERE fingerprint=? ORDER BY id DESC LIMIT 1", (fp,))
+                last = {"key": key, "at": float(row["ts"])} if row else {}
+            if last:
+                if last.get("let_run") or db.one(
+                        "SELECT 1 FROM runs WHERE task=? AND role='worker' AND started>=? AND ended IS NOT NULL "
+                        "LIMIT 1", (task["id"], float(last["at"]))):
+                    entry["raised"] = {**last, "let_run": True}
+                    return True
+                if now - float(last.get("at") or 0) < s["repeat_s"]:
+                    entry["raised"] = last
+                    return False
         entry["raised"] = {"key": key, "at": now}
         text = (f"#{task['id']} {task['title']}: its detached job {entry['name']} {st['why']} ({entry['line']}). "
                 f"Its next check comes within {s['check_cap_s'] / 60:g} min. Decide: let it run, or have it "
@@ -12431,6 +12445,7 @@ class Daemon:
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (now, "daemon", "job_underuse", fp, "normal", text, status, task["id"]))
         log(self.p, f"task {task['id']} job {entry['name']} under-used: {st['why']}")
+        return False
 
     def _pull_check(self, tid: int, why: str, now: float, s: dict) -> bool:
         """Bring a waiting task's next check to at most check_cap_s away; that check wakes a worker.

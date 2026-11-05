@@ -23,7 +23,12 @@ the job held open for the whole window, is under-use: the stretch is recorded on
 `check_cap_s` away (one worker check per stretch). It raises one `job_underuse` event per job, keyed
 on the job (its .rc, its root's start and its request), not on the stretch: a stretch that ends and
 starts again raises nothing more until `repeat_s` has passed, unless the job was restarted or its
-request changed. Where sampling is unavailable the job shows as unmeasured and nothing fires.
+request changed. Once a worker run of the task started after that event and ended with the job still
+running, the worker let it run: that job raises no second event (nor pulls in another check) until it
+restarts, its request changes or the reason it declared is removed. A job that waits on what the
+sampler cannot see (a remote API, another host) says so with `ttp detach --idle-ok "<why>"`
+(declared()): its idle time is by design.
+Where sampling is unavailable the job shows as unmeasured and nothing fires.
 """
 from __future__ import annotations
 
@@ -341,12 +346,20 @@ def assess(state: dict | None, got: dict | None, req: dict, now: float, s: dict)
 _CHECKS_CMD = re.compile(r"(?:^|[\s;&|(/])ttp(?:\.sh)?\s+checks\b")
 
 
+IDLE_OK_MAX = 200   # chars of a declared reason kept in the job's entry
+
+
+def declared(job: dict) -> str:
+    """The reason the job's `ttp detach --idle-ok` declared its idle time by design, or ''."""
+    return " ".join(str(job.get("idle_ok") or "").split())[:IDLE_OK_MAX]
+
+
 def idle_by_design(task: dict, job: dict, resources: set, paused: dict, gate: str = "",
                    now: float | None = None) -> str:
     """Why an under-used job's idle time is by design, read from what its task and job record, or ''
-    when nothing does (the alarm fires as before). By design: the job runs the project's checks (they
-    wait for a checks slot or run on a test host), its task is deferred (start_after still ahead, or a
-    start_when probe), the job or its task names a paused resource (`resources`: the task's resource
+    when nothing does (the alarm fires as before). By design: the job declared why (`ttp detach
+    --idle-ok`), it runs the project's checks (they wait for a checks slot or run on a test host), its
+    task is deferred (start_after still ahead, or a start_when probe), the job or its task names a paused resource (`resources`: the task's resource
     labels and the job's --lock names; `paused`: db.paused_resources()), its spend cap stopped it, or
     the budget gate holds new work (`gate`, the daemon's words for it): a worker woken then could not
     start or change anything. A plain timer or another probe explains nothing: a build that under-uses
@@ -354,6 +367,8 @@ def idle_by_design(task: dict, job: dict, resources: set, paused: dict, gate: st
     import time as _time
     from .db import deferral
     now = _time.time() if now is None else now
+    if why := declared(job):
+        return f"declared: {why}"
     if _CHECKS_CMD.search(str(job.get("command") or "")):
         return "it runs the project's checks, which wait for a checks slot or run on a test host"
     d = deferral(task)

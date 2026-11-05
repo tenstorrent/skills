@@ -555,6 +555,34 @@ def test_detach_reap_closes_an_ended_job_refuses_a_live_one_and_is_idempotent(en
     assert "--reap" in _ttp_run(p, "detach", "--help").stdout
 
 
+def test_detach_idle_ok_records_its_reason_and_sets_or_clears_it_on_a_running_job(env, tmp_path):
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    e = _lock_job_env(env, p, run_dir)
+    r = _ttp_run(p, "detach", "api", "--idle-ok", "waits on a remote API", "--", *_until(tmp_path / "stop"), env=e)
+    assert r.returncode == 0 and "idle by design: waits on a remote API" in r.stdout, r.stderr
+    rc = (run_dir / "api.rc").resolve()
+    assert _record(rc)["idle_ok"] == "waits on a remote API"
+    # Removed on the running job, then set again by its .rc path, with the reason's whitespace folded.
+    r = _ttp_run(p, "detach", "--idle-ok", "", "api", env=e)
+    assert r.returncode == 0 and "idle_ok" not in _record(rc), r.stderr
+    r = _ttp_run(p, "detach", "--idle-ok", "polls  a\ncontainer", str(rc), env=e)
+    assert r.returncode == 0 and _record(rc)["idle_ok"] == "polls a container", r.stderr
+    # Refused: no reason when starting, a remote job, a job no record names, a job that is over.
+    r = _ttp_run(p, "detach", "x", "--idle-ok", " ", "--", "true", env=e)
+    assert r.returncode != 0 and "needs the reason" in r.stderr and not (run_dir / "x.rc").exists()
+    r = _ttp_run(p, "detach", "--remote", "nohost", "--idle-ok", "w", "y", "--", "true", env=e)
+    assert r.returncode != 0 and "--idle-ok is for a local job" in r.stderr
+    assert _ttp_run(p, "detach", "--idle-ok", "w", "other", env=e).returncode == 2
+    (tmp_path / "stop").touch()
+    assert _until_true(rc.exists)
+    r = _ttp_run(p, "detach", "--idle-ok", "w", "api", env=e)
+    assert r.returncode == 1 and "is over" in r.stderr and "idle_ok" in _record(rc)
+    assert _record(rc)["idle_ok"] == "polls a container"
+    assert "--idle-ok" in _ttp_run(p, "detach", "--help").stdout
+
+
 def _leftover_slot(p, rc, res, tid):
     """Slot `res` of the project held by a real leftover process (no run in its environment, in a session
     of its own that the label names as the holder's group), its label naming detached job `rc` of task

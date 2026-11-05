@@ -265,3 +265,135 @@ def test_an_under_used_job_idle_by_design_wakes_no_model_and_an_unexplained_one_
             assert "underuse_wake" not in res and not entry.get("pulled"), (case, res, entry)
     finally:
         lock.close()
+
+
+def test_idle_by_design_honours_a_declared_reason_and_only_a_real_one():
+    from ttp import jobuse
+    now = time.time()
+
+    def why(job):
+        return jobuse.idle_by_design({}, {"command": "make -j8", **job}, set(), {}, "", now)
+    assert why({"idle_ok": "waits on a remote API"}) == "declared: waits on a remote API"
+    assert why({"idle_ok": " polls\n a  container "}) == "declared: polls a container"
+    assert len(why({"idle_ok": "x" * 500})) == len("declared: ") + jobuse.IDLE_OK_MAX
+    for blank in ("", "  \n", None):
+        assert why({"idle_ok": blank}) == "", blank   # an empty declaration explains nothing
+
+
+def _underused(p, monkeypatch, tid, rc, clock):
+    """Job rc of task tid samples as steadily idle (8 cores asked, none used) at clock[0]."""
+    from ttp import jobuse
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": 100.0, "start": "S", "dev": None})
+    monkeypatch.setattr(jobuse, "containers", lambda: [])
+    p.db.set_kv(jobuse.KV, {str(rc): {"task": tid, "name": "build", "req": {"cores": 8},
+                                      "st": {"ring": [[clock[0] - 960, 0.0], [clock[0] - 60, 95.0]], "start": "S",
+                                             "since": clock[0] - 960}}})
+
+
+def _set_idle_ok(rc, why):
+    reg = rc.parent / "detached.json"
+    jobs = json.loads(reg.read_text())
+    if why is None:
+        jobs[0].pop("idle_ok", None)
+    else:
+        jobs[0]["idle_ok"] = why
+    reg.write_text(json.dumps(jobs))
+
+
+def test_a_declared_idle_job_raises_nothing_and_shows_why_until_the_reason_is_removed(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        clock = [time.time()]
+        _underused(p, monkeypatch, tid, rc, clock)
+        d = dmod.Daemon(p.base)
+
+        def events():
+            return p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=?", (tid,))
+        # Raised once and let run by a worker (its run started after the event and ended).
+        _replay(d, clock, {"v": 0}, [])
+        d._jobs_sampled = 0
+        d.sample_jobs()
+        assert len(events()) == 1
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", clock[0] + 10, clock[0] + 100, "ok", str(rc.parent.parent / "later")))
+        # It then declares why it is idle: no event, the reason on its line, no pulled-in check.
+        _set_idle_ok(rc, "waits on a remote API")
+        for _ in range(3):
+            clock[0] += 600
+            d._jobs_sampled = 0
+            d.sample_jobs()
+        entry = p.db.kv(jobuse.KV)[str(rc)]
+        assert len(events()) == 1 and entry["declared"] and not entry.get("pulled")
+        assert entry["by_design"] == "declared: waits on a remote API"
+        assert "idle by design: declared: waits on a remote API" in entry["line"]
+        status = _ttp_run(p, "status").stdout
+        assert "declared: waits on a remote API" in status, status
+        # The reason removed: a real change, so it alarms again at once despite the earlier let-run.
+        _set_idle_ok(rc, None)
+        clock[0] += 60
+        d._jobs_sampled = 0
+        d.sample_jobs()
+        entry = p.db.kv(jobuse.KV)[str(rc)]
+        assert len(events()) == 2 and "by_design" not in entry and "redo" not in entry, entry
+        # ...and only once: the next samples hold off as before.
+        for _ in range(3):
+            clock[0] += 60
+            d._jobs_sampled = 0
+            d.sample_jobs()
+        assert len(events()) == 2
+    finally:
+        lock.close()
+
+
+@pytest.mark.parametrize("case", ["let_run", "no_worker_run", "run_before_event", "run_still_going", "restarted",
+                                  "kv_forgot"])
+def test_a_job_a_worker_let_run_raises_no_second_alarm_but_a_restart_or_no_decision_does(env, monkeypatch, case):
+    p = make(env)
+    from ttp import daemon as dmod, jobuse
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        clock, start = [time.time()], {"v": "S"}
+        _underused(p, monkeypatch, tid, rc, clock)
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": 100.0, "start": start["v"], "dev": None})
+        d = dmod.Daemon(p.base)
+        d.sample_jobs()
+        ev = lambda: p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=?", (tid,))  # noqa: E731
+        assert len(ev()) == 1
+        t0 = clock[0]
+        run = {"let_run": (t0 + 5, t0 + 900), "restarted": (t0 + 5, t0 + 900), "kv_forgot": (t0 + 5, t0 + 900),
+               "run_before_event": (t0 - 50, t0 + 900), "run_still_going": (t0 + 5, None)}.get(case)
+        if run:
+            p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+                   (tid, "worker", "fake", run[0], run[1], "ok" if run[1] else "running", str(rc.parent.parent / "later")))
+        if case == "kv_forgot":
+            p.db.set_kv(jobuse.KV, {})
+        if case == "restarted":
+            start["v"] = "S2"
+        # Seven hours on (past repeat_s, 6 h), still idle, sampled in a fresh idle stretch each hour.
+        for _ in range(7):
+            clock[0] += 3600
+            p.db.update_task(tid, not_before=clock[0] + 3 * 3600)
+            entry = p.db.kv(jobuse.KV).get(str(rc)) or {}
+            entry.update({"task": tid, "name": "build", "req": {"cores": 8},
+                          "st": {"ring": [[clock[0] - 960, 0.0], [clock[0] - 60, 95.0]], "start": start["v"],
+                                 "since": clock[0] - 960}})
+            entry.pop("pulled", None)
+            p.db.set_kv(jobuse.KV, {str(rc): entry})
+            d._jobs_sampled = 0
+            d.sample_jobs()
+        entry = p.db.kv(jobuse.KV)[str(rc)]
+        nb = float(p.db.task(tid)["not_before"])
+        if case in ("let_run", "kv_forgot"):
+            assert len(ev()) == 1 and entry["raised"].get("let_run"), entry
+            assert not entry.get("pulled") and nb > clock[0] + 3600, "no check pulled in for a job let run"
+        elif case == "restarted":   # a new job: it alarms as a new one (and repeats, no worker decided since)
+            assert len({e["fingerprint"] for e in ev()}) == 2 and not entry["raised"].get("let_run"), entry
+        else:   # no worker decided after the event: it repeats after repeat_s as before
+            assert len(ev()) == 2 and not entry["raised"].get("let_run"), (case, entry)
+    finally:
+        lock.close()

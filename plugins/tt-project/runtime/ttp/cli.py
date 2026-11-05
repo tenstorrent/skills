@@ -7014,7 +7014,10 @@ def cmd_detach(a) -> None:
     from the job for its task's obligations (obligations._job_results). A task that owns an open
     obligation and starts a job without it is reminded to report results (_results_reminder).
     `--spend-cmd <cmd> --spend-cap <usd> [--spend-every <s>]` (together) has the daemon read a paid-API
-    job's spend model-free and stop it at the cap (spendcap.py)."""
+    job's spend model-free and stop it at the cap (spendcap.py).
+    `--idle-ok "<why>"` declares the job's low use by design (it waits on what the sampler cannot see):
+    no under-use alarm, the reason shown where the job is listed (jobuse.declared); with a name or .rc
+    and no command it sets or ('') removes that on a running job (_detach_idle_ok)."""
     from . import detach, jobuse
     from . import locks as lk
     from .push import _boxed, _own_ttp
@@ -7044,6 +7047,8 @@ def cmd_detach(a) -> None:
         sys.exit(_detach_stop_pids(a.stop_pids))
     if a.check is None:
         _start_options(a)
+    if getattr(a, "idle_ok", None) is not None and a.check is None and not a.remote and not a.command:
+        sys.exit(_detach_idle_ok(a.name or "", a.idle_ok))
     if a.check is None and (getattr(a, "rows", None) is not None or getattr(a, "after", None) is not None):
         die("--rows and --after go with --check")
     if a.check is None and getattr(a, "mirror", None):
@@ -7055,6 +7060,11 @@ def cmd_detach(a) -> None:
         die("usage: ttp detach <name> --lock <resource> [--lock <resource>...] -- <command...>")
     if getattr(a, "resumable", False) and (a.remote or a.check is not None):
         die("--resumable is for a local job: a --remote one already outlives a reboot here")
+    idle_ok = getattr(a, "idle_ok", None)
+    if idle_ok is not None and (a.remote or a.check is not None):
+        die("--idle-ok is for a local job: the daemon here samples its use")
+    if idle_ok is not None and not jobuse.declared({"idle_ok": idle_ok}):
+        die("--idle-ok needs the reason the job's idle time is by design, e.g. 'waits on a remote API'")
     results = getattr(a, "results", None)
     if results is not None and (a.remote or a.check is not None):
         die("--results is for a local job: the daemon reads its result files here")
@@ -7155,6 +7165,7 @@ def cmd_detach(a) -> None:
                  **({"locks": job_locks} if job_locks else {}),
                  **({"results": results, "cwd": os.getcwd()} if results else {}),
                  **({"spend": spendcap.entry(*spend_opts)} if spend_opts[0] is not None else {}),
+                 **({"idle_ok": jobuse.declared({"idle_ok": idle_ok})} if idle_ok is not None else {}),
                  "requested": jobuse.requested(asked, os.environ, getattr(a, "cores", None),
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                _job_base_env(state))})
@@ -7167,6 +7178,8 @@ def cmd_detach(a) -> None:
              if spend_opts[0] is not None else "")
           + (f"results: each new file matching {results} under {os.getcwd()} counts as a result report\n"
              if results else _results_reminder(state))
+          + (f"idle by design: {jobuse.declared({'idle_ok': idle_ok})} (no under-use alarm while it says so)\n"
+             if idle_ok is not None else "")
           + f"hand off: status waiting, retry_when \"{lk.job_probe([rc], _own_ttp())}\"")
 
 
@@ -7208,6 +7221,36 @@ def _detach_reap(what: str) -> int:
     print(f"{rc.stem}: {e['status']} rc={ex} at {time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(e['ended']))}"
           + (f" ({e['why']})" if e.get("why") else ""))
     _free_ended_slots(rc)
+    return 0
+
+
+def _detach_idle_ok(what: str, why: str) -> int:
+    """`ttp detach --idle-ok "<why>" <name or .rc path>`: declare a running job's idle time by design
+    (jobuse.declared), so the daemon raises no under-use alarm for it; `--idle-ok ''` removes the
+    declaration, and the job's next under-use alarms anew. 0 once recorded, 1 when the job is over, 2
+    when no record names it. A name is a job of $TTP_RUN_DIR."""
+    from . import detach, jobuse
+    if not what:
+        die("usage: ttp detach --idle-ok \"<why>\" <name or .rc path>  (or before -- <command> when starting it)")
+    rc = Path(what) if what.endswith(".rc") or "/" in what else \
+        Path(os.environ.get("TTP_RUN_DIR") or die("--idle-ok <name> needs $TTP_RUN_DIR; give the .rc path")) / f"{what}.rc"
+    rc = rc.resolve()
+    if not detach._entry(rc):
+        print(f"ttp detach --idle-ok: no detached job is recorded at {rc}", file=sys.stderr)
+        return 2
+    if detach.state(rc)[0] in ("ended", "lost"):
+        print(f"ttp detach --idle-ok: {rc.stem} is over; nothing samples it now", file=sys.stderr)
+        return 1
+    reason = jobuse.declared({"idle_ok": why})
+    with detach.registry(rc.parent) as jobs:
+        for j in jobs:
+            if isinstance(j, dict) and j.get("rc") == str(rc):
+                if reason:
+                    j["idle_ok"] = reason
+                else:
+                    j.pop("idle_ok", None)
+    print(f"{rc.stem}: idle by design: {reason} (no under-use alarm while it says so)" if reason else
+          f"{rc.stem}: no declared idle reason; its next under-use alarms")
     return 0
 
 
@@ -7464,6 +7507,7 @@ def _start_options(a) -> None:
     words = list(a.command or [])
     known = {"--cores": int, "--devices": int, "--mem-gb": float, "--resumable": None, "--lock": list,
              **({"--dir": str} if a.remote else {"--remote-host": str, "--remote-pid": str, "--remote-marker": str,
+                                                  "--idle-ok": str,
                                                   "--results": str, "--spend-cmd": str, "--spend-cap": float,
                                                   "--spend-every": int})}
     while words and words[0].startswith("-") and words[0] != "--":
@@ -12255,6 +12299,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--spend-cap", type=float, metavar="USD", help="with --spend-cmd: the job's spend cap in USD")
     s.add_argument("--spend-every", type=int, metavar="S",
                    help="with --spend-cmd: seconds between spend reads (default 300, at least 60)")
+    s.add_argument("--idle-ok", metavar="WHY",
+                   help="the job's low CPU or device use is by design (it waits on a remote API, another host or a "
+                   "container the sampler cannot see): the daemon raises no under-use alarm for it and shows WHY "
+                   "where the job is listed. With a name or .rc path and no command: set it on a running job; "
+                   "--idle-ok '' removes it, and the job's next under-use alarms anew")
     s.add_argument("--cores", type=int, help="cores the job is meant to keep busy (default: read from -j N, "
                    "--jobs/--threads/--workers N, OMP_NUM_THREADS); the daemon flags sustained under-use")
     s.add_argument("--devices", type=int, help="devices the job is meant to use")
