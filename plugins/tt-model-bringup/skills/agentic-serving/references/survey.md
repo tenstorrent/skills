@@ -38,8 +38,8 @@ eval.
 |---|---|---|
 | `batch` | Which batch for N agents? | The validated batch with the least time per call: output tokens ÷ its per-user rate + time outside generation; usually the smallest at or above N |
 | `agents` | How many agents per server? | min(`max_num_seqs`, pool tokens ÷ working set per agent, task sandboxes the host can run at once) |
-| `suite_hours` | Will each suite finish? | tasks ÷ agents × measured time per task, from the smoke and then from the largest rung so far; the serving formula tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents covers only generation |
-| `task_lists` | Which tasks per rung, and how many at full load? | Inputs, else the harness's lists, else the skill's default rule; full load = `agents`; 95% interval ±2·√(p(1−p)/n) |
+| `run_hours` | How long will each planned run take? | tasks ÷ agents × measured time per task, from the smoke and then from the largest rung so far; the serving formula tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents covers only generation |
+| `task_lists` | Which tasks per rung, and how many in the server-sized list? | Inputs, else the harness's lists, else the skill's default rule; server-sized = `agents`; 95% interval ±2·√(p(1−p)/n) |
 | `agent_timeout` | What agent time limit? | turns × turn time at the served speed, never below the release limit |
 | `output_cap` | What output cap? | Longest answer so far plus headroom, never below the release cap |
 | `bytes` | Where do the bytes go? | Per cache ID: block × KV bytes per token + state bytes; fill per layer group; duplicate weights |
@@ -47,14 +47,14 @@ eval.
 | `block_cost` | What does the block size cost? | Recompute per returning turn ≈ block ÷ 2 |
 | `prefill_padding` | How much prefill is useful? | live rows ÷ batch rows |
 
-`suite_hours` is the first go or stop estimate for the release run. Update it after every rung and effort, and record
+`run_hours` for the release lists is the first go or stop estimate for the release run. Update it after every rung and effort, and record
 the ratio of prediction to measurement.
 
 ## Shortfalls carried in
 
 Earlier stages may pass with a recorded reason: a second weight copy, a KV pool below concurrency ×
 working set, prefix caching off or below 0.9 of the ceiling, traces rebuilt after warm-up. List
-each under `shortfalls` with the hours it costs the suites, from the calculations above. A
+each under `shortfalls` with the `hours` it adds to the release run, from the calculations above. A
 shortfall that costs hours is a problem to rank, not a footnote.
 
 ## Short tests

@@ -3,7 +3,7 @@
 
 Critical (2) only when evidence is missing, or a measured shortfall has no recorded reason.
 A shortfall with a `reason` is advisory (1), so a hard problem never blocks later stages;
-goal 12 must price each one in suite hours in its survey. The runner gives each failure one
+goal 12 must price each one in hours on its release run in its survey. The runner gives each failure one
 remediation goal.
 Exit 0 pass, 1 advisory, 2 critical.
 """
@@ -22,12 +22,12 @@ MIN_HIT_FRACTION = 0.9
 SURVEY_CHECKS = ("time_split", "busy_rows", "live_prefill_rows", "trace_captures", "served_step", "prefix_hits",
                  "cache_pressure", "cache_bytes", "memory_headroom", "cutoffs", "eval_validity", "accuracy_drift",
                  "generation_share", "prefill_under_load", "host_contention")
-SURVEY_CALCULATIONS = ("batch", "agents", "suite_hours", "task_lists", "agent_timeout", "output_cap", "bytes",
+SURVEY_CALCULATIONS = ("batch", "agents", "run_hours", "task_lists", "agent_timeout", "output_cap", "bytes",
                        "cache_agents", "block_cost", "prefill_padding")
 PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route", "smoke")
 LEARNED = ("harness_facts", "suite_timings", "generic_fixes")
 LIST_SOURCES = ("inputs", "harness", "default_rule")
-MODES = ("light", "full")
+MODES = ("light", "extended")
 INPUTS = Path("bringup/agentic_evals/inputs.json")
 DEFAULT_RUN_TIMEOUT_HOURS = 12
 EFFORT_STATUS = ("done", "running", "not_run")
@@ -130,9 +130,9 @@ def check_survey(evals: Path, carried: int, problems: list) -> None:
     for key in SURVEY_CALCULATIONS:
         if key not in calculations:
             problems.append((2, f"survey calculation {key!r} is missing"))
-    priced = [row for row in survey.get("shortfalls") or [] if isinstance(row, dict) and number(row.get("suite_hours"))]
+    priced = [row for row in survey.get("shortfalls") or [] if isinstance(row, dict) and number(row.get("hours"))]
     if len(priced) < carried:
-        problems.append((2, f"{carried} shortfall(s) carried from earlier stages, {len(priced)} priced in suite hours"))
+        problems.append((2, f"{carried} shortfall(s) carried from earlier stages, {len(priced)} priced in hours"))
 
 
 def check_preflight(evals: Path, problems: list) -> None:
@@ -316,8 +316,8 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
         elif row["decision"] == "stop":
             if not positive_int(row.get("functional_at")):
                 problems.append((1, f"{name}: stopped with no cohort completed: {row['reason']}"))
-        elif not isinstance(read(evals / "full" / name / "results.json", problems).get("actual_hours"), (int, float)):
-            problems.append((2, f"{name}: full results lack actual_hours"))
+        elif not isinstance(read(evals / "release" / name / "results.json", problems).get("actual_hours"), (int, float)):
+            problems.append((2, f"{name}: release results lack actual_hours"))
 
 
 def main() -> int:

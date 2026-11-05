@@ -78,7 +78,7 @@ def test_shortfall_is_critical_without_a_reason_and_advisory_with_one(tmp_path, 
 CHECKS = ('time_split', 'busy_rows', 'live_prefill_rows', 'trace_captures', 'served_step', 'prefix_hits',
           'cache_pressure', 'cache_bytes', 'memory_headroom', 'cutoffs', 'eval_validity', 'accuracy_drift',
           'generation_share', 'prefill_under_load', 'host_contention')
-CALCULATIONS = ('batch', 'agents', 'suite_hours', 'task_lists', 'agent_timeout', 'output_cap', 'bytes', 'cache_agents',
+CALCULATIONS = ('batch', 'agents', 'run_hours', 'task_lists', 'agent_timeout', 'output_cap', 'bytes', 'cache_agents',
                 'block_cost', 'prefill_padding')
 PREFLIGHT = ('release_values', 'registry', 'disk', 'admission', 'release_route', 'smoke')
 
@@ -86,13 +86,13 @@ PREFLIGHT = ('release_values', 'registry', 'disk', 'admission', 'release_route',
 def goal12(model, **overrides):
     """Write a complete, passing goal-12 evidence set; overrides replace whole files."""
     evals = model / 'doc/agentic_evals'
-    (evals / 'full/swe').mkdir(parents=True, exist_ok=True)
+    (evals / 'release/swe').mkdir(parents=True, exist_ok=True)
     files = {
         'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'start_hours': 20}],
                       'release': {'dry_run': 'runs/release-dry-run', 'projected_hours': 9.5}},
         'REPORT.md': '# Report',
         'estimate.json': {'evals': {'swe': {'decision': 'go', 'reason': 'fits'}}},
-        'full/swe/results.json': {'actual_hours': 6.5},
+        'release/swe/results.json': {'actual_hours': 6.5},
         'survey.json': {'checks': {k: {'value': 1, 'healthy': True} for k in CHECKS},
                         'calculations': {k: 1 for k in CALCULATIONS}, 'shortfalls': []},
         'preflight.json': {k: {'ok': True} for k in PREFLIGHT},
@@ -131,7 +131,7 @@ def goal12(model, **overrides):
 
 
 def test_agentic_evals_requires_decisions_and_results(tmp_path):
-    goal12(tmp_path, **{'full/swe/results.json': None})
+    goal12(tmp_path, **{'release/swe/results.json': None})
     assert check(tmp_path, 'agentic-evals', evidence())[0] == 2
     goal12(tmp_path, **{'estimate.json': {'evals': {
         'swe': {'decision': 'go', 'reason': 'fits'}, 'terminal': {'decision': 'stop', 'reason': 'latest start passed'}}}})
@@ -167,9 +167,9 @@ def test_carried_shortfalls_must_be_priced(tmp_path):
     data['ledger']['weights'][0].update(copies=2, copy_reason='measured: fused copy')
     files = goal12(tmp_path)
     code, stderr = check(tmp_path, 'agentic-evals', data)
-    assert code == 2 and 'priced in suite hours' in stderr
+    assert code == 2 and 'priced in hours' in stderr
     survey = files['survey.json']
-    survey['shortfalls'] = [{'name': 'attention held twice', 'suite_hours': 1.5}]
+    survey['shortfalls'] = [{'name': 'attention held twice', 'hours': 1.5}]
     goal12(tmp_path, **{'survey.json': survey})
     assert check(tmp_path, 'agentic-evals', data)[0] == 1
 
@@ -299,7 +299,7 @@ def test_task_lists_need_source_rule_and_tasks(tmp_path, row):
     assert code == 2 and 'selection rule' in stderr
 
 
-@pytest.mark.parametrize('plan', [{'mode': 'everything', 'schedule': [{}]}, {'mode': 'full'}])
+@pytest.mark.parametrize('plan', [{'mode': 'everything', 'schedule': [{}]}, {'mode': 'extended'}])
 def test_plan_needs_a_mode_and_a_schedule(tmp_path, plan):
     goal12(tmp_path, **{'plan.json': plan})
     code, stderr = check(tmp_path, 'agentic-evals', evidence())
@@ -397,7 +397,7 @@ def test_agent_replay_reports_hits_and_prefill_amplification(tmp_path):
 @pytest.mark.parametrize('mode, release, message', [
     ('light', {'projected_hours': 9.5}, 'dry_run'),
     ('light', {'dry_run': 'runs/d', 'projected_hours': 13}, 'smaller list'),
-    ('full', {'dry_run': 'runs/d', 'projected_hours': {'swe': 11, 'terminal': 14}}, 'terminal projected'),
+    ('extended', {'dry_run': 'runs/d', 'projected_hours': {'swe': 11, 'terminal': 14}}, 'terminal projected'),
 ])
 def test_release_needs_a_dry_run_and_a_projection_that_fits(tmp_path, mode, release, message):
     plan = {'mode': mode, 'schedule': [{}], 'release': release}
@@ -406,11 +406,11 @@ def test_release_needs_a_dry_run_and_a_projection_that_fits(tmp_path, mode, rele
     assert code == 2 and message in stderr
 
 
-def test_full_mode_projects_each_suite_against_run_timeout_hours(tmp_path):
-    plan = {'mode': 'full', 'schedule': [{}],
+def test_extended_mode_projects_each_suite_against_run_timeout_hours(tmp_path):
+    plan = {'mode': 'extended', 'schedule': [{}],
             'release': {'dry_run': 'runs/d', 'projected_hours': {'swe': 11.5, 'terminal': 9}}}
     goal12(tmp_path, **{'plan.json': plan})
-    assert check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'full'}) == (0, '')
+    assert check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'extended'}) == (0, '')
 
 
 def test_no_release_needed_when_every_eval_stopped(tmp_path):
@@ -433,8 +433,8 @@ def test_release_limit_comes_from_the_operator_inputs(tmp_path, inputs, passes):
 
 def test_plan_mode_must_match_the_operator_inputs(tmp_path):
     goal12(tmp_path)
-    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'full'})
-    assert code == 2 and "mode 'full'" in stderr
+    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'extended'})
+    assert code == 2 and "mode 'extended'" in stderr
 
 
 @pytest.mark.parametrize('stage, key', [

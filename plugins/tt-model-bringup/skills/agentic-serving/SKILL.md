@@ -10,7 +10,7 @@ asks for in `models/autoports/<model>/doc/agentic_serving.json`; `scripts/check_
 gates it. Missing evidence is critical. A measured shortfall is critical unless it carries a reason
 (`copy_reason`, `pool_shortfall_reason`, `serving.reason`, `trace_reason`,
 `growing_contexts.reason`), which makes it advisory.
-Goal 12 must price every such shortfall in suite hours before it ranks its work.
+Goal 12 must price every such shortfall in hours on its release run before it ranks its work.
 
 ## Target workload
 
@@ -102,17 +102,17 @@ long prompts prefill, and the engine's host time per step against task-container
 Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the target checkout:
 
 - evals: default `r1_gpqa_diamond`, `swe_bench_verified` and `terminal_bench_2_1`;
-- `mode`: `light` (default) or `full`, see [Modes](#modes);
+- `mode`: `light` (default) or `extended`, see [Modes](#modes);
 - `task_lists`, optional: task names per eval and rung, replacing the lists
   [Task lists](#task-lists) would choose;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
 - `release_spec`, optional: where the release values come from. Without it, find the release
   configuration for each eval yourself, in the release workflow and the serving harness;
-- `stage_budget_hours` (default 24 for `light`, 48 for `full`), covering survey to the start of the
+- `stage_budget_hours` (default 24 for `light`, 48 for `extended`), covering survey to the start of the
   release run;
 - `run_timeout_hours` (default 12): the longest any single run may take. The release is one run of
-  all suites in `light` and one run per suite in `full`, so it bounds both;
+  all suites in `light` and one run per suite in `extended`, so it bounds both;
 - `permissions`: standing decisions the stage would otherwise stop to ask for, such as
   `release_route_repairs` (may the stage publish fixes to the release route) and
   `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
@@ -130,14 +130,19 @@ says; the plan may shorten, but the stage must not depend on them. Record what w
 
 ### Modes
 
-- **`light`, 24 h.** Make every suite run validly at mid size (its full-load list) and leave a
+Words used below: a **suite** is one eval (GPQA Diamond, SWE-bench Verified, Terminal-Bench); a
+**task list** is the subset of a suite that one run scores; the **full suite** is the whole
+dataset (198, 500 and 89 tasks). Neither mode aims at the full suites: they run only when one fits
+`run_timeout_hours`.
+
+- **`light`, 24 h.** Make every suite run validly at mid size (its server-sized list) and leave a
   release configuration whose whole release run, all suites together, finishes within
   `run_timeout_hours` on one machine.
   Efforts go first to validity, then to whatever makes that release run fit. The final step runs
   it.
-- **`full`, 48 h.** Everything `light` does, then speed work, estimates for the full suites from
-  measured runs, and per suite the largest task list that finishes within `run_timeout_hours` on one
-  machine: the full suite when it fits. The final step runs those lists, one suite after another,
+- **`extended`, 48 h.** Everything `light` does, then speed work, an estimate of what each full
+  suite would take from measured runs, and per suite the largest task list that finishes within
+  `run_timeout_hours` on one machine, which is the full suite only when it fits. The final step runs those lists, one suite after another,
   each suite its own run of up to `run_timeout_hours`.
 
 The release run starts before the stage time limit ends and may finish after it. Both modes end
@@ -240,15 +245,15 @@ rule so another run picks the same tasks. Never take a prefix of a sorted list.
 |---|---|---|---|---|
 | smoke | 2 | 2 | 2 | fixed |
 | nightly | about 10 | about 5 | about 10 | the harness: main's usual nightly sizes; read them for this model |
-| full load | agents per server | agents per server | agents per server | the agent, from [Batch and agents](#batch-and-agents) |
-| larger (`full`) | — | multiples of full load | multiples of full load | the agent, from `run_timeout_hours`; a larger list also projects the full suite |
+| server-sized | agents per server | agents per server | agents per server | the agent, from [Batch and agents](#batch-and-agents) |
+| larger (`extended`) | — | multiples of server-sized | multiples of server-sized | the agent, from `run_timeout_hours`; a larger list also projects the full suite |
 | full suite | 198 | 500 | 89 | fixed |
 
 **Read every score with its error.** Report the 95% interval, about ±2·√(p(1−p)/n), and say when a
 list is too small to separate the model from its reference.
 
 **Aggregates, not single tasks.** Per-task durations do not repeat between runs. Conclude from
-score, suite wall and total agent time.
+score, run wall time and total agent time.
 
 **Shape follows the claim.** Concurrency needs enough simultaneous conversations to load the pool
 and scheduler, precision and long context need long free-running replies, caching needs repeated
@@ -273,25 +278,26 @@ time measured there projects the next rung to finish before the release run must
    scored trajectory. A suite that cannot becomes the first problem in the ranking.
 3. **Nightly rung.** The first deliverable: the lists the release grades, scored against the
    references. Record `functional_at`.
-4. **Full-load rung**: one run per suite that fills the server. It measures suite time, agent
-   capacity and the slow tail at real load; its time replaces the estimate for larger runs.
+4. **Server-sized rung**: one run per suite with as many tasks as the server holds agents. It
+   measures run time per task, agent capacity and the slow tail at real load; its time replaces the
+   estimate for larger runs.
 5. **Efforts**, ranked against the last banked rung, in the time the plan leaves them. They start
    once the smoke rung is banked and share the device through the queue; a rung never waits for
    an effort.
-6. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
+6. **Larger rungs**, `extended` mode only, growing each suite toward the largest list that fits
    `run_timeout_hours`. They set the release lists.
 7. **Combine and dry run.** Freeze the release configuration: serving settings, task lists,
    limits, route and commits. Then launch the release exactly as it will run and stop it once it is
    clearly running: the server loads the frozen settings, every task environment in the release
    lists is pulled or built, the planned number of sandboxes start together, and each suite's first
-   agents get model replies. No scores; suite lengths come from the measured rungs. Fix what fails
+   agents get model replies. No scores; run lengths come from the measured rungs. Fix what fails
    and dry-run again. Nothing changes after the last clean dry run.
 8. **Release run**, started before the stage time limit and allowed to finish after it, within
    `run_timeout_hours`, through the same route every earlier run used. It must land without help:
    start it only on the configuration that passed the dry run and only when its projection, with each suite's
    slow tail at the agent limit, fits `run_timeout_hours` with margin. Otherwise release a smaller
-   list that does. It runs the evals with a `go` decision: in `light` their full-load lists, all
-   within `run_timeout_hours` together; in `full` each one's largest fitting list. A failure during it is reported, not fixed: the
+   list that does. It runs the evals with a `go` decision: in `light` their server-sized lists, all
+   within `run_timeout_hours` together; in `extended` each one's largest fitting list. A failure during it is reported, not fixed: the
    release result is what it ran.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
@@ -303,13 +309,13 @@ Rank in two tiers.
 
 1. **Validity first.** A problem that keeps a suite from producing a valid or representative score
    records `unblocks: <eval>` and ranks above every speed problem, cheapest first.
-2. **Then speed**, by suite hours saved, summed over the evals, per device hour. Price savings at
-   the suite sizes the release runs, not at sample size. Agents per server is always a candidate,
+2. **Then speed**, by hours saved on the release run, summed over the evals, per device hour.
+   Price savings on the release lists, not at sample size. Agents per server is always a candidate,
    priced against the pool and the measured call times.
 
 For each problem estimate the device hours it needs; agent time is not counted. When
 a number cannot be calculated, guess and mark it. Name how the effort will confirm success without
-the full suites, and the value that counts. Adjust where judgement says otherwise and record why.
+the release run, and the value that counts. Adjust where judgement says otherwise and record why.
 Rank every problem, even past the budget; problems found later, by efforts, rungs or the
 coordinator's own look at the run, join the ranking the same way. Re-rank after each effort and
 each rung from the checks and calculations it touched.
@@ -383,11 +389,11 @@ Write these to `doc/agentic_evals/`:
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
 - `plan.json`, with the `mode`, the schedule updated after every run, and
   `release`: the frozen configuration, the `dry_run` that launched it, and
-  `projected_hours` with each suite's slow tail: one number in `light`, one per eval in `full`
+  `projected_hours` with each suite's slow tail: one number in `light`, one per eval in `extended`
 - `runs/<arm>/` (manifest and collected results)
 - `estimate.json`: per eval `decision` (`go`: it is in the release run; `stop`: it is not),
   `reason` and `functional_at`, the size of the largest task list that completed with valid scores
-- `full/<eval>/results.json`: the release run's results, with `actual_hours` next to the projection
+- `release/<eval>/results.json`: the release run's results, with `actual_hours` next to the projection
 - `serving_config.json`: the measured `max_concurrency`, `prefix_caching`, `max_num_seqs`,
   `validated_batches`, per run in `batch_by_eval` its `batch` and `planned_clients`, the agent and
   request time limits and output cap, and `release_limits`
