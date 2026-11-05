@@ -72,9 +72,11 @@ gh workflow run "$WORKFLOW" -R "$REPO" \
 Use the granted workflow as it is, with its default setup and cleanup; do not fork, wrap or patch
 it. Other users share the runner pool: `max_parallel` is a ceiling, not machines waiting idle, so
 jobs may queue. Queueing is not a failure; never cancel a run only because it has no runner yet.
-Dispatch the first CI smoke in the first hour so the wait overlaps local work, and keep up to
-`max_parallel` runs in flight after it: one suite per runner, rung runs and effort samples side by
-side. Samples may run while the smoke is pending and count once it passes.
+CI runners are secondary devices, as the skill's Devices section says: the coordinator places jobs
+on them from the schedule, and the local device stays primary. Dispatch the first CI smoke in the
+first hour so the wait overlaps local work, and keep up to `max_parallel` runs in flight after it
+when the schedule has work for them. Samples may run while the smoke is pending and count once it
+passes.
 When the stage stops for any reason, its dispatched CI runs keep running; collect their results on
 resume instead of cancelling them.
 

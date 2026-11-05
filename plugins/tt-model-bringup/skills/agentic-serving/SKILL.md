@@ -122,9 +122,9 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - `compute`, optional.
 
 By default the stage runs on one machine: the local device, which every earlier stage used. Plan,
-size and time everything for it. `compute` may grant more machines; then
-[CI compute](references/ci-compute.md) says how to use them, and the plan may shorten, but the
-stage must not depend on them. Record what was actually used in `doc/agentic_evals/compute.json`.
+size and time everything for it. `compute` may grant more machines as secondary devices, used as
+[Devices](#devices) says; the plan may shorten, but the stage must not depend on them. Record what
+was actually used in `doc/agentic_evals/compute.json`.
 
 ### Modes
 
@@ -333,18 +333,32 @@ decides against the current ranking whether it continues.
 - **Evidence is written once**, by the effort, when it ends. No sub-agent maintains or audits the
   evidence while the stage runs; one short closure review at the end, inside the schedule.
 
-The coordinator holds the current best, the device queue and the schedule, chooses which efforts
+The coordinator holds the current best, the device queues and the schedule, chooses which efforts
 run together, and reads wide where efforts read deep, as
 [Look at the whole run](#look-at-the-whole-run) asks. Every run registers with it at launch. At
 each effort boundary it re-reads `inputs.json` and `steering.md` (operator prose, if present) and
 logs what it applied to `steering.log`.
 
-### Sharing the local device
+### Devices
 
-Parallel efforts reach the local device only through one queue in `doc/agentic_evals/device_queue/`,
-which runs one job at a time as [tt-device-usage](../tt-device-usage/SKILL.md) requires and logs
-each job's owner, start, end and exit status. After
-a hang or crash, reset and check the device before the next job.
+The local device is primary. The schedule in `plan.json` must work with it alone, and the
+rehearsal and release run use it unless the operator says otherwise, so the release lands on the
+machine it was rehearsed on.
+
+Granted machines are secondary. They take work the plan would otherwise run one after another on
+the local device: a rung of one suite while another suite's rung runs locally, an effort's scored
+sample, or a second arm of a paired comparison. Give a secondary machine work whose result still
+counts if the machine disappears, and keep a local fallback in the schedule for anything on the
+critical path. Compare timings only between machines of the same device type; a number measured
+on another machine class is a separate measurement.
+
+Every device has one queue in `doc/agentic_evals/device_queue/<device>/`, which runs one job at a
+time as [tt-device-usage](../tt-device-usage/SKILL.md) requires and logs each job's owner, start,
+end and exit status. Sub-agents do not pick devices or dispatch on their own: they hand a job to
+the coordinator, which places it on a queue by the schedule, so parallel efforts use parallel
+devices without two jobs ever sharing one. After a hang or crash, reset and check that device
+before its next job. [CI compute](references/ci-compute.md) covers the publish and dispatch steps
+for CI machines.
 
 ### Outputs
 
