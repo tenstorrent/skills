@@ -7,7 +7,9 @@ was created for a user's order (origin 'user', or it answers a chat: reply_chat)
 such a task with its budget spent, the daemon raises its budget by its tier's default
 (budget.task_default_usd) and starts it in the same tick, with no coordinator turn
 (Daemon._dispatch). A run of one stopped by its budget mid-run goes back to the queue, not to failed,
-so the next tick tops it up and continues it (Daemon._finish_worker). Each top-up is one KIND event on
+so the next tick tops it up and continues it (Daemon._finish_worker); a budget stop is either the
+runner's check (run status 'budget') or the agent's own cap (a failed run, error_max_budget_usd:
+turnsize.over_budget), recorded on the run (mark_stop) for the runaway guard. Each top-up is one KIND event on
 the task (data: the budget before and after, the branch head, the count), handled at once so it wakes
 no turn, and one low notice to the chat.
 
@@ -81,6 +83,34 @@ def top_up(db, cfg: dict, task: dict, head: str = "", now: float | None = None) 
     return {**task, "budget_usd": after}
 
 
+STOP_KEY = "budget_stop"   # in a run's note: it ended on its budget (turnsize.over_budget)
+
+
+def mark_stop(db, run: dict) -> None:
+    """Record on the run that its budget stopped it, whichever way (the runner's check: status 'budget';
+    the agent's own cap: a failed run with error_max_budget_usd), so runaway reads one cause."""
+    if not run.get("id"):
+        return
+    row = db.one("SELECT note FROM runs WHERE id=?", (run["id"],))
+    try:
+        note = json.loads((row or {}).get("note") or "{}")
+    except ValueError:
+        note = {}
+    if not isinstance(note, dict):
+        note = {}
+    db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({**note, STOP_KEY: True}), run["id"]))
+
+
+def stopped_on_budget(row: dict) -> bool:
+    if row.get("status") == "budget":
+        return True
+    try:
+        note = json.loads(row.get("note") or "{}")
+    except ValueError:
+        return False
+    return isinstance(note, dict) and note.get(STOP_KEY) is True
+
+
 def runaway(db, task: dict, run: dict, head: str, handed_off: bool) -> str:
     """Evidence when `run`, which just stopped on its budget, repeats the run before the last top-up:
     that top-up came after a worker run stopped by its budget, `run` started after it, handed off
@@ -91,9 +121,9 @@ def runaway(db, task: dict, run: dict, head: str, handed_off: bool) -> str:
     if not ups:
         return ""
     last = ups[-1]
-    prev = db.q("SELECT id, status, started FROM runs WHERE task=? AND role='worker' AND id<? "
+    prev = db.q("SELECT id, status, started, note FROM runs WHERE task=? AND role='worker' AND id<? "
                 "ORDER BY id DESC LIMIT 1", (task["id"], run["id"]))
-    if not prev or prev[0]["status"] != "budget" or float(prev[0]["started"] or 0) > last["ts"] \
+    if not prev or not stopped_on_budget(prev[0]) or float(prev[0]["started"] or 0) > last["ts"] \
             or float(run.get("started") or 0) < last["ts"]:
         return ""
     if (last["data"].get("head") or "") != (head or ""):

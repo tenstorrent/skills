@@ -5088,6 +5088,7 @@ class Daemon:
                 self._reboot_losses(task["id"], "lost_to_network") <= int(
                 self.cfg["budget"].get("max_reboot_losses", 3))
         no_handoff = status == "ok" and rstatus is None
+        topped, guard = False, ""   # a top-up continues the run: not an attempt; the runaway guard ends it
         if waiting:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
         elif refusal:
@@ -5101,22 +5102,24 @@ class Daemon:
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
         elif status in FREE_ENDS or reboot_lost:
             new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
-        elif status == "budget" and topup.eligible(task) and topup.enabled(self.cfg):
-            # An urgent or user-ordered task stopped by its budget is topped up and continued at the
-            # next dispatch (topup.py), not failed, unless it repeats the run before its last top-up.
+        elif turnsize.over_budget(status, usage) and topup.eligible(task) and topup.enabled(self.cfg):
+            # An urgent or user-ordered task stopped by its budget (the runner's check, or the agent's
+            # own cap: a failed run with error_max_budget_usd) is topped up and continued at the next
+            # dispatch (topup.py), not failed, unless it repeats the run before its last top-up.
+            topup.mark_stop(db, r)
             guard = topup.runaway(db, task, r, self._branch_head(task), bool(rstatus))
             new = "failed" if guard else "queued"
             if guard:
                 summary = f"{guard}. {summary}"[:1500]
                 log(self.p, f"task {task['id']}: {guard}")
+            else:
+                topped = True
         else:
             new = "failed"
-        topped = status == "budget" and new == "queued"   # a top-up continues the run: not an attempt
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
                                                   or rejects or topped else 1)
-        if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
-                                                                                     "stalled", "no_handoff",
-                                                                                     "refused_wait"):
+        if new == "failed" and not guard and attempts < int(task["max_attempts"] or 3) \
+                and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait"):
             new = "queued"
         # A done hand-off on a spec's `cells:` line that left requested cells unfinished or unreported
         # is never passed on as complete: its summary says so, and missing cells get a `continue:`

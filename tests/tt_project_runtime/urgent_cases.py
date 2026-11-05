@@ -773,6 +773,16 @@ def test_an_urgent_or_user_ordered_task_at_its_budget_is_topped_up_and_started_m
     from ttp import web
     row = next(t for t in web.state_payload(p, p.db)["tasks"] if t["id"] == hot)
     assert row["budget_topups"] == {"n": 1, "usd": 2.0}
+    # The web app renders it on the task card, in topup.words' words.
+    js = (RUNTIME / "ttp" / "web" / "app.js").read_text()
+    assert "esc(topupWords(t.budget_topups))" in js[js.index("function taskRow"):]
+    node = shutil.which("node")
+    if node:
+        fn = js[js.index("const topupWords ="):js.index("// A chain's metric")]
+        cases = [{"n": 1, "usd": 2.0}, {"n": 2, "usd": 16}, None, {"n": 0, "usd": 0}]
+        out = subprocess.run([node, "-e", fn + f"console.log(JSON.stringify({json.dumps(cases)}.map(topupWords)))"],
+                             capture_output=True, text=True, timeout=30)
+        assert json.loads(out.stdout) == [topup.words(c) for c in cases], out.stderr
     # Turned off, an urgent task waits on its budget as before.
     d.cfg["budget"]["urgent_topup"] = False
     off = _spent_task(p, "urgent off", priority=1)
@@ -796,6 +806,57 @@ def test_an_urgent_run_stopped_by_its_budget_is_requeued_quietly_and_topped_up(e
     d.dispatch()
     assert [k["task"]["id"] for k in started] == [tid] and p.db.task(tid)["budget_usd"] == 4.0
     assert len(topup.events(p.db, tid)) == 1
+
+
+def test_an_urgent_run_stopped_by_the_agents_own_budget_cap_is_topped_up_and_guarded(env, monkeypatch, tmp_path):
+    """(1b) Claude Code's own --max-budget-usd stop ends the run 'failed' with error_max_budget_usd, not
+    'budget': it is the same budget stop. Requeued at once (no attempt, no delay, no coordinator wake),
+    and two such runs across a top-up with no new commit trip the runaway guard. A routine task's
+    failed run keeps its attempt and delay."""
+    from ttp import topup
+    from ttp.providers.base import RunUsage
+
+    def capped():
+        return RunUsage(cost_usd=2.0, error="error_max_budget_usd: Reached maximum budget",
+                        extra={"subtype": "error_max_budget_usd"})
+
+    p = make(env)
+    d, started = _topup_daemon(p, monkeypatch)
+    monkeypatch.setattr(d, "_branch_head", lambda t: "abc123")
+    now = time.time()
+    tid = _spent_task(p, "urgent fix", priority=1)
+    p.db.update_task(tid, status="running")
+    first = _budget_run(p, tid, now - 600, "failed")
+    d._finish_worker(first, capped(), "failed", tmp_path)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["attempts"] == 0 and not t["not_before"], t
+    assert not p.db.q("SELECT kind FROM events WHERE task=? AND status='queued'", (tid,))
+    assert topup.stopped_on_budget(p.db.one("SELECT * FROM runs WHERE id=?", (first["id"],)))
+    topup.top_up(p.db, d.cfg, p.db.task(tid), head="abc123", now=now - 300)
+    p.db.update_task(tid, status="running")
+    d._finish_worker(_budget_run(p, tid, now - 200, "failed"), capped(), "failed", tmp_path)
+    t = p.db.task(tid)
+    assert t["status"] == "failed" and "runaway guard" in t["result"], t
+    # Mixed causes (the runner's check, then the agent's cap) are the same repeat.
+    mixed = _spent_task(p, "urgent mixed", priority=1)
+    _budget_run(p, mixed, now - 600, "budget")
+    topup.top_up(p.db, d.cfg, p.db.task(mixed), head="abc123", now=now - 300)
+    p.db.update_task(mixed, status="running")
+    d._finish_worker(_budget_run(p, mixed, now - 200, "failed"), capped(), "failed", tmp_path)
+    assert p.db.task(mixed)["status"] == "failed"
+    # A plain failure before the top-up is no budget stop: never the guard.
+    plain = _spent_task(p, "urgent plain", priority=1)
+    _budget_run(p, plain, now - 600, "failed")
+    topup.top_up(p.db, d.cfg, p.db.task(plain), head="abc123", now=now - 300)
+    p.db.update_task(plain, status="running")
+    d._finish_worker(_budget_run(p, plain, now - 200, "failed"), capped(), "failed", tmp_path)
+    assert p.db.task(plain)["status"] == "queued" and p.db.task(plain)["attempts"] == 0
+    # A routine task's capped run: an attempt and a delay, as before.
+    routine = _spent_task(p, "routine", priority=3)
+    p.db.update_task(routine, status="running")
+    d._finish_worker(_budget_run(p, routine, now - 100, "failed"), capped(), "failed", tmp_path)
+    t = p.db.task(routine)
+    assert t["status"] == "queued" and t["attempts"] == 1 and t["not_before"], t
 
 
 def test_a_dollar_cap_still_stops_a_topped_up_urgent_task(env, monkeypatch):

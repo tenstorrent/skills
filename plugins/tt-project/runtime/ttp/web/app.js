@@ -93,6 +93,8 @@ const held = (t) => !!heldAs(t);
 // A queued task whose dependencies have not finished waits on them, not on a worker slot.
 const depWait = (t) => { const on = t.status === "queued" ? (t.waits_on || []).filter((i) => i != null) : [];
   return on.length ? "waits on " + on.map((i) => "#" + i).join(", ") : ""; };
+// Budget top-ups of an urgent or user-ordered task (topup.words): "budget topped up 2x (+$16.00)".
+const topupWords = (c) => c && c.n ? `budget topped up ${c.n}x (+$${Number(c.usd || 0).toFixed(2)})` : "";
 
 // A chain's metric across its runs (continues, fixes, re-reviews): run, time, value and delta.
 const num = (v) => Math.abs(v) >= 1000 || Number.isInteger(v) ? String(Math.round(v * 100) / 100) : String(+v.toPrecision(4));
@@ -113,7 +115,7 @@ function taskRow(t) {
   const noteLabel = t.status === "blocked" ? "Blocked" : waiting(t) ? "Waiting" : held(t) ? "Held" : "Note";
   return `<details class="row"><summary><span class="id">#${t.id}</span> <span class="st st-${t.outcome || t.status}">${label}</span>
     <span class="title">${esc(t.title)}</span> <span class="meta">${esc(t.tier)} · ${money(t.spent_usd)}${t.budget_usd ? " / " + money(t.budget_usd) : ""} · ${agoH(t.updated)} ago${t.pr_url ? ` · ${isHttp(t.pr_url) ? link(t.pr_url, "PR") : "PR " + esc(t.pr_url)}` : ""}</span></summary>
-    ${t.wait ? `<p class="meta">${esc(t.wait.text)} (${esc(t.wait.age_text)})</p>` : ""}${t.eta ? `<p class="meta">${esc(t.eta)}</p>` : ""}${(t.job_use || []).map((x) => `<p class="meta">${esc(x)}</p>`).join("")}${t.start_when ? `<p class="meta">start check: <code>${esc(t.start_when)}</code></p>` : ""}${t.gate ? `<p class="meta">${t.gate.warn ? "<b>warning:</b> " : ""}${esc(t.gate.text)}</p>` : ""}
+    ${t.wait ? `<p class="meta">${esc(t.wait.text)} (${esc(t.wait.age_text)})</p>` : ""}${t.eta ? `<p class="meta">${esc(t.eta)}</p>` : ""}${topupWords(t.budget_topups) ? `<p class="meta">${esc(topupWords(t.budget_topups))}</p>` : ""}${(t.job_use || []).map((x) => `<p class="meta">${esc(x)}</p>`).join("")}${t.start_when ? `<p class="meta">start check: <code>${esc(t.start_when)}</code></p>` : ""}${t.gate ? `<p class="meta">${t.gate.warn ? "<b>warning:</b> " : ""}${esc(t.gate.text)}</p>` : ""}
     ${t.blocked_reason ? `<p><b>${noteLabel}:</b> ${esc(t.blocked_reason)}</p>` : ""}${t.result ? `<p>${esc(t.result)}</p>` : ""}${trendHtml(t.trend)}
     ${(t.pushed || []).map((x) => `<p class="meta">${x.status === "landed" ? "already on the branch" : "pushed"} ${esc((x.sha || "").slice(0, 7))}${x.version ? " as " + esc(x.version) : ""} (${esc(x.branch || "?")})</p>`).join("")}
     <p class="meta">origin ${esc(t.origin)} · kind ${esc(t.kind)} · attempts ${t.attempts}${t.branch ? " · branch " + esc(t.branch) : ""}</p>
