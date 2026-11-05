@@ -273,11 +273,11 @@ def take(path: Path):
 def _catalogue(fd: int, bound: float, where=LOCK):
     """The folder-wide lock, waited for at most `bound` seconds (none for 0); yields None when it
     stays busy. Its holder's pid is written in the lock file, so a waiter can name it."""
-    deadline, said = time.monotonic() + bound, False
+    deadline, said, holder = time.monotonic() + bound, False, None
     while (f := _take_fd(fd)) is None:
         if bound <= 0:
             break
-        holder = _holder(fd)
+        holder = _holder(fd) or holder   # a read that misses it (a busy /proc/locks) keeps the last seen
         if not said:
             print(f'ttp checks: {where} is busy: waiting for pid {holder or "(unknown)"} '
                   f'(up to {bound:g} s)', file=sys.stderr, flush=True)
@@ -310,16 +310,18 @@ def _catalogue(fd: int, bound: float, where=LOCK):
 def _holder(fd: int) -> int | None:
     """The pid holding the folder lock: from the lock file, else (Linux) /proc/locks. There a lock
     names the superblock's device, which on btrfs differs from the st_dev stat gives: an exact device
-    match wins, else the one FLOCK on that inode number."""
+    match wins, else the one FLOCK on that inode number. The kernel hands that table out a page per
+    read, so while other locks come and go a line can slip between two pages: a read that finds no
+    lock on the inode at all is retried."""
     pid = _read(fd, LOCK).get('pid')
     if isinstance(pid, int) and pid > 0:
         return pid
     try:
         st = os.stat(LOCK, dir_fd=fd, follow_symlinks=False)
         dev = (os.major(st.st_dev), os.minor(st.st_dev))
-        others = set()
-        with open(PROC_LOCKS) as f:
-            for line in f:
+        for _ in range(3):
+            others = set()
+            for line in _proc_locks():
                 parts = line.split()
                 if len(parts) < 6 or parts[1] != 'FLOCK':
                     continue
@@ -329,11 +331,16 @@ def _holder(fd: int) -> int | None:
                 if (int(where[0], 16), int(where[1], 16)) == dev:
                     return int(parts[4])
                 others.add(int(parts[4]))
-        if len(others) == 1:
-            return others.pop()
+            if others:
+                return others.pop() if len(others) == 1 else None
     except (OSError, ValueError):
         pass
     return None
+
+
+def _proc_locks() -> list:
+    with open(PROC_LOCKS) as f:
+        return f.readlines()
 
 
 def _take_fd(fd, *, wait=False):

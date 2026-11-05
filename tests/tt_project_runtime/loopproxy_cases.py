@@ -251,23 +251,21 @@ def test_loopback_script_forwards_only_from_another_namespace(tmp_path):
             PORTS_ENV: f"{ports[0]} 22 x {ports[1]}"}
     for netns, want in ((os.readlink("/proc/self/ns/net"), False), ("net:[1]", True), ("", False)):
         log.unlink(missing_ok=True)
-        out = subprocess.run(["bash", "-c", 'set -u; . "$1"; echo "rc=$?"', "sh", str(SCRIPT)], capture_output=True,
-                             text=True, env={**base, NETNS_ENV: netns}, timeout=60)
+        # The forwarders start in the background: the shell waits for them (the stand-ins log and exit),
+        # so every line is in before the log is read, however loaded the host; their order is free.
+        out = subprocess.run(["bash", "-c", 'set -u; . "$1"; rc=$?; wait; echo "rc=$rc"', "sh", str(SCRIPT)],
+                             capture_output=True, text=True, env={**base, NETNS_ENV: netns}, timeout=120)
         assert out.stdout.strip() == "rc=0", out
         calls = log.read_text().splitlines() if log.exists() else []
         if not want:
             assert calls == [], netns
             continue
-        # The forwarders start in the background: under load their lines land late and in either order.
-        deadline = time.monotonic() + 10
-        while len(calls) < 2 and time.monotonic() < deadline:
-            time.sleep(0.05)
-            calls = log.read_text().splitlines() if log.exists() else []
         assert sorted(calls) == [f"TCP-LISTEN:{p},bind=127.0.0.1,fork,reuseaddr "
                                  f"PROXY:127.0.0.1:localhost:{p},proxyport=3128,proxyauth=user:pw"
                                  for p in sorted(ports)]
     log.unlink(missing_ok=True)
-    out = subprocess.run(["bash", "-c", '. "$1"', "sh", str(SCRIPT)], capture_output=True, text=True, timeout=60,
+    out = subprocess.run(["bash", "-c", '. "$1"; rc=$?; wait; exit $rc', "sh", str(SCRIPT)], capture_output=True,
+                         text=True, timeout=120,
                          env={**base, NETNS_ENV: "net:[1]", "HTTPS_PROXY": "http://proxy.example.com:3128"})
     assert out.returncode == 0 and not log.exists(), "only the sandbox's own loopback proxy carries them"
     for s in held:

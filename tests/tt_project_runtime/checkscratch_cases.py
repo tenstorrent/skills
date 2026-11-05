@@ -370,3 +370,49 @@ def test_a_clean_tree_removed_under_a_detached_check_reports_killed_not_test_fai
     assert json.loads((run / "checks.json").read_text())["killed"].startswith(cli.TREE_GONE)
     assert not (run / "check_failure.json").exists()
     _no_checkouts(repo, tmp)
+
+
+def test_check_scratch_holder_survives_a_proc_locks_read_that_misses_its_line(env, monkeypatch, capsys):
+    """The kernel hands out /proc/locks a page per read, so while other locks come and go the holder's
+    line can slip past one read (under host load a wait said 'pid (unknown) still holds' after naming
+    the pid): a read with no lock on the inode is retried, at most three reads, and the wait's last
+    message keeps the last holder it saw."""
+    from ttp import checkdirs
+    folder = make(env).state / checkdirs.FOLDER
+    folder.mkdir(parents=True, exist_ok=True)
+    (folder / checkdirs.LOCK).touch()
+    st = os.stat(folder / checkdirs.LOCK)
+    dev = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}"
+    line = f"1: FLOCK  ADVISORY  WRITE 4242 {dev}:{st.st_ino} 0 EOF\n"
+    stranger = f"2: FLOCK  ADVISORY  WRITE 4343 ff:ff:{st.st_ino} 0 EOF\n"
+    reads = []
+
+    def table(*seq, then=()):
+        it = iter(seq)
+        reads.clear()
+        monkeypatch.setattr(checkdirs, "_proc_locks", lambda: reads.append(1) or list(next(it, then)))
+
+    fd = os.open(folder, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        table([], [line])
+        assert checkdirs._holder(fd) == 4242 and len(reads) == 2
+        table([], [], [], [line])
+        assert checkdirs._holder(fd) is None and len(reads) == 3, "bounded: three reads"
+        table([f"1: POSIX  ADVISORY  WRITE 4242 {dev}:{st.st_ino} 0 EOF\n"], [line])
+        assert checkdirs._holder(fd) == 4242, "a POSIX lock alone is no FLOCK holder: read again"
+        table([line.replace("4242", "4141"), stranger])
+        assert checkdirs._holder(fd) == 4141 and len(reads) == 1
+        table([stranger, stranger.replace("4343", "4444")])
+        assert checkdirs._holder(fd) is None and len(reads) == 1, "two strangers are an answer, not a miss"
+        held = checkdirs._take_fd(fd)   # a second open file description: the wait below finds it busy
+        try:
+            table([line], then=[])
+            with checkdirs._catalogue(fd, 0.3, "the lock") as got:
+                assert got is None
+        finally:
+            held.close()
+    finally:
+        os.close(fd)
+    err = capsys.readouterr().err
+    assert "waiting for pid 4242 " in err and "pid 4242 still holds the lock" in err, err
+    assert len(reads) > 1, "later reads missed the line"
