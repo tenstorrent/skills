@@ -32,9 +32,10 @@ BROKER_TIMEOUT_S, or reads no job rows, never keeps a run off: the locks alone d
 that cannot run or finish within DEVICE_SCAN_S: the run says so. The scan reads, without sudo, only what the
 ssh user may (/proc/<pid>/fd of its own processes, and others' where the host lets it).
 Runs already on the host go on. The skip shows in one line in `ttp status` and the web app (skip_lines)
-while it is fresh (SKIP_SHOW_S). Its slots:
-the lanes its cores and available memory give (checklane.default_slots) less the remote checks
-running there from any machine (their ttp-check.* folders); this machine also holds one claim file
+while it is fresh (SKIP_SHOW_S). Its slots follow what it has idle now (checklane.host_slots): the runs
+its idle cores (cores less the 1-minute load average) and available memory fit, at most the runs its
+cores hold less the remote checks running there from any machine (their ttp-check.* folders), not a
+small fixed count; a host whose load does not read gets checklane.default_slots less those. This machine also holds one claim file
 per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so its own runs never
 take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
 counted by neither, so the host can take one run more than its slots in that gap: a bound, not a guard.
@@ -85,7 +86,8 @@ _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || e
           "m=$(awk '/^MemAvailable:/{print $2}' /proc/meminfo 2>/dev/null)\n"
           "n=$(find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'ttp-check.*' -type d "
           f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l)\n"
-          "echo \"ttp-spill $c ${m:-0} $n\"\n")
+          "l=$(cut -d' ' -f1 /proc/loadavg 2>/dev/null)\n"
+          "echo \"ttp-spill $c ${m:-0} $n ${l:--}\"\n")
 DEVICE_NODES = "/dev/tenstorrent*"   # a host's Tenstorrent device nodes (a glob); a process holding one open is a tenant
 NODES_ENV = "TTP_TEST_DEVICE_NODES"   # tests: the device node glob instead of DEVICE_NODES
 DEVICE_SCAN_S = 15   # the holder scan's share of PROBE_TIMEOUT_S; past it the scan is cut and fails open
@@ -346,15 +348,20 @@ def probe(alias: str) -> tuple[int, str, str]:
         return 0, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}", ""
     if r.returncode == 3:
         return 0, "it lacks git or tar", ""
-    m = re.search(r"^ttp-spill (\d+) (\d+) (\d+)$", r.stdout, re.M)
+    m = re.search(r"^ttp-spill (\d+) (\d+) (\d+)(?: (\d+(?:\.\d+)?|-))?$", r.stdout, re.M)
     if r.returncode != 0 or not m:
         return 0, f"its probe failed (exit {r.returncode})", ""
     busy, note = _device_holders(r.stdout)
     if busy:
         return 0, busy, ""
-    cores, mem_kib, running = (int(x) for x in m.groups())
-    n = checklane.default_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None)
-    return (n - running, "", note) if running < n else (0, f"its {n} check slot(s) are busy", note)
+    cores, mem_kib, running = (int(x) for x in m.groups()[:3])
+    load = float(m[4]) if m[4] and m[4] != "-" else None
+    n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, load, running)
+    if n > 0:
+        return n, "", note
+    return 0, (f"its {running} running check(s) fill it" if load is None
+               else f"its idle cores and memory fit no check now (load {load:g} of {cores} cores, "
+                    f"{running} check(s) running)"), note
 
 
 def claim_dir() -> Path:

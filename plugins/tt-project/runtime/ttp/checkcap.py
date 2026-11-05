@@ -30,14 +30,16 @@ branch host-wide, across projects. `ttp land`'s checks take one too, keyed by th
 and the local branch it moves (push.priority_key with no remote). Task checks keep their cap and their order: the priority slot never
 takes one of theirs. It is an OS file lock like the others, so a killed push frees it too.
 
-Checks of priority-1 tasks (the daemon files live-impact work, heal self-fixes and interim mitigations,
-at priority 1) go next: ahead of other waiters in the queue, taking turns by project among themselves,
-but at most `checks.priority_turns` (TTP_CHECKS_PRIORITY_TURNS, default PRIORITY_TURNS; 0 turns it off)
-turns in a row while other checks wait, so those still progress (locks.fair_order's `urgent_max`).
+Checks of urgent tasks (priority 1 or better, an `urgent:` spec line: user-ordered and live-impact work,
+heal self-fixes, interim mitigations, the review of an urgent change) go next: ahead of every routine
+waiter of any project whatever its arrival, the most urgent first, then the oldest (locks.fair_order with
+locks.URGENT_FIRST, the default PRIORITY_TURNS). `checks.priority_turns` N (TTP_CHECKS_PRIORITY_TURNS)
+instead bounds them to N turns in a row while other checks wait, taking turns by project; 0 serves them
+in the fair order only.
 
-No checks run waits without a bound: one that has waited `checks.starve_s` (TTP_CHECKS_STARVE_S, default
-STARVE_S, about one full suite run) goes ahead of every later arrival, priority-1 and obligation checks
-included, for the next free slot (locks.fair_order's `aged_before`). A run parked outside the queue for its
+A routine checks run waits without a bound only behind urgent ones: one that has waited `checks.starve_s`
+(TTP_CHECKS_STARVE_S, default STARVE_S, about one full suite run) goes ahead of every later routine arrival
+(and of urgent ones under a set checks.priority_turns), for the next free slot (locks.fair_order's `aged_before`). A run parked outside the queue for its
 test slots (acquire's `startable`) holds a PARKED ticket meanwhile, so the wait is visible: once it has
 waited that long, later runs of its project leave it their project's next free test slots
 (testslots.pool_room, starved_ahead), and push checks run on their branch's reserved test lane alone
@@ -119,7 +121,7 @@ REEXEC_ENV = "TTP_CHECKS_REEXEC"
 KEPT_ENV = "TTP_CHECKS_KEPT_SLOT"
 UPGRADE_SETTLE_S = 10.0   # a newly installed version is adopted once seen this long (an install copies file by file)
 EXTRA_SLOTS = 2   # at most this many slots beyond the cap while the host is lightly loaded (extra())
-PRIORITY_TURNS = 3   # at most this many priority-1 turns in a row while other checks wait (priority_turns())
+PRIORITY_TURNS = locks.URGENT_FIRST   # urgent checks always first (priority_turns(); N > 0 bounds their run)
 PARKED = "checks-parked"   # the queue of runs waiting outside the checks queue for their test slots (acquire)
 STARVE_S = 3600.0   # default checks.starve_s: a run waiting this long goes before every later arrival (starve_s())
 STARVE_ENV = "TTP_CHECKS_STARVE_S"
@@ -313,7 +315,8 @@ def extra_max() -> int:
 
 def priority_turns() -> int:
     """Priority-1 checks' turns in a row at most while other checks wait: TTP_CHECKS_PRIORITY_TURNS, else
-    the account's checks.priority_turns, else PRIORITY_TURNS; 0 serves them in the fair order only."""
+    the account's checks.priority_turns, else PRIORITY_TURNS (locks.URGENT_FIRST: always first, unbounded);
+    0 serves them in the fair order only."""
     for v in (os.environ.get("TTP_CHECKS_PRIORITY_TURNS"),
               (project.load_account_settings().get("checks") or {}).get("priority_turns")):
         if v not in (None, "") and (n := _number(v)) is not None:
@@ -979,3 +982,50 @@ def wait_line(state: Path, now: float | None = None) -> str:
     if not st:
         return ""
     return f"checks slot waits (24 h): {st['n']} taken, median {_dur(st['median_s'])}, p90 {_dur(st['p90_s'])}"
+
+
+URGENT_WAIT = "urgent_check_wait"   # the daemon's event kind (urgent_waits)
+URGENT_WAIT_S = 600.0   # an urgent run waiting this long in a host-wide queue raises one event
+
+
+def urgent_waits(project_name: str | None, now: float | None = None, min_s: float = URGENT_WAIT_S) -> list[dict]:
+    """This project's urgent check runs (a ticket of priority locks.URGENT_PRIORITY or less) waiting `min_s`
+    or more in a host-wide queue: the checks queue (RESOURCE), the parked runs' queue (PARKED) or the test
+    pool's host line (testslots). Each: queue, ticket (its file name: one per wait), holder (the waiter's
+    label), waited_s and held_by (who holds what it waits for: the checks slots, or the test pool's slots,
+    each label with its count). Read only; an unreadable queue gives none."""
+    from . import testslots
+    gid = locks.group_id(project_name)
+    now = time.time() if now is None else now
+    s = testslots.sizes(None)
+    pool = testslots.paths(s[0]) if s else []
+    out = []
+    for queue, held in ((RESOURCE, lambda: paths()), (PARKED, lambda: pool),
+                        (testslots.TESTS.resource, lambda: pool)):
+        try:
+            q = [t for t in locks.queued(slot_dir(), queue) if locks.ticket_group(t) == gid and locks._urgent(t)
+                 and now - locks._arrival(t) >= min_s]
+        except OSError:
+            continue
+        if not q:
+            continue
+        labels: dict[str, int] = {}
+        for h in locks.held_labels(held()):
+            labels[h or "?"] = labels.get(h or "?", 0) + 1
+        held_by = [f"{h} (x{n})" if n > 1 else h for h, n in labels.items()]
+        for t in q:
+            try:
+                holder = t.read_text().strip()
+            except OSError:
+                holder = ""
+            out.append({"queue": queue, "ticket": t.name, "holder": holder or t.name,
+                        "priority": locks.ticket_priority(t), "waited_s": now - locks._arrival(t),
+                        "held_by": held_by})
+    return out
+
+
+def urgent_wait_text(w: dict) -> str:
+    """One urgent_waits entry in words: the queue, the waiter, how long and what holds it."""
+    held = "; ".join(w["held_by"][:8]) + (f"; and {len(w['held_by']) - 8} more" if len(w["held_by"]) > 8 else "")
+    return (f"urgent checks {w['holder']} (priority {w['priority']:g}) have waited {w['waited_s'] / 60:.0f} min in "
+            f"the host-wide {w['queue']} queue; held by: {held or 'nothing held right now (the next turn is due)'}")

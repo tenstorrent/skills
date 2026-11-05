@@ -4303,7 +4303,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     this host's disk is saturated (diskgate) it tries them before it waits here at all. Both
     settings are read again at each bound: hosts set while a run waits take it at its next bound.
     `yielder()`, asked while it waits, raises checkjoin.Yield when the task's same checks run or wait
-    ahead, or a newer head's do: the wait ends holding nothing."""
+    ahead, or a newer head's do: the wait ends holding nothing. The branch checked out at `top` moving
+    off `head` while it waits (_HeadMoved: its task replaced the head) ends it as a cancel does."""
     from . import checkcap, checkjoin, checklane, checkspill, diskgate, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
@@ -4353,6 +4354,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     spill_to = bool(spill and p)
     told: set[str] = set()
     first = True
+    moved = _HeadMoved(top, head)   # its task replacing the head while it waits drops the run
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
@@ -4370,7 +4372,8 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             limit = checkspill.after_s(spill_cfg) if limit is None else min(limit, checkspill.after_s(spill_cfg))
         try:
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
-                                     cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder)
+                                     cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder,
+                                     moved=moved)
         except checkcap.Upgraded as e:
             if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
                 checkjoin.forget(p.state)
@@ -4399,21 +4402,54 @@ def _wrap_lane_after(cfg: dict) -> bool:
         return False
 
 
+class _HeadMoved:
+    """Asked while checks of `head` wait for a slot: "" while the branch checked out at `top` still points
+    at `head`, else why the run is dropped (its task replaced the head it was queued for, so its result
+    could land nothing). Only a branch whose tip was `head` when the wait began counts: a detached HEAD or
+    another checked-out commit never ends a wait. git is asked at most every HEAD_MOVED_S seconds."""
+    HEAD_MOVED_S = 30.0
+
+    def __init__(self, top: str, head: str):
+        self.top, self.head, self.at = top, head, 0.0
+        self.ref = ""
+        if top and head and _git_out(top, "rev-parse", "HEAD") == head:
+            self.ref = _git_out(top, "symbolic-ref", "-q", "HEAD")
+
+    def __call__(self) -> str:
+        if not self.ref or time.time() - self.at < self.HEAD_MOVED_S:
+            return ""
+        self.at = time.time()
+        tip = _git_out(self.top, "rev-parse", "-q", "--verify", self.ref)
+        if not tip or tip == self.head:
+            return ""
+        return (f"its task replaced head {self.head[:12]} with {tip[:12]} on {self.ref.removeprefix('refs/heads/')} "
+                "while it waited: checks of the old head could land nothing (run them again for the new head)")
+
+
+def _git_out(top: str, *args: str) -> str:
+    try:
+        r = subprocess.run(["git", "-C", top, *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    return r.stdout.strip() if r.returncode == 0 else ""
+
+
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
                       done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
-                      lock: str = "", restart: bool = False, yielder=None):
+                      lock: str = "", restart: bool = False, yielder=None, moved=None):
     """One wait of _checks_slot for the repository's lane (or `lock`'s), a host-wide checks slot and
     test-worker slots, at most `limit` seconds (None: no limit): the slot, or None once `limit` passed.
     With `restart` (detached checks), a newer runtime installed while it waits (checkcap.upgraded) ends the
     wait with checkcap.Upgraded once it let go of all it held; it is asked only while waiting, never once
     the slot is granted and the commands may start. A host-wide checks slot granted before such an
     upgrade is kept across the re-execution with its lane (checkcap.keep_slot). `yielder()` as for _checks_slot: its checkjoin.Yield
-    ends the wait with all it held let go."""
+    ends the wait with all it held let go. `moved()` (_HeadMoved), asked with the cancel request, names why
+    the run is dropped once its task replaced the head it waits for: the wait ends as a cancel does."""
     from . import checkcap, checkjoin, checklane, cleantree, push, testslots
     t0 = time.time()
 
     def stop() -> str:
-        if why := _checks_cancelled(run_dir):
+        if why := _checks_cancelled(run_dir) or (moved() if moved else ""):
             return why
         if restart and (new := checkcap.upgraded()):
             raise checkcap.Upgraded(new)

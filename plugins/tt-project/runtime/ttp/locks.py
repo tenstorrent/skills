@@ -1378,8 +1378,15 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     host is upgraded.
 
     `aged_before` (an epoch time): waiters that arrived at or before it have waited past their bound and go
-    first, by arrival, ahead of urgent ones and every turn above, so no waiter waits without a bound."""
+    first, by arrival, ahead of urgent ones and every turn above, so no waiter waits without a bound.
+
+    `urgent_max` URGENT_FIRST: every urgent waiter goes first, whatever its project or the others' arrival
+    (aged ones included), the most urgent priority first, then the oldest (urgent_order); the rest follow
+    in the order above. Accepted gap: a steady stream of urgent runs holds routine ones back."""
     q = queued(locks_dir, resource) if q is None else q
+    if urgent_max == URGENT_FIRST:
+        front = urgent_order([t for t in q if _urgent(t)])
+        return front + fair_order(locks_dir, resource, [t for t in q if t not in front], 0, aged_before)
     aged = sorted((t for t in q if _arrival(t) <= aged_before), key=_arrival) if aged_before is not None else []
     if aged:
         q = [t for t in q if t not in aged]
@@ -1413,10 +1420,17 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
 
 
 URGENT_PRIORITY = 1   # a waiter at this task priority or better is urgent in fair_order with urgent_max
+URGENT_FIRST = -1     # fair_order's urgent_max: urgent waiters always first, by priority then age
 
 
 def _urgent(ticket: Path) -> bool:
     return ticket_priority(ticket) <= URGENT_PRIORITY
+
+
+def urgent_order(q: list[Path]) -> list[Path]:
+    """`q` with its urgent waiters (_urgent) first, the most urgent priority first, then by arrival; the
+    rest after them by arrival. Tickets without a priority (older runtimes) are routine."""
+    return sorted(q, key=lambda t: (not _urgent(t), ticket_priority(t) if _urgent(t) else 0, _arrival(t)))
 
 
 def streak_path(locks_dir: Path, resource: str) -> Path:

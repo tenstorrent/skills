@@ -37,7 +37,7 @@ One project holds at most project_max() slots at once over all its runs, as per-
 beside the pool's, so a burst of one project's checks leaves room for the others. Its default is the
 project's checks at once (checklane.project_cap: checks.test_project_max, else its lanes) times one
 run's grant, at most the pool, so every check under the cap gets its slots; an explicit slot budget
-(checks.test_project_slots or TTP_TEST_PROJECT_SLOTS) wins. Waiters are served first-come (a
+(checks.test_project_slots or TTP_TEST_PROJECT_SLOTS) wins. Waiters are served urgent first, then first-come (a
 locks.enqueue ticket each, freed with its process). A waiter whose project is at its budget steps out
 of the host's line, so it never holds up other projects, but keeps its ticket in its project's line
 (the "<own>.<project id>" queue): it re-enters the host's line at its first arrival, and a later
@@ -474,7 +474,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
             since: float | None = None, full: bool = False, waits: Callable[[str], None] | None = None) -> Grant | None:
-    """Take this run's test slots (above); waits while none is free, first-come, telling why every
+    """Take this run's test slots (above); waits while none is free, urgent runs of any project first
+    (locks.urgent_order: priority 1 or better, by priority then arrival), the rest first-come, telling why every
     TELL_S. None only once `wait_s` passed with none free (a foreground caller hands over). Nested in a
     run that holds slots, its grant at once; with the pool off, Grant() (no limit, nothing set).
     `project_name` (default TTP_PROJECT's) is whose budget it counts against; `push_key` (push.priority_key)
@@ -606,8 +607,9 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                         k, files, what = top, files + [f], f"{what} (with its push branch's reserved lane)"
                 else:
                     if ticket is None:
-                        ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, arrival, group=name)
-                    q = locks.queued(checkcap.slot_dir(), kind.resource)
+                        ticket = locks.enqueue(checkcap.slot_dir(), kind.resource, holder, arrival, group=name,
+                                               priority=priority)
+                    q = locks.urgent_order(locks.queued(checkcap.slot_dir(), kind.resource))
                     if q and q[0] == ticket and free < need:
                         # First in line, it keeps its place until a full run's fewest slots are free.
                         why = (f"a full run starts with at least {need} free (checks.{RUN_MIN_KEY}); "
@@ -948,7 +950,10 @@ def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, pr
     (checkspill.after_s) takes no host-wide checks slot only to hand it back at the bound. A priority-1
     run (`priority`) whose project's budget is held only by less urgent runs counts its urgent slots
     instead (urgent_paths), as acquire takes them. A run of the project parked past checkcap.starve_s() that
-    arrived before `since` (this run's arrival; default now) goes first (checkcap.starved_ahead): no room."""
+    arrived before `since` (this run's arrival; default now) goes first (checkcap.starved_ahead): no room.
+    A run leaves `need` slots of the pool to each urgent run of another project parked for its test slots
+    ahead of it (urgent_parked: a routine run to every one, an urgent run to those more urgent or as urgent
+    and older), so a freed slot goes to the urgent one, not to whichever polls first."""
     if full and load_guard():
         return False
     if checkcap.starved_ahead(project_name, since):
@@ -972,7 +977,23 @@ def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, pr
             and (recs := locks.holder_records(own)) and all(_rank(r) > 1 for r in recs)
             and locks.any_free(urgent := urgent_paths(project_name, top))):
         own_free = _free(urgent)
-    return min(s[1], pool - used, own_free if own else pool) >= need
+    kept = need * urgent_parked(project_name, priority, since)
+    return min(s[1], pool - used - kept, own_free if own else pool) >= need
+
+
+def urgent_parked(project_name: str | None, priority: int | None = None, since: float | None = None) -> int:
+    """How many urgent runs (locks.URGENT_PRIORITY or better) of other projects than `project_name` are parked
+    for their test slots now (checkcap.PARKED tickets) ahead of a run at `priority` that arrived at `since`
+    (default now): every one for a routine run, else those more urgent, or as urgent and older."""
+    gid = locks.group_id(project_name)
+    try:
+        q = locks.queued(checkcap.slot_dir(), checkcap.PARKED)
+    except OSError:
+        return 0
+    mine = (float(priority), time.time() if since is None else since) \
+        if priority is not None and priority <= locks.URGENT_PRIORITY else None
+    return sum(1 for t in q if locks._urgent(t) and locks.ticket_group(t) != gid
+               and (mine is None or (locks.ticket_priority(t), locks._arrival(t)) < mine))
 
 
 @contextlib.contextmanager

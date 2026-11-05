@@ -1750,7 +1750,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_urgent_check_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -7379,6 +7379,33 @@ class Daemon:
                 continue
             record(ev["fingerprint"], ev["text"], "coalesced", ev["task"])
             log(self.p, f"checks slot wait: {ev['text'][:300]}")
+
+    def check_urgent_check_wait(self, every_s: float = 60) -> None:
+        """Model-free urgent checks wait: an urgent `ttp checks` run of this project (priority 1 or less, or
+        an `urgent:` line) waiting checkcap.URGENT_WAIT_S or more in a host-wide queue (the checks queue, the
+        parked runs' or the test pool's) raises one `urgent_check_wait` event naming the queue and what
+        holds it (checkcap.urgent_waits), once per wait (keyed on its queue ticket). The first new one of a
+        tick is queued, the rest coalesced; an active `daemon:urgent_check_wait` observation_mute records
+        it 'muted'."""
+        now = time.time()
+        if now - getattr(self, "_urgent_check_wait_checked", 0.0) < every_s:
+            return
+        self._urgent_check_wait_checked = now
+        from . import checkcap
+        db, status = self.p.db, "queued"
+        for w in checkcap.urgent_waits(self.p.name, now):
+            fp = f"{checkcap.URGENT_WAIT}:{w['queue']}:{w['ticket']}"
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                continue
+            text = checkcap.urgent_wait_text(w)
+            m = re.search(r"\btask (\d+)\b|#(\d+)", w["holder"])
+            task = int(m[1] or m[2]) if m else None
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", checkcap.URGENT_WAIT, fp, "normal", text[:4000],
+                  "muted" if scr.count_muted(db, f"daemon:{checkcap.URGENT_WAIT}", text, "normal", now) else status,
+                  task))
+            status = "coalesced"
+            log(self.p, f"urgent checks wait: {text[:300]}")
 
     def check_cap_wait(self, every_s: float = 60) -> None:
         """Model-free cap wait (loadcaps): a ready device task held only by device.max_tasks for

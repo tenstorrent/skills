@@ -182,6 +182,20 @@ def default_slots(n_cores: int | None = None, mem_gib: float | None = None, cfg:
     return max(1, n)
 
 
+def host_slots(n_cores: int, mem_gib: float | None, load: float | None, running: int) -> int:
+    """Free check slots on another host (checkspill.probe), from what it has idle now rather than a small
+    fixed count: the runs its idle cores (`n_cores` less the 1-minute `load`, which counts the runs under
+    way) and available memory (`mem_gib`, GIB_PER_LANE each) fit at one run's cores (run_cores), at most
+    the runs its cores hold less the `running` checks there. An unread load: default_slots less `running`."""
+    if load is None:
+        return max(0, default_slots(n_cores, mem_gib) - running)
+    run = run_cores(None, n_cores)
+    n = min(int(max(0.0, n_cores - load) // run), max(1, n_cores // run) - running)
+    if mem_gib is not None:
+        n = min(n, int(mem_gib // GIB_PER_LANE))
+    return max(0, n)
+
+
 def run_cores(cfg: dict | None = None, n_cores: int | None = None) -> int:
     """One checks run's cores: its test grant (testslots.sizes' run_max), at least CORES_PER_LANE (a
     full required-suite run measured at about that many cores at its peak)."""

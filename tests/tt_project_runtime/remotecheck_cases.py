@@ -417,7 +417,8 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
     machines.add("outside")
     machines.remove("unlisted")
     p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-c": {"reason": "user hold", "by": "user", "since": 1}})
-    for i in range(checklane.MAX_LANES):   # remote checks from other machines fill check-host-a
+    # Remote checks from other machines fill check-host-a: as many as its cores hold (checklane.host_slots).
+    for i in range(max(checklane.MAX_LANES, os.cpu_count() or 1)):
         (remote / f"ttp-check.busy{i}").mkdir()
     log = tmp_path / "where.log"
     cmd = f"pwd >> {log}"
