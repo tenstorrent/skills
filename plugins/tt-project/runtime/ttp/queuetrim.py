@@ -32,7 +32,7 @@ from typing import Any
 from .db import DB, deferral, dependency_ids
 
 KEY = "queue_expired"          # kv: [{task, title, why, at, listed}] expired tasks, newest last
-KEEP = 500                     # records kept
+KEEP = 500                     # records kept, beyond those of open tasks (_trim)
 EVERY_S = 600.0
 COVER_S = 86400.0              # a report task finished this recently still covers its target
 THROUGHPUT_DAYS = 3            # done tasks per day are measured over this many days
@@ -127,6 +127,20 @@ def candidates(db: DB, cfg: dict, now: float | None = None) -> list[tuple[dict, 
     return out
 
 
+def _trim(db: DB, recs: list) -> list:
+    """The newest KEEP records, plus the newest of each task still open: a requeued task ages from its
+    record (candidates), so trimming it would expire the requeue again on the next pass."""
+    if len(recs) <= KEEP:
+        return recs
+    ids = sorted({int(r["task"]) for r in recs[:-KEEP] if r.get("task")})
+    open_ids = {r["id"] for r in db.q(f"SELECT id FROM tasks WHERE id IN ({','.join('?' * len(ids))}) "
+                                      f"AND status NOT IN ({','.join('?' * len(TERMINAL))})",
+                                      (*ids, *TERMINAL))} if ids else set()
+    newest = {r.get("task"): i for i, r in enumerate(recs)}
+    return [r for i, r in enumerate(recs) if i >= len(recs) - KEEP
+            or (r.get("task") in open_ids and newest[r.get("task")] == i)]
+
+
 def expire(db: DB, cfg: dict, project: str, now: float | None = None) -> list[str]:
     """Cancel each candidate with its reason and undo; one log line each."""
     now = time.time() if now is None else now
@@ -145,7 +159,7 @@ def expire(db: DB, cfg: dict, project: str, now: float | None = None) -> list[st
                   "handled", t["id"]))
             recs = list(db.kv(KEY, []) or [])
             recs.append({"task": t["id"], "title": t["title"][:160], "why": why, "undo": undo, "at": now})
-            db.set_kv(KEY, recs[-KEEP:])
+            db.set_kv(KEY, _trim(db, recs))
         lines.append(f"task {t['id']} expired: {why}")
     return lines
 

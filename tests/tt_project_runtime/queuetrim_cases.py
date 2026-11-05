@@ -223,6 +223,38 @@ def test_queuetrim_requeued_task_ages_from_its_requeue_not_its_creation(env):
         [f"task {stale} expired"]
 
 
+def test_queuetrim_requeued_open_task_keeps_its_record_past_the_cap(env):
+    from ttp import queuetrim
+    p = make(env)
+    db = p.db
+    requeued = _qt_aged(p, "tidy the old notes", 50, kind="work")
+    t0 = time.time()
+    assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0)] == [f"task {requeued} expired"]
+    assert db.requeue(requeued) == ""
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (t0 + 3600, requeued))
+    # More than KEEP newer records of finished or deleted tasks would push the requeued task's out.
+    done = _qt_aged(p, "an old finished one", 60, kind="work")
+    db.update_task(done, status="cancelled")
+    recs = list(db.kv(queuetrim.KEY))
+    recs = [dict(recs[0], at=t0 - 86400)] + recs   # an older record of it: only its newest is kept
+    recs += [{"task": done, "title": "x", "why": "w", "undo": "u", "at": t0 + 1}]
+    recs += [{"task": 10 ** 6 + i, "title": "x", "why": "w", "undo": "u", "at": t0 + 2}
+             for i in range(queuetrim.KEEP)]
+    db.set_kv(queuetrim.KEY, recs)
+    never = _qt_aged(p, "tidy the other notes", 50, kind="work")
+    # The next pass trims the records: a task never requeued still expires, the requeued one is kept.
+    assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0 + 7200)] == \
+        [f"task {never} expired"]
+    kept = db.kv(queuetrim.KEY)
+    assert len(kept) == queuetrim.KEEP + 1 and kept[0]["task"] == requeued and kept[0]["at"] == t0, kept[:2]   # KEEP, plus the open one
+    assert done not in {r["task"] for r in kept}
+    for later in (3 * 3600, 47 * 3600):   # it still ages from its requeue, never its creation
+        assert queuetrim.expire(db, p.config(), p.name, t0 + 3600 + later) == [], later
+    assert db.task(requeued)["status"] == "queued"
+    assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0 + 3600 + 48.5 * 3600)] == \
+        [f"task {requeued} expired"]
+
+
 def test_queuetrim_report_targets_never_match_on_empty_or_one_word_subsets(env):
     from ttp import queuetrim
     p = make(env)
