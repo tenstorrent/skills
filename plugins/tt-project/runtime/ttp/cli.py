@@ -2039,6 +2039,23 @@ def cmd_hostcheck(a) -> None:
     sys.exit(rc)
 
 
+def cmd_selfchange(a) -> None:
+    """The coordinator's self-changes and per-wake metrics (selfimprove.py); `review` measures the due ones,
+    keeps those that helped and reverts the rest. The daily review runs it."""
+    from . import selfimprove
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp selfchange [list|review] <name>`")
+    if a.action == "review":
+        lines = selfimprove.review(p)
+        out = {"reviewed": lines}
+        lines = lines or ["no self-change due"]
+    else:
+        out = {"metrics": selfimprove.summary(p.db), "items": selfimprove.items(p.db)}
+        lines = out["metrics"]
+    print(json.dumps(out, indent=1, default=str) if a.json else "\n".join(lines))
+
+
 def cmd_eta(a) -> None:
     """Expected finish of a task or obligation from its critical path (eta.py): measured medians, no padding.
     Workers read it before setting a retry or deadline wake."""
@@ -11345,7 +11362,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "spend-today", "throughput", "echoes", "uninstall")),
+               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "uninstall")),
 )
 
 
@@ -11760,6 +11777,13 @@ def main(argv: list[str] | None = None) -> None:
                                  "git-log, git-show, lock-holder, broker-job, log-tail, tt-smi or squeue")
     s.add_argument("args", nargs=argparse.REMAINDER, help="the check's arguments (plain words)")
     s.set_defaults(fn=cmd_hostcheck)
+
+    s = sub.add_parser("selfchange", help="the coordinator's self-changes and per-wake metrics; review: measure "
+                                          "the due ones, keep those that helped, revert the rest")
+    s.add_argument("action", nargs="?", choices=("list", "review"), default="list")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--json", action="store_true", help="print JSON")
+    s.set_defaults(fn=cmd_selfchange)
 
     s = sub.add_parser("ttr", help="how long each machine took to recover from problems: incidents, median, "
                                    "90th percentile and longest time, and the ones still open")

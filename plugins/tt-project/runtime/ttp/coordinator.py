@@ -87,6 +87,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     selfreview,
     reviewreuse,
     selfblock,
+    selfimprove,
     settinghold,
     settled,
     shared,
@@ -161,7 +162,7 @@ from .providers.base import NULL_OPERATIONS, normalize_action
 
 ACTION_TYPES = ("reply", "task_add", "task_update", "ask_user", "resolve", "notify", "memory_add", "memory_forget",
                 "charter_update", "schedule_set", "config_set", "resource_pause", "observation_mute", "pr_approve",
-                "sweep", "obligation", "noop")
+                "sweep", "obligation", "self_change", "noop")
 
 # A deferred task's `start_after`: `now`, a delay (`90m`, `3d`) or an ISO date or time (in the
 # project's home zone unless it names one). Plain character classes, so every provider's schema engine takes it.
@@ -230,6 +231,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"}, "justify": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
+            "metric": {"type": "string"}, "fresh_project": {"type": "boolean"}, "generic": {"type": "boolean"},
             "milestones": {"type": "array", "items": {"type": "object", "properties": {
                 "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
                 "due": {"type": ["number", "string"]}, "evidence_required": {"type": "string"}},
@@ -3492,6 +3494,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(throughmute.cap_note(m, a.get("hours")))
             elif t == "sweep":
                 sweep.record(db, a, parse_start_after(a.get("start_after") or "now", tz=timefmt.home(p)), where=p)
+            elif t == "self_change":
+                notes.append(selfimprove.add(p, a, parse_start_after(a.get("start_after") or selfimprove.DEFAULT_CHECK,
+                                                                     tz=timefmt.home(p)), settable=settable))
             elif t in ("noop", None):
                 pass
             else:

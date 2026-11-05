@@ -417,6 +417,7 @@ class Claude(Provider):
         reported: dict[str, set[str]] = {}
         cache_keys = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         cache_complete = False
+        tool_ids: set[str] = set()   # tool calls, each block once (a streamed message repeats its blocks)
         for n, ev in enumerate(self._events(output_path)):
             t = ev.get("type")
             if t == "rate_limit_event":
@@ -438,6 +439,9 @@ class Claude(Provider):
                 for k in USAGE_KEYS:
                     seen[k] = max(seen.get(k, 0), int(us.get(k) or 0))
                 for block in msg.get("content") or []:
+                    if isinstance(block, dict) and block.get("type") == "tool_use":
+                        tool_ids.add(str(block.get("id") or f"{ident}:{len(tool_ids)}"))
+                        u.extra["tool_calls"] = len(tool_ids)
                     if isinstance(block, dict) and block.get("type") == "text":
                         last_text = block.get("text") or last_text
                     elif isinstance(block, dict) and block.get("type") == "tool_use" \

@@ -4530,6 +4530,11 @@ class Daemon:
         except Exception:   # bookkeeping: without it the next wait_stale raises a turn as before
             log(self.p, "wait_stale turn record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         decided = len(_decisions(actions))
+        try:   # the per-wake record the daily review measures self-changes by (selfimprove)
+            from . import selfimprove
+            note = {**note, "wake": selfimprove.wake(db, usage, actions, problems, float(r.get("started") or 0))}
+        except Exception:   # bookkeeping: the turn is settled either way
+            log(self.p, "coordinator wake record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         self._log_decided(r, note, decided)
         if not decided:
             try:

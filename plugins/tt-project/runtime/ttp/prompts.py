@@ -112,6 +112,9 @@ def coordinator_features(p: Project) -> set[str]:
             on.add("obligations")
     except Exception:
         pass
+    from . import coordsession
+    if coordsession.settings(cfg)["mode"] == "on":
+        on.add("session")   # the persistent coordinator: its self-improvement loop (selfimprove)
     return on
 
 

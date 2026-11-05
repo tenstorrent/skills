@@ -280,7 +280,9 @@ def entries(db, where=None, now: float | None = None, days: float = LEDGER_DAYS)
         out.append({**base, "title": t["title"] or "", "spec": t["spec"] or "", "key": subject_key(t["title"] or ""),
                     "outcome": outcome,
                     "result": _line(res.get("result") or res.get("summary") or t.get("spec"))})
-    return out
+    from . import selfimprove
+    own = selfimprove.tried_entries(db, now - days * 86400, where)   # the coordinator's measured self-changes
+    return sorted(out + own, key=lambda e: -e["ts"]) if own else out
 
 
 def same_day(entry: dict, where=None, now: float | None = None) -> bool:
@@ -316,7 +318,7 @@ def describe(entry: dict, where=None, now: float | None = None) -> str:
     title = entry["title"] if len(entry["title"]) <= TITLE_CHARS else entry["title"][: TITLE_CHARS - 1] + "…"
     verb = {"done": "finished", "failed": "failed", "cancelled": "cancelled after a run"}.get(entry["outcome"],
                                                                                            entry["outcome"])
-    return f"task #{entry['id']} '{title}' was {verb} {when}" + (f" (result: {entry['result']})" if entry["result"] else "")
+    return f"{entry.get('what') or 'task #' + str(entry['id'])} '{title}' was {verb} {when}" + (f" (result: {entry['result']})" if entry["result"] else "")
 
 
 def rejection(entry: dict, where=None, now: float | None = None) -> str:

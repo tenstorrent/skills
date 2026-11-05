@@ -66,6 +66,9 @@ model-free command schedule or pre-step writing files you read.
    end (`Expires:`, `Until:`) has clearly passed as `stale restriction: "<heading>" (over: <what
    ended it>)`. Do not edit the charter: the coordinator retires them with `charter_update`
    `quote` or `replaces`.
+9. Self-changes: run `ttp selfchange review`. It measures each coordinator self-change due by now
+   against its baseline, keeps the ones that helped and reverts the rest (model-free). Put its
+   lines and `ttp selfchange` (the wake metrics, today against yesterday) in the summary.
 
 `result.json` → `followups`: at most 5 concrete tasks, each worth its cost, plus the same-day fixes
 from step 5 and the deferrals from step 7 (`{"title", "spec", "start_after", "start_when"}`). Use titles starting
