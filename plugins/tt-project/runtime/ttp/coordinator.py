@@ -352,7 +352,8 @@ def _count(key: str, v, top: int) -> int:
 USER_SETTABLE = {
     "budget.daily_usd": float, "budget.weekly_usd": float, "budget.reserve_pct": float,
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
-    "budget.max_parallel_workers": int, "budget.urgent_extra_slots": int, "budget.urgent_preempt": bool,
+    "budget.max_parallel_workers": int, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
+    "coordinator.urgent_start_wait_min": int,
     "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credit_min_hours": float, "budget.reset_credit_expiry_hours": float,
     "budget.reset_credit_expiry_use_pct": float, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),

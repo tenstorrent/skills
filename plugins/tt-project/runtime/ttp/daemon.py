@@ -1757,7 +1757,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_urgent_check_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.expire_queue, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_urgent_start, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_urgent_check_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.expire_queue, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -7249,6 +7249,85 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", fp, "high" if owns else "normal", text[:4000], "queued", tid))
             log(self.p, f"slot wait: task {tid} ({why}) waited {mins:g} min or more for a {provider} worker slot")
+
+    def check_urgent_start(self, every_s: float = 60) -> None:
+        """Model-free start watch for user-ordered urgent machine or device work: a task with a fresh
+        `urgent:` line (urgent.extra_ok) that names a resource (coord.task_resources) or holds a device
+        (holds_device) raises one high observation when it is still queued coordinator.urgent_start_wait_min
+        (default urgent.START_WAIT_MIN, 0: off) after it was queued (urgent.waited_s), naming its unmet
+        dependencies or what holds it (_start_hold, _hold_words), or when its run has waited that long in
+        an open `ttp lock` wait (locks.wait_spans) on a lock others hold, naming those holders (project,
+        task, run). One per fingerprint (urgent_start or urgent_lock, task and run)."""
+        now = time.time()
+        if now - getattr(self, "_urgent_start_checked", 0.0) < every_s:
+            return
+        self._urgent_start_checked = now
+        try:
+            mins = float(self.cfg["coordinator"].get("urgent_start_wait_min", urgent.START_WAIT_MIN) or 0)
+        except (TypeError, ValueError):
+            mins = float(urgent.START_WAIT_MIN)
+        if mins <= 0 or self.cfg_status == "unavailable" or self.settling():
+            return
+        db = self.p.db
+        rows = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','running') AND spec LIKE '%urgent:%'")
+                if urgent.extra_ok(t, now) and (coord.task_resources(t) or holds_device(t, self.cfg))]
+        if not rows:
+            return
+        core = self.cfg.get("core_provider", "claude")
+        queued = [t for t in rows if t["status"] == "queued"]
+        unmet = db.unmet_dependencies(queued) if queued else {}
+        ctx = {"now": now, "paused": db.paused_resources(), "committed": None,
+               "busy": {r["provider"]: r["n"] for r in db.q(
+                   "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
+                   "GROUP BY provider")},
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in queued}}}
+        dev = sorted(locks.device_locks(self.cfg))
+        for t in rows:
+            tid = t["id"]
+            run = db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
+            rid = (run or {}).get("id") or 0
+            if t["status"] == "queued":
+                waited = urgent.waited_s(db, t, now)
+                fp = f"urgent_start:{tid}:{rid}"
+                if waited < mins * 60 or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                    continue
+                if deps := unmet.get(tid):
+                    held = "unmet dependencies " + ", ".join(f"#{x}" for x in deps[:STALL_LIST_MAX])
+                elif (d := deferral(t)).get("when") or (d.get("after") or 0) > now:
+                    held = "its start gate: " + convgate.gate_words((d.get("after") or 0) > now and d.get("after"),
+                                                                     d.get("when"), now)
+                elif why := self._start_hold(t, t["provider"] or core, ctx):
+                    held = self._hold_words(t, why, ctx)
+                else:
+                    held = "nothing now (dispatch starts it at its next pass)"
+                text = (f"Urgent start: #{tid} {t['title'][:80]} (user-ordered: {urgent.why(t)}) has not started "
+                        f"{waited / 60:.0f} min after it was queued; held by {held}. Clear the hold if it is ours "
+                        f"to clear, else tell the user why it waits.")
+            else:
+                if not run or run["status"] != "running":
+                    continue
+                waits = [s for s, e in locks.wait_spans(self._run_dir(run)) if e is None and now - s >= mins * 60]
+                fp = f"urgent_lock:{tid}:{rid}"
+                if not waits or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                    continue
+                res = sorted(coord.task_resources(t) | ({dev[0]} if dev and needs_device(t, self.cfg) else set()))
+                who = []
+                for r in res:
+                    for h in locks.holder_records(self._slot_paths(r)):
+                        if str(h.get("project") or "") == self.p.name and str(h.get("task_id") or "") == str(tid):
+                            continue   # its own hold
+                        who.append(f"{r}: {h.get('project') or '?'} #{h.get('task_id') or '?'} run "
+                                   f"{h.get('run_id') or '?'}" + (f" ({h['note']})" if h.get("note") else ""))
+                if not who:
+                    continue   # a wait on something other than its resources' locks (checks): their own events
+                waited = now - min(waits)
+                text = (f"Urgent lock wait: #{tid} {t['title'][:80]} (user-ordered: {urgent.why(t)}) has waited "
+                        f"{waited / 60:.0f} min in `ttp lock`; held by:\n"
+                        + "\n".join(f"- {x}" for x in who[:STALL_LIST_MAX])
+                        + "\nIts waiters go first once the lock frees; ask a holder to release it if it may.")
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", fp, "high", text[:4000], "queued", tid))
+            log(self.p, f"urgent start: task {tid} {fp.split(':')[0]} after {mins:g} min or more")
 
     def check_unstarted(self, every_s: float = 60) -> None:
         """Model-free watch for known, ready work that has not started (unstarted.py). First the

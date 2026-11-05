@@ -644,7 +644,10 @@ prolonged whole-box outage.
   observation naming it and the running tasks holding the slots with their priorities. An urgent
   task (below) raises one once it has waited that long since it was queued and anything holds it
   (slots, the spend or auth gate, a pause, a lock, a branch), naming the hold. One per task until it
-  runs again.
+  runs again. A user-ordered urgent task (a fresh `urgent:` line) that names a machine or device
+  resource gets one sooner, after `coordinator.urgent_start_wait_min` (5; 0 turns it off): still
+  queued, naming what holds it, or running but waiting that long in `ttp lock`, naming the lock's
+  holders (project, task, run).
 - Ready to resume goes first: within one priority, dispatch picks a task whose wait is over (its
   `retry_when` passed, or its checks, job or on_pass_cmd woke it) before any other queued task, the
   one ready longest first; priority still wins across levels. A passed wait whose on_pass or
@@ -946,13 +949,20 @@ never held for "the user's word".
 A task is urgent when its priority is 1 or its spec has a line `urgent: <why>`. The harness task
 that finishes a template merge after an upgrade is urgent too and starts before other urgent work:
 until it ends, the project runs an older release. Urgent work never queues behind routine work;
-nothing running is interrupted:
+running work is interrupted only by the preemption below:
 
 - Workers: urgent tasks start first: a fresh `urgent:` line (under a day old) first, then the
   required owners of an open obligation (earliest due first), then priority 1 alone, so a deadline
   task never waits behind a project's routine priority 1 work. With every slot taken, a task with a
-  fresh `urgent:` line or an obligation's required owner may take `budget.urgent_extra_slots` (1;
-  0 turns it off) more, the `urgent:` line first; priority 1 alone never does. The spend gate, auth gate, pauses and locks still hold it.
+  fresh `urgent:` line or an obligation's required owner may take `budget.urgent_extra_slots` (2;
+  0 turns it off) more, the `urgent:` line first; priority 1 alone never does. A fresh `urgent:` line
+  takes them at a green, yellow or orange gate (an orange plan gate of 0 slots too); an obligation
+  owner only while the gate allows a slot. A red gate (the coordinator turn guard's red holds routine
+  work only), the dollar caps, the auth gate, pauses and locks still hold it.
+- Preemption: with those extra slots full too, dispatch stops the lowest-priority routine run of its
+  provider at a safe point (`budget.urgent_preempt`, on by default): the run's work is kept and its
+  task goes back to the queue with no attempt spent, marked "preempted for user-ordered urgent work;
+  resumes". Urgent work, reviews, pushes, harness tasks and runs holding a lock are never preempted.
 - Detection: an urgent task ready over 2 minutes with a free slot and nothing holding it makes the
   daemon run dispatch at once and raise one `ready_not_started` event. A deadline task (a fresh
   `urgent:` line or an obligation owner) whose resources are free but whose slots are all taken is
@@ -968,8 +978,9 @@ nothing running is interrupted:
   review for 10 minutes raises `review_stall`.
 - Push queue: an approved head of an urgent task's review starts its batch at once; a running batch
   or deploy still goes first.
-- Waiting lists: resource reservations, `ttp lock` waiters and device runner queues serve urgent
-  waiters first. Held locks, holds, pauses and recovery owners stay as they are.
+- Waiting lists: resource reservations, `ttp lock` waiters, `ttp checks` slots and device runner
+  queues serve urgent waiters first, a user-ordered one (a fresh `urgent:` line) ahead of other urgent
+  ones. Held locks, holds, pauses and recovery owners stay as they are.
 - Waits: a waiting urgent task whose `retry_when` is not a bare clock gate sleeps at most
   `waiting.urgent_retry_cap_s` (300 s; 0 turns it off) per timer, whatever `retry_after_s` it asked
   for; a timer that ends while its probe still says not yet puts it back to sleep with no model call.
