@@ -66,7 +66,7 @@ def block(db, ids) -> str:
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
     if not out:
         return ""
-    return ("Each item below is late or did not hold. Act on every one in this turn: re-order or start its "
+    return (f"## {SECTION}\nEach item below is late or did not hold. Act on every one in this turn: re-order or start its "
             "work (task_add or task_update naming its key, or updating its owner), record or close it "
             "(`obligation` with its key), or tell the user in its chat (reply) what is true and by when. An "
             "item with no such action wakes you once more, then the daemon tells the user itself.\n"

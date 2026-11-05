@@ -142,6 +142,7 @@ from . import upjournal
 from . import machine_ledger
 from . import netwait
 from . import obligations
+from . import mustact
 from . import onpassdry
 from . import outagemsg
 from . import pageto
@@ -436,6 +437,7 @@ PROBE_EVERY_S = 180     # how often a waiting task's `retry_when` (or a deferred
 NOT_YET_RCS = (1, 75, 255)   # probe exits meaning "not yet": 1, EX_TEMPFAIL (a busy `ttp lock`), ssh unreachable
 JOB_FAILED = "detached job failed"   # what a `ttp detach --check` exit detach.FAILED_RC found (Daemon._job_failed)
 PROBE_TIMEOUT_S = 60
+CLAIM_EVERY_S = 30   # check_claims: how often due claim checks are re-run
 LANDED_REPROBE_S = 30   # a landing gate reruns after a recorded push at most this often (_start_probe_due)
 # A child the tick itself waits on (a device runner start, `ttp checks --detach`) runs in a session of
 # its own and is killed whole after this: under a minute, so one never holds a step past STEP_BUDGET_S.
@@ -1761,7 +1763,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_urgent_start, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_urgent_check_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.expire_queue, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_urgent_start, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_urgent_check_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.check_claims, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.expire_queue, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -4386,8 +4388,10 @@ class Daemon:
             return
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
+        applied: list = []
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=coord.user_turn(db, note.get("messages") or []),
-                               turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap)
+                               turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
+                               applied=applied)
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         problems = list(problems)
@@ -4396,6 +4400,12 @@ class Daemon:
         evs = note.get("events", [])
         if evs:
             db.x(f"UPDATE events SET status='handled' WHERE id IN ({','.join('?' * len(evs))})", evs)
+        try:
+            # A must-act item no applied action touched wakes once more, then is told model-free.
+            for key, text in mustact.settle(self.p, evs, actions, applied):
+                self.observe("daemon:must-act", text, "normal", whole=True, key=key)
+        except Exception:   # bookkeeping: the turn is settled either way
+            log(self.p, "must-act settle failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         try:
             correction.settle(db, note, actions, str((out or {}).get("summary") or ""), float(r.get("started") or 0))
         except Exception:   # bookkeeping: the turn is settled either way
@@ -7900,6 +7910,22 @@ class Daemon:
         except Exception:
             log(self.p, "obligations: check failed\n" + traceback.format_exc())
 
+    def check_claims(self) -> None:
+        """Re-run each due claim check (obligations.due_claims) off the tick, about every CLAIM_EVERY_S:
+        a probe that answers records its exit code (obligations.claim_result), which closes the claim
+        or raises its one claim_failed must-act event."""
+        now = time.time()
+        if now - getattr(self, "_claims_at", 0.0) < CLAIM_EVERY_S:
+            return
+        self._claims_at = now
+        try:
+            for oid, probe in obligations.due_claims(self.p.db, now):
+                rc = self._probe_now(probe)
+                if rc is not None:
+                    obligations.claim_result(self.p, oid, rc, now)
+        except Exception:
+            log(self.p, "claims: check failed\n" + traceback.format_exc())
+
     def check_unreachable(self, every_s: float = 60) -> None:
         """One alert per network outage (netwait): every task that could start waits on a probe saying
         this machine cannot reach its host (exit 255), no worker runs and no other task is ready to start,
@@ -8337,11 +8363,13 @@ class Daemon:
             if now - newest < debounce and now - oldest < 4 * debounce:
                 return
             own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
-            if not msgs and not rerun and self._burst_hold(own, now):
+            # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py).
+            urgent = any(e["kind"] in mustact.KINDS for e in evs)
+            if not msgs and not rerun and not urgent and self._burst_hold(own, now):
                 return
-            if not msgs and not rerun and self._batch_hold(own, now):
+            if not msgs and not rerun and not urgent and self._batch_hold(own, now):
                 return
-            if not msgs and not rerun and self._event_hold(own, now):
+            if not msgs and not rerun and not urgent and self._event_hold(own, now):
                 return
         if not msgs and not rerun:
             try:
@@ -8419,6 +8447,8 @@ class Daemon:
                                               db.kv(coord.DIGEST_SEEN_KEY) or {}, flagged)
             # The sections rendered from the prompt snapshot end the cached context block.
             cached, parts = coord.split_cached(parts)
+            must = mustact.block(db, [e["id"] for e in evs])
+            parts = ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
             prompt = "\n".join(text for _, text in parts)
             head, context = coord.prompt_parts(self.p)

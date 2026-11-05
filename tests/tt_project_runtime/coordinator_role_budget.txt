@@ -43,3 +43,4 @@
 +190: a device or machine action reads as under way only once STATE shows it on the host; stops only once the jobs are gone
 +70: wake_now only when the worker must act before its wait ends; priority 1 alone is no spec wake (#5955)
 +140: user_msg marks a task as the user's newer order on a resource (userorder.py)
++480: a user order and reply/notify claims in the ledger; Must act now items are acted on in the same turn (mustact.py)
