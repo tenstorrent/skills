@@ -33,7 +33,7 @@ the sweep turn as before; its reason names the items changed and their fields.
 A re-check a sweep outcome asked for (its `next` or the daily re-check) that came due is a sweep due only by
 time: a receipt stands in for its turn only while the last model sweep is less than
 coordinator.blocker_sweep_recheck_skip_h (RECHECK_SKIP_H, 6; 0: never) old and each item's stamp (_stamp: its
-updated time, its probe and that probe's last exit code) is what it was at the last sweep, a turn or a skip
+task's fields less what a model-free re-sleep writes, its probe and that probe's last exit code) is what it was at the last sweep, a turn or a skip
 (LAST_KEY). The receipt carries the re-check on, so once the model sweep is that old the next sweep due runs a
 turn for it (the charter's high-effort re-evaluation at least every 6 hours).
 
@@ -216,13 +216,31 @@ def _fp(db: DB, i: dict, e: str | None, paused: dict | None = None) -> str:
     return _h([i["key"], *_parts(db, i, e, paused).values()])
 
 
-def _stamp(i: dict, probe_of: Probe) -> str:
-    """What a re-check skip also needs unchanged since the last sweep (turn or skip): the item's updated time
-    and its probe with its last exit code (a start_when watch, or the task's last probe answer)."""
+def _stamp(db: DB, i: dict, probe_of: Probe) -> str:
+    """What a re-check skip also needs unchanged since the last sweep (turn or skip): the task's fields a turn
+    judges (_task_stamp) and its probe with its last exit code (a start_when watch, or the task's last probe
+    answer). The raw updated time is not used: the daemon moves it on each model-free re-sleep."""
     w = i.get("watch") or {}
     got = probe_of(i["task"]) if i.get("task") else None
     got = [got[0], got[2]] if isinstance(got, (tuple, list)) and len(got) >= 3 else None
-    return _h([i.get("updated"), w.get("probe"), w.get("rc"), got])
+    t = db.task(i["task"]) if i.get("task") else None
+    return _h([_task_stamp(t) if t else None, w.get("probe"), w.get("rc"), got])
+
+
+# Hand-off fields the daemon itself writes while a task waits: the wait's clock, wake counts, a peer hold's state
+# and the wake gate's skip memory (waitgate.skipped).
+TIMER_FIELDS = frozenset({"waiting_since", "stale_wakes", "peer_held_at", "peer_hold_live", "wake_gate"})
+
+
+def _task_stamp(t: dict) -> list:
+    """The task as a turn judges it, less what the daemon re-writes when it puts it back to sleep: not_before,
+    the updated time, TIMER_FIELDS, a waiting task's reason (only the daemon writes it: "waiting for <its probe's
+    latest line>; its probe says not yet; next try <time>", or the wake gate's skip; the wait itself is the hand-off
+    and its task_waiting event), and a blocked reason's "; next try <time>" tail or "starts after <time>"."""
+    res = {k: v for k, v in load_result(t["result"]).items() if k not in TIMER_FIELDS}
+    reason = "" if t["status"] == "waiting" else \
+        STARTS_AT.sub("starts after", NEXT_TRY.sub("", str(t["blocked_reason"] or "")))
+    return [t["status"], t["spec"], t["priority"], res, t["labels"], t["depends_on"], reason]
 
 
 def _recheck(cfg: dict, model: dict, last: dict, stamps: dict, due: list[str], now: float) -> list[str]:
@@ -265,7 +283,7 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
     got = {i["key"]: end(db, cfg, i, now, probe_of, asks, paused, project) for i in live}
     parts = {i["key"]: {f: _h(v) for f, v in _parts(db, i, got[i["key"]], paused).items()} for i in live}
     fps = {i["key"]: _fp(db, i, got[i["key"]], paused) for i in live}
-    stamps = {i["key"]: _stamp(i, probe_of or (lambda _tid: None)) for i in live}
+    stamps = {i["key"]: _stamp(db, i, probe_of or (lambda _tid: None)) for i in live}
     model = db.kv(MODEL_KEY) or {}
     model = model if isinstance(model, dict) else {}
     last = db.kv(LAST_KEY) or {}

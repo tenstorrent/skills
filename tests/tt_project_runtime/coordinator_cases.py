@@ -16235,11 +16235,11 @@ def test_blocker_sweep_skip_still_turns_on_a_real_change_and_names_it(env, monke
     assert eid and recs == [], f"{case}: a model sweep, no receipt"
 
 
-def _recheck_sweep(p, monkeypatch):
+def _recheck_sweep(p, monkeypatch, before=None):
     """_held_sweep, then a turn's outcome asks to re-check the until-blocked task 2 h after the model sweep at
     T0; returns the fixture and T1, a minute after that re-check came due (well within the 6-h floor)."""
     from ttp import sweep
-    d, db, t0, at, run, ids = _held_sweep(p, monkeypatch)
+    d, db, t0, at, run, ids = _held_sweep(p, monkeypatch, before)
     sweep.record(db, {"id": ids["until"], "outcome": "still_blocked", "until": "the window opens",
                       "until_probe": "test -e out/window"}, t0 + 2 * 3600, t0 + 30)
     return d, db, t0, at, run, ids, t0 + 2 * 3600 + 60
@@ -16270,6 +16270,40 @@ def test_blocker_sweep_due_only_by_a_recheck_skips_within_the_floor_and_turns_on
     assert db.kv(sweepskip.LAST_KEY)["rechecks"] == [], "the model sweep judged the re-check"
 
 
+@pytest.mark.parametrize("how", ["hold_waiting", "update_task", "wake gate skip"])
+def test_blocker_sweep_due_only_by_a_recheck_skips_after_the_daemon_re_sleeps_a_waiting_task(env, monkeypatch, how):
+    """The daemon's own not-yet re-sleep of a waiting task between the model sweep and the re-check (its
+    not_before, its "; next try" reason and the updated time it moves) is no item change: the re-check skips."""
+    from ttp import sweep, sweepskip
+
+    def before(db, t0, ids):   # the hand-off's wait event, which names the wait the sweep lists
+        db.x("INSERT INTO events(ts,task,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
+             (t0 - 60, ids["waiting"], "daemon", "task_waiting", "low", f"#{ids['waiting']} waits on a build: "
+              "waiting for the build", json.dumps({"for": "the build", "wait": "external"}), "handled"))
+    p = make(env)
+    d, db, t0, at, run, ids, t1 = _recheck_sweep(p, monkeypatch, before)
+    for ts in (t0 + 3600, t0 + 5400):
+        at(ts)
+        if how == "hold_waiting":
+            assert d._hold_waiting(db.task(ids["waiting"]), json.loads(db.task(ids["waiting"])["result"]), ts) is False
+        elif how == "wake gate skip":   # what Daemon's wake gate writes when it skips a turn (waitgate.skipped)
+            prev = json.loads(db.task(ids["waiting"])["result"])
+            db.update_task(ids["waiting"], not_before=ts + 1800, result=json.dumps(
+                {**prev, "wake_gate": {"log": [7], "seen": "x", "since": ts, "by": "probe", "reason": "same"}}),
+                blocked_reason="waiting for the build; the wake gate skipped a turn (same); next try 03:00 PST")
+        else:
+            db.update_task(ids["waiting"], not_before=ts + 1800)
+    w = db.task(ids["waiting"])
+    assert w["updated"] > t0 + 30 and w["not_before"] > t0 + 3600, "the daemon re-wrote the waiting task"
+    if how == "hold_waiting":
+        assert "next try" in w["blocked_reason"]
+    at(t1)
+    got = sweepskip.check(db, d.cfg, sweep.items(db, t1, d.cfg), t1, d._probe_rc.get)
+    assert got["skip"], got["why"]
+    eid, recs = run(t1)
+    assert eid is None and len(recs) == 1, "a receipt, no turn"
+
+
 def _recheck_turn(case, d, db, t1, ids):
     if case == "changed item":
         db.update_task(ids["until"], blocked_reason="the lab window moved")
@@ -16280,8 +16314,12 @@ def _recheck_turn(case, d, db, t1, ids):
         d.cfg.setdefault("coordinator", {})["blocker_sweep_recheck_skip_h"] = 1
     elif case == "floor off":
         d.cfg.setdefault("coordinator", {})["blocker_sweep_recheck_skip_h"] = 0
-    elif case == "updated time moved":
-        db.x("UPDATE tasks SET updated=? WHERE id=?", (t1 - 30, ids["waiting"]))
+    elif case == "new hand-off":   # a real write on the waiting task: a new hand-off result, same wait and words
+        db.update_task(ids["waiting"], result=json.dumps({"status": "waiting", "summary": "build", "retry_when":
+                                                          "test -e out/w", "waiting_since": t1 - 30,
+                                                          "artifacts": ["out/build.log"]}))
+    elif case == "label added":
+        db.update_task(ids["waiting"], labels=["needs:bench"])
     elif case == "probe exit code changed":
         d._probe_rc[ids["waiting"]] = (75, t1 - 60, "test -e out/w")
     elif case == "no stamps on record":
@@ -16292,7 +16330,8 @@ def _recheck_turn(case, d, db, t1, ids):
     ("changed item", "items changed"), ("new event", "another event needs a turn"),
     ("model sweep past the floor", "the last model sweep is 1 h old"),
     ("floor off", "the last model sweep is 0 h old"),
-    ("updated time moved", "re-written since the last sweep: task:"),
+    ("new hand-off", "re-written since the last sweep: task:"),
+    ("label added", "re-written since the last sweep: task:"),
     ("probe exit code changed", "re-written since the last sweep: task:"),
     ("no stamps on record", "no item stamps on record"),
 ])
