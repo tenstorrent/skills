@@ -3131,7 +3131,7 @@ def test_a_restrictions_item_without_a_valid_source_is_rejected_with_the_memory_
                      ({"msg": out, "quote": "Never push tags"}, "not a message from the user"),
                      ({"msg": "soon", "quote": "Never push tags"}, "must be a user message id"),
                      ({"origin": "brief", "quote": "never push tags"}, "is not in the Brief"),
-                     ({"origin": "nobody"}, "must be brief or gate"),
+                     ({"origin": "nobody"}, "must be brief, gate, record or relayer"),
                      ({"origin": "relayer"}, "relayer counts only with")):
         err = coord.apply(p, [{**add, **({"source": src} if src is not None else {})}], turn=2)
         if why == "a relayer's context does not count":   # a readable user message: its filled resend instead
