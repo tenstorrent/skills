@@ -7044,3 +7044,104 @@ def test_an_urgent_check_waiting_ten_minutes_raises_one_urgent_check_wait_event(
     finally:
         for t in tickets:
             locks.dequeue(t)
+
+
+def test_a_spilled_pass_is_reused_by_a_local_run_of_the_same_tree_but_another_host_s_is_not(env):
+    # A review's pre-started checks queued a full run for a tree whose code-task checks had passed:
+    # the pass was spilled to another host, recorded under that host's key, and missed here.
+    from ttp import cli, push
+    p, tree = make(env), "t" * 40
+    local = push.check_list(["pytest -q"])
+    spilled = cli._spill_to(local, "spill-a")
+    assert push.remote_host(spilled[0]) == "spill-a", "it still runs on the spill host"
+    cli._record_pass(p, tree, spilled)
+    assert cli._recorded_pass(p, tree, local), "a local run of the same tree did not reuse the spilled pass"
+    # A check run on a configured host (its own or delivery.checks_host) stays that host's pass.
+    for there in (push.check_list([{"run": "pytest -q", "host": "box-a"}]), push.with_host(local, "box-a")):
+        assert cli._command_key(there[0]) != cli._command_key(local[0])
+        cli._record_pass(p, "u" * 40, there)
+        assert not cli._recorded_pass(p, "u" * 40, local), there
+
+
+def _carried_setup(env, monkeypatch, upstream: dict):
+    """A change branch whose checks passed at H1 (recorded with its carry ref), then `upstream` landed
+    on main and the branch was rebased to H2: (project, repo, cmds, H2, tree of H2)."""
+    from ttp import cli, push
+    for var, val in (("GIT_AUTHOR_NAME", "t"), ("GIT_AUTHOR_EMAIL", "t@t"),
+                     ("GIT_COMMITTER_NAME", "t"), ("GIT_COMMITTER_EMAIL", "t@t")):
+        monkeypatch.setenv(var, val)
+    p = make(env)
+    p.set_config("delivery.push_exclude_paths", ["notes/**"])
+    repo = env["tmp"] / "carried"
+    repo.mkdir()
+    _git_out(repo, "init", "-q", "-b", "main")
+
+    def commit(files, msg):
+        for path, text in files.items():
+            (repo / path).parent.mkdir(parents=True, exist_ok=True)
+            (repo / path).write_text(text)
+        _git_out(repo, "add", "-A")
+        _git_out(repo, "commit", "-qm", msg)
+        return _git_out(repo, "rev-parse", "HEAD")
+
+    commit({"src/a.py": "a = 1\n", "notes/n.md": "n\n"}, "base")
+    _git_out(repo, "checkout", "-q", "-b", "change")
+    h1 = commit({"src/a.py": "a = 2\n"}, "change")
+    cmds = push.check_list(["pytest -q"])
+    cli._record_pass(p, _git_out(repo, "rev-parse", "HEAD^{tree}"), cmds, at=cli._carry_ref(repo, h1, "main"))
+    _git_out(repo, "checkout", "-q", "main")
+    commit(upstream, "upstream")
+    _git_out(repo, "checkout", "-q", "change")
+    _git_out(repo, "rebase", "-q", "main")
+    return p, repo, cmds, _git_out(repo, "rev-parse", "HEAD"), _git_out(repo, "rev-parse", "HEAD^{tree}")
+
+
+def test_a_pass_carries_to_a_rebased_head_whose_delta_its_checks_do_not_cover(env, monkeypatch):
+    from ttp import cli
+    p, repo, cmds, h2, tree = _carried_setup(env, monkeypatch, {"notes/n.md": "m\n"})
+    assert not cli._recorded_pass(p, tree, cmds), "another tree"
+    hit = cli._carried_pass(p, repo, h2, tree, cmds, "main")
+    assert hit and hit["carried"].endswith("upstream delta touched only: notes/n.md"), hit
+    # Nothing carries to a detached HEAD, a branch other than the pass's, or another purpose.
+    assert cli._carried_pass(p, repo, h2, tree, cmds, "main", purpose="final") is None
+    _git_out(repo, "checkout", "-q", "--detach")
+    assert cli._carried_pass(p, repo, h2, tree, cmds, "main") is None
+    _git_out(repo, "checkout", "-q", "-b", "other")
+    assert cli._carried_pass(p, repo, h2, tree, cmds, "main") is None
+
+
+def test_a_rebase_whose_delta_its_checks_cover_runs_them_again(env, monkeypatch):
+    from ttp import cli
+    p, repo, cmds, h2, tree = _carried_setup(env, monkeypatch, {"src/b.py": "b = 1\n"})
+    assert cli._carried_pass(p, repo, h2, tree, cmds, "main") is None
+
+
+def test_an_urgent_review_held_by_its_pre_checks_names_the_host_checks_slot_wait(env, monkeypatch):
+    # The urgent-wait observation said "a disk guard or its review's pre-checks"; it names the real hold.
+    from ttp import checkcap, cli
+    from ttp.daemon import PRECHECK_LABEL, PRECHECKS_DIR, Daemon, precheck_run_id
+    p = make(env)
+    d = Daemon(p.base)
+    out = p.state / PRECHECKS_DIR / f"t7-{'a' * 12}"
+    out.mkdir(parents=True)
+    rid = p.db.add_task("review", "s", kind="review", tier="light", origin="user", priority=1,
+                        labels=[f"{PRECHECK_LABEL}{out.name}"])
+    task = p.db.task(rid)
+    label = f"{p.name} task #7 (run {precheck_run_id(out)})"
+    monkeypatch.setattr(checkcap, "state", lambda: {"queued": ["x", "y", label], "running": ["r"] * 4,
+                                                    "parked": []})
+    monkeypatch.setattr(d, "_branch_clash", lambda *a: None)
+    monkeypatch.setattr(d, "_disk_holds", lambda t: False)
+    monkeypatch.setattr(d, "_precheck_holds", lambda t, now: True)
+    (out / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"since": time.time() - 600, "pid": 1}))
+    ctx = {"now": time.time(), "paused": {}, "busy": {}, "committed": None, "logged_out": {}, "live": []}
+    assert d._start_hold(task, "claude", ctx) == "held"
+    words = d._hold_words(task, "held", ctx)
+    assert words.endswith("waiting 10 min for a host checks slot, 2 ahead (4 running)"), words
+    assert "disk guard" not in words
+    (out / cli.CHECKS_SLOT_WAIT).unlink()
+    d._start_hold(task, "claude", ctx)
+    assert d._hold_words(task, "held", ctx).endswith(", running")
+    monkeypatch.setattr(d, "_disk_holds", lambda t: True)
+    d._start_hold(task, "claude", ctx)
+    assert d._hold_words(task, "held", ctx).startswith("the disk guard (")

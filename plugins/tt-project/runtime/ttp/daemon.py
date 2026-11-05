@@ -14530,7 +14530,7 @@ class Daemon:
             wait = None
         if not isinstance(wait, dict):
             return f"{what}, running"
-        mins = f" for {(time.time() - float(wait.get('since') or time.time())) / 60:.0f} min"
+        mins = f" {(time.time() - float(wait.get('since') or time.time())) / 60:.0f} min"
         if wait.get("follows"):
             return f"{what}, following another run of the same checks: {str(wait['follows'])[:160]}"
         if wait.get("suite"):
