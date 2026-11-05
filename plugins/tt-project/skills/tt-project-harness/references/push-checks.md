@@ -25,6 +25,7 @@ Set, an extra command runs as the wrapper's words followed by `bash -e -o pipefa
 A wrapper (a path relative to the checkout, or a name on PATH) that is missing or not executable fails the checks with a line naming the key; the command never runs unwrapped. `ttp push --own` runs the recorded extras behind it too.
 `delivery.push_checks` never go through it (a check that needs the lock names the wrapper in its own command), nor do extras run on a check host.
 It is not chat-settable: the user sets it with `ttp config <project> checks.wrap_cmd '<command>'`.
+A wrapper that runs its own test pool (shards in parallel, locally, over its own ssh, or in its local fallback) starts each shard as `ttp checks-shard -- <cmd>` on the host the shard runs on, so every shard counts toward that host's checks slots (`checks.host_max` and its load guard): inside the `ttp checks` that holds a slot there its first shard runs on that slot and each further one counts as a pool run without waiting; elsewhere (a shard started over ssh) it takes a host slot, queued as `ttp checks` is.
 A command that needs no device (a CPU-only test script, a lint) runs without the wrapper and its lane: `ttp checks --no-device -- <cmd>`, or list its leading words in `checks.no_device_cmds` (project setting, a list or one comma-separated string, matched as `checks.light_cmds` is: every part of a `&&` or `|` line must match).
 
 Which one to set for commands that need no device:

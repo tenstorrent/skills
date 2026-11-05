@@ -5906,6 +5906,27 @@ def cmd_said(a) -> None:
     print(f"{len(found)} message{'' if len(found) == 1 else 's'} found (newest first; the newest word on a topic wins)")
 
 
+def cmd_checks_shard(a) -> None:
+    """Run one shard of a project's own test pool as a check of this host (checkcap.shard): a pool behind
+    checks.wrap_cmd, and its local fallback, start each shard as `ttp checks-shard -- <cmd>` on the host
+    it runs on (over ssh too), so the shard takes that host's checks slot or counts as a pool run there.
+    Exits with the command's code (128 + the signal for one a signal ended)."""
+    from . import checkcap
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        die("ttp checks-shard: give the command after --")
+    name = os.environ.get("TTP_PROJECT") or None
+    try:
+        with checkcap.shard(checkcap.label(name, "pool shard"), " ".join(cmd)[:300], project_name=name,
+                            tell=lambda line: print(f"ttp checks-shard: {line}", file=sys.stderr, flush=True)) as env:
+            rc = subprocess.run(cmd, env={**os.environ, **env}).returncode
+    except checkcap.Unavailable as e:
+        die(f"ttp checks-shard: {e}")
+    except OSError as e:
+        die(f"ttp checks-shard: could not start {cmd[0]!r}: {e}")
+    sys.exit(128 - rc if rc < 0 else rc)
+
+
 def cmd_killscan(a) -> None:
     """Check scripts for kills by name or pattern (`pkill`, `killall`, `pgrep`/`pidof`, `ps | grep`) before
     running them: such a kill can match the worker's own tool shell. Exits 1 when one is found.
@@ -11238,9 +11259,9 @@ COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
-    ("inside a run", ("note", "notify", "progress", "checks", "lock", "host-run", "detach", "devq", "push", "land",
-                      "clip", "sandbox", "pool-wait", "skill", "killscan", "svcscan", "leftover-procs", "said",
-                      "hostcheck")),
+    ("inside a run", ("note", "notify", "progress", "checks", "checks-shard", "lock", "host-run", "detach", "devq",
+                      "push", "land", "clip", "sandbox", "pool-wait", "skill", "killscan", "svcscan", "leftover-procs",
+                      "said", "hostcheck")),
     ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -11746,6 +11767,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--shim", metavar="DIR", help="write logging stand-ins for pkill, killall, pgrep and pidof "
                                                  "into DIR (put DIR first on PATH)")
     s.set_defaults(fn=cmd_killscan)
+
+    s = sub.add_parser("checks-shard", help="run one shard of a project's own test pool (checks.wrap_cmd or its "
+                                            "local fallback) as a check of this host: it takes the host's checks "
+                                            "slot, or counts as a pool run inside a `ttp checks` that holds one")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="-- then the shard's command")
+    s.set_defaults(fn=cmd_checks_shard)
 
     s = sub.add_parser("svcscan", help="flag service unit changes (systemctl stop/disable/mask/start/restart/"
                                        "enable/unmask, also under sudo) in scripts before running them; "

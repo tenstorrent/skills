@@ -28360,7 +28360,7 @@ def test_push_checks_take_a_priority_slot_ahead_of_every_queued_task_check(env, 
     push = checkcap.acquire_priority("git@example:org/repo#main", "proj push batch 5", "push checks", told.append)
     assert sorted(os.listdir(locks.served_dir(checkcap.slot_dir(), checkcap.RESOURCE))) == served, \
         "the priority slot takes no project's turn"
-    assert push.f is not None and push.env() == {checkcap.HELD_ENV: "1"}, "it starts at once with every slot busy"
+    assert push.f is not None and push.env() == {checkcap.HELD_ENV: "1", checkcap.SLOT_KEY_ENV: push.key()}, "it starts at once with every slot busy"
     assert got == [], "task checks keep their cap: the priority slot is not theirs"
     assert "push priority slot" in told[0] and "2 task checks running, 3 queued behind" in told[0]
     st = checkcap.state()

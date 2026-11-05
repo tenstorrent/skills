@@ -1518,7 +1518,9 @@ running work is interrupted only by the preemption below:
   (seconds) sets that limit for a check that is silent longer by design, and 0 turns it off. A full run of
   the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
-  fails the checks, and `delivery.push_checks` never go through it. `checks.fallback_lane` (project setting,
+  fails the checks, and `delivery.push_checks` never go through it. A wrapper running its own test pool starts
+  each shard, local or over ssh, as `ttp checks-shard -- <cmd>`, so the shard counts toward that host's checks slots.
+  `checks.fallback_lane` (project setting,
   default "", off) is where those commands run while the wrapper's lock is paused (`held by pause on`): a
   wrapper command (a CPU pool's `ttp lock`, say) or `unwrapped` (no wrapper, TTP_NO_DEVICE=1 set). The pass
   line and checks.json (`fallback_lane`) name the lane and the pause; off, or with the fallback paused or

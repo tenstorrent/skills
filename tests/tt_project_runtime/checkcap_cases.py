@@ -7302,6 +7302,18 @@ def test_an_urgent_run_waiting_in_two_queues_raises_one_urgent_check_wait_event(
                 locks.dequeue(t)
 
 
+def _pool_folder(pool: Path, held: bool) -> Path:
+    """A pool run's folder made by remotecheck's own command, run here as its ssh runs it on the host, by a
+    run that holds a checks slot at its origin (`held`) or not."""
+    from ttp import checkcap, remotecheck
+    env = {k: v for k, v in os.environ.items() if k != checkcap.HELD_ENV} | {"TMPDIR": str(pool)}
+    env |= {checkcap.HELD_ENV: "1"} if held else {}
+    r = subprocess.run(["sh", "-c", remotecheck.mktemp_cmd(env)], env=env, capture_output=True, text=True, check=True)
+    made = Path(r.stdout.strip())
+    assert made.is_dir() and remotecheck._TMP.fullmatch(str(made)), (r.stdout, "its cleanup's pattern")
+    return made
+
+
 def test_a_pool_run_on_the_host_takes_one_of_its_checks_slots_and_one_holding_a_slot_here_counts_once(env, monkeypatch):
     """A check another `ttp checks` runs on this host (a project's own pool, a spill or check host: a
     ttp-check.* folder) takes a host slot, so it queues with the checks started here; a run whose
@@ -7311,28 +7323,77 @@ def test_a_pool_run_on_the_host_takes_one_of_its_checks_slots_and_one_holding_a_
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     pool = Path(os.environ["TTP_CHECKS_POOL_DIRS"])
     pool.mkdir(parents=True, exist_ok=True)
-    (pool / f"ttp-check.{checkcap.host_tag()}Ab12Cd34").mkdir()
+    _pool_folder(pool, held=True)
     s = checkcap.acquire("own", max_wait_s=2)
     assert s is not None and s.f is not None, "a run already holding a slot here is not counted twice"
     s.close()
-    (pool / "ttp-check.Xy98Zw76").mkdir()
-    assert len(checkcap.pool_runs()) == 1 and checkcap.state()["pool"] == 1
+    untagged = _pool_folder(pool, held=False)
+    assert checkcap.pool_runs() == [untagged] and checkcap.state()["pool"] == 1
     assert checkcap.acquire("blocked", max_wait_s=1) is None, "the pool run holds the host's one slot"
     old = time.time() - checkcap.POOL_MAX_AGE_S - 60
-    os.utime(pool / "ttp-check.Xy98Zw76", (old, old))
+    os.utime(untagged, (old, old))
     assert checkcap.pool_runs() == [], "a leftover folder past the age bound is not a running check"
     s = checkcap.acquire("next", max_wait_s=2)
     assert s is not None and s.f is not None
     s.close()
 
 
-def test_remote_check_folder_names_the_origin_only_when_its_run_holds_a_slot_there(env, monkeypatch):
-    """remotecheck tags its folder with the origin's host tag only for a run that holds a slot there, and
-    the tagged name still matches the folder pattern its cleanup uses."""
-    from ttp import checkcap, remotecheck
-    src = Path(remotecheck.__file__).read_text()
-    assert "checkcap.host_tag() if os.environ.get(checkcap.HELD_ENV)" in src
-    assert remotecheck._TMP.search(f"/tmp/ttp-check.{checkcap.host_tag()}Ab12Cd34")
+def test_remote_check_folder_names_the_origin_only_when_its_run_holds_a_slot_there(env):
+    """remotecheck's folder carries the origin's host tag only for a run that holds a slot there: pool_runs
+    counts the untagged folder and not the tagged one."""
+    from ttp import checkcap
+    pool = Path(os.environ["TTP_CHECKS_POOL_DIRS"])
+    pool.mkdir(parents=True, exist_ok=True)
+    tagged, untagged = _pool_folder(pool, held=True), _pool_folder(pool, held=False)
+    assert tagged.name.startswith(f"ttp-check.{checkcap.host_tag()}")
+    assert not untagged.name.startswith(f"ttp-check.{checkcap.host_tag()}")
+    assert checkcap.pool_runs() == [untagged]
+
+
+def test_a_wrapped_pool_shard_takes_a_host_slot_and_one_inside_a_held_slot_counts_once(env, monkeypatch, tmp_path):
+    """A shard a checks.wrap_cmd pool (or its local fallback) starts here with `ttp checks-shard` takes the
+    host's checks slot; inside a `ttp checks` that holds the slot its first shard runs on that slot (counted
+    once) and a further one at the same time counts as a pool run, which other checks then wait behind."""
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    for k in (checkcap.HELD_ENV, checkcap.SLOT_KEY_ENV, checkcap.SHARD_ENV):
+        monkeypatch.delenv(k, raising=False)
+    seen = tmp_path / "seen"
+    probe = (f"{sys.executable} -c 'from ttp import checkcap, locks; "
+             f"print(len(locks.held_labels(checkcap.all_paths())), len(checkcap.pool_runs()))' >> {seen}")
+    wrapper = tmp_path / "wrap.sh"   # a stub checks.wrap_cmd: its local fallback runs the command as one shard here
+    wrapper.write_text(f'#!/bin/sh\nexec "{sys.executable}" -m ttp checks-shard -- "$@"\n')
+    wrapper.chmod(0o755)
+
+    def shard(cmd: str, extra: dict | None = None) -> int:
+        r = subprocess.run([str(wrapper), "sh", "-c", cmd], capture_output=True, text=True, timeout=60,
+                           env={**os.environ, "PYTHONPATH": str(RUNTIME), **(extra or {})})
+        return r.returncode
+
+    def last() -> str:
+        return seen.read_text().splitlines()[-1]
+
+    assert shard(probe) == 0 and last() == "1 0", "a shard on its own takes the host's slot"
+    assert shard("exit 3") == 3, "the shard's exit code passes through"
+    assert not locks.held_labels(checkcap.all_paths()), "the shard's slot ends with it"
+    s = checkcap.acquire("own", max_wait_s=2)
+    assert s is not None and s.f is not None
+    assert shard(probe, s.env()) == 0 and last() == "1 0", "the run's first shard runs on its slot: counted once"
+    for k, v in s.env().items():
+        monkeypatch.setenv(k, v)
+    with checkcap.shard("first shard"):
+        assert checkcap.pool_runs() == []
+        assert shard(probe, s.env()) == 0 and last() == "1 1", "a second shard at once counts as a pool run"
+        with checkcap.shard("second shard"):
+            assert len(checkcap.pool_runs()) == 1 and checkcap.state()["pool"] == 1
+            monkeypatch.delenv(checkcap.HELD_ENV)
+            monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+            assert checkcap.acquire("blocked", max_wait_s=1) is None, "the extra shard holds the host's second slot"
+            monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+            monkeypatch.setenv(checkcap.HELD_ENV, "1")
+    assert checkcap.pool_runs() == [], "an ended shard is no longer counted"
+    s.close()
 
 
 def test_coordinator_sets_the_account_checks_host_cap_logged_with_its_setter_and_undo(env, capsys):

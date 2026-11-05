@@ -79,12 +79,14 @@ when it arrived (grant_line).
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
 import math
 import os
 import re
+import secrets
 import threading
 import time
 from pathlib import Path
@@ -408,7 +410,63 @@ def pool_runs(now: float | None = None) -> list[Path]:
             if (f.is_dir() and st.st_uid == uid and now - st.st_mtime < POOL_MAX_AGE_S
                     and not f.name.startswith(mine)):
                 out.append(f)
-    return out
+    return out + shard_runs()
+
+
+SHARD_ENV = "TTP_CHECKS_SHARD"   # set for a shard's command: a shard started in it runs on its slot
+SLOT_KEY_ENV = "TTP_CHECKS_SLOT_KEY"   # names the slot a run holds (Slot.env): its first shard runs on it
+
+
+def shard_dir() -> Path:
+    return slot_dir() / "shards"
+
+
+def shard_runs() -> list[Path]:
+    """The shards running here beyond the slot of the `ttp checks` that started them (shard): each counts
+    as a pool run, so it takes one of this host's slots from the checks that wait."""
+    try:
+        found = sorted(shard_dir().glob("run.*"))
+    except OSError:
+        return []
+    return [f for f in found if locks.free_state(f) is False]
+
+
+@contextlib.contextmanager
+def shard(holder: str, what: str = "", tell: Callable[[str], None] | None = None,
+          project_name: str | None = None, priority: int | None = None):
+    """Run one shard of a project's own test pool (behind checks.wrap_cmd, or its local fallback) as a
+    check of this host: yields the environment its command gets. Outside a `ttp checks` that holds a slot
+    here (a shard started over ssh, or a pool run on its own) it takes a host checks slot under the same
+    cap, queue and load guard as `ttp checks`. Inside one (HELD_ENV), its first shard runs on that slot and
+    each further one at the same time counts as a pool run (shard_runs) without waiting, so a run that
+    waits on its shards never waits on a slot it holds itself. A shard started in a shard runs in its place."""
+    if os.environ.get(SHARD_ENV):
+        yield {}
+        return
+    env = {SHARD_ENV: "1"}
+    if not os.environ.get(HELD_ENV):
+        slot = acquire(holder, what, tell, project_name=project_name, priority=priority)
+        try:
+            yield env | (slot.env() if slot else {})
+        finally:
+            if slot:
+                slot.close()
+        return
+    key, f, mine = os.environ.get(SLOT_KEY_ENV, ""), None, None
+    if key:   # a run of an older runtime names no slot: its shards run on its slot as before
+        f = locks.try_take([shard_dir() / f"cover.{key}"], holder, what)
+        for _ in range(5) if f is None else ():
+            mine = shard_dir() / f"run.{os.getpid()}.{secrets.token_hex(4)}"
+            if (f := locks.try_take([mine], holder, what)) is not None:
+                break
+            time.sleep(0.05)   # a counter (shard_runs) held the new file for an instant
+    try:
+        yield env
+    finally:
+        if mine is not None:
+            mine.unlink(missing_ok=True)
+        if f is not None:
+            f.close()
 
 
 def extra(n: int | None = None) -> int:
@@ -588,10 +646,16 @@ class Slot:
 
     def env(self) -> dict[str, str]:
         """For the check commands' environment: a `ttp checks` or push nested in them runs at once."""
-        return ({HELD_ENV: "1"} if self.f is not None else {}) | (self.tests.env() if self.tests else {})
+        return (({HELD_ENV: "1", SLOT_KEY_ENV: self.key()} if self.f is not None else {})
+                | (self.tests.env() if self.tests else {}))
+
+    def key(self) -> str:
+        """This slot's name for its shards (shard): its holder's pid and slot file, kept across exec."""
+        return f"{os.getpid()}.{Path(self.f.name).name}" if self.f is not None else ""
 
     def close(self) -> None:
         if self.f is not None:
+            (shard_dir() / f"cover.{self.key()}").unlink(missing_ok=True)
             self.f.close()
             self.f = None
         if self.tests is not None:

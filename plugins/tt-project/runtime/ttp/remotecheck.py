@@ -181,6 +181,14 @@ class _Stop(Exception):
     pass
 
 
+def mktemp_cmd(env=None) -> str:
+    """The shell command that makes the run's folder on the host. A run that holds a checks slot here names
+    this machine in it: should the host be this machine, its slot counts it there once (checkcap.pool_runs)."""
+    from . import checkcap
+    tag = checkcap.host_tag() if (os.environ if env is None else env).get(checkcap.HELD_ENV) else ""
+    return f'mktemp -d "${{TMPDIR:-/tmp}}/ttp-check.{tag}XXXXXXXX"'
+
+
 def _stop(_sig, _frame) -> None:
     raise _Stop()
 
@@ -215,12 +223,8 @@ def main(args: list[str]) -> int:
         signal.signal(s, _stop)
     tmp, proc = "", None
     try:
-        # A run that holds a checks slot here names this machine in its folder: should the host be this
-        # machine, its slot counts it there once (checkcap.pool_runs).
-        from . import checkcap
-        tag = checkcap.host_tag() if os.environ.get(checkcap.HELD_ENV) else ""
         try:
-            made = subprocess.run(_ssh(host, f'mktemp -d "${{TMPDIR:-/tmp}}/ttp-check.{tag}XXXXXXXX"'),
+            made = subprocess.run(_ssh(host, mktemp_cmd()),
                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s")
