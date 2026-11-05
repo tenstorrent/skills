@@ -10149,7 +10149,11 @@ def test_unblocking_turns_name_their_trigger_and_routine_turns_do_not(env, monke
     # The turn after a rejected ask_user names it, and so does one after any other rejection.
     p.db.set_kv(coord.REJECTED_KEY, ["ask_user: ask_user rejected: decide it yourself"])
     assert turn("task_done") == "retry after a rejected ask_user"
+    # Any other rejection rides along with the turn something else starts, named only once it is due.
     p.db.set_kv(coord.REJECTED_KEY, ["task_add: task_add rejected: depends on #1 which is failed"])
+    p.db.set_kv(coord.REJECTED_AT_KEY, clock[0])
+    assert turn("task_done") == "" and calls[-1]["note"]["carried"] == ["rejected action"]
+    p.db.set_kv(coord.REJECTED_AT_KEY, clock[0] - coord.REJECTION_WAIT_S)
     assert turn("task_done") == "rejected action"
     p.db.set_kv(coord.REJECTED_KEY, [])
     assert turn("task_done") == "", "a routine task_done turn names no trigger"
@@ -10199,9 +10203,13 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
     assert trig(msgs=[m]) == ["user message"]
     m = db.post("in", "Change of plan: drop the old goal and do this instead", chat="c1", kind="user")
     assert trig(msgs=[m]) == ["user message", "change of plan"]
-    # Rejected actions.
+    # Rejected actions: carried into the next turn, raised once REJECTION_WAIT_S passed with none.
     db.set_kv(coord.REJECTED_KEY, ["task_add: rejected: over the cap"])
+    carried: list = []
+    assert coord.effort_triggers(db, cfg, [], None, carried=carried)[0] == [] and carried == ["rejected action"]
+    db.set_kv(coord.REJECTED_AT_KEY, time.time() - coord.REJECTION_WAIT_S - 1)
     assert trig() == ["rejected action"]
+    assert trig(due=coord.REJECTION_DUE) == ["rejected action"]
     db.set_kv(coord.REJECTED_KEY, [])
     # A high alert posted since the last turn.
     db.post("out", "something broke", kind="alert", severity="high")
@@ -10237,12 +10245,24 @@ def test_effort_triggers_raise_every_tricky_turn_and_leave_routine_ones_low(env)
     db.set_kv(coord.EFFORT_SEEN_KEY, seen)
     assert trig() == []
     db.update_task(held, status="cancelled")
-    # The budget gate entering or leaving red.
-    got, seen = coord.effort_triggers(db, cfg, [], None, [], {"claude": {"level": "red"}})
-    assert got == ["budget gate change"]
+    # The budget gate entering or leaving red holding nothing that needs a decision: carried, no trigger.
+    red = {"claude": {"level": "red"}}
+    carried = []
+    got, seen = coord.effort_triggers(db, cfg, [], None, [], red, carried=carried)
+    assert got == [] and carried == ["budget gate change"] and seen["gate_held"] == []
     db.set_kv(coord.EFFORT_SEEN_KEY, seen)
-    assert trig(gates={"claude": {"level": "red"}}) == []
-    assert trig(gates={"claude": {"level": "green"}}) == ["budget gate change"]
+    assert trig(gates={"claude": {"level": "green"}}) == []
+    # Holding a user-ordered task (a chat reply owed) or an urgent one raises it once per newly held task.
+    ordered = db.add_task("ordered", "s", origin="user", provider="claude")
+    db.x("UPDATE tasks SET reply_chat='c1' WHERE id=?", (ordered,))
+    got, seen = coord.effort_triggers(db, cfg, [], None, [], red)
+    assert got == ["budget gate change"] and seen["gate_held"] == [f"claude:#{ordered}"]
+    db.set_kv(coord.EFFORT_SEEN_KEY, seen)
+    assert trig(gates=red) == []
+    hot = db.add_task("hot", "s", origin="user", provider="claude", priority=1)
+    assert trig(gates=red) == ["budget gate change"]
+    db.x("UPDATE tasks SET status='cancelled' WHERE id IN (?,?)", (ordered, hot))
+    db.set_kv(coord.EFFORT_SEEN_KEY, {})
 
 
 
@@ -20517,11 +20537,23 @@ def test_settled_refusals_cost_no_turn_of_their_own_and_show_once_with_a_count(e
     assert not coord.informational_rejection(p.db.kv(coord.REJECTED_KEY)[0])
     assert event(), "a refusal a reply may rest on raises the next turn"
     assert not event()
-    # Another refusal class keeps raising the next turn.
+    # Another refusal class with nothing resting on it rides along, and starts a turn of its own only
+    # once coord.REJECTION_WAIT_S passed with none to carry it.
     assert event([{"type": "task_update", "id": 999999, "priority": 1}], kind="task_note")
-    assert event(), "a refusal that needs a decision raises the next turn"
+    assert not event(), "a refusal with nothing resting on it started a turn before its wait"
+    assert coord.rejection_due(p.db, clock[0] + coord.REJECTION_WAIT_S)
+    clock[0] += coord.REJECTION_WAIT_S
+    n = len(prompts)
+    d.maybe_coordinate()
+    assert len(prompts) == n + 1 and notes[-1]["triggers"] == ["rejected action"], notes[-1]
+    assert notes[-1]["wake_due"] == coord.REJECTION_DUE and "no task #999999" in prompts[-1]
+    rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+    d._finish_coordinator({"id": rid, "dir": "x"}, SimpleNamespace(
+        structured={"actions": [{"type": "noop"}], "summary": ""}, error="", final_text="", cost_usd=0.2),
+        "ok", notes[-1])
+    assert not coord.rejection_due(p.db, clock[0] + coord.REJECTION_WAIT_S)
     assert not event()
-    assert quietgate.skipped(p.db, 0)["n"] == 6
+    assert quietgate.skipped(p.db, 0)["n"] == 7
 
 
 def test_settle_refusals_marks_only_its_classes_and_only_without_a_backing_action():
@@ -22463,3 +22495,57 @@ def test_a_coordinator_turn_with_no_actions_anywhere_still_fails(env, tmp_path, 
     assert usage.actions_text == ""
     d._finish_coordinator({"id": 1, "dir": "x"}, usage, "ok", {})
     assert not p.db.q("SELECT id FROM tasks") and int(p.db.kv("coordinator_failures", 0)) == 1
+
+
+def test_gate_holds_wake_only_for_a_decision_and_a_rejection_survives_a_restart(env, monkeypatch):
+    """gatewake.held: a red gate counts only for a held user-ordered, urgent or promise-owning task, or
+    a spend limit only the user can lift; the turn guard's red (`lane`) holds none. A rejection is kept
+    across a daemon restart and starts a turn once coord.REJECTION_WAIT_S passed with none."""
+    p = make(env)
+    from types import SimpleNamespace
+    from ttp import coordinator as coord, gatewake
+    from ttp.daemon import Daemon, wake_fingerprint
+    db = p.db
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    red = {"claude": {"level": "red"}}
+    db.add_task("routine", "s", origin="user", provider="claude")
+    assert gatewake.held(db, red) == [] and gatewake.held(db, {"claude": {"level": "green"}}) == []
+    fp = wake_fingerprint(p, {"claude": {"level": "green"}})
+    assert wake_fingerprint(p, red) == fp, "a red gate holding nothing that needs a decision changed the wake state"
+    hot = db.add_task("hot", "urgent: the user is waiting\nfix it", origin="user", provider="claude")
+    assert gatewake.held(db, red) == [f"claude:#{hot}"] and wake_fingerprint(p, red) != fp
+    assert gatewake.held(db, {"claude": {"level": "red", "lane": "coordinator"}}) == [], "the turn guard holds none"
+    assert gatewake.held(db, {"codex": {"level": "red"}}) == [], "another provider's gate holds no claude task"
+    assert gatewake.held(db, {"claude": {"level": "red", "allow_new_work": True}}) == []
+    limit = {"claude": {"level": "red", "lane": "coordinator",
+                        "reasons": ["claude reports its spend limit reached"]}}
+    assert gatewake.held(db, limit) == ["claude:funds"]
+    db.update_task(hot, status="cancelled")
+    # A rejection recorded by one daemon is still pending in the next one, then starts a turn.
+    clock = [time.time()]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    d = Daemon(p.base)
+    d.update_gates()
+    db.set_kv("last_coordinator_turn", clock[0])
+    bad = SimpleNamespace(structured={"actions": [{"type": "task_update", "id": 987654, "status": "queued"}],
+                                      "summary": ""}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, bad, "ok", {})
+    assert not coord.rejection_due(db, clock[0])
+    d = Daemon(p.base)   # a restart
+    calls = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: calls.append(k))
+    clock[0] += 60
+    d.maybe_coordinate()
+    assert calls == [], "a fresh rejection started a turn of its own"
+    clock[0] += coord.REJECTION_WAIT_S
+    assert coord.rejection_due(db, clock[0])
+    d.maybe_coordinate()
+    assert len(calls) == 1 and calls[0]["note"]["wake_due"] == coord.REJECTION_DUE, calls
+    assert calls[0]["note"]["triggers"] == ["rejected action"]
+    assert "no task #987654" in coord.digest(p, {}, [], [])
+    # A turn that also replied: what it told the user may rest on the refusal, so it is due at once.
+    told = SimpleNamespace(structured={"actions": [{"type": "task_update", "id": 987654, "status": "queued"},
+                                                   {"type": "reply", "chat": "web", "text": "Done."}],
+                                       "summary": ""}, error="", final_text="")
+    d._finish_coordinator({"dir": "x"}, told, "ok", {})
+    assert coord.rejection_due(db, clock[0])

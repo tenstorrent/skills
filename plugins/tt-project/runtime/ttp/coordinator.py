@@ -55,6 +55,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     ends,
     failover,
     forbidden,
+    gatewake,
     gitmemo,
     heal,
     heldwait,
@@ -523,6 +524,10 @@ CHARTER_HISTORY = ends.CHARTER_HISTORY   # harness file: charter sections replac
 CHARTER_APPROVALS_KEY = "charter_approvals"
 CHARTER_APPROVAL_DAYS = 7.0
 REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, shown in the next digest
+# kv: when the last turn's rejections were recorded. They ride along with the next turn something else
+# starts; one still unseen REJECTION_WAIT_S later starts a turn itself (rejection_due), so none is dropped.
+REJECTED_AT_KEY = "rejected_actions_at"
+REJECTION_WAIT_S = 3600.0
 REJECTED_REPLY_KEY = "rejected_after_reply"   # kv: that turn also sent the user a reply
 REPEATS_KEY = "rejected_repeats"   # kv: hashes of rejections already recorded as repeated (an event each, once)
 AGAIN_KEY = "rejected_again"   # kv: hashes of the last turn's rejections that repeat the turn before's
@@ -1680,6 +1685,23 @@ class InfoRejection(ValueError):
 
     def __init__(self, text: str):
         super().__init__(f"{text} {INFO_MARK}")
+
+
+REJECTION_DUE = "rejection"   # the wake_due of a turn started for a rejection no other turn carried
+
+
+def rejection_due(db, now: float | None = None) -> bool:
+    """Whether the last turn's rejections (not information-only ones) have waited REJECTION_WAIT_S for a
+    turn to carry them: then they start one. A set with no recorded time (written before it was
+    kept) counts from the last turn's start, the turn that recorded it."""
+    if not [x for x in db.kv(REJECTED_KEY, []) or [] if not informational_rejection(str(x))]:
+        return False
+    at = db.kv(REJECTED_AT_KEY)
+    at = db.kv("last_coordinator_turn") if at is None else at
+    try:
+        return (now or time.time()) - float(at) >= REJECTION_WAIT_S
+    except (TypeError, ValueError):
+        return True
 
 
 def informational_rejection(problem: str) -> bool:
@@ -4096,15 +4118,19 @@ TOOL_PATTERN_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.:-]{0,199}\*?$")
 def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
                     msg_ids: list[int] | None = None, gates: dict | None = None,
                     now: float | None = None, conflicts: list[dict] | None = None,
-                    lowered: list[str] | None = None, harness=None) -> tuple[list[str], dict]:
+                    lowered: list[str] | None = None, harness=None,
+                    carried: list[str] | None = None) -> tuple[list[str], dict]:
     """Why the coming coordinator turn is tricky or blocking, as trigger labels ([] for a routine
     one), and the state-based triggers' state for EFFORT_SEEN_KEY, saved once the turn starts so a
     lasting state raises one turn, not every turn. All the rules live here; each label names its
     rule, so turns can be counted by trigger. `conflicts`: the charter's contradicting Restrictions
     pairs (restriction_pairs); a pair not seen before raises the turn whose digest shows it.
     `lowered`, when given, gets one line per event a lowering rule kept routine (LOWERED_*), for the
-    turn's note next to its outcome. `harness`: the project's harness dir (its own ack-wait wrapper)."""
+    turn's note next to its outcome. `harness`: the project's harness dir (its own ack-wait wrapper).
+    `carried`, when given, gets the labels the old rules raised that now ride along (a rejection not yet
+    due, a gate change holding nothing new), so before and after can be counted (unblock.triggers_by_day)."""
     now = now or time.time()
+    carried = carried if carried is not None else []
     c = cfg.get("coordinator") or {}
     out: list[str] = []
     seen_before = db.kv(EFFORT_SEEN_KEY, {}) or {}
@@ -4166,8 +4192,10 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     rejected = [str(x) for x in db.kv(REJECTED_KEY, []) or [] if not informational_rejection(str(x))]
     if any(x.startswith("ask_user:") for x in rejected):
         add("retry after a rejected ask_user")
-    elif rejected:
+    elif rejected and (wake_due == REJECTION_DUE or rejection_due(db, now)):
         add("rejected action")
+    elif rejected:   # it rides along: this turn's digest shows it, if one starts
+        carried.append("rejected action")
     if db.one("SELECT 1 FROM messages WHERE direction='out' AND kind='alert' AND ts>? AND severity IN (%s)"
               % ",".join("?" * len(EFFORT_SEVERITIES)), (last, *EFFORT_SEVERITIES)):
         add("high severity alert")
@@ -4229,11 +4257,21 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     seen["charter_conflicts"] = keys
     if set(keys) - set(seen_before.get("charter_conflicts") or []):
         add("charter conflict")
-    # The budget gate going red or leaving it is a spend decision.
+    # Dispatch enforces the budget gate: a red gate raises the turn only once it holds something that
+    # needs a decision (gatewake.held: a user-ordered, urgent or promise-owning task, or funds only the
+    # user can add). A change with nothing new held is counted as carried, not raised.
     red = sorted(k for k, g in (gates or {}).items() if (g or {}).get("level") == "red")
     seen["red"] = red
-    if gates is not None and red != (seen_before.get("red") or []):
-        add("budget gate change")
+    if gates is not None:
+        try:
+            held = gatewake.held(db, gates, cfg.get("core_provider"))
+        except Exception:   # an unreadable hold set raises the change as before
+            held = [f"{k}:?" for k in red]
+        seen["gate_held"] = held
+        if set(held) - set(seen_before.get("gate_held") or []):
+            add("budget gate change")
+        elif red != (seen_before.get("red") or []):
+            carried.append("budget gate change")
     if wake_due == "idle":
         if db.one("SELECT id FROM tasks WHERE status='blocked'"):
             add("stalled on blocked tasks")

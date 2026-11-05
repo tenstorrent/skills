@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: budget gate changes and rejected actions no longer start coordinator turns of their own. Dispatch already enforces the gate, so a gate going red or leaving red wakes the coordinator only when the hold needs a decision: a held task the user ordered, an urgent one, one that owns an owed promise, or a provider spend limit only the user can lift (`gatewake.held`). The status lines and funds alerts are unchanged. A rejected action reaches the next turn something else starts, in session mode too. It starts a turn itself only after an hour with none, or at once when the same turn also replied, notified or recorded a promise that may rest on it. Rejections and their time are kept on disk together, so a restart drops none. Each turn's run note lists the triggers it raised and the ones it carried without raising. The daily review shows both per day for the last 3 days.

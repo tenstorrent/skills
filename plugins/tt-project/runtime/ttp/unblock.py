@@ -913,6 +913,34 @@ def triggers_line(db: DB, since: float) -> str:
     return line
 
 
+TRIGGER_DAYS = 3   # triggers_by_day's span: before and after a wake rule change compare over these days
+
+
+def triggers_by_day(db: DB, now: float, days: int = TRIGGER_DAYS) -> str:
+    """Coordinator turns per trigger label in each of the last `days` 24-h windows, newest first, and
+    the labels that rode along instead (the turn note's `carried`: coordinator.effort_triggers), so a
+    wake rule's effect reads as raised vs carried per day."""
+    out = []
+    for i in range(days):
+        rows = db.q("SELECT note FROM runs WHERE role='coordinator' AND started>=? AND started<?",
+                    (now - (i + 1) * 86400, now - i * 86400))
+        per: dict[str, int] = {}
+        rode: dict[str, int] = {}
+        for r in rows:
+            note = _note(r["note"])
+            for t in _triggers(note):
+                per[t] = per.get(t, 0) + 1
+            carried = note.get("carried")
+            for t in carried if isinstance(carried, list) else []:
+                rode[str(t)] = rode.get(str(t), 0) + 1
+
+        def counts(d: dict) -> str:
+            return ", ".join(f"{k} {v}" for k, v in sorted(d.items(), key=lambda kv: (-kv[1], kv[0])))
+        out.append(f"{i * 24}-{(i + 1) * 24} h ago: {len(rows)} turns"
+                   + (f"; {counts(per)}" if per else "") + (f"; carried, not raised: {counts(rode)}" if rode else ""))
+    return " | ".join(out)
+
+
 def lines(db: DB, now: float | None = None) -> list[str]:
     """The daily review's 'Unblocking quality' lines."""
     now = time.time() if now is None else now
@@ -932,5 +960,6 @@ def lines(db: DB, now: float | None = None) -> list[str]:
         out.append(f"asks sent but flagged by the gate, {label}: {refused_line(db, now - span, flagged=True)}")
     out.append(f"coordinator, 24 h: {turns_line(db, now - 86400)}")
     out.append(f"coordinator triggers, 24 h: {triggers_line(db, now - 86400)}")
+    out.append(f"coordinator triggers by day, {TRIGGER_DAYS} d: {triggers_by_day(db, now)}")
     out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")
     return out

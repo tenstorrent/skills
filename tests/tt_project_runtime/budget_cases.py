@@ -1151,7 +1151,8 @@ def test_plan_pacing_changes_do_not_alert_the_user(env, monkeypatch):
 
 def test_only_reaching_the_plan_line_alerts_once_per_window_and_no_level_wakes(env, monkeypatch):
     """Green, yellow and orange flips post nothing and leave the wake state alone; reaching the line
-    alerts once, and again only in the next window."""
+    alerts once, and again only in the next window. Red with nothing held that needs a decision leaves
+    the wake state alone too (gatewake.held): dispatch enforces the gate."""
     p = make(env)
     from ttp import budget as bud
     from ttp.daemon import Daemon, wake_fingerprint
@@ -1172,7 +1173,7 @@ def test_only_reaching_the_plan_line_alerts_once_per_window_and_no_level_wakes(e
     for level in ("yellow", "orange", "yellow", "orange", "green"):
         assert settle(level) == fp, f"{level} changed what wakes the coordinator"
     assert alerts() == [], alerts()
-    assert settle("red", 90.0) != fp
+    assert settle("red", 90.0) == fp, "a red gate holding nothing that needs a decision changed the wake state"
     assert len(alerts()) == 1 and alerts()[0].startswith("Budget for fake is now red"), alerts()
     settle("orange", 89.0)
     settle("red", 90.0)

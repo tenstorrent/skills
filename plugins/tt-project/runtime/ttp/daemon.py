@@ -100,6 +100,7 @@ from . import conflictfix
 from . import correction
 from . import slowcomplaint
 from . import credits
+from . import gatewake
 from . import gitmemo
 from . import gitreplay
 from . import globalcap as gcap
@@ -4651,7 +4652,9 @@ class Daemon:
             except Exception:   # bookkeeping: the turn is settled either way
                 log(self.p, "coordinator turn gate record failed: "
                     + traceback.format_exc().replace("\n", " | ")[:1000])
-        self._record_rejections([coord.clip_rejection(x) for x in problems])
+        self._record_rejections([coord.clip_rejection(x) for x in problems],
+                                backed=any(isinstance(a, dict) and a.get("type") in coord.BACKING_ACTIONS
+                                           for a in actions or []))
         try:
             rejcool.start(db, self.cfg, evs, problems)   # its triggers' same cause does not wake again at once
         except Exception:   # bookkeeping: without it the next repeat wakes as before
@@ -4711,7 +4714,8 @@ class Daemon:
                    for c in machine_ledger.changes()]
         outages = {a: [o.get(k) for k in ("why", "owner", "until", "covers")]
                    for a, o in machine_ledger.outages().items()}
-        return quietgate.fingerprint(db, self.cfg, wake_fingerprint(self.p, gates, db), projpause.current(db),
+        return quietgate.fingerprint(db, self.cfg, wake_fingerprint(self.p, gates, db, self.cfg.get("core_provider")),
+                                     projpause.current(db),
                                      [changes, outages])
 
     def _keep_messages(self, r: dict, ids: list, problems: list[str]) -> bool:
@@ -4743,13 +4747,19 @@ class Daemon:
         """What the turn decided, for the daily review's audit of turns that decided nothing."""
         self.p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps({**note, "decided": decided}), r.get("id")))
 
-    def _record_rejections(self, problems: list[str]) -> None:
-        """Rejected actions reach the next turn's digest; they never start a turn by themselves.
+    def _record_rejections(self, problems: list[str], backed: bool = False) -> None:
+        """Rejected actions reach the next turn's digest (kv, so a restart keeps them): they ride along
+        with the next turn something else starts, and start one only once coord.REJECTION_WAIT_S passed
+        with none (coord.rejection_due), in session mode too (the events section is sent every wake).
+        `backed`: the turn also sent a reply, notify or obligation (coord.BACKING_ACTIONS), which may
+        rest on the refused action: then they are due at once, as before.
         A rejection repeated on consecutive turns is a harness problem and is recorded once; the next
         digest marks it as a repeat so it is not sent again as is."""
         db = self.p.db
         before = set(db.kv(coord.REJECTED_KEY, []) or [])
-        db.set_kv(coord.REJECTED_KEY, problems)
+        with db.tx():   # the set and its time together: a restart between them never drops or rushes it
+            db.set_kv(coord.REJECTED_KEY, problems)
+            db.set_kv(coord.REJECTED_AT_KEY, time.time() - (coord.REJECTION_WAIT_S if backed else 0.0))
         db.set_kv(coord.AGAIN_KEY, [coord.rejection_key(x) for x in problems if x in before])
         if not problems:
             return
@@ -8776,15 +8786,19 @@ class Daemon:
         rides = [e for e in evs if pagesev.rides_along(e)]
         if not msgs and len(rides) == len(evs) and (
                 not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
-            last = float(db.kv("last_coordinator_turn", 0))
-            if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
-                return
-            w = idle_wake(self.p, self.cfg, {k: g.as_dict() for k, g in self.gates.items()}, now)
-            if not w["due"]:
-                return
-            if w["due"] == "starve":
-                db.set_kv("starve", w["starve"])
-            wake = w["wake"]
+            if coord.rejection_due(db, now):
+                # A rejection no turn carried in coord.REJECTION_WAIT_S starts one, so none is dropped.
+                w, wake = {"due": coord.REJECTION_DUE}, db.kv("idle_wake", {}) or {}
+            else:
+                last = float(db.kv("last_coordinator_turn", 0))
+                if now - last <= min(float(c.get("idle_wake_s", 3600)), float(c.get("starve_wake_s", 300))):
+                    return
+                w = idle_wake(self.p, self.cfg, {k: g.as_dict() for k, g in self.gates.items()}, now)
+                if not w["due"]:
+                    return
+                if w["due"] == "starve":
+                    db.set_kv("starve", w["starve"])
+                wake = w["wake"]
         else:
             newest = max([m["ts"] for m in msgs] + [e["ts"] for e in evs])
             oldest = min([m["ts"] for m in msgs] + [e["ts"] for e in evs])
@@ -8831,7 +8845,8 @@ class Daemon:
                 # without a model run (turngate.py). A batch with an effort trigger always runs; the
                 # triggers' seen-state is saved only by a turn that starts, so here it is dropped.
                 gates_now = {k: g.as_dict() for k, g in self.gates.items()}
-                seen_now = turngate.material(db, wake_fingerprint(self.p, gates_now), [e["id"] for e in evs])
+                seen_now = turngate.material(db, wake_fingerprint(self.p, gates_now, core=self.cfg.get("core_provider")),
+                                             [e["id"] for e in evs])
                 pre = [] if any(e["kind"] in coord.UNBLOCK_KINDS for e in evs) else \
                     coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], None, [], gates_now, now,
                                           coord.charter_conflicts(self.p), harness=self.p.harness)[0]
@@ -8865,9 +8880,11 @@ class Daemon:
                 sweep.prepare(db, sweep_event, self.cfg, now)
             due = (w or {}).get("due")
             lowered: list[str] = []
+            carried: list[str] = []
             triggers, seen = coord.effort_triggers(db, self.cfg, [e["id"] for e in evs], due,
                                                    [m["id"] for m in msgs], gates, now,
-                                                   coord.charter_conflicts(self.p), lowered, harness=self.p.harness)
+                                                   coord.charter_conflicts(self.p), lowered, harness=self.p.harness,
+                                                   carried=carried)
             unblock = ", ".join(triggers)
             flagged = correction.flag(db, self.cfg, msgs, now)   # likely corrections, tagged in the digest
             speed = slowcomplaint.on_messages(self.p, self.cfg, msgs, now, gates)   # a speed complaint: measured review
@@ -8905,6 +8922,7 @@ class Daemon:
                                  "budget_usd": budget, **({"sizing": sized["info"]} if sized["info"] else {}),
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),
                                  "triggers": triggers, **({"lowered": lowered} if lowered else {}),
+                                 **({"carried": carried} if carried else {}),
                                  **({"corrections": {str(k): v for k, v in flagged.items()}} if flagged else {}),
                                  **({"wake_due": due} if due else {}),
                                  "digest": {**coord.digest_size(parts), "cached_chars": len(cached)}, **({"gate": seen_now} if seen_now else {}),
@@ -16462,7 +16480,7 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
     gate = gates.get(cfg.get("core_provider", "claude"))
     last = float(db.kv("last_coordinator_turn", 0))
     idle_s = float(c.get("idle_wake_s", 3600))
-    fp = wake_fingerprint(p, gates, db)
+    fp = wake_fingerprint(p, gates, db, cfg.get("core_provider"))
     prev = db.kv("idle_wake", {}) or {}
     same = prev.get("fp") == fp
     repeats = int(prev.get("n", 0)) if same else 0
@@ -16487,9 +16505,10 @@ def idle_wake(p: Project, cfg: dict, gates: dict[str, dict], now: float, db=None
             "wake": {"fp": fp, "n": repeats + 1}, "starve": starve}
 
 
-def wake_fingerprint(p: Project, gates: dict[str, dict], db=None) -> str:
+def wake_fingerprint(p: Project, gates: dict[str, dict], db=None, core: str | None = None) -> str:
     """The state a wake turn decides on. Running counts as queued: dispatch moves tasks between
-    the two without the coordinator. Spend numbers are left out; gate levels carry them."""
+    the two without the coordinator. Spend numbers and gate levels are left out: dispatch enforces
+    the gate, so only its holds that need a decision count (gatewake.held; `core`: the core provider)."""
     db = db or p.db
     tasks = [(t["id"], "queued" if t["status"] == "running" else t["status"], t["priority"], t["depends_on"])
              for t in db.q("SELECT id, status, priority, depends_on FROM tasks "
@@ -16497,8 +16516,8 @@ def wake_fingerprint(p: Project, gates: dict[str, dict], db=None) -> str:
     asks = [r["id"] for r in db.q("SELECT id FROM messages WHERE kind='ask' AND handled=0 ORDER BY id")]
     scheds = [(s["name"], s["enabled"], s["every_s"], s["at"])
               for s in db.q("SELECT name, enabled, every_s, at FROM schedules ORDER BY name")]
-    # Only red changes what a turn can do; green, yellow and orange are pacing and wake nobody.
-    levels = sorted((k, g["level"] == "red", g["allow_new_work"]) for k, g in gates.items())
+    # Green, yellow and orange are pacing; a red gate counts only by what it holds that needs a decision.
+    levels = gatewake.held(db, gates, core)
     files = [p.charter_path, p.config_path, p.memory_index,
              *(p.memory_dir.iterdir() if p.memory_dir.is_dir() else [])]
     mtimes = sorted((f.name, f.stat().st_mtime) for f in files if f.exists())
