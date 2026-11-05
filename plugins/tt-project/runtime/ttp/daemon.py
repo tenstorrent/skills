@@ -48,6 +48,7 @@ from . import resumefirst
 from . import rejcool
 from . import stalegate
 from . import indexignore
+from . import plangate
 from . import lanewait
 from . import coordsession
 from . import thenwaits
@@ -5661,6 +5662,11 @@ class Daemon:
             else:   # shown as a link in the web app: only an https:// PR URL is kept
                 log(self.p, f"task {task['id']}: hand-off pr {str(result['pr'])[:120]!r} is not an https:// "
                             f"PR URL; not stored")
+        plan_line = ""   # a done plan's start gate, held by every task it queues (plangate)
+        if task["kind"] == "plan" and new == "done":
+            gate_labels, plan_line = plangate.on_handoff(db, db.task(task["id"]) or task, result)
+            if gate_labels is not None:
+                upd["labels"] = gate_labels
         if approval:
             with db.tx():   # rows, pins and the status together: a failed pin leaves the run to be retried
                 pushq.approve(self.p, task["id"], r.get("id"), approval)
@@ -5672,6 +5678,8 @@ class Daemon:
                       f"{'~' if usage.estimated else ''}${usage.cost_usd:.2f})", "handled", task["id"]))
         else:
             db.update_task(task["id"], **upd)
+        if plan_line and (gate := plangate.stored(db.task(task["id"]))):   # tasks queued from it already
+            plan_line += "".join(f"\n{n}" for n in plangate.hold_queued(self.p, db, task["id"], gate))
         effort.settle(db, task["id"], "done" if rejects else new, attempts)
         try:   # the wake-gate decisions behind this run: a wake that only handed the wait back is a miss
             waitgate.settle_run(db, json.loads(r.get("note") or "{}"), load_result(task["result"]), result,
@@ -5766,6 +5774,7 @@ class Daemon:
             if facts:
                 notes += "\nFindings (save the durable ones as memory):" + "".join(
                     f"\n- {f['fact']} [{f.get('source', '')}]" for f in facts)
+            notes += plan_line
             plugs = [x for x in (result.get("enable_plugins") or []) if isinstance(x, dict) and x.get("path")]
             if plugs:
                 notes += "\nRecommended skill plugins for workers:" + "".join(

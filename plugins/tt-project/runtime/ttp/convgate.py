@@ -88,6 +88,11 @@ def safety_class(*texts: str | None) -> str | None:
     return None
 
 
+def user_word(*texts: str | None) -> bool:
+    """Whether any of `texts` (a gate's why, its probe) cites the user's own word (CLASSES' first)."""
+    return any(t and _CLASSES[0][1].search(str(t)) for t in texts)
+
+
 def kept_class(labels: list) -> str | None:
     """The `start_safety:<class>` a task's labels recorded, else None."""
     for lb in labels if isinstance(labels, list) else []:

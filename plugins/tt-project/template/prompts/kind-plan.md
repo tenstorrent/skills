@@ -28,6 +28,9 @@ charter requires, so a speedup that breaks quality is caught.
   measurement that decides it. Dependencies only where one task truly needs another's output.
 - An urgent goal (priority 1 or an `urgent:` line): every task starts at once. No chain between its
   tasks unless one needs another's new file or symbol; give each the goal's priority and `urgent:` line.
+- A start condition in the order ('once', 'after', 'only when', 'until'): put it in `gate`, as task
+  ids to wait on (`depends_on`) and/or a model-free `start_when` probe, with `why` quoting the
+  condition. Every task the plan queues inherits it, not only the one it names.
 - Findings worth keeping: put them in `findings`, one fact each, with its source.
 - Knowledge that would help but is out of reach (access, a missing connector, a person to ask):
   say what and why.
@@ -36,5 +39,6 @@ charter requires, so a speedup that breaks quality is caught.
 {"status": "done", "summary": "...",
  "findings": [{"fact": "...", "source": "..."}],
  "followups": [{"title": "...", "spec": "...", "depends_on": []}],
+ "gate": {"depends_on": [], "start_when": "", "why": "..."},
  "enable_plugins": [{"path": "...", "why": "..."}]}
 ```

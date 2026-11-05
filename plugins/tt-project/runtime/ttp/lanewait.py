@@ -18,7 +18,8 @@
   (600; 0: never) raises one event, naming both tasks, the holder's status and the hours so far. It
   wakes the coordinator once per wait and is cleared (handled) once the task starts or no longer
   waits on a task. A start_when with no task in it (a secret, a sign-in, a cadence: the user's say)
-  or a start_after still ahead is no lane wait. Nor is the task's own pending premise check (the
+  or a start_after still ahead is no lane wait, nor is a hold the user ordered (a plan's gate,
+  plangate.HELD, or a start_why citing the user's word): it wakes no one per held task. Nor is the task's own pending premise check (the
   question its `premise:<id>` label names, premise.py): any other holder still counts. A premise
   question that never ends is caught as any task is: a stuck run by its tier's stall_s and the
   progress check's no_progress key, a question dispatch never starts by Daemon.check_stall. Known gap, accepted: a probe naming a task and
@@ -29,7 +30,7 @@ import json
 import time
 from pathlib import Path
 
-from . import landed
+from . import convgate, landed, plangate
 from .db import OPEN_TASKS, deferral, without_deferral
 
 START_FROM = "start_from:"   # + sha: a new worktree branches from it (worktree.early_head)
@@ -112,9 +113,12 @@ def holders(db, t: dict, unmet: list, now: float) -> list[tuple[int, str]]:
     else too that is not a task (a start_when naming none, a start_after ahead)."""
     from .premise import pending
     from .worktree import lineage_hold
-    when = deferral(t).get("when")
+    d = deferral(t)
+    when = d.get("when")
     refs = [int(r) for r in landed.task_refs(when) if r.isdigit()]
     if (when and not refs) or (t["not_before"] or 0) > now:
+        return []
+    if plangate.held(t) or (when and convgate.user_word(d.get("why"))):   # a hold the user ordered
         return []
     out = [(r, f"start_when landed:#{r}") for r in refs]
     out += [(d, "depends_on") for d in unmet if isinstance(d, int)]

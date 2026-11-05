@@ -71,6 +71,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     outagemsg,
     pauseends,
     plainreply,
+    plangate,
     prguard,
     progress,
     projpause,
@@ -226,7 +227,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "start_after": {"type": "string", "pattern": START_AFTER_RE}, "start_when": {"type": "string"},
             "waits_on": {"type": "string"}, "outcome": {"type": "string", "enum": list(sweep.OUTCOMES)},
             "clear_fields": {"type": "array", "items": {"type": "string", "enum": list(NULL_OPERATIONS)}},
-            "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"},
+            "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"}, "gate": {"type": ["object", "null"], "properties": {"depends_on": {"type": "array", "items": {"type": "integer"}},
+                     "start_when": {"type": "string"}, "why": {"type": "string"}}},
             "wake_now": {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": list(bud.TIER_ORDER)}]},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"}, "justify": {"type": "string"},
@@ -2363,6 +2365,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     labels.append("needs_device")
                 if tier == "deep" and a.get("user_deep"):
                     labels.append(effort.USER_DEEP)   # a device task keeps deep on its first start
+                a, gate_deps, gate_notes, gate_marks = plangate.inherit(p, db, a)   # a cited plan's start condition
                 a, as_deps = _landed_as_deps(p, a)
                 try:
                     deps = _new_dependencies(db, None, a.get("depends_on") or [])
@@ -2518,6 +2521,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if lineage := _lineage_tie(p, kind, labels, {old["id"]} if old else set()):
                     labels.append(f"{worktree.LINEAGE_HOLD}{lineage[0]}")
                 labels += defer_labels(after, when, why_after) + convgate.labels_for(safe, after, when)
+                deps = list(dict.fromkeys([*deps, *gate_deps]))   # after the dead check: a dead one blocks it
+                labels += gate_marks
                 with db.tx():
                     new_id = db.add_task(title, a.get("spec") or "", kind=kind, tier=tier,
                                          tier_source="user_deep" if effort.USER_DEEP in labels else tier_source,
@@ -2578,6 +2583,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if lineage:
                     notes.append(f"task_add: #{new_id} chained after #{lineage[0]}, which is using {lineage[1]}: it "
                                  f"starts once #{lineage[0]} ends, in a worktree of its own from that branch's head")
+                notes.extend(f"task_add: #{new_id} added; {n}" for n in gate_notes)
                 if as_deps:
                     notes.append(f"task_add: #{new_id} added; {as_deps}")
                 if stale:
@@ -2618,6 +2624,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if not task:
                     raise ValueError(f"no task #{a.get('id')}")
                 batch_tasks[task["id"]] = task["reply_chat"]
+                if "gate" in a:   # a plan's start condition recorded after its run: its queued tasks too
+                    if task["kind"] != "plan":
+                        raise ValueError(f"#{task['id']} rejected: `gate` is set on a plan task only")
+                    notes.extend(f"task_update #{task['id']}: {n}" for n in plangate.set_gate(p, db, task, a["gate"]))
+                    a = {k: v for k, v in a.items() if k != "gate"}
+                    if not set(a) - {"type", "id"}:
+                        continue
+                    task = db.task(task["id"])
                 if str(a.get("text") or "").strip().lower().startswith(workernotify.DROPPED):
                     # Its held worker notify is not posted; the text steers nothing else.
                     workernotify.handled(db, [task["id"]])
