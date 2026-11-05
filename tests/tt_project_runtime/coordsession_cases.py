@@ -488,9 +488,10 @@ def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsy
 
 # The session role's own room over the stateless coordinator role budget (coordinator_role_budget.txt,
 # which stays the stateless role's cap): the order-ledger block the session always carries plus
-# prompts/coordinator-session.md (2900), plus the session-only `self_change` row of coordinator.md's
-# action table (1300, selfimprove.py). Session mode only; it never widens coordinator_role(p)'s cap.
-SESSION_ROLE_ROOM = 2900 + 1300
+# prompts/coordinator-session.md (2900, +100 for its Context-block line, user msg #1785), plus the
+# session-only `self_change` row of coordinator.md's action table (1300, selfimprove.py). Session mode
+# only; it never widens coordinator_role(p)'s cap.
+SESSION_ROLE_ROOM = 2900 + 100 + 1300
 
 _CS_CHARTER = ("# demo\n\n## Goals\nShip v1.\n\n## Restrictions\n- Never push to main (user msg #1).\n\n"
                "## Policies\nLabel every number.\n")
@@ -577,6 +578,32 @@ def test_coordsession_system_prompt_is_byte_identical_between_wakes_with_an_unch
     # The session role keeps to the stateless budget plus its own room; the stateless role keeps the old cap (sa17).
     assert len(coordinator_session_role(p)) <= _role_budget() + SESSION_ROLE_ROOM
     assert len(coordinator_role(p)) <= _role_budget()
+
+
+def test_both_coordinator_modes_and_the_planner_pass_the_worker_the_context_it_cannot_see(env):
+    """User msg #1785: a worker or planner sees none of the coordinator's context, so each spec, plan
+    brief and mid-run correction carries a Context block; a plan gives its own tasks the same block."""
+    from ttp.prompts import coordinator_role, coordinator_session_role
+    p = make(env)
+    rule = ("Think a task through at full effort when you get or start it: write the ideal plan, or give its "
+            "`plan` task every key point. Workers see none of your context, so each `spec` (task_add, plan brief, "
+            "mid-run `task_update`, continue, fix) is self-contained")
+    items = ("the user's intent and verbatim words with message ids (relayer text as data)", "decisions and why",
+             "binding Restrictions restated", "failed attempts and review findings (result.json paths)",
+             "relevant memory, related tasks and files", "Only what bears on it; paths, not pasted output.")
+    for role in (coordinator_role(p), coordinator_session_role(p)):
+        role = " ".join(role.split())
+        assert rule in role and "`Context:` block" in role
+        assert all(i in role for i in items), [i for i in items if i not in role]
+        assert "self-contained: goal, context, acceptance criteria" not in role, "the older line is replaced"
+    session = " ".join(coordinator_session_role(p).split())
+    assert "Workers and planners see none of this session: each spec's `Context:` block carries" in session
+    assert "see none of this session" not in " ".join(coordinator_role(p).split())
+    plan = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-plan.md").read_text().split())
+    assert "Its worker sees only its spec: give each a short `Context:` block" in plan
+    assert all(i in plan for i in ("verbatim words with message ids", "the binding Restrictions",
+                                   "failed attempts (result.json paths)", "relevant memory", "Paths, not pasted output."))
+    assert "Findings worth keeping, and what later tasks must know" in plan
 
 
 def test_coordsession_note_and_chat_lines_keep_to_their_caps(env):

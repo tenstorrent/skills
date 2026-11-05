@@ -2122,6 +2122,12 @@ running work is interrupted only by the preemption below:
 - A plan task starts from what is already known: prior work, the organization's docs and chats
   through the connectors you have, available skills, and public work. Skill plugins it recommends
   can be enabled for the project's workers only (`providers.claude.plugin_dirs`).
+- Workers and planners never see the coordinator's context. When it gets or starts a task, the
+  coordinator thinks it through and writes the plan, or hands the planner every key point, and
+  each spec, plan brief and mid-run correction carries a short `Context:` block: the user's intent
+  and words with message ids, decisions, the binding Restrictions, earlier findings and failed
+  attempts (as result.json paths), relevant memory, and related tasks and files. A plan gives
+  each task it proposes the same block.
 - On Claude, the part of a worker's prompt that is the same for every task (rules, charter,
   memory) goes in the system prompt, so the next worker, of any kind, reads it from the cache. The
   kind's rules and the task itself go in the user prompt.

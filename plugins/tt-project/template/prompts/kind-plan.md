@@ -26,12 +26,17 @@ charter requires, so a speedup that breaks quality is caught.
 
 - Tasks that can run side by side, each with a self-contained spec, acceptance criteria and the
   measurement that decides it. Dependencies only where one task truly needs another's output.
+- Its worker sees only its spec: give each a short `Context:` block of what bears on it, from your
+  brief and sweep: the user's intent and verbatim words with message ids, decisions, the binding
+  Restrictions, earlier findings and failed attempts (result.json paths), relevant memory, related
+  tasks and files. Paths, not pasted output.
 - An urgent goal (priority 1 or an `urgent:` line): every task starts at once. No chain between its
   tasks unless one needs another's new file or symbol; give each the goal's priority and `urgent:` line.
 - A start condition in the order ('once', 'after', 'only when', 'until'): put it in `gate`, as task
   ids to wait on (`depends_on`) and/or a model-free `start_when` probe, with `why` quoting the
   condition and, when the user gave it, its message id first ('user msg #N: ...'). Every task the plan queues inherits it, not only the one it names.
-- Findings worth keeping: put them in `findings`, one fact each, with its source.
+- Findings worth keeping, and what later tasks must know: put them in `findings`, one fact each,
+  with its source.
 - Knowledge that would help but is out of reach (access, a missing connector, a person to ask):
   say what and why.
 

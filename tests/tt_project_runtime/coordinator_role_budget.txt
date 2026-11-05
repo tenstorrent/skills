@@ -48,3 +48,4 @@
 +180: Restrictions gate accepts ordered exceptions with no new risk class and the owner's cited record words; `"ask": N` closes the cited gate ask (#5959, #6066)
 +60: a plan's tasks cite it to inherit its start gate; task_update sets one later (plangate)
 +400: each user message gets an order or no_order; owner kind fit; reply `cites` of run results (turnrules.py)
++580: each spec is self-contained with a Context block of what the worker cannot see; plan first (user msg #1785)
