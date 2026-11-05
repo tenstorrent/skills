@@ -5142,7 +5142,7 @@ class Daemon:
     def _prefetch_hop(self, task: dict, fups: list[dict]) -> None:
         """For _prefetch_git: what _split and _continue_ready read from git for a done task."""
         branch = task.get("branch")
-        if task["kind"] == "code" and branch and not chaincap.split_head(task):
+        if branch and not chaincap.split_head(task) and self._code_change(task):
             head, _ = self._branch_tip(branch)
             if head:
                 self._has_changes(task)
@@ -5965,9 +5965,11 @@ class Daemon:
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
         # reads inside this transaction (rev-parse, the diff base, rev-list --count), each milliseconds; they
         # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
+        # A task of another kind whose branch changes anything (a `continue:` hop that kept its parent's
+        # kind) is a code change too: _code_change.
         review = self._auto_review(dict(task, **upd), summary) \
             if (new == "done" or new == "review" and (urgent.is_urgent(task) or obligations.owned_open(db, task["id"]))) \
-            and task["kind"] == "code" and not split and not requeued else None
+            and not split and not requeued and self._code_change(task) else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
@@ -14156,7 +14158,7 @@ class Daemon:
         a duplicate."""
         d = self.cfg.get("delivery") or {}
         branch = task.get("branch")
-        if task.get("kind") != "code" or not branch or not d.get("push_branch"):
+        if not branch or not d.get("push_branch") or not self._code_change(task):
             return ""
         try:
             found = gitmemo.cached(("landed.equivalent", branch),   # warmed before a finish transaction
@@ -14361,7 +14363,8 @@ class Daemon:
             log(self.p, "mitigations: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
     def sweep_reviews(self) -> None:
-        """Model-free retry of reviews left to the coordinator: a code task in 'review' whose last run
+        """Model-free retry of reviews left to the coordinator: a code task (or one of another kind whose
+        branch changes anything: _code_change) in 'review' whose last run
         ended review.sweep_after_s ago (0 off) and that no review has covered since it entered review
         gets its review (_auto_review), so a hand-off with notes the coordinator queued no review for
         does not sit there. It only queues reviews and never closes or changes a task, except one
@@ -14390,7 +14393,8 @@ class Daemon:
         if after <= 0:
             return
         try:
-            todo = db.q("SELECT * FROM tasks WHERE kind IN ('code','harness') AND status='review' ORDER BY id")
+            todo = db.q("SELECT * FROM tasks WHERE status='review' AND (kind IN ('code','harness') OR kind!='review' "
+                        "AND branch IS NOT NULL AND branch!='') ORDER BY id")
             if not todo:
                 return
             since = db.review_since()
@@ -14421,6 +14425,8 @@ class Daemon:
             return
         if t["kind"] == "harness":
             self._sweep_harness_review(t, reviews, float(since.get(t["id"]) or 0), merged.get(str(t["id"])), now)
+            return
+        if not self._code_change(t):   # a question or work task whose branch changes nothing
             return
         # A change that landed under another task's commits needs no review of its own; the
         # task is closed as superseded (it may have had its say from a review already).
@@ -15560,6 +15566,14 @@ class Daemon:
             head = worktree._git(self.p.root, "rev-parse", "--verify", "--quiet", f"{branch}^{{commit}}", check=False)
             return head, worktree._git(self.p.root, "log", "-1", "--format=%s", head, check=False) if head else ""
         return gitmemo.cached(("daemon.branch_tip", branch), read)
+
+    def _code_change(self, task: dict) -> bool:
+        """Whether finished task `task` carries a code change to review: a code task, or one of another
+        kind (a `continue:` hop that kept its parent's kind 'question', a work task) whose branch changes
+        anything against the base (_has_changes). A review's own commits (its version bump) are its
+        verdict's, and a harness task has its own review (_auto_review_harness): never one here."""
+        kind = task.get("kind")
+        return kind == "code" or kind not in ("review", "harness") and self._has_changes(task)
 
     def _has_changes(self, task: dict) -> bool:
         """Whether a task's branch changes anything against the base; True when that cannot be read.

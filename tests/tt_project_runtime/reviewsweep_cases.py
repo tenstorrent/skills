@@ -176,3 +176,60 @@ def test_a_branchless_hand_off_s_top_level_branch_and_head_queue_exactly_one_rev
     p.db.update_task(other, branch="ttp/none-such", result=json.dumps({
         "status": "done", "summary": "ok", "branch": "fix/y", "head": head}))
     assert d._external_change(p.db.task(other)) is None
+
+
+def test_a_question_hop_with_a_branch_commit_gets_one_review_at_hand_off_and_one_without_a_diff_none(env):
+    """#6127: a `continue:` hop kept its parent's kind 'question', committed on its branch and sat in
+    review with no review queued. A done task of any kind but review or harness whose branch changes
+    anything gets exactly one review at its hand-off, with no coordinator turn; one that changes nothing
+    gets none, and the review sweep raises nothing for it."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
+    parent = p.db.add_task("look into caps", "spec", kind="question", origin="coordinator")
+    tid, branch, done, reviews = _finish_code(env, p, "continue: caps line", {"caps.py": 5}, kind="question",
+                                              labels=[f"continues:{parent}"])
+    (rev,) = reviews
+    assert rev["title"] == f"Review #{tid}: continue: caps line" and rev["origin"] == "daemon"
+    assert f"branch {branch}, head " in rev["spec"] and "spec of continue: caps line" in rev["spec"]
+    assert done["status"] == "handled", "a routine hand-off still starts a coordinator turn"
+    assert f"Review #{rev['id']} queued by the daemon" in done["text"]
+    # One head gets one review: asking again (a sweep, a repeated hand-off) names the same one.
+    d = Daemon(p.base)
+    assert d._auto_review(p.db.task(tid), "again") == (rev["id"], False)
+    p.db.update_task(tid, status="review")
+    _sweep(d)
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
+    # A question (or work) task whose branch changes nothing gets no review.
+    for kind in ("question", "work"):
+        q, _, qdone, none = _finish_code(env, p, f"{kind} only", {}, kind=kind)
+        assert not none and "queued by the daemon" not in qdone["text"]
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1 and not _unqueued(p)
+
+
+def test_the_sweep_reviews_a_non_code_task_in_review_with_a_diff_once_and_skips_one_without(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, branch, head = _unreviewed(env, p, "work hop", kind="work", status="review", age=1900, result={
+        "status": "needs_review", "summary": "work hop committed"})
+    bare = p.db.add_task("plain question", "spec", kind="question", origin="coordinator")
+    p.db.update_task(bare, status="review", result=json.dumps({"status": "needs_review", "summary": "answer"}))
+    _ran(p, bare, time.time() - 1900)
+    d = Daemon(p.base)
+    _sweep(d)
+    (rev,) = _daemon_reviews(p, tid)
+    assert f"branch {branch}, head {head[:12]}" in rev["spec"]
+    assert not _daemon_reviews(p, bare) and not _unqueued(p)
+    _sweep(Daemon(p.base))
+    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1 and not _unqueued(p)
+
+
+def test_a_review_or_harness_task_s_own_commits_are_never_a_change_to_review(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    for kind, want in (("review", False), ("harness", False), ("code", True)):
+        tid, _, _ = _unreviewed(env, p, f"{kind} commits", kind=kind)
+        assert d._code_change(p.db.task(tid)) is want, kind
+    tid = p.db.add_task("no branch", "spec", kind="question", origin="coordinator")
+    assert d._code_change(p.db.task(tid)) is False

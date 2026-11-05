@@ -30869,14 +30869,14 @@ def test_replay_reports_the_turns_batching_saves_without_idle_slots(env):
     assert replay.main([str(db.path), "--days", "1", "--slots", "2"]) == 0
 
 
-def _finish_code(env, p, title, files, result=None, labels=None, before=None, edit=None):
-    """A code task that committed `files` (name -> lines), and what `edit(worktree)` changed, on its
-    branch, then handed off. `before` is called with the task id and its branch's head just before
-    the hand-off."""
+def _finish_code(env, p, title, files, result=None, labels=None, before=None, edit=None, kind="code"):
+    """A code task (or one of `kind`) that committed `files` (name -> lines), and what `edit(worktree)`
+    changed, on its branch, then handed off. `before` is called with the task id and its branch's head
+    just before the hand-off."""
     from ttp import worktree
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage
-    tid = p.db.add_task(title, f"spec of {title}", kind="code", tier="standard", origin="coordinator",
+    tid = p.db.add_task(title, f"spec of {title}", kind=kind, tier="standard", origin="coordinator",
                         labels=labels)
     path, branch = worktree.ensure(p, p.db.task(tid))
     for name, lines in files.items():
@@ -31449,13 +31449,13 @@ def test_the_review_sweep_reviews_a_branchless_code_task_at_its_prs_head(env, mo
     assert branch in brev["spec"] and "gh pr diff" not in brev["spec"] and not views
 
 
-def _unreviewed(env, p, title, result=None, status="done", age=600, labels=None, spec=None, edit=None):
+def _unreviewed(env, p, title, result=None, status="done", age=600, labels=None, spec=None, edit=None, kind="code"):
     """A code task in the state #2800 was left in: committed on its branch, handed off and recorded
     `status` `age` seconds ago, with no review of it queued; `edit(worktree)` replaces its one file.
     (task id, branch, head)."""
     from ttp import worktree
     from ttp.db import dump_result
-    tid = p.db.add_task(title, spec or f"spec of {title}", kind="code", tier="standard", origin="coordinator",
+    tid = p.db.add_task(title, spec or f"spec of {title}", kind=kind, tier="standard", origin="coordinator",
                         labels=labels)
     path, branch = worktree.ensure(p, p.db.task(tid))
     (edit or (lambda w: (w / f"{tid}.py").write_text(f"{title}\n")))(path)
