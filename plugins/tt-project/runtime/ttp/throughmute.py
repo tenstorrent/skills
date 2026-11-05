@@ -12,7 +12,8 @@ efficiency watcher, or any observation whose text names a limit, queue or wait a
   rate (`rate_text`).
 - `review_lines`: every active mute for the daily review (source, match, count, first seen, owner),
   each throughput-class mute whose owner task is done or gone, or that has no owner, flagged as a
-  problem to fix that day.
+  problem to fix that day; one whose done or gone owner's end probe names a live task moves to that
+  task instead (`probe_owner`), flagged only when its probe is broken or names no live task.
 
 Model-free; reads only the project's own database."""
 from __future__ import annotations
@@ -34,6 +35,9 @@ SOURCE_RE = re.compile(r"progress|wait[_-]?stale|lane[_-]?wait|review[_-]?stall|
 CAUSE_RE = re.compile(r"\b(?:limit(?:s|ed)?|rate[- ]limit\w*|cap(?:s|ped)?|quota\w*|queue[sd]?|queueing|queuing|"
                       r"backlog\w*|wait(?:s|ed|ing)?|stall(?:s|ed)?|throttl\w*|no progress|under[- ]?used?)\b", re.I)
 TASK_RE = re.compile(r"#(\d+)\b", re.A)
+# Task ids an end probe names: #<id> (landed:#<id>), `ttp task <project> show <id>`, `--task <id>`, `ttp eta <id>`.
+PROBE_TASK_RE = re.compile(r"(?:#|\btask\s+\S+\s+show\s+|--task[\s=]+|\beta\s+)(\d+)\b", re.A)
+LIVE_TASK_STATES = ("queued", "waiting", "blocked", "running")
 OUTSIDE_RE = re.compile(r"(?<!not )\bonly (?:the user|(?:an? |the )?(?:outside|external|third[- ]party) "
                         r"(?:party|team|service|vendor)|the vendor)\b[^.;]{0,40}?\bcan\b", re.I)
 
@@ -102,6 +106,32 @@ def match_owner(db, match):
     return {"task": ids[0], "probe": probe} if probe else {"task": ids[0]}
 
 
+def probe_owner(db, m, o):
+    """The first live task (queued, waiting, blocked or running) that mute `m`'s end probe, or its
+    owner `o`'s probe, names; None when none does or the probe is broken (its `probe_broken`)."""
+    probes = [str(m.get("end_when") or ""), str(o.get("probe") or "")]
+    if m.get("probe_broken") or not any(probes):
+        return None
+    for tid in dict.fromkeys(int(x) for x in PROBE_TASK_RE.findall("\n".join(probes))):
+        row = db.one("SELECT status FROM tasks WHERE id=?", (tid,))
+        if row and row["status"] in LIVE_TASK_STATES:
+            return tid
+    return None
+
+
+def move_owner(db, m, tid):
+    """Store task `tid` as the owner of stored mute `m` (same source, match and start), noting the old one."""
+    from .screen import MUTES_KEY, _same_mute
+    with db.tx():
+        active = db.kv(MUTES_KEY, []) or []
+        x = next((x for x in active if _same_mute(x, m["source"], m["match"]) and x.get("since") == m.get("since")), None)
+        if x is None or not (x.get("throughput") or {}).get("owner"):
+            return
+        old = x["throughput"]["owner"]
+        x["throughput"]["owner"] = {"task": tid, "moved_from": old.get("task")}
+        db.set_kv(MUTES_KEY, active)
+
+
 def vet(db: Any, source: Any, match: Any, why: Any, end_when: Any, cfg: dict | None = None,
         now: float | None = None) -> dict | None:
     """None when a mute of `source`/`match` is not throughput-class; else its owner and longest life,
@@ -154,7 +184,7 @@ def owner_text(m: dict, owner: dict | None = None) -> str:
     """The mute's owner as shown in review lines; `owner` overrides the stored one (a match-derived owner)."""
     o = owner if owner is not None else (m.get("throughput") or {}).get("owner") or {}
     if "task" in o:
-        return f"task #{o['task']}"
+        return f"task #{o['task']}" + (f" (moved from finished #{o['moved_from']})" if o.get("moved_from") else "")
     if "probe" in o:
         return f"probe `{str(o['probe'])[:80]}`"
     if "outside" in o:
@@ -195,7 +225,8 @@ def rate_text(m: dict, now: float) -> str:
 
 def review_lines(db: Any, now: float | None = None, where: Any = None) -> list[str]:
     """Each active mute, for the daily review; a throughput-class one whose owner task is done or gone,
-    or that has no owner, is flagged as a problem to fix today."""
+    or that has no owner, is flagged as a problem to fix today. One whose done or gone owner's end
+    probe names a live task moves to it instead (stored, so later reviews see the new owner)."""
     from .db import TERMINAL_TASK_STATES
     from .screen import _when, mutes
     now = time.time() if now is None else now
@@ -203,14 +234,20 @@ def review_lines(db: Any, now: float | None = None, where: Any = None) -> list[s
     for m in mutes(db, now):
         cls = marked(m)
         o = (m.get("throughput") or {}).get("owner") or {}
+        stored = bool(o)
         if cls and not o:
             o = match_owner(db, m.get("match")) or {}   # the match itself may name its owner task
         problem = ""
         if cls and "task" in o:
             row = db.one("SELECT status FROM tasks WHERE id=?", (int(o["task"]),))
             if row is None or row["status"] in TERMINAL_TASK_STATES:
-                problem = (f"PROBLEM: its owner task #{o['task']} is {'gone' if row is None else row['status']}; "
-                           f"fix the condition today or end the mute")
+                if (tid := probe_owner(db, m, o)) is not None:   # its end probe names the live task now owning it
+                    if stored:
+                        move_owner(db, m, tid)
+                    o = {"task": tid, "moved_from": o["task"]}
+                else:
+                    problem = (f"PROBLEM: its owner task #{o['task']} is {'gone' if row is None else row['status']}; "
+                               f"fix the condition today or end the mute")
         elif cls and not o and not m.get("end_when"):
             problem = "PROBLEM: throughput-class with no owner task or probe; give it one today or end the mute"
         first = m.get("first_seen") or min((float(c["first_at"]) for c in (m.get("conds") or {}).values()

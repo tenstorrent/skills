@@ -714,6 +714,59 @@ def test_a_match_named_owner_does_not_replace_a_stored_one_and_needs_exactly_one
     assert f"PROBLEM: its owner task #{a} is done" in line, line
 
 
+def test_a_mute_whose_done_owner_has_an_end_probe_naming_a_live_task_moves_to_it_unflagged(env):
+    p = make(env)
+    from ttp import screen as scr
+    from ttp import throughmute as tm
+    owner = p.db.add_task("switch one project", "s", status="queued")
+    nxt = p.db.add_task("roll out to the rest", "s", status="queued")
+    probe = f"ttp task proj show {nxt} | grep -q 'status: done'"
+    vet = tm.vet(p.db, "daemon:wait_stale", f"waits on #{nxt}", f"#{owner} owns the fix", probe)
+    scr.mute(p.db, "daemon:wait_stale", f"waits on #{nxt}", 12, why=f"#{owner} owns the fix",
+             end_when=probe, throughput=vet)
+    p.db.update_task(owner, status="done")
+    # The done owner's end probe names a queued task: the audit moves the mute there, with no PROBLEM.
+    [line] = [x for x in tm.review_lines(p.db) if x.startswith("daemon:wait_stale")]
+    assert f"owner task #{nxt} (moved from finished #{owner})" in line and "PROBLEM" not in line, line
+    [m] = scr.mutes(p.db)
+    assert m["throughput"]["owner"]["task"] == nxt, m   # stored: the next review reads the new owner
+    [line] = [x for x in tm.review_lines(p.db) if x.startswith("daemon:wait_stale")]
+    assert f"owner task #{nxt}" in line and "PROBLEM" not in line, line
+    # Each probe form names it: landed:#<id>, --task <id>, ttp eta <id>; waiting, blocked and running count.
+    for form, status in (("landed:#{}", "waiting"), ("ttp landed --task {}", "blocked"), ("ttp eta {}", "running")):
+        t = p.db.add_task("live", "s", status=status)
+        assert tm.probe_owner(p.db, {"end_when": form.format(t)}, {}) == t, (form, status)
+    # Once the new owner is done too and the probe names no other live task, it is flagged.
+    p.db.update_task(nxt, status="done")
+    [line] = [x for x in tm.review_lines(p.db) if x.startswith("daemon:wait_stale")]
+    assert f"PROBLEM: its owner task #{nxt} is done" in line, line
+
+
+def test_a_mute_whose_done_owner_has_no_probe_naming_a_live_task_or_a_broken_one_is_still_flagged(env):
+    p = make(env)
+    from ttp import screen as scr
+    from ttp import throughmute as tm
+    owner = p.db.add_task("owner", "s", status="queued")
+    done = p.db.add_task("finished", "s", status="done")
+    live = p.db.add_task("live", "s", status="queued")
+    cases = {"daemon:progress": f"ttp task proj show {done} | grep -q 'status: done'",   # names only a done task
+             "daemon:wait_stale": "test -e /tmp/flag",                                    # names no task
+             "daemon:review_stall": f"ttp task proj show 999{live}0 | grep -q done",     # names a task that does not exist
+             "daemon:job_underuse": f"ttp task proj show {live} | grep -q 'status: done'"}   # broken below
+    for src, probe in cases.items():
+        vet = tm.vet(p.db, src, "stalled", f"#{owner} owns the fix", probe)
+        scr.mute(p.db, src, "stalled", 12, why=f"#{owner} owns the fix", end_when=probe, throughput=vet)
+    p.db.update_task(owner, status="done")
+    assert scr.mute_probe_broken(p.db, "daemon:job_underuse", "stalled", cases["daemon:job_underuse"], "exit 2")
+    # A number that is not a task id (a port, a size) names no task: `x 123` is not a task form.
+    assert tm.probe_owner(p.db, {"end_when": f"curl -s localhost:{live} | grep -q {live}"}, {}) is None
+    lines = tm.review_lines(p.db)
+    for src in cases:
+        [line] = [x for x in lines if x.startswith(src)]
+        assert f"PROBLEM: its owner task #{owner} is done" in line, line
+    assert all(m["throughput"]["owner"] == {"task": owner} for m in scr.mutes(p.db))
+
+
 def test_mute_escalates_once_when_a_muted_condition_persists(env):
     p = make(env)
     from ttp import coordinator as coord
