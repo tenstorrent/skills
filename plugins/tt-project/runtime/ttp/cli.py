@@ -2223,12 +2223,16 @@ def cmd_note(a) -> None:
 
 def print_update() -> bool:
     """Print the run's unread coordinator update (steer.md), marking it read: how a worker whose
-    provider has no hook gets it, at each `ttp note` and `ttp steer`. Only in a worker's own run
-    (TTP_RUN_DIR), never in a model-free completion. True when one was printed."""
+    run has no hook gets it, at each `ttp note` and `ttp steer`. Only in a worker's own run
+    (TTP_RUN_DIR), never in a model-free completion or a `ttp detach` job (its output goes to a log
+    the worker may never read), and never once the run's hook runs (hook.hooked): the hook hands it
+    to the worker itself, never to a subagent, which could run `ttp note` too. True when one was printed."""
     run_dir = os.environ.get("TTP_RUN_DIR")
-    if not run_dir:
+    if not run_dir or os.environ.get("TTP_DETACHED"):
         return False
-    from .hook import take_update
+    from .hook import hooked, take_update
+    if hooked(Path(run_dir)):
+        return False
     try:
         text = take_update(Path(run_dir))
     except OSError:
@@ -2239,10 +2243,18 @@ def print_update() -> bool:
 
 
 def cmd_steer(a) -> None:
-    """`ttp steer`: print the coordinator's unread update for this run, if any (see print_update)."""
-    if not os.environ.get("TTP_RUN_DIR"):
+    """`ttp steer`: print the coordinator's unread update for this run, if any (see print_update).
+    On a run whose hook runs it prints none: the hook hands it over after this very call, to the
+    worker only (a subagent's `ttp steer` would otherwise take it)."""
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not run_dir:
         die("ttp steer only works inside a tt-project run")
-    if not print_update():
+    from .hook import hooked
+    if os.environ.get("TTP_DETACHED"):
+        print("ttp steer: a detached job gets no updates; the worker does")
+    elif hooked(Path(run_dir)):
+        print("this run's hook hands any update over after each tool call, this one included")
+    elif not print_update():
         print("no new update for your task")
 
 

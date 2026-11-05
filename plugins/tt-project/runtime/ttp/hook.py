@@ -6,7 +6,10 @@ Claude Code calls it after every tool use. Codex (where its hooks are on) sends 
 fields and takes the same replies; providers/codex.py passes it per run. If the coordinator has changed the task since the
 worker started (it appends to `$TTP_RUN_DIR/steer.md`), the new part is handed to the worker as
 added context, once. Workers on providers without hooks get it printed by `ttp note` and `ttp steer`
-(take_update); either way steer.offset marks it read and steer.reads records when.
+(take_update); either way steer.offset marks it read and steer.reads records when. The hook's first
+tool event in a run writes HOOKED_FILE there: from then on `ttp note` and `ttp steer` leave updates
+to the hook (Codex may run without it, so this is known per run, not per provider). A Bash call's
+PreToolUse comes before the command, so the marker exists before a worker's first `ttp note` runs.
 
 Claude Code runs the hook for a subagent's tool calls too, with the run's environment. An update
 handed over there would reach the subagent as text inside one of its command outputs, an order
@@ -94,6 +97,22 @@ from typing import Callable
 STEER_FILE = "steer.md"
 OFFSET_FILE = "steer.offset"
 READS_FILE = "steer.reads"
+HOOKED_FILE = "steer.hooked"   # this run's hook hands updates over (see the module docstring)
+TOOL_EVENTS = ("PreToolUse", "PostToolUse", "PostToolUseFailure")
+
+
+def hooked(run_dir: Path) -> bool:
+    """Whether this run's hook has run, so it, not `ttp note` or `ttp steer`, hands updates over."""
+    try:
+        return (run_dir / HOOKED_FILE).exists()
+    except OSError:
+        return False
+
+
+def mark_hooked(run_dir: Path) -> None:
+    """Record that this run's hook runs (once; a lost marker only lets `ttp note` print an update)."""
+    if not hooked(run_dir):
+        (run_dir / HOOKED_FILE).touch()
 
 
 def unread_update(run_dir: Path) -> tuple[str, int]:
@@ -129,8 +148,8 @@ def update_context(text: str) -> str:
 
 
 def take_update(run_dir: Path) -> str:
-    """The unread update as handed to the worker, marked read; "" when there is none. For providers
-    with no hook: `ttp note` and `ttp steer` print it (cli.print_update)."""
+    """The unread update as handed to the worker, marked read; "" when there is none. For runs
+    whose hook does not run: `ttp note` and `ttp steer` print it (cli.print_update)."""
     text, offset = unread_update(run_dir)
     if not text:
         return ""
@@ -1888,6 +1907,11 @@ def main(argv: list[str]) -> int:
     handler = HANDLERS.get(event or payload.get("hook_event_name") or "")
     if not handler:
         return 0
+    if (event or payload.get("hook_event_name")) in TOOL_EVENTS and (run_dir := os.environ.get("TTP_RUN_DIR")):
+        try:
+            mark_hooked(Path(run_dir))
+        except OSError:
+            pass
     try:
         out, delivered = handler(payload)
         if out:

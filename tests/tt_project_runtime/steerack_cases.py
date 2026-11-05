@@ -76,6 +76,44 @@ def test_ttp_note_prints_no_update_outside_a_worker_run(env, monkeypatch, capsys
     assert "PINEAPPLE" not in capsys.readouterr().out and not (run / OFFSET_FILE).exists()
 
 
+def test_ttp_note_takes_no_update_in_a_detached_job_or_where_the_hook_runs(env, monkeypatch, tmp_path, capsys):
+    # A detached job's `ttp note` prints into its own log, and a subagent's (the hook skips subagents)
+    # into the subagent's output: neither may mark the worker's update read.
+    from ttp import cli, coordinator as coord, hook, steerack
+    from ttp.hook import HOOKED_FILE, OFFSET_FILE, unread_update
+    p = make(env)
+    p.set_config("steer.ack_after_s", 60)
+    _, _, run = _steer_run(env, monkeypatch, p, "cursor")
+    coord._append_update(run / "steer.md", "Also say PINEAPPLE.", "k1")
+    t0 = time.time()
+    os.utime(run / "steer.md", (t0, t0))
+    runs = lambda: p.db.q("SELECT * FROM runs WHERE status='running'")
+    assert len(steerack.check(p.db, p.config(), runs(), {}, t0 + 61)) == 1
+    monkeypatch.setenv("TTP_DETACHED", "1")
+    cli.main(["note", "job step done"])
+    cli.main(["steer"])
+    assert "PINEAPPLE" not in capsys.readouterr().out and not (run / OFFSET_FILE).exists()
+    steerack.check(p.db, p.config(), runs(), {}, t0 + 62)
+    assert [e["status"] for e in p.db.q("SELECT * FROM events WHERE kind=?", (steerack.KIND,))] == ["queued"]
+    monkeypatch.delenv("TTP_DETACHED")
+    # The run's hook runs (its first tool event, a subagent's too, marks the run): `ttp note` and
+    # `ttp steer` leave the update to it, and the hook hands it to the worker's own next tool call.
+    for event, extra in (("PreToolUse", {"agent_id": "sub1"}), ("PostToolUse", {"agent_id": "sub1"})):
+        monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(
+            {"hook_event_name": event, "tool_name": "Bash", "tool_input": {"command": "ttp note x"}, **extra})))
+        hook.main(["hook", event])
+    assert (run / HOOKED_FILE).exists() and "PINEAPPLE" not in capsys.readouterr().out
+    cli.main(["note", "subagent step done"])
+    cli.main(["steer"])
+    out = capsys.readouterr().out
+    assert "PINEAPPLE" not in out and "hook hands any update over" in out, out
+    assert "PINEAPPLE" in unread_update(run)[0]
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps(
+        {"hook_event_name": "PostToolUse", "tool_name": "Bash", "tool_input": {"command": "ls"}})))
+    hook.main(["hook", "PostToolUse"])
+    assert "PINEAPPLE" in capsys.readouterr().out and unread_update(run)[0] == ""
+
+
 def test_an_unread_update_raises_one_event_after_the_delay_and_none_once_read(env, monkeypatch):
     from ttp import coordinator as coord, steerack
     from ttp.hook import take_update

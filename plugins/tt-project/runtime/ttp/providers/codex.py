@@ -29,8 +29,8 @@ Claude Code (`tool_name` "Bash", `tool_input.command`) and takes the same deny a
 replies, so workers get `ttp.hook` through `-c hooks.*` keys, never a file under `~/.codex`. Codex
 runs a hook only once its hash is trusted, and silently skips a `-c` hook that is not, so the hook
 needs `--dangerously-bypass-hook-trust`. That flag trusts every hook of the run, so it is passed
-only when no other hook source exists (hook_sources); otherwise the worker reads steer.md between
-steps, as before.
+only when no other hook source exists (hook_sources); otherwise the worker gets coordinator updates
+from `ttp note` and `ttp steer` (cli.print_update), which leave them to the hook in a run where it runs.
 
 Per-run plugins: not possible. Codex loads a plugin only from its install cache under
 `$CODEX_HOME/plugins/cache` (`codex plugin add` copies it there); enabling a local marketplace's

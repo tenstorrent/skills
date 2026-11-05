@@ -2539,6 +2539,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `ttp doctor` line saying workers run without them.
 - Coordinator updates reach a running worker on every provider: through the hook after a tool call
   (Claude Code, Codex where the hook runs), else printed by the worker's next `ttp note` or `ttp steer`.
+  Where the hook runs (known per run), `ttp note` and `ttp steer` leave updates to it, so a subagent never
+  takes one; a `ttp detach` job's `ttp note` never takes one either.
   One still unread after `steer.ack_after_s` (300 s; 0: off) raises one `steer_unread` event to the
   coordinator, naming the task and the update; it is marked handled once the worker reads it.
 - Not yet on Cursor: worker plugins, worker isolation, and isolation of coordinator turns from your own CLI config and MCP servers. Cursor
