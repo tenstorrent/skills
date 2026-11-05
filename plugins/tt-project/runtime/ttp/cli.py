@@ -11780,7 +11780,8 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("selfchange", help="the coordinator's self-changes and per-wake metrics; review: measure "
                                           "the due ones, keep those that helped, revert the rest")
-    s.add_argument("action", nargs="?", choices=("list", "review"), default="list")
+    s.add_argument("action", nargs="?", choices=("list", "review"), default="list",
+                   help="list (default): the self-changes and recent wake metrics; review: settle the due ones")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_selfchange)

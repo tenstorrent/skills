@@ -23,7 +23,6 @@ only general fixes go upstream to tt-project). Model-free throughout:
   recorded too (MISSES), goes upstream with its numbers."""
 from __future__ import annotations
 
-import fcntl
 import json
 import os
 import re
@@ -149,12 +148,11 @@ def _miss_path():
 
 
 def _note_miss(name: str, cls: str, now: float) -> None:
+    from . import project
     path = _miss_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
-    with os.fdopen(fd, "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)   # every project of this user appends here
-        f.write(json.dumps({"ts": now, "project": name, "cls": cls}, sort_keys=True) + "\n")
+    # every project of this user appends here: one O_APPEND write per line keeps lines whole
+    project.durable_append(path, json.dumps({"ts": now, "project": name, "cls": cls}, sort_keys=True) + "\n")
 
 
 def projects_with(cls: str, now: float | None = None) -> set[str]:
