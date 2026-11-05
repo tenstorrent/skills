@@ -93,7 +93,11 @@ Plan:
 - the freeze map does not cover every parameter and module input under the
   recipe;
 - the roofline target has no derivation, mixes forward-only FLOPs with a training
-  step, omits dX or dW, or ignores recompute the memory budget forces;
+  step, omits required dX or dW, counts frozen dW as useful work, or ignores recompute cost;
+- LoRA MFU counts only trainable parameters, recompute inflates useful FLOPs, TP duplicates the
+  numerator, or the nominal denominator uses an assumed rather than actual compute grid;
+- the inventory omits available reusable training paths, gives no reason for decomposing a
+  compatible fused kernel, or lacks forward/backward layouts and per-rank program-config choices;
 - the memory budget omits optimiser state, saved activations at the target
   sequence length, or workspace, or draws no recompute conclusion;
 - the plan has no hardware-ceiling section: no clock ladder with telemetry, no limits and firmware
@@ -111,8 +115,11 @@ Composite bring-up:
 - PCC is reported without relative error, or a tensor passes PCC with a visible
   bias in relative error;
 - the loss comparison has no stated tolerance or no torch trajectory;
-- a backward op allocates or writes a gradient for an input the freeze map marks
-  frozen;
+- a backward op computes, allocates, writes or reduces a gradient the freeze map does not require,
+  or detaches a frozen module whose input gradient is required;
+- the first-baseline checks lack evidence: constant preparation repeats per step, a selected
+  program config never executes on shard shapes, or redundant conversions/host reads are deferred
+  without a concrete need for new kernel work;
 - the baseline MFU was taken with profiler environment variables set, or the
   MFU FLOP count differs from the plan's;
 - `doc/perf_analysis.md` lacks the ranked cost table or the table lacks op
@@ -127,7 +134,9 @@ Composite bring-up:
   match ran on one chip instead of the layout, or the loss script can end without a log and still
   count as a pass;
 - the baseline row has no telemetry (settled clock, critical chip) or the host/dispatch gap was
-  computed from profiler cycles at the nominal clock.
+  computed from profiler cycles at the nominal clock;
+- compilation/warmup is timed as steady training, or a settling time/clock trend is presented as
+  sustained MFU without a settled measurement window or a transient label.
 
 Optimisation loop:
 

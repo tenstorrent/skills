@@ -50,6 +50,11 @@ The three [goal templates](../../prompts/train_bringup_multigoal) run in order:
 2. Composite bring-up — `composite-bringup`
 3. Optimisation loop — `optimization-loop`
 
+The first baseline must already use the plan's reusable training kernels, freeze-aware backward
+paths, layouts and one-time constant preparation. Apply the
+[first-baseline checks](../composite-bringup/SKILL.md#before-accepting-the-first-baseline) before
+handing off to the loop; useful FLOPs follow the actual recipe, including frozen-base work for LoRA.
+
 `tt-device-usage` and `stage-review` provide shared requirements; `autodebug`, `autotriage` and
 `autofix` come from the dependency. Every phase ends with an independent `stage-review` that returns
 `clean-pass`; findings require repairs and re-review. Commit phase-owned changes locally; never push.

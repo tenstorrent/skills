@@ -9,8 +9,10 @@ Three phases, run in order by `scripts/multigoal` or one at a time by hand:
    roofline target at the nominal peak, memory budget, hardware ceiling (clock ladder, power cap,
    critical chip, multi-chip fit).
 2. `composite-bringup` — the full model in ttml autograd on the plan's chips, existing kernels where the
-   inventory has them, composed ops elsewhere; PCC harness on the forward and every gradient; loss
-   matches torch.
+   inventory has them, composed ops elsewhere; first-baseline checks for skipped frozen gradients,
+   one-time constant preparation, layouts and actual shard configs; PCC harness on the forward and
+   every gradient; loss matches torch. Useful FLOPs follow the recipe (including frozen-base work
+   for LoRA), and MFU uses the actual chips' nominal peak.
 3. `optimization-loop` — measure (cooled MFU with telemetry + Tracy), attribute, classify every op
    into useful math / layout / glue / wasted / dispatch, cost in wall ms/step with training
    multiplicity, take the biggest math kernel first, verify, repeat until the roofline target or

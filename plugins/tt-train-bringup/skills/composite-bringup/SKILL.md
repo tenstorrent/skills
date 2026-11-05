@@ -14,17 +14,41 @@ Implement every layer kind and the full model in ttml autograd under
 `tt-train/sources/ttml/ttml/models/<model>/`, with a training example under
 `tt-train/sources/examples/<model>_train/` that runs real steps (data, loss, optimiser) on the
 plan's chips (one chip, or the TP/DP layout of the plan's multi-chip fit section).
-Follow the kernel inventory: call an existing ttnn or ttml kernel wherever one exists, compose from
-ttml ops everywhere else. Reshapes, permutes, concats and slices are allowed in this phase; they are
-what the loop removes later. Load HF weights through a documented loader. Apply the freeze map from
-day one: every backward op takes per-input `requires_grad` flags and allocates no gradient for a frozen
-input.
+Follow the kernel inventory's selected training paths: use compatible existing fused kernels and
+program configs, compose from ttml ops where support is missing, and document why a fallback is
+needed. Load HF weights through a documented loader. Apply the freeze map from day one: per-input
+`requires_grad` must suppress the gradient computation, allocation and reduction, not merely discard
+its result. Preserve input gradients through frozen modules wherever earlier trainable parameters
+need them.
 
 Keep one layout contract from the start: activations cross module boundaries as `[B, 1, T, W]` in
 tile layout with heads merged on the last dimension. A module that needs another layout converts
 internally so the cost is visible to its owner. Putting a head axis on dimension −2 pads it to 32
 rows and every following op streams the padding; avoid it where an existing kernel allows, and
 record it where it cannot be avoided yet.
+
+## Before accepting the first baseline
+
+Correctness-first includes removing avoidable work using existing capabilities. During implementation
+and the baseline profile below, check these properties and record the evidence in `doc/composite/README.md`:
+
+- The executed backward agrees with the freeze map: no unused base-weight, norm-parameter or
+  embedding gradients, and all required activation and adapter gradients remain. Check op emission
+  as well as gradient values; a discarded dW can leave numerical tests passing.
+- Constant preparation happens once when valid: frozen embedding untilize, weight packing or
+  transposition, and position caches. Do not cache data that changes with optimiser updates or
+  inputs; include persistent copies in the memory budget.
+- Large matmuls use the selected orientation and explicit supported program configs where needed,
+  in both forward and backward at the actual shard shapes. Confirm those paths execute; a config
+  keyed only on the global shape can silently miss every TP call.
+- Explain each large matmul, collective, layout conversion and host synchronisation in a step.
+  Remove redundant conversions, repeated constant work and unnecessary host reads using existing
+  paths. Retain required communication, data/loss work and correctness checks. Necessary layout
+  ops are allowed; record their reason and measured cost for the loop.
+
+Fix violations before measuring and accepting the composite baseline. There is no universal minimum initial MFU.
+New optimisation kernels and exhaustive config sweeps belong to the loop after the baseline uses
+the planned capabilities and passes the forward, gradient and loss checks.
 
 ## PCC harness
 
@@ -62,13 +86,18 @@ its candidate. Create `doc/optimization/README.md` and `doc/perf_analysis.md` in
 [loop's document format](../optimization-loop/SKILL.md#document-format): the result table with one
 row (composite baseline), the first ranked cost table at projected full depth, and the four raw
 Tracy measurements with their fit, residuals and projection in the evidence directory.
+Record actual compute cores, participating chips, useful FLOPs and nominal peak with the baseline.
+Exclude compilation and warmup from timing, and inspect per-step time and loaded clock trends;
+if they are still settling, extend the run to report a settled window or label the result transient.
+Keep cold, warm, random-init and real-weight measurements distinct when comparing runs.
 
 ## Gate
 
 PCC harness passes for every module and layer kind on the forward and every gradient at real shapes,
 including the per-rank shard shapes when the plan's layout is multi-chip. Loss over N steps matches
 torch within tolerance at the plan's layout. Full model runs training steps on the plan's chips
-within the plan's memory budget. `doc/perf_analysis.md` exists with the baseline, the measured
-host/dispatch gap and the top-op kernel attribution. `doc/composite/README.md`
+within the plan's memory budget. The first-baseline checks above have evidence, with no frozen
+gradient work or redundant constant preparation deferred to the loop. `doc/perf_analysis.md` exists
+with the baseline, the measured host/dispatch gap and the top-op kernel attribution. `doc/composite/README.md`
 and `work_log.md` record commands, PCC and relative-error tables, perf, limitations and artefacts.
 `stage-review` returns `clean-pass`.
