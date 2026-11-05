@@ -695,6 +695,9 @@ def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_roll
     # A rollover: a new session with the whole digest.
     p.set_config("coordinator.session.rollover_tokens", 1)
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 5})
+    s, prompt, _ = wake()   # the handover wake resumes the session first, its digest a delta
+    assert s["mode"] == "resume" and s["why"] == "handover" and s["sent"].startswith("delta: ")
+    assert coordsession.HANDOVER_HEAD in prompt
     s, prompt, _ = wake()
     assert s["mode"] == "new" and s["sent"] == "full: new session" and "Since your last wake" not in prompt
     p.set_config("coordinator.session.rollover_tokens", 140000)
