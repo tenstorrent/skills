@@ -1158,6 +1158,48 @@ def test_doctor_masks_the_web_app_token_and_points_to_ttp_web(env, monkeypatch, 
     assert cli.web_line(p) == "web app: not running yet (check `ttp status`)"
 
 
+@pytest.mark.parametrize("in_run", [True, False])
+def test_ttp_web_and_connect_mask_the_web_app_token_only_in_a_worker_run(env, monkeypatch, capsys, tmp_path, in_run):
+    """A worker run (TTP_RUN_DIR set) keeps its output in its transcript, so `ttp web` (local, remote,
+    --tunnel, --tunnel --keep) and `ttp connect` print the address and the token's first 4 characters
+    there; the user's own shell still gets the full link."""
+    from ttp import cli, consent, timefmt, tunnel, web, weblink
+    if in_run:
+        monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    p = make(env)
+    p.db.set_kv("web", {"port": 18700})
+    tok = web.token(p)
+    monkeypatch.setattr(weblink, "verify", lambda url, name: ("", ""))
+    monkeypatch.setattr(cli, "need", lambda *a: p)
+    monkeypatch.setattr(cli, "status_text", lambda p: "status")
+    monkeypatch.setattr(timefmt, "in_ssh_login", lambda: True)
+    monkeypatch.setattr(cli, "resolve", lambda name: (p, None))
+    cli.main(["web", "demo"])
+    cli.main(["connect", "demo"])
+    # a remote project: --tunnel, its not-yet-open forward, and --tunnel --keep (weblink.remote)
+    rtok = "abcdef0123456789"
+    monkeypatch.setattr(cli, "resolve", lambda name: (None, {"host": "host-a", "dir": "/srv/p"}))
+    monkeypatch.setattr(cli.subprocess, "run", lambda argv, **k:
+                        subprocess.CompletedProcess(argv, 0, f"web app: http://127.0.0.1:18701/#token={rtok}\n", ""))
+    monkeypatch.setattr(cli.subprocess, "Popen", lambda *a, **k: None)
+    monkeypatch.setattr(tunnel, "installed", lambda name: None)
+    monkeypatch.setattr(tunnel, "keep", lambda *a, **k: (18801, "kept"))
+    monkeypatch.setattr(consent, "gate", lambda *a: "")
+    for argv in (["web", "demo", "--tunnel"], ["web", "demo"], ["web", "demo", "--tunnel", "--keep"]):
+        cli.main(argv)
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if l.startswith("web app")]
+    assert len(lines) == 5, out
+    if in_run:
+        assert tok not in out and rtok not in out and "#token=" not in out, out
+        note = "the full link is shown only outside worker runs"
+        assert lines[0] == lines[1] == f"web app: http://127.0.0.1:18700/ (token {tok[:4]}…; {note})", lines
+        assert all(f"(token {rtok[:4]}…; {note})" in l for l in lines[2:]), lines
+    else:
+        assert lines[0] == lines[1] == f"web app: http://127.0.0.1:18700/#token={tok}", lines
+        assert all(l.endswith(f"/#token={rtok}") for l in lines[2:]), lines
+
+
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
 def test_doctor_reports_an_unreadable_secret_store_in_one_line_and_runs_its_later_checks(env, monkeypatch, capsys):
     from ttp import cli, project

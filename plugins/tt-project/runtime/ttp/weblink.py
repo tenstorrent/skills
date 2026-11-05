@@ -12,6 +12,7 @@ broken instead, and the command exits UNVERIFIED.
 from __future__ import annotations
 
 import json
+import os
 import re
 import subprocess
 import time
@@ -67,8 +68,22 @@ def verify(url: str, name: str, waits=WAITS) -> tuple[str, str]:
     return kind, why
 
 
+def masked(url: str, note: str) -> str:
+    """The link with its access token cut to the first 4 characters, then note (where the full one is)."""
+    base, _, tok = url.partition("#token=")
+    return f"{base} (token {tok[:4]}…; {note})"
+
+
+def shown(url: str) -> str:
+    """The link as printed: in full for the user's own shell; in a worker run (TTP_RUN_DIR set) masked,
+    since its output stays in the worker's transcript and logs."""
+    if not os.environ.get("TTP_RUN_DIR"):
+        return url
+    return masked(url, "the full link is shown only outside worker runs")
+
+
 def ok_line(url: str) -> str:
-    return f"web app: {url}"
+    return f"web app: {shown(url)}"
 
 
 def bad_line(what: str, why: str, tried: list[str]) -> str:

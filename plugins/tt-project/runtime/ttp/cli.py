@@ -964,12 +964,11 @@ def _wait_for_daemon(p: Project, timeout: float = 20) -> None:
 def web_line(p: Project) -> str:
     """Doctor's web app line. Workers run doctor and its output stays in their logs and transcripts, so
     the access token shows only its first 4 characters; `ttp web` prints the full link for the user."""
-    from .weblink import link
+    from .weblink import link, masked
     url = link(p)
     if not url:
         return "web app: not running yet (check `ttp status`)"
-    base, _, tok = url.partition("#token=")
-    return f"web app: {base} (token {tok[:4]}…; the full link: `ttp web {p.name}`)"
+    return f"web app: {masked(url, f'the full link: `ttp web {p.name}`')}"
 
 
 # talking ------------------------------------------------------------------------------------------
@@ -2196,7 +2195,7 @@ def cmd_web(a) -> None:
     if kind:
         print(weblink.bad_line(kind, why, []))
         sys.exit(weblink.UNVERIFIED)
-    print(weblink.ok_line(url) if opened else f"web app (once that forward is open): {url}")
+    print(weblink.ok_line(url) if opened else f"web app (once that forward is open): {weblink.shown(url)}")
 
 
 def cmd_note(a) -> None:
