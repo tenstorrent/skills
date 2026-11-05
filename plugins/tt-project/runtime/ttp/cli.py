@@ -9190,6 +9190,8 @@ def cmd_config(a) -> None:
     hint = unknown_key_hint(a.key)
     if hint:
         die(hint)
+    if a.value == "":
+        return _config_remove(p, a.key, run)
     if a.key == "runner.pin_verify":
         from .project import pin_verify_mode
         try:
@@ -9245,12 +9247,35 @@ def cmd_config(a) -> None:
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
         _refuse_user_only_in_run(k)
+    from .project import key_type_problem
+    if why := key_type_problem(a.key, val):
+        die(why)
     try:
         from . import configwho
         p.set_config(a.key, val, by=configwho.from_env())
     except (RuntimeError, ValueError) as e:   # project.json unreadable with no last good copy; a section given one value
         die(str(e))
     print(f"{a.key} = {json.dumps(val)}")
+
+
+def _config_remove(p, key: str, run) -> None:
+    """`ttp config NAME KEY ''`: remove KEY from project.json so it reads its default again (as '' does for
+    --account settings), never store "" over a list or object. The same who-may gates as setting it."""
+    from . import configwho
+    if (key == "runner.host_commands" or "runner.host_commands".startswith(key + ".")
+            or key.startswith("runner.host_commands.")) and configwho.from_env()["by"] == "worker":
+        die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
+            "the user or the coordinator, never by a worker: name the exact command in your hand-off")
+    if run and (k := _user_only_change(p.raw_config(), key, None)):
+        _refuse_user_only_in_run(k)
+    try:
+        removed = p.unset_config(key, by=configwho.from_env())
+    except RuntimeError as e:
+        die(str(e))
+    node = p.config()
+    for part in key.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    print(f"{key} {'removed' if removed else 'was not set'}; now {json.dumps(node)}")
 
 
 def cmd_config_why(words: list[str], key: str) -> None:
@@ -12518,7 +12543,9 @@ def main(argv: list[str] | None = None) -> None:
                                       "value every project on this machine reads: ttp config --account KEY [VALUE]")
     s.add_argument("name", help="the project (inside a run: may be left out)")
     s.add_argument("key", nargs="?", help="the dotted key or section (none: every value)")
-    s.add_argument("value", nargs="?", help="the new value (none: print the current one)")
+    s.add_argument("value", nargs="?", help="the new value as JSON or plain text (none: print the current one; "
+                                            "'': remove the key so its default applies); a list or object key "
+                                            "refuses another type")
     s.add_argument("--account", action="store_true",
                    help="the account-level setting (" + ", ".join(
                        f"{sec}.{k}" for sec, ks in ACCOUNT_KEYS.items() for k in sorted(ks)) + "); '' removes it")

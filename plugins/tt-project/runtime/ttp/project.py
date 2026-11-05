@@ -700,6 +700,30 @@ def section_value_problem(dotted: str, value: Any) -> str | None:
             f"ttp config {dotted}.<key> VALUE{hint}")
 
 
+# Provider keys with no built-in default whose value is still of one JSON type (providers.<name>.<key>).
+PROVIDER_KEY_TYPES: dict[str, type] = {"write_dirs": list}
+
+
+def key_type_problem(dotted: str, value: Any) -> str | None:
+    """Why `value` cannot be saved at `dotted`: a key whose default is a list or an object (or a provider
+    key in PROVIDER_KEY_TYPES) given another JSON type, e.g. "" turning sandbox.fence_freed_commands
+    into a string. Sections are section_value_problem's. None when fine or the key has no such type."""
+    parts = dotted.split(".")
+    if _is_section(parts):
+        return None
+    want = PROVIDER_KEY_TYPES.get(parts[2]) if len(parts) == 3 and parts[0] == "providers" else None
+    if want is None:
+        node: Any = DEFAULT_CONFIG
+        for part in parts:
+            node = node.get(part) if isinstance(node, dict) else None
+        want = type(node) if isinstance(node, (list, dict)) else None
+    if want is None or isinstance(value, want):
+        return None
+    name = "a JSON list" if want is list else "a JSON object"
+    return (f"{dotted} needs {name} ({'[...]' if want is list else '{...}'}), not {json.dumps(value)[:60]}; "
+            f"nothing was written ('' removes it, back to its default)")
+
+
 def bad_sections(raw: dict) -> dict[str, Any]:
     """The sections of a project's own settings that hold no object ({dotted key: its value}): read as
     absent (layered), never kept as the last good copy, and named by config_problems and the daemon."""
@@ -1480,6 +1504,39 @@ class Project:
                 configwho.record(self.db, dotted, by, before=before, after=raw)
             except Exception:   # the setting is written; a busy or broken database only loses its setter
                 pass
+
+    def unset_config(self, dotted: str, by: dict | None = None) -> bool:
+        """Remove one key from project.json, so it reads its default again, and record who did; sections
+        it leaves empty go too. False when the key was not set (nothing written)."""
+        raw = self.raw_config()
+        if self.config_status == "unavailable":
+            raise RuntimeError(f"{self.config_path} is missing or not valid JSON and there is no last good copy: "
+                               f"restore it before changing settings")
+        before = copy.deepcopy(raw)
+        parts = dotted.split(".")
+        trail = [raw]
+        for p in parts[:-1]:
+            nxt = trail[-1].get(p)
+            if not isinstance(nxt, dict):
+                return False
+            trail.append(nxt)
+        if parts[-1] not in trail[-1]:
+            return False
+        del trail[-1][parts[-1]]
+        for i in range(len(parts) - 1, 0, -1):
+            if trail[i]:
+                break
+            del trail[i - 1][parts[i - 1]]
+        if self.config_status == "fallback":
+            self.keep_broken_config()
+        write_json(self.config_path, raw)
+        if self.established():
+            try:
+                from . import configwho
+                configwho.record(self.db, dotted, by, before=before, after=raw)
+            except Exception:   # as in set_config: the removal is written; only its setter is lost
+                pass
+        return True
 
     def keep_broken_config(self) -> None:
         """Before set_config writes the last good copy over a project.json that did not read (a hand
