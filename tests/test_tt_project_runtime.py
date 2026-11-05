@@ -27176,6 +27176,7 @@ DURABLE_EXEMPT = {
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
     ("hook.py", "OFFSET_FILE).write_text"): "a lost offset re-delivers messages, never drops one",
+    ("hook.py", 'READS_FILE, "a")'): "the read times of updates, for reports: steer.offset decides what is read",
     ("hook.py", "mark.write_text(why"): "a once-per-run marker for the no-sandbox notice: a lost one only repeats the notice",
     ("hook.py", "CHECKED_FILE).write_text"): "the result.json version last checked: a lost one only repeats the check's notice",
     ("hook.py", "STOP_BLOCKS_FILE).write_text"): "the Stop refusal count: a torn one reads as 0, and stop_hook_active still ends the run",
