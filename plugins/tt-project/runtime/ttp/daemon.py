@@ -2860,17 +2860,36 @@ class Daemon:
                                web=role == "coordinator" or web_needed(role, task))
         if read_only:   # a decision-only turn, unsandboxed unless opted in: its output goes through the action gates
             argv = prov.read_only_args(argv, on=provider_fence_on(self.cfg, provider), restrictions=restrictions)
+        session_on = role == "coordinator" and not resume and coordsession.on(self.cfg, provider)
+        session_mode = ""   # coordinator.session.mode on: this wake's coordsession.decide()
+        if session_on:   # first: a session wake's cache lifetime follows the session's own writes
+            sp = session_prompt or {}
+            key = coordsession.prefix_key(sp.get("system", system), sp.get("context", context), schema, provider)
+            try:
+                session_mode, why = coordsession.decide(
+                    self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
+                    lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
+                    guard=self.p.db.kv(coordsession.GUARD_KEY))
+            except Exception as e:   # the stateless turn is always safe
+                session_mode, why = "stateless", f"decide failed: {type(e).__name__}: {e}"[:200]
+                log(self.p, f"coordinator session {why}")
         cache_fp = None
+        session_ttl_at = None   # a session wake's start, recorded with its lifetime once launched
         if role != "coordinator" and not cache_ttl:
             cache_ttl = cachettl.worker_setting(self.cfg.get("budget") or {})
         if cache_ttl == cachettl.AUTO:
-            if prov.cache_env("1h"):
+            warm_min = (self.cfg.get("coordinator") or {}).get("cache_warm_min", cachettl.WARM_MIN)
+            if prov.cache_env("1h") and session_mode in ("new", "resume"):
+                session_ttl_at = now = time.time()
+                cache_ttl, ttl_why = cachettl.choose_session(
+                    self.p.db.kv(coordsession.KEY), session_mode, now, warm_min,
+                    lambda: cachettl.signals(self.p.db, now))
+            elif prov.cache_env("1h"):
                 cache_fp = cachettl.fingerprint(system, context, schema, model, effort,
                                                 cachettl.cli_stamp(prov.binary()))
                 now = time.time()
                 cache_ttl, ttl_why = cachettl.choose(
-                    self.p.db.kv(cachettl.KEY), cache_fp, now,
-                    (self.cfg.get("coordinator") or {}).get("cache_warm_min", cachettl.WARM_MIN),
+                    self.p.db.kv(cachettl.KEY), cache_fp, now, warm_min,
                     lambda: cachettl.signals(self.p.db, now))
             else:
                 cache_ttl, ttl_why = "1h", "the agent sets its own cache lifetime"
@@ -2883,18 +2902,7 @@ class Daemon:
         # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
         thread = ""
-        session_mode = ""   # coordinator.session.mode on: this wake's coordsession.decide()
-        if role == "coordinator" and not resume and coordsession.on(self.cfg, provider):
-            sp = session_prompt or {}
-            key = coordsession.prefix_key(sp.get("system", system), sp.get("context", context), schema, provider)
-            try:
-                session_mode, why = coordsession.decide(
-                    self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
-                    lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
-                    guard=self.p.db.kv(coordsession.GUARD_KEY))
-            except Exception as e:   # the stateless turn is always safe
-                session_mode, why = "stateless", f"decide failed: {type(e).__name__}: {e}"[:200]
-                log(self.p, f"coordinator session {why}")
+        if session_on:
             state = self.p.db.kv(coordsession.KEY)
             session_cap = None
             if session_mode == "resume":
@@ -3262,6 +3270,12 @@ class Daemon:
                 db.set_kv(cachettl.KEY, cachettl.record(db.kv(cachettl.KEY), cache_fp))
             except Exception as e:   # bookkeeping: the next turn then goes at 1h again
                 log(self.p, f"run {run_id}: prompt cache turn not recorded: {e}")
+        if session_ttl_at is not None:
+            try:   # the next session wake judges its own lifetime on this one's (cachettl.choose_session)
+                db.set_kv(coordsession.KEY, cachettl.session_record(db.kv(coordsession.KEY), session_mode,
+                                                                    cache_ttl, session_ttl_at))
+            except Exception as e:   # bookkeeping: the next session wake then goes at 1h
+                log(self.p, f"run {run_id}: session prompt cache wake not recorded: {e}")
         log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']} "
                     f"sandbox={prov.launch_sandbox(argv) or 'none'}")
         return run_id

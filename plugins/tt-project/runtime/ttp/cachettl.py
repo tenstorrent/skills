@@ -166,6 +166,10 @@ def choose(state, fp: dict, now: float, warm_min: float = WARM_MIN, signals=None
         last = max(entries.values(), key=_ts)
         changed = [k for k in PARTS if last.get(k, "") != fp.get(k, "")]
         reason = "changed since the last 1h turn: " + (", ".join(changed) or "prefix")
+    return _cold(reason, now, signals)
+
+
+def _cold(reason: str, now: float, signals) -> tuple[str, str]:
     if signals is None:
         return "1h", reason
     try:
@@ -181,6 +185,57 @@ def record(state, fp: dict, now: float | None = None) -> dict:
     entries[_key(fp)] = {"ts": time.time() if now is None else now, **{k: fp.get(k, "") for k in PARTS}}
     newest = sorted(entries.items(), key=lambda kv: _ts(kv[1]), reverse=True)[:KEEP]
     return dict(newest)
+
+
+# A persistent coordinator session (coordsession.py) caches its whole history, not only the stateless
+# prefix, so its wakes are judged on the session's own writes, kept in its kv state under SESSION:
+# {"h1": start of its last 1h wake, "ttl": its last wake's lifetime, "end": that wake's end}. A resumed
+# wake goes at 5m only while the session's last 1h write is warm and what later 5m wakes added is still
+# alive (their last one ended under TAIL_MIN ago); any other session wake rewrites history, so it goes
+# at 1h when a next wake is likely (likely_next). A new session has no write of its own yet.
+SESSION = "cache"
+TAIL_MIN = 4             # a 5m write this young (from its wake's end) is alive for the next wake's first call
+
+
+def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, signals=None) -> tuple[str, str]:
+    """(ttl, reason) for a session wake of `mode` ("new" or "resume"), given the session's kv state."""
+    st = state if isinstance(state, dict) else {}
+    c = st.get(SESSION) if isinstance(st.get(SESSION), dict) else {}
+    warm_s = _num(warm_min, WARM_MIN) * 60
+    h1 = c.get("h1")
+    if mode != "resume":
+        reason = "cold: a new session"
+    elif not isinstance(h1, (int, float)):
+        reason = "cold: no 1h write of this session"
+    elif not 0 <= now - h1 < warm_s:
+        reason = f"cold: the session last wrote at 1h {max(now - h1, 0) / 60:.0f} min ago"
+    elif c.get("ttl") == "1h":
+        return "5m", f"warm: the session wrote at 1h {(now - h1) / 60:.0f} min ago"
+    else:
+        end = c.get("end")
+        tail = now - end if isinstance(end, (int, float)) else None
+        if tail is not None and 0 <= tail < TAIL_MIN * 60:
+            return "5m", (f"warm: the session wrote at 1h {(now - h1) / 60:.0f} min ago and its last 5m "
+                          f"wake ended {tail / 60:.0f} min ago")
+        reason = "cold: the session's last 5m wake " + (f"ended {max(tail, 0) / 60:.0f} min ago"
+                                                        if tail is not None else "did not record its end")
+    return _cold(reason, now, signals)
+
+
+def session_record(state, mode: str, ttl: str, now: float) -> dict:
+    """The session's kv state once a wake of `mode` started at `ttl`: a new session starts its own."""
+    st = dict(state) if isinstance(state, dict) else {}
+    prev = st.get(SESSION) if mode == "resume" and isinstance(st.get(SESSION), dict) else {}
+    st[SESSION] = {"h1": now if ttl == "1h" else prev.get("h1"), "ttl": ttl}
+    return st
+
+
+def session_ended(state, now: float) -> dict:
+    """The session's kv state once its wake ended: a 5m write lives from the last call."""
+    st = dict(state) if isinstance(state, dict) else {}
+    if isinstance(st.get(SESSION), dict):
+        st[SESSION] = {**st[SESSION], "end": now}
+    return st
 
 
 # Agents whose prompt cache follows the session (Provider.cache_key_per_session) miss it on every
