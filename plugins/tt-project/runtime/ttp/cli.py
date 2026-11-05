@@ -6150,6 +6150,10 @@ def cmd_lock(a) -> None:
                 why = f" ({held['reason']})" if held.get("reason") else ""
                 die(f"held by pause on {L['name']}: {L['name']} is paused{why}; hand the task back as waiting "
                     "until it is resumed", 75)
+        if held_by := _ordered():
+            if waiting:
+                _end_wait()
+            die(f"refused: {held_by[1]}", 75)
 
     from . import shared
     cfg = p.config()
@@ -6166,6 +6170,24 @@ def cmd_lock(a) -> None:
     if a.shared and dev and not a.probe:   # a probe answers for the plain lock: a retry_when keeps working
         die(f"{dev['name']} is a device lock: one command at a time may use the device, so it cannot be "
             f"held shared. Use a plain `ttp lock {dev['name']} -- <command>`", 2)
+
+    # A newer user order on one of them holds a task created or last re-specified before it (userorder.py):
+    # its take (before each try, as a pause) and its probe say busy, so the task waits until it is
+    # re-specified or the order's task ends.
+    otask = str(getattr(a, "task", None) or os.environ.get("TTP_TASK") or "").strip()
+
+    def _ordered() -> tuple | None:
+        if not otask.isdigit():
+            return None
+        from . import userorder
+        ordered = userorder.holding(p.db, cfg, p.db.task(int(otask)), [L["name"] for L in todo])
+        return (ordered, userorder.line(p, otask, *ordered)) if ordered else None
+    if held_by := _ordered():
+        if a.probe:
+            print(json.dumps({"name": held_by[0][0], "free": False, "line": held_by[1], "user_order": held_by[0][2]})
+                  if a.json else held_by[1])
+            sys.exit(75)
+        die(f"refused: {held_by[1]}", 75)
 
     def _unwritable(e: OSError, L: dict) -> None:
         # Never a private lock instead: other holders would not see it. Say what is wrong.

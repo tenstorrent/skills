@@ -42,6 +42,7 @@ from . import urgentfup
 from . import topup
 from . import checksettle
 from . import checksgone
+from . import userorder
 from . import resumefirst
 from . import rejcool
 from . import stalegate
@@ -13020,7 +13021,16 @@ class Daemon:
         running tasks that fill its slots) or {"kind": "lock", "resource", "holders"} (its `ttp lock`
         slots are taken: each holder's label, pid and alive, from locks.holder_records), or with config
         locks.pre_grant_check set, {"kind": "pre_grant", "resource", "rc", "line"} (the project's own
-        check holds it, or is broken: pregrant.py)."""
+        check holds it, or is broken: pregrant.py), or {"kind": "order", "resource", "line"} (a newer user
+        order on it holds a task created or last re-specified before it: userorder.py)."""
+        try:
+            ordered = userorder.holding(self.p.db, self.cfg, task, sorted(coord.task_resources(task)))
+        except Exception as e:   # a broken order record never stops dispatch
+            log(self.p, f"task {task['id']}: user orders not read: {e}")
+            ordered = None
+        if ordered:
+            return {"kind": "order", "resource": ordered[0],
+                    "line": userorder.line(self.p, task["id"], *ordered)}
         paused = self.p.db.paused_resources().keys()
         hit = sorted(coord.task_resources(task) & paused)
         if hit:
@@ -16699,6 +16709,8 @@ def hold_reason(hold: dict | None) -> str:
         return f"{res} reserved for higher-priority task #{hold.get('task') or '?'}"
     if kind == "pre_grant":
         return hold.get("line") or f"{res} held by the project's pre-grant check"
+    if kind == "order":
+        return hold.get("line") or f"{res} held by a newer user order"
     hs = [h for h in hold.get("holders") or [] if isinstance(h, dict)]
 
     def _who(h: dict, state: str) -> str:

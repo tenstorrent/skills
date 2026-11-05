@@ -116,6 +116,7 @@ from . import schedule as sched
 from . import workernotify
 from . import provallow
 from . import hostrun
+from . import userorder
 from .db import (
     PAUSE_REMOVED_KIND,
     PAUSED_RESOURCES_KEY,
@@ -212,6 +213,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "needs_device": {"type": "boolean"}, "user_deep": {"type": "boolean"}, "standing": {"type": "boolean"},
             "continues": {"type": "integer"}, "resource": {"type": "string"}, "machine": {"type": "string"}, "paused": {"type": "boolean"},
             "user_asked": {"type": "boolean"}, "user_end": {"type": "boolean"}, "outage": {"type": "boolean"},
+            "user_msg": {"type": "integer"},
             "reason": {"type": "string"}, "supersedes": {"type": "array", "items": {"type": "string"}}, "permanent": {"type": "boolean"},
             "replaces": {"type": "string"}, "over": {"type": "string"}, "both_hold": {"type": "boolean"},
             "expires": {"type": "string"}, "until": {"type": "string"}, "until_probe": {"type": "string"},
@@ -1280,6 +1282,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append("- (none)")
     lines, shas[TASK_ROWS_SEEN_KEY] = collapse_rows(p, db, lines, rows, seen, event_ids, msg_ids, now)
     section("tasks", lines)
+    section("user_orders", userorder.digest_lines(p))
     events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
               if event_ids else [])
     # A task finishing this turn has its full hand-off under NEW EVENTS. Only a hand-off counts:
@@ -2492,6 +2495,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         batch_obls.append(oid)
                         notes.append(f"task_add: #{new_id} attached as an owner of obligation {oid}: it carries "
                                      f"an owner's work on")
+                if order := _user_order(p, a, new_id, f"{title}\n{a.get('spec') or ''}", messages):
+                    notes.append(f"task_add: #{new_id} {order}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
                 if pub:
@@ -2763,6 +2768,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if upd.get("spec"):
+                    userorder.respec(db, task["id"])
+                if upd.get("status", task["status"]) not in TERMINAL_TASK_STATES \
+                        and (order := _user_order(p, a, task["id"], spec, messages)):
+                    notes.append(f"task_update: #{task['id']} {order}")
                 if upd.get("priority") is not None and upd["priority"] != task["priority"] \
                         and (moved := chainprio.follow(db, task["id"])):
                     notes.append(f"task_update: #{task['id']} priority {upd['priority']}: its review hops follow ("
@@ -4630,6 +4640,27 @@ def without_lock_probes(probe: Any, gone: set[str], canon: Any = None) -> str | 
 
     keep = [r for r, cmd in zip(raw, steps) if not gone_lock(cmd)]
     return None if len(keep) == len(raw) else " && ".join(keep)
+
+
+def _user_order(p: Project, a: dict, task_id: int, text: str, messages: list[int] | None) -> str:
+    """Record task `task_id` as the latest user order on the resources it names (userorder.py) when the
+    action carries the user's message (`user_msg`), or a task_add's text cites one of this turn's (a
+    re-spec of an older task citing it is no new order); its note, else ""."""
+    try:
+        msg = int(a["user_msg"]) if a.get("user_msg") is not None else \
+            userorder.cited(p.db, text, messages) if a.get("type") == "task_add" else None
+    except (TypeError, ValueError):
+        msg = None
+    try:
+        names = sorted(task_resources(p.db.task(task_id) or {})) if msg else []
+        ordered = userorder.record(p.db, task_id, msg, names) if names else []
+        if not ordered:
+            return ""
+        told = userorder.steer_running(p, ordered, task_id)
+    except Exception as e:   # the task itself stands; only its order is not recorded
+        return f"is a user order (msg #{msg}) not recorded: {type(e).__name__}: {str(e)[:200]}"
+    return (f"is the latest user order (msg #{msg}) on {', '.join(ordered)}: older open tasks there are held"
+            + (f"; told running " + ", ".join(f"#{t}" for t in told) + " to stop conflicting steps" if told else ""))
 
 
 def task_resources(task: dict) -> set[str]:
