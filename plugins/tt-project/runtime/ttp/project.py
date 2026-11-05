@@ -519,11 +519,14 @@ EXTRA_KEYS = {
     # such as a repo's recovery scripts (echoes.py; default none).
     # agent_orders_as_user: the owner's own chat agent's relayed context and findings count as the owner's
     # word (relay.agent_orders; default off, set only on the owner's own message).
+    # owner_identities: names, handles or emails the owner writes external records under (tickets, chat
+    # comments), read with the project root's git user.name and user.email to verify a cited record's
+    # author (restriction_source.owner_identities; default none, set only on the owner's own message).
     # session: the persistent coordinator ({"mode": "on" | "off", default off}). With it on (coordtools.py,
     # hostcheck.py): "wake_budget_usd" and "wake_budget_s" cap one wake (default: the stateless turn's sized
     # budget and timeout), "host_access" ({alias: helper argv in the project folder | ssh config file
     # there}, default none) and "log_paths" ({name: absolute path} `ttp hostcheck log-tail` may read).
-    "coordinator": {"session", "agent_orders_as_user", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
+    "coordinator": {"session", "agent_orders_as_user", "owner_identities", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
                     "blocker_sweep_recheck_skip_h", "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
                     "progress_check", "probe_stall_dispose_h", "echo_paths",
                     "reply_terms", "reply_max_terms", "reply_soft_chars"},   # plain-reply check (plainreply.py)

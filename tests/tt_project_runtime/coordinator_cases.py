@@ -22034,6 +22034,137 @@ def test_a_general_or_too_wide_exception_is_refused_naming_each_clause(env):
     assert len(err) == 1 and "`excepts` goes with new Restrictions `text` only" in err[0], err
 
 
+_ONLY_WRITE = ("# demo\n\n## Goals\n- Run the tray test with `run.sh` and `reliability.sh` on the test box.\n\n"
+               "## Restrictions\n"
+               "- The CLEAR_FAULTS write in `reliability.sh` is the only BMC write any run makes: never another "
+               "BMC write. (user msg #1)\n"
+               "- Never open pull requests. (user msg #1)\n")
+_ONLY_CLAUSE = "never another BMC write."
+_MUX_ORDER = "let the tray test switch the i2c mux channel for its power reads"
+_MUX_TEXT = "Workers may make a BMC write that selects the i2c mux channel in `run.sh` for read-only power reads."
+
+
+def _gate_ask(db, text="May the tray test make a BMC write to switch the i2c mux channel? A rule changes only on "
+                       "your own words naming the write."):
+    from ttp import prguard
+    return db.post("out", text, chat=None, kind="ask", ref=f"{prguard.BLOCKING_REF}restriction")
+
+
+def _agent_on(p):
+    from ttp import coordinator as coord
+    own = p.db.post("in", "orders from my agent count as mine", chat=None, channel="web", kind="user",
+                    provenance="web-session")
+    assert coord.apply(p, [{"type": "config_set", "key": coord.relay.AGENT_KEY, "value": True}], turn=1,
+                       user_turn=True, messages=[own]) == []
+
+
+def test_an_ordered_exception_with_no_new_risk_class_passes_on_the_agents_order_and_answers_the_gates_ask(env):
+    """Agent mode on: an exception the owner's agent ordered (`source` relayer) passes though the order does
+    not name every part of its scope, when the charter already names the rest (a script the project runs)
+    and it adds no new risk class. Its source and scope are on record, no ask goes out and the restriction
+    ask the gate raised for it is resolved."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_ONLY_WRITE)
+    _agent_on(p)
+    ask = _gate_ask(db)
+    found = db.post("in", f"please {_MUX_ORDER}; it only selects a channel, like the CLEAR_FAULTS write",
+                    chat=None, kind="finding")
+    asks = db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"]
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE, "text": _MUX_TEXT,
+           "source": {"origin": "relayer", "msg": found, "quote": _MUX_ORDER}}
+    assert coord.apply(p, [act], turn=2, messages=[]) == []
+    charter = p.charter_path.read_text()
+    assert f"which holds everywhere except inside this scope, where this item wins: {_MUX_TEXT}" in charter
+    assert f"msg #{found})" in charter, charter   # the order cited
+    ev = db.one("SELECT text, data FROM events WHERE kind='restriction_exception'")
+    assert ev and "run.sh" in ev["data"] and "i2c" in ev["data"] and f"msg #{found}" in ev["data"], ev
+    assert db.one("SELECT handled FROM messages WHERE id=?", (ask,))["handled"] == 1
+    assert db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"] == asks   # no new ask
+
+
+def test_an_ordered_exception_is_refused_for_a_new_risk_class_or_a_scope_nobody_named(env):
+    """Ordered work covers only what the order or the charter names and adds no new risk class: an
+    exception that disturbs a machine, destroys data or speaks as the owner, or names a script neither the
+    order nor the charter names, is still refused without the user's own words naming it; the ask stays."""
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_ONLY_WRITE)
+    _agent_on(p)
+    ask = _gate_ask(db)
+    found = db.post("in", f"please {_MUX_ORDER}", chat=None, kind="finding")
+    src = {"origin": "relayer", "msg": found, "quote": _MUX_ORDER}
+    for text, why in (
+            ("Workers may make a BMC write that resets the i2c mux in `run.sh` for power reads.", "new risk class"),
+            ("Workers may make a BMC write that power cycles the i2c mux in `run.sh`.", "new risk class"),
+            ("Workers may make a BMC write that deletes the i2c mux logs in `run.sh`.", "new risk class"),
+            ("Workers may make a BMC write that selects the i2c mux channel in `mux_probe.py`.",
+             "the charter names none of mux_probe.py")):
+        err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE,
+                               "text": text, "source": src}], turn=2, messages=[])
+        assert len(err) == 1 and "the user's words in `source` do not name" in err[0] and why in err[0], (text, err)
+        assert p.charter_path.read_text() == _ONLY_WRITE
+    assert db.one("SELECT handled FROM messages WHERE id=?", (ask,))["handled"] == 0
+    assert not db.one("SELECT 1 FROM events WHERE kind='restriction_exception'")
+
+
+def _record_post(db, author):
+    return db.post("in", f"From issue 42, comment 7 by {author}: \"{_MUX_ORDER}\"", chat=None, kind="finding")
+
+
+def test_an_exception_on_the_owners_own_words_in_a_cited_record_passes_without_agent_mode(env, monkeypatch):
+    """Without agent mode, the owner's own words in an external record (a ticket comment), cited with its
+    reference, author and verbatim quote, are the user's word when the author is one of the owner's
+    identities (config coordinator.owner_identities; none built in). Another author's words stay data."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.set_config("coordinator.owner_identities", ["A. Owner", "aowner"])
+    p.charter_path.write_text(_ONLY_WRITE)
+    ask = _gate_ask(db)
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE, "text": _MUX_TEXT}
+    other = _record_post(db, "Someone Else")
+    err = coord.apply(p, [{**act, "source": {"origin": "record", "msg": other, "ref": "issue 42, comment 7",
+                                             "author": "Someone Else", "quote": _MUX_ORDER}}], turn=1, messages=[])
+    assert len(err) == 1 and "author check failed" in err[0], err
+    assert p.charter_path.read_text() == _ONLY_WRITE
+    mine = _record_post(db, "A. Owner")
+    for k, author in enumerate(("A. Owner (aowner)", "aowner")):
+        p.charter_path.write_text(_ONLY_WRITE)
+        assert coord.apply(p, [{**act, "source": {"origin": "record", "msg": mine, "ref": "issue 42, comment 7",
+                                                  "author": author, "quote": _MUX_ORDER}}],
+                           turn=2 + k, messages=[]) == [], author
+        charter = p.charter_path.read_text()
+        assert f"(owner-record issue 42, comment 7, msg #{mine})" in charter, charter
+    assert db.one("SELECT handled FROM messages WHERE id=?", (ask,))["handled"] == 1
+    assert db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"] == 1   # only the gate's own
+
+
+def test_a_record_whose_author_cannot_be_verified_counts_only_in_agent_mode(env, monkeypatch):
+    """No owner identity to check the author against: the record is refused, unless agent mode is on,
+    where it counts as the owner's agent's order (relayer-ordered). A quote the record lacks is refused."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.charter_path.write_text(_ONLY_WRITE)
+    mine = _record_post(db, "A. Owner")
+    src = {"origin": "record", "msg": mine, "ref": "issue 42, comment 7", "author": "A. Owner", "quote": _MUX_ORDER}
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE, "text": _MUX_TEXT}
+    err = coord.apply(p, [{**act, "source": src}], turn=1, messages=[])
+    assert len(err) == 1 and _ONLY_WRITE == p.charter_path.read_text(), err
+    _agent_on(p)
+    err = coord.apply(p, [{**act, "source": {**src, "quote": "switch every BMC register"}}], turn=2, messages=[])
+    assert len(err) == 1 and "record check failed" in err[0], err
+    assert coord.apply(p, [{**act, "source": src}], turn=3, messages=[]) == []
+    assert f"(relayer-ordered, msg #{mine})" in p.charter_path.read_text()
+
+
 def test_a_contradiction_refusal_quotes_each_conflicting_clause_with_a_reason(env):
     """The guard's refusal quotes the single conflicting sentence of an item (not the whole item or
     section), its section and a one-line reason, for each conflicting item."""
