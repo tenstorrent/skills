@@ -232,12 +232,12 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "milestones": {"type": "array", "items": {"type": "object", "properties": {
                 "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
                 "due": {"type": ["number", "string"]}, "evidence_required": {"type": "string"}},
-                "required": ["key", "due", "evidence_required"]}}},
+                "required": ["key", "due", "evidence_required"]}},
             "order": {"type": "integer"}, "action_class": {"type": "string", "enum": list(obligations.ORDER_CLASSES)},
             "due": {"type": ["number", "string"]}, "start_by": {"type": ["number", "string"]},
             "claims": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"}, "task": {"type": "integer"}, "action": {"type": "integer"},
-                "expect": {"type": "string"}, "due": {"type": ["number", "string"]}}, "required": ["text"]}},
+                "expect": {"type": "string"}, "due": {"type": ["number", "string"]}}, "required": ["text"]}}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
