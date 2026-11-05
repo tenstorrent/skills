@@ -1353,6 +1353,10 @@ class Daemon:
         defaults) and says so in one alert, which clears once the file reads again."""
         raw, status = self.p.read_config()
         self.cfg = layered(raw)
+        # The process sandbox for checks, off unless the project turns it on: this daemon's own check
+        # runs read it here, its workers from their environment (start_run).
+        from . import sandbox as process_sandbox
+        os.environ[process_sandbox.ENV] = "1" if (self.cfg.get("sandbox") or {}).get("checks") is True else "0"
         if status != self.cfg_status:
             log(self.p, {"ok": "project.json reads again",
                          "fallback": "project.json is missing or not valid JSON: its last good copy stays in force",
@@ -2985,6 +2989,7 @@ class Daemon:
                     tmp = run_dir / "tmp"
                     tmp.mkdir(exist_ok=True)
                 tmp_env = {var: str(tmp) for var in ("TMPDIR", "TMP", "TEMP")}
+                tmp_env["TTP_SANDBOXED"] = "1"   # privlock.sandboxed_run
                 if prov.fence_by_name:
                     tmp_env["TTP_FENCE_BY_NAME"] = "1"
             if mcp_servers:
@@ -3048,6 +3053,7 @@ class Daemon:
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
+                   "TTP_CHECK_SANDBOX": os.environ.get("TTP_CHECK_SANDBOX", "0"),   # sandbox.opted_in
                    # Tests run straight in its shell take at most one run's share of the host's test slots.
                    **(testslots.worker_env(self.cfg) if role in ("worker", "reviewer") else {}),
                    # A worker's sandbox may run commands in a PID namespace or cgroup of their own, which

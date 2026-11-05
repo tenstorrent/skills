@@ -9,7 +9,9 @@ The same events carry the account's plan windows (`rate_limits`), so a running r
 with each model call; the app-server meter, read every few minutes, covers the time between.
 
 Write fence (from the docs; Codex was not installed where this was probed). Workers run in
-`workspace-write`, so they are fenced: they write their cwd, temp dirs and `writable_args` roots.
+`danger-full-access` by default: no sandbox. A project that sets `providers.codex.write_fence: true`, or
+has the no_internet restriction, runs them in `workspace-write` (fence_args): they write their cwd, temp
+dirs and `writable_args` roots.
 
 | Question | Linux | macOS |
 | :- | :- | :- |
@@ -284,6 +286,21 @@ class Codex(Provider):
 
     def write_fence(self, restrictions=None) -> str:
         return ""   # workspace-write: Seatbelt on macOS, bubblewrap or the bundled helper on Linux
+
+    fence_optional = True   # workspace-write only on request (providers.codex.write_fence) or under no_internet
+
+    def fence_args(self, argv, dirs, cwd="", on=True, restrictions=None, freed=()):
+        if on or (restrictions or {}).get("no_internet") or "workspace-write" not in argv:
+            return super().fence_args(argv, dirs, cwd, on, restrictions, freed)
+        argv = list(argv)
+        argv[argv.index("workspace-write")] = "danger-full-access"
+        i = next((k for k, w in enumerate(argv) if w == "sandbox_workspace_write.network_access=true"), None)
+        if i is not None and argv[i - 1] == "-c":
+            del argv[i - 1:i + 1]
+        return argv, False
+
+    def fenced(self, on=True, restrictions=None):
+        return on or bool((restrictions or {}).get("no_internet"))
 
     def _events(self, output_path: Path):
         try:

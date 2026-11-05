@@ -225,7 +225,8 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
                              str(record), *cmd],
                             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
-                            pass_fds=(lock.fileno(),), preexec_fn=privlock.no_new_privs_preexec())
+                            pass_fds=(lock.fileno(),),
+                            preexec_fn=privlock.no_new_privs_preexec() if privlock.sandboxed_run() else None)
     # Inherited on purpose, unlike a `ttp lock` command's locks: the job lock means "a process of this job
     # lives", even one that left its group, and jobstop finds and ends those through it (jobstop._free).
     # Every reader takes the .rc first, so a leftover never makes an ended job look running; the kernel

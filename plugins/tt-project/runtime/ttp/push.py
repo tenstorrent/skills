@@ -585,7 +585,7 @@ def sandbox_lines(checks: list) -> list[str]:
     """What a run of `checks` says about its process sandbox: why there is none (once), and each
     local check that opted out. Nothing when every local check runs in one."""
     local = [c for c in checks if not remote_host(c)]
-    off = [c for c in local if getattr(c, "sandbox", True) is False]
+    off = [c for c in local if getattr(c, "sandbox", True) is False] if sandbox.opted_in() else []
     lines = [notice for notice in [sandbox.notice()] if notice and len(off) < len(local)]
     return lines + [f"{c}: {sandbox.notice(False)}" for c in off]
 

@@ -6265,9 +6265,9 @@ def cmd_lock(a) -> None:
     a.probe = a.probe or a.json
     if not cmd and not a.probe:
         die("usage: ttp lock [--disruptive] <resource> -- <command...>  |  ttp lock --probe <resource>")
-    if cmd and in_run():
+    from . import privlock
+    if cmd and in_run() and privlock.sandboxed_run():
         # Freed from the sandbox for the lock only: a privileged command goes through `ttp host-run`.
-        from . import privlock
         if why := privlock.refusal(cmd):
             die(why, 2)
         privlock.no_new_privs()
@@ -11214,7 +11214,8 @@ def cmd_doctor(a) -> None:
     for line in hostrun.sudo_prefix_warnings((p.config().get("runner") or {}).get("host_commands")):
         print(f"host-run: {line}")
     from . import sandbox
-    print(f"process sandbox for checks: {sandbox.notice() or 'on (own PID namespace per check command)'}")
+    print("process sandbox for checks: " + (sandbox.notice() or ("on (own PID namespace per check command)"
+          if sandbox.opted_in() else "off (default; project.json sandbox.checks true turns it on)")))
     from .project import config_problems
     for line in config_problems(p.raw_config(), p.root):
         print(f"project.json: {line}")
@@ -11715,8 +11716,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --, that returns once a slot is free")
     s.set_defaults(fn=cmd_pool_wait)
 
-    s = sub.add_parser("sandbox", help="run a command (a test suite) in its own PID namespace, where it cannot see "
-                                       "or signal other processes; nothing it starts outlives it")
+    s = sub.add_parser("sandbox", help="run a command (a test suite); in its own PID namespace only where the project "
+                                       "turned it on (sandbox.checks) or, under TTP_NO_DEVICE=1, to hide device nodes")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_sandbox)
 

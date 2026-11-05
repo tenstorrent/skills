@@ -881,6 +881,8 @@ def lock_privileged(cmd: str) -> str | None:
     refused: `ttp lock` itself refuses it (privlock.py), and a privileged command goes through `ttp host-run`.
     A lock inside `ttp host-run -- ...` is the daemon's, under host-run's allowlist (hostrun.unlocked)."""
     from . import privlock
+    if not privlock.sandboxed_run():
+        return None   # an unsandboxed run may run sudo itself
     for seg in _segments(cmd, strip=False):
         i = next((j for j, w in enumerate(seg) if os.path.basename(w) == "ttp" and seg[j + 1:j + 2] == ["lock"]), None)
         if i is not None and any(os.path.basename(w) == "ttp" and seg[j + 1:j + 2] == ["host-run"]

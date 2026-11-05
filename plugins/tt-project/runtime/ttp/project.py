@@ -465,7 +465,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # The project's own host-reaching commands (a script in its harness bin/ that wraps ssh), which a
     # fenced Claude worker runs outside the Bash sandbox as a simple command, as it runs ssh (fencefree.py):
     # each a name in bin/ or {command, env: [VAR, ...]} (also frees `VAR=... name ...`).
-    "sandbox": {"fence_freed_commands": []},
+    # checks: run check and test commands in their own PID namespace (sandbox.py); off by default.
+    "sandbox": {"fence_freed_commands": [], "checks": False},
     # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
@@ -592,8 +593,8 @@ EXTRA_KEYS = {
     "failover": {"standby", "fleet", "lease_remote", "lease_ttl_s", "allow_delivery_remote"},
 }
 OPEN_SECTIONS = {"resources"}           # any name below is fine
-# write_fence: false runs the provider's workers without its optional write fence (Claude's Bash
-# sandbox, Provider.fence_args); default on where the host can run it.
+# write_fence: true runs the provider's workers in its optional write fence (Claude's Bash sandbox, Codex's
+# workspace-write, Provider.fence_args) where the host can run it; off by default (providers.fence_on).
 # loopback_ports: extra host loopback ports fenced workers reach (loopproxy.ports_env), or false for none.
 # write_dirs: extra directories inside the project root fenced workers may write (write_dirs below).
 PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_fence", "mcp_servers", "mcp_withheld",

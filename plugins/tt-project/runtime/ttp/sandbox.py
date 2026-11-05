@@ -1,7 +1,12 @@
 """A process sandbox for check and test commands: `ttp sandbox -- <cmd...>`, and every check the
 runtime runs (push.check_argv).
 
-The command runs in a PID namespace of its own with a private /proc, so it sees only its own process
+Off by default: commands run as they are, unsandboxed, and see the host's processes, network and sudo.
+A project turns it on with project.json `sandbox.checks: true` (the daemon passes TTP_CHECK_SANDBOX=1 to
+its runs and checks). One case stays on by default, the device gate: a run that holds no device
+(TTP_NO_DEVICE=1) on a host with device nodes still runs its commands in the sandbox that hides them.
+
+When on, the command runs in a PID namespace of its own with a private /proc, so it sees only its own process
 tree: a kill, pkill or os.kill aimed at any other pid on the host reaches nothing, and every process
 it started ends with it. Network, files, environment, working directory and exit code stay as they
 are. It needs unprivileged user namespaces and util-linux `unshare` or bubblewrap `bwrap`; where
@@ -33,6 +38,13 @@ SETTINGS = (("kernel.apparmor_restrict_unprivileged_userns", "1",
             ("user.max_user_namespaces", "0", "set it above 0"))
 SYSCTL_DIR = Path("/proc/sys")
 _STATE: dict[str, tuple[list[str] | None, str]] = {}   # by PATH: what status() found
+ENV = "TTP_CHECK_SANDBOX"   # "1": the project turned the process sandbox on (sandbox.checks)
+
+
+def opted_in(env: dict | None = None) -> bool:
+    """Whether the project turned the process sandbox on (TTP_CHECK_SANDBOX=1 in `env`, default this
+    process's environment)."""
+    return (os.environ if env is None else env).get(ENV, "").strip() == "1"
 
 
 def _tools() -> list[tuple[str, list[str]]]:
@@ -126,10 +138,11 @@ def _visible(paths: list[str]) -> bool:
 
 
 def wrap(argv: list[str], on: bool = True, env: dict | None = None) -> list[str]:
-    """`argv` run in a sandbox where one works and `on`; as it is otherwise or when already in one
-    that hides what this run must not see. `env` is the command's environment (default this process's)."""
+    """`argv` run in a sandbox where one works, `on`, and the project opted in (opted_in) or device
+    nodes must be hidden (device_nodes); as it is otherwise or when already in one that hides what this
+    run must not see. `env` is the command's environment (default this process's)."""
     hide = device_nodes(env) if on else []
-    if not on or (inside() and not _visible(hide)):
+    if not on or not (hide or opted_in(env)) or (inside() and not _visible(hide)):
         return list(argv)
     pre, _ = status()
     if not pre:
@@ -143,7 +156,10 @@ def wrap(argv: list[str], on: bool = True, env: dict | None = None) -> list[str]
 
 
 def notice(on: bool = True) -> str:
-    """One line for a run's output when its commands run without the sandbox; "" when they run in one."""
+    """One line for a run's output when its commands run without the sandbox it should have; "" when
+    they run in one, or by default (the project did not opt in and no device nodes are to be hidden)."""
+    if not opted_in() and not device_nodes():
+        return ""
     if not on:
         return ("sandbox off (\"sandbox\": false): this check sees and can signal every process of "
                 "this user on the host")

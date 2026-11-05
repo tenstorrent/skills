@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""A worker's `ttp lock <res> -- <cmd...>` is no way around `ttp host-run`'s allowlist.
+"""A sandboxed worker's `ttp lock <res> -- <cmd...>` is no way around `ttp host-run`'s allowlist.
 
+Only a run the daemon started in a sandbox (TTP_SANDBOXED=1: the project opted into its provider's write
+fence, providers.<name>.write_fence) gets any of this; by default runs are unsandboxed and sudo works.
 The Claude provider frees `ttp lock *` from the Bash sandbox by name (providers/claude.py FENCE_EXCLUDED)
 so that a wrapped ssh or broker command reaches its host. Only the lock's take and release need that; a
 privileged command a worker runs goes through `ttp host-run` (config runner.host_commands). So, for a
@@ -35,6 +37,7 @@ VALUE_OPTS = {"-u", "--unset", "-C", "--chdir", "-s", "--signal", "-k", "--kill-
               "-c", "--class", "-p", "--pid", "-a", "--arg-file", "-I", "-E", "-d", "--delimiter", "-L",
               "-P", "--max-procs", "-w", "--wait", "-i", "-o", "-e"}
 PR_SET_NO_NEW_PRIVS = 38
+SANDBOXED_ENV = "TTP_SANDBOXED"   # set by the daemon in a run it started in a sandbox
 HOST_RUN_HINT = ("a privileged command a worker runs goes through `ttp host-run -- <command...>` (config "
                  "runner.host_commands), never `ttp lock`: the lock only takes and releases the resource. "
                  "Wrap host-run in the lock if it needs the resource: `ttp lock <res> -- ttp host-run -- <command...>`; "
@@ -218,6 +221,11 @@ def _prctl():
         return ctypes.CDLL(None, use_errno=True).prctl
     except (OSError, AttributeError):
         return None
+
+
+def sandboxed_run(env: dict | None = None) -> bool:
+    """Whether `env` (default this process's) belongs to a run the daemon started in a sandbox."""
+    return (os.environ if env is None else env).get(SANDBOXED_ENV, "").strip() == "1"
 
 
 def no_new_privs() -> bool:

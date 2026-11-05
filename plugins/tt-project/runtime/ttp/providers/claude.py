@@ -5,10 +5,10 @@ plan windows (utilization as a 0..1 fraction plus reset times), per-message usag
 `result` with the reported cost, the last message and any schema-validated output.
 
 Write fence (probed on CLI 2.1.285 and 2.1.296; Linux measured, macOS from the docs). Workers run
-with bypassPermissions and, where the sandbox can start (Linux with bubblewrap and socat, macOS), the
-Bash sandbox (fence_args, sandbox_settings): Bash writes only its cwd, the CLI's own temp dir and the
-`filesystem.allowWrite` roots. `providers.claude.write_fence: false` turns it off. Without a
-dependency the run goes unfenced, as before, and the daemon raises one observation.
+with bypassPermissions and no sandbox by default. A project that sets `providers.claude.write_fence: true`
+gets, where the sandbox can start (Linux with bubblewrap and socat, macOS), the Bash sandbox (fence_args,
+sandbox_settings): Bash writes only its cwd, the CLI's own temp dir and the `filesystem.allowWrite` roots.
+Without a dependency that run goes unfenced and the daemon raises one observation.
 
 Measured on CLI 2.1.296 (Linux): only one `--settings` flag counts (a second replaced the first, sandbox
 and all), so the sandbox goes into the worker's settings JSON. Under bypassPermissions in `-p` the

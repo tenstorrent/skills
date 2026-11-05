@@ -31,5 +31,7 @@ def all_providers() -> list[Provider]:
 
 
 def fence_on(cfg: dict, name: str) -> bool:
-    """Whether the project leaves provider `name`'s write fence on (providers.<name>.write_fence)."""
-    return ((cfg.get("providers") or {}).get(name) or {}).get("write_fence", True) is not False
+    """Whether the project turned provider `name`'s optional write fence on (providers.<name>.write_fence
+    true). Off by default: workers run without an OS sandbox (no bwrap, no network or PID namespace, sudo
+    works); locks, device holds, pauses, spend caps, checks, review and Restrictions are the gates."""
+    return ((cfg.get("providers") or {}).get(name) or {}).get("write_fence") is True
