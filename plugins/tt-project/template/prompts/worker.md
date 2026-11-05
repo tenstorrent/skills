@@ -64,8 +64,7 @@
 
 Other workers run other tasks of this project concurrently.
 
-- Edit only in your own working directory; another repository: your own `git worktree` of it, in
-  `$TTP_RUN_DIR/<name>`, never under `$TMPDIR` (removed when the run ends).
+- Edit only in your own working directory; another repository: your own `git worktree` of it.
   Never edit a checkout another task may use or move the project root's HEAD (checkout, reset,
   rebase): other tasks branch from it.
 - Change a script (harness scripts, hooks, checks) by writing a temp file beside it and renaming
