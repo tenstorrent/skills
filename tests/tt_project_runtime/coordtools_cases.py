@@ -446,7 +446,7 @@ def test_the_answer_check_runs_through_the_coordinator_hook_entry_point(env, tmp
     assert out["permissionDecision"] == "deny" and "no task #424242" in out["permissionDecisionReason"]
 
 
-def _settings(argv):
+def _coord_settings(argv):
     return json.loads(argv[argv.index("--settings") + 1])
 
 
@@ -459,7 +459,7 @@ def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypat
         "the read-only turn's Edit/Write deny goes"
     allowed = argv[argv.index("--allowedTools") + 1:argv.index("--allowedTools") + 10]
     assert {"StructuredOutput", "Bash", "Edit", "Write"} <= set(allowed)
-    s = _settings(argv)
+    s = _coord_settings(argv)
     assert s["hooks"]["PreToolUse"][0]["hooks"][0]["command"].endswith("CoordPreToolUse")
     assert s["hooks"]["PostToolUse"][0]["hooks"][0]["command"].endswith("CoordPostToolUse")
     assert s["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"].endswith("CoordPostToolUseFailure")
@@ -472,7 +472,7 @@ def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypat
     for cfg in ({"mode": "on", "tools": "read_only"}, {"mode": "on", "tools": "everything"}):
         argv, _, _, _ = _coord_argv(env, monkeypatch, cfg)
         assert argv[argv.index("--tools") + 1] == "Read,Bash", cfg
-        assert "TTP_COORD_FULL_TOOLS" not in _settings(argv)["env"]
+        assert "TTP_COORD_FULL_TOOLS" not in _coord_settings(argv)["env"]
     monkeypatch.setattr(coordsession, "decide", lambda *a, **k: ("stateless", "test"))
     argv, _, _, _ = _coord_argv(env, monkeypatch, {"mode": "on"})
     assert argv[argv.index("--tools") + 1] == "Read,Bash"
