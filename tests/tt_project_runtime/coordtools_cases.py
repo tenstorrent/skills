@@ -603,19 +603,42 @@ def test_full_tools_coordinator_lands_nothing_and_moves_no_tag(tmp_path, monkeyp
     for cmd in ("ttp push --queue", "ttp push --free", "ttp push --result /r/m", "ttp push --result /r/m --pushed",
                 "ttp task demo add 'push the fix'"):
         assert _decide(tmp_path, "Bash", command=cmd) == "allow", cmd
-    # `ttp push` itself, past the hook's text check: by the full-tools variable or the run's role.
-    from ttp import cli, coordtools
-    for var, val in ((coordtools.FULL_ENV, "1"), (coordtools.ROLE_ENV, "coordinator")):
-        monkeypatch.delenv(coordtools.FULL_ENV, raising=False)
-        monkeypatch.setenv(var, val)
-        monkeypatch.delenv("TTP_TASK", raising=False)
-        for args in (["push"], ["push", "--detach"], ["push", "--land"], ["push", "--own"],
-                     ["push", "--move-tag", "t", "c"], ["push", "--free", "--move-tag", "t", "c"],
-                     ["push", "--marker", "m"], ["push", "--batch", "m"]):
-            with pytest.raises(SystemExit) as e:
-                cli.main(args)
-            assert e.value.code not in (0, None), (var, args)
-        monkeypatch.delenv("TTP_PUSH_LAND", raising=False)
+
+
+def test_ttp_push_refuses_every_landing_form_in_a_coordinator_run(env, tmp_path, monkeypatch, capsys):
+    # `ttp push` itself, past the hook's text check: by the full-tools variable or the run's role. A
+    # throwaway project (by TTP_PROJECT, or by the cwd), never the caller's, and every path that would
+    # push, move a tag or prepare a worktree fails the test if it is reached.
+    from ttp import batch, channeltag, cli, coordtools, push, worktree
+    p = make(env)
+
+    def reached(*a, **k):
+        raise AssertionError(f"a push path ran in a coordinator run: {a}")
+    for mod, name in ((push, "run"), (push, "detach"), (push, "run_detached"), (push, "free"),
+                      (channeltag, "move"), (batch, "run_batch"), (worktree, "prepare")):
+        monkeypatch.setattr(mod, name, reached)
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    for by_cwd in (False, True):
+        if by_cwd:
+            monkeypatch.delenv("TTP_PROJECT", raising=False)
+            monkeypatch.chdir(p.base)
+        else:
+            monkeypatch.setenv("TTP_PROJECT", str(p.base))
+            monkeypatch.chdir(tmp_path)
+        for var, val in ((coordtools.FULL_ENV, "1"), (coordtools.ROLE_ENV, "coordinator")):
+            monkeypatch.delenv(coordtools.FULL_ENV, raising=False)
+            monkeypatch.delenv(coordtools.ROLE_ENV, raising=False)
+            monkeypatch.setenv(var, val)
+            for args in (["push"], ["push", "--detach"], ["push", "--land"], ["push", "--own"],
+                         ["push", "--move-tag", "t", "c"], ["push", "--free", "--move-tag", "t", "c"],
+                         ["push", "--marker", "m"], ["push", "--batch", "m"]):
+                capsys.readouterr()
+                with pytest.raises(SystemExit) as e:
+                    cli.main(args)
+                assert e.value.code not in (0, None), (by_cwd, var, args)
+                assert coordtools.PUSH_REFUSAL in capsys.readouterr().err, (by_cwd, var, args)
+            monkeypatch.delenv(push.LAND_ENV, raising=False)
+            monkeypatch.delenv(push.OWN_BRANCH_ENV, raising=False)
     monkeypatch.setenv(coordtools.ROLE_ENV, "worker")
     monkeypatch.delenv(coordtools.FULL_ENV, raising=False)
     assert not coordtools.coordinator_run()
