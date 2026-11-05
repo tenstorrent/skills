@@ -26,3 +26,5 @@ code +155: urgent work sets a retry or deadline wake at the expected finish from
 system +155: urgent work sets a retry or deadline wake at the expected finish from `ttp eta`, never a padded worst case
 question +155: urgent work sets a retry or deadline wake at the expected finish from `ttp eta`, never a padded worst case
 every +155: urgent work sets a retry or deadline wake at the expected finish from `ttp eta`, never a padded worst case
+code +265: a waiting hand-off lists the later waits of a known sequence in `then`, passed model-free
+every +265: a waiting hand-off lists the later waits of a known sequence in `then`, passed model-free
