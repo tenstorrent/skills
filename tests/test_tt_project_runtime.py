@@ -17102,7 +17102,7 @@ def test_a_coordinator_turn_replayed_after_a_crash_writes_its_files_once(env, tm
     cdir = tmp_path / "coordinator"
     cdir.mkdir()
     (cdir / "output.jsonl").write_text(json.dumps({"actions": [
-        {"type": "reply", "text": "noted"},
+        {"type": "reply", "text": "noted", "no_order": "a memory and charter note"},
         {"type": "memory_add", "text": "X holds", "memory_kind": "fact"},
         {"type": "charter_update", "section": "Restrictions", "text": "Never do Y.",
          "source": {"msg": mid, "quote": "never do Y"}},
@@ -47975,7 +47975,7 @@ def _turn_budget_rig(p, monkeypatch, cost_of, flaky=lambda note: False):
         p.db.x("UPDATE runs SET status=?, ended=?, cost_usd=? WHERE id=?",
                ("ok" if ok else "failed", time.time(), min(cost, cap), rid))
         err = "" if ok else "boom" if other else "error_max_budget_usd: Reached maximum budget"
-        usage = SimpleNamespace(structured={"actions": [], "summary": "ok"} if ok else None, final_text="", error=err,
+        usage = SimpleNamespace(structured={"actions": [{"type": "noop", "no_order": "test backlog"}], "summary": "ok"} if ok else None, final_text="", error=err,
                                 extra={"subtype": "success" if ok else "error" if other else "error_max_budget_usd"})
         d._finish_coordinator({"id": rid, "dir": "", "provider": "fake"}, usage, "ok" if ok else "failed", note)
         return rid
