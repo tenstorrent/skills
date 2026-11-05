@@ -233,8 +233,10 @@ prolonged whole-box outage.
   the full resolved worktree path the same way, never a bare `t<id>`.
   A harness task's checks also get the daemon's verdict on whether its commits land:
   `TTP_HARNESS_LANDING` is `merged` (in the harness HEAD), `lands` (on the task's branch
-  `ttp/harness-t<id>`, which fast-forwards the harness HEAD: the daemon merges it when the run ends) or
-  `refused` (no harness commit named, one on neither line, or a branch that does not fast-forward),
+  `ttp/harness-t<id>`, which fast-forwards the harness HEAD: the daemon merges it when the run ends),
+  `none` (a `commit` of `none: <why>` with no commit on that branch the harness HEAD lacks: a valid
+  no-change hand-off) or `refused` (no harness commit named, one on neither line, a `none:` hand-off
+  whose branch still holds unmerged commits, or a branch that does not fast-forward),
   with `TTP_HARNESS_LANDING_WHY` saying what the worker can do. A harness-landed check should fail only
   on `refused`: a worker's sandbox cannot write the harness checkout, so it can never merge there itself.
 - A task that has ended (done, failed, cancelled, exhausted) can still leave processes behind. Its own

@@ -411,6 +411,36 @@ def test_a_diverged_harness_branch_or_an_unknown_commit_is_refused_with_steps_th
     assert got == "refused" and f"neither in the harness HEAD nor on branch ttp/harness-t{tid}" in why
 
 
+def test_a_harness_hand_off_with_commit_none_lands_as_no_change_unless_its_branch_holds_unmerged_work(env):
+    from ttp import harnesstree
+    p = make(env)
+    tid, own, log = _hc_harness(env, p)
+    none = {"status": "done", "summary": "nothing to change", "commit": "none: already fixed upstream"}
+    # (a) no branch commits beyond HEAD: a valid no-change landing, which a harness-landed check passes
+    assert harnesstree.handoff_landing(p, dict(p.db.task(tid), result=json.dumps(none))) == (
+        "none", "already fixed upstream")
+    for odd in ("None: already fixed upstream", "  none:already fixed upstream"):
+        got = harnesstree.handoff_landing(p, dict(p.db.task(tid), result=json.dumps(dict(none, commit=odd))))
+        assert got == ("none", "already fixed upstream"), odd
+    assert harnesstree.handoff_landing(p, dict(p.db.task(tid), result=json.dumps(dict(none, commit="none:"))))[0] == "none"
+    t = _hc_hand_off(env, p, tid, none)
+    assert t["status"] != "queued", t["result"]
+    assert log.read_text().splitlines() == ["none|already fixed upstream"]
+    # a bare "none" or a "none" buried elsewhere is no no-change claim: still refused
+    for res in ({"commit": "none"}, {"commit": "nothing: none: x"}, {"summary": "commit none: x"}):
+        got, why = harnesstree.handoff_landing(p, dict(p.db.task(tid), result=json.dumps(res)))
+        assert got == "refused" and "names no commit of the harness" in why, res
+    # (b) the branch holds a commit HEAD lacks: refused, so that work is not lost
+    _commit_in_harness_tree(own, "prompts/extra.md", "more\n", "prompt")
+    sha = _hgit(own, "rev-parse", "HEAD").strip()
+    got, why = harnesstree.handoff_landing(p, dict(p.db.task(tid), result=json.dumps(none)))
+    assert got == "refused" and f"ttp/harness-t{tid} has 1 commit(s) the harness HEAD lacks" in why
+    # (c) a real commit behaves as before
+    task = dict(p.db.task(tid), result=json.dumps({"status": "done", "summary": "x", "commit": sha}))
+    assert harnesstree.handoff_landing(p, task)[0] == "lands"
+    assert harnesstree.handoff_landing(p, dict(task, result=json.dumps({"commit": "deadbeefdeadbeef"})))[0] == "refused"
+
+
 def test_a_harness_landed_verdict_is_given_only_to_harness_tasks_checks(env):
     p = make(env)
     log = env["tmp"] / "kinds.log"

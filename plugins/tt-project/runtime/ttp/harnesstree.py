@@ -287,8 +287,10 @@ def handoff_landing(p: Project, task: dict) -> tuple[str, str]:
     why) when each named commit the harness has is in its HEAD; ("lands", why) when some are only on the
     task's branch and that branch fast-forwards HEAD (land merges it once the run ended: the worker's
     sandbox cannot write the harness checkout), also when the branch holds commits HEAD lacks beyond the
-    named ones; ("refused", what the worker can do) for no named commit the harness has, one on neither,
-    or a branch that neither fast-forwards HEAD nor is in it; ("", "") with no
+    named ones; ("none", why) for a `commit` of "none: <why>" (nothing needed changing) while the task's
+    branch has no commit HEAD lacks; ("refused", what the worker can do) for no named commit the harness
+    has, one on neither, a "none:" hand-off whose branch still holds commits HEAD lacks (that work would be
+    lost), or a branch that neither fast-forwards HEAD nor is in it; ("", "") with no
     harness repo. Unlike merged_commit, which lets dependents start, "lands" is not merged yet."""
     if not _is_repo(p):
         return "", ""
@@ -302,6 +304,15 @@ def handoff_landing(p: Project, task: dict) -> tuple[str, str]:
                                         "HEAD").returncode == 0   # merged already, the harness moved on
     if has_b and not fwd and not behind:
         return "refused", f"branch {b} does not fast-forward the harness HEAD: {rebase}"
+    from .db import load_result
+    commit = str(load_result(task.get("result")).get("commit") or "").strip()
+    if commit[:5].lower() == "none:":
+        ahead = unmerged(p, task["id"])
+        if ahead == 0:
+            return "none", commit[5:].strip() or "nothing needed changing"
+        return "refused", (f"the hand-off's `commit` is \"none:\" but branch {b} has "
+                           f"{'commits' if ahead < 0 else f'{ahead} commit(s)'} the harness HEAD lacks: name "
+                           f"its head commit in `commit` so the daemon merges it, or drop them from {b} (in {own})")
     found, lands = [], False
     for c in named_commits(task):
         full = _git(p.harness, "rev-parse", "--verify", "-q", f"{c}^{{commit}}")
