@@ -1551,14 +1551,17 @@ def test_ttp_lock_is_free_once_its_command_ends_though_a_process_it_left_running
     try:
         assert first.wait(timeout=60) == 0, first.stderr.read()
         bg_pid = int(pidf.read_text())
+        ended = _cmd_end_waiter(bg_pid)   # it waits for go: alive until then
         assert not _cmd_ended(bg_pid, timeout=0.2), "the background process should still run"
         if sys.platform.startswith("linux"):
             assert "board.0.lock" not in fds.read_text(), fds.read_text()   # not inherited by the command
         r = _lock_probe(run_env, "board")
         assert r.returncode == 0, r.stdout
+        assert not _cmd_ended(bg_pid, timeout=0), "the lock was free only once the background process ended"
     finally:
         go.touch()
-    assert _cmd_ended(bg_pid)
+    # A pidfd, not a 30 s poll: a loaded full suite held the ended loop up past that poll (a flaky fail).
+    assert ended()
 
 
 def test_a_waiting_ttp_lock_logs_who_sent_it_sigterm_and_still_exits_143(env, tmp_path):
