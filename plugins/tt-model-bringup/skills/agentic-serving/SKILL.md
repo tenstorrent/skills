@@ -89,8 +89,8 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
   per batch and stage 11 measures a profile for each surviving one;
 - `release_spec`, optional: where the release values come from. Without it, find the release
   configuration for each eval yourself, in the release workflow and the serving harness;
-- `stage_budget_hours` (default 24 for `light`, 48 for `full`), covering survey to the end of the
-  release run, and `release_hours` (default 12);
+- `stage_budget_hours` (default 24 for `light`, 48 for `full`), covering survey to the start of the
+  release run, and `release_hours` (default 12), the release run's own limit after that;
 - `permissions`: standing decisions the stage would otherwise stop to ask for, such as
   `release_route_repairs` (may the stage publish fixes to the release route) and
   `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
@@ -116,23 +116,25 @@ stage must not depend on them. Record what was actually used in `doc/agentic_eva
   measured runs, and per suite the largest task list that finishes within `release_hours` on one
   machine: the full suite when it fits. The final step runs those lists, one suite after another.
 
-Both modes end holding the last rung they banked; a mode that cannot reach its goal reports how
+The release run starts before the stage time limit ends and may finish after it, within
+`release_hours`. Both modes end holding the last rung they banked; a mode that cannot reach its goal reports how
 far it got with `functional_at` and the estimate that stopped it.
 
 ### Time
 
 The device is the scarce resource and the clock is fixed. Manage both.
 
-- **Plan the clock first.** In `plan.json`, write the schedule: survey, rungs, efforts, and the
-  release run with its estimated length and the latest time it may start. Nothing may take that
-  reserve. Update the plan after every run with measured times.
+- **Plan the clock first.** In `plan.json`, write the schedule: survey, rungs, efforts and the
+  start of the release run, which must fall inside the stage time limit, with the release run's
+  estimated length. Leave time before that start to prepare and check its configuration. Update
+  the plan after every run with measured times.
 - **One job on the device at a time, and always one.** Queue the next device job before the
   current one ends. While a long run holds the device, agents analyse, write code and prepare the
   next job; they do not sleep waiting for it.
 - **Estimate before running, compare after.** Every run gets a predicted duration from the last
   measured run; record predicted against measured and correct the next estimate by the ratio.
 - **Stop what cannot finish.** When a run's progress projects past its slot or past the release
-  reserve, stop it and keep its partial results. A run with no model calls for 30 minutes is
+  start, stop it and keep its partial results. A run with no model calls for 30 minutes is
   stalled: look at why before waiting longer.
 - **Count device time from the queue log**, by the jobs that held the device. A server left up
   between jobs is not effort time.
@@ -230,7 +232,7 @@ tests do not.
 
 Test size grows one rung at a time, so each problem a larger run could hit shows on the smallest
 list that reveals it. A suite moves up a rung when it scored validly on the current one and the
-time measured there projects the next rung inside the time left before the release reserve.
+time measured there projects the next rung to finish before the release run must start.
 
 1. **Survey and preflight, about 2 h.** Answer every check and calculation in
    [the survey](references/survey.md) on the stage-11 data and one smoke run at release limits.
@@ -252,8 +254,8 @@ time measured there projects the next rung inside the time left before the relea
 6. **Combine, about 2 h.** Re-check the current best, then one scored probe.
 7. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
    `release_hours`.
-8. **Release run**, through the same route every earlier run used, inside the reserve the plan
-   kept for it: in `light` the mid-size lists of all suites within `release_hours` in total, in
+8. **Release run**, started before the stage time limit and allowed to finish after it, within
+   `release_hours`, through the same route every earlier run used: in `light` the mid-size lists of all suites within `release_hours` in total, in
    `full` each suite's largest fitting list. An infrastructure failure is run again.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
