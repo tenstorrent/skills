@@ -29,6 +29,12 @@ def _read(p: Project, name: str, on: set[str] | None = None) -> str:
     return strip_markers(f.read_text()) if on is None else feature_blocks(f.read_text(), on)
 
 
+def _raw(p: Project, name: str) -> str:
+    """Harness prompt `name` as written, fences and all, for _sections to pick its blocks."""
+    f = p.harness / "prompts" / name
+    return f.read_text() if f.exists() else ""
+
+
 def strip_markers(text: str) -> str:
     """`text` without its `<!-- ttp:... -->` / `<!-- /ttp:... -->` lines. They fence a block (such as
     kind-review.md's result rule) so a project's own wording of it merges as one unit on upgrades;
@@ -151,11 +157,25 @@ REVIEW_PUSH_SECTIONS = ("## Pushing a reviewed change", "## Approving into the p
 OWN_SECTION = "## Publishing onto its own PR branch"   # kind-review.md's `ttp push --own` section
 
 
+SPLIT_MARK = "{{split_lines}}"   # kind-code.md's split threshold, filled in from chains.split_lines
+
+
+def split_lines(cfg: dict) -> int:
+    """chains.split_lines: the non-test lines past which a code worker splits its change; 0 when off or unreadable."""
+    try:
+        return max(0, int((cfg.get("chains") or {}).get("split_lines") or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def _sections(text: str, cfg: dict) -> str:
     """A kind prompt without the push section that does not apply: the plain push's or the queue's,
-    the `ttp push --own` advice while own pushes are off (delivery.own_push), and its upstream note
-    rules while this project does not read the upstream inbox (upstream.ingest)."""
-    text = feature_blocks(text, {"upstream_ingest"} if (cfg.get("upstream") or {}).get("ingest") else set())
+    the `ttp push --own` advice while own pushes are off (delivery.own_push), its upstream note
+    rules while this project does not read the upstream inbox (upstream.ingest), and its split rule
+    while chains.split_lines is off (else with that threshold filled in)."""
+    n = split_lines(cfg)
+    on = ({"upstream_ingest"} if (cfg.get("upstream") or {}).get("ingest") else set()) | ({"split_lines"} if n else set())
+    text = feature_blocks(text, on).replace(SPLIT_MARK, str(n))
     text = drop_section(text, REVIEW_PUSH_SECTIONS[0 if push_queue_on(cfg) else 1])
     return own_off(drop_section(text, OWN_SECTION)) if own_push(cfg) == "off" else text
 
@@ -845,7 +865,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                  "workers, so do not install into it; its editable installs import the project root's code, not "
                  "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
     parts = [
-        _sections(_read(p, f"kind-{kind}.md"), cfg),
+        _sections(_raw(p, f"kind-{kind}.md"), cfg),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"
         f"kind: {kind} · tier: {task['tier']}" + (f" · this run: {run_tier} wake" if wake else "")

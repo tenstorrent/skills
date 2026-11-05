@@ -1350,3 +1350,40 @@ def test_a_done_hand_off_whose_continue_only_waits_is_refused(env):
     path.write_text(json.dumps({"status": "waiting", "summary": "x" * 40, "retry_when": "true",
                                 "followups": [{"title": "continue: wait for checks", "spec": "s"}]}))
     assert not (hook.handoff_problem(path) or "").count(chaincap.WAITS_ONLY_HINT)
+
+
+def test_split_lines_defaults_to_200_and_reads_0_when_off_or_unreadable(env):
+    """chains.split_lines, the code worker's split threshold, ships a generic default; off or junk reads 0."""
+    from ttp.project import DEFAULT_CONFIG as DEFAULTS
+    from ttp.prompts import split_lines
+    p = make(env)
+    assert DEFAULTS["chains"]["split_lines"] == 200 and split_lines(p.config()) == 200
+    for bad in (0, None, "x", -5, [1]):
+        assert split_lines({"chains": {"split_lines": bad}}) == 0
+    assert split_lines({}) == 0 and split_lines({"chains": None}) == 0
+
+
+def test_a_code_worker_is_told_to_split_past_the_configured_line_count_into_separately_reviewed_parts(env):
+    """kind-code.md's split rule renders chains.split_lines into a code worker's prompt and asks for parts
+    each reviewed on their own: a follow-up waiting on this task's landing, never a `continue:` hop or a
+    split/wip mark (chaincap: a split head skips its review and the chain's last hop reviews everything).
+    Off (0), the rule and its marker are gone; no worker gets an unfilled placeholder."""
+    from ttp.prompts import SPLIT_MARK, _sections, worker_prompt
+    p = make(env)
+    tid = p.db.add_task("code: a big change", "do it", kind="code", origin="user")
+    on = " ".join(worker_prompt(p, p.db.task(tid), str(p.root), None).split())
+    assert "would pass about 200 non-test lines goes in parts" in on and SPLIT_MARK not in on
+    assert "`start_when` is `landed:#<your task id>`" in on and "no `continue:` title, no `continues`" in on
+    assert "Never mark a part `split` or `wip`" in on and "ttp:if" not in on
+    p.set_config("chains.split_lines", 350)
+    assert "about 350 non-test lines" in " ".join(worker_prompt(p, p.db.task(tid), str(p.root), None).split())
+    p.set_config("chains.split_lines", 0)
+    off = worker_prompt(p, p.db.task(tid), str(p.root), None)
+    assert "non-test lines goes in parts" not in off and SPLIT_MARK not in off
+    raw = (RUNTIME.parent / "template" / "prompts" / "kind-code.md").read_text()
+    assert SPLIT_MARK in raw and SPLIT_MARK not in _sections(raw, {"chains": {"split_lines": "junk"}})
+    # The follow-up the rule asks for is no split: the part is reviewed now, not carried to a hop.
+    from ttp import chaincap
+    fup = {"title": "code: part 2 of a big change", "spec": "the rest", "start_when": f"landed:#{tid}"}
+    assert chaincap.post_landing(fup, tid) and not chaincap.code_hop(fup, tid)
+    assert not chaincap.marked_split({"summary": "Part 1 of 2 done; part 2 is a follow-up."})

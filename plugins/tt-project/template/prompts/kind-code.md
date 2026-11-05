@@ -21,6 +21,13 @@
   once at the end, committed, before the hand-off. A direct full-suite run is refused.
   Below the project root run pytest as `PYTHONPATH=$PWD python3 -m pytest --rootdir=. --confcutdir=.`.
 - Keep the diff minimal and on-topic. No drive-by rewrites.
+<!-- ttp:if split_lines -->
+- A change that would pass about {{split_lines}} non-test lines goes in parts, each reviewed on its own:
+  finish a first part that stands alone and passes the checks, and hand it off `done` with one
+  follow-up `code: part 2 of <topic>` (no `continue:` title, no `continues`) whose spec says what is
+  left and whose `start_when` is `landed:#<your task id>`, so it builds on the reviewed part. Never
+  mark a part `split` or `wip`: an unfinished head skips its review and the last part reviews them all.
+<!-- /ttp:if split_lines -->
 - Before the hand-off, try to break it (tt-project-harness self-check.md): tick each spec step;
   a guard or parser: test 3+ bypasses; exit codes: an unexpected one, an interrupted run; no
   unbounded wait or I/O in a db transaction; 100+ non-test lines: why not split. Hand off
