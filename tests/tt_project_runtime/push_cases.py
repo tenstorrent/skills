@@ -14738,6 +14738,51 @@ def test_a_push_check_time_limit_leaves_out_its_running_shards_waits_for_test_po
     assert 1400 <= t < 1410, t   # 900 s run + 500 s of shard pool waits
 
 
+def test_a_push_check_time_limit_keeps_out_a_pool_wait_whose_waiter_died_before_closing_it(monkeypatch, tmp_path):
+    """A shard's `ttp pool-wait` killed mid-wait leaves its record open with no live waiter, which then counts
+    nothing in checkwait.state; the push still never counts the time it saw that wait as run time. So a check
+    that waited 1300 s for a pool slot and ran 200 s passes under a 900 s limit (it was ended at once with
+    '1300 s run, 0 s waiting' before), and one whose own run goes past the limit is still ended at it, its
+    message giving the same counted seconds the decision used."""
+    from ttp import checkwait, locks, push
+
+    def run(name, ends_at):
+        clock = [1000.0]
+        monkeypatch.setattr(push.time, "time", lambda: clock[0])
+        monkeypatch.setattr(push, "check_limit_s", 900.0)
+        monkeypatch.setattr(push, "check_queue_s", 60.0)
+        monkeypatch.setattr(push, "pool_wait_s", 4 * 3600.0)
+        waits = tmp_path / name
+        pool = waits / checkwait.POOL
+        pool.mkdir(parents=True)
+        locks.record_wait(pool, "shard-1", 1000.0, None)   # this process holds its live lock
+
+        def die():   # the waiter is gone, its record still open
+            os.close(locks._WAITS_HELD.pop((str(pool), "shard-1")))
+        proc = _ClockCheck(clock, 1000.0 + ends_at, at={2300.0: die})
+        monkeypatch.setattr(push, "_kill_tree", lambda pid: setattr(proc, "killed", True))
+        said = []
+        rc = push._timed_wait(proc, waits, "run-shards", said.append)
+        assert checkwait.state(waits, 1000.0, clock[0])[0] == 0.0   # the record alone counts nothing now
+        return rc, "\n".join(said), clock[0] - 1000.0
+
+    rc, said, _ = run("a", 1500)
+    assert rc == 0 and "ran past its limit" not in said, said
+    rc, said, t = run("b", 5000)
+    assert rc == 124 and 2190 <= t < 2210, (rc, t, said)   # ~1300 s seen waiting (to the last poll) + 900 s run
+    m = re.search(r"\((\d+) s run, (\d+) s waiting for a grant or a test-pool slot not counted", said)
+    assert m and 900 <= int(m[1]) < 910 and 1290 <= int(m[2]) <= 1300, said
+
+
+def test_checkwait_seen_never_shrinks_and_never_passes_its_cap():
+    from ttp import checkwait
+    s = checkwait.Seen()
+    assert s.read(100.0, 500.0) == 100.0
+    assert s.read(0.0, 600.0) == 100.0     # a dead wait dropped out: still counted
+    assert s.read(50.0, 700.0) == 150.0    # a new wait adds what it grew by
+    assert s.read(10 ** 6, 800.0) == 800.0  # never more than the check's time
+
+
 def test_checkwait_counts_pool_waits_as_waiting_but_never_as_a_queued_grant(tmp_path):
     """A pool wait is waiting time (state), read on its own by pool(); an open one is no open grant wait,
     so the push never answers 'queued' for it; overlapping grant and pool waits count once."""

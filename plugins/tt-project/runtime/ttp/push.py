@@ -4035,20 +4035,24 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
     """Wait for check `proc`; its exit code. Its time limit (check_limit_s) counts only its run time: the
     time since it started less its waits for a grant (a `ttp lock`, a checks lane, a host-wide checks slot)
     and for a test-pool slot (`ttp pool-wait`, in the check or any of its shards) that it recorded in
-    `waits` (checkwait). Past the limit while it runs it is ended: 124, a failed check. Still waiting for a
+    `waits` (checkwait), kept once seen (checkwait.Seen: a waiter that died open still waited). Past the limit
+    while it runs it is ended: 124, a failed check. Still waiting for a
     grant once its limit plus the push's own wait bound (check_queue_s) have gone by since it started, not
     counting its pool waits, it is ended without having run: QUEUED, a transient answer, never a failure.
     Waiting for a test-pool slot past pool_wait_s in all, it is ended: 124, saying how long it waited for
     the pool. The seconds it waited for a test-pool slot go to the push log."""
     started = time.time()
     pool_s = 0.0
+    seen_waits, seen_pool = checkwait.Seen(), checkwait.Seen()   # a wait once counted stays counted
     try:
         if check_limit_s is None:
             return proc.wait()
         while True:
             now = time.time()
             waited, queued = checkwait.state(waits, started, now)
+            waited = seen_waits.read(waited, now - started)
             pool_s, pooling = checkwait.pool(waits, started, now)
+            pool_s = seen_pool.read(pool_s, now - started)
             ran = now - started - waited
             if pooling and pool_wait_s and pool_s >= pool_wait_s:
                 _kill_tree(proc.pid)

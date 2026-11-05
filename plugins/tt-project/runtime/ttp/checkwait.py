@@ -12,7 +12,8 @@ check started and whether it waits now.
 A wait for a slot of a test pool (a check script's or its shards' own pick of a free test host, wrapped in
 `ttp pool-wait`) records itself the same way in the folder's POOL subfolder: it is not run time either
 (state() counts it), but it is no grant the push may queue on; pool() reads it on its own, for the push's
-separate pool-wait bound and its log."""
+separate pool-wait bound and its log. The push keeps what it read in a Seen: a wait it once counted stays counted,
+even when its waiter dies before closing its record (which then counts nothing here)."""
 from __future__ import annotations
 
 import os
@@ -115,3 +116,18 @@ def pool(d: str | Path, since: float, now: float | None = None) -> tuple[float, 
     now = time.time() if now is None else now
     spans, live = _spans(Path(d) / POOL, since, now)
     return _union(spans), live
+
+
+class Seen:
+    """A check's wait total as the push read it, poll by poll, that never shrinks: each read adds only what the
+    waits grew by since the last one. A wait whose waiter died open (killed mid-wait) drops out of state() and
+    pool(), but the time it was seen waiting stays out of the check's run time; it stops growing from then on."""
+
+    def __init__(self) -> None:
+        self.total = self.last = 0.0
+
+    def read(self, now_total: float, cap: float) -> float:
+        """The total after a read of `now_total` seconds, never past `cap` (the check's time since it started)."""
+        self.total = min(self.total + max(0.0, now_total - self.last), cap)
+        self.last = now_total
+        return self.total
