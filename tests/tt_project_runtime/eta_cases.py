@@ -327,3 +327,49 @@ def test_eta_coordinator_guard_red_holds_routine_work_only_and_a_held_review(env
     _eta_gate(p, reasons=["global daily cap reached: y"], numbers={"global_resets_at": now + 7200})
     e = eta.estimate(p.db, c, now)
     assert e["why"] is None and e["end"] >= now + 7200 + 1800 and e["end"] > before
+
+
+def test_eta_a_task_waiting_on_another_tasks_landing_starts_after_that_landing(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now, kind="code", runs=(1000,), wait=100)
+    _eta_history(p, now, kind="work", runs=(500,), wait=100)
+    rv = p.db.add_task("Review #1", "s", kind="review", status="done")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5000, rv))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')", (rv, now - 4900, now - 3300))
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (rv, "b", "h", "t", "pushed", now - 3000, now - 2400))   # medians: wait 100, review 1700, landing 600
+    n = p.db.add_task("the fix", "s", kind="code")
+    w = p.db.add_task("deploy it", "s", kind="work", reply_chat="c1", labels=[f"start_when:landed:#{n}"])
+    w2 = p.db.add_task("check it", "s", kind="work", labels=[f"start_when:ttp landed --task {n} && ttp landed --task #{rv} || exit 1"])
+    other = p.db.add_task("other probe", "s", kind="work", labels=[f"start_when:ttp landed --task {n} && test -e /x"])
+    own = now + 100 + 500   # a work task's own queue and run legs
+    o = _eta_promise(p, w, "c1", "I'll post here when it's deployed.", now)
+
+    def check(n_end, state):
+        assert eta.estimate(p.db, n, now)["end"] == pytest.approx(n_end), state
+        for t in (w, w2):
+            e = eta.estimate(p.db, t, now)
+            assert e["why"] is None and e["end"] == pytest.approx(max(n_end, now) + 600 if n_end > now else own), state
+            assert e["path"] == ([t, n] if n_end > now else [t]), state
+        assert eta.obligation_estimate(p.db, o, now)["end"] == pytest.approx(eta.estimate(p.db, w, now)["end"]), state
+        assert eta.estimate(p.db, other, now)["end"] == pytest.approx(own), state   # a mixed probe is not judged
+    check(now + 100 + 1000 + 1700 + 600, "queued")   # before the fix: deploy it showed now + 600
+    p.db.update_task(n, status="running")
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (n, now - 400))
+    check(now + 600 + 1700 + 600, "running")
+    p.db.update_task(n, status="review")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 200, n))
+    check(now + 1500 + 600, "review")
+    p.db.update_task(n, status="pushing")
+    q = p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+               (n, "b2", "h2", "t", "approved", now - 100, now - 100))
+    check(now + 500, "pushing")
+    p.db.update_task(n, status="done")
+    p.db.x("UPDATE push_queue SET status='landed', landed_sha='abc1234' WHERE id=?", (q,))
+    check(now, "landed")
+    # A task waiting on its own landing names the cycle rather than guessing.
+    p.db.update_task(n, status="queued", labels=[f"start_when:landed:#{w}"])
+    p.db.x("DELETE FROM push_queue WHERE id=?", (q,))
+    assert "dependency cycle" in eta.estimate(p.db, w, now)["why"]

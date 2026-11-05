@@ -16,6 +16,10 @@ last WINDOW_S days), never a worst case or padding:
   window (else the leg is not part of its path). A task in review or with an approved row has only
   what is left of those; a done one whose open review task (db.reviews_task) has not approved it yet
   lands at that review task's own estimate plus the landing leg.
+- landing wait: a queued or waiting task whose start_when waits only on other tasks' landings (exactly
+  `landed:#N`, or `ttp landed --task N` terms joined by `&&`, optionally ending `|| exit 1`) starts no
+  earlier than the latest of those tasks' own expected landing (their finish plus their review and
+  landing legs); one already landed (landed.recorded) adds nothing. Any other probe is not judged.
 - hold: a queued or waiting task whose provider's spend gate (kv `gates`) allows no new work starts no
   earlier than the gate's known reset (budget.hold_clears: a cap's period end, a plan window's reset,
   the runaway guard's hour, a provider limit's end); with no known reset it has no estimate and says it
@@ -35,6 +39,7 @@ later promise to the same chat with an earlier due) or justified on record (the 
 from __future__ import annotations
 
 import json
+import re
 import statistics
 import time
 
@@ -43,6 +48,8 @@ LONG_H = 2.0
 ROWS = 5000
 CLOSED = ("done", "failed", "cancelled")
 PUSH_DONE = ("pushed", "landed")
+LANDED_ALL = re.compile(r"\s*ttp\s+landed\s+--task\s+#?\d+(?:\s*&&\s*ttp\s+landed\s+--task\s+#?\d+)*"
+                        r"(?:\s*\|\|\s*exit\s+1)?\s*")
 PUSH_FINAL = ("pushed", "landed", "conflict", "check_failed", "refused", "scope_held", "nothing", "dropped")
 
 
@@ -60,6 +67,19 @@ def _labels(t: dict) -> list:
 
 def _locks(t: dict) -> list[str]:
     return sorted(lb for lb in _labels(t) if lb.startswith(("resource:", "exclusive:")))
+
+
+def landing_waits(t: dict) -> list[int]:
+    """The task ids a start_when made only of landing waits names: `landed:#N`, or `ttp landed --task N`
+    terms joined by `&&` (optionally ending `|| exit 1`); [] for any other probe or none."""
+    from .db import deferral
+    from .landed import LANDED_PROBE
+    when = deferral(t).get("when") or ""
+    if m := LANDED_PROBE.fullmatch(when):
+        return [int(m.group(1))]
+    if LANDED_ALL.fullmatch(when):
+        return list(dict.fromkeys(int(x) for x in re.findall(r"--task\s+#?(\d+)", when)))
+    return []
 
 
 def history(db, now: float | None = None) -> dict:
@@ -244,6 +264,17 @@ class _Est:
                     crit = e
             if crit and crit["done"] > start:
                 start, path = crit["done"], [tid] + crit["path"]
+            for n in landing_waits(t) if st != "running" else []:
+                from .landed import recorded
+                if recorded(self.db, n)[0]:
+                    continue   # landed: the probe passes
+                if n in seen:
+                    return self._cycle(tid, seen, n)
+                e = self.task(n, seen)
+                if e["why"]:
+                    return {**self._none(tid, e["why"]), "path": [tid] + e["path"]}
+                if e["end"] > start:   # its own finish, review and landing: the probe passes then
+                    start, path = e["end"], [tid] + e["path"]
             runs = self._run(t)
             if not runs:
                 return {**self._none(tid, f"no measured {t['kind']} run yet"), "path": path}
