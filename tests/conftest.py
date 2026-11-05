@@ -175,15 +175,30 @@ def _session_git_config(path: str) -> bytes:
     return _GIT_CONFIG_TEXT[path]
 
 
+def _content_mark(path: str) -> tuple:
+    """A file's size and sha256: the account's own tooling rewrites some watched files with the same
+    bytes while a suite runs (a deploy's `ttp setup` rewrites ~/.local/bin/ttp), which is no change. An
+    unreadable file: its size and mtime."""
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                digest.update(chunk)
+            return os.fstat(f.fileno()).st_size, digest.hexdigest()
+    except OSError:
+        st = os.stat(path)
+        return st.st_size, st.st_mtime_ns
+
+
 def home_marks(home: str | Path) -> dict[str, object]:
-    """Each HOME_WATCHED path under `home`: a file's (size, mtime_ns), a folder's entry names (a
-    frozenset), or None when it is missing."""
+    """Each HOME_WATCHED path under `home`: a file's content mark (_content_mark), a folder's entry
+    names (a frozenset), or None when it is missing."""
     marks: dict[str, object] = {}
     for rel in HOME_WATCHED:
         path = os.path.join(home, rel)
         try:
-            st = os.stat(path)
-            marks[rel] = frozenset(os.listdir(path)) if os.path.isdir(path) else (st.st_size, st.st_mtime_ns)
+            marks[rel] = frozenset(os.listdir(path)) if os.path.isdir(path) else _content_mark(path)
         except OSError:
             marks[rel] = None
     return marks

@@ -1305,6 +1305,10 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (real / ".config" / "systemd" / "user").mkdir(parents=True)
     (real / ".bashrc").write_text("mine\n")
     (real / ".gitconfig").write_text("[t]\n\tmine = 1\n")
+    (real / ".local" / "bin").mkdir(parents=True)
+    (real / ".local" / "bin" / "ttp").write_text("#!/bin/sh\n")
+    (real / ".claude").mkdir()
+    (real / ".claude" / "settings.json").write_text("{}\n")
     out.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".gitignore").write_text("__pycache__/\n")
@@ -1330,7 +1334,13 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "    if os.environ.get('LEAK'):\n"
         "        pathlib.Path(REAL, '.bashrc').write_text('changed\\n')\n"
         "        pathlib.Path(REAL, '.config/systemd/user/x.service').write_text('')\n"
-        "        pathlib.Path('left.txt').write_text('x')\n")
+        "        pathlib.Path('left.txt').write_text('x')\n"
+        "def test_rewrite():\n"   # the account's own tooling (a deploy's `ttp setup`) rewriting a file
+        "    for rel, text in (('.local/bin/ttp', '#!/bin/sh\\n'), ('.claude/settings.json', '{}\\n')):\n"
+        "        path, tmp = pathlib.Path(REAL, rel), pathlib.Path(REAL, rel + '.tmp')\n"
+        "        tmp.write_text(text + os.environ.get('REWRITE', ''))\n"
+        "        os.replace(tmp, path)\n"
+        "        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 10**9))\n")
     env = {**os.environ, "HOME": str(real), "REAL": str(real), "OUT": str(out), "TTP_TEST_JOBS": "3"}
     for var in ("CI", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
         env.pop(var, None)
@@ -1340,10 +1350,10 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
                               cwd=str(repo), env={**env, **extra}, capture_output=True, text=True, timeout=120)
 
     r = run()
-    assert r.returncode == 0 and "61 passed" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "62 passed" in r.stdout, r.stdout + r.stderr
     homes = {(out / f"home-{i}").read_text() for i in range(60)}
     assert len(homes) == 60, "tests shared a HOME"
-    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".config", ".gitconfig"] and (real / ".bashrc").read_text() == "mine\n"
+    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".claude", ".config", ".gitconfig", ".local"] and (real / ".bashrc").read_text() == "mine\n"
     assert (real / ".gitconfig").read_text() == "[t]\n\tmine = 1\n"
     assert not list((real / ".config" / "systemd" / "user").iterdir())
     assert "wrote outside" not in r.stdout
@@ -1352,6 +1362,13 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
     assert "tests wrote outside their temp folders" in r.stdout, r.stdout
     for line in (f"{real}/.bashrc: changed", f"{real}/.config/systemd/user/x.service: created", f"{repo}/left.txt: created"):
+        assert f"  {line}\n" in r.stdout, r.stdout
+    # A rewrite with the same bytes and a new mtime is no change; other bytes still are.
+    r = run("-k", "test_rewrite")
+    assert r.returncode == 0 and "1 passed" in r.stdout and "wrote outside" not in r.stdout, r.stdout + r.stderr
+    r = run("-k", "test_rewrite", REWRITE="x")
+    assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
+    for line in (f"{real}/.local/bin/ttp: changed", f"{real}/.claude/settings.json: changed"):
         assert f"  {line}\n" in r.stdout, r.stdout
 
 
