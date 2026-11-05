@@ -73,3 +73,59 @@ def test_status_keeps_routine_lines_behind_verbose_and_shows_their_anomalies(env
         for line in lines.values():
             assert line in full, (line, full)
             assert (line in out) == (lines is bad), (line, out)
+
+
+
+def test_status_reads_a_read_only_locks_dir_without_writing_or_raising(env, monkeypatch):
+    """`ttp status <other project>` from a worker sandbox: the project's state is read-only there. The
+    view tests each detached push's run lock without creating or writing one and without raising; a
+    held lock still reads as held, a free one as free, and one whose file does not open as unknown."""
+    import fcntl
+    import stat
+    from ttp import cli, locks, push
+    p = make(env)
+    pushes, d = p.state / push.DETACHED, p.state / "locks"
+    pushes.mkdir(parents=True, exist_ok=True)
+    d.mkdir(parents=True, exist_ok=True)
+    retried = [{"cause": "non_fast_forward", "attempt": 2, "at": 1.0, "detail": "x"}]
+    for name in ("held", "free", "nolock", "unreadable"):
+        (pushes / f"{name}.json").write_text(json.dumps(
+            {"id": name, "status": "running", "target": "origin/main", "retries": retried}))
+    run_lock = {n: push._run_lock(pushes / f"{n}.json") for n in ("held", "free", "unreadable")}
+    for x in run_lock.values():
+        x.write_text('{"holder": "push", "since": 1}')
+    hold = open(run_lock["held"])
+    fcntl.flock(hold, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    writes = []
+    real_open = os.open
+    monkeypatch.setattr(os, "open", lambda path, flags, *a, **k: (
+        writes.append(path) if flags & (os.O_WRONLY | os.O_RDWR | os.O_CREAT) and str(d) in str(path)
+        else None) or real_open(path, flags, *a, **k))
+    try:
+        for x in run_lock.values():
+            x.chmod(stat.S_IRUSR)
+        run_lock["unreadable"].chmod(0)
+        d.chmod(stat.S_IRUSR | stat.S_IXUSR)
+        before = sorted(d.iterdir())
+        lines = cli.status_text(p).splitlines() + cli.status_text(p, verbose=True).splitlines()
+        assert sorted(d.iterdir()) == before   # no lock file created
+        assert locks.free_state(run_lock["held"]) is False
+        assert locks.free_state(run_lock["free"]) is True
+        assert locks.free_state(d / "push:run-nolock.0.lock") is True
+        if os.geteuid() != 0:   # root opens any file
+            assert locks.free_state(run_lock["unreadable"]) is None
+            assert locks.any_free([run_lock["unreadable"]]) is False
+    finally:
+        d.chmod(stat.S_IRWXU)
+        hold.close()
+    shown = [ln for ln in lines if ln.startswith("  push ")]
+    assert any(ln.startswith("  push held running") and "non_fast_forward" in ln for ln in shown)
+    assert not any(ln.startswith(("  push free ", "  push nolock ")) for ln in shown)
+    if os.geteuid() != 0:
+        assert any(ln.startswith("  push unreadable running") and "run lock state unknown" in ln for ln in shown)
+    # Where the folder is writable, testing opens for writing (an NFS exclusive lock needs it) and
+    # still creates nothing.
+    run_lock["free"].chmod(stat.S_IRUSR | stat.S_IWUSR)
+    writes.clear()
+    assert locks.free_state(run_lock["free"]) is True and writes
+    assert locks.free_state(d / "push:run-gone.0.lock") is True and not (d / "push:run-gone.0.lock").exists()

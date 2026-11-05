@@ -4929,12 +4929,14 @@ def _pid_alive(pid: Any) -> bool:
 
 
 def running(p: Project) -> list[dict]:
-    """Markers of this project's detached pushes that are still running or queued."""
+    """Markers of this project's detached pushes that are still running or queued. A running one whose
+    run lock does not open (locks.free_state None) counts, with `lock_unknown`."""
     out = []
     for marker in sorted((p.state / DETACHED).glob("*.json")):
         m = _read(marker)
-        if m.get("status") == "queued" or m.get("status") == "running" and not locks.any_free([_run_lock(marker)]):
-            out.append({**m, "marker": str(marker)})
+        free = locks.free_state(_run_lock(marker)) if m.get("status") == "running" else True
+        if m.get("status") == "queued" or m.get("status") == "running" and not free:
+            out.append({**m, "marker": str(marker), **({"lock_unknown": True} if free is None else {})})
     return out
 
 
@@ -4943,7 +4945,9 @@ def status_lines(p: Project) -> list[str]:
     and the causes, so the coordinator and the user see a push that tries again by itself."""
     out = []
     for m in running(p):
-        if words := retry_words(m):
+        words = "; ".join(x for x in (retry_words(m), "run lock state unknown (its file does not open here)"
+                                      if m.get("lock_unknown") else "") if x)
+        if words:
             task = f"task #{m['task']}, " if m.get("task") else ""
             out.append(f"  push {m.get('id') or Path(m['marker']).stem} {m.get('status')} "
                        f"({task}{m.get('target') or 'no target'}): {words}")

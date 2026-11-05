@@ -738,19 +738,37 @@ def shared_holders(paths: list[Path]) -> list[dict]:
     return out
 
 
+def free_state(path: Path) -> bool | None:
+    """Whether the slot at path is free right now; None when its lock file does not open: unknown.
+    Testing never creates the file, and takes the slot for an instant; a `ttp lock` that tries in that
+    instant just retries. It opens the file for writing (NFS takes an exclusive lock only on a writable
+    file) and read-only where writing is refused, as in a worker sandbox reading another project's
+    status or on a read-only filesystem."""
+    fd = None
+    for flags in (os.O_WRONLY | os.O_APPEND, os.O_RDONLY):
+        try:
+            fd = os.open(path, flags)
+            break
+        except FileNotFoundError:
+            return True
+        except OSError:   # refused for writing (read-only folder or filesystem): try read-only
+            continue
+    if fd is None:
+        return None
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    except OSError:
+        return None if flags == os.O_RDONLY else False
+    finally:
+        os.close(fd)
+    return True
+
+
 def any_free(paths: list[Path]) -> bool:
-    """Whether some slot is free right now. Testing takes the slot for an instant; a `ttp lock`
-    that tries in that instant just retries."""
-    for path in paths:
-        if not path.exists():
-            return True
-        with open(path, "a") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except OSError:
-                continue
-            return True
-    return False
+    """Whether some slot is free right now (free_state); a slot of unknown state counts as taken."""
+    return any(free_state(path) for path in paths)
 
 
 def holders(paths: list[Path], where=None, pids: bool = False) -> list[str]:
