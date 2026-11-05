@@ -140,6 +140,7 @@ from . import lockprobe
 from . import locks
 from . import upjournal
 from . import machine_ledger
+from . import accountset
 from . import netwait
 from . import obligations
 from . import mustact
@@ -2180,6 +2181,10 @@ class Daemon:
             self.power_cycle_notices(now)
         except Exception:
             log(self.p, "power-cycle notices failed\n" + traceback.format_exc())
+        try:   # account checks caps a worker queued (accountset): applied and logged here
+            accountset.apply_requests(self.p.state, lambda m: log(self.p, m))
+        except Exception:
+            log(self.p, "applying queued account settings failed\n" + traceback.format_exc())
         try:
             pausegone.check(self.p, self.alert)   # an open ledger entry whose project pause is gone
         except Exception:

@@ -26,6 +26,7 @@ from zoneinfo import ZoneInfo
 
 from . import budget as bud, locks
 from . import (   # one name per line: two changes adding names merge without a conflict
+    accountset,
     anchors,
     askauto,
     askrethink,
@@ -498,6 +499,8 @@ def settable(key: str):
     per-tier routing, the saved endpoint's alias); ValueError saying why when chat may not set it."""
     if (canonical := ALIASES.get(key, key)) in USER_SETTABLE:
         return USER_SETTABLE[canonical]
+    if key in accountset.KEYS:   # the account's host checks caps: applied in the daemon (accountset.apply)
+        return accountset.conv(key)
     if conv := chatset.setter(key):
         return conv
     from .project import unknown_key_hint
@@ -3389,6 +3392,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                         if key == MERGE_KEY else ""))
                 before = _only_adds_repos(cfg, value) if key == MERGE_KEY else []
                 own = _users_own(db, messages or []) if user_turn else []
+                if key in accountset.KEYS:   # account-level: logged with its setter and undo, a user's value kept
+                    notes.append(accountset.apply(key, value, configwho.by("user", msgs=own, via="chat") if own
+                                                  else configwho.by("coordinator", via="config_set")))
+                    continue
                 p.set_config(key, value, by=configwho.by("user", msgs=own, via="chat") if own
                              else configwho.by("coordinator", via="config_set"))
                 cfg = p.config()

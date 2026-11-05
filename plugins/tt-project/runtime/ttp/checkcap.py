@@ -364,6 +364,53 @@ def _load() -> float:
         return float("inf")
 
 
+POOL_DIRS_ENV = "TTP_CHECKS_POOL_DIRS"   # where pool runs' folders are looked for (os.pathsep-separated)
+POOL_MAX_AGE_S = 720 * 60.0   # an older ttp-check.* folder is a leftover, not a running check (checkspill's bound)
+
+
+def host_tag() -> str:
+    """This machine's short tag (of /etc/machine-id, else its host name) in the folder name of a pool run
+    that already holds one of its slots (remotecheck), so pool_runs never counts that run twice."""
+    try:
+        ident = Path("/etc/machine-id").read_text().strip()
+    except OSError:
+        ident = ""
+    if not ident:
+        import socket
+        ident = socket.gethostname()
+    return hashlib.sha256(ident.encode()).hexdigest()[:8]
+
+
+def pool_dirs() -> list[Path]:
+    if v := os.environ.get(POOL_DIRS_ENV):
+        return [Path(x) for x in v.split(os.pathsep) if x]
+    return list(dict.fromkeys(Path(x) for x in (os.environ.get("TMPDIR") or "/tmp", "/tmp")))
+
+
+def pool_runs(now: float | None = None) -> list[Path]:
+    """The check runs that run on this host for a `ttp checks` elsewhere, as a project's own pool, a spill
+    host or a check host sends them (remotecheck: a ttp-check.* folder of this account, fresh within
+    POOL_MAX_AGE_S). Each takes one of this host's slots (_room), so another project's pool queues fairly
+    with the checks started here under the same cap and load guard. A run whose `ttp checks` holds a slot
+    of this host already (its folder carries host_tag()) is counted once, by that slot."""
+    now = time.time() if now is None else now
+    mine, uid, out = f"ttp-check.{host_tag()}", os.getuid(), []
+    for d in pool_dirs():
+        try:
+            found = list(d.glob("ttp-check.*"))
+        except OSError:
+            continue
+        for f in found:
+            try:
+                st = f.stat()
+            except OSError:
+                continue
+            if (f.is_dir() and st.st_uid == uid and now - st.st_mtime < POOL_MAX_AGE_S
+                    and not f.name.startswith(mine)):
+                out.append(f)
+    return out
+
+
 def extra(n: int | None = None) -> int:
     """Slots open beyond the cap now: two while the 1-minute load average is under a quarter of the
     cores, one under half, none above that, with the cap off or with checks.load_extra 0."""
@@ -487,7 +534,8 @@ def state() -> dict:
         except OSError:
             continue
     return {"limit": n, "extra": extra(n), "running": running, "queued": queued, "priority": priority,
-            "ahead": ahead, "queued_at": arrived, "priority_since": since, "parked": parked}
+            "ahead": ahead, "queued_at": arrived, "priority_since": since, "parked": parked,
+            "pool": len(pool_runs()) if n else 0}
 
 
 def _project(holder: str) -> str:
@@ -793,7 +841,7 @@ def _running(every: list[Path], same: str) -> str:
 
 
 def _room(n: int, every: list[Path]) -> int:
-    return n + extra(n) - len(locks.held_labels(every))
+    return n + extra(n) - len(locks.held_labels(every)) - len(pool_runs())
 
 
 def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, same: str, room: int | None = None):

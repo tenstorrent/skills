@@ -8916,6 +8916,31 @@ def _run_dir_alive(p: Project, run_id: int) -> bool:
         return False
 
 
+def cmd_account_cap(key: str, value: str, run: bool) -> None:
+    """`ttp config --account <checks cap> VALUE` (accountset.KEYS): at a terminal it applies at once as the
+    user's; in a run it is queued for the project's daemon (it never writes the account file itself, so a
+    write fence does not stop it), which applies and logs it on its next tick."""
+    from . import accountset, configwho
+    try:
+        val = json.loads(value)
+    except ValueError:
+        val = value
+    by = configwho.from_env()
+    try:
+        if not run:
+            print(accountset.apply(key, val, by))
+            return
+        p = here()
+        if p is None:
+            die(f"{key}: no project here to queue the change for; run it in a project's run or folder")
+        rid, new = accountset.queue(p.state, key, val, by)
+    except ValueError as e:
+        die(str(e))
+    print(f"{key} -> {json.dumps(accountset.conv(key)(val))}: " + ("queued" if new else "queued already")
+          + f" for {p.name}'s daemon (request {rid}); it applies and logs it with its undo on its next tick, "
+          f"within about a minute (`ttp config --account {key}` reads it)")
+
+
 def cmd_account_config(key: str, value: str | None) -> None:
     """Read or set an account-level setting (project.ACCOUNT_KEYS) in ~/.tt-project/settings.json."""
     if value is None:
@@ -8996,7 +9021,8 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
     from . import chatset
     from .coordinator import USER_SETTABLE, settable
     if key == "list":
-        print("\n".join([*sorted(USER_SETTABLE), *chatset.PATTERNS]))
+        from . import accountset
+        print("\n".join([*sorted([*USER_SETTABLE, *accountset.KEYS]), *chatset.PATTERNS]))
         return
     try:
         conv = settable(key)
@@ -9026,6 +9052,9 @@ def cmd_config(a) -> None:
         if run and a.key not in (None, "", "[]") and a.name in ACCOUNT_USER_ONLY:
             # The account's spill pool sends every project's code to those machines: only clearing it is a run's.
             _refuse_user_only_in_run(a.name)
+        from . import accountset
+        if a.name in accountset.KEYS and a.key is not None:
+            return cmd_account_cap(a.name, a.key, run)
         return cmd_account_config(a.name, a.key)
     if a.why:
         return cmd_config_why([w for w in (a.name, a.key, a.value) if w is not None], a.why)

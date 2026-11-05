@@ -7300,3 +7300,101 @@ def test_an_urgent_run_waiting_in_two_queues_raises_one_urgent_check_wait_event(
         for t in (parked, queued):
             if t:
                 locks.dequeue(t)
+
+
+def test_a_pool_run_on_the_host_takes_one_of_its_checks_slots_and_one_holding_a_slot_here_counts_once(env, monkeypatch):
+    """A check another `ttp checks` runs on this host (a project's own pool, a spill or check host: a
+    ttp-check.* folder) takes a host slot, so it queues with the checks started here; a run whose
+    `ttp checks` holds a slot here already (its folder carries this host's tag) is not counted again."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    pool = Path(os.environ["TTP_CHECKS_POOL_DIRS"])
+    pool.mkdir(parents=True, exist_ok=True)
+    (pool / f"ttp-check.{checkcap.host_tag()}Ab12Cd34").mkdir()
+    s = checkcap.acquire("own", max_wait_s=2)
+    assert s is not None and s.f is not None, "a run already holding a slot here is not counted twice"
+    s.close()
+    (pool / "ttp-check.Xy98Zw76").mkdir()
+    assert len(checkcap.pool_runs()) == 1 and checkcap.state()["pool"] == 1
+    assert checkcap.acquire("blocked", max_wait_s=1) is None, "the pool run holds the host's one slot"
+    old = time.time() - checkcap.POOL_MAX_AGE_S - 60
+    os.utime(pool / "ttp-check.Xy98Zw76", (old, old))
+    assert checkcap.pool_runs() == [], "a leftover folder past the age bound is not a running check"
+    s = checkcap.acquire("next", max_wait_s=2)
+    assert s is not None and s.f is not None
+    s.close()
+
+
+def test_remote_check_folder_names_the_origin_only_when_its_run_holds_a_slot_there(env, monkeypatch):
+    """remotecheck tags its folder with the origin's host tag only for a run that holds a slot there, and
+    the tagged name still matches the folder pattern its cleanup uses."""
+    from ttp import checkcap, remotecheck
+    src = Path(remotecheck.__file__).read_text()
+    assert "checkcap.host_tag() if os.environ.get(checkcap.HELD_ENV)" in src
+    assert remotecheck._TMP.search(f"/tmp/ttp-check.{checkcap.host_tag()}Ab12Cd34")
+
+
+def test_coordinator_sets_the_account_checks_host_cap_logged_with_its_setter_and_undo(env, capsys):
+    """config_set of checks.host_max applies account-wide, is chat-settable, and logs who, old, new and
+    the undo; the value the user set is then refused to the coordinator and to a worker's queue."""
+    import json as _json
+    from ttp import accountset, cli, coordinator, project
+    p = make(env)
+    cli.main(["config", "--chat-settable", "list"])
+    assert "checks.host_max" in capsys.readouterr().out.split()
+    assert coordinator.apply(p, [{"type": "config_set", "key": "checks.host_max", "value": "3"}]) == []
+    assert project.load_account_settings()["checks"]["host_max"] == 3
+    notes = p.db.kv(coordinator.NOTES_KEY, [])
+    assert any('undo: ttp config --account checks.host_max ""' in n for n in notes), notes
+    rec = _json.loads(accountset.log_path().read_text().splitlines()[-1])
+    assert (rec["key"], rec["old"], rec["new"], rec["by"]) == ("checks.host_max", None, 3, "coordinator")
+    assert rec["undo"] == 'ttp config --account checks.host_max ""'
+    coordinator.apply(p, [{"type": "config_set", "key": "checks.host_max", "value": "2"}])
+    assert project.load_account_settings()["checks"]["host_max"] == 2, "its own value it may change again"
+    # The user sets it at a terminal: theirs from then on.
+    cli.main(["config", "--account", "checks.host_max", "5"])
+    assert _json.loads(accountset.log_path().read_text().splitlines()[-1])["by"] == "user"
+    notes = coordinator.apply(p, [{"type": "config_set", "key": "checks.host_max", "value": "1"}])
+    assert project.load_account_settings()["checks"]["host_max"] == 5
+    assert any("set by the user" in n for n in notes), notes
+    with pytest.raises(ValueError, match="set by the user"):
+        accountset.queue(p.state, "checks.host_max", 1, {"by": "worker", "task": "7"})
+    # A value no logged change explains (set before the log, or by hand) is the user's too.
+    project.set_account_setting("checks.load_extra", 4)
+    assert accountset.user_set("checks.load_extra")
+    with pytest.raises(ValueError, match="set by the user"):
+        accountset.apply("checks.load_extra", 0, {"by": "coordinator"})
+
+
+def test_a_workers_account_checks_cap_change_is_queued_for_the_daemon_which_applies_it_once(env, monkeypatch, capsys):
+    """In a run, `ttp config --account checks.host_max N` writes no account file: it queues a request
+    in the project's state, the same command again adds nothing, and the daemon's apply_requests sets
+    and logs it with the worker as setter; a refused request is kept with its reason."""
+    import json as _json
+    from ttp import accountset, cli, project
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_ID", "r1")
+    monkeypatch.setenv("TTP_TASK_ID", "42")
+    cli.main(["config", "--account", "checks.host_max", "2"])
+    assert "queued for" in capsys.readouterr().out
+    cli.main(["config", "--account", "checks.host_max", "2"])
+    assert "queued already" in capsys.readouterr().out
+    assert (project.load_account_settings().get("checks") or {}).get("host_max") is None, "not written by the run"
+    assert len(list((p.state / accountset.REQUESTS).glob("*.json"))) == 1
+    with pytest.raises(SystemExit):
+        cli.main(["config", "--account", "checks.host_max", "-1"])
+    logged = []
+    assert len(accountset.apply_requests(p.state, logged.append)) == 1
+    assert project.load_account_settings()["checks"]["host_max"] == 2
+    rec = _json.loads(accountset.log_path().read_text().splitlines()[-1])
+    assert (rec["by"], rec["task"], rec["new"]) == ("worker", "42", 2) and "undo" in rec
+    assert not list((p.state / accountset.REQUESTS).glob("*.json")) and logged
+    # A request the user's later value refuses is kept with the reason.
+    accountset.queue(p.state, "checks.host_max", 1, {"by": "worker", "task": "43"})
+    accountset.apply("checks.host_max", 6, {"by": "user"})
+    assert accountset.apply_requests(p.state, logged.append) == []
+    failed = list((p.state / accountset.REQUESTS).glob("*.failed.json"))
+    assert len(failed) == 1 and "set by the user" in _json.loads(failed[0].read_text())["error"]
+    assert project.load_account_settings()["checks"]["host_max"] == 6

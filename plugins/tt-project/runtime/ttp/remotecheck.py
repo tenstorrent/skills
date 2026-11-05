@@ -215,8 +215,12 @@ def main(args: list[str]) -> int:
         signal.signal(s, _stop)
     tmp, proc = "", None
     try:
+        # A run that holds a checks slot here names this machine in its folder: should the host be this
+        # machine, its slot counts it there once (checkcap.pool_runs).
+        from . import checkcap
+        tag = checkcap.host_tag() if os.environ.get(checkcap.HELD_ENV) else ""
         try:
-            made = subprocess.run(_ssh(host, 'mktemp -d "${TMPDIR:-/tmp}/ttp-check.XXXXXXXX"'),
+            made = subprocess.run(_ssh(host, f'mktemp -d "${{TMPDIR:-/tmp}}/ttp-check.{tag}XXXXXXXX"'),
                                   stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=PROBE_TIMEOUT_S)
         except subprocess.TimeoutExpired:
             return _fault(host, f"ssh timed out after {PROBE_TIMEOUT_S} s")
