@@ -186,6 +186,10 @@ prolonged whole-box outage.
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
+  Its coordinator signal (self-started coordinator turns past `budget.hourly_coordinator_usd`, or
+  too many of them on a plan) defers those turns and holds routine work only: turns for your
+  messages, urgent tasks and user-ordered tasks (answering a chat, owning an obligation) still start,
+  under the dollar caps. `ttp status` says so in its slots line.
 - A coordinator turn that goes over `coordinator.turn_budget_usd` is never retried as is: its batch is
   halved down to single items; a single item runs once more alone at the ceiling
   (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above the hourly coordinator limit

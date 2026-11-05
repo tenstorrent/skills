@@ -12,7 +12,9 @@ an older release, so it leads the lane, ahead of priority-1 work. One holds the 
   alone, so a deadline task never waits behind a project's routine priority-1 work. With every worker
   slot of its provider taken, a stated one (extra_ok) starts in up to budget.urgent_extra_slots (default 1; 0: off) slots beyond the gate's max_parallel. The spend gate
   (allow_new_work, a gate of 0 slots, the dollar caps), the auth gate, pauses and resource locks
-  still hold it; a running run is never interrupted.
+  still hold it; a running run is never interrupted. The coordinator turn guard's red is no such
+  hold: it holds routine work only, and urgent and user-ordered tasks (user_ordered) start under the
+  rest of the gate (budget.for_task).
 - Review: an urgent code task's review is queued as soon as it hands off (done or needs_review)
   at priority 1; the review sweeps skip review.sweep_after_s and review.unreviewed_per_pass for it,
   and an urgent task in review for WAIT_S raises the review_stall event (Daemon._raise_review_stalls).
@@ -68,6 +70,12 @@ def _priority(task: dict) -> int:
 def leads(task: dict | None) -> bool:
     """The harness task finishing a template merge after an upgrade (release.UPGRADE_TASK_TITLE)."""
     return bool(task) and task.get("kind") == "harness" and task.get("title") == UPGRADE_TASK_TITLE
+
+
+def user_ordered(task: dict | None, owners=()) -> bool:
+    """A task the user asked for: one answering a user's chat (`reply_chat`, also a review of one) or a
+    required owner of an open obligation (`owners`: obligations.owner_due's task ids)."""
+    return bool(task) and (bool(task.get("reply_chat")) or task.get("id") in owners)
 
 
 def is_urgent(task: dict | None) -> bool:

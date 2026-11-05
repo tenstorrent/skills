@@ -4727,3 +4727,44 @@ def test_a_reading_that_matches_the_new_logins_window_is_filed_under_it(env, tmp
     rid, started = _claude_run_with_reading(p, "usage-acct", tmp_path, util=0.5, resets_at=resets + 86400)
     d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), {"rc": 0, "started": started, "ended": time.time()})
     assert {r["account"] for r in p.db.q("SELECT account FROM snapshots WHERE utilization=50")} == {"usage-acct"}
+
+
+def _coordinator_guard_turns(p, now, n=7, cost=0.60):
+    """`n` self-started coordinator turns in the last hour costing `cost` each: past the $4 guard at 7."""
+    for i in range(n):
+        p.db.x("INSERT INTO runs(role,provider,effort,status,started,ended,cost_usd,note) "
+               "VALUES('coordinator','claude','high','ok',?,?,?,?)",
+               (now - 120 - i * 300, now - 60 - i * 300, cost, json.dumps({"messages": [], "events": [i]})))
+        p.db.spend("claude", cost, "coordinator")
+
+
+def test_the_coordinator_turn_guard_holds_routine_work_only_and_a_dollar_cap_holds_everything(env):
+    """The coordinator's self-started turns past their $/h limit set the gate red for routine work and
+    self-started turns, but leave a lane for urgent and user-ordered tasks (Gate.lane, for_task) and
+    say so in the slot line; a dollar cap reached (or any other red) leaves no lane."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    p.set_config("budget.global_daily_usd", 0)
+    _coordinator_guard_turns(p, now)
+    g = bud.evaluate(p.db, p.config(), "claude", [], now=now)
+    assert g.level == "red" and not g.allow_new_work and g.max_parallel == 0, g.reasons
+    assert any(r.startswith("runaway guard: coordinator spent $4.20") for r in g.reasons), g.reasons
+    workers = int(p.config()["budget"]["max_parallel_workers"])
+    assert g.lane == {"max_parallel": workers, "max_tier": "deep", "allow_optional": True}, g.lane
+    assert bud.for_task(g, False) is g, "routine work stays held"
+    lane = bud.for_task(g, True)
+    assert lane.allow_new_work and lane.max_parallel == workers and lane.max_tier == "deep"
+    assert lane.level == "red" and g.max_parallel == 0, "the lane is a copy: the shared gate stays red"
+    assert "urgent and user-ordered tasks still start" in bud.gate_slots(g, workers)
+    assert bud.Gate(**g.as_dict()).lane == g.lane, "the saved gate keeps its lane"
+    # A dollar cap reached: no lane, nothing new starts.
+    p.set_config("budget.daily_usd", 1)
+    g = bud.evaluate(p.db, p.config(), "claude", [], now=now)
+    assert g.level == "red" and any(r.startswith("cap reached") for r in g.reasons), g.reasons
+    assert g.lane == {} and bud.for_task(g, True) is g and not bud.for_task(g, True).allow_new_work
+    # Another runaway signal (the total spend ceiling) also leaves no lane.
+    p.set_config("budget.daily_usd", 0)
+    p.set_config("budget.hourly_floor_usd", 2)
+    g = bud.evaluate(p.db, p.config(), "claude", [], now=now)
+    assert any("spent in the last hour" in r for r in g.reasons) and g.lane == {}, g.reasons

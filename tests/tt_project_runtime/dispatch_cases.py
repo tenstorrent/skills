@@ -1809,3 +1809,80 @@ def test_an_obligation_owner_takes_the_extra_slot_past_full_slots_and_routine_pr
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def _guard_turns(p, now, n=7, cost=0.60):
+    """`n` self-started coordinator turns in the last hour on the core provider costing `cost` each:
+    past the $4 guard at 7."""
+    core = p.config().get("core_provider", "claude")
+    for i in range(n):
+        p.db.x("INSERT INTO runs(role,provider,effort,status,started,ended,cost_usd,note) "
+               "VALUES('coordinator',?,'high','ok',?,?,?,?)",
+               (core, now - 120 - i * 300, now - 60 - i * 300, cost, json.dumps({"messages": [], "events": [i]})))
+        p.db.spend(core, cost, "coordinator")
+
+
+def test_a_tripped_coordinator_turn_guard_starts_urgent_and_user_ordered_tasks_and_holds_routine(
+        env, monkeypatch, tmp_path):
+    """The coordinator's self-started turns past budget.hourly_coordinator_usd hold routine and scheduled
+    work only: urgent tasks (priority 1 or an `urgent:` line) and user-ordered ones (answering a chat,
+    owning an obligation) still start; `ttp status` says which runs it holds. A dollar cap reached
+    holds every one of them."""
+    from ttp.cli import status_text
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
+    try:
+        p.set_config("budget.global_daily_usd", 0)
+        d.cfg = p.config()
+        now = time.time()
+        _guard_turns(p, now)
+        d.update_gates()
+        core = d.cfg.get("core_provider", "claude")
+        assert d.gates[core].level == "red" and d.gates[core].lane, d.gates[core].reasons
+        add = lambda title, spec="s", **kw: p.db.task(p.db.add_task(title, spec, kind="work", tier="standard",
+                                                                     **{"priority": 3, **kw}))
+        routine = add("routine work")
+        scheduled = add("scheduled sweep", origin="schedule")
+        prio1 = add("priority-1 work", priority=1)
+        line = add("urgent line", "urgent: the release waits on it\ndo it", priority=2)
+        chat = add("answers the user", reply_chat="c1")
+        owner = add("owes a deliverable")
+        _owe(p, owner["id"], now + 3600)
+
+        def ctx():
+            return {"now": time.time(), "paused": {}, "committed": None, "busy": {core: 0}, "logged_out": {}}
+        for t in (prio1, line, chat, owner):
+            c = ctx()
+            assert d._start_hold(t, core, c) is None, t["title"]
+            assert c["gate"].allow_new_work and c["gate"].max_tier == "deep", t["title"]
+        for t in (routine, scheduled):
+            c = ctx()
+            assert d._start_hold(t, core, c) == "gate", t["title"]
+            assert "runaway guard: coordinator spent" in d._hold_words(t, "gate", c)
+        assert d.gates[core].max_parallel == 0 and not d.gates[core].allow_new_work, "the shared gate stays red"
+        p.db.set_kv("gates", {core: d.gates[core].as_dict()})
+        text = status_text(p)
+        assert "urgent and user-ordered tasks still start" in text, text
+        # A dollar cap reached: nothing new starts, urgent or user-ordered included.
+        p.set_config("budget.daily_usd", 1)
+        d.cfg = p.config()
+        d.update_gates()
+        assert not d.gates[core].lane, d.gates[core].reasons
+        for t in (prio1, line, chat, owner, routine, scheduled):
+            assert d._start_hold(t, core, ctx()) == "gate", t["title"]
+    finally:
+        drain(d)
+
+
+def test_a_tripped_coordinator_turn_guard_defers_self_started_turns_and_runs_user_message_turns(env, monkeypatch):
+    """The guard's red still defers the coordinator's self-started turns; a user message's turn runs."""
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=0)
+    p.set_config("budget.global_daily_usd", 0)
+    d.cfg = p.config()
+    _guard_turns(p, clock[0])
+    d.update_gates()
+    core = d.cfg.get("core_provider", "claude")
+    assert d.gates[core].level == "red" and d.gates[core].lane, d.gates[core].reasons
+    _event(p, clock, "task_done")
+    assert not _turn_within(d, clock, starts, 900, step=30), "a self-started turn ran past the guard"
+    p.db.post("in", "what is the status?", chat="c1")
+    assert _turn_within(d, clock, starts, 900, step=30), "the user's message got no turn"

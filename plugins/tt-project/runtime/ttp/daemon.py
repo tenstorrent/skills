@@ -5937,7 +5937,7 @@ class Daemon:
             lim = self._provider_pause(prov)
             if lim and lim.get("until", 0) > time.time():
                 bud._raise(g, "red", f"provider limit: {lim.get('note')}")
-                g.max_parallel, g.allow_new_work, g.allow_optional = 0, False, False
+                g.max_parallel, g.allow_new_work, g.allow_optional, g.lane = 0, False, False, {}
             prev = self.gates.get(prov) or _saved_gate(saved.get(prov))
             provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
             # Green, yellow and orange are the budget working as designed (more or fewer workers);
@@ -7213,6 +7213,7 @@ class Daemon:
             ran = db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,))
             fp = f"{unstarted.READY_KIND}:{tid}:{(ran or {}).get('id') or 0}"
             gate = self.gates.get(prov)
+            gate = gate and bud.for_task(gate, bool(getattr(gate, "lane", None)) and self._priority_task(t, ctx))
             free = (gate.allow_new_work and busy.get(prov, 0) < gate.max_parallel) if gate else \
                 sum(busy.values()) < int(self.cfg["budget"].get("max_parallel_workers", 6))
             # deadline work (a stated `urgent:` line or an obligation owner) held only by full slots is still
@@ -8724,8 +8725,9 @@ class Daemon:
             return "logged_out"
         if self.net_held(provider) and not self._net_may_probe(provider):
             return "net"
-        gate = ctx["gate"] = self.gates.get(provider) or \
-            bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
+        gate = self.gates.get(provider) or bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
+        # The coordinator turn guard holds routine work only: urgent and user-ordered tasks start under the rest.
+        gate = ctx["gate"] = bud.for_task(gate, bool(getattr(gate, "lane", None)) and self._priority_task(task, ctx))
         if "owners" not in ctx:   # an obligation's required owner ranks ahead of urgent work (db.ready_tasks)
             ctx["owners"] = self._owner_due()
         # Deadline work (urgent.extra_ok: a fresh `urgent:` line or the template-merge task, or an
@@ -8905,6 +8907,20 @@ class Daemon:
                 route.host_release(*lease)
             except OSError as e:
                 log(self.p, f"routed slot lease {lease[1]} not freed (dropped once stale): {e}")
+
+    def _priority_task(self, task: dict, ctx: dict | None = None) -> bool:
+        """Urgent (urgent.is_urgent) or user-ordered (urgent.user_ordered): work a coordinator turn
+        guard's red does not hold (budget.for_task). The obligation owners are read once per ctx."""
+        if urgent.is_urgent(task):
+            return True
+        ctx = {} if ctx is None else ctx
+        if "owners" not in ctx:
+            from . import obligations
+            try:
+                ctx["owners"] = set(obligations.owner_due(self.p.db))
+            except Exception:   # unreadable obligations only lose the exemption, never the dispatch
+                ctx["owners"] = set()
+        return urgent.user_ordered(task, ctx["owners"])
 
     def _no_room(self, prov: str, ctx: dict) -> str:
         """Why routed-to `prov` cannot take a run now, or '': auth (logged out), down (its API host
@@ -15319,7 +15335,7 @@ class Daemon:
         if db.one("SELECT 1 FROM runs WHERE status='running' LIMIT 1") or \
                 db.one("SELECT 1 FROM tasks WHERE status='pushing' LIMIT 1"):
             return True
-        if db.kv("paused", False) or self.gates and not any(g.allow_new_work for g in self.gates.values()):
+        if db.kv("paused", False) or self.gates and not any(g.allow_new_work or getattr(g, "lane", None) for g in self.gates.values()):
             return False
         return self._dispatchable()
 

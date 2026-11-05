@@ -18,7 +18,9 @@ it under the dollar caps whatever windows it reports; `plan` with no windows to 
 meter) is regime "plan": no dollar cap holds it and its spend is plan spend, not billed.
 A runaway check (a loop: wasted runs, a coordinator spinning, spend far above this project's own
 norm) overrides both. On plan windows its dollars are virtual, so it counts wasted runs and
-coordinator turns there.
+coordinator turns there. Its coordinator signals (self-started turns) defer those turns and hold
+routine work only: urgent and user-ordered tasks keep starting under the rest of the gate (Gate.lane,
+for_task), so the dollar caps and every other red still hold them.
 """
 from __future__ import annotations
 
@@ -29,7 +31,7 @@ import re
 import shlex
 import statistics
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +91,9 @@ class Gate:
     allow_new_work: bool = True # anything but replies to a user's direct message
     numbers: dict[str, Any] = field(default_factory=dict)
     cause: str = ""             # the reason that set the current level (slot_words)
+    # Set when only the coordinator turn guard made the gate red: what urgent and user-ordered tasks
+    # still start under (max_parallel, max_tier, allow_optional); for_task applies it. Empty otherwise.
+    lane: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -162,8 +167,27 @@ def gate_slots(gate: Gate | dict | None, configured: int) -> str:
         return ""
     allowed = int(allowed) if g.get("allow_new_work", True) else 0
     why = g.get("cause") or next(iter(g.get("reasons") or []), "")
+    lane = g.get("lane") or {}
     return (f"the budget gate allows {allowed or 'none'} at {g.get('level') or 'green'}"
-            + (f": {why[:160]}" if why else ""))
+            + (f": {why[:160]}" if why else "")
+            + (f"; {lane_words(lane)}" if lane.get("max_parallel") else ""))
+
+
+def lane_words(lane: dict) -> str:
+    """What a coordinator guard's red still starts (Gate.lane), for status lines."""
+    return (f"it holds self-started coordinator turns and routine work only; urgent and user-ordered "
+            f"tasks still start (up to {int(lane['max_parallel'])}, {lane.get('max_tier') or 'deep'} tier)")
+
+
+def for_task(gate: Gate, priority: bool) -> Gate:
+    """The gate a task starts under. A red set only by the coordinator turn guard (gate.lane) holds
+    routine work: an urgent or user-ordered (`priority`) task gets the slots, tier and optional-work
+    allowance the rest of the gate gives. Any other gate is returned as is."""
+    lane = getattr(gate, "lane", None) or {}
+    if not priority or int(lane.get("max_parallel") or 0) <= 0:
+        return gate
+    return replace(gate, max_parallel=int(lane["max_parallel"]), max_tier=lane.get("max_tier") or gate.max_tier,
+                   allow_optional=bool(lane.get("allow_optional")), allow_new_work=True)
 
 
 def slot_lines(gates: dict | None, configured: int, running: dict | None = None) -> list[str]:
@@ -366,6 +390,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                          f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
     selfs = [r for r in coord_h if not user_turn(r)]
     same = repeated_turns(selfs)
+    coord_red: list[str] = []   # the coordinator turn signals: applied after the level, see below
     g.numbers.update({"coordinator_turns_1h": len(selfs), "coordinator_repeats_1h": same})
     if virtual:
         # Below coordinator.max_turns_per_hour, which stops self-started turns by itself: a guard at
@@ -374,15 +399,15 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         repeat_cap = int(b.get("hourly_coordinator_repeats", 4))
         shares += [_share(len(selfs), turn_cap), _share(same, repeat_cap)]
         if len(selfs) > turn_cap:
-            _raise(g, "red", f"runaway guard: {len(selfs)} self-started coordinator turns in the last hour "
+            coord_red.append(f"runaway guard: {len(selfs)} self-started coordinator turns in the last hour "
                              f"(limit {turn_cap}; turns for user messages not counted)")
         if same >= repeat_cap:
-            _raise(g, "red", f"runaway guard: {same} self-started coordinator turns in the last hour met the "
+            coord_red.append(f"runaway guard: {same} self-started coordinator turns in the last hour met the "
                              f"same evidence (limit {repeat_cap - 1}); resumes automatically as the hour rolls over")
     else:
         shares += [_share(thrash, thrash_cap), _share(last_h, ceiling)]
     if not virtual and thrash > thrash_cap:
-        _raise(g, "red", f"runaway guard: coordinator spent ${thrash:.2f} on self-started turns in the last hour "
+        coord_red.append(f"runaway guard: coordinator spent ${thrash:.2f} on self-started turns in the last hour "
                          f"(limit ${thrash_cap:.0f}; turns for user messages not counted)")
     if last_h > ceiling and not virtual:
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
@@ -398,6 +423,16 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         # On a plan the headroom may already allow no new start at all.
         g.max_tier, g.max_parallel, g.allow_optional = "light", min(g.max_parallel, 1), False
     elif g.level == "red":
+        g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
+    if coord_red:
+        # The coordinator turn guard defers self-started coordinator turns (the daemon runs none while
+        # red, turns for user messages excepted) and holds routine work. It is no dollar cap: urgent and
+        # user-ordered tasks keep starting under what the rest of the gate allows (for_task), and under
+        # nothing when a dollar cap or another red already stops new work.
+        if g.allow_new_work and g.max_parallel > 0:
+            g.lane = {"max_parallel": g.max_parallel, "max_tier": g.max_tier, "allow_optional": g.allow_optional}
+        for reason in coord_red:
+            _raise(g, "red", reason + ("; urgent and user-ordered tasks still start" if g.lane else ""))
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     return g
 

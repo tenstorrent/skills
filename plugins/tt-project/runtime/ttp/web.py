@@ -187,6 +187,8 @@ def holding(db: DB, now: float, core: str = "claude", gates: dict | None = None)
             label = next((lb for lb, names in (("5h", FIVE_HOUR), ("7d", SEVEN_DAY)) if w and w["window"] in names),
                          w["window"] if w else "")
             why = f"{label} {w['utilization']:.0f}%" if w else "red"
+            if (g.get("lane") or {}).get("max_parallel"):   # the coordinator turn guard: routine work only
+                why += " (runaway guard: routine work held; urgent and user-ordered tasks still start)"
         else:
             continue
         k = count[prov]
