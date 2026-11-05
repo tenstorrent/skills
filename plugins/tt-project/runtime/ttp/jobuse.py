@@ -338,6 +338,38 @@ def assess(state: dict | None, got: dict | None, req: dict, now: float, s: dict)
     return st, True
 
 
+_CHECKS_CMD = re.compile(r"(?:^|[\s;&|(/])ttp(?:\.sh)?\s+checks\b")
+
+
+def idle_by_design(task: dict, job: dict, resources: set, paused: dict, gate: str = "",
+                   now: float | None = None) -> str:
+    """Why an under-used job's idle time is by design, read from what its task and job record, or ''
+    when nothing does (the alarm fires as before). By design: the job runs the project's checks (they
+    wait for a checks slot or run on a test host), its task is deferred (start_after still ahead, or a
+    start_when probe), the job or its task names a paused resource (`resources`: the task's resource
+    labels and the job's --lock names; `paused`: db.paused_resources()), its spend cap stopped it, or
+    the budget gate holds new work (`gate`, the daemon's words for it): a worker woken then could not
+    start or change anything. A plain timer or another probe explains nothing: a build that under-uses
+    its cores while its task sleeps on a timer is what the alarm is for."""
+    import time as _time
+    from .db import deferral
+    now = _time.time() if now is None else now
+    if _CHECKS_CMD.search(str(job.get("command") or "")):
+        return "it runs the project's checks, which wait for a checks slot or run on a test host"
+    d = deferral(task)
+    if d.get("when"):
+        return "its task is deferred until its start_when probe passes"
+    if float(d.get("after") or 0) > now:
+        return "its task is deferred to its start_after time"
+    if hit := sorted(set(resources) & set(paused or {})):
+        return f"it waits for paused resource {hit[0]}"
+    if (job.get("spend") or {}).get("capped"):
+        return "its spend cap stopped it"
+    if gate:
+        return gate
+    return ""
+
+
 def line(req: dict, st: dict | None) -> str:
     """One short line: requested vs used."""
     asked = ", ".join(x for x in (f"{req['cores']} cores" if req.get("cores") else "",

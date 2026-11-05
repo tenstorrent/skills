@@ -197,3 +197,71 @@ def test_a_flapping_under_used_job_raises_one_event_until_restart_request_change
         assert fps[3] == fps[2] and len(set(fps)) == 3
     finally:
         lock.close()
+
+
+def test_idle_by_design_names_what_explains_a_jobs_idle_time_and_nothing_else():
+    from ttp import jobuse
+    now = time.time()
+
+    def why(job=None, labels=(), res=(), paused=None, gate=""):
+        return jobuse.idle_by_design({"labels": json.dumps(list(labels))}, job or {"command": "make -j8"},
+                                     set(res), paused or {}, gate, now)
+    assert why() == ""
+    for cmd in ("ttp checks --detach -- pytest -q", "/opt/bin/ttp.sh checks run", "cd w && ttp checks"):
+        assert "checks" in why({"command": cmd}), cmd
+    for cmd in ("make checks", "./run_checks.sh", "echo ttp-checks", "pytest -k checks"):
+        assert why({"command": cmd}) == "", cmd   # a plain command naming checks waits on no slot
+    assert "start_when" in why(labels=["start_when:test -e /tmp/x"])
+    assert why(labels=["start_when:now"]) == ""
+    assert "start_after" in why(labels=[f"start_after:{now + 600}"])
+    assert why(labels=[f"start_after:{now - 600}"]) == "", "a start_after already passed explains nothing"
+    assert "paused resource box-a" in why(res={"box-a"}, paused={"box-a": {"reason": "r"}})
+    assert why(res={"box-b"}, paused={"box-a": {"reason": "r"}}) == ""
+    assert "spend cap" in why({"command": "x", "spend": {"capped": True}})
+    assert why({"command": "x", "spend": {"capped": False}}) == ""
+    assert why(gate="the budget gate (red) allows no new work") == "the budget gate (red) allows no new work"
+
+
+@pytest.mark.parametrize("case", ["checks", "after", "when", "paused_label", "paused_lock", "capped", "gate",
+                                  "plain", "after_passed", "other_pause", "gate_green"])
+def test_an_under_used_job_idle_by_design_wakes_no_model_and_an_unexplained_one_still_does(env, monkeypatch, case):
+    p = make(env)
+    from ttp import budget, daemon as dmod, db as dbm, jobuse
+    tid = p.db.add_task("bench", "s", kind="work", tier="light", origin="user")
+    rc, lock = _job_of_waiting_task(p, tid, {"cores": 8})
+    try:
+        now = time.time()
+        reg = rc.parent / "detached.json"
+        job = json.loads(reg.read_text())[0]
+        job.update({"checks": {"command": "ttp checks --detach -- pytest -q"},
+                    "paused_lock": {"locks": ["box-a"]}, "capped": {"spend": {"capped": True}}}.get(case, {}))
+        reg.write_text(json.dumps([job]))
+        labels = {"after": [f"start_after:{now + 900}"], "after_passed": [f"start_after:{now - 900}"],
+                  "when": ["start_when:test -e /tmp/never"], "paused_label": ["resource:box-a"],
+                  "other_pause": ["resource:box-b"]}.get(case)
+        if labels:
+            p.db.update_task(tid, labels=json.dumps(labels))
+        if case in ("paused_label", "paused_lock", "other_pause"):
+            p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"box-a": {"reason": "maintenance", "since": now, "by": "user"}})
+        monkeypatch.setattr(jobuse, "sample", lambda pid, nodes=None: {"cpu": 100.0, "start": "S", "dev": None})
+        monkeypatch.setattr(jobuse, "containers", lambda: [])
+        p.db.set_kv(jobuse.KV, {str(rc): {"task": tid, "name": "build", "req": {"cores": 8},
+                                          "st": {"ring": [[now - 960, 0.0], [now - 60, 95.0]], "start": "S",
+                                                 "since": now - 960}}})
+        d = dmod.Daemon(p.base)
+        if case.startswith("gate"):
+            d.gates = {k: budget.Gate(k, level="green" if case == "gate_green" else "red",
+                                      allow_new_work=case == "gate_green")
+                       for k in {"claude", "fake", str(d.cfg.get("core_provider") or "claude")}}
+        d.sample_jobs()
+        ev = p.db.q("SELECT * FROM events WHERE kind='job_underuse' AND task=?", (tid,))
+        entry = p.db.kv(jobuse.KV)[str(rc)]
+        res = json.loads(p.db.task(tid)["result"])
+        if case in ("plain", "after_passed", "other_pause", "gate_green"):
+            assert len(ev) == 1 and "by_design" not in entry, (case, entry)
+            assert "underuse_wake" in res or entry.get("pulled"), (case, res, entry)   # its check pulled in
+        else:
+            assert not ev and entry.get("by_design") and "idle by design" in entry["line"], (case, entry)
+            assert "underuse_wake" not in res and not entry.get("pulled"), (case, res, entry)
+    finally:
+        lock.close()

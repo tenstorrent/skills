@@ -161,3 +161,51 @@ def test_a_same_boot_restart_with_no_detached_waits_changes_nothing(env, tmp_pat
     d.wake_after_reboot()
     assert {tid: dict(p.db.task(tid)) for tid in before} == before
     assert not p.db.q("SELECT id FROM events WHERE kind IN ('job_relaunched','task_blocked')")
+
+
+def _over_before(p, tid, how):
+    """The task's detached job (from _waiting_from_before_the_boot) ended before this boot: its .lost
+    marker or its closed record dates from before the boot; "after" marks it lost only after the boot."""
+    (run_dir,) = [pathlib.Path(r["dir"]) for r in p.db.q("SELECT dir FROM runs WHERE task=?", (tid,))]
+    rc = run_dir / "soak.rc"
+    if how == "closed":
+        reg = run_dir / "detached.json"
+        reg.write_text(json.dumps([{**j, "status": "died", "ended": time.time() - 3600}
+                                   for j in json.loads(reg.read_text())]))
+        return rc
+    lost = rc.with_suffix(".lost")
+    lost.write_text("lost\n")
+    at = time.time() - (3600 if how == "lost" else 60)
+    os.utime(lost, (at, at))
+    return rc
+
+
+@pytest.mark.parametrize("how, wakes", [("lost", False), ("closed", False), ("after", True)])
+def test_a_job_over_before_the_boot_does_not_wake_its_task_after_a_reboot(env, how, wakes):
+    p = make(env)
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    _waiting_from_before_the_boot(p, tid, job=True, retry_when="exit 1")
+    _over_before(p, tid, how)
+    _boot_daemon(p)
+    assert _woken(p, tid) is wakes, dict(p.db.task(tid))
+
+
+@pytest.mark.parametrize("probe, wakes", [
+    ('test "$(date +%s)" -ge 1900000000', False),   # a bare timer: noted, sleeps on
+    ("exit 1", True),   # any other wait with a job the reboot cut short wakes as before
+])
+def test_a_bare_timer_wait_sleeps_through_a_reboot_with_a_note_of_the_job_it_cut(env, probe, wakes):
+    p = make(env)
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    _waiting_from_before_the_boot(p, tid, job=True, retry_when=probe)
+    _boot_daemon(p)
+    t = p.db.task(tid)
+    assert _woken(p, tid) is wakes, dict(t)
+    (run_dir,) = [pathlib.Path(r["dir"]) for r in p.db.q("SELECT dir FROM runs WHERE task=?", (tid,))]
+    note = run_dir / "progress.md"
+    if wakes:
+        assert "bare timer" not in (note.read_text() if note.exists() else "")
+    else:
+        assert t["not_before"] > time.time() + 3000 and "woke" not in json.loads(t["result"])
+        assert "the host reboot cut short detached job soak" in note.read_text()
+        assert not p.db.q("SELECT id FROM events WHERE task=?", (tid,)), "a model was called for it"

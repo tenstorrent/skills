@@ -11501,6 +11501,11 @@ class Daemon:
                 continue   # asleep on its retry_when: the same checks or resumable jobs run again
             if rebootwait.stays_asleep(prev, (str(self.p.runs),)) and not self._job_without_rc(t["id"]):
                 continue   # nothing it waits on died with the host: its timer and probe stand
+            if time_gate(str(prev.get("retry_when") or "")) is not None:
+                # A bare timer waits on no job: one of its own the reboot cut short is noted for the run
+                # that timer wakes, and nothing wakes now (a model call that could only re-arm the timer).
+                self._note_cut_jobs(t["id"])
+                continue
             probe = str(prev.get("retry_when") or "")
             rcs = rebootwait.local_jobs(probe)
             lost = self._lost_jobs(t["id"], rcs)
@@ -11821,9 +11826,42 @@ class Daemon:
         return last["boot_id"] if last else None
 
     def _jobs_without_rc(self, tid: int, boot: str) -> bool:
-        """Whether a run of task tid on `boot` detached a job that wrote no .rc."""
+        """Whether a run of task tid on `boot` detached a job that wrote no .rc and was not already over
+        before this boot (_over_before_boot)."""
+        return bool(self._cut_jobs(tid, boot))
+
+    def _cut_jobs(self, tid: int, boot: str) -> list[Path]:
+        """The .rc paths of the jobs task tid's runs on `boot` detached that the reboot cut short: no .rc,
+        and not found over (lost, or their record closed) before this boot."""
         dirs = self.p.db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, boot))
-        return any(not Path(j["rc"]).exists() for r in dirs for j in _detached_jobs(Path(r["dir"])))
+        return [Path(j["rc"]) for r in dirs for j in _detached_jobs(Path(r["dir"]))
+                if not Path(j["rc"]).exists() and not self._over_before_boot(Path(j["rc"]), j)]
+
+    def _over_before_boot(self, rc: Path, job: dict | None = None) -> bool:
+        """Whether a job with no .rc was already over before this boot: its <name>.lost was written, or
+        its record closed (ended or died), before the host booted. A reboot cut nothing short there."""
+        at = float(self.boot_at or 0)
+        if not at:
+            return False
+        job = job or {}
+        if job.get("status") in detach.CLOSED and 0 < float(job.get("ended") or 0) < at:
+            return True
+        try:
+            return detach.lost(rc).stat().st_mtime < at
+        except OSError:
+            return False
+
+    def _note_cut_jobs(self, tid: int) -> None:
+        """Note on task tid, for its next run, the detached jobs of its own the reboot cut short."""
+        boot = self._last_earlier_boot(tid)
+        cut = self._cut_jobs(tid, boot) if boot else []
+        if not cut:
+            return
+        names = ", ".join(rc.stem for rc in cut[:5]) + (f" and {len(cut) - 5} more" if len(cut) > 5 else "")
+        why = (f"the host reboot cut short detached job{'s' if len(cut) > 1 else ''} {names}; the task's "
+               "retry_when is a bare timer, so it sleeps on to it and this run decides whether to relaunch")
+        _task_note(cut[0].parent, why)
+        log(self.p, f"task {tid}: {why}")
 
     def _lost_jobs(self, tid: int, rcs: list[Path]) -> list[Path]:
         """Of the local detached jobs task tid waits on (`rcs`) and those its runs on the earlier boot
@@ -11832,7 +11870,8 @@ class Daemon:
         boot = self._last_earlier_boot(tid)
         dirs = self.p.db.q("SELECT dir FROM runs WHERE task=? AND boot_id=? AND dir IS NOT NULL", (tid, boot)) \
             if boot else []
-        jobs = dict.fromkeys([*rcs, *(Path(j["rc"]) for r in dirs for j in _detached_jobs(Path(r["dir"])))])
+        jobs = dict.fromkeys([*rcs, *(Path(j["rc"]) for r in dirs for j in _detached_jobs(Path(r["dir"]))
+                                      if not self._over_before_boot(Path(j["rc"]), j))])
         return [rc for rc in jobs if not rc.exists() and not detach.running_pid(rc, self._this_boot)]
 
     def _job_without_rc(self, tid: int) -> bool:
@@ -12206,6 +12245,14 @@ class Daemon:
                     got = with_containers(jobuse.sample(pid, nodes)) if pid else None
                     st = jobuse.assess(was.get("st"), got, req, now, s)[0]
                     entry = {"task": t["id"], "name": j["name"], "req": req, "st": st, "line": jobuse.line(req, st)}
+                    if st.get("under") and (why := self._idle_by_design(t, j, now)):
+                        # Idle by design (waiting on checks, a deferral, a pause, a spend cap or the budget
+                        # gate): shown, no event and no pulled-in check, so no model wakes for it.
+                        entry.update(by_design=why, line=f"{entry['line']}; idle by design: {why}")
+                        if was.get("raised"):
+                            entry["raised"] = was["raised"]
+                        new[str(rc)] = entry
+                        continue
                     if was.get("pulled") and was.get("pulled") == st.get("under"):
                         entry["pulled"] = was["pulled"]
                     if was.get("raised"):
@@ -12223,6 +12270,15 @@ class Daemon:
                 self._unpull_check(tid)
         if new or old:
             db.set_kv(jobuse.KV, new)
+
+    def _idle_by_design(self, task: dict, job: dict, now: float) -> str:
+        """jobuse.idle_by_design for a live task's under-used job, with the project's paused resources
+        and the task's provider's budget gate as this daemon reads them."""
+        prov = task.get("provider") or self.cfg.get("core_provider") or "claude"
+        gate = self.gates.get(prov)
+        held = f"the budget gate ({gate.level}) allows no new work" if gate and not gate.allow_new_work else ""
+        res = coord.task_resources(task) | {str(x) for x in job.get("locks") or []}
+        return jobuse.idle_by_design(task, job, res, self.p.db.paused_resources() if res else {}, held, now)
 
     def watch_progress(self, every_s: float = 60) -> None:
         """Drivers' reports (`ttp progress report`, progress.py), model-free, every minute: a key whose
