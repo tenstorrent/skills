@@ -16622,14 +16622,14 @@ def test_ttp_land_in_a_sandbox_that_cannot_write_the_main_checkout_hands_the_fas
     assert Path(p.root).resolve() == Path(repo).resolve()
     _git_out(repo, "checkout", "-q", "proj")
     dirs = _checkout_dirs(repo)
+    th, done, gone = _land_daemon(p, before=lambda: _writable(dirs))
     _read_only(dirs)
     said = []
     try:
-        th, done, gone = _land_daemon(p, before=lambda: _writable(dirs))
         rc = land.land(p, repo, head, t, said.append)
+    finally:
         gone.set()
         th.join(10)
-    finally:
         _writable(dirs)
     assert rc == 0 and done == [1], said
     assert any("asking the daemon to fast-forward proj" in m for m in said), said
@@ -16655,14 +16655,14 @@ def test_ttp_land_through_the_daemon_never_overwrites_a_dirty_or_moved_checkout_
     def dirty():
         _writable(dirs)
         (repo / "README.md").write_text("my edit\n")
+    th, done, gone = _land_daemon(p, before=dirty)
     _read_only(dirs)
     said = []
     try:
-        th, done, gone = _land_daemon(p, before=dirty)
         rc = land.land(p, repo, head, t, said.append)
+    finally:
         gone.set()
         th.join(10)
-    finally:
         _writable(dirs)
     assert rc == land.DIRTY and done == [1], said
     assert any("uncommitted changes" in m and "nothing landed" in m for m in said), said
