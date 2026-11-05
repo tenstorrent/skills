@@ -38221,6 +38221,7 @@ def test_a_review_run_works_in_the_changes_worktree_or_its_own_never_the_project
     assert d._workdir_for(p.db.task(review)) == (ocwd, None)
     p.db.update_task(review, result=None)
     # Once that worktree is gone, a detached one of its own at the reviewed head; reused by its next run.
+    _git_out(repo, "worktree", "unlock", cwd)   # the run's keep lock (worktree.keep)
     _git_out(repo, "worktree", "remove", cwd)
     own = str(p.worktrees / f"t{review}")
     assert d._workdir_for(p.db.task(review)) == (own, None)

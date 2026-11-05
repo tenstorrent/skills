@@ -15397,6 +15397,7 @@ class Daemon:
             # A PR fix whose PR is in another repository than the root's: a worktree of its clone.
             try:
                 path, branch = worktree.ensure_in(self.p, task, repo)
+                worktree.keep(path)
                 return str(path), branch
             except RuntimeError as e:   # e.g. a fork's branch, neither local nor on origin: the root, as before
                 log(self.p, f"task {task['id']}: no worktree in {repo} ({str(e)[:200]}); working in the project root")
@@ -15406,6 +15407,7 @@ class Daemon:
         if (worktree.gets_worktree(self.p, task["kind"]) or carries) and worktree.is_git(self.p.root):
             self.guard_root_head()   # never a worktree branched from a HEAD a task moved the root to
             path, branch = worktree.ensure(self.p, task)
+            worktree.keep(path)   # no partial-view `git worktree prune` can orphan it
             return str(path), branch
         if task["kind"] == "review" and worktree.is_git(self.p.root):
             # A review that rebases or checks out a head must not do it in the root, which other
@@ -15413,6 +15415,7 @@ class Daemon:
             prefer = str((conflictfix.of(task) or {}).get("branch") or "")
             path = worktree.review_workdir(self.p, task, prefer)
             if path:
+                worktree.keep(path)
                 return str(path), None
         return str(self.p.root), None
 

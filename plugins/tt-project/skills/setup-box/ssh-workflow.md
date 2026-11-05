@@ -66,8 +66,11 @@ ssh <box-alias> 'mkdir -p <workdir>/runs/<task> && cd <workdir>/runs/<task> &&
   In a shared clone, `git fetch` moves its `origin/*` refs (the clone then shows "behind N"), but
   never moves its checkout.
 - Commit and push from the worktree, or report `git -C <path> rev-parse HEAD` and a diff.
-- Clean up when the task ends: `git -C <workdir_root>/<repo> worktree remove <path>` once
-  everything is pushed or reported, then `git worktree prune`. Keep build trees others reuse.
+- Clean up when the task ends: remove only your own worktree,
+  `git -C <workdir_root>/<repo> worktree remove <own path>`, once everything is pushed or reported.
+  Never run a bare `git worktree prune` on a shared clone: it deletes the git records of every
+  worktree whose folder it cannot see (another user's, one outside your view), and git cannot make
+  them again. Pruning stays with the clone's owner. Keep build trees others reuse.
 
 ## Keys and agents
 

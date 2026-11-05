@@ -1110,16 +1110,20 @@ def remove(p: Project, task_id: int, force: bool = False) -> None:
 
 
 def remove_path(repo: Path, path: Path, force: bool = False) -> None:
-    """remove() for the worktree at `path` of the repository `repo`, then `git worktree prune` there."""
+    """remove() for the worktree at `path` of the repository `repo`, then `git worktree prune` there.
+    The harness's own keep lock (keep) is lifted just before; any other lock makes git refuse."""
     if path.exists():
+        unkeep(path)
         _git(repo, "worktree", "remove", *(["--force"] if force else []), str(path))
     _git(repo, "worktree", "prune", check=False)
 
 
-def _repo_of(path: Path) -> Path | None:
-    """The repository whose linked worktree is at `path`, read from its `.git` file (gitdir: <common
-    dir>/worktrees/<name>, whose commondir file names the common dir) without running git; None when
-    `path` holds no linked worktree of a non-bare repository."""
+KEEP_LOCK = "ttp: task worktree, kept until the harness removes it"
+
+
+def _gitdir(path: Path) -> Path | None:
+    """The admin dir (<common dir>/worktrees/<name>) the `.git` file at `path` names, without running
+    git; None when `path` holds no such file."""
     try:
         text = (path / ".git").read_text()
     except OSError:
@@ -1127,7 +1131,43 @@ def _repo_of(path: Path) -> Path | None:
     if not text.startswith("gitdir:"):
         return None
     gd = Path(text[len("gitdir:"):].strip())
-    gd = gd if gd.is_absolute() else path / gd
+    return gd if gd.is_absolute() else path / gd
+
+
+def _admin_dir(path: Path) -> Path | None:
+    """_gitdir() of the linked worktree at `path` when that admin dir exists."""
+    gd = _gitdir(path)
+    return gd if gd is not None and gd.is_dir() else None
+
+
+def keep(path: Path) -> None:
+    """Lock the task worktree at `path` (KEEP_LOCK) unless it is locked already. git never prunes a
+    locked worktree, so a `git worktree prune` run where this folder is out of view (a sandbox that
+    mounts only part of the tree, another clone's owner) cannot delete its admin dir and orphan it:
+    `git worktree repair` cannot make a deleted one again. Only the harness's own removal steps lift
+    it (remove_path); a half-made one goes with `remove --force --force` (_clear_partial)."""
+    ad = _admin_dir(path)
+    if ad is not None and not (ad / "locked").exists():
+        _git(path, "worktree", "lock", "--reason", KEEP_LOCK, str(path), check=False)
+
+
+def unkeep(path: Path) -> None:
+    """Lift keep()'s lock from the worktree at `path`; a lock anyone else set stays."""
+    ad = _admin_dir(path)
+    try:
+        ours = ad is not None and (ad / "locked").read_text().startswith(KEEP_LOCK)
+    except OSError:
+        ours = False
+    if ours:
+        _git(path, "worktree", "unlock", str(path), check=False)
+
+
+def _repo_of(path: Path) -> Path | None:
+    """The repository whose linked worktree is at `path`, read from its `.git` file (gitdir: <common
+    dir>/worktrees/<name>, whose commondir file names the common dir) without running git; None when
+    `path` holds no linked worktree of a non-bare repository."""
+    if (gd := _gitdir(path)) is None:
+        return None
     try:
         common = (gd / (gd / "commondir").read_text().strip()).resolve()
     except OSError:
@@ -1991,6 +2031,10 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             half = lock is not None and lock.startswith(HARNESS_LOCKS) and not (path / ".git").is_file()
             if not half and not is_git(path):
                 continue
+            if lock is None and not dry_run:
+                keep(path)   # one made before keep() existed: from now on no partial-view prune orphans it
+            if (lock or "").startswith(KEEP_LOCK):
+                lock = None   # the harness's own keep lock: remove_path lifts it if the worktree goes
             if w is None:
                 res = {"task": task["id"], "path": str(path), "branch": task["branch"], "status": task["status"],
                        "updated": task["updated"], "cleared": []}

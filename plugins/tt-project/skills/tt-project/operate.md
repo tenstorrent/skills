@@ -184,7 +184,10 @@
   saved instead as `tracked.patch` (checked to apply to its head; `git apply` restores them) and the
   worktree goes. Any other dirty worktree is kept and listed, and so is one with submodules set up
   (their commits may exist only there). A stale "initializing" lock (an unfinished `git worktree
-  add`) is cleared; any other lock, or a process running in the worktree, keeps it. A worktree is
+  add`) is cleared; any other lock, or a process running in the worktree, keeps it. Every task
+  worktree carries the harness's own keep lock from its first run (or the first sweep that sees it)
+  until the sweep removes it, so no `git worktree prune` run where its folder is out of view (a
+  sandbox mounting part of the tree) deletes its git record; that lock never keeps it. A worktree is
   left untouched for at least an hour after its task ends (not once a review of it has ended, pass or
   fail), until the coordinator has seen the result,
   and while an unfinished task still needs it (it depends on or continues the task, or its spec names
