@@ -310,7 +310,7 @@ def long_promises(db, cfg: dict | None, now: float | None = None) -> list[dict]:
         if not _open(o):
             continue
         cands = []
-        if pr := o.get("promise"):
+        if (pr := o.get("promise")) and not pr.get("claim"):   # a claim's due is its check time, no ETA
             cands.append(("promise", float(pr["due"]), float(pr.get("set_at") or o["created"])))
         for m in (o.get("milestones") or {}).values():
             if not m.get("receipt"):

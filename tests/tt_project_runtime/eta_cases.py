@@ -186,6 +186,20 @@ def test_eta_long_promise_on_urgent_work_is_flagged_and_clears(env):
     assert eta.course_lines(p.db, p.config(), now + 60)[0] == []
 
 
+def test_eta_a_claim_on_urgent_work_is_no_long_promise_or_expected_finish_line(env):
+    """A claim backed by an urgent task, due by default hours out, is no promise: no course line, no
+    Expected finish line."""
+    from ttp import eta, obligations as ob
+    p = make(env)
+    now = time.time()
+    hot = p.db.add_task("hot work", "urgent: the user is waiting\nfix it", kind="work", reply_chat="c3")
+    out = p.db.post("out", "the fix is running", chat="c3", kind="reply")
+    [line] = ob.record_claims(p, [(out, "c3", [{"text": "the fix lands", "task": hot}])], {}, now=now)
+    assert ob.get(p.db, line.split()[1])["promise"]["due"] - now > 2 * 3600
+    assert eta.course_lines(p.db, p.config(), now)[0] == []
+    assert not any("promise" in x for x in eta.state_lines(p.db, p, now))
+
+
 def test_eta_long_promise_needs_urgent_work_and_a_long_due(env):
     from ttp import eta
     p = make(env)
