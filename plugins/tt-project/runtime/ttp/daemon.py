@@ -7169,7 +7169,9 @@ class Daemon:
         push queue sent back, a wait whose probe passed, a requeue). One per stay in the
         queue (keyed on its last run), retired once it starts or such a hold takes it. A task with a
         queued announced_not_started or slot_wait event for the same wait is left to that one; a review
-        held for its own pre-review checks is a checks wait. Observation only: dispatch never reads it."""
+        held for its own pre-review checks is a checks wait. An urgent task (urgent.is_urgent) past
+        READY_P1_S that dispatch would start now (no hold at all) also kicks dispatch from here, once per
+        check (_kick_dispatch): a slow tick never keeps it waiting for the tick's own dispatch step."""
         now = time.time()
         last = getattr(self, "_unstarted_checked", 0.0)
         if now - last < every_s:
@@ -7188,11 +7190,12 @@ class Daemon:
         ready = db.ready_tasks()
         busy = {r["provider"]: r["n"] for r in db.q(
             "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
-        ctx = {"now": now, "paused": paused, "busy": busy, "committed": None,
+        ctx = {"now": now, "paused": paused, "busy": busy, "committed": None, "owners": obligations.owner_due(db),
                "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in ready}}}
         seen, held_before = getattr(self, "_unstarted_seen", {}), getattr(self, "_unstarted_held", set())
         was_ready = getattr(self, "_unstarted_ready", None)   # the previous check's ready ids; None: no such check
         self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), {t["id"] for t in ready}
+        kick = []   # urgent tasks past READY_P1_S that dispatch would start now
         for t in ready:
             tid, prov = t["id"], t["provider"] or core
             why = self._start_hold(t, prov, ctx)
@@ -7201,7 +7204,12 @@ class Daemon:
             gate = self.gates.get(prov)
             free = (gate.allow_new_work and busy.get(prov, 0) < gate.max_parallel) if gate else \
                 sum(busy.values()) < int(self.cfg["budget"].get("max_parallel_workers", 6))
-            if why in self.SKIP_HOLDS or not free or (t["kind"] == "review" and self._precheck_holds(t, now)):
+            # deadline work (a stated `urgent:` line or an obligation owner) held only by full slots is still
+            # raised, at READY_URGENT_S, naming what fills them: its resources are free
+            hot = urgent.extra_ok(t, now) or tid in ctx["owners"]
+            slots_only = why == "gate" and tid in ctx.get("full", {})
+            if ((why in self.SKIP_HOLDS or not free) and not (hot and (slots_only or why is None))) \
+                    or (t["kind"] == "review" and self._precheck_holds(t, now)):
                 self._unstarted_held.add(tid)
                 obligations._retire(db, now, f"held: {why or 'no free slot'}", fp)
                 continue
@@ -7210,22 +7218,47 @@ class Daemon:
                 since = max(since, last)
             self._unstarted_seen[tid] = since
             prio = 1 if urgent.is_urgent(t) else t["priority"]
-            if now - since < unstarted.threshold(prio, unstarted.READY_P1_S, unstarted.READY_S) \
-                    or db.one("SELECT 1 FROM events WHERE fingerprint IN (?,?) OR (kind=? AND task=? AND status='queued')",
+            late = now - since >= (unstarted.READY_URGENT_S if hot else
+                                   unstarted.threshold(prio, unstarted.READY_P1_S, unstarted.READY_S))
+            if late and why is None and prio <= 1:
+                kick.append(tid)
+            if not late or db.one("SELECT 1 FROM events WHERE fingerprint IN (?,?) OR (kind=? AND task=? AND status='queued')",
                               (fp, f"slot_wait:{tid}:{(ran or {}).get('id') or 0}", unstarted.ANNOUNCED_KIND, tid)):
                 continue
             what = self._hold_words(t, why, ctx) if why else (
                 f"nothing dispatch records as a hold ({t['blocked_reason'][:160]})" if t["blocked_reason"]
                 else "nothing dispatch records as a hold: see the daemon log for its start")
+            if slots_only:
+                what += f"; they hold {self._slot_users(prov)}"
             text = (f"Ready, not started: #{tid} {t['title'][:80]} (p{t['priority']}) has been ready "
-                    f"{(now - since) / 60:.0f} min with a {prov} worker slot free; held by {what}. Known, ready work "
-                    f"starts now: clear the hold if it is ours to clear, else say why it must wait.")
+                    f"{(now - since) / 60:.0f} min " + ("with every worker slot taken but its resources free"
+                                               if slots_only else f"with a {prov} worker slot free")
+                    + f"; held by {what}. Known, ready work starts now: clear the hold if it is ours to clear, "
+                    f"else say why it must wait." + (" The daemon kicked dispatch for it." if tid in kick else ""))
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", unstarted.READY_KIND, fp, "normal", text[:4000], "queued", tid))
             log(self.p, f"ready not started: task {tid} ready {(now - since) / 60:.0f} min, held by {what[:200]}")
         for r in db.q("SELECT fingerprint, task FROM events WHERE kind=? AND status='queued'", (unstarted.READY_KIND,)):
             if r["task"] not in self._unstarted_seen and r["task"] not in self._unstarted_held:
                 obligations._retire(db, now, "started or left the queue", r["fingerprint"])
+        if kick:
+            self._kick_dispatch(kick, now)
+
+    def _slot_users(self, provider: str | None = None) -> str:
+        """What holds the worker slots of `provider` (all providers: None), in words (schedlog.slot_users)."""
+        return schedlog.slot_words(schedlog.slot_users(self.p.db, provider))
+
+    def _kick_dispatch(self, ids: list[int], now: float) -> None:
+        """Run dispatch now for urgent tasks check_unstarted found ready past READY_P1_S with nothing holding
+        them, under the tick's own guards for dispatch (the project lease, a host power cycle, a stop)."""
+        if self.stopping or not self.lease_held() or self.host_cycle_held(now):
+            return
+        log(self.p, f"dispatch kick: urgent task(s) {', '.join(f'#{i}' for i in ids)} ready with a free slot "
+                    f"over {unstarted.READY_P1_S // 60} min")
+        try:
+            self.dispatch()
+        except Exception:   # the kick never breaks the check; the tick's own dispatch step still runs
+            log(self.p, "dispatch kick failed\n" + traceback.format_exc())
 
     def check_resume_wait(self, every_s: float = 60) -> None:
         """Model-free starvation guard for ready-to-resume work (resumefirst.py): a woken wait still
@@ -8557,7 +8590,8 @@ class Daemon:
         unmet = db.unmet_dependencies(rest) if rest else {}
         for r in rest:
             held[_queued_held_by(r, ctx["now"], unmet.get(r["id"]))] += 1
-        schedlog.record(schedlog.path(self.p), schedlog.entry(free, runnable, held, picked, ctx["now"]),
+        schedlog.record(schedlog.path(self.p), schedlog.entry(free, runnable, held, picked, ctx["now"],
+                                                                   schedlog.slot_users(db)),
                         self.__dict__.setdefault("_schedlog", {}), lambda msg: log(self.p, msg))
 
     def _live_claims(self) -> dict[int, tuple[set[str], set[str]]]:
@@ -8638,10 +8672,14 @@ class Daemon:
             return "net"
         gate = ctx["gate"] = self.gates.get(provider) or \
             bud.evaluate(self.p.db, self.cfg, provider, bud.plan_windows(self.p.db))
-        # An urgent task may take budget.urgent_extra_slots beyond them, unless the gate allows no slot.
-        extra = urgent.extra_slots(self.cfg) if gate.max_parallel > 0 and urgent.is_urgent(task) else 0
+        # A stated urgent task (urgent.extra_ok: a fresh `urgent:` line or the template-merge task, not
+        # priority alone) may take budget.urgent_extra_slots beyond them, unless the gate allows no slot.
+        extra = urgent.extra_slots(self.cfg) if gate.max_parallel > 0 and urgent.extra_ok(task, now) else 0
         slots, kept = gate.max_parallel + extra, 0
-        if not urgent.is_urgent(task):   # routine work leaves a slot for urgent work ready or due soon
+        if "owners" not in ctx:   # an obligation's required owner ranks ahead of urgent work (db.ready_tasks)
+            ctx["owners"] = obligations.owner_due(self.p.db)
+        if not urgent.is_urgent(task) and task["id"] not in ctx["owners"]:
+            # routine work leaves a slot for urgent work ready or due soon
             if "reserve" not in ctx:   # read once per ctx; reserve_slots drops those started since
                 ctx["reserve"] = urgent.reserve_due(self.p.db, now)
             kept = urgent.reserve_slots(self.cfg, self.p.db, now, gate.max_parallel, provider=provider,

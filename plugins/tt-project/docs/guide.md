@@ -922,9 +922,16 @@ that finishes a template merge after an upgrade is urgent too and starts before 
 until it ends, the project runs an older release. Urgent work never queues behind routine work;
 nothing running is interrupted:
 
-- Workers: urgent tasks start first. With every slot taken, an urgent task may take
-  `budget.urgent_extra_slots` (1; 0 turns it off) more. The spend gate, auth gate, pauses and locks
-  still hold it.
+- Workers: urgent tasks start first: a fresh `urgent:` line (under a day old) first, then the
+  required owners of an open obligation (earliest due first), then priority 1 alone, so a deadline
+  task never waits behind a project's routine priority 1 work. With every slot taken, a task with a
+  fresh `urgent:` line may take `budget.urgent_extra_slots` (1; 0 turns it off) more; priority 1
+  alone never does. The spend gate, auth gate, pauses and locks still hold it.
+- Detection: an urgent task ready over 2 minutes with a free slot and nothing holding it makes the
+  daemon run dispatch at once and raise one `ready_not_started` event. A deadline task (a fresh
+  `urgent:` line or an obligation owner) whose resources are free but whose slots are all taken is
+  raised after 1 minute, naming what fills the slots. Each scheduler.jsonl line lists them too
+  (`slots`: running runs by task kind, and runs whose task already ended but are not reaped yet).
 - Reserve: while a priority 1 task is ready to start, or due within the hour, routine
   work leaves `budget.urgent_reserve_slots` (1; 0 turns it off) of the regular slots free, at least
   one slot staying open to routine work. A ready urgent task never waits behind routine runs that

@@ -17,6 +17,8 @@ def _ready_setup(env, monkeypatch):
     d = Daemon(p.base)
     d.cfg = p.config()
     d.update_gates()
+    d.kicks = []   # dispatch kicks (Daemon._kick_dispatch) recorded, not run
+    monkeypatch.setattr(d, "dispatch", lambda: d.kicks.append(time.time()))
 
     def check(at):
         monkeypatch.setattr(time, "time", lambda: at)
@@ -333,3 +335,49 @@ def test_status_and_web_name_the_dependency_a_queued_task_waits_on(env):
                               "depWait({status: 'queued', waits_on: []}), depWait({status: 'running', waits_on: [7]})]))"],
                              capture_output=True, text=True, timeout=30)
         assert json.loads(out.stdout) == ["waits on #7", "", ""], out.stderr
+
+
+def test_an_urgent_task_ready_with_a_free_slot_kicks_dispatch_and_routine_work_does_not(env, monkeypatch):
+    """The model-free detector: a priority 1 task ready past READY_P1_S with a free slot and no hold kicks
+    dispatch from the check (it does not wait for the tick's own dispatch step) and its event says so."""
+    from ttp import unstarted
+    p, d, check = _ready_setup(env, monkeypatch)
+    routine = p.db.add_task("routine work", "s", kind="work", tier="light", origin="coordinator", priority=3)
+    p1 = p.db.add_task("urgent work", "s", kind="work", tier="light", origin="coordinator", priority=1)
+    start = time.time()
+    assert check(start + 60) == [] and d.kicks == []
+    got = check(start + unstarted.READY_P1_S + 30)
+    assert [e["task"] for e in got] == [p1] and "kicked dispatch" in got[0]["text"]
+    assert len(d.kicks) == 1, "one kick for the urgent task"
+    p.db.update_task(p1, status="running")
+    d.kicks.clear()
+    assert routine not in [e["task"] for e in check(start + 300)] and d.kicks == [], "priority 3 never kicks"
+    p.db.update_task(p1, status="queued")
+    monkeypatch.setattr(d, "lease_held", lambda: False)
+    check(start + 400)
+    assert d.kicks == [], "no kick without the project lease"
+
+
+def test_a_deadline_task_held_only_by_full_slots_raises_at_60_s_naming_what_fills_them(env, monkeypatch):
+    """A fresh `urgent:` line or an obligation owner whose resources are free but whose worker slots
+    (extra slot included) are all taken is raised after unstarted.READY_URGENT_S, naming the slots' users."""
+    from ttp import unstarted
+    p, d, check = _ready_setup(env, monkeypatch)
+    core = d.cfg.get("core_provider", "claude")
+    gate = d.gates[core]
+    for i in range(gate.max_parallel + 1):
+        tid = p.db.add_task(f"busy {i}", "s", kind="code" if i % 2 else "review", tier="light", origin="user")
+        p.db.update_task(tid, status="running")
+        p.db.x("INSERT INTO runs(task, role, provider, status, started) VALUES(?,?,?,?,?)",
+               (tid, "worker", core, "running", time.time()))
+    hot = p.db.add_task("user deadline", "s\nurgent: the user waits on it", kind="work", tier="light",
+                        origin="user", priority=1)
+    plain = p.db.add_task("routine p1", "s", kind="work", tier="light", origin="coordinator", priority=1)
+    start = time.time()
+    assert check(start + 30) == []
+    got = check(start + 30 + unstarted.READY_URGENT_S + 5)
+    assert [e["task"] for e in got] == [hot], "the deadline task only; routine priority 1 is a slot wait"
+    assert "every worker slot taken but its resources free" in got[0]["text"]
+    assert f"they hold {gate.max_parallel + 1} runs (" in got[0]["text"] and " review" in got[0]["text"]
+    assert d.kicks == [], "no free slot: nothing to kick"
+    assert plain not in [e["task"] for e in check(start + 30 + unstarted.READY_URGENT_S + 70)]

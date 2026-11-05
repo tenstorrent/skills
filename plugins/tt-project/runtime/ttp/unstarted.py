@@ -35,6 +35,7 @@ ANNOUNCED_S = 600       # a promise or announced task with no started owner run 
 ANNOUNCED_P1_S = 300    # an owner of priority 1
 READY_S = 600           # a ready task with a free slot not started after this
 READY_P1_S = 120        # priority 1 or urgent
+READY_URGENT_S = 60     # a fresh `urgent:` line or an obligation owner: its slots full counts too
 DEFER_S = 600           # task_update adding spec to a task deferred further than this gets the nudge
 MAX_AGE_S = 86400
 READY_TITLE = re.compile(r"(?i)^\s*ready\s*:\s*")   # a hand-off follow-up whose inputs are ready now

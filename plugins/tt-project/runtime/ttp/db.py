@@ -1047,8 +1047,8 @@ END""")
     def ready_tasks(self, later: bool = False) -> list[dict]:
         """Queued tasks whose dependencies are all finished, in dispatch's pick order: urgent tasks
         first (urgent.is_urgent: priority 1, an `urgent:` spec line or the template-merge task, which leads
-        them: urgent.leads), then required owners
-        of an open obligation (its earliest due milestone first, obligations.owner_due), then best
+        them: urgent.leads; a fresh `urgent:` line, then required owners of an open obligation (its earliest
+        due milestone first, obligations.owner_due), then priority alone: urgent.first), then best
         priority, then within a priority a woken wait first (resumefirst.order: the one ready longest
         first), then oldest. Read afresh on every call: no order outlives a dispatch pass or a daemon
         restart. A task deferred with `start_when` is not ready until its probe passes (see deferral).
@@ -1066,7 +1066,7 @@ END""")
             if due:
                 rows.sort(key=lambda r: (r["id"] not in due, due.get(r["id"], 0.0)))   # stable: priority, id within
             from . import urgent
-            rows = urgent.first(rows)
+            rows = urgent.first(rows, owners=due)
         unmet = self.unmet_dependencies(rows)
         return [r for r in rows if not unmet[r["id"]] and "when" not in deferral(r)]
 

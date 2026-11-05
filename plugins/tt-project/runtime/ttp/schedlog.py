@@ -47,15 +47,44 @@ def _last_key(f: Path) -> list | None:
         return None
 
 
+def slot_users(db, provider: str | None = None) -> dict:
+    """What holds the worker slots (running runs other than the coordinator's, of `provider` or all):
+    {"running": n, "by_kind": {task kind or run role: n}, "unreaped": runs whose task is no longer running
+    (it handed off or was stopped and the run is not reaped yet), "untracked": runs with no task}."""
+    rows = db.q("SELECT r.role, t.kind, t.status FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                "WHERE r.role!='coordinator' AND r.status='running'" + (" AND r.provider=?" if provider else ""),
+                (provider,) if provider else ())
+    out = {"running": len(rows), "by_kind": {}, "unreaped": 0, "untracked": 0}
+    for r in rows:
+        kind = r["kind"] or r["role"] or "other"
+        out["by_kind"][kind] = out["by_kind"].get(kind, 0) + 1
+        if r["status"] is None:
+            out["untracked"] += 1
+        elif r["status"] != "running":
+            out["unreaped"] += 1
+    return out
+
+
+def slot_words(users: dict) -> str:
+    """slot_users in words: '5 runs (3 code, 2 review; 1 of them for a task no longer running)'."""
+    kinds = ", ".join(f"{n} {k}" for k, n in sorted(users.get("by_kind", {}).items(), key=lambda kv: -kv[1]))
+    extra = [f"{users[k]} of them {w}" for k, w in (("unreaped", "for a task no longer running, not reaped yet"),
+                                                    ("untracked", "with no task")) if users.get(k)]
+    n = users.get("running", 0)
+    return f"{n} run{'s' if n != 1 else ''}" + (f" ({kinds}" + (f"; {'; '.join(extra)}" if extra else "") + ")"
+                                                 if kinds else "")
+
+
 def entry(free: int, runnable: list[dict], held: dict[str, int], picked: list[int],
-          now: float | None = None) -> dict:
-    """The line for one slot fill. runnable: {"id", "priority", "owns_obligation"} in rank order."""
+          now: float | None = None, slots: dict | None = None) -> dict:
+    """The line for one slot fill. runnable: {"id", "priority", "owns_obligation"} in rank order. slots:
+    what holds the worker slots (slot_users), so a line with few free slots names their users."""
     ts = dt.datetime.fromtimestamp(now, dt.timezone.utc) if now is not None else dt.datetime.now(dt.timezone.utc)
     return {"ts": ts.isoformat(timespec="seconds").replace("+00:00", "Z"), "free_slots": int(free),
             "runnable": [{"id": int(c["id"]), "priority": c["priority"], "owns_obligation": bool(c["owns_obligation"])}
                          for c in runnable[:TOP]],
             "runnable_total": len(runnable), "held": {r: int(held.get(r, 0)) for r in REASONS},
-            "picked": [int(i) for i in picked]}
+            "picked": [int(i) for i in picked], **({"slots": slots} if slots is not None else {})}
 
 
 def record(f: Path, line: dict, cache: dict, warn: Callable[[str], None]) -> bool:

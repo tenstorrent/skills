@@ -47,7 +47,7 @@ def _owe(p, tid, due):
                            milestones=[{"key": "m1", "due": due, "evidence_required": "a result"}])
 
 
-def test_dispatch_starts_urgent_then_obligation_owners_first_and_never_past_max_parallel(
+def test_dispatch_starts_obligation_owners_then_urgent_first_and_never_past_max_parallel(
         env, monkeypatch, tmp_path, reap_tmp_processes):
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
     try:
@@ -61,14 +61,14 @@ def test_dispatch_starts_urgent_then_obligation_owners_first_and_never_past_max_
         _owe(p, late_owner, now + 7200)
         _owe(p, early_owner, now + 3600)
         assert "## Obligation o" in p.db.task(early_owner)["spec"], "attached through the real record path"
-        assert [t["id"] for t in p.db.ready_tasks()] == [plain_p1, early_owner, late_owner, old_p3]
+        assert [t["id"] for t in p.db.ready_tasks()] == [early_owner, late_owner, plain_p1, old_p3]
         d.dispatch()
-        assert _slot_tasks(p) == [plain_p1, early_owner], "urgent first, then the earliest due obligation owner"
+        assert _slot_tasks(p) == [early_owner, late_owner], "obligation owners by due, before priority 1 alone"
         d.dispatch()
         assert len(_slot_tasks(p)) == 2, "a second pass started past max_parallel"
         settle(d)
         d.dispatch()
-        assert _slot_tasks(p) == [late_owner, old_p3], "then the later owner before the older priority 3"
+        assert _slot_tasks(p) == [plain_p1, old_p3], "then priority 1 before the older priority 3"
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
@@ -164,7 +164,8 @@ def _gate_cut_wait(env, monkeypatch, tmp_path, level, allowed, cause, extra):
     assert len(_slot_tasks(p)) == 2
     d.gates[core] = dataclasses.replace(d.gates[core], level=level, regime="caps", max_parallel=allowed,
                                         cause=cause, reasons=["billed by use since 01:00 PST", cause])
-    hot = p.db.add_task("urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
+    hot = p.db.add_task("urgent fix", "s\nurgent: a user deadline", kind="work", tier="light", origin="user",
+                        priority=1)
     d.dispatch()
     assert len(_slot_tasks(p)) == 2 and hot not in _slot_tasks(p), "the gate's cut let the urgent task start"
     start = time.time()
@@ -211,13 +212,15 @@ def test_slot_wait_names_the_budget_gates_one_slot_at_orange_and_the_urgent_extr
 
 
 def test_slot_wait_words_name_the_slot_held_back_for_urgent_work(env, monkeypatch, tmp_path):
-    """An obligation owner that is not urgent leaves budget.urgent_reserve_slots to a ready urgent task:
-    its slot count names that reserve; with no cut and no reserve nothing is added."""
+    """Routine work leaves budget.urgent_reserve_slots to a ready urgent task: its slot count names that
+    reserve; with no cut and no reserve nothing is added. An obligation owner keeps none (it ranks ahead)."""
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
     core = d.cfg.get("core_provider", "claude")
-    owner = p.db.task(p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user",
+    owner = p.db.task(p.db.add_task("routine work", "s", kind="work", tier="light", origin="user",
                                         priority=2))
-    _owe(p, owner["id"], time.time() + 3600)
+    debtor = p.db.task(p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user",
+                                     priority=2))
+    _owe(p, debtor["id"], time.time() + 3600)
     ctx = {"now": time.time(), "paused": {}, "committed": None, "busy": {core: 1}, "logged_out": {}}
     assert d._start_hold(owner, core, ctx) is None, "a free slot with no urgent task due"
     p.db.add_task("urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
@@ -226,6 +229,8 @@ def test_slot_wait_words_name_the_slot_held_back_for_urgent_work(env, monkeypatc
     assert ctx["full"][owner["id"]] == 1
     assert ctx["full_why"][owner["id"]] == "2 configured; 1 held back for urgent work"
     assert d._hold_words(owner, "gate", ctx) == f"every {core} slot taken (1; 2 configured; 1 held back for urgent work)"
+    ctx = {"now": time.time(), "paused": {}, "committed": None, "busy": {core: 1}, "logged_out": {}}
+    assert d._start_hold(p.db.task(debtor["id"]), core, ctx) is None, "an obligation owner keeps no reserve"
 
 
 def test_budget_slot_words_name_the_gate_cut_only_when_it_lowers_the_configured_slots():
@@ -831,11 +836,12 @@ def test_a_slot_fill_flags_an_obligation_owner_and_lists_it_where_dispatch_ranks
         owner = p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user", priority=3)
         _owe(p, owner, time.time() + 3600)
         d.dispatch()
-        assert _slot_tasks(p) == [plain], "an urgent task ranks before an obligation owner"
+        assert _slot_tasks(p) == [owner], "an obligation owner ranks before priority 1 alone"
         line, = _sched_lines(p)
-        assert line["runnable"] == [{"id": plain, "priority": 1, "owns_obligation": False},
-                                    {"id": owner, "priority": 3, "owns_obligation": True}], line
-        assert line["picked"] == [plain]
+        assert line["runnable"] == [{"id": owner, "priority": 3, "owns_obligation": True},
+                                    {"id": plain, "priority": 1, "owns_obligation": False}], line
+        assert line["picked"] == [owner]
+        assert line["slots"] == {"running": 1, "by_kind": {"work": 1}, "unreaped": 0, "untracked": 0}, line
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
@@ -1255,18 +1261,18 @@ def test_an_urgent_task_starts_first_and_takes_one_extra_slot_past_full_routine_
         hot = p.db.add_task("time-sensitive fix", "Fix it.\nurgent: the user is waiting on it", kind="work",
                             tier="light", origin="user", priority=3)
         hot2 = p.db.add_task("another urgent fix", "s", kind="work", tier="light", origin="user", priority=1)
-        assert [t["id"] for t in p.db.ready_tasks()] == [hot2, hot, r3], "urgent first, by priority within"
+        assert [t["id"] for t in p.db.ready_tasks()] == [hot, hot2, r3], "a stated urgent line first, then p1"
         d.cfg["budget"]["urgent_extra_slots"] = 0
         d.dispatch()
         assert _slot_tasks(p) == [r1, r2], "0 turns the extra slot off"
         d.cfg["budget"]["urgent_extra_slots"] = 1
         d.dispatch()
-        assert _slot_tasks(p) == [r1, r2, hot2], "one extra slot, for the first urgent task"
+        assert _slot_tasks(p) == [r1, r2, hot], "one extra slot, for the task with an urgent line"
         d.dispatch()
-        assert _slot_tasks(p) == [r1, r2, hot2], "a second urgent task waits past the extra slot"
+        assert _slot_tasks(p) == [r1, r2, hot], "priority 1 alone never takes the extra slot"
         settle(d)
         d.dispatch()
-        assert _slot_tasks(p) == [hot, r3], "the spec-line urgent task before routine priority 2"
+        assert _slot_tasks(p) == [hot2, r3], "priority 1 before routine priority 2"
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
@@ -1717,3 +1723,53 @@ def test_a_template_merge_task_starts_ahead_of_queued_p1_work_and_the_gates_stil
     finally:
         drain(d)
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_deadline_task_with_an_urgent_line_starts_before_routine_priority_1_work_and_takes_the_extra_slot(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The stall: a project running its routine work at priority 1 (older tasks, woken waits) ranked a fresh
+    `urgent:` deadline task behind all of it, and routine priority 1 took the one extra slot. Now the stated
+    line ranks first and only it may start past full slots; a stale line (over urgent.STALE_S) ranks as
+    priority alone."""
+    from ttp import urgent
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    try:
+        routine = [p.db.add_task(f"routine p1 {i}", "s", kind="work", tier="light", origin="coordinator",
+                                 priority=1) for i in range(3)]
+        d.dispatch()
+        assert _slot_tasks(p) == routine[:1], "routine priority 1 fills the only slot"
+        stale = p.db.add_task("old deadline", "s\nurgent: last week's deadline", kind="work", tier="light",
+                              origin="user", priority=1)
+        p.db.x("UPDATE tasks SET created=? WHERE id=?", (time.time() - urgent.STALE_S - 60, stale))
+        hot = p.db.add_task("user deadline", "s\nurgent: the user waits on it tonight", kind="work",
+                            tier="light", origin="user", priority=1)
+        assert [t["id"] for t in p.db.ready_tasks()] == [hot] + routine[1:] + [stale]
+        d.dispatch()
+        assert _slot_tasks(p) == [routine[0], hot], "the deadline task takes the extra slot at once"
+        d.dispatch()
+        assert _slot_tasks(p) == [routine[0], hot], "routine and stale priority 1 never take an extra slot"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_schedlog_slot_users_name_what_fills_the_worker_slots(env):
+    from ttp import schedlog
+    p = make(env)
+    p.db.x("UPDATE tasks SET status='done'")
+    code = p.db.add_task("a change", "s", kind="code", tier="light", origin="user")
+    rev = p.db.add_task("its review", "s", kind="review", tier="light", origin="user")
+    gone = p.db.add_task("handed off", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(code, status="running")
+    p.db.update_task(rev, status="running")
+    p.db.update_task(gone, status="done")
+    for tid, role in ((code, "worker"), (rev, "reviewer"), (gone, "worker"), (None, "worker"), (None, "coordinator")):
+        p.db.x("INSERT INTO runs(task, role, provider, status, started) VALUES(?,?,?,?,?)",
+               (tid, role, "claude", "running", time.time()))
+    users = schedlog.slot_users(p.db, "claude")
+    assert users == {"running": 4, "by_kind": {"code": 1, "review": 1, "work": 1, "worker": 1},
+                     "unreaped": 1, "untracked": 1}, users
+    assert schedlog.slot_users(p.db, "codex")["running"] == 0
+    words = schedlog.slot_words(users)
+    assert words.startswith("4 runs (") and "1 review" in words and "1 of them for a task no longer running" in words
+    assert schedlog.entry(1, [], {}, [], 0, users)["slots"] == users and "slots" not in schedlog.entry(1, [], {}, [], 0)

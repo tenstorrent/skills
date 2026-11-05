@@ -8,8 +8,9 @@ an older release, so it leads the lane, ahead of priority-1 work. One holds the 
 (release.take_finish_lock), so it cannot starve other work.
 
 - Worker start: db.ready_tasks puts urgent tasks before every other ready task (obligation owners
-  included). With every worker slot of its provider taken, an urgent task starts in up to
-  budget.urgent_extra_slots (default 1; 0: off) slots beyond the gate's max_parallel. The spend gate
+  included), and among them a fresh `urgent:` line (stated), then obligation owners, before priority
+  alone, so a deadline task never waits behind a project's routine priority-1 work. With every worker
+  slot of its provider taken, a stated one (extra_ok) starts in up to budget.urgent_extra_slots (default 1; 0: off) slots beyond the gate's max_parallel. The spend gate
   (allow_new_work, a gate of 0 slots, the dollar caps), the auth gate, pauses and resource locks
   still hold it; a running run is never interrupted.
 - Review: an urgent code task's review is queued as soon as it hands off (done or needs_review)
@@ -34,6 +35,7 @@ from __future__ import annotations
 
 import json
 import re
+import time
 
 from . import db as dbmod, timefmt
 from .release import UPGRADE_TASK_TITLE
@@ -134,10 +136,29 @@ def shown_why(db, task: dict, now: float) -> str:
     return f"{reason} (written {age} ago" + ("" if heard else ", no user message since") + ")"
 
 
-def first(rows: list[dict]) -> list[dict]:
-    """`rows` with the urgent ones first, the template-merge task (leads) before the rest of them, each
-    part in its own order (a stable sort)."""
-    return sorted(rows, key=lambda r: (not is_urgent(r), not leads(r)))
+def stated(task: dict | None, now: float) -> bool:
+    """An `urgent: <why>` line in the spec written under STALE_S ago (line_since). A project that runs its
+    routine work at priority 1 leaves priority alone saying nothing: the stated line is what marks the
+    deadline among them."""
+    if not task or not LINE.search(str(task.get("spec") or "")):
+        return False
+    since = line_since(task)
+    return since is None or now - since < STALE_S
+
+
+def first(rows: list[dict], now: float | None = None, owners=()) -> list[dict]:
+    """`rows` in the urgent lane's order, each part in its own order (a stable sort): the template-merge
+    task (leads), then a fresh `urgent:` line (stated), then the `owners` (required owners of an open
+    obligation, whatever their priority), then the other urgent ones (priority alone), then the rest."""
+    now = time.time() if now is None else now
+    return sorted(rows, key=lambda r: (not leads(r), not stated(r, now), r["id"] not in owners, not is_urgent(r)))
+
+
+def extra_ok(task: dict | None, now: float) -> bool:
+    """Whether `task` may start in budget.urgent_extra_slots past a full gate: the template-merge task
+    or a fresh `urgent:` line, not priority alone, so a project's routine priority-1 work never holds
+    the one extra slot a deadline task needs."""
+    return leads(task) or stated(task, now)
 
 
 def extra_slots(cfg: dict) -> int:
