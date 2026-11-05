@@ -90,3 +90,112 @@ def test_a_lift_the_users_words_do_not_cover_is_still_refused_naming_the_fix(env
         if "contradicts" not in why:
             assert "Not repaired as a scoped exception" in err[0] and "`excepts`" in err[0], err
         assert p.charter_path.read_text() == _SCOPED_BANS, text
+
+
+
+_CITE_CHARTER = "# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n"
+
+
+def _cite_change(p, cited, src: dict, turn: int, **kw) -> tuple[list[str], str]:
+    """A Restrictions change whose text cites user msg #`cited` and whose `source` is `src`: (errors, the
+    stored line, "" when none)."""
+    import json
+    from ttp import coordinator as coord
+    act = {"type": "charter_update", "section": "Restrictions",
+           "text": f"- Keep the changelog in English (user msg #{cited}).", "source": json.dumps(src)}
+    err = coord.apply(p, [act], turn=turn, **kw)
+    return err, next((x for x in p.charter_path.read_text().splitlines() if "changelog" in x), "")
+
+
+def _user_said(p, words: str, context: str | None = None) -> int:
+    return p.db.post("in", words, chat=None, channel="web", kind="user", provenance="web-session", context=context)
+
+
+def test_a_text_cite_of_another_logged_user_message_is_kept_beside_the_source(env):
+    """Text cites user message A, `source` names user message B, both logged user messages: the change
+    applies citing both (in or out of a user turn, and with agent mode's relayer source, which the earlier
+    foreign-cite swap skipped and refused), the turn's notes and CHARTER_HISTORY name the repair, and no
+    charter_retry is raised. A resend of that change in a later turn lands the same way."""
+    from ttp import relay
+    from ttp import coordinator as coord
+    for k, form in enumerate(("plain", "user turn", "agent relayer", "resend")):
+        p = make(env)
+        p.charter_path.write_text(_CITE_CHARTER)
+        if form == "agent relayer":
+            p.set_config(relay.AGENT_KEY, True)
+        a = _user_said(p, "Keep the changelog in English.")
+        b = _user_said(p, "Also keep release notes short.")
+        src = {"msg": b, "quote": "keep release notes short", **({"origin": "relayer"} if "agent" in form else {})}
+        kw = {"user_turn": True, "messages": [b]} if form == "user turn" else {}
+        err, line = _cite_change(p, a, src, 2 + k, **kw)
+        if form == "resend":   # as if refused before: the resend in a later turn lands
+            p.charter_path.write_text(_CITE_CHARTER)
+            err, line = _cite_change(p, a, src, 10 + k)
+        assert err == [], (form, err)
+        assert f"#{a}" in line and line.endswith(f" (user msg #{b})"), (form, line)
+        assert sum(f"#{n}" in line for n in (a, b)) == 2 and _CITE_CHARTER.split("\n")[3] in p.charter_path.read_text()
+        notes = p.db.kv(coord.NOTES_KEY, []) or []
+        assert any("charter_update repaired" in n and f"#{a}" in n for n in notes), (form, notes)
+        hist = (p.harness / coord.CHARTER_HISTORY).read_text()
+        assert f"cites repaired: kept the cite of logged user message #{a}" in hist, (form, hist)
+        assert not p.db.q("SELECT 1 FROM events WHERE kind='charter_retry'"), form
+
+
+def test_a_text_cite_no_logged_user_message_backs_is_swapped_for_the_source(env):
+    """A cite of an id not in the log, a message with only a relayer's context, a worker note, the
+    coordinator's own line, or the owner's agent's finding with agent mode off is never kept as the user's:
+    the source's cite replaces it (or, beside a kept one, it is dropped). A Brief or gate source still
+    refuses such a cite, as before. With agent mode on, the owner's agent's finding counts as a user cite."""
+    from ttp import relay
+    p = make(env)
+    p.charter_path.write_text(_CITE_CHARTER)
+    b = _user_said(p, "Also keep release notes short.")
+    src = {"msg": b, "quote": "keep release notes short"}
+    ctx = _user_said(p, "", context="relayer: they asked about the changelog language")
+    note = p.db.post("in", "worker: keep the changelog in English", chat=None, kind="note", provenance="worker")
+    out = p.db.post("out", "Keep the changelog in English?", chat="web", kind="reply")
+    finding = p.db.post("in", "", chat="cli", kind="finding", provenance="cli-legacy",
+                        context="Order: write the changelog in plain words")
+    for k, cited in enumerate((99999, ctx, note, out, finding)):
+        p.charter_path.write_text(_CITE_CHARTER)
+        err, line = _cite_change(p, cited, src, 2 + k)
+        assert err == [] and f"#{cited}" not in line and line.endswith(f" (user msg #{b})"), (cited, err, line)
+        p.charter_path.write_text(_CITE_CHARTER)
+        err, line = _cite_change(p, cited, {"origin": "gate"}, 20 + k)
+        assert len(err) == 1 and "which `source` does not name" in err[0] and not line, (cited, err)
+    # Agent mode on: the owner's agent's finding is the owner's word, so its cite stays beside the source's.
+    p.set_config(relay.AGENT_KEY, True)
+    p.charter_path.write_text(_CITE_CHARTER)
+    err, line = _cite_change(p, finding, src, 40)
+    assert err == [] and f"#{finding}" in line and line.endswith(f" (user msg #{b})"), (err, line)
+    # A relayer's context alone still is not, nor a note.
+    for k, cited in enumerate((note, out)):
+        p.charter_path.write_text(_CITE_CHARTER)
+        err, line = _cite_change(p, cited, src, 41 + k)
+        assert err == [] and f"#{cited}" not in line, (cited, line)
+    # Beside a kept cite, an unbacked one in the same run is dropped and the logged one stays.
+    p.set_config(relay.AGENT_KEY, False)
+    a = _user_said(p, "Keep the changelog in English.")
+    p.charter_path.write_text(_CITE_CHARTER)
+    err, line = _cite_change(p, f"{a} and #99999", src, 50)
+    assert err == [] and f"#{a}" in line and "99999" not in line and line.endswith(f" (user msg #{b})"), (err, line)
+    # A gate source with a cite of a logged user message keeps both.
+    p.charter_path.write_text(_CITE_CHARTER)
+    err, line = _cite_change(p, a, {"origin": "gate"}, 51)
+    assert err == [] and f"#{a}" in line and line.endswith(" (origin: harness gate)"), (err, line)
+
+
+def test_a_kept_text_cite_is_not_the_users_word_for_a_loosening(env):
+    """A loosening rests only on the source quote's checked words: a kept cite of another user message
+    that would cover the lift does not make it pass."""
+    import json
+    from ttp import coordinator as coord
+    p = make(env)
+    p.charter_path.write_text(_SCOPED_BANS)
+    _aid, yid = _ask_and_yes(p, _YES_ASK)   # a yes that would cover the lift
+    other = _user_said(p, "Keep release notes short.")
+    act = {"type": "charter_update", "section": "Restrictions", "text": f"{_YES_EXC} (user msg #{yid})",
+           "source": json.dumps({"msg": other, "quote": "keep release notes short"})}
+    err = coord.apply(p, [act], turn=3)
+    assert len(err) == 1 and "contradicts the Restrictions item" in err[0], err
+    assert p.charter_path.read_text() == _SCOPED_BANS

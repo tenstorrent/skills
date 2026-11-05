@@ -215,6 +215,56 @@ def _own_cite(text: str, cite: str, charter: str) -> str:
     return cite
 
 
+def user_cites(db, text: str, agent: bool = False) -> list[int]:
+    """The message ids `text` cites that are the user's own logged messages: inbound, not system, of kind
+    user with words of their own, or with `agent` (relay.agent_orders) the owner's agent's words in a user
+    message's context or a finding. A relayer's context alone, a note, an ask or an unknown id is none."""
+    ids = sorted({int(n) for m in _CITES_RE.finditer(text) for n in re.findall(r"#(\d+)", m.group())})
+    out = []
+    for r in relay.recent(db, ids) if ids else []:
+        kind = db.one("SELECT kind FROM messages WHERE id=?", (r["id"],))["kind"]
+        own, ctx = relay.split(r["text"] or "", r["context"])
+        if (kind == "user" and (own.strip() or agent and ctx.strip())
+                or agent and kind == "finding" and (own + ctx).strip()):
+            out.append(r["id"])
+    return out
+
+
+def repair(db, charter: str, text: str, src, agent: bool = False) -> tuple[str, str, str]:
+    """For a `text` check() refused for citing what `src` does not name: (the text to store, the source's
+    checked cite, what was repaired). A cite of a logged user message (user_cites) stays and the source's
+    cite is added beside it; any other cite is dropped for the source's, except with a Brief or gate
+    source, which still refuses it. The loosening checks read only the returned source cite: a kept cite
+    is never the user's word for them. ValueError when the source itself does not check."""
+    from .prompts import charter_restrictions
+    cite = check(db, charter, "", src, agent)   # the source alone: its own checks, no cite in `text` yet
+    kept = {f"#{n}" for n in user_cites(db, text, agent)}
+    want = kept | _cite_keys(cite) | _cite_keys(charter_restrictions(charter))
+    origin = str(_parse(src).get("origin") or "").strip().lower()
+    added, dropped = set(), []
+
+    def fix(m: re.Match) -> str:
+        keys = _cite_keys(m.group())
+        if keys <= want:
+            added.update(keys & kept)
+            return m.group()
+        if origin in ORIGINS:   # the Brief or a gate: a cite no user message backs stays refused
+            check(db, charter, text, src, agent)
+        dropped.append(m.group().strip())
+        ok = sorted((keys & kept), key=lambda k: int(k[1:]))
+        added.update(ok)
+        return f" (user msg {', '.join(ok)})" if ok else ""
+    text = _BARE_RE.sub(fix, text)
+    text = cite_items(text, cite, also=kept)
+    why = "; ".join(x for x in (
+        f"kept the cite of logged user message {', '.join(sorted(added, key=lambda k: int(k[1:])))} beside the "
+        f"source's" if added else "",
+        f"dropped {', '.join(dropped)} for the source's cite, as no logged user message backs it"
+        if dropped and not added else
+        f"dropped what no logged user message backs in {', '.join(dropped)}" if dropped else "") if x)
+    return text, cite, why.replace("(", "").replace(")", "")
+
+
 def cited_unsourced(charter: str, text: str) -> str:
     """The unsourced Restrictions item an ask's text is about, when it is about no sourced one; else ""."""
     from .coordinator import _BAN_RE, _sentences
@@ -234,15 +284,17 @@ def cited_unsourced(charter: str, text: str) -> str:
     return hits[0][0]
 
 
-def cite_items(text: str, cite: str) -> str:
-    """`text` with `cite` at the end of each of its items that has none (a multi-item update)."""
+def cite_items(text: str, cite: str, also: set[str] = frozenset()) -> str:
+    """`text` with `cite` at the end of each of its items that has none (a multi-item update), or cites
+    only `also` (message keys "#N" repair() keeps beside the source's)."""
     if not cite:
         return text
     lines = text.split("\n")
     ends, at = [], 0
     for it in split_items(text):
         at = lines.index(it[0], at) + len(it) - 1
-        if not it[0].lstrip().startswith("#") and not sourced(" ".join(it)):
+        keys = _cite_keys(" ".join(it))
+        if not it[0].lstrip().startswith("#") and (not sourced(" ".join(it)) or keys and keys <= also):
             ends.append(at)
     for i in ends:
         lines[i] = lines[i].rstrip() + cite

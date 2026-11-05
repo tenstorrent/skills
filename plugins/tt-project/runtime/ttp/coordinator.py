@@ -2990,6 +2990,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     queue = cited if ok is None and len(over) < OVER_MIN else []   # a findings turn queues it too
                     cited = [] if via else queue
                     uturn = user_turn or bool(via) or bool(cited)
+                    repaired = ""   # what restriction_source.repair changed, for CHARTER_HISTORY
                     unsourced, agent_cite, cite = "", False, ""   # an added or changed item records its
                     if text and _DATED.sub("", section).lower().startswith("restriction"):   # source; the user's
                         try:                                                                 # yes is one
@@ -3001,15 +3002,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             agent_cite = "relayer-ordered" in cite
                         except ValueError as e:   # raised by _charter_update after its own checks
                             unsourced = str(e)
-                            if "which `source` does not name" in unsourced and not _parse_origin(a.get("source")):
-                                try:
-                                    bare = restriction_source.bare(text)
-                                    cite = restriction_source.check(db, p.charter_path.read_text(), bare,
-                                                                    a.get("source"), agent)
-                                    notes.append(f"charter_update repaired: dropped the cites in `text` that "
-                                                 f"`source` does not name and cited{cite}")
-                                    text, unsourced = restriction_source.cite_items(bare, cite), ""
-                                    agent_cite = "relayer-ordered" in cite
+                            if "which `source` does not name" in unsourced:   # a relayer source too
+                                try:   # a cite of a logged user message stays beside the source's
+                                    text, cite, repaired = restriction_source.repair(
+                                        db, p.charter_path.read_text(), text, a.get("source"), agent)
+                                    notes.append(f"charter_update repaired: {repaired}; cited{cite}")
+                                    unsourced, agent_cite = "", "relayer-ordered" in cite
                                 except ValueError:
                                     pass
                     # a Restrictions item edited without the user's word or `over` is refused below anyway
@@ -3089,7 +3087,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     try:
                         target, extra, retired = _charter_update(p, section, text, quote, replaces, key,
                                                                  uturn or ok is not None, over, end, no_ok,
-                                                                 source, unsourced, turn_src)
+                                                                 source, unsourced, turn_src, repaired)
                     except ValueError as e:
                         # a missing source is no approval to record, nor is a Restrictions edit without
                         # this turn's words in `source` (a later retry would apply it on that approval)
@@ -7001,7 +6999,7 @@ _DATED = re.compile(r"\s*\(added [^)]*\)$", re.I)   # legacy "## Policies (added
 def _charter_update(p: Project, section: str, text: str, quote: str, replaces: str, key: str | None,
                     user_turn: bool, over: str = "", end: dict | None = None,
                     no_approval: str = "", source: list[int] | None = None,
-                    unsourced: str = "", turn_source: str = "") -> tuple[str, str, str]:
+                    unsourced: str = "", turn_source: str = "", repaired: str = "") -> tuple[str, str, str]:
     """Apply one charter_update: retire the section `replaces` names, then edit the one section
     `section` names. With `quote`, the single span of that section matching it is replaced by
     `text` (or removed when `text` is empty); otherwise `text` is added at the section's end, and
@@ -7017,12 +7015,14 @@ def _charter_update(p: Project, section: str, text: str, quote: str, replaces: s
     named in CHARTER_HISTORY. `unsourced`: why the new Restrictions text has no valid source
     (restriction_source.check), raised once every other check passed. `turn_source`: why the user
     turn's `source` does not back removing or replacing a cited Restrictions item
-    (restriction_source.turn_quote), raised when the edit touches one; an uncited item needs none."""
+    (restriction_source.turn_quote), raised when the edit touches one; an uncited item needs none.
+    `repaired`: what restriction_source.repair changed in the text's cites, named in CHARTER_HISTORY."""
     from .prompts import charter_sections
     sections = charter_sections(p.charter_path.read_text())
     hist = p.harness / CHARTER_HISTORY
     stamp = time.strftime("%Y-%m-%d") + (f", turn {key}" if key else "")
     said = f", user message #{', #'.join(map(str, source))}" if source else ""
+    said += f"; cites repaired: {repaired}" if repaired else ""
     logged = time.strftime("%Y-%m-%d") + said + (f", turn {key}" if key else "")   # ends ", turn <key>)" too
     log: list[str] = []
     # Logged by an earlier try of this turn: write the charter only if that try died before it did.
