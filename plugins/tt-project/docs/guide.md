@@ -101,8 +101,10 @@ prolonged whole-box outage.
   the line holds new starts back. You get an alert only when the project reaches the line, once
   per window; it clears by itself when the window resets.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default
-  (`budget.daily_usd`, `budget.weekly_usd`). A new run
-  starts only if its budget fits in what is left of both caps. A plan account whose successful
+  (`budget.daily_usd`, `budget.weekly_usd`). With `budget.day_start` set, the daily cap counts
+  the budget day instead of the last 24 hours. A new run
+  starts only if its budget fits in what is left of both caps, each over that same window. At
+  `budget.cap_yellow_pct` (60 by default) of a cap the gate turns yellow and halves the worker slots. A plan account whose successful
   runs stop reporting plan windows falls under these caps too (failed or silent runs do not count).
   The caps count only spend made on an account that was billed by use at the time: after a switch
   from a plan account to a usage-billed one, the plan's earlier spend stays out.

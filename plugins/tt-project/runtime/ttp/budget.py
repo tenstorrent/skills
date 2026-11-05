@@ -543,9 +543,19 @@ def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: 
         _raise(g, "red", "cap reached: " + ", ".join(set_caps))
     elif ratio >= 0.85:
         _raise(g, "orange", f"{ratio:.0%} of cap used")
-    elif ratio >= 0.6:
+    elif ratio >= yellow_ratio(b):
         _raise(g, "yellow", f"{ratio:.0%} of cap used")
     _global(db, g, b, provider, day, now, extra)
+
+
+def yellow_ratio(b: dict) -> float:
+    """The share of a dollar cap at which the gate turns yellow and halves the worker slots:
+    budget.cap_yellow_pct (default 60; a value that is not a number above 0 keeps the default)."""
+    try:
+        pct = float(b.get("cap_yellow_pct", 60))
+    except (TypeError, ValueError):
+        pct = 60.0
+    return pct / 100 if pct > 0 else 0.6
 
 
 def _paid_since(db: DB, provider: str, rows: list[dict], line: float, now: float) -> float:

@@ -3819,6 +3819,62 @@ def test_an_unbudgeted_task_starts_capped_at_its_tier_default_and_commits_it_und
     assert argv[argv.index("--max-budget-usd") + 1] == "8.00"
 
 
+def test_the_dispatch_cap_check_measures_the_daily_cap_over_the_budget_day_like_the_gate(env, monkeypatch):
+    """_start_hold's dollar-cap check measures the daily cap over the window budget._caps defines it
+    on: the budget day (spent_today) once budget.day_start is set, else the last 24 h; the weekly cap
+    stays on the last 7 days. Committed running spend and the task's own cost still count."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    _no_events(p)
+    d = Daemon(p.base)
+    prov = d.cfg.get("core_provider", "claude")
+    task = p.db.task(p.db.add_task("urgent fix", "s", kind="work", tier="standard", origin="user",
+                                   priority=1, budget_usd=8.0))
+
+    def hold(committed: float, **numbers) -> str | None:
+        d.gates = {prov: bud.Gate(provider=prov, regime="caps", max_parallel=5,
+                                  numbers={"daily_cap": 100.0, "weekly_cap": 0.0, "spent_7d": 0.0, **numbers})}
+        monkeypatch.setattr(d, "_committed_usd", lambda: committed)
+        return d._start_hold(task, prov, {"now": time.time(), "paused": {}, "committed": None, "busy": {},
+                                          "logged_out": {}})
+
+    # budget day set: the rolling 24 h is near the cap, the budget day is at 60%
+    assert hold(2.0, spent_24h=98.0, spent_today=60.0) is None, "the budget day has room left"
+    # the budget day plus committed plus the task's cost passes the cap: still held
+    assert hold(33.0, spent_24h=98.0, spent_today=60.0) == "caps", "60 + 33 + 8 > 100"
+    assert hold(0.0, spent_24h=10.0, spent_today=93.0) == "caps", "the budget day alone, not the 24 h, counts"
+    # no budget day: the last 24 h, as before
+    assert hold(2.0, spent_24h=98.0) == "caps"
+    assert hold(2.0, spent_24h=60.0) is None
+    # the weekly cap stays on the last 7 days
+    assert hold(2.0, spent_24h=98.0, spent_today=10.0, spent_7d=495.0, weekly_cap=500.0) == "caps"
+    assert hold(2.0, spent_24h=98.0, spent_today=10.0, spent_7d=480.0, weekly_cap=500.0) is None
+
+
+def test_the_yellow_cap_share_is_a_config_key_with_the_60_percent_default(env):
+    """budget.cap_yellow_pct sets the share of a dollar cap at which the gate turns yellow (and halves
+    the worker slots); unset, or not a number above 0, it stays at 60%."""
+    p = make(env)
+    from ttp import budget as bud
+    from ttp.project import _known_keys
+    now = time.time()
+    _login(env, "acct-a", "usage-billed", org="org")
+    bud.note_account(p.db, "claude", "acct-a | org | usage-billed")
+    p.db.spend("claude", 70.0, "task:2", account="acct-a | org | usage-billed", ts=now - 60)
+    cfg = p.config()
+
+    def level(**budget) -> str:
+        return bud.evaluate(p.db, {**cfg, "budget": {**cfg["budget"], **budget}}, "claude", [], now).level
+
+    assert level() == "yellow", "70% of $100 is past the default 60%"
+    assert level(cap_yellow_pct=75) == "green"
+    assert level(cap_yellow_pct=50) == "yellow"
+    for bad in (0, -5, "lots", None):
+        assert level(cap_yellow_pct=bad) == "yellow", bad
+    assert "cap_yellow_pct" in _known_keys(["budget"]), "ttp config accepts the key"
+
+
 def test_an_unbudgeted_task_that_already_spent_gets_its_tier_default_on_top(env, monkeypatch):
     """A task that ran before it had a budget is not stopped by the default: its cap starts at what it spent."""
     p = make(env)

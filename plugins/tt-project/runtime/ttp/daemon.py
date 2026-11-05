@@ -9112,9 +9112,13 @@ class Daemon:
 
     @staticmethod
     def _fits_caps(gate, usd: float) -> bool:
+        """Whether `usd` more fits under the dollar caps, each over the window budget._caps measures
+        it on: the daily cap over the budget day once budget.day_start is set (spent_today), else the
+        last 24 h; the weekly cap over the last 7 days."""
         n = gate.numbers
+        day = n["spent_today"] if "spent_today" in n else n.get("spent_24h", 0)
         return all(not cap or spent + usd <= cap for spent, cap in (
-            (n.get("spent_24h", 0), n.get("daily_cap")), (n.get("spent_7d", 0), n.get("weekly_cap"))))
+            (day, n.get("daily_cap")), (n.get("spent_7d", 0), n.get("weekly_cap"))))
 
     def check_disk(self) -> None:
         """The disk guard. Free space under the project folder and its worktrees below the smaller of
