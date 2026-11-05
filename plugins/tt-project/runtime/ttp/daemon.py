@@ -7599,9 +7599,10 @@ class Daemon:
         """Model-free urgent checks wait: an urgent `ttp checks` run of this project (priority 1 or less, or
         an `urgent:` line) waiting checkcap.URGENT_WAIT_S or more in a host-wide queue (the checks queue, the
         parked runs' or the test pool's) raises one `urgent_check_wait` event naming the queue and what
-        holds it (checkcap.urgent_waits), once per wait (keyed on its queue ticket). The first new one of a
-        tick is queued, the rest coalesced; an active `daemon:urgent_check_wait` observation_mute records
-        it 'muted'."""
+        holds it (checkcap.urgent_waits), once per run: keyed on its ticket name alone, which a run keeps
+        (its arrival, pid, priority and group) as it moves from the parked queue to the checks queue and
+        the host line, so a later queue raises no second event. The first new one of a tick is queued, the
+        rest coalesced; an active `daemon:urgent_check_wait` observation_mute records it 'muted'."""
         now = time.time()
         if now - getattr(self, "_urgent_check_wait_checked", 0.0) < every_s:
             return
@@ -7609,7 +7610,7 @@ class Daemon:
         from . import checkcap
         db, status = self.p.db, "queued"
         for w in checkcap.urgent_waits(self.p.name, now):
-            fp = f"{checkcap.URGENT_WAIT}:{w['queue']}:{w['ticket']}"
+            fp = f"{checkcap.URGENT_WAIT}:{w['ticket']}"
             if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
                 continue
             text = checkcap.urgent_wait_text(w)

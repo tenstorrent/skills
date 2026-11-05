@@ -992,7 +992,7 @@ URGENT_WAIT_S = 600.0   # an urgent run waiting this long in a host-wide queue r
 def urgent_waits(project_name: str | None, now: float | None = None, min_s: float = URGENT_WAIT_S) -> list[dict]:
     """This project's urgent check runs (a ticket of priority locks.URGENT_PRIORITY or less) waiting `min_s`
     or more in a host-wide queue: the checks queue (RESOURCE), the parked runs' queue (PARKED) or the test
-    pool's host line (testslots). Each: queue, ticket (its file name: one per wait), holder (the waiter's
+    pool's host line (testslots). Each: queue, ticket (its file name: the same for one run in every queue), holder (the waiter's
     label), waited_s and held_by (who holds what it waits for: the checks slots, or the test pool's slots,
     each label with its count). Read only; an unreadable queue gives none."""
     from . import testslots

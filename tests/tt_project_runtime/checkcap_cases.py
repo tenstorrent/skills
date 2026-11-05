@@ -7270,3 +7270,33 @@ def test_an_urgent_review_held_by_its_pre_checks_names_the_host_checks_slot_wait
     monkeypatch.setattr(d, "_disk_holds", lambda t: True)
     d._start_hold(task, "claude", ctx)
     assert d._hold_words(task, "held", ctx).startswith("the disk guard (")
+
+
+def test_an_urgent_run_waiting_in_two_queues_raises_one_urgent_check_wait_event(env, monkeypatch, tmp_path):
+    """#6004: one urgent run parked 10+ minutes, then waiting in the checks queue (its ticket keeps the same
+    arrival, group and priority), raises one urgent_check_wait event over both ticks, not one per queue."""
+    from ttp import checkcap, daemon as dm, locks
+    p = make(env)
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    since = time.time() - 700
+    holder = f"{p.name} task #42 (run 7) ttp checks"
+    events = lambda: p.db.q("SELECT text, task FROM events WHERE kind=?", (checkcap.URGENT_WAIT,))
+    parked = locks.enqueue(sd, checkcap.PARKED, holder, since, group=p.name, priority=1)
+    queued = None
+    try:
+        d = dm.Daemon(p.base)
+        d.check_urgent_check_wait()
+        got = events()
+        assert len(got) == 1 and got[0]["task"] == 42 and f"host-wide {checkcap.PARKED} queue" in got[0]["text"], got
+        locks.dequeue(parked)
+        parked = None
+        queued = locks.enqueue(sd, checkcap.RESOURCE, holder, since, group=p.name, priority=1)
+        assert [w["queue"] for w in checkcap.urgent_waits(p.name)] == [checkcap.RESOURCE]
+        d._urgent_check_wait_checked = 0
+        d.check_urgent_check_wait()
+        assert len(events()) == 1, ("one event per urgent run, not one per queue", events())
+    finally:
+        for t in (parked, queued):
+            if t:
+                locks.dequeue(t)
