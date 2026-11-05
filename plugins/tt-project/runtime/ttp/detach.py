@@ -1085,9 +1085,10 @@ def mirror_read(d, name: str, host: str, pre: str) -> dict | None:
 
 
 def mirror_save(d, name: str, host: str, pre: str, *, tail: bytes | None = None, size=None,
-                end: dict | None = None) -> None:
+                end: dict | None = None, probe: dict | None = None) -> None:
     """Record what a remote job's answer said in folder `d`: its log tail and size, and its end
-    ({"rc": code} or {"gone": why}), which is kept once known."""
+    ({"rc": code} or {"gone": why}), which is kept once known; `probe`: the job sweep's last liveness
+    answer (onhost.refresh_remote)."""
     d = Path(d)
     m = mirror_read(d, name, host, pre) or {"host": host, "path": pre}
     if tail is not None:
@@ -1098,6 +1099,8 @@ def mirror_save(d, name: str, host: str, pre: str, *, tail: bytes | None = None,
         m["end"] = end
         if "rc" in end:
             durable_write(d / f"{name}.remote.rc", f"{end['rc']}\n")
+    if probe is not None:
+        m["probe"] = probe
     m["at"] = int(time.time())
     write_json(d / f"{name}.remote.json", m)
 
@@ -1125,7 +1128,7 @@ def _split_tail(out: str) -> tuple[list[str], tuple | None]:
     return rest, tail
 
 
-def mirror_probe(host: str, pre: str, d=None, rows: str | None = None):
+def mirror_probe(host: str, pre: str, d=None, rows: str | None = None, timeout: float = 60):
     """One ssh call for a remote job: the rows count (with `rows`), its log tail when mirroring into
     folder `d`, and the check's verdict (cli._REMOTE_CHECK). (r, lines): r is None or exits 255 when
     ssh failed; lines are its answer less the tail, which is mirrored into `d` already."""
@@ -1137,7 +1140,7 @@ def mirror_probe(host: str, pre: str, d=None, rows: str | None = None):
     check = f'v=$(\n{_REMOTE_CHECK}\n)\n' if d else _REMOTE_CHECK
     script = ((_REMOTE_ROWS if rows is not None else "") + check
               + (_REMOTE_TAIL % MIRROR_TAIL_BYTES + 'printf "%s\\n" "$v"\n' if d else ""))
-    r = _ssh_sh(host, script, [pre, rows or "", seen] if d else [pre, rows] if rows is not None else [pre])
+    r = _ssh_sh(host, script, [pre, rows or "", seen] if d else [pre, rows] if rows is not None else [pre], timeout)
     if r is None or r.returncode == 255:
         return r, []
     lines, tail = _split_tail(r.stdout)

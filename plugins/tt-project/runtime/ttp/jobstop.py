@@ -639,8 +639,9 @@ def run_of(p: Project, rc: Path) -> int | None:
 
 def sweep(p: Project, now: float | None = None) -> list[dict]:
     """The daemon's pass: stop each running job, detached checks and detached push of a task in ENDED that
-    no open task waits on, then carry out queued `ttp detach --stop` requests. The summaries of the jobs
-    it stopped."""
+    no open task waits on, ask the hosts of such a task's `ttp detach --remote` jobs whether they still run
+    (onhost.refresh_remote, for its stop line), then carry out queued `ttp detach --stop` requests. The
+    summaries of the jobs it stopped."""
     now = time.time() if now is None else now
     out = []
     marks = ",".join("?" * len(ENDED))
@@ -673,6 +674,11 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
     for marker, task, state in ended_pushes(p):
         if waited_on(p, marker) is None and (r := end_push(p, marker, f"task #{task} is {state}", task)):
             out.append(r)
+    try:   # their `ttp detach --remote` jobs: each host's bounded answer, for the stop line (onhost.refresh_remote)
+        from . import onhost
+        onhost.refresh_remote(p, now)
+    except Exception as e:
+        out.append({"text": f"probing the remote jobs of ended tasks failed: {type(e).__name__}: {e}"})
     out += serve_requests(p)
     return out
 

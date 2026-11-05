@@ -120,6 +120,108 @@ def test_a_cancelled_task_with_a_live_detached_job_reads_stop_requested(env, mon
     assert onhost.line(p, p.db.task(tid)) == "" and "Stops not yet confirmed" not in coord.digest(p, {}, [], [])
 
 
+def _oh_remote(d, name, host="hostA"):
+    from ttp import detach
+    detach.mirror_save(d, name, host, f"~/.ttp-detach/r1/{name}")
+
+
+def _oh_answers(monkeypatch, answers):
+    """Stand-in for the ssh call of the job sweep's remote probe: `answers[host]` is the check's last line,
+    None for a host that does not answer. The (host, path) of each call is recorded."""
+    import subprocess
+    from ttp import detach
+    calls = []
+
+    def probe(host, pre, d=None, rows=None, timeout=60):
+        calls.append((host, pre, timeout))
+        a = answers.get(host)
+        if a is None:
+            return subprocess.CompletedProcess([], 255, "", "ssh: connect timed out"), []
+        return subprocess.CompletedProcess([], 0, a + "\n", ""), [a]
+    monkeypatch.setattr(detach, "mirror_probe", probe)
+    return calls
+
+
+def test_a_cancelled_task_with_only_a_remote_detached_job_reads_stop_requested(env, monkeypatch):
+    from ttp import coordinator as coord, jobstop, onhost
+    p = make(env)
+    tid = _oh_task(p, status="running")
+    d = _oh_run(p, tid, env)
+    _oh_remote(d, "bench")
+    calls = _oh_answers(monkeypatch, {"hostA": "running 4242"})
+    p.db.update_task(tid, status="cancelled")
+    # Before any probe the job is not known to have ended: it counts.
+    assert onhost.line(p, p.db.task(tid)) == "stop requested; 1 job still running on hostA"
+    assert calls == []   # reading the line runs no ssh
+    jobstop.sweep(p)
+    assert [c[:2] for c in calls] == [("hostA", "~/.ttp-detach/r1/bench")] and calls[0][2] <= onhost.REMOTE_TIMEOUT_S
+    assert onhost.line(p, p.db.task(tid)) == "stop requested; 1 job still running on hostA"
+    assert "stop requested; 1 job still running on hostA" in coord.digest(p, {}, [], [])
+    jobstop.sweep(p)
+    assert len(calls) == 1   # asked again only after REMOTE_EVERY_S
+    # The host says it ended: the line is gone and its end is mirrored.
+    onhost.refresh_remote(p, time.time() + onhost.REMOTE_EVERY_S + 1)
+    assert len(calls) == 2
+    calls_end = _oh_answers(monkeypatch, {"hostA": "rc 0"})
+    onhost.refresh_remote(p, time.time() + 2 * onhost.REMOTE_EVERY_S + 2)
+    assert len(calls_end) == 1 and (d / "bench.remote.rc").read_text().strip() == "0"
+    assert onhost.line(p, p.db.task(tid)) == ""
+    onhost.refresh_remote(p, time.time() + 9 * onhost.REMOTE_EVERY_S)
+    assert len(calls_end) == 1   # an ended job is never asked about again
+    # A host that answers no driver is recorded at the path reads as not running either.
+    _oh_remote(d, "gone", host="hostB")
+    _oh_answers(monkeypatch, {"hostB": "none ~/.ttp-detach/r1/gone"})
+    onhost.refresh_remote(p)
+    assert onhost.line(p, p.db.task(tid)) == ""
+
+
+def test_a_stop_line_counts_local_and_remote_detached_jobs(env, monkeypatch):
+    from ttp import detach, jobstop, onhost
+    p = make(env)
+    tid = _oh_task(p, status="running")
+    d = _oh_run(p, tid, env)
+    rc = d / "drv.rc"
+    (d / detach.REGISTRY).write_text(json.dumps([{"name": "drv", "rc": str(rc), "status": "running"}]))
+    monkeypatch.setattr(jobstop, "running", lambda r: str(r) == str(rc))
+    monkeypatch.setattr(jobstop, "job_resources", lambda p, r: {"box1-device"})
+    monkeypatch.setattr(jobstop, "end", lambda *a, **k: None)   # the sweep's stop of the local job is not under test
+    d2 = _oh_run(p, tid, env, name="r2")
+    _oh_remote(d2, "bench")
+    _oh_answers(monkeypatch, {"hostA": "running 77"})
+    p.db.update_task(tid, status="failed")
+    jobstop.sweep(p)
+    assert onhost.line(p, p.db.task(tid)) == "stop requested; 2 jobs still running on box1-device, hostA"
+    assert onhost.state(p, p.db.task(tid))["started"] is False
+
+
+def test_a_remote_job_on_an_unreachable_host_reads_possibly_running(env, monkeypatch):
+    from ttp import coordinator as coord, jobstop, onhost
+    p = make(env)
+    tid = _oh_task(p, status="running")
+    d = _oh_run(p, tid, env)
+    _oh_remote(d, "a")
+    _oh_remote(d, "b")
+    _oh_remote(d, "c", host="hostB")
+    calls = _oh_answers(monkeypatch, {"hostA": None, "hostB": "running 9"})
+    p.db.update_task(tid, status="cancelled")
+    jobstop.sweep(p)
+    # One call to the host that did not answer per sweep, not one per job.
+    assert sorted(c[0] for c in calls) == ["hostA", "hostB"]
+    got = onhost.line(p, p.db.task(tid))
+    assert got == ("stop requested; 1 job still running on hostB; "
+                   "2 jobs still possibly running on hostA (host unreachable)"), got
+    # A reply saying it stopped is marked, never posted as a fact.
+    coord.apply(p, [{"type": "reply", "text": f"#{tid} is stopped.", "chat": "c1"}], turn=1)
+    (sent,) = _oh_sent(p)
+    assert onhost.MARK in sent and "still possibly running on hostA (host unreachable)" in sent, sent
+    # An unreachable host is asked again only after REMOTE_UNREACHABLE_S, and a failed ssh never ends a job.
+    onhost.refresh_remote(p, time.time() + onhost.REMOTE_EVERY_S + 1)
+    assert sorted(c[0] for c in calls) == ["hostA", "hostB", "hostB"]
+    assert "2 jobs still possibly running on hostA" in onhost.line(p, p.db.task(tid))
+    # The ssh time one sweep spends is bounded: a spent budget leaves the rest for the next sweep.
+    assert onhost.refresh_remote(p, time.time() + onhost.REMOTE_UNREACHABLE_S + 1, budget=0) == 0
+
+
 def test_a_reply_about_non_device_work_is_unaffected(env):
     from ttp import coordinator as coord, onhost
     p = make(env)

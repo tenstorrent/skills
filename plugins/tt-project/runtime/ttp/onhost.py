@@ -12,7 +12,12 @@ line() is the state the digest rows and Expected finish show for a host task:
 - 'worker running, waiting for <resource> since HH:MM' (running, no grant yet),
 - 'on <resource> since HH:MM' (a grant recorded),
 - 'stop requested; N jobs still running on <resource>' (a cancelled, failed or exhausted task whose
-  detached jobs still run: until the job sweep has ended them).
+  detached jobs still run: until the job sweep has ended them). Its `ttp detach --remote` jobs count
+  too, from their mirrors in its run dirs (detach.mirror_save): one counts until an answer from its host
+  shows it ended. The job sweep asks each host (refresh_remote: one bounded ssh call per job, a host
+  that did not answer is not asked again in that sweep) and records the answer in the mirror, so
+  reading the line runs no ssh. A host that cannot be reached reads 'still possibly running (host
+  unreachable)', never stopped.
 
 guard() checks a coordinator reply or notify before it is posted. Its scope is the host tasks the text
 names (#id), the reply's backing tasks (open tasks answering its chat, its `owners`) and host tasks this
@@ -127,10 +132,31 @@ def started(p, task: dict, cfg: dict | None = None) -> tuple[float, str] | None:
     return best
 
 
-def live_jobs(p, task: dict) -> tuple[int, list[str]]:
-    """(count, resources) of the task's detached jobs that still run, across its runs."""
-    from . import jobstop
-    n, res = 0, []
+def remote_jobs(run_dir) -> list[dict]:
+    """The mirrors of a run's `ttp detach --remote` jobs not known to have ended: {"name", "host", "path",
+    "probe"}. A job whose host last answered that no driver is recorded at its path is left out."""
+    out = []
+    for meta in sorted(Path(run_dir).glob("*.remote.json")):
+        try:
+            m = json.loads(meta.read_text())
+        except (OSError, ValueError):
+            continue
+        if not isinstance(m, dict) or m.get("end") or not m.get("host") or not m.get("path"):
+            continue
+        probe = m.get("probe") if isinstance(m.get("probe"), dict) else {}
+        if probe.get("state") != "none":
+            out.append({"name": meta.name[:-len(".remote.json")], "host": str(m["host"]), "path": str(m["path"]),
+                        "probe": probe})
+    return out
+
+
+def live_jobs(p, task: dict) -> tuple[int, list[str], int, list[str]]:
+    """(count, resources, unsure count, unsure hosts) of the task's detached jobs that still run, across its
+    runs: local ones (jobstop._live_jobs) and remote ones not known to have ended. A remote job whose host
+    did not answer the last probe is unsure: still possibly running, never counted as stopped."""
+    from . import jobstop, locks
+    n, res, u, ures = 0, [], 0, []
+    cfg = None
     for _, d in _run_dirs(p, task["id"]):
         for rc in jobstop._live_jobs(d):
             n += 1
@@ -138,7 +164,66 @@ def live_jobs(p, task: dict) -> tuple[int, list[str]]:
                 res += sorted(jobstop.job_resources(p, rc))
             except Exception:
                 pass
-    return n, list(dict.fromkeys(res))
+        for j in remote_jobs(d):
+            try:
+                cfg = p.config() if cfg is None else cfg
+                host = locks.canonical(cfg, j["host"])
+            except Exception:
+                host = j["host"]
+            if j["probe"].get("state") == "unreachable":
+                u, ures = u + 1, ures + [host]
+            else:
+                n, res = n + 1, res + [host]
+    return n, list(dict.fromkeys(res)), u, list(dict.fromkeys(ures))
+
+
+REMOTE_TIMEOUT_S = 10       # one ssh call for a remote job's liveness
+REMOTE_EVERY_S = 60         # a remote job seen running is asked about again after this long
+REMOTE_UNREACHABLE_S = 300  # one whose host did not answer, after this long
+REMOTE_BUDGET_S = 20        # ssh time one sweep spends; the rest wait for the next sweep
+
+
+def refresh_remote(p, now: float | None = None, budget: float = REMOTE_BUDGET_S) -> int:
+    """The job sweep's model-free probe of the `ttp detach --remote` jobs of tasks that ended (jobstop.ENDED,
+    within SWEEP_DAYS): one bounded ssh call per job not known to have ended (detach.mirror_probe), whose
+    answer goes to its mirror: an end, 'running', 'none' (no driver at its path) or 'unreachable'. A host
+    that did not answer is not asked again in this sweep. The number of ssh calls made."""
+    from . import detach
+    from .jobstop import ENDED, SWEEP_DAYS
+    now = time.time() if now is None else now
+    marks = ",".join("?" * len(ENDED))
+    rows = p.db.q(f"SELECT DISTINCT r.dir FROM runs r JOIN tasks t ON t.id=r.task WHERE t.status IN ({marks}) "
+                  "AND r.dir IS NOT NULL AND COALESCE(r.started, 0)>?", (*ENDED, now - SWEEP_DAYS * 86400))
+    down: set[str] = set()
+    calls, t0 = 0, time.monotonic()
+    for row in rows:
+        for j in remote_jobs(row["dir"]):
+            probe, host = j["probe"], j["host"]
+            wait = REMOTE_UNREACHABLE_S if probe.get("state") == "unreachable" else REMOTE_EVERY_S
+            try:
+                if now - float(probe.get("at") or 0) < wait:
+                    continue
+            except (TypeError, ValueError):
+                pass
+            end = None
+            if host in down:
+                state = "unreachable"
+            elif time.monotonic() - t0 >= budget:
+                return calls
+            else:
+                calls += 1
+                r, lines = detach.mirror_probe(host, j["path"], row["dir"], timeout=REMOTE_TIMEOUT_S)
+                word = (lines[-1].split(" ", 1)[0] if lines else "") if r is not None and r.returncode == 0 else ""
+                end = detach.mirror_end(lines[-1]) if word else None
+                state = "running" if word == "running" else "none" if word == "none" else \
+                    "ended" if end else "unreachable"
+                if state == "unreachable":
+                    down.add(host)
+            try:
+                detach.mirror_save(row["dir"], j["name"], host, j["path"], end=end, probe={"at": now, "state": state})
+            except OSError:
+                pass
+    return calls
 
 
 def _waiting_since(p, task: dict) -> float | None:
@@ -177,12 +262,14 @@ def state(p, task: dict, now: float | None = None, est=None, cfg: dict | None = 
     if st in CLOSED:
         if st == "done":
             return None
-        n, res = live_jobs(p, task)
-        if not n:
+        n, res, u, ures = live_jobs(p, task)
+        if not n and not u:
             return None
         where = ", ".join(res or named) or "its host"
-        return {"kind": "stop", "started": False,
-                "line": f"stop requested; {n} job{'s' if n != 1 else ''} still running on {where}"}
+        parts = [f"{n} job{'s' if n != 1 else ''} still running on {where}"] if n else []
+        if u:
+            parts.append(f"{u} job{'s' if u != 1 else ''} still possibly running on {', '.join(ures)} (host unreachable)")
+        return {"kind": "stop", "started": False, "line": "stop requested; " + "; ".join(parts)}
     if not named:
         return None
     got = started(p, task, cfg)
