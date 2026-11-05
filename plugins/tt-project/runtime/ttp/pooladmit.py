@@ -102,12 +102,8 @@ def record(what: str, seconds: float, granted: int, planned: int | None = None, 
     data = _load()
     key = _key(what)
     data[key] = ([r for r in data.get(key) or [] if isinstance(r, dict)] + [rec])[-KEEP:]
-    path = _path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{HISTORY}.{os.getpid()}")
-        tmp.write_text(json.dumps(data))
-        tmp.replace(path)
+        project.durable_write(_path(), json.dumps(data))
     except OSError:
         pass
 
