@@ -25,7 +25,7 @@ def test_a_claim_about_a_queued_host_task_is_sent_marked_with_the_honest_status(
     from ttp import coordinator as coord, onhost
     p = make(env)
     tid = _oh_task(p)
-    coord.apply(p, [{"type": "reply", "text": _OH_CLAIM, "chat": "c1"}], turn=1)
+    coord.apply(p, [{"type": "reply", "text": _OH_CLAIM, "chat": "c1", "owners": [tid]}], turn=1)
     (got,) = _oh_sent(p)
     assert got != _OH_CLAIM and f"{onhost.MARK} Power cycling it now" in got
     assert f"#{tid}: queued for a worker, ETA" in got, got
@@ -35,6 +35,42 @@ def test_a_claim_about_a_queued_host_task_is_sent_marked_with_the_honest_status(
     coord.apply(p, [{"type": "notify", "text": f"#{tid}: resetting the box right away."}], turn=2)
     alert = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert' ORDER BY id DESC LIMIT 1")[0]["text"]
     assert onhost.MARK in alert and "queued for a worker" in alert
+
+
+def test_only_sentences_about_an_unstarted_host_task_are_marked(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+    # The chat's queued host task does not make a true sentence about other work read as planned.
+    for text in ("The docs rewrite finished at 14:00 and landed.", _OH_CLAIM):
+        coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=1)
+        assert _oh_sent(p)[-1] == text
+    # The chat's task is tied by its resource or its #id.
+    coord.apply(p, [{"type": "reply", "text": "Power cycling box1 now.", "chat": "c1"}], turn=2)
+    assert _oh_sent(p)[-1].startswith(f"{onhost.MARK} Power cycling box1 now.")
+    done = p.db.add_task("tidy the docs", "s", kind="work", status="done", reply_chat="c1")
+    coord.apply(p, [{"type": "reply", "text": f"#{done} finished. Power cycling #{tid} now.", "chat": "c1"}], turn=3)
+    got = _oh_sent(p)[-1]
+    assert got.startswith(f"#{done} finished. {onhost.MARK} Power cycling #{tid} now."), got
+    assert f"#{tid}: queued for a worker" in got
+    # Naming a done task alone, next to the reply's own unstarted task: unchanged.
+    text = f"#{done} finished and landed."
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1", "owners": [tid]}], turn=4)
+    assert _oh_sent(p)[-1] == text
+
+
+def test_a_notify_keeps_held_worker_notifies_only_its_status_line_names(env):
+    from ttp import coordinator as coord, onhost, workernotify
+    p = make(env)
+    a = p.db.add_task("tidy the docs", "s", kind="work", status="done")
+    b = _oh_task(p, chat=None)
+    assert workernotify.hold(p.db, p.db.task(b), "box1 is wedged", "r9", "21:00 PST", 900)
+    coord.apply(p, [{"type": "notify", "text": f"#{a} finished; power cycling the box now."},
+                    {"type": "task_update", "id": b, "priority": 1}], turn=1)
+    alert = p.db.q("SELECT text FROM messages WHERE direction='out' AND kind='alert' ORDER BY id DESC LIMIT 1")[0]["text"]
+    assert f"{onhost.MARK} power cycling the box now." in alert and f"Status now: #{b}: queued" in alert, alert
+    # The coordinator never named #b: its held notify still goes to the user.
+    assert [e["task"] for e in workernotify._entries(p.db)] == [b]
 
 
 def test_the_same_claim_after_the_lock_grant_is_sent_unchanged(env, monkeypatch):

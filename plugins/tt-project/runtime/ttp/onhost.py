@@ -246,15 +246,26 @@ def claims(sentence: str) -> bool:
 
 
 def scope(p, text: str, chat: str | None, owners=(), batch_ids=(), pending: list | None = None) -> list[dict]:
-    """The tasks a reply speaks for: named (#id), its backing tasks (open tasks answering `chat`, `owners`)
-    and this batch's (`batch_ids`). `pending`: host task_add actions of this batch not added yet."""
+    """The tasks a reply speaks for: named (#id), its owners (`owners`), this batch's (`batch_ids`) and
+    `pending` (host task_add actions of this batch not added yet). Open tasks answering `chat` are covered
+    too, marked `via_chat`: guard() ties a sentence to one of those only by its #id or its resource."""
     ids = {int(x) for x in re.findall(r"#(\d{1,9})\b", text or "")}
     ids |= {int(x) for x in owners or [] if str(x).isdigit()} | {int(x) for x in batch_ids or []}
-    if chat:
-        ids |= {r["id"] for r in p.db.q("SELECT id FROM tasks WHERE reply_chat=? AND status NOT IN "
-                                        "('done','failed','cancelled','exhausted')", (chat,))}
     out = [t for i in sorted(ids) if (t := p.db.task(i))]
+    if chat:
+        out += [dict(t, via_chat=True) for r in p.db.q("SELECT id FROM tasks WHERE reply_chat=? AND status NOT IN "
+                                                       "('done','failed','cancelled','exhausted') ORDER BY id", (chat,))
+                if r["id"] not in ids and (t := p.db.task(r["id"]))]
     return out + list(pending or [])
+
+
+def _names(sentence: str, task: dict) -> bool:
+    """Whether a sentence names one of a task's resources (or that resource's host part before '-device')."""
+    for r in resources(task):
+        for n in {r, re.sub(r"(?i)-device$", "", r)}:
+            if n and re.search(rf"(?i)(?<![\w-]){re.escape(n)}(?![\w-])", sentence):
+                return True
+    return False
 
 
 def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[str, list[str]]:
@@ -273,7 +284,7 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
         est = eta._Est(p.db, now)
     except Exception:
         return text, []
-    honest = []
+    waiting = []   # (task, honest status) of each covered task not started on its host
     for t in tasks:
         try:
             if t.get("pending"):
@@ -284,11 +295,23 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
             got = None
         if got and not got["started"]:
             who = f"#{t['id']}" if t.get("id") else f"new task '{str(t.get('title') or '')[:60]}'"
-            honest.append(f"{who}: {got['line']}")
-    if not honest:
+            waiting.append((t, f"{who}: {got['line']}"))
+    if not waiting:
         return text, []
+    ids = {t["id"] for t, _ in waiting if t.get("id")}
+    direct = [t for t, _ in waiting if not t.get("via_chat")]
+    marked = 0
     for k in hits:
-        parts[k] = f"{MARK} {parts[k].strip()}"
+        named = {int(x) for x in re.findall(r"#(\d{1,9})\b", parts[k])}
+        # A sentence is about an unstarted task when it names its #id; naming no #id, when it names that
+        # task's resource or the reply speaks for exactly one unstarted task (a chat's other open tasks do
+        # not count). Any other claim sentence is left as written: it may be about other, finished work.
+        if (named & ids) if named else (len(direct) == 1 or any(_names(parts[k], t) for t, _ in waiting)):
+            parts[k] = f"{MARK} {parts[k].strip()}"
+            marked += 1
+    if not marked:
+        return text, []
+    honest = [h for _, h in waiting]
     out = "".join(parts).rstrip() + "\nStatus now: " + "; ".join(honest)
     note = (f"onhost: a message said work was under way or done that has not started on its host "
             f"({'; '.join(honest)[:300]}); it was sent marked as planned with that status. Describe an "

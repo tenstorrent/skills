@@ -2198,12 +2198,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
                 chat = a.get("chat") or default_chat
+                said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 sent.append((replies[-1], chat, a["text"]))
-                workernotify.handled(db, workernotify.named(a["text"]))
+                workernotify.handled(db, said)
                 if a.get("delivers"):
                     delivered.append((replies[-1], chat, list(a["delivers"])))
                 if a.get("delivers") or a.get("owners"):
@@ -2901,10 +2902,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 if why := msgparts.too_long(a["text"], "notify"):
                     raise ValueError(why)
+                said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
-                workernotify.handled(db, workernotify.named(a["text"]))
+                workernotify.handled(db, said)
             elif t == "memory_add" and a.get("memory_kind") == settled.KIND:
                 rec = settled.from_action(p, a, key)
                 notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "
