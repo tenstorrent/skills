@@ -29,7 +29,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
 import re
 import time
 
@@ -202,12 +201,8 @@ def save_note(p, session_id: str, text) -> str:
         note = note[:NOTE_CHARS - 40].rstrip() + "\n[cut at the 4,000-token note cap]"
     path = _note_path(p, session_id)
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    with open(tmp, "w") as f:
-        f.write(note + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, path)
+    from .project import durable_write
+    durable_write(path, note + "\n")
     return str(path)
 
 
