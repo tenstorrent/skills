@@ -57,7 +57,7 @@ def problem(result: dict) -> str | None:
 
 
 # Per-wait state a new stage starts without, as a fresh worker hand-off would (daemon._peer_hold).
-PER_WAIT_KEYS = (KEY, "on_pass_cmd", "woke", "peer_held_at", "peer_hold_live")
+PER_WAIT_KEYS = (KEY, "on_pass_cmd", "probe_match", "woke", "peer_held_at", "peer_hold_live")
 
 
 def advance(prev: dict, now: float) -> dict | None:

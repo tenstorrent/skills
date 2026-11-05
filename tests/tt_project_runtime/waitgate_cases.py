@@ -428,3 +428,118 @@ def test_no_lull_advice_for_disruptive_work_a_task_without_a_device_or_another_w
     assert coord.apply(p, [{"type": "task_add", "title": "control", "spec": "Run it.", "resources": ["board-device"],
                             "start_when": "test -e /tmp/ttp-lull-control", "why": "wait for a lull"}]) == []
     assert sum("deferred on a device resource" in n for n in p.db.kv(coord.NOTES_KEY)) == 1
+
+
+_MATCH = {"pass": "ALL DONE", "fail": ["FAILED", "Traceback"], "wait": "still running"}
+
+
+def _match_task(p, tmp_path, monkeypatch, out, **extra):
+    """A daemon and a task asleep on a probe that prints `out` and exits 0, with a probe_match and an on_pass."""
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    dm = dmod.Daemon(p.base)
+    hand = {"probe_match": _MATCH, "on_pass": {"status": "done", "summary": "The job ended: {probe_out}"}, **extra}
+    tid = _gate_task(p, tmp_path, f"echo '{out}'", **hand)
+    return dm, tid
+
+
+def _match_notes(tmp_path, tid):
+    f = tmp_path / f"gate-run-{tid}" / "progress.md"
+    return f.read_text() if f.exists() else ""
+
+
+def test_a_probe_match_wait_keeps_the_task_asleep_and_a_timer_wake_re_defers_it(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "3 of 11 trials done, still running")
+    _settle_probe(dm, tid)
+    task = p.db.task(tid)
+    assert not _ready(p, tid) and "woke" not in json.loads(task["result"]), task["result"]
+    assert "probe_match: still waiting, settled model-free: 3 of 11" in _match_notes(tmp_path, tid)
+    # Its timer runs out with new progress that still says "wait": the gate re-defers with a back-off.
+    _gate_set(p, tid, retry_when="echo '4 of 11 trials done, still running'")
+    _settle_probe(dm, tid)
+    assert not _ready(p, tid) and _match_notes(tmp_path, tid).count("still waiting") == 2
+    p.db.update_task(tid, not_before=time.time() - 1)
+    skipped, _ = dm._wake_gate(p.db.task(tid))
+    assert skipped and (p.db.task(tid)["not_before"] or 0) > time.time() + 60
+    row = p.db.one("SELECT * FROM wake_gate ORDER BY id DESC LIMIT 1")
+    assert row["decision"] == "skip" and "probe_match wait" in row["reason"], dict(row)
+
+
+def test_a_probe_match_pass_records_on_pass_with_the_probe_output_model_free(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "ALL DONE: 11 of 11 trials")
+    _settle_probe(dm, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done" and res["run_status"] == "model-free", (task["status"], res)
+    assert res["summary"] == "The job ended: ALL DONE: 11 of 11 trials", res["summary"]
+    assert "its output matched its probe_match pass" in (p.logs / "daemon.log").read_text()
+    assert "probe_match: pass, recorded its on_pass model-free" in _match_notes(tmp_path, tid)
+
+
+def test_a_probe_match_fail_wakes_the_task_at_its_own_tier_with_the_output(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "trial 3 FAILED: exit 2")
+    _settle_probe(dm, tid)
+    res = json.loads(p.db.task(tid)["result"])
+    assert _ready(p, tid) and res["escalated_wake"] and res["wake_tier"] == "standard", res
+    assert res["woke"].startswith("probe passed; its output matched its probe_match fail:\ntrial 3 FAILED"), res["woke"]
+    assert "probe_match: fail, waking the task" in _match_notes(tmp_path, tid)
+
+
+@pytest.mark.parametrize("out, said", [
+    ("ALL DONE, but trial 3 FAILED", "its output matched pass and fail of its probe_match, so it is unclear"),
+    ("ALL DONE yet still running", "its output matched pass and wait of its probe_match, so it is unclear"),
+    ("something else entirely", "its output matched none of its probe_match")])
+def test_an_unclear_probe_match_still_wakes_the_model(env, monkeypatch, tmp_path, out, said):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, out)
+    _settle_probe(dm, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert _ready(p, tid) and task["status"] == "queued" and said in res["woke"], res
+    skipped, note = dm._wake_gate(task)
+    assert not skipped and note["by"] == "event", note
+
+
+def test_a_probe_match_reads_only_a_probe_that_exits_0(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "ALL DONE")
+    _gate_set(p, tid, retry_when="echo 'ALL DONE'; exit 1")
+    _settle_probe(dm, tid)
+    assert not _ready(p, tid) and p.db.task(tid)["status"] == "queued"
+    _gate_set(p, tid, retry_when="echo 'trial FAILED'; exit 1")
+    _settle_probe(dm, tid)
+    assert not _ready(p, tid) and "woke" not in json.loads(p.db.task(tid)["result"])
+
+
+def test_a_probe_match_pass_with_an_on_pass_cmd_leaves_the_command_to_decide(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "ALL DONE", on_pass_cmd="exit 3")
+    started = []
+    monkeypatch.setattr(dm, "_start_on_pass", lambda task, now, **kw: started.append(task["id"]) or True)
+    _settle_probe(dm, tid)
+    assert started == [tid] and p.db.task(tid)["status"] == "queued"
+
+
+@pytest.mark.parametrize("raw", [
+    "ALL DONE", {}, {"pass": "x", "done": "y"}, {"pass": []}, {"pass": ""}, {"fail": ["ok", 3]},
+    {"wait": ["x"] * 9}, {"pass": "x" * 201}])
+def test_a_malformed_probe_match_is_refused(raw):
+    from ttp import probematch
+    assert probematch.problem(raw)
+    assert probematch.verdict({"probe_match": raw}, "ALL DONE x ok") is None
+
+
+def test_a_waiting_hand_off_with_a_malformed_probe_match_drops_it_with_an_event(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("watch the job", "s", kind="work", tier="standard", origin="user")
+    t = _reply_wait_hand_off(p, d, tmp_path, tid, waiting_for="the job", retry_when="exit 1",
+                             probe_match={"pass": "x", "done": "y"})
+    res = json.loads(t["result"])
+    assert res["status"] == "waiting" and "probe_match" not in res, res
+    ev = p.db.one("SELECT text FROM events WHERE kind='handoff_probe_refused' AND task=?", (tid,))
+    assert ev and "probe_match was not stored: probe_match has unknown keys: done" in ev["text"], ev

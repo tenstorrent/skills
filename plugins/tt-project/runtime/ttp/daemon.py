@@ -56,6 +56,7 @@ from . import lanewait
 from . import steerack
 from . import coordsession
 from . import thenwaits
+from . import probematch
 from . import chainprio
 from . import churnwatch
 from . import alerts
@@ -337,7 +338,7 @@ ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it c
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
              "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY, "spec_seen", "spec_wakes",
-             "spec_hold", "spec_urgent", "spec_urgent_woke", thenwaits.KEY, thenwaits.STAGE_KEY)
+             "spec_hold", "spec_urgent", "spec_urgent_woke", thenwaits.KEY, thenwaits.STAGE_KEY, probematch.KEY)
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -1144,6 +1145,7 @@ class Daemon:
         self._probe_files: dict[int, object] = {}   # id(probe proc) -> the file its output goes to
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         self._probe_live: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last line, when read, probe
+        self._match_seen: dict[int, str] = {}   # task -> the output its probe_match last noted as still waiting
         self._woke_on: dict[int, tuple[int | str, float, str]] = {}   # task -> the verdict its last wake came on (wake gate)
         self._spec_capped: set[int] = set()   # tasks whose spec-change wake the loop guard holds (logged once)
         self._spec_deferred: set[int] = set()   # tasks whose spec change sleeps until their wait ends (logged once)
@@ -5422,6 +5424,14 @@ class Daemon:
             # passed probe records its on_pass (or wakes it), never stops on "on_pass_cmd is not a command".
             result = {k: v for k, v in result.items() if k != "on_pass_cmd"}
             log(self.p, f"task {task['id']} hand-off: its empty on_pass_cmd names none; dropped")
+        if rstatus == "waiting" and probematch.KEY in result and (bad := probematch.problem(result[probematch.KEY])):
+            # Not stored, said loudly: its probe passes then wake the task as any passed probe does.
+            result = {k: v for k, v in result.items() if k != probematch.KEY}
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
+                  f"#{task['id']} {task['title']}: its waiting hand-off's probe_match was not stored: {bad}; "
+                  f"a passed probe wakes the task", "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: probe_match refused: {bad}")
         if rstatus == "waiting":
             # A wait on a user-only step wakes on the step's model-free check, never on the user's next message.
             result, how = userstep.handoff(db, task, result)
@@ -11227,6 +11237,10 @@ class Daemon:
             if task and task["status"] == "queued" and deferral(task).get("when"):
                 self._start_verdict(task, "timeout" if rc is None else rc, now)
                 continue
+            if rc == 0 and task and task["status"] == "queued" \
+                    and probematch.verdict(load_result(task["result"]), outs[id(proc)]) == "wait":
+                rc = 1   # its probe_match says the wait goes on: "not yet", no wake
+                self._match_waited(task, outs[id(proc)])
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if task and task["status"] == "queued":
                 self._flag_never_passes(task, probe, rc, outs[id(proc)])
@@ -12922,6 +12936,14 @@ class Daemon:
         if self._staged_pass(task, now, why):
             return
         try:
+            matched = self._match_pass(task, now) if why.startswith("probe passed") else None
+        except Exception as e:   # a wake is always safe
+            log(self.p, f"task {task['id']}: could not settle its probe_match: {type(e).__name__}: {e}")
+            matched = None
+        if matched is True:
+            return
+        why += matched or ""
+        try:
             got = self._checks_wait(task)
         except Exception as e:   # a wake is always safe; a broken check must not keep the task asleep
             log(self.p, f"task {task['id']}: could not read its checks: {type(e).__name__}: {e}")
@@ -12996,6 +13018,65 @@ class Daemon:
                 why += f"; its on_pass_cmd was not run: {started}"
         more, extra = self._push_landing(task)
         self._wake_waiting(task, why + more, now, extra=extra)
+
+    def _match_waited(self, task: dict, out: str) -> None:
+        """Its probe exited 0 with output its probe_match reads as `wait`: logged and noted once per new
+        output (clock times masked), so the task's notes show each settled check."""
+        tid = task["id"]
+        seen = waitgate.evidence(str(load_result(task["result"]).get("retry_when") or ""), out)
+        if self._match_seen.get(tid) == seen:
+            return
+        self._match_seen[tid] = seen
+        line = f"probe_match: still waiting, settled model-free: {probematch.tail(out, 300)}"
+        log(self.p, f"task {tid} {line}")
+        if (r := self._last_worker_run(tid)) and r["dir"]:
+            _task_note(Path(r["dir"]), line)
+
+    def _last_worker_run(self, tid: int) -> dict | None:
+        return self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND dir IS NOT NULL "
+                             "ORDER BY id DESC LIMIT 1", (tid,))
+
+    def _match_pass(self, task: dict, now: float) -> bool | str | None:
+        """A passed probe of a hand-off naming a probe_match (probematch): its output's `fail` wakes the
+        task at its own tier with the output's tail, its `pass` records the hand-off's on_pass (with
+        {probe_out} filled) model-free. True when settled so; else what to add to the wake ("" or None
+        to go on as usual: no probe_match, or a pass whose on_pass_cmd decides)."""
+        tid, prev = task["id"], load_result(task["result"])
+        if probematch.KEY not in prev or task["status"] != "queued" or prev.get("status") != "waiting":
+            return None
+        probe = str(prev.get("retry_when") or "")
+        got = self._probe_out.get(tid)
+        out = got[0] if got and got[2] == probe else ""
+        verdict = probematch.verdict(prev, out)
+        r = self._last_worker_run(tid)
+        if verdict == "fail":
+            if r:
+                _task_note(Path(r["dir"]), f"probe_match: fail, waking the task: {probematch.tail(out, 300)}")
+            self._wake_waiting(task, f"probe passed; its output matched its probe_match fail:\n{probematch.tail(out)}",
+                               now, extra={"wake_tier": _own_tier(task), "escalated_wake": True})
+            return True
+        if verdict == "pass" and prev.get("on_pass_cmd") is not None:
+            return None   # that command decides (_start_on_pass)
+        if verdict != "pass":
+            return probematch.unclear(prev, out)
+        if not r or r["status"] == "running":
+            return "; its probe_match passed but its run has not ended"
+        run_dir = Path(r["dir"])
+        full = _read_result(run_dir / RESULT_FILE) or {}
+        if full.get("status") != "waiting" or not _same_probe(full, prev):
+            return "; its probe_match passed but the run's result.json is not the hand-off the task waits on"
+        if "on_pass" not in full or (problem := on_pass_problem(full["on_pass"])):
+            return f"; its probe_match passed but its on_pass was not applied: {problem if 'on_pass' in full else 'it names none'}"
+        on_pass = probematch.fill(with_waiting_followups(full["on_pass"], full), out)
+        from .providers.base import RunUsage
+        self._probe_rc.pop(tid, None)
+        self._prefetch_remote(tid, on_pass, run_dir)
+        _task_note(run_dir, f"probe_match: pass, recorded its on_pass model-free: {probematch.tail(out, 300)}")
+        with self._finish_tx(tid):
+            self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
+        log(self.p, f"task {tid} retry_when probe passed; its output matched its probe_match pass: "
+                    f"recorded its on_pass ({on_pass['status']}) model-free")
+        return True
 
     def _staged_pass(self, task: dict, now: float, why: str) -> bool:
         """A passed probe of a hand-off with `then` stages (thenwaits) whose current stage names no

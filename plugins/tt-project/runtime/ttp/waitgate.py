@@ -39,7 +39,7 @@ from pathlib import Path
 from typing import Any
 
 from . import budget as bud
-from . import jevuse, locks
+from . import jevuse, locks, probematch
 from .db import DB
 
 USE = "wake_gate"
@@ -232,6 +232,8 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         last = {}
     woke = str(prev.get("woke") or "").strip().rstrip(".")
     ended = float(last_run["ended"] or last_run["started"] or now) if last_run else float(prev["waiting_since"])
+    # Its probe_match reads the probe's "not yet" output as a wait: a changed progress line is no event.
+    matchwait = bool(probe and probe[0] in _not_yet() and probematch.verdict(prev, probe[1]) == "wait")
     d = None
     if prev.get("escalated_wake"):
         d = Decision(True, "event", "an escalated wake")
@@ -239,7 +241,7 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         d = Decision(True, "event", f"woken because: {woke[:200]}")
     elif spec_sha and last.get("spec_sha") and last["spec_sha"] != spec_sha:
         d = Decision(True, "event", "its spec changed since the last turn")
-    elif gate.get("seen") and seen and gate["seen"] != seen:
+    elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
         d = Decision(True, "event", "its probe's answer changed since the gate's last skip")
     elif len(skips) >= int(s["max_skips"]) or now - ended >= float(s["max_skip_h"]) * 3600:
         d = Decision(True, "cap", f"{len(skips)} skip(s), {(now - ended) / 3600:.1f} h since its last turn")
@@ -255,7 +257,8 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         d = Decision(True, "event", f"its probe answered exit {probe[0]}")
     else:
         try:
-            why = pending(p, cfg, prev.get("retry_when"))
+            why = ("its probe's output still matches its probe_match wait" if matchwait
+                   else pending(p, cfg, prev.get("retry_when")))
         except Exception:   # a rule that cannot tell decides nothing
             why = None
         if why:
