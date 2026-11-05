@@ -8,7 +8,8 @@ read-only `ttp` commands, `ttp hostcheck` among them (hostcheck.py: git log/show
 other host checks). No write tool, no free shell. Three fences hold it: the CLI's tool list, its
 allow and deny rules under the dontAsk permission mode (anything not allowed is refused), and a
 PreToolUse hook (pre_tool_use) that denies every call outside the list, also a Bash line with a shell
-operator, redirect or substitution.
+operator, redirect or substitution. The one other tool it allows is StructuredOutput, the CLI's
+own tool for the turn's --json-schema answer, without which the turn has no structured result.
 
 Budget: a wake stops at whichever comes first of coordinator.session.wake_budget_usd (the CLI's
 --max-budget-usd) and wake_budget_s (the run's timeout); there is no tool-call cap. Unset, each is
@@ -31,6 +32,8 @@ HOOK_EVENT = "CoordPreToolUse"
 DENIED_ENV = "TTP_COORD_DENIED_READS"
 FILE_TOOLS = ("Read", "Grep", "Glob")
 CLI_TOOLS = ("Read", "Bash")   # Grep and Glob are not in every CLI: --tools names only these two
+# The CLI's tool for a --json-schema answer: a turn ends only through it, and it writes nothing.
+ANSWER_TOOL = "StructuredOutput"
 # `ttp <words...>` prefixes a session coordinator may run, each followed by any plain arguments.
 # "*" is one project name: the CLI rules name the coordinator's own, the hook takes any (all read-only).
 READ_COMMANDS = (("status",), ("task", "*", "show"), ("task", "*", "list"), ("said",), ("eta",), ("landed",),
@@ -77,7 +80,7 @@ def session_tool_args(cfg: dict, *, project: str = "", root: str = "", denied_re
     import json
     allow = [f"Read(/{os.path.abspath(root)}/**)"] if root else []
     deny = [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]
-    args = ["--tools", ",".join(CLI_TOOLS), "--allowedTools", *allow, *_rules(project or "*")]
+    args = ["--tools", ",".join(CLI_TOOLS), "--allowedTools", ANSWER_TOOL, *allow, *_rules(project or "*")]
     if deny:   # one comma-separated value, so a later flag is no rule
         args += ["--disallowedTools", ",".join(deny)]
     return args + ["--settings", json.dumps(hook_settings(denied_reads))]
@@ -124,6 +127,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
             path = str(args.get("file_path") or args.get("path") or (os.getcwd() if search else ""))
             if path and _denied_read(path, denied, search):
                 return _deny("that file holds a credential; a coordinator never reads it"), None
+            return None, None
+        if tool == ANSWER_TOOL:   # the turn's structured answer (module doc)
             return None, None
         if tool == "Bash":
             why = bash_refusal(str(args.get("command") or ""))

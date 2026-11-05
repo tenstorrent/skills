@@ -48,7 +48,8 @@ def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
     allowed = allowed[:next(i for i, a in enumerate(allowed) if a.startswith("--"))]
     assert f"Read(/{p.root.resolve()}/**)" in allowed
     assert f"Bash(ttp task {p.name} show *)" in allowed and "Bash(ttp hostcheck *)" in allowed
-    assert all(a.startswith("Bash(ttp ") or a.startswith("Read(") for a in allowed)
+    assert "StructuredOutput" in allowed, "the turn's --json-schema answer goes through it"
+    assert all(a.startswith("Bash(ttp ") or a.startswith("Read(") or a == "StructuredOutput" for a in allowed)
     assert not [a for a in allowed if "Edit" in a or "Write" in a or a == "Bash(*)"]
     deny = argv[len(argv) - 1 - argv[::-1].index("--disallowedTools") + 1]
     assert deny.count("Read(//") == 2, "the web token and the credential store"
@@ -99,8 +100,11 @@ def test_the_coordinator_tool_hook_allows_reads_and_denies_the_rest(tmp_path, mo
         assert decide("Bash", command=cmd) == "allow", cmd
     for cmd in denied:
         assert decide("Bash", command=cmd) == "deny", cmd
-    for tool in ("Edit", "Write", "NotebookEdit", "WebFetch", "Skill", "Task", "mcp__x__y", ""):
+    for tool in ("Edit", "Write", "NotebookEdit", "WebFetch", "Skill", "Task", "mcp__x__y", "",
+                 "structuredoutput", "StructuredOutput ", "mcp__x__StructuredOutput", "StructuredOutputX"):
         assert decide(tool, file_path=str(tmp_path / "a")) == "deny", tool
+    # The CLI ends a --json-schema turn only through StructuredOutput: denying it loses the answer.
+    assert decide("StructuredOutput", actions=[], summary="ok") == "allow"
     assert decide("Read", file_path=str(tmp_path / "a.md")) == "allow"
     assert decide("Glob", pattern="*.md", path=str(tmp_path / "other")) == "allow"
     assert decide("Read", file_path=str(secret)) == "deny"
