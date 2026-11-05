@@ -515,7 +515,7 @@ def test_user_ordered_urgent_device_work_not_started_or_stuck_in_ttp_lock_raises
     p.db.update_task(hot, status="running")
     rid = p.db.x("INSERT INTO runs(task, role, provider, status, started, dir) VALUES(?,?,?,?,?,?)",
                  (hot, "worker", "claude", "running", start + 8 * 60, str(run_dir)))
-    locks.record_wait(run_dir, "42:1.0", start + 8 * 60, None)
+    locks.record_wait(run_dir, "42:1.0", start + 8 * 60, None, ["box-a"])
     slot = d._slot_paths("box-a")[0]
     slot.parent.mkdir(parents=True, exist_ok=True)
     slot.write_text(json.dumps({"holder": "other #7 (run 9)", "project": "other", "task_id": "7", "run_id": "9"}))
@@ -554,3 +554,105 @@ def test_an_expect_claim_with_no_owner_open_20_min_is_never_announced_not_starte
     assert unstarted.announced(p, now + 1200) == [] and _unstarted_events(p, unstarted.ANNOUNCED_KIND) == []
     assert ob.open_promises(p.db) == [] and ob.promise_lines(p.db, now + 1200) == []
     assert not [i for i in sweep.items(p.db, now + 1200) if i.get("promise") == oid]
+
+
+def test_one_stuck_user_ordered_task_held_by_full_slots_gives_one_wake_across_the_three_start_checks(
+        env, monkeypatch):
+    """check_unstarted (READY_URGENT_S), check_urgent_start (5 min) and check_slot_wait (10 min) all see one
+    user-ordered urgent task held only by full worker slots: one event per run and hold, in whatever order
+    they run and also once a turn handled it. A ready_not_started retired because its hold ended does not
+    count, so the next hold is raised once."""
+    from ttp import obligations, unstarted, urgent
+    p, d, check = _ready_setup(env, monkeypatch)
+    core = d.cfg.get("core_provider", "claude")
+    for i in range(d.gates[core].max_parallel + urgent.extra_slots(d.cfg)):
+        tid = p.db.add_task(f"busy {i}", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(tid, status="running")
+        p.db.x("INSERT INTO runs(task, role, provider, status, started) VALUES(?,?,?,?,?)",
+               (tid, "worker", core, "running", time.time()))
+    hot = p.db.add_task("reset the box", "s\nurgent: the user ordered it", kind="work", tier="light",
+                        origin="user", priority=1)
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["resource:box-a"]), hot))
+    start = time.time()
+
+    def run(at, *which):
+        monkeypatch.setattr(time, "time", lambda: at)
+        for name in which:
+            setattr(d, {"unstarted": "_unstarted_checked", "urgent_start": "_urgent_start_checked",
+                        "slot_wait": "_slot_wait_checked"}[name], at - 60)
+            getattr(d, f"check_{name}")()
+        return [(e["task"], e["fingerprint"].split(":")[0]) for e in p.db.q(
+            "SELECT * FROM events WHERE task=? AND fingerprint NOT LIKE 'urgent_lock:%' ORDER BY id", (hot,))]
+    every = ("slot_wait", "urgent_start", "unstarted")   # the tick's order
+    assert run(start + 30, *every) == []
+    one = [(hot, unstarted.READY_KIND)]
+    assert run(start + 30 + unstarted.READY_URGENT_S + 5, *every) == one
+    assert run(start + 6 * 60, *every) == one, "urgent_start after the deadline event: one wake"
+    p.db.x("UPDATE events SET status='handled' WHERE task=?", (hot,))
+    assert run(start + 11 * 60, *every) == one, "slot_wait after it, handled by a turn: still one wake"
+    # Its hold ended (check_unstarted retires its event): the next hold is a new event, raised once.
+    p.db.x("UPDATE events SET status='queued' WHERE task=?", (hot,))
+    assert obligations._retire(p.db, start + 11 * 60, "held: resource", f"{unstarted.READY_KIND}:{hot}:0") == 1
+    assert run(start + 12 * 60, *every) == [
+        (hot, unstarted.READY_KIND), (hot, "slot_wait")], "a retired event is no open one"
+    # Any one of the three first: the other two leave it.
+    for first in every:
+        p.db.x("DELETE FROM events WHERE task=?", (hot,))
+        rest = [n for n in every if n != first]
+        got = run(start + 13 * 60, first)
+        assert len(got) == 1, (first, got)
+        assert run(start + 14 * 60, *rest) == got, f"{first} first: the others raised again"
+
+
+def test_an_urgent_lock_wait_names_only_the_holders_of_the_lock_it_waits_on(env, monkeypatch, tmp_path):
+    """Daemon.check_urgent_start, running branch: a task with two resources whose open `ttp lock` wait is on
+    the second names only that lock's holders, not the first's; a wait naming no lock (a checks lane or a
+    push) names none and raises nothing. record_wait keeps the locks when the closing call leaves them out."""
+    import fcntl
+    from ttp import locks
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    hot = p.db.add_task("flash both boxes", "s\nurgent: the user ordered it", kind="work", tier="light",
+                        origin="user", priority=3)
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(["resource:box-a", "resource:box-b"]), hot))
+    p.db.update_task(hot, status="running")
+    start = time.time()
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    rid = p.db.x("INSERT INTO runs(task, role, provider, status, started, dir) VALUES(?,?,?,?,?,?)",
+                 (hot, "worker", "claude", "running", start, str(run_dir)))
+    fds = []
+    for res, task in (("box-a", "5"), ("box-b", "7")):
+        slot = d._slot_paths(res)[0]
+        slot.parent.mkdir(parents=True, exist_ok=True)
+        slot.write_text(json.dumps({"holder": f"other #{task}", "project": "other", "task_id": task, "run_id": "9"}))
+        fds.append(os.open(slot, os.O_RDWR))
+        fcntl.flock(fds[-1], fcntl.LOCK_EX)
+
+    def check(at):
+        monkeypatch.setattr(time, "time", lambda: at)
+        d._urgent_start_checked = at - 60
+        d.check_urgent_start()
+        return p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'urgent_lock:%' ORDER BY id")
+    try:
+        locks.record_wait(run_dir, "push:1:1.0", start, None)   # no lock named: not a resource wait
+        assert check(start + 10 * 60) == [], "a wait naming no lock names every resource's holders"
+        locks.record_wait(run_dir, "42:2.0", start + 60, None, ["box-b"])
+        (ev,) = check(start + 10 * 60)
+        assert ev["fingerprint"] == f"urgent_lock:{hot}:{rid}"
+        assert "box-b: other #7 run 9" in ev["text"], ev["text"]
+        assert "box-a" not in ev["text"] and "#5" not in ev["text"], "a holder of a lock it does not wait on"
+        assert "waited 9 min" in ev["text"], "from the start of the wait on that lock"
+        locks.record_wait(run_dir, "42:2.0", start + 60, start + 11 * 60)
+        assert [r[2] for r in locks.wait_rows(run_dir) if r[1] is not None] == [["box-b"]], \
+            "the closing record keeps its locks"
+    finally:
+        for fd in fds:
+            os.close(fd)
+        locks.record_wait(run_dir, "push:1:1.0", start, start + 20 * 60)
+

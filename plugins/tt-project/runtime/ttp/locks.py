@@ -983,12 +983,15 @@ def _live_name(key: str) -> str:
     return f"{WAITS_FILE}.{hashlib.sha256(key.encode()).hexdigest()[:16]}.live"
 
 
-def record_wait(run_dir: Path, key: str, start: float, end: float | None) -> None:
+def record_wait(run_dir: Path, key: str, start: float, end: float | None,
+                locks: list[str] | None = None) -> None:
     """Record one `ttp lock` wait of a run: open (end None) while it waits, closed once it ends.
     Several commands of one run may wait at once; the flock keeps their updates from overwriting
     each other, and the rename keeps readers from seeing half a file. While open, the waiter holds an
     exclusive flock on a live file of its own, which ends with its process: readers test that, never
-    its pid, which inside a PID-namespace sandbox (ttp sandbox, bwrap) names another process outside."""
+    its pid, which inside a PID-namespace sandbox (ttp sandbox, bwrap) names another process outside.
+    `locks`: the canonical locks it waits on (wait_rows), kept when the closing call leaves them out;
+    none for a wait that is not on a resource lock (a checks lane, a push)."""
     run_dir = Path(run_dir)
     held = (str(run_dir), key)
     try:
@@ -999,6 +1002,11 @@ def record_wait(run_dir: Path, key: str, start: float, end: float | None) -> Non
             except (OSError, ValueError):
                 waits = {}
             rec = {"start": start, "end": end, "pid": os.getpid()}
+            prev = waits.get(key) if isinstance(waits, dict) else None
+            if locks is None and isinstance(prev, dict) and isinstance(prev.get("locks"), list):
+                locks = prev["locks"]
+            if locks:
+                rec["locks"] = [str(x) for x in locks]
             if end is None:
                 try:
                     if held not in _WAITS_HELD:
@@ -1043,6 +1051,11 @@ def _wait_alive(run_dir: Path, w: dict) -> bool:
 def wait_spans(run_dir: Path) -> list[tuple[float, float | None]]:
     """(start, end) of each wait recorded in `run_dir`: end None while it waits; an open one whose
     process is gone ends at its start (counts nothing). Rows with bad fields are skipped."""
+    return [(start, end) for start, end, _ in wait_rows(run_dir)]
+
+
+def wait_rows(run_dir: Path) -> list[tuple[float, float | None, list[str]]]:
+    """wait_spans with the locks each wait is on (record_wait's `locks`; [] when it named none)."""
     def read() -> dict:
         try:
             waits = json.loads((Path(run_dir) / WAITS_FILE).read_text())
@@ -1058,7 +1071,9 @@ def wait_spans(run_dir: Path) -> list[tuple[float, float | None]]:
                 again = read() if again is None else again
                 w2 = again.get(key)
                 end = w2.get("end") if isinstance(w2, dict) and w2.get("end") is not None else start
-            out.append((start, None if end is None else float(end)))
+            on = w.get("locks")
+            out.append((start, None if end is None else float(end),
+                        [str(x) for x in on] if isinstance(on, list) else []))
         except (KeyError, TypeError, ValueError, AttributeError):
             continue
     return out

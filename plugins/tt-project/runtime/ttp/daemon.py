@@ -7243,7 +7243,8 @@ class Daemon:
         line) or by its run not fitting the dollar caps (limits only time or the user clears), it raises
         nothing: that wake would be a self-started coordinator turn, adding to the very guard that holds
         it. It is kept in urgent.SPEND_HELD_KEY, with when the hold is expected to clear
-        (budget.hold_clears), for the next turn's digest."""
+        (budget.hold_clears), for the next turn's digest. None for a task already raised for the same
+        run and hold as ready_not_started or urgent_start (_stuck_raised): one stuck task, one wake."""
         now = time.time()
         last = getattr(self, "_slot_wait_checked", 0.0)
         if now - last < every_s:
@@ -7307,9 +7308,9 @@ class Daemon:
                 continue
             ran = db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,))
             fp = f"slot_wait:{tid}:{(ran or {}).get('id') or 0}"
-            if db.one("SELECT id FROM events WHERE fingerprint IN (?,?)",
-                      (fp, f"{unstarted.READY_KIND}:{tid}:{(ran or {}).get('id') or 0}")):
-                continue   # raised already, or as ready_not_started (check_unstarted) for the same wait
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)) \
+                    or self._stuck_raised(tid, (ran or {}).get("id") or 0, unstarted.READY_KIND, "urgent_start"):
+                continue   # raised already, or as ready_not_started or urgent_start for the same wait
             text = (f"Urgent wait: #{tid} {t['title'][:80]} (urgent: {urgent.why(t)}) is ready but has waited "
                     f"{waited / 60:.0f} min; held by {held}. It starts first once that clears: clear the hold "
                     f"if it is ours to clear, else say why it must wait.")
@@ -7324,7 +7325,8 @@ class Daemon:
                 continue
             ran = db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,))
             fp = f"slot_wait:{tid}:{(ran or {}).get('id') or 0}"
-            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)) \
+                    or self._stuck_raised(tid, (ran or {}).get("id") or 0, unstarted.READY_KIND, "urgent_start"):
                 continue
             provider = t["provider"] or core
             owns = obligations.owned_open(db, tid) if tid in due else []
@@ -7350,8 +7352,10 @@ class Daemon:
         (holds_device) raises one high observation when it is still queued coordinator.urgent_start_wait_min
         (default urgent.START_WAIT_MIN, 0: off) after it was queued (urgent.waited_s), naming its unmet
         dependencies or what holds it (_start_hold, _hold_words), or when its run has waited that long in
-        an open `ttp lock` wait (locks.wait_spans) on a lock others hold, naming those holders (project,
-        task, run). One per fingerprint (urgent_start or urgent_lock, task and run)."""
+        an open `ttp lock` wait (locks.wait_rows) on a lock others hold, naming only the holders (project,
+        task, run) of the locks that wait is on. One per fingerprint (urgent_start or urgent_lock, task and
+        run); no urgent_start for a task already raised as ready_not_started or slot_wait for the same run
+        and hold (_stuck_raised)."""
         now = time.time()
         if now - getattr(self, "_urgent_start_checked", 0.0) < every_s:
             return
@@ -7375,7 +7379,6 @@ class Daemon:
                    "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                    "GROUP BY provider")},
                "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in queued}}}
-        dev = sorted(locks.device_locks(self.cfg))
         for t in rows:
             tid = t["id"]
             run = db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
@@ -7383,7 +7386,8 @@ class Daemon:
             if t["status"] == "queued":
                 waited = urgent.waited_s(db, t, now)
                 fp = f"urgent_start:{tid}:{rid}"
-                if waited < mins * 60 or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+                if waited < mins * 60 or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)) \
+                        or self._stuck_raised(tid, rid, unstarted.READY_KIND, "slot_wait"):
                     continue
                 if deps := unmet.get(tid):
                     held = "unmet dependencies " + ", ".join(f"#{x}" for x in deps[:STALL_LIST_MAX])
@@ -7400,24 +7404,26 @@ class Daemon:
             else:
                 if not run or run["status"] != "running":
                     continue
-                waits = [s for s, e in locks.wait_spans(self._run_dir(run)) if e is None and now - s >= mins * 60]
+                waits = [(s, on) for s, e, on in locks.wait_rows(self._run_dir(run))
+                         if e is None and now - s >= mins * 60]
                 fp = f"urgent_lock:{tid}:{rid}"
                 if not waits or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
                     continue
-                res = sorted(coord.task_resources(t) | ({dev[0]} if dev and needs_device(t, self.cfg) else set()))
-                who = []
-                for r in res:
-                    for h in locks.holder_records(self._slot_paths(r)):
-                        if str(h.get("project") or "") == self.p.name and str(h.get("task_id") or "") == str(tid):
-                            continue   # its own hold
-                        who.append(f"{r}: {h.get('project') or '?'} #{h.get('task_id') or '?'} run "
-                                   f"{h.get('run_id') or '?'}" + (f" ({h['note']})" if h.get("note") else ""))
+                who, since = {}, []
+                for s, on in waits:   # only the locks each wait is on; one naming none (checks, a push): their own events
+                    for r in on:
+                        for h in locks.holder_records(self._slot_paths(r)):
+                            if str(h.get("project") or "") == self.p.name and str(h.get("task_id") or "") == str(tid):
+                                continue   # its own hold
+                            who[f"{r}: {h.get('project') or '?'} #{h.get('task_id') or '?'} run {h.get('run_id') or '?'}"
+                                + (f" ({h['note']})" if h.get("note") else "")] = None
+                            since.append(s)
                 if not who:
-                    continue   # a wait on something other than its resources' locks (checks): their own events
-                waited = now - min(waits)
+                    continue
+                waited = now - min(since)
                 text = (f"Urgent lock wait: #{tid} {t['title'][:80]} (user-ordered: {urgent.why(t)}) has waited "
                         f"{waited / 60:.0f} min in `ttp lock`; held by:\n"
-                        + "\n".join(f"- {x}" for x in who[:STALL_LIST_MAX])
+                        + "\n".join(f"- {x}" for x in list(who)[:STALL_LIST_MAX])
                         + "\nIts waiters go first once the lock frees; ask a holder to release it if it may.")
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", fp, "high", text[:4000], "queued", tid))
@@ -7436,7 +7442,7 @@ class Daemon:
         previous check when that check did not find it ready (it re-entered the queue since: a review the
         push queue sent back, a wait whose probe passed, a requeue). One per stay in the
         queue (keyed on its last run), retired once it starts or such a hold takes it. A task with a
-        queued announced_not_started or slot_wait event for the same wait is left to that one; a review
+        queued announced_not_started, or a slot_wait or urgent_start event for the same wait, is left to that one; a review
         held for its own pre-review checks is a checks wait. An urgent task (urgent.is_urgent) past
         READY_P1_S that dispatch would start now (no hold at all) also kicks dispatch from here, once per
         check (_kick_dispatch): a slow tick never keeps it waiting for the tick's own dispatch step."""
@@ -7495,8 +7501,9 @@ class Daemon:
                                    unstarted.threshold(prio, unstarted.READY_P1_S, unstarted.READY_S))
             if late and why is None and prio <= 1:
                 kick.append(tid)
-            if not late or db.one("SELECT 1 FROM events WHERE fingerprint IN (?,?) OR (kind=? AND task=? AND status='queued')",
-                              (fp, f"slot_wait:{tid}:{(ran or {}).get('id') or 0}", unstarted.ANNOUNCED_KIND, tid)):
+            if not late or db.one("SELECT 1 FROM events WHERE fingerprint IN (?,?,?) OR (kind=? AND task=? AND status='queued')",
+                              (fp, f"slot_wait:{tid}:{(ran or {}).get('id') or 0}",
+                               f"urgent_start:{tid}:{(ran or {}).get('id') or 0}", unstarted.ANNOUNCED_KIND, tid)):
                 continue
             what = self._hold_words(t, why, ctx) if why else (
                 f"nothing dispatch records as a hold ({t['blocked_reason'][:160]})" if t["blocked_reason"]
@@ -7525,6 +7532,17 @@ class Daemon:
         except Exception:
             log(self.p, "obligation owners unreadable\n" + traceback.format_exc())
             return {}
+
+    def _stuck_raised(self, tid: int, rid: int, *kinds: str) -> bool:
+        """One wake per stuck task: whether an event of `kinds` (fingerprint prefixes: check_unstarted's
+        ready_not_started, check_slot_wait's slot_wait, check_urgent_start's urgent_start) was raised for
+        the same task and last run and still stands for the same hold: queued, or handled by a turn. One
+        check_unstarted retired (obligations._retire) because the task started or another hold took it
+        does not count: a new hold is a new event."""
+        fps = [f"{k}:{tid}:{rid}" for k in kinds]
+        return bool(fps and self.p.db.one(
+            f"SELECT id FROM events WHERE fingerprint IN ({','.join('?' * len(fps))}) "
+            "AND NOT (status='handled' AND COALESCE(data, '') LIKE '%\"retired\"%')", tuple(fps)))
 
     def _slot_users(self, provider: str | None = None) -> str:
         """What holds the worker slots of `provider` (all providers: None), in words (schedlog.slot_users)."""

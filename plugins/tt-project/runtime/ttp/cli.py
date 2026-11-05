@@ -6667,7 +6667,7 @@ def cmd_lock(a) -> None:
         if wait_dir and not waiting:
             # The run's wall clock stops while it waits here; the supervisor reads this record.
             # A signal ends the wait through _end_wait, so the record never stays open.
-            lk.record_wait(wait_dir, wait_key, started, None)
+            lk.record_wait(wait_dir, wait_key, started, None, [L["res"] for L in todo])
             waiting = True
             for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
                 signal.signal(sig, lambda signum, _f: (_end_wait(), sys.exit(128 + signum)))

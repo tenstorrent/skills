@@ -38,7 +38,9 @@ an older release, so it leads the lane, ahead of priority-1 work. One holds the 
   task's lane has its own lane_wait event, not a second one here. A hold only time or the user can
   clear (the spend gate allowing no new work: the runaway guard, a cap, a plan window at its line)
   wakes nobody: such a wake would be a self-started coordinator turn adding to the guard's count.
-  The task is listed in the next turn's digest instead (SPEND_HELD_KEY, spend_held_lines)."""
+  The task is listed in the next turn's digest instead (SPEND_HELD_KEY, spend_held_lines). One stuck
+  task gives one of these (with check_unstarted's ready_not_started) per run and hold
+  (Daemon._stuck_raised); a lock wait names only the holders of the lock it waits on (locks.wait_rows)."""
 from __future__ import annotations
 
 import json
