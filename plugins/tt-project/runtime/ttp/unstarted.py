@@ -22,7 +22,8 @@ obligation owners held by full slots or any hold) and check_stall (no worker run
 not: any queued task dispatch could start while a slot of its provider is free that still has not.
 A backlog is not such a stall: while more tasks are ready than their provider has free slots, or the
 spend gate stopped new work less than BACKLOG_S ago (the queue a red gate left), a late task with no
-recorded hold raises no alarm; one BACKLOG_KIND record per episode (handled: it wakes nothing) gives the
+recorded hold raises no alarm while the queue drains (a run of its provider started within the task's
+threshold and after the gate cleared; free slots with no such start still raise it); one BACKLOG_KIND record per episode (handled: it wakes nothing) gives the
 queue depth, when the gate cleared or that it still holds, the live runs and the free slots (backlog_words).
 
 parked_nudge() is the coordinator's advice for a deferral that names no external fact: it never

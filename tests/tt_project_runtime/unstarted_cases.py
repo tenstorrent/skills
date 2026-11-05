@@ -48,35 +48,70 @@ def test_ready_not_started_after_10_min_and_2_min_at_priority_1_once_and_clears_
     assert _unstarted_events(p, "ready_backlog") == [], "free slots and no gate: the plain alarm, no backlog"
 
 
+def _start_run(p, d, at, title="other work"):
+    """A worker run of the core provider started at `at` for a task of its own (a slot turning over)."""
+    tid = p.db.add_task(title, "s", kind="work", tier="light", origin="coordinator", priority=3)
+    p.db.update_task(tid, status="running")
+    p.db.x("INSERT INTO runs(task, role, provider, started, status) VALUES(?,?,?,?,?)",
+           (tid, "worker", d.cfg.get("core_provider", "claude"), at, "running"))
+    return tid
+
+
 def test_ready_not_started_reports_a_backlog_while_more_tasks_are_ready_than_free_slots(env, monkeypatch):
-    """Five ready tasks, two slots: the queue drains as slots free. The late ones raise no alarm; one handled
-    backlog record gives the queue depth, live runs and free slots. Once the backlog is gone the plain
-    alarm is back, from when it drained."""
+    """Five ready tasks, three slots, runs starting as slots free: the queue drains. The late ones raise no
+    alarm; one handled backlog record gives the queue depth, live runs and free slots. Once the backlog is
+    gone the plain alarm is back, from when it drained."""
     p, d, check = _ready_setup(env, monkeypatch)
-    p.set_config("budget.max_parallel_workers", 2)
+    p.set_config("budget.max_parallel_workers", 3)
     d.cfg = p.config()
     d.update_gates()
     ids = [p.db.add_task(f"queued work {i}", "s", kind="work", tier="light", origin="coordinator", priority=3)
            for i in range(5)]
     start = time.time()
     check(start + 60)
+    _start_run(p, d, start + 650)
     assert check(start + 700) == [], "a backlog drains: no ready-not-started alarm"
     got = _unstarted_events(p, "ready_backlog")
     assert len(got) == 1 and got[0]["status"] == "handled" and got[0]["severity"] == "low"
     core = d.cfg.get("core_provider", "claude")
-    assert f"5 ready on {core} (queue depth)" in got[0]["text"] and "0 runs live" in got[0]["text"]
+    assert f"5 ready on {core} (queue depth)" in got[0]["text"] and "1 run" in got[0]["text"]
     assert "2 free slots" in got[0]["text"] and "not a stall" in got[0]["text"]
+    _start_run(p, d, start + 1300)
     assert check(start + 1400) == [] and len(_unstarted_events(p, "ready_backlog")) == 1, "one per episode"
     for tid in ids[:3]:
         p.db.update_task(tid, status="done")
+    p.db.x("UPDATE runs SET status='done', ended=? WHERE status='running'", (start + 1450,))
     assert check(start + 1500) == [], "drained: each wait counts from here"
     assert [e["task"] for e in check(start + 2110)] == ids[3:], "no backlog, free slots: the plain alarm"
     assert "since" not in (p.db.kv("ready_backlog") or {}).get(core, {}), "the episode ended"
 
 
+def test_ready_backlog_with_free_slots_and_no_start_is_a_stall(env, monkeypatch):
+    """More ready than free slots, but a free slot left unused and no run started for READY_S: the queue is
+    not draining, so the plain alarm is raised, naming the backlog; a fresh start mutes it again."""
+    from ttp import unstarted
+    p, d, check = _ready_setup(env, monkeypatch)
+    p.set_config("budget.max_parallel_workers", 3)
+    d.cfg = p.config()
+    d.update_gates()
+    ids = [p.db.add_task(f"queued work {i}", "s", kind="work", tier="light", origin="coordinator", priority=3)
+           for i in range(5)]
+    start = time.time()
+    _start_run(p, d, start - 100)   # live, but started before the task's window
+    check(start + 60)
+    got = check(start + 60 + unstarted.READY_S + 10)
+    assert [e["task"] for e in got] == ids, "free slots, nothing started: a stall"
+    assert "does not explain it" in got[0]["text"] and "5 ready on" in got[0]["text"]
+    assert _unstarted_events(p, "ready_backlog") == []
+    _start_run(p, d, start + 700)
+    assert [e["status"] for e in check(start + 720)] == ["handled"] * 5, "draining again: the alarms clear"
+    assert len(_unstarted_events(p, "ready_backlog")) == 1
+
+
 def test_ready_not_started_names_the_backlog_a_red_spend_gate_left_until_it_drains(env, monkeypatch):
-    """A red gate holds three tasks (its own alert). Once it clears, tasks still waiting within
-    BACKLOG_S name when it cleared and why it held, not an unexplained stall; after that, the plain alarm."""
+    """A red gate holds three tasks (its own alert). Once it clears, tasks still waiting while runs start
+    name when it cleared and why it held, not an unexplained stall; with free slots and no start since it
+    cleared, the plain alarm; once the gate cleared long ago, the plain alarm too."""
     from ttp import budget as bud
     from ttp import unstarted
     p, d, check = _ready_setup(env, monkeypatch)
@@ -86,19 +121,27 @@ def test_ready_not_started_names_the_backlog_a_red_spend_gate_left_until_it_drai
     d.gates = {prov: bud.Gate(provider=prov, level="red", max_parallel=0, allow_new_work=False,
                               cause="no new work at red: global daily cap reached") for prov in green}
     start = time.time()
+    _start_run(p, d, start + 2990)   # before the gate cleared: no sign the queue drains after it
     assert check(start + 60) == [] and check(start + 3000) == [], "the red gate has its own alert"
     core = d.cfg.get("core_provider", "claude")
     assert (p.db.kv("ready_backlog") or {})[core]["stopped"] is True
     d.gates = green
     assert check(start + 3060) == []
-    assert check(start + 3700) == [], "the queue the gate left: no unexplained-stall alarm"
+    got = check(start + 3700)
+    assert [e["task"] for e in got] == ids, "free slots and no start since the gate cleared: a stall"
+    assert "or since the gate cleared" in got[0]["text"]
+    assert _unstarted_events(p, "ready_backlog") == []
+    _start_run(p, d, start + 3710)
+    assert [e["status"] for e in check(start + 3720)] == ["handled"] * 3, "the queue the gate left drains"
     got = _unstarted_events(p, "ready_backlog")
     assert len(got) == 1, got
-    assert f"3 ready on {core} (queue depth)" in got[0]["text"] and "6 free slots" in got[0]["text"]
+    assert f"3 ready on {core} (queue depth)" in got[0]["text"] and "4 free slots" in got[0]["text"]
     assert "the spend gate cleared at" in got[0]["text"] and "global daily cap reached" in got[0]["text"]
     later = start + 3060 + unstarted.BACKLOG_S + 60
-    assert check(later) == [], "the gate cleared long ago: each wait counts from here"
-    assert [e["task"] for e in check(later + 610)] == ids, "no backlog and free slots: the plain alarm"
+    p.db.x("UPDATE runs SET status='done', ended=? WHERE status='running'", (later - 10,))
+    check(later)
+    assert "since" not in (p.db.kv("ready_backlog") or {}).get(core, {}), "the gate cleared long ago: no backlog"
+    assert len(_unstarted_events(p, "ready_backlog")) == 1
 
 
 def test_ready_backlog_never_hides_deadline_work(env, monkeypatch):
