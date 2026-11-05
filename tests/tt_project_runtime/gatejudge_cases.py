@@ -64,6 +64,16 @@ def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of
     for out in ("1 passed in 0.1s\n", "\n"):
         v = gatejudge.judge([a, b], lambda at, ids: (0, out), tmp_path, "b1", "host-a", 1000.0)
         assert v["new"] == [a, b] and v["flaky"] == []
+    # Exit 1 listing only the other id, with fewer run than rerun (the selection missed one): the
+    # unreported id stays new, even when the other fails on the base too.
+    fail_q = (1, f"FAILED {b} - assert 0\n1 failed, 9 deselected in 0.1s\n")
+    v = gatejudge.judge([a, b], lambda at, ids: fail_q, tmp_path, "b1", "host-a", 1000.0)
+    assert v["new"] == [a, b] and v["flaky"] == [] and v["pre_existing"] == []
+    assert gatejudge.active(tmp_path, 1000.0) == {}
+    # One passed and one failed (both ran): the passed one is flaky, the other compared on the base.
+    v = gatejudge.judge([a, b], lambda at, ids: (1, f"FAILED {b} - assert 0\n1 failed, 1 passed in 0.1s\n"),
+                        tmp_path, "b1", "host-a", 1000.0)
+    assert v["flaky"] == [a] and v["pre_existing"] == [b] and v["new"] == []
     # Both reported passed: flaky, as before.
     v = gatejudge.judge([a, b], lambda at, ids: (0, "2 passed, 9 deselected in 0.1s\n"), tmp_path, "b1",
                         "host-a", 1000.0)

@@ -41,7 +41,17 @@ BASE_KEEP_S = 7 * 86400.0
 EVIDENCE_MAX = 5    # sightings kept per quarantined test
 NO_TESTS = 5        # pytest's exit status when nothing was selected
 EVENT = "checks_flaky_test"   # the queued fix note to the coordinator
-_PASSED = re.compile(r"\b(\d+) passed\b")   # the count in pytest's summary line
+_COUNT = re.compile(r"\b(\d+) (passed|failed|errors?)\b")   # the counts in pytest's summary line
+
+
+def _ran(output: str) -> tuple[int, int] | None:
+    """(passed, failed or errored) in the last line of `output` that carries pytest's counts."""
+    for line in reversed(output.splitlines()):
+        got = _COUNT.findall(line)
+        if got:
+            return (sum(int(n) for n, k in got if k == "passed"),
+                    sum(int(n) for n, k in got if k != "passed"))
+    return None
 
 
 def settings(cfg: dict) -> dict:
@@ -76,11 +86,13 @@ def judgeable(rc: int | None, output: str, cfg: dict) -> list[str]:
 def failed_of(rc: int | None, output: str, ids: list[str], at: str = "base") -> set[str] | None:
     """Which of `ids` failed in a rerun of them: none on exit 0, or on exit 5 at the base (nothing
     selected: not there), those listed on exit 1 with a complete list, None when the rerun cannot
-    tell. At the head the ids just failed, so a rerun that selected none of them, or reports fewer
-    passed than it reran (a name selection that missed one), proves nothing."""
-    if rc == 0 and at == "head":
-        got = [int(n) for n in _PASSED.findall(output)]
-        return set() if got and got[-1] >= len(set(ids)) else None
+    tell. At the head the ids just failed, so a rerun that selected none of them, or whose summary
+    reports fewer run (passed on exit 0, passed plus failed or errored on exit 1) than it reran (a
+    name selection that missed one), proves nothing."""
+    if at == "head" and rc in (0, 1):
+        ran = _ran(output)
+        if ran is None or ran[0] + (ran[1] if rc == 1 else 0) < len(set(ids)):
+            return None
     if rc == 0 or (rc == NO_TESTS and at == "base"):
         return set()
     if rc != 1:
