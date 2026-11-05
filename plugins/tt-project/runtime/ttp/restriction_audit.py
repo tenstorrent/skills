@@ -4,8 +4,9 @@
 
 After the user's word loosens or removes a Restrictions item (a quoted edit, or a `replaces` of a
 whole Restrictions section with looser wording), or `over` retires one, the project's own tools
-(bin/, hooks/, schedules, task probes) may still carry the old rule; so may they after a scoped exception
-(`excepts`, or a lifting `both_hold` text) narrows one. restriction_tools queues one priority-1 task per
+(bin/, hooks/, schedules, task probes) may still carry the old rule. A purely additive item (a scoped
+`excepts` exception, a `both_hold` text) leaves every older item's text as it was: no check. Only the
+changed clause's words match, as whole words. restriction_tools queues one priority-1 task per
 change to update them, names them in a queued `restriction_tools` event for the next digest, and
 digest_lines shows that task while it is open; it never edits a tool. coordinator.apply() calls it
 once per turn, with the turn's tasks, so a tool a task of that batch already names is left out. An
@@ -18,7 +19,6 @@ for the coordinator's one-time ask to loosen it. Only the user's own words loose
 """
 from __future__ import annotations
 
-import bisect
 import difflib
 import hashlib
 import json
@@ -57,25 +57,58 @@ def tool_term_ids(text: str) -> set[str]:
     return out
 
 
+def changed_clause(old: str, new: str) -> str:
+    """The changed clause of a Restrictions item: a word diff of `old` against `new` (case and punctuation
+    aside), and the clauses of `old` (ended by . ; : , ! or ?) whose words it drops or replaces, or that
+    an insertion extends (tools enforce the old wording: the words `new` adds are not in it); all of `old`
+    when `new` is empty. A clause the
+    diff leaves alone is never in it ("Never X; never Y" -> "Never X; Y on weekends": Y's clause only),
+    nor is any other item."""
+    if not new.strip():
+        return old
+    toks, clause, c = old.split(), [], 0
+    for t in toks:
+        clause.append(c)
+        c += bool(re.search(r"[.;:,!?][)\"'’”]*$", t))
+    key = lambda ts: [re.sub(r"[^\w#]", "", t.lower()) for t in ts]
+    added = new.split()
+    touched = set()
+    for op, i1, i2, j1, j2 in difflib.SequenceMatcher(a=key(toks), b=key(added), autojunk=False).get_opcodes():
+        if op in ("delete", "replace"):
+            touched.update(clause[i1:i2])
+        elif op == "insert" and toks:
+            touched.add(clause[max(i1 - 1, 0)])
+    return " ".join(t for t, k in zip(toks, clause) if k in touched)
+
+
+def clause_words(text: str) -> set[str]:
+    """The whole words a rule is about, lowercased: \\w+ words of four or more characters starting with a
+    letter, rule and filler words (coordinator._RULE_STOP) and citation words (CITE_WORDS) left out. Never
+    stemmed: a tool line matches one only as a whole word of its own."""
+    from .coordinator import _RULE_STOP
+    return {w for w in _TOKEN.findall(text.lower())
+            if len(w) >= 4 and w[0].isalpha() and w not in _RULE_STOP and w not in CITE_WORDS}
+
+
 def tool_terms(old: str, new: str, charter: str = "",
                lines: list[str] | tuple = ()) -> tuple[set[str], set[str], set[str]]:
-    """The old item's distinctive terms for restriction_tools, as (ids, words, exact): identifiers
-    (_TOOL_TERM_RE) of its changed sentences that neither the new text nor the current `charter` (any
-    section) still has, and its rule words (_rule_words) the new text dropped. When the new text dropped
-    fewer than two, or all of them (a removal or retirement), the words are all of the changed
-    sentences' but only the distinctive ones (distinctive_words over the scanned tool `lines`), and
-    `exact` holds the changed sentences' quoted phrases and user-message cites (exact_terms), which
-    hit on their own; else `exact` is empty. A new text whose rule words are all citation words
-    (CITE_STEMS: "(User's word, 2026-10-05.)") keeps no rule: a removal."""
-    from .coordinator import _changed_sentences, _rule_words
-    changed = " ".join(_changed_sentences(old, new)) or old
+    """The changed item's terms for restriction_tools, as (ids, words, exact), all from its changed clause
+    (changed_clause: the word diff of `old` against `new`), never from words both keep or from other
+    items: identifiers (_TOOL_TERM_RE) that neither the new text nor the current `charter` (any section)
+    still has, whole words (clause_words), and quoted phrases `new` and `charter` no longer have and
+    user-message cites `new` no longer has (exact_terms). A removal (no `new`, or a `new` of citation words only: "(User's word,
+    2026-10-05.)") keeps only its distinctive words (distinctive_words over the scanned tool `lines`)."""
+    changed = changed_clause(old, new)
+    if not clause_words(new):
+        changed, new = old, ""
     ids = tool_term_ids(changed)
     ids = {t for t in ids if t not in new and t not in charter and not re.fullmatch(r"[\d./-]+", t)}
-    every, kept = _rule_words(changed), _rule_words(new)
-    words = every - kept
-    if 2 <= len(words) < len(every) and not kept <= CITE_STEMS:
-        return ids, words, set()
-    return ids, distinctive_words(every, lines), exact_terms(changed, new + "\n" + charter)
+    words = clause_words(changed)
+    if not new:
+        words = distinctive_words(words, lines)
+    # A cite the new text keeps names the item as it now stands: no sign of its old wording.
+    exact = {t for t in exact_terms(changed, new + "\n" + charter) if not re.search(rf"{t}(?!\d)", new)}
+    return ids, words, exact
 
 
 # A stem on more than this share of the scanned tool lines is too common to match. An absolute share,
@@ -85,24 +118,24 @@ def tool_terms(old: str, new: str, charter: str = "",
 COMMON_SHARE = 0.005
 COMMON_MIN = 20       # ... and on more than this many lines: on a small tool tree 0.5% is a line or two,
                       # and the harness's own scripts alone name 'reset' or 'host' on ten
-# Stems (_rule_words) of a citation rather than a rule: "(user msg #12)", "the user's word, October 5".
-CITE_STEMS = frozenset({"user", "word", "msg", "messag", "january", "february", "march", "april", "jun", "july",
-                        "august", "september", "october", "november", "december"})
+# Whole words (clause_words) of a citation rather than a rule: "(user msg #12)", "the user's word, October 5".
+CITE_WORDS = frozenset({"user", "users", "word", "words", "message", "messages", "msgs", "january", "february", "march",
+                        "april", "june", "july", "august", "september", "october", "november", "december"})
 
 
 _TOKEN = re.compile(r"\w+")
 
 
-def _starts(w: str, low: str) -> bool:
-    """re.search(rf"\\b{re.escape(w)}", low): `w` starts a word of `low`."""
-    return re.search(rf"\b{re.escape(w)}", low) is not None
+def _whole(w: str, low: str) -> bool:
+    """`w` is in `low` as whole words: no word character right before or after it ('rul' is never in 'rule')."""
+    return re.search(rf"(?<!\w){re.escape(w)}(?!\w)", low) is not None
 
 
 class WordIndex:
-    """Word starts of `lines`, tokenized once: a stem that is all word characters starts a word of a
-    line exactly when one of the line's \\w+ tokens starts with it (a sorted-token range, no regex per
-    line); any other stem is searched only on the lines whose tokens start with its leading word part.
-    Each stem's lines are kept, so counting (distinctive_words) and matching (tool_hit) share one pass."""
+    """Whole words of `lines`, tokenized once: a word that is all word characters is on a line exactly
+    when it is one of the line's \\w+ tokens (a dict lookup, no regex per line); any other word is searched
+    (_whole) only on the lines that have its leading word part. Each word's lines are kept, so counting
+    (distinctive_words) and matching (tool_hit) share one pass."""
 
     def __init__(self, lines=()):
         self.low: list[str] = []
@@ -122,29 +155,24 @@ class WordIndex:
         self._keys, self._memo = None, {}
 
     def lines_of(self, w: str) -> frozenset[int]:
-        """The indexes of the lines `w` starts a word of."""
+        """The indexes of the lines that have `w` as whole words (_whole)."""
         if (got := self._memo.get(w)) is not None:
             return got
         head = _TOKEN.match(w)
-        if not head:   # no leading word part to narrow by: one search per line
-            got = frozenset(i for i, x in enumerate(self.low) if _starts(w, x))
-        else:
-            if self._keys is None:
-                self._keys = sorted(self._by)
-            keys, at, ids = self._keys, bisect.bisect_left(self._keys, head[0]), set()
-            while at < len(keys) and keys[at].startswith(head[0]):
-                ids.update(self._by[keys[at]])
-                at += 1
-            got = frozenset(ids if head[0] == w else (i for i in ids if _starts(w, self.low[i])))
+        if head and head[0] == w:
+            got = frozenset(self._by.get(w, ()))
+        else:   # a word with other characters: searched on the lines that have its leading word part
+            got = frozenset(i for i in (self._by.get(head[0], ()) if head else range(len(self.low)))
+                            if _whole(w, self.low[i]))
         self._memo[w] = got
         return got
 
     def words_on(self, i: int, words) -> list[str]:
-        """The stems of `words` that start a word of line `i`, sorted."""
+        """The words of `words` that line `i` has as whole words, sorted."""
         return sorted(w for w in words if i in self.lines_of(w))
 
     def hits(self, words) -> dict[int, list[str]]:
-        """Line index -> the sorted stems of `words` that start a word of it, for the lines with any."""
+        """Line index -> the sorted words of `words` it has as whole words, for the lines with any."""
         out: dict[int, list[str]] = {}
         for w in sorted(words):
             for i in self.lines_of(w):
@@ -153,7 +181,7 @@ class WordIndex:
 
 
 def distinctive_words(words: set[str], lines: list[str] | tuple | WordIndex) -> set[str]:
-    """The stems of `words` found (as word starts) on at most COMMON_SHARE of the non-blank `lines`,
+    """The words of `words` found (as whole words) on at most COMMON_SHARE of the non-blank `lines`,
     or on at most COMMON_MIN of them: 'work', 'project' or 'fail' of a long item match almost any line.
     `lines` may be a WordIndex, built once for several calls."""
     idx = lines if isinstance(lines, WordIndex) else WordIndex(lines)
@@ -198,23 +226,22 @@ def enabled_schedules(text: str) -> str:
 
 def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozenset(),
              rare: set[str] | None = None, on: list[str] | None = None) -> list[str]:
-    """What a line names of the old item: an identifier, a quoted phrase or user-message cite of
-    `exact` (exact_terms), or else two or more of its rule words (as word starts), one of them in
-    `rare` (distinctive_words) when given; [] when none. `on`: the sorted words of `words` the line
-    has, when already known (WordIndex.words_on)."""
+    """What a line names of the old item, each as whole words (_whole: 'rul' is never in 'rule'): an
+    identifier, a quoted phrase or user-message cite of `exact` (exact_terms), or else two or more of its
+    words, one of them in `rare` (distinctive_words) when given; [] when none. `on`: the sorted words of
+    `words` the line has, when already known (WordIndex.words_on)."""
     from .restriction_source import CITE_RE
-    got = sorted(t for t in ids if t in line)
+    got = sorted(t for t in ids if _whole(t, line))
     low = line.lower()
     if exact:
         folded = " ".join(low.split())
         cites = {"#" + re.search(r"\d+$", m.group())[0] for m in CITE_RE.finditer(line)}
-        got += sorted(t for t in exact if (t in cites if t.startswith("#") else t in folded))
+        got += sorted(t for t in exact if (t in cites if t.startswith("#") else _whole(t, folded)))
     if got:
         return got
-    if on is None:   # one tokenizing pass: every word start's prefixes, no regex per word
-        heads = {t[:k] for t in set(_TOKEN.findall(low)) for k in range(1, len(t) + 1)}
-        on = sorted(w for w in words if ((h[0] in heads and (h[0] == w or _starts(w, low)))
-                                         if (h := _TOKEN.match(w)) else _starts(w, low)))
+    if on is None:
+        tokens = set(_TOKEN.findall(low))
+        on = sorted(w for w in words if (w in tokens if (h := _TOKEN.match(w)) and h[0] == w else _whole(w, low)))
     got = on
     return got if len(got) >= 2 and (rare is None or rare & set(got)) else []
 
@@ -303,22 +330,23 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
                       notes: list[str] | None = None, budget_s: float | None = None) -> list[str]:
     """After Restrictions items were loosened or removed, name the project's own tools that still carry
     the old wording: files under bin/ and hooks/ (project root and harness), harness/schedules.json,
-    and the command and heal check of each enabled schedule, whose lines name an identifier of the old item
-    or two of its dropped rule words (tool_terms; an identifier the current charter still states anywhere
-    is not one; a removed or retired item matches only its distinctive words, quoted phrases and cites;
-    two words hit only with one distinctive word among them),
+    and the command and heal check of each enabled schedule, whose lines name, as whole words, an identifier
+    of the item's changed clause or two of its words (tool_terms: only the words the change dropped or
+    inserted, never words it kept or other items' words; an identifier the current charter still states
+    anywhere is not one; a removed or retired item matches only its distinctive words, quoted phrases and
+    cites; two words hit only with one distinctive word among them),
     each named with the terms it matched. A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over[,
     advisory]), `over` empty for the user's word, else the end that retired the item; `advisory`: the dropped
     items were all unsourced (restriction_source.drops_unsourced), so whoever dropped them and with any `over`,
     one the Brief or a sourced item still states is left out, as is `over` "unsourced". A file a task of this batch
     names (its title or spec has the file's path or name) is left out. Open tasks' start_when probes and
-    schedule prechecks are scanned too. `loosened` entries may carry a fifth field, `exception`: the new
-    text excepts the item, which still stands, so its own terms (identifiers, distinctive words, quotes,
-    cites, and the words it shares with the exception) match. Per item with such files: one priority-1 harness task naming them (label TASK_LABEL +
-    a key of the change: a change that already queued one queues none) and one queued restriction_tools
-    event for the next digest. Model-free; it edits no tool. Returns the event texts.
+    schedule prechecks are scanned too. A purely additive item (an `excepts` exception, a `both_hold` text)
+    changes no older item and is never passed in. One call is one change (the turn's): at most one
+    priority-1 harness task naming every flagged item and its files (one label TASK_LABEL + a key per item:
+    an item a task already covers is skipped, so the same change again queues none) and one queued
+    restriction_tools event for the next digest. Model-free; it edits no tool. Returns the event texts.
     Bounded by `budget_s` (AUDIT_BUDGET_S) of wall clock: past it the scan fails open, keeps what it found
-    (an item's tools named so far still queue its task) and appends a cut-short note to `notes`."""
+    (the items' tools named so far still queue the task) and appends a cut-short note to `notes`."""
     from .coordinator import clip
     end = time.monotonic() + (AUDIT_BUDGET_S if budget_s is None else budget_s)
     files: list[tuple[str, str]] = []   # (label, text)
@@ -371,57 +399,56 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
         starts.append(len(idx.low))
         idx.add(text.splitlines())
     files = files[:len(starts)]
-    out, checked = [], 0
+    out: list[str] = []
+    flagged, labels, checked = [], [], 0   # (how, new text, hits) per changed item with tools still naming it
+    from .restriction_source import bare
     for old, new, over, *rest in loosened:
         if cut:
             break
         checked += 1
-        advisory, exception = bool(rest and rest[0]), len(rest) > 1 and bool(rest[1])
-        if (over == "unsourced" or advisory) and still_stated(charter, old):
+        if (over == "unsourced" or (rest and rest[0])) and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
-        # an exception leaves the item standing: its own identifiers, quotes and cites, and its distinctive
-        # words the exception names too (its scope; the item's other words say what still holds)
-        ids, words, exact = tool_terms(old, "", "", idx) if exception else tool_terms(old, new, charter, idx)
-        if exception:
-            from .coordinator import _rule_words
-            words &= _rule_words(new)
+        key = "\0".join(" ".join(bare(x).lower().split()) for x in (old, new, over))   # cites aside
+        label = TASK_LABEL + hashlib.sha256(key.encode()).hexdigest()[:12]
+        if label in labels or p.db.q("SELECT 1 FROM tasks WHERE labels LIKE ? LIMIT 1", (f'%"{label}"%',)):
+            continue   # a task already covers this change: idempotent per change
+        ids, words, exact = tool_terms(old, new, charter, idx)
         rare = distinctive_words(words, idx)
         on = idx.hits(words)
         hits = []
-        for (label, text), at in zip(files, starts):
+        for (label_, text), at in zip(files, starts):
             if time.monotonic() > end:
                 cut = "matching the tool lines"
                 break
             line, got = next(((n, g) for n, x in enumerate(text.splitlines(), 1)
                               if (g := tool_hit(x, ids, words, exact, rare, on.get(at + n - 1, [])))),
                              (0, []))
-            probe = label.startswith(("schedule ", "task #"))   # no file: no line number
-            if not line or label in named or (not probe and Path(label).name in named):
+            probe = label_.startswith(("schedule ", "task #"))   # no file: no line number
+            if not line or label_ in named or (not probe and Path(label_).name in named):
                 continue
-            hits.append(label + (f":{line}" if not probe else "")
+            hits.append(label_ + (f":{line}" if not probe else "")
                         + f" ({', '.join(clip(g, 40) for g in got[:4])})")
-        if not hits:
-            continue
-        from .restriction_source import bare
-        key = "\0".join(" ".join(bare(x).lower().split()) for x in (old, new, over))   # cites aside
-        label = TASK_LABEL + hashlib.sha256(key.encode()).hexdigest()[:12]
-        if p.db.q("SELECT 1 FROM tasks WHERE labels LIKE ? LIMIT 1", (f'%"{label}"%',)):
-            continue   # this change already queued its update task: idempotent per change
-        how = (f"`over` retired the Restrictions item \"{clip(old, 200)}\" ({clip(over, 150)})" if over
-               else f"The user's word added an exception to the Restrictions item \"{clip(old, 200)}\"" if exception
-               else f"The user's word loosened the Restrictions item \"{clip(old, 200)}\"")
-        listed = ", ".join(hits[:10]) + (f" and {len(hits) - 10} more" if len(hits) > 10 else "")
+        if hits:
+            how = (f"`over` retired the Restrictions item \"{clip(old, 200)}\" ({clip(over, 150)})" if over
+                   else f"The user's word loosened the Restrictions item \"{clip(old, 200)}\"")
+            flagged.append((how, new, hits))
+            labels.append(label)
+    if flagged:   # one task and one event for the whole change, however many items it touched
+        items = []
+        for how, new, hits in flagged:
+            listed = ", ".join(hits[:10]) + (f" and {len(hits) - 10} more" if len(hits) > 10 else "")
+            items.append(f"{how}" + (f"; it now reads: \"{clip(new, 400)}\"" if new else "; it was removed")
+                         + f". These project tools still name its changed words: {listed}.")
         tid = p.db.add_task(
             "Update project tools still enforcing a changed Restrictions item",
-            f"{how}" + (f"; it now reads: \"{clip(new, 400)}\"" if new else "; it was removed")
-            + f". These project tools still name its terms: {listed}. Update each tool to allow exactly what "
+            " ".join(items) + " Update each tool to allow exactly what "
             "the new wording allows and keep enforcing the rest; never loosen past the new text. Add or adjust "
             "the tool's tests if it has any. A tool that does not enforce the item: say so in `summary` and "
             "change nothing. Edit only this project's own tools.",
-            kind="harness", tier="standard", priority=1, origin="daemon", labels=[label])
-        x = (f"{how}, but these project tools still name its terms and no task of that batch names them: {listed}"
-             f". Queued priority-1 task #{tid} to update every tool that enforces the old wording; cancel it "
-             "and say in `summary` why if these do not enforce it.")
+            kind="harness", tier="standard", priority=1, origin="daemon", labels=labels)
+        x = (" ".join(items)[:3000] + f" No task of that batch names them. Queued priority-1 task #{tid} to update "
+             "every tool that enforces the old wording; cancel it and say in `summary` why if these do not "
+             "enforce it.")
         out.append(x)
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "harness", "restriction_tools", "normal", x, "queued"))

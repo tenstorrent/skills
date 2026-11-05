@@ -2173,8 +2173,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     restr_before: str | None = None
     rules_added: list[tuple[str, str]] = []
     restr_edited = False
-    # (old item, new text, over, advisory[, exception]) of Restrictions items loosened or retired; advisory: only
-    loosened: list[tuple] = []   # unsourced items dropped (drops_unsourced); exception: `text` excepts the item
+    # (old item, new text, over, advisory) of Restrictions items loosened or retired; advisory: only
+    loosened: list[tuple] = []   # unsourced items dropped (drops_unsourced)
     replies: list[int] = []
     # Promises (obligations.record_promises): what this batch sent, the tasks it added or updated with
     # their reply_chat, and the obligations it recorded or attached owners to.
@@ -3092,7 +3092,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     refused = (quote and _DATED.sub("", section).lower().startswith("restriction")
                                and not (uturn or ok or len(over) >= OVER_MIN))
                     excepts = " ".join(str(a.get("excepts") or "").split())
-                    lifted: list[str] = []   # Restrictions items this exception narrows, for restriction_audit
                     if excepts:   # a scoped exception to one standing ban, on the user's verbatim words
                         if quote or replaces or not (text and _DATED.sub("", section).lower().startswith("restriction")):
                             raise ValueError("`excepts` goes with new Restrictions `text` only, "
@@ -3100,7 +3099,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         verbatim = bool(a.get("source")) and bool(re.search(r"user msg #\d+|relayer-ordered", cite))
                         # the source message's words: the user's own, the agent's too in agent mode, a yes's ask
                         said = _verbatim_said(db, cite, agent) if verbatim and not unsourced else ""
-                        lifted = [x[0] for x in [_excepted_item(p.charter_path.read_text(), excepts)] if x]
                         text, overlap = _scoped_exception(
                             p.charter_path.read_text(), section, text, excepts,
                             "" if verbatim and not unsourced else unsourced or (
@@ -3212,10 +3210,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             loosened += [(o, n, why, loose_drop) for o, n in restriction_audit.replaced_items(gone, into)]
                     elif text and not quote and not a.get("both_hold") and not excepts:
                         rules_added.append((target, text))
-                    if lifted and target.lower().startswith("restriction"):
-                        # an `excepts` exception on the user's word: tools enforcing the excepted item still
-                        # refuse it. A `both_hold` item is an addition, its neighbours unchanged: no update task
-                        loosened += [(x, text, "", False, True) for x in lifted]
+                    # An `excepts` exception or a `both_hold` item is an addition: every older item's text stands
+                    # unchanged, so no tool-update check (restriction_audit.restriction_tools) for it
                     if retired:
                         db.post("out", f"Retired the charter restriction {retired}: "
                                        f"{over or 'it cited no user message, the Brief or a harness gate'}."

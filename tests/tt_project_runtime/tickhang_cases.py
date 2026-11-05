@@ -161,14 +161,14 @@ def test_a_lean_reap_that_raises_is_quarantined_at_once_and_a_full_one_keeps_its
 
 
 def test_a_lean_apply_skips_the_restriction_checks_and_notes_it(env):
-    """The same exception that queues a restriction_tools task applied lean: the charter changes the
+    """The same narrowing that queues a restriction_tools task applied lean: the charter changes the
     same, no tool scan runs, and the next digest's notes say the checks were skipped."""
     from ttp import coordinator as coord
     p, tasks = _soak_guard(env)
-    mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
-    act = {"type": "charter_update", "section": "Restrictions", "excepts": _GUARD_SOAK,
-           "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
+    mids, src = _turn_said(p, "the soak test may run on a shared rack at night")
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _GUARD_SOAK + " (user msg #7)",
+           "text": "Run the soak test on a shared rack only at night.", "source": src}
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids, lean=True) == []
-    assert "Exception to \"Never run the soak test on a shared rack.\"" in p.charter_path.read_text()
+    assert "only at night" in p.charter_path.read_text()
     assert tasks() == [] and not p.db.q("SELECT id FROM events WHERE kind='restriction_tools'")
     assert any("restriction checks skipped" in n for n in p.db.kv(coord.NOTES_KEY, []))

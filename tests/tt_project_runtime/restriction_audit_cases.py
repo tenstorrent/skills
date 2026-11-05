@@ -171,18 +171,19 @@ def _long_tree(p, n=40):
 
 
 def test_a_long_retired_item_flags_only_the_tools_citing_or_enforcing_it(env):
-    """A long retired item's common stems ('work', 'project', 'fail', 'keep', 'serv') are on most tool
-    lines: only its distinctive words and its cite match, and each file is named with what it matched."""
+    """A long retired item's common words ('project', 'keep', 'service', 'queue') are on most tool lines:
+    only its distinctive words and its cite match, as whole words ('drain' is not 'drains'), and each file
+    is named with what it matched."""
     from ttp import restriction_audit
     p = make(env)
     _long_tree(p)
     out = restriction_audit.restriction_tools(p, [(_LONG, "", "the fleet was retired")], [])
     assert len(out) == 1, out
     assert "bin/hold.sh:2 (#42)" in out[0], out
-    assert "hooks/drain.sh:2 (drain, fleet, offlin)" in out[0] and "bin/tool" not in out[0] and " more" not in out[0], out
-    # A cite of another message is no cite of this item; a line of common stems alone matches nothing.
+    assert "hooks/drain.sh:2 (fleet, offline)" in out[0] and "bin/tool" not in out[0] and " more" not in out[0], out
+    # A cite of another message is no cite of this item; a line of common words alone matches nothing.
     ids, words, exact = restriction_audit.tool_terms(_LONG, "", "", [x for i in range(40) for x in _COMMON])
-    assert "#42" in exact and not {"work", "project", "fail", "keep", "serv", "queue"} & words, words
+    assert "#42" in exact and not {"project", "keep", "service", "queue"} & words, words
     assert restriction_audit.tool_hit("see user msg #420", ids, words, exact) == []
     assert restriction_audit.tool_hit("see user msg #42.", ids, words, exact) == ["#42"]
     assert restriction_audit.tool_hit(_COMMON[1] + _COMMON[2], ids, words, exact) == []
@@ -190,7 +191,7 @@ def test_a_long_retired_item_flags_only_the_tools_citing_or_enforcing_it(env):
 
 def test_a_quoted_phrase_and_a_short_item_still_hit(env):
     """A quoted phrase of the item hits word for word even when its words are common; a short item on a
-    small tool tree keeps every rule word, and a partial loosening keeps its dropped words as before."""
+    small tool tree keeps every rule word, and a loosening keeps only the words of the clause it changed."""
     from ttp import restriction_audit
     lines = [x for i in range(40) for x in _COMMON]
     ids, words, exact = restriction_audit.tool_terms(_LONG, "", "", lines)
@@ -203,9 +204,11 @@ def test_a_quoted_phrase_and_a_short_item_still_hit(env):
     ids, words, exact = restriction_audit.tool_terms(short, "", "", ["#!/bin/sh", "skip reboot on the farm"])
     assert {"reboot", "farm", "build"} <= words and exact == {"#7"}
     assert restriction_audit.tool_hit("skip reboot on the farm", ids, words, exact) == ["farm", "reboot"]
-    # A loosening that dropped two or more of the words (not all) matches those, uncut, as before.
-    got = restriction_audit.tool_terms(_LONG, "Workers may restart a service; hold the 'quiet window'.", "", lines)
-    assert "work" not in got[1] and {"project", "fail"} <= got[1] and got[2] == set(), got
+    # A loosening of the last clause only: that clause's words, uncut; none of the clauses it kept.
+    new = _LONG.replace(" and the old workers keep serving", "")
+    got = restriction_audit.tool_terms(_LONG, new, "", lines)
+    assert {"power", "budget", "workers", "serving"} <= got[1] and got[2] == set(), got
+    assert not {"restart", "fleet", "quiet", "drains"} & got[1], got
     p = make(env)
     (p.root / "bin").mkdir(exist_ok=True)
     (p.root / "bin" / "farm.sh").write_text("#!/bin/sh\n# skip reboot while the farm is busy\n")
@@ -242,26 +245,26 @@ def test_stems_under_five_percent_but_common_are_cut_and_the_citing_tools_still_
     assert restriction_audit.COMMON_SHARE <= 0.01
     out = restriction_audit.restriction_tools(p, [(_ITEM, "", "the fleet was retired")], [])
     assert len(out) == 1, out
-    assert "bin/cite.sh:2 (#77)" in out[0] and "bin/drain.sh:2 (drain, fleet, offlin)" in out[0], out
+    assert "bin/cite.sh:2 (#77)" in out[0] and "bin/drain.sh:2 (drain, fleet, offline)" in out[0], out
     assert "bin/spare.sh:2 (cold spare)" in out[0] and "common" not in out[0] and "filler" not in out[0], out
 
 
 def test_a_citation_only_new_text_is_a_removal(env):
     """A new text whose rule words are only citation words (user, word, msg, message, month names, dates)
-    removes the item: distinctive words, quoted phrases and cites, not every dropped stem uncut."""
+    removes the item: distinctive words, quoted phrases and cites, not every dropped word uncut."""
     from ttp import restriction_audit
     lines = ["echo step %d ok" % i for i in range(1000)] + ["# the worker may build the queue now"] * 30
     removed = restriction_audit.tool_terms(_ITEM, "", "", lines)
-    assert "#77" in removed[2] and "cold spare" in removed[2] and not {"worker", "build", "queu"} & removed[1]
+    assert "#77" in removed[2] and "cold spare" in removed[2] and not {"worker", "build", "queue"} & removed[1]
     for new in ("(User's word, 2026-10-05.)", "(user msg #77)", "Per the user's words (msgs #77, #78), October 5.",
                 "User message, 5 November 2026."):
         assert restriction_audit.tool_terms(_ITEM, new, "", lines) == removed, new
-    # The spec's short case: 'loosen' and 'rul' dropped, 'user' and 'word' kept as a cite: still a removal.
+    # The spec's short case: 'loosens' and 'rule' dropped, 'user' and 'word' kept as a cite: still a removal.
     short = "Only the user's word loosens a rule."
-    assert restriction_audit.tool_terms(short, "(User's word, 2026-10-05.)", "", [])[1] == {"user", "word", "loosen", "rul"}
-    # A new text keeping one real rule word is a loosening: its dropped words, no exact terms.
+    assert restriction_audit.tool_terms(short, "(User's word, 2026-10-05.)", "", [])[1] == {"loosens", "rule"}
+    # A new text keeping a real rule word is a loosening: the changed clauses' words uncut, none it adds.
     ids, words, exact = restriction_audit.tool_terms(_ITEM, "A worker may build at night (user msg #80).", "", lines)
-    assert exact == set() and "worker" not in words and {"queu", "drain", "fleet"} <= words, words
+    assert {"queue", "drain", "fleet"} <= words and "night" not in words and "#77" in exact, words
 
 
 def test_every_two_word_hit_needs_a_rare_word(env):
@@ -270,9 +273,9 @@ def test_every_two_word_hit_needs_a_rare_word(env):
     from ttp import restriction_audit
     ids, words, exact = restriction_audit.tool_terms(_ITEM, "A worker may run at night (user msg #80).", "", [])
     rare = {"drain", "fleet"}
-    assert restriction_audit.tool_hit("build the queue", ids, words, exact) == ["build", "queu"]
+    assert restriction_audit.tool_hit("build the queue", ids, words, exact) == ["build", "queue"]
     assert restriction_audit.tool_hit("build the queue", ids, words, exact, rare) == []
-    assert restriction_audit.tool_hit("Queue the fleet", ids, words, exact, rare) == ["fleet", "queu"]
+    assert restriction_audit.tool_hit("Queue the fleet", ids, words, exact, rare) == ["fleet", "queue"]
     assert restriction_audit.tool_hit("fleet", ids, words, exact, rare) == []
     p = make(env)
     _big_tree(p)
@@ -300,35 +303,50 @@ def _soak_guard(env):
     return p, lambda: [dict(r) for r in p.db.q("SELECT * FROM tasks WHERE labels LIKE '%restriction_tools:%'")]
 
 
-def test_a_scoped_exception_queues_one_update_task_naming_the_guard_still_enforcing_the_item(env):
-    """An `excepts` exception on the user's words leaves the item standing, but a guard script citing it
-    still refuses what the exception allows: one priority-1 harness task names the file, line, old item
-    and new exception, a restriction_tools event says so, and the digest shows it while it is open. The
-    guard is never edited; the same change again queues no second task."""
+def test_a_scoped_exception_is_an_addition_and_queues_no_update_task(env):
+    """An `excepts` exception on the user's words adds a scoped item and leaves the item it excepts word
+    for word: no tool-update task, no restriction_tools event and no digest line, though a guard script
+    still cites and enforces the excepted item."""
     from ttp import coordinator as coord, restriction_audit
     p, tasks = _soak_guard(env)
     mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
     act = {"type": "charter_update", "section": "Restrictions", "excepts": _GUARD_SOAK,
            "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
-    assert "Exception to \"Never run the soak test on a shared rack.\"" in p.charter_path.read_text()
+    charter = p.charter_path.read_text()
+    assert "Exception to \"Never run the soak test on a shared rack.\"" in charter
+    assert charter.count(_GUARD_SOAK + " (user msg #7)") == 1, charter
+    assert tasks() == [] and not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'"), tasks()
+    assert restriction_audit.digest_lines(p) == []
+
+
+def test_a_narrowed_item_queues_one_update_task_naming_the_guard_and_the_digest_shows_it(env):
+    """A quoted edit on the user's words that narrows the ban, and a guard script citing it still
+    refusing what the new text allows: one priority-1 harness task names the file, line, old item and
+    new text, one restriction_tools event says so, and the digest shows it while it is open. The guard is
+    never edited; the same change again queues no second task."""
+    from ttp import coordinator as coord, restriction_audit
+    p, tasks = _soak_guard(env)
+    mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _GUARD_SOAK + " (user msg #7)",
+           "text": "Never run the soak test on a shared rack, except on rack-a with `soak_leg.sh`. (user msg #7)",
+           "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
     got = tasks()
     assert len(got) == 1, got
     t = got[0]
     assert t["priority"] == 1 and t["kind"] == "harness" and t["status"] == "queued", t
     assert "bin/soak-guard.sh:2" in t["spec"] and _GUARD_SOAK in t["spec"] and "rack-a" in t["spec"], t["spec"]
     assert "pre.sh" not in t["spec"] and "never loosen past the new text" in t["spec"], t["spec"]
-    assert "exception" in t["spec"] and "keep enforcing the rest" in t["spec"], t["spec"]
     ev = [r["text"] for r in p.db.q("SELECT text FROM events WHERE kind='restriction_tools'")]
     assert len(ev) == 1 and f"task #{t['id']}" in ev[0], ev
     assert "exit 1" in (p.root / "bin" / "soak-guard.sh").read_text(), "the check never edits a tool"
     lines = restriction_audit.digest_lines(p)
     assert len(lines) == 2 and lines[0].startswith("## Guards behind the charter") and f"#{t['id']}" in lines[1]
     assert "Guards behind the charter" in dict(coord.digest_parts(p, {}, [], [])[0]).get("guards_behind", "")
-    # The same change again (the exception already stored): no second task, no second event.
-    stored = [x for x in p.charter_path.read_text().splitlines() if x.startswith("- Exception")]
-    assert coord.apply(p, [act], turn=2, user_turn=True, messages=mids) is not None
-    assert len(tasks()) == 1 and stored, tasks()
+    # The same change again: no second task, no second event.
+    restriction_audit.restriction_tools(p, [(act["quote"], act["text"], "")], [])
+    assert len(tasks()) == 1 and len(p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'")) == 1
     # Once its task is done, the digest line goes.
     p.db.update_task(t["id"], status="done")
     assert restriction_audit.digest_lines(p) == []
@@ -388,17 +406,56 @@ def test_an_item_added_after_an_unchanged_item_queues_no_update_task(env):
         assert tasks() == [] and not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'"), tasks()
 
 
-def test_a_scoped_exception_matches_tools_only_on_words_it_shares_with_the_item(env):
-    """An `excepts` exception matches tools on the item's cites, identifiers and the rule words the
-    exception names too; a tool line naming only the item's other words is no hit."""
+_MULTI = "Never reset a shared board; never reboot the build farm while its nightly queue runs. (user msg #9)"
+
+
+def test_a_narrowing_lists_only_its_changed_clause_words_as_whole_words(env):
+    """A narrowing of one clause of a two-clause item: its keywords come only from that clause, never from
+    the clause it kept, the words it added or another item; and a keyword matches a tool line only as a
+    whole word ('farm' is not in 'farmer', 'reboot' not in 'reboots', 'reset' not in 'preset')."""
     from ttp import restriction_audit
-    p, tasks = _soak_guard(env)
-    (p.root / "bin" / "soak-guard.sh").write_text("#!/bin/sh\necho 'refused: a shared rack is banned'; exit 1\n")
-    exc = "Workers may run the soak test on rack-a with `soak_leg.sh`."
-    assert restriction_audit.restriction_tools(p, [(_GUARD_SOAK, exc, "", False, True)], []) == []
-    (p.root / "bin" / "soak-guard.sh").write_text("#!/bin/sh\necho 'refused: no soak test here'; exit 1\n")
-    assert len(restriction_audit.restriction_tools(p, [(_GUARD_SOAK, exc, "", False, True)], [])) == 1
-    assert len(tasks()) == 1 and "bin/soak-guard.sh:2" in tasks()[0]["spec"], tasks()
+    new = "Never reset a shared board; reboot the build farm only at night. (user msg #9)"
+    assert restriction_audit.changed_clause(_MULTI, new).startswith("never reboot the build farm")
+    ids, words, exact = restriction_audit.tool_terms(_MULTI, new, "- Never move the release tag. (user msg #3)")
+    assert {"reboot", "farm", "nightly", "queue"} <= words, words
+    assert not {"reset", "shared", "board", "night", "move", "release"} & words and exact == set(), words
+    assert restriction_audit.tool_hit("reboot the farm", ids, words, exact) == ["farm", "reboot"]
+    assert restriction_audit.tool_hit("the farmer reboots a preset board", ids, words, exact) == []
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- " + new + "\n- Never move the release tag. (user msg #3)\n")
+    (p.root / "bin").mkdir(exist_ok=True)
+    (p.root / "bin" / "farm.sh").write_text("#!/bin/sh\n# no reboot of the farm while the nightly queue runs\n")
+    (p.root / "bin" / "board.sh").write_text("#!/bin/sh\n# refuse a reset of a shared board\n")
+    (p.root / "bin" / "fragment.sh").write_text("#!/bin/sh\n# the farmer reboots a preset board nightly\n")
+    (p.root / "bin" / "tag.sh").write_text("#!/bin/sh\n# never move the release tag\n")
+    out = restriction_audit.restriction_tools(p, [(_MULTI, new, "")], [])
+    assert len(out) == 1 and "bin/farm.sh:2 (farm, nightly, queue, reboot)" in out[0], out
+    assert "board.sh" not in out[0] and "fragment.sh" not in out[0] and "tag.sh" not in out[0], out
+
+
+def test_a_change_touching_three_items_queues_exactly_one_task(env):
+    """One charter change that loosens three items, each with a guard still enforcing it: one task and
+    one restriction_tools event list all three items and files; running the check again queues none."""
+    from ttp import restriction_audit
+    p = make(env)
+    items = ["Never run the soak test on a shared rack. (user msg #7)",
+             "Never reboot the build farm. (user msg #8)",
+             "Never prune the artifact cache. (user msg #9)"]
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never open pull requests. (user msg #1)\n")
+    (p.root / "bin").mkdir(exist_ok=True)
+    for name, line in (("soak", "refuse the soak test on a shared rack"), ("farm", "refuse to reboot the build farm"),
+                       ("cache", "refuse to prune the artifact cache")):
+        (p.root / "bin" / f"{name}.sh").write_text(f"#!/bin/sh\n# {line}\nexit 1\n")
+    loosened = [(x, "", "the user lifted it") for x in items]
+    out = restriction_audit.restriction_tools(p, loosened, [])
+    got = [dict(r) for r in p.db.q("SELECT * FROM tasks WHERE labels LIKE '%restriction_tools:%'")]
+    assert len(out) == 1 and len(got) == 1, (out, got)
+    assert all(f"bin/{n}.sh:2" in got[0]["spec"] for n in ("soak", "farm", "cache")), got[0]["spec"]
+    assert all(x in got[0]["spec"] for x in items), got[0]["spec"]
+    assert got[0]["labels"].count("restriction_tools:") == 3, got[0]["labels"]
+    assert len(p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'")) == 1
+    assert restriction_audit.restriction_tools(p, loosened, []) == []
+    assert len(p.db.q("SELECT 1 FROM tasks WHERE labels LIKE '%restriction_tools:%'")) == 1
 
 
 # The audit runs on the daemon's tick thread (coordinator.apply in reap_runs): it tokenizes the tool lines
