@@ -1657,7 +1657,8 @@ def test_worker_ttp_lock_refuses_a_privileged_command_and_points_to_host_run(env
     run_dir = p.base / "state" / "runs" / "9"
     run_dir.mkdir(parents=True)
     path = f"{bin_dir}:{os.environ['PATH']}"
-    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir), PATH=path)
+    # A run the daemon sandboxed (its project turned the write fence on); by default runs are unsandboxed.
+    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir), PATH=path, TTP_SANDBOXED="1")
     for cmd in (["sudo", "-n", "tt-smi", "-glx_reset"], [str(bin_dir / "sudo"), "true"], ["bash", "-c", "sudo true"],
                 ["sh", "-c", "echo a; doas true"], ["bash", "-lc", "x=$(pkexec id)"], ["sh", "-c", "eval su -c id"],
                 ["env", "A=1", "timeout", "-s", "KILL", "5", "nohup", "su", "-c", "id"], ["sh", "-c", "true\nsudo id"],
@@ -1678,6 +1679,11 @@ def test_worker_ttp_lock_refuses_a_privileged_command_and_points_to_host_run(env
     assert r.returncode == 0 and log.read_text() == "ssh box sudo -n tt-smi -s\n", r
     from ttp import privlock
     assert privlock.refusal(["ttp", "host-run", "--", "sudo", "-n", "tt-smi", "-s"]) is None
+    # An unsandboxed run (the default: no write fence) runs sudo under the lock as given.
+    plain = {k: v for k, v in worker.items() if k != privlock.SANDBOXED_ENV}
+    r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "sudo", "-n", "id"], env=plain,
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and log.read_text().splitlines()[-1] == "sudo -n id", r
     # Outside a run (the user's own shell) the lock runs what it is given.
     user = {k: v for k, v in _lock_env(env, p, PATH=path).items()
             if k not in ("TTP_RUN_DIR", "TTP_RUN_ID", "TTP_NOTE_RUN_DIR")}
@@ -1705,6 +1711,7 @@ def test_worker_ttp_lock_runs_its_command_without_new_privileges(env, monkeypatc
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.setenv("TTP_TASK", "7")
     monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv(privlock.SANDBOXED_ENV, "1")
     with pytest.raises(_Set):
         cli.main(["lock", "rig", "--", "true"])
     assert calls == [1]
@@ -1794,7 +1801,7 @@ def test_worker_ttp_lock_refuses_a_root_service_client_and_the_user_shell_runs_i
     run_dir = p.base / "state" / "runs" / "9"
     run_dir.mkdir(parents=True)
     path = f"{bin_dir}:{os.environ['PATH']}"
-    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir), PATH=path)
+    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir), PATH=path, TTP_SANDBOXED="1")
     for cmd in (["docker", "run", "x"], ["env", "A=1", "systemctl", "restart", "u"], ["sh", "-c", "systemctl stop u"]):
         r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", *cmd], env=worker, capture_output=True,
                            text=True, timeout=60)
@@ -1829,8 +1836,9 @@ def test_privileged_finds_sudo_in_command_position_only():
 
 
 def test_worker_hook_points_sudo_under_ttp_lock_to_host_run(env, monkeypatch, tmp_path):
-    from ttp import hook
+    from ttp import hook, privlock
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv(privlock.SANDBOXED_ENV, "1")   # a run the daemon sandboxed (write fence on)
 
     def why(cmd):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
@@ -1844,6 +1852,9 @@ def test_worker_hook_points_sudo_under_ttp_lock_to_host_run(env, monkeypatch, tm
                 "ttp host-run -- ttp lock r -- sudo -n x", "ttp host-run --detach -- ttp lock r -- sudo -n x",
                 "ttp lock --probe r", "ttp lock r -- make test"):
         assert "host-run" not in why(cmd), cmd
+    # An unsandboxed run (the default) may run sudo itself, under a lock too.
+    monkeypatch.delenv(privlock.SANDBOXED_ENV)
+    assert "host-run" not in why("ttp lock r -- sudo tt-smi -glx_reset")
 
 
 def test_a_lock_wait_notice_never_follows_a_symlinked_progress_log(env, tmp_path):

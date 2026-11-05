@@ -11,7 +11,9 @@ with each model call; the app-server meter, read every few minutes, covers the t
 Write fence (from the docs; Codex was not installed where this was probed). Workers run in
 `danger-full-access` by default: no sandbox. A project that sets `providers.codex.write_fence: true`, or
 has the no_internet restriction, runs them in `workspace-write` (fence_args): they write their cwd, temp
-dirs and `writable_args` roots.
+dirs and `writable_args` roots. Coordinator turns likewise drop `-s read-only` for `danger-full-access`
+unless the same key is on (read_only_args); the daemon applies their output only through its action gates
+and logs a turn that changed files (coordwrites).
 
 | Question | Linux | macOS |
 | :- | :- | :- |
@@ -290,14 +292,23 @@ class Codex(Provider):
     fence_optional = True   # workspace-write only on request (providers.codex.write_fence) or under no_internet
 
     def fence_args(self, argv, dirs, cwd="", on=True, restrictions=None, freed=()):
-        if on or (restrictions or {}).get("no_internet") or "workspace-write" not in argv:
+        if on or (restrictions or {}).get("no_internet"):
             return super().fence_args(argv, dirs, cwd, on, restrictions, freed)
+        if "workspace-write" not in argv:
+            return argv, False
         argv = list(argv)
         argv[argv.index("workspace-write")] = "danger-full-access"
         i = next((k for k, w in enumerate(argv) if w == "sandbox_workspace_write.network_access=true"), None)
         if i is not None and argv[i - 1] == "-c":
             del argv[i - 1:i + 1]
         return argv, False
+
+    def read_only_args(self, argv, on=False, restrictions=None):
+        # `-s read-only` only with the opt-in fence or no_internet; the daemon's action gates apply the output.
+        i = next((k for k in range(1, len(argv)) if argv[k] == "read-only" and argv[k - 1] == "-s"), None)
+        if on or (restrictions or {}).get("no_internet") or i is None:
+            return argv
+        return argv[:i] + ["danger-full-access"] + argv[i + 1:]
 
     def launch_sandbox(self, argv):
         i = next((k for k, w in enumerate(argv) if w in ("-s", "--sandbox")), None)

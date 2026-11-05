@@ -41,6 +41,7 @@ from . import pausegone
 from . import urgentfup
 from . import topup
 from . import checksettle
+from . import coordwrites
 from . import checksgone
 from . import userorder
 from . import resumefirst
@@ -2784,6 +2785,8 @@ class Daemon:
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,
                                web=role == "coordinator" or web_needed(role, task))
+        if read_only:   # a decision-only turn, unsandboxed unless opted in: its output goes through the action gates
+            argv = prov.read_only_args(argv, on=provider_fence_on(self.cfg, provider), restrictions=restrictions)
         cache_fp = None
         if role != "coordinator" and not cache_ttl:
             cache_ttl = cachettl.worker_setting(self.cfg.get("budget") or {})
@@ -3121,6 +3124,8 @@ class Daemon:
                     # Workers and reviewers run niced, and all they start with them; the coordinator not.
                     "nice": nice_level(self.cfg.get("runner"))[0] if role != "coordinator" else 0}
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
+            if role == "coordinator":
+                self._coord_snapshot(run_dir)
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
                                         env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
@@ -4050,6 +4055,8 @@ class Daemon:
                     log(p, f"run {r['id']} of task {r['task']}: {held}")
                 return
         run_dir = self._run_dir(r)
+        if r["role"] == "coordinator" and not self._lean_reap:
+            self._coord_writes(r, run_dir)   # before its output is applied
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
         try:   # the runner masks them too, unless it died first: before the output or hand-off is read
             redact.scrub_run(run_dir)
@@ -4373,6 +4380,26 @@ class Daemon:
             labels = json.loads(task["labels"] or "[]")
             return f"schedule:{labels[0]}" if labels else f"task:{task['id']}"
         return f"task:{r['task']}" if r["task"] else r["role"]
+
+    def _coord_folders(self) -> list[Path]:
+        return [self.p.harness, self.p.root]
+
+    def _coord_snapshot(self, run_dir: Path) -> None:
+        """The harness folder and repo checkout before a coordinator turn (coordwrites): a report only."""
+        try:
+            coordwrites.save(run_dir, self._coord_folders())
+        except Exception:
+            log(self.p, f"run {run_dir.name}: coordinator write snapshot failed\n" + traceback.format_exc())
+
+    def _coord_writes(self, r: dict, run_dir: Path) -> None:
+        """Logs a warning when a coordinator turn changed files in the harness folder or the repo
+        checkout (coordwrites): no model call, no alert; the turn's end stands."""
+        try:
+            if changed := coordwrites.changed(run_dir):
+                log(self.p, f"run {r['id']}: warning: coordinator turn changed files in {', '.join(changed)} "
+                            "(coordinator turns run unsandboxed; a write is the daemon's or a worker's job)")
+        except Exception:
+            log(self.p, f"run {r['id']}: coordinator write check failed\n" + traceback.format_exc())
 
     def _finish_coordinator(self, r: dict, usage, status: str, note: dict) -> None:
         db = self.p.db

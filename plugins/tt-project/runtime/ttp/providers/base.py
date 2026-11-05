@@ -405,6 +405,11 @@ class Provider:
         when an OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""
         return "no write sandbox"
 
+    def read_only_args(self, argv: list[str], on: bool = False, restrictions: dict | None = None) -> list[str]:
+        """`argv` of a read-only (coordinator) turn as it launches: an adapter whose read-only mode is an
+        OS sandbox drops it unless the project turned its write fence on (`on`); unchanged by default."""
+        return argv
+
     def launch_sandbox(self, argv: list[str]) -> str:
         """The OS sandbox launch `argv` starts the agent in, read from the argv itself ("" for none):
         recorded with each run (run.json `sandbox`, the daemon log's run start line)."""

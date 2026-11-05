@@ -33,10 +33,12 @@ def test_claude_worker_settings_carry_the_sandbox_where_it_can_start(monkeypatch
     out, got = prov.fence_args(argv, ["/state", "/repo/.git"], cwd="/wt")
     assert got is fenced and out[-1] == "-", "the prompt on stdin stays last"
     settings = _settings(out)
-    assert {k: v for k, v in settings.items() if k != "sandbox"} == _settings(argv), "the rest is kept"
+    assert _settings(argv)["sandbox"] == {"enabled": False}, "unfenced, even if the user's settings turn it on"
+    assert {k: v for k, v in settings.items() if k != "sandbox"} == {
+        k: v for k, v in _settings(argv).items() if k != "sandbox"}, "the rest is kept"
     assert (prov.write_fence() == "") is fenced
     if not fenced:
-        assert "sandbox" not in settings and out == argv
+        assert settings["sandbox"] == {"enabled": False} and out == argv
         assert prov.write_fence().startswith("bypassPermissions without the Bash sandbox, which needs ")
         return
     box = settings["sandbox"]
@@ -96,9 +98,11 @@ def test_daemon_fences_claude_workers_and_observes_a_missing_dependency_once(env
     have = {"bwrap", "socat"}
     monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}" if b in have else None)
     p = make(env)
+    _write_fence("claude")(p)   # the fence is opt-in (providers.claude.write_fence)
     wt = env["tmp"] / "wt"
     subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
     spec = _claude_launch(env, p, wt)
+    assert spec["sandbox"] == "claude-bash-sandbox"
     allow = _settings(spec["argv"])["sandbox"]["filesystem"]["allowWrite"]
     assert allow[0] == str(wt) and str(p.state) in allow, "the worktree and the state (run dir, notes, queues)"
     assert str((env["repo"] / ".git").resolve()) in allow, "commits in a worktree write the main repo's git dir"
@@ -111,14 +115,14 @@ def test_daemon_fences_claude_workers_and_observes_a_missing_dependency_once(env
     have.discard("bwrap")
     for _ in range(2):
         spec = _claude_launch(env, p, wt)
-        assert "sandbox" not in _settings(spec["argv"]), "a host without bwrap runs the worker as before"
+        assert not _settings(spec["argv"])["sandbox"]["enabled"], "a host without bwrap runs the worker as before"
     rows = observed()
     assert len(rows) == 1 and "needs bwrap" in rows[0]["title"] and "write_fence false" in rows[0]["title"], rows
     p.set_config("providers", {**p.config()["providers"], "claude": {**p.config()["providers"].get("claude", {}),
                                                                       "write_fence": False}})
     have.add("bwrap")
     spec = _claude_launch(env, p, wt)
-    assert "sandbox" not in _settings(spec["argv"]) and not spec["env"].get("TMPDIR"), "turned off by config"
+    assert not _settings(spec["argv"])["sandbox"]["enabled"] and not spec["env"].get("TMPDIR"), "turned off by config"
     assert not spec["env"].get("TTP_FENCE_BY_NAME"), "an unfenced worker's ssh runs anywhere"
 
 
@@ -471,6 +475,7 @@ def test_write_dirs_reach_the_fenced_worker_and_refusals_alert(env, monkeypatch)
     alerts: dict = {}
     monkeypatch.setattr(Daemon, "alert", lambda self, key, text, **kw: alerts.__setitem__(key, (text, kw)))
     p = make(env)
+    _write_fence("claude")(p)
     wt = env["tmp"] / "wt"
     subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
     before = _settings(_claude_launch(env, p, wt)["argv"])["sandbox"]["filesystem"]["allowWrite"]
@@ -567,6 +572,7 @@ def test_fence_freed_commands_reach_the_sandbox_and_the_hook_of_a_fenced_worker(
     monkeypatch.setattr(claude.sys, "platform", "linux")
     monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}")
     p = make(env)
+    _write_fence("claude")(p)
     wt = env["tmp"] / "wt"
     subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
     spec = _claude_launch(env, p, wt)
@@ -589,7 +595,7 @@ def test_fence_freed_commands_reach_the_sandbox_and_the_hook_of_a_fenced_worker(
     p.set_config("providers", {**p.config()["providers"], "claude": {**p.config()["providers"].get("claude", {}),
                                                                       "write_fence": False}})
     spec = _claude_launch(env, p, wt)
-    assert "sandbox" not in _settings(spec["argv"]) and "TTP_FENCE_FREED" not in spec["env"], "unfenced"
+    assert not _settings(spec["argv"])["sandbox"]["enabled"] and "TTP_FENCE_FREED" not in spec["env"], "unfenced"
 
 
 @pytest.mark.parametrize("cmd,refused", [
@@ -718,3 +724,134 @@ def test_the_coordinator_changes_the_worker_sandbox_only_in_a_turn_carrying_the_
     assert p.raw_config()["providers"]["claude"]["write_fence"] is False
     cli.main(["config", "--chat-settable", "providers.claude.write_fence", "true"])
     assert "providers.claude.write_fence: accepted as true" in capsys.readouterr().out
+
+
+def _launch_role(env, p, provider, role, cwd, monkeypatch):
+    """run.json of a `role` run the daemon starts with `provider` (a stand-in agent), and the daemon log."""
+    from ttp import coordinator as coord, providers
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(providers.get_provider(provider).__class__, "binary", lambda self: "/usr/bin/true")
+    d = Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
+    kw = {"read_only": True, "schema": coord.ACTIONS_SCHEMA, "system": "s"} if role == "coordinator" else \
+        {"task": p.db.task(tid)}
+    rid = d.start_run(role, "go", provider, "light", str(cwd), **kw)
+    (p.runs / str(rid) / "STOP").touch()
+    deadline = time.time() + 30
+    while not (p.runs / str(rid) / "exit.json").exists() and time.time() < deadline:
+        time.sleep(0.05)
+    return json.loads((p.runs / str(rid) / "run.json").read_text()), (p.logs / "daemon.log").read_text(), rid
+
+
+@pytest.mark.parametrize("role", ["worker", "reviewer", "coordinator"])
+def test_default_runs_launch_unsandboxed_and_say_so(env, monkeypatch, role):
+    """No write fence key: no bwrap, no namespace, the Claude Bash sandbox off, and run.json and the
+    daemon log say sandbox none (what a verifier reads)."""
+    from ttp.providers import claude
+    monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}")   # the sandbox could start
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.delenv("TTP_CHECK_SANDBOX", raising=False)
+    p = make(env)
+    spec, log, rid = _launch_role(env, p, "claude", role, env["repo"], monkeypatch)
+    assert not [a for a in spec["argv"] if "bwrap" in a or a.startswith("--unshare")], spec["argv"]
+    if "--settings" in spec["argv"]:
+        assert _settings(spec["argv"])["sandbox"].get("enabled") is False
+    assert spec["sandbox"] == "none"
+    assert f"run {rid} start role={role} " in log and "sandbox=none" in log.split(f"run {rid} start ", 1)[1]
+    assert spec["env"].get("TTP_SANDBOXED") != "1", "sudo under ttp lock and detached jobs keep privileges"
+
+
+def test_codex_runs_drop_its_sandbox_by_default_and_keep_it_on_opt_in(env, monkeypatch):
+    p = make(env)
+    monkeypatch.delenv("TTP_CHECK_SANDBOX", raising=False)
+
+    def mode(argv):
+        return argv[argv.index("-s") + 1]
+    worker, _, _ = _launch_role(env, p, "codex", "worker", env["repo"], monkeypatch)
+    coord, log, rid = _launch_role(env, p, "codex", "coordinator", p.base, monkeypatch)
+    assert mode(worker["argv"]) == "danger-full-access" and worker["sandbox"] == "none"
+    assert not [a for a in worker["argv"] if a.startswith("sandbox_workspace_write.")], worker["argv"]
+    assert mode(coord["argv"]) == "danger-full-access" and "read-only" not in coord["argv"]
+    assert coord["sandbox"] == "none" and "sandbox=none" in log.split(f"run {rid} start ", 1)[1]
+    _write_fence("codex")(p)
+    worker, _, _ = _launch_role(env, p, "codex", "worker", env["repo"], monkeypatch)
+    coord, _, _ = _launch_role(env, p, "codex", "coordinator", p.base, monkeypatch)
+    assert mode(worker["argv"]) == "workspace-write" and worker["sandbox"] == "codex-workspace-write"
+    assert mode(coord["argv"]) == "read-only" and coord["sandbox"] == "codex-read-only"
+
+
+def test_codex_read_only_args_keep_the_sandbox_on_opt_in_or_no_internet():
+    from ttp.providers import codex
+    prov = codex.Codex()
+    argv = ["codex", "exec", "-s", "read-only", "-"]
+    assert prov.read_only_args(argv) == ["codex", "exec", "-s", "danger-full-access", "-"]
+    assert prov.read_only_args(argv, on=True) == argv
+    assert prov.read_only_args(argv, restrictions={"no_internet": True}) == argv
+    assert prov.read_only_args(["codex", "exec", "read-only"]) == ["codex", "exec", "read-only"], "only the -s value"
+    worker = ["codex", "exec", "-s", "workspace-write", "-c", "sandbox_workspace_write.network_access=true", "-"]
+    assert prov.fence_args(worker, [], restrictions={"no_internet": True})[0][3] == "workspace-write"
+
+
+def test_a_config_without_the_sandbox_keys_runs_everything_unsandboxed(env, monkeypatch):
+    from ttp import sandbox
+    from ttp.daemon import Daemon
+    from ttp.providers import all_providers, fence_on
+    monkeypatch.setenv(sandbox.ENV, "1")   # a stale value from before the config was read
+    p = make(env)
+    p.set_config("sandbox", {})   # neither sandbox.checks nor any providers.<name>.write_fence
+    cfg = p.config()
+    assert not (cfg.get("sandbox") or {}).get("checks") and not any((cfg.get("providers") or {}).get(n.name, {}).get("write_fence")
+                                            for n in all_providers())
+    assert not any(fence_on(cfg, prov.name) for prov in all_providers())
+    Daemon(p.base)
+    assert os.environ[sandbox.ENV] == "0" and not sandbox.opted_in()
+    p.set_config("sandbox", {"checks": True})
+    Daemon(p.base)
+    assert sandbox.opted_in()
+
+
+def test_push_checks_run_unwrapped_by_default_and_in_the_sandbox_on_opt_in(monkeypatch, tmp_path):
+    from ttp import push, sandbox
+    monkeypatch.delenv("TTP_NO_DEVICE", raising=False)
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
+    monkeypatch.setattr(sandbox, "status", lambda: (["unshare", "--pid", "--fork"], ""))
+    plain = push.check_argv("echo hi", env={"PATH": os.environ.get("PATH", "")})
+    assert "unshare" not in plain
+    wrapped = push.check_argv("echo hi", env={"PATH": os.environ.get("PATH", ""), sandbox.ENV: "1"})
+    assert wrapped[0] == "unshare", wrapped
+
+
+def test_coordinator_write_detector_reads_git_status_or_top_level_mtimes(tmp_path):
+    from ttp import coordwrites
+    repo, plain, run = tmp_path / "repo", tmp_path / "plain", tmp_path / "run"
+    for d in (repo, plain, run):
+        d.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (plain / "a").write_text("1")
+    coordwrites.save(run, [repo, plain, tmp_path / "gone"])
+    assert set(json.loads((run / coordwrites.FILE).read_text())) == {str(repo), str(plain)}
+    assert coordwrites.changed(run) == [], "nothing changed"
+    (repo / "new.txt").write_text("x")
+    assert coordwrites.changed(run) == [str(repo)]
+    os.utime(plain / "a", ns=(1, 1))
+    assert coordwrites.changed(run) == [str(repo), str(plain)]
+    assert coordwrites.changed(tmp_path / "none") == [], "no snapshot: no compare"
+
+
+def test_daemon_logs_a_coordinator_turn_that_changed_files_without_a_model_call(env, monkeypatch):
+    from ttp.daemon import Daemon
+    calls = []
+    monkeypatch.setattr(Daemon, "alert", lambda self, *a, **kw: calls.append(a))
+    p = make(env)
+    d = Daemon(p.base)
+    run = env["tmp"] / "coord-run"
+    run.mkdir()
+    d._coord_snapshot(run)
+    assert set(json.loads((run / "coord-writes.json").read_text())) >= {str(p.harness)}
+    d._coord_writes({"id": 7}, run)
+    log = lambda: (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    assert "coordinator turn changed files" not in log()
+    (p.harness / "scratch.md").write_text("x")
+    d._coord_writes({"id": 7}, run)
+    assert f"run 7: warning: coordinator turn changed files in {p.harness}" in log()
+    assert not calls, "a log line only: no alert, no model call"

@@ -5,9 +5,10 @@ from __future__ import annotations
 
 
 def _live_sandbox(monkeypatch):
-    """A real sandbox for this test, nested when the suite itself runs in one; skips where the host
-    cannot create user namespaces."""
+    """A real sandbox for this test (the project opted in), nested when the suite itself runs in one;
+    skips where the host cannot create user namespaces."""
     from ttp import sandbox
+    monkeypatch.setenv(sandbox.ENV, "1")
     monkeypatch.setattr(sandbox, "_STATE", {})
     monkeypatch.setattr(sandbox, "inside", lambda: False)
     pre, why = sandbox.status()
@@ -18,6 +19,7 @@ def _live_sandbox(monkeypatch):
 
 def _no_sandbox_tools(monkeypatch):
     from ttp import sandbox
+    monkeypatch.setenv(sandbox.ENV, "1")
     monkeypatch.setattr(sandbox, "_STATE", {})
     monkeypatch.setattr(sandbox, "inside", lambda: False)
     which = shutil.which
@@ -132,7 +134,7 @@ def test_ttp_sandbox_under_timeout_ends_on_sigterm(tmp_path, monkeypatch, capsys
     assert r.returncode == 124 and time.time() - start < 20
 
 
-def test_ttp_checks_runs_each_check_in_the_sandbox_by_default(env, tmp_path, monkeypatch, capsys):
+def test_ttp_checks_runs_each_check_in_the_sandbox_once_the_project_opts_in(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     _live_sandbox(monkeypatch)
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -149,6 +151,7 @@ def test_ttp_checks_runs_each_check_in_the_sandbox_by_default(env, tmp_path, mon
 
 def test_check_argv_wraps_local_checks_unless_one_opts_out(tmp_path, monkeypatch):
     from ttp import push, pushpass, sandbox
+    monkeypatch.setenv(sandbox.ENV, "1")
     monkeypatch.setattr(sandbox, "inside", lambda: False)
     monkeypatch.setattr(sandbox, "status", lambda: (["/sb/unshare", "--pid"], ""))
     plain = push.check_argv("make a", tmp_path)
@@ -214,6 +217,7 @@ def test_a_blocked_user_namespace_names_the_setting_that_allows_it(tmp_path, mon
 
 def test_ttp_checks_reports_a_push_check_that_opts_out_of_the_sandbox(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, sandbox
+    monkeypatch.setenv(sandbox.ENV, "1")
     monkeypatch.setattr(sandbox, "inside", lambda: False)
     monkeypatch.setattr(sandbox, "status", lambda: (None, "unused"))
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

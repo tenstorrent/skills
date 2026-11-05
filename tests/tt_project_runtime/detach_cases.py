@@ -2064,12 +2064,13 @@ def test_a_resumable_job_relaunched_by_the_daemon_leaves_loopback_proxies_out(en
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="no_new_privs is Linux only")
 def test_a_detached_job_runs_with_no_new_privs_so_sudo_cannot_gain_privileges(tmp_path, monkeypatch):
     """Every start path (a worker's direct start, the daemon's queued, relaunched and heal fix starts)
-    goes through detach.start, which fences the job whether or not its starter is fenced. A sandboxed
-    test runner has the flag already, so the spy shows the start asks for the fence itself."""
+    goes through detach.start, which fences the job of a run the daemon sandboxed. A sandboxed test
+    runner has the flag already, so the spy shows the start asks for the fence itself."""
     from ttp import detach, locks, privlock
     asked, real = [], privlock.no_new_privs_preexec
     monkeypatch.setattr(privlock, "no_new_privs_preexec", lambda: asked.append(1) or real())
     monkeypatch.setenv("TTP_RUN_ID", "71")
+    monkeypatch.setenv(privlock.SANDBOXED_ENV, "1")   # a run the daemon sandboxed (write fence on)
     rc = tmp_path / "run" / "job.rc"
     rc.parent.mkdir()
     lock = locks.try_take([locks.job_lock(rc)], "detached job job", "read its own flag")
@@ -2081,6 +2082,30 @@ def test_a_detached_job_runs_with_no_new_privs_so_sudo_cannot_gain_privileges(tm
     assert _wait_for_path(rc) and rc.read_text().strip() == "0"
     assert re.search(r"NoNewPrivs:\s*1", rc.with_suffix(".log").read_text())
     assert asked == [1]
+    detach.reap_children()
+
+
+def test_a_detached_job_of_an_unsandboxed_run_keeps_its_privileges(tmp_path, monkeypatch):
+    """By default runs are unsandboxed (no write fence): detach.start sets no no_new_privs, so sudo works."""
+    from ttp import detach, locks, privlock
+    asked, seen = [], {}
+    monkeypatch.setattr(privlock, "no_new_privs_preexec", lambda: asked.append(1))
+    monkeypatch.delenv(privlock.SANDBOXED_ENV, raising=False)
+    real_popen = detach.subprocess.Popen
+
+    def popen(*a, **k):
+        seen["preexec_fn"] = k.get("preexec_fn")
+        return real_popen(*a, **k)
+    monkeypatch.setattr(detach.subprocess, "Popen", popen)
+    rc = tmp_path / "run" / "job.rc"
+    rc.parent.mkdir()
+    lock = locks.try_take([locks.job_lock(rc)], "detached job job", "read its own flag")
+    try:
+        detach.start(rc, rc.with_suffix(".log"), ["true"], str(tmp_path), dict(os.environ), lock)
+    finally:
+        lock.close()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+    assert asked == [] and seen == {"preexec_fn": None}
     detach.reap_children()
 
 

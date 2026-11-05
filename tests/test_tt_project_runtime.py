@@ -15251,6 +15251,7 @@ def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
     monkeypatch.setattr(codex_provider.Codex, "binary", lambda self: "/usr/bin/true")  # never a real agent
     p = make(env)
     p.set_config("pricing", {"codex": {"some-model": [1.0, 0.1, 2.0]}})
+    _write_fence("codex")(p)   # writable roots exist only under the opt-in fence
     from ttp.daemon import Daemon
     wt = env["tmp"] / "wt"
     subprocess.run(["git", "-C", str(env["repo"]), "worktree", "add", "-q", str(wt)], check=True)
@@ -15271,6 +15272,13 @@ def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
     (p.runs / str(crid) / "STOP").touch()
 
 
+def _write_fence(name):
+    """A `before` hook (or a call on a project) that turns provider `name`'s opt-in write fence on."""
+    def on(p):
+        p.set_config("providers", {**(p.config().get("providers") or {}), name: {"write_fence": True}})
+    return on
+
+
 def _codex_worker_roots(env, p, cwd):
     """The writable roots the daemon gives a Codex worker in cwd."""
     return _codex_worker_launch(env, p, cwd)[0]
@@ -15283,6 +15291,7 @@ def _codex_worker_launch(env, p, cwd):
     from ttp.daemon import Daemon
     real = codex_provider.Codex.binary
     codex_provider.Codex.binary = lambda self: "/usr/bin/true"   # never a real agent
+    _write_fence("codex")(p)   # writable roots exist only under the opt-in fence
     try:
         d = Daemon(p.base)
         tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
@@ -15654,7 +15663,7 @@ def _codex_turn(text, inp=1000, cached=0, out=500):
 def test_codex_worker_launches_on_stdin_and_hands_off(env, monkeypatch):
     done = {"status": "done", "summary": "changed the README"}
     p, run, task, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
-                                         result=done)
+                                         result=done, before=_write_fence("codex"))
     cwd = str(env["repo"])
     assert argv[1:3] == ["exec", "--json"] and argv[argv.index("-C") + 1] == cwd
     assert argv[argv.index("-s") + 1] == "workspace-write" and "approval_policy=never" in argv
@@ -15672,7 +15681,8 @@ def test_sandboxed_worker_temp_dir_is_removed_when_the_run_ends(env, monkeypatch
     # Run dirs are kept, so a fenced worker's temp files (pytest basetemps, build scratch) that the
     # OS used to clean from /tmp must not pile up in state/: the runner removes the dir at the end.
     done = {"status": "done", "summary": "ok"}
-    p, run, task, _, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done)
+    p, run, task, _, _ = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")), result=done,
+                                  before=_write_fence("codex"))
     run_dir = p.runs / str(run["id"])
     from ttp import shorttmp
     tmp = pathlib.Path((env["tmp"] / "fakecli" / "tmpdir.txt").read_text())
@@ -24674,7 +24684,7 @@ def test_codex_keeps_its_thread_id_and_resumes_it(env, tmp_path, monkeypatch):
 def test_codex_resume_puts_the_subcommand_after_its_options(env, monkeypatch):
     _, run, task, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn("all done")),
                                          result={"status": "done", "summary": "ok"}, help_text=CODEX_EXEC_HELP,
-                                         resume=THREAD)
+                                         resume=THREAD, before=_write_fence("codex"))
     assert argv[-3:] == ["resume", THREAD, "-"], argv
     assert argv.index("-C") < argv.index("resume") and argv.index("-s") < argv.index("resume")
     assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv[:argv.index("resume")])
