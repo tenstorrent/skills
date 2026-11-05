@@ -163,3 +163,39 @@ def test_ttp_task_restart_stops_a_running_task_and_records_the_why_in_its_spec(e
     with pytest.raises(SystemExit):
         cli.main(["task", p.name, "restart", str(queued), "why"])
     assert "restart:" not in p.db.task(queued)["spec"], "a refused restart leaves the spec alone"
+
+
+def test_a_restart_of_a_run_handed_back_by_an_on_pass_dry_run_starts_fresh_with_the_restart_block(
+        env, tmp_path, monkeypatch):
+    # The handed-back run continued the old session (onpassdry.KEY): a restart drops that session with its
+    # direction, so the next run neither resumes it nor counts as a wake of the dropped wait.
+    from ttp import coordinator as coord, onpassdry
+    from ttp.daemon import Daemon, _stale_wakes
+    from ttp.prompts import worker_task
+    p = make(env)
+    _rs_live(monkeypatch)
+    _sessions(env, monkeypatch, "s1")
+    tid, rid, run_dir = _rs_running(p, tmp_path)
+    worktree_dir = tmp_path / "wt"
+    worktree_dir.mkdir()
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(worktree_dir), "env": {}}))
+    p.db.x("UPDATE runs SET provider='fake' WHERE id=?", (rid,))
+    p.db.update_task(tid, result=json.dumps({
+        "status": "waiting", "summary": "waits on the build", "retry_when": "test -e /nonexistent",
+        "on_pass_cmd": "true", onpassdry.NOTE_KEY: "WARNING: on_pass_cmd cannot run as written",
+        onpassdry.KEY: {"run": rid, "session": "s1", "text": "the on_pass_cmd cannot run"}}))
+    d = Daemon(p.base)
+    assert d._resumable(p.db.task(tid), "fake")["cause"] == "dry_run", "the setup resumes before the restart"
+    assert coord.apply(p, [{"type": "task_update", "id": tid,
+                            "spec": "Build only the CPU target.\nrestart: it is rebuilding the device target"}]) == []
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 143, "stopped": "shutdown", "ended": time.time()}))
+    d.reap_runs()
+    t = p.db.task(tid)
+    prev = json.loads(t["result"])
+    assert t["status"] == "queued" and prev["status"] == "restarted"
+    assert onpassdry.KEY not in prev and onpassdry.NOTE_KEY not in prev, prev
+    assert d._resumable(t, "fake") is None, "the session the coordinator dropped is never resumed"
+    assert _stale_wakes(prev, {"key": "k", "head": "h"}, False) == 0
+    prompt = worker_task(p, t, str(worktree_dir), t["branch"])
+    assert prompt.startswith("# RESTARTED BY THE COORDINATOR"), prompt[:200]
+    assert "Build only the CPU target." in prompt.split("\n\n# ")[0]

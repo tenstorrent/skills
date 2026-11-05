@@ -5277,10 +5277,12 @@ class Daemon:
         if restart is not None:
             # A coordinator restart (preempt.request_restart): the old run's direction is dropped, any hand-off
             # with it; the task runs again on its own branch with the updated spec, no attempt spent.
-            # Its last wait is dropped too: the next run works at the task's tier, never as a wake of that wait.
+            # Its last wait is dropped too: the next run works at the task's tier, never as a wake of that wait,
+            # and an on_pass_cmd dry run's hand-back with it, so _resumable never continues the dropped session.
             why, prev = str(restart.get("why") or ""), load_result(task["result"])
             earlier = str(prev.get("summary") or "")[:600]
-            prev = {k: v for k, v in prev.items() if k not in WAIT_KEYS + ("woke", "escalated_wake", "on_pass")}
+            prev = {k: v for k, v in prev.items() if k not in WAIT_KEYS + ("woke", "escalated_wake", "on_pass",
+                                                                              onpassdry.KEY, onpassdry.NOTE_KEY)}
             prev.update({"status": "restarted", "summary": f"run {r['id']} stopped by a coordinator restart"
                          + (f"; before it: {earlier}" if earlier else ""),
                          preempt.RESTART_KEY: {"why": why, "update": str(restart.get("update") or "")[:4000],
