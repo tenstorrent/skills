@@ -7795,3 +7795,159 @@ def test_a_waiting_routine_checks_run_whose_task_turns_urgent_re_executes_once_a
     assert seen == {"rerank": "1", "reexec": "", "arrived": "1234.5"}, seen
     assert told[0].startswith("its task turned urgent (priority 1) while these checks waited at priority 3"), told
     assert checkcap.reranked(p, 3, now=9000.0) is None, "once per run"
+
+
+def _yield_setup(monkeypatch, cap: str = "1"):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", cap)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    for k in (checkcap.HELD_ENV, checkcap.YIELD_ENV, checkcap.PREEMPT_ASKED_ENV):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(checkcap, "POLL_S", 0.05)
+
+
+def test_a_check_waiting_on_an_outside_pool_frees_its_slot_and_takes_one_back_in_priority_order(env, monkeypatch):
+    """[note d3dbe43fdffc5aab] (1) a run whose command waits on an outside pool gives its host-wide slot up
+    (checks-yield) and a queued check starts on it; (2) asked to resume, it queues again in the normal
+    order: an urgent run goes before a routine waiter of another project that arrived earlier."""
+    import threading
+    from ttp import checkcap, locks
+    _yield_setup(monkeypatch)
+    run = checkcap.acquire("waiter", project_name="A", priority=1)
+    assert run.allow_yield() and run.env()[checkcap.YIELD_ENV].startswith(str(checkcap.slot_dir()))
+    monkeypatch.setenv(checkcap.YIELD_ENV, run.yield_stem)
+    got, asked = {}, {}
+    queued = threading.Thread(target=lambda: got.update(b=checkcap.acquire("queued", project_name="B", max_wait_s=30)))
+    queued.start()
+    ask = threading.Thread(target=lambda: asked.update(y=checkcap.ask_yield("yield", os.getpid(), wait_s=30)))
+    ask.start()
+    assert _wait_for(lambda: Path(run.yield_stem + ".req").exists())
+    told = []
+    checkcap.serve_yield(run, told.append)
+    ask.join(30)
+    queued.join(30)
+    assert asked == {"y": ""} and run.f is None and run.yielded and told, "the slot went at once, told"
+    assert got["b"] is not None and got["b"].f is not None, "a queued check started on the freed slot"
+    checkcap.serve_yield(run)
+    assert run.f is None and len(locks.held_labels(checkcap.all_paths())) == 1, "a request is answered once"
+    routine = threading.Thread(target=lambda: got.update(c=checkcap.acquire("routine", project_name="C",
+                                                                            priority=5, max_wait_s=30)))
+    routine.start()
+    assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE) or []) >= 1)
+    ask = threading.Thread(target=lambda: asked.update(r=checkcap.ask_yield("resume", os.getpid())))
+    ask.start()
+    assert _wait_for(lambda: '"resume"' in Path(run.yield_stem + ".req").read_text())
+    serve = threading.Thread(target=checkcap.serve_yield, args=(run,))
+    serve.start()
+    assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE) or []) >= 2)
+    assert serve.is_alive() and "r" not in asked, "it waits for a slot: none is free"
+    got["b"].close()
+    serve.join(30)
+    ask.join(30)
+    assert asked["r"] == "" and run.f is not None and not run.yielded, "it took the freed slot back"
+    assert routine.is_alive() and "c" not in got, "before the routine waiter that arrived earlier"
+    run.close()
+    routine.join(30)
+    assert got["c"] is not None and got["c"].f is not None
+    got["c"].close()
+    assert not list(checkcap.slot_dir().glob(f"{checkcap.YIELD}.*")), "its request files went with the run"
+    assert checkcap.line() == ""
+
+
+def test_a_killed_pool_waiter_leaks_no_host_wide_checks_slot(env, monkeypatch):
+    """[note d3dbe43fdffc5aab] (3) a waiter killed while its run's slot is given up holds nothing and leaves
+    the run with exactly one slot again for its further work; a slot freed once is never freed twice; a run
+    that ends while it queues to take one back holds none; a run killed while yielded leaves none held."""
+    from ttp import checkcap, locks
+    _yield_setup(monkeypatch, "2")
+
+    def held() -> int:
+        return len(locks.held_labels(checkcap.all_paths()))
+
+    run = checkcap.acquire("waiter", project_name="A")
+    assert run.allow_yield()
+    waiter = subprocess.Popen(["sleep", "60"])
+    Path(run.yield_stem + ".req").write_text(json.dumps({"id": "1", "want": "yield", "pid": waiter.pid}))
+    checkcap.serve_yield(run)
+    assert run.f is None and held() == 0
+    checkcap.serve_yield(run)
+    assert run.yielded and held() == 0, "its waiter lives: the slot stays given up"
+    waiter.kill()
+    waiter.wait()
+    checkcap.serve_yield(run)
+    assert run.f is not None and not run.yielded and held() == 1, "the waiter died: the run holds one slot again"
+    other = checkcap.acquire("other", max_wait_s=5)
+    run.let_go()
+    run.close()
+    run.close()
+    assert held() == 1 and other.f is not None, "freed once: the other run keeps its slot"
+    other.close()
+
+    full = [checkcap.acquire("x"), checkcap.acquire("y")]
+    run = checkcap.acquire("ends", max_wait_s=0.2)
+    assert run is None, "both slots held"
+    for s in full[1:]:
+        s.close()
+    run = checkcap.acquire("ends")
+    run.allow_yield()
+    run.f.close()
+    run.f, run.yielded, run.waiter = None, True, os.getpid()
+    full[1] = checkcap.acquire("y")
+    assert not run.hold_again(stop=lambda: "its command ended") and run.f is None and held() == 2, \
+        "ended while queued: it holds none"
+    for s in full:
+        s.close()
+
+    code = (f"import os, sys, time; sys.path.insert(0, {str(RUNTIME)!r}); from ttp import checkcap; "
+            "s = checkcap.acquire('killed'); s.allow_yield(); print(s.yield_stem, flush=True); time.sleep(60)")
+    proc = subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True, env=dict(os.environ))
+    stem = proc.stdout.readline().strip()
+    assert stem and held() == 1
+    monkeypatch.setenv(checkcap.YIELD_ENV, stem)
+    proc.kill()
+    proc.wait()
+    assert held() == 0, "a killed run holds nothing"
+    assert checkcap.ask_yield("resume", os.getpid()) == "the checks run that held the slot has ended"
+    assert checkcap.line() == ""
+
+
+def test_checks_run_gives_its_slot_up_while_its_command_waits_and_holds_one_for_the_next(env, tmp_path, monkeypatch, capsys):
+    """[note d3dbe43fdffc5aab] end to end: a `ttp checks` command runs `ttp checks-yield` before it waits on an
+    outside pool; another run takes the freed slot; `ttp checks-yield --resume` returns once the run holds
+    one again; a command whose wait never resumed leaves the next command to run on a slot taken again."""
+    from ttp import checkcap, checkwall, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _yield_setup(monkeypatch)
+    monkeypatch.setattr(checkwall, "POLL_S", 0.05)
+    helper = tmp_path / "yield.sh"
+    helper.write_text(f'#!/bin/sh\nPYTHONPATH={RUNTIME} exec "{sys.executable}" -m ttp checks-yield --pid $PPID "$@"\n')
+    helper.chmod(0o755)
+    flag, go, seen = tmp_path / "yielded", tmp_path / "go", tmp_path / "seen"
+    probe = (f"PYTHONPATH={RUNTIME} {sys.executable} -c 'from ttp import checkcap, locks; "
+             f"print(len(locks.held_labels(checkcap.all_paths())))' >> {seen}")
+    wait = f"{helper} && touch {flag} && while [ ! -e {go} ]; do sleep 0.05; done"
+    import threading
+    rcs = []
+    t = threading.Thread(target=lambda: rcs.append(cli.main(
+        ["checks", "--", f"{wait} && {helper} --resume && {probe}", f"{helper} && {probe}", probe])))
+    t.start()
+    try:
+        assert _wait_for(flag.exists, 60)
+        other = checkcap.acquire("other", max_wait_s=10)
+        assert other is not None and other.f is not None, "the waiting run's slot went to another check"
+        go.touch()
+        time.sleep(0.5)
+        assert not seen.exists(), "its CPU work waits for a slot again"
+        other.close()
+        t.join(60)
+    finally:
+        go.touch()
+    out = capsys.readouterr().out
+    assert not t.is_alive() and "passed" in out, out
+    assert seen.read_text().split() == ["1", "0", "1"], "one slot for its CPU work; the next command's taken again"
+    log = (run / "checks.log").read_text()
+    assert log.count("gave up its host-wide checks slot") == 2, log
+    assert not list(checkcap.slot_dir().glob(f"{checkcap.YIELD}.*")) and checkcap.line() == ""
+    assert not locks.held_labels(checkcap.all_paths())

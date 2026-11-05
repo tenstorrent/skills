@@ -1617,6 +1617,13 @@ running work is interrupted only by the preemption below:
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
   fails the checks, and `delivery.push_checks` never go through it. A wrapper running its own test pool starts
   each shard, local or over ssh, as `ttp checks-shard -- <cmd>`, so the shard counts toward that host's checks slots.
+  A check command that waits on an outside CPU pool (a test gate waiting for a pool slot) gives the run's host-wide
+  checks slot up while it waits: it runs `ttp checks-yield` before the wait and `ttp checks-yield --resume` before
+  its CPU work, which returns once the run holds a slot again, queued in the normal priority order (urgent first);
+  checks queued behind it start meanwhile. Only the host-wide slot goes (its lane and test slots stay). A waiter
+  that dies while yielded leaves the run to take a slot again for its further work, the next command never starts
+  without one, and a killed run holds none. Outside a run that can yield (no slot, cap off, urgent or
+  spilled) both return at once; every waiter on the same pool should yield, so none holds a slot the pool waits on.
   `checks.fallback_lane` (project setting,
   default "", off) is where those commands run while the wrapper's lock is paused (`held by pause on`): a
   wrapper command (a CPU pool's `ttp lock`, say) or `unwrapped` (no wrapper, TTP_NO_DEVICE=1 set). The pass

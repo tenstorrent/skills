@@ -3607,6 +3607,8 @@ def cmd_checks(a) -> None:
         preempted_by = ""
         if slot is not None and not hit and not spilled and getattr(slot, "f", None) and not slot.urgent:
             _CHECK_PREEMPT["since"] = slot.since
+            # Its commands may give the slot up while they wait on an outside pool (ttp checks-yield).
+            _CHECK_YIELD["slot"] = slot if slot.allow_yield() else None
         if spilled:
             if slurm := getattr(spilled, "slurm", None):   # one batch job per check, --time from the run's median
                 minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
@@ -3842,6 +3844,7 @@ def cmd_checks(a) -> None:
         except checkcap.Preempted as e:
             preempted_by = str(e)
         finally:
+            _CHECK_YIELD["slot"] = None
             if _CHECK_PREEMPT["since"] is not None:   # a request it never saw is for no later run
                 _CHECK_PREEMPT["since"] = None
                 checkcap.clear_preempt()
@@ -5153,12 +5156,43 @@ def _check_popen(argv: list, **kw) -> subprocess.Popen:
 _CHECK_PREEMPT: dict = {"since": None}
 
 
+# The running checks' slot while their commands may give it up and take it back (checkcap.serve_yield).
+_CHECK_YIELD: dict = {"slot": None}
+
+
 def _checks_preempt_stop() -> None:
     """checkwall.wait's `stop` for the running checks: raises checkcap.Preempted once an urgent run asked
     for their slot."""
     from . import checkcap
     if (since := _CHECK_PREEMPT["since"]) is not None and (by := checkcap.preempted(since)):
         raise checkcap.Preempted(by)
+
+
+def _checks_running_stop(proc, out):
+    """checkwall.wait's `stop` for a running check `proc`: its yield requests answered (checkcap.serve_yield;
+    a slot taken again is told in `out`, the check's log, and ends unheld once `proc` ended), then a
+    preempt request for a held slot (_checks_preempt_stop). None when neither applies."""
+    from . import checkcap
+    slot = _CHECK_YIELD["slot"]
+    if slot is None:
+        return _checks_preempt_stop if _CHECK_PREEMPT["since"] is not None else None
+
+    def stop():
+        checkcap.serve_yield(slot, _checks_slot_told(out),
+                             lambda: "its command ended" if proc.poll() is not None else "")
+        if slot.f is not None:
+            _CHECK_PREEMPT["since"] = slot.since
+            _checks_preempt_stop()
+    return stop
+
+
+def _checks_slot_told(out):
+    """A tell for a slot taken again in a check's log `out` (also its output: the silence watch sees it)."""
+    def tell(line: str) -> None:
+        if out is not None and hasattr(out, "write"):
+            out.write(f"ttp checks: {line}\n")
+            out.flush()
+    return tell
 
 
 def _checks_stop(sig, _frame):
@@ -5280,6 +5314,8 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     `silent_s` seconds (0: never), it is ended and checkwall.Silent raised (checkwall.wait)."""
     from . import checkwall
     proc = None
+    if (slot := _CHECK_YIELD["slot"]) is not None:   # a slot a yield gave up: held again before more work
+        slot.hold_again(_checks_slot_told(kw.get("stdout")))
     _CHECK_STOP.update(defer=True, pending=None)
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
@@ -5290,8 +5326,7 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
         _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
             raise SystemExit(_CHECK_STOP["pending"])
-        rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s,
-                            stop=_checks_preempt_stop if _CHECK_PREEMPT["since"] is not None else None)
+        rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s, stop=_checks_running_stop(proc, kw.get("stdout")))
         _reap_check(proc, group, kw)
         return rc
     except BaseException:
@@ -6179,6 +6214,15 @@ def cmd_checks_shard(a) -> None:
     except OSError as e:
         die(f"ttp checks-shard: could not start {cmd[0]!r}: {e}")
     sys.exit(128 - rc if rc < 0 else rc)
+
+
+def cmd_checks_yield(a) -> None:
+    """Inside a check command: give the run's host-wide checks slot up while the calling script waits on an
+    outside pool, or (--resume) take one back before CPU work, queued in the normal priority order
+    (checkcap.ask_yield). Exits 0 once done, or at once with no slot to give up; 1 when the run did not answer."""
+    from . import checkcap
+    if why := checkcap.ask_yield("resume" if a.resume else "yield", a.pid):
+        die(f"ttp checks-yield: {why}", 1)
 
 
 def cmd_killscan(a) -> None:
@@ -12170,6 +12214,14 @@ def main(argv: list[str] | None = None) -> None:
                                             "slot, or counts as a pool run inside a `ttp checks` that holds one")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="-- then the shard's command")
     s.set_defaults(fn=cmd_checks_shard)
+
+    s = sub.add_parser("checks-yield", help="inside a check command waiting on an outside CPU pool: give the run's "
+                                            "host-wide checks slot up while it waits; --resume takes one back "
+                                            "(queued in priority order) before its CPU work")
+    s.add_argument("--resume", action="store_true", help="take a host-wide checks slot again; returns once held")
+    s.add_argument("--pid", type=int, default=0, help="the process that waits: the slot is taken back once it "
+                                                       "ends (default: the caller of this command)")
+    s.set_defaults(fn=cmd_checks_yield)
 
     s = sub.add_parser("svcscan", help="flag service unit changes (systemctl stop/disable/mask/start/restart/"
                                        "enable/unmask, also under sudo) in scripts before running them; "

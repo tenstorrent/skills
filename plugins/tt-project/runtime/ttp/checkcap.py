@@ -22,6 +22,9 @@ slot per CORES_PER_SLOT cores (and at least one), at most one per CORES_PER_SLOT
 running checks count in that load, so the cap shrinks as they load the host; a check keeps its slot
 until it ends, and a waiter reads the cap again on every try. Check commands run with HELD_ENV
 set, so a `ttp checks` nested in them runs at once instead of waiting for the slot its parent holds.
+A check command that waits on an outside CPU pool gives the slot up meanwhile (`ttp checks-yield`: ask_yield,
+answered by the run's serve_yield while the command runs) and takes one back in the normal order before its CPU
+work (`--resume`); the run's next command never starts without one (Slot.hold_again).
 
 Push checks (the push queue's batches and `ttp push` to the push branch) hold the push lock, so every
 approved change waits on them: they never queue behind task checks. Each push branch has one priority
@@ -788,9 +791,14 @@ class Slot:
     """A held slot (or none: cap off or nested); `close()` releases it. `served`: none is held because
     `done()` ended the wait (acquire): the caller reads the recorded pass, never runs the checks on it."""
 
-    def __init__(self, f=None, served: bool = False):
+    def __init__(self, f=None, served: bool = False, again: dict | None = None):
         self.f = f
         self.served = served
+        self.again = again   # acquire's arguments that took it, to take one again after a yield (hold_again)
+        self.yield_stem = ""   # its commands may ask it to give the slot up (allow_yield, YIELD_ENV)
+        self.yielded = False   # given up while its commands wait on an outside pool (serve_yield)
+        self.waiter = 0   # the process that asked it to: its death ends the yield
+        self.answered = ""   # the last yield request answered
         self.tests = None   # the run's test slots (testslots.Grant), held and freed with this slot
         self.spill = None   # a claim on a spill host the checks run on instead (checkspill.Claim)
         self.urgent = False   # a reserved urgent slot beyond the cap (acquire's `urgent`, urgent_key)
@@ -799,6 +807,7 @@ class Slot:
     def env(self) -> dict[str, str]:
         """For the check commands' environment: a `ttp checks` or push nested in them runs at once."""
         return (({HELD_ENV: "1", SLOT_KEY_ENV: self.key()} if self.f is not None else {})
+                | ({YIELD_ENV: self.yield_stem} if self.yield_stem else {})
                 | (self.tests.env() if self.tests else {}))
 
     def key(self) -> str:
@@ -806,16 +815,46 @@ class Slot:
         return f"{os.getpid()}.{Path(self.f.name).name}" if self.f is not None else ""
 
     def close(self) -> None:
-        if self.f is not None:
-            (shard_dir() / f"cover.{self.key()}").unlink(missing_ok=True)
-            self.f.close()
-            self.f = None
+        self.let_go()
+        if self.yield_stem:
+            for end in (".req", ".ack"):
+                Path(self.yield_stem + end).unlink(missing_ok=True)
+            self.yield_stem = ""
         if self.tests is not None:
             self.tests.close()
             self.tests = None
         if self.spill is not None:
             self.spill.close()
             self.spill = None
+
+    def let_go(self) -> None:
+        """Free the host-wide slot alone (its test slots and spill claim stay); a second call frees nothing."""
+        if self.f is not None:
+            (shard_dir() / f"cover.{self.key()}").unlink(missing_ok=True)
+            self.f.close()
+            self.f = None
+
+    def allow_yield(self) -> bool:
+        """Let its commands give the slot up while they wait (YIELD_ENV in env()): a slot of the cap
+        acquire took, never a nested run's, an urgent one or one whose checks run on a spill host."""
+        if self.f is None or self.again is None or self.urgent or self.spill is not None:
+            return False
+        self.yield_stem = self.yield_stem or str(slot_dir() / f"{YIELD}.{os.getpid()}.{secrets.token_hex(4)}")
+        return True
+
+    def hold_again(self, tell: Callable[[str], None] | None = None, stop: Callable[[], str] | None = None) -> bool:
+        """After a yield, queue for a host-wide slot again in the normal order (a new arrival, its priority
+        and project) and hold it; False when `stop()` gave a reason first (then it holds none)."""
+        if not self.yielded:
+            return True
+        try:
+            got = acquire(**(self.again or {}), tell=tell, stop=stop)
+        except Cancelled:
+            return False
+        self.f, self.since, self.yielded, self.waiter = got.f if got else None, time.time(), False, 0
+        if got is not None:
+            got.f = None
+        return True
 
     def __enter__(self):
         return self
@@ -907,6 +946,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`."""
     n = limit()
     label = {"priority": priority, "checks_project": project_name, **({"preemptible": True} if preemptible else {})}
+    again = {"holder": holder, "what": what, "project_name": project_name, "priority": priority, "owns": owns,
+             "cap": cap, "preemptible": preemptible}
     if not n or os.environ.get(HELD_ENV):
         return Slot()
     since = time.time() if since is None else since
@@ -921,7 +962,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
             _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
-            return Slot(f)
+            return Slot(f, again=again)
         if f := _urgent_take(urgent, priority, every, holder, what, same):
             return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
@@ -990,7 +1031,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
                 locks.mark_turn(slot_dir(), RESOURCE, ticket)
                 _granted(tell, state, project_name, priority, owns, since, bool(told), cap, lane_at)
-                return Slot(f)
+                return Slot(f, again=again)
             if time.time() - told >= TELL_S:
                 if tell and ticket is not None:
                     q = locks.fair_order(slot_dir(), RESOURCE, **order())
@@ -1114,6 +1155,76 @@ def clear_preempt() -> None:
         _preempt_path(os.getpid()).unlink()
     except OSError:
         pass
+
+
+YIELD = "yield"   # check-slots/yield.<pid>.<token>.req|.ack: a run's commands ask it to give its slot up and back
+YIELD_ENV = "TTP_CHECKS_YIELD"   # that stem, for the commands of a run that may yield (Slot.allow_yield)
+YIELD_WAIT_S = 60.0   # ask_yield waits this long for the run to answer a yield (it looks every checkwall.POLL_S)
+
+
+def _read(path: Path) -> dict:
+    try:
+        got = json.loads(path.read_text() or "{}")
+    except (OSError, ValueError):
+        return {}
+    return got if isinstance(got, dict) else {}
+
+
+def _write(path: Path, rec: dict) -> None:
+    tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(rec))
+    os.replace(tmp, path)
+
+
+def serve_yield(slot, tell: Callable[[str], None] | None = None, stop: Callable[[], str] | None = None) -> None:
+    """Answer the latest yield request of `slot`'s commands (ask_yield), called while they run: "yield" frees
+    the host-wide slot (Slot.let_go), "resume" queues for one in the normal order and holds it (hold_again,
+    which `stop()` ends: its command ended). A waiter that died while yielded never left the run without a
+    slot for its further work: the run takes one again at once. One answer per request, so a slot is freed once."""
+    if not getattr(slot, "yield_stem", ""):
+        return
+    req = _read(Path(slot.yield_stem + ".req"))
+    rid, want = str(req.get("id") or ""), req.get("want")
+    if rid and rid != slot.answered:
+        if want == "yield" and slot.f is not None:
+            slot.let_go()
+            slot.yielded, slot.waiter = True, int(req.get("pid") or 0)
+            tell and tell("gave up its host-wide checks slot while its command waits on an outside pool (ttp checks-yield)")
+        elif want == "resume" and not slot.hold_again(tell, stop):
+            return
+        slot.answered = rid
+        try:
+            _write(Path(slot.yield_stem + ".ack"), {"id": rid, "held": slot.f is not None})
+        except OSError:
+            pass   # unanswered: the asker ends at its bound or with the run
+    elif slot.yielded and not locks._alive(slot.waiter):
+        slot.hold_again(tell, stop)
+
+
+def ask_yield(want: str, pid: int | None = None, wait_s: float | None = None) -> str:
+    """From a check command: ask the `ttp checks` run it is in (YIELD_ENV) to give its host-wide slot up
+    while `pid` (default: this process's parent, the script that waits) waits on an outside pool ("yield",
+    answered within YIELD_WAIT_S), or to take one again before CPU work ("resume": waits until it holds one,
+    queued in the normal priority order). "" once answered or when there is no slot to give up (outside a
+    run, cap off, nested, urgent or spilled), else why not."""
+    stem = os.environ.get(YIELD_ENV) or ""
+    if not stem:
+        return ""
+    owner = int((Path(stem).name.split(".") + ["", ""])[1] or 0)
+    rid = secrets.token_hex(6)
+    try:
+        _write(Path(stem + ".req"), {"id": rid, "want": want, "pid": pid or os.getppid(), "at": time.time()})
+    except OSError as e:
+        return f"could not ask: {e}"
+    span = YIELD_WAIT_S if wait_s is None else wait_s
+    end = None if want == "resume" else time.time() + span
+    while _read(Path(stem + ".ack")).get("id") != rid:
+        if not locks._alive(owner):
+            return "the checks run that held the slot has ended"
+        if end is not None and time.time() >= end:
+            return f"no answer from the checks run (pid {owner}) within {span:.0f} s"
+        time.sleep(poll_s(0.5))
+    return ""
 
 
 def _park(parked: bool, park: Path | None, holder: str, since: float, project_name: str | None,
