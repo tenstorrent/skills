@@ -322,10 +322,12 @@ def core_of(where) -> str | None:
         return None
 
 
-def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None = None) -> dict:
-    """The expected finish of an obligation or promise: the latest landing of its owner tasks."""
+def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None = None,
+                        core: str | None = None) -> dict:
+    """The expected finish of an obligation or promise: the latest landing of its owner tasks
+    (`core`: the project's core provider, for owner tasks with none, when no `est` is given)."""
     from .obligations import _owner_ids
-    est = est or _Est(db, time.time() if now is None else now)
+    est = est or _Est(db, time.time() if now is None else now, core=core)
     ids = _owner_ids(o)
     if not ids:
         return {"done": None, "end": None, "path": [], "legs": [], "why": "no owner task", "overrun": False}

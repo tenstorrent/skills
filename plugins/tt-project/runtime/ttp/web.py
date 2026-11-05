@@ -724,7 +724,7 @@ def state_payload(p: Project, db: DB) -> dict:
     paused = db.paused_resources()
     entered = sweep.entered_map(db, [t for t in tasks if t["status"] == "blocked"], now)
     cfg, probed = p.config(), {}
-    est = eta._Est(db, now)
+    est = eta._Est(db, now, core=eta.core_of(cfg))
     topped = topup.counts(db)   # budget top-ups of urgent or user-ordered tasks (topup.py)
     for t in tasks:
         t["budget_topups"] = topped.get(t["id"])

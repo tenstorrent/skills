@@ -281,7 +281,7 @@ def state(p, task: dict, now: float | None = None, est=None, cfg: dict | None = 
                 "line": f"worker running, waiting for {', '.join(named)}"
                         + (f" since {timefmt.short(since, p, now)}" if since else "")}
     try:
-        e = (est.task(task["id"]) if est is not None else eta.estimate(p.db, task["id"], now))
+        e = (est.task(task["id"]) if est is not None else eta.estimate(p.db, task["id"], now, core=eta.core_of(cfg)))
     except Exception:
         e = None
     return {"kind": "queued", "started": False, "line": queued_line(e, p, now)}

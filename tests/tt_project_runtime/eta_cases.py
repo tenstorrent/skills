@@ -270,6 +270,30 @@ def test_eta_red_spend_gate_starts_held_work_at_its_known_reset(env):
     assert eta.estimate(p.db, t, now, core="other")["end"] == pytest.approx(reset + 1500)
 
 
+def test_eta_task_with_no_provider_is_held_by_the_core_providers_gate(env):
+    from ttp import eta, onhost, web
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)
+    p.set_config("core_provider", "other")
+    reset = now + 7200
+    _eta_gate(p, prov="other", reasons=["global daily cap reached: x"], numbers={"global_resets_at": reset})
+    t = p.db.add_task("held urgent work", "s", kind="work", priority=1, reply_chat="c1",
+                      labels=["resource:box1-device"])
+    held = eta.estimate(p.db, t, now, core="other")
+    assert held["end"] == pytest.approx(reset + 1500) and eta.estimate(p.db, t, now)["end"] < reset
+    # The web task list, the queued-host-task line with no shared estimator, and a promise on it.
+    (row,) = [r for r in web.state_payload(p, p.db)["tasks"] if r["id"] == t]
+    assert row["eta"] == eta.field(eta._Est(p.db, time.time(), core="other").task(t), p, time.time())
+    assert row["eta"].startswith("ETA ") and row["eta"] != eta.field(eta.estimate(p.db, t, time.time()), p,
+                                                                       time.time())
+    assert onhost.state(p, p.db.task(t), now)["line"] == onhost.queued_line(held, p, now)
+    o = _eta_promise(p, t, "c1", "I'll post here when it's live.", now)
+    assert eta.obligation_estimate(p.db, o, now, core="other")["end"] == pytest.approx(reset + 1500)
+    # A task routed to claude is not held by the core provider's gate.
+    p.db.x("UPDATE tasks SET provider='claude' WHERE id=?", (t,))
+    assert eta.estimate(p.db, t, now, core="other")["end"] < reset
+
 def test_eta_red_spend_gate_with_no_known_reset_gives_no_clock_time(env):
     from ttp import eta
     p = make(env)
