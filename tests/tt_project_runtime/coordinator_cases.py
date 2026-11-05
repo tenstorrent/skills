@@ -19579,6 +19579,72 @@ def test_repeated_reply_waits_stay_routine_while_the_peer_recovers_and_raise_onc
     assert coord.effort_triggers(db, cfg, [], None, harness=p.harness)[0] == ["repeated waits"]
 
 
+def _repeated_waits(p, result: dict) -> tuple:
+    """A queued task whose last 8 hand-offs (the count backstop) were the same external wait `result`."""
+    from ttp import unblock
+    db = p.db
+    db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    db.x("DELETE FROM messages WHERE direction='out'")
+    db.set_kv("last_coordinator_turn", time.time() - 60)
+    tid = db.add_task("waits on something", "s", origin="user")
+    db.update_task(tid, result=json.dumps(result))
+    for _ in range(8):
+        kind, why = unblock.classify_wait(result)
+        db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), f"task:{tid}", "task_waiting", "low", f"#{tid} t: waiting",
+              json.dumps({"wait": kind, "why": why, "for": result.get("waiting_for")}), "handled", tid))
+    return db, tid
+
+
+@pytest.mark.parametrize("case, held", [
+    ("user step", True), ("user pause probe", True), ("lock on a user-paused resource", True),
+    ("listed peer", True), ("listed peer as an object", True), ("another project's known outage", True),
+    ("plain external wait", False), ("lock on a coordinator-paused resource", False), ("unlisted peer", False),
+    ("own known outage", False), ("outage on another machine", False), ("unreadable peers file", False),
+])
+def test_repeated_waits_skip_waits_held_by_the_user_a_peer_or_another_projects_outage(env, monkeypatch, case, held):
+    """'repeated waits' neither raises nor records seen-state for a wait no turn here can move (heldwait.py):
+    a user step, a user pause, a lock on a resource the user paused, a peer listed in peer_recovery.json, or a
+    machine under a known outage only other projects recorded. Every other repeated wait still raises."""
+    from ttp import coordinator as coord, heldwait, machine_ledger
+    p = make(env)
+    cfg = p.config()
+    here = str(cfg.get("name") or p.name)
+    cfg["name"] = here
+    outages = {}
+    monkeypatch.setattr(machine_ledger, "outage_entries", lambda now=None, doc=None: outages)
+    result = {"status": "waiting", "waiting_for": "the box", "retry_when": "ssh box-a test -e /tmp/ready"}
+    peers = p.harness / heldwait.PEERS_FILE
+    if case == "user step":
+        result = {**result, "wait_kind": "user", "waiting_for": "the user's sign-in"}
+    elif case == "user pause probe":
+        result = {**result, "retry_when": "test -e out/user-hold"}
+    elif case.startswith("lock on a"):
+        coord.pause_resource(p, "board-u", True, reason="hold", by="user" if "user" in case else "coordinator")
+        result = {**result, "retry_when": "ttp lock --probe board-u"}
+    elif case in ("listed peer", "unlisted peer", "unreadable peers file"):
+        peers.write_text("{not json" if case == "unreadable peers file" else json.dumps(["peer-b"]))
+        who = "peer-c" if case == "unlisted peer" else "peer-b"
+        result = {**result, "waiting_for": f"{who} to finish its recovery", "retry_when": f"ttp task {who} show 12"}
+    elif case == "listed peer as an object":
+        peers.write_text(json.dumps({"peer-b": {"why": "recovers its own box"}}))
+        result = {**result, "waiting_for": "peer-b's recovery", "retry_when": "ttp task peer-b show 12"}
+    elif case == "another project's known outage":
+        outages["box-a"] = {"other-project": {"why": "tray repair", "by": "other-project"}}
+    elif case == "own known outage":
+        outages["box-a"] = {here: {"why": "tray repair", "by": here}}
+    elif case == "outage on another machine":
+        outages["box-b"] = {"other-project": {"why": "tray repair", "by": "other-project"}}
+    db, tid = _repeated_waits(p, result)
+    got = coord.effort_triggers(db, cfg, [], None, harness=p.harness)
+    if held:
+        assert heldwait.why(db, cfg, db.task(tid), p.harness), case
+        assert got[0] == [] and str(tid) not in (got[1].get("waits") or {}), (case, got)
+    else:
+        assert heldwait.why(db, cfg, db.task(tid), p.harness) == "", case
+        assert got[0] == ["repeated waits"], (case, got)
+
+
 def _connector_stream(*tools):
     return "\n".join(json.dumps({"type": "assistant", "message": {"id": f"m{i}", "content": [
         {"type": "tool_use", "id": f"t{i}", "name": name, "input": {}}]}}) for i, name in enumerate(tools)) + "\n"
