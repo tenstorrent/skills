@@ -12605,11 +12605,12 @@ class Daemon:
         tid, db = task["id"], self.p.db
         with db.tx():
             cur = db.task(tid) or {}
-            nxt = thenwaits.advance(load_result(cur.get("result"))) if cur.get("status") == "queued" else None
+            nxt = thenwaits.advance(load_result(cur.get("result")), now) if cur.get("status") == "queued" else None
             if nxt is None or load_result(cur["result"]).get("status") != "waiting":
                 return False
             left = len(nxt.get(thenwaits.KEY) or [])
-            db.update_task(tid, result=dump_result(nxt), not_before=now + _retry_s(nxt),
+            retry = waitpoll.capped(self.cfg, cur, nxt, _retry_s(nxt))   # as a hand-off's: urgent stays capped
+            db.update_task(tid, result=dump_result(nxt), not_before=now + retry,
                            blocked_reason=f"its {why}; stage {nxt[thenwaits.STAGE_KEY] + 1} of "
                                           f"{nxt[thenwaits.STAGE_KEY] + 1 + left} waits on: {nxt['retry_when'][:200]}")
         self._probe_rc.pop(tid, None)

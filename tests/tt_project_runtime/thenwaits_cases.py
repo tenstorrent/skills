@@ -180,3 +180,39 @@ def test_a_malformed_then_is_refused_at_hand_off_and_a_valid_one_gets_its_run_va
         else:
             assert "then" not in res and res["then_refused"] and res["retry_when"] == "exit 1", res
             assert len(refused) == 1 and "`then`" in refused[0]["text"], refused
+
+
+def test_a_new_stage_starts_its_own_wait_clock(env, monkeypatch, tmp_path):
+    """A stage change resets waiting_since (and drops the per-wait peer-hold keys), so a stage that has
+    just begun after earlier stages took longer than max_hold_s raises no wait_stale."""
+    from ttp import daemon as dmod
+    p = make(env)
+    every = dmod.PROBE_EVERY_S
+    d = _then_daemon(p, monkeypatch)
+    tid, _ = _then_task(p, tmp_path, [{"retry_when": "false"}])
+    old = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**old, "waiting_since": time.time() - 7 * 3600,
+                                             "peer_held_at": time.time() - 7 * 3600, "peer_hold_live": True}))
+    _settle_probe(d, tid)
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["then_stage"] == 1 and res["retry_when"] == "false", res
+    assert abs(res["waiting_since"] - time.time()) < 30, res
+    assert "peer_held_at" not in res and "peer_hold_live" not in res, res
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", every)
+    _settle_probe(d, tid)
+    p.db.update_task(tid, not_before=time.time() - 1)
+    d.probe_waiting()          # due with a fresh "not yet": sleeps on, no stale event for a new stage
+    assert not _ready(p, tid) and p.db.task(tid)["not_before"] > time.time() + 60
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind IN ('wait_stale', 'probe_never_passes')", (tid,))
+
+
+def test_a_later_stage_keeps_an_urgent_tasks_capped_retry(env, monkeypatch, tmp_path):
+    from ttp import daemon as dmod
+    p = make(env)
+    d = _then_daemon(p, monkeypatch)
+    tid, _ = _then_task(p, tmp_path, [{"retry_when": "false", "retry_after_s": 3600}])
+    monkeypatch.setattr(dmod.waitpoll, "capped", lambda cfg, task, result, retry_s: min(retry_s, 120))
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    assert json.loads(task["result"])["then_stage"] == 1
+    assert task["not_before"] < time.time() + 200, task["not_before"] - time.time()

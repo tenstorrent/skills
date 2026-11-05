@@ -56,15 +56,20 @@ def problem(result: dict) -> str | None:
     return None
 
 
-def advance(prev: dict) -> dict | None:
-    """The stored hand-off `prev` with its next stage as its wait, or None when it has no next stage.
-    The run's own retry_when and on_pass_cmd stay as `<key>_orig` (daemon._same_probe), so the run's
-    result.json is still the hand-off the task waits on."""
+# Per-wait state a new stage starts without, as a fresh worker hand-off would (daemon._peer_hold).
+PER_WAIT_KEYS = (KEY, "on_pass_cmd", "woke", "peer_held_at", "peer_hold_live")
+
+
+def advance(prev: dict, now: float) -> dict | None:
+    """The stored hand-off `prev` with its next stage as its wait, started at `now`, or None when it has
+    no next stage. The run's own retry_when and on_pass_cmd stay as `<key>_orig` (daemon._same_probe),
+    so the run's result.json is still the hand-off the task waits on."""
     then = prev.get(KEY) if isinstance(prev, dict) else None
     if not isinstance(then, list) or not then or not isinstance(then[0], dict):
         return None
     stage, rest = then[0], then[1:]
-    nxt = {k: v for k, v in prev.items() if k not in (KEY, "on_pass_cmd", "woke")}
+    nxt = {k: v for k, v in prev.items() if k not in PER_WAIT_KEYS}
+    nxt["waiting_since"] = now    # its own wait clock: max_hold_s and the stale fingerprints key on it
     nxt.setdefault("retry_when_orig", prev.get("retry_when"))
     nxt.setdefault("on_pass_cmd_orig", prev.get("on_pass_cmd"))
     nxt["retry_when"] = stage["retry_when"]
