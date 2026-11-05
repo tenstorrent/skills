@@ -27,6 +27,13 @@ standing memory, the open order ledger, that handover and the last CHAT_EXCHANGE
 verbatim, then the full digest. The agent's own auto-compaction is only a backstop: limit()
 sits below a known context window.
 
+Memory between wakes: the digest's memory deltas compare live memory with the prompt snapshot, so they
+reset when the snapshot re-renders, and a session never sees what was recorded between its last wake
+and that re-render. kv KEY's `sent` holds a hash of each entry the session was sent (memory_view: the
+standing memory, the STANDING block and the cached sections user_corrections and memory_recent). Each
+resumed wake leads with the entries added, changed or retired since (resume_memory), and a wake that
+ends ok makes its `pending` map the new `sent`; one that fails keeps the old map, so they are sent again.
+
 The sibling spend guard trips kv GUARD_KEY ({"tripped": true, "until": ts}): while it is tripped,
 every wake is stateless. A missing key is not tripped. Mode "shadow" is reserved; it acts as off.
 
@@ -52,6 +59,9 @@ DEFAULTS = {"mode": "off", "rollover_tokens": 0, "rollover_growth_tokens": 10000
             "rollover_margin_tokens": 40000, "max_failures_per_h": 3, "pause_h": 6}
 LONG_WINDOW = 1_000_000   # a model id ending "[1m]" (Claude's long-context variant)
 HANDOVER_HEAD = "## Session handover"
+MEMORY_HEAD = ("## Memory changed since this session last saw it (a changed entry replaces its earlier line; "
+               "a retired one no longer applies)")
+STANDING = "# STANDING"   # memory_view's key of the STANDING block (no memory entry's name starts with #)
 NOTE_CHARS = 16000        # a session_note's cap, about 4,000 tokens
 CHAT_EXCHANGES = 20       # the chat exchanges a new session's first message carries verbatim
 CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the newest always stays
@@ -171,6 +181,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
     st["last_why"] = str(turn.get("why") or "")
     ack = turn.get("digest") if ok and isinstance(turn.get("digest"), dict) else None
     st.pop(DIGEST, None)   # a stateless, failed or unacknowledged wake: the next session wake sends it whole
+    pending = st.pop("pending", None)   # this wake's memory_view hashes: sent once it ended ok
     if mode == "stateless":
         st.pop("rerun", None)
         return st
@@ -192,6 +203,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
         st["context_tokens"] = context_tokens(usage)
         if mode == "new":   # the fresh session's prompt: limit() allows growth over it
             st["base_tokens"] = _telemetry(usage, "first_context")
+        if isinstance(pending, dict):
+            st["sent"] = pending
     return st
 
 
@@ -203,6 +216,7 @@ def fail(cfg: dict, state, now: float) -> tuple[dict, bool]:
     fails = [t for t in (st.get("failures") or []) if isinstance(t, (int, float)) and now - t < 3600] + [now]
     st.update({"failures": fails, "last_ok": False, "rerun": True, "last_why": "resume failed"})
     st.pop(DIGEST, None)
+    st.pop("pending", None)
     if len(fails) >= _num(s.get("max_failures_per_h"), DEFAULTS["max_failures_per_h"]):
         st.update({"paused_until": now + _num(s.get("pause_h"), DEFAULTS["pause_h"]) * 3600, "failures": []})
         return st, True
@@ -416,3 +430,38 @@ def seed(p, state, why: str, cached: str = "", now: float | None = None) -> str:
     chats = chat_lines(p.db, where)
     out.append("\n".join(chats) if chats else "## Last chat exchanges\n(none yet)")
     return "\n\n".join(out)
+
+
+def memory_view(p, now: float | None = None) -> dict:
+    """{key: [hash, line]} of what a new session's seed sends from the prompt snapshot now: each
+    standing memory entry, the STANDING block and each entry of the cached sections (user_corrections,
+    memory_recent)."""
+    from . import coordinator as coord
+    snap, live = coord.prompt_state(p, time.time() if now is None else now)
+    out = {}
+    if standing := str(snap.get("standing") or ""):
+        out[STANDING] = [coord._sha(standing), f"## STANDING now reads\n{standing}"]
+    taken = snap.get("entries") or {}
+    out.update({e["name"]: [live["shas"][e["name"]], e["line"]] for e in live["entries"] if e["name"] in taken})
+    recent = snap.get("recent") or {}
+    for names, lines in ((recent.get("entries") or {}, recent.get("lines") or []),
+                         (snap.get("corrections") or {}, snap.get("correction_lines") or [])):
+        by_sha = {coord._sha(x): x for x in lines}
+        out.update({n: [sha, by_sha[sha]] for n, sha in names.items() if sha in by_sha})
+    return out
+
+
+def resume_memory(p, state, prompt: str, now: float | None = None) -> tuple[str, dict]:
+    """(MEMORY_HEAD block, or "" when nothing changed; this wake's `pending` hashes): the memory_view
+    entries added or changed since kv KEY's `sent` and the ones retired from memory. A line this wake's
+    digest already carries is not repeated. A session without `sent` (seeded before it) gets them all once.
+    An entry that only left the view (aged out of the recent sections) is still in memory: not retired."""
+    view = memory_view(p, now)
+    sent = (state or {}).get("sent") if isinstance(state, dict) else None
+    sent = sent if isinstance(sent, dict) else {}
+    lines = [line for k, (sha, line) in view.items() if sent.get(k) != sha and line not in prompt]
+    if gone := [k for k in sent if k not in view]:
+        live = {e["name"] for e in p._memory_entries()}
+        lines += ["## STANDING now reads\n(empty)" if k == STANDING else f"[{k}] retired, ignore"
+                  for k in gone if k not in live]
+    return ("\n".join([MEMORY_HEAD, *lines]) if lines else ""), {k: v[0] for k, v in view.items()}

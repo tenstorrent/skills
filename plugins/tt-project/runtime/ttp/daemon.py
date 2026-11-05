@@ -2905,7 +2905,12 @@ class Daemon:
                 try:   # the rollover handover (coordsession.py): no order, promise or decision is lost
                     if session_mode == "new":
                         prompt = coordsession.seed(self.p, state, why, session_prompt.get("cached") or "") + "\n\n" + prompt
-                    elif why == "handover":
+                        pending = {k: v[0] for k, v in coordsession.memory_view(self.p).items()}
+                    else:   # memory recorded since the last wake, though a re-render emptied the digest's deltas
+                        changed, pending = coordsession.resume_memory(self.p, state, prompt)
+                        prompt = f"{changed}\n\n{prompt}" if changed else prompt
+                    self.p.db.set_kv(coordsession.KEY, {**(state or {}), "pending": pending})   # record() keeps it once ok
+                    if why == "handover":
                         prompt = prompt + "\n\n" + coordsession.handover_ask(state)
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])

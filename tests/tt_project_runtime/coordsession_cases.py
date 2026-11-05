@@ -793,3 +793,58 @@ def test_coordsession_whole_digest_keeps_the_lines_of_one_shot_section_builders(
         assert builds == [1], "the digest is built once per turn"
         assert "## Temporary instructions possibly over" in prompt and "until the freeze is lifted" in prompt, sent
         assert f"## Health coverage changed: wake {n[0]}" in prompt, sent
+
+
+def test_coordsession_a_resumed_wake_carries_memory_recorded_before_a_prompt_re_render(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import coordsession
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    old = p.add_memory("The soak window was 02:00.", kind="decision")
+    gone = p.add_memory("Builds use the old cache.", kind="fact").stem
+    rule = p.add_memory("Label every chart axis.", kind="preference", standing=True)
+    first, _, prompt1 = wake("one")
+    assert first["mode"] == "new" and "The soak window was 02:00." in prompt1 and "Label every chart axis." in prompt1
+    st = p.db.kv(coordsession.KEY)
+    # Recorded, changed and retired between two wakes, then the snapshot re-renders before the digest
+    # is built: the digest's deltas are empty, so only the session's own diff can carry them.
+    old.write_text(old.read_text().replace("was 02:00.", "is 03:00 now."))
+    added = p.add_memory("The bench runs on Fridays.", kind="decision").stem
+    rule.write_text(rule.read_text().replace("chart axis.", "chart axis and its unit."))
+    p.forget_memory(gone)
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, {"at": time.time(), "section": "Goals"})
+    second, _, prompt2 = wake("two")
+    assert second["mode"] == "resume", second
+    assert coordsession.MEMORY_HEAD in prompt2, prompt2[:2000]
+    block = prompt2.split(coordsession.MEMORY_HEAD, 1)[1].split("two", 1)[0]
+    for text in ("The soak window is 03:00 now.", "The bench runs on Fridays.", "and its unit.", f"[{gone}] retired"):
+        assert text in block, (text, prompt2[:3000])
+    assert coord.RECENT_ADDED_HEADER not in prompt2, "the re-render emptied the digest's own delta"
+    assert set(st["sent"]) >= {old.stem, gone, rule.stem} and "pending" not in st, st
+    st = p.db.kv(coordsession.KEY)
+    assert added in st["sent"] and gone not in st["sent"] and "pending" not in st
+
+
+def test_coordsession_an_unchanged_memory_adds_nothing_and_a_failed_resume_sends_it_again(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import coordsession
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    p.add_memory("The soak runs nightly.", kind="decision")
+    wake("one")
+    sent = p.db.kv(coordsession.KEY).get("sent")
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, {"at": time.time(), "section": "Goals"})   # a re-render alone
+    second, _, prompt2 = wake("two")
+    assert second["mode"] == "resume" and coordsession.MEMORY_HEAD not in prompt2
+    third, _, prompt3 = wake("three")
+    assert third["mode"] == "resume" and coordsession.MEMORY_HEAD not in prompt3
+    assert p.db.kv(coordsession.KEY)["sent"] == sent and sent
+    # A failed resume keeps the old hashes: the entry it carried goes again with the next session wake.
+    bench = p.add_memory("The bench runs on Fridays.", kind="decision").stem
+    p.db.set_kv(coord.PROMPT_REFRESH_KEY, {"at": time.time(), "section": "Goals"})
+    state = {**p.db.kv(coordsession.KEY), "pending": {"x": "y"}}
+    after, _ = coordsession.fail(_cs_cfg(), state, time.time())
+    assert "pending" not in after and after["sent"] == sent
+    text, pending = coordsession.resume_memory(p, after, "")
+    assert "The bench runs on Fridays." in text and pending != sent
+    assert coordsession.resume_memory(p, {**after, "sent": pending}, "")[0] == "", "nothing new once sent"
+    assert coordsession.resume_memory(p, {**after, "sent": sent}, f"[{bench}] The bench runs on Fridays.")[0] == "", \
+        "a line the digest already carries is not repeated"
