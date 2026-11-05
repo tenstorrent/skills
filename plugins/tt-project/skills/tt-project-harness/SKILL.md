@@ -63,7 +63,7 @@ read the one for the lever you change.
 | Hand-off lint | Model-free, on every code hand-off: flags a follow-up to push an own branch that is not on the remote. See [references/own-pushes.md](references/own-pushes.md) |
 | Requested cells | A spec line `cells: a, b; c` names the measurements or tests a task must cover, as short names (one per chip id or test), never a description: a descriptive line is refused at task_add/task_update and, stored from before, ignored; its done hand-off lists the ones finished with a valid result in `cells`: a list of names, or a dict name -> row; a dict value that is empty, `valid: false` or a string starting `invalid` is not finished (0 is a measurement). Model-free: a done missing some reads `partial: N of M cells` and gets a `continue:` follow-up for the rest; one without `cells` reads `cells unreported: M requested`. The status stays done. Cells no hop could produce (`cells_unrunnable`) get none: see [references/continue-hops.md](references/continue-hops.md); a wrong mark is corrected with `ttp task <project> rejudge <id>` (same file) |
 | Model-free wait endings | A waiting hand-off's `on_pass` or `on_pass_cmd` ends the task with no model run; `ttp task set-when`, `ttp ack-wait`, and where a detached `ttp checks` keeps its output. See [references/model-free-wait-endings.md](references/model-free-wait-endings.md) |
-| SSH preflight | `ttp ssh-preflight <host>` or `@<resource>`: a strict ssh check whose exit codes tell gone, wrong key and no auth apart. See [references/ssh-preflight.md](references/ssh-preflight.md) |
+| SSH preflight | `ttp ssh-preflight <host>` or `@<resource>`: a strict ssh check whose exit codes tell gone, wrong key, no auth and a sudo ProxyCommand that no_new_privs breaks apart. See [references/ssh-preflight.md](references/ssh-preflight.md) |
 | Stock goal checks | `ttp goal suite_green\|artifact_fresh\|service_up`: model-free "is this goal met?" for a probe, `on_pass_cmd`, heal check or watcher. See [references/goal-checks.md](references/goal-checks.md) |
 | The ask test | Ask the user only on harm to people or speaking as the user; inputs, space and routes are decided (accessible copy first, then a location with room). See the Asks section of `docs/guide.md` |
 | Project ask-gate rules | `ask_gate.refuse` in `project.json`: the project's own ask_user refusal rules (regexes, exceptions, a reason), enforced by the coordinator's gate with no runtime edit. See [references/ask-gate-rules.md](references/ask-gate-rules.md) |
@@ -267,6 +267,11 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   the template, and a local edit there turns each upgrade that changes them into a merge task. A
   name that is not an executable in the harness's `bin/`, or is a shell, wrapper, `ttp`, `git` or
   `gh`, is left out with one daemon log line.
+- In a sandboxed run (and its `ttp lock` and `ttp detach` jobs) nothing can gain privileges, so an ssh
+  whose ProxyCommand runs sudo fails at once with `kex_exchange_identification: Connection closed by
+  remote host`; the host is not refusing. `ttp ssh-preflight` exits 13 for it. Stay unsandboxed (the
+  default), run that ssh from a model-free command schedule or pre-step, or use a ProxyCommand without
+  sudo or a ControlMaster opened outside: see [references/ssh-preflight.md](references/ssh-preflight.md).
 - A reset or a single-host power cycle never affects other hosts: nothing waits on or snapshots
   them first. Only a quad serving a quad-wide workload goes down and up as a quad.
 - Neighbours, a `serving` tag or a site rule the harness infers never hold a reset, power cycle,

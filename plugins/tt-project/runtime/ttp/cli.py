@@ -6021,7 +6021,8 @@ def cmd_svcscan(a) -> None:
 
 def cmd_ssh_preflight(a) -> None:
     """Exit 0 once a host answers over ssh, 255 while it does not (for retry_when; 12 with
-    --classified), 10 when its host key does not verify, 11 when authentication fails (both wake a
+    --classified), 10 when its host key does not verify, 11 when authentication fails, 13 when this
+    process cannot gain privileges (no_new_privs) and the host's ProxyCommand runs sudo (all three wake a
     waiting task). ssh runs with strict host-key checking and no connection sharing. `@<resource>`
     finds the host in the project's config `device.hosts` (or `device.runners`) each time it runs,
     so a probe follows its resource to another box; an unknown resource exits 2."""
@@ -6041,7 +6042,8 @@ def cmd_ssh_preflight(a) -> None:
     rc, out = hostmap.preflight(host, a.timeout, a.classified)
     shown = f"{host} ({target})" if host != target else host
     why = {hostmap.HOST_KEY_RC: "host key not verified (changed, or not in known_hosts)",
-           hostmap.AUTH_RC: "authentication failed"}.get(rc, "not reachable")
+           hostmap.AUTH_RC: "authentication failed",
+           hostmap.NO_NEW_PRIVS_RC: "not reachable from here"}.get(rc, "not reachable")
     if rc == 0:
         print(f"ssh-preflight: {shown} reachable")
     else:
@@ -11838,7 +11840,8 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_host_run)
 
     s = sub.add_parser("ssh-preflight", help="exit 0 once a host answers over ssh, 255 while not (for "
-                                             "retry_when), 10 host key not verified, 11 auth failed; "
+                                             "retry_when), 10 host key not verified, 11 auth failed, "
+                                             "13 no_new_privs with a sudo ProxyCommand; "
                                              "@<resource> takes the host from config device.hosts")
     s.add_argument("target", help="an ssh host, or @<resource> (config device.hosts or device.runners)")
     s.add_argument("--timeout", type=float, default=30.0, help="give up on ssh after this many seconds")

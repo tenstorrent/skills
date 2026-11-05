@@ -1134,8 +1134,10 @@ running work is interrupted only by the preemption below:
   and fsync each step's result as the step ends, not only in an end-of-run summary file; with `--rows <file> --after <n>` it
   exits 0 also once that file (on that host) has more than n lines, and 0 once the job ended or its driver
   is gone, else 1. A retry_when that tests only an end marker over ssh is flagged. `ttp ssh-preflight <host>` exits 0 once the host answers over ssh
-  and 255 while not (12 with `--classified`), 10 when its host key does not verify and 11 when
-  authentication fails (ssh runs with strict host-key checking and no connection sharing);
+  and 255 while not (12 with `--classified`), 10 when its host key does not verify, 11 when
+  authentication fails and 13 when this process cannot gain privileges (no_new_privs, a sandboxed run)
+  and the host's ProxyCommand runs sudo, which ssh reports as `kex_exchange_identification` (ssh runs
+  with strict host-key checking and no connection sharing);
   `ttp ssh-preflight @<resource>` looks the host up in config `device.hosts`
   ({resource: host}, else `device.runners.<name>.host`) each time it runs, so a waiting probe follows
   a resource moved to another box (an unknown resource exits 2). Config `device.runners.<name>` (opt-in) sets up one serial

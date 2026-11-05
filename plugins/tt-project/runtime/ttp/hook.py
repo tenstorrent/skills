@@ -16,7 +16,8 @@ worker's next own tool call.
 After a failed tool call (Claude Code's PostToolUseFailure, which replaces PostToolUse there) it hands
 over the same update and hand-off problems, and, when the error is the Bash sandbox's mount race
 (MOUNT_RACE: bwrap could not bind a path that vanished while it started), the hint to re-run the
-command unchanged; `ttp audit` counts the runs that hit it.
+command unchanged; `ttp audit` counts the runs that hit it. In a sandboxed run, an ssh that failed with
+`kex_exchange_identification` gets the hint that a sudo ProxyCommand cannot run there (KEX_NO_NEW_PRIVS_HINT).
 
 The hand-off guard: after a tool call that changed `$TTP_RUN_DIR/result.json` (any tool: it compares
 the file's size and mtime with the last one checked), the hook parses it as the daemon does and, if
@@ -1797,6 +1798,18 @@ NO_NEW_PRIVS_HINT = ("tt-project: your sandbox cannot gain privileges, so sudo f
                      "allows runs on the host through the daemon: `ttp host-run -- <command...>` (config "
                      "runner.host_commands, set by the user or the coordinator). Not listed: name the exact "
                      "command in your hand-off.")
+# An ssh whose ProxyCommand runs sudo dies before any banner where nothing can gain privileges, and ssh
+# then blames the host. Hinted only in a run the daemon started sandboxed (it sets TTP_SANDBOXED=1 there):
+# unsandboxed (the default), sudo works and the host really refused.
+KEX_FAIL = re.compile(r"kex_exchange_identification", re.I)
+SANDBOXED_ENV = "TTP_SANDBOXED"
+KEX_NO_NEW_PRIVS_HINT = ("tt-project: this run is sandboxed, so nothing in it can gain privileges (no_new_privs). "
+                         "If that host's ssh ProxyCommand runs sudo, sudo dies at once and ssh says "
+                         "'kex_exchange_identification: Connection closed by remote host': the host is not "
+                         "refusing. `ttp ssh-preflight <host>` exits 13 for this case. Run that ssh from a "
+                         "model-free command schedule or pre-step, or use a ProxyCommand without sudo or a "
+                         "ControlMaster opened outside the sandbox (tt-project-harness "
+                         "references/ssh-preflight.md).")
 
 
 def post_tool_use_failure(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
@@ -1808,6 +1821,8 @@ def post_tool_use_failure(payload: dict) -> tuple[dict | None, Callable[[], None
         parts.insert(0, MOUNT_RACE_HINT)
     if NO_NEW_PRIVS.search(str(payload.get("error") or "")):
         parts.insert(0, NO_NEW_PRIVS_HINT)
+    if KEX_FAIL.search(str(payload.get("error") or "")) and os.environ.get(SANDBOXED_ENV, "").strip() == "1":
+        parts.insert(0, KEX_NO_NEW_PRIVS_HINT)
     if not parts:
         return None, delivered
     return {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure",
