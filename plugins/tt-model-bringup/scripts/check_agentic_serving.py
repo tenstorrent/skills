@@ -300,6 +300,8 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
         if not (isinstance(release, dict) and release.get("dry_run") and per_run
                 and all(number(hours) for hours in per_run.values())):
             problems.append((2, "plan.json release needs its dry_run and projected_hours"))
+        elif not (release.get("benchmarks") and release.get("benchmark_source")):
+            problems.append((2, "plan.json release needs the benchmark matrix and the similar models it came from"))
         else:
             for name, hours in per_run.items():
                 if hours > limit:

@@ -184,8 +184,20 @@ in `learned.json` so the next model finds it.
 ### Models new to the harness
 
 When tt-inference-server has no entry for the model, add one before the preflight: the model and
-its serving settings, and per eval its nightly task list, limits and reference. Find where each
-lives in the current harness. This entry is the release spec that `serving_config.json` describes.
+its serving settings, stage 11's benchmark matrix, and per eval its nightly task list, limits and
+reference. Find where each lives in the current harness. This entry is the release spec that
+`serving_config.json` describes.
+
+### Release contents
+
+The harness's release workflow runs benchmarks, evals and spec tests. Goal 12's release runs the
+benchmarks and the evals with a `go` decision, and skips the spec tests.
+
+**Benchmark matrix.** Stage 11 chose it from similar models in tt-inference-server and wrote it to
+`doc/benchmark/release_benchmark_matrix.json`. Use it as it is. Measure the rows stage 11 did not
+once, next to the server-sized rung, so the release projection uses measured times. In the release
+the benchmarks run once: inside the single release run in `light`, as their own run in `extended`.
+Copy the matrix and the models it came from into `plan.json`.
 
 ### Eval settings
 
@@ -289,15 +301,16 @@ time measured there projects the next rung to finish before the release run must
 7. **Combine and dry run.** Freeze the release configuration: serving settings, task lists,
    limits, route and commits. Then launch the release exactly as it will run and stop it once it is
    clearly running: the server loads the frozen settings, every task environment in the release
-   lists is pulled or built, the planned number of sandboxes start together, and each suite's first
-   agents get model replies. No scores; run lengths come from the measured rungs. Fix what fails
+   lists is pulled or built, the planned number of sandboxes start together, each suite's first
+   agents get model replies, and the benchmark client reaches the server. No scores; run lengths come from the measured rungs. Fix what fails
    and dry-run again. Nothing changes after the last clean dry run.
 8. **Release run**, started before the stage time limit and allowed to finish after it, within
    `run_timeout_hours`, through the same route every earlier run used. It must land without help:
    start it only on the configuration that passed the dry run and only when its projection, with each suite's
    slow tail at the agent limit, fits `run_timeout_hours` with margin. Otherwise release a smaller
-   list that does. It runs the evals with a `go` decision: in `light` their server-sized lists, all
-   within `run_timeout_hours` together; in `extended` each one's largest fitting list. A failure during it is reported, not fixed: the
+   list that does. It runs what [Release contents](#release-contents) lists: the benchmark matrix
+   and the evals with a `go` decision, in `light` their server-sized lists all within
+   `run_timeout_hours` together, in `extended` each one's largest fitting list. A failure during it is reported, not fixed: the
    release result is what it ran.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
@@ -388,7 +401,8 @@ Write these to `doc/agentic_evals/`:
   `confirmed` and `evidence`; and `rankings`, each with `after`, `order` (`problem`,
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
 - `plan.json`, with the `mode`, the schedule updated after every run, and
-  `release`: the frozen configuration, the `dry_run` that launched it, and
+  `release`: the frozen configuration, the `benchmarks` matrix with the `benchmark_source` models
+  it was taken from, the `dry_run` that launched it, and
   `projected_hours` with each suite's slow tail: one number in `light`, one per eval in `extended`
 - `runs/<arm>/` (manifest and collected results)
 - `estimate.json`: per eval `decision` (`go`: it is in the release run; `stop`: it is not),

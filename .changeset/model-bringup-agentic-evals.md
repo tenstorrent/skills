@@ -11,5 +11,7 @@ survey and preflight, then growing task lists on the harness as it is on main (s
 lists, a server-sized run), efforts ranked validity first, and a release run that passes a dry
 run first, starts inside the time limit, and fits `run_timeout_hours`. Extra devices are optional and defined
 by the operator. `scripts/agent_replay.py` replays recorded agent histories to test capacity and
-caching. Benchmark, multichip and serving-stack guidance gains slow-run diagnosis, a teardown
+caching. Stage 11 chooses the release benchmark matrix from similar models in tt-inference-server;
+goal 12's release runs it with the evals and skips spec tests. Benchmark, multichip and serving-stack
+guidance gains slow-run diagnosis, a teardown
 rule and a no-mixed-runtimes rule.

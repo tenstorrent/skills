@@ -89,7 +89,9 @@ def goal12(model, **overrides):
     (evals / 'release/swe').mkdir(parents=True, exist_ok=True)
     files = {
         'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'start_hours': 20}],
-                      'release': {'dry_run': 'runs/release-dry-run', 'projected_hours': 9.5}},
+                      'release': {'dry_run': 'runs/release-dry-run', 'projected_hours': 9.5,
+                                  'benchmarks': [{'isl': 4096, 'osl': 128, 'concurrency': 8}],
+                                  'benchmark_source': ['similar/model']}},
         'REPORT.md': '# Report',
         'estimate.json': {'evals': {'swe': {'decision': 'go', 'reason': 'fits'}}},
         'release/swe/results.json': {'actual_hours': 6.5},
@@ -396,8 +398,11 @@ def test_agent_replay_reports_hits_and_prefill_amplification(tmp_path):
 
 @pytest.mark.parametrize('mode, release, message', [
     ('light', {'projected_hours': 9.5}, 'dry_run'),
-    ('light', {'dry_run': 'runs/d', 'projected_hours': 13}, 'smaller list'),
-    ('extended', {'dry_run': 'runs/d', 'projected_hours': {'swe': 11, 'terminal': 14}}, 'terminal projected'),
+    ('light', {'dry_run': 'runs/d', 'projected_hours': 13, 'benchmarks': [{}], 'benchmark_source': ['m']},
+     'smaller list'),
+    ('extended', {'dry_run': 'runs/d', 'projected_hours': {'swe': 11, 'terminal': 14}, 'benchmarks': [{}],
+                  'benchmark_source': ['m']}, 'terminal projected'),
+    ('light', {'dry_run': 'runs/d', 'projected_hours': 9}, 'benchmark matrix'),
 ])
 def test_release_needs_a_dry_run_and_a_projection_that_fits(tmp_path, mode, release, message):
     plan = {'mode': mode, 'schedule': [{}], 'release': release}
@@ -408,7 +413,8 @@ def test_release_needs_a_dry_run_and_a_projection_that_fits(tmp_path, mode, rele
 
 def test_extended_mode_projects_each_suite_against_run_timeout_hours(tmp_path):
     plan = {'mode': 'extended', 'schedule': [{}],
-            'release': {'dry_run': 'runs/d', 'projected_hours': {'swe': 11.5, 'terminal': 9}}}
+            'release': {'dry_run': 'runs/d', 'projected_hours': {'swe': 11.5, 'terminal': 9},
+                        'benchmarks': [{}], 'benchmark_source': ['m']}}
     goal12(tmp_path, **{'plan.json': plan})
     assert check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'extended'}) == (0, '')
 

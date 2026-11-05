@@ -33,6 +33,16 @@ The report labels the profile, concurrent requests and server slots separately. 
 
 Use the run contract's server-control hook to prepare and record the largest configured server before accuracy, then step down through the remaining batches. Switching and warmup count toward the stage budget. Preserve ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time in the report details.
 
+## Release benchmark matrix
+
+Choose the benchmark matrix this model's release will run, from the matrices of similar models
+already in tt-inference-server: same family or architecture, similar size, same device. Keep the
+input and output lengths and concurrencies they use that this model supports, within its validated
+batches and context; drop the rest and add none they do not run. Write it to
+`doc/benchmark/release_benchmark_matrix.json` with the models it was taken from and, per row, an
+estimated time from the profiles measured above. Measure the rows the stage budget leaves room for
+and record their actual time; goal 12 measures the rest and runs the matrix in its release.
+
 ## Diagnose slow benchmarks and evals
 
 Before a long run, use a small representative subset to estimate wall time from measured TTFT,
