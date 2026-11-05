@@ -172,6 +172,7 @@ valid one: No `result.json`, no credit.
 <!-- /ttp:if cells -->
  "outcome": "if it applies: landed, kept, shelved or rejected",
  "tried": [{"title": "each lever tried", "outcome": "kept | shelved | rejected", "result": "number or bound reached"}],
+ "context_gaps": ["what you needed that the spec and its context block lacked (a decision, the user's words, an earlier finding)"],
  "followups": [{"title": "...", "spec": "self-contained next step"}]}
 ```
 

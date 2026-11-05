@@ -116,6 +116,7 @@ from . import probevars
 from . import onhost
 from . import coordsession
 from . import coordtools
+from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -2600,6 +2601,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"an owner's work on")
                 if order := _user_order(p, a, new_id, f"{title}\n{a.get('spec') or ''}", messages):
                     notes.append(f"task_add: #{new_id} {order}")
+                try:   # a spec missing its order's words or the earlier findings: a note, never a refusal
+                    notes.extend(ctxblock.spec_notes(p, new_id))
+                except Exception as e:
+                    log(p, f"task_add #{new_id}: context check failed: {type(e).__name__}: {e}")
                 if followup:
                     notes.append(f"task_add: #{followup['id']} is done; added #{new_id} as its follow-up")
                 if pub:

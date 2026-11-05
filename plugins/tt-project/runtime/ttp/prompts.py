@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 
 from . import budget as bud
-from . import chaincap, conflictfix, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
+from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
 from . import preempt
 from .db import continues_id, load_result
 from .hook import unread_update
@@ -915,9 +915,18 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         replymsg.prompt_block(dict(task)),
         settled.prompt_block(p, dict(task)),
         taskfacts.prompt_block(p, dict(task)),
-        overlap.prompt_block(p, dict(task)),
-        restrictions_pointer(p)]
+        overlap.prompt_block(p, dict(task))]
+    parts.append(ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p)))
+    parts.append(restrictions_pointer(p))
     return "\n\n".join(x for x in parts if x.strip())
+
+
+def _system_memory(p: Project) -> set[str]:
+    """The memory entries worker_system shows (the context block leaves them out)."""
+    try:
+        return {e["name"] for e in worker_context(p, reserve=WORKER_RANKED_MIN_CHARS)[1]}
+    except Exception:
+        return set()
 
 
 def conflict_fix_task(p: Project, task: dict, cwd: str, branch: str | None, cf: dict) -> str:

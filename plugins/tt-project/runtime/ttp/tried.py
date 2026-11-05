@@ -291,14 +291,19 @@ def same_day(entry: dict, where=None, now: float | None = None) -> bool:
         datetime.fromtimestamp(time.time() if now is None else now, tz).date()
 
 
-def match(db, title: str, spec: str, where=None, skip=None, now: float | None = None) -> dict | None:
-    """The ledger entry new work repeats: today's settled results first, then the newest. `skip` is
-    the task the new one continues (or a set of ids: its lineage)."""
+def matches(db, title: str, spec: str, where=None, skip=None, now: float | None = None) -> list[dict]:
+    """Every ledger entry new work (title, spec) repeats, newest first, leaving out `skip` (see match)."""
     ledger = entries(db, where, now)
     usual = common(ledger)
     skips = {str(x) for x in skip} if isinstance(skip, (set, list, tuple)) else {str(skip)}
-    hits = [e for e in ledger if str(e["id"]) not in skips
+    return [e for e in ledger if str(e["id"]) not in skips
             and similar(title, spec or "", e["title"], e["spec"], usual)]
+
+
+def match(db, title: str, spec: str, where=None, skip=None, now: float | None = None) -> dict | None:
+    """The ledger entry new work repeats: today's settled results first, then the newest. `skip` is
+    the task the new one continues (or a set of ids: its lineage)."""
+    hits = matches(db, title, spec, where, skip, now)
     if not hits:
         return None
     today = [e for e in hits if e["outcome"] in SETTLED and same_day(e, where, now)]

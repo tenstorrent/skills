@@ -37,6 +37,8 @@ the project could have saved. Model-free; the review grades it.
   of all Claude runs ended in the window;
 - the check pre-stage derived from frequent detached checks failures (checkprestage): its last list
   and the failures it caught before detaching (each a worker wake saved).
+- context gaps: what workers' hand-offs (`context_gaps`) said they needed and their spec and context
+  block (ctxblock) lacked, counted per task.
 
 An empty day is one line, NOTHING. `ttp audit` prints the same lines, or `report` as JSON. It reads
 only the project's own database and harness files."""
@@ -47,7 +49,7 @@ import time
 from typing import Any
 
 from . import budget, chaincap, checkprestage, coordmodel, correction, ends, obligations, plainreply, quietgate, relay, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
-from .db import DB, continues_id
+from .db import DB, continues_id, load_result
 from .project import Project
 
 WINDOW_S = 86400
@@ -224,6 +226,18 @@ def finished(db: DB, since: float) -> list[dict]:
     """Tasks that ended (done or failed) since `since`, most costly first."""
     return db.q("SELECT id, title, status, kind, tier, spent_usd FROM tasks WHERE status IN ('done','failed') "
                 "AND updated>=? ORDER BY spent_usd DESC", (since,))
+
+
+def context_gaps(db: DB, since: float) -> list[dict]:
+    """Hand-offs since `since` naming context_gaps (what a worker needed that its spec and context block
+    lacked), most gaps first: {id, title, gaps}."""
+    out = []
+    for t in db.q("SELECT id, title, result FROM tasks WHERE updated>=? AND result LIKE '%\"context_gaps\"%'", (since,)):
+        gaps = load_result(t["result"]).get("context_gaps")
+        gaps = [str(g).strip() for g in (gaps if isinstance(gaps, list) else [gaps]) if str(g or "").strip()]
+        if gaps:
+            out.append({"id": t["id"], "title": t["title"], "gaps": gaps})
+    return sorted(out, key=lambda r: -len(r["gaps"]))
 
 
 def no_change_code(db: DB, since: float) -> dict:
@@ -481,6 +495,10 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
                       if fixed else "") + (": " if cont else "") + ", ".join(
             f"#{t['id']} {_short(t['title'], 50)} continues #{t['of']} (${t['of_usd']:.2f} + ${t['usd']:.2f})"
             for t in cont[:TOP]) + _more(cont))
+    if gaps := context_gaps(db, since):
+        out.append(f"context gaps (what workers needed and their spec lacked): {sum(len(g['gaps']) for g in gaps)} "
+                   f"in {len(gaps)} tasks: " + "; ".join(f"#{g['id']}: {_short(g['gaps'][0], 80)}" for g in gaps[:TOP])
+                   + _more(gaps))
     if fixes := correction.audit_line(db, since):
         out.append(fixes)
     if promised := obligations.audit_line(db, since, now):
@@ -626,4 +644,5 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
-            "repeated_instructions": correction.repeat_summary(db, since), "mount_races": mount_races(db, since)}
+            "repeated_instructions": correction.repeat_summary(db, since), "mount_races": mount_races(db, since),
+            "context_gaps": context_gaps(db, since)}
