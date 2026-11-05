@@ -1910,6 +1910,9 @@ def set_due(p, oid: str, due, now: float | None = None) -> str:
     with p.db.tx():
         st = _load(p.db)
         o = _need(st, oid)
+        if _open(o) and not o.get("promise"):   # still owed: retrying the move cannot help, closing can
+            raise ValueError(f"{oid} is open but has no promise or due to move: close it with evidence "
+                             f"(receipt) or why (drop)")
         if not o.get("promise") or not _open(o):
             raise ValueError(f"{oid} is not an open order, promise or claim")
         o["promise"].update(due=at, timed=True, raised=None, set_at=now)

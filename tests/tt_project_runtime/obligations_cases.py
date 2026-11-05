@@ -499,3 +499,30 @@ def test_the_daily_audit_counts_user_orders_unstarted_past_30_minutes_over_7_day
     line = ob.order_audit_line(p.db, now)
     assert line == "user orders unstarted past 30 min: 2 of 3 in the last 7 days (1 of 2 in the 7 days before)", line
     assert line in "\n".join(audit.lines(p.db, now))
+
+
+def test_set_due_refusal_says_a_plain_open_obligation_is_open_and_how_to_close_it(env, monkeypatch):
+    """A due move on an open obligation with no promise names it open and the way to close it (evidence
+    or why); an unknown or closed key keeps the old message; an order's due still moves."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    plain = ob.add(p, "ship the report", [tid], by="coordinator", now=now)
+    with pytest.raises(ValueError) as e:
+        ob.set_due(p, plain, now + 3600, now=now)
+    msg = str(e.value)
+    assert f"{plain} is open" in msg and "evidence" in msg and "why" in msg
+    assert "not an open order" not in msg
+    with pytest.raises(ValueError, match="no obligation"):
+        ob.set_due(p, "o999", now + 3600, now=now)
+    ob.drop(p, plain, "recorded by mistake", by="coordinator", now=now)
+    with pytest.raises(ValueError, match="is not an open order, promise or claim"):
+        ob.set_due(p, plain, now + 3600, now=now)
+    oid = ob.add_order(p, "build it", mid, [tid], due=now + 7200, action_class="change", now=now).split()[1]
+    ob.record(p, oid, "receipt", "built: commit abc123", None)
+    with pytest.raises(ValueError, match="is not an open order, promise or claim"):
+        ob.set_due(p, oid, now + 3600, now=now)
+    mid2 = p.db.post("in", "please build another", chat="c1")
+    open_order = ob.add_order(p, "build another", mid2, [tid], due=now + 7200, action_class="change",
+                              now=now).split()[1]
+    assert ob.set_due(p, open_order, now + 9000, now=now).startswith(f"{open_order} now due")
+    assert ob.get(p.db, open_order)["promise"]["due"] == now + 9000
