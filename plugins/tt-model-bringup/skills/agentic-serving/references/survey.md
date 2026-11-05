@@ -22,6 +22,9 @@ Read these on the stage-11 benchmark and the smoke run, and again on every later
 | `cutoffs` | Share of tasks ending at the time limit or the output cap, split into still progressing and looping | Near 0 |
 | `eval_validity` | Network isolation, fetched fixes, infrastructure failures | Isolated, no fetches |
 | `accuracy_drift` | KL against HF on long agent prompts | At the noise floor |
+| `generation_share` | Per model call on the smoke: output tokens × served step ÷ call wall, and what fills the rest (tool commands, container round trips, prefill waits) | Known; it bounds what any serving change can save |
+| `prefill_under_load` | Prefilled tokens ÷ the agents' final context tokens, prefill tok/s at real context lengths, decode rate while a long prompt prefills | Prefilled close to the final contexts; decode not stalled |
+| `host_contention` | Engine host time per step against task-container CPU, from a host monitor during the smoke | Flat as task CPU rises |
 
 Record each as `{"value": ..., "healthy": true|false}`. A check you cannot measure yet records
 `not_measured` with the reason and the test that will measure it.
@@ -33,16 +36,19 @@ eval.
 
 | Key | Question | Formula |
 |---|---|---|
-| `batch` | Which batch? | Full evals: the largest validated batch; samples: the largest the test keeps busy |
-| `suite_hours` | Will each suite finish? | tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents |
+| `batch` | Which batch for N agents? | The validated batch with the least time per call: output tokens ÷ its per-user rate + time outside generation; usually the smallest at or above N |
+| `agents` | How many agents per server? | min(`max_num_seqs`, pool tokens ÷ working set per agent, host trial limit) |
+| `suite_hours` | Will each suite finish? | From the nearest suite-timing prior in harness facts: tasks ÷ agents × per-task wall, tail at the agent limit; after a rung, from its measured wall. The serving formula tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents is a cross-check, and covers only generation |
+| `cohort` | Which tasks, how many? | CI subset plus round-robin across strata; size = agents per server; 95% interval ±2·√(p(1−p)/n) |
 | `agent_timeout` | What agent time limit? | turns × turn time at the served speed, never below the release limit |
 | `output_cap` | What output cap? | Longest answer so far plus headroom, never below the release cap |
 | `bytes` | Where do the bytes go? | Per cache ID: block × KV bytes per token + state bytes; fill per layer group; duplicate weights |
-| `agents` | How many agents keep the prefix cache? | agents ≤ pool IDs ÷ (live blocks + state IDs per agent) |
+| `cache_agents` | How many agents keep the prefix cache? | agents ≤ pool IDs ÷ (live blocks + state IDs per agent) |
 | `block_cost` | What does the block size cost? | Recompute per returning turn ≈ block ÷ 2 |
 | `prefill_padding` | How much prefill is useful? | live rows ÷ batch rows |
 
-`suite_hours` is the first go or stop estimate. Update it after every effort.
+`suite_hours` is the first go or stop estimate. Update it after every rung and effort, and record
+the ratio of prediction to measurement.
 
 ## Shortfalls carried in
 
@@ -64,5 +70,12 @@ Most problems the checks raise are found and proven by a test of minutes, not a 
 | Long-prefix KL against HF | Divergence on real agent prompts, per precision | Precision that breaks tool calls |
 | Prefill vs batch shape | One live row at batch 1, 8 and the serving batch | Padded prefill |
 | Memory under stress | Allocator events and minimum free DRAM over a loaded run | Safe pool size |
-| Cache replay | Recorded traffic through the prefix cache, per layout and agent count | Agent count, block size, cache layout |
+| Agent replay | Recorded agent histories replayed at the target agent count with one output token per call (`scripts/agent_replay.py`): hit rate, prefilled ÷ final context tokens, time per call, preemptions | Pool too small for real contexts, agent count, block size, cache layout |
+| Host monitor | CPU per process and per container every 20 s beside the engine's step timers, during the smoke | Task containers starving the engine thread |
+
+The replay is the capacity test. Qwen's synthetic 32-agent test passed while real SWE histories
+collapsed the cache: replaying 8 recorded histories on the default pool finished 0 of 8 agents in
+45 minutes at 68.5% hits; on a pool sized to hold them, 8 of 8 in 37 minutes at 91.1% hits and no
+preemptions. Record histories from any earlier run, including the smoke, as one JSONL file per
+agent with one chat request per line.
 

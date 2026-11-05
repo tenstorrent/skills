@@ -20,10 +20,12 @@ EVIDENCE = Path("doc/agentic_serving.json")
 EVALS = Path("doc/agentic_evals")
 MIN_HIT_FRACTION = 0.9
 SURVEY_CHECKS = ("time_split", "busy_rows", "live_prefill_rows", "trace_captures", "served_step", "prefix_hits",
-                 "cache_pressure", "cache_bytes", "memory_headroom", "cutoffs", "eval_validity", "accuracy_drift")
-SURVEY_CALCULATIONS = ("batch", "suite_hours", "agent_timeout", "output_cap", "bytes", "agents", "block_cost",
-                       "prefill_padding")
-PREFLIGHT = ("release_values", "registry", "disk", "release_route", "isolation_smoke")
+                 "cache_pressure", "cache_bytes", "memory_headroom", "cutoffs", "eval_validity", "accuracy_drift",
+                 "generation_share", "prefill_under_load", "host_contention")
+SURVEY_CALCULATIONS = ("batch", "agents", "suite_hours", "cohort", "agent_timeout", "output_cap", "bytes",
+                       "cache_agents", "block_cost", "prefill_padding")
+PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route", "isolation_smoke")
+LEARNED = ("harness_facts", "suite_timings", "generic_fixes")
 EFFORT_STATUS = ("done", "running", "not_run")
 CHANGES = ("kept", "dropped", "none")
 PROBLEM_STATUS = ("solved", "open")
@@ -57,6 +59,8 @@ def check_memory(evidence: dict, problems: list) -> None:
             problems.append((2, "ledger.weights must list every weight family"))
         elif entry.get("copies", 1) > 1:
             shortfall(problems, entry.get("copy_reason"), f"weight family {entry['name']!r} is held more than once")
+    if ledger.get("pool_sizing") == "fixed":
+        shortfall(problems, ledger.get("pool_sizing_reason"), "KV pool is a fixed budget, not sized from free DRAM")
     pool, need = ledger.get("pool_tokens"), workload["target_concurrency"] * workload["working_set_tokens"]
     if not positive_int(pool):
         problems.append((2, "ledger.pool_tokens is missing"))
@@ -157,8 +161,15 @@ def check_rankings(rankings, problems: list) -> None:
                 and row["device_hours"] > 0 for row in order)):
             problems.append((2, f"ranking {index} needs order rows with saving_hours and device_hours"))
             continue
-        rates = [row["saving_hours"] / row["device_hours"] for row in order]
-        if any(a < b for a, b in zip(rates, rates[1:])) and not ranking.get("reason"):
+        if ranking.get("reason"):
+            continue
+        unblocks = [bool(row.get("unblocks")) for row in order]
+        if any(not a and b for a, b in zip(unblocks, unblocks[1:])):
+            problems.append((2, f"ranking {index} puts speed work above a validity problem (unblocks) and records no "
+                                "reason"))
+            continue
+        speed = [row["saving_hours"] / row["device_hours"] for row in order if not row.get("unblocks")]
+        if any(a < b for a, b in zip(speed, speed[1:])):
             problems.append((2, f"ranking {index} is not by saving per device hour and records no reason"))
 
 
@@ -197,13 +208,29 @@ def check_serving_config(evals: Path, problems: list) -> None:
             and isinstance(batches, dict) and batches):
         problems.append((2, "serving_config needs validated_batches and batch_by_eval"))
         return
+    seqs = config.get("max_num_seqs")
     for name, row in batches.items():
-        batch = (row or {}).get("batch")
-        if not positive_int(batch):
-            problems.append((2, f"batch_by_eval.{name} needs batch"))
-        elif batch < max(validated):
-            shortfall(problems, (row or {}).get("batch_reason"),
-                      f"{name} ran on batch {batch}; batch {max(validated)} is validated")
+        row = row or {}
+        batch, clients = row.get("batch"), row.get("planned_clients")
+        if not (positive_int(batch) and positive_int(clients)):
+            problems.append((2, f"batch_by_eval.{name} needs batch and planned_clients"))
+            continue
+        expected = min((b for b in validated if b >= clients), default=max(validated))
+        if batch != expected:
+            shortfall(problems, row.get("batch_reason"),
+                      f"{name} ran {clients} agents on batch {batch}; the rule picks batch {expected}")
+        if positive_int(seqs) and clients > seqs:
+            shortfall(problems, row.get("agents_reason"),
+                      f"{name} planned {clients} agents against max_num_seqs {seqs}; the rest queue")
+
+
+def check_cohorts(evals: Path, problems: list) -> None:
+    cohorts = read(evals / "cohorts.json", problems)
+    if not cohorts:
+        return
+    for name, row in cohorts.items():
+        if not (isinstance(row, dict) and row.get("rule") and row.get("tasks")):
+            problems.append((2, f"cohorts.json {name!r} needs the selection rule and its tasks"))
 
 
 def check_evals(model_dir: Path, carried: int, problems: list) -> None:
@@ -215,6 +242,10 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
     check_preflight(evals, problems)
     check_efforts(evals, problems)
     check_serving_config(evals, problems)
+    check_cohorts(evals, problems)
+    learned = read(evals / "learned.json", problems)
+    if learned and not all(isinstance(learned.get(key), list) for key in LEARNED):
+        problems.append((2, f"learned.json needs {', '.join(LEARNED)} as lists, empty when there is nothing"))
     decisions = read(evals / "estimate.json", problems).get("evals") or {}
     if not decisions:
         problems.append((2, "estimate.json has no per-eval decisions"))
@@ -222,7 +253,8 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
         if row.get("decision") not in ("go", "stop") or not row.get("reason"):
             problems.append((2, f"{name}: estimate needs decision go/stop and a reason"))
         elif row["decision"] == "stop":
-            problems.append((1, f"{name}: full suite not run: {row['reason']}"))
+            if not positive_int(row.get("functional_at")):
+                problems.append((1, f"{name}: stopped with no cohort completed: {row['reason']}"))
         elif not isinstance(read(evals / "full" / name / "results.json", problems).get("actual_hours"), (int, float)):
             problems.append((2, f"{name}: full results lack actual_hours"))
 

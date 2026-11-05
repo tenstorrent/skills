@@ -56,6 +56,9 @@ git ls-tree -r --long "$SHA" -- "models/autoports/$MODEL" | sort -k4 -n -r | hea
 
 The largest blobs should be source.
 
+tt-inference-server ignores `*.json`: force-add any new config file the server reads, and confirm
+from the server log on the first run that it loaded.
+
 ## Dispatch
 
 ```bash
@@ -68,7 +71,10 @@ gh workflow run "$WORKFLOW" -R "$REPO" \
 Use the granted workflow as it is, with its default setup and cleanup; do not fork, wrap or patch
 it. Other users share the runner pool: `max_parallel` is a ceiling, not machines waiting idle, so
 jobs may queue. Queueing is not a failure; never cancel a run only because it has no runner yet.
-Dispatch the first CI smoke early so the wait overlaps local work.
+Dispatch the first CI smoke in the first hour so the wait overlaps local work, and keep up to
+`max_parallel` runs in flight after it: one suite per runner, rung runs and effort samples side by
+side. Samples may run while the smoke is pending and count once it passes. Stage 12 on Qwen never
+had more than one CI run in flight, and every CI sample waited behind one smoke.
 When the stage stops for any reason, its dispatched CI runs keep running; collect their results on
 resume instead of cancelling them.
 
@@ -82,6 +88,7 @@ nothing. Use it as a planning bound — do not dispatch what the top of its esti
 suites on task boundaries so parts stay scorable, and give a multi-eval run per-eval timeouts
 summing under the cap.
 
-Infrastructure failures (runner offline, image pull, unrelated timeout) are re-dispatched, not
-scored. Crashes, loops and malformed output are measurements. This holds for the release run too, and
+Infrastructure failures (runner offline, image pull, full disk, unrelated timeout) are
+re-dispatched, not scored. A retry may land on the same runner, since jobs target the pool label;
+see [harness facts](harness-facts.md). Crashes, loops and malformed output are measurements. This holds for the release run too, and
 the release route is proven in the survey's preflight, not first used at the end.

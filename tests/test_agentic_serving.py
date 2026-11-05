@@ -64,9 +64,11 @@ def test_shortfall_is_critical_without_a_reason_and_advisory_with_one(tmp_path, 
 
 
 CHECKS = ('time_split', 'busy_rows', 'live_prefill_rows', 'trace_captures', 'served_step', 'prefix_hits',
-          'cache_pressure', 'cache_bytes', 'memory_headroom', 'cutoffs', 'eval_validity', 'accuracy_drift')
-CALCULATIONS = ('batch', 'suite_hours', 'agent_timeout', 'output_cap', 'bytes', 'agents', 'block_cost',
-                'prefill_padding')
+          'cache_pressure', 'cache_bytes', 'memory_headroom', 'cutoffs', 'eval_validity', 'accuracy_drift',
+          'generation_share', 'prefill_under_load', 'host_contention')
+CALCULATIONS = ('batch', 'agents', 'suite_hours', 'cohort', 'agent_timeout', 'output_cap', 'bytes', 'cache_agents',
+                'block_cost', 'prefill_padding')
+PREFLIGHT = ('release_values', 'registry', 'disk', 'admission', 'release_route', 'isolation_smoke')
 
 
 def goal12(model, **overrides):
@@ -80,7 +82,10 @@ def goal12(model, **overrides):
         'full/swe/results.json': {'actual_hours': 6.5},
         'survey.json': {'checks': {k: {'value': 1, 'healthy': True} for k in CHECKS},
                         'calculations': {k: 1 for k in CALCULATIONS}, 'shortfalls': []},
-        'preflight.json': {k: {'ok': True} for k in ('release_values', 'registry', 'disk', 'release_route', 'isolation_smoke')},
+        'preflight.json': {k: {'ok': True} for k in PREFLIGHT},
+        'cohorts.json': {'swe': {'rule': 'ci-nightly plus round-robin over repositories',
+                                 'tasks': ['astropy__astropy-14508', 'django__django-14034']}},
+        'learned.json': {'harness_facts': [], 'suite_timings': [], 'generic_fixes': []},
         'efforts.json': {
             'efforts': [
                 {'problem': 'padded prefill', 'owner': 'prefill', 'status': 'done',
@@ -100,8 +105,8 @@ def goal12(model, **overrides):
         'serving_config.json': {'agent_timeout_s': 6300, 'request_timeout_s': 3600, 'output_cap_tokens': 81920,
                                 'release_limits': {'agent_timeout_s': 6300, 'request_timeout_s': 3600,
                                                    'output_cap_tokens': 81920},
-                                'validated_batches': [1, 8, 16, 32],
-                                'batch_by_eval': {'swe': {'batch': 32}}},
+                                'validated_batches': [1, 8, 16, 32], 'max_num_seqs': 32,
+                                'batch_by_eval': {'swe': {'batch': 32, 'planned_clients': 29}}},
     }
     files.update(overrides)
     for name, body in files.items():
@@ -126,7 +131,7 @@ def test_complete_goal12_evidence_passes(tmp_path):
     assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
 
 
-@pytest.mark.parametrize('name', ['survey.json', 'preflight.json', 'efforts.json'])
+@pytest.mark.parametrize('name', ['survey.json', 'preflight.json', 'efforts.json', 'cohorts.json', 'learned.json'])
 def test_goal12_requires_survey_preflight_and_efforts(tmp_path, name):
     goal12(tmp_path, **{name: None})
     assert check(tmp_path, 'agentic-evals', evidence())[0] == 2
@@ -230,7 +235,9 @@ def test_reordered_ranking_needs_a_reason(tmp_path):
 @pytest.mark.parametrize('mutate, message', [
     (lambda c: c.update(agent_timeout_s=900), 'agent_timeout_s 900 is below'),
     (lambda c: c.update(output_cap_tokens=16384), 'output_cap_tokens 16384 is below'),
-    (lambda c: c['batch_by_eval']['swe'].update(batch=8), 'batch 32 is validated'),
+    (lambda c: c['batch_by_eval']['swe'].update(batch=8), 'the rule picks batch 32'),
+    (lambda c: c['batch_by_eval']['swe'].update(planned_clients=8), 'the rule picks batch 8'),
+    (lambda c: c.update(max_num_seqs=8), 'against max_num_seqs 8'),
 ])
 def test_release_limits_and_batch_choice(tmp_path, mutate, message):
     files = goal12(tmp_path)
@@ -240,6 +247,7 @@ def test_release_limits_and_batch_choice(tmp_path, mutate, message):
     code, stderr = check(tmp_path, 'agentic-evals', evidence())
     assert code == 2 and message in stderr
     config['limits_reason'] = config['batch_by_eval']['swe']['batch_reason'] = 'measured: recorded cause'
+    config['batch_by_eval']['swe']['agents_reason'] = 'measured: recorded cause'
     goal12(tmp_path, **{'serving_config.json': config})
     assert check(tmp_path, 'agentic-evals', evidence())[0] == 1
 
@@ -254,3 +262,108 @@ def test_benchmark_server_records_prefix_caching_instead_of_rejecting_it():
     del server['prefix_caching']
     with pytest.raises(ValueError, match='record whether prefix caching'):
         validate_server(server, 32, 'org/model', 'http://unused')
+
+
+def test_stop_with_a_banked_cohort_passes_and_without_one_is_advisory(tmp_path):
+    estimate = {'evals': {'swe': {'decision': 'go', 'reason': 'fits'},
+                          'terminal': {'decision': 'stop', 'reason': 'rung 2 does not fit', 'functional_at': 32}}}
+    goal12(tmp_path, **{'estimate.json': estimate})
+    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
+    del estimate['evals']['terminal']['functional_at']
+    goal12(tmp_path, **{'estimate.json': estimate})
+    code, stderr = check(tmp_path, 'agentic-evals', evidence())
+    assert code == 1 and 'no cohort completed' in stderr
+
+
+def test_cohort_needs_a_rule(tmp_path):
+    goal12(tmp_path, **{'cohorts.json': {'swe': {'tasks': ['a']}}})
+    code, stderr = check(tmp_path, 'agentic-evals', evidence())
+    assert code == 2 and 'selection rule' in stderr
+
+
+def test_learned_needs_its_lists(tmp_path):
+    goal12(tmp_path, **{'learned.json': {'harness_facts': []}})
+    code, stderr = check(tmp_path, 'agentic-evals', evidence())
+    assert code == 2 and 'suite_timings' in stderr
+
+
+def validity_ranking(ledger, unblocks_first):
+    order = [{'problem': 'padded prefill', 'saving_hours': 4.5, 'device_hours': 2},
+             {'problem': 'terminal verifier offline', 'saving_hours': 0, 'device_hours': 3, 'unblocks': 'terminal'}]
+    ledger['rankings'][0]['order'] = order[::-1] if unblocks_first else order
+
+
+def test_validity_problem_ranks_above_speed_without_a_reason(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: validity_ranking(e, True))
+    assert code == 0, stderr
+
+
+def test_speed_above_a_validity_problem_needs_a_reason(tmp_path):
+    code, stderr = efforts_with(tmp_path, lambda e: validity_ranking(e, False))
+    assert code == 2 and 'validity problem' in stderr
+
+
+def test_fixed_pool_budget_is_a_shortfall(tmp_path):
+    data = evidence()
+    data['ledger']['pool_sizing'] = 'fixed'
+    assert check(tmp_path, 'full-model', data)[0] == 2
+    data['ledger']['pool_sizing_reason'] = 'measured: adapter API has no free-DRAM query'
+    assert check(tmp_path, 'full-model', data)[0] == 1
+
+
+REPLAY = PLUGIN / 'scripts/agent_replay.py'
+
+
+def test_agent_replay_reports_hits_and_prefill_amplification(tmp_path):
+    """A fake server caches each conversation's previous prompt; the replay must recover that."""
+    import http.server
+    import threading
+
+    seen = {}
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            body = b'vllm:num_preemptions_total{engine="0"} 3\n'
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_POST(self):
+            request = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
+            assert request['max_tokens'] == 1
+            key = request['messages'][0]['content']
+            prompt = sum(len(m['content']) for m in request['messages'])
+            cached = seen.get(key, 0)
+            seen[key] = prompt
+            body = json.dumps({'usage': {'prompt_tokens': prompt, 'prompt_tokens_details': {'cached_tokens': cached}}})
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(body.encode())
+
+    server = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    histories = tmp_path / 'histories'
+    histories.mkdir()
+    for agent in ('a', 'b'):
+        lines = []
+        messages = [{'role': 'system', 'content': agent * 100}]
+        for turn in range(3):
+            messages = messages + [{'role': 'user', 'content': 'x' * 10}]
+            lines.append(json.dumps({'model': 'm', 'messages': messages, 'max_tokens': 4096}))
+        (histories / f'{agent}.jsonl').write_text('\n'.join(lines))
+    out = tmp_path / 'replay.json'
+    result = subprocess.run([sys.executable, str(REPLAY), '--base-url', f'http://127.0.0.1:{server.server_port}/v1',
+                             '--histories', str(histories), '--agents', '2', '--out', str(out)],
+                            text=True, capture_output=True)
+    server.shutdown()
+    assert result.returncode == 0, result.stderr
+    summary = json.loads(out.read_text())
+    assert summary['calls_done'] == 6 and summary['histories_finished'] == 2 and summary['errors'] == 0
+    # per agent prompts 110, 120, 130 with cached 0, 110, 120
+    assert summary['prompt_tokens'] == 720 and summary['cached_tokens'] == 460
+    assert summary['prefilled_tokens'] == 260 and summary['final_context_tokens'] == 260
+    assert summary['prefilled_per_final_context'] == 1.0
+    assert summary['preemptions'] == 0

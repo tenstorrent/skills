@@ -42,6 +42,13 @@ measured `copy_reason`), reserves against their measured peak use, KV bytes per 
 `pool_tokens`. The pool should hold `target_concurrency × working_set_tokens`; otherwise record a
 `pool_shortfall_reason`. Reconcile the ledger with allocator readings and explain any gap.
 
+Size the pool from free DRAM measured after weights, reserves and trace region, and record
+`pool_sizing: measured`. A fixed token budget is `pool_sizing: fixed` and needs a
+`pool_sizing_reason`: Qwen's adapter sized B8 for one 262k context and left about 18 GB per device
+unused. For hybrid models record bytes per cache ID by group, allocated against used: an ID that
+gets a page in every group but lives in one wastes the rest (Qwen: 74.1 MB allocated per ID, 35.7
+or 12.8 MB used).
+
 ## Serving invariants
 
 Check these on replayed or synthetic multi-turn traffic at the target concurrency, not only on
@@ -67,21 +74,33 @@ memory and cache fill. Then ask where time goes, what sits idle, what work repea
 differs from the middle. Name a mechanism, predict the effect of a change, and check it on the next
 run.
 
+For an agentic run, split each model call's wall time into generation (output tokens × served
+step), prefill and waiting for it, and everything outside the server: tool commands, container
+round trips, scheduling. Most of it is often outside: on Gemma SWE, generation was 42% of agent
+time at batch 32 and 19% at batch 8. Under real agent load also read: prefilled tokens against the
+agents' final context tokens (Qwen SWE prefilled 24× the final contexts once the pool evicted
+histories), decode rate while long prompts prefill, and the engine's host time per step against
+task-container CPU (busy tasks on shared cores starved Gemma's engine thread to 170 steps a
+minute).
+
 ## Goal 12: agentic evals
 
 Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the target checkout:
 
-- evals: default `r1_gpqa_diamond`, `swe_bench_verified` and `terminal_bench_2_1`; the default
-  subset is 10 tasks each;
+- evals: default `r1_gpqa_diamond`, `swe_bench_verified` and `terminal_bench_2_1`, scored on
+  cohorts chosen as [Cohorts](#cohorts) says;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
 - `release_spec`, optional: where the release values come from. Without it, find the release
   configuration for each eval yourself, in the release workflow and the serving harness;
 - `stage_budget_hours` (default 24), `effort_budget_hours` (default 16) and `suite_budget_hours`
-  (default 8). The stage budget covers survey to release dispatch; each release suite then runs
-  to completion within `suite_budget_hours`;
+  (default 8). The stage budget covers survey to release dispatch. Rung runs draw on the suite
+  budget, not the effort budget; each release suite runs to completion within `suite_budget_hours`;
+- `permissions`: standing decisions the stage would otherwise stop to ask for, such as
+  `release_route_repairs` (may the stage publish fixes to the release route) and
+  `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
 - reference scores;
-- the eval harness: default the tt-inference-server agentic runner;
+- the eval harness: default the tt-inference-server agentic runner on its main branch;
 - `compute`.
 
 `compute` is the hardware the operator grants, on top of the local device, which stays available
@@ -96,6 +115,21 @@ a CI repository, which needs the implementation pushed where the runners can fet
 loop. Either way, record the grant you actually used in `doc/agentic_evals/compute.json` so a
 reader can tell a thin result from a small grant.
 
+Read [harness facts](references/harness-facts.md) before the survey. It holds what earlier runs
+measured about the route, the hosts and suite durations. Check its values against this run and
+record any that differ in `learned.json`; do not spend an effort re-deriving one.
+
+### Harness
+
+Run the harness and the release route as they are on main. Do not write a stage-owned sandbox,
+wrapper, task selector or network policy. On Gemma the stage's own isolation policy turned every
+Terminal-Bench package into a pinning problem, took 4 device-hours and scored nothing; the stock
+route then scored 12 of 32 with no model change. Validity comes from the trajectory audit: a task
+whose trajectory fetched its fix or reached the network is quarantined, not scored.
+
+A real harness defect is fixed on a generic branch named for the defect, not the model, and listed
+in `learned.json` so the next model finds it.
+
 ### Eval settings
 
 Find the release values for the time limits and output cap before the first run, and record their
@@ -107,40 +141,101 @@ source and values in the preflight.
   output cap or time limit; it counts as a failure, and raising the limit does not fix it. Loops
   are a problem of their own: record them and rank finding their cause as an effort. Never go below
   the release values, and report the limits each score used.
-- Batch: run the full evals on the largest validated batch, with enough agents to fill it, unless a
-  recorded reason says otherwise. Samples and tests use the largest batch that works and suits the
-  test. Record the batch each eval used.
+- Task CPU and memory come from each task's definition. Never override them with a blanket value.
 
-Record the limits and batches used in `serving_config.json`, with the release values as `release_limits`.
+Record the limits in `serving_config.json`, with the release values as `release_limits`.
+
+### Batch and agents
+
+Record `planned_clients` for every run before it starts: how many agents it runs at once.
+
+- **Agents** never exceed `max_num_seqs`, the agents the pool holds (pool tokens ÷ working set per
+  agent, measured by the replay), or the host's trial limit in harness facts. Extra agents queue
+  and slow every agent: 10 agents on `max_num_seqs` 8 kept 2 always waiting, and 29 SWE agents on
+  a pool that held 8 histories made one model call each per 35 minutes.
+- **Batch**: serve each run on the validated batch that finishes its agents soonest. Per model
+  call, time is output tokens ÷ that batch's measured per-user rate plus the call's time outside
+  generation, which the smoke measures. A batch above the agents pays its full step for empty rows;
+  one below makes agents queue. That is usually the smallest validated batch at or above
+  `planned_clients`; the gate expects it unless `batch_reason` says otherwise.
+- Predict with the measured generation share, not the rate ratio alone. Gemma's per-user rates
+  promised 3.3× for SWE at batch 8 against 32; wall time fell 8% because generation was under half
+  of agent time. Batch 8 still scored 17 of 32 against 15 with no timeout kills.
+- The adapter serves one batch per server. A run on another batch needs its own server: restart
+  for it rather than serve a small run on the largest batch.
+
+Record the batch and `planned_clients` of each run in `serving_config.json`.
+
+### Cohorts
+
+A cohort is the task set a rung scores. Choose it by rule before any score is seen, and record the
+rule and the task names in `cohorts.json`.
+
+- **Representative.** Start from the harness's own CI subset for the eval (main's `ci-nightly`
+  list), then fill round-robin across the eval's strata (repositories for SWE-bench, categories
+  for Terminal-Bench) so every stratum appears. Never take a prefix of a sorted list:
+  `sorted(all500)[:32]` is 22 astropy and 10 django, two repositories of twelve.
+- **Sized by the server, read with its error.** The first full cohort has as many tasks as the
+  server holds agents. Report every score with its 95% interval, about ±2·√(p(1−p)/n): ±17 points
+  at 32 tasks, ±44 at 5. Separating the model from a reference by d needs about 4·p(1−p)/d² tasks;
+  say when a cohort cannot.
+- **Aggregates, not single tasks.** The same task's duration moved 0.08× to 15× between two runs.
+  Conclude from score, suite wall and total agent time, or from repeated attempts; never rank work
+  from one run's per-task times.
+- **Shape follows the claim.** Concurrency needs enough simultaneous conversations to load the pool
+  and scheduler, precision and long context need long free-running replies, caching needs repeated
+  multi-turn traffic. Real trajectories through the replay test show capacity; short synthetic
+  32-agent tests did not.
 
 ### Stage order
 
-1. **Survey, about 2 h.** Answer every check and calculation in [the survey](references/survey.md)
-   on the stage-11 data and one smoke run at release limits, and run the preflight: release values,
-   registry, disk, the release route the final run will use, and an isolated 2-task smoke with a
-   trajectory audit. Write `survey.json` and `preflight.json`.
-2. **Rank, about 0.5 h.** Turn each problem the survey found into an effort in `efforts.json`, as
-   [Ranking](#ranking) describes. Write the first go or stop estimate per eval to `estimate.json`.
-3. **Efforts, `effort_budget_hours`, hard stop.** Run efforts in parallel, each owned by one
-   sub-agent, as [Efforts](#efforts) describes.
-4. **Combine, about 2 h.** Re-check the current best, then one scored probe at release limits.
-5. **Release.** Run the suites with a go estimate through the same workflow every earlier run used,
+Each rung banks a result and the next is optional, so the stage always ends holding a working
+version. Dispatch on CI from the first hour, in parallel up to `max_parallel`.
+
+1. **Survey and preflight, about 2 h.** Answer every check and calculation in
+   [the survey](references/survey.md) on the stage-11 data and one smoke run at release limits.
+   The preflight proves the release values and their source, the registry, disk and admission
+   (cohort × declared task storage plus the admission reserve against free disk; concurrent trials
+   against the host limit), the release route, and an isolated 2-task smoke with a trajectory
+   audit. Write `survey.json` and `preflight.json`, rank the problems found as
+   [Ranking](#ranking) says, and write the first go or stop estimate per eval to `estimate.json`.
+2. **Rung 0: two tasks per suite** on the stock harness and route, served on the batch the rule
+   picks for two agents. Each suite must produce a valid scored trajectory. A suite that cannot
+   becomes the first problem in the ranking.
+3. **Rung 1: one full cohort per suite**, dispatched as soon as rung 0 passes for that suite. This
+   is the stage's first deliverable: record `functional_at` and the measured suite hours, and
+   replace the suite-time prior with them.
+4. **Efforts, `effort_budget_hours`, hard stop**, ranked against the banked rung. They may start
+   once rung 0 is banked and run while rung 1 is on CI; a rung never waits for an effort.
+5. **Combine, about 2 h.** Re-check the current best, then one scored probe.
+6. **Rung 2 and release.** Larger cohorts, then the full suites, when the projection from the last
+   measured rung fits the budget left. Run them through the same workflow every earlier run used,
    split on task boundaries so each dispatch finishes inside the grant's per-run timeout. An
    infrastructure failure is re-dispatched; the release coordinator must allow that.
 
-A measured stop is a valid result at any step. Report it with the estimate that decided it.
+A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
+that decided it.
 
 ### Ranking
 
-For each problem, estimate the suite hours it saves per eval and the device hours it needs, local
-and CI; agent time is not counted. When a number cannot be calculated, guess and mark it. Name how
-the effort will confirm success without the full suites, and the value that counts.
+Rank in two tiers.
 
-Order by suite hours saved, summed over the evals, per device hour, then adjust where judgement says
-otherwise and record why. Rank every problem, even past the budget; problems found later, by
-efforts, samples or the coordinator's own look at the run, join the ranking the same way. Re-rank
-after each effort from the checks and calculations the change touched; the full suites run only at
-release.
+1. **Validity first.** A problem that keeps a suite from producing a valid or representative score
+   records `unblocks: <eval>` and ranks above every speed problem, cheapest first. Saving per
+   device hour cannot express it: on Gemma the Terminal-Bench repair chain (3.25 device-hours)
+   ranked 18th to 20th, below a predicted 2-second saving, and it was the difference between no
+   score and 37.5%.
+2. **Then speed**, by suite hours saved, summed over the evals, per device hour. Price savings at
+   the suite sizes the release runs, not at sample size: priced on 10-task subsets, a 2× speed-up
+   looked like 0.4 h and ranked below harness checks. Agents per server is always a candidate:
+   price 8, 16 and 32 agents against the pool and the measured call times.
+
+For each problem estimate the device hours it needs, local and CI; agent time is not counted. When
+a number cannot be calculated, guess and mark it. Name how the effort will confirm success without
+the full suites, and the value that counts. Adjust where judgement says otherwise and record why.
+Rank every problem, even past the budget; problems found later, by efforts, rungs or the
+coordinator's own look at the run, join the ranking the same way. Re-rank after each effort and
+each rung from the checks and calculations it touched.
 
 ### Efforts
 
@@ -151,8 +246,10 @@ the runs it chooses; it is not a target. Stop once the question is settled. At t
 records what it learned and re-estimates the device hours left and the saving; the coordinator
 decides against the current ranking whether it continues.
 
-- **Fastest test first.** Prefer a short test to a scored sample; size samples as
-  [Sizing a sample](#sizing-a-sample) says.
+- **Fastest test first.** Prefer a short test to a scored sample. The replay test
+  (`scripts/agent_replay.py`) answers capacity and caching questions in minutes. Estimate a
+  sample's CI time before dispatching and size it to what it has to separate; one run may test
+  several changes when its results separate what each contributed.
 - **Accepting a change.** A paired exactness check plus the confirmation accepts an exact change. A
   change that alters outputs needs a scored pair against the current best.
 - **Change and problem are separate.** A real gain that misses its target is kept; the problem
@@ -160,11 +257,17 @@ decides against the current ranking whether it continues.
 - **Merge as you go.** Later efforts build on the current best. An effort that started from an
   older best confirms again after rebasing.
 - **Re-ranks do not interrupt running efforts**, unless a merge already solved their problem.
+- **Evidence is written once**, by the effort, when it ends. No sub-agent maintains or audits the
+  evidence while the stage runs; one closure review at the end, boxed at 1 h. On Gemma 2,468 of
+  5,297 shell commands touched the evidence files, and the two longest-lived agents did no
+  evaluation.
 
 The coordinator holds the current best, the slot ledger and the budget, chooses which efforts run
 together, and reads wide where efforts read deep, as [Look at the whole run](#look-at-the-whole-run)
-asks. Every dispatched run registers with it at launch. At each effort boundary it re-reads
-`inputs.json` and logs what it applied to `steering.log`. When blocked, it writes the reason to
+asks. Every dispatched run registers with it at launch. Charge an effort for the device jobs it
+ran, by the slots they occupied; a server that stays up between jobs is not effort time. At each
+effort boundary the coordinator re-reads `inputs.json` and `steering.md` (operator prose, if
+present) and logs what it applied to `steering.log`. When blocked, it writes the reason to
 `blocked.json` at once.
 
 ### Sharing the local device
@@ -174,40 +277,37 @@ which runs one job at a time as [tt-device-usage](../tt-device-usage/SKILL.md) r
 each job's owner, start, end and exit status. Keep local jobs short and send long runs to CI. After
 a hang or crash, reset and check the device before the next job.
 
-### Sizing a sample
-
-Estimate a sample's CI time before dispatching, and size it to what it has to separate. Too small
-to beat the noise decides nothing; a full suite to settle what a sample answers costs more.
-
-Grow test size step by step before the full suites, so that each problem a full run could hit shows
-on the smallest set that reveals it. One run may test several changes when its results separate
-what each contributed.
-
-Shape follows the claim: concurrency needs enough simultaneous conversations to load the pool and
-scheduler, precision and long context need long free-running replies, caching needs repeated
-multi-turn traffic. A count valid for one is meaningless for another.
+### Outputs
 
 Write these to `doc/agentic_evals/`:
 
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
-- `preflight.json`: `release_values` (with their source), `registry`, `disk`, `release_route`
-  and `isolation_smoke`, each with `ok`
+- `preflight.json`: `release_values` (with their source), `registry`, `disk`, `admission`,
+  `release_route` and `isolation_smoke`, each with `ok`
+- `cohorts.json`: per eval `rule` and `tasks` for each rung
 - `efforts.json`: `efforts`, each with `problem`, `owner`, `goal`, `plan`, `predicted`
   (`saving_hours` per eval, `device_hours`, `basis`: `measured`, `calculated` or `guess`),
-  `confirm` (`method`, `success`), `box_hours`, `re_estimate` once past the box, `status`
-  (`done`, `running`, or `not_run` with a `reason`), and when done `used_device_hours`, `change`
-  (`kept`, `dropped`, `none`),
-  `problem_status` (`solved`, `open`), `confirmed` and `evidence`; and `rankings`, each with
-  `after`, `order` (`problem`, `saving_hours`, `device_hours`) and a `reason` when it departs from
-  saving per device hour
+  `unblocks` for a validity problem, `confirm` (`method`, `success`), `box_hours`, `re_estimate`
+  once past the box, `status` (`done`, `running`, or `not_run` with a `reason`), and when done
+  `used_device_hours`, `change` (`kept`, `dropped`, `none`), `problem_status` (`solved`, `open`),
+  `confirmed` and `evidence`; and `rankings`, each with `after`, `order` (`problem`,
+  `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
 - `plan.json`
 - `runs/<arm>/` (manifest and collected results)
-- `estimate.json`: per eval `decision` (`go` or `stop`) and `reason`
+- `estimate.json`: per eval `decision` (`go` or `stop`), `reason` and `functional_at`, the largest
+  cohort that completed with valid scores
 - `full/<eval>/results.json` with `actual_hours` next to the prediction
-- `serving_config.json`: the measured `max_concurrency`, `prefix_caching`, `max_num_seqs`, the batch
-  each eval used, the agent and request time limits and output cap, and `release_limits`
+- `serving_config.json`: the measured `max_concurrency`, `prefix_caching`, `max_num_seqs`,
+  `validated_batches`, per run in `batch_by_eval` its `batch` and `planned_clients`, the agent and
+  request time limits and output cap, and `release_limits`
 - `compute.json`: the grant as used — `max_parallel`, peak runs in flight, and for a CI grant the
   published refs and every dispatched run id, so each result traces back to a run
-- `REPORT.md`, with each effort's predictions next to its results
+- `learned.json`: what the next model's stage 12 should not rediscover. `harness_facts`, each with
+  `fact`, `value`, `source` and whether it matched harness facts; `suite_timings`, per run `eval`,
+  `tasks`, `agents`, `batch`, `wall_hours`, `agent_hours`, `timeouts` and `score`; and
+  `generic_fixes`, each a branch and SHA with what it fixes. The skill's harness facts are updated
+  from it between versions.
+- `REPORT.md`, leading with `functional_at` and the score and interval per suite, then each
+  effort's predictions next to its results
 
 Update `workload` with the measured values.
