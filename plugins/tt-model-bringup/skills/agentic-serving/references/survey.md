@@ -73,9 +73,7 @@ Most problems the checks raise are found and proven by a test of minutes, not a 
 | Agent replay | Recorded agent histories replayed at the target agent count with one output token per call (`scripts/agent_replay.py`): hit rate, prefilled ÷ final context tokens, time per call, preemptions | Pool too small for real contexts, agent count, block size, cache layout |
 | Host monitor | CPU per process and per container every 20 s beside the engine's step timers, during the smoke | Task containers starving the engine thread |
 
-The replay is the capacity test. Qwen's synthetic 32-agent test passed while real SWE histories
-collapsed the cache: replaying 8 recorded histories on the default pool finished 0 of 8 agents in
-45 minutes at 68.5% hits; on a pool sized to hold them, 8 of 8 in 37 minutes at 91.1% hits and no
-preemptions. Record histories from any earlier run, including the smoke, as one JSONL file per
-agent with one chat request per line.
+The replay is the capacity test: synthetic multi-agent tests can pass while real histories
+overflow the pool. Record histories from any earlier run, including the smoke, as one JSONL file
+per agent with one chat request per line.
 

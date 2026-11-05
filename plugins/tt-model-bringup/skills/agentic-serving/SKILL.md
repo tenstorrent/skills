@@ -44,10 +44,8 @@ measured `copy_reason`), reserves against their measured peak use, KV bytes per 
 
 Size the pool from free DRAM measured after weights, reserves and trace region, and record
 `pool_sizing: measured`. A fixed token budget is `pool_sizing: fixed` and needs a
-`pool_sizing_reason`: Qwen's adapter sized B8 for one 262k context and left about 18 GB per device
-unused. For hybrid models record bytes per cache ID by group, allocated against used: an ID that
-gets a page in every group but lives in one wastes the rest (Qwen: 74.1 MB allocated per ID, 35.7
-or 12.8 MB used).
+`pool_sizing_reason`. For hybrid models record bytes per cache ID by group, allocated against used:
+an ID that gets a page in every group but lives in one wastes the rest.
 
 ## Serving invariants
 
@@ -74,14 +72,10 @@ memory and cache fill. Then ask where time goes, what sits idle, what work repea
 differs from the middle. Name a mechanism, predict the effect of a change, and check it on the next
 run.
 
-For an agentic run, split each model call's wall time into generation (output tokens × served
-step), prefill and waiting for it, and everything outside the server: tool commands, container
-round trips, scheduling. Most of it is often outside: on Gemma SWE, generation was 42% of agent
-time at batch 32 and 19% at batch 8. Under real agent load also read: prefilled tokens against the
-agents' final context tokens (Qwen SWE prefilled 24× the final contexts once the pool evicted
-histories), decode rate while long prompts prefill, and the engine's host time per step against
-task-container CPU (busy tasks on shared cores starved Gemma's engine thread to 170 steps a
-minute).
+For an agentic run, split each model call's wall time into generation, prefill and waiting for it,
+and everything outside the server: tool commands, container round trips, scheduling. Under real
+agent load also read prefilled tokens against the agents' final context tokens, decode rate while
+long prompts prefill, and the engine's host time per step against task-container CPU.
 
 ## Goal 12: agentic evals
 
@@ -127,9 +121,7 @@ record any that differ in `learned.json`; do not spend an effort re-deriving one
 ### Harness
 
 Run the harness and the release route as they are on main. Do not write a stage-owned sandbox,
-wrapper, task selector or network policy. On Gemma the stage's own isolation policy turned every
-Terminal-Bench package into a pinning problem, took 4 device-hours and scored nothing; the stock
-route then scored 12 of 32 with no model change. Validity comes from the trajectory audit: a task
+wrapper, task selector or network policy. Validity comes from the trajectory audit: a task
 whose trajectory fetched its fix or reached the network is quarantined, not scored.
 
 A real harness defect is fixed on a generic branch named for the defect, not the model, and listed
@@ -137,21 +129,9 @@ in `learned.json` so the next model finds it.
 
 ### Models new to the harness
 
-The stage must work for a model tt-inference-server does not know yet. When the model has no entry,
-the stage adds what serving and scoring it needs, as one commit on the harness branch the compute
-grant publishes, and runs the preflight smoke from that commit. Read the current harness for where
-each part lives; on the runs so far it was:
-
-- the implementation spec (`workflows/model_spec.py`) and the device entry
-  (`workflows/model_specs/*/llm.yaml`) with the serving values the stage chose: `max_num_seqs`,
-  block sizes and count, prefill threshold, prefix caching, model overrides;
-- the eval entries (`reference_config/evals/eval_config.py`): the nightly task list per eval from
-  [Task lists](#task-lists), limits at the release values, and concurrent trials from
-  [Batch and agents](#batch-and-agents);
-- the reference score per eval, or none;
-- any new config file force-added, since the harness ignores `*.json`.
-
-Change only these entries. This commit is the release spec that `serving_config.json` describes.
+When tt-inference-server has no entry for the model, add one before the preflight: the model and
+its serving settings, and per eval its nightly task list, limits and reference. Find where each
+lives in the current harness. This entry is the release spec that `serving_config.json` describes.
 
 ### Eval settings
 
@@ -174,16 +154,14 @@ Record `planned_clients` for every run before it starts: how many agents it runs
 
 - **Agents** never exceed `max_num_seqs`, the agents the pool holds (pool tokens ÷ working set per
   agent, measured by the replay), or the host's trial limit in harness facts. Extra agents queue
-  and slow every agent: 10 agents on `max_num_seqs` 8 kept 2 always waiting, and 29 SWE agents on
-  a pool that held 8 histories made one model call each per 35 minutes.
+  and slow every agent.
 - **Batch**: serve each run on the validated batch that finishes its agents soonest. Per model
   call, time is output tokens ÷ that batch's measured per-user rate plus the call's time outside
   generation, which the smoke measures. A batch above the agents pays its full step for empty rows;
   one below makes agents queue. That is usually the smallest validated batch at or above
   `planned_clients`; the gate expects it unless `batch_reason` says otherwise.
-- Predict with the measured generation share, not the rate ratio alone. Gemma's per-user rates
-  promised 3.3× for SWE at batch 8 against 32; wall time fell 8% because generation was under half
-  of agent time. Batch 8 still scored 17 of 32 against 15 with no timeout kills.
+- Predict with the measured share of agent time spent generating, not the rate ratio alone: when
+  most of an agent's time is tool work, a faster batch saves little.
 - Choose only among the batches the model supports: `validated_batches` from stage 10. When a
   validated batch has no measured per-user rate, measure it with a short serving run before
   choosing it, or choose among the measured ones and say so.
@@ -203,12 +181,9 @@ Where a list comes from, first match wins, per eval and rung:
 2. the model's own lists in tt-inference-server, for the nightly rung (its `ci-nightly` list);
 3. the default rule below.
 
-**Default rule.** Take the eval's full task list at the pinned dataset commit. Group tasks by
-stratum (repository for SWE-bench, category for Terminal-Bench, none for GPQA) and order each group
-by a hash of the task name with a fixed seed. Then take one task from each group in turn, groups in
-name order. Every list is the start of the same sequence, so each rung extends the one before it
-and two runs pick the same tasks. A task already scored on the current configuration is not run
-again. When the harness does not expose Terminal-Bench categories, use one group and say so.
+**Default rule.** Spread each list across the eval's strata (repositories for SWE-bench,
+categories for Terminal-Bench), make each rung's list contain the one before it, and record the
+rule so another run picks the same tasks. Never take a prefix of a sorted list.
 
 | Rung | GPQA Diamond | SWE-bench Verified | Terminal-Bench | Size set by |
 |---|---|---|---|---|
@@ -218,21 +193,16 @@ again. When the harness does not expose Terminal-Bench categories, use one group
 | larger | — | multiples of full load, or 100 to project 500 | multiples of full load | the agent, from the target and the budget |
 | full suite | 198 | 500 | 89 | fixed |
 
-Never take a prefix of a sorted list: `sorted(all500)[:32]` is 22 astropy and 10 django, two
-repositories of twelve.
+**Read every score with its error.** Report the 95% interval, about ±2·√(p(1−p)/n), and say when a
+list is too small to separate the model from its reference.
 
-**Read every score with its error.** Report the 95% interval, about ±2·√(p(1−p)/n): ±17 points at
-32 tasks, ±44 at 5. Separating the model from a reference by d needs about 4·p(1−p)/d² tasks; say
-when a list cannot.
-
-**Aggregates, not single tasks.** The same task's duration moved 0.08× to 15× between two runs.
-Conclude from score, suite wall and total agent time, or from repeated attempts; never rank work
-from one run's per-task times.
+**Aggregates, not single tasks.** Per-task durations do not repeat between runs. Conclude from
+score, suite wall and total agent time.
 
 **Shape follows the claim.** Concurrency needs enough simultaneous conversations to load the pool
 and scheduler, precision and long context need long free-running replies, caching needs repeated
-multi-turn traffic. Real trajectories through the replay test show capacity; short synthetic
-32-agent tests did not.
+multi-turn traffic. Replaying real agent histories shows capacity; short synthetic
+tests do not.
 
 ### Stage order
 
@@ -272,14 +242,10 @@ that decided it.
 Rank in two tiers.
 
 1. **Validity first.** A problem that keeps a suite from producing a valid or representative score
-   records `unblocks: <eval>` and ranks above every speed problem, cheapest first. Saving per
-   device hour cannot express it: on Gemma the Terminal-Bench repair chain (3.25 device-hours)
-   ranked 18th to 20th, below a predicted 2-second saving, and it was the difference between no
-   score and 37.5%.
+   records `unblocks: <eval>` and ranks above every speed problem, cheapest first.
 2. **Then speed**, by suite hours saved, summed over the evals, per device hour. Price savings at
-   the suite sizes the release runs, not at sample size: priced on 10-task subsets, a 2× speed-up
-   looked like 0.4 h and ranked below harness checks. Agents per server is always a candidate:
-   price 8, 16 and 32 agents against the pool and the measured call times.
+   the suite sizes the release runs, not at sample size. Agents per server is always a candidate,
+   priced against the pool and the measured call times.
 
 For each problem estimate the device hours it needs, local and CI; agent time is not counted. When
 a number cannot be calculated, guess and mark it. Name how the effort will confirm success without
@@ -309,9 +275,7 @@ decides against the current ranking whether it continues.
   older best confirms again after rebasing.
 - **Re-ranks do not interrupt running efforts**, unless a merge already solved their problem.
 - **Evidence is written once**, by the effort, when it ends. No sub-agent maintains or audits the
-  evidence while the stage runs; one closure review at the end, boxed at 1 h. On Gemma 2,468 of
-  5,297 shell commands touched the evidence files, and the two longest-lived agents did no
-  evaluation.
+  evidence while the stage runs; one closure review at the end, boxed at 1 h.
 
 The coordinator holds the current best, the slot ledger and the budget, chooses which efforts run
 together, and reads wide where efforts read deep, as [Look at the whole run](#look-at-the-whole-run)
