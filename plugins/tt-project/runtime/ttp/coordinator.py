@@ -528,6 +528,9 @@ REJECTED_KEY = "rejected_actions"   # kv: the last turn's rejected actions, show
 # starts; one still unseen REJECTION_WAIT_S later starts a turn itself (rejection_due), so none is dropped.
 REJECTED_AT_KEY = "rejected_actions_at"
 REJECTION_WAIT_S = 3600.0
+# kv: that turn also sent a reply, notify or obligation (BACKING_ACTIONS) that may rest on the refusal.
+# It raises the next turn something else starts (effort_triggers), never starts one (rejection_due).
+REJECTED_BACKED_KEY = "rejected_actions_backed"
 REJECTED_REPLY_KEY = "rejected_after_reply"   # kv: that turn also sent the user a reply
 REPEATS_KEY = "rejected_repeats"   # kv: hashes of rejections already recorded as repeated (an event each, once)
 AGAIN_KEY = "rejected_again"   # kv: hashes of the last turn's rejections that repeat the turn before's
@@ -4192,7 +4195,7 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     rejected = [str(x) for x in db.kv(REJECTED_KEY, []) or [] if not informational_rejection(str(x))]
     if any(x.startswith("ask_user:") for x in rejected):
         add("retry after a rejected ask_user")
-    elif rejected and (wake_due == REJECTION_DUE or rejection_due(db, now)):
+    elif rejected and (wake_due == REJECTION_DUE or db.kv(REJECTED_BACKED_KEY, False) or rejection_due(db, now)):
         add("rejected action")
     elif rejected:   # it rides along: this turn's digest shows it, if one starts
         carried.append("rejected action")

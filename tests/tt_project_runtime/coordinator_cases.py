@@ -22543,9 +22543,24 @@ def test_gate_holds_wake_only_for_a_decision_and_a_rejection_survives_a_restart(
     assert len(calls) == 1 and calls[0]["note"]["wake_due"] == coord.REJECTION_DUE, calls
     assert calls[0]["note"]["triggers"] == ["rejected action"]
     assert "no task #987654" in coord.digest(p, {}, [], [])
-    # A turn that also replied: what it told the user may rest on the refusal, so it is due at once.
+    # A turn that also replied: what it told the user may rest on the refusal, so the next turn something
+    # else starts raises it, but it still starts no turn of its own before coord.REJECTION_WAIT_S.
     told = SimpleNamespace(structured={"actions": [{"type": "task_update", "id": 987654, "status": "queued"},
                                                    {"type": "reply", "chat": "web", "text": "Done."}],
                                        "summary": ""}, error="", final_text="")
+    db.set_kv("last_coordinator_turn", clock[0])
     d._finish_coordinator({"dir": "x"}, told, "ok", {})
-    assert coord.rejection_due(db, clock[0])
+    assert not coord.rejection_due(db, clock[0]) and db.kv(coord.REJECTED_BACKED_KEY)
+    calls.clear()
+    clock[0] += 5
+    d.maybe_coordinate()
+    assert calls == [], "a backed rejection started a turn of its own"
+    db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    clock[0] += 30   # past the message debounce
+    d.maybe_coordinate()
+    assert len(calls) == 1 and calls[0]["note"].get("wake_due") != coord.REJECTION_DUE, calls
+    assert "rejected action" in calls[0]["note"]["triggers"], calls[0]["note"]
+    # A turn with no rejection clears the flag with the set.
+    d._finish_coordinator({"dir": "x"}, SimpleNamespace(structured={"actions": [], "summary": ""}, error="",
+                                                        final_text=""), "ok", {})
+    assert not db.kv(coord.REJECTED_BACKED_KEY)

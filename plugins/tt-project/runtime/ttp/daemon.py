@@ -4752,14 +4752,16 @@ class Daemon:
         with the next turn something else starts, and start one only once coord.REJECTION_WAIT_S passed
         with none (coord.rejection_due), in session mode too (the events section is sent every wake).
         `backed`: the turn also sent a reply, notify or obligation (coord.BACKING_ACTIONS), which may
-        rest on the refused action: then they are due at once, as before.
+        rest on the refused action: then the next turn something else starts raises them as a trigger
+        (coord.REJECTED_BACKED_KEY) rather than carrying them; they still start no turn of their own sooner.
         A rejection repeated on consecutive turns is a harness problem and is recorded once; the next
         digest marks it as a repeat so it is not sent again as is."""
         db = self.p.db
         before = set(db.kv(coord.REJECTED_KEY, []) or [])
         with db.tx():   # the set and its time together: a restart between them never drops or rushes it
             db.set_kv(coord.REJECTED_KEY, problems)
-            db.set_kv(coord.REJECTED_AT_KEY, time.time() - (coord.REJECTION_WAIT_S if backed else 0.0))
+            db.set_kv(coord.REJECTED_AT_KEY, time.time())
+            db.set_kv(coord.REJECTED_BACKED_KEY, bool(problems and backed))
         db.set_kv(coord.AGAIN_KEY, [coord.rejection_key(x) for x in problems if x in before])
         if not problems:
             return
