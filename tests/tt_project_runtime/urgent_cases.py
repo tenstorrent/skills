@@ -714,3 +714,177 @@ def test_queue_priority_ranks_user_ordered_urgent_work_0_other_urgent_work_1_and
     assert urgent.queue_priority({"id": 3, "priority": 2, "spec": "s\nurgent: no"}, now) is None
     assert urgent.queue_priority(None, now) is None
     assert urgent.queue_priority({"id": 4, "kind": "harness", "title": urgent.UPGRADE_TASK_TITLE}, now) == 0
+
+
+def _topup_daemon(p, monkeypatch):
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    d.jev = None
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    started = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: started.append(k) or 0)
+    return d, started
+
+
+def _spent_task(p, title, priority=3, spec="s", origin="coordinator", reply_chat=None, budget=2.0):
+    tid = p.db.add_task(title, spec, kind="work", tier="light", priority=priority, origin=origin,
+                        reply_chat=reply_chat, budget_usd=budget)
+    p.db.update_task(tid, spent_usd=budget)
+    return tid
+
+
+def _budget_run(p, tid, started, status="budget"):
+    rid = p.db.x("INSERT INTO runs(task, role, status, started, ended, note) VALUES(?,?,?,?,?,?)",
+                 (tid, "worker", status, started, started + 60, "{}"))
+    return dict(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)))
+
+
+def test_an_urgent_or_user_ordered_task_at_its_budget_is_topped_up_and_started_model_free(env, monkeypatch):
+    """(1) An urgent task (priority 1 or an `urgent:` line) or one made for the user's order (origin
+    user, a chat it answers) with its budget spent is raised by its tier's default and started in the
+    same tick: one handled event on the task, one low notice, no coordinator wake. An older budget
+    hold of one is released; status, the web payload and the digest show the top-up."""
+    from ttp import topup
+    p = make(env)
+    d, started = _topup_daemon(p, monkeypatch)
+    hot = _spent_task(p, "urgent fix", priority=1)
+    line = _spent_task(p, "urgent line", spec="Fix it.\nurgent: the user is waiting")
+    ordered = _spent_task(p, "user order", origin="user")
+    chat = _spent_task(p, "chat answer", reply_chat="c1")
+    held = _spent_task(p, "held urgent", priority=1)
+    p.db.update_task(held, status="blocked", blocked_reason="task budget exhausted")
+    d.dispatch()
+    ids = {k["task"]["id"] for k in started}
+    assert {hot, line, ordered, chat, held} <= ids, started
+    for tid in (hot, line, ordered, chat, held):
+        t = p.db.task(tid)
+        assert t["budget_usd"] == 4.0 and t["status"] == "running", t   # light default $2 on top of $2 spent
+        (k,) = [k for k in started if k["task"]["id"] == tid]
+        assert k["budget_usd"] == 2.0
+        (ev,) = topup.events(p.db, tid)
+        assert ev["data"]["before"] == 2.0 and ev["data"]["after"] == 4.0 and ev["data"]["n"] == 1
+    assert not p.db.q("SELECT 1 FROM events WHERE kind IN (?, 'task_budget_exhausted') AND status != 'handled'",
+                      (topup.KIND,))
+    notes = p.db.q("SELECT text, severity FROM messages WHERE direction='out' AND text LIKE '%budget top-up%'")
+    assert len(notes) == 5 and {n["severity"] for n in notes} == {"low"}
+    assert topup.counts(p.db)[hot] == {"n": 1, "usd": 2.0}
+    assert "budget top-up" not in "".join(topup.digest_lines(p.db, time.time() + 1))
+    assert any(f"#{hot} urgent fix" in x for x in topup.digest_lines(p.db, 0))
+    from ttp import web
+    row = next(t for t in web.state_payload(p, p.db)["tasks"] if t["id"] == hot)
+    assert row["budget_topups"] == {"n": 1, "usd": 2.0}
+    # Turned off, an urgent task waits on its budget as before.
+    d.cfg["budget"]["urgent_topup"] = False
+    off = _spent_task(p, "urgent off", priority=1)
+    d.dispatch()
+    assert p.db.task(off)["status"] == "blocked" and not topup.events(p.db, off)
+
+
+def test_an_urgent_run_stopped_by_its_budget_is_requeued_quietly_and_topped_up(env, monkeypatch, tmp_path):
+    """(1) A run of an urgent task that its budget stopped goes back to the queue at once (no attempt,
+    no delay, no coordinator wake); the next dispatch tops it up and starts it."""
+    from ttp import topup
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    d, started = _topup_daemon(p, monkeypatch)
+    tid = _spent_task(p, "urgent fix", priority=1)
+    p.db.update_task(tid, status="running")
+    d._finish_worker(_budget_run(p, tid, time.time() - 120), RunUsage(cost_usd=2.0), "budget", tmp_path)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["attempts"] == 0 and not t["not_before"], t
+    assert not p.db.q("SELECT kind FROM events WHERE task=? AND status='queued'", (tid,))
+    d.dispatch()
+    assert [k["task"]["id"] for k in started] == [tid] and p.db.task(tid)["budget_usd"] == 4.0
+    assert len(topup.events(p.db, tid)) == 1
+
+
+def test_a_dollar_cap_still_stops_a_topped_up_urgent_task(env, monkeypatch):
+    """(2) The top-up raises the task's budget; the dollar caps still hold it like any task."""
+    import dataclasses
+    from ttp import budget as bud, topup
+    p = make(env)
+    d, started = _topup_daemon(p, monkeypatch)
+    core = d.cfg.get("core_provider", "claude")
+    gate = bud.evaluate(p.db, d.cfg, core, bud.plan_windows(p.db))
+    d.gates[core] = dataclasses.replace(gate, regime="caps", numbers={**gate.numbers, "daily_cap": 1.5,
+                                                                       "spent_24h": 0.0})
+    tid = _spent_task(p, "urgent fix", priority=1)
+    d.dispatch()
+    t = p.db.task(tid)
+    assert not started and t["status"] == "blocked" and "above the dollar cap" in t["blocked_reason"], t
+    assert len(topup.events(p.db, tid)) == 1   # raised once, then held by the cap: not raised again
+    d.dispatch()
+    assert not started and len(topup.events(p.db, tid)) == 1
+    # Under the cap but over what is left of it today: it waits queued, unstarted.
+    d.gates[core] = dataclasses.replace(gate, regime="caps", numbers={**gate.numbers, "daily_cap": 10.0,
+                                                                       "spent_24h": 9.5})
+    p.db.update_task(tid, status="queued", blocked_reason=None)
+    d.dispatch()
+    assert not started and p.db.task(tid)["status"] == "queued"
+
+
+def test_the_runaway_guard_fails_an_urgent_task_whose_budget_runs_repeat_across_a_top_up(env, monkeypatch, tmp_path):
+    """(3) Two runs in a row stopped by their budget across a top-up, with no hand-off and no new
+    commit: failed with that evidence, never topped up again nor held on budget. A new commit, a
+    hand-off or a run of another kind before the top-up keeps it going."""
+    from ttp import topup
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    d, started = _topup_daemon(p, monkeypatch)
+    head = ["abc123"]
+    monkeypatch.setattr(d, "_branch_head", lambda t: head[0])
+    now = time.time()
+
+    def round_trip(tid, prev_status="budget"):
+        """A run that ends `prev_status`, a top-up, then a run stopped by its budget; the task's status."""
+        _budget_run(p, tid, now - 600, prev_status)
+        topup.top_up(p.db, d.cfg, p.db.task(tid), head=head[0], now=now - 300)
+        p.db.update_task(tid, status="running")
+        d._finish_worker(_budget_run(p, tid, now - 200), RunUsage(cost_usd=2.0), "budget", tmp_path)
+        return p.db.task(tid)
+
+    stuck = _spent_task(p, "urgent stuck", priority=1)
+    t = round_trip(stuck)
+    assert t["status"] == "failed", t
+    assert "runaway guard" in t["result"] and "no new commit (head abc123)" in t["result"]
+    n = len(topup.events(p.db, stuck))
+    d.dispatch()
+    assert stuck not in {k["task"]["id"] for k in started} and len(topup.events(p.db, stuck)) == n
+    # A new commit since the top-up is progress: it goes on.
+    moved = _spent_task(p, "urgent moving", priority=1)
+    _budget_run(p, moved, now - 600)
+    topup.top_up(p.db, d.cfg, p.db.task(moved), head="old999", now=now - 300)
+    p.db.update_task(moved, status="running")
+    d._finish_worker(_budget_run(p, moved, now - 200), RunUsage(cost_usd=2.0), "budget", tmp_path)
+    assert p.db.task(moved)["status"] == "queued"
+    # The run before the top-up ended another way (a timeout): not the same failure twice.
+    other = _spent_task(p, "urgent other", priority=1)
+    assert round_trip(other, prev_status="timeout")["status"] == "queued"
+    # The first budget stop has no top-up behind it: never the guard.
+    first = _spent_task(p, "urgent first", priority=1)
+    p.db.update_task(first, status="running")
+    d._finish_worker(_budget_run(p, first, now - 100), RunUsage(cost_usd=2.0), "budget", tmp_path)
+    assert p.db.task(first)["status"] == "queued"
+    # A hand-off in the stopped run is no repeat.
+    assert topup.runaway(p.db, p.db.task(stuck), _budget_run(p, stuck, now), head[0], handed_off=True) == ""
+
+
+def test_a_routine_task_keeps_its_budget_hold_and_its_budget_stop_fails(env, monkeypatch, tmp_path):
+    """(4) A task neither urgent nor ordered by the user: no top-up, the budget hold and its
+    task_budget_exhausted event as before; a run its budget stopped fails."""
+    from ttp import topup
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    d, started = _topup_daemon(p, monkeypatch)
+    tid = _spent_task(p, "routine", priority=3, spec="Do it.\nurgent: no")
+    d.dispatch()
+    t = p.db.task(tid)
+    assert not started and t["status"] == "blocked" and t["blocked_reason"] == "task budget exhausted"
+    assert t["budget_usd"] == 2.0 and not topup.events(p.db, tid)
+    assert p.db.q("SELECT 1 FROM events WHERE kind='task_budget_exhausted' AND task=?", (tid,))
+    d.dispatch()   # its hold is not released for a top-up
+    assert p.db.task(tid)["status"] == "blocked" and not started
+    run = _spent_task(p, "routine run", priority=3)
+    p.db.update_task(run, status="running")
+    d._finish_worker(_budget_run(p, run, time.time() - 60), RunUsage(cost_usd=2.0), "budget", tmp_path)
+    assert p.db.task(run)["status"] == "failed" and p.db.task(run)["attempts"] == 1

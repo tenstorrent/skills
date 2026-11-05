@@ -1701,10 +1701,14 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.append(f"idle: {h['why_idle']}")
     elif h["held"]:
         lines.append(f"held: {h['held']}")
+    from . import topup
+    topped = topup.counts(db)   # urgent or user-ordered tasks whose budget the daemon raised (topup.py)
     for w in h["working"][:8]:
         what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
-                     + (f" [{w['floor']}]" if w.get("floor") else "") + (f" — {w['note']}" if w["note"] else ""))
+                     + (f" [{w['floor']}]" if w.get("floor") else "")
+                     + (f" [{topup.words(topped[w['task']])}]" if w["task"] in topped else "")
+                     + (f" — {w['note']}" if w["note"] else ""))
     if stuck or h.get("drivers_stalled"):
         lines.append("stuck, the project is on it:")
     for t in stuck[:8]:
@@ -1732,7 +1736,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
             fin = f", {eta.field(e, p, now)}" if est and (e := est.task(t["id"]))["end"] else ""
         except Exception:
             fin = ""
-        row(t, f"{t['status']} ({urgent.mark(db, t, now)}{fin})", f"urgent: {urgent.shown_why(db, t, now)}")
+        row(t, f"{t['status']} ({urgent.mark(db, t, now)}{fin})", f"urgent: {urgent.shown_why(db, t, now)}"
+            + (f"; {topup.words(topped[t['id']])}" if t["id"] in topped else ""))
     for t in h["waiting"][:5]:
         why = re.sub(r";? *next try \S+$", "", t["blocked_reason"] or "").strip()
         row(t, f"waiting, next try {at(t['not_before'], now, tz)}", why,

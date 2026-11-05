@@ -20,7 +20,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
 from . import schedule as sched
-from . import pauseends, selfreview, startgate, sweepskip, timefmt, trend, upstream
+from . import pauseends, selfreview, startgate, sweepskip, timefmt, topup, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      SLACK_ERROR_KEY, WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -725,7 +725,9 @@ def state_payload(p: Project, db: DB) -> dict:
     entered = sweep.entered_map(db, [t for t in tasks if t["status"] == "blocked"], now)
     cfg, probed = p.config(), {}
     est = eta._Est(db, now)
+    topped = topup.counts(db)   # budget top-ups of urgent or user-ordered tasks (topup.py)
     for t in tasks:
+        t["budget_topups"] = topped.get(t["id"])
         t["job_use"] = [f"job {j['name']}: {j['line']}" for j in job_use.values() if j.get("task") == t["id"]] or None
         t["review_since"] = in_review.get(t["id"])
         # The urgent lane (ttp/urgent.py): the spec is read for its `urgent:` line, never sent.

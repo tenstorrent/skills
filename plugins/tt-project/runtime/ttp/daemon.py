@@ -39,6 +39,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import ackwait
 from . import pausegone
 from . import urgentfup
+from . import topup
 from . import checksettle
 from . import checksgone
 from . import resumefirst
@@ -5100,10 +5101,19 @@ class Daemon:
             new = {"done": "done", "blocked": "blocked", "failed": "failed", "needs_review": "review"}[rstatus]
         elif status in FREE_ENDS or reboot_lost:
             new = "queued"   # not an attempt: the account refused or the host went down, the task did not fail
+        elif status == "budget" and topup.eligible(task) and topup.enabled(self.cfg):
+            # An urgent or user-ordered task stopped by its budget is topped up and continued at the
+            # next dispatch (topup.py), not failed, unless it repeats the run before its last top-up.
+            guard = topup.runaway(db, task, r, self._branch_head(task), bool(rstatus))
+            new = "failed" if guard else "queued"
+            if guard:
+                summary = f"{guard}. {summary}"[:1500]
+                log(self.p, f"task {task['id']}: {guard}")
         else:
             new = "failed"
+        topped = status == "budget" and new == "queued"   # a top-up continues the run: not an attempt
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
-                                                  or rejects else 1)
+                                                  or rejects or topped else 1)
         if new == "failed" and attempts < int(task["max_attempts"] or 3) and status in ("failed", "lost", "timeout",
                                                                                      "stalled", "no_handoff",
                                                                                      "refused_wait"):
@@ -5417,7 +5427,7 @@ class Daemon:
             upd["blocked_reason"] = None
         if not_before:
             upd["not_before"] = not_before
-        elif reboot_lost:
+        elif reboot_lost or topped:
             upd["not_before"] = None
         elif new == "queued" and status not in FREE_ENDS:
             upd["not_before"] = time.time() + 120 * attempts
@@ -5547,7 +5557,7 @@ class Daemon:
         # ended without a verdict, leaves nothing to decide: the final attempt's outcome starts the turn.
         # A timeout still does, since the task may need splitting before it times out again.
         quiet = new == "queued" and status in (*FREE_ENDS, "failed", "lost", "stalled", "no_handoff",
-                                               "refused_wait") or push_quiet \
+                                               "refused_wait") or push_quiet or topped \
             or new == "done" and premise.is_check(task) and not fups and not notes   # premise.tend acts on it
         # A finished code task's next step is its review, queued here in the same step whatever else the
         # hand-off holds: its follow-ups go into the review's spec and stay the coordinator's to queue.
@@ -8515,6 +8525,7 @@ class Daemon:
     def _dispatch(self, busy: dict) -> None:
         db = self.p.db
         self._tend_premises()   # a code task queued this tick with a `premise:` line waits on its check
+        self._release_topup_holds()   # an urgent or user-ordered task held on its spent budget goes back
         ready = db.ready_tasks()   # read after _slot_reservations, which may have woken a reserving task
         reached = set()     # tasks that got past the gates to the resource check
         paused = db.paused_resources()
@@ -8550,6 +8561,10 @@ class Daemon:
                 task = dict(task, budget_usd=round((task["spent_usd"] or 0)
                                                    + bud.task_default_usd(self.cfg, task["tier"]), 2))
                 db.update_task(task["id"], budget_usd=task["budget_usd"])
+            # An urgent or user-ordered task never waits on its spent budget: raised here, model-free
+            # (topup.py); the dollar caps in _start_hold still hold it.
+            if topup.spent(task) and topup.eligible(task) and topup.enabled(self.cfg):
+                task = topup.top_up(db, self.cfg, task, head=self._branch_head(task), now=now)
             # Before _start_hold: a review whose pre-review checks failed needs no reviewer, nor its gates.
             if task["kind"] == "review" and self._precheck_failed(task):
                 fate[task["id"]] = "other"
@@ -8890,6 +8905,16 @@ class Daemon:
         if (task["blocked_reason"] or "") != held:
             self.p.db.update_task(task["id"], blocked_reason=held)
             log(self.p, f"task {task['id']} held: {held}")
+
+    def _release_topup_holds(self) -> None:
+        """An urgent or user-ordered task blocked on its spent budget (an older hold, or one made while
+        budget.urgent_topup was off) is queued again: dispatch tops it up (topup.py)."""
+        if not topup.enabled(self.cfg):
+            return
+        for t in self.p.db.q("SELECT * FROM tasks WHERE status='blocked' AND blocked_reason='task budget exhausted'"):
+            if topup.eligible(t):
+                self.p.db.update_task(t["id"], status="queued", blocked_reason=None)
+                log(self.p, f"task {t['id']}: released from its budget hold for a top-up")
 
     def _start_cost(self, task: dict) -> tuple[float, float]:
         """What the task may still spend, and what its start commits under the dollar caps."""

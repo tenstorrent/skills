@@ -106,6 +106,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     yesask,
 )
 from . import urgent
+from . import topup
 from . import probevars
 from . import onhost
 from . import coordsession
@@ -354,6 +355,7 @@ USER_SETTABLE = {
     "budget.global_daily_usd": float, "budget.day_start": str, "budget.timezone": str,
     "budget.max_parallel_workers": int, "budget.urgent_extra_slots": int, "budget.urgent_preempt": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "coordinator.urgent_start_wait_min": int,
+    "budget.urgent_topup": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credits_auto": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     "budget.reset_credit_min_hours": float, "budget.reset_credit_expiry_hours": float,
     "budget.reset_credit_expiry_use_pct": float, "notify.slack": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
@@ -1205,6 +1207,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("guards_behind", restriction_audit.digest_lines(p))
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("budget_topups", topup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0)))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("queue_backlog", queuetrim.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))

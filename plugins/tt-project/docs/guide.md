@@ -969,6 +969,12 @@ running work is interrupted only by the preemption below:
   raised after 1 minute (or `coordinator.urgent_slot_wait_min` if shorter; 0 turns it off),
   naming what fills the slots. Each scheduler.jsonl line lists them too
   (`slots`: running runs by task kind, and runs whose task already ended but are not reaped yet).
+- Budget: an urgent task, or one created for the user's order, never waits on its per-task budget.
+  When it is spent, the daemon raises it by the tier's default (`budget.task_default_usd`) and
+  starts the task again at once, without a coordinator turn. Each top-up is recorded on the task
+  and sent as one low notice; `ttp status`, the web app and the digest show them. The dollar caps
+  still stop it. If two runs in a row stop on their budget across a top-up with no hand-off and no
+  new commit, the task fails with that evidence. `budget.urgent_topup` false turns this off.
 - Reserve: while a priority 1 task is ready to start, or due within the hour, routine
   work leaves `budget.urgent_reserve_slots` (1; 0 turns it off) of the regular slots free, at least
   one slot staying open to routine work. A ready urgent task never waits behind routine runs that
