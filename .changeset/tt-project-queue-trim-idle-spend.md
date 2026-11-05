@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: cuts idle spend from a stale queue and repeated reports. The daemon cancels a non-urgent task that has never started once it has been queued for `queue.expire_h` hours (default 48; time the project was paused does not count), or blocked on a failed or cancelled dependency for `queue.dead_dep_h` hours (default 24). Each cancelled task records the reason and a one-command undo (`ttp task <project> requeue <id>`), and is listed once in the daily review. Urgent, user-ordered, review and obligation tasks never expire, and neither do tasks that wait on a probe, a later start time, open work or a paused resource. A new status, report, summary or check-on task that covers the same target as an open one of the same kind, or one finished within 24 h, is merged into that task if it is still queued; otherwise it is refused unless sent with `force: true` and a reason. Urgent and user-ordered requests are merged, never refused. The coordinator digest shows the queued backlog against the measured daily throughput.

@@ -179,6 +179,7 @@ from . import verified
 from . import waitgate
 from . import waitheal
 from . import watchdup
+from . import queuetrim
 from . import schedrun
 from . import screen as scr
 from . import shared
@@ -1050,6 +1051,7 @@ class Daemon:
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
+        self._queue_trimmed = 0.0   # when expire_queue last ran
         self._local_only_ok: dict[str, str] = {}   # branch -> head found on a remote: not looked at again
         self._local_only_job: dict | None = None   # the check running in its thread, applied by a later tick
         self._backup_job: dict | None = None   # the backup pushes running in their thread (backup_branches)
@@ -1750,7 +1752,7 @@ class Daemon:
         core_held = self._run_step(lambda: self.net_held(core) and not self._net_may_probe(core), "net_held", default=False)
         cycle = self._run_step(lambda: self.host_cycle_held(now), "host_cycle_held", default=False)
         for step in (self.run_schedules, self.check_self_review, self.poll_slack, self.check_resource_trouble, self.read_upstream,
-                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_urgent_check_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
+                     self.wake_upstream_fixes, self.drain_note_outbox, self.forward_upstream, self.retry_rejected, self.check_stall, self.check_slot_wait, self.check_unstarted, self.check_resume_wait, self.check_checks_wait, self.check_urgent_check_wait, self.check_checks_owner, self.check_checks_stall, self.check_cap_wait, self.check_progress, self.check_churn, self.check_host_load, self.check_idle_capacity, self.check_obligations, self.audit_pushes, self.retire_ended, self.archive_hidden_memory, self.route_machines, self.check_route_models, self.refresh_coverage, self.sweep_holds, self.sweep_reviews, self.sweep_unreviewed, self.check_unqueued_continues, self.check_stale_duplicates, self.expire_queue, self.tend_mitigations, self.failover_pinned, self.rethink_asks, self.check_self_blocking, self.blocker_sweep, self.check_coord_guard, self.maybe_coordinate, self.refresh_ref_waits, self.sample_jobs, self.watch_progress, self.probe_waiting, self.start_pushes, self.dispatch, self.raise_pre_grant_faults, self.check_unreachable, self.remind_logouts, self.relay_when_blocked, self.deliver_outbound):
             if self.cfg_status == "unavailable" and step in (self.maybe_coordinate, self.dispatch):
                 continue   # no routing to start model work with (see _load_config)
             # While the host settles after a sleep only new work waits: a person who wrote is answered now.
@@ -6743,6 +6745,14 @@ class Daemon:
                          f"{pushclaim.daily_line(db)}.")
             except Exception as e:   # nor must the push audit
                 log(self.p, f"push audit line failed: {type(e).__name__}: {e}")
+        if payload.get("audit_report", s["name"] == "daily-review"):
+            try:
+                gone = queuetrim.review_lines(db)
+                if gone:
+                    spec += ("\n\nExpired never-started tasks (the stale queued tail, cancelled by the daemon; requeue "
+                             "one only if it still serves the plan):\n" + "\n".join(f"- {line}" for line in gone))
+            except Exception as e:   # nor must the expiry list
+                log(self.p, f"expired tasks line failed: {type(e).__name__}: {e}")
         if payload.get("audit_report", s["name"] == "daily-review"):
             noisy = watchdup.review_lines(db)
             if noisy:
@@ -13294,6 +13304,20 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (now, f"task:{t['id']}", STALE_DUPLICATE, "normal", text, "queued", t["id"]))
             log(self.p, f"task {t['id']}: {STALE_DUPLICATE} raised")
+
+    def expire_queue(self) -> None:
+        """Model-free, every queuetrim.EVERY_S: cancel never-started tasks of the stale queued tail
+        (queuetrim.expire: queued past queue.expire_h, or blocked on a dead dependency past
+        queue.dead_dep_h), each with its reason and undo; urgent and user-ordered tasks never."""
+        now = time.time()
+        if now - self._queue_trimmed < queuetrim.EVERY_S:
+            return
+        self._queue_trimmed = now
+        try:
+            for line in queuetrim.expire(self.p.db, self.cfg, self.p.name, now):
+                log(self.p, line)
+        except Exception:   # expiry only saves spend: a failure keeps the queue as it is
+            log(self.p, "queue expiry failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
     def tend_mitigations(self) -> None:
         """Model-free: an overdue mitigation wakes the coordinator, a done fix lists its measures for undo."""

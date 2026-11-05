@@ -77,6 +77,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     push,
     reask,
     rejcool,
+    queuetrim,
     relay,
     responsibilities,
     restriction_audit,
@@ -1200,6 +1201,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
+    section("queue_backlog", queuetrim.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
     course_lines, course_id = course.digest_lines(db, p.config(), now)
@@ -2249,6 +2251,24 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             f"near duplicate of task #{same['id']} ({same['status']}) "
                                          f"'{same['title'][:120]}': update or continue it; if this is new work, say "
                                          f"how it differs in the title and spec, or add force: true")
+                # A repeated status or report task (queuetrim.covering): a queued one takes the new spec,
+                # an open or recently finished one refuses it; force with a reason adds it.
+                forced = a.get("force") and str(a.get("reason") or "").strip()
+                cover = None if forced or a.get("continues") is not None else \
+                    queuetrim.covering(db, title, a.get("kind") or "work", skip=skip)
+                if cover:
+                    if queuetrim.merge(db, cover, title, a.get("spec") or ""):
+                        raise InfoRejection(f"merged into queued task #{cover['id']} '{cover['title'][:120]}', which "
+                                            f"covers the same report target; its spec now carries this request")
+                    # An urgent or user-ordered request is only ever merged, never refused.
+                    asked = {"title": title, "spec": a.get("spec"), "priority": a.get("priority"),
+                             "reply_chat": a.get("reply_chat")}
+                    if urgent.is_urgent(asked) or queuetrim.user_ordered(asked):
+                        cover = None
+                if cover:
+                    raise InfoRejection(f"task #{cover['id']} ({cover['status']}) '{cover['title'][:120]}' covers the "
+                                        f"same report target within 24 h: read or update it; to add this anyway, "
+                                        f"send force: true with a reason")
                 review = a.get("kind") == "review"
                 cap = task_cap(cfg, review)
                 free_at = next_task_slot(db, cap, review=review)

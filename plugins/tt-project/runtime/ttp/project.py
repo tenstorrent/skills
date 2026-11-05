@@ -402,6 +402,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # run reporting nothing closed, sent again under its key within this many hours at the same or a
     # lower severity, only counts; it stays closed and wakes nobody (null or 0: off).
     "screen": {"wake_min_severity": "normal", "rewake_after_h": 6, "same_subject_warn": 3, "reraise_window_h": 6},
+    # The stale queued tail (queuetrim.py): a task that never started is cancelled, with its reason and a
+    # `ttp task <project> requeue <id>` undo, after expire_h queued (no open dependency, no start_when) or
+    # dead_dep_h blocked on a failed or cancelled dependency (0: off). Urgent, user-ordered, review and
+    # obligation-owner tasks never expire.
+    "queue": {"expire_h": 48, "dead_dep_h": 24},
     # Builtin watchers (prs, logfile): one run stops at deadline_s (capped at 1800), keeps what it read
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
     # the time left. The prs watcher reads pr_workers PRs at once, each within pr_timeout_s, each PR once
