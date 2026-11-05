@@ -272,7 +272,8 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
         tokens = set(_TOKEN.findall(low))
         on = sorted(w for w in words if (w in tokens if (h := _TOKEN.match(w)) and h[0] == w else _whole(w, low)))
     got = on
-    anchor = set(got) - generic_stems()
+    from .coordinator import _stem   # stems or whole words alike: a word's stem is compared
+    anchor = {w for w in got if _stem(w) not in generic_stems()}
     return got if len(got) >= 2 and (anchor if rare is None else rare & anchor) else []
 
 

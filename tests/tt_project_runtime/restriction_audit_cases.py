@@ -668,6 +668,12 @@ def test_shared_generic_stems_alone_never_match_a_retired_machine_ban(env):
         assert restriction_audit.tool_hit(line, ids, words, exact, set(words)) == [], line
     assert restriction_audit.tool_hit("the box-a machine remains held", ids, words, exact) == ["box-a", "machin", "remain"]
     assert restriction_audit.tool_hit("a thermal soak is required", ids, words, exact) == ["requir", "soak", "thermal"]
+    # Whole-word keywords (not stems) are judged by their stems alike.
+    whole = {"remains", "requires", "verified", "machine", "valid", "box-a", "thermal", "soak", "clearance"}
+    assert restriction_audit.tool_hit(_GENERIC_DESC, set(), whole) == []
+    assert restriction_audit.tool_hit(_GENERIC_DESC, set(), whole, rare=set(whole)) == []
+    assert restriction_audit.tool_hit("box-a remains held", set(), whole) == ["box-a", "remains"]
+    assert restriction_audit.tool_hit("a written clearance requires review", set(), whole) == ["clearance", "requires"]
 
 
 def test_a_tool_still_naming_the_machine_or_the_clearance_condition_is_found(env):
