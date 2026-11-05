@@ -568,6 +568,8 @@ EXTRA_KEYS = {
     # push_solo_paths: pathspecs a batch takes at most one routine change touching (pushq.SOLO_PATHS, off); push_cap_tests:
     # the name regex of prompt size cap tests, whose lone failure sends a trim-to-fit fix (conflictfix.CAP_TESTS).
     # push_rerun_s: the time limit of one rerun of a failed push check's failing tests (batch.RERUN_S).
+    # mechanical_merge_paths: globs of shared docs whose push-rebase conflicts settle by keeping both sides'
+    # lines, carrying the approval (batch.settle_union; default batch.MECHANICAL_PATHS, empty: off).
     # landed_probe: with no push_branch, the read-only command (`{id}`: the task id) that answers
     # `landed:#<id>` (landed.landed_probe); unset there, the harness chains with depends_on instead.
     # push_checks_timeout_s: the wall-time limit of each `ttp push` check, test-pool waits included (push.check_limit_of; 0: none).
@@ -577,7 +579,7 @@ EXTRA_KEYS = {
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "after_push",
-                 "push_solo_paths", "push_cap_tests", "push_rerun_s",
+                 "push_solo_paths", "push_cap_tests", "push_rerun_s", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),

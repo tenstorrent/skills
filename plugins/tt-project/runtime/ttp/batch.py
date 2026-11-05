@@ -62,9 +62,13 @@ STALE = "(stale plugin version)"   # the `cmd` of a check failure that is push.s
 SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds",
                  "imports": "names both sides import", "release": "release notes both sides wrote",
-                 "cells": "different cells of a table row"}
+                 "cells": "different cells of a table row",
+                 "union": "both sides' lines of a shared doc (delivery.mechanical_merge_paths)"}
 RELEASE_KINDS = {"version", "release"}   # settlements in the shared release files only (release_kind)
-MERGED_KINDS = {"added", "hunks", "imports", "cells"}   # settlements that keep both sides' changes: kept only when the checks pass
+MERGED_KINDS = {"added", "hunks", "imports", "cells", "union"}   # settlements that keep both sides' changes: kept only when the checks pass
+# delivery.mechanical_merge_paths default: shared docs and changesets, whose conflicts settle_union
+# settles by keeping both sides' lines (fnmatch on the repo path, so `*` also crosses `/`).
+MECHANICAL_PATHS = ("docs/*.md", "*/docs/*.md", "*README.md", "*CHANGELOG.md", "*.changeset/*.md")
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 # sequence.editor of a rebase that leaves out an entry's commits already on the target (Batch._landed):
 # drops each todo `pick` whose commit one of the shas before the todo file's path starts with
@@ -893,11 +897,63 @@ def settle_release(wt: Path, path: str, cfg: dict | None, kinds: set | None = No
     return True
 
 
-def own_diff(repo: Path, a: str, b: str, cfg: dict | None) -> str:
-    """The change a..b makes outside the release files (release_excludes), without context, blob ids
-    or line numbers: two replays of one change onto different bases give the same text."""
+def mechanical_paths(delivery: dict) -> list[str]:
+    """`delivery.mechanical_merge_paths` as repo-path globs; unset: MECHANICAL_PATHS; empty: none,
+    which turns settle_union off."""
+    v = delivery.get("mechanical_merge_paths")
+    return list(MECHANICAL_PATHS) if v is None else push.exclude_list(v)
+
+
+def _union3(ours: str, base: str, theirs: str) -> str | None:
+    """`git merge-file --union` of the three texts: each conflicting region keeps ours' lines, then
+    theirs', in order. None when git fails."""
+    with tempfile.TemporaryDirectory(prefix="ttp-union-") as d:
+        names = []
+        for name, text in (("ours", ours), ("base", base), ("theirs", theirs)):
+            (Path(d) / name).write_bytes(text.encode())
+            names.append(str(Path(d) / name))
+        r = subprocess.run(["git", "merge-file", "-p", "--union", *names], capture_output=True)
+    if r.returncode < 0 or r.returncode > 127:
+        return None
+    try:
+        return r.stdout.decode()
+    except UnicodeDecodeError:
+        return None
+
+
+def settle_union(wt: Path, path: str, globs: list[str], kinds: set | None = None) -> bool:
+    """Settle a stopped rebase's conflict in a shared doc of `wt` (`path` matches one of `globs`,
+    delivery.mechanical_merge_paths) when settle could not: both sides' lines are kept, ours then
+    theirs in each conflicting region (_union3). True when settled; adds "union" to `kinds`. A side
+    that deleted the file, a binary file, or a result that holds a conflict marker
+    (conflictfix._MARKER, a doc's `=` heading underline aside) is a real conflict."""
+    import fnmatch
+    if not any(fnmatch.fnmatchcase(path, g) for g in globs):
+        return False
+    ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
+    if ours is None or theirs is None:
+        return False
+    try:
+        o, b, t = ours.decode(), (base or b"").decode(), theirs.decode()
+    except UnicodeDecodeError:
+        return False
+    if "\0" in o + b + t or (merged := _union3(o, b, t)) is None:
+        return False
+    if any(conflictfix._MARKER.match(ln) and not conflictfix._marker_ok(path, ln) for ln in merged.splitlines()):
+        say(f"{path}: keeping both sides would leave a conflict marker; not settled")
+        return False
+    durable_write(wt / path, merged)
+    if kinds is not None:
+        kinds.add("union")
+    return True
+
+
+def own_diff(repo: Path, a: str, b: str, cfg: dict | None, also: list[str] | tuple = ()) -> str:
+    """The change a..b makes outside the release files (release_excludes) and the globs `also`,
+    without context, blob ids or line numbers: two replays of one change onto different bases give
+    the same text."""
     out = _git(repo, "diff", "--no-color", "--no-ext-diff", "--no-renames", "-U0", a, b, "--", ".",
-               *release_excludes(cfg)).stdout
+               *release_excludes(cfg), *(f":(exclude){g}" for g in also)).stdout
     return "\n".join("@@" if ln.startswith("@@") else ln for ln in out.splitlines() if not ln.startswith("index "))
 
 
@@ -1149,6 +1205,7 @@ class Batch:
         self.target = str(m.get("target") or "")
         self.remote, _, self.branch = self.target.partition("/")
         self.d = p.config().get("delivery") or {}
+        self.mechanical = mechanical_paths(self.d)   # shared docs settle_union may settle
         self.entries = [e for e in m.get("entries") or [] if isinstance(e, dict)]
         self.wt = p.worktrees / WORKTREE
         self.status: dict[int, str] = {}       # entry index -> status
@@ -1432,6 +1489,7 @@ class Batch:
                     and MERGED_KINDS & set(self.settled.get(i, {}).get("settled_by", [])):
                 say(f"entry {self.entries[i].get('id')}: its checks failed after the batch merged both sides' "
                     "changes; sent back for a rebase")
+                self.settled[i].pop("approval_carried", None)
                 self._set(i, "conflict", files=self.settled[i]["settled"], cmd=failed[0], tail=failed[1])
             elif n == k + 1 and failed:
                 self._set(i, "check_failed", cmd=failed[0], tail=failed[1])
@@ -1495,7 +1553,7 @@ class Batch:
             if csdir and (csfile := self.cfg.get("changeset_file") or "") and not brings:
                 # an entry that edits the release changeset itself brings its own changeset
                 brings = csfile in _git(self.repo, "diff", "--name-only", base, top, "--", csfile).stdout.split()
-            self.info[i] = {"subjects": subjects, "changeset": brings, "top": top}
+            self.info[i] = {"subjects": subjects, "changeset": brings, "top": top, "base": base}
             if not checks and (code := push.code_paths(self.repo, base, top)):
                 more = f" and {len(code) - 3} more" if len(code) > 3 else ""
                 self._set(i, "refused", message=f"no checks configured, and this change touches more than "
@@ -1538,6 +1596,17 @@ class Batch:
                     new, files = h, ["(the rebase settled only release files, but the change's own diff "
                                      "is no longer the approved one)"]
                     self.settled.pop(i)
+                elif "union" in self._settling[1]:
+                    if why := self._union_lost(gone, base, top, h, new):
+                        new, files = h, [f"(the rebase kept both sides' lines of {', '.join(self._union_files())}, "
+                                         f"but {why})"]
+                        self.settled.pop(i)
+                    else:
+                        self.settled[i]["approval_carried"] = (
+                            f"its only conflicts were in shared docs ({', '.join(self._union_files())}), settled by "
+                            "keeping both sides' lines; its own diff outside them is the approved one")
+                        say(f"entry {e.get('id')} ({e.get('branch')}): approval carried: "
+                            + self.settled[i]["approval_carried"])
             if files is not None:
                 say(f"entry {e.get('id')} ({e.get('branch')}) conflicts with {h[:10]} in {', '.join(files)}")
                 self._set(i, "conflict", files=files, onto=h, _after=len(carried))
@@ -1558,6 +1627,20 @@ class Batch:
                 self._set(i, "carried")
                 h = new
         return carried
+
+    def _union_files(self) -> list[str]:
+        return sorted(set(self._settling[0])) if self._settling else []
+
+    def _union_lost(self, gone: dict, base: str, top: str, onto: str, new: str) -> str:
+        """Why a replay onto `onto` that kept both sides' lines of a shared doc (settle_union) does not
+        carry the approval of base..top, or "": commits of it left out as landed, or a change of its own
+        diff outside delivery.mechanical_merge_paths and the release files (own_diff)."""
+        if gone:
+            return "some of its commits were left out as landed"
+        if own_diff(self.repo, onto, new, self.cfg, self.mechanical) != own_diff(self.repo, base, top, self.cfg,
+                                                                                 self.mechanical):
+            return "the change's own diff outside them is no longer the approved one"
+        return ""
 
     def _markers(self, commits: list[str]) -> list[str]:
         """conflictfix.stray_markers of the entry `commits` this batch would replay."""
@@ -1631,7 +1714,8 @@ class Batch:
                      if f] if stopped else []
             kinds: set = set()
             real = [f for f in files if not settle_release(wt, f, self.cfg, kinds)
-                    and not settle(wt, f, version_files, hunks=True, imports=True, kinds=kinds)]
+                    and not settle(wt, f, version_files, hunks=True, imports=True, kinds=kinds)
+                    and not settle_union(wt, f, self.mechanical, kinds)]
             if real or not files:       # a real conflict, or a stop that is no conflict at all
                 if stopped:
                     _git(wt, "rebase", "--abort")
@@ -2162,11 +2246,14 @@ class Batch:
         for i, _ in later:
             self._settling = ([], set())
             new, files = self._rebase(h, self.info[i]["top"])
-            if files is not None or new == h:
+            if files is not None or new == h or ("union" in self._settling[1] and self._union_lost(
+                    {}, self.info[i]["base"], self.info[i]["top"], h, new)):
                 break
-            self.settled.pop(i, None)
+            carry = self.settled.pop(i, {}).get("approval_carried")
             if self._settling[0]:
                 self.settled[i] = {"settled": sorted(set(self._settling[0])), "settled_by": sorted(self._settling[1])}
+                if carry and "union" in self._settling[1]:
+                    self.settled[i]["approval_carried"] = carry
             replayed.append((i, new))
             h = new
         if len(replayed) < len(later):

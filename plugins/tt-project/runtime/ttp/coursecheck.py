@@ -12,7 +12,8 @@ so an idle project's digest does not grow. Each reuses a signal the harness alre
 - self_race: a task's passed gate invalidated `self_races` (2) or more times in 48 h because the branch
   moved while another of this project's own pushes (a detached push or a push-queue batch that pushed)
   landed: its push checks (a non_fast_forward retry or kept-moving exit in its push marker, or a push-queue
-  batch that ended 'moved') or its review's approval (sent back as a push conflict, its push_queue row):
+  batch that ended 'moved') or its review's approval (sent back as a push conflict, its push_queue row;
+  an approval the batch carried across a conflict in shared docs, batch.settle_union, never counts):
   a race with its own writers. A lane waiting on its own lock leaves no
   model-free signal and is left to the prompt.
 - rule_clash: an open ask or a blocked task citing a rule (charter, restriction, policy) that a later
@@ -154,8 +155,10 @@ def _gate_losses(db: DB | None, ms: list[dict], since: float) -> list[tuple]:
             out.append((str(m.get("task") or "?"), start, t, "checks", m.get("id"), m.get("target")))
             start = t
     if db is not None:
+        # An approval the batch carried across a settled conflict (batch.settle_union) was not lost.
         for r in db.q("SELECT task, batch, target, created, updated FROM push_queue WHERE status='conflict' "
-                      "AND updated>=?", (since,)):
+                      "AND updated>=? AND (detail IS NULL OR NOT json_valid(detail) "
+                      "OR json_extract(detail, '$.approval_carried') IS NULL)", (since,)):
             out.append((str(r["task"]), float(r["created"]), float(r["updated"]), "review", r["batch"], r["target"]))
     return out
 

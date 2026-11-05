@@ -139,6 +139,12 @@ def test_course_self_review_flags_review_approvals_sent_back_as_push_conflicts_b
     assert len(lines) == 1 and "self race: task #12's passed review approval was (push conflict)" in lines[0], lines
     assert "2 times" in lines[0] and "#14" in lines[0] and "#15" in lines[0] and "#13" not in lines[0]
     assert ident == "self_race:12"
+    # An approval the batch carried across a shared-doc conflict (batch.settle_union) is no loss.
+    for n, st in enumerate(("pushed", "conflict", "conflict")):
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated,detail) "
+               "VALUES(?,?,?,?,?,?,?,?,?)", (16, "ttp/t16", "c" * 40, "origin/main", st, f"batch-c{n}",
+                                             t0 + 100, t0 + 1600, json.dumps({"approval_carried": "docs only"})))
+    assert "#16" not in "\n".join(_cc(p)[0])
 
 
 def test_course_self_review_flags_a_rule_cited_against_a_newer_user_message(env):

@@ -2109,6 +2109,24 @@ def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_th
         "no gap after a stopped search: the requeued ones go on at once"
 
 
+def test_a_pushed_approval_the_batch_carried_across_a_shared_doc_conflict_is_noted_on_its_review(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    tid, rid = _pq_review(s)
+    now = time.time()
+    s.p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', 'm', 'origin/proj', ?)", (now,))
+    s.p.db.x("UPDATE push_queue SET status='batched', batch='b1' WHERE id=?", (rid,))
+    why = "its only conflicts were in shared docs (docs/guide.md), settled by keeping both sides' lines"
+    m = {"outcome": "pushed", "ended": now, "pushed_sha": "c" * 40, "results": [
+        {"id": rid, "status": "pushed", "detail": {"settled": ["docs/guide.md"], "settled_by": ["union"],
+                                                   "approval_carried": why}}]}
+    pushq._apply(s.p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
+    t = s.p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["approval_carried"] == [why], t["result"]
+    (e,) = s.p.db.q("SELECT text FROM events WHERE kind='approval_carried' AND task=?", (tid,))
+    assert "batch b1 kept its approval: " + why in e["text"]
+
+
 def test_rows_a_batch_requeued_untested_skip_the_push_gap(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
@@ -17364,6 +17382,79 @@ def test_a_push_batch_still_sends_back_a_real_conflict_beside_a_release_file_con
     rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
     assert _statuses(m) == ["conflict"], m
     assert m["results"][0]["detail"]["files"] == ["plugins/p/f1.txt"], m["results"]
+
+
+def _doc_race(env, monkeypatch, entry_code="1\n", target_code=None, base_extra=""):
+    """An approval and a landing that both rewrite one line of docs/guide.md (no pure addition: settle
+    cannot take it); the approval also edits plugins/p/f1.txt. (p, origin, batch marker after the run)."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    (other / "docs").mkdir()
+    _land_as(other, {"docs/guide.md": f"# Guide\n{base_extra}shared line\nend\n", "plugins/p/f1.txt": "base\n"},
+             "guide")
+    head = _entry(repo, "e1", {"docs/guide.md": f"# Guide\n{base_extra}mine line\nend\n",
+                               "plugins/p/f1.txt": entry_code})
+    _land_as(other, {"docs/guide.md": f"# Guide\n{base_extra}theirs line\nend\n",
+                     **({"plugins/p/f1.txt": target_code} if target_code else {})}, "target guide")
+    return p, origin, _batch_marker(p, [head])
+
+
+def test_a_push_batch_carries_the_approval_across_a_conflict_only_in_a_shared_doc(env, monkeypatch, capsys):
+    """Both sides rewrote one line of a shared doc (delivery.mechanical_merge_paths): the batch keeps
+    both sides' lines, the checks run on the result, and the approval carries with its reason recorded."""
+    p, origin, marker = _doc_race(env, monkeypatch)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    d = m["results"][0]["detail"]
+    assert d["settled"] == ["docs/guide.md"] and "union" in d["settled_by"], d
+    assert "only conflicts were in shared docs (docs/guide.md)" in d["approval_carried"], d
+    assert _git_out(origin, "show", "proj:docs/guide.md").splitlines() == ["# Guide", "theirs line", "mine line", "end"]
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "1"
+    assert "approval carried" in capsys.readouterr().out
+
+
+def test_a_push_batch_still_sends_back_a_code_conflict_beside_a_shared_doc_conflict(env, monkeypatch):
+    p, origin, marker = _doc_race(env, monkeypatch, entry_code="mine\n", target_code="theirs\n")
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["plugins/p/f1.txt"], m["results"]
+
+
+def test_a_push_batch_sends_back_a_shared_doc_union_that_would_leave_a_conflict_marker(env, monkeypatch, capsys):
+    """The doc on the branch holds a stray marker line: a union keeping it is no clean merge."""
+    p, origin, marker = _doc_race(env, monkeypatch, base_extra="<" * 7 + " stale\n")
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["docs/guide.md"], m["results"]
+    assert "docs/guide.md: keeping both sides would leave a conflict marker" in capsys.readouterr().out
+
+
+def test_an_empty_mechanical_merge_paths_turns_the_shared_doc_carry_off(env, monkeypatch):
+    from ttp import batch
+    assert batch.mechanical_paths({}) == list(batch.MECHANICAL_PATHS)
+    assert batch.mechanical_paths({"mechanical_merge_paths": ""}) == []
+    assert batch.mechanical_paths({"mechanical_merge_paths": ["notes/*.md"]}) == ["notes/*.md"]
+    p, origin, marker = _doc_race(env, monkeypatch)
+    p.set_config("delivery.mechanical_merge_paths", [])
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["docs/guide.md"], m["results"]
+
+
+def test_a_push_batch_sends_back_a_shared_doc_settlement_that_changed_the_change(env, monkeypatch):
+    """A union-settled replay whose own diff outside the shared docs is no longer the approved one is
+    sent back: the approval covered that diff only."""
+    from ttp import batch
+    real, calls = batch.own_diff, []
+
+    def changed(*a):   # the replay's own diff (asked first) differs from the approved one
+        calls.append(a)
+        return real(*a) + ("\n+a line the review never saw" if len(calls) == 1 else "")
+    p, origin, marker = _doc_race(env, monkeypatch)
+    monkeypatch.setattr(batch, "own_diff", changed)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert "no longer the approved one" in m["results"][0]["detail"]["files"][0], m["results"]
+    assert calls and calls[0][4] == list(batch.MECHANICAL_PATHS), calls
 
 
 def test_a_push_batch_sends_back_the_later_of_two_overlapping_members_once(env, monkeypatch):

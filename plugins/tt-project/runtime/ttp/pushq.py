@@ -1678,6 +1678,12 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         if ff:
             result["fast_forward"] = ff
         result.pop("woke", None)
+        # Its approval carried across a conflict the batch settled in shared docs (batch.settle_union).
+        if carried := [str(_detail(x)["approval_carried"]) for x in current
+                       if x["status"] == "pushed" and _detail(x).get("approval_carried")]:
+            result["approval_carried"] = carried
+            _event(db, task, "approval_carried", f"#{tid} {task['title']}: batch {b['id']} kept its approval: "
+                                                 f"{carried[0]}", queued=False)
         db.update_task(tid, status="done", blocked_reason=None, result=dump_result(result))
         # Handled: the coordinator sees it in its next turn's task list; no turn is spent on it.
         _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
