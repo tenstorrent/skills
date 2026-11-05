@@ -73,20 +73,21 @@ os.environ.setdefault("TTP_ALLOW_VOLATILE_BASE", "1")   # the suite runs on tmpf
 os.environ.setdefault("TTP_DEVICE_NODES", "")   # no host device node changes what a test sees; tests set their own
 
 
-def _git_identity_fallback() -> None:
-    """Tests commit with the identity git resolves; on a host with none (a fresh test host) every such
-    commit fails. There, the suite and every process it starts get a global git config of a test
-    identity that includes the account's own; a host with an identity keeps it unchanged."""
-    try:
-        # Outside any repository: the checkout running the suite may set an identity of its own.
-        if subprocess.run(["git", "var", "GIT_COMMITTER_IDENT"], capture_output=True, cwd=os.sep,
-                          env={k: v for k, v in os.environ.items() if not k.startswith("GIT_DIR")}).returncode == 0:
-            return
-    except OSError:
-        return   # no git: the tests that need it say so
+def _git_global_config() -> None:
+    """Every test runs with HOME in a temp folder (_temp_home), so git would find neither the account's
+    global config nor its identity there, and a test's `git config --global` would write the account's
+    own ~/.gitconfig without it. The suite and every process it starts get a global git config of their
+    own instead, a session file that includes the account's (read only), with a test identity under
+    it where git resolves none (a fresh test host)."""
     import atexit
     import shutil
     import tempfile
+    try:
+        # Outside any repository: the checkout running the suite may set an identity of its own.
+        ident = subprocess.run(["git", "var", "GIT_COMMITTER_IDENT"], capture_output=True, cwd=os.sep,
+                               env={k: v for k, v in os.environ.items() if not k.startswith("GIT_DIR")}).returncode == 0
+    except OSError:
+        return   # no git: the tests that need it say so
     home = Path(os.environ.get("HOME", "/"))
     xdg = Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config")
     own = [os.environ["GIT_CONFIG_GLOBAL"]] if os.environ.get("GIT_CONFIG_GLOBAL") else \
@@ -94,12 +95,116 @@ def _git_identity_fallback() -> None:
     folder = tempfile.mkdtemp(prefix="ttp-test-git-")
     atexit.register(shutil.rmtree, folder, True)
     config = Path(folder) / "gitconfig"
-    config.write_text("[user]\n\tname = t\n\temail = test@example.invalid\n"
-                      + "".join(f"[include]\n\tpath = {f}\n" for f in own))
+    config.write_text(("" if ident else "[user]\n\tname = t\n\temail = test@example.invalid\n")
+                      + "".join(f"[include]\n\tpath = {f}\n" for f in own)
+                      # Signing keys live in the account's home folder, which tests never see.
+                      + "[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n")
     os.environ["GIT_CONFIG_GLOBAL"] = str(config)
 
 
-_git_identity_fallback()
+_git_global_config()
+
+
+# No test writes into the account's own home folder: each one runs with HOME, the XDG folders and the
+# agent CLIs' config folders in a fresh temp folder of its own (_temp_home), and every process it starts
+# inherits them. Python's user packages stay importable from the account's own user base. A session
+# also fails when, at its end, one of the account's own files below (HOME_WATCHED, under REAL_HOME) or
+# an untracked file in the repository the suite runs from is new or changed: what a test wrote there by
+# an absolute path, or relative to its working folder.
+REAL_HOME = os.path.expanduser("~")
+_XDG = {"XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
+        "XDG_CACHE_HOME": ".cache"}
+_AGENT_HOMES = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME")
+
+
+def _user_base() -> str | None:
+    import site
+    return site.getuserbase() if site.ENABLE_USER_SITE else None
+
+
+_USER_BASE = _user_base()
+HOME_WATCHED = (".bash_profile", ".bash_login", ".bashrc", ".profile", ".zprofile", ".zshrc", ".zshenv",
+                ".gitconfig", ".gitmodules", ".config/git/config", ".ssh/config", ".ssh/authorized_keys",
+                ".mcp.json", ".ripgreprc", ".idea", ".vscode", ".claude/settings.json",
+                ".claude/settings.local.json", ".claude/CLAUDE.md", ".claude/skills", ".claude/agents",
+                ".claude/commands", ".claude/hooks", ".codex/config.toml", ".config/systemd/user",
+                "Library/LaunchAgents", ".local/bin/ttp")
+
+
+@pytest.fixture(autouse=True)
+def _temp_home(tmp_path_factory, monkeypatch):
+    """Points HOME (and the XDG and agent config folders) at a fresh temp folder for this test."""
+    root = tmp_path_factory.getbasetemp() / "homes"
+    root.mkdir(mode=0o700, exist_ok=True)
+    import tempfile
+    home = tempfile.mkdtemp(prefix="home-", dir=root)
+    monkeypatch.setenv("HOME", home)
+    for var, sub in _XDG.items():
+        monkeypatch.setenv(var, os.path.join(home, sub))
+    for var in _AGENT_HOMES:
+        monkeypatch.delenv(var, raising=False)
+    if _USER_BASE and not os.environ.get("PYTHONUSERBASE"):
+        monkeypatch.setenv("PYTHONUSERBASE", _USER_BASE)
+    if os.environ.get("GIT_CONFIG_GLOBAL"):   # a `git config --global` of its own: tests never share one
+        own = Path(home, ".gitconfig")
+        own.write_text(f"[include]\n\tpath = {os.environ['GIT_CONFIG_GLOBAL']}\n")
+        monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(own))
+    return Path(home)
+
+
+def home_marks(home: str | Path) -> dict[str, object]:
+    """Each HOME_WATCHED path under `home`: a file's (size, mtime_ns), a folder's entry names (a
+    frozenset), or None when it is missing."""
+    marks: dict[str, object] = {}
+    for rel in HOME_WATCHED:
+        path = os.path.join(home, rel)
+        try:
+            st = os.stat(path)
+            marks[rel] = frozenset(os.listdir(path)) if os.path.isdir(path) else (st.st_size, st.st_mtime_ns)
+        except OSError:
+            marks[rel] = None
+    return marks
+
+
+def untracked_files(root: str | Path) -> set[str] | None:
+    """The untracked, not ignored files of the git repository whose top folder is `root`; None when
+    `root` is not one (a suite run from a temp folder) or git fails."""
+    try:
+        top = subprocess.run(["git", "-C", str(root), "rev-parse", "--show-toplevel"], capture_output=True,
+                             text=True, timeout=30)
+        if top.returncode != 0 or os.path.realpath(top.stdout.strip()) != os.path.realpath(root):
+            return None
+        r = subprocess.run(["git", "--no-optional-locks", "-C", str(root), "status", "--porcelain", "-z",
+                            "--untracked-files=all"], capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return {e[3:] for e in r.stdout.split("\0") if e.startswith("?? ")}
+
+
+def written_outside(before: dict, after: dict) -> list[str]:
+    """What a session wrote outside its temp folders, from two snapshots of {"home": home_marks,
+    "home_path": ..., "repo": untracked_files, "repo_path": ...}: one line per path."""
+    lines = []
+    for rel, was in before["home"].items():
+        now = after["home"].get(rel)
+        path = os.path.join(before["home_path"], rel)
+        if was == now:
+            continue
+        if isinstance(was, frozenset) and isinstance(now, frozenset):
+            lines += [f"  {os.path.join(path, n)}: created" for n in sorted(now - was)]
+            lines += [f"  {os.path.join(path, n)}: removed" for n in sorted(was - now)]
+        else:
+            lines.append(f"  {path}: {'created' if was is None else 'removed' if now is None else 'changed'}")
+    if before["repo"] is not None and after["repo"] is not None:
+        lines += [f"  {os.path.join(before['repo_path'], f)}: created" for f in sorted(after["repo"] - before["repo"])]
+    return lines
+
+
+def _outside_snapshot(config) -> dict:
+    root = str(config.rootpath)
+    return {"home": home_marks(REAL_HOME), "home_path": REAL_HOME, "repo": untracked_files(root), "repo_path": root}
 
 
 def _jobs(config, items) -> int:
@@ -329,9 +434,17 @@ def leaked_tmp_processes():
 def pytest_sessionstart(session):
     global _STARTED
     _STARTED = time.time()
+    if not os.environ.get("PYTEST_XDIST_WORKER"):
+        session.config._ttp_outside = _outside_snapshot(session.config)
 
 
 def pytest_sessionfinish(session, exitstatus):
+    before = getattr(session.config, "_ttp_outside", None)
+    written = written_outside(before, _outside_snapshot(session.config)) if before else []
+    if written:
+        _report(session, ["tests wrote outside their temp folders (the account's home folder or the "
+                          "repository the suite runs from):"] + written)
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
     if not any(i.path.name.startswith(_SHARDED) for i in session.items):
         return
     root = getattr(getattr(session.config, "_tmp_path_factory", None), "_basetemp", None)
@@ -344,13 +457,17 @@ def pytest_sessionfinish(session, exitstatus):
     lines = [f"tests left {len(found)} process(es) running that name this session's temp root {root} "
              f"(stopped now{'' if not left else f'; {len(left)} still alive'}):"]
     lines += [f"  pid {pid} (group {pgid}): {cmd[:300]}" for pid, pgid, cmd in found]
+    _report(session, lines)
+    session.exitstatus = pytest.ExitCode.TESTS_FAILED
+
+
+def _report(session, lines: list[str]) -> None:
     tr = session.config.pluginmanager.get_plugin("terminalreporter")
     for line in lines:
         if tr:
             tr.write_line(line, red=True)
         else:
             print(line, file=sys.stderr)
-    session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
 def _units(items) -> list[list]:

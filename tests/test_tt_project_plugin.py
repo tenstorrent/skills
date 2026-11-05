@@ -1293,6 +1293,63 @@ def test_the_test_runner_restores_the_signal_handlers_and_mask_a_test_left_chang
     assert r.returncode == 0 and "60 passed" in r.stdout, r.stdout + r.stderr
 
 
+def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fails(tmp_path):
+    """Workers run unsandboxed: a test writing ~/.bashrc or `git config --global` would change the
+    account's own files. Every test (forked or not) runs with HOME, the XDG folders and git's global
+    config in temp folders that the processes it starts inherit, and a session fails, naming the paths,
+    when a test still wrote one of the account's own files by an absolute path, or left an untracked
+    file in the repository the suite runs from."""
+    import shutil
+    import subprocess
+    real, repo, out = tmp_path / "realhome", tmp_path / "repo", tmp_path / "out"
+    (real / ".config" / "systemd" / "user").mkdir(parents=True)
+    (real / ".bashrc").write_text("mine\n")
+    out.mkdir()
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    (repo / ".gitignore").write_text("__pycache__/\n")
+    shutil.copy(pathlib.Path(__file__).with_name("conftest.py"), repo / "conftest.py")
+    (repo / "test_tt_project_home.py").write_text(
+        "import os, pathlib, subprocess, pytest\n"
+        "REAL = os.environ['REAL']\n"
+        "@pytest.mark.parametrize('i', range(60))\n"
+        "def test_home(i):\n"
+        "    home = pathlib.Path.home()\n"
+        "    assert str(home) != REAL and not str(home).startswith(REAL) and [p.name for p in home.iterdir()] == ['.gitconfig']\n"
+        "    assert os.environ['XDG_CONFIG_HOME'] == str(home / '.config') and 'CLAUDE_CONFIG_DIR' not in os.environ\n"
+        "    sh = 'echo \"$HOME\"; cd ~ && printf x > .bashrc && git config --global t.k v'\n"
+        "    if i == 0:\n"
+        "        sh += ' && python3 -c \"import pytest\"'   # the account's user packages still import\n"
+        "    r = subprocess.run(['sh', '-c', sh], capture_output=True, text=True)\n"
+        "    assert r.returncode == 0 and r.stdout.strip() == str(home), r.stderr\n"
+        "    pathlib.Path(os.environ['OUT'], f'home-{i}').write_text(str(home))\n"
+        "def test_leak():\n"
+        "    if os.environ.get('LEAK'):\n"
+        "        pathlib.Path(REAL, '.bashrc').write_text('changed\\n')\n"
+        "        pathlib.Path(REAL, '.config/systemd/user/x.service').write_text('')\n"
+        "        pathlib.Path('left.txt').write_text('x')\n")
+    env = {**os.environ, "HOME": str(real), "REAL": str(real), "OUT": str(out), "TTP_TEST_JOBS": "3"}
+    for var in ("CI", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+        env.pop(var, None)
+
+    def run(*args, **extra):
+        return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args, str(repo)],
+                              cwd=str(repo), env={**env, **extra}, capture_output=True, text=True, timeout=120)
+
+    r = run()
+    assert r.returncode == 0 and "61 passed" in r.stdout, r.stdout + r.stderr
+    homes = {(out / f"home-{i}").read_text() for i in range(60)}
+    assert len(homes) == 60, "tests shared a HOME"
+    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".config"] and (real / ".bashrc").read_text() == "mine\n"
+    assert not list((real / ".config" / "systemd" / "user").iterdir())
+    assert "wrote outside" not in r.stdout
+    # A test that still writes there, by an absolute path or relative to its working folder.
+    r = run("-k", "test_leak", LEAK="1")
+    assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
+    assert "tests wrote outside their temp folders" in r.stdout, r.stdout
+    for line in (f"{real}/.bashrc: changed", f"{real}/.config/systemd/user/x.service: created", f"{repo}/left.txt: created"):
+        assert f"  {line}\n" in r.stdout, r.stdout
+
+
 def _test_conftest():
     import importlib.util
     spec = importlib.util.spec_from_file_location("ttp_tests_conftest", pathlib.Path(__file__).with_name("conftest.py"))
@@ -3491,12 +3548,12 @@ def test_setup_box_agents_editor_defaults_merge_keeps_entries_and_comments(tmp_p
         with pytest.raises(ValueError):
             ba.merge_defaults(bad)
     # Only the editors installed here; a dry run writes nothing; --run backs the file up first.
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     assert set(ba.settings_paths(tmp_path, "Linux")) == set()
     (tmp_path / ".config/Cursor/User").mkdir(parents=True)
     assert list(ba.settings_paths(tmp_path, "Linux")) == ["Cursor"]
     (tmp_path / "Library/Application Support/Code/User").mkdir(parents=True)
     assert list(ba.settings_paths(tmp_path, "Darwin")) == ["VS Code"]
-    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
     f = tmp_path / "settings.json"
     f.write_text(text)
     import box
