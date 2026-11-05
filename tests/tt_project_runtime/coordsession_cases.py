@@ -1128,3 +1128,30 @@ def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_stateless_
     p.set_config("coordinator.session.mode", "off")
     r = turn("EVENTS 4")[0]
     assert ttls(r)[0] == "5m" and ttls(r)[1].startswith("warm: same prefix sent at 1h"), ttls(r)
+
+
+def test_coordinator_and_worker_prompts_follow_intent_ask_rarely_and_frame_the_session_as_manager(env):
+    # User msg #1776: read orders by intent (a Restriction binds as written, stricter reading in doubt),
+    # ask rarely without waiting, decide unless a step could hurt people or speak or pass as a human.
+    # The session coordinator is the hands-on manager; the tool-less turn keeps its own role line.
+    from ttp.prompts import coordinator_role, coordinator_session_role, worker_system
+    p = make(env)
+    flat = lambda t: " ".join(t.split())
+    shared = ("Follow the intent of orders and goals, not a literal reading; a Restriction binds as written "
+              "(in doubt, its stricter reading).", "speaks to people as the user or passes as a human",
+              "A rare, real ambiguity: act on your best reading, ask which they meant in the `reply`, never wait.")
+    stateless = flat(coordinator_role(p))
+    assert all(s in stateless for s in shared)
+    assert "you NEVER do it yourself" in stateless and "tool-less turn" in stateless
+    assert "hands-on manager" not in stateless and "## Managing" not in stateless
+    p.set_config("coordinator.session.mode", "on")
+    session = flat(coordinator_session_role(p))
+    assert all(s in session for s in shared)
+    assert "you NEVER do it yourself" not in session and "tool-less" not in session
+    assert "hands-on manager of one long-running project" in session
+    assert "instruct and correct it mid-run (`task_update` `spec`)" in session
+    assert "Fix what is wrong yourself, in the work, the workers and the project's prompts" in session
+    assert "larger code changes still go to workers" in session
+    worker = flat(worker_system(p, {"kind": "code", "title": "t"}))
+    assert "decide yourself, by the intent of your spec and the user's orders, not a literal reading" in worker
+    assert "including the task, as written (in doubt, the stricter reading)" in worker

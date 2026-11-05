@@ -248,6 +248,8 @@ Precedents:
 A default headless Claude Code run carries tens of thousands of tokens of built-in context. A
 decision turn with a replaced system prompt, no tools and a JSON schema costs a few cents. The
 coordinator therefore reads a digest and delegates anything needing files or commands.
+The persistent session (`coordinator.session`) trades this for one resumed session that manages
+workers hands-on; its role prompt keeps to the same size budget plus a small room.
 The stable part (role, charter, memory) is the system prompt, which providers cache.
 
 ## User corrections

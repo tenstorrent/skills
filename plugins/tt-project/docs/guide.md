@@ -37,7 +37,12 @@ sent. A failure to read replies is reported on stderr and never stops the messag
 - **Daemon** (one per project): schedules, watchers, budget gates, message routing, web app.
   Deterministic and cheap. It starts a model only through a run.
 - **Coordinator**: a short, tool-less decision over a digest of the project, batched and rate
-  capped. Anything needing files, commands or deep thought becomes a task.
+  capped. Anything needing files, commands or deep thought becomes a task. With
+  `coordinator.session` on it is the project's hands-on manager instead: one persistent session
+  that corrects workers mid-run and fixes the project's own prompts, scripts and config, while
+  heavy work still goes to workers. Either way it reads orders by their intent (a Restriction binds
+  as written), decides on its own unless a step could hurt people or speak or pass as a human,
+  and asks rarely, never waiting on the answer.
 - **Workers**: one task each, in a git worktree on their own branch for code, with a dollar
   budget, a wall clock, and a stall guard. Each hands off a structured result. A worker whose
   machine or queue is busy hands the task back to retry later, instead of waiting inside the run.
