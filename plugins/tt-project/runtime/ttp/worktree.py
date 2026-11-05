@@ -1145,7 +1145,7 @@ def keep(path: Path) -> None:
     locked worktree, so a `git worktree prune` run where this folder is out of view (a sandbox that
     mounts only part of the tree, another clone's owner) cannot delete its admin dir and orphan it:
     `git worktree repair` cannot make a deleted one again. Only the harness's own removal steps lift
-    it (remove_path); a half-made one goes with `remove --force --force` (_clear_partial)."""
+    it (remove_path, harnesstree.land for a harness task's); a half-made one goes with `remove --force --force` (_clear_partial)."""
     ad = _admin_dir(path)
     if ad is not None and not (ad / "locked").exists():
         try:   # best effort: a git that hangs or fails never stops a run or a sweep

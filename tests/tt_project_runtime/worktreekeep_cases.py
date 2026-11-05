@@ -168,3 +168,36 @@ def test_a_kept_record_under_a_hidden_or_unreadable_parent_stays(env, tmp_path):
     (tmp_path / "run900").rename(run_wt.parent)
     assert [r["path"] for r in worktree.sweep(p, full_view=True) if r.get("gone")] == [str(run_wt.resolve())]
     assert "wt" not in _wk_listed(p) and path.name in _wk_listed(p)
+
+
+def test_a_harness_worktree_hidden_during_a_prune_keeps_its_admin_dir_and_a_foreign_lock_stays(env, tmp_path):
+    p = make(env)
+    from ttp import harnesstree, worktree
+    from ttp.daemon import Daemon
+    a, b, c = _harness_task(p, "a"), _harness_task(p, "b"), _harness_task(p, "c")
+    assert Daemon(p.base)._workdir_for(p.db.task(a))[0] == str(p.harness)   # the checkout: nothing to lock
+    _harness_run(p, a)
+    own = pathlib.Path(Daemon(p.base)._workdir_for(p.db.task(b))[0])
+    assert own == harnesstree.path(p, b)
+    admin = _wk_admin(p, own)
+    assert (admin / "locked").read_text().startswith(worktree.KEEP_LOCK)
+    _commit_in_harness_tree(own, "prompts/kept.md", "kept\n", "b: prompt")
+    hidden = tmp_path / "hidden"
+    own.rename(hidden)   # out of this view, as in a sandbox that mounts only part of the tree
+    _hgit(p.harness, "worktree", "prune")
+    assert admin.is_dir(), "a prune deleted the harness worktree's admin dir"
+    hidden.rename(own)
+    assert _hgit(own, "symbolic-ref", "--short", "HEAD").strip() == f"ttp/harness-t{b}"
+    # Once its task ended the landing lifts its own lock and removes it.
+    p.db.update_task(b, status="done")
+    assert harnesstree.land(p, b) == "merged"
+    assert not own.exists() and not admin.exists()
+    assert (p.harness / "prompts" / "kept.md").read_text() == "kept\n"
+    # Someone else's lock is never lifted: the worktree stays.
+    other = pathlib.Path(Daemon(p.base)._workdir_for(p.db.task(c))[0])
+    _hgit(p.harness, "worktree", "unlock", str(other))
+    _hgit(p.harness, "worktree", "lock", "--reason", "a user's hold", str(other))
+    Daemon(p.base)._workdir_for(p.db.task(c))
+    p.db.update_task(c, status="done")
+    assert harnesstree.land(p, c) == "kept" and other.exists()
+    assert (_wk_admin(p, other) / "locked").read_text().strip() == "a user's hold"

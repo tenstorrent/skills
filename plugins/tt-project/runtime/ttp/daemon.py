@@ -15683,7 +15683,10 @@ class Daemon:
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":   # its own worktree of the harness while another works there
-            return str(harnesstree.workdir(self.p, task["id"])), None
+            path = harnesstree.workdir(self.p, task["id"])
+            if path != self.p.harness:
+                worktree.keep(path)   # as a task worktree: no partial-view prune can orphan it
+            return str(path), None
         if task["kind"] not in worktree.NEVER_OWN_KINDS and (repo := worktree.pr_repo(self.p, task)):
             # A PR fix whose PR is in another repository than the root's: a worktree of its clone.
             try:

@@ -223,6 +223,8 @@ def land(p: Project, tid: int) -> str:
         outcome = "merged"
     if dirty(own) or held(p, tid):
         return "kept"
+    from .worktree import unkeep
+    unkeep(own)   # the daemon's keep lock (worktree.keep) only; any other lock makes git refuse
     r = _git(p.harness, "worktree", "remove", str(own), timeout=120)
     if r.returncode != 0 and own.exists():
         return outcome or "kept"
