@@ -837,6 +837,8 @@ def test_the_tip_rerun_runs_its_tests_in_the_process_sandbox_like_every_check(en
             return None
         return real(argv, *a, **kw)
     monkeypatch.setattr(subprocess, "Popen", popen)
+    monkeypatch.setenv(sandbox.ENV, "0")   # restored after the test: the daemon sets it from the config
+    p.set_config("sandbox", {"checks": True})   # the process sandbox is opt-in
     d = dmod.Daemon(p.base)
     d.cfg = {**d.cfg, "runner": {**(d.cfg.get("runner") or {}), "nice": 7}}
     ids = ["tests/test_a.py::test_x", "tests/test_b.py::test_y[1 2]"]

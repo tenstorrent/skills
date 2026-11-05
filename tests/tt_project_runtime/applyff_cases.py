@@ -217,6 +217,7 @@ def test_a_daemon_taking_neither_request_gets_no_sandboxed_merge_task_and_a_clea
     from ttp.providers import claude
     p, restarts = _conflicting_upgrade(env, monkeypatch)
     p.set_config("core_provider", "claude")
+    _write_fence("claude")(p)   # the fence is opt-in
     monkeypatch.setattr(claude, "fence_missing", lambda: [])   # the merge task's worker runs fenced
     h = p.harness
     _git_out(h, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "config")   # main stays put
@@ -352,6 +353,7 @@ def test_a_daemon_taking_neither_request_still_gets_the_merge_task_of_an_unfence
     (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": [], "receipt": {"version": "0.0.1"}}))
     assert applyff.route(p)[0] == "none"
     p.set_config("core_provider", "claude")
+    _write_fence("claude")(p)   # the fence is opt-in
     missing = []
     monkeypatch.setattr(claude, "fence_missing", lambda: list(missing))
     assert cli._harness_worker_fenced(p)

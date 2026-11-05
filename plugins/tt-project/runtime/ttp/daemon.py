@@ -3056,7 +3056,7 @@ class Daemon:
                    "TTP_RUN_ID": str(run_id), **task_env(task["id"] if task else ""), "PYTHONPATH": runtime_dir,
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
-                   "TTP_CHECK_SANDBOX": os.environ.get("TTP_CHECK_SANDBOX", "0"),   # sandbox.opted_in
+                   "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in
                    # Tests run straight in its shell take at most one run's share of the host's test slots.
                    **(testslots.worker_env(self.cfg) if role in ("worker", "reviewer") else {}),
                    # A worker's sandbox may run commands in a PID namespace or cgroup of their own, which

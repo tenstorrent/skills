@@ -2424,7 +2424,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   true` or the `no_internet` restriction they run in Codex's workspace-write sandbox, with the
   project's state folder, the repository's git folder and the shared lock folder
   (`~/.tt-project/locks`, for `ttp lock` on resources shared across projects) added as writable
-  roots. Coordinator turns use its read-only sandbox.
+  roots. Codex coordinator turns run with `danger-full-access` too, and in its read-only sandbox
+  only under the same opt-in. The daemon snapshots the harness folder and the repository checkout
+  before each coordinator turn and logs `run N: warning: coordinator turn changed files in ...`
+  when the turn changed any (a log line only: no alert, no model call).
 - Codex and Cursor coordinator turns run from an empty scratch directory, so the project's
   AGENTS.md and rules stay out of them. Codex's shell and web search tools are off, and Cursor
   runs in ask mode, when the installed CLI offers those switches.

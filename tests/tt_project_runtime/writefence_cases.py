@@ -750,7 +750,7 @@ def test_default_runs_launch_unsandboxed_and_say_so(env, monkeypatch, role):
     from ttp.providers import claude
     monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}")   # the sandbox could start
     monkeypatch.setattr(claude.sys, "platform", "linux")
-    monkeypatch.delenv("TTP_CHECK_SANDBOX", raising=False)
+    monkeypatch.delenv("TTP_SANDBOX_CHECKS", raising=False)
     p = make(env)
     spec, log, rid = _launch_role(env, p, "claude", role, env["repo"], monkeypatch)
     assert not [a for a in spec["argv"] if "bwrap" in a or a.startswith("--unshare")], spec["argv"]
@@ -763,7 +763,7 @@ def test_default_runs_launch_unsandboxed_and_say_so(env, monkeypatch, role):
 
 def test_codex_runs_drop_its_sandbox_by_default_and_keep_it_on_opt_in(env, monkeypatch):
     p = make(env)
-    monkeypatch.delenv("TTP_CHECK_SANDBOX", raising=False)
+    monkeypatch.delenv("TTP_SANDBOX_CHECKS", raising=False)
 
     def mode(argv):
         return argv[argv.index("-s") + 1]

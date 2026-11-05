@@ -6776,27 +6776,29 @@ def test_worker_prompt_and_harness_skill_state_the_glx_reset_only_practice():
 
 
 def test_prompts_and_harness_skill_run_host_reaching_commands_bare_or_from_a_model_free_pre_step():
-    """Host names do not resolve in the worker sandbox; only a bare excluded command (`ssh`, `git fetch`,
-    `ttp lock ...`) runs outside it, never one inside cd, a pipe, `;`, `&&`, a subshell or a script it
-    runs (upstream note fd7ddf9490b3ed3c). Workers, daily reviews, the blocker sweep and harness authors
-    read where such a command goes."""
+    """Runs are unsandboxed by default (user msg #1663), so the worker, daily-review and coordinator
+    prompts no longer say host names do not resolve. The bare-command rule (upstream note
+    fd7ddf9490b3ed3c) lives only in the harness reference, scoped to a project that turned its
+    provider's write fence on; a recurring report still comes from a model-free pre-step."""
     prompts = PLUGIN / "template" / "prompts"
     harness = SKILLS / "tt-project-harness"
     assert "](references/host-reaching-commands.md)" in (harness / "SKILL.md").read_text(encoding="utf-8")
-    for path in (prompts / "worker.md", prompts / "daily-review.md", harness / "references" / "host-reaching-commands.md"):
+    for path in (prompts / "worker.md", prompts / "daily-review.md"):
         flat = re.sub(r"\s+", " ", path.read_text(encoding="utf-8"))
-        for part in ("Host names do not resolve in", "another host or GitHub", "git fetch/ls-remote/push",
-                     "one bare command", "`ttp lock <res> -- <cmd>`", "absolute paths, no cd, pipe, `;`, `&&` or subshell",
-                     "model-free", "pre-step writing files"):
-            assert part in flat, (path.name, part)
-    # The loopback hint it replaced stays.
-    assert "use 127.0.0.1, not `localhost`" in re.sub(r"\s+", " ", (prompts / "worker.md").read_text())
+        assert "Host names do not resolve in" not in flat, path.name
+        assert "model-free command schedule or pre-step writing files you read" in flat, path.name
+    reference = re.sub(r"\s+", " ", (harness / "references" / "host-reaching-commands.md").read_text(encoding="utf-8"))
+    assert "unsandboxed by default" in reference
+    assert "`providers.<name>.write_fence: true`" in reference
+    for part in ("Host names do not resolve in", "another host or GitHub", "git fetch/ls-remote/push",
+                 "one bare command", "`ttp lock <res> -- <cmd>`", "absolute paths, no cd, pipe, `;`, `&&` or subshell",
+                 "model-free", "pre-step writing files"):
+        assert part in reference, part
     coordinator = re.sub(r"\s+", " ", (prompts / "coordinator.md").read_text(encoding="utf-8"))
     sweep = coordinator[coordinator.index("A `Blocker sweep` turn"):]
     sweep = sweep[:sweep.index(". A provider")]
-    for part in ("unresolved host name hit its sandbox", "bare (e.g. `ttp lock <res> -- <cmd>`",
-                 "model-free command schedule or pre-step"):
-        assert part in sweep, part
+    assert "unresolved host name hit its sandbox" not in coordinator
+    assert "rechecks everything stuck" in sweep
 
 
 def test_no_shipped_text_states_a_corrected_claim():

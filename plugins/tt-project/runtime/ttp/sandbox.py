@@ -2,7 +2,7 @@
 runtime runs (push.check_argv).
 
 Off by default: commands run as they are, unsandboxed, and see the host's processes, network and sudo.
-A project turns it on with project.json `sandbox.checks: true` (the daemon passes TTP_CHECK_SANDBOX=1 to
+A project turns it on with project.json `sandbox.checks: true` (the daemon passes TTP_SANDBOX_CHECKS=1 to
 its runs and checks). One case stays on by default, the device gate: a run that holds no device
 (TTP_NO_DEVICE=1) on a host with device nodes still runs its commands in the sandbox that hides them.
 
@@ -38,11 +38,11 @@ SETTINGS = (("kernel.apparmor_restrict_unprivileged_userns", "1",
             ("user.max_user_namespaces", "0", "set it above 0"))
 SYSCTL_DIR = Path("/proc/sys")
 _STATE: dict[str, tuple[list[str] | None, str]] = {}   # by PATH: what status() found
-ENV = "TTP_CHECK_SANDBOX"   # "1": the project turned the process sandbox on (sandbox.checks)
+ENV = "TTP_SANDBOX_CHECKS"   # "1": the project turned the process sandbox on (sandbox.checks); not checkreap.MARKER
 
 
 def opted_in(env: dict | None = None) -> bool:
-    """Whether the project turned the process sandbox on (TTP_CHECK_SANDBOX=1 in `env`, default this
+    """Whether the project turned the process sandbox on (TTP_SANDBOX_CHECKS=1 in `env`, default this
     process's environment)."""
     return (os.environ if env is None else env).get(ENV, "").strip() == "1"
 

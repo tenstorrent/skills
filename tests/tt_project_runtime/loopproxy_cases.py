@@ -211,8 +211,10 @@ def test_daemon_gives_fenced_claude_workers_the_host_loopback_ports(env, monkeyp
     def set_ports(value):
         provs = p.config()["providers"]
         p.set_config("providers", {**provs, "claude": {**provs.get("claude", {}), "loopback_ports": value}})
+    assert loopproxy.PORTS_ENV not in launch(), "an unfenced worker (the default) shares the host's network"
+    _write_fence("claude")(p)
     got = launch()
-    assert got[loopproxy.PORTS_ENV] == "2222 8080" and got[loopproxy.NETNS_ENV].startswith("net:"), "on by default"
+    assert got[loopproxy.PORTS_ENV] == "2222 8080" and got[loopproxy.NETNS_ENV].startswith("net:"), "on once fenced"
     set_ports([5000])
     assert launch()[loopproxy.PORTS_ENV] == "5000 2222 8080"
     set_ports(False)

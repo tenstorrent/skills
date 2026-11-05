@@ -8101,6 +8101,7 @@ def test_codex_coordinator_turn_is_read_only_and_its_actions_apply(env, monkeypa
     def chat(p):
         p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
                (time.time(), "t", time.time()))
+        _write_fence("codex")(p)   # read-only is opt-in; the default is covered in writefence_cases
     reply = {"actions": [{"type": "reply", "chat": "c1", "text": "hello from codex", "title": None}],
              "summary": None}
     p, run, _, argv, stdin = _cli_run(env, monkeypatch, "codex", _codex_events(*_codex_turn(json.dumps(reply))),

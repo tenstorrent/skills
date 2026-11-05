@@ -149,6 +149,17 @@ def test_ttp_checks_runs_each_check_in_the_sandbox_once_the_project_opts_in(env,
         sentinel.wait()
 
 
+def test_a_checks_reap_token_never_reads_as_the_projects_sandbox_opt_in(monkeypatch):
+    """Each check's env carries checkreap's run token; the opt-in is another variable, so the token
+    neither turns the sandbox off for an opted-in project nor on for one that did not opt in."""
+    from ttp import checkreap, sandbox
+    assert sandbox.ENV != checkreap.MARKER
+    tok = checkreap.token()
+    assert sandbox.opted_in({sandbox.ENV: "1", checkreap.MARKER: tok})
+    assert not sandbox.opted_in({sandbox.ENV: "0", checkreap.MARKER: tok})
+    assert not sandbox.opted_in({checkreap.MARKER: "1"})
+
+
 def test_check_argv_wraps_local_checks_unless_one_opts_out(tmp_path, monkeypatch):
     from ttp import push, pushpass, sandbox
     monkeypatch.setenv(sandbox.ENV, "1")
