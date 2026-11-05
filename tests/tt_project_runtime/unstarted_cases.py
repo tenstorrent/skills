@@ -360,12 +360,13 @@ def test_an_urgent_task_ready_with_a_free_slot_kicks_dispatch_and_routine_work_d
 
 def test_a_deadline_task_held_only_by_full_slots_raises_at_60_s_naming_what_fills_them(env, monkeypatch):
     """A fresh `urgent:` line or an obligation owner whose resources are free but whose worker slots
-    (extra slot included) are all taken is raised after unstarted.READY_URGENT_S, naming the slots' users."""
-    from ttp import unstarted
+    (burst slots included) are all taken is raised after unstarted.READY_URGENT_S, naming the slots' users."""
+    from ttp import unstarted, urgent
     p, d, check = _ready_setup(env, monkeypatch)
     core = d.cfg.get("core_provider", "claude")
     gate = d.gates[core]
-    for i in range(gate.max_parallel + 1):
+    full = gate.max_parallel + urgent.extra_slots(d.cfg)
+    for i in range(full):
         tid = p.db.add_task(f"busy {i}", "s", kind="code" if i % 2 else "review", tier="light", origin="user")
         p.db.update_task(tid, status="running")
         p.db.x("INSERT INTO runs(task, role, provider, status, started) VALUES(?,?,?,?,?)",
@@ -378,7 +379,7 @@ def test_a_deadline_task_held_only_by_full_slots_raises_at_60_s_naming_what_fill
     got = check(start + 30 + unstarted.READY_URGENT_S + 5)
     assert [e["task"] for e in got] == [hot], "the deadline task only; routine priority 1 is a slot wait"
     assert "every worker slot taken but its resources free" in got[0]["text"]
-    assert f"they hold {gate.max_parallel + 1} runs (" in got[0]["text"] and " review" in got[0]["text"]
+    assert f"they hold {full} runs (" in got[0]["text"] and " review" in got[0]["text"]
     assert d.kicks == [], "no free slot: nothing to kick"
     assert plain not in [e["task"] for e in check(start + 30 + unstarted.READY_URGENT_S + 70)]
 
