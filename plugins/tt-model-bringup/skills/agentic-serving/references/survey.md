@@ -68,10 +68,10 @@ Most problems the checks raise are found and proven by a test of minutes, not a 
 | Per-layer split at batch 1 | Non-matmul ops ranked by share | Reshape and layout overhead |
 | Paired exactness check | Tokens, recurrent state and logits, candidate against baseline | Accepts a speedup without an eval |
 | Long-prefix KL against HF | Divergence on real agent prompts, per precision | Precision that breaks tool calls |
-| Prefill vs batch shape | One live row at batch 1, 8 and the serving batch | Padded prefill |
+| Prefill vs batch shape | One live row at batch 1, a middle batch and the serving batch | Padded prefill |
 | Memory under stress | Allocator events and minimum free DRAM over a loaded run | Safe pool size |
 | Agent replay | Recorded agent histories replayed at the target agent count with one output token per call (`scripts/agent_replay.py`): hit rate, prefilled ÷ final context tokens, time per call, preemptions | Pool too small for real contexts, agent count, block size, cache layout |
-| Host monitor | CPU per process and per container every 20 s beside the engine's step timers, during the smoke | Task containers starving the engine thread |
+| Host monitor | CPU per process and per container, sampled through the run beside the engine's step timers, during the smoke | Task containers starving the engine thread |
 
 The replay is the capacity test: synthetic multi-agent tests can pass while real histories
 overflow the pool. Record histories from any earlier run, including the smoke, as one JSONL file

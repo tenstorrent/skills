@@ -31,7 +31,7 @@ and fast checks can stay on the local device; CI is for what needs the grant.
 }
 ```
 
-`dispatch_inputs` must match the workflow's declared `workflow_dispatch` names. Each distinct
+The numbers are an example of the shape, not values to copy. `dispatch_inputs` must match the workflow's declared `workflow_dispatch` names. Each distinct
 `runner_label` is a machine class to prove separately, not a duplicate.
 
 ## Publish

@@ -137,8 +137,9 @@ The device is the scarce resource and the clock is fixed. Manage both.
 - **Estimate before running, compare after.** Every run gets a predicted duration from the last
   measured run; record predicted against measured and correct the next estimate by the ratio.
 - **Stop what cannot finish.** When a run's progress projects past its slot or past the release
-  start, stop it and keep its partial results. A run with no model calls for 30 minutes is
-  stalled: look at why before waiting longer.
+  start, stop it and keep its partial results. A run whose agents go without a model call for
+  several times the gap between calls measured on earlier runs is stalled: look at why before
+  waiting longer.
 - **Count device time from the queue log**, by the jobs that held the device. A server left up
   between jobs is not effort time.
 - **Blocked on one thing, keep working on the rest.** Write the block to `blocked.json` at once.
@@ -215,9 +216,9 @@ rule so another run picks the same tasks. Never take a prefix of a sorted list.
 | Rung | GPQA Diamond | SWE-bench Verified | Terminal-Bench | Size set by |
 |---|---|---|---|---|
 | smoke | 2 | 2 | 2 | fixed |
-| nightly | 10 | 5 | 10 | fixed, the sizes main runs nightly |
+| nightly | about 10 | about 5 | about 10 | the harness: main's usual nightly sizes; read them for this model |
 | full load | agents per server | agents per server | agents per server | the agent, from [Batch and agents](#batch-and-agents) |
-| larger (`full`) | — | multiples of full load, or 100 to project 500 | multiples of full load | the agent, from `release_hours` |
+| larger (`full`) | — | multiples of full load | multiples of full load | the agent, from `release_hours`; a larger list also projects the full suite |
 | full suite | 198 | 500 | 89 | fixed |
 
 **Read every score with its error.** Report the 95% interval, about ±2·√(p(1−p)/n), and say when a
@@ -310,7 +311,7 @@ decides against the current ranking whether it continues.
   older best confirms again after rebasing.
 - **Re-ranks do not interrupt running efforts**, unless a merge already solved their problem.
 - **Evidence is written once**, by the effort, when it ends. No sub-agent maintains or audits the
-  evidence while the stage runs; one closure review at the end, boxed at 1 h.
+  evidence while the stage runs; one short closure review at the end, inside the schedule.
 
 The coordinator holds the current best, the device queue and the schedule, chooses which efforts
 run together, and reads wide where efforts read deep, as
