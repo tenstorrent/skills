@@ -161,9 +161,8 @@ def refusal(payload: dict) -> str | None:
         if not found:
             return None
         seen |= {_key(actions[i]) for i, _ in found}
-        tmp = state_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps({"denials": denials + 1, "seen": sorted(seen)}))
-        tmp.replace(state_path)
+        from .project import durable_write
+        durable_write(state_path, json.dumps({"denials": denials + 1, "seen": sorted(seen)}))
         lines = "; ".join(f"actions[{i}] ({actions[i].get('type')}): {why}" for i, why in found)
         return (f"this answer was not applied. {lines}. Fix or drop each of these and send the whole answer "
                 f"again; the other actions are fine. An action resent unchanged goes through and is refused "
