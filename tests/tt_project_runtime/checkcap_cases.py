@@ -2415,7 +2415,7 @@ def test_light_checks_run_at_once_while_a_heavy_run_holds_the_lane_and_a_failing
 
 
 def test_only_whole_light_commands_are_light(env):
-    from ttp import checklane
+    from ttp import checklane, testslots
     pats = checklane.light_patterns({})
     for cmd in ("python3 -m py_compile a.py", "python3 -m py_compile a.py && git diff --check", "ruff check .",
                 "timeout 60 ruff check .", "FOO=1 ruff check .", "black --check .", "git diff --check"):
@@ -2451,7 +2451,7 @@ def test_checks_lanes_default_from_the_machine_and_follow_checks_slots(env, monk
 
 
 def test_checks_lanes_follow_the_host_small_keeps_the_old_default_idle_large_gets_more(env, monkeypatch):
-    from ttp import checklane
+    from ttp import checklane, testslots
     monkeypatch.delenv(checklane.SLOTS_ENV)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "2")
     for c, mem in ((8, 30), (16, 60)):
@@ -4546,7 +4546,7 @@ def test_a_checks_queue_of_21_waiters_wakes_the_coordinator_once_and_records_eve
 
 
 def test_a_checks_queue_incident_rewakes_once_per_escalation_interval_of_its_longest_wait(env, monkeypatch):
-    from ttp import checklane
+    from ttp import checklane, testslots
     from ttp.daemon import Daemon
     p = make(env)
     evs = _queue_events(5)
@@ -4572,7 +4572,7 @@ def test_a_checks_queue_incident_rewakes_once_per_escalation_interval_of_its_lon
 
 
 def test_a_drained_checks_queue_ends_its_incident_and_a_new_queue_wakes_afresh(env, monkeypatch):
-    from ttp import checklane
+    from ttp import checklane, testslots
     from ttp.daemon import Daemon
     p = make(env)
     evs = _queue_events(4)
@@ -6881,3 +6881,37 @@ def test_slot_status_shows_the_disk_gate_with_its_values(env, tmp_path, monkeypa
         cli.main(["checks", "--slot-status", "--json"])
     disk = _json.loads(capsys.readouterr().out)["disk"]
     assert disk["dirty_mb"] == 3072.0 and disk["io_full_avg60"] is None and "Dirty 3.0 GB" in disk["held"], disk
+
+
+def _waiting_precheck_lane(p, tid, head, queued, monkeypatch):
+    """A lane record of the daemon's review precheck of task `tid`, waiting for a slot (no run_since)."""
+    from ttp import checklane, testslots
+    lane = Path("lane0")
+    monkeypatch.setattr(testslots, "suite_bases", lambda name: ["b"])
+    monkeypatch.setattr(testslots, "_lanes_of", lambda base: [lane])
+    rec = {"pid": os.getpid(), "task": str(tid), "holder": f"run t{tid}-{head}", "since": time.time(), "queued": queued}
+    return checklane, lane, rec
+
+
+def test_a_waiting_precheck_of_a_finished_task_is_flagged_by_its_arrival_not_its_refreshed_since(env, monkeypatch):
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code")
+    head = "ab12cd34ef56"
+    now = time.time()
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now - 7200, tid))
+    checklane, lane, rec = _waiting_precheck_lane(p, tid, head, now - 7000, monkeypatch)
+    monkeypatch.setattr(checklane.locks, "holder_records", lambda paths: [rec])
+    h = checklane.finished_holders(p, {}, now)
+    assert h and h[0]["ended_s"] >= 6900 and h[0]["stop"], h   # waiting, not running: stopped without grace
+
+
+def test_a_precheck_of_a_done_task_whose_review_is_open_is_kept(env, monkeypatch):
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code")
+    head = "ab12cd34ef56"
+    now = time.time()
+    p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (now - 7200, tid))
+    p.db.add_task("review", "r", kind="review", labels=[f"precheck:t{tid}-{head}"])
+    checklane, lane, rec = _waiting_precheck_lane(p, tid, head, now - 7000, monkeypatch)
+    monkeypatch.setattr(checklane.locks, "holder_records", lambda paths: [rec])
+    assert checklane.finished_holders(p, {}, now) == []

@@ -643,13 +643,15 @@ def finished_holders(p, cfg: dict | None, now: float | None = None) -> list[dict
                 if not row or row["status"] not in FINISHED or open_precheck(p.db, task, rec.get("holder")):
                     continue
                 since = float(rec.get("since") or now)
-                ended = now - max(float(row["updated"] or 0), since)
+                # a check still waiting for a slot refreshes 'since' every cycle: date it by its arrival
+                arrived = float(rec.get("queued") or since)
+                ended = now - max(float(row["updated"] or 0), arrived)
                 if ended < flag:
                     continue
                 grace = done_grace_s(cfg, rec)
                 out.append({"lane": str(path), "pid": rec.get("pid"), "task": task, "run": _run_of(rec.get("holder")),
                             "precheck": _precheck_of(rec.get("holder")), "status": row["status"], "since": since, "ended_s": ended, "held_s": now - since,
-                            "grace_s": grace, "stop": ended >= grace, "command": str(rec.get("command") or "")})
+                            "grace_s": grace, "stop": ended >= grace or (bool(_precheck_of(rec.get("holder"))) and not rec.get("run_since")), "command": str(rec.get("command") or "")})
     return out
 
 
