@@ -58,6 +58,88 @@ def test_an_urgent_code_task_gets_its_review_at_priority_one_on_a_needs_review_h
     assert [r["priority"] for r in reviews] == [p.db.task(tid)["priority"]], "a routine review keeps its chain's (chainprio)"
 
 
+def test_an_owed_code_task_gets_its_review_at_once_on_a_needs_review_hand_off(env):
+    """A task that owns an open obligation is reviewed in the same pass as an urgent one, at its own
+    priority; once the obligation has its receipt or is dropped it waits for the sweep again."""
+    from ttp import obligations
+    p = make(env)
+    _with_origin(env, clone=False)
+    owed = lambda tid, head: obligations.add(p, "the fix the user asked for", owners=[tid])   # noqa: E731
+    tid, _, _, reviews = _finish_code(env, p, "owed fix", {"o.py": 5}, before=owed,
+                                      result={"status": "needs_review", "summary": "ok"})
+    assert [(r["priority"], r["origin"]) for r in reviews] == [(p.db.task(tid)["priority"], "daemon")]
+    dropped = lambda tid, head: obligations.drop(p, obligations.add(p, "x", owners=[tid]), "done")   # noqa: E731
+    tid, _, _, reviews = _finish_code(env, p, "was owed", {"w.py": 5}, before=dropped,
+                                      result={"status": "needs_review", "summary": "ok"})
+    assert reviews == [], "a dropped obligation still jumped the sweep"
+
+
+def _question_on_own_branch(env, p, title, spec, branch=None, commit=True):
+    """A question task (no worktree of its own) whose worker made `branch` ({tid} its id; default its own
+    ttp/t<id>-... branch) from the base and committed there, as #6127 did; returns its id."""
+    tid = p.db.add_task(title, spec, kind="question", tier="standard", origin="coordinator")
+    branch = (branch or "ttp/t{tid}-" + title.replace(" ", "-")).format(tid=tid)
+    path = env["tmp"] / f"q-{tid}-{branch.replace('/', '_')}"
+    _git_out(p.root, "worktree", "add", "-q", "-b", branch, str(path))
+    if commit:
+        (path / f"{tid}.py").write_text("x = 1\n")
+        _git_out(path, "add", ".")
+        _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", title)
+    p.db.update_task(tid, status="running")
+    return tid
+
+
+def _finish_question(env, p, tid, status="needs_review"):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    run_dir = env["tmp"] / f"run-q-{tid}"
+    run_dir.mkdir()
+    result = {"status": status, "summary": "the fix is on my branch"}
+    (run_dir / "result.json").write_text(json.dumps(result))
+    d = Daemon(p.base)
+    d._prefetch_remote(tid, result, run_dir)   # every finish path runs it before the transaction
+    d._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    return p.db.q("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([tid]),))
+
+
+def test_an_urgent_question_task_that_committed_its_change_gets_its_review_in_the_same_pass(env):
+    """#6127: an urgent `continue:` hop of a question task ran as kind question (no worktree), made its own
+    ttp/t<id>-... branch, committed the fix and handed off needs_review. The review gate took code tasks
+    only, so no review was queued and it sat in review until the stall alert. Now it becomes a code task
+    on that branch before the finish transaction and its review is queued at once at priority 1."""
+    p = make(env)
+    _with_origin(env, clone=False)
+    tid = _question_on_own_branch(env, p, "caps line", "urgent: owed to the user\nFix caps_line.")
+    reviews = _finish_question(env, p, tid)
+    t = p.db.task(tid)
+    assert (t["kind"], t["branch"], t["status"]) == ("code", f"ttp/t{tid}-caps-line", "review")
+    assert [(r["priority"], r["origin"]) for r in reviews] == [(1, "daemon")], "no review queued in the pass"
+    assert t["branch"] in reviews[0]["spec"]
+    # A routine one is still a code task now, so the sweep and the coordinator see a change to review.
+    tid = _question_on_own_branch(env, p, "routine q", "Fix it.")
+    assert _finish_question(env, p, tid) == [] and p.db.task(tid)["kind"] == "code"
+    tid = _question_on_own_branch(env, p, "routine done", "Fix it.")
+    assert len(_finish_question(env, p, tid, "done")) == 1
+
+
+def test_a_question_task_is_not_made_a_code_task_without_a_commit_on_its_own_branch(env):
+    p = make(env)
+    _with_origin(env, clone=False)
+    hot = "urgent: owed\nAnswer it."
+    cases = [_question_on_own_branch(env, p, "no commit", hot, commit=False)]
+    cases.append(_question_on_own_branch(env, p, "not its own", hot, branch="ttp/t{tid}0-x"))   # task <id>0's
+    two = _question_on_own_branch(env, p, "two", hot)
+    _git_out(p.root, "branch", f"ttp/t{two}-again", f"ttp/t{two}-two")   # which one is the change: unknown
+    cases += [two, _question_on_own_branch(env, p, "unnamed", hot, branch="fix/t{tid}-x"),
+              _question_on_own_branch(env, p, "no dash", hot, branch="ttp/t{tid}")]
+    for tid in cases:
+        assert _finish_question(env, p, tid) == [], tid
+        assert (p.db.task(tid)["kind"], p.db.task(tid)["branch"]) == ("question", None), tid
+    # A failed hand-off is not a change to review either.
+    tid = _question_on_own_branch(env, p, "failed", hot)
+    assert _finish_question(env, p, tid, "failed") == [] and p.db.task(tid)["kind"] == "question"
+
+
 def test_the_review_sweeps_take_an_urgent_task_at_once_and_past_the_cap(env):
     from ttp.daemon import Daemon
     p = make(env)

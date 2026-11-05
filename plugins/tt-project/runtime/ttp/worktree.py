@@ -1038,6 +1038,23 @@ def rescue_detached(p: Project, task: dict, result: dict | None, cwd: str = "",
     return "", ""
 
 
+def own_branch(p: Project, task: dict, timeout_s: float = RESCUE_TIMEOUT_S) -> str:
+    """The one local branch named after `task` (ttp/t<id>-...) that adds a commit its base lacks, or '' (none,
+    several, or git failing): a task of a kind that gets no worktree (a question, say) whose worker made its
+    own task branch and committed its change there. Only that name ties the branch to this task."""
+    own = f"ttp/t{int(task['id'])}-"
+    try:
+        names = [n for n in _git(p.root, "for-each-ref", "--format=%(refname:short)", "refs/heads/ttp/",
+                                 check=False, timeout=timeout_s).split() if n.startswith(own)]
+        if len(names) != 1:
+            return ""
+        base = resolve_base(p)
+        return names[0] if _git(p.root, "rev-list", "-n", "1", names[0], "--not", base, check=False,
+                                timeout=timeout_s) else ""
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        return ""
+
+
 def carried_head(p: Project, task: dict) -> str | None:
     """The head of the task's carried branch (carried_branch), so it builds on what it delivers onto,
     or of the branch it rebases (rebased_branch)."""

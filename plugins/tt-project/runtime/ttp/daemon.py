@@ -4898,6 +4898,7 @@ class Daemon:
         now, before the transaction that records it: inside it the answer is read, never fetched, so
         the write lock never waits on the network. Best effort: an unanswered question reads as before."""
         self._rescue_detached(task_id, result, run_dir)
+        self._adopt_own_branch(task_id, result)
         task = self._prefetch_lint(task_id, result, run_dir)
         if not isinstance(result, dict) or result.get("status") not in ("done", "needs_review"):
             return   # only a finished hand-off approves a push or gets its review
@@ -4927,6 +4928,23 @@ class Daemon:
             self.p.db.update_task(task_id, branch=branch)
             log(self.p, f"task {task_id}: its commits were on a detached HEAD at {head[:12]}; kept on branch "
                         f"{branch}, now its branch on record")
+
+    def _adopt_own_branch(self, task_id: int, result) -> None:
+        """A task of a kind that gets no worktree (question, plan, work) finishing done or needs_review with
+        no branch on record, whose worker committed a change on its own task branch (worktree.own_branch),
+        becomes a code task on that branch before the transaction that queues its review: a finished
+        change always gets its review (an urgent or owed one at once), never only a stall alert. Best
+        effort: git failing leaves the task as it was."""
+        task = self.p.db.task(task_id)
+        if not task or task["kind"] in ("code", *worktree.NEVER_OWN_KINDS) or task.get("branch") \
+                or not isinstance(result, dict) or result.get("status") not in ("done", "needs_review") \
+                or not worktree.is_git(self.p.root):
+            return
+        branch = worktree.own_branch(self.p, task)
+        if branch:
+            self.p.db.update_task(task_id, kind="code", branch=branch)
+            log(self.p, f"task {task_id}: a {task['kind']} task that committed its change on its own branch "
+                        f"{branch}; now a code task on it, so its change gets its review")
 
     def _prefetch_lint(self, task_id: int, result, run_dir: Path | None = None) -> dict | None:
         """What the hand-off lint (handofflint.lint, in _finish_worker) reads from the remote, and the
@@ -5767,13 +5785,14 @@ class Daemon:
         if split:
             text += (f"\nSplit at head {split[:12]}: no review of it; its continue hop builds on this branch, and "
                      f"the chain's last hop gets the one review.")
-        # An urgent one's review is queued at once on a needs_review hand-off too (no sweep_after_s wait).
+        # An urgent or owed one's (an open obligation's owner) review is queued at once on a needs_review hand-off
+        # too (no sweep_after_s wait).
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
         # reads inside this transaction (rev-parse, the diff base, rev-list --count), each milliseconds; they
         # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
         review = self._auto_review(dict(task, **upd), summary) \
-            if (new == "done" or new == "review" and urgent.is_urgent(task)) and task["kind"] == "code" \
-            and not split else None
+            if (new == "done" or new == "review" and (urgent.is_urgent(task) or obligations.owned_open(db, task["id"]))) \
+            and task["kind"] == "code" and not split else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
