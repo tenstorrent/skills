@@ -44,6 +44,17 @@ def begin(what: str = "", pool: bool = False) -> tuple[str, str, float] | None:
     return token
 
 
+def waited(seconds: float, what: str = "") -> bool:
+    """Record a test-pool wait that already ended: the last `seconds` up to now (a pool that times its own pick
+    of a slot, as a running check's shard does, reports it once granted). False outside a push check."""
+    token = begin(what, pool=True)
+    if not token:
+        return False
+    now = token[2]
+    locks.record_wait(Path(token[0]), token[1], now - seconds, now)
+    return True
+
+
 def end(token: tuple[str, str, float] | None) -> None:
     """Close the wait begin() recorded (granted, or given up)."""
     if token:

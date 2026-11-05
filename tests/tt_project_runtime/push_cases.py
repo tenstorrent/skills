@@ -14698,6 +14698,45 @@ def test_a_push_check_waiting_past_its_pool_bound_fails_naming_the_pool_wait(mon
             push.pool_wait_of(bad)
 
 
+def test_a_push_check_time_limit_leaves_out_its_running_shards_waits_for_test_pool_slots(monkeypatch, tmp_path):
+    """Shards of a check already running wait for test-pool slots while other shards run: those waits (live,
+    wrapped in `ttp pool-wait`, or reported once granted with `--waited`) are left out of the check's limit,
+    overlapping ones counted once, so a 1005 s check with 400 s of shard pool waits passes under 900 s; a
+    check whose own run then goes past the limit still times out, at its limit plus the waits."""
+    from ttp import checkwait, locks, push
+
+    def run(name, ends_at):
+        clock = [1000.0]
+        monkeypatch.setattr(push.time, "time", lambda: clock[0])
+        monkeypatch.setattr(push, "check_limit_s", 900.0)
+        monkeypatch.setattr(push, "check_queue_s", 60.0)
+        monkeypatch.setattr(push, "pool_wait_s", 4 * 3600.0)
+        waits = tmp_path / name
+        waits.mkdir()
+        monkeypatch.setenv(checkwait.ENV, str(waits))
+        pool = waits / checkwait.POOL
+        pool.mkdir()
+        steps = {
+            1100.0: lambda: locks.record_wait(pool, "shard-2", 1100.0, None),    # shard 2 waits live
+            1200.0: lambda: locks.record_wait(pool, "shard-3", 1200.0, None),    # and shard 3, overlapping
+            1400.0: lambda: locks.record_wait(pool, "shard-2", 1100.0, 1400.0),
+            1450.0: lambda: locks.record_wait(pool, "shard-3", 1200.0, 1450.0),
+            1700.0: lambda: checkwait.waited(150.0, "cpu-pool"),                 # shard 4 granted after 150 s
+        }
+        proc = _ClockCheck(clock, 1000.0 + ends_at, at=steps)
+        monkeypatch.setattr(push, "_kill_tree", lambda pid: setattr(proc, "killed", True))
+        said = []
+        rc = push._timed_wait(proc, waits, "run-shards", said.append)
+        return rc, "\n".join(said), clock[0] - 1000.0
+
+    rc, said, _ = run("a", 1005)   # 350 s + 150 s of shard pool waits: 505 s of its own run
+    assert rc == 0, said
+    assert "waited 500 s for a test-pool slot, not counted against its time limit" in said, said
+    rc, said, t = run("b", 3000)
+    assert rc == 124 and "check ran past its limit of 900 s" in said, said
+    assert 1400 <= t < 1410, t   # 900 s run + 500 s of shard pool waits
+
+
 def test_checkwait_counts_pool_waits_as_waiting_but_never_as_a_queued_grant(tmp_path):
     """A pool wait is waiting time (state), read on its own by pool(); an open one is no open grant wait,
     so the push never answers 'queued' for it; overlapping grant and pool waits count once."""
@@ -14715,6 +14754,27 @@ def test_checkwait_counts_pool_waits_as_waiting_but_never_as_a_queued_grant(tmp_
         assert checkwait.pool(d, 100, 200) == (60.0, True)
     finally:
         locks.record_wait(d / checkwait.POOL, "b", 180.0, 190.0)
+
+
+def test_ttp_pool_wait_waited_records_a_wait_the_pool_timed_itself(tmp_path, monkeypatch, capsys):
+    """`ttp pool-wait --waited N` records a pool wait of the last N s, ending now, clipped to the check's
+    start; it refuses a bad number or a command beside it, and does nothing outside a push check."""
+    from ttp import checkwait
+    d = tmp_path / "waits"
+    d.mkdir()
+    monkeypatch.setenv(checkwait.ENV, str(d))
+    now = time.time()
+    assert _ttp("pool-wait", "--what", "cpu-pool", "--waited", "120") == 0
+    waited, open_ = checkwait.pool(d, now - 1000)
+    assert 119 <= waited < 125 and not open_, waited
+    assert checkwait.pool(d, now - 30)[0] < 40   # never more than since the check started
+    for bad in ("soon", "-5", "nan", "inf", ""):
+        assert _ttp("pool-wait", "--waited", bad) == 2, bad
+    assert _ttp("pool-wait", "--waited", "5", "--", "true") == 2
+    assert "--waited" in capsys.readouterr().err
+    assert 119 <= checkwait.pool(d, now - 1000)[0] < 125, "a refused report records nothing"
+    monkeypatch.delenv(checkwait.ENV)
+    assert _ttp("pool-wait", "--waited", "60") == 0
 
 
 def test_ttp_pool_wait_records_its_command_as_a_pool_wait_only_inside_a_push_check(tmp_path, monkeypatch):
