@@ -75,6 +75,7 @@ The batch log and `ttp status` show `push priority slot: <holder>`; slots are OS
 
 `delivery.push_checks` receive a writable absolute `TTP_RUN_DIR`, never empty or `/`.
 Foreground `ttp checks` uses the worker's run directory; detached checks, detached pushes and push-queue batches get unique directories under project `state/check-runs/`, outside the checked worktree.
+`ttp checks` records the checked worktree by its real path (links resolved). It refuses to detach checks, or to hand busy foreground checks over to detached ones, for a worktree inside the run's temporary folder (run.json `tmp_dir`, the run's TMPDIR, or the run dir's `tmp`): that folder is removed when the run ends, so the checks would die waiting. It names a lasting place (`git worktree move <tree> $TTP_RUN_DIR/wt-<name>`, which keeps uncommitted changes); foreground checks there still run.
 Use `"$TTP_RUN_DIR/report.json"` for durable outputs.
 `checks.pid` and queue markers record `check_run_dir`; a restarted daemon rebuilds queued directories and a rebooted check invocation gets a fresh one.
 Outputs survive worker cleanup and completion; only detached checks' temporary scratch is reclaimed once its lifetime lock is free.

@@ -92,3 +92,107 @@ def test_checktree_warning_fires_only_for_a_stale_or_project_root_tree_off_the_c
     assert checktree.warning(top, old, root=tmp_path, tip_ref=ref, callers=[top]) == ""
     # No push target known: only a root checked from elsewhere warns.
     assert checktree.warning(top, old, root=None, tip_ref="", callers=[elsewhere]) == ""
+
+
+def _temp_worktree(run, git, tmp):
+    """A linked worktree of the checks repo inside the run's temporary folder (run.json tmp_dir)."""
+    tmp.mkdir()
+    (run / "run.json").write_text(json.dumps({"cwd": str(run), "tmp_dir": str(tmp)}))
+    wt = tmp / "wt"
+    subprocess.run([*git, "worktree", "add", "-q", "--detach", str(wt), "HEAD"], check=True)
+    return wt
+
+
+def test_ttp_checks_refuse_to_detach_or_queue_a_worktree_in_the_runs_temporary_folder(env, tmp_path, monkeypatch,
+                                                                                     capsys):
+    # Queued checks of a tree under the run's TMPDIR died with ENOENT once the run ended and its TMPDIR
+    # went: they are refused up front, naming a lasting place in the run dir, and nothing is queued.
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    wt = _temp_worktree(run, git, tmp_path / "runtmp")
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    for how in (["--worktree", str(wt)], []):   # by flag, and from a shell inside it
+        if not how:
+            monkeypatch.chdir(wt / ".")
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--detach", *how, "--", "true"])
+        err = capsys.readouterr().err
+        assert e.value.code == 2, err
+        assert f"worktree {wt.resolve()} is inside this run's temporary folder {(tmp_path / 'runtmp').resolve()}" in err
+        assert f"worktree move {wt.resolve()} {run / 'wt-wt'}" in err
+        assert not list((p.state / detach.QUEUE).glob("*.json")) and not (run / cli.CHECKS_PID).exists()
+    # The run dir's own tmp is removed at run end too; a symlink into the temp folder resolves into it.
+    link = tmp_path / "link"
+    link.symlink_to(wt)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--detach", "--worktree", str(link), "--", "true"])
+    assert e.value.code == 2 and "temporary folder" in capsys.readouterr().err
+    # Foreground checks there still run: nothing outlives the call.
+    cli.main(["checks", "--worktree", str(wt), "--", "true"])
+    assert json.loads((run / "checks.json").read_text())["passed"] is True
+    # Moved to the suggested lasting place, the same checks queue.
+    lasting = run / "wt-wt"
+    subprocess.run([*git, "worktree", "move", str(wt), str(lasting)], check=True)
+    monkeypatch.chdir(lasting)
+    cli.main(["checks", "--detach", "--fresh", "--", "true"])
+    assert "queued" in capsys.readouterr().out
+    q = next((p.state / detach.QUEUE).glob("*.json"))
+    assert json.loads(q.read_text())["checks"]["worktree"] == str(lasting.resolve())
+
+
+def test_ttp_checks_never_hand_a_temporary_folder_worktree_over_to_detached_checks(env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    wt = _temp_worktree(run, git, run / "tmp")
+    monkeypatch.chdir(wt)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.5)
+    ran = tmp_path / "ran"
+    holder = _cap_holder("other project task #3 (run 9)")
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+    finally:
+        holder.kill()
+        holder.wait()
+    captured = capsys.readouterr()
+    assert e.value.code == 2 and "every checks slot stayed busy" in captured.err, captured
+    assert f"inside this run's temporary folder {(run / 'tmp').resolve()}" in captured.err
+    assert cli.CHECKS_HANDOVER not in captured.out and not (run / cli.CHECKS_PID).exists() and not ran.exists()
+
+
+def test_ttp_checks_record_a_symlinked_worktree_as_its_real_path(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, detach, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    link = tmp_path / "via"
+    link.symlink_to(repo)
+    monkeypatch.chdir(tmp_path)
+    cli.main(["checks", "--worktree", str(link), "--", "true"])
+    assert f"in worktree {repo.resolve()}" in capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["worktree"] == str(repo.resolve())
+    monkeypatch.setattr(push, "_boxed", lambda: True)
+    cli.main(["checks", "--detach", "--fresh", "--worktree", str(link), "--", "true"])
+    q = next((p.state / detach.QUEUE).glob("*.json"))
+    assert json.loads(q.read_text())["checks"]["worktree"] == str(repo.resolve())
+    assert json.loads(q.read_text())["cwd"] == str(repo.resolve())
+    # The shell's own directory reached through the link records the real path too.
+    monkeypatch.chdir(link)
+    cli.main(["checks", "--fresh", "--", "true"])
+    assert json.loads((run / "checks.json").read_text())["worktree"] == str(repo.resolve())
+
+
+def test_checktree_temp_root_matches_only_the_runs_own_temporary_folders(tmp_path):
+    from ttp import checktree
+    run, tmp = tmp_path / "run", tmp_path / "t"
+    run.mkdir()
+    tmp.mkdir()
+    assert checktree.temp_root(tmp / "w", run) == ""   # no run.json: only the run dir's tmp counts
+    assert checktree.temp_root(run / "tmp" / "w", run) == str((run / "tmp").resolve())
+    (run / "run.json").write_text(json.dumps({"tmp_dir": str(tmp)}))
+    assert checktree.temp_root(tmp / "a" / "b", run) == str(tmp.resolve())
+    assert checktree.temp_root(tmp, run) == str(tmp.resolve())
+    assert checktree.temp_root(tmp_path / "t2" / "w", run) == "", "a sibling with the same prefix is not inside"
+    assert checktree.temp_root(run / "wt-x", run) == "", "the run dir itself lasts"
+    assert checktree.temp_root(tmp / "w", None) == ""
+    (run / "run.json").write_text("{not json")
+    assert checktree.temp_root(tmp / "w", run) == ""

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -62,6 +63,34 @@ def run_worktree(run_dir: str | Path | None) -> str:
     except (OSError, ValueError, AttributeError):
         return ""
     return toplevel(cwd) if isinstance(cwd, str) else ""
+
+
+def temp_root(top: str | Path, run_dir: str | Path | None) -> str:
+    """The run's temporary folder that `top` lies in, or "": run.json's `tmp_dir` (the run's TMPDIR)
+    or the run dir's `tmp`, both removed when the run ends. Paths are compared resolved."""
+    roots = [Path(run_dir) / "tmp"] if run_dir else []
+    try:
+        tmp = json.loads((Path(run_dir) / "run.json").read_text()).get("tmp_dir") if run_dir else None
+    except (OSError, ValueError, AttributeError):
+        tmp = None
+    if isinstance(tmp, str) and tmp:
+        roots.insert(0, Path(tmp))
+    real = Path(os.path.realpath(top))
+    for r in roots:
+        r = Path(os.path.realpath(r))
+        if real == r or r in real.parents:
+            return str(r)
+    return ""
+
+
+def temp_refusal(top: str, tmp: str, run_dir: str | Path) -> str:
+    """Why detached or queued checks of `top`, inside the run's temporary folder `tmp`, do not start."""
+    to = Path(run_dir) / f"wt-{Path(top).name}"
+    return (f"ttp checks: not started: worktree {top} is inside this run's temporary folder {tmp}, which is "
+            "removed when the run ends, so checks left waiting or running after the hand-off would lose it. "
+            f"Move it to a lasting place first, e.g. `git -C {shlex.quote(top)} worktree move {shlex.quote(top)} "
+            f"{shlex.quote(str(to))}` (it keeps your "
+            "commits and uncommitted changes), then run `ttp checks` there again")
 
 
 def behind(top: str | Path, head: str, tip_ref: str) -> int | None:

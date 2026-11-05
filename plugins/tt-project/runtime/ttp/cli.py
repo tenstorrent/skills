@@ -3141,16 +3141,22 @@ def cmd_checks(a) -> None:
     # it this was started: a repo-relative check started in a subdirectory would test the wrong place.
     # Which worktree that is, the line naming it and the stale-tree warning: checktree.
     from . import checktree
-    where = getattr(a, "worktree", None) or str(Path.cwd())
+    # Real paths: checks.pid and checks.json record them, and a re-queue cds there, never through a link.
+    where = os.path.realpath(getattr(a, "worktree", None) or str(Path.cwd()))
     if not Path(where).is_dir():
         die(f"ttp checks: --worktree {where} is not a directory")
     top = subprocess.run(["git", "-C", where, "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
+    top = os.path.realpath(top) if top else top
     git = ["git", "-C", top or where]
     head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
     if not top or not head:
         die("ttp checks: run it in the change's git worktree (or pass --worktree <path>)")
     print(checktree.line(head, top), flush=True)
+    # A tree in the run's temporary folder is gone after the hand-off: detached checks would die with it.
+    temp = checktree.temp_root(top, run_dir) if not getattr(a, "own_group", False) else ""
+    if temp and a.detach:
+        die(checktree.temp_refusal(top, temp, run_dir))
     if warn := checktree.warning(top, head, root=p.root if p else None, tip_ref=_checks_tip_ref(p, Path(top)),
                                  callers=checktree.callers(Path.cwd(), run_dir)):
         print(warn, flush=True)
@@ -3769,6 +3775,8 @@ def cmd_checks(a) -> None:
                                                                 if fallback[0] else {})})
             print(f"ttp checks: {said}", file=sys.stderr)
             sys.exit(75)
+    if handover and temp:
+        die(f"{checktree.temp_refusal(top, temp, run_dir)} (with --detach: every checks slot stayed busy)")
     if handover:
         try:
             _checks_detach(a, Path(run_dir), p, top, head, arrived, no_spill, shorttmp.need(top, head, cmds))
