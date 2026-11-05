@@ -189,36 +189,35 @@ def record(state, fp: dict, now: float | None = None) -> dict:
 
 # A persistent coordinator session (coordsession.py) caches its whole history, not only the stateless
 # prefix, so its wakes are judged on the session's own writes, kept in its kv state under SESSION:
-# {"h1": start of its last 1h wake, "ttl": its last wake's lifetime, "end": that wake's end}. A resumed
-# wake goes at 5m only while the session's last 1h write is warm and what later 5m wakes added is still
-# alive (their last one ended under TAIL_MIN ago); any other session wake rewrites history, so it goes
-# at 1h when a next wake is likely (likely_next). A new session has no write of its own yet.
+# {"h1": start of its last 1h wake, "ttl": its last wake's lifetime}. A resumed wake goes at 5m only
+# right after the session's own 1h wake, while that is warm: what it adds is then the only part a gap
+# over 5 min loses. Any other session wake (a new session, a resume after a 5m wake) goes at 1h when a
+# next wake is likely (likely_next), so the history it writes outlives the many 5-60 min gaps. The
+# handover wake goes at 5m: the next wake starts a new session, which reads none of this one's history.
+# A replay of recorded session wakes found 5m after each fresh 5m wake (while the tail lives) or
+# whenever the 1h write is warm costing more: their 5m tails grow, and a miss rewrites all of them.
 SESSION = "cache"
-TAIL_MIN = 4             # a 5m write this young (from its wake's end) is alive for the next wake's first call
 
 
-def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, signals=None) -> tuple[str, str]:
-    """(ttl, reason) for a session wake of `mode` ("new" or "resume"), given the session's kv state."""
+def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, signals=None,
+                   handover: bool = False) -> tuple[str, str]:
+    """(ttl, reason) for a session wake of `mode` ("new" or "resume"), given the session's kv state;
+    `handover`: the session's last wake (coordsession.decide's "handover")."""
+    if handover:
+        return "5m", "the session's handover wake: the next wake starts a new session"
     st = state if isinstance(state, dict) else {}
     c = st.get(SESSION) if isinstance(st.get(SESSION), dict) else {}
-    warm_s = _num(warm_min, WARM_MIN) * 60
     h1 = c.get("h1")
     if mode != "resume":
         reason = "cold: a new session"
     elif not isinstance(h1, (int, float)):
         reason = "cold: no 1h write of this session"
-    elif not 0 <= now - h1 < warm_s:
+    elif not 0 <= now - h1 < _num(warm_min, WARM_MIN) * 60:
         reason = f"cold: the session last wrote at 1h {max(now - h1, 0) / 60:.0f} min ago"
-    elif c.get("ttl") == "1h":
-        return "5m", f"warm: the session wrote at 1h {(now - h1) / 60:.0f} min ago"
+    elif c.get("ttl") != "1h":
+        reason = "the session's last wake went at 5m"
     else:
-        end = c.get("end")
-        tail = now - end if isinstance(end, (int, float)) else None
-        if tail is not None and 0 <= tail < TAIL_MIN * 60:
-            return "5m", (f"warm: the session wrote at 1h {(now - h1) / 60:.0f} min ago and its last 5m "
-                          f"wake ended {tail / 60:.0f} min ago")
-        reason = "cold: the session's last 5m wake " + (f"ended {max(tail, 0) / 60:.0f} min ago"
-                                                        if tail is not None else "did not record its end")
+        return "5m", f"warm: the session's last wake went at 1h {(now - h1) / 60:.0f} min ago"
     return _cold(reason, now, signals)
 
 
@@ -227,14 +226,6 @@ def session_record(state, mode: str, ttl: str, now: float) -> dict:
     st = dict(state) if isinstance(state, dict) else {}
     prev = st.get(SESSION) if mode == "resume" and isinstance(st.get(SESSION), dict) else {}
     st[SESSION] = {"h1": now if ttl == "1h" else prev.get("h1"), "ttl": ttl}
-    return st
-
-
-def session_ended(state, now: float) -> dict:
-    """The session's kv state once its wake ended: a 5m write lives from the last call."""
-    st = dict(state) if isinstance(state, dict) else {}
-    if isinstance(st.get(SESSION), dict):
-        st[SESSION] = {**st[SESSION], "end": now}
     return st
 
 

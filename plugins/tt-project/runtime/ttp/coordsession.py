@@ -61,8 +61,6 @@ import json
 import re
 import time
 
-from . import cachettl
-
 KEY = "coord_session"
 GUARD_KEY = "coord_session_guard"
 MODES = ("off", "on", "shadow")
@@ -215,7 +213,6 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
         return st
     if ack:
         st[DIGEST] = ack
-    st = cachettl.session_ended(st, now)
     if mode == "new":   # failed-resume times stay: fail() bounds them to the hour across rollovers
         st.update({"started": now, "wakes": 0, "prev": st.get("id") or ""})
         st.pop("handover", None)

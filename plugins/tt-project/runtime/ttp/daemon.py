@@ -2883,7 +2883,7 @@ class Daemon:
                 session_ttl_at = now = time.time()
                 cache_ttl, ttl_why = cachettl.choose_session(
                     self.p.db.kv(coordsession.KEY), session_mode, now, warm_min,
-                    lambda: cachettl.signals(self.p.db, now))
+                    lambda: cachettl.signals(self.p.db, now), handover=why == "handover")
             elif prov.cache_env("1h"):
                 cache_fp = cachettl.fingerprint(system, context, schema, model, effort,
                                                 cachettl.cli_stamp(prov.binary()))
