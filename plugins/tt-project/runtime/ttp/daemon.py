@@ -1113,6 +1113,7 @@ class Daemon:
         self._machines_routed = 0.0
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
+        self._urgent_own_logged: dict[int, int] = {}   # task -> run whose own-wait hold check_urgent_start logged
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
         self._stall_probes: dict[str, list] = {}   # probe (or a caller's key) -> its re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
@@ -7595,6 +7596,20 @@ class Daemon:
                  (now, "daemon", "observation", fp, "high" if owns else "normal", text[:4000], "queued", tid))
             log(self.p, f"slot wait: task {tid} ({why}) waited {mins:g} min or more for a {provider} worker slot")
 
+    def _own_wait(self, t: dict, now: float) -> str:
+        """The short form of the wait a queued task sleeps on by its own hand-off ("" for none): its
+        retry_when (its own checks, a detached job, any probe) or its retry timer while not_before is
+        ahead, or a retry_when not yet woken whose last probe answer was "not yet" (NOT_YET_RCS) in
+        the moment between its timer running out and probe_waiting putting it back to sleep."""
+        res = load_result(t["result"]) if t.get("result") else {}
+        probe = str(res.get("retry_when") or "").strip()
+        if (t.get("not_before") or 0) > now:
+            return f"`{probe[:100]}`" if probe else f"its retry timer, {((t['not_before'] - now) / 60):.0f} min left"
+        got = self._probe_rc.get(t["id"])
+        if probe and "woke" not in res and got and got[2] == res.get("retry_when") and got[0] in NOT_YET_RCS:
+            return f"`{probe[:100]}`"
+        return ""
+
     def check_urgent_start(self, every_s: float = 60) -> None:
         """Model-free start watch for user-ordered urgent machine or device work: a task with a fresh
         `urgent:` line (urgent.extra_ok) that names a resource (coord.task_resources) or holds a device
@@ -7604,7 +7619,9 @@ class Daemon:
         an open `ttp lock` wait (locks.wait_rows) on a lock others hold, naming only the holders (project,
         task, run) of the locks that wait is on. One per fingerprint (urgent_start or urgent_lock, task and
         run); no urgent_start for a task already raised as ready_not_started or slot_wait for the same run
-        and hold (_stuck_raised)."""
+        and hold (_stuck_raised), nor for one asleep on its own wait (_own_wait: a retry_when, its own
+        checks or detached job, a retry timer), which is only logged, once per run, as held by its own
+        wait; urgent.waited_s counts from when that wait passed."""
         now = time.time()
         if now - getattr(self, "_urgent_start_checked", 0.0) < every_s:
             return
@@ -7633,7 +7650,12 @@ class Daemon:
             run = db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
             rid = (run or {}).get("id") or 0
             if t["status"] == "queued":
-                waited = urgent.waited_s(db, t, now)
+                if own := self._own_wait(t, now):   # asleep on its own wait: nothing holds it, nothing to chase
+                    if self._urgent_own_logged.get(tid) != rid:
+                        self._urgent_own_logged[tid] = rid
+                        log(self.p, f"urgent start: task {tid} held by its own wait: {own}")
+                    continue
+                waited = urgent.waited_s(db, t, now)   # since its own wait passed, if it had one
                 fp = f"urgent_start:{tid}:{rid}"
                 if waited < mins * 60 or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)) \
                         or self._stuck_raised(tid, rid, unstarted.READY_KIND, "slot_wait"):

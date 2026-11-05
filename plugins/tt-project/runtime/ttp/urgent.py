@@ -265,13 +265,16 @@ def approvals_waiting(db, target: str) -> list[int]:
 
 
 def waited_s(db, task: dict, now: float) -> float:
-    """How long `task` has waited in its present state: a queued task since it was made or its last
-    run ended (whichever is later), one in review since it entered review; 0 for other states."""
+    """How long `task` has waited in its present state: a queued task since it was made, its last
+    run ended or its own wait passed (not_before: a retry timer or retry_when, which a wake moves to the
+    wake's time; whichever is latest, so 0 while it still sleeps), one in review since it entered
+    review; 0 for other states."""
     if task.get("status") == "review":
         since = db.review_since().get(task["id"])
     elif task.get("status") == "queued":
         ended = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (task["id"],))
-        since = max(float(task.get("created") or 0), float((ended or {}).get("e") or 0))
+        since = max(float(task.get("created") or 0), float((ended or {}).get("e") or 0),
+                    float(task.get("not_before") or 0))
     else:
         return 0.0
     return max(now - float(since), 0.0) if since else 0.0

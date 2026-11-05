@@ -652,6 +652,65 @@ def test_user_ordered_urgent_device_work_not_started_or_stuck_in_ttp_lock_raises
         locks.record_wait(run_dir, "42:1.0", start + 8 * 60, start + 20 * 60)
 
 
+def test_an_urgent_task_asleep_on_its_own_wait_is_never_held_by_nothing_and_counts_from_its_wake(
+        env, monkeypatch):
+    """check_urgent_start: a queued urgent task asleep on its own retry_when (its timer ahead, or past
+    with the probe's last answer "not yet") raises no urgent_start, however long ago its last run
+    ended; once the wait passes (_wake_waiting) urgent.waited_s counts from the wake. An urgent task
+    with no wait still raises 'held by nothing now'."""
+    from ttp import urgent
+    from ttp.daemon import Daemon, dump_result
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    d.settling = lambda: False
+    start = time.time()
+    probe = "ttp checks --result /tmp/checks-run"
+
+    def add(title):
+        tid = p.db.add_task(title, "s\nurgent: the user ordered it", kind="work", tier="light", origin="user")
+        p.db.x("UPDATE tasks SET labels=?, created=? WHERE id=?", (json.dumps(["resource:box-a"]), start - 3600, tid))
+        return tid
+    asleep, plain = add("sleeps on its checks"), add("waits on nothing")
+    rid = p.db.x("INSERT INTO runs(task, role, provider, status, started, ended) VALUES(?,?,?,?,?,?)",
+                 (asleep, "worker", "claude", "done", start - 1800, start - 1200))
+    p.db.update_task(asleep, not_before=start + 3600,
+                     result=dump_result({"status": "waiting", "retry_when": probe}))
+    logged = []
+    monkeypatch.setattr("ttp.daemon.log", lambda _p, line: logged.append(line))
+
+    def check(at):
+        monkeypatch.setattr(time, "time", lambda: at)
+        d._urgent_start_checked = at - 60
+        d.check_urgent_start()
+        return {e["task"]: e for e in p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'urgent_start:%'")}
+    got = check(start + 60)
+    assert set(got) == {plain} and got[plain]["severity"] == "high", got
+    assert "held by nothing now" in got[plain]["text"], got[plain]["text"]
+    assert urgent.waited_s(p.db, p.db.task(asleep), start + 60) == 0, "asleep: no wait counted"
+    assert [x for x in logged if f"task {asleep} held by its own wait: `{probe}`" in x], logged
+    check(start + 120)
+    assert len([x for x in logged if f"task {asleep} held by its own wait" in x]) == 1, "logged once per run"
+    # Its timer ran out, the probe's last answer still "not yet": still its own wait.
+    p.db.update_task(asleep, not_before=start + 300)
+    d._probe_rc[asleep] = (1, start + 290, probe)
+    assert asleep not in check(start + 310)
+    d._probe_rc[asleep] = (75, start + 600, probe)
+    p.db.update_task(asleep, not_before=start + 900)
+    assert asleep not in check(start + 610)
+    # probe_waiting puts it back to sleep; the wait passes at +20 min: counted from then, raised 5 min later.
+    p.db.update_task(asleep, not_before=start + 3600)
+    monkeypatch.setattr(time, "time", lambda: start + 1200)
+    d._wake_waiting(p.db.task(asleep), "probe passed", start + 1200)
+    assert asleep not in check(start + 1200 + 4 * 60)
+    assert 4 * 60 <= urgent.waited_s(p.db, p.db.task(asleep), start + 1200 + 4 * 60) < 5 * 60
+    got = check(start + 1200 + 5 * 60 + 5)
+    assert got[asleep]["fingerprint"] == f"urgent_start:{asleep}:{rid}" and "held by nothing now" in got[asleep]["text"]
+
+
 def test_an_expect_claim_with_no_owner_open_20_min_is_never_announced_not_started(env):
     """A claim is promise-shaped but owes no work: an expect claim still open 20 min on raises no
     announced_not_started and shows in neither the promises digest nor the sweep's items."""
