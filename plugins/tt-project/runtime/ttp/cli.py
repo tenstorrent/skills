@@ -4677,7 +4677,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if suite is None and (suite := hold(repo, lanes_now, lock=lock,
                                             cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True, running=True,
-                                            startable=lambda: testslots.pool_room(cfg, p.name if p else None, since=arrived))) is None:
+                                            startable=lambda: testslots.pool_room(
+                                                cfg, p.name if p else None, priority=prio, since=arrived))) is None:
             if tree is not None:
                 tree.close()
             return None

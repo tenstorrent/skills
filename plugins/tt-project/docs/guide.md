@@ -1547,8 +1547,11 @@ running work is interrupted only by the preemption below:
   row (default 3; 0 turns this off) while other checks wait, so the rest still progress. No run waits
   without a bound: one that has waited `checks.starve_s` seconds (account-level, env
   `TTP_CHECKS_STARVE_S`, default 3600, about one full suite run; it cannot be turned off) goes ahead of
-  every later arrival, priority-1 and obligation checks included, for the next free slot, and later
-  runs of its project leave it their next free test slots; while any run waits for test slots, push
+  later arrivals at its own priority or a less urgent one for the next free slot, and those runs of its
+  project leave it their next free test slots. More urgent runs keep their precedence under a backlog,
+  but once `checks.priority_turns` N of them (default 3 when it is unset; 0 lets the aged run go first)
+  started while it waited, the aged run takes the next turn, so it still starts within a bound; priority-0
+  runs are never held by a less urgent one. While any run waits for test slots, push
   checks use only their branch's reserved test slot. There is no
   separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
   before this, their waiters may disagree on who is next and a slot can sit idle until another frees.

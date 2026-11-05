@@ -1361,7 +1361,7 @@ def _served(locks_dir: Path, resource: str) -> dict[str, float]:
 
 
 def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0,
-               aged_before: float | None = None) -> list[Path]:
+               aged_before: float | None = None, aged_turns: int | None = None) -> list[Path]:
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
@@ -1379,14 +1379,18 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     host is upgraded.
 
     `aged_before` (an epoch time): waiters that arrived at or before it have waited past their bound and go
-    first, by arrival, ahead of urgent ones and every turn above, so no waiter waits without a bound.
+    first, by arrival, ahead of every turn above. Under urgent turns (`urgent_max` > 0 or URGENT_FIRST) only
+    routine ones do, and only ahead of routine waiters: they take the routine turns, so urgent ones keep
+    theirs and the `urgent_max` bound still lets a routine one go.
 
     `urgent_max` URGENT_FIRST: every urgent waiter goes first, whatever its project or the others' arrival
     (aged ones included), the most urgent priority first, then by the turns above among projects; the rest
-    follow in the order above. Accepted gap: a steady stream of urgent runs holds routine ones back."""
+    follow in the order above. `aged_turns` N: once N urgent turns went in a row while a routine waiter
+    waited (mark_turn), the oldest aged routine waiter goes first, so it starts within N urgent turns of
+    aging. None: no such turn (accepted gap: a steady stream of urgent runs holds routine ones back)."""
     q = queued(locks_dir, resource) if q is None else q
     first = urgent_max == URGENT_FIRST
-    aged = sorted((t for t in q if _arrival(t) <= aged_before and not (first and _urgent(t))),
+    aged = sorted((t for t in q if _arrival(t) <= aged_before and not ((first or urgent_max > 0) and _urgent(t))),
                   key=_arrival) if aged_before is not None else []
     if aged:
         q = [t for t in q if t not in aged]
@@ -1398,11 +1402,19 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     for ts in groups.values():
         ts.sort(key=ticket_priority)   # stable: arrival order within a priority
     hot = sum(map(_urgent, q)) if urgent_max > 0 or first else 0
-    cold, n_hot = len(q) - hot, hot
-    run = _streak(locks_dir, resource) if hot and cold and not first else 0
+    cold = len(q) - hot + len(aged)   # aged ones are routine here, or there are no urgent turns (hot 0)
+    streak = _streak(locks_dir, resource) if hot and cold else 0
+    run = 0 if first else streak
+    owed = bool(first and aged and aged_turns is not None and streak >= aged_turns)
     out = []
-    while groups:
+    while groups or aged:
         want = (True if hot else None) if first else (run < urgent_max if hot and cold else None)  # None: either
+        # a routine turn: the aged ones first, by arrival; a user-ordered waiter still goes before an owed one
+        ordered = owed and any(ticket_priority(t) < URGENT_PRIORITY for ts in groups.values() for t in ts)
+        if aged and ((owed and not ordered) or not hot or want is False):
+            out.append(aged.pop(0))
+            cold, run, owed = cold - 1, 0, False
+            continue
         cand = [g for g, ts in groups.items() if want is None or any(_urgent(t) == want for t in ts)]
         if want is not False:   # a user-ordered waiter (below URGENT_PRIORITY) goes first, in any group
             best = min(ticket_priority(groups[g][0]) for g in cand)
@@ -1422,7 +1434,7 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
             key[g] = (1, len(out), "")
         else:
             del groups[g]
-    return out[:n_hot] + aged + out[n_hot:] if first else aged + out
+    return out
 
 
 URGENT_PRIORITY = 1   # a waiter at this task priority or better is urgent in fair_order with urgent_max
@@ -1471,12 +1483,13 @@ def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
 
 
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
-            urgent_max: int = 0, past_multi: bool = False, aged_before: float | None = None) -> bool:
+            urgent_max: int = 0, past_multi: bool = False, aged_before: float | None = None,
+            aged_turns: int | None = None) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
     slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
-    arrival order (and `aged_before` as there). Either way landing waiters go first (landing_first). `past_multi`
+    arrival order (and `aged_before`, `aged_turns` as there). Either way landing waiters go first (landing_first). `past_multi`
     (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
     behind it would never end."""
@@ -1484,7 +1497,7 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
     if ticket not in q:   # none queued, unless it was this process's and was dropped (its run ended): never
         return not dropped(ticket)
     if fair:
-        q = fair_order(locks_dir, resource, q, urgent_max, aged_before)
+        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns)
     else:   # urgent waiters (an urgent task's) first, a user-ordered one (priority 0) before them, arrival
         q = sorted(q, key=lambda t: min(ticket_priority(t), URGENT_PRIORITY + 1))   # order within: plain arrival
     q = landing_first(q)

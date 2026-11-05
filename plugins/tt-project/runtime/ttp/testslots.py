@@ -1032,13 +1032,14 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     the bound. A priority-1 run (`priority`) whose project's budget is held only by less urgent runs counts
     its urgent slots instead (urgent_paths), as acquire takes them. A run of the project parked past
     checkcap.starve_s() that arrived before `since` (this run's arrival; default now) goes first
-    (checkcap.starved_ahead). A run leaves `need` slots of the pool to each urgent run of another project
-    parked for its test slots ahead of it (urgent_parked: a routine run to every one, an urgent run to those
-    more urgent or as urgent and older), so a freed slot goes to the urgent one, not to whichever polls
-    first. The reason names the term that failed, for status (checklane._parked)."""
+    (checkcap.starved_ahead), unless this run is more urgent and that one's turn (one per
+    checkcap.aged_turns() urgent starts) has not come. A run leaves `need` slots of the pool to each urgent
+    run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
+    an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
+    to whichever polls first. The reason names the term that failed, for status (checklane._parked)."""
     if full and (why := load_held(priority)):
         return f"host load: {why}"
-    if (ahead := checkcap.starved_ahead(project_name, since)):
+    if (ahead := checkcap.starved_ahead(project_name, since, priority=priority)):
         return f"{len(ahead)} run(s) of its project parked longer go first (checkcap.starved_ahead)"
     if full and admitted_ahead(project_name, priority):
         return "a run of its project as urgent or more holds a host-wide checks slot and waits for its test slots"

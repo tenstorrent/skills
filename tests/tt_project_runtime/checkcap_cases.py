@@ -6651,32 +6651,42 @@ def test_push_checks_wait_for_the_load_guard_without_a_host_slot(env, monkeypatc
             s.close()
 
 
-def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_arrival(env, monkeypatch):
-    # Under a set checks.priority_turns, a routine run that waited past checks.starve_s outranks later urgent
-    # (p1) arrivals for the next free slot; under the bound the bounded urgent turns still put the p1 first.
-    # The default (locks.URGENT_FIRST) keeps the p1 first past the bound too (#5893).
+def test_checks_waiter_past_the_starve_bound_goes_before_a_later_priority_one_arrival_only_on_its_turn(env, monkeypatch):
+    # A routine run that waited past checks.starve_s keeps later urgent (p1) arrivals ahead of it until N urgent
+    # turns went while it waited (a set checks.priority_turns N, else checkcap.AGED_TURNS under the default
+    # locks.URGENT_FIRST); then it takes the next free slot (#6033: before, it outranked every later arrival).
     from ttp import checkcap, locks, project
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
-    monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "3")
     held = checkcap.acquire("h")
     now = time.time()
     old = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "old p2", since=now - 120, group="A", priority=2)
     p1 = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "new p1", since=now - 1, group="B", priority=1)
     try:
-        monkeypatch.setenv(checkcap.STARVE_ENV, "600")
-        assert checkcap.state()["queued"] == ["new p1", "old p2"], "under the bound: urgent turns first"
         monkeypatch.setenv(checkcap.STARVE_ENV, "60")
-        monkeypatch.delenv("TTP_CHECKS_PRIORITY_TURNS")
-        assert checkcap.state()["queued"] == ["new p1", "old p2"], "urgent first by default, past the bound too"
-        monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "3")
-        assert checkcap.state()["queued"] == ["old p2", "new p1"]
+        for turns, n in (("3", 3), ("5", 5), (None, checkcap.AGED_TURNS)):
+            if turns:
+                monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", turns)
+            else:
+                monkeypatch.delenv("TTP_CHECKS_PRIORITY_TURNS")
+            assert checkcap.aged_turns() == n
+            locks.mark_turn(checkcap.slot_dir(), checkcap.RESOURCE, None)   # no urgent turns in a row yet
+            for _ in range(n):
+                assert checkcap.state()["queued"] == ["new p1", "old p2"], (turns, "the aged run's turn has not come")
+                locks.mark_turn(checkcap.slot_dir(), checkcap.RESOURCE, p1)   # an urgent run took a slot meanwhile
+            assert checkcap.state()["queued"] == ["old p2", "new p1"], (turns, "its turn after N urgent ones")
+        monkeypatch.setenv(checkcap.STARVE_ENV, "600")
+        assert checkcap.state()["queued"] == ["new p1", "old p2"], "under the bound: urgent first, as before"
+        monkeypatch.setenv(checkcap.STARVE_ENV, "60")
         held.close()
         every = checkcap.all_paths(1)
         assert checkcap._take_in_turn(1, p1, checkcap.paths(1), every, "new p1", "", "") is None, \
-            "the p1 waits behind the aged run"
+            "the p1 waits behind the aged run on its turn"
         got = checkcap._take_in_turn(1, old, checkcap.paths(1), every, "old p2", "", "")
         assert got is not None, "the aged run takes the next free slot"
         got.close()
+        monkeypatch.setenv("TTP_CHECKS_PRIORITY_TURNS", "0")
+        assert checkcap.aged_turns() == 0, "priority_turns 0 (no urgent precedence): an aged run goes first"
+        monkeypatch.delenv("TTP_CHECKS_PRIORITY_TURNS")
         for bad in ("0", "-5", "inf", "nan", "x"):   # never off: the bound keeps routine runs from starving
             monkeypatch.setenv(checkcap.STARVE_ENV, bad)
             assert checkcap.starve_s() == checkcap.STARVE_S
@@ -6764,6 +6774,71 @@ def test_a_run_parked_past_the_starve_bound_gets_its_projects_next_test_slots(en
         t.join(30)
         for s in got:
             s and s.close()
+
+
+def test_aged_parked_routine_runs_hold_a_later_urgent_run_of_their_project_only_on_their_turn(env, monkeypatch):
+    # #6033: three p2 runs parked past checks.starve_s and an aged p1 run that arrived after them: the p1 run
+    # goes first (starved_ahead holds only later arrivals at the aged run's priority or lower). Once
+    # checkcap.aged_turns() p1 runs of the project took a slot since the p2s aged, the oldest p2s' turn comes
+    # (the bound); a p2 start resets it. Priority 0 is never held, push checks (no priority) are as before.
+    from ttp import checkcap, locks, testslots
+    monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
+    monkeypatch.setenv("TTP_TEST_POOL", "8")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "4")
+    monkeypatch.setattr(testslots, "load_guard", lambda: "")
+    now = time.time()
+    d, P = checkcap.slot_dir(), checkcap.PARKED
+    p2s = [locks.enqueue(d, P, f"pa task #{i} (run {i})", since=now - 9000 + i, group="pa", priority=2)
+           for i in range(3)]
+    late = now - 5000   # the p1 run: aged too, arrived after every p2
+    p1 = locks.enqueue(d, P, "pa task #9 (run 9)", since=late, group="pa", priority=1)
+    late = locks._arrival(p1)   # as its ticket records it
+    try:
+        assert checkcap.starved_ahead("pa", late, now, priority=1) == [], "the urgent run is not held"
+        assert testslots.pool_room({}, "pa", priority=1, since=late), "so it has room"
+        assert checkcap.starved_ahead("pa", now, now, priority=2) == p2s + [p1], "a later p2 still is, by arrival"
+        assert not testslots.pool_room({}, "pa", priority=2)
+        assert checkcap.starved_ahead("pa", now, now) == p2s + [p1], "push checks (no priority): as before"
+        assert checkcap.starved_ahead("pa", now, now, priority=0) == [], "priority 0: never held by a less urgent"
+        aged_at = now - 9000 + 3600
+        checkcap.record_wait(None, "pa", 1, aged_at - 600, aged_at - 300)   # before they aged: not a pass
+        checkcap.record_wait(None, "pb", 1, aged_at, aged_at + 60)   # another project's: not this one's turn
+        checkcap.record_wait(None, "pa", None, aged_at, aged_at + 60, "push")   # push checks: not a turn
+        for k in range(checkcap.AGED_TURNS):
+            assert checkcap.starved_ahead("pa", late, now, priority=1) == [], f"{k} urgent starts: not yet"
+            checkcap.record_wait(None, "pa", 1, aged_at + k, aged_at + 100 + k)
+        assert checkcap.starved_ahead("pa", late, now, priority=1) == p2s, "after N urgent starts: their turn"
+        assert not testslots.pool_room({}, "pa", priority=1, since=late)
+        assert checkcap.starved_ahead("pa", late, now, priority=0) == [], "priority 0 keeps its precedence"
+        locks.dequeue(p2s[0])
+        checkcap.record_wait(None, "pa", 2, now - 9000, aged_at + 200)   # the oldest p2 started: the turn is used
+        assert checkcap.starved_ahead("pa", late, now, priority=1) == [], "urgent first again for N more starts"
+    finally:
+        for t in p2s + [p1]:
+            locks.dequeue(t)
+
+
+def test_aged_routine_waiters_take_routine_turns_and_nothing_changes_without_a_backlog(tmp_path):
+    # #6033 on the host queue (locks.fair_order): aged routine waiters go ahead of later routine ones only;
+    # urgent ones stay first until `aged_turns` urgent turns went in a row (mark_turn's streak). With no
+    # waiter past the bound the order is the same as with no bound at all, in every urgent mode.
+    from ttp import locks
+    d = tmp_path / "slots"
+    for n, (label, g, pr) in enumerate([("a2", "A", 2), ("b2", "B", 2), ("c2", "C", 2), ("a1", "A", 1),
+                                        ("d3", "D", 3), ("b1", "B", 1)]):
+        locks.enqueue(d, "r", label, since=1000.0 + n, group=g, priority=pr)
+    names = lambda m, **k: [x.read_text() for x in locks.fair_order(d, "r", urgent_max=m, **k)]
+    aged = {"aged_before": 1003.5, "aged_turns": 3}   # the three p2s and a1 waited past the bound
+    for m in (locks.URGENT_FIRST, 3):
+        assert names(m, **aged)[:2] == ["a1", "b1"], (m, "the p1s first, the aged one and the later one")
+        assert names(m, **aged)[2:5] == ["a2", "b2", "c2"], (m, "then the aged p2s by arrival")
+    for m in (locks.URGENT_FIRST, 3, 0):
+        assert names(m, aged_before=999.0, aged_turns=3) == names(m), (m, "no backlog: unchanged")
+    locks.streak_path(d, "r").write_text("3")   # three urgent turns went while routine ones waited
+    assert names(locks.URGENT_FIRST, **aged)[:3] == ["a2", "a1", "b1"], "the oldest aged p2's turn"
+    assert names(3, **aged)[:3] == ["a2", "a1", "b1"], "under priority_turns 3 too"
+    assert names(locks.URGENT_FIRST, aged_before=1003.5)[:2] == ["a1", "b1"], "no aged_turns: no such turn"
+    assert names(0, **aged)[:4] == ["a2", "b2", "c2", "a1"], "priority_turns 0: every aged one first, as before"
 
 
 def test_checks_status_names_the_push_priority_holder_and_each_waiters_wait(env, monkeypatch):

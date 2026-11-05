@@ -28,6 +28,12 @@ in `state/runs/<id>/`, so a daemon restart never loses a result.
 changed adds one line (runnable queued tasks in rank order with priority and obligation flag, held
 counts by reason, the ids started); it rotates to `scheduler.1.jsonl` past 2 MB (`runtime/ttp/schedlog.py`).
 
+The host-wide checks queue (`runtime/ttp/checkcap.py`, ordered by `locks.fair_order`) serves push checks
+on their own slots, then urgent runs, then routine ones by project turns. A run waiting past
+`checks.starve_s` goes ahead only of later arrivals at its priority or lower; it passes more urgent ones
+once N of them started meanwhile (`checks.priority_turns`, default 3), so urgency holds under a backlog
+and every run still starts within a bound.
+
 Detached checks keep durable reports in `state/check-reports/<id>/` and managed scratch in
 `state/check-runs/<id>/checks-tmp`. Only check subprocesses holding the lifetime guard receive
 that scratch environment; push and batch supervisors, Git commands and `after_push` keep
