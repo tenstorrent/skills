@@ -433,13 +433,14 @@ def test_no_lull_advice_for_disruptive_work_a_task_without_a_device_or_another_w
 _MATCH = {"pass": "ALL DONE", "fail": ["FAILED", "Traceback"], "wait": "still running"}
 
 
-def _match_task(p, tmp_path, monkeypatch, out, **extra):
-    """A daemon and a task asleep on a probe that prints `out` and exits 0, with a probe_match and an on_pass."""
+def _match_task(p, tmp_path, monkeypatch, out, probe=None, **extra):
+    """A daemon and a task asleep on a probe that prints `out` (or runs `probe`) and exits 0, with a
+    probe_match and an on_pass."""
     from ttp import daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     dm = dmod.Daemon(p.base)
     hand = {"probe_match": _MATCH, "on_pass": {"status": "done", "summary": "The job ended: {probe_out}"}, **extra}
-    tid = _gate_task(p, tmp_path, f"echo '{out}'", **hand)
+    tid = _gate_task(p, tmp_path, probe or f"echo '{out}'", **hand)
     return dm, tid
 
 
@@ -543,3 +544,53 @@ def test_a_waiting_hand_off_with_a_malformed_probe_match_drops_it_with_an_event(
     assert res["status"] == "waiting" and "probe_match" not in res, res
     ev = p.db.one("SELECT text FROM events WHERE kind='handoff_probe_refused' AND task=?", (tid,))
     assert ev and "probe_match was not stored: probe_match has unknown keys: done" in ev["text"], ev
+
+
+_PAD = "head -c 600 /dev/zero | tr '\\0' x; echo"   # 600 chars of output, past the 400-char wait-note clip
+
+
+def test_a_probe_match_pass_word_followed_by_600_chars_still_settles_pass(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "", probe=f"echo 'ALL DONE: 11 of 11 trials'; {_PAD}")
+    _settle_probe(dm, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done" and res["run_status"] == "model-free", (task["status"], res)
+    assert res["summary"].startswith("The job ended: ALL DONE: 11 of 11 trials\n" + "x" * 600), res["summary"]
+
+
+def test_a_probe_match_fail_word_far_before_a_wait_word_wakes_the_model_as_unclear(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "x")
+    _gate_set(p, tid, retry_when=f"echo 'trial 3 FAILED'; {_PAD}; echo 'still running'")
+    _settle_probe(dm, tid)
+    res = json.loads(p.db.task(tid)["result"])
+    assert _ready(p, tid) and "matched fail and wait of its probe_match, so it is unclear" in res.get("woke", ""), res
+    # The wake gate reads the same raw tail: no "still waiting" skip on it.
+    skipped, note = dm._wake_gate(p.db.task(tid))
+    assert not skipped, note
+
+
+def test_a_probe_match_wait_word_far_before_the_end_keeps_its_window_of_4000_chars(env, monkeypatch, tmp_path):
+    from ttp import probematch
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "x")
+    _gate_set(p, tid, retry_when=f"echo 'still running'; {_PAD}")
+    _settle_probe(dm, tid)
+    assert not _ready(p, tid) and "woke" not in json.loads(p.db.task(tid)["result"])
+    assert len(dm._match_out[tid][0]) <= probematch.OUT_CHARS
+    # Past the window the wait word is no longer read: the model wakes ("matched none").
+    _gate_set(p, tid, retry_when=f"echo 'still running'; head -c {probematch.OUT_CHARS + 10} /dev/zero | tr '\\0' x")
+    _settle_probe(dm, tid)
+    assert _ready(p, tid) and "matched none of its probe_match" in json.loads(p.db.task(tid)["result"])["woke"]
+
+
+def test_a_probe_stall_re_check_pass_on_a_probe_match_wait_output_sleeps_on(env, monkeypatch, tmp_path):
+    p = make(env)
+    dm, tid = _match_task(p, tmp_path, monkeypatch, "3 of 11 trials done, still running")
+    _settle_probe(dm, tid)
+    assert not _ready(p, tid)
+    # The re-check reads only the exit code: its last output still says it waits.
+    dm._probe_stall_act(p.db.task(tid), "passed", "")
+    task = p.db.task(tid)
+    assert task["status"] == "queued" and not _ready(p, tid) and "woke" not in json.loads(task["result"]), task["result"]

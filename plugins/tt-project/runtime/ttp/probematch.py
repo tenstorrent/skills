@@ -7,10 +7,12 @@ a confirm or watch wait with no model run.
 
 Each of `pass`, `fail` and `wait` (any one or more) is a string or a list of strings, found as plain,
 case-sensitive substrings (never regular expressions: no pattern can stall the daemon) in the last
-OUT_CHARS of the probe's output. Only a probe that exits 0 is read; exactly one kind must match:
+OUT_CHARS of the probe's output as printed (whitespace not squeezed). Only a probe that exits 0 is
+read; exactly one kind must match:
 
 - wait: the exit 0 counts as "not yet", so the task sleeps on; a timer wake on the same output
-  re-defers with the wake gate's back-off (waitgate), up to its caps.
+  re-defers with the wake gate's back-off (waitgate), up to its caps. A pass that reads no output (a
+  probe-stall re-check) whose last output matched wait sleeps on too.
 - pass: the hand-off's `on_pass` is recorded model-free, `{probe_out}` in its summary or message
   filled with the output's tail (a hand-off that also names an `on_pass_cmd` runs that command).
 - fail: the task wakes at its own tier with the output's tail.

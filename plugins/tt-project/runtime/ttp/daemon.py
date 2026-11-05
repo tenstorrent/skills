@@ -1146,6 +1146,7 @@ class Daemon:
         self._probe_out: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last output, unchanged since, probe
         self._probe_live: dict[int, tuple[str, float, str]] = {}   # task -> its probe's last line, when read, probe
         self._match_seen: dict[int, str] = {}   # task -> the output its probe_match last noted as still waiting
+        self._match_out: dict[int, tuple[str, str]] = {}   # task naming a probe_match -> its probe's raw output tail, probe
         self._woke_on: dict[int, tuple[int | str, float, str]] = {}   # task -> the verdict its last wake came on (wake gate)
         self._spec_capped: set[int] = set()   # tasks whose spec-change wake the loop guard holds (logged once)
         self._spec_deferred: set[int] = set()   # tasks whose spec change sleeps until their wait ends (logged once)
@@ -9860,7 +9861,8 @@ class Daemon:
                 out = self._probe_out.get(tid)
                 probe = (got[0], out[0] if out and out[2] == got[2] else "")
             d = waitgate.decide(self.p, self.cfg, task, prev, now, probe=probe, last_run=last,
-                                jev=self.jev, spec_sha=spec_digest(task))
+                                jev=self.jev, spec_sha=spec_digest(task),
+                                match_out=self._match_text(tid, got[2]) if probe else None)
         except Exception as e:   # a wake is always safe
             log(self.p, f"task {tid}: wake gate failed, waking: {type(e).__name__}: {e}")
             return False, None
@@ -11182,6 +11184,7 @@ class Daemon:
         self._sweep_on_pass_notes(now)
         outs: dict[int, str] = {}   # one read of a probe run's output, whichever tasks share it
         lines: dict[int, str] = {}   # and its last line (waitheal.last_line)
+        raws: dict[int, str] = {}   # and its raw tail, up to probematch.OUT_CHARS (what a probe_match reads)
         timed: dict[int, object] = {}   # the verdict of a run killed on its timeout (probespawn.timed_out)
         tails: dict[int, str] = {}   # its own output's tail, before a timeout note is added
         done = []
@@ -11193,7 +11196,7 @@ class Daemon:
             if rc is None:
                 _kill_group(proc)
             if id(proc) not in outs:
-                outs[id(proc)], lines[id(proc)] = self._probe_texts(proc)
+                outs[id(proc)], lines[id(proc)], raws[id(proc)] = self._probe_texts(proc)
                 tails[id(proc)] = outs[id(proc)].strip()[-300:]
                 if rc is None:   # killed on its timeout: "not yet" unless it keeps timing out
                     timed[id(proc)] = probespawn.timed_out(probe)
@@ -11216,6 +11219,10 @@ class Daemon:
             if task and _current_probe(task) != probe:
                 continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
             self._note_probe_out(tid, probe, outs[id(proc)], now, lines[id(proc)])
+            if task and probematch.KEY in load_result(task["result"]):
+                self._match_out[tid] = (raws.get(id(proc), ""), probe)
+            else:
+                self._match_out.pop(tid, None)
             if devq_runner := waitheal.devq_runner(probe):   # how long its job queues (the lock-wait alert)
                 try:
                     from . import lockreap
@@ -11238,9 +11245,9 @@ class Daemon:
                 self._start_verdict(task, "timeout" if rc is None else rc, now)
                 continue
             if rc == 0 and task and task["status"] == "queued" \
-                    and probematch.verdict(load_result(task["result"]), outs[id(proc)]) == "wait":
+                    and probematch.verdict(load_result(task["result"]), raws.get(id(proc), "")) == "wait":
                 rc = 1   # its probe_match says the wait goes on: "not yet", no wake
-                self._match_waited(task, outs[id(proc)])
+                self._match_waited(task, raws.get(id(proc), ""))
             self._probe_rc[tid] = ("timeout" if rc is None else rc, now, probe)
             if task and task["status"] == "queued":
                 self._flag_never_passes(task, probe, rc, outs[id(proc)])
@@ -12197,20 +12204,21 @@ class Daemon:
         """The end of a finished probe run's output, once (its file is closed after)."""
         return self._probe_texts(proc)[0]
 
-    def _probe_texts(self, proc) -> tuple[str, str]:
-        """_probe_text, and the output's last non-empty line (waitheal.last_line) for a wait note."""
+    def _probe_texts(self, proc) -> tuple[str, str, str]:
+        """_probe_text, the output's last non-empty line (waitheal.last_line) for a wait note, and its raw
+        tail of up to probematch.OUT_CHARS chars, not squeezed (what a probe_match reads)."""
         f = self._probe_files.pop(id(proc), None)
         if isinstance(f, probespawn.Pending):
             f = f.take_file()
         if f is None:
-            return "", ""
+            return "", "", ""
         try:
             f.seek(0, os.SEEK_END)
-            f.seek(max(0, f.tell() - 4000))
-            raw = f.read().decode(errors="replace")
-            return waitheal.clip(raw), waitheal.last_line(raw)
+            f.seek(max(0, f.tell() - 4 * probematch.OUT_CHARS))   # a char is up to 4 bytes
+            raw = f.read().decode(errors="replace")[-probematch.OUT_CHARS:]
+            return waitheal.clip(raw), waitheal.last_line(raw), raw
         except (OSError, ValueError):
-            return "", ""
+            return "", "", ""
         finally:
             f.close()
 
@@ -13019,6 +13027,11 @@ class Daemon:
         more, extra = self._push_landing(task)
         self._wake_waiting(task, why + more, now, extra=extra)
 
+    def _match_text(self, tid: int, probe: str) -> str:
+        """The raw output tail a probe_match reads from task `tid`'s last run of `probe` ("" when none)."""
+        got = self._match_out.get(tid)
+        return got[0] if got and got[1] == probe else ""
+
     def _match_waited(self, task: dict, out: str) -> None:
         """Its probe exited 0 with output its probe_match reads as `wait`: logged and noted once per new
         output (clock times masked), so the task's notes show each settled check."""
@@ -13044,11 +13057,13 @@ class Daemon:
         tid, prev = task["id"], load_result(task["result"])
         if probematch.KEY not in prev or task["status"] != "queued" or prev.get("status") != "waiting":
             return None
-        probe = str(prev.get("retry_when") or "")
-        got = self._probe_out.get(tid)
-        out = got[0] if got and got[2] == probe else ""
+        out = self._match_text(tid, str(prev.get("retry_when") or ""))
         verdict = probematch.verdict(prev, out)
         r = self._last_worker_run(tid)
+        if verdict == "wait":
+            # Only a pass that read no output (a probe-stall re-check) gets here: its last output says it waits.
+            self._match_waited(task, out)
+            return True
         if verdict == "fail":
             if r:
                 _task_note(Path(r["dir"]), f"probe_match: fail, waking the task: {probematch.tail(out, 300)}")

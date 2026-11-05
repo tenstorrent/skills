@@ -212,11 +212,13 @@ def _ask_jev(db: DB, cfg: dict, s: dict, jev, task: dict, prev: dict, probe: tup
 
 
 def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None = None,
-           last_run: dict | None = None, jev=None, spec_sha: str | None = None) -> Decision | None:
+           last_run: dict | None = None, jev=None, spec_sha: str | None = None,
+           match_out: str | None = None) -> Decision | None:
     """Whether the due wake of waiting task `task` (its hand-off `prev`) starts a model turn now; None
     when the gate does not apply (it is off, or this is no daemon-tracked wait: a coordinator that ends
     a wait drops its waiting_since). `probe` is the probe's
-    latest (exit, output), `last_run` the task's last run row, `spec_sha` the spec's digest now. The
+    latest (exit, output), `last_run` the task's last run row, `spec_sha` the spec's digest now,
+    `match_out` the raw output tail its probe_match reads (default: the probe's output). The
     decision is logged; a skip carries its re-defer."""
     s = settings(cfg)
     if not s["enabled"] or not isinstance(prev, dict) or prev.get("status") != "waiting" \
@@ -233,7 +235,7 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
     woke = str(prev.get("woke") or "").strip().rstrip(".")
     ended = float(last_run["ended"] or last_run["started"] or now) if last_run else float(prev["waiting_since"])
     # Its probe_match reads the probe's "not yet" output as a wait: a changed progress line is no event.
-    matchwait = bool(probe and probe[0] in _not_yet() and probematch.verdict(prev, probe[1]) == "wait")
+    matchwait = bool(probe and probe[0] in _not_yet() and probematch.verdict(prev, probe[1] if match_out is None else match_out) == "wait")
     d = None
     if prev.get("escalated_wake"):
         d = Decision(True, "event", "an escalated wake")
