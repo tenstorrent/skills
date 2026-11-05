@@ -3352,7 +3352,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                                                messages if user_turn else ()))
                     elif _DATED.sub("", target.lstrip("# ")).lower().startswith("goal"):   # only the tasks it touches
                         notes.append(_fan(p, f"Goals changed ({target}): {clip(text or quote, 600)}",
-                                          msgs=messages if user_turn else (), text=text or quote, key=key))
+                                          msgs=messages if user_turn else (), text=text or quote, goals=True, key=key))
                 p.commit_harness([p.charter_path, p.harness / CHARTER_HISTORY], msg)
                 chartertemplate.landed(db, a)   # a refusal alert told to the relayer's chat clears
             elif t == "schedule_set":

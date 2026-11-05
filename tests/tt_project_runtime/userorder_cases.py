@@ -312,6 +312,32 @@ def test_a_restrictions_change_reaches_every_running_run_with_the_users_words_an
     assert "Never reboot rig." in (bare / "steer.md").read_text()
 
 
+def test_a_goals_change_and_its_order_on_one_user_turn_both_reach_a_run_once_and_goals_skip_the_chat(
+        env, tmp_path):
+    from ttp import coordinator as coord
+    p = make(env)
+    t, d = _order_run(p, tmp_path, "gate", spec="edit runtime/ttp/gate.py", chat="c1")
+    asker, asker_dir = _order_run(p, tmp_path, "report", chat="c1")
+    msg = _order_msg(p, "Make runtime/ttp/gate.py fail open.")
+    goals = {"type": "charter_update", "section": "Goals", "text": "Make runtime/ttp/gate.py fail open."}
+    order = {"type": "obligation", "order": msg, "text": "gate fails open", "owners": [t], "action_class": "read",
+             "supersedes": ["step 4: add retries"]}
+    assert coord.apply(p, [goals, order], user_turn=True, messages=[msg]) == []
+    steer = (d / "steer.md").read_text()
+    assert "Goals changed (" in steer and "step 4: add retries" in steer and "you own it" in steer, steer
+    assert f"(turn user-goals-{msg}-" in steer and f"(turn user-order-{msg}-" in steer, steer
+    # The Goals change reaches only the tasks it touches: the asker hears the order (its chat), not the Goals.
+    ask = (asker_dir / "steer.md").read_text()
+    assert "you answer its chat" in ask and "Goals changed" not in ask, ask
+    # The same Goals change and order again for that message: neither is appended twice to one run.
+    coord.apply(p, [goals, order], user_turn=True, messages=[msg])
+    steer = (d / "steer.md").read_text()
+    assert steer.count("Goals changed (") == 1 and steer.count("step 4: add retries") == 1, steer
+    # A different Goals change on the same message still reaches the run.
+    coord.apply(p, [dict(goals, text="Keep runtime/ttp/gate.py logging.")], user_turn=True, messages=[msg])
+    assert (d / "steer.md").read_text().count("Goals changed (") == 2
+
+
 def test_an_order_naming_a_resource_keeps_its_resource_steer_and_is_not_told_twice(env, tmp_path):
     from ttp import coordinator as coord
     p, ids, msg, run_dir, other_dir = _ordered(env, tmp_path)

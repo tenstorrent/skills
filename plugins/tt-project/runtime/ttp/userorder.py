@@ -17,6 +17,7 @@ or that nobody matched, is logged as a FANOUT_KIND event naming the tasks told.
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -220,17 +221,22 @@ def _told(steer: Path, msg: int, run: int) -> bool:
 
 
 def fan_out(p, head: str, *, msgs=(), owners=(), chat: str | None = None, text: str = "", supersedes=(),
-            everyone: bool = False, key: str | None = None) -> str:
+            everyone: bool = False, goals: bool = False, key: str | None = None) -> str:
     """Tell each running worker run that a user order (user messages `msgs`) or charter change affects, once,
     through its steer.md, quoting the user's words; log who was told, or that nobody was. Affected: every run
     when `everyone` (a Restrictions change); else runs whose task is in `owners`, answers `chat` (its
-    reply_chat), or whose spec, unlanded branch or resources name a path or resource `text` names. For an order,
-    a task created after its message is skipped (its spec carries it). Returns a note for the coordinator."""
+    reply_chat), or whose spec, unlanded branch or resources name a path or resource `text` names. A Goals change
+    (`goals`) reaches only the tasks it touches (no chat match) under its own key, so the order of the same
+    message still reaches each run once. For an order, a task created after its message is skipped (its spec
+    carries it). Returns a note for the coordinator."""
     from . import coordinator as coord
     from . import overlap
     db = p.db
     words, msg_chat, at = _words(db, msgs)
-    chat, msg = chat or msg_chat, max((int(m) for m in msgs or []), default=None)
+    chat, msg = None if goals else chat or msg_chat, max((int(m) for m in msgs or []), default=None)
+    order = msg and not everyone and not goals   # keyed user-order-<msg>-<run>: _told and steer_running share it
+    if msg and goals:   # one key per Goals text and message: the same change twice is told once
+        key = f"user-goals-{msg}-{hashlib.sha1(head.encode()).hexdigest()[:8]}"
     runs = db.q("SELECT id, task, dir FROM runs WHERE status='running' AND role!='coordinator' "
                 "AND dir IS NOT NULL ORDER BY id")
     text = "\n".join(x for x in (text, words) if x)   # what it names: the order's summary and the user's words
@@ -257,7 +263,7 @@ def fan_out(p, head: str, *, msgs=(), owners=(), chat: str | None = None, text: 
         hits += [f"your branch changes {m}" for m in paths if any(overlap.same(m, x) for x in files.get(tid, []))][:3]
         hits += [f"your resource {n}" for n in _named(coord.task_resources(t), text)] if not everyone else []
         steer = Path(r["dir"]) / "steer.md"
-        if not hits or not Path(r["dir"]).is_dir() or (msg and not everyone and _told(steer, msg, r["id"])):
+        if not hits or not Path(r["dir"]).is_dir() or (order and _told(steer, msg, r["id"])):
             continue
         body = [head.strip()]
         if words:
@@ -269,7 +275,8 @@ def fan_out(p, head: str, *, msgs=(), owners=(), chat: str | None = None, text: 
             body.append(f"You get this because {', '.join(hits)}. Follow it where it touches your task: where your "
                         "spec conflicts with it, the order wins. Commit what you have and say in your hand-off what "
                         "you changed for it.")
-        coord._append_update(steer, "\n".join(body), f"user-order-{msg}-{r['id']}" if msg and not everyone else key)
+        coord._append_update(steer, "\n".join(body), f"user-order-{msg}-{r['id']}" if order else
+                           f"{key}-{r['id']}" if msg and goals else key)
         if tid:
             told.append(tid)
             why[str(tid)] = hits
