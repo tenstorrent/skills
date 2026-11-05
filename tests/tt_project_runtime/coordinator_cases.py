@@ -22410,3 +22410,55 @@ def test_agent_mode_refuses_a_permission_ask_for_what_was_already_ordered(env):
               {**restr, "not_covered": "the order named box-q7 only, this needs box-q8 as well for the run"},
               {**restr, "text": "May I lift 'Never run device tests on box-q7 during the soak run' for good?"}):
         assert not ordered(ask(a)), a
+
+
+
+def _claude_turn(tmp_path, texts, final, sub=None):
+    """A Claude stream: one assistant text message per entry of `texts`, an optional subagent text
+    `sub`, then a result line ending on `final` with no structured_output."""
+    from ttp.providers import get_provider
+    evs = [{"type": "assistant", "message": {"id": f"m{i}", "content": [{"type": "text", "text": t}]}}
+           for i, t in enumerate(texts)]
+    if sub is not None:
+        evs.append({"type": "assistant", "parent_tool_use_id": "toolu_1",
+                    "message": {"id": "sub", "content": [{"type": "text", "text": sub}]}})
+    evs.append({"type": "result", "subtype": "success", "result": final, "usage": {}})
+    out = tmp_path / "out.jsonl"
+    out.write_text("".join(json.dumps(e) + "\n" for e in evs))
+    return get_provider("claude").parse(out)
+
+
+def test_a_coordinator_turn_ending_on_prose_applies_the_actions_of_its_newest_earlier_message(env, tmp_path):
+    """A turn that put its actions JSON in an earlier assistant message and ended on prose (Quad run
+    26296): the newest main-agent message holding an actions list is applied, not the batch lost.
+    A subagent's text, an older message and a JSON without an actions list never count."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    old = json.dumps({"actions": [{"type": "task_add", "title": "older", "spec": "s"}]})
+    new = "Here is the batch:\n" + json.dumps({"actions": [{"type": "task_add", "title": "newest", "spec": "s"}],
+                                                "summary": "x"})
+    sub = json.dumps({"actions": [{"type": "task_add", "title": "from a subagent", "spec": "s"}]})
+    usage = _claude_turn(tmp_path, [old, new, '{"note": "no actions here"}'],
+                         "Please apply my previous text answer.", sub=sub)
+    assert usage.structured is None and usage.actions_text == new
+    d._finish_coordinator({"id": 1, "dir": "x"}, usage, "ok", {})
+    assert [t["title"] for t in p.db.q("SELECT title FROM tasks")] == ["newest"]
+    assert int(p.db.kv("coordinator_failures", 0)) == 0
+    # Structured output or a final text with actions still wins over an earlier message.
+    usage = _claude_turn(tmp_path, [old], json.dumps({"actions": [{"type": "task_add", "title": "final",
+                                                                   "spec": "s"}]}))
+    d._finish_coordinator({"id": 2, "dir": "x"}, usage, "ok", {})
+    assert {t["title"] for t in p.db.q("SELECT title FROM tasks")} == {"newest", "final"}
+
+
+@pytest.mark.parametrize("texts", [[], ["Working on it."], ['{"actions": "not a list"}'], ['{"actions": [ broken']])
+def test_a_coordinator_turn_with_no_actions_anywhere_still_fails(env, tmp_path, texts):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    usage = _claude_turn(tmp_path, texts, "Please apply my previous text answer.",
+                         sub=json.dumps({"actions": [{"type": "task_add", "title": "sub", "spec": "s"}]}))
+    assert usage.actions_text == ""
+    d._finish_coordinator({"id": 1, "dir": "x"}, usage, "ok", {})
+    assert not p.db.q("SELECT id FROM tasks") and int(p.db.kv("coordinator_failures", 0)) == 1

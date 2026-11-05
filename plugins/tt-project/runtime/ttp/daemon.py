@@ -4497,6 +4497,13 @@ class Daemon:
             log(self.p, f"coordinator run {r['id']} timed out: " + json.dumps(details, sort_keys=True))
             db.set_kv("last_coordinator_timeout", {"run": r["id"], "at": time.time(), **details})
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
+        if not isinstance((out or {}).get("actions"), list) \
+                and isinstance((early := last_json_object(getattr(usage, "actions_text", "") or "")), dict) \
+                and isinstance(early.get("actions"), list):
+            # Its actions were in an earlier message and it ended on prose: apply them, not lose the batch.
+            log(self.p, f"coordinator run {r.get('id')}: no actions in its output; applying the "
+                        f"{len(early['actions'])} in its newest earlier message that held them")
+            out = early
         actions = (out or {}).get("actions")
         lost_to = "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else \
             "reboot" if note.get("lost_to_reboot") and status == "lost" else ""

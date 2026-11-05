@@ -48,7 +48,8 @@ from . import register
 from ..budget import Window
 from .. import fencefree
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
-                   cli_output, find_binary, request_rejected, status_check, strict_schema, drop_nulls)
+                   cli_output, find_binary, last_json_object, request_rejected, status_check, strict_schema,
+                   drop_nulls)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -444,6 +445,11 @@ class Claude(Provider):
                         u.extra["tool_calls"] = len(tool_ids)
                     if isinstance(block, dict) and block.get("type") == "text":
                         last_text = block.get("text") or last_text
+                        # A coordinator that put its actions in an earlier message, then ended on prose
+                        # (Daemon._finish_coordinator): a subagent's text never counts.
+                        if not ev.get("parent_tool_use_id") and "actions" in (block.get("text") or "") \
+                                and isinstance((last_json_object(block["text"]) or {}).get("actions"), list):
+                            u.actions_text = block["text"]
                     elif isinstance(block, dict) and block.get("type") == "tool_use" \
                             and self.is_connector(str(block.get("name") or "")):
                         # Its workers then keep the connectors (Daemon._connectors_needed).

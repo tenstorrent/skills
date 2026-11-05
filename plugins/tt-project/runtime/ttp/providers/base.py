@@ -188,6 +188,7 @@ class RunUsage:
     cache_write_tokens: int = 0
     final_text: str = ""             # the agent's last message
     structured: dict | None = None   # schema-validated output, when requested and supported
+    actions_text: str = ""           # the newest main-agent text holding an {"actions": [...]} object
     auth_failed: bool = False        # the provider is logged out or its credentials are invalid
     limited: bool = False            # the provider refused for quota/limit reasons
     limit_note: str = ""
