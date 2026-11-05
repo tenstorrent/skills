@@ -59,6 +59,15 @@ def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
     assert len(settings["permissions"]["deny"]) == 2
 
 
+def test_providers_doc_names_structuredoutput_in_the_read_only_coordinator_row():
+    import pathlib
+    doc = (RUNTIME.parent / "docs" / "providers.md").read_text()
+    row = next(line for line in doc.splitlines() if line.startswith("| Read-only coordinator"))
+    claude = row.split("|")[2]
+    assert "StructuredOutput" in claude, "the doc must name the --json-schema answer tool"
+    assert "--allowedTools" in claude
+
+
 def test_a_wake_stops_at_its_dollar_and_time_limits(env, monkeypatch):
     argv, timeout, note, _ = _coord_argv(env, monkeypatch, {"mode": "on", "wake_budget_usd": 0.4,
                                                             "wake_budget_s": 300}, budget=1.0)
