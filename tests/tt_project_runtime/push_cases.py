@@ -14774,6 +14774,57 @@ def test_a_push_check_time_limit_keeps_out_a_pool_wait_whose_waiter_died_before_
     assert m and 900 <= int(m[1]) < 910 and 1290 <= int(m[2]) <= 1300, said
 
 
+def test_a_push_check_time_limit_leaves_out_a_test_gates_head_and_base_rerun_pool_waits(monkeypatch, tmp_path):
+    """A check whose tests gate reruns failing tests on the head and the base waits for a pool slot for each
+    rerun (gatejudge.rerun records it, checkwait): 180 s of shard pool waits plus 480 s and 300 s of gate rerun
+    waits leave a 1290 s check 330 s of run under a 900 s limit, so it passes; one whose own run then goes past
+    the limit is still ended at it, failed (124)."""
+    from ttp import checkwait, push
+
+    def run(name, ends_at, steps):
+        clock = [1000.0]
+        monkeypatch.setattr(push.time, "time", lambda: clock[0])
+        monkeypatch.setattr(push, "check_limit_s", 900.0)
+        monkeypatch.setattr(push, "check_queue_s", 60.0)
+        monkeypatch.setattr(push, "pool_wait_s", 4 * 3600.0)
+        waits = tmp_path / name
+        waits.mkdir()
+        monkeypatch.setenv(checkwait.ENV, str(waits))
+        tok = {}
+        at = {1000.0 + t: (lambda f=f: f(tok)) for t, f in steps.items()}
+        proc = _ClockCheck(clock, 1000.0 + ends_at, at=at)
+        monkeypatch.setattr(push, "_kill_tree", lambda pid: setattr(proc, "killed", True))
+        said = []
+        rc = push._timed_wait(proc, waits, "push-checks", said.append)
+        return rc, "\n".join(said), clock[0] - 1000.0
+
+    def gate(at, start, length):   # a gate rerun waiting `length` s for a pool slot from `start` s in
+        return {start: lambda tok: tok.__setitem__(at, checkwait.begin(f"gate {at} rerun backoff", pool=True)),
+                start + length: lambda tok: checkwait.end(tok.pop(at))}
+    steps = {200.0: lambda tok: checkwait.waited(180.0, "cpu-pool"), **gate("head", 300.0, 480.0),
+             **gate("base", 900.0, 300.0)}
+    rc, said, _ = run("a", 1290, steps)
+    assert rc == 0 and "ran past its limit" not in said, said
+    assert "waited 960 s for a test-pool slot, not counted" in said, said
+    rc, said, t = run("b", 5000, steps)
+    assert rc == 124 and "check ran past its limit of 900 s" in said and 1860 <= t < 1870, (t, said)
+
+
+def test_a_push_check_that_exits_75_itself_is_busy_never_a_failed_check(tmp_path):
+    """A check whose own wait could not be measured, or whose pool, lock or tests gate rerun admitted it nowhere,
+    exits 75 (busy: `ttp checks` does when a gate rerun stays busy): the push answers busy (75) with a
+    retry_when, never CHECKS_FAILED (4); any other failing exit still fails it."""
+    from ttp import push
+    (tmp_path / "busy.sh").write_text("echo 'no free pool slot' >&2; exit 75\n")
+    (tmp_path / "fail.sh").write_text("exit 1\n")
+    said = []
+    assert push._run_one("bash busy.sh", tmp_path, dict(os.environ), said.append) == push.BUSY
+    assert any(x.startswith("busy, not failed: bash busy.sh exited 75") and "retry_when" in x for x in said), said
+    said = []
+    assert push._run_one("bash fail.sh", tmp_path, dict(os.environ), said.append) == push.CHECKS_FAILED
+    assert not any("busy" in x for x in said), said
+
+
 def test_checkwait_seen_never_shrinks_and_never_passes_its_cap():
     from ttp import checkwait
     s = checkwait.Seen()

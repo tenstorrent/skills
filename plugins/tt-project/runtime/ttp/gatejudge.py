@@ -34,7 +34,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
-from . import sharedchecks
+from . import checkwait, sharedchecks
 
 QUARANTINE_FILE = "test_quarantine.json"   # in the project's state: {id: entry}
 BASE_FILE = "gate_base.json"               # in the project's state: {"host|base|id": {"failed", "ts"}}
@@ -186,15 +186,28 @@ def save_base(state: Path, where: str, base: str, verdicts: dict[str, bool], now
 def rerun(run, at: str, ids: list[str], tries: int = BUSY_TRIES, wait_s: float = BUSY_WAIT_S,
           sleep=time.sleep) -> tuple[int | None, str]:
     """`run(at, ids)`, again after a doubling backoff while it exits BUSY, at most `tries` more times and
-    `wait_s` of sleeps in all. Each try runs on this same host (`run` is bound to it)."""
-    got, slept, back = run(at, ids), 0.0, BUSY_FIRST_S
+    `wait_s` of sleeps in all. Each try runs on this same host (`run` is bound to it). A try that exits BUSY
+    ran nothing: it and the backoff after it wait for a test-pool slot, never run time of a push check this
+    runs in (checkwait)."""
+    def once():
+        t0 = time.time()
+        got = run(at, ids)
+        if got[0] == BUSY:
+            checkwait.waited(max(0.0, time.time() - t0), f"gate {at} rerun")
+        return got
+
+    got, slept, back = once(), 0.0, BUSY_FIRST_S
     for _ in range(max(0, tries)):
         if got[0] != BUSY or slept >= wait_s:
             break
         pause = min(back, wait_s - slept)
-        sleep(pause)
+        token = checkwait.begin(f"gate {at} rerun backoff", pool=True)
+        try:
+            sleep(pause)
+        finally:
+            checkwait.end(token)
         slept, back = slept + pause, back * 2
-        got = run(at, ids)
+        got = once()
     return got
 
 

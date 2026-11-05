@@ -4085,7 +4085,8 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
 
 
 def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
-    """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when its check host
+    """Run one push check: 0 when it passes, CHECKS_FAILED when it fails, BUSY when it exits 75 itself (busy: a
+    lock, a test pool or a tests gate's rerun gave it no slot, so it judged nothing), when its check host
     could not run it (an environment fault, recorded as runner_wait records a missing runner) or its
     test workers were lost again on its one rerun, each exiting cleanly (workerloss): the host too."""
     if remote_host(cmd):
@@ -4147,6 +4148,10 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
             p = p if p.exists() else None
         envfault.record(p, fault, os.environ.get("TTP_TASK"))
         say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
+        return BUSY
+    if rc == BUSY:   # its own "busy" (a lock, a test pool or a gate rerun that admitted it nowhere): not the change
+        say(f"busy, not failed: {cmd}{where(cmd)} exited 75 (no free slot, lock or pool); not pushing. Hand off "
+            f"`waiting`; retry_when: test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
         return BUSY
     return CHECKS_FAILED
 

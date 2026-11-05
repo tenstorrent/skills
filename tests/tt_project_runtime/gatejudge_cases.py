@@ -351,3 +351,34 @@ def test_gate_judge_busy_settings_come_from_checks_config():
     assert s["busy_tries"] == 1 and s["busy_wait_s"] == 5
     d = gatejudge.settings({})
     assert d["busy_tries"] == gatejudge.BUSY_TRIES and d["busy_wait_s"] == gatejudge.BUSY_WAIT_S
+
+
+def test_gate_judge_busy_reruns_and_their_backoff_are_pool_wait_of_the_push_check_it_runs_in(monkeypatch, tmp_path):
+    """Inside a push check, a head or base rerun that exits BUSY ran nothing: its try and the backoff after it
+    are recorded as a test-pool wait (checkwait), so the check's time limit never counts them; the try that
+    runs is run time."""
+    from ttp import checkwait, gatejudge
+    waits = tmp_path / "waits"
+    waits.mkdir()
+    monkeypatch.setenv(checkwait.ENV, str(waits))
+    clock = [1000.0]
+    monkeypatch.setattr(gatejudge.time, "time", lambda: clock[0])
+    i = "tests/test_a.py::test_a"
+    fail = (1, f"FAILED {i} - assert 0\n1 failed in 0.1s\n")
+    results = {"head": [(75, ""), (75, ""), fail], "base": [(0, "1 passed in 0.1s\n")]}
+
+    def run(at, ids):
+        clock[0] += 240.0 if results[at][0][0] == 75 else 100.0   # a busy try waits 240 s for admission
+        return results[at].pop(0)
+
+    def sleep(s):
+        clock[0] += s
+    v = gatejudge.judge([i], run, tmp_path / "state", "b" * 40, "h1", 1000.0, sleep=sleep)
+    assert v["new"] == [i]
+    pooled, live = checkwait.pool(waits, 1000.0, clock[0])
+    assert not live and pooled == 240 + 30 + 240 + 60, pooled   # the two runs that ran (200 s) are not wait
+    assert checkwait.state(waits, 1000.0, clock[0]) == (pooled, False)
+    monkeypatch.delenv(checkwait.ENV)
+    results["head"] = [(75, ""), fail]
+    gatejudge.rerun(run, "head", [i], sleep=sleep)   # outside a push check: records nothing, still retries
+    assert not results["head"]
