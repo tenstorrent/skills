@@ -14545,17 +14545,39 @@ def test_a_push_check_past_its_time_limit_is_ended_and_fails_the_push_loudly(env
 
 
 def _waiting_check(env, name, wait_s, run_s):
-    """A push check that waits `wait_s` for a grant (recorded through checkwait), then runs `run_s`."""
+    """A push check that waits `wait_s` for a grant, then runs `run_s` and writes <name>.ran beside its
+    script. Its wait is the one _waits_open_from_start opens before it starts, so its own start-up (nice,
+    the sandbox, the interpreter and its imports), which a loaded host stretches past its 1 s limit, is
+    waiting time: only `run_s` and its exit are run time. The check closes that wait once granted."""
     script = env["tmp"] / f"{name}.py"
     script.write_text(
-        "import sys, time\n"
+        "import os, sys, time\n"
         f"sys.path.insert(0, {str(RUNTIME)!r})\n"
-        "from ttp import checkwait\n"
-        "t = checkwait.begin('lane')\n"
+        "from pathlib import Path\n"
+        "from ttp import checkwait, locks\n"
         f"time.sleep({wait_s})\n"
-        "checkwait.end(t)\n"
-        f"time.sleep({run_s})\n")
+        "locks.record_wait(Path(os.environ[checkwait.ENV]), 'lane', 0.0, time.time())\n"
+        f"time.sleep({run_s})\n"
+        f"Path({str(script.with_suffix('.ran'))!r}).write_text('ran')\n")
     return f"{sys.executable} {script}"
+
+
+def _waits_open_from_start(monkeypatch, request):
+    """Each push check's waits folder gets an open 'lane' wait as the push makes it, before the check
+    starts: a check born waiting for its grant. This process holds the wait's live lock (as the waiter
+    would) until the test ends; the check closes the wait (_waiting_check)."""
+    from ttp import locks, push
+    real = push.tempfile.mkdtemp
+
+    def mkdtemp(*a, **k):
+        d = real(*a, **k)
+        if k.get("prefix") == "check-waits-":
+            locks.record_wait(Path(d), "lane", 0.0, None)
+            fd = locks._WAITS_HELD.pop((str(d), "lane"), None)
+            if fd is not None:
+                request.addfinalizer(lambda: os.close(fd))
+        return d
+    monkeypatch.setattr(push.tempfile, "mkdtemp", mkdtemp)
 
 
 def _sandboxed_checks(monkeypatch):
@@ -14565,36 +14587,38 @@ def _sandboxed_checks(monkeypatch):
     if not sandbox.status()[0]:
         pytest.skip(f"no PID-namespace sandbox here: {sandbox.status()[1]}")
 
-def test_a_push_check_time_limit_counts_run_time_not_its_wait_for_a_grant(env, monkeypatch, capsys):
+def test_a_push_check_time_limit_counts_run_time_not_its_wait_for_a_grant(env, monkeypatch, capsys, request):
     """A check that waits 3 s for a checks lane and then runs 0.2 s passes under a 1 s limit; one that waits
     and then runs past the limit fails, saying the wait was not counted."""
     from ttp import push
     monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
     _sandboxed_checks(monkeypatch)
+    _waits_open_from_start(monkeypatch, request)
     p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "quick", 3, 0.2)])
     p.set_config("delivery.push_checks_timeout_s", 1)
     p.set_config("delivery.push_wait_s", 60)
     _commit(repo, "mine.txt", "mine\n")
     assert _ttp("push") == 0, capsys.readouterr().err
+    assert (env["tmp"] / "quick.ran").exists()
     assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")
     capsys.readouterr()
     p.set_config("delivery.push_checks", [_waiting_check(env, "slow", 2, 30)])
     before = _git_out(origin, "rev-parse", "proj")
     _commit(repo, "more.txt", "more\n")
-    t0 = time.time()
     assert _ttp("push") == push.CHECKS_FAILED
     err = capsys.readouterr().err
-    assert time.time() - t0 < 25
+    assert not (env["tmp"] / "slow.ran").exists(), "ended before its 30 s run finished"
     assert "check ran past its limit of 1 s" in err and "waiting for a grant not counted" in err, err
     assert _git_out(origin, "rev-parse", "proj") == before
 
 
-def test_a_push_check_still_waiting_for_a_grant_at_its_outer_bound_is_queued_not_failed(env, monkeypatch, capsys):
+def test_a_push_check_still_waiting_for_a_grant_at_its_outer_bound_is_queued_not_failed(env, monkeypatch, capsys, request):
     """Still waiting for a grant once its limit plus the push wait have gone by, the check never ran: the push
     exits 75 (queued, not run) with a retry_when, never a failed check that would open a fix task."""
     from ttp import batch, push
     monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
     _sandboxed_checks(monkeypatch)
+    _waits_open_from_start(monkeypatch, request)
     p, repo, origin, other = _push_setup(env, monkeypatch, [_waiting_check(env, "stuck", 60, 0)])
     p.set_config("delivery.push_checks_timeout_s", 1)
     p.set_config("delivery.push_wait_s", 1)
@@ -16560,22 +16584,25 @@ def test_a_scratch_clone_of_a_shallow_or_grafted_repository_has_a_whole_history(
 
 def _land_daemon(p, before=None):
     """A stand-in daemon on another thread: once `ttp land` writes its request it runs before() (which
-    gives the tree back its write access, as the host has) and takes the request (landff.take)."""
+    gives the tree back its write access, as the host has) and takes the request (landff.take). It waits
+    for the request itself, never a wall-clock bound: one that gave up while `ttp land` still ran its
+    checks under load would give the tree its write access too early. Set `gone` once `ttp land`
+    returned: with no request written, it then does nothing (done stays empty)."""
     import threading
     from ttp import landff
     (p.state / "heartbeat").write_text(json.dumps({"pid": 1, "takes": [landff.TAKES]}))
-    done = []
+    done, gone = [], threading.Event()
 
     def run():
-        end = time.time() + 30
-        while time.time() < end and not list((p.state / landff.DIR).glob("*.req")):
-            time.sleep(0.05)
+        while not list((p.state / landff.DIR).glob("*.req")):
+            if gone.wait(0.05):
+                return
         if before:
             before()
         done.append(landff.take(p))
     t = threading.Thread(target=run, daemon=True)
     t.start()
-    return t, done
+    return t, done, gone
 
 
 def _checkout_dirs(repo):
@@ -16598,8 +16625,9 @@ def test_ttp_land_in_a_sandbox_that_cannot_write_the_main_checkout_hands_the_fas
     _read_only(dirs)
     said = []
     try:
-        th, done = _land_daemon(p, before=lambda: _writable(dirs))
+        th, done, gone = _land_daemon(p, before=lambda: _writable(dirs))
         rc = land.land(p, repo, head, t, said.append)
+        gone.set()
         th.join(10)
     finally:
         _writable(dirs)
@@ -16630,8 +16658,9 @@ def test_ttp_land_through_the_daemon_never_overwrites_a_dirty_or_moved_checkout_
     _read_only(dirs)
     said = []
     try:
-        th, done = _land_daemon(p, before=dirty)
+        th, done, gone = _land_daemon(p, before=dirty)
         rc = land.land(p, repo, head, t, said.append)
+        gone.set()
         th.join(10)
     finally:
         _writable(dirs)
