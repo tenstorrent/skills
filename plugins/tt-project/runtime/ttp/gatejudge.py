@@ -85,6 +85,13 @@ def select_rx(ids: list[str]) -> str:
     return "^(?:" + "|".join(re.escape(n) for n in sorted({i.rpartition("::")[2] for i in ids})) + ")$"
 
 
+def select_env(ids: list[str], env: dict) -> dict:
+    """The variables that rerun only `ids`, each by its full node id: a same-named test in another
+    file is deselected, so its pass never counts for an id that did not run."""
+    from . import pushpass
+    return pushpass.select_env(select_rx(ids), env, ids=list(ids))
+
+
 def judgeable(rc: int | None, output: str, cfg: dict) -> list[str]:
     """The failing ids of a check that exited 1 with a complete list of at most max_ids, else []."""
     s = settings(cfg)

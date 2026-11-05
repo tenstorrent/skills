@@ -5104,7 +5104,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
                 tree = cleantree.Checkout(top, sha, tmp_base)
                 worktree.prepare(p, tree.path)
                 where = str(tree.path)
-            e = {**env, "PWD": where, **pushpass.select_env(gatejudge.select_rx(sel), env)}
+            e = {**env, "PWD": where, **gatejudge.select_env(sel, env)}
             out.write(f"$ {c} (rerun on the {at} {sha[:12]} of: {' '.join(sel)})\n")
             out.flush()
             start = out.tell()

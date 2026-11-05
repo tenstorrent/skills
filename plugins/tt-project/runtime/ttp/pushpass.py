@@ -357,11 +357,15 @@ def probe_record(p: Project, tree: str, cmd: str, eid: str, ok: bool, tail: str,
     return ""
 
 
-def select_env(pattern: str, env: dict) -> dict:
-    """The variables that load the select plugin to run only the tests whose name matches `pattern`."""
+def select_env(pattern: str, env: dict, ids: list[str] | None = None) -> dict:
+    """The variables that load the select plugin to run only the tests whose name matches `pattern`
+    and, given `ids`, whose full node id is one of them."""
     pp = os.pathsep.join(filter(None, (str(PLUGIN_DIR), env.get("PYTHONPATH", ""))))
     opts = " ".join(filter(None, (env.get("PYTEST_ADDOPTS", ""), f"-p {SELECT_PLUGIN}")))
-    return {"PYTHONPATH": pp, "PYTEST_ADDOPTS": opts, "TTP_PYTEST_SELECT": pattern}
+    out = {"PYTHONPATH": pp, "PYTEST_ADDOPTS": opts, "TTP_PYTEST_SELECT": pattern}
+    if ids is not None:
+        out["TTP_PYTEST_SELECT_IDS"] = "\n".join(ids)
+    return out
 
 
 def resumable(cmd: str) -> bool:

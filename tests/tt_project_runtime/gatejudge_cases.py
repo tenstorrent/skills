@@ -80,6 +80,41 @@ def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of
     assert v["flaky"] == [a, b] and v["new"] == []
 
 
+def test_gate_rerun_selects_each_failing_id_by_its_full_node_id(tmp_path):
+    # A real pytest rerun through the select plugin: a same-named test in another file is never run,
+    # so its pass cannot stand in for a failing id that did not run (and get that id quarantined).
+    from ttp import gatejudge
+    proj = tmp_path / "proj"
+    (proj / "tests").mkdir(parents=True)
+    (proj / "pytest.ini").write_text("[pytest]\n")
+    (proj / "tests" / "test_a.py").write_text("def test_other():\n    pass\n\ndef test_z():\n    assert 0\n")
+    (proj / "tests" / "test_b.py").write_text("def test_x():\n    pass\n\ndef test_z():\n    pass\n")
+    (proj / "tests" / "test_c.py").write_text("def test_y():\n    pass\n")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "TTP_PYTEST_"))}
+
+    def run(at, ids, cwd=proj):
+        e = {**clean, **gatejudge.select_env(ids, clean)}
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--rootdir={proj}"],
+                           cwd=str(cwd), env=e, capture_output=True, text=True, timeout=120)
+        return r.returncode, r.stdout + r.stderr
+    gone, y = "tests/test_a.py::test_x", "tests/test_c.py::test_y"
+    # The failing id no longer runs on the head; only tests/test_b.py::test_x has its name: not flaky.
+    assert run("head", [gone])[0] == gatejudge.NO_TESTS
+    v = gatejudge.judge([gone], run, tmp_path / "s1", "", "host-a", 1000.0)
+    assert v["new"] == [gone] and v["flaky"] == [] and gatejudge.active(tmp_path / "s1", 1000.0) == {}
+    # With another failing id that passes, the namesake's pass would make up the count: both stay new.
+    v = gatejudge.judge([gone, y], run, tmp_path / "s2", "", "host-a", 1000.0)
+    assert v["new"] == [gone, y] and v["flaky"] == []
+    # A failing id that runs again fails alone; its passing namesake in test_b.py is deselected.
+    z = "tests/test_a.py::test_z"
+    rc, out = run("head", [z])
+    assert rc == 1 and gatejudge._ran(out) == (0, 1), out
+    assert gatejudge.judge([z], run, tmp_path / "s3", "", "host-a", 1000.0)["new"] == [z]
+    # Ids as pytest prints them from a subdirectory (relative to the current directory) still select.
+    rc, out = run("head", ["test_b.py::test_x"], cwd=proj / "tests")
+    assert rc == 0 and gatejudge._ran(out) == (1, 0), out
+
+
 def test_gate_judge_uses_a_saved_base_result_only_from_the_same_host(tmp_path):
     from ttp import gatejudge
     a = "tests/test_a.py::test_pre"
