@@ -90,8 +90,12 @@ read the one for the lever you change.
 - One friction, one small commit, a one-line reason in the message.
 - NEVER loosen a restriction, cap or notification policy without the user.
 - To change an executable script (`bin/`, hooks, check scripts), write the new version to a temp
-  file in the same directory and rename it over the old one; never edit a script in place: a
-  running shell may be reading it.
+  file in the same directory, keep its mode, and rename it over the old one; never edit a script in
+  place while it may be running: a shell reads a script a piece at a time, so an in-place edit gives
+  it half the old file and half the new (`line N: syntax error`). `ttp setup` and `ttp upgrade`
+  replace harness files the same way. A check that fails on such a syntax error in a script outside
+  the change is run once more; failing so again, it is an infrastructure fault, never the change's
+  failure (references/push-checks.md).
 - Runtime edits: keep Python 3.9-compatible; run `python3 -m pytest -q runtime/tests` if present;
   (pytest from the harness root uses its `pytest.ini`, isolated from any enclosing repository's
   pytest config and `conftest.py`, with `runtime/` on the import path; add local paths to its `pythonpath`)

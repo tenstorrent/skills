@@ -36,7 +36,7 @@ from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
-from . import chatgone, checkwait, scriptwatch, sshcmd, timefmt, workerloss
+from . import chatgone, checkwait, scriptwatch, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -701,14 +701,15 @@ def bootstrap(root: Path, name: str, brief: str, provider: str, home_tz: str | N
         d.mkdir(parents=True, exist_ok=True)
     template = PLUGIN_ROOT / "template"
     _copy_tree(RUNTIME, p.harness / "runtime")
-    (p.harness / "runtime" / "ttp" / SOURCE_FILE).write_text(source_commit() + "\n")
+    # Every harness file is renamed into place, never rewritten: a shell running the old one keeps reading it whole.
+    durable_write(p.harness / "runtime" / "ttp" / SOURCE_FILE, source_commit() + "\n", sync=False)
     _copy_tree(template / "prompts", p.harness / "prompts")
     _copy_tree(template / "bin", p.harness / "bin")
     for f in (p.harness / "bin").iterdir():
         f.chmod(0o755)
     for f in HARNESS_ROOT_FILES:
-        shutil.copy2(template / f, p.harness / f)
-    (p.harness / ".gitignore").write_text("__pycache__/\n*.pyc\n")
+        replace_copy(template / f, p.harness / f)
+    durable_write(p.harness / ".gitignore", "__pycache__/\n*.pyc\n", sync=False)
     subprocess.run(["git", "init", "-q", "-b", "upstream", str(p.harness)], check=True)
     _git(p.harness, "add", "-A")
     _git(p.harness, "-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost", "commit", "-q",
@@ -3373,6 +3374,7 @@ def cmd_checks(a) -> None:
     spilled = None   # the spill host's claim when the checks run there (checkspill)
     worker_loss = None   # test workers lost again on the rerun: an infrastructure fault (workerloss)
     gate_busy = None     # the gate's rerun found no slot after its retries (gatejudge.undecided): no verdict
+    torn = None          # a transient syntax error outside the change, again on the rerun (syntaxfault): no verdict
     tree_gone = ""   # the clean checkout was removed under a check: killed, never a failure of the change
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
@@ -3669,7 +3671,7 @@ def cmd_checks(a) -> None:
                     out.flush()
                     check_start = out.tell()
                 began = time.monotonic()
-                loss_reruns = 0
+                loss_reruns = torn_reruns = 0
                 try:
                     while True:
                         rc = scriptwatch.rerun(
@@ -3687,6 +3689,13 @@ def cmd_checks(a) -> None:
                                                                           fb_lane)}
                             said(f"{push.WRAP_KEY}'s lock {on} is paused: {c!r} and the other wrapped commands run "
                                  f"on {push.FALLBACK_KEY} {fallback[0]!r} instead")
+                            continue
+                        # A syntax error in a script outside the change, whole again now: once more (syntaxfault).
+                        if (rc != 0 and not torn_reruns and not push.remote_host(c)
+                                and (found := syntaxfault.transient(_log_since(out, log, check_start), cwd, base, head))):
+                            torn_reruns += 1
+                            said(syntaxfault.rerun_line(found, str(c)))
+                            time.sleep(syntaxfault.SETTLE_S)
                             continue
                         # A test worker lost mid-run is the host, not the change: once more (workerloss).
                         if rc == 0 or push.remote_host(c) or loss_reruns >= workerloss.RERUNS:
@@ -3716,6 +3725,10 @@ def cmd_checks(a) -> None:
                     if cwd != top and not clean.path.is_dir():
                         tree_gone = _tree_gone(clean, c, head)
                         out.write(f"ttp checks: {tree_gone}\n")
+                        out.write(_check_took(c, rc, began))
+                        break
+                    if torn_reruns and (found := syntaxfault.transient(_log_since(out, log, check_start), cwd, base, head)):
+                        torn = {"check": str(c), "scripts": found}
                         out.write(_check_took(c, rc, began))
                         break
                     if loss_reruns and workerloss.infra(loss := workerloss.lost(_log_since(out, log, check_start))):
@@ -3871,6 +3884,15 @@ def cmd_checks(a) -> None:
             write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": "test-worker-lost"})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
+        # A script outside the change rewritten in place as the check ran it, again on the rerun: no verdict.
+        if torn is not None and not passed and not _CHECK_STOP.get("stopped"):
+            said = f"{syntaxfault.line(torn['scripts'], torn['check'])}. Run the checks again later; the change is neither passed nor failed"
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "infra_fault": syntaxfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
             sys.exit(75)
         # The gate's rerun found no slot (an admission timeout): no verdict, never a failure of the head.

@@ -37,6 +37,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     runner,
     scopehold,
     sharedchecks,
+    syntaxfault,
     timefmt,
     upstream,
     urgent,
@@ -1916,6 +1917,8 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
                                             + "; ".join(warn), queued=True)
         if outcome == "worker_loss":   # the host, not the approvals: they keep their place and verdicts
             st["backoff_until"] = max(float(st.get("backoff_until") or 0), now + push.WORKER_LOSS_S)
+        if outcome == "script_torn":   # a script outside the change being rewritten in place: the same
+            st["backoff_until"] = max(float(st.get("backoff_until") or 0), now + syntaxfault.RETRY_S)
         if outcome == "rejected":
             st["backoff_until"] = now + BACKOFF_MAX_S
             later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: "
@@ -1927,7 +1930,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             _settle(p, tid, b, m, now)
         # In the transaction that finalizes the batch: a crash before it commits records them again.
         _resolve_upstream(p, shipped, version)
-        if outcome in ("moved", "busy", "env_fault", "worker_loss", "rejected", "nothing", "landed", "pushed",
+        if outcome in ("moved", "busy", "env_fault", "worker_loss", "script_torn", "rejected", "nothing", "landed", "pushed",
                        "tip_failed", "yielded") and back:
             _event(db, None, "push_requeued", f"push batch {b['id']} ended {outcome}: {len(back)} approval"
                                               f"{'s' if len(back) != 1 else ''} back in the queue", queued=False)
@@ -2557,7 +2560,8 @@ OUTCOME_WORDS = {"pushed": "pushed", "landed": "already on the branch", "nothing
                  "conflict": "conflicted", "tip_failed": "the branch tip fails its checks", "moved": "the branch kept moving",
                  "busy": "another push held the branch", "rejected": "rejected by the remote", "refused": "refused",
                  "died": "ended before finishing", "rebooted": "cut short by a reboot", "error": "failed",
-                 "yielded": "stopped for an urgent approval"}
+                 "yielded": "stopped for an urgent approval",
+                 "script_torn": "held: a script outside the change was rewritten as its check ran"}
 AFTER_WORDS = {"ok": "deploy ok", "failed": "deploy failed", "timeout": "deploy timed out",
                "killed": "deploy cut short", "skipped": "no deploy"}
 

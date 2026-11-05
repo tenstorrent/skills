@@ -85,6 +85,10 @@ Symlinked directories or locks are refused.
 Missing, invalid or unwritable output storage fails before checks; never skip a check or substitute `/`.
 Detached launches strip `TTP_PIDNS` and `TTP_CGROUP`.
 
+## A script rewritten as a check ran it
+
+A shell reads a script a piece at a time, so a script rewritten in place while a check runs it dies with `line N: syntax error`. When a failed local check's output names such errors only in scripts outside the change under test (outside the repository, or files the diff from the branch tip does not touch, not under a temporary folder) that pass `bash -n` now, `ttp push` and `ttp checks` run it once more after a short settle. Failing so again is an infrastructure fault: `ttp push` stops with exit 75 and a `retry_when` and the head stays queued, `ttp checks` exits 75 with `infra_fault: script-syntax-transient`; the change is neither passed nor failed. A syntax error in a file the change touches, or in a script still broken, is a real failure. Replace scripts by temp file plus rename to avoid this altogether.
+
 ## Checks on another host
 
 `delivery.checks_host: "test-box"` (an ssh alias or machines-list alias) runs every check there; a check object's own `"host"` overrides it (`"local"` keeps that check here) and its `"env"` exports variables first, e.g. `{"run": "pytest -q", "host": "build-host", "env": {"PATH": "$HOME/.local/bin:$PATH"}}`. The exact head is copied with `git archive` over ssh into a fresh temporary directory, made a git checkout (one commit), and the command's output and exit code come back; the directory is always removed. ssh failing or a host without git or tar is an environment fault (`env:check-host:<host>`): the check waits (exit 75), never counts as failed or passed. `ttp checks` records and log lines name the host.

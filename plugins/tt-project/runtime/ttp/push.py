@@ -40,7 +40,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, locks, machines, prguard, prhead, remotecheck, repoid, runner,
-               sandbox, scriptwatch, settinghold, shorttmp, slurmcheck, testslots, timefmt, workerloss, worktree)
+               sandbox, scriptwatch, settinghold, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -4137,6 +4137,22 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
             break
         reruns += 1
         say(workerloss.rerun_line(loss, str(cmd)))
+    # A syntax error in a script outside the change, whole again now: one rewritten in place as it ran.
+    # Once more after a settle; again so, the host's fault: the head is neither passed nor failed (syntaxfault).
+    if not remote_host(cmd) and (torn := syntaxfault.transient(collect.text(), repo, env.get("TTP_PUSH_TIP"))):
+        say(syntaxfault.rerun_line(torn, str(cmd)))
+        time.sleep(syntaxfault.SETTLE_S)
+        rc = scriptwatch.rerun(once, bool, str(cmd), repo, env, say, on_pass=True)
+        if rc == 0:
+            return 0
+        if rc == QUEUED:
+            say(f"queued, not run: {cmd}{where(cmd)}; not pushing. Hand off `waiting`; retry_when: "
+                f"test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
+            return BUSY
+        if torn := syntaxfault.transient(collect.text(), repo, env.get("TTP_PUSH_TIP")):
+            say(f"{syntaxfault.line(torn, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
+                f"test \"$(date +%s)\" -ge {int(time.time()) + syntaxfault.RETRY_S}")
+            return BUSY
     if reruns and workerloss.infra(loss := workerloss.lost(collect.text())):
         say(f"{workerloss.line(loss, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
             f"test \"$(date +%s)\" -ge {int(time.time()) + WORKER_LOSS_S}")
