@@ -5825,14 +5825,26 @@ def _checks_result(run_dir: Path) -> int:
 
 def cmd_pool_wait(a) -> None:
     """Run the command that waits for a test-pool slot (a check script's or shard's own pick of a free test
-    host), recording that wait in its push check's waits folder while it runs (checkwait.POOL): the check's
-    time limit does not count it, its pool-wait bound (delivery.push_pool_wait_s) does. Outside a push check
-    it only runs the command. Exits with the command's code (128 + the signal for one a signal ended).
-    `--waited N` instead records a wait the pool timed itself (a shard granted a slot after N s), ending now;
-    the check's time since its start bounds what it counts."""
+    host), recording that wait in its push check's waits folder while it runs (checkwait.POOL): the push log
+    and `ttp push --result` show it live, and the check's time limit counts it as wall time, as does its
+    pool-wait bound (delivery.push_pool_wait_s). Outside a push check it only runs the command. Exits with the
+    command's code (128 + the signal for one a signal ended). `--start` / `--stop` instead mark a wait the
+    script runs itself, live, from one call to the other (same `--what`, same calling script or `--id`; a
+    script that ends first ends it). `--waited N` records a wait the pool timed itself (a shard granted a slot
+    after N s), ending now; the check's time since its start bounds what it counts."""
     import math
     from . import checkwait
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    what = f"test-pool slot {a.what}".strip()
+    if a.start or a.stop:
+        if cmd or a.waited is not None or (a.start and a.stop):
+            die("pool-wait: --start and --stop mark a live wait; give neither a command, --waited nor both")
+        owner = a.id or str(os.getppid())
+        if a.start:
+            checkwait.start(what, owner, 0 if a.id else os.getppid())
+        else:
+            checkwait.stop(what, owner)
+        sys.exit(0)
     if a.waited is not None:
         if cmd:
             die("pool-wait: --waited records a wait that already ended; give no command with it")
@@ -5842,11 +5854,12 @@ def cmd_pool_wait(a) -> None:
             secs = -1.0
         if not math.isfinite(secs) or secs < 0:
             die(f"pool-wait: --waited wants the seconds waited (a number, 0 or more), not {a.waited!r}")
-        checkwait.waited(secs, f"test-pool slot {a.what}".strip())
+        checkwait.waited(secs, what)
         sys.exit(0)
     if not cmd:
-        die("usage: ttp pool-wait [--what <pool>] (-- <command that returns once a slot is free> | --waited <seconds>)")
-    token = checkwait.begin(f"test-pool slot {a.what}".strip(), pool=True)
+        die("usage: ttp pool-wait [--what <pool>] (-- <command that returns once a slot is free> | --start | --stop "
+            "| --waited <seconds>)")
+    token = checkwait.begin(what, pool=True)
     try:
         rc = subprocess.call(cmd)
     except OSError as e:
@@ -11908,8 +11921,13 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_clip)
 
     s = sub.add_parser("pool-wait", help="run the command a push check (or its shard) uses to wait for a test-pool "
-                                         "slot, so the check's time limit does not count that wait; its code")
+                                         "slot, so the push shows that wait live and in its log; its code")
     s.add_argument("--what", default="", help="the pool's name, for the record")
+    s.add_argument("--start", action="store_true", help="mark a wait for a slot open from now, live, until --stop "
+                                                        "(or the calling script ends)")
+    s.add_argument("--stop", action="store_true", help="end the wait --start marked (same --what and script or --id)")
+    s.add_argument("--id", default="", help="with --start/--stop: the name pairing them (default: the calling "
+                                            "process); a named mark ends only at --stop")
     s.add_argument("--waited", metavar="SECONDS", help="record a wait the pool timed itself, ending now (a shard "
                                                        "granted its slot after SECONDS), instead of running a command")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --, that returns once a slot is free")

@@ -12,9 +12,10 @@ its first fetch to its push, so two reviewers never race each other through roun
 OS file lock (locks.py): a killed push or a reboot frees it. A waiting push waits as long as the
 last measured check run takes, with a margin, up to 2 h (`delivery.push_wait_s` overrides it).
 Each check runs at most four times the last measured check run, at least 4 h
-(`delivery.push_checks_timeout_s` overrides it, 0 for no limit), counting run time only (checkwait): one running past it is ended and fails the push; one still waiting for a grant at the limit plus the push wait exits 75, queued, not run. Waits for a
-test-pool slot (`ttp pool-wait`) are not run time either, but past 4 h in all (`delivery.push_pool_wait_s`, 0 for no
-bound) the check is ended and fails, saying how long it waited for the pool; the push log gives those seconds.
+(`delivery.push_checks_timeout_s` overrides it, 0 for no limit), counting wall time less its waits for a grant (checkwait):
+one past it, running or waiting for a test-pool slot (`ttp pool-wait`), is ended and fails the push; one still waiting for a
+grant at the limit plus the push wait exits 75, queued, not run. Past 4 h of test-pool waits in all (`delivery.push_pool_wait_s`,
+0 for no bound) the check is ended and fails, saying how long it waited for the pool; the push log gives those seconds, live.
 
 With `delivery.version_bump` set, the push also owns the version bump: after each rebase it sets the
 listed files one patch version above the tip's and adds a changeset, in one commit of its own. The
@@ -60,6 +61,8 @@ CHECK_LIMIT_FLOOR_S = 4 * 3600   # a push check's time limit with no measured ch
 CHECK_LIMIT_FACTOR = 4           # times the last measured check run
 POOL_WAIT_S = 4 * 3600          # how long a push check may wait for test-pool slots unless delivery.push_pool_wait_s says
 CHECK_POLL_S = 5.0               # how often a timed check's waits for a grant are read (checkwait)
+POOL_SAY_S = 60.0                # how often the push log gives a check's live test-pool wait so far
+POOL_STATUS_SUFFIX = ".pool"     # beside a detached push's marker: its check's test-pool wait so far
 QUEUED = 1075                    # once()'s answer for a check still queued at its outer bound: never a process's code
 QUEUED_RETRY_S = 1800            # a push whose check stayed queued is tried again after this
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
@@ -4032,28 +4035,40 @@ def _copy_out(stream, collect: workerloss.Collector) -> None:
 
 
 def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[str], None]) -> int:
-    """Wait for check `proc`; its exit code. Its time limit (check_limit_s) counts only its run time: the
-    time since it started less its waits for a grant (a `ttp lock`, a checks lane, a host-wide checks slot)
-    and for a test-pool slot (`ttp pool-wait`, in the check or any of its shards) that it recorded in
-    `waits` (checkwait), kept once seen (checkwait.Seen: a waiter that died open still waited). Past the limit
-    while it runs it is ended: 124, a failed check. Still waiting for a
-    grant once its limit plus the push's own wait bound (check_queue_s) have gone by since it started, not
-    counting its pool waits, it is ended without having run: QUEUED, a transient answer, never a failure.
-    Waiting for a test-pool slot past pool_wait_s in all, it is ended: 124, saying how long it waited for
-    the pool. The seconds it waited for a test-pool slot go to the push log."""
+    """Wait for check `proc`; its exit code. Its time limit (check_limit_s) counts its wall time since it started,
+    its waits for a test-pool slot (`ttp pool-wait`, in the check or any of its shards, recorded in `waits`)
+    included, less only its waits for a grant (a `ttp lock`, a checks lane, a host-wide checks slot) that it
+    recorded there (checkwait), kept once seen (checkwait.Seen: a waiter that died open still waited). Past the
+    limit, whether it runs or waits for a pool slot, it is ended within a poll (CHECK_POLL_S): 124, timed out,
+    with its elapsed time. Still waiting for a grant once its limit plus the push's own wait bound
+    (check_queue_s) have gone by since it started, not counting its pool waits, it is ended without having run:
+    QUEUED, a transient answer, never a failure. Waiting for a test-pool slot past pool_wait_s in all, it is
+    ended: 124, saying how long it waited for the pool. While it waits for a pool slot the push log gives the
+    seconds so far every POOL_SAY_S, and pool_status (a detached push's marker side file) has them for
+    `ttp push --result`; at the end the log gives the seconds it waited in all."""
     started = time.time()
-    pool_s = 0.0
-    seen_waits, seen_pool = checkwait.Seen(), checkwait.Seen()   # a wait once counted stays counted
+    pool_s, pooling, told = 0.0, False, None
+    seen_grants, seen_pool = checkwait.Seen(), checkwait.Seen()   # a wait once counted stays counted
     try:
-        if check_limit_s is None:
-            return proc.wait()
         while True:
             now = time.time()
-            waited, queued = checkwait.state(waits, started, now)
-            waited = seen_waits.read(waited, now - started)
+            granted, queued = checkwait.grants(waits, started, now)
+            granted = seen_grants.read(granted, now - started)
             pool_s, pooling = checkwait.pool(waits, started, now)
             pool_s = seen_pool.read(pool_s, now - started)
-            ran = now - started - waited
+            _pool_status(pool_s, pooling, now)
+            if pooling and pool_s >= 1 and (told is None or now - told >= POOL_SAY_S):
+                told = now
+                say(f"check waiting for a test-pool slot: {pool_s:.0f} s so far, counted against its time limit: "
+                    f"{cmd}{where(cmd)}")
+            elif not pooling:
+                told = None
+            if check_limit_s is None:
+                try:
+                    return proc.wait(timeout=CHECK_POLL_S)
+                except subprocess.TimeoutExpired:
+                    continue
+            ran = now - started - granted
             if pooling and pool_wait_s and pool_s >= pool_wait_s:
                 _kill_tree(proc.pid)
                 proc.wait()
@@ -4070,9 +4085,11 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
             if not queued and ran >= check_limit_s:
                 _kill_tree(proc.pid)
                 proc.wait()
-                say(f"check ran past its limit of {check_limit_s:.0f} s and was ended: {cmd}{where(cmd)} "
-                    f"({ran:.0f} s run, {waited:.0f} s waiting for a grant or a test-pool slot not counted; "
-                    "delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h)")
+                say(f"check ran past its limit of {check_limit_s:.0f} s and was ended: timed out after "
+                    f"{now - started:.0f} s, {'waiting for a test-pool slot' if pooling else 'running'}: "
+                    f"{cmd}{where(cmd)} ({ran:.0f} s counted, {pool_s:.0f} s of it waiting for a test-pool slot; "
+                    f"{granted:.0f} s waiting for a grant not counted; delivery.push_checks_timeout_s; "
+                    "unset: 4x the last measured check run, at least 4 h)")
                 return 124
             try:
                 return proc.wait(timeout=min(CHECK_POLL_S, max(check_limit_s - ran, 0.05)))
@@ -4080,8 +4097,31 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
                 pass
     finally:
         pool_s = max(pool_s, checkwait.pool(waits, started)[0])
+        _pool_status(pool_s, False, time.time())
         if pool_s >= 1:
-            say(f"check waited {pool_s:.0f} s for a test-pool slot, not counted against its time limit: {cmd}{where(cmd)}")
+            say(f"check waited {pool_s:.0f} s for a test-pool slot, counted against its time limit: {cmd}{where(cmd)}")
+
+
+def _pool_status(seconds: float, waiting: bool, now: float) -> None:
+    """Write a check's pool-wait seconds so far to pool_status, for `ttp push --result` while the push runs."""
+    if pool_status is None or (not waiting and seconds < 1):
+        return
+    try:
+        durable_write(pool_status, json.dumps({"s": round(seconds), "waiting": waiting, "at": now}))
+    except OSError:
+        pass
+
+
+def pool_status_words(marker: Path) -> str:
+    """The running push's pool wait as `ttp push --result` shows it ('' when its checks waited for none)."""
+    try:
+        st = json.loads(marker.with_suffix(POOL_STATUS_SUFFIX).read_text())
+        s = float(st.get("s") or 0)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return ""
+    if st.get("waiting"):
+        return f"; check waiting for a test-pool slot, {s:.0f} s so far"
+    return f"; check waited {s:.0f} s for a test-pool slot" if s >= 1 else ""
 
 
 def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int:
@@ -4335,6 +4375,7 @@ def run_after(p: Project, repo: Path) -> dict | None:
 check_limit_s: float | None = None   # the time limit of each check of the current run() (check_limit_of)
 check_queue_s: float = 0.0   # how much longer than check_limit_s a check may wait for a grant (the run()'s push wait)
 pool_wait_s: float | None = None   # how long a check may wait for test-pool slots in all (pool_wait_of)
+pool_status: Path | None = None    # a detached push's file for its check's live test-pool wait (_pool_status)
 last_ff: list[str] = []   # the fast_forward outcome of the last run(): `ff`/`not ff` and `mirror`/`not mirrored` lines
 last_after: dict | None = None   # the after_push outcome of the last run() (batch.after_ordinary_push)
 pending_after: tuple[str, str, str] | None = None   # (sha, target, tip) whose after_push run() left to run
@@ -4441,7 +4482,7 @@ def _prune(folder: Path, now: float) -> int:
             continue
         if old and _read(marker).get("status") not in ("running", "queued"):
             n += 1
-            for f in (marker, marker.with_suffix(".log"), _run_lock(marker)):
+            for f in (marker, marker.with_suffix(".log"), marker.with_suffix(POOL_STATUS_SUFFIX), _run_lock(marker)):
                 try:
                     f.unlink()
                 except OSError:
@@ -4686,6 +4727,8 @@ def run_detached(p: Project, repo: Path, marker: Path, own: bool = False) -> int
     except (OSError, ValueError):
         pass
     print(f"--- {time.strftime('%Y-%m-%dT%H:%M:%S')} detached push, marker {marker}", flush=True)
+    global pool_status
+    pool_status = marker.with_suffix(POOL_STATUS_SUFFIX)
     m = _read(marker)
     if m.get("status") == "running":
         m["alive"] = time.time()   # it began: a death from here on is not one at startup
@@ -4986,7 +5029,8 @@ def result(marker: Path, pushed_only: bool = False) -> int:
         took = 0
     retried = f"; {retry_words(m)}" if retry_words(m) else ""
     if m.get("status") == "running":
-        print(f"ttp push: still running (pid {m.get('pid')}, {took:.0f} s{retried}); log: {m.get('log')}")
+        print(f"ttp push: still running (pid {m.get('pid')}, {took:.0f} s{retried}{pool_status_words(marker)}); "
+              f"log: {m.get('log')}")
         return 1
     if m.get("status") == "queued":
         print(f"ttp push: queued for the daemon ({took:.0f} s{retried}); log: {m.get('log')}")

@@ -563,7 +563,7 @@ EXTRA_KEYS = {
     # push_rerun_s: the time limit of one rerun of a failed push check's failing tests (batch.RERUN_S).
     # landed_probe: with no push_branch, the read-only command (`{id}`: the task id) that answers
     # `landed:#<id>` (landed.landed_probe); unset there, the harness chains with depends_on instead.
-    # push_checks_timeout_s: the time limit of each `ttp push` check (push.check_limit_of; 0: none).
+    # push_checks_timeout_s: the wall-time limit of each `ttp push` check, test-pool waits included (push.check_limit_of; 0: none).
     # push_pool_wait_s: how long one push check may wait for test-pool slots in all (push.pool_wait_of; 0: no bound).
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).

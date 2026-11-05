@@ -1263,10 +1263,22 @@ running work is interrupted only by the preemption below:
   the wait is twice the last measured check run plus 60 s, at least 900 s and at most 2 h.
   Each check runs at most `delivery.push_checks_timeout_s` (unset: four times the last measured
   check run, at least 4 h; 0 for no limit): one past it is ended and the push fails, saying so.
-  The limit counts run time only: time the check spends waiting for a grant (a `ttp lock`, a
-  checks lane or a host-wide checks slot) is not counted. A check still waiting once the limit
-  plus the push wait has passed is ended as `queued, not run` and the push exits 75 (busy, try
-  again), never a failed check. A gate of your own that is not behind `ttp lock` counts as run time.
+  The limit counts wall time since the check started, less only time it spends waiting for a
+  grant (a `ttp lock`, a checks lane or a host-wide checks slot): waits for a test-pool slot
+  count. Past it the check is ended within a few seconds, running or waiting for a slot, and the
+  push log says it timed out, after how long and how much of that was pool wait. A check still
+  waiting for a grant once the limit plus the push wait has passed is ended as `queued, not run`
+  and the push exits 75 (busy, try again), never a failed check. A gate of your own that is not
+  behind `ttp lock` counts as run time.
+- A check script that picks its own test-pool host (shards on a CPU pool, say) reports that wait
+  so the push can show it: wrap a command that returns once a slot is free in
+  `ttp pool-wait -- <cmd>`, or mark a wait loop of its own live with `ttp pool-wait --start`
+  before it and `ttp pool-wait --stop` after it (same `--what`; from one script, or paired with
+  `--id <name>` across processes; a script that ends first ends its wait). A pool that times a
+  wait itself reports it once over with `ttp pool-wait --waited <seconds>`. While a check waits,
+  the push log gives the seconds so far every minute and `ttp push --result` shows them; at the
+  end the log gives the whole pool wait. Past `delivery.push_pool_wait_s` of pool wait (default
+  4 h, 0 no bound) the check is ended, saying how long it waited.
 - A check is a command, which runs on every head. One that only makes sense once a file exists
   (a test file a later change adds) can opt in to being skipped where it does not apply:
   `{"run": "pytest tests/test_new.py", "if_exists": "tests/test_new.py"}`. `if_exists` is a
