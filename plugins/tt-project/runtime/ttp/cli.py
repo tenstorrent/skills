@@ -1587,6 +1587,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.append(coord)
     if verbose:
         lines.append(coordmodel.line(p.config(), db, p))
+        from . import coordguard
+        if guard := coordguard.status_line(db, p.config(), now, lambda ts: at(ts, now, tz)):
+            lines.append(guard)
     cache = budget.coordinator_cache(db, now)["24h"] if verbose else {}
     if cache.get("turns"):
         lines.append(budget.coordinator_cache_line(cache))
