@@ -67,7 +67,9 @@ reached while work waited (`at_limit`) or capacity sat idle (`idle`; for the che
 
 apply() changes only LEVERS, each a key config_set accepts (coordinator.USER_SETTABLE), and only for a
 slow lane whose limit was reached while work waited and whose resource has headroom: the provider
-gate allows new work and is not the binding cap, no pause, and the host's load leaves CPU free. The
+gate allows new work and is not the binding cap, the provider is not paused, and the host's load leaves
+CPU free. A paused resource holds only its own resource:/device: lane and its tasks' waits (the hold
+lane), never another lane's raise; it is still never dispatched. The
 new value comes from load_size() over what was seen (work waiting at the limit, slots, hosts), never a
 fixed step. Spend caps, budgets, provider gates, locks, holds, pauses, restrictions and review-before-
 push are never touched (safe()). Each change is kept in KV with its reason and undo command
@@ -737,15 +739,14 @@ def cpu_free() -> tuple[bool, str]:
 
 
 def headroom(db: DB, cfg: dict, report: dict) -> tuple[bool, str]:
-    """(may raise, why not): the provider gate allows new work, no provider or resource pause."""
+    """(may raise, why not): the provider gate allows new work and the provider is not paused. A paused
+    resource is no reason here: it holds only its own lanes (plan()) and its tasks' waits (the hold lane)."""
     g = report.get("gate") or {}
     if g and (g.get("level") == "red" or g.get("allow_new_work") is False):
         return False, f"the provider gate is {g.get('level')} (spend or plan window): never raised here"
     lim = db.kv(f"limited:{cfg.get('core_provider', 'claude')}") or {}
     if isinstance(lim, dict) and float(lim.get("until") or 0) > time.time():
         return False, "the provider is paused"
-    if db.paused_resources():
-        return False, "a resource is paused"
     return True, ""
 
 
@@ -753,6 +754,10 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
     """(changes [{key, old, new, why}], kept [{lane, key, why, info?}]) for the slow lanes; `info` marks a
     kept lane reported as information only (no change is ever proposed from it: it opens no task)."""
     ok, why_not = headroom(db, cfg, report)
+    try:
+        paused = set(db.paused_resources())
+    except Exception:   # an unreadable shared or fleet file: no lane of a resource is raised anyway
+        paused = set()
     changes, kept = [], []
     th = report["thresholds_s"]
     for ln in report["lanes"]:
@@ -771,6 +776,9 @@ def plan(db: DB, cfg: dict, report: dict) -> tuple[list[dict], list[dict]]:
         if ln.get("holder"):
             # Checks waits the host held, not the project's limits: information only, no raise, no task.
             kept.append({"lane": name, "key": None, "info": True, "why": ln["note"]})
+            continue
+        if name.split(":", 1)[0] in ("resource", "device") and name.split(":", 1)[1] in paused:
+            kept.append({"lane": name, "key": key, "why": f"{name.split(':', 1)[1]} is paused: its lane is not raised"})
             continue
         if not key or not safe(key):
             kept.append({"lane": name, "key": key, "why": ln.get("note") or (

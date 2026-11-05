@@ -164,6 +164,47 @@ def test_throughput_worker_raise_moves_no_spend_limit(env, monkeypatch):
     assert throughput.spend_workers(p.db, 2) == 2 and throughput.spend_workers(p.db, c["new"]) == c["new"]
 
 
+def test_throughput_a_paused_resource_holds_only_its_own_lane_not_the_worker_raise(env, monkeypatch):
+    """A pause holds its resource's lane and its tasks (never dispatched), never the worker_slots raise:
+    that is judged on the provider gate and the host's CPU alone."""
+    from ttp import coordinator, throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    now = time.time()
+    _tp_busy_fixture(p, now)
+    p.set_config("resources", {"boxA": 1, "boxZ": 1})
+    monkeypatch.setattr(throughput, "cpu_free", lambda: (True, ""))
+    monkeypatch.setattr(throughput.os, "cpu_count", lambda: 64)
+    # A task the dispatcher held busy on boxA 4 h ago; boxA paused 1 h ago (under half its wait: its lane).
+    on_a = _tp_task(p, "on boxA", now - 4 * 3600, prio=1, labels=["resource:boxA"])
+    _tp_dispatch_hold(p, monkeypatch, on_a, now - 4 * 3600 + 60, "resource:boxA")
+    real_time = time.time
+    try:
+        monkeypatch.setattr(time, "time", lambda: now - 3600)
+        coordinator.pause_resource(p, "boxA", True, "maintenance", by="user")
+        monkeypatch.setattr(time, "time", lambda: now - 7 * 86400)
+        coordinator.pause_resource(p, "boxZ", True, "firmware update", by="user")
+    finally:
+        monkeypatch.setattr(time, "time", real_time)
+    assert set(p.db.paused_resources()) >= {"boxA", "boxZ"}
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    assert _tp_lane(rep, "resource:boxA")["count"] == 1
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    (c,) = [c for c in changes if c["key"] == "budget.max_parallel_workers"]
+    assert (c["old"], c["new"]) == (2, 4)
+    assert not any("paused" in k["why"] for k in kept if k["lane"] != "resource:boxA"), kept
+    (ka,) = [k for k in kept if k["lane"] == "resource:boxA"]
+    assert ka["why"] == "boxA is paused: its lane is not raised"
+    assert not any(c["key"].startswith("resources.") for c in changes)
+    # The pause still holds its tasks at dispatch.
+    assert Daemon(p.base)._resource_hold(p.db.task(on_a)) == {"kind": "pause", "resource": "boxA"}
+    # The provider gate still refuses the raise.
+    prov = p.config()["core_provider"]
+    rep = throughput.measure(p.db, p.config(), now=now,
+                             gates={prov: {"level": "red", "allow_new_work": False, "max_parallel": 2}})
+    assert throughput.plan(p.db, p.config(), rep)[0] == []
+
+
 def test_throughput_dependency_waits_are_their_own_lane_and_raise_no_workers(env, monkeypatch):
     from ttp import throughput
     p = make(env)
@@ -254,6 +295,11 @@ def test_throughput_measures_requeue_waits_by_reason_and_a_slow_checks_lane_gets
         or _tp_lane(rep, "worker_slots")["waiting_now"] == 0
     _, kept = throughput.plan(p.db, p.config(), rep)
     assert any(k["lane"] == "checks_slots" for k in kept)
+    # A pause of an unrelated resource changes no verdict of the checks lane (judged without it).
+    from ttp import coordinator
+    coordinator.pause_resource(p, "boxZ", True, "maintenance", by="user")
+    assert throughput.plan(p.db, p.config(), rep)[1] == kept
+    coordinator.pause_resource(p, "boxZ", False, by="user")
     fid = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])["opened"]
     t = p.db.one("SELECT priority, spec FROM tasks WHERE id=?", (fid,))
     assert t["priority"] == 1 and "lane checks_slots slow: 4 wait(s)" in t["spec"]
