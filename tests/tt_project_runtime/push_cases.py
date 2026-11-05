@@ -2194,7 +2194,7 @@ def test_merge3_never_keeps_a_line_twice_or_moves_one_into_another_block(env):
 def test_merge3_hunks_takes_both_changes_only_where_they_touch_different_lines(env):
     """git calls changes of adjacent lines a conflict. With `hunks` (the push batch), a conflict whose
     two sides changed different lines of the base takes both; one where they changed the same line,
-    or where one inserts at the edge of the other's change, or both add one line, stays a conflict."""
+    or where one inserts inside the other's change, or both add one line, stays a conflict."""
     from ttp.batch import merge3
     base = "a\nb\nc\nd\n"
     ours, theirs = "A\nb\nc\nd\n", "a\nB\nc\nd\n"
@@ -2202,7 +2202,8 @@ def test_merge3_hunks_takes_both_changes_only_where_they_touch_different_lines(e
     kinds = set()
     assert merge3(ours, base, theirs, hunks=True, kinds=kinds) == "A\nB\nc\nd\n" and kinds == {"hunks"}
     assert merge3("a\nb\nc\n", "a\nb\nX\nc\n", "a\nB\nX\nc\n", hunks=True) == "a\nB\nc\n", "a deletion next to an edit"
-    assert merge3("a\nX\nb\n", "a\nb\n", "a\nB\n", hunks=True) is None, "an insertion at the edge of an edit"
+    assert merge3("a\nX\nb\n", "a\nb\n", "a\nB\n", hunks=True) == "a\nX\nB\n", "an insertion at the edge of an edit"
+    assert merge3("a\nB\nC\nd\n", "a\nb\nc\nd\n", "a\nb\nX\nc\nd\n", hunks=True) is None, "an insertion inside an edit"
     assert merge3("a\nX\n", "a\nb\n", "a\nY\n", hunks=True) is None, "both changed one line"
     assert merge3("A\nimport os\nb\n", "a\nb\n", "a\nB\nimport os\n", hunks=True) is None, "both add one line"
     kinds = set()
@@ -16287,6 +16288,64 @@ def test_two_names_added_to_a_one_name_per_line_import_list_settle_model_free_an
         for node in ast.parse(src).body:
             if isinstance(node, ast.ImportFrom) and node.level and len(node.names) > 4:
                 assert node.end_lineno - node.lineno == len(node.names) + 1, (name, node.lineno)
+
+
+def test_a_block_added_beside_a_line_the_other_side_changed_settles_with_both_sides_lines_as_written():
+    """Recorded pattern (a review's approval sent back twice in 48 h): the tip added a bullet block right
+    before a bullet the approved change reworded. git calls the adjacent changes a conflict; the batch's
+    hunks rule now places the block before the reworded line, every line of both sides as written, so
+    the approval is kept (its checks still run on the result). Inside an edit, at one spot both sides
+    insert at, or where the block could as well be read one line into the edit, it stays a conflict."""
+    from ttp.batch import merge3
+    base = "- intro\n- A fenced worker's ssh runs outside the sandbox.\n- tail\n"
+    block = "- The worker sandbox is the user's setting.\n  A project never opts out on its own.\n"
+    tip = base.replace("- A fenced", block + "- A fenced")
+    change = base.replace("A fenced worker's", "A fenced worker's (write_fence true)")
+    want = tip.replace("A fenced worker's", "A fenced worker's (write_fence true)")
+    for ours, theirs in ((tip, change), (change, tip)):
+        kinds: set = set()
+        assert merge3(ours, base, theirs, hunks=True, kinds=kinds) == want and kinds == {"hunks"}
+    after = base.replace("- tail", block.rstrip("\n") + "\n- tail")          # the block after the reworded line
+    assert merge3(after, base, change, hunks=True) == after.replace("A fenced worker's", "A fenced worker's (write_fence true)")
+    # a block whose first line repeats the edited line: before it or one line into it is a guess
+    echo = base.replace("- A fenced", "- A fenced worker's ssh runs outside the sandbox.\n- note\n- A fenced")
+    assert merge3(echo, base, change, hunks=True) is None
+    # both insert at one spot beside an edit (ours's edit adds X before rewording b): the order is a guess
+    assert merge3("a\nX\nB\n", "a\nb\n", "a\nY\nb\nc\n", hunks=True) is None
+    assert merge3("a\nX\nB\n", "a\nb\n", "a\nY\nb\n", hunks=True) is None
+
+
+def test_a_push_batch_keeps_the_approval_of_a_change_whose_reworded_line_the_tip_added_a_block_beside(
+        env, monkeypatch):
+    """The recorded pattern end to end: e1 (the tip's change) adds a block before a line e2 rewords. The
+    batch settles it by hunks, runs the checks on the result and pushes both, with no model."""
+    path = "docs/skill.md"
+    base = "# Skill\n\n- intro\n- A fenced worker's ssh runs outside the sandbox.\n- tail\n"
+    block = "- The worker sandbox is the user's setting.\n"
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    (other / "docs").mkdir(parents=True)
+    _commit(other, path, base)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {path: base.replace("- A fenced", block + "- A fenced")}),
+             _entry(repo, "e2", {path: base.replace("ssh runs", "ssh (write_fence true) runs")})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+    d = m["results"][1]["detail"]
+    assert d["settled"] == [path] and "hunks" in d["settled_by"], d
+    got = _git_out(origin, "show", f"proj:{path}")
+    assert got.strip() == base.replace("- A fenced", block + "- A fenced").replace("ssh runs", "ssh (write_fence true) runs").strip()
+
+
+def test_the_daemon_tick_steps_stay_one_per_line():
+    """Six of fifteen daemon.py push conflicts in a week were two changes each adding a step to the
+    tick's packed step tuple. One step per line makes two additions a both-sides-added settlement."""
+    import ast
+    src = (RUNTIME / "ttp" / "daemon.py").read_text()
+    loops = [n.iter for n in ast.walk(ast.parse(src)) if isinstance(n, ast.For) and isinstance(n.iter, ast.Tuple)
+             and any(isinstance(e, ast.Attribute) and e.attr == "run_schedules" for e in n.iter.elts)]
+    assert len(loops) == 1 and len(loops[0].elts) > 20, "the tick's step tuple"
+    for tup in loops:
+        assert len({e.lineno for e in tup.elts}) == len(tup.elts), "one step per line"
 
 
 def test_an_edit_edit_or_unparsable_or_shadowing_push_conflict_falls_back(tmp_path):

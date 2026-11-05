@@ -394,21 +394,23 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
 
 def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool, near: bool = False) -> list[str] | None:
     """Both sides' changes of the `old` lines of one conflict, when they touch different lines: each
-    side's edits (line diff against old) share no old line, and neither inserts lines at the edge of
-    or inside an edit of the other (the order would be a guess). None on an overlap, or when the
-    lines the two sides added share one (_said: the result would hold it twice), or with `near`,
-    when one nearly repeats the other (_near)."""
+    side's edits (line diff against old) share no old line, and neither inserts lines inside an edit
+    of the other or where the other inserts too (the order would be a guess). An insertion at the
+    edge of the other's edit goes before or after it (_edge_ok), every line of both sides as written:
+    a block added next to a line the other side changed no longer sends an approval back. None on an
+    overlap, or when the lines the two sides added share one (_said: the result would hold it twice),
+    or with `near`, when one nearly repeats the other (_near)."""
     def edits(side: list[str]) -> list[tuple[int, int, list[str]]]:
         sm = difflib.SequenceMatcher(None, old, side, autojunk=False)
         return [(i1, i2, side[j1:j2]) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal"]
     a, b = edits(mine), edits(theirs)
     if not a or not b:
         return None
-    for i1, i2, _ in a:
-        for j1, j2, _ in b:
+    for i1, i2, x in a:
+        for j1, j2, y in b:
             if i1 < j2 and j1 < i2:                     # both changed an old line
                 return None
-            if (i1 == i2 and j1 <= i1 <= j2) or (j1 == j2 and i1 <= j1 <= i2):
+            if (i1 == i2 and not _edge_ok(i1, x, j1, j2, y, old)) or (j1 == j2 and not _edge_ok(j1, y, i1, i2, x, old)):
                 return None                             # an insertion where the other edits
     new_a, new_b = [x for *_, new in a for x in new], [x for *_, new in b for x in new]
     if _said(new_a, py) & _said(new_b, py) or near and _near(new_a, new_b, py):
@@ -418,6 +420,19 @@ def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool, near: b
         out += old[pos:i1] + new
         pos = i2
     return out + old[pos:]
+
+
+def _edge_ok(k: int, new: list[str], e1: int, e2: int, edit: list[str], old: list[str]) -> bool:
+    """Whether lines `new` inserted before old[k] have one place beside the other side's edit of
+    old[e1:e2] into `edit`: not inside it, not where the other inserts too, and at its edge only when
+    the edit rewords or deletes lines without adding any (a longer edit may hold an insertion at that
+    same spot) and the block cannot as well be read one line into it (its first line repeats the
+    edit's first old line, or its last the edit's last: the line diff's placement is a guess)."""
+    if not e1 <= k <= e2:
+        return True
+    if e1 == e2 or e1 < k < e2 or len(edit) not in (0, e2 - e1):
+        return False
+    return new[0] != old[e1] if k == e1 else new[-1] != old[e2 - 1]
 
 
 def _import_stmts(lines: list[str]) -> list[tuple[tuple, list[str], int, int]] | None:
