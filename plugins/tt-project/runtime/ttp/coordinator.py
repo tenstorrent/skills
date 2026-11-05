@@ -5676,7 +5676,7 @@ def _reject_contradicting_append(p: Project, section: str, text: str, user_turn:
           "condition or a duty, or is not about the same thing), resend with `both_hold`: true, or say in the "
           "text that it loosens no restriction. If the user's verbatim words allow it only for a named scope (hosts, "
           "resources, actions, a time window) while that item still holds elsewhere, resend it in Restrictions with "
-          "`excepts` set to that item's clause and `source` their words (work they ordered that adds no new risk class needs no new words naming what the charter already names). Never drop a restriction the user did not "
+          "`excepts` set to that item's clause and `source` their words (work they ordered that adds no new risk class needs no new words naming what the charter's Goals, Resources or Policies already name). Never drop a restriction the user did not "
           "change")
 
 
@@ -5737,9 +5737,10 @@ _SAID_CITE = r"user msg #\d+|relayer-ordered|owner-record"   # cites _verbatim_s
 def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], said: str) -> str:
     """Why an exception whose scope names `unsaid` are not in the order's words `said` is not ordered work
     with no new risk class, else "". It is when the order names part of its scope, its text has no
-    new-risk-class words (_DISTURB_RE, relay.HELD) and the charter already names the rest of its scope (an
-    action or resource the project already works with, such as a step the Restrictions already allow):
-    then the order needs no new words of the user naming each part."""
+    new-risk-class words (_DISTURB_RE, relay.HELD) and the charter's Goals, Resources or Policies name the
+    rest of its scope (an action or resource the project already works with); no Restrictions item counts,
+    the excepted ban or any other. Then the order needs no new words of the user naming each part. A scope
+    the order names in other words than the exception text is refused: resend it in the order's words."""
     if not said or not names - set(unsaid):
         return "and the order in `source` names none of its scope"
     bare = restriction_source.bare(text)
@@ -5748,10 +5749,13 @@ def _ordered_work(charter: str, text: str, names: set[str], unsaid: list[str], s
     if risk:
         return (f"and \"{risk}\" makes it a new risk class (someone's work or data, a machine or service others "
                 f"use, speaking as the owner, money or a credential), which needs the user's own words naming it")
-    unknown = [n for n in unsaid if _loose(n) not in _loose(charter)]
+    from .prompts import charter_sections
+    known = _loose("\n".join("\n".join([h, *b]) for h, b in charter_sections(charter)
+                             if _DATED.sub("", h[3:]).strip().lower().startswith(("goal", "resource", "polic"))))
+    unknown = [n for n in unsaid if _loose(n) not in known]
     if unknown:
-        return (f"and the charter names none of {', '.join(unknown)}: ordered work covers only what the order or "
-                f"the charter already names")
+        return (f"and the charter's Goals, Resources and Policies name none of {', '.join(unknown)}: ordered work "
+                f"covers only what the order or those sections name")
     return ""
 
 
@@ -5811,7 +5815,7 @@ def _scoped_exception(charter: str, section: str, text: str, clause: str, source
     stored = (bullet[0] if bullet else "- ") + SCOPED_EXCEPTION.format(clause=restriction_source.bare(item).strip(), section=sec) + text
     note = (f"charter_update: scoped exception to {named} went in" + (
         f" as ordered work with no new risk class (the order names {', '.join(sorted(names - set(unsaid)))}; the "
-        f"charter already names {', '.join(unsaid)})" if unsaid else "") + (
+        f"charter's Goals, Resources or Policies name {', '.join(unsaid)})" if unsaid else "") + (
         "; these items name none of its scope and still hold: " + "; ".join(f"\"{clip(s, 120)}\"" for s in rest)
         if rest else ""))
     if accepted is not None:
@@ -5828,20 +5832,19 @@ def _owners(p: Project, cfg: dict, src) -> list[str] | None:
 
 def _ordered_exception_applied(db, scope: dict, cite: str, text: str, a: dict) -> list[str]:
     """Record an applied scoped exception's source and scope (an event), and resolve each open restriction
-    ask the gate's refusal of it raised: one this update cites ("ask #N", "ask N"), or whose question names
-    every non-numeric name of the scope the order named. The notes say which."""
+    ask this update cites by id ("ask #N" in its text or `source`, or `source`'s "ask": N); no ask is
+    matched by its words. The notes say which."""
     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
          (time.time(), "coordinator", "restriction_exception", "low",
           clip(f"Restrictions exception to \"{scope.get('clause')}\" applied on{cite}: scope "
                f"{', '.join(scope.get('scope') or [])}", 500),
           json.dumps({**scope, "cite": cite.strip(), "text": text}), "handled"))
     said = " ".join(str(a.get(k) or "") for k in ("text", "source", "excepts"))
-    want = [n for n in scope.get("by_order") or [] if not n.isdigit()]
+    cited = {int(n) for n in re.findall(r"\bask\b\W{0,4}#?(\d+)\b", said, re.I)}
     out = []
     for q in db.q("SELECT id, text FROM messages WHERE direction='out' AND kind='ask' AND handled=0 AND ref=?",
                   (f"{prguard.BLOCKING_REF}restriction",)):
-        if (re.search(rf"\bask\s*#?{q['id']}\b", said, re.I)
-                or want and all(_loose(n) in _loose(q["text"] or "") for n in want)):
+        if int(q["id"]) in cited:
             db.x("UPDATE messages SET handled=1 WHERE id=? AND kind='ask'", (q["id"],))
             unblock.record_resolve(db, int(q["id"]), [])
             out.append(f"charter_update: ask #{q['id']} resolved: the Restrictions exception it asked for went in")
@@ -7117,7 +7120,7 @@ CHARTER_GUARD_FUNCS = ("_reject_contradicting_append", "_append_conflicts", "_ov
                        "_ref_ids", "_companion_exception", "_changed_sentences", "_quoted_news",
                        "_charter_approval", "_ask_charter_approval", "_conflict_reason", "_scope_names",
                        "_scoped_exception", "_excepted_item")
-CHARTER_GUARD_PIN = (17, "7eee854688344193ed2d321f53b48ff855c518656fa0ca50a18b1ff1327f1481")
+CHARTER_GUARD_PIN = (17, "1a04da38f7231e8b05374a173b8b60a068d5c927886dcbe7f5e6f9800bbcc004")
 CHARTER_RERAISE_KEY = "charter_reraise"   # kv: {"version", "ts"} of the last re-raise pass
 
 

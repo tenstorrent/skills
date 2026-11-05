@@ -186,11 +186,14 @@ def _is_owner(author: str, owners: list[str]) -> bool:
 
 def record_cite(db, src: dict, agent: bool, owners: list[str] | None) -> str:
     """The cite of a `source` {origin RECORD, ref, author, quote, optional msg}: the owner's own words in an
-    external record they wrote (a ticket or chat comment). A logged inbound message (`msg`, else the newest
-    of the last SCAN) must carry the reference and the quote, so no record is made up. The author is checked
-    against `owners`: a match is the owner's word in any mode (RECORD_CITE); another author's words are data
-    and never count; with no owner identity to check, it counts only with agent mode on, as the owner's
-    agent's order (RELAYER_CITE). ValueError naming the failed check otherwise."""
+    external record they wrote (a ticket or chat comment). The message carrying it (`msg`, else the newest
+    of the last SCAN logged inbound ones) must be the user's own (their verbatim words carry the reference,
+    the quote and the author), or, with agent mode on, the owner's agent's (a finding or relayed context),
+    so neither a record nor its author is made up: the coordinator's `author` alone never counts. An author
+    that is one of `owners` is the owner's word (RECORD_CITE); another author's words are data and never
+    count; with no owner identity to check, it counts only with agent mode on, as the owner's agent's order
+    (RELAYER_CITE). ValueError naming the failed check otherwise. Known gap: a carrier that names both the
+    owner and another person next to the record is read as the owner's."""
     ref, author = (" ".join(str(src.get(k) or "").split()) for k in ("ref", "author"))
     quote = str(src.get("quote") or "").strip()
     if not ref or not author or len(quote) < 3:
@@ -203,13 +206,22 @@ def record_cite(db, src: dict, agent: bool, owners: list[str] | None) -> str:
         mid = 0
     rows = db.q("SELECT id, text, context, kind, provenance FROM messages WHERE direction='in' "
                 + ("AND id=? " if mid else "") + "ORDER BY id DESC LIMIT ?", ((mid,) if mid else ()) + (SCAN,))
-    row = next((r for r in rows if r["kind"] in ("user", "finding") and (r["provenance"] or "") != "system"
-                and _loose(ref) in _loose(f"{r['text']}\n{r['context'] or ''}")
-                and _loose(quote) in _loose(f"{r['text']}\n{r['context'] or ''}")), None)
+
+    def carried(r) -> str:   # the words of `r` that may carry the record: the user's own, the agent's in agent mode
+        if (r["provenance"] or "") == "system" or r["kind"] not in (("user", "finding") if agent else ("user",)):
+            return ""
+        return _loose(f"{r['text']}\n{r['context'] or ''}" if agent else r["text"] or "")
+
+    row = next((r for r in rows if _loose(ref) in carried(r) and _loose(quote) in carried(r)), None)
     if row is None:
-        raise ValueError(f"charter_update rejected: record check failed: no logged message from the user or the "
-                         f"owner's agent{f' (#{mid})' if mid else ''} carries record {ref!r} with that `quote`; cite "
-                         f"the message that quotes the record. " + SOURCE_FORMS)
+        raise ValueError(f"charter_update rejected: record check failed: no logged message from the user"
+                         f"{' or the owner' + chr(39) + 's agent' if agent else ''}{f' (#{mid})' if mid else ''} "
+                         f"carries record {ref!r} with that `quote` in their own words; cite the message that "
+                         f"quotes the record. " + SOURCE_FORMS)
+    if not _is_owner(carried(row), [author]):
+        raise ValueError(f"charter_update rejected: author check failed: message #{row['id']} does not name "
+                         f"{author!r} as the record's author; `author` is who that message says wrote it, never "
+                         f"the coordinator's own claim")
     owners = owners or []
     if owners and _is_owner(author, owners):
         return RECORD_CITE.format(re.sub(r"[()#\n]", " ", ref)[:80].strip(), row["id"])

@@ -22060,20 +22060,22 @@ def _agent_on(p):
 
 def test_an_ordered_exception_with_no_new_risk_class_passes_on_the_agents_order_and_answers_the_gates_ask(env):
     """Agent mode on: an exception the owner's agent ordered (`source` relayer) passes though the order does
-    not name every part of its scope, when the charter already names the rest (a script the project runs)
-    and it adds no new risk class. Its source and scope are on record, no ask goes out and the restriction
-    ask the gate raised for it is resolved."""
+    not name every part of its scope, when the charter's Goals already name the rest (a script the project
+    runs) and it adds no new risk class. Its source and scope are on record, no ask goes out, and only the
+    restriction ask the update cites by id is resolved: another open restriction ask sharing its scope
+    words stays open (sa46)."""
     p = make(env)
     from ttp import coordinator as coord
     db = p.db
     p.charter_path.write_text(_ONLY_WRITE)
     _agent_on(p)
     ask = _gate_ask(db)
+    other = _gate_ask(db, "May workers reboot the box to clear the i2c bus hang? Never-reboot rule holds.")
     found = db.post("in", f"please {_MUX_ORDER}; it only selects a channel, like the CLEAR_FAULTS write",
                     chat=None, kind="finding")
     asks = db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"]
     act = {"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE, "text": _MUX_TEXT,
-           "source": {"origin": "relayer", "msg": found, "quote": _MUX_ORDER}}
+           "source": json.dumps({"origin": "relayer", "msg": found, "quote": _MUX_ORDER, "ask": ask})}
     assert coord.apply(p, [act], turn=2, messages=[]) == []
     charter = p.charter_path.read_text()
     assert f"which holds everywhere except inside this scope, where this item wins: {_MUX_TEXT}" in charter
@@ -22081,13 +22083,15 @@ def test_an_ordered_exception_with_no_new_risk_class_passes_on_the_agents_order_
     ev = db.one("SELECT text, data FROM events WHERE kind='restriction_exception'")
     assert ev and "run.sh" in ev["data"] and "i2c" in ev["data"] and f"msg #{found}" in ev["data"], ev
     assert db.one("SELECT handled FROM messages WHERE id=?", (ask,))["handled"] == 1
+    assert db.one("SELECT handled FROM messages WHERE id=?", (other,))["handled"] == 0   # not cited: stays open
     assert db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"] == asks   # no new ask
 
 
 def test_an_ordered_exception_is_refused_for_a_new_risk_class_or_a_scope_nobody_named(env):
-    """Ordered work covers only what the order or the charter names and adds no new risk class: an
-    exception that disturbs a machine, destroys data or speaks as the owner, or names a script neither the
-    order nor the charter names, is still refused without the user's own words naming it; the ask stays."""
+    """Ordered work covers only what the order or the charter's Goals, Resources and Policies name and adds
+    no new risk class: an exception that disturbs a machine, destroys data or speaks as the owner, or names
+    a script only a Restrictions item (the excepted ban or another) names, is still refused without the
+    user's own words naming it; the ask stays (sa46)."""
     p = make(env)
     from ttp import coordinator as coord
     db = p.db
@@ -22095,29 +22099,43 @@ def test_an_ordered_exception_is_refused_for_a_new_risk_class_or_a_scope_nobody_
     _agent_on(p)
     ask = _gate_ask(db)
     found = db.post("in", f"please {_MUX_ORDER}", chat=None, kind="finding")
-    src = {"origin": "relayer", "msg": found, "quote": _MUX_ORDER}
+    src = {"origin": "relayer", "msg": found, "quote": _MUX_ORDER, "ask": ask}
     for text, why in (
             ("Workers may make a BMC write that resets the i2c mux in `run.sh` for power reads.", "new risk class"),
             ("Workers may make a BMC write that power cycles the i2c mux in `run.sh`.", "new risk class"),
             ("Workers may make a BMC write that deletes the i2c mux logs in `run.sh`.", "new risk class"),
             ("Workers may make a BMC write that selects the i2c mux channel in `mux_probe.py`.",
-             "the charter names none of mux_probe.py")):
+             "Policies name none of mux_probe.py")):
         err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE,
                                "text": text, "source": src}], turn=2, messages=[])
         assert len(err) == 1 and "the user's words in `source` do not name" in err[0] and why in err[0], (text, err)
         assert p.charter_path.read_text() == _ONLY_WRITE
+    # a name only a Restrictions item carries is not one the charter allows (it passed on the whole charter)
+    hosts = ("# demo\n\n## Goals\n- Run tests on box-a.\n\n## Restrictions\n"
+             "- Never write to `/etc/hosts` on any box. (user msg #1)\n"
+             "- Never open pull requests from `release.sh`. (user msg #1)\n")
+    p.charter_path.write_text(hosts)
+    found = db.post("in", "please run the tests on box-a", chat=None, kind="finding")
+    err = coord.apply(p, [{"type": "charter_update", "section": "Restrictions", "excepts":
+                           "Never write to `/etc/hosts` on any box", "text":
+                           "Workers may write to `/etc/hosts` on box-a with `release.sh`.",
+                           "source": {"origin": "relayer", "msg": found, "quote": "run the tests on box-a"}}],
+                      turn=3, messages=[])
+    assert len(err) == 1 and "Policies name none of release.sh" in err[0], err
+    assert p.charter_path.read_text() == hosts
     assert db.one("SELECT handled FROM messages WHERE id=?", (ask,))["handled"] == 0
     assert not db.one("SELECT 1 FROM events WHERE kind='restriction_exception'")
 
 
-def _record_post(db, author):
-    return db.post("in", f"From issue 42, comment 7 by {author}: \"{_MUX_ORDER}\"", chat=None, kind="finding")
+def _record_post(db, author, kind="user"):
+    return db.post("in", f"From issue 42, comment 7 by {author}: \"{_MUX_ORDER}\"", chat=None, kind=kind)
 
 
 def test_an_exception_on_the_owners_own_words_in_a_cited_record_passes_without_agent_mode(env, monkeypatch):
     """Without agent mode, the owner's own words in an external record (a ticket comment), cited with its
-    reference, author and verbatim quote, are the user's word when the author is one of the owner's
-    identities (config coordinator.owner_identities; none built in). Another author's words stay data."""
+    reference, author and verbatim quote, are the user's word when the user's own message carries it and
+    names that author, and the author is one of the owner's identities (config
+    coordinator.owner_identities; none built in). Another author's words stay data."""
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
     monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
     p = make(env)
@@ -22132,16 +22150,43 @@ def test_an_exception_on_the_owners_own_words_in_a_cited_record_passes_without_a
                                              "author": "Someone Else", "quote": _MUX_ORDER}}], turn=1, messages=[])
     assert len(err) == 1 and "author check failed" in err[0], err
     assert p.charter_path.read_text() == _ONLY_WRITE
-    mine = _record_post(db, "A. Owner")
+    mine = _record_post(db, "A. Owner (aowner)")
     for k, author in enumerate(("A. Owner (aowner)", "aowner")):
         p.charter_path.write_text(_ONLY_WRITE)
-        assert coord.apply(p, [{**act, "source": {"origin": "record", "msg": mine, "ref": "issue 42, comment 7",
-                                                  "author": author, "quote": _MUX_ORDER}}],
-                           turn=2 + k, messages=[]) == [], author
+        src = {"origin": "record", "msg": mine, "ref": "issue 42, comment 7", "author": author, "quote": _MUX_ORDER,
+               "ask": ask}
+        assert coord.apply(p, [{**act, "source": src}], turn=2 + k, messages=[]) == [], author
         charter = p.charter_path.read_text()
         assert f"(owner-record issue 42, comment 7, msg #{mine})" in charter, charter
     assert db.one("SELECT handled FROM messages WHERE id=?", (ask,))["handled"] == 1
     assert db.one("SELECT COUNT(*) n FROM messages WHERE kind='ask'")["n"] == 1   # only the gate's own
+
+
+def test_a_record_author_is_the_carrying_messages_never_the_coordinators_claim(env, monkeypatch):
+    """The coordinator's `author` alone never makes a record the owner's word (sa46): the carrying message
+    must name that author, and without agent mode it must be the user's own message, not an agent's
+    finding. A carrier attributing the record to someone else is refused whatever author is claimed."""
+    monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    p = make(env)
+    from ttp import coordinator as coord
+    db = p.db
+    p.set_config("coordinator.owner_identities", ["A. Owner"])
+    p.charter_path.write_text(_ONLY_WRITE)
+    act = {"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE, "text": _MUX_TEXT}
+    src = {"origin": "record", "ref": "issue 42, comment 7", "author": "A. Owner", "quote": _MUX_ORDER}
+    for msg, why in ((_record_post(db, "Someone Else"), "does not name 'A. Owner'"),
+                     (_record_post(db, "Someone Else", kind="finding"), "record check failed"),
+                     (_record_post(db, "A. Owner", kind="finding"), "record check failed")):
+        err = coord.apply(p, [{**act, "source": {**src, "msg": msg}}], turn=1, messages=[])
+        assert len(err) == 1 and why in err[0], (msg, err)
+        assert p.charter_path.read_text() == _ONLY_WRITE
+    _agent_on(p)   # the agent's finding may carry it now, but still names the author it does
+    err = coord.apply(p, [{**act, "source": {**src, "msg": _record_post(db, "Someone Else", kind="finding")}}],
+                      turn=2, messages=[])
+    assert len(err) == 1 and "does not name 'A. Owner'" in err[0], err
+    assert coord.apply(p, [{**act, "source": {**src, "msg": _record_post(db, "A. Owner", kind="finding")}}],
+                       turn=3, messages=[]) == []
 
 
 def test_a_record_whose_author_cannot_be_verified_counts_only_in_agent_mode(env, monkeypatch):
@@ -22153,7 +22198,7 @@ def test_a_record_whose_author_cannot_be_verified_counts_only_in_agent_mode(env,
     from ttp import coordinator as coord
     db = p.db
     p.charter_path.write_text(_ONLY_WRITE)
-    mine = _record_post(db, "A. Owner")
+    mine = _record_post(db, "A. Owner", kind="finding")
     src = {"origin": "record", "msg": mine, "ref": "issue 42, comment 7", "author": "A. Owner", "quote": _MUX_ORDER}
     act = {"type": "charter_update", "section": "Restrictions", "excepts": _ONLY_CLAUSE, "text": _MUX_TEXT}
     err = coord.apply(p, [{**act, "source": src}], turn=1, messages=[])

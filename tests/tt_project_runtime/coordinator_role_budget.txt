@@ -45,4 +45,4 @@
 +140: user_msg marks a task as the user's newer order on a resource (userorder.py)
 +480: a user order and reply/notify claims in the ledger; Must act now items are acted on in the same turn (mustact.py)
 +230: the worker sandbox is the user's (config_set row): a harness-wide order binds every project, no opt-out
-+80: Restrictions gate accepts ordered exceptions with no new risk class and the owner's cited record words (#5959)
++180: Restrictions gate accepts ordered exceptions with no new risk class and the owner's cited record words; `"ask": N` closes the cited gate ask (#5959, #6066)

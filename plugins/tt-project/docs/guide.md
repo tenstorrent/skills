@@ -2322,13 +2322,17 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   goes in as written, and offers the temporary-exception route only when the user's own words make
   it temporary.
 - A scoped exception for work you (or, in agent mode, your agent) ordered goes in without new
-  words from you when it adds no new risk class: the order names part of its scope and the charter
-  already names the rest. It still needs your own words naming it when it would touch someone's
-  work or data, disturb a machine or service others use, speak as you, merge, take a PR out of
-  draft, or involve money or credentials. Your own words in a ticket or chat comment you wrote count
-  when cited with the record, author and quote and the author matches `coordinator.owner_identities`
-  or the project's git identity. The exception records its source and scope and answers the gate's
-  open ask for it.
+  words from you when it adds no new risk class: the order names part of its scope and the
+  charter's Goals, Resources or Policies name the rest (never a Restrictions item). It still needs
+  your own words naming it when it would touch someone's work or data, disturb a machine or service
+  others use, speak as you, merge, take a PR out of draft, or involve money or credentials. Your
+  own words in a ticket or chat comment you wrote count when your own message (or, in agent mode,
+  your agent's) quotes the record and names you as its author, the coordinator cites the record,
+  author and quote, and the author matches `coordinator.owner_identities` or the project's git
+  identity. The exception records its source and scope and closes only the gate's ask it cites by
+  id. Known gaps: an order naming its scope in other words than the exception is refused (the
+  coordinator resends it in the order's words); an exception whose whole scope the order names is
+  not risk-checked; a message naming both you and someone else beside the record reads as yours.
 - A Restrictions edit resting only on your agent's words (`coordinator.agent_orders_as_user`) is read
   by the clauses it changes. The quoted item and the new text are split into clauses (at `,` `;` `:`,
   a sentence's `.`, and before an "and" that starts a held step such as "and post"). A clause both
