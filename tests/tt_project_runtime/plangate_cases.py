@@ -71,7 +71,7 @@ def test_task_add_citing_a_gated_plan_inherits_its_gate_anded_with_its_own(env):
         {"type": "task_add", "title": "bench", "spec": f"from plan #{plan}: run the head-to-head"},
         {"type": "task_add", "title": "injection", "spec": f"From plan #{plan}. Assess attacks.",
          "depends_on": [own], "start_when": "test -f other", "why": "after the routing code"},
-        # An urgent task keeps the gate: its why cites the user's word.
+        # An urgent task drops the gate's probe as a convenience gate: its why cites no user message.
         {"type": "task_add", "title": "urgent one", "spec": f"from plan #{plan}\nurgent: asked twice",
          "priority": 1}]) == []
     bench, inj, urg = (_added(p, t) for t in ("bench", "injection", "urgent one"))
@@ -80,10 +80,26 @@ def test_task_add_citing_a_gated_plan_inherits_its_gate_anded_with_its_own(env):
     assert sorted(json.loads(p.db.task(inj)["depends_on"])) == sorted([own, dep])
     assert "start_when:test -f ready && test -f other" in _labels(p, inj), _labels(p, inj)
     why = next(lb for lb in _labels(p, inj) if lb.startswith("start_why:"))
-    assert why.startswith(f"start_why:plan #{plan}'s start condition (the user's words)") and "routing" in why
-    assert "start_when:test -f ready" in _labels(p, urg) and json.loads(p.db.task(urg)["depends_on"]) == [dep]
+    assert why == (f"start_why:once the persistent coordinator is in place (plan #{plan}'s start gate); "
+                   f"after the routing code"), why
+    assert not any(lb.startswith(("start_when:", "start_safety")) for lb in _labels(p, urg)), _labels(p, urg)
+    assert json.loads(p.db.task(urg)["depends_on"]) == [dep]
     for t in (bench, inj, urg):
         assert not _ready(p, t)
+
+
+def test_a_gate_citing_a_user_message_holds_an_urgent_task_too(env):
+    from ttp import convgate
+    from ttp import coordinator as coord
+    p = make(env)
+    plan, _ = _finish_plan(env, p, {"gate": {"start_when": "test -f ready",
+                                             "why": "user msg #1725: only after the persistent coordinator"}})
+    assert coord.apply(p, [{"type": "task_add", "title": "urgent one", "spec": f"from plan #{plan}\nurgent: now",
+                            "priority": 1}]) == []
+    labels = _labels(p, _added(p, "urgent one"))
+    assert "start_when:test -f ready" in labels and f"start_safety:{convgate.CLASSES[0][0]}" in labels, labels
+    # The plan's own name adds no class: a gate with no why is a convenience gate.
+    assert convgate.safety_class(f"plan #{plan}'s start gate") is None
 
 
 def test_a_landed_gate_and_a_compound_own_probe_and_together_safely(env):
@@ -186,8 +202,9 @@ def test_a_hold_the_user_ordered_raises_no_lane_wait(env, how):
     from ttp import lanewait, plangate
     p = make(env)
     holder = p.db.add_task("the holder", "s", kind="code", status="running")
+    plan, _ = _finish_plan(env, p, {"gate": {"depends_on": [holder], "why": "user msg #1725: only after it"}})
     t0 = time.time() - 3 * 3600
-    labels = ({"plan_gate": [f"{plangate.HELD}7"],
+    labels = ({"plan_gate": [f"{plangate.HELD}{plan}"],
                "user_cited_why": [f"start_when:landed:#{holder}", "start_why:user msg #1725: only after it",
                                   f"deferred_since:{t0:.0f}"]})[how]
     dep = p.db.add_task("the waiter", "s", kind="code", status="queued", labels=labels,
@@ -195,3 +212,38 @@ def test_a_hold_the_user_ordered_raises_no_lane_wait(env, how):
     p.db.x("UPDATE tasks SET created=? WHERE id=?", (t0, dep))
     lanewait.check(p.db, {"waiting": {"lane_wait_event_s": 600}}, time.time())
     assert not p.db.q("SELECT id FROM events WHERE kind='lane_wait'")
+
+
+@pytest.mark.parametrize("gate_why", ["user msg #1725: only after it", "once it is in place"])
+def test_a_held_task_still_raises_lane_wait_on_its_other_holders(env, gate_why):
+    """Only the holders a user-cited gate names are skipped: the task's own dependency still counts, and
+    a gate citing no user message skips nothing."""
+    from ttp import lanewait, plangate
+    p = make(env)
+    gate_dep = p.db.add_task("the gate's work", "s", kind="code", status="running")
+    sibling = p.db.add_task("a sibling", "s", kind="code", status="running")
+    plan, _ = _finish_plan(env, p, {"gate": {"depends_on": [gate_dep], "why": gate_why}})
+    t0 = time.time() - 3 * 3600
+    t = p.db.add_task("the waiter", "s", kind="code", status="queued", labels=[f"{plangate.HELD}{plan}"],
+                      depends_on=[gate_dep, sibling])
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (t0, t))
+    lanewait.check(p.db, {"waiting": {"lane_wait_event_s": 600}}, time.time())
+    ev = p.db.q("SELECT data FROM events WHERE kind='lane_wait'")
+    want = [sibling] if gate_why.startswith("user msg") else [gate_dep, sibling]
+    assert len(ev) == 1 and sorted(json.loads(ev[0]["data"])["holders"]) == want, ev
+    # The gate met, its own holder still waiting: one event, not one per check.
+    p.db.update_task(gate_dep, status="done")
+    lanewait.check(p.db, {"waiting": {"lane_wait_event_s": 600}}, time.time())
+    assert len(p.db.q("SELECT id FROM events WHERE kind='lane_wait'")) == 1
+
+
+def test_a_gate_probe_naming_a_queued_task_does_not_hold_it_on_itself(env):
+    from ttp import plangate
+    p = make(env)
+    plan, _ = _finish_plan(env, p, {})
+    t = p.db.add_task("the gate's work", f"from plan #{plan}", origin="coordinator", labels=["start_when:test -f a"])
+    other = p.db.add_task("another", f"from plan #{plan}", origin="coordinator")
+    notes = plangate.set_gate(p, p.db, p.db.task(plan), {"start_when": f"landed:#{t}", "why": "user msg #3: after it"})
+    assert any(n.startswith(f"#{t}: plan #{plan}'s gate start_when") and "itself" in n for n in notes), notes
+    assert "start_when:test -f a" in _labels(p, t) and not any(f"#{t}" in lb for lb in _labels(p, t)), _labels(p, t)
+    assert f"start_when:landed:#{t}" in _labels(p, other), _labels(p, other)

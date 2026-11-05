@@ -7,9 +7,10 @@ A plan run's hand-off may carry `gate`: {"depends_on": [task ids], "start_when":
 "<the order's condition>"}, one or both of depends_on and start_when. The daemon stores it on the plan
 task (label `plan_gate:<json>`, `on_handoff`); each done plan hand-off replaces it, one without a gate
 clears it. task_add of a task whose spec cites `from plan #<id>` inherits it (`inherit`): its
-depends_on joins the task's own, its start_when is ANDed with the task's own, and its why, which
-names the user's word, comes first (so an urgent task keeps it: convgate); the task gets the HELD
-label, so lanewait raises no event per held task. A gate the coordinator records later (task_update
+depends_on joins the task's own, its start_when is ANDed with the task's own, and its why comes first,
+verbatim (`gate_why`): it claims the user's word only when it cites a user message itself, so convgate
+classes it as any why (an urgent task drops it as a convenience gate unless it names a safety class);
+the task gets the HELD label, and lanewait counts no holder a user-cited gate names (`user_holders`). A gate the coordinator records later (task_update
 `gate` on the plan, `set_gate`) and a done hand-off's gate also hold the plan's tasks already queued
 and never started (`hold_queued`), and name any that already started. A gate it cannot apply
 whole (a task id that no longer exists, a combined probe too long) comes back as a note, never
@@ -21,7 +22,7 @@ import json
 import re
 
 LABEL = "plan_gate:"
-HELD = "plan_gated:"   # + plan id: a task held on that plan's gate (lanewait skips it: the user's hold)
+HELD = "plan_gated:"   # + plan id: a task held on that plan's gate (lanewait: user_holders)
 CITE = re.compile(r"\bfrom plan #(\d+)\b", re.I)
 _PLAIN = re.compile(r"[|;\n`]|\$\(|(?<!&)&(?!&)")   # a probe that is not one plain `&&` chain
 
@@ -138,6 +139,32 @@ def held(task: dict) -> bool:
     return any(isinstance(lb, str) and lb.startswith(HELD) for lb in labels if isinstance(labels, list))
 
 
+def gate_why(pid: int, gate: dict) -> str:
+    """A gate's why as a held task's start_why: its own words first, as given, then the plan it came from.
+    It adds no claim of the user's word: convgate classes it by what the why itself cites."""
+    return f"{gate['why']} (plan #{pid}'s start gate)" if gate.get("why") else f"plan #{pid}'s start gate"
+
+
+def user_holders(db, task: dict) -> set[int]:
+    """The task ids the user-given gates a task is HELD on name (their depends_on, the tasks their
+    start_when waits on): lanewait counts none of them. A gate whose why and probe cite no user message
+    names none, and the task's other holders always count."""
+    from . import convgate, landed
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except (ValueError, TypeError):
+        return set()
+    out: set[int] = set()
+    for lb in labels if isinstance(labels, list) else []:
+        if not (isinstance(lb, str) and lb.startswith(HELD) and lb[len(HELD):].isdigit()):
+            continue
+        gate = stored(db.task(int(lb[len(HELD):])))
+        if gate and convgate.user_word(gate.get("why"), gate.get("start_when")):
+            out |= {d for d in gate.get("depends_on") or [] if isinstance(d, int)}
+            out |= {int(r) for r in landed.task_refs(gate.get("start_when") or "") if r.isdigit()}
+    return out
+
+
 def inherit(p, db, a: dict) -> tuple[dict, list[int], list[str], list[str]]:
     """A task_add `a` under the gates of the plans its spec cites: (the action with the gates' probes
     ANDed into its start_when and their whys first in its why; the gates' depends_on, for the caller to
@@ -171,8 +198,7 @@ def inherit(p, db, a: dict) -> tuple[dict, list[int], list[str], list[str]]:
                              f"start_when (too long or invalid together): only the gate's is kept; resend the "
                              f"task's own check with task_update, shorter, ANDed with the gate's")
                 when = g
-        whys.append(f"plan #{pid}'s start condition (the user's words)"
-                    + (f": {gate['why']}" if gate.get("why") else ""))
+        whys.append(gate_why(pid, gate))
     if not gated:
         return a, [], [], []
     out = dict(a)
@@ -202,6 +228,7 @@ def hold_queued(p, db, pid: int, gate: dict) -> list[str]:
     """Hold every task that cites `from plan #<pid>`, has never started and is not yet HELD on it, on
     `gate`, as task_add would have (a task queued in the same batch before the gate was recorded);
     notes, also naming any such task already started (the coordinator steers or stops it)."""
+    from . import landed
     from .db import deferral, dependency_ids, without_deferral
     from .coordinator import defer_labels, START_WHY_CHARS
     notes, mark = [], f"{HELD}{pid}"
@@ -225,13 +252,16 @@ def hold_queued(p, db, pid: int, gate: dict) -> list[str]:
         deps = dependency_ids(t)
         deps += [x for x in gate.get("depends_on") or [] if x not in deps and x != t["id"] and db.task(x)]
         when, own = d.get("when") or "", d.get("when") or ""
-        if g := str(gate.get("start_when") or ""):
+        g = str(gate.get("start_when") or "")
+        if g and str(t["id"]) in landed.task_refs(g):   # it would wait on its own landing for ever
+            notes.append(f"#{t['id']}: plan #{pid}'s gate start_when {g[:120]!r} waits on #{t['id']} itself: "
+                         f"not applied to it")
+        elif g:
             when = and_probes(g, own, p) or g
             if own and when == g:
                 notes.append(f"#{t['id']}: plan #{pid}'s gate start_when could not be ANDed with its own "
                              f"start_when: only the gate's is kept; resend its own with task_update")
-        why = "; ".join([f"plan #{pid}'s start condition (the user's words)"
-                         + (f": {gate['why']}" if gate.get("why") else ""), *([d["why"]] if d.get("why") else [])])
+        why = "; ".join([gate_why(pid, gate), *([d["why"]] if d.get("why") else [])])
         new = without_deferral(labels) + defer_labels(d.get("after"), when, " ".join(why.split())[:START_WHY_CHARS]
                                                        if when else None) + [mark]
         db.update_task(t["id"], depends_on=deps, labels=new)

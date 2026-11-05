@@ -30,7 +30,7 @@ charter requires, so a speedup that breaks quality is caught.
   tasks unless one needs another's new file or symbol; give each the goal's priority and `urgent:` line.
 - A start condition in the order ('once', 'after', 'only when', 'until'): put it in `gate`, as task
   ids to wait on (`depends_on`) and/or a model-free `start_when` probe, with `why` quoting the
-  condition. Every task the plan queues inherits it, not only the one it names.
+  condition and, when the user gave it, its message id first ('user msg #N: ...'). Every task the plan queues inherits it, not only the one it names.
 - Findings worth keeping: put them in `findings`, one fact each, with its source.
 - Knowledge that would help but is out of reach (access, a missing connector, a person to ask):
   say what and why.
