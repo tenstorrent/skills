@@ -372,19 +372,31 @@ def test_a_clean_tree_removed_under_a_detached_check_reports_killed_not_test_fai
     _no_checkouts(repo, tmp)
 
 
-def test_check_scratch_holder_survives_a_proc_locks_read_that_misses_its_line(env, monkeypatch, capsys):
+@pytest.mark.parametrize("ino", [None, 43434242])
+def test_check_scratch_holder_survives_a_proc_locks_read_that_misses_its_line(env, monkeypatch, capsys, ino):
     """The kernel hands out /proc/locks a page per read, so while other locks come and go the holder's
     line can slip past a read or two in a row (under host load a wait said 'pid (unknown) still holds'
     after naming the pid): a read with no lock on the inode is retried, at most HOLDER_READS reads, and
-    the wait's last message keeps the last holder it saw."""
+    the wait's last message keeps the last holder it saw. `ino`: the lock file's inode number shows
+    in /proc/locks, so one holding a pid's digits must not change a line's pid or inode."""
     from ttp import checkdirs
+    if ino:
+        real = os.stat
+
+        def stat(path, *a, **kw):
+            s = real(path, *a, **kw)
+            return os.stat_result((s[0], ino, *s[2:])) if str(path).endswith(checkdirs.LOCK) else s
+        monkeypatch.setattr(os, "stat", stat)
     folder = make(env).state / checkdirs.FOLDER
     folder.mkdir(parents=True, exist_ok=True)
     (folder / checkdirs.LOCK).touch()
     st = os.stat(folder / checkdirs.LOCK)
     dev = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev):02x}"
-    line = f"1: FLOCK  ADVISORY  WRITE 4242 {dev}:{st.st_ino} 0 EOF\n"
-    stranger = f"2: FLOCK  ADVISORY  WRITE 4343 ff:ff:{st.st_ino} 0 EOF\n"
+    other = f"{os.major(st.st_dev):02x}:{os.minor(st.st_dev) + 1:02x}"
+
+    def flock(pid, where=dev, n=1):   # built per pid: a str.replace of the pid also hit an inode number holding it
+        return f"{n}: FLOCK  ADVISORY  WRITE {pid} {where}:{st.st_ino} 0 EOF\n"
+    line, stranger = flock(4242), flock(4343, other, 2)
     reads = []
 
     def table(*seq, then=()):
@@ -402,9 +414,9 @@ def test_check_scratch_holder_survives_a_proc_locks_read_that_misses_its_line(en
         assert checkdirs._holder(fd) is None and len(reads) == checkdirs.HOLDER_READS, "bounded"
         table([f"1: POSIX  ADVISORY  WRITE 4242 {dev}:{st.st_ino} 0 EOF\n"], [line])
         assert checkdirs._holder(fd) == 4242, "a POSIX lock alone is no FLOCK holder: read again"
-        table([line.replace("4242", "4141"), stranger])
+        table([flock(4141), stranger])
         assert checkdirs._holder(fd) == 4141 and len(reads) == 1
-        table([stranger, stranger.replace("4343", "4444")])
+        table([stranger, flock(4444, other, 3)])
         assert checkdirs._holder(fd) is None and len(reads) == 1, "two strangers are an answer, not a miss"
         held = checkdirs._take_fd(fd)   # a second open file description: the wait below finds it busy
         try:
