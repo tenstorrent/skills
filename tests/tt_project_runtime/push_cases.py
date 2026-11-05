@@ -14669,6 +14669,10 @@ def test_a_push_check_time_limit_leaves_out_its_wait_for_a_test_pool_slot(monkey
     rc, said, _ = _clock_timed_wait(monkeypatch, tmp_path / "a", 900.0, 4 * 3600.0, 600, 1000)
     assert rc == 0, said
     assert "waited 600 s for a test-pool slot, not counted against its time limit: run-shards" in said, said
+    # A pool wait longer than the limit itself (1261 s), then a short run (249 s), still passes.
+    rc, said, _ = _clock_timed_wait(monkeypatch, tmp_path / "e", 900.0, 4 * 3600.0, 1261, 1510)
+    assert rc == 0 and "ran past its limit" not in said, said
+    assert "waited 1261 s for a test-pool slot" in said, said
     rc, said, t = _clock_timed_wait(monkeypatch, tmp_path / "b", 900.0, 4 * 3600.0, 600, 2000)
     assert rc == 124 and "check ran past its limit of 900 s" in said, said
     assert 1500 <= t < 1510, t   # 600 s pool wait + 900 s run, not 900 s since it started
