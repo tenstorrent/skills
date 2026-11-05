@@ -40,6 +40,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     charterpromise,
     chartertemplate,
     configwho,
+    coordfix,
     convgate,
     chainprio,
     chatset,
@@ -1357,6 +1358,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("ends", ends.digest_lines(p, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("heal", heal.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("budget_topups", topup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0)))
+    section("unexplained_fixes", coordfix.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("noisy_watchers", watchdup.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("queue_backlog", queuetrim.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))

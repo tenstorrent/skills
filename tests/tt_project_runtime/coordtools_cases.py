@@ -585,6 +585,108 @@ def test_full_tools_log_each_mutating_call(tmp_path, monkeypatch):
     assert len((run / coordtools.AUDIT).read_text().splitlines()) == 4
 
 
+def _coord_post(payload):
+    from ttp import coordtools
+    assert coordtools.post_tool_use(payload) == (None, None)
+
+
+def test_a_hands_on_fix_records_what_why_the_order_it_serves_and_its_undo(tmp_path, monkeypatch, capsys):
+    from ttp import coordfix, coordtools
+    _, _, run = _full_env(tmp_path, monkeypatch)
+    _coord_post({"tool_name": "Bash", "tool_input": {"command": "sed -i s/a/b/ x.md"}})   # before any why
+    why = ["audit", "why", "the worker kept a stale lock path", "--serves", "o171", "--undo", "git revert abc1234"]
+    assert _ttp_main(*why) is None
+    assert "serves o171" in capsys.readouterr().out
+    _coord_post({"tool_name": "Bash", "tool_input": {"command": "ttp audit why 'x (y)' --serves 12 --undo none:z"}})
+    _coord_post({"tool_name": "Bash", "tool_input": {"command": "sed -i s/old/new/ scripts/run.sh",
+                                               "description": "fix the worker script's lock path"}})
+    _coord_post({"tool_name": "Edit", "tool_input": {"file_path": "/p/prompts/worker.md"}})
+    # A `ttp audit why` chained or substituted with another command is logged like any other call.
+    for cmd in ("ttp audit why x; rm y", "ttp audit why x && rm y", "ttp audit why \"$(rm y)\"",
+                "ttp audit why x\nrm y", "ttp audit why x#c;rm y", "ttp audit why x | sh"):
+        _coord_post({"tool_name": "Bash", "tool_input": {"command": cmd}})
+    rows = [json.loads(line) for line in (run / coordtools.AUDIT).read_text().splitlines()]
+    assert len(rows) == 9 and "why" not in rows[0], "the first call came before any why"
+    assert rows[1]["what"] == "fix the worker script's lock path" and rows[2]["what"] == "Edit /p/prompts/worker.md"
+    for r in rows[1:]:
+        assert (r["why"], r["serves"], r["undo"]) == ("the worker kept a stale lock path", "o171", "git revert abc1234")
+        assert r["target"] and r["exit"] == 0 and r["ts"]
+    assert "(why: the worker kept a stale lock path; serves o171)" in (run / "progress.md").read_text()
+    assert _ttp_main("audit", "why", "--done") is None   # later calls carry no why
+    _coord_post({"tool_name": "Write", "tool_input": {"file_path": "/p/notes.md"}})
+    assert "why" not in json.loads((run / coordtools.AUDIT).read_text().splitlines()[-1])
+    # Each field is required; --serves names an obligation, a user message or a task.
+    for bad in (["audit", "why", "--serves", "o1", "--undo", "u"], ["audit", "why", "w", "--serves", "o1"],
+                ["audit", "why", "w", "--serves", "the plan", "--undo", "u"], ["audit", "why", "w", "--undo", "u"]):
+        with pytest.raises(SystemExit):
+            _ttp_main(*bad)
+    assert [coordfix.serves(x) for x in ("O171", "msg#1776", "user msg 1776", "#6302", "task 6302", "6302")] == [
+        "o171", "user msg #1776", "user msg #1776", "task #6302", "task #6302", "task #6302"]
+    monkeypatch.delenv("TTP_RUN_DIR")
+    with pytest.raises(SystemExit):
+        _ttp_main(*why)
+
+
+def _fix_rows(p, rows, started):
+    """A finished coordinator run whose audit file holds `rows`."""
+    from ttp import coordtools
+    run = p.runs / f"fix{started:.0f}"
+    run.mkdir(parents=True)
+    (run / coordtools.AUDIT).write_text("".join(json.dumps(r) + "\n" for r in rows) + "not json\n")
+    return p.db.x("INSERT INTO runs(role,status,started,ended,dir) VALUES('coordinator','ok',?,?,?)",
+                  (started, started + 60, str(run)))
+
+
+def test_a_change_with_no_why_is_flagged_once_in_the_next_digest(env):
+    from ttp import coordinator as coord
+    p = make(env)
+    now = time.time()
+    _fix_rows(p, [{"ts": now - 50, "tool": "Bash", "target": "rm -rf build", "what": "Bash rm -rf build", "exit": 0},
+                  {"ts": now - 40, "tool": "Edit", "target": "/p/a.md", "what": "Edit /p/a.md", "exit": 0,
+                   "why": "w", "serves": "o1", "undo": "u"}], now - 60)
+    p.db.set_kv("last_coordinator_turn", now - 60)   # the turn that made them
+    digest = coord.digest(p, {}, [], [])
+    assert "## Hands-on changes with no recorded why: 1" in digest and "Bash rm -rf build" in digest
+    assert "/p/a.md" not in digest, "a change with a why is not flagged"
+    p.db.set_kv("last_coordinator_turn", now)   # the next turn started: shown once only
+    assert "no recorded why" not in coord.digest(p, {}, [], [])
+
+
+def test_the_daily_review_and_ttp_audit_fixes_list_the_days_fixes_by_order(env, capsys):
+    from ttp import audit
+    p = make(env)
+    now = time.time()
+    _fix_rows(p, [{"ts": now - 3 * 86400, "tool": "Bash", "target": "old", "what": "an old fix", "exit": 0}], now - 3 * 86400)
+    _fix_rows(p, [{"ts": now - 3600, "tool": "Edit", "target": "/p/w.md", "what": "Edit /p/w.md", "exit": 0,
+                   "why": "workers misread the lock rule", "serves": "o171", "undo": "git revert 1a2b"},
+                  {"ts": now - 3500, "tool": "Bash", "target": "ttp task demo add x", "what": "requeue #12", "exit": 0,
+                   "why": "the run died", "serves": "task #12", "undo": "ttp task demo cancel 13"},
+                  {"ts": now - 3400, "tool": "Bash", "target": "ttp x", "what": "retune the queue", "exit": 2,
+                   "why": "w2", "serves": "o171", "undo": "u2"},
+                  {"ts": now - 3300, "tool": "Bash", "target": "rm f", "what": "Bash rm f", "exit": 0}], now - 3700)
+    line = next(x for x in audit.lines(p.db, p=p) if x.startswith("coordinator hands-on fixes"))
+    assert line.startswith("coordinator hands-on fixes: 4, by order: o171 (2): Edit /p/w.md (why: workers misread "
+                           "the lock rule; undo: git revert 1a2b); retune the queue (exit 2) (why: w2; undo: u2) | "
+                           "task #12 (1): requeue #12"), line
+    assert line.endswith("| no why recorded (1): Bash rm f") and "an old fix" not in line
+    assert len(audit.report(p.db, p=p)["coordinator_fixes"]) == 4
+    monkey = pytest.MonkeyPatch()
+    monkey.chdir(p.root)
+    try:
+        assert _ttp_main("audit", "fixes") is None
+        out = capsys.readouterr().out
+        assert out.startswith("o171: 2\n") and "    why: the run died\n    undo: ttp task demo cancel 13" in out, out
+        assert "an old fix" not in out
+        assert _ttp_main("audit", "fixes", "--since", "4d") is None
+        assert "an old fix" in capsys.readouterr().out
+        assert _ttp_main("audit", "fixes", "--since", "1m") is None
+        assert capsys.readouterr().out.startswith("no coordinator hands-on fixes since ")
+        assert _ttp_main("audit", "fixes", "demo", "--json") is None
+        assert len(json.loads(capsys.readouterr().out)) == 4
+    finally:
+        monkey.undo()
+
+
 def test_session_tools_key_loosens_only_on_the_users_word():
     from ttp import coordinator as coord, coordtools
     assert coord.NEEDS_USER["coordinator.session.tools"] == "restriction"

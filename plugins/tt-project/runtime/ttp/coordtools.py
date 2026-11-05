@@ -555,6 +555,8 @@ def post_tool_use(payload: dict, failed: bool = False) -> tuple[dict | None, Non
         args = payload.get("tool_input") or {}
         if not run or os.environ.get(FULL_ENV) != "1" or payload.get("agent_id"):
             return out, None
+        if tool == "Bash" and _records_why(str(args.get("command") or "")):
+            return None, None   # `ttp audit why` itself: the record, not a change
         if tool == "Bash" and bash_refusal(str(args.get("command") or "")) is not None:
             what = str(args.get("command") or "")
         elif tool in EDITS:
@@ -565,14 +567,33 @@ def post_tool_use(payload: dict, failed: bool = False) -> tuple[dict | None, Non
         code = (int(m.group(1)) if m else 1) if failed else 0
         from pathlib import Path
         from . import timefmt
+        from . import coordfix
         from .project import durable_append
+        said = " ".join(str(args.get("description") or "").split())[:300] if tool == "Bash" else ""
+        why = coordfix.intent(run)   # the why, order and undo declared before it (coordfix.py)
         durable_append(Path(run) / AUDIT, json.dumps({"ts": time.time(), "tool": tool, "target": what[:2000],
-                                                      "exit": code}) + "\n")
+                                                      "what": said or f"{tool} {what[:300]}", "exit": code,
+                                                      **why}) + "\n")
         line = " ".join(what.split())[:200]
-        durable_append(Path(run) / "progress.md", f"{timefmt.clock()} coordinator {tool} exit {code}: {line}\n")
+        tag = f" (why: {why['why'][:120]}; serves {why['serves']})" if why else " (no why recorded)"
+        durable_append(Path(run) / "progress.md", f"{timefmt.clock()} coordinator {tool} exit {code}: {line}{tag}\n")
     except Exception:
         pass
     return out, None
+
+
+def _records_why(cmd: str) -> bool:
+    """True for a plain `ttp audit why ...` call: no unquoted shell operator and no substitution, so
+    it runs nothing else (a chained or substituted command is logged as any other)."""
+    if "$(" in cmd or "`" in cmd or "\n" in cmd or "\r" in cmd:
+        return False
+    try:
+        lex = shlex.shlex(cmd, posix=True, punctuation_chars=True)
+        lex.whitespace_split, lex.commenters = True, ""   # `#` read as a word: a `;` after it still counts
+        words = list(lex)
+    except ValueError:
+        return False
+    return words[:3] == ["ttp", "audit", "why"] and not any(w and set(w) <= set("();<>|&") for w in words)
 
 
 def wake_budget(cfg: dict, turn_usd: float | None, turn_timeout_s: float) -> tuple[float | None, float]:

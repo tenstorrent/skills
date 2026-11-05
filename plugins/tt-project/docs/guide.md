@@ -497,7 +497,10 @@ only in the feed and never under "needs you".
   foreground command stops at `tool_timeout_s` (300, at most 600); a longer or background one is
   denied with a pointer to `ttp detach` or a worker task. Each mutating call (the command or file,
   its exit code) goes to the run's `tool-audit.jsonl` and `progress.md`, which the web run view
-  shows. `read_only` keeps `Read` and a list of read-only `ttp` commands. Moving to `read_only`
+  shows. Before a fix the coordinator runs `ttp audit why "<why>" --serves <o12|msg#123|#456> --undo
+  "<how>"`; each later mutating call in that wake carries the why, the order or task it serves and
+  the undo (coordfix.py). A call with none is flagged once in the next digest, the daily review lists
+  the day's fixes grouped by order, and `ttp audit fixes [--since 6h]` prints them. `read_only` keeps `Read` and a list of read-only `ttp` commands. Moving to `read_only`
   needs no word; back to `full` needs the user's. A stateless turn has no tools either way.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
   refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown

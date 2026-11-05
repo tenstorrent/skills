@@ -1991,10 +1991,36 @@ def cmd_replicate(a) -> None:
 
 def cmd_audit(a) -> None:
     """The daily review's self-efficiency audit of this project's last `--hours`, model-free."""
-    from . import audit
-    p = need(a.name, sys.argv[1:]) if a.name else here()
+    from . import audit, coordfix
+    if a.name == "why":   # the session coordinator's why for its next hands-on changes (coordfix.py)
+        run = os.environ.get("TTP_RUN_DIR")
+        if not run or not Path(run).is_dir():
+            die("ttp audit why records a fix of the run it is called in: no run here (TTP_RUN_DIR)")
+        if a.done:
+            coordfix.done(run)
+            print("ttp audit why: done; later changes in this run carry no why until the next one")
+            return
+        try:
+            rec = coordfix.declare(run, " ".join(a.rest), a.serves or "", a.undo or "")
+        except ValueError as e:
+            die(str(e))
+        print(f"ttp audit why: recorded for this run's next changes (serves {rec['serves']}; undo: {rec['undo']})")
+        return
+    fixes = a.name == "fixes"
+    name = (a.rest[0] if a.rest else None) if fixes else a.name
+    p = need(name, sys.argv[1:]) if name else here()
     if not p:
         die("no tt-project project here; name one: `ttp audit <name>`")
+    if fixes:   # the coordinator's hands-on fixes, grouped by the order they serve
+        from .activity import parse_since
+        now = time.time()
+        try:
+            since = parse_since(a.since, now, a.hours * 3600, p)
+        except ValueError as e:
+            die(str(e))
+        rows = coordfix.entries(p.db, since, now)
+        print(json.dumps(rows, indent=1) if a.json else coordfix.fixes_text(p.db, since, timefmt.home(p), now))
+        return
     hours = float((p.config().get("review") or {}).get("blocked_long_h", audit.BLOCKED_H))
     if a.json:
         print(json.dumps(audit.report(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p), indent=1, default=str))
@@ -12175,8 +12201,16 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("audit", help="the daily review's self-efficiency audit: asks, wasted runs, idle wakes, "
                                      "$ per outcome, review loops, stuck work and overrides held past their end")
-    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("name", nargs="?", help="the project (default: the one here); or `fixes [<project>]`: the "
+                                           "coordinator's hands-on fixes grouped by the order they serve; or "
+                                           "`why \"<why>\" --serves <ref> --undo \"<how>\"`: the why its next "
+                                           "changes in this run carry")
+    s.add_argument("rest", nargs="*", help=argparse.SUPPRESS)
     s.add_argument("--hours", type=float, default=24, help="the window to audit, in hours (default 24)")
+    s.add_argument("--since", help="with fixes: from a delay back (6h, 2d) or an ISO time (default: --hours)")
+    s.add_argument("--serves", help="with why: the order or task the fix serves: o171, msg#1776 or #6302")
+    s.add_argument("--undo", help="with why: the command or steps that undo it (`none: <why>` when nothing can)")
+    s.add_argument("--done", action="store_true", help="with why: later changes in this run carry no why")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_audit)
 

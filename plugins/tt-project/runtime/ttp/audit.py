@@ -48,7 +48,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordmodel, correction, ends, obligations, plainreply, quietgate, relay, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, obligations, plainreply, quietgate, relay, reviewstats, route, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -505,6 +505,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(promised)
     if orders := obligations.order_audit_line(db, now):
         out.append(orders)
+    if hands_on := coordfix.audit_line(db, since, now):
+        out.append(hands_on)
     if chains := chaincap.audit_line(db, since, TOP):
         out.append(chains)
     if shared := sharedchecks.audit_line(db, since):
@@ -645,4 +647,4 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "reviews": {**reviewstats.summary(db, since), "rows": reviewstats.rows(db, since)},
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
             "repeated_instructions": correction.repeat_summary(db, since), "mount_races": mount_races(db, since),
-            "context_gaps": context_gaps(db, since)}
+            "context_gaps": context_gaps(db, since), "coordinator_fixes": coordfix.entries(db, since, now)}
