@@ -1148,7 +1148,10 @@ def keep(path: Path) -> None:
     it (remove_path); a half-made one goes with `remove --force --force` (_clear_partial)."""
     ad = _admin_dir(path)
     if ad is not None and not (ad / "locked").exists():
-        _git(path, "worktree", "lock", "--reason", KEEP_LOCK, str(path), check=False)
+        try:   # best effort: a git that hangs or fails never stops a run or a sweep
+            _git(path, "worktree", "lock", "--reason", KEEP_LOCK, str(path), check=False, timeout=30)
+        except (OSError, subprocess.SubprocessError):
+            pass
 
 
 def unkeep(path: Path) -> None:

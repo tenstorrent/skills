@@ -80,3 +80,18 @@ def test_a_worktree_really_gone_is_still_pruned_and_a_foreign_lock_stays(env, tm
     # Not a linked worktree: nothing to lock, no error.
     worktree.keep(tmp_path)
     worktree.unkeep(p.root)
+
+
+def test_a_git_that_hangs_while_locking_never_stops_the_run_or_the_sweep(env, monkeypatch):
+    p = make(env)
+    from ttp import worktree
+    tid, path, _ = _code_task(p, "kept", status="done")
+    real = worktree._git
+
+    def hang(cwd, *args, **kw):
+        if args[:2] == ("worktree", "lock"):
+            raise subprocess.TimeoutExpired(["git", *args], kw.get("timeout") or 0)
+        return real(cwd, *args, **kw)
+    monkeypatch.setattr(worktree, "_git", hang)
+    worktree.keep(path)
+    assert [r["task"] for r in worktree.sweep(p)] == [tid] and path.exists()
