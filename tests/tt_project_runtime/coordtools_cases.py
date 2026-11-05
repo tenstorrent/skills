@@ -150,15 +150,16 @@ def test_hostcheck_catalogue_builds_fixed_read_only_argv():
 
 
 def test_hostcheck_own_host_runs_here_and_remote_uses_project_access(tmp_path, monkeypatch):
-    from ttp import hostcheck as hc, machines
-    monkeypatch.setattr(machines, "ssh_hostname", lambda alias: "host-not-local.invalid")
+    from ttp import hostcheck as hc
+    away = {"hostname": "host-not-local.invalid", "port": 22, "proxy": False}
+    monkeypatch.setattr(hc, "ssh_target", lambda alias, config=None: away)
     known = {"box1": {"tags": []}, "box2": {"tags": []}}
     assert hc.command({}, tmp_path, "local", "uptime", [], known) == (["uptime"], True)
     me = socket.gethostname()
     assert hc.command({}, tmp_path, me, "uptime", [], known) == (["uptime"], True)
-    monkeypatch.setattr(machines, "ssh_hostname", lambda alias: "127.0.0.1")
+    monkeypatch.setattr(hc, "ssh_target", lambda alias, config=None: {**away, "hostname": me})
     assert hc.command({}, tmp_path, "box1", "uptime", [], known) == (["uptime"], True), "resolves to this host"
-    monkeypatch.setattr(machines, "ssh_hostname", lambda alias: "host-not-local.invalid")
+    monkeypatch.setattr(hc, "ssh_target", lambda alias, config=None: away)
     # Default: no access, refused (never the user's own ssh setup).
     for alias in ("box1", "stranger"):
         try:
@@ -191,36 +192,63 @@ def test_hostcheck_own_host_runs_here_and_remote_uses_project_access(tmp_path, m
 
 
 def test_hostcheck_loopback_tunnel_end_is_remote_never_this_host(tmp_path, monkeypatch):
-    from ttp import hostcheck as hc, machines
+    from ttp import hostcheck as hc
     known = {"tunnel-box": {"tags": []}, "box1": {"tags": [], "hostname": "127.0.0.1"}}
     cfg = {"coordinator": {"session": {"host_access": {"*": "ssh.conf"}}}}
-    for loop in ("127.0.0.1", "::1", "localhost"):
-        monkeypatch.setattr(machines, "ssh_hostname", lambda alias, loop=loop: loop)
-        monkeypatch.setattr(hc, "ssh_port", lambda alias: 2222)
-        for alias in ("tunnel-box", "box1", "localhost"):   # an ssh alias, a loopback machines entry, a name
-            assert not hc.own_host(alias, known), (loop, alias)
+    seen = []
+
+    def target(hostname, port, proxy=False):
+        def fake(alias, config=None):
+            seen.append(config)
+            return {"hostname": hostname, "port": port, "proxy": proxy}
+        return fake
+    # A loopback HostName is a tunnel end or a hop (ProxyJump into a container) whatever its port: remote.
+    for loop in ("127.0.0.1", "::1", "localhost", "127.0.0.2", "LOCALHOST"):
+        for port in (2222, 22, None):
+            monkeypatch.setattr(hc, "ssh_target", target(loop, port))
+            for alias in ("tunnel-box", "box1", "localhost"):   # an ssh alias, a loopback machines entry, a name
+                assert not hc.own_host(alias, known), (loop, port, alias)
             argv, here = hc.command(cfg, tmp_path, "tunnel-box", "uptime", [], known)
-            assert not here and argv[0] == "ssh" and argv[-2:] == ["tunnel-box", "uptime"], (loop, argv)
-        for port in (22, None):   # ssh's own port on loopback is this host's own sshd
-            monkeypatch.setattr(hc, "ssh_port", lambda alias, port=port: port)
-            assert hc.command(cfg, tmp_path, "tunnel-box", "uptime", [], known) == (["uptime"], True)
+            assert not here and argv[0] == "ssh" and argv[-2:] == ["tunnel-box", "uptime"], (loop, port, argv)
+    assert seen[-1] == str((tmp_path / "ssh.conf").resolve()), "ssh -G reads the access's own config file"
+    # A non-loopback name of this machine counts only on port 22 with no proxy hop; ssh not answering: remote.
+    me = socket.gethostname()
+    for port, proxy in ((22, True), (2222, False), (None, False)):
+        monkeypatch.setattr(hc, "ssh_target", target(me, port, proxy))
+        assert not hc.own_host("tunnel-box", known), (port, proxy)
+    monkeypatch.setattr(hc, "ssh_target", lambda alias, config=None: None)
+    assert not hc.own_host("tunnel-box", known)
+    monkeypatch.setattr(hc, "ssh_target", target(me, 22))
+    assert hc.command(cfg, tmp_path, "tunnel-box", "uptime", [], known) == (["uptime"], True)
     # `local` and this machine's own name never ask ssh, whatever its config says.
-    monkeypatch.setattr(hc, "ssh_port", lambda alias: 2222)
-    assert hc.own_host("local", known) and hc.own_host(socket.gethostname(), known)
+    monkeypatch.setattr(hc, "ssh_target", target("127.0.0.1", 2222, True))
+    assert hc.own_host("local", known) and hc.own_host(me, known)
+    for loop in ("127.0.0.1", "localhost", "::1"):
+        assert not hc._local_address(loop), loop
 
 
-def test_hostcheck_ssh_port_reads_ssh_g(monkeypatch):
+def test_hostcheck_ssh_target_reads_one_ssh_g(monkeypatch):
     from ttp import hostcheck as hc
     seen = []
+    out = "user u\nhostname localhost\nport 22\n"
 
     def fake(argv, **kw):
         seen.append(argv)
-        return subprocess.CompletedProcess(argv, 0, "user u\nhostname 127.0.0.1\nport 2222\n", "")
+        return subprocess.CompletedProcess(argv, 0, out, "")
     monkeypatch.setattr(hc.subprocess, "run", fake)
-    assert hc.ssh_port("tunnel-box") == 2222 and seen == [["ssh", "-G", "tunnel-box"]]
-    assert hc.ssh_port("-oProxyCommand=id") is None and len(seen) == 1
+    assert hc.ssh_target("inner") == {"hostname": "localhost", "port": 22, "proxy": False}
+    assert seen == [["ssh", "-G", "inner"]]
+    for extra in ("proxyjump bastion\n", "proxycommand nc %h %p\n", "ProxyJump bastion\n"):
+        out = "hostname localhost\nport 22\n" + extra
+        assert hc.ssh_target("inner", "/p/ssh.conf")["proxy"], extra
+    assert seen[-1] == ["ssh", "-G", "-F", "/p/ssh.conf", "inner"] and len(seen) == 4, "one ssh -G per alias"
+    out = "hostname 127.0.0.1\nport 2222\nproxycommand none\n"
+    assert hc.ssh_target("tunnel-box") == {"hostname": "127.0.0.1", "port": 2222, "proxy": False}
+    for bad in ("-oProxyCommand=id", "a b", "x;id"):
+        assert hc.ssh_target(bad) is None
+    assert len(seen) == 5
     monkeypatch.setattr(hc.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 255, "", "x"))
-    assert hc.ssh_port("tunnel-box") is None
+    assert hc.ssh_target("tunnel-box") is None
 
 
 def test_hostcheck_run_times_out_caps_output_and_marks_unreachable(tmp_path, monkeypatch):

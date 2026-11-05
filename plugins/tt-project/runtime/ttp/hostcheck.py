@@ -10,8 +10,9 @@ all, the connection included) and its output is capped at 4,000 characters. tt-s
 host's own environment: device masking stays as the host sets it.
 
 Aliases: `local`, the daemon's own host, or a `ttp machines` alias; any other name is refused. The
-own host (`local`, a name of this machine, or a name resolving to an address of this machine on ssh's
-port 22, never a loopback tunnel end on another port) runs here with no ssh. Any other alias is reached only through the project's own access, coordinator.session.
+own host (`local`, a name of this machine, or an ssh alias whose HostName is a non-loopback address of
+this machine on port 22 with no ProxyJump or ProxyCommand) runs here with no ssh; any other loopback
+HostName is a tunnel end or a hop to another machine, so remote. Any other alias is reached only through the project's own access, coordinator.session.
 host_access.<alias> (or `*`): a list is a helper's argv prefix (its program in the project folder),
 to which the check's argv is appended word by word; a string is an ssh config file in the project
 folder (`ssh -F <file> -o BatchMode=yes -o ConnectTimeout=5 -- <alias> <quoted argv>`). The default
@@ -151,39 +152,50 @@ def build(check: str, args: list[str], cfg: dict | None = None) -> list[str]:
 
 
 def _local_address(name: str) -> bool:
-    """Whether `name` resolves to an address of this machine (bindable here; nothing is sent)."""
+    """Whether `name` resolves to a non-loopback address of this machine (bindable here; nothing is sent)."""
+    import ipaddress
     try:
         infos = socket.getaddrinfo(name, None)
     except (OSError, UnicodeError):
         return False
     for fam, _, _, _, addr in infos:
         try:
+            if ipaddress.ip_address(addr[0].split("%")[0]).is_loopback:
+                continue
             with socket.socket(fam, socket.SOCK_DGRAM) as s:
                 s.bind((addr[0], 0))
                 return True
-        except OSError:
+        except (OSError, ValueError):
             continue
     return False
 
 
-def ssh_port(alias: str) -> int | None:
-    """The port `ssh -G` reports for `alias` (no connection); None when it cannot say."""
+def ssh_target(alias: str, config: str | None = None) -> dict | None:
+    """What one `ssh -G` (no connection; `-F config` when given) reports for `alias`: hostname, port (int or
+    None) and proxy (a ProxyJump or ProxyCommand is set). None when it cannot say."""
     if not re.fullmatch(r"[A-Za-z0-9._-]+", alias):
         return None
     try:
-        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=10,
-                           stdin=subprocess.DEVNULL)
+        r = subprocess.run(["ssh", "-G", *(["-F", config] if config else []), alias], capture_output=True,
+                           text=True, timeout=10, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError):
         return None
-    m = re.search(r"^port\s+(\d+)\s*$", r.stdout, re.M | re.I) if r.returncode == 0 else None
-    return int(m.group(1)) if m else None
+    if r.returncode != 0:
+        return None
+    got = {}
+    for line in r.stdout.splitlines():
+        k, _, v = line.strip().partition(" ")
+        got.setdefault(k.lower(), v.strip())
+    port = got.get("port", "")
+    return {"hostname": got.get("hostname") or alias, "port": int(port) if port.isdigit() else None,
+            "proxy": any(got.get(k, "none").lower() != "none" for k in ("proxyjump", "proxycommand"))}
 
 
-def own_host(alias: str, known: dict | None = None) -> bool:
+def own_host(alias: str, known: dict | None = None, config: str | None = None) -> bool:
     """Whether `alias` is the daemon's own host: `local`, a name of this machine, a machines-list entry
-    whose host field is one, or an ssh alias whose HostName is or resolves to an address of this machine
-    on ssh's own port (22). A loopback HostName on another port is a tunnel end (LocalForward or reverse
-    tunnel) to some other host, so it is remote, as is a loopback name with such a port."""
+    whose host field is one, or an ssh alias whose HostName is a non-loopback address of this machine on
+    port 22 with no ProxyJump or ProxyCommand. Any other alias whose HostName is loopback is a tunnel end
+    or a hop into another machine, so remote: the remote path is always right, only an ssh hop dearer."""
     from . import machines
     loopback = {"localhost", "127.0.0.1", "::1"}
     mine = machines.local_names() - loopback
@@ -192,14 +204,20 @@ def own_host(alias: str, known: dict | None = None) -> bool:
     if alias == LOCAL or v in mine or any(
             a.lower() == v and str(m.get("hostname") or "").strip().lower() in mine for a, m in known.items()):
         return True
-    try:
-        real = machines.ssh_hostname(alias)
-    except Exception:
-        real = alias
-    r = str(real).strip().lower()
-    if not (r in loopback or r in mine or _local_address(real)):
+    got = ssh_target(alias, config)
+    if not got or got["proxy"] or got["port"] != 22:
         return False
-    return ssh_port(alias) in (None, 22)
+    r = str(got["hostname"]).strip().lower()
+    return r not in loopback and (r in mine or _local_address(r))
+
+
+def _ssh_file(cfg: dict, root: Path, alias: str) -> str | None:
+    """The ssh config file the project's access uses for `alias`, if it is one."""
+    try:
+        prefix = access(cfg, root, alias)
+    except Refused:
+        return None
+    return prefix[2] if prefix[0] == "ssh" else None
 
 
 def access(cfg: dict, root: Path, alias: str) -> list[str]:
@@ -229,7 +247,7 @@ def command(cfg: dict, root: Path, alias: str, check: str, args: list[str],
     """(argv to run, whether it runs here). Refused for an unknown check, a bad argument or no access."""
     _word(alias, _NAME, "alias")
     argv = build(check, args, cfg)
-    if own_host(alias, known):
+    if own_host(alias, known, _ssh_file(cfg, root, alias)):
         return argv, True
     from . import machines
     if alias not in (machines.load() if known is None else known):
