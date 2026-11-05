@@ -225,6 +225,11 @@
   has it open, no git runs there) are moved to `.git/ttp-stale-locks/`, never deleted. The next successful commit, and the daemon every
   `harness_git.sweep_every_s` (600 s), commit charter and memory files a failed commit left behind. Files that look like a
   power-cut write are left for the boot integrity check, and nothing is swept before it has run.
+  That sweep also moves aside ref locks (`refs/**/*.lock`, `packed-refs.lock`; never index, HEAD,
+  config, shallow or worktree locks) in the project root's repository, its common dir for a worktree,
+  that a killed or rebooted writer left: older than `harness_git.root_ref_lock_s` (3600 s; 0: off), open
+  in no process, and with no live process that started before the lock working in the repository
+  (cwd or GIT_DIR). They go to `<git dir>/ttp-stale-locks/`, never deleted; without /proc nothing moves.
 - Making a task's worktree recovers by itself. Each git command gets `worktree.git_timeout_s`
   (default 120 s), scaled by the host's load per CPU up to `worktree.git_timeout_max_s` (900 s). After
   a timeout or a failure left behind by one, a whole worktree is reused and a half-made one (still

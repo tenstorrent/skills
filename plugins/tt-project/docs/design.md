@@ -367,7 +367,14 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   harness repository is moved aside to `.git/ttp-stale-locks/` once it is older than
   `harness_git.stale_lock_s` (600 s; 0: off; the old `watchdog.stale_git_lock_s` counts while the new
   key is unset) and no process holds it (none has it open, and no git process of the user runs in
-  or names the repository), and logged (`ttp.gitlocks`).
+  or names the repository), and logged (`ttp.gitlocks`). The daemon's sweep also moves aside the ref
+  locks (`refs/**/*.lock`, `packed-refs.lock`, never index, HEAD, config, shallow or worktree locks) a
+  killed or rebooted writer left in the project root's repository (its common dir), which otherwise
+  make ref updates and `git gc --auto` fail: once older than `harness_git.root_ref_lock_s` (3600 s; 0:
+  off), open in no process, and with no live process that started before the lock having its working
+  directory or GIT_DIR in the repository (git may close a ref lock before renaming it, so an open-file
+  check alone proves nothing). Without /proc it does nothing. Each lock's path, age and holder check
+  go to the daemon log.
 - Before a task's workspace is made, run-start checks (`ttp.startcheck`) look for what a reboot
   or cleanup took away. A worktree whose git dir is gone moves aside to `worktrees/.stale-<time>/`.
   If its repository is gone too, the task is blocked, since its unpushed commits went with it.

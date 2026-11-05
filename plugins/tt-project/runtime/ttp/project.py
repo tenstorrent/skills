@@ -539,7 +539,9 @@ EXTRA_KEYS = {
     # for the coordinator before it is posted unchanged (workernotify.py; default 900, 0 posts at run end).
     "notify": {"slack_poll_s", "hold_s"},
     # stale_lock_s: see "harness_git" in DEFAULT_CONFIG; unset so that the old watchdog key below still counts.
-    "harness_git": {"stale_lock_s"},
+    # root_ref_lock_s: the age (unset: 3600 s; 0: off) past which a ref lock in the project root's repository
+    # that nothing may own is moved aside by the daemon's harness sweep (gitlocks.clear_root_refs).
+    "harness_git": {"stale_lock_s", "root_ref_lock_s"},
     "watchdog": {"stale_git_lock_s"},   # deprecated alias of harness_git.stale_lock_s, read only when that is unset
     # push_queue..after_push_timeout_s: the daemon-owned push queue (see PUSH_QUEUE_DEFAULTS).
     # backup_remote: a git remote finished code tasks' branches are pushed to, fast-forward only (off: unset).
@@ -1646,6 +1648,26 @@ class Project:
         rel = [str(x.relative_to(gdir)) for x in moved]
         self._git_log(f"moved stale lock file(s) aside to {gitlocks.keep_dir(gdir, now)}: {', '.join(rel)}")
         return rel
+
+    def clear_stale_root_ref_locks(self, now: float | None = None) -> list[str]:
+        """Move aside the ref locks a killed or rebooted writer left in the project root's repository,
+        once older than harness_git.root_ref_lock_s and nothing may own them (gitlocks.clear_root_refs).
+        Each lock past the age is logged with its age and holder check. Returns the moved paths."""
+        try:
+            cfg = statcache.load_json(self.config_path)
+        except (OSError, ValueError):
+            cfg = {}
+        now = time.time() if now is None else now
+        try:
+            moved, kept = gitlocks.clear_root_refs(self.root, gitlocks.root_settings(cfg if isinstance(cfg, dict) else {}), now)
+        except Exception as e:
+            self._git_log(f"root ref lock check failed: {e!r}")
+            return []
+        for path, age, why in kept:
+            self._git_log(f"root ref lock {path} ({age / 3600:.1f} h old) left alone: {why}")
+        for path, age, to in moved:
+            self._git_log(f"root ref lock {path} ({age / 3600:.1f} h old, no holder) moved aside to {to}")
+        return [str(p) for p, _, _ in moved]
 
     def _git_commit(self, rel: list[str], message: str, gone: list[str] = (), sweep: bool = True) -> bool:
         """Commit these harness paths. A failure is logged with git's stderr and exit code; files it

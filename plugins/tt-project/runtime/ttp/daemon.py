@@ -9829,7 +9829,8 @@ class Daemon:
     def heal_harness_git(self) -> None:
         """Every harness_git.sweep_every_s, commit the charter and memory files a failed harness commit
         left behind (Project.sweep_harness), moving aside any stale git lock first (ttp.gitlocks): such
-        a lock blocks every harness commit. Each move is logged and kept as a handled event."""
+        a lock blocks every harness commit. Stale ref locks in the project root's repository are moved
+        aside too (Project.clear_stale_root_ref_locks). Each move is logged and kept as a handled event."""
         now = time.time()
         if now - getattr(self, "_harness_swept", 0.0) < self.p._harness_git_cfg("sweep_every_s"):
             return
@@ -9840,6 +9841,12 @@ class Daemon:
                 self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                             (now, "daemon", "git_lock_cleared", "low",
                              f"Moved stale git lock file(s) no process held aside: {', '.join(moved)}"[:500],
+                             "handled"))
+            root_moved = self.p.clear_stale_root_ref_locks(now)
+            if root_moved:
+                self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                            (now, "daemon", "git_lock_cleared", "low",
+                             f"Moved stale ref lock(s) of the project root's repository aside: {', '.join(root_moved)}"[:500],
                              "handled"))
             self.p.sweep_harness()
         except Exception:
