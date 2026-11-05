@@ -1577,6 +1577,20 @@ running work is interrupted only by the preemption below:
   the root cause, use a fake clock or event in place of wall-time assertions, and pass 20 runs of
   each repeated test under parallel load at the default worker count before done. Any other runner, a cut list or one failing id not seen
   elsewhere wakes the task as before. A task still lands only after its own checks pass.
+- Tests gate judging (`gatejudge`): when a plain local pytest check of `ttp checks` fails with a complete
+  list of at most `checks.judge_max_ids` (default 10) failing ids, only those ids run again at once, on
+  the same host and in the same checks slot, never through the queue: once on the head, then those
+  failing again once on the merge base with the push target (each rerun bounded by
+  `checks.judge_rerun_s`, default 600). Failing on both is pre-existing and does not block (reported by
+  name); passing on the head rerun is flaky: it goes into the project's quarantine
+  (`state/test_quarantine.json`: first seen, evidence, expiry after `checks.quarantine_days`, default 7),
+  which `ttp status` shows, one fix note goes to the coordinator, and it does not block. Failing on the
+  head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell. A saved
+  base result counts only when it ran on the same host for the same base commit. A quarantined test the
+  change does not touch is excused without a rerun. Nothing in the repository is edited or skipped. An
+  excused check counts for this change's landing only: the run reads `LANDING ONLY`, its pass is never
+  recorded for reuse, and `ttp checks --release` (a release cut's or a required whole-suite check)
+  excuses nothing and joins no other run. `checks.judge: false` turns judging off.
 - Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
   uses the worker's run directory. Detached checks, pushes and push-queue batches each
   get a unique directory under the project's `state/check-reports/`, outside the checked worktree.

@@ -4,7 +4,7 @@ A release channel is a tag that users install from and that a release cut moves 
 
 `delivery.channel_tags` lists the tags that may move (default: none). A project sets it with `ttp config <project> delivery.channel_tags '["<tag>"]'` or the coordinator's `config_set`. Creating a tag needs no force and is unchanged.
 
-A release cut task moves the tag, after its candidate checks passed at the new commit, with:
+A release cut task runs its candidate checks at the new commit with `ttp checks --release`, which never counts a pre-existing, flaky or quarantined failure as passed. Once they passed, it moves the tag with:
 
 ```sh
 ttp push --move-tag <tag> <commit>

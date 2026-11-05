@@ -1637,6 +1637,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.extend(checklane.lane_lines(p.name, p.config(), now))
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
     lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
+    from . import gatejudge   # tests the gate quarantined as flaky (no release check counts them passed)
+    lines.extend(gatejudge.status_lines(p.state, now, lambda ts: at(ts, now, tz)))
     if verbose:
         lines.extend(checkspill.status_lines(p.name, now))
         lines.extend(slurmcheck.status_lines(p.name, now))
@@ -3347,6 +3349,7 @@ def cmd_checks(a) -> None:
     tree_gone = ""   # the clean checkout was removed under a check: killed, never a failure of the change
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
+    excused = []   # checks whose failing tests the gate judged not new on this head (gatejudge): landing only
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
@@ -3488,7 +3491,7 @@ def cmd_checks(a) -> None:
         slot = None
         light = bool(todo) and checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ())
         # The task's same checks queued twice run one suite; a newer head's supersede an older waiter (checkjoin).
-        if todo and not hit and not light:
+        if todo and not hit and not light and not getattr(a, "release", False):
             join_rec = _checks_join_register(p, str(top), head, todo, purpose, pre_env, Path(run_dir), arrived)
             arrived = _checks_replace(p, join_rec, out, arrived)
         while todo and not hit:
@@ -3625,6 +3628,7 @@ def cmd_checks(a) -> None:
                 group = bool(getattr(a, "own_group", False))
                 env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
                        "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {})}
+                judge_env = dict(env)   # a rerun of the failing tests records no suite durations
                 if pushpass.resumable(c) and not push.remote_host(c):   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
@@ -3685,6 +3689,17 @@ def cmd_checks(a) -> None:
                         break
                     if loss_reruns and workerloss.infra(loss := workerloss.lost(_log_since(out, log, check_start))):
                         worker_loss = loss
+                    elif (judged := _checks_judge(
+                            a, p, c, rc, _log_since(out, log, check_start), cwd, judge_env, head, base, top, out, log,
+                            lambda argv, where, e, t: _run_check(
+                                _low_priority(argv), group, record=reap_rec, cwd=where, stdout=out,
+                                stderr=subprocess.STDOUT, env=e, pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else (),
+                                timeout=min(t, left) if (left := checkwall.deadline_left(deadline)) is not None else t),
+                            run_env.get("TMPDIR") if os.environ.get("TTP_CHECKS_TMP_FD") else None)) is not None:
+                        passed, failed = True, None
+                        excused.append(judged)
+                        out.write(_check_took(c, rc, began))
+                        continue
                     if cwd != top:   # what only this worktree has may be what the check missed
                         output = _log_since(out, log, check_start)
                         if clean_note := cleantree.hint(cleantree.authoring_only(top, cwd, str(c), output)):
@@ -3696,7 +3711,7 @@ def cmd_checks(a) -> None:
             py_check = next((c for c in executed if not push.remote_host(c) and addedtests.eligible(c)), None)
             if passed and py_check is not None and (new_tests := addedtests.added(top, base, head)):
                 for n, c in enumerate(todo if run_envs and run_parts else []):
-                    if c not in reused:
+                    if c not in reused and str(c) not in {x["check"] for x in excused}:
                         _record_pass(p, tree, [c], purpose, run_dir, [run_envs[n]], [run_parts[n]], suite=True)
                 cwd = top if _in_place(py_check) else str(clean.path)
                 tmp_fd = bool(getattr(a, "own_group", False)) and getattr(a, "tmp_fd", None) is not None
@@ -3892,7 +3907,8 @@ def cmd_checks(a) -> None:
                                                      **({"spilled_to": spilled.host} if spilled else {}),
                                                      **({"fallback_lane": fell_back} if fell_back else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
-                                                     **({"added_tests": rerun} if rerun else {})})
+                                                     **({"added_tests": rerun} if rerun else {}),
+                                                     **({"excused": excused, "landing_only": True} if excused else {})})
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
@@ -3931,13 +3947,18 @@ def cmd_checks(a) -> None:
               + f"); the project's checks did NOT run, so this is not a full pass and does not count for a PR "
               f"(full output: {log})")
         return
+    # An excused check's pass counts for this landing only: never recorded for reuse (gatejudge).
+    spared = {x["check"] for x in excused}
     if purpose == "candidate":
-        _mark_verified(p, head, tree, list(todo) + list(verified_cmds) + list(queue_cmds))
+        _mark_verified(p, head, tree, [c for c in list(todo) + list(verified_cmds) + list(queue_cmds)
+                                       if str(c) not in spared])
     if hit:
         print(said)
         return
     # The push queue's passes count with this run's: recorded together, in the order they apply.
     rec = [c for c in selected if c in todo or c in queue_cmds] if queue_cmds else todo
+    if spared:
+        rec = [c for c in rec if str(c) not in spared]
     if rec:
         _record_pass(p, tree, rec, purpose, run_dir,
                      *((run_envs, run_parts) if run_envs and rec == todo else _check_envs(top, rec, run_env)),
@@ -3958,6 +3979,11 @@ def cmd_checks(a) -> None:
         more += (f"; {len(fell_back['commands'])} ran on {push.FALLBACK_KEY} {fell_back['lane']!r}, NOT behind "
                  f"{push.WRAP_KEY}, as its lock {fell_back['paused']} is paused: "
                  f"{', '.join(map(repr, fell_back['commands']))}")
+    if excused:
+        from . import gatejudge
+        more += (f"; LANDING ONLY: {len(excused)} check(s) failed only on tests not new on this head, so their pass "
+                 "is not recorded and never counts for a release or whole-suite check: "
+                 + "; ".join(f"{x['check']!r}: " + ". ".join(gatejudge.lines(x)) for x in excused))
     print(f"ttp checks: {len(todo)} check(s) passed on {head[:12]}{more}; "
           + ("recorded as a harness qualification only: it never counts for a PR, an on_pass hand-off or a push"
              if purpose == "harness" else "recorded for the draft PR") + f" (full output: {log})")
@@ -4963,6 +4989,68 @@ def _checks_stop(sig, _frame):
     raise SystemExit(128 + sig)
 
 
+def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: dict, head: str, base: str,
+                  top: str, out, log, run_check, tmp_base) -> dict | None:
+    """A failed check's failing tests rerun at once on this host (gatejudge): on the head, then those
+    failing again on the merge base with `base`. The verdict when none of them is new on the head (each
+    pre-existing, flaky or quarantined), else None: the failure stands. Never for a release check
+    (`--release`), a harness run, a remote check or a command that is not one plain pytest run."""
+    from . import cleantree, gatejudge, push, pushpass, pushq, worktree
+    if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate") \
+            or push.remote_host(c) or not pushpass.resumable(c):
+        return None
+    cfg = p.config()
+    ids = gatejudge.judgeable(rc, output, cfg)
+    if not ids:
+        return None
+    s = gatejudge.settings(cfg)
+    mb = subprocess.run(["git", "-C", top, "merge-base", base, head], capture_output=True, text=True) if base else None
+    mb = mb.stdout.strip() if mb is not None and mb.returncode == 0 else ""
+    diff = subprocess.run(["git", "-C", top, "diff", "--name-only", f"{mb}..{head}"], capture_output=True,
+                          text=True) if mb else None
+    changed = diff.stdout.split() if diff is not None and diff.returncode == 0 else None
+
+    def touched(i: str) -> bool:   # the change touches the test's file (unknown: it does)
+        f = i.partition("::")[0]
+        return changed is None or any(x == f or x.endswith("/" + f) for x in changed)
+
+    said = "the failing test(s) rerun at once on this host, on the head and then on the base: " + " ".join(ids)
+    print(f"ttp checks: {said}", flush=True)
+    out.write(f"ttp checks: {said}\n")
+
+    def run(at: str, sel: list[str]):
+        sha, where, tree = (head, cwd, None) if at == "head" else (mb, "", None)
+        try:
+            if at == "base":
+                tree = cleantree.Checkout(top, sha, tmp_base)
+                worktree.prepare(p, tree.path)
+                where = str(tree.path)
+            e = {**env, "PWD": where, **pushpass.select_env(gatejudge.select_rx(sel), env)}
+            out.write(f"$ {c} (rerun on the {at} {sha[:12]} of: {' '.join(sel)})\n")
+            out.flush()
+            start = out.tell()
+            got = run_check(push.check_argv(c, where, e, commit=sha), where, e, s["rerun_s"])
+            return got, _log_since(out, log, start)
+        except (subprocess.TimeoutExpired, cleantree.Error, OSError, subprocess.SubprocessError) as err:
+            out.write(f"ttp checks: the rerun on the {at} could not tell: {err}\n")
+            return None, ""
+        finally:
+            if tree is not None:
+                tree.close()
+    now = time.time()
+    v = {"check": str(c), "head": head,
+         **gatejudge.judge(ids, run, p.state, mb, gatejudge.host(), now, touched)}
+    for line in gatejudge.lines(v):
+        print(f"ttp checks: {line}", flush=True)
+        out.write(f"ttp checks: {line}\n")
+    if v["flaky"]:
+        new = gatejudge.quarantine(p.state, v["flaky"], {"head": head, "check": str(c), "host": v["host"],
+                                                         "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
+        if new:   # one fix note per newly quarantined test
+            pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c)), queued=True)
+    return None if gatejudge.blocks(v) else v
+
+
 def _log_since(out, log, start: int) -> str:
     """What the checks log holds from `start`: a check's own output."""
     out.flush()
@@ -5317,6 +5405,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                                       *(["--fresh"] if a.fresh else []), *(["--full"] if getattr(a, "full", False) else []),
                                       *(["--light"] if getattr(a, "light", False) else []),
                                       *(["--no-device"] if getattr(a, "no_device", False) else []),
+                                      *(["--release"] if getattr(a, "release", False) else []),
                                       *(["--purpose", a.purpose] if getattr(a, "purpose", None) else []), *a.cmd],
                                      cwd=top or Path.cwd(), env=env, stdin=subprocess.PIPE, stdout=out,
                                      stderr=subprocess.STDOUT, start_new_session=True, pass_fds=(guard.fileno(),))
@@ -11394,6 +11483,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--light", action="store_true",
                    help="the commands after -- are light checks (syntax, lint, format, validation): with only "
                         "light checks to run they run at once, without waiting for a checks slot (checklane)")
+    s.add_argument("--release", action="store_true",
+                   help="a release or required whole-suite check: every failing test blocks; none is judged "
+                        "pre-existing, flaky or quarantined (gatejudge), and it joins no other run")
     s.add_argument("--no-device", action="store_true",
                    help="the commands after -- need no device: they run without checks.wrap_cmd (the project's "
                         "lock or queue wrapper) and its lane, as commands checks.no_device_cmds names do")
