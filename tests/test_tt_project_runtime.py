@@ -27128,6 +27128,7 @@ DURABLE_EXEMPT = {
     ("locks.py", "os.replace(tmp, path)"): "the priority-turn streak: only a count, a lost write shifts the bound by a turn",
     ("activity.py", 'open(state / LOCK, "a")'): "a flock guard file, never written",
     ("activity.py", "os.replace(log, state / OLD)"): "rotates the bounded activity log; a rename lost to a crash leaves the log one generation longer",
+    ("daemon.py", "os.replace(path, path.with_name(LOG_OLD))"): "rotates the bounded daemon.log; a rename lost to a crash leaves the log one generation longer",
     ("schedlog.py", "os.replace(f, f.with_name(OLD))"): "rotates the bounded scheduler log; a rename lost to a crash leaves the log one generation longer",
     ("machines.py", 'open(log, "a")'): "the background copy's stdout; a log cut by a crash has no done line, so its failures are not reported, never misreported",
     ("checkcap.py", 'open(d / lock, "a")'): "a flock guard file, never written",
