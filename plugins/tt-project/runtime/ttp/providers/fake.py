@@ -85,7 +85,9 @@ def _main(role: str, args: list[str] | None = None) -> int:
                 if line.startswith("- [user message "):
                     chat = line.split("chat=")[1].split("]")[0]
                     text = line.split("] ", 1)[1]
-                    actions.append({"type": "reply", "chat": chat, "text": f"ack: {text}"})
+                    mid = int(line.split("#", 1)[1].split()[0])
+                    actions.append({"type": "reply", "chat": chat, "text": f"ack: {text}", "order": mid,
+                                    "no_order": "fake turn"})
                     actions.append({"type": "task_add", "title": f"do: {text}"[:80], "spec": text, "tier": "light",
                                     "reply_chat": chat})
             out = {"actions": actions or [{"type": "noop"}]}
