@@ -7614,6 +7614,8 @@ class Daemon:
         tid = task["id"]
         if why == "held" and (b := ctx.get("branch", {}).get(tid)):
             return f"task #{b[0]}, which is using {b[1]}"
+        if why == "held" and (w := ctx.get("held_by", {}).get(tid)):
+            return w
         if why in ("paused", "resource") and (h := ctx.get("holds", {}).get(tid)):
             who = ", ".join(f"#{x}" for x in h.get("tasks") or []) or ", ".join(
                 str(x.get("holder")) for x in h.get("holders") or [] if x.get("holder"))
@@ -8917,12 +8919,17 @@ class Daemon:
         ctx.setdefault("full", {}).pop(task["id"], None)
         ctx.setdefault("full_why", {}).pop(task["id"], None)
         ctx.setdefault("branch", {}).pop(task["id"], None)
+        ctx.setdefault("held_by", {}).pop(task["id"], None)
         if "live" not in ctx:
             ctx["live"] = self._live_claims()
         if why := self._branch_clash(task, ctx["live"]):
             ctx["branch"][task["id"]] = why
             return "held"
-        if self._disk_holds(task) or self._precheck_holds(task, now):
+        if self._disk_holds(task):
+            ctx["held_by"][task["id"]] = f"the disk guard ({(self._disk_free or 0) / 1e9:.0f} GB free)"
+            return "held"
+        if self._precheck_holds(task, now):
+            ctx["held_by"][task["id"]] = self._precheck_words(task)
             return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
             ctx["holds"][task["id"]] = {"kind": "pause", "resource": sorted(coord.task_resources(task)
@@ -14506,6 +14513,38 @@ class Daemon:
         info = _read_checks_pid(out)
         return (not (out / CHECKS_RC).exists() and _checks_alive(info)
                 and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+
+    def _precheck_words(self, task: dict) -> str:
+        """What the checks _precheck_holds waits for are doing, in words: waiting for a host checks slot
+        (with how many are ahead and running), for test slots, for the project's checks lane, following
+        another run of the same checks, or running."""
+        from . import checkcap
+        from .cli import CHECKS_SLOT_WAIT, _read_checks_pid
+        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
+        out = self.p.state / PRECHECKS_DIR / name
+        head = str(_read_checks_pid(out).get("head") or name.rsplit("-", 1)[-1])[:12]
+        what = f"its review's pre-checks (`ttp checks` on {head}, started by the daemon)"
+        try:
+            wait = json.loads((out / CHECKS_SLOT_WAIT).read_text())
+        except (OSError, ValueError):
+            wait = None
+        if not isinstance(wait, dict):
+            return f"{what}, running"
+        mins = f" for {(time.time() - float(wait.get('since') or time.time())) / 60:.0f} min"
+        if wait.get("follows"):
+            return f"{what}, following another run of the same checks: {str(wait['follows'])[:160]}"
+        if wait.get("suite"):
+            return f"{what}, waiting{mins} for this project's other full checks in its checks lane"
+        try:
+            st = checkcap.state()
+        except OSError:
+            return f"{what}, waiting{mins} for a host checks slot"
+        me = f"(run {precheck_run_id(out)})"
+        if (n := next((i for i, h in enumerate(st["queued"]) if me in h), None)) is not None:
+            return f"{what}, waiting{mins} for a host checks slot, {n} ahead ({len(st['running'])} running)"
+        if any(me in h for h, _ in st["parked"]):
+            return f"{what}, waiting{mins} for free test slots ({len(st['running'])} host checks running)"
+        return f"{what}, waiting{mins} for a host checks slot ({len(st['running'])} running)"
 
     def _precheck_failed(self, task: dict) -> bool:
         """A review whose checks the daemon started on its head (_precheck) failed on that head, still

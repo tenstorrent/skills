@@ -2638,7 +2638,9 @@ def _command_key(c) -> str:
     if not isinstance(c, str):
         return str(c)
     from . import push
-    if host := push.remote_host(c):   # another machine's pass is not this one's, nor one with other env
+    # Another machine's pass is not this one's, nor one with other env; a spill host's (_spill_to) is: it
+    # ran the same check on a copy of the commit only because the slots here were busy.
+    if (host := push.remote_host(c)) and not getattr(c, "spilled", False):
         return json.dumps([str(c), host, dict(getattr(c, "env", ()) or ())])
     if getattr(c, "env", ()):
         return json.dumps([str(c), dict(c.env)])
@@ -2748,6 +2750,19 @@ def _commands_hash(cmds: list) -> str:
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
+def _spill_to(todo: list, host: str, cfg: dict | None) -> list:
+    """`todo` run on spill host `host` (checkspill, push.spill_to), each local check marked `spilled`: its
+    pass is recorded, and found, under the same key as a run here (_command_key), so a later local `ttp checks`
+    of the same tree (a review's pre-started checks, the reviewer's own) reuses it instead of running
+    the suite again."""
+    from . import push
+    out = push.spill_to(todo, host, cfg)
+    for was, c in zip(todo, out):
+        if not push.remote_host(was) and isinstance(c, push.Check):
+            c.spilled = True
+    return out
+
+
 def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate",
                    envs: list[str] | None = None) -> dict | None:
     """The recorded pass of exactly these commands, in this order, on this tree, for this purpose, or
@@ -2850,10 +2865,12 @@ def _check_envs(top: str | Path, cmds: list, run_env: dict) -> tuple[list[str] |
 
 
 def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate", run_dir: str | Path = "",
-                 envs: list[str] | None = None, parts: list[dict] | None = None, suite: bool = False) -> None:
+                 envs: list[str] | None = None, parts: list[dict] | None = None, suite: bool = False,
+                 at: dict | None = None) -> None:
     """Only passes are recorded, with `envs` (pushpass.check_envs) when given, and the part_digests of
     their `parts` (pushpass.check_env_parts) to say what differs on a miss. A failed write is said
-    and never fails the checks. `suite`: one command's own pass in a call not yet passed (_suite_pass)."""
+    and never fails the checks. `suite`: one command's own pass in a call not yet passed (_suite_pass).
+    `at`: the head, tip and branch it passed on (_carry_ref), so _carried_pass can carry it across a rebase."""
     if not p or not tree:
         return
     import fcntl
@@ -2881,10 +2898,58 @@ def _record_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candi
                            **({"env_parts": [pushpass.part_digests(x) for x in parts]}
                               if parts is not None and len(parts) == len(cmds) else {}),
                            **({"purpose": purpose} if purpose != "candidate" else {}),
-                           **({"suite": True} if suite else {})})
+                           **({"suite": True} if suite else at or {})})
             write_json(path, {"passes": passes[-CHECK_PASSES_MAX:]})
     except OSError as e:
         print(f"ttp checks: could not record the pass in {path}: {e}", file=sys.stderr)
+
+
+CARRY_TRIES = 3   # earlier passes of the branch _carried_pass tries, newest first
+
+
+def _carry_ref(top: str | Path, head: str, base: str) -> dict:
+    """{head, tip (its merge base with the push target `base`), branch} for a pass record, or {}."""
+    from . import checktree
+    if not base or not head:
+        return {}
+    r = subprocess.run(["git", "-C", str(top), "merge-base", base, head], capture_output=True, text=True)
+    tip, br = r.stdout.strip() if r.returncode == 0 else "", checktree.branch(top)
+    return {"head": head, "tip": tip, "branch": br} if tip and br else {}
+
+
+def _carried_pass(p: Project | None, top: str | Path, head: str, tree: str, cmds: list, base: str,
+                  purpose: str = "candidate") -> dict | None:
+    """A recorded pass of these commands on an earlier head of this branch that carries to `head` under
+    the push queue's rule (verdictcarry): the change's own diff unchanged, and neither the upstream
+    delta nor what differs between the heads touches a path any of them covers (if_changed,
+    ignore_paths, delivery.push_exclude_paths). The entry plus its "carried" line, or None: anything
+    git cannot tell, or a covered path, and the checks run."""
+    if not p or not tree or not cmds or not (ref := _carry_ref(top, head, base)):
+        return None
+    try:
+        passes = json.loads((p.state / CHECK_PASSES).read_text()).get("passes")
+    except (OSError, ValueError, AttributeError):
+        return None
+    from . import push, verdictcarry
+    exclude = push.exclude_list(((p.config() or {}).get("delivery") or {}).get("push_exclude_paths"))
+    key, tries = _commands_hash(cmds), 0
+    for e in reversed(passes if isinstance(passes, list) else []):
+        if not (isinstance(e, dict) and not e.get("suite") and e.get("tree") != tree
+                and e.get("purpose", "candidate") == purpose and e.get("branch") == ref["branch"]
+                and e.get("head") and e.get("tip") and e["head"] != head
+                and (e.get("commands") == key or key in (e.get("prefixes") or ()))):
+            continue
+        delta: set[str] = set()
+        for c in cmds:
+            if (d := verdictcarry.carry(Path(top), c, e["tip"], e["head"], ref["tip"], head, exclude)) is None:
+                break
+            delta.update(d)
+        else:
+            return {**e, "carried": verdictcarry.line(e["head"], sorted(delta))}
+        tries += 1
+        if tries >= CARRY_TRIES:
+            break
+    return None
 
 
 CHECKS_ENV = "checks_env.json"   # under the project's state: the last check that failed at import, for doctor
@@ -3284,6 +3349,8 @@ def cmd_checks(a) -> None:
         # scope changed since, are verified through it (verified.py); `ttp push` never reads the marker.
         # A recorded pass of every check on this tree comes first: the marker only covers what it lacks.
         hit = _recorded_pass(p, tree, todo, purpose) if todo and not a.fresh else None
+        if todo and not a.fresh and not hit and passed and purpose == "candidate":   # a rebase that changed nothing they cover
+            hit = _carried_pass(p, top, head, tree, todo, base, purpose)
         mark, verified_cmds = _verified_scope(p, Path(top), head, todo, lambda m: (print(f"ttp checks: {m}"),
                                                                                     out.write(f"{m}\n")),
                                               a.fresh) \
@@ -3328,6 +3395,10 @@ def cmd_checks(a) -> None:
                        "--fresh produces it")
             said = (f"ttp checks: {len(todo)} check(s) passed on {tree[:12]} in run {hit.get('run') or '?'} "
                     f"at {when} (recorded); --fresh runs them again ({rec_out})")
+            if hit.get("carried"):
+                said = (f"ttp checks: {len(todo)} check(s) passed on {str(hit.get('head'))[:12]} in run "
+                        f"{hit.get('run') or '?'} at {when} and carry to {head[:12]}: {hit['carried']}; "
+                        f"--fresh runs them again ({rec_out})")
             out.write(f"{said}\n")
         # A stale coverage digest fails a harness check-plan at once: found here, it fails before the wait
         # for a checks slot, not after it (the check needs no slot to fail).
@@ -3405,7 +3476,7 @@ def cmd_checks(a) -> None:
         # The slots here stayed busy and a spill host took the run: its checks run there (remotecheck).
         spilled = getattr(slot, "spill", None) if slot is not None and not hit else None
         if spilled:
-            todo = push.spill_to(todo, spilled.host, cfg)
+            todo = _spill_to(todo, spilled.host, cfg)
             for w in dict.fromkeys(c.remote_wrap for c in todo if c.remote_wrap):
                 said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
                 print(f"ttp checks: {said}", flush=True)
@@ -3808,7 +3879,8 @@ def cmd_checks(a) -> None:
     rec = [c for c in selected if c in todo or c in queue_cmds] if queue_cmds else todo
     if rec:
         _record_pass(p, tree, rec, purpose, run_dir,
-                     *((run_envs, run_parts) if run_envs and rec == todo else _check_envs(top, rec, run_env)))
+                     *((run_envs, run_parts) if run_envs and rec == todo else _check_envs(top, rec, run_env)),
+                     at=_carry_ref(top, head, base))
     # Released only once the pass is recorded: a waiter for the same checks finds it the moment it may run.
     if slot:
         slot.close()
