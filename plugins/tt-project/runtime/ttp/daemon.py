@@ -7605,7 +7605,10 @@ class Daemon:
         queued announced_not_started, or a slot_wait or urgent_start event for the same wait, is left to that one; a review
         held for its own pre-review checks is a checks wait. An urgent task (urgent.is_urgent) past
         READY_P1_S that dispatch would start now (no hold at all) also kicks dispatch from here, once per
-        check (_kick_dispatch): a slow tick never keeps it waiting for the tick's own dispatch step."""
+        check (_kick_dispatch): a slow tick never keeps it waiting for the tick's own dispatch step.
+        A late task with no recorded hold whose provider has a ready backlog (_ready_backlog: more ready
+        tasks than free slots, or the spend gate stopped new work within unstarted.BACKLOG_S) is held by
+        that backlog instead, unless it is deadline work: one handled ready_backlog record per episode."""
         now = time.time()
         last = getattr(self, "_unstarted_checked", 0.0)
         if now - last < every_s:
@@ -7630,6 +7633,7 @@ class Daemon:
         was_ready = getattr(self, "_unstarted_ready", None)   # the previous check's ready ids; None: no such check
         self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), {t["id"] for t in ready}
         kick = []   # urgent tasks past READY_P1_S that dispatch would start now
+        backlog, drained = self._ready_backlog(ready, busy, core, now), {}
         wait_s = 60 * float(self.cfg["coordinator"].get("urgent_slot_wait_min", 10) or 0)
         for t in ready:
             tid, prov = t["id"], t["provider"] or core
@@ -7659,6 +7663,12 @@ class Daemon:
             late = now - since >= (min(unstarted.READY_URGENT_S, wait_s) if slots_only else
                                    unstarted.READY_URGENT_S if hot else
                                    unstarted.threshold(prio, unstarted.READY_P1_S, unstarted.READY_S))
+            if late and why is None and not hot and prov in backlog:   # draining, not a stall
+                del self._unstarted_seen[tid]
+                self._unstarted_held.add(tid)
+                drained[prov] = drained.get(prov, 0) + 1
+                obligations._retire(db, now, "held: a ready backlog", fp)
+                continue
             if late and why is None and prio <= 1:
                 kick.append(tid)
             if not late or db.one("SELECT 1 FROM events WHERE fingerprint IN (?,?,?) OR (kind=? AND task=? AND status='queued')",
@@ -7681,8 +7691,61 @@ class Daemon:
         for r in db.q("SELECT fingerprint, task FROM events WHERE kind=? AND status='queued'", (unstarted.READY_KIND,)):
             if r["task"] not in self._unstarted_seen and r["task"] not in self._unstarted_held:
                 obligations._retire(db, now, "started or left the queue", r["fingerprint"])
+        for prov, n in drained.items():
+            self._report_backlog(prov, backlog[prov], n, now)
         if kick:
             self._kick_dispatch(kick, now)
+
+    def _ready_backlog(self, ready: list[dict], busy: dict, core: str, now: float) -> dict:
+        """{provider: its ready backlog in words (unstarted.backlog_words)} for each provider with ready
+        tasks and more of them than free slots, or whose spend gate stopped new work less than
+        unstarted.BACKLOG_S ago. Keeps when each gate stopped and cleared (kv unstarted.BACKLOG_KV,
+        written only when that changes) and ends the backlog episode of a provider without one."""
+        db = self.p.db
+        saved = db.kv_dict(unstarted.BACKLOG_KV)[0]
+        recs = {k: dict(v) for k, v in saved.items() if isinstance(v, dict)}
+        configured = int(self.cfg["budget"].get("max_parallel_workers", 6))
+        depth: dict[str, int] = {}
+        for t in ready:
+            depth[t["provider"] or core] = depth.get(t["provider"] or core, 0) + 1
+        out = {}
+        for prov in set(depth) | set(self.gates):
+            g, r = self.gates.get(prov), recs.setdefault(prov, {})
+            if g is not None and not g.allow_new_work and not r.get("stopped"):
+                r.update(stopped=True, why=g.cause or next(iter(g.reasons), ""), cleared=None)
+            elif (g is None or g.allow_new_work) and r.get("stopped"):
+                r.update(stopped=False, cleared=now)
+            free = (max(g.max_parallel - busy.get(prov, 0), 0) if g.allow_new_work else 0) if g is not None \
+                else max(configured - sum(busy.values()), 0)
+            n = depth.get(prov, 0)
+            if not n or not (r.get("stopped") or now - float(r.get("cleared") or 0) < unstarted.BACKLOG_S
+                             or free < n):
+                r.pop("since", None)
+                continue
+            out[prov] = unstarted.backlog_words(prov, n, free, self._slot_users(prov), r,
+                                                bud.gate_slots(g, configured) if g is not None else "",
+                                                lambda ts: timefmt.short(ts, self.p, now))
+        recs = {k: v for k, v in recs.items() if v}
+        if recs != saved:
+            db.set_kv(unstarted.BACKLOG_KV, recs)
+        return out
+
+    def _report_backlog(self, prov: str, words: str, n: int, now: float) -> None:
+        """Once per backlog episode of `prov` (from the first check it held a late task): one handled
+        ready_backlog record and a log line, so the queue reads as draining, never as a stall."""
+        db = self.p.db
+        recs = db.kv_dict(unstarted.BACKLOG_KV)[0]
+        r = recs.get(prov) or {}
+        if r.get("since"):
+            return
+        text = (f"Ready backlog, not a stall: {words}. {n} late task(s) with no hold of their own wait "
+                f"their turn as slots free; the ready-not-started alarm resumes once the backlog drains.")
+        with db.tx():
+            db.set_kv(unstarted.BACKLOG_KV, {**recs, prov: {**r, "since": now}})
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", unstarted.BACKLOG_KIND, f"{unstarted.BACKLOG_KIND}:{prov}:{int(now)}", "low",
+                  text[:4000], "handled"))
+        log(self.p, f"ready backlog: {words[:400]}")
 
     def _owner_due(self) -> dict:
         """obligations.owner_due, or {} when obligations are unreadable: they only lose the boost, never

@@ -20,6 +20,10 @@ ready_since() and READY_S/READY_P1_S size the ready-not-started check, which nee
 holds (Daemon._start_hold) and so lives in the daemon. It covers what check_slot_wait (urgent work and
 obligation owners held by full slots or any hold) and check_stall (no worker run at all for hours) do
 not: any queued task dispatch could start while a slot of its provider is free that still has not.
+A backlog is not such a stall: while more tasks are ready than their provider has free slots, or the
+spend gate stopped new work less than BACKLOG_S ago (the queue a red gate left), a late task with no
+recorded hold raises no alarm; one BACKLOG_KIND record per episode (handled: it wakes nothing) gives the
+queue depth, when the gate cleared or that it still holds, the live runs and the free slots (backlog_words).
 
 parked_nudge() is the coordinator's advice for a deferral that names no external fact: it never
 refuses, it counts (NUDGE_KV)."""
@@ -37,6 +41,9 @@ ANNOUNCED_P1_S = 300    # an owner of priority 1
 READY_S = 600           # a ready task with a free slot not started after this
 READY_P1_S = 120        # priority 1 or urgent
 READY_URGENT_S = 60     # a fresh `urgent:` line or an obligation owner: its slots full counts too
+BACKLOG_KIND = "ready_backlog"
+BACKLOG_S = 3600        # a spend gate that stopped new work this recently still explains the queue it left
+BACKLOG_KV = "ready_backlog"   # kv: {provider: {"stopped": bool, "why": str, "cleared": ts, "since": ts}}
 DEFER_S = 600           # task_update adding spec to a task deferred further than this gets the nudge
 MAX_AGE_S = 86400
 READY_TITLE = re.compile(r"(?i)^\s*ready\s*:\s*")   # a hand-off follow-up whose inputs are ready now
@@ -211,6 +218,18 @@ def announced(p, now: float | None = None, paused: dict | None = None) -> list[s
         if r["fingerprint"] not in live:   # its promise closed or its task ended
             _retire(db, now, "closed", r["fingerprint"])
     return raised
+
+
+def backlog_words(prov: str, depth: int, free: int, live: str, rec: dict, limit: str, when) -> str:
+    """A ready backlog in words: queue depth, the spend gate (still stopping new work, or when it cleared
+    and why it held; `limit` its cut of the slots now, budget.gate_slots), the live runs and the free
+    slots. `when` formats a timestamp in the project's zone."""
+    why = f" ({rec['why'][:160]})" if rec.get("why") else ""
+    gate = (f"the spend gate still stops new work{why}" if rec.get("stopped") else
+            f"the spend gate cleared at {when(rec['cleared'])}, after it stopped new work{why}"
+            if rec.get("cleared") else "")
+    return (f"{depth} ready on {prov} (queue depth), {live} live, {free} free slot{'s' if free != 1 else ''}"
+            + "".join(f"; {x}" for x in (gate, limit) if x))
 
 
 def ready_since(db, task: dict) -> float:
