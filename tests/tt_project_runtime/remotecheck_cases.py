@@ -1637,7 +1637,7 @@ def test_an_unreachable_or_refusing_cluster_keeps_the_run_here_never_failed(env,
     refuses the job is an environment fault, and the run runs again here, whose verdict counts."""
     import threading
     from ttp import cli
-    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, [], host=host)
+    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, ["down"], host=host)
     monkeypatch.setenv("FAKE_SLURM_MODE", mode)
     lane = _spill_lane(p, repo)
     threading.Timer(1.5, lane.close).start()
@@ -1646,7 +1646,8 @@ def test_an_unreachable_or_refusing_cluster_keeps_the_run_here_never_failed(env,
     text = (run / "checks.log").read_text()
     assert rec["passed"] is True and "/ttp-check." not in log.read_text(), (rec, text)
     if host == "down":
-        assert "spilled_to" not in rec and "ssh cannot reach it" in text and not (d / "sbatch.log").exists(), text
+        assert "spilled_to" not in rec and "Slurm overflow (down) cannot now" in text, text
+        assert not (d / "sbatch.log").exists(), text
     else:
         assert "sbatch refused the job" in text and "running them again on this machine" in text, text
 

@@ -38,7 +38,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, locks, machines, prguard, prhead, remotecheck, repoid, runner,
-               sandbox, scriptwatch, settinghold, shorttmp, testslots, timefmt, workerloss, worktree)
+               sandbox, scriptwatch, settinghold, shorttmp, slurmcheck, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -566,7 +566,6 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if slurm := getattr(cmd, "slurm", None):   # the account's Slurm overflow: one batch job (slurmcheck)
-        from . import slurmcheck
         return slurmcheck.argv(str(cmd), slurm, exports, commit, getattr(cmd, "time_min", 0))
     if host := remote_host(cmd):
         return remotecheck.argv(str(cmd), host, exports, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()))
