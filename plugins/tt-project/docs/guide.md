@@ -1430,6 +1430,25 @@ running work is interrupted only by the preemption below:
   project's remote wrapper. A remote wrapper missing or not executable on the host is a host fault: the check never
   runs unwrapped. A run that does not pass on a spill host runs again here, and that result
   counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
+  `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
+  (each paused, busy with a device job, full or unreachable, or no pool at all) to a Slurm cluster instead of
+  waiting here: `ttp config --account checks.slurm_overflow '{"host": "<cluster-login>", "partition":
+  "<cpu-partition>", "workdir": "~/ttp-checks"}'` (only the user sets it, a run may only clear it with `""`).
+  `host` is the submit host's ssh alias, `partition` a CPU partition, `workdir` a folder on the cluster's shared
+  file system; `max_jobs` (2) caps this machine's jobs there at once, `--time` is the run's median wall time plus
+  `margin_s` (600), at most `max_time_s` (7200, also its value before a median exists), and a job pending past
+  `max_pending_s` (1800) is cancelled. Each check is one batch job (`--nodes=1 --ntasks=1`, no GRES) on a copy
+  of the commit, copied as for a spill host; the submit host only runs sbatch, squeue, sacct and scancel and
+  serves the job's output and exit code. A run with a spill wrapper (`spill_wrap_cmd`) never overflows: the
+  batch job runs none. Urgent runs take a free job slot first. A cluster ssh does not reach
+  keeps the run waiting here; one whose sbatch refuses the job, or a job that ends for a cluster reason twice
+  (it is submitted again once: never started, node fault, preempted), is an environment fault and the run runs
+  again here, whose result counts. Stopping the run (a stop, a timeout, a newer head) cancels its job; a job
+  whose run died is cancelled by the next overflow pick, and one the submit host stopped answering for still
+  ends at its time limit. Every job (id, project, task, check, submit, start and end times, state, exit code) is
+  logged in `check-slots/slurm/jobs.jsonl` under the account folder; `ttp status`, `ttp checks status` and
+  `checks.json` (`spilled_to`, the submit host) show running ones like a spill host's. A project's own
+  `delivery.checks_spill_hosts: []` keeps its runs here, overflow included.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
   age, alive or dead, what it checks and whether its task has finished) and its waiters in queue order, the next
   one marked; it is read only and never queues. Every lane group has a name (its repository or wrapper lock, else the project

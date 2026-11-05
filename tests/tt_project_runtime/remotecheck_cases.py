@@ -1430,3 +1430,264 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
     assert n == 0 and "load 60 of 64 cores" in why, why
     out["line"] = "ttp-spill 64 x 2"
     assert checkspill.probe("h")[0] == 0 and "probe failed" in checkspill.probe("h")[1]
+
+
+# The account's Slurm overflow (slurmcheck): fake sbatch, squeue, sacct and scancel run through the fake
+# ssh. FAKE_SLURM=<dir> holds their logs and job states; FAKE_SLURM_MODE: run (the job runs at once and
+# completes), hold (it stays RUNNING until scancel), refuse (sbatch exits 1), nodefail1 (the first job
+# ends NODE_FAIL without running, later ones run).
+_SLURM_FAKES = {
+    "sbatch": r'''#!/bin/sh
+d=$FAKE_SLURM
+echo "$*" >> "$d/sbatch.log"
+[ "$FAKE_SLURM_MODE" = refuse ] && { echo "sbatch: error: invalid partition specified" >&2; exit 1; }
+n=$(( $(cat "$d/next" 2>/dev/null || echo 100) + 1 )); echo $n > "$d/next"
+out= ; dir= ; for a in "$@"; do case "$a" in --output=*) out=${a#--output=};; --chdir=*) dir=${a#--chdir=};; esac; script=$a; done
+if [ "$FAKE_SLURM_MODE" = hold ]; then echo RUNNING > "$d/state.$n"
+elif [ "$FAKE_SLURM_MODE" = nodefail1 ] && [ ! -e "$d/failed" ]; then touch "$d/failed"; echo NODE_FAIL > "$d/state.$n"
+else (cd "$dir" && sh "$script" > "$out" 2>&1); echo COMPLETED > "$d/state.$n"
+fi
+echo "$n"
+''',
+    "squeue": r'''#!/bin/sh
+for a in "$@"; do [ "$prev" = -j ] && j=$a; prev=$a; done
+s=$(cat "$FAKE_SLURM/state.$j" 2>/dev/null)
+case "$s" in PENDING|RUNNING) echo "$s";; esac
+''',
+    "sacct": r'''#!/bin/sh
+for a in "$@"; do [ "$prev" = -j ] && j=$a; prev=$a; done
+echo "$(cat "$FAKE_SLURM/state.$j" 2>/dev/null)|0:0"
+''',
+    "scancel": r'''#!/bin/sh
+echo "$1" >> "$FAKE_SLURM/scancel.log"
+echo CANCELLED > "$FAKE_SLURM/state.$1"
+''',
+}
+
+
+def _slurm_fakes(tmp_path, monkeypatch=None, mode="run"):
+    """The fake ssh and Slurm tools on a bin folder: (environment for them, the fakes' state folder)."""
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    d = tmp_path / "slurm"
+    d.mkdir(exist_ok=True)
+    for name, text in _SLURM_FAKES.items():
+        (bin_ / name).write_text(text)
+        (bin_ / name).chmod(0o755)
+    fake = {"PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote),
+            "FAKE_SLURM": str(d), "FAKE_SLURM_MODE": mode, "TTP_SLURM_POLL_S": "0.1"}
+    for k, v in fake.items():
+        if monkeypatch is not None:
+            monkeypatch.setenv(k, v)
+    return fake, d
+
+
+_SLURM_SET = {"host": "cluster-login", "partition": "cpu-part", "max_time_s": 1800}
+
+
+def _slurm_run(tmp_path, repo, cmd, fake, wait=True, minutes=0):
+    from ttp import slurmcheck
+    s = slurmcheck.settings_of({**_SLURM_SET, "workdir": str(tmp_path / "remote")})
+    proc = subprocess.Popen(slurmcheck.argv(cmd, s, {"GREETING": "hi"}, "", minutes), cwd=repo,
+                            env={**os.environ, **fake}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    if not wait:
+        return proc
+    out = proc.communicate(timeout=60)[0]
+    return proc.returncode, out
+
+
+def test_slurm_overflow_is_off_by_default_validated_and_only_the_user_sets_it(env, capsys, monkeypatch):
+    from ttp import cli, project, slurmcheck
+    assert slurmcheck.settings() is None and slurmcheck.enabled({}) is None
+    assert slurmcheck.pick(None, {}, pytest.fail) is None, "unset: nothing is tried"
+    s = slurmcheck.settings_of({"host": "cluster-login", "partition": "cpu"})
+    assert s == {"host": "cluster-login", "partition": "cpu", "workdir": slurmcheck.DEFAULT_WORKDIR,
+                 "max_jobs": 2, "margin_s": 600, "max_time_s": 7200, "max_pending_s": 1800}
+    for bad in ("cluster-login", {"host": "a b", "partition": "cpu"}, {"host": "h", "partition": "c p"},
+                {"host": "h", "partition": "cpu", "workdir": "rel/dir"}, {"host": "h", "partition": "cpu", "workdir": "/a/../b"},
+                {"host": "h", "partition": "cpu", "max_jobs": 0}, {"host": "h", "partition": "cpu", "gres": "x"}):
+        with pytest.raises(ValueError):
+            slurmcheck.settings_of(bad)
+    # --time: the run's median plus the margin, capped; the cap before any median is known.
+    assert slurmcheck.time_min(None, s) == 120 and slurmcheck.time_min(300, s) == 15
+    assert slurmcheck.time_min(10 ** 6, s) == 120
+    value = '{"host": "cluster-login", "partition": "cpu"}'
+    cli.main(["config", "--account", slurmcheck.KEY, value])
+    assert slurmcheck.settings()["partition"] == "cpu"
+    with pytest.raises(SystemExit):
+        cli.main(["config", "--account", slurmcheck.KEY, '{"host": "cluster-login"}'])
+    assert "partition" in capsys.readouterr().err
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "--account", slurmcheck.KEY, '{"host": "other", "partition": "cpu"}'])
+    assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err
+    assert slurmcheck.enabled({"delivery": {"checks_spill_hosts": []}}) is None, "an own [] keeps runs here"
+    cli.main(["config", "--account", slurmcheck.KEY, ""])
+    assert slurmcheck.settings() is None and "slurm_overflow" not in (project.load_account_settings().get("checks") or {})
+
+
+def test_a_slurm_job_runs_the_check_on_a_copy_of_head_as_one_cpu_job_with_its_time_and_is_logged(env, tmp_path):
+    from ttp import slurmcheck
+    repo = _rc_repo(tmp_path)
+    fake, d = _slurm_fakes(tmp_path)
+    (repo / "a.txt").write_text("uncommitted\n")
+    rc, out = _slurm_run(tmp_path, repo, 'git status --porcelain; cat a.txt; echo "$GREETING from the job"', fake,
+                         minutes=17)
+    assert rc == 0 and "a\nhi from the job" in out and "as Slurm job 101" in out, out
+    sbatch = (d / "sbatch.log").read_text()
+    assert "--partition=cpu-part --time=17 --nodes=1 --ntasks=1" in sbatch and "gres" not in sbatch, sbatch
+    assert _rc_left(tmp_path) == [] and not (d / "scancel.log").exists()
+    rec = slurmcheck.jobs()[-1]
+    assert rec["job"] == "101" and rec["state"] == "COMPLETED" and rec["rc"] == 0 and rec["submit"] <= rec["end"], rec
+    assert {"project", "task", "check", "head"} <= set(rec)
+    assert not list(slurmcheck.slurm_dir().glob("job.*.json")), "the live record goes with the run"
+    rc, out = _slurm_run(tmp_path, repo, "exit 3", fake)
+    assert rc == 3 and slurmcheck.jobs()[-1]["rc"] == 3, out
+    assert "--time=30 " in (d / "sbatch.log").read_text().splitlines()[-1], "max_time_s with no median"
+
+
+def test_a_slurm_job_the_cluster_ends_runs_again_once_and_a_refused_one_is_a_fault(env, tmp_path):
+    from ttp import remotecheck, slurmcheck
+    repo = _rc_repo(tmp_path)
+    fake, d = _slurm_fakes(tmp_path, mode="nodefail1")
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", fake)
+    assert rc == 0 and "submitting it again once" in out and "ran" in out, out
+    assert len((d / "sbatch.log").read_text().splitlines()) == 2
+    assert [j["state"] for j in slurmcheck.jobs()] == ["NODE_FAIL", "COMPLETED"]
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_MODE": "refuse"})
+    assert rc == remotecheck.FAULT_RC and "sbatch refused the job" in out and remotecheck.SIG in out, out
+    assert _rc_left(tmp_path) == []
+    s = slurmcheck.settings_of({**_SLURM_SET, "host": "down"})
+    proc = subprocess.run(slurmcheck.argv("echo ran", s), cwd=repo, env={**os.environ, **fake}, capture_output=True,
+                          text=True, timeout=60)
+    assert proc.returncode == remotecheck.FAULT_RC and not (d / "scancel.log").exists(), proc.stdout
+
+
+def test_a_stopped_slurm_check_cancels_its_job_and_leaves_nothing(env, tmp_path):
+    from ttp import slurmcheck
+    repo = _rc_repo(tmp_path)
+    fake, d = _slurm_fakes(tmp_path, mode="hold")
+    proc = _slurm_run(tmp_path, repo, "sleep 60", fake, wait=False)
+    deadline = time.time() + 30
+    while not list(slurmcheck.slurm_dir().glob("job.*.json")) and time.time() < deadline:
+        time.sleep(0.1)
+    assert (d / "sbatch.log").exists()
+    proc.send_signal(signal.SIGTERM)
+    out = proc.communicate(timeout=30)[0]
+    assert proc.returncode == 143 and "cancelled job 101" in out, out
+    assert (d / "scancel.log").read_text().split() == ["101"]
+    assert _rc_left(tmp_path) == [] and not list(slurmcheck.slurm_dir().glob("job.*.json"))
+    assert slurmcheck.jobs()[-1]["state"] == "CANCELLED"
+
+
+def test_a_slurm_job_whose_run_died_is_cancelled_by_the_next_pick(env, tmp_path, monkeypatch):
+    from ttp import slurmcheck
+    fake, d = _slurm_fakes(tmp_path, monkeypatch)
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    slurmcheck.slurm_dir().mkdir(parents=True, exist_ok=True)
+    (slurmcheck.slurm_dir() / f"job.{dead.pid}.json").write_text(json.dumps(
+        {"pid": dead.pid, "job": "55", "host": "cluster-login", "project": "x"}))
+    assert slurmcheck.reap() == ["55"] and (d / "scancel.log").read_text().split() == ["55"]
+    assert slurmcheck.jobs()[-1]["state"] == "ORPHANED"
+
+
+def _slurm_overflow_setup(env, tmp_path, monkeypatch, pool, host="cluster-login", **more):
+    from ttp import project, slurmcheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, pool)
+    fake, d = _slurm_fakes(tmp_path, monkeypatch)
+    project.set_account_setting(slurmcheck.KEY, {**_SLURM_SET, "host": host, "workdir": str(remote), **more})
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    return p, repo, run, d, log, cmd
+
+
+def test_a_run_no_pool_host_can_take_overflows_to_slurm_and_one_the_pool_takes_does_not(env, tmp_path, monkeypatch):
+    from ttp import cli, slurmcheck
+    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, ["down"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "cluster-login", rec
+    text = (run / "checks.log").read_text()
+    assert "overflowing to Slurm cluster cluster-login" in text and "as Slurm job 101" in text, text
+    assert "--time=30 " in (d / "sbatch.log").read_text() and "/ttp-check." in log.read_text()
+    assert slurmcheck.holders(p.name) == [] and slurmcheck.status_lines(p.name) == []
+    assert not list(slurmcheck.slurm_dir().glob("want.*.json")), "the run's place among the waiters goes"
+    # A reachable pool host takes the next run: no job.
+    (d / "sbatch.log").unlink()
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    from ttp import machines
+    machines.add("check-host-a")
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    assert json.loads((run / "checks.json").read_text())["spilled_to"] == "check-host-a"
+    assert not (d / "sbatch.log").exists()
+
+
+@pytest.mark.parametrize("host,mode", [("down", "run"), ("cluster-login", "refuse")])
+def test_an_unreachable_or_refusing_cluster_keeps_the_run_here_never_failed(env, tmp_path, monkeypatch, host, mode):
+    """A cluster ssh does not reach is skipped and the run waits here in its place; one whose sbatch
+    refuses the job is an environment fault, and the run runs again here, whose verdict counts."""
+    import threading
+    from ttp import cli
+    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, [], host=host)
+    monkeypatch.setenv("FAKE_SLURM_MODE", mode)
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    text = (run / "checks.log").read_text()
+    assert rec["passed"] is True and "/ttp-check." not in log.read_text(), (rec, text)
+    if host == "down":
+        assert "spilled_to" not in rec and "ssh cannot reach it" in text and not (d / "sbatch.log").exists(), text
+    else:
+        assert "sbatch refused the job" in text and "running them again on this machine" in text, text
+
+
+def test_urgent_runs_take_the_slurm_overflow_first(env, tmp_path, monkeypatch):
+    from ttp import project, slurmcheck
+    _slurm_fakes(tmp_path, monkeypatch)
+    project.set_account_setting(slurmcheck.KEY, {**_SLURM_SET, "workdir": str(tmp_path / "remote")})
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        slurmcheck.slurm_dir().mkdir(parents=True, exist_ok=True)
+        (slurmcheck.slurm_dir() / f"want.{other.pid}.json").write_text(json.dumps(
+            {"pid": other.pid, "prio": 0, "arrived": time.time(), "until": time.time() + 600}))
+
+        class P:
+            name = "proj"
+        told = []
+        assert slurmcheck.pick(P(), {}, told.append, "x", prio=None, arrived=time.time() - 100) is None
+        assert "1 run(s) ahead of this one" in told[-1]
+        claim = slurmcheck.pick(P(), {}, told.append, "x", prio=0, arrived=time.time() - 100)
+        assert claim is not None and claim.slurm["host"] == "cluster-login", told
+        assert slurmcheck.status_lines("proj")[0].startswith("checks of pid ")
+        claim.close()
+    finally:
+        other.kill()
+        other.wait()
+    assert slurmcheck.ahead(None, time.time()) == 0, "a dead waiter's ticket counts no more"
+
+
+def test_a_run_behind_a_spill_wrapper_never_overflows_to_slurm(env, tmp_path, monkeypatch):
+    """The batch job runs no spill wrapper and a wrapped check never runs unwrapped (remotecheck): a run
+    with one waits here in its place instead of overflowing."""
+    import threading
+    from ttp import cli
+    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, ["down"])
+    p.set_config("checks.spill_wrap_cmd", "scripts/wrap.sh")
+    assert cli._spill_wrapped(["pytest"], p.config()) and not cli._spill_wrapped(["pytest"], {})
+    assert cli._spill_wrapped(["pytest"], {"checks": {"spill_wrap_cmd": "'unclosed"}}), "unparsed counts"
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert not (d / "sbatch.log").exists() and "/ttp-check." not in log.read_text()

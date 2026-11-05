@@ -557,13 +557,17 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     pipeline fails when any stage does (bash `-e -o pipefail`; plain `sh -e` where bash is missing).
     With `top` (the worktree it runs in), a bare pytest runs with the repository's venv, else the one
     `env` (the check's environment; default this process's) has active (venv_cmd). A check with a host
-    (remote_host) runs there instead, on a copy of `commit`, else of the checkout's HEAD (remotecheck). A local check runs
+    (remote_host) runs there instead, on a copy of `commit`, else of the checkout's HEAD (remotecheck; one
+    tagged `slurm` as a batch job on that cluster, slurmcheck). A local check runs
     in a process sandbox (sandbox.wrap) unless it opts out or `isolate` is false; sandbox_lines says
     when one cannot."""
     exports = dict(getattr(cmd, "env", ()) or ())
     wrap = tuple(getattr(cmd, "wrap", ()) or ())
     lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
+    if slurm := getattr(cmd, "slurm", None):   # the account's Slurm overflow: one batch job (slurmcheck)
+        from . import slurmcheck
+        return slurmcheck.argv(str(cmd), slurm, exports, commit, getattr(cmd, "time_min", 0))
     if host := remote_host(cmd):
         return remotecheck.argv(str(cmd), host, exports, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()))
     cmd = venv_cmd(cmd, top, env) if top else cmd

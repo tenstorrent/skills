@@ -1606,7 +1606,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if rl:
         lines.append(rl)
     # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
-    from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, testslots
+    from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, slurmcheck, testslots
     if verbose:
         if host := checkcap.line():
             lines.append(host)
@@ -1616,6 +1616,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
     if verbose:
         lines.extend(checkspill.status_lines(p.name, now))
+        lines.extend(slurmcheck.status_lines(p.name, now))
         lines.extend(f"checks {x.strip()}" for x in checkjoin.status_lines(p.state, now))
         if slot_waits := checkcap.wait_line(p.state, now):
             lines.append(slot_waits)
@@ -2763,6 +2764,19 @@ def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
     return out
 
 
+def _spill_wrapped(cmds: list, cfg: dict | None) -> bool:
+    """Whether a check of `cmds` runs behind a spill wrapper (push.spill_wrap_of; one that does not parse
+    counts): it never runs unwrapped, so its run never overflows to Slurm (slurmcheck), whose job runs none."""
+    from . import push
+    for c in cmds:
+        try:
+            if push.spill_wrap_of(c, cfg):
+                return True
+        except ValueError:
+            return True
+    return False
+
+
 def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "candidate",
                    envs: list[str] | None = None) -> dict | None:
     """The recorded pass of exactly these commands, in this order, on this tree, for this purpose, or
@@ -3474,6 +3488,8 @@ def cmd_checks(a) -> None:
             # (same arrival time), never run the checks uncapped.
             if slot is None or not slot.served:
                 break
+        from . import slurmcheck
+        slurmcheck.forget()   # this run waits for the Slurm overflow no more
         if joined and joined[0] != "handover":
             _checks_report_joined(join_rec, Path(run_dir), out, joined, head, str(top), todo, skipped, purpose)
             return
@@ -3482,7 +3498,11 @@ def cmd_checks(a) -> None:
         # The slots here stayed busy and a spill host took the run: its checks run there (remotecheck).
         spilled = getattr(slot, "spill", None) if slot is not None and not hit else None
         if spilled:
+            if slurm := getattr(spilled, "slurm", None):   # one batch job per check, --time from the run's median
+                minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
             todo = _spill_to(todo, spilled.host, cfg)
+            for c in todo if slurm else []:
+                c.slurm, c.time_min = slurm, minutes
             for w in dict.fromkeys(c.remote_wrap for c in todo if c.remote_wrap):
                 said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
                 print(f"ttp checks: {said}", flush=True)
@@ -4339,7 +4359,7 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
-    from . import checkjoin, checkspill, diskgate, hostload
+    from . import checkjoin, checkspill, diskgate, hostload, slurmcheck
     followers = checkjoin.status_lines(p.state)
     disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
@@ -4349,13 +4369,14 @@ def _checks_lane_status(as_json: bool) -> int:
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
+                          "slurm_overflow": slurmcheck.holders(p.name),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "disk": disk,
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in checkspill.status_lines(p.name):
+        for line in [*checkspill.status_lines(p.name), *slurmcheck.status_lines(p.name)]:
             print(f"  {line}")
         print("check runs per host:")
         print("\n".join(f"  {line}" for line in hostload.lines(s=load)))
@@ -4382,13 +4403,14 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     for that wrapper lock's one lane, at most checklane.project_cap of the project's at once, told with
     the holder and the queue position each minute. With `spill` and delivery.checks_spill_hosts set, a
     wait past delivery.checks_spill_after_s tries those hosts (checkspill.pick) and keeps its place here
-    when none can take the run: a slot whose `spill` claim names the host the checks then run on; while
+    when none can take the run (nor the account's Slurm overflow, slurmcheck.pick): a slot whose `spill`
+    claim names the host the checks then run on (with `slurm` set, the cluster's submit host); while
     this host's disk is saturated (diskgate) it tries them before it waits here at all. Both
     settings are read again at each bound: hosts set while a run waits take it at its next bound.
     `yielder()`, asked while it waits, raises checkjoin.Yield when the task's same checks run or wait
     ahead, or a newer head's do: the wait ends holding nothing. The branch checked out at `top` moving
     off `head` while it waits (_HeadMoved: its task replaced the head) ends it as a cancel does."""
-    from . import checkcap, checkjoin, checklane, checkspill, diskgate, locks as lk
+    from . import checkcap, checkjoin, checklane, checkspill, diskgate, locks as lk, slurmcheck
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
@@ -4469,6 +4491,13 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         # The same hosts skipped for the same reasons are told once, not after every bound.
         if checkspill.hosts(spill_cfg) and (claim := checkspill.pick(
                 p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)), what)) is not None:
+            slot = checkcap.Slot()
+            slot.spill = claim
+            return slot
+        # No pool host could take it: the account's Slurm overflow (slurmcheck), urgent runs first. Its batch
+        # job runs no spill wrapper and a wrapped check never runs unwrapped, so a wrapped run waits here.
+        if not _spill_wrapped(cmds, spill_cfg) and (claim := slurmcheck.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
+                                     what, prio, start if arrived is None else arrived)) is not None:
             slot = checkcap.Slot()
             slot.spill = claim
             return slot
@@ -8684,7 +8713,7 @@ def cmd_account_config(key: str, value: str | None) -> None:
         val = json.loads(value)
     except ValueError:
         val = value
-    from . import checkspill
+    from . import checkspill, slurmcheck
     from .globalcap import setting_problems
     sec, _, k = key.partition(".")
     bad = setting_problems({k: val}) if sec == "budget" and val not in ("", None) else []
@@ -8693,6 +8722,11 @@ def cmd_account_config(key: str, value: str | None) -> None:
             val = checkspill.hosts_of(val) or ""   # an empty pool is no pool: removed
         except ValueError as e:
             bad = [str(e).replace(f"delivery.{checkspill.KEY}", key)]
+    if key == slurmcheck.KEY and val not in ("", None, {}):
+        try:
+            slurmcheck.settings_of(val)
+        except ValueError as e:
+            bad = [str(e)]
     if bad:
         die(bad[0])
     try:
