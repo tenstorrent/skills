@@ -306,3 +306,130 @@ def test_coordtools_and_hostcheck_are_killscan_clean():
     from ttp import killscan
     for name in ("coordtools.py", "hostcheck.py"):
         assert not killscan.scan((RUNTIME / "ttp" / name).read_text()), name
+
+
+def _answer(p, tmp_path, monkeypatch, actions, run="run"):
+    """The coordinator hook's decision on a StructuredOutput answer of `actions` in session run `run`:
+    (permission decision or None, its reason)."""
+    from ttp import coordtools
+    (tmp_path / run).mkdir(exist_ok=True)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / run))
+    out, _ = coordtools.pre_tool_use({"tool_name": "StructuredOutput",
+                                      "tool_input": {"actions": actions, "summary": "s", "session_note": None}})
+    if out is None:
+        return None, ""
+    o = out["hookSpecificOutput"]
+    return o["permissionDecision"], o["permissionDecisionReason"]
+
+
+def test_a_session_answer_with_a_bad_task_update_comes_back_in_the_same_turn(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord
+    p = make(env)
+    tid = p.db.add_task("port kernel", "s", origin="user")
+    gone = p.db.add_task("old probe", "s", origin="user")
+    p.db.update_task(gone, status="failed")
+    p.db.update_task(tid, status="blocked")
+    reply = {"type": "reply", "chat": None, "text": "on it", "id": None, "status": None}
+    bad = [reply, {"type": "task_update", "id": tid + 1000, "status": "queued", "spec": None},
+           {"type": "task_update", "id": tid, "status": "queued", "depends_on": [gone], "spec": None}]
+    before = p.db.q("SELECT id, status, depends_on FROM tasks ORDER BY id")
+    decision, why = _answer(p, tmp_path, monkeypatch, bad)
+    assert decision == "deny"
+    assert f"actions[1] (task_update): no task #{tid + 1000}" in why
+    assert f"actions[2] (task_update): #{tid} rejected: depends on #{gone} which is failed" in why
+    assert "actions[0]" not in why and "send the whole answer again" in why
+    assert p.db.q("SELECT id, status, depends_on FROM tasks ORDER BY id") == before, "the check writes nothing"
+    # The model fixes both in the same turn; the fixed answer goes through and applies.
+    fixed = [reply, {"type": "task_update", "id": tid, "status": "queued", "depends_on": [], "spec": None}]
+    assert _answer(p, tmp_path, monkeypatch, fixed) == (None, "")
+    assert coord.apply(p, [{k: v for k, v in a.items() if v is not None} for a in fixed[1:]]) == []
+    assert p.db.task(tid)["status"] == "queued"
+
+
+def test_a_valid_session_answer_is_not_changed(env, tmp_path, monkeypatch):
+    p = make(env)
+    tid = p.db.add_task("port kernel", "s", origin="user")
+    run = p.db.add_task("bench", "s", origin="user")
+    p.db.update_task(run, status="running")
+    ok = [{"type": "task_update", "id": tid, "status": "blocked", "text": "needs a box"},
+          {"type": "task_update", "id": run, "spec": "also label each number", "status": None},
+          {"type": "task_update", "id": run, "status": "cancelled"},
+          {"type": "task_add", "title": "new work", "spec": "do it", "kind": "code", "depends_on": [tid]},
+          {"type": "reply", "text": "done"}, "not a dict"]
+    assert _answer(p, tmp_path, monkeypatch, ok) == (None, "")
+    assert not (tmp_path / "run" / "answer-precheck.json").exists()
+    assert _answer(p, tmp_path, monkeypatch, []) == (None, "")
+
+
+def test_session_answer_check_refuses_what_apply_refuses_and_never_traps_the_turn(env, tmp_path, monkeypatch):
+    from ttp import coordinator as coord, coordprecheck
+    p = make(env)
+    tid = p.db.add_task("bench", "s", origin="user")
+    p.db.update_task(tid, status="running")
+    done = p.db.add_task("landed", "s", origin="user")
+    p.db.update_task(done, status="done")
+    cases = [({"type": "task_update", "id": tid, "status": "queued"}, f"task #{tid} is running"),
+             ({"type": "task_update", "id": tid, "resources": ["box"]}, "its resources change only"),
+             ({"type": "task_update", "id": done, "start_after": "1h"}, "only a task that has not started"),
+             ({"type": "task_update", "id": done, "pr_branch": "x"}, "its branch changes only"),
+             ({"type": "task_update", "id": tid, "status": "waiting"}, "status `waiting`"),
+             ({"type": "task_update", "id": "abc"}, "needs the id of a task"),
+             ({"type": "task_add", "title": "bench", "spec": "s"}, f"duplicate of open task #{tid}"),
+             ({"type": "task_add", "title": "x", "spec": " "}, coord.MISSING_FIELDS),
+             ({"type": "task_add", "title": "x", "spec": "s", "kind": "nope"}, coord.UNKNOWN_KIND),
+             ({"type": "task_add", "title": "x", "spec": "s", "continues": 99999}, "no task #99999"),
+             ({"type": "task_add", "title": "x", "spec": "s", "depends_on": [99999]}, "names no task")]
+    for i, (a, want) in enumerate(cases):
+        got = coordprecheck.problems(p, [a])
+        assert len(got) == 1 and want in got[0][1], (a, got)
+        assert coord.INFO_MARK not in got[0][1]
+        # apply refuses each one too (the check is a subset of apply's)
+        assert coord.apply(p, [a]), a
+    # A task cap reached: refused, unless a config_set in the batch changes a cap (apply runs it first).
+    p.set_config("coordinator.max_new_tasks_per_day", 1)
+    add = {"type": "task_add", "title": "fresh", "spec": "s"}
+    assert coordprecheck.problems(p, [add]) == []
+    assert [i for i, _ in coordprecheck.problems(p, [add, {**add, "title": "fresh 2"}])] == [1]
+    raise_cap = {"type": "config_set", "key": "coordinator.max_new_tasks_per_day", "value": "5"}
+    assert coordprecheck.problems(p, [raise_cap, add, {**add, "title": "fresh 2"}]) == []
+    # An action resent unchanged goes through, and apply refuses it with its side effects (the retry wake).
+    two = [add, {**add, "title": "fresh 2"}]
+    decision, why = _answer(p, tmp_path, monkeypatch, two, run="cap")
+    assert decision == "deny" and "actions[1] (task_add): the 24 h cap" in why
+    assert _answer(p, tmp_path, monkeypatch, two, run="cap") == (None, "")
+    assert coord.apply(p, two) and p.db.kv(coord.RETRY_WAKE_KEY)
+    # At most MAX_DENIALS answers of a run are denied, each with a new problem.
+    for n in range(coordprecheck.MAX_DENIALS + 1):
+        decision, _ = _answer(p, tmp_path, monkeypatch, [{"type": "task_update", "id": 5000 + n}], run="many")
+        assert decision == ("deny" if n < coordprecheck.MAX_DENIALS else None), n
+    # No run dir, no project, an unreadable project or a broken check: the answer goes through.
+    bad = [{"type": "task_update", "id": 777777}]
+    assert _answer(p, tmp_path, monkeypatch, bad, run="fresh")[0] == "deny"
+    monkeypatch.delenv("TTP_RUN_DIR")
+    from ttp import coordtools
+    so = {"tool_name": "StructuredOutput", "tool_input": {"actions": bad}}
+    assert coordtools.pre_tool_use(so) == (None, None)
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path / "fresh2"))
+    (tmp_path / "fresh2").mkdir()
+    monkeypatch.setenv("TTP_PROJECT", str(tmp_path / "nowhere" / "x"))
+    assert coordtools.pre_tool_use(so) == (None, None)
+    assert not (tmp_path / "nowhere").exists(), "no database is created"
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setattr(coordprecheck, "problems", lambda *a: 1 / 0)
+    assert coordtools.pre_tool_use(so) == (None, None)
+    for answer in (None, "x", {"actions": "x"}, {"actions": None}):
+        assert coordtools.pre_tool_use({"tool_name": "StructuredOutput", "tool_input": answer}) == (None, None)
+
+
+def test_the_answer_check_runs_through_the_coordinator_hook_entry_point(env, tmp_path):
+    p = make(env)
+    run = tmp_path / "run"
+    run.mkdir()
+    payload = json.dumps({"tool_name": "StructuredOutput", "tool_input": {"actions": [
+        {"type": "task_update", "id": 424242, "status": "queued"}]}})
+    environ = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(run), "PYTHONPATH": str(RUNTIME)}
+    hook = subprocess.run([sys.executable, "-m", "ttp.hook", "CoordPreToolUse"], input=payload, env=environ,
+                          capture_output=True, text=True, cwd=str(RUNTIME), timeout=60)
+    out = json.loads(hook.stdout)["hookSpecificOutput"]
+    assert out["permissionDecision"] == "deny" and "no task #424242" in out["permissionDecisionReason"]

@@ -433,7 +433,11 @@ prolonged whole-box outage.
   or read time alone is no change), and a line counting the rest and naming the tasks no longer open.
   A new session, a daemon restart, a stateless, failed or
   compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
-  digest on the next wake.
+  digest on the next wake. A session wake's answer is checked before its turn ends: an action the
+  daemon would refuse (an unknown task id, a dependency that failed, a task cap reached, a field a
+  running or finished task keeps) comes back as the answer tool's result, so the coordinator fixes
+  or drops it in the same turn. An action resent unchanged goes through and is refused after the
+  turn as before; at most 2 answers a wake are sent back.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
   refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown
   of `coordinator.rejection_cooldown_s` (default 900; 0 turns it off). Inside it, an event with the

@@ -9,7 +9,8 @@ other host checks). No write tool, no free shell. Three fences hold it: the CLI'
 allow and deny rules under the dontAsk permission mode (anything not allowed is refused), and a
 PreToolUse hook (pre_tool_use) that denies every call outside the list, also a Bash line with a shell
 operator, redirect or substitution. The one other tool it allows is StructuredOutput, the CLI's
-own tool for the turn's --json-schema answer, without which the turn has no structured result.
+own tool for the turn's --json-schema answer, without which the turn has no structured result; the
+hook denies an answer with an action coord.apply would refuse, with the reason (coordprecheck.py).
 
 Budget: a wake stops at whichever comes first of coordinator.session.wake_budget_usd (the CLI's
 --max-budget-usd) and wake_budget_s (the run's timeout); there is no tool-call cap. Unset, each is
@@ -114,6 +115,18 @@ def bash_refusal(cmd: str) -> str | None:
     return f"`ttp {' '.join(argv[1:3])}` is not one of the coordinator's read-only commands"
 
 
+def _answer_check(payload: dict) -> dict | None:
+    """A denial carrying the reasons coord.apply would refuse actions of the answer, to fix in this
+    turn (coordprecheck.py); None lets it through, also on any error: the answer always can end the turn."""
+    from .hook import _deny
+    try:
+        from .coordprecheck import refusal
+        why = refusal(payload)
+    except Exception:
+        return None
+    return _deny(why) if why else None
+
+
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     """Deny every coordinator tool call outside its read-only list; no opinion on the rest, so the
     CLI's own allow rules still apply. Any error denies."""
@@ -129,7 +142,7 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
                 return _deny("that file holds a credential; a coordinator never reads it"), None
             return None, None
         if tool == ANSWER_TOOL:   # the turn's structured answer (module doc)
-            return None, None
+            return _answer_check(payload), None
         if tool == "Bash":
             why = bash_refusal(str(args.get("command") or ""))
             return (_deny(why) if why else None), None
