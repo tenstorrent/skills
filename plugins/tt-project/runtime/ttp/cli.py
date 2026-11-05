@@ -3799,14 +3799,20 @@ def cmd_checks(a) -> None:
             if stop_handlers:
                 _CHECK_STOP["stopped"] = None
         if preempted_by:
-            # What it recorded stays (passes, logs); the command it ran ended, and the run queues again at
-            # its arrival, its old place, as a spill host's rerun does.
+            # What it recorded stays (passes, logs; in a pinned run only those on the pinned commit); the
+            # command it ran ended, and the run queues again at its arrival, its old place, as a spill host's
+            # rerun does. Its queue entry and status say who took the slot (checkcap.label).
             checkcap.clear_preempt()
-            said = (f"{preempted_by} (urgent) needed this host-wide checks slot: these checks stopped and queue "
-                    f"again at their arrival {timefmt.clock(now=arrived)}")
+            said = (f"preempted by {preempted_by}: an urgent run needed this host-wide checks slot; these checks "
+                    f"stopped and queue again at their arrival {timefmt.clock(now=arrived)}, then run to their result")
             out.write(f"ttp checks: {said}\n")
             out.flush()
             print(f"ttp checks: {said}", flush=True)
+            os.environ[checkcap.PREEMPTED_ENV] = preempted_by
+            try:   # its task's notes: the run is told, and its own retry (this rerun) goes on
+                durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} checks: {said}\n")
+            except OSError:
+                pass
             if slot:
                 slot.close()
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
@@ -4616,7 +4622,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
                 checkjoin.forget(p.state)
             _checks_reexec(str(e), arrived, prio, spill, tell, out, getattr(e, "lanes", None),
-                           getattr(e, "slot", None))
+                           getattr(e, "slot", None), rerank=isinstance(e, checkcap.Reranked))
             continue   # it could not re-execute: wait again with the code it runs
         if slot is not None or not spill_to:
             return slot
@@ -4702,6 +4708,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             return why
         if restart and (new := checkcap.upgraded()):
             raise checkcap.Upgraded(new)
+        if restart and (rank := checkcap.reranked(p, prio)) is not None:   # its task turned urgent: queue as urgent
+            raise checkcap.Reranked(str(rank))
         return (yielder() if yielder else "") or ""
 
     # Concurrent runs are isolated (own clean checkout, scratch, output folder and port block); what is
@@ -4785,7 +4793,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     startable=startable,
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
-                                    urgent=urgent, preemptible=True)
+                                    urgent=urgent, preemptible=checkcap.preemptible(cmds, lock))
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
@@ -4864,7 +4872,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
 
 
 def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out, lanes=None,
-                   slot=None) -> None:
+                   slot=None, rerank: bool = False) -> None:
     """Run these waiting detached checks again with the runtime installed now (version `new`,
     checkcap.Upgraded), as the same process: exec keeps its pid and start time, so checks.pid, the
     launcher's `go` and a cancel request still name it, and its checks.rc is written once at its end.
@@ -4872,13 +4880,17 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     granted (`slot`, checkcap.keep_slot: no other waiter takes it in between) and queues again for the
     rest at its arrival time `arrived` and its task's priority `prio`, so it keeps its place. Called only
     while it waits, holding nothing else; returns only when the exec failed, with the lanes and the slot
-    let go (freed as a dead holder's are)."""
+    let go (freed as a dead holder's are). With `rerank` (checkcap.Reranked) its task turned urgent (`new` is
+    its new priority): the same runtime re-executes once (RERANK_ENV) and reads that priority at its start."""
     from . import checkcap, checkspill, testslots
     if arrived is not None:
         os.environ[checkcap.ARRIVED_ENV] = repr(arrived)
     if not spill:   # what cmd_checks took out of the environment: no spill host for these checks
         os.environ[checkspill.OFF_ENV] = "1"
-    os.environ[checkcap.REEXEC_ENV] = new
+    if rerank:
+        os.environ[checkcap.RERANK_ENV] = new
+    else:
+        os.environ[checkcap.REEXEC_ENV] = new
     if lanes is not None and (spec := testslots.keep_lanes(lanes)):
         os.environ[testslots.LANE_ENV] = spec
         if slot is not None and (spec := checkcap.keep_slot(slot)):
@@ -4886,11 +4898,14 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     elif slot is not None:   # no lane to keep it with: the new process queues for both
         slot.close()
         slot = None
-    tell(f"runtime {__version__} was upgraded to {new} while these checks waited: re-executing with it "
-         f"(same pid{', keeping its checks lane' if os.environ.get(testslots.LANE_ENV) else ''}"
+    tell((f"its task turned urgent (priority {new}) while these checks waited at priority "
+          f"{prio if prio is not None else '-'}: re-executing to queue as urgent " if rerank else
+          f"runtime {__version__} was upgraded to {new} while these checks waited: re-executing with it ")
+         + f"(same pid{', keeping its checks lane' if os.environ.get(testslots.LANE_ENV) else ''}"
          f"{' and its host-wide checks slot' if os.environ.get(checkcap.KEPT_ENV) else ''}), "
          f"queueing again at their arrival "
-         f"{timefmt.clock(now=arrived) if arrived is not None else 'now'} and priority {prio if prio is not None else '-'}")
+         f"{timefmt.clock(now=arrived) if arrived is not None else 'now'} and priority "
+         f"{new if rerank else prio if prio is not None else '-'}")
     for f in (out, sys.stdout, sys.stderr):
         f.flush()
     namer = _CHECK_NAMER["on"] and _CHECK_NAMER["rc"]
@@ -4907,6 +4922,7 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
         if slot is not None:
             slot.close()
         tell(f"could not re-execute with runtime {new} ({e.strerror or e}): waiting on with {__version__}")
+        # (a failed rank re-execution keeps RERANK_ENV: it is not tried again, the run waits on at its priority)
 
 
 def _checks_tip_ref(p: Project | None, top: Path) -> str:

@@ -1584,11 +1584,18 @@ running work is interrupted only by the preemption below:
   on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
   host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past
   its project's cap (`checks.urgent_slots`, account-level, env `TTP_CHECKS_URGENT_SLOTS`, default 1, so
-  at most that many urgent runs above the cap at once; 0 turns them off); else it asks the
-  lowest-priority routine run on a cap slot to step back. That run ends its current command, frees its
-  slots and queues again at its old arrival, keeping its place and every pass and log it recorded, and
-  the urgent run takes the freed slot. Another urgent run or a push check is never asked; `ttp status`
-  shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
+  at most that many urgent runs above the cap at once; 0 turns them off); else, once it has waited
+  `checks.preempt_after_s` from its arrival (account-level, env `TTP_CHECKS_PREEMPT_AFTER_S`, default
+  120; 0 asks at once), it asks one routine run on a cap slot to step back, once per request: a run of
+  its own project first, then the least urgent, then the latest started. That run ends its current
+  command, frees its slots and queues again at its old arrival, ahead of every later arrival of its
+  project, keeping every pass and log it recorded (a pinned run keeps only passes on its pinned commit
+  and reruns the rest there), and the urgent run takes the freed slot. Its log, its task's notes and
+  its queue entry in `ttp status` say `preempted by urgent #<task>`, and its own rerun goes on to its
+  result. Another urgent run, a push check and a run behind a lock (the `checks.wrap_cmd` wrapper, or
+  commands that run `ttp lock`, `ttp devq` or `flock`) are never asked. A routine run whose task
+  turns urgent while it waits notices within 30 s and re-executes once as an urgent run, at the same
+  arrival. `ttp status` shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
   checks use only their branch's reserved test slot. There is no
   separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
   before this, their waiters may disagree on who is next and a slot can sit idle until another frees.

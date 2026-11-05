@@ -7597,6 +7597,8 @@ def test_an_urgent_checks_run_with_no_urgent_slot_preempts_the_lowest_priority_r
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
     monkeypatch.setattr(checkcap, "POLL_S", 0.1)
     hold = [checkcap.acquire("urgent other", priority=0, preemptible=True),
             checkcap.acquire("routine 2", priority=2, preemptible=True),
@@ -7607,7 +7609,7 @@ def test_an_urgent_checks_run_with_no_urgent_slot_preempts_the_lowest_priority_r
     t.start()
     try:
         assert _wait_for(lambda: any(checkcap.PREEMPT_LINE.format("routine 5") == m for m in told)), told
-        assert checkcap.preempted(hold[2].since) == "urgent"
+        assert checkcap.preempted(hold[2].since) == "urgent urgent", "no task: named by its holder"
         assert checkcap.preempted(time.time() + 60) == "", "a request older than the slot is not for it"
         hold[2].close()
         t.join(30)
@@ -7630,14 +7632,156 @@ def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again
     monkeypatch.setattr(checkcap, "acquire",
                         lambda *a, **k: arrivals.append((a[5] if len(a) > 5 else k.get("since"), k.get("preemptible")))
                         or real(*a, **k))
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
     mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
     script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
-              f'printf \'{{"by": "urgent u", "at": %s}}\' "$(($(date +%s) + 1))" > {req}; sleep 60')
+              f'printf \'{{"by": "urgent u", "task": "77", "at": %s}}\' "$(($(date +%s) + 1))" > {req}; sleep 60')
     t0 = time.time()
     cli.main(["checks", "--", "sh", "-c", script])
     out = capsys.readouterr().out
     assert time.time() - t0 < 45, "its command ended once asked"
-    assert "urgent u (urgent) needed this host-wide checks slot" in out, out
+    assert "preempted by urgent #77: an urgent run needed this host-wide checks slot" in out, out
+    assert "preempted by urgent #77" in (run / "progress.md").read_text(), "its task is told"
+    assert os.environ[checkcap.PREEMPTED_ENV] == "urgent #77", "its queue entry and status say so (label)"
+    assert "passed" in out.rsplit("preempted by", 1)[1], "its own retry ran to its result"
     assert len(arrivals) == 2 and arrivals[0] == arrivals[1] and arrivals[0][1], "it queued again at its old place"
     assert not req.exists() and checkcap.line() == ""
     assert mark.exists()
+
+
+def test_an_urgent_checks_run_past_its_grace_preempts_one_routine_run_of_its_own_project_first(env, monkeypatch):
+    """#6246 (1): every cap slot and the urgent slot held, an urgent run that has waited past
+    checks.preempt_after_s asks exactly one routine run to step back: its own project's first, even over a
+    less urgent run of another project, and only once per request (a re-execution at the same arrival too);
+    it takes the slot that run frees. The asked run sees `urgent #<task>` and its queue entry says so."""
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0.5")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.setenv("TTP_TASK", "6198")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    other = checkcap.acquire("other p3", project_name="other", priority=3, preemptible=True)
+    mine = checkcap.acquire("mine p2", project_name="mine", priority=2, preemptible=True)
+    held_urgent = checkcap.acquire("other urgent", project_name="other", priority=1, urgent=True)
+    assert held_urgent.urgent, "the urgent slot beyond the cap is held too"
+    told, got, since = [], [], time.time()
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "urgent", project_name="mine", priority=1, urgent=True, tell=told.append, since=since, max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any(checkcap.PREEMPT_LINE.format("mine p2") == m for m in told)), told
+        assert time.time() - since >= 0.5, "not before its grace"
+        assert checkcap.preempted(mine.since) == "urgent #6198"
+        monkeypatch.setenv(checkcap.PREEMPTED_ENV, checkcap.preempted(mine.since))
+        assert checkcap.label("mine") == "mine task #6198 (run ?) [preempted by urgent #6198]"
+        mine.close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None and not got[0].urgent
+        assert sum(m.startswith("urgent checks with every") for m in told) == 1, "one preemption per request"
+        got[0].close()
+        checkcap.clear_preempt()
+        # The same request again (a re-execution keeps its arrival): it never asks a second time.
+        mine = checkcap.acquire("mine p2", project_name="mine", priority=2, preemptible=True)
+        told.clear()
+        assert checkcap.acquire("urgent", project_name="mine", priority=1, urgent=True, tell=told.append,
+                                since=since, max_wait_s=1.0) is None
+        assert not any(m.startswith("urgent checks with every") for m in told), told
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"))
+    finally:
+        checkcap.clear_preempt()
+        for h in (other, mine, held_urgent, *got):
+            if h is not None:
+                h.close()
+
+
+def test_push_priority_urgent_and_lock_holding_checks_runs_are_never_preempted(env, monkeypatch):
+    """#6246 (2): with the cap held by an urgent run and a routine run behind a lock, and a push branch's
+    priority slot held, an urgent waiter past its grace asks nobody; preemptible() refuses a wrapper lock and
+    commands that take a lock or device queue themselves."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    assert checkcap.preemptible(["pytest -q tests/test_flock_utils.py"]) and checkcap.preemptible(["ttp locks"])
+    assert not checkcap.preemptible(["pytest -q"], lock="abc123"), "behind checks.wrap_cmd's lock"
+    for cmd in ("ttp lock board -- pytest -q", "make && ttp devq run x", "(flock /tmp/l make)", "flock -n x y"):
+        assert not checkcap.preemptible([cmd]), cmd
+    held = [checkcap.acquire("urgent run", priority=1, preemptible=True),
+            checkcap.acquire("lock holder", priority=5, preemptible=checkcap.preemptible(["ttp lock board -- t"]))]
+    push = checkcap.acquire_priority("origin/branch", "push checks")
+    told = []
+    try:
+        assert checkcap.acquire("urgent", priority=0, urgent=True, tell=told.append, max_wait_s=1.0) is None
+        assert not any(m.startswith("urgent checks with every") for m in told), told
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json")), "nobody was asked"
+    finally:
+        push.close()
+        for h in held:
+            h.close()
+
+
+def test_no_preemption_within_the_grace_and_it_counts_from_the_arrival(env, monkeypatch):
+    """#6246 (3): an urgent waiter asks nobody while it has waited less than checks.preempt_after_s (default
+    PREEMPT_AFTER_S); one that arrived longer ago (a re-execution keeps its arrival) asks at once."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.delenv(checkcap.PREEMPT_AFTER_ENV, raising=False)
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    assert checkcap.preempt_after_s() == checkcap.PREEMPT_AFTER_S == 120.0
+    for bad in ("-1", "x", "inf"):
+        monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, bad)
+        assert checkcap.preempt_after_s() == 120.0, bad
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "5")
+    routine = checkcap.acquire("routine", priority=3, preemptible=True)
+    told = []
+    try:
+        assert checkcap.acquire("urgent", priority=1, urgent=True, tell=told.append, max_wait_s=1.0) is None
+        assert not any(m.startswith("urgent checks with every") for m in told), told
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"))
+        assert checkcap.acquire("urgent", priority=1, urgent=True, tell=told.append, since=time.time() - 6,
+                                max_wait_s=1.0) is None
+        assert checkcap.PREEMPT_LINE.format("routine") in told, told
+    finally:
+        checkcap.clear_preempt()
+        routine.close()
+
+
+def test_a_waiting_routine_checks_run_whose_task_turns_urgent_re_executes_once_as_urgent(env, monkeypatch):
+    """#6246: the checks of a task raised to urgent while they wait read its priority again (reranked, at most
+    every RERANK_S) and re-execute once to queue as urgent, keeping their arrival; never for an urgent run."""
+    import io
+    from ttp import checkcap, cli
+    monkeypatch.setenv(checkcap.RERANK_ENV, "")
+    monkeypatch.setenv(checkcap.REEXEC_ENV, "")
+    monkeypatch.setattr(checkcap, "_RERANK", {"at": 0.0})
+    rank = [(3, [])]
+    monkeypatch.setattr(checkcap, "task_rank", lambda p: rank[0])
+    p = object()
+    assert checkcap.reranked(p, 3, now=1000.0) is None, "still routine"
+    rank[0] = (1, [])
+    assert checkcap.reranked(p, 3, now=1000.0 + checkcap.RERANK_S / 2) is None, "read again only every RERANK_S"
+    assert checkcap.reranked(p, 3, now=1000.0 + checkcap.RERANK_S) == 1
+    assert checkcap.reranked(p, 1, now=5000.0) is None and checkcap.reranked(None, 3, now=6000.0) is None
+    seen = {}
+
+    def execv(*a):
+        seen.update(rerank=os.environ.get(checkcap.RERANK_ENV), reexec=os.environ.get(checkcap.REEXEC_ENV),
+                    arrived=os.environ.get(checkcap.ARRIVED_ENV))
+        raise OSError("no exec in a test")
+    monkeypatch.setattr(os, "execv", execv)
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, "")
+    told = []
+    cli._checks_reexec("1", 1234.5, 3, True, told.append, io.StringIO(), rerank=True)
+    assert seen == {"rerank": "1", "reexec": "", "arrived": "1234.5"}, seen
+    assert told[0].startswith("its task turned urgent (priority 1) while these checks waited at priority 3"), told
+    assert checkcap.reranked(p, 3, now=9000.0) is None, "once per run"

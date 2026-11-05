@@ -56,10 +56,15 @@ wait first, cli._checks_slot); with no pool host free it takes a reserved urgent
 beyond the cap and the load's extras, as push checks have one per branch, each with a reserved test lane
 (testslots' reserved lane keyed urgent_key) and past its project's cap of running checks. Only urgent runs take
 one, so at most that many run above the cap at once; the cores and disk gates do not hold it (as for push checks).
-With those held too, an urgent waiter asks, once a wait, the lowest-priority routine run on a cap slot to step
-back (preempt): it ends its command, lets its slots go and queues again at its old arrival, so it keeps its place
-and what it recorded, and the waiter takes the freed slot. Never another urgent run or a push check (their
-priority slots are no cap slots); a holder whose label does not say it can be asked (an older ttp) is skipped.
+With those held too, an urgent waiter that has waited preempt_after_s() since its arrival asks, once per request
+(PREEMPT_ASKED_ENV, kept over a re-execution), one routine run on a cap slot to step back (preempt): its own
+project's first, then the least urgent, then the latest granted (it loses the least work). It ends its command,
+lets its slots go and queues again at its old arrival, so it keeps its place and what it recorded (in a pinned
+run, only passes on the pinned commit), and the waiter takes the freed slot; its log and its queue entry say
+`preempted by urgent #<task>` (PREEMPTED_ENV, label()). Never another urgent run or a push check (their priority
+slots are no cap slots), nor a run behind a lock (a wrapper lock, `ttp lock`, `ttp devq`: preemptible()); a
+holder whose label does not say it can be asked (an older ttp) is skipped. A routine run whose task turns urgent
+while it waits sees it within RERANK_S (reranked) and re-executes as an urgent run (cli._checks_reexec).
 
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
@@ -147,6 +152,12 @@ STARVE_ENV = "TTP_CHECKS_STARVE_S"
 URGENT = "checks-urgent"   # check-slots/checks-urgent.<n>.lock: the reserved urgent slots beyond the cap (urgent_paths)
 URGENT_SLOTS = 1   # default checks.urgent_slots: urgent runs at once above the cap
 URGENT_SLOTS_ENV = "TTP_CHECKS_URGENT_SLOTS"
+PREEMPT_AFTER_S = 120.0   # default checks.preempt_after_s: an urgent waiter's grace before it asks a routine run
+PREEMPT_AFTER_ENV = "TTP_CHECKS_PREEMPT_AFTER_S"
+PREEMPT_ASKED_ENV = "TTP_CHECKS_PREEMPT_ASKED"   # this urgent request asked already (kept over a re-execution)
+PREEMPTED_ENV = "TTP_CHECKS_PREEMPTED"   # this routine run was preempted: "urgent #<task>" (label())
+RERANK_ENV = "TTP_CHECKS_RERANKED"   # these waiting checks re-executed once as urgent (reranked)
+RERANK_S = 30.0   # a waiting routine run reads its task's priority again at most this often (reranked)
 
 
 def slot_dir() -> Path:
@@ -353,6 +364,48 @@ def urgent_slots() -> int:
         if v not in (None, "") and (n := _number(v)) is not None:
             return n
     return URGENT_SLOTS
+
+
+def preempt_after_s() -> float:
+    """Seconds an urgent waiter waits from its arrival before it asks a routine run for its slot (preempt):
+    TTP_CHECKS_PREEMPT_AFTER_S, else the account's checks.preempt_after_s, else PREEMPT_AFTER_S. 0 asks at once;
+    an unreadable or negative value is the default."""
+    for v in (os.environ.get(PREEMPT_AFTER_ENV), (project.load_account_settings().get("checks") or {}).get("preempt_after_s")):
+        if v not in (None, ""):
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                continue
+            if 0 <= f < math.inf:
+                return f
+    return PREEMPT_AFTER_S
+
+
+_LOCKING = re.compile(r"(^|[\s;&|(])(ttp\s+(lock|devq)|flock)\b")
+
+
+def preemptible(cmds, lock: str = "") -> bool:
+    """Whether a routine run of `cmds` may be asked for its slot (preempt): never one behind a wrapper lock
+    (`lock`, checks.wrap_cmd) or whose commands take a lock or a device queue themselves (`ttp lock`, `ttp devq`,
+    `flock`): stopping it could leave a device or machine mid-step."""
+    return not lock and not any(_LOCKING.search(str(c)) for c in cmds or [])
+
+
+_RERANK: dict = {"at": 0.0}
+
+
+def reranked(p, prio: int | None, now: float | None = None) -> int | None:
+    """The task's priority read again (task_rank), at most every RERANK_S: the new one once the task of these
+    waiting routine checks (`prio`) turned urgent, else None. Once per run (RERANK_ENV): its re-execution reads
+    the new priority at its start."""
+    if p is None or is_urgent(prio) or os.environ.get(RERANK_ENV):
+        return None
+    now = time.time() if now is None else now
+    if now - _RERANK["at"] < RERANK_S:
+        return None
+    _RERANK["at"] = now
+    new = task_rank(p)[0]
+    return new if is_urgent(new) else None
 
 
 def urgent_paths() -> list[Path]:
@@ -576,6 +629,11 @@ class Upgraded(Exception):
     version): it lets go of what it holds and re-executes itself with it (cli._checks_reexec)."""
 
 
+class Reranked(Upgraded):
+    """A waiting detached routine `ttp checks` whose task turned urgent (reranked; the message is its new
+    priority): it re-executes as Upgraded does, with the same runtime, and queues again as an urgent run."""
+
+
 _SEEN: dict = {}   # upgraded(): the installed version it last saw differ, and since when
 
 
@@ -604,6 +662,8 @@ def label(project_name: str | None, what: str = "") -> str:
     """Who holds or waits for a slot, as status lines show it: the project and the task's run."""
     task, run = os.environ.get("TTP_TASK"), os.environ.get("TTP_RUN_ID")
     who = f"{project_name or 'no project'}" + (f" task #{task} (run {run or '?'})" if task else "")
+    if by := os.environ.get(PREEMPTED_ENV):
+        who += f" [preempted by {by}]"
     return who + (f" {what}" if what else "")
 
 
@@ -844,9 +904,9 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     checks run now; with none free it asks the lowest-priority preemptible routine run on a slot of the cap
     to give its slot up (preempt), once a wait, and then takes the first one that frees, in turn or not.
     `preemptible`: the caller stops its checks when asked (preempted), so its slot's label says it may be
-    asked; Slot.since is when it was granted."""
+    asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`."""
     n = limit()
-    label = {"priority": priority, **({"preemptible": True} if preemptible else {})}
+    label = {"priority": priority, "checks_project": project_name, **({"preemptible": True} if preemptible else {})}
     if not n or os.environ.get(HELD_ENV):
         return Slot()
     since = time.time() if since is None else since
@@ -873,7 +933,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             parks(True)
     except OSError as e:
         raise _unavailable(e) from e
-    started, told, checked, parked_told, asked = time.time(), 0.0, time.time(), parked, ""
+    started, told, checked, parked_told = time.time(), 0.0, time.time(), parked
+    asked = _asked(since)   # one request asks once, over a re-execution too
     try:
         while True:
             if done and ((ticket is None and not parked) or time.time() - checked >= DONE_S):
@@ -919,8 +980,10 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
             if not f and asked and not twin and not parked:   # the slot a preempted run gave up is this run's
                 f = _take(n, paths(n), every, holder, what, same, label=label)
-            if not f and not asked and not twin and urgent and is_urgent(priority):
-                if asked := preempt(holder, every):
+            if (not f and not asked and not twin and urgent and is_urgent(priority)
+                    and time.time() - since >= preempt_after_s()):
+                if asked := preempt(holder, every, project_name):
+                    os.environ[PREEMPT_ASKED_ENV] = json.dumps({"since": since, "asked": asked})
                     if tell:
                         tell(PREEMPT_LINE.format(asked))
             if f:
@@ -976,7 +1039,7 @@ def _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, la
 
 PREEMPT = "preempt"
 PREEMPT_LINE = ("urgent checks with every host-wide checks slot busy and no urgent slot free: asked {} to give up "
-                "its slot and queue again at its place")
+                "its slot and queue again at its place (checks.preempt_after_s)")
 
 
 class Preempted(BaseException):
@@ -989,11 +1052,12 @@ def _preempt_path(pid: int) -> Path:
     return slot_dir() / f"{PREEMPT}.{pid}.json"
 
 
-def preempt(by: str, every: list[Path]) -> str:
-    """Ask the lowest-priority routine run holding a slot of the cap (`every`) to give it up: no priority
-    first, then the highest number, the latest granted among equals (it loses the least work). Only a
-    holder whose label says it can be asked (acquire's `preemptible`), never an urgent run (is_urgent) or
-    a reserved slot's; push checks hold priority slots, never these. Returns the holder asked, or ""."""
+def preempt(by: str, every: list[Path], project_name: str | None = None) -> str:
+    """Ask one routine run holding a slot of the cap (`every`) to give it up: a run of the asker's project
+    (`project_name`) first, then the lowest priority (none first, then the highest number), the latest granted
+    among equals (it loses the least work). Only a holder whose label says it can be asked (acquire's
+    `preemptible`), never an urgent run (is_urgent) or a reserved slot's; push checks hold priority slots,
+    never these. Returns the holder asked, or ""."""
     best, rank = None, None
     for path in every:
         if not locks.held_labels([path]):
@@ -1008,27 +1072,40 @@ def preempt(by: str, every: list[Path]) -> str:
         if pid <= 0:
             continue
         prio = h.get("priority")
-        r = (prio is None, prio if isinstance(prio, int) else 0, float(h.get("since") or 0))
+        r = (bool(project_name) and h.get("checks_project") == project_name, prio is None,
+             prio if isinstance(prio, int) else 0, float(h.get("since") or 0))
         if rank is None or r > rank:
             best, rank = (pid, str(h.get("holder") or pid)), r
     if best is None:
         return ""
     try:
-        _preempt_path(best[0]).write_text(json.dumps({"by": by, "at": time.time()}))
+        _preempt_path(best[0]).write_text(json.dumps({"by": by, "task": os.environ.get("TTP_TASK") or "",
+                                                      "at": time.time()}))
     except OSError:
         return ""
     return best[1]
 
 
+def _asked(since: float) -> str:
+    """The holder the request arriving at `since` asked already (PREEMPT_ASKED_ENV), or ""."""
+    try:
+        got = json.loads(os.environ.get(PREEMPT_ASKED_ENV) or "{}")
+    except ValueError:
+        return ""
+    return str(got.get("asked") or "") if isinstance(got, dict) and got.get("since") == since else ""
+
+
 def preempted(since: float) -> str:
-    """Who asked this process's checks to give up their slot (preempt), granted at `since`, or ""."""
+    """Who asked this process's checks to give up their slot (preempt), granted at `since`, or "":
+    "urgent #<task>" when the asker ran for a task, else "urgent <its holder>"."""
     try:
         req = json.loads(_preempt_path(os.getpid()).read_text() or "{}")
     except (OSError, ValueError):
         return ""
     if not isinstance(req, dict) or float(req.get("at") or 0) < since:
         return ""
-    return str(req.get("by") or "an urgent run")
+    task = str(req.get("task") or "")
+    return f"urgent #{task}" if task.isdigit() else f"urgent {req.get('by') or 'run'}"
 
 
 def clear_preempt() -> None:
