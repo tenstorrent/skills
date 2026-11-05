@@ -16,7 +16,9 @@ rerun that selected none or not all of the ids) keeps the failure. A rerun that 
 checks.wrap_cmd lock or queue gave it no slot, an admission timeout) ran nothing: it is retried on the
 same host after a backoff (checks.judge_busy_tries, default 3; checks.judge_busy_wait_s, default 600 s in
 all). Still busy, its ids are `busy`: neither new nor excused, so the checks run ends neither passed nor
-failed (exit 75, run it again later), never as a failure of the head. A base result saved earlier (BASE_FILE) counts only when it ran on this same host for the
+failed (exit 75, run it again later), never as a failure of the head. A remote check's reruns (a spill
+host's included) run on its own host, the select plugin shipped there with each copy (remotecheck); a
+host fault there (exit 75 too) is busy alike. A base result saved earlier (BASE_FILE) counts only when it ran on this same host for the
 same base commit. A failing id in the active quarantine is excused without a rerun unless the change
 touches its file.
 

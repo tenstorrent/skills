@@ -5132,12 +5132,15 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
                   top: str, out, log, run_check, tmp_base) -> dict | None:
     """A failed check's failing tests rerun at once on this host (gatejudge): on the head, then those
     failing again on the merge base with `base`. The verdict when none of them is new on the head (each
-    pre-existing, flaky or quarantined), else None: the failure stands. Never for a release check
-    (`--release`), a harness run, a remote check or a command that is not one plain pytest run."""
+    pre-existing, flaky or quarantined), else None: the failure stands. A remote check (a spill host's
+    included) reruns on its own host, each rerun a copy of the commit there with the select plugin
+    shipped along (remotecheck), and its base results are that host's. Never for a release check
+    (`--release`), a harness run, a Slurm batch check or a command that is not one plain pytest run."""
     from . import cleantree, gatejudge, push, pushpass, pushq, worktree
     if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate") \
-            or push.remote_host(c) or not pushpass.resumable(c):
+            or getattr(c, "slurm", None) or not pushpass.resumable(c):
         return None
+    remote = push.remote_host(c)
     cfg = p.config()
     ids = gatejudge.judgeable(rc, output, cfg)
     if not ids:
@@ -5153,22 +5156,25 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         f = i.partition("::")[0]
         return changed is None or any(x == f or x.endswith("/" + f) for x in changed)
 
-    said = "the failing test(s) rerun at once on this host, on the head and then on the base: " + " ".join(ids)
+    said = (f"the failing test(s) rerun at once on {remote or 'this host'}, on the head and then on the base: "
+            + " ".join(ids))
     print(f"ttp checks: {said}", flush=True)
     out.write(f"ttp checks: {said}\n")
 
     def run(at: str, sel: list[str]):
-        sha, where, tree = (head, cwd, None) if at == "head" else (mb, "", None)
+        sha, tree = head if at == "head" else mb, None
+        where = cwd if at == "head" or remote else ""   # a remote rerun copies `sha` there from this checkout
         try:
-            if at == "base":
+            if at == "base" and not remote:
                 tree = cleantree.Checkout(top, sha, tmp_base)
                 worktree.prepare(p, tree.path)
                 where = str(tree.path)
-            e = {**env, "PWD": where, **gatejudge.select_env(sel, env)}
-            out.write(f"$ {c} (rerun on the {at} {sha[:12]} of: {' '.join(sel)})\n")
+            pick = gatejudge.select_env(sel, env)
+            e, cc = {**env, "PWD": where, **pick}, _remote_select(c, pick) if remote else c
+            out.write(f"$ {c} (rerun on the {at} {sha[:12]} of: {' '.join(sel)}){push.where(c)}\n")
             out.flush()
             start = out.tell()
-            got = run_check(push.check_argv(c, where, e, commit=sha), where, e, s["rerun_s"])
+            got = run_check(push.check_argv(cc, where, e, commit=sha), where, e, s["rerun_s"])
             return got, _log_since(out, log, start)
         except (subprocess.TimeoutExpired, cleantree.Error, OSError, subprocess.SubprocessError) as err:
             out.write(f"ttp checks: the rerun on the {at} could not tell: {err}\n")
@@ -5178,7 +5184,8 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
                 tree.close()
     now = time.time()
     v = {"check": str(c), "head": head,
-         **gatejudge.judge(ids, run, p.state, mb, gatejudge.host(), now, touched, s["busy_tries"], s["busy_wait_s"])}
+         **gatejudge.judge(ids, run, p.state, mb, remote or gatejudge.host(), now, touched, s["busy_tries"],
+                           s["busy_wait_s"])}
     for line in gatejudge.lines(v):
         print(f"ttp checks: {line}", flush=True)
         out.write(f"ttp checks: {line}\n")
@@ -5188,6 +5195,23 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         if new:   # one fix note per newly quarantined test
             pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c)), queued=True)
     return None if gatejudge.blocks(v) else v   # undecided (gatejudge.undecided): the caller stops at exit 75
+
+
+def _remote_select(c, pick: dict):
+    """Remote check `c` set to run only what select env `pick` (pushpass.select_env) selects on its host:
+    the select plugin shipped there (remotecheck), loaded by -p after the check's own PYTEST_ADDOPTS
+    (else the host's), with the selection exported as given."""
+    from . import push, pushpass
+    c2 = push.Check(str(c))
+    if isinstance(c, push.Check):
+        c2.__dict__.update(c.__dict__)
+    own = dict(getattr(c, "env", ()) or ())
+    opts = own.get("PYTEST_ADDOPTS", "${PYTEST_ADDOPTS}")
+    own["PYTEST_ADDOPTS"] = f"{opts} -p {pushpass.SELECT_PLUGIN}".lstrip()
+    c2.env = tuple(sorted(own.items()))
+    c2.ship_py = (str(pushpass.PLUGIN_DIR / f"{pushpass.SELECT_PLUGIN}.py"),)
+    c2.literal_env = tuple(sorted((k, v) for k, v in pick.items() if k not in ("PYTHONPATH", "PYTEST_ADDOPTS")))
+    return c2
 
 
 def _log_since(out, log, start: int) -> str:

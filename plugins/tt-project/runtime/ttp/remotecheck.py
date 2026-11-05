@@ -17,7 +17,9 @@ project's, a shared or another project's pause; nothing reaches it over ssh): th
 exit FAULT_RC is reported as 1, so it never reads as a fault. A check spilled with a remote wrapper
 (--wrap: push.spill_to) runs behind it there; a wrapper missing or not executable on the host (a
 relative path in the copy of the commit, else a name on the host's PATH) is a fault too: the check
-never runs unwrapped.
+never runs unwrapped. `--py` files (the tests gate's select plugin, cli._remote_select) are written into the
+run folder's .git, out of the tree the check sees, and put first on PYTHONPATH; `--literal` variables are
+exported as given, never expanded there.
 
 `host` is an ssh alias (a machines-list alias is one): `ssh <host>` must reach it without a prompt."""
 from __future__ import annotations
@@ -33,6 +35,7 @@ import sys
 from pathlib import Path
 
 FAULT_RC = 75
+SHIP_DIR = ".git/ttp-py"   # where shipped Python files go in the run folder: never in the tree the check sees
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
 LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_host is set
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
@@ -65,12 +68,16 @@ def env_problem(v) -> str:
     return ""
 
 
-def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: tuple[str, ...] = ()) -> list[str]:
+def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: tuple[str, ...] = (),
+         py: tuple[str, ...] = (), literal: dict | None = None) -> list[str]:
     """The local command that runs check `cmd` on `host` (main): on `commit` when given (the commit a
-    `ttp checks` run records), else on the checkout's HEAD; behind `wrap` there when given."""
+    `ttp checks` run records), else on the checkout's HEAD; behind `wrap` there when given. `py`: local
+    Python files copied there onto PYTHONPATH (shipped); `literal`: variables exported as given, unexpanded."""
     return [sys.executable, "-c", _BOOT, str(Path(__file__).resolve().parents[1]), "--host", host,
             "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []),
-            *(["--wrap", json.dumps(list(wrap))] if wrap else []), "--", cmd]
+            *(["--wrap", json.dumps(list(wrap))] if wrap else []),
+            *(["--py", json.dumps(list(py))] if py else []),
+            *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []), "--", cmd]
 
 
 def _ssh(host: str, script: str) -> list[str]:
@@ -142,6 +149,20 @@ def exports(env: dict) -> str:
     return "".join(f'export {k}="' + re.sub(r'([\\"`])', r"\\\1", v) + '"\n' for k, v in sorted(env.items()))
 
 
+def shipped(files: list[str], literal: dict) -> str:
+    """The host's lines, after the check's exports, that write `files` (local paths) into the run folder's
+    .git/ttp-py (out of the tree the check sees) and put it first on PYTHONPATH, then export `literal`
+    as given. OSError when a file cannot be read."""
+    out = ""
+    if files:
+        out = f"mkdir -p {SHIP_DIR}\n"
+        for f in files:
+            text, end = Path(f).read_text(), f"TTP_PY_{secrets.token_hex(8)}"
+            out += f"cat > {SHIP_DIR}/{shlex.quote(Path(f).name)} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
+        out += f'export PYTHONPATH="$PWD/{SHIP_DIR}${{PYTHONPATH:+:$PYTHONPATH}}"\n'
+    return out + "".join(f"export {k}={shlex.quote(v)}\n" for k, v in sorted(literal.items()))
+
+
 def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...] = ()) -> str:
     """The host's side of a check run in directory `q`: the command in a process group of its own
     (setsid, else perl's setpgrp), with stdin from /dev/null and Ctrl-C and quit at their default, and a watcher that stops that group (TERM,
@@ -194,7 +215,7 @@ def _stop(_sig, _frame) -> None:
 
 
 def main(args: list[str]) -> int:
-    host, env, commit, wrap = "", {}, "", ()
+    host, env, commit, wrap, py, literal = "", {}, "", (), [], {}
     while args and args[0] != "--":
         flag, value, args = args[0], args[1] if len(args) > 1 else "", args[2:]
         if flag == "--host":
@@ -205,9 +226,19 @@ def main(args: list[str]) -> int:
             commit = value
         elif flag == "--wrap":
             wrap = tuple(str(w) for w in json.loads(value or "[]"))
+        elif flag == "--py":
+            py = [str(f) for f in json.loads(value or "[]")]
+        elif flag == "--literal":
+            literal = json.loads(value or "{}")
     cmd = " ".join(args[1:])
-    if host_problem(host) or host == LOCAL or env_problem(env) or not cmd:
-        _say(f"usage: --host <ssh alias> [--env <json>] -- <command> ({host_problem(host) or env_problem(env)})")
+    if host_problem(host) or host == LOCAL or env_problem(env) or env_problem(literal) or not cmd:
+        _say(f"usage: --host <ssh alias> [--env <json>] -- <command> "
+             f"({host_problem(host) or env_problem(env) or env_problem(literal)})")
+        return 2
+    try:
+        extra = shipped(py, literal)
+    except OSError as e:
+        _say(f"cannot read a file to copy there: {e}")
         return 2
     # A paused host may be lent to others: no ssh to it until the pause lifts.
     if why := paused(host):
@@ -257,7 +288,7 @@ def main(args: list[str]) -> int:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
         mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
-        script = _run_script(q, exports(env), cmd, mark, wrap)
+        script = _run_script(q, exports(env) + extra, cmd, mark, wrap)
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
         proc = subprocess.Popen(_ssh(host, script), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)

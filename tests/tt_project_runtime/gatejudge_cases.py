@@ -382,3 +382,48 @@ def test_gate_judge_busy_reruns_and_their_backoff_are_pool_wait_of_the_push_chec
     results["head"] = [(75, ""), fail]
     gatejudge.rerun(run, "head", [i], sleep=sleep)   # outside a push check: records nothing, still retries
     assert not results["head"]
+
+
+def _busy_base_repo(env, tmp_path, monkeypatch, busy_runs: int):
+    # test_pre fails on base and head; the base checkout's pytest exits 75 (no free slot) for its first
+    # `busy_runs` runs, as a test pool's admission timeout does, then runs.
+    count = tmp_path / "base-runs"
+    body = (f"import os\nimport pathlib\n\nif (pathlib.Path(__file__).parent.parent / 'b.txt').read_text() == 'base\\n':\n"
+            f"    C = pathlib.Path({str(count)!r})\n    n = len(C.read_text()) if C.exists() else 0\n"
+            f"    C.write_text('x' * (n + 1))\n    if n < {busy_runs}:\n"
+            f"        print('admission timeout: no free slot', flush=True)\n        os._exit(75)\n\n\n" + _PRE)
+    p, run = _gate_repo(env, tmp_path, monkeypatch, body, body + "\n\ndef helper():\n    return 1\n")
+    p.set_config("checks.judge_busy_wait_s", 0.01)
+    return p, run, count
+
+
+def test_ttp_checks_retries_a_busy_base_rerun_then_lets_a_failure_on_base_and_head_land(env, tmp_path, monkeypatch, capsys):
+    # The base rerun exits 75 once, is retried on the same host and then judged: pre-existing, not new and
+    # not undecided, so the change lands (landing only).
+    from ttp import cli
+    p, run, count = _busy_base_repo(env, tmp_path, monkeypatch, 1)
+    cli.main(["checks", "--", _FAIL])
+    out = capsys.readouterr().out
+    assert len(count.read_text()) == 2, "the busy base rerun ran again"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] and rec["landing_only"] and "infra_fault" not in rec, out
+    assert rec["excused"][0]["pre_existing"] == ["tests/test_gate.py::test_pre"] and not rec["excused"][0]["busy"]
+
+
+def test_ttp_checks_a_base_rerun_still_busy_after_its_retries_exits_75_never_a_head_failure(
+        env, tmp_path, monkeypatch, capsys):
+    # Busy on every try (checks.judge_busy_tries bounds them): no verdict, so the run ends exit 75 with
+    # infra_fault gate-rerun-busy, never 1 and never a pass.
+    from ttp import cli, gatejudge
+    p, run, count = _busy_base_repo(env, tmp_path, monkeypatch, 99)
+    monkeypatch.setattr(gatejudge, "BUSY_FIRST_S", 0.01)
+    p.set_config("checks.judge_busy_wait_s", 5)
+    p.set_config("checks.judge_busy_tries", 2)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _FAIL])
+    out = capsys.readouterr()
+    assert e.value.code == 75, out
+    assert len(count.read_text()) == 3, "one run and its 2 retries"
+    rec = json.loads((run / "checks.json").read_text())
+    assert not rec["passed"] and rec["infra_fault"] == "gate-rerun-busy", rec
+    assert "new on this head" not in out.out + out.err

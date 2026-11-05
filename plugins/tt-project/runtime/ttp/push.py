@@ -574,7 +574,8 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     if slurm := getattr(cmd, "slurm", None):   # the account's Slurm overflow: one batch job (slurmcheck)
         return slurmcheck.argv(str(cmd), slurm, exports, commit, getattr(cmd, "time_min", 0))
     if host := remote_host(cmd):
-        return remotecheck.argv(str(cmd), host, exports, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()))
+        return remotecheck.argv(str(cmd), host, exports, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()),
+                                tuple(getattr(cmd, "ship_py", ()) or ()), dict(getattr(cmd, "literal_env", ()) or ()))
     cmd = venv_cmd(cmd, top, env) if top else cmd
     cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")

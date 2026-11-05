@@ -1788,3 +1788,117 @@ def test_a_run_behind_a_spill_wrapper_never_overflows_to_slurm(env, tmp_path, mo
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     assert not (d / "sbatch.log").exists() and "/ttp-check." not in log.read_text()
+
+
+def test_a_remote_check_ships_python_files_out_of_its_tree_and_exports_literals_unexpanded(tmp_path):
+    """--py files land on the host's PYTHONPATH in the run folder's .git (the copy's tree and status stay
+    the commit's), ahead of a PYTHONPATH the check's env sets; --literal values export as given, never
+    expanded or split by the remote shell; a file that cannot be read copies nothing (exit 2)."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    mod = tmp_path / "ttp_ship_probe.py"
+    mod.write_text("WORD = 'shipped'\nEND = 'TTP_PY_x'\n")
+    seen = tmp_path / "seen"
+    seen.mkdir()
+    cmd = (f"python3 -c 'import ttp_ship_probe as m; print(m.WORD)' > {seen}/mod; git status --porcelain > {seen}/status; "
+           f"printf %s \"$PYTHONPATH\" > {seen}/pp; printf %s \"$SEL\" > {seen}/sel")
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote)}
+    odd = "^(?:a|b)$ `x` \"q\" 'z' $HOME\nline2"
+    argv = remotecheck.argv(cmd, "box1", {"PYTHONPATH": "/own"}, py=(str(mod),), literal={"SEL": odd})
+    r = subprocess.run(argv, cwd=repo, env=penv, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert (seen / "mod").read_text().strip() == "shipped"
+    assert (seen / "status").read_text() == "", "the shipped file is not in the tree the check sees"
+    pp = (seen / "pp").read_text()
+    assert pp.endswith(f"/{remotecheck.SHIP_DIR}:/own") and "/ttp-check." in pp, pp
+    assert (seen / "sel").read_text() == odd
+    assert _rc_left(tmp_path) == []
+    gone = remotecheck.argv("true", "box1", py=(str(tmp_path / "missing.py"),))
+    r = subprocess.run(gone, cwd=repo, env=penv, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 2 and "cannot read" in r.stdout + r.stderr
+    bad = remotecheck.argv("true", "box1", literal={"1x": "v"})
+    assert subprocess.run(bad, cwd=repo, env=penv, capture_output=True, text=True, timeout=60).returncode == 2
+
+
+_GATE_PRE = "def test_ok():\n    pass\n\n\ndef test_pre():\n    assert False\n"
+_GATE_FAIL = "python3 -m pytest -p no:cacheprovider tests/"
+
+
+def _spill_gate(env, tmp_path, monkeypatch, base_body, head_body):
+    """A spill setup whose base commit has tests/test_gate.py with `base_body` and whose head has `head_body`,
+    checked by one plain pytest run: (project, repo, run dir)."""
+    from ttp import cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_gate.py").write_text(base_body)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "base"], check=True)
+    base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (repo / "tests" / "test_gate.py").write_text(head_body)
+    subprocess.run([*git, "commit", "-qam", "head"], check=True)
+    monkeypatch.setattr(cli, "_checks_base", lambda *a: base)
+    p.set_config("delivery.push_checks", [_GATE_FAIL])
+    return p, repo, run
+
+
+def test_a_spilled_failure_on_base_and_head_is_judged_on_the_spill_host_and_lands_without_a_rerun_here(
+        env, tmp_path, monkeypatch):
+    """Follow-up of the spill hosts' tests gate: a spilled pytest check whose failing test also fails on the
+    base reruns only that test on the spill host (the select plugin shipped there), on the head and the
+    base, and the change lands (landing only) without running the checks again here; the base result is
+    saved under the spill host's name. A failure new on the head still runs again here, as before."""
+    import threading
+    from ttp import cli, gatejudge
+    marks = tmp_path / "where.log"
+    # Each pytest run (a rerun included) records where it ran and which tests it kept.
+    conftest = (f"import os\n\n\ndef pytest_collection_finish(session):\n"
+                f"    with open({str(marks)!r}, 'a') as f:\n"
+                f"        f.write(os.getcwd() + ' ' + ','.join(i.name for i in session.items) + '\\n')\n")
+    p, repo, run = _spill_gate(env, tmp_path, monkeypatch, _GATE_PRE, _GATE_PRE + "\n\ndef helper():\n    return 1\n")
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "conftest.py").write_text(conftest)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "conftest"], check=True)
+    base = subprocess.run([*git, "rev-parse", "HEAD~2"], capture_output=True, text=True).stdout.strip()
+    monkeypatch.setattr(cli, "_checks_base", lambda *a: base)
+    lane = _spill_lane(p, repo)
+    late = threading.Timer(30.0, lane.close)
+    late.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        late.cancel()
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    text = (run / "checks.log").read_text()
+    assert rec["passed"] and rec.get("landing_only") and rec.get("spilled_to") == "check-host-a", (rec, text)
+    assert rec["excused"][0]["pre_existing"] == ["tests/test_gate.py::test_pre"], rec
+    assert rec["excused"][0]["host"] == "check-host-a", rec
+    assert "did not pass on spill host" not in text, "no rerun here"
+    runs = [line.split(" ", 1) for line in marks.read_text().splitlines()]
+    assert all("/ttp-check." in where for where, _ in runs), runs
+    assert [kept for _, kept in runs][1:] == ["test_pre"], ("the head rerun ran only the failing test", runs, text)
+    # The base (no conftest there) ran on the spill host too: its saved result is that host's.
+    assert gatejudge.saved_base(p.state, "check-host-a", base, ["tests/test_gate.py::test_pre"], time.time())
+    assert not gatejudge.saved_base(p.state, gatejudge.host(), base, ["tests/test_gate.py::test_pre"], time.time())
+
+
+def test_a_spilled_failure_new_on_the_head_is_judged_new_there_and_still_runs_again_here(env, tmp_path, monkeypatch):
+    """The spill host's gate finds a failure new on the head (it passes on the base there): no excuse, so the
+    checks run again here as before, and that result fails the change."""
+    import threading
+    from ttp import cli
+    base = "def test_ok():\n    pass\n\n\ndef test_x():\n    pass\n"
+    p, repo, run = _spill_gate(env, tmp_path, monkeypatch, base,
+                               base.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
+    lane = _spill_lane(p, repo)
+    threading.Timer(2.0, lane.close).start()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh"])
+    assert e.value.code == 1
+    text = (run / "checks.log").read_text()
+    assert "rerun at once on check-host-a" in text and "new on this head" in text, text
+    assert "did not pass on spill host check-host-a" in text, text
+    assert not json.loads((run / "checks.json").read_text())["passed"]
