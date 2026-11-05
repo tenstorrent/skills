@@ -424,7 +424,9 @@ prolonged whole-box outage.
   20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
   backstop. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
-  line naming the sections left out. A new session, a daemon restart, a stateless, failed or
+  line naming the sections left out. Open tasks goes row by row: only its new and changed rows (an age
+  or read time alone is no change), and a line counting the rest and naming the tasks no longer open.
+  A new session, a daemon restart, a stateless, failed or
   compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
   digest on the next wake.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only

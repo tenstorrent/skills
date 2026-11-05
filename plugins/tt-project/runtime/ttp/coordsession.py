@@ -44,7 +44,14 @@ KEY (DIGEST), so they are on disk. The whole digest, the turn's one build withou
 collapsing (coordinator.COLLAPSIBLE, rendered beside the collapsed parts), goes to a new session (a rollover), and to a resumed one whenever the
 saved hashes may not match what it saw: none saved, a stateless turn or a failed or compacted wake
 since, another turn's digest since (the collapse baseline moved), a daemon restart, or the session
-asked for it with the action {"type": "noop", "key": FULL_ASK}."""
+asked for it with the action {"type": "noop", "key": FULL_ASK}.
+
+The Open tasks section (ROWS) is compared row by row, each without its ages and read times (TICKS),
+against the row hashes the acknowledged wake saved: a changed section sends its header, a line naming
+how many rows are as last shown and the tasks no longer open, then only the new and changed rows, each
+whole with its current age (the whole section when that is shorter). An unchanged row is not resent;
+one whose only change is its age counts as unchanged. An acknowledged digest without row hashes sends
+the section whole."""
 from __future__ import annotations
 
 import hashlib
@@ -68,11 +75,17 @@ CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the 
 NOTE_DIR = "coord-session"
 # The agents whose coordinator turns may resume one session (the fake stands in for Claude in tests).
 PROVIDERS = ("claude", "fake")
-DIGEST = "digest"   # in KEY: {"sections": {key: [hash, label]}, "seen": collapse baseline, "gen": daemon start}
+DIGEST = "digest"   # in KEY: {"sections": {key: [hash, label]}, "rows": {row key: hash}, "seen": collapse baseline,
+#                     "gen": daemon start}
 FULL_ASK = "full_digest"
 ALWAYS = ("events",)   # digest sections every wake sends
 HEAD = "budget"        # its first line is the STATE time header, sent every wake; the rest is hashed
 DELTA = "session_delta"
+ROWS = "tasks"         # the Open tasks section (coordinator.digest_parts): sent row by row
+# Ages and read times, left out of what is hashed of a row (coordinator.collapse_rows uses the same rule).
+TICKS = re.compile(r"\b\d+(?:\.\d+)?\s?(?:h|min|m|s)\b")
+_READ_RE = re.compile(r"\(read [^()]*\)")
+_TASK_RE = re.compile(r"- #(\d+) \| ")
 
 
 def mode_of(value) -> str:
@@ -247,14 +260,55 @@ def _label(text: str) -> str:
     return re.split(r"[:(]", first)[0].strip()[:60] or "?"
 
 
+def _unticked(text: str) -> str:
+    return _READ_RE.sub("(read)", TICKS.sub("", text))
+
+
 def _body(key: str, text: str) -> str:
-    """What is hashed of a section: HEAD without its time header line."""
-    return (text.split("\n", 1)[1] if "\n" in text else "") if key == HEAD else text
+    """What is hashed of a section: HEAD without its time header line, ROWS without ages."""
+    if key == HEAD:
+        return text.split("\n", 1)[1] if "\n" in text else ""
+    return _unticked(text) if key == ROWS else text
 
 
 def sections(parts: list[tuple[str, str]]) -> dict:
     """{key: [hash, label]} of a digest's (section, text) parts."""
     return {k: [_sha(_body(k, t)), _label(_body(k, t) or t)] for k, t in _keyed(parts)}
+
+
+def _row_keys(text: str) -> list[tuple[str, str]]:
+    """The ROWS section's (key, line) after its header: '#<task id>', or the hash of a line naming no
+    one task (a group line); a repeated key numbered."""
+    out, count = [], {}
+    for ln in text.split("\n")[1:]:
+        if ln.strip():
+            m = _TASK_RE.match(ln)
+            key = f"#{m[1]}" if m else f"~{_sha(_unticked(ln))}"
+            count[key] = count.get(key, 0) + 1
+            out.append((key if count[key] == 1 else f"{key}/{count[key]}", ln))
+    return out
+
+
+def rows(parts: list[tuple[str, str]]) -> dict:
+    """{row key: hash} of the ROWS section's lines, without ages."""
+    text = next((t for k, t in parts if k == ROWS), "")
+    return {k: _sha(_unticked(ln)) for k, ln in _row_keys(text)}
+
+
+def _row_delta(text: str, before: dict) -> str:
+    """The ROWS section with only its new and changed rows, after a line naming the rest."""
+    now = _row_keys(text)
+    sent = [ln for k, ln in now if before.get(k) != _sha(_unticked(ln))]
+    keys = {k for k, _ in now}
+    grouped = " ".join(ln for k, ln in now if k.startswith("~"))
+    # A task left out of this view is gone unless a group line still names it.
+    gone = [k for k in before if k.startswith("#") and k not in keys
+            and not re.search(rf"{k.split('/')[0]}\b", grouped)]
+    other = sum(1 for k in before if k.startswith("~") and k not in keys)
+    note = (f"(only new and changed rows follow; {len(now) - len(sent)} as last shown, not repeated, their ages "
+            "grown since" + (f"; no longer open: {', '.join(gone)}" if gone else "")
+            + (f"; {other} other lines gone" if other else "") + ")")
+    return "\n".join([text.split("\n", 1)[0], note] + sent)
 
 
 def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str) -> tuple[list | None, str]:
@@ -268,18 +322,25 @@ def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str) -> tuple[
     if got.get("seen") != seen_fp:
         return None, "another turn's digest since"
     before, now = got["sections"], sections(parts)
-    sent, same = [], []
+    old_rows = got.get("rows")
+    sent, same, by_row = [], [], False
     for key, text in _keyed(parts):
         old = before.get(key)
-        if key in ALWAYS or not isinstance(old, list) or old[:1] != now[key][:1]:
+        rowed = (_row_delta(text, old_rows) if key == ROWS and isinstance(old, list) and old[:1] != now[key][:1]
+                 and isinstance(old_rows, dict) else None)
+        if rowed is not None and len(rowed) < len(text):   # else the whole section is the shorter
+            sent.append((key, rowed))
+            by_row = True
+        elif key in ALWAYS or not isinstance(old, list) or old[:1] != now[key][:1]:
             sent.append((key, text))
         else:
             same.append(now[key][1])
             if key == HEAD:
                 sent.append((key, text.split("\n", 1)[0]))
     gone = [str(v[1]) for k, v in before.items() if k not in now and isinstance(v, list) and len(v) > 1]
-    line = ("## Since your last wake in this session only the changed sections follow, each whole. "
-            f"Unchanged, not repeated: {', '.join(same) or 'none'}"
+    line = ("## Since your last wake in this session only the changed sections follow, each whole"
+            + (" (Open tasks: only its new and changed rows). " if by_row else ". ")
+            + f"Unchanged, not repeated: {', '.join(same) or 'none'}"
             + (f". Gone (now empty): {', '.join(gone)}" if gone else "")
             + f'. For the whole digest on the next wake, add the action {{"type": "noop", "key": "{FULL_ASK}"}}.')
     at = 1 if sent and sent[0][0] == HEAD else 0
@@ -296,7 +357,7 @@ def wake_digest(mode: str, state, parts: list[tuple[str, str]], full: list[tuple
     if sent is None:
         parts = list(full)
         sent, why = parts, f"full: {why}"
-    return sent, {"sections": sections(parts), "seen": shown_fp, "gen": gen}, why
+    return sent, {"sections": sections(parts), "rows": rows(parts), "seen": shown_fp, "gen": gen}, why
 
 
 def asked_full(actions) -> bool:

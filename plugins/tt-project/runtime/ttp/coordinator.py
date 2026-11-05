@@ -622,7 +622,7 @@ LEDGER_SEEN_KEY = "machine_ledger_lines"   # in digest_seen: {"lines": {key: has
 # note is read at least once per refresh cycle).
 TASK_ROWS_SEEN_KEY = "task_rows"   # in digest_seen: {"snap": snapshot time, "rows": {task id: hash}}
 ROW_TITLE_CHARS = 60
-_TICKS_RE = re.compile(r"\b\d+(?:\.\d+)?\s?(?:h|min|m|s)\b")   # ages and read times, normalised away
+_TICKS_RE = coordsession.TICKS   # ages and read times, normalised away
 LEDGER_WHOLE_CHANGES = 10   # change lines in a whole view (overdue, then the project's own); the rest counted
 LEDGER_HEAD = "## Shared machines in your Resources"
 # Sections rendered from the prompt snapshot alone: they end the cached context block (with_cached)
