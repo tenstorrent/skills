@@ -83,11 +83,14 @@ def changed_clause(old: str, new: str) -> str:
 
 def clause_words(text: str) -> set[str]:
     """The whole words a rule is about, lowercased: \\w+ words of four or more characters starting with a
-    letter, rule and filler words (coordinator._RULE_STOP) and citation words (CITE_WORDS) left out. Never
-    stemmed: a tool line matches one only as a whole word of its own."""
+    letter, and hyphenated names (_HYPHENATED: a machine alias such as box-a or tt-box-3, whose parts are
+    too short to count), rule and filler words (coordinator._RULE_STOP) and citation words (CITE_WORDS)
+    left out. Never stemmed: a tool line matches one only as a whole word of its own."""
     from .coordinator import _RULE_STOP
-    return {w for w in _TOKEN.findall(text.lower())
-            if len(w) >= 4 and w[0].isalpha() and w not in _RULE_STOP and w not in CITE_WORDS}
+    low = text.lower()
+    return {w for w in _TOKEN.findall(low) + _HYPHENATED.findall(low)
+            if len(w) >= 4 and w[0].isalpha() or "-" in w and re.search(r"[a-z]", w)
+            if w not in _RULE_STOP and w not in CITE_WORDS}
 
 
 def tool_terms(old: str, new: str, charter: str = "",
@@ -138,11 +141,15 @@ valid applicable available possible current specific general certain normal usua
 result model value status machine host node device system thing case part place time hour minute week
 work worker project task user requirement verification restoration validity application""".split())
 _TOKEN = re.compile(r"\w+")
+# Letters and digits joined by '-', bounded by neither: box-a, tt-box-3 (a date has no letter: clause_words).
+_HYPHENATED = re.compile(r"(?<![\w-])[a-z0-9]+(?:-[a-z0-9]+)+(?![\w-])")
 
 
 def _whole(w: str, low: str) -> bool:
-    """`w` is in `low` as whole words: no word character right before or after it ('rul' is never in 'rule')."""
-    return re.search(rf"(?<!\w){re.escape(w)}(?!\w)", low) is not None
+    """`w` is in `low` as whole words: no word character right before or after it ('rul' is never in 'rule'),
+    nor a '-' when `w` has one (box-a is never in my-box-a or box-a-2)."""
+    b = r"[\w-]" if "-" in w else r"\w"
+    return re.search(rf"(?<!{b}){re.escape(w)}(?!{b})", low) is not None
 
 
 def generic_stems() -> frozenset[str]:

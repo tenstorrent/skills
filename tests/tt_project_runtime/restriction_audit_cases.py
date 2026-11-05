@@ -690,3 +690,29 @@ def test_a_tool_still_naming_the_machine_or_the_clearance_condition_is_found(env
     rows = (p.harness / "schedules.json").read_text().splitlines()
     named = {n for n, x in enumerate(rows, 1) if f"schedules.json:{n} (" in t["spec"]}
     assert named == {n for n, x in enumerate(rows, 1) if "testbox1" in x}, t["spec"]
+
+
+def test_a_retired_ban_naming_a_hyphenated_alias_finds_the_lines_naming_that_alias(env):
+    """A machine named by a hyphenated alias (box-a, tt-box-3) is a whole-word term of the changed clause:
+    a schedule line naming it is found though its other words ('jobs') are common in the tool tree; a line
+    naming another alias (box-b), or the alias inside a longer one (box-a2, my-box-a), is not."""
+    from ttp import restriction_audit
+    for item in ("Never schedule device jobs on box-a while its cooling fan is replaced.",
+                 "Never schedule device jobs on `box-a` while its cooling fan is replaced."):
+        p, tasks = _box_project(env, "hold device jobs on box-a", "hold device jobs on box-b",
+                                "hold device jobs on box-a2", "hold device jobs on my-box-a")
+        (p.root / "bin").mkdir(exist_ok=True)
+        (p.root / "bin" / "queue.sh").write_text("".join(f"echo 'jobs {i} queued'\n" for i in range(40)))
+        out = restriction_audit.restriction_tools(p, [(item, "", "the fan was replaced")], [])
+        assert len(out) == 1, (item, out)
+        t = tasks()[-1]
+        rows = (p.harness / "schedules.json").read_text().splitlines()
+        named = {n for n, x in enumerate(rows, 1) if f"schedules.json:{n} (" in t["spec"]}
+        assert named == {n for n, x in enumerate(rows, 1) if "on box-a\"" in x}, (item, t["spec"])
+        assert "queue.sh" not in t["spec"], t["spec"]
+    assert "tt-box-3" in restriction_audit.clause_words("never use tt-box-3 or x86-64 today")
+    assert "x86-64" in restriction_audit.clause_words("never use x86-64")
+    assert not {"2026-10-05", "-a", "box-"} & restriction_audit.clause_words("on 2026-10-05 -a box- here")
+    assert restriction_audit.tool_hit("hold jobs on tt-box-3", set(), {"jobs", "tt-box-3"}) == ["jobs", "tt-box-3"]
+    for line in ("hold jobs on tt-box-30", "hold jobs on tt-box-3-b", "hold jobs on my-tt-box-3", "hold jobs on box-b"):
+        assert restriction_audit.tool_hit(line, set(), {"jobs", "tt-box-3", "box-a"}) == [], line
