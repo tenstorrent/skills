@@ -413,11 +413,12 @@ def test_a_light_or_chat_routed_runs_notify_is_refused_and_a_standard_runs_is_qu
         tid = p.db.add_task("t", "s", kind="review" if role == "reviewer" else "work", tier=tier, origin="user")
         rid = d.start_run(role, "go", "claude", tier, str(p.root), task=p.db.task(tid))
         (p.runs / str(rid) / "STOP").touch()
-        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+        # The child's env as the runner builds it: run.json's env over the daemon's own (runner.supervise).
+        return {**os.environ, **json.loads((p.runs / str(rid) / "run.json").read_text())["env"]}
 
     assert run_env("worker", "light")[workernotify.ENV] == "on the light tier"
     assert run_env("reviewer", "light")[workernotify.ENV] == "on the light tier"
-    assert workernotify.ENV not in run_env("worker", "standard"), "never an inherited value"
+    assert run_env("worker", "standard").get(workernotify.ENV, "").strip() == "", "never an inherited value"
     cfg = p.config()
     assert workernotify.no_post(cfg, "worker", "standard", "chat") == "routed to the chat provider"
     assert workernotify.no_post(cfg, "worker", "deep", "chat") == "routed to the chat provider"

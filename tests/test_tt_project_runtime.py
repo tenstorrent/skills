@@ -503,6 +503,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
                 "TTP_OUTLIVES_RUN", "TTP_CGROUP", "TTP_CHECK_OUTPUT_DIR", "TTP_CHECKS_TMP_FD", "TTP_PUSH_OWN_BRANCH", "TTP_DETACH_RC",
                 "TTP_CHECKS_SLOT", "TTP_CHECKS_HOST_MAX", "TTP_ROUTE_HOST_MAX", "TTP_WAITS_IDLE", "TTP_TEST_SLOTS_HELD", "TTP_TEST_POOL", "TTP_TEST_RUN_MAX",
                 "TTP_BUILD_SLOTS_HELD", "TTP_BUILD_POOL", "TTP_BUILD_RUN_MAX", "TTP_BUILD_PROJECT_MAX", "MAKEFLAGS",
+                "TTP_NO_USER_POST",   # a light-tier or chat-routed run's mark (workernotify.ENV)
                 "CMAKE_BUILD_PARALLEL_LEVEL"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")   # the checks cap never grows with this host's load
