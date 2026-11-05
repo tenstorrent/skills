@@ -194,3 +194,105 @@ def test_set_config_still_refuses_what_no_reader_reads(env, key, value, forms):
         p.set_config(key, value)
     assert f"{key} needs " in str(e.value) and forms in str(e.value), str(e.value)
     assert p.config_path.read_text() == before
+
+
+# The coordinator's config_set and the web app's /api/config follow the same rules as `ttp config`.
+
+def test_coordinator_config_set_empty_removes_a_list_or_object_key_and_its_default_applies(env):
+    """config_set '' once stored [] (provider_failover_to) or was refused (conclusion_floor); now it removes
+    the key so its default applies, and the next turn's notes say so. A key never set writes nothing."""
+    from ttp import coordinator as coord
+    from ttp.project import DEFAULT_CONFIG
+    p = make(env)
+    p.set_config("coordinator.provider_failover_to", ["codex"])
+    p.set_config("coordinator.conclusion_floor", {"tier": "deep", "effort": "high"})
+    for key in ("coordinator.provider_failover_to", "coordinator.conclusion_floor"):
+        assert coord.apply(p, [{"type": "config_set", "key": key, "value": ""}]) == [], key
+        assert key.split(".")[1] not in (p.raw_config().get("coordinator") or {}), key
+        assert p.config()["coordinator"][key.split(".")[1]] == DEFAULT_CONFIG["coordinator"][key.split(".")[1]]
+        assert any(f"config_set {key}: removed" in n for n in p.db.kv(coord.NOTES_KEY) or []), key
+    before = p.config_path.read_text()
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.provider_failover_to", "value": ""}]) == []
+    assert p.config_path.read_text() == before
+    assert any("was not set" in n for n in p.db.kv(coord.NOTES_KEY) or [])
+
+
+def test_coordinator_config_set_refuses_a_mistyped_list_or_object_value(env, monkeypatch):
+    """A value whose JSON type does not match a list or object key is refused and nothing is written, even
+    when the key's own converter lets it through; the right type still sets."""
+    from ttp import coordinator as coord
+    p = make(env)
+    monkeypatch.setitem(coord.USER_SETTABLE, "sandbox.fence_freed_commands", lambda v: v)
+    monkeypatch.setitem(coord.USER_SETTABLE, "coordinator.turn_timeouts_s", lambda v: v)
+    before = p.config_path.read_text()
+    for key, val, want in (("sandbox.fence_freed_commands", "make", "a JSON list"),
+                           ("sandbox.fence_freed_commands", 3, "a JSON list"),
+                           ("sandbox.fence_freed_commands", None, "a JSON list"),
+                           ("coordinator.turn_timeouts_s", [1], "a JSON object")):
+        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": val}], user_turn=True)
+        assert probs and f"{key} needs {want}" in probs[0] and "nothing was written" in probs[0], (key, val, probs)
+    assert p.config_path.read_text() == before
+    assert coord.apply(p, [{"type": "config_set", "key": "coordinator.turn_timeouts_s", "value": {"standard": 900}}],
+                       user_turn=True) == []
+    assert p.raw_config()["coordinator"]["turn_timeouts_s"] == {"standard": 900}
+
+
+def test_coordinator_config_set_empty_keeps_the_who_may_gates(env):
+    """Removing a user-only key outside a user turn is refused unless its default is the off side: a spend cap,
+    an on-by-default switch and the merge list stay; an off-by-default switch is removed. In a user turn the
+    spend cap is removed; the merge list is still never emptied by config_set (it only adds repos)."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.set_config("budget.daily_usd", 7.0)
+    p.set_config("budget.reset_credits_auto", False)
+    p.set_config("delivery.auto_merge_repos", ["org/repo"])
+    p.set_config("delivery.backup_remote", "backup")
+    before = p.raw_config()
+    for key in ("budget.daily_usd", "budget.reset_credits_auto", "delivery.auto_merge_repos"):
+        probs = coord.apply(p, [{"type": "config_set", "key": key, "value": ""}])
+        assert probs and f"{key} needs the user's approval" in probs[0], (key, probs)
+    assert p.raw_config() == before
+    assert coord.apply(p, [{"type": "config_set", "key": "delivery.backup_remote", "value": ""}]) == []
+    assert "backup_remote" not in (p.raw_config().get("delivery") or {})
+    assert coord.apply(p, [{"type": "config_set", "key": "budget.daily_usd", "value": ""}], user_turn=True) == []
+    assert "daily_usd" not in (p.raw_config().get("budget") or {})
+    mid = p.db.x("INSERT INTO messages(ts, direction, kind, text) VALUES (?, 'in', 'user', 'drop the merge grant')",
+                 (time.time(),))   # the user's own word: config_set still only adds repos
+    probs = coord.apply(p, [{"type": "config_set", "key": "delivery.auto_merge_repos", "value": ""}],
+                        user_turn=True, messages=[mid])
+    assert probs and "only adds repos" in probs[0], probs
+    assert p.raw_config()["delivery"]["auto_merge_repos"] == ["org/repo"]
+
+
+@needs_sockets
+def test_web_api_config_empty_removes_and_a_mistyped_value_is_refused(env):
+    """The web app's settings: '' removes the key (its default applies); a list key given another type is a
+    400 naming the expected type and writes nothing (provider_failover_to's converter once let it through)."""
+    from ttp import web
+    p = make(env)
+    port = _start_web(p)
+
+    def post(body):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/api/config", method="POST", data=json.dumps(body).encode(),
+                                     headers={"X-TTP-Token": web.token(p), "Content-Type": "application/json"})
+        for _ in range(50):
+            try:
+                with urllib.request.urlopen(req, timeout=5) as r:
+                    return r.status, json.loads(r.read())
+            except urllib.error.HTTPError as e:
+                return e.code, json.loads(e.read())
+            except OSError:
+                time.sleep(0.1)
+        raise AssertionError("the web app did not start")
+    before = p.config_path.read_text()
+    for val in (5, {"a": 1}, None):   # one string ("codex") is a plain form its reader takes (KEY_EXTRA_FORMS)
+        code, out = post({"key": "coordinator.provider_failover_to", "value": val})
+        assert code == 400 and "needs a JSON list" in out["error"], (val, code, out)
+    assert p.config_path.read_text() == before
+    p.set_config("coordinator.provider_failover_to", ["codex"])
+    p.set_config("budget.daily_usd", 7.0)
+    for key in ("coordinator.provider_failover_to", "budget.daily_usd"):
+        assert post({"key": key, "value": ""}) == (200, {"ok": True, "removed": True}), key
+    assert "provider_failover_to" not in (p.raw_config().get("coordinator") or {})
+    assert "daily_usd" not in (p.raw_config().get("budget") or {})
+    assert post({"key": "budget.daily_usd", "value": ""}) == (200, {"ok": True, "removed": False})

@@ -205,7 +205,11 @@ only in the feed and never under "needs you".
   (`budget.compact_window_tokens` and `budget.split_reread_tokens`: one non-negative number for every tier;
   `budget.resume_lost` and `waiting.wake_gate`: `false`, off; `coordinator.conclusion_floor`: a string such
   as `standard/high` or `off`; `providers_allowed`: a comma-separated string; `coordinator.provider_failover_to`
-  and `ack_wait.probe_commands`: one string). The chat's config_set and the web app check alike. `ttp spend-today [--json]` prints this machine's tt-project spend for the
+  and `ack_wait.probe_commands`: one string). The coordinator's `config_set` and the web app's
+  settings do the same: `''` removes the key and a mistyped list or object is refused, writing nothing.
+  Removing a user-only key (`config_set` outside the user's turn) is refused unless its default is the off
+  side, and `config_set` still never empties `delivery.auto_merge_repos`; chat routing keys
+  (`providers.chat.endpoint`, `providers.chat.tiers.*`) keep their own checks for `''`. `ttp spend-today [--json]` prints this machine's tt-project spend for the
   budget day by provider and account hash, and its other Claude Code sessions as estimated; it is
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.

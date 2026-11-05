@@ -152,6 +152,7 @@ from .project import (
     CORRECTION_PREFIX,
     CORRECTIONS_HEADER,
     COORDINATOR_MEMORY_CHARS,
+    DEFAULT_CONFIG,
     COORDINATOR_PINNED_WARN_SHARE,
     PINNED_MEMORY_KINDS,
     Project,
@@ -161,6 +162,7 @@ from .project import (
     own_push,
     own_push_mode,
     durable_write,
+    key_type_problem,
     pin_verify_mode,
     push_queue_number,
     push_queue_on,
@@ -3574,27 +3576,40 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "config_set":
                 key = a.get("key", "")
                 key = ALIASES.get(key, key)
-                value = settable(key)(a.get("value"))
+                conv = settable(key)
+                # '' removes a project key so its default applies (as `ttp config NAME KEY ''`), never "" stored
+                # over a list or an object; an account key keeps accountset's own handling of '', and a chat
+                # routing key (chatset) its own check, so no routed tier loses its model or endpoint.
+                remove = a.get("value") == "" and key in USER_SETTABLE and key not in accountset.KEYS
+                value = None if remove else conv(a.get("value"))
                 chatset.route_ready(cfg, key, value)
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
                                                                                     "backup_remote": value})):
                     raise ValueError(why)
-                if key == "delivery.fast_forward_also":
+                if key == "delivery.fast_forward_also" and not remove:
                     value = push.fast_forward_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
-                if key == "coordinator.provider_failover_to":
+                if key == "coordinator.provider_failover_to" and not remove:
                     value = failover.to_of(value, cfg.get("providers"))
-                if key in ("delivery.rebase_replace", "delivery.never_force") and (why := rebase_problems(
-                        {**(cfg.get("delivery") or {}), key.split(".", 1)[1]: value})):
-                    raise ValueError("; ".join(why))
-                if key == "delivery.mirror_remotes":
+                if key in ("delivery.rebase_replace", "delivery.never_force"):
+                    d = {**(cfg.get("delivery") or {}), key.split(".", 1)[1]: value}
+                    if remove:
+                        d.pop(key.split(".", 1)[1])
+                    if why := rebase_problems(d):
+                        raise ValueError("; ".join(why))
+                if key == "delivery.mirror_remotes" and not remove:
                     value = push.mirror_check(value, str((cfg.get("delivery") or {}).get("push_branch") or ""))
+                if not remove and key not in accountset.KEYS and (why := key_type_problem(key, value)):
+                    raise ValueError(why)   # a list or object key given another type: nothing written
                 # Merges and the agent-orders trust count only the user's own message of this turn (none the
                 # harness posted; for the trust, one with words of its own, never a relayer's alone).
                 said = _users_own(db, messages or []) if user_turn and key in (MERGE_KEY, relay.AGENT_KEY) else []
                 if key == relay.AGENT_KEY:
                     said = [m["id"] for m in relay.recent(db, said) if relay.split(m["text"] or "")[0]] if said else []
                 by_user = bool(said) if key in (MERGE_KEY, relay.AGENT_KEY) else user_turn
-                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and ((value == OFF_VALUE[key]) if key in OFF_VALUE else value in (False, "", []))):
+                # Removing a user-only key is safe only where its default is off (none of OFF_VALUE's keys).
+                off = (key not in OFF_VALUE and _default_of(key) in (None, False, "", [])) if remove else (
+                    (value == OFF_VALUE[key]) if key in OFF_VALUE else value in (False, "", []))
+                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and off):
                     if key in HELD_SETTING and relay.agent_orders(cfg) and messages and relay.recent(db, messages):
                         raise ValueError(relay.held_refusal(f"config_set {key}", HELD_SETTING[key], key,
                                                             "the setting name (HELD_SETTING)"))
@@ -3605,19 +3620,23 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      + "set it in the turn that carries their yes"
                                      + ("; only their word in chat grants it, never a charter line or a quote"
                                         if key == MERGE_KEY else ""))
-                before = _only_adds_repos(cfg, value) if key == MERGE_KEY else []
+                before = _only_adds_repos(cfg, [] if remove else value) if key == MERGE_KEY else []
                 own = _users_own(db, messages or []) if user_turn else []
                 if key in accountset.KEYS:   # account-level: logged with its setter and undo, a user's value kept
                     notes.append(accountset.apply(key, value, configwho.by("user", msgs=own, via="chat") if own
                                                   else configwho.by("coordinator", via="config_set")))
                     continue
-                p.set_config(key, value, by=configwho.by("user", msgs=own, via="chat") if own
-                             else configwho.by("coordinator", via="config_set"))
+                who = configwho.by("user", msgs=own, via="chat") if own else configwho.by("coordinator", via="config_set")
+                if remove:
+                    notes.append(f"config_set {key}: {'removed' if p.unset_config(key, by=who) else 'was not set'}; "
+                                 f"its default applies ({json.dumps(_default_of(key))})")
+                else:
+                    p.set_config(key, value, by=who)
                 cfg = p.config()
                 if key in (MERGE_KEY, relay.AGENT_KEY) and said:   # the audit trail: the messages that let it
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                          (time.time(), "coordinator", "config_grant", "low",
-                          f"config_set {key} {json.dumps(value)} on the user's word in message "
+                          f"config_set {key} {'removed' if remove else json.dumps(value)} on the user's word in message "
                           + ", ".join(f"#{m}" for m in said),
                           json.dumps({"key": key, "value": value, "before": before, "messages": said}), "handled"))
             elif t == "obligation":
@@ -3790,6 +3809,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     if applied is not None:
         applied[:] = [i for i in range(len(actions)) if i not in failed]
     return settle_refusals(problems, actions)
+
+
+def _default_of(key: str):
+    """The built-in default of a dotted project key (DEFAULT_CONFIG), None when it has none."""
+    node: Any = DEFAULT_CONFIG
+    for part in key.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
 
 
 def _only_adds_repos(cfg: dict, value: list[str]) -> list[str]:

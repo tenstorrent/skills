@@ -973,9 +973,15 @@ class Handler(BaseHTTPRequestHandler):
                 key = body.get("key")
                 if key not in USER_SETTABLE and key not in ALIASES:
                     return self._send(400, {"error": f"{key} not settable here"})
+                from .project import key_type_problem
+                key = ALIASES.get(key, key)
                 try:
-                    p.set_config(ALIASES.get(key, key), USER_SETTABLE[ALIASES.get(key, key)](body.get("value")),
-                                 by={"by": "user", "via": "web"})
+                    if body.get("value") == "":   # removes the key, so its default applies, as `ttp config NAME KEY ''`
+                        return self._send(200, {"ok": True, "removed": p.unset_config(key, by={"by": "user", "via": "web"})})
+                    value = USER_SETTABLE[key](body.get("value"))
+                    if why := key_type_problem(key, value):   # a list or object key given another type
+                        raise ValueError(why)
+                    p.set_config(key, value, by={"by": "user", "via": "web"})
                 except ValueError as e:
                     return self._send(400, {"error": str(e)})
                 except RuntimeError as e:   # project.json unreadable with no last good copy
