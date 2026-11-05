@@ -110,6 +110,10 @@ _VERSIONED = re.compile(r"[\w.]*[-@]v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
 _STATE = {"running", "runs", "using", "uses", "version", "versions", "release", "build", "installed", "deployed",
           "currently"}
 # A state word glued to its version (no space before it) reads as the spaced form; no other word is split.
+# A command's scaffolding around a script it names ('bash tests/x.sh --quick'): an interpreter or test runner and
+# option flags say no rule beside a weak token either.
+_RUNNER = {"bash", "zsh", "python", "python3", "pytest", "node", "perl", "ruby", "source", "exec"}
+_FLAG = re.compile(r"--?[a-z][\w-]*(?:=\S*)?")
 _STATE_GLUED = re.compile(r"\b(" + "|".join(sorted(_STATE, key=len, reverse=True)) + r")(v?\d+(?:\.\d+)+)\b", re.I)
 _EVIDENCE = re.compile(r"(?:#\d+|[0-9a-f]*\d[0-9a-f]*|(?:msgs?|tasks?|runs?|notes?|pr|issue)\s*#?\d+|https?:\S*)")
 _NEGATION = re.compile(r"\b(?:not|never|no longer|instead of|rather than|isn't|aren't|wasn't|weren't|retires)\s*$")
@@ -151,14 +155,19 @@ def _weak_token(tok: str) -> bool:
 def _weak(ph: str) -> bool:
     """Whether phrase `ph` names no rule alone: each of its words of 4+ characters (all of them when none
     is) is a file name, path, version, hash, number or evidence reference ('msg #12', a commit), or, beside
-    at least one such, a word that only says it is in use (_STATE: 'running 0.2.646')."""
+    at least one such, a word that only says it is in use (_STATE: 'running 0.2.646') or a command's
+    interpreter or option flag (_RUNNER, _FLAG: 'bash tests/x.sh --quick')."""
     s = _STATE_GLUED.sub(r"\1 \2", ph.strip("`'\" "))
     for pair in re.findall(r"(?:msgs?|tasks?|runs?|notes?|pr|issue)\s+#?\d+", s):   # 'msg #12' is one reference
         s = s.replace(pair, pair.replace(" ", ""))
     words = s.split()
     long = [w for w in words if len(w.strip("`'\"()[]{}<>,;:.!?")) >= 4] or words
     weak = [w for w in long if _weak_token(w)]
-    return bool(weak) and all(w in weak or w.strip("`'\"()[]{}<>,;:.!?").lower() in _STATE for w in long)
+    return bool(weak) and all(w in weak or _filler(w.strip("`'\"()[]{}<>,;:.!?").lower()) for w in long)
+
+
+def _filler(w: str) -> bool:
+    return w in _STATE or w in _RUNNER or bool(_FLAG.fullmatch(w))
 
 
 def _fragment(ph: str, old: str) -> bool:

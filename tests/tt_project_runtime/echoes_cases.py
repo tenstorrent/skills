@@ -345,6 +345,38 @@ def test_a_withdrawal_rests_on_its_governing_phrase_never_on_a_file_name_version
                                              "gate releases on verify_fixture.py", "sudo -n true", "deadbeef"))
 
 
+def test_a_withdrawn_memory_decision_shared_only_by_a_script_path_or_its_command_orders_no_fix(env):
+    # A task spec naming only the script a withdrawn decision named (bare, or as the command running it) is
+    # advisory at most; the decision's rule wording, with or without the path, is still a fix order.
+    from ttp import echoes
+    p = make(env)
+    rec = echoes.record(p.db, "memory [fleet] (user correction)",
+                        "Gate every push on `bash tests/test_fleet.sh --quick` from the release lane.",
+                        "Pushes gate on the required suite.")
+    assert rec["kind"] == echoes.WITHDRAWN and "bash tests/test_fleet.sh --quick" in rec["phrases"], rec
+    path = p.db.add_task("path", "Fix the drain flake in tests/test_fleet.sh.")
+    cmd = p.db.add_task("cmd", "Then rerun `bash tests/test_fleet.sh --quick` and report the counts.")
+    rule = p.db.add_task("rule", "Gate every push on the release lane before landing.")
+    both = p.db.add_task("both", "Gate every push on `bash tests/test_fleet.sh --quick` from the release lane.")
+    by = {h["label"]: h for h in echoes.scan(p)}
+    for t in (path, cmd):
+        assert by[f"task #{t} spec"]["class"] == "advisory" and "file name" in by[f"task #{t} spec"]["why"], by
+    assert by[f"task #{both} spec"]["class"] == "directive", by
+    assert f"task #{rule} spec" not in by, by   # no distinctive phrase of the decision: no match at all
+    sec = echoes.digest_lines(p)
+    assert [ln for ln in sec if f"task #{both} spec" in ln] and not [ln for ln in sec if f"task #{cmd} " in ln
+                                                                       or f"task #{path} " in ln], sec
+    # The rule's own wording (here a quoted span, no path) is still a fix order.
+    worded = echoes.record(p.db, "memory [lane] (user correction)", 'Keep the "release lane frozen on fridays" rule.')
+    spec = p.db.add_task("worded", "Keep the release lane frozen on Fridays as before.")
+    assert [h["class"] for h in echoes.scan(p) if h["label"] == f"task #{spec} spec"] == ["directive"], worded
+    # Only an interpreter or flag beside a path or file name is scaffolding: a rule's own words never are.
+    assert all(echoes._weak(x) for x in ("bash tests/test_fleet.sh --quick", "pytest tests/test_fleet.py",
+                                         "python3 -m pytest tests/x.py --maxfail=1", "source env/setup.sh"))
+    assert not any(echoes._weak(x) for x in ("bash --login", "--quick", "probe-legacy --deep", "sudo -n true",
+                                             "pytest tests/x.py -k drain", "legacy-card-kick --force tests/x.sh"))
+
+
 def test_a_memory_forget_on_the_users_word_is_a_withdrawal_and_a_legacy_record_gets_a_kind(env):
     from ttp import coordinator as coord, echoes
     p = make(env)
