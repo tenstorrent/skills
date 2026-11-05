@@ -7,7 +7,9 @@ leave its jobs running: their process group, the device-broker jobs they queued 
 slots. Each daemon tick (sweep) ends every still running job of such a task, unless an open task still
 waits on it (its retry_when, on_pass_cmd, on_pass or next_step names the job's .rc or `<run>/<name>`).
 It does the same, across all of the task's runs, for a task that handed off `done` (keeping a job its
-own hand-off names) and for a `blocked` task whose own hand-off names none of its jobs (HANDED_OFF).
+own hand-off names; HANDED_OFF). A task still alive (waiting, blocked, queued, running) keeps its jobs
+whatever its hand-off says: a blocked hand-off with live jobs is recorded as waiting on them
+(task_live_jobs).
 end() does it in this order:
 
 1. SIGSTOP the job's whole process group, so a loop in it cannot resubmit what is ended next.
@@ -63,7 +65,7 @@ from .db import load_result
 from .project import Project, durable_write, write_json
 
 ENDED = ("cancelled", "failed", "exhausted")   # task states whose jobs the daemon stops
-HANDED_OFF = ("done", "blocked")                # hand-offs whose jobs the daemon stops unless the hand-off names them
+HANDED_OFF = ("done",)                          # hand-offs whose jobs the daemon stops unless the hand-off names them
 STOPPABLE = ENDED + ("done",)                   # task states whose jobs `ttp detach --stop` may stop
 OPEN_WAITER_SKIP = ("done", "failed", "cancelled", "exhausted")
 BROKER = "tt-device-mcp"
@@ -611,6 +613,16 @@ def _live_jobs(run_dir: Path) -> list[Path]:
             if isinstance(j, dict) and j.get("rc") and j.get("status") not in detach.CLOSED and running(Path(j["rc"]))]
 
 
+def task_live_jobs(p: Project, task: int, now: float | None = None) -> list[Path]:
+    """The .rc of each live job (_live_jobs) across this task's runs of the last SWEEP_DAYS."""
+    now = time.time() if now is None else now
+    out: list[Path] = []
+    for row in p.db.q("SELECT DISTINCT dir FROM runs WHERE task=? AND dir IS NOT NULL AND COALESCE(started, 0)>? "
+                      "ORDER BY id", (task, now - SWEEP_DAYS * 86400)):
+        out += [rc for rc in _live_jobs(Path(row["dir"])) if rc not in out]
+    return out
+
+
 def task_of(p: Project, rc: Path) -> dict | None:
     """The task whose run started the job at this .rc."""
     d = Path(rc).parent
@@ -666,8 +678,8 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
 
 
 def _sweep_handed_off(p: Project, now: float) -> list[dict]:
-    """Stop the live jobs, across all its runs, of a task that handed off done or blocked: all but those its
-    own hand-off names (a blocked one keeps them all when it names any) or an open task waits on."""
+    """Stop the live jobs, across all its runs, of a task that handed off done: all but those its own
+    hand-off names or an open task waits on. A task in any other state keeps them all."""
     out = []
     marks = ",".join("?" * len(HANDED_OFF))
     rows = p.db.q(f"SELECT r.dir, t.id, t.status, t.result FROM runs r JOIN tasks t ON t.id=r.task "
@@ -683,8 +695,6 @@ def _sweep_handed_off(p: Project, now: float) -> list[dict]:
             tasks.setdefault(row["id"], (row["status"], load_result(row["result"]), []))[2].extend(live)
     for tid, (status, result, jobs) in tasks.items():
         kept = [rc for rc in jobs if names_job(result, rc)]
-        if status == "blocked" and kept:
-            continue
         for rc in jobs:
             if rc in kept or waited_on(p, rc) is not None:
                 continue

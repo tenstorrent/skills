@@ -4878,6 +4878,21 @@ class Daemon:
             fb = route.of((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note"))
             if fb and fb.get("fallback") in (*route.FAULTS, *route.RUN_CAUSES) and r.get("provider") == fb.get("to"):
                 summary = route.fallback_line(r["id"], fb)
+        if status == "ok" and rstatus == "blocked" and isinstance(result, dict):
+            # Its own detached jobs still run: the task is not blocked but waiting on them, and they keep
+            # running (jobstop reaps only a done or ended task's jobs). It keeps its own retry_when, else
+            # waits for those jobs to end, and its next run sees the question it asked.
+            from . import jobstop
+            if live := jobstop.task_live_jobs(self.p, task["id"]):
+                probe = result.get("retry_when")
+                if not (isinstance(probe, str) and probe.strip()):
+                    probe = locks.job_probe(live, push._own_ttp(self.p))
+                result = {**result, "status": "waiting", "retry_when": probe, "blocked_while_jobs_run": True,
+                          "wake_tier": result.get("wake_tier") or "standard",
+                          "waiting_for": result.get("waiting_for") or f"its {len(live)} detached job(s) to end"}
+                rstatus = "waiting"
+                log(self.p, f"task {task['id']} hand-off: blocked with {len(live)} live detached job(s); "
+                            f"recorded as waiting on {probe[:300]}")
         if rstatus == "waiting" and result.get("retry_when") is not None and not isinstance(result["retry_when"], str):
             # No shell command (JSON true, a number, a list): never run, nor read as passed through its
             # truthiness. It is dropped, said loudly, and the task wakes at its timer (or on its jobs' probe).

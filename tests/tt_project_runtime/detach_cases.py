@@ -1000,8 +1000,21 @@ def test_handed_off_4b_a_file_of_another_kind_counts_only_by_its_full_name():
         assert not jobstop.names_job({"on_pass_cmd": text}, rc), text
 
 
-def test_handed_off_5_a_blocked_task_keeps_its_jobs_only_when_its_hand_off_names_one(env, tmp_path):
+def _no_signal_and_alive(p, pgid, rc):
+    """The sweep sent no signal: no signal row, the group's processes run (not stopped) and hold its lock."""
     from ttp import jobstop, locks as lk
+    assert _signal_rows(p) == [] and _stopped_events(p) == []
+    alive = jobstop.members(pgid)
+    assert alive and all(pathlib.Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "T"
+                         for pid in alive)
+    assert not lk.any_free([lk.job_lock(rc)]) and not rc.with_suffix(".lost").exists()
+
+
+def test_handed_off_5_a_blocked_task_keeps_every_job_whatever_its_hand_off_names(env, tmp_path):
+    """Regression: a task that handed off blocked while its retry_when waits on its jobs' .rc files (in a
+    form names_job does not read, such as a glob), or that names none of them, still owns live work: the
+    sweep sends its jobs no signal, across all its runs."""
+    from ttp import jobstop
     p = make(env)
     broker = _stub_broker(tmp_path)
     tid = p.db.add_task("blocked", "s", kind="work", tier="light", origin="user")
@@ -1009,17 +1022,91 @@ def test_handed_off_5_a_blocked_task_keeps_its_jobs_only_when_its_hand_off_names
     rc2, pgid2 = _locked_job(p, tid, broker, name="other", status="blocked", lock="builddir2")
     try:
         _later_run(p, tid)
-        p.db.update_task(tid, result=json.dumps({"status": "blocked", "question": "which?",
-                                                 "next_step": f"ttp detach --check {rc.parent}/loop"}))
-        assert jobstop.sweep(p) == [], "a blocked hand-off naming one of its jobs keeps them all"
-        assert not lk.any_free([lk.job_lock(rc)]) and not lk.any_free([lk.job_lock(rc2)])
-        p.db.update_task(tid, result=json.dumps({"status": "blocked", "question": "which?"}))
-        assert sorted(r["pgid"] for r in jobstop.sweep(p)) == sorted([pgid, pgid2])
-        assert lk.any_free([lk.job_lock(rc)]) and lk.any_free([lk.job_lock(rc2)])
-        assert f"task #{tid} handed off blocked" in rc.with_suffix(".lost").read_text()
+        for res in ({"status": "blocked", "question": "which?", "retry_when": f"ls {rc.parent}/*.rc"},
+                    {"status": "blocked", "question": "which?", "retry_when": f"ttp detach --check {rc} {rc2}"},
+                    {"status": "blocked", "question": "which?"}):
+            p.db.update_task(tid, result=json.dumps(res))
+            assert jobstop.sweep(p) == [], res
+        _no_signal_and_alive(p, pgid, rc)
+        _no_signal_and_alive(p, pgid2, rc2)
     finally:
         _end_group(pgid)
         _end_group(pgid2)
+
+
+def test_handed_off_6_a_blocked_hand_off_with_live_jobs_is_recorded_waiting(env, tmp_path):
+    """A blocked hand-off while the task's own detached jobs run is recorded as waiting: it keeps its own
+    retry_when, else waits on those jobs (job_probe), wakes at standard, and the sweep leaves the jobs."""
+    from ttp import jobstop, locks as lk
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("blocked", "s", kind="work", tier="standard", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="running")
+    try:
+        d = Daemon(p.base)
+        for given in (f"ls {rc.parent}/*.rc", None):
+            p.db.update_task(tid, status="running")
+            res = {"status": "blocked", "summary": "needs a pick", "question": "which?"}
+            if given:
+                res["retry_when"] = given
+            (rc.parent / "result.json").write_text(json.dumps(res))
+            d._finish_worker({"task": tid, "note": None, "dir": str(rc.parent)}, RunUsage(final_text="bye"), "ok",
+                             rc.parent)
+            t = p.db.task(tid)
+            got = json.loads(t["result"])
+            assert t["status"] == "queued" and got["status"] == "waiting", (given, t["status"], got)
+            assert got["retry_when"] == (given or lk.job_probe([rc], got["retry_when"].split(" detach")[0]))
+            assert got["question"] == "which?" and got["wake_tier"] == "standard" and got["blocked_while_jobs_run"]
+            assert jobstop.sweep(p) == []
+        _no_signal_and_alive(p, pgid, rc)
+        # Once its jobs ended, a blocked hand-off is blocked.
+        _end_group(pgid)
+        assert _wait_for(lambda: not jobstop.running(rc))
+        p.db.update_task(tid, status="running")
+        (rc.parent / "result.json").write_text(json.dumps({"status": "blocked", "summary": "needs a pick"}))
+        d._finish_worker({"task": tid, "note": None, "dir": str(rc.parent)}, RunUsage(final_text="bye"), "ok", rc.parent)
+        assert p.db.task(tid)["status"] == "blocked"
+    finally:
+        _end_group(pgid)
+
+
+def test_handed_off_7_a_waiting_queued_or_running_task_keeps_its_jobs(env, tmp_path):
+    """A task still alive keeps its jobs whatever its stored hand-off text says (even a stale done)."""
+    from ttp import jobstop
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("alive", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="queued")
+    try:
+        _later_run(p, tid)
+        for state, res in (("queued", {"status": "waiting", "retry_when": "false"}),
+                           ("queued", {"status": "done", "summary": "stale"}),
+                           ("running", {"status": "blocked", "question": "which?"}),
+                           ("blocked", {"status": "done", "summary": "stale"})):
+            p.db.update_task(tid, status=state, result=json.dumps(res))
+            assert jobstop.sweep(p) == [], (state, res)
+        _no_signal_and_alive(p, pgid, rc)
+    finally:
+        _end_group(pgid)
+
+
+def test_handed_off_8_a_cancelled_or_done_tasks_jobs_are_still_reaped(env, tmp_path):
+    from ttp import jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    for state in ("cancelled", "done"):
+        tid = p.db.add_task(state, "s", kind="work", tier="light", origin="user")
+        rc, pgid = _locked_job(p, tid, broker, status=state, lock=f"build-{state}")
+        try:
+            p.db.update_task(tid, result=json.dumps({"status": "done" if state == "done" else "waiting",
+                                                     "summary": "x"}))
+            (r,) = jobstop.sweep(p)
+            assert r["pgid"] == pgid and not jobstop.members(pgid) and lk.any_free([lk.job_lock(rc)]), state
+            assert f"task #{tid}" in rc.with_suffix(".lost").read_text()
+        finally:
+            _end_group(pgid)
 
 
 def test_a_restart_mid_stop_finishes_it_on_the_next_pass(env, tmp_path):
