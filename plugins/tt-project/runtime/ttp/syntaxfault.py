@@ -4,8 +4,9 @@ A shell reads a script a piece at a time, so a script rewritten in place while a
 harness script, say, edited by another task) dies with `line N: syntax error near unexpected token` although the
 file is whole again a moment later. That says nothing about the change. transient() names such scripts in a failed
 check's output: each must exist, lie outside the change under test (outside the repository, or a file the diff
-from `base` does not touch, and not under a temporary folder, where a test's own fixtures live) and pass `bash -n`
-now. Any one that fails those (a file the change touches, a script still broken, a path it cannot find) makes it
+from `base` does not touch, and not under a temporary folder, where a test's own fixtures live) and parse now
+with the shell whose error format named it (`bash -n` for bash's, `dash -n` for dash's: a bash-only script run
+with sh fails under dash every time). Any one that fails those (a file the change touches, a script still broken, a path it cannot find) makes it
 answer nothing: a real failure stays one. The runners rerun such a check once after SETTLE_S; failing so again, it
 is an infrastructure fault that leaves the change neither passed nor failed (`ttp push` exits BUSY, `ttp checks` 75).
 """
@@ -25,15 +26,21 @@ RETRY_S = 600         # a push stopped by it is tried again after this
 MAX_SCRIPTS = 20      # more named scripts than this: not a torn read, never judged
 INFRA = "script-syntax-transient"
 # bash: `path: line 131: syntax error near unexpected token `('`; dash: `path: 131: Syntax error: "(" unexpected`.
-_LINE = re.compile(r"""(?P<path>[^\s:'"`]+): (?:line )?(?P<n>\d+): [Ss]yntax error""")
+_LINE = re.compile(r"""(?P<path>[^\s:'"`]+): (?P<bash>line )?(?P<n>\d+): [Ss]yntax error""")
+
+
+def _named(text: str) -> dict[str, set[str]]:
+    """Each script path a shell named in a syntax error in `text`, first seen first, with the shells whose
+    format named it ("bash", "dash")."""
+    seen: dict[str, set[str]] = {}
+    for m in _LINE.finditer(text or ""):
+        seen.setdefault(m.group("path"), set()).add("bash" if m.group("bash") else "dash")
+    return seen
 
 
 def scripts(text: str) -> list[str]:
     """The script paths a shell named in a syntax error in `text`, first seen first."""
-    seen: dict[str, None] = {}
-    for m in _LINE.finditer(text or ""):
-        seen.setdefault(m.group("path"), None)
-    return list(seen)
+    return list(_named(text))
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
@@ -51,12 +58,13 @@ def _temp_roots() -> list[Path]:
     return out
 
 
-def _parses(path: Path) -> bool:
-    bash = shutil.which("bash")
-    if not bash:
+def _parses(path: Path, shell: str = "bash") -> bool:
+    """`path` parses with `shell -n`; False when that shell is missing (never judged by another shell)."""
+    exe = shutil.which(shell)
+    if not exe:
         return False
     try:
-        return subprocess.run([bash, "-n", str(path)], capture_output=True, timeout=30).returncode == 0
+        return subprocess.run([exe, "-n", str(path)], capture_output=True, timeout=30).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
 
@@ -66,7 +74,7 @@ def transient(text: str, cwd: str | Path, base: str | None, head: str = "HEAD") 
     there is none, or when any script named in a syntax error does not qualify. `cwd` is the folder the check
     ran in (relative paths resolve there), `base` the commit the change is measured from (none: every file of
     the repository counts as changed)."""
-    named = scripts(text)
+    named = _named(text)
     if not named or len(named) > MAX_SCRIPTS:
         return []
     cwd = Path(cwd)
@@ -96,9 +104,9 @@ def transient(text: str, cwd: str | Path, base: str | None, head: str = "HEAD") 
         if top and real.is_relative_to(top):
             if changed is None or real.relative_to(top).as_posix() in changed:
                 return []
-        if not _parses(real):
+        if not all(_parses(real, shell) for shell in sorted(named[name])):
             return []
-    return named
+    return list(named)
 
 
 def rerun_line(found: list[str], cmd: str) -> str:

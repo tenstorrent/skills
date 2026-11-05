@@ -86,6 +86,36 @@ def test_syntaxfault_names_only_transient_syntax_errors_outside_the_change(tmp_p
     assert t(_torn_line(link), repo, base) == [], "a link to a changed file is that file"
 
 
+def test_syntaxfault_judges_each_script_with_the_shell_that_reported_it(tmp_path, monkeypatch):
+    """A bash-only script run with sh fails under dash every time, though `bash -n` passes it: dash's error
+    format is judged with dash, bash's with bash, and a missing shell judges nothing transient."""
+    import shutil
+    from ttp import push, syntaxfault
+    if not shutil.which("dash") or not shutil.which("bash"):
+        pytest.skip("needs dash and bash")
+    repo, base, whole, _ = _torn_repo(tmp_path)
+    _outside_temp(monkeypatch)
+    bashonly = whole.parent / "bashonly"
+    bashonly.write_text("a=(1 2)\necho ${a[0]}\n")
+    real = subprocess.run(["dash", str(bashonly)], capture_output=True, text=True)
+    assert real.returncode != 0 and f"{bashonly}: 1: Syntax error" in real.stderr, real
+    t = syntaxfault.transient
+    assert t(real.stderr, repo, base) == [], "dash's error, still broken under dash: a real failure"
+    assert t(_torn_line(bashonly), repo, base) == [str(bashonly)], "bash's error: bash parses it now"
+    assert t(_torn_line(bashonly) + real.stderr, repo, base) == [], "named by both: each shell must pass it"
+    assert t(_torn_line(whole) + real.stderr, repo, base) == [], "one script that fails its shell fails it all"
+    which = shutil.which
+    monkeypatch.setattr(syntaxfault.shutil, "which", lambda c, *a, **k: None if c == "dash" else which(c, *a, **k))
+    assert t(f'{whole}: 3: Syntax error: "(" unexpected\n', repo, base) == [], "no dash here: never judged"
+    assert t(_torn_line(whole), repo, base) == [str(whole)]
+    monkeypatch.setattr(syntaxfault.shutil, "which", which)
+    # The push queue: such a check fails after one run, never rerun or held as infra.
+    said = []
+    env = {**os.environ, "TTP_PUSH_TIP": base}
+    assert push._run_one(f"sh {bashonly}", repo, env, said.append) == push.CHECKS_FAILED, said
+    assert not any("running it once more" in s or "infrastructure fault" in s for s in said), said
+
+
 def test_ttp_replacing_a_harness_script_mid_run_never_tears_it(tmp_path):
     """A shell reads a script a piece at a time: an in-place rewrite as it runs tears it, while ttp's own
     replacement (setup and upgrade copy harness trees with _copy_tree) leaves it the old file to the end."""
