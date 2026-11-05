@@ -1294,6 +1294,21 @@ running work is interrupted only by the preemption below:
   the push log gives the seconds so far every minute and `ttp push --result` shows them; at the
   end the log gives the whole pool wait. Past `delivery.push_pool_wait_s` of pool wait (default
   4 h, 0 no bound) the check is ended, saying how long it waited.
+  A check script that runs its own test pool and is granted fewer slots than it planned asks
+  `ttp pool-admit --planned N --granted K [--files F] [--what <pool>]` before it starts the shards:
+  exit 0 starts them; exit 3 means the run on K slots is estimated to go past the time the check
+  has left, so it is not started there, and stdout gives the fewest slots that would fit. The
+  script then gives the slots back and waits for that many inside `ttp pool-wait` (that wait
+  counts against the limit, so it asks again once granted), or runs the set on this host's checks
+  slots (`ttp checks-shard`). The estimate is the median slot-seconds per file (with `--files`),
+  else per planned shard, of earlier passing runs the script recorded with `ttp pool-admit --ran
+  <s> --granted K [--planned N] [--files F]`; with none, each planned shard is taken as half of
+  the whole limit. Granted every planned slot, or with no limit known, nothing changes. A push
+  check gets its limit in `TTP_CHECK_LIMIT` (the time left takes off only its grant waits, as the
+  push does), a `ttp checks` run its wall cap in `TTP_CHECKS_WALL`.
+  Why this design: refusing the cut run is the simplest rule that never starts a run certain to
+  time out, and it leaves the project's own pool in charge of where its shards go. The limit is
+  never scaled for a cut run: that would let one run hold a push longer than the project set.
 - A check is a command, which runs on every head. One that only makes sense once a file exists
   (a test file a later change adds) can opt in to being skipped where it does not apply:
   `{"run": "pytest tests/test_new.py", "if_exists": "tests/test_new.py"}`. `if_exists` is a

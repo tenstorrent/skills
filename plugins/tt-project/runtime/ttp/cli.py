@@ -3623,7 +3623,7 @@ def cmd_checks(a) -> None:
                 if not getattr(a, "own_group", False):
                     stop_handlers = _foreground_stop()
                 # The run's wall-time cap from its first command on (checkwall); the status line shows it.
-                from . import checkwall, testslots
+                from . import checkwall, pooladmit, testslots
                 wall, wall_how = checkwall.cap(p)
                 ran_since, ran_cpu = time.time(), checkcap.child_cpu_s()
                 deadline = ran_since + wall if wall > 0 else None
@@ -3660,7 +3660,8 @@ def cmd_checks(a) -> None:
                 # A detached run gives each check a group of its own, so a stop ends it with ttp checks.
                 group = bool(getattr(a, "own_group", False))
                 env = {**push.check_env("checks", run_dir=getattr(a, "check_run_dir", None)), **child_env,
-                       "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {})}
+                       "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {}),
+                       **({pooladmit.WALL_ENV: f"{ran_since:.0f}:{wall:.0f}"} if deadline else {})}
                 judge_env = dict(env)   # a rerun of the failing tests records no suite durations
                 if pushpass.resumable(c) and not push.remote_host(c):   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
@@ -5894,6 +5895,47 @@ def cmd_pool_wait(a) -> None:
     finally:
         checkwait.end(token)
     sys.exit(128 - rc if rc < 0 else rc)
+
+
+def cmd_pool_admit(a) -> None:
+    """Whether a sharded run on a test pool may start on the slots it was granted (pooladmit): exit 0 to
+    start, pooladmit.SHORT when its estimate on them is over the time its check has left (stdout: the
+    fewest slots that would fit). `--ran S` instead records a passing run's seconds into the pool's history."""
+    import math
+    from . import checkwait, pooladmit
+
+    def count(v, flag: str, least: int) -> int | None:
+        if v is None:
+            return None
+        try:
+            n = int(v)
+        except ValueError:
+            n = least - 1
+        if n < least:
+            die(f"pool-admit: {flag} wants a whole number of {least} or more, not {v!r}")
+        return n
+    planned, granted, files = count(a.planned, "--planned", 1), count(a.granted, "--granted", 1), count(a.files, "--files", 1)
+    if granted is None:
+        die("usage: ttp pool-admit --granted K (--planned N [--files F] | --ran SECONDS) [--what <pool>]")
+    if a.ran is not None:
+        try:
+            secs = float(a.ran)
+        except ValueError:
+            secs = -1.0
+        if not math.isfinite(secs) or secs <= 0:
+            die(f"pool-admit: --ran wants the run's seconds (more than 0), not {a.ran!r}")
+        if os.environ.get(checkwait.ENV):   # its pool waits are no run time
+            secs = max(secs - checkwait.pool(os.environ[checkwait.ENV], time.time() - secs)[0], 0.0)
+        pooladmit.record(a.what, secs, granted, planned, files)
+        sys.exit(0)
+    if planned is None:
+        die("pool-admit: give --planned N, the shards the run was planned for")
+    ok, need, why = pooladmit.admit(planned, granted, files, a.what)
+    if why:
+        print(f"ttp pool-admit: {why}", file=sys.stderr)
+    if not ok and need:
+        print(need)
+    sys.exit(0 if ok else pooladmit.SHORT)
 
 
 def cmd_clip(a) -> None:
@@ -11534,7 +11576,7 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
     ("inside a run", ("note", "notify", "progress", "checks", "checks-shard", "lock", "host-run", "detach", "devq",
-                      "push", "land", "clip", "sandbox", "pool-wait", "skill", "killscan", "svcscan", "leftover-procs",
+                      "push", "land", "clip", "sandbox", "pool-wait", "pool-admit", "skill", "killscan", "svcscan", "leftover-procs",
                       "said", "hostcheck")),
     ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
@@ -12000,6 +12042,15 @@ def main(argv: list[str] | None = None) -> None:
                                                        "granted its slot after SECONDS), instead of running a command")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --, that returns once a slot is free")
     s.set_defaults(fn=cmd_pool_wait)
+
+    s = sub.add_parser("pool-admit", help="whether a sharded test-pool run granted fewer slots than planned can finish "
+                                          "inside its check's time limit: exit 0 to start, 3 not (stdout: slots needed)")
+    s.add_argument("--planned", metavar="N", help="the shards the run was planned for")
+    s.add_argument("--granted", metavar="K", help="the slots the pool granted")
+    s.add_argument("--files", metavar="F", help="the test files in the run (a per-file estimate)")
+    s.add_argument("--what", default="", help="the pool's name: its timing history")
+    s.add_argument("--ran", metavar="SECONDS", help="record a passing run's seconds on K slots instead")
+    s.set_defaults(fn=cmd_pool_admit)
 
     s = sub.add_parser("sandbox", help="run a command (a test suite); in its own PID namespace only where the project "
                                        "turned it on (sandbox.checks) or, under TTP_NO_DEVICE=1, to hide device nodes")

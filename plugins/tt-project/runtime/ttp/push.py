@@ -40,7 +40,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, locks, machines, prguard, prhead, remotecheck, repoid, runner,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner,
                sandbox, scriptwatch, settinghold, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -4145,7 +4145,10 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         try:
             proc = subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo,
                                     env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
-                                         **({landmark.ENV: str(mark.path)} if mark else {})},
+                                         **({landmark.ENV: str(mark.path)} if mark else {}),
+                                         # its run-time limit, for a sharded pool run's admission (pooladmit)
+                                         **({pooladmit.LIMIT_ENV: f"{time.time():.0f}:{check_limit_s:.0f}"}
+                                            if check_limit_s is not None else {})},
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited())
         except BaseException:
             if mark:
