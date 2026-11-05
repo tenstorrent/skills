@@ -3143,8 +3143,13 @@ class Daemon:
                 (run_dir / "system.md").write_text(system)
                 if provider == "claude":
                     tools = (coordtools.session_tool_args(self.cfg, project=self.p.name, root=str(self.p.root),
-                                                          denied_reads=no_reads)
+                                                          denied_reads=no_reads, session_mode=session_mode,
+                                                          protected=coordtools.protected_paths(self.p),
+                                                          web=not restrictions.get("no_internet"))
                              if role == "coordinator" else [])
+                    if role == "coordinator" and coordtools.full_tools(self.cfg, session_mode):
+                        # A worker's tools (coordtools.py): the read-only turn's Edit/Write deny goes.
+                        argv = coordtools.without_edit_deny(argv)
                     argv, inline = _with_system_prompt(prov, argv, run_dir / "system.md", tools)
                     if not inline:   # too long for the command line: it leads what the agent reads
                         if stdin is not None:

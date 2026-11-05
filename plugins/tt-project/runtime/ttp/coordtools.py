@@ -1,9 +1,27 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""Read-only tools and the per-wake budget of a coordinator in session mode (coordinator.session.mode
-"on"). With the mode off or unset, nothing here changes how a coordinator turn launches.
+"""The tools and the per-wake budget of a coordinator in session mode (coordinator.session.mode
+"on"). With the mode off or unset, nothing here changes how a coordinator turn launches: the stateless
+turn has no tools.
 
-Tools: Read (and Grep/Glob where the CLI has them) on the project folder, and Bash for a fixed list of
+Full tools (coordinator.session.tools "full", the default): a session wake (a new or resumed session)
+gets a worker's tools (providers/claude.WORKER_TOOLS and its web tools) under a worker's guards: the
+worker PreToolUse checks (hook.pre_tool_use: the PR draft and gh guards, no posting as the user, no
+credential reads, the kill guard, the device-run broker rule, no direct full suite) run on every Bash
+and file edit, the run's PATH starts with the harness's gh and git wrappers, and it runs unsandboxed
+as every coordinator turn does. On top of them (full_refusal): no direct write to the project's
+charter, memory, project.json or state database (Edit/Write deny rules and the hook; the denial names
+the action or command that applies the same checks), no raw `git push` (code goes to a worker task,
+review and the push queue), and no foreground command past coordinator.session.tool_timeout_s
+(TOOL_TIMEOUT_S; the CLI's own Bash timeout is set to it too): longer work goes to `ttp detach` or a
+worker. Every call that is not a read (Bash off the read-only list, Edit, Write) is logged with its
+exit to the run's AUDIT file and its progress.md, which the web app shows (post_tool_use). Accepted
+gaps, as for a worker: the Bash checks read the command text, so a command that builds a protected
+path or a push at run time (a variable, a glob, a script file) is not seen; the deny rules still fence
+the file tools. Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
+(also a session's stateless fallback) never gets them: the fallback keeps the read-only set below.
+
+Read-only tools ("read_only", any value but "full"): Read (and Grep/Glob where the CLI has them) on the project folder, and Bash for a fixed list of
 read-only `ttp` commands, `ttp hostcheck` among them (hostcheck.py: git log/show, lock holders and the
 other host checks). No write tool, no free shell. Three fences hold it: the CLI's tool list, its
 allow and deny rules under the dontAsk permission mode (anything not allowed is refused), and a
@@ -22,10 +40,12 @@ design. A typical wake costs less than its ceiling: the session's cached context
 A wake that hits either limit ends with what it has; that non-ok end takes the stateless rerun path."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
 import sys
+import time
 
 from .coordlimits import positive
 
@@ -39,6 +59,16 @@ ANSWER_TOOL = "StructuredOutput"
 # "*" is one project name: the CLI rules name the coordinator's own, the hook takes any (all read-only).
 READ_COMMANDS = (("status",), ("task", "*", "show"), ("task", "*", "list"), ("said",), ("eta",), ("landed",),
                  ("stats",), ("hostcheck",), ("machines", "list"), ("machines", "activity"), ("machines", "status"))
+FULL_ENV = "TTP_COORD_FULL_TOOLS"   # "1": the hook applies full_refusal, not the read-only list
+PROTECTED_ENV = "TTP_COORD_PROTECTED"   # the files no tool writes directly, os.pathsep-separated
+TIMEOUT_ENV = "TTP_COORD_TOOL_TIMEOUT_S"
+POST_EVENT, FAIL_EVENT = "CoordPostToolUse", "CoordPostToolUseFailure"
+AUDIT = "tool-audit.jsonl"   # in the run dir: one line per mutating tool call
+TOOL_TIMEOUT_S = 300   # a foreground command's limit by default
+MAX_TOOL_TIMEOUT_S = 600   # the CLI's own Bash ceiling
+MODES = ("full", "read_only")
+EDITS = ("Edit", "Write", "MultiEdit", "NotebookEdit")
+SHELLS = {"sh", "bash", "zsh", "dash", "ksh", "eval", "ssh", "su", "sudo", "script"}
 # Anything a shell would act on: operators, redirects, substitutions, globs, comments, escapes.
 SHELL_META = re.compile(r"[;&|<>`$\\(){}*?\[\]!#\n\r]")
 
@@ -53,6 +83,31 @@ def session_on(cfg: dict) -> bool:
     return str(session(cfg).get("mode") or "").strip().lower() == "on"
 
 
+def tools_mode(cfg: dict) -> str:
+    """coordinator.session.tools: "full" when unset or "full", else "read_only" (an unknown value fails closed)."""
+    v = session(cfg).get("tools")
+    return "full" if v is None or str(v).strip().lower() == "full" else "read_only"
+
+
+def tools_mode_of(value) -> str:
+    """The config_set validator of coordinator.session.tools."""
+    mode = str(value).strip().lower()
+    if mode not in MODES:
+        raise ValueError(f"coordinator.session.tools: give one of {', '.join(MODES)}")
+    return mode
+
+
+def tool_timeout_s(cfg: dict) -> int:
+    """A foreground command's limit: coordinator.session.tool_timeout_s, else TOOL_TIMEOUT_S, at most the CLI's."""
+    return int(min(positive(session(cfg).get("tool_timeout_s"), TOOL_TIMEOUT_S), MAX_TOOL_TIMEOUT_S))
+
+
+def protected_paths(p) -> list[str]:
+    """The project files a coordinator changes only through actions and the ttp CLI."""
+    return [str(x) for x in (p.charter_path, p.memory_index, p.harness / "memory", p.config_path,
+                             p.state / "project.db")]
+
+
 def _rules(project: str) -> list[str]:
     out = []
     for words in READ_COMMANDS:
@@ -61,26 +116,57 @@ def _rules(project: str) -> list[str]:
     return out
 
 
-def hook_settings(denied_reads=()) -> dict:
+def hook_settings(denied_reads=(), *, full: bool = False, protected=(), timeout_s: int = TOOL_TIMEOUT_S) -> dict:
     """The coordinator's PreToolUse hook (every tool goes through it) and the files it never reads,
-    as --settings JSON."""
+    as --settings JSON; `full`: also its audit hooks, the protected files' Edit deny rules and the
+    CLI's Bash timeout."""
     from pathlib import Path
     runtime = str(Path(__file__).resolve().parents[1])
-    cmd = f"{shlex.quote(sys.executable)} -m ttp.hook {HOOK_EVENT}"
+    cmd = f"{shlex.quote(sys.executable)} -m ttp.hook"
     deny = [str(p) for p in denied_reads if os.path.isabs(p)]
-    return {"hooks": {"PreToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": cmd, "timeout": 20}]}]},
-            "permissions": {"deny": [f"Read(/{p})" for p in deny]},
-            "env": {"PYTHONPATH": runtime, DENIED_ENV: os.pathsep.join(deny)}}
+    hook = lambda event: [{"matcher": "*", "hooks": [{"type": "command", "command": f"{cmd} {event}", "timeout": 20}]}]  # noqa: E731
+    out = {"hooks": {"PreToolUse": hook(HOOK_EVENT)}, "permissions": {"deny": [f"Read(/{p})" for p in deny]},
+           "env": {"PYTHONPATH": runtime, DENIED_ENV: os.pathsep.join(deny)}}
+    if full:
+        mine = [str(p) for p in protected if os.path.isabs(p)]
+        out["hooks"].update(PostToolUse=hook(POST_EVENT), PostToolUseFailure=hook(FAIL_EVENT))
+        out["permissions"]["deny"] += [f"Edit(/{p}{'/**' if not os.path.splitext(p)[1] else ''})" for p in mine]
+        ms = str(int(timeout_s) * 1000)
+        out["env"].update({FULL_ENV: "1", PROTECTED_ENV: os.pathsep.join(mine), TIMEOUT_ENV: str(int(timeout_s)),
+                           "BASH_DEFAULT_TIMEOUT_MS": ms, "BASH_MAX_TIMEOUT_MS": ms})
+    return out
 
 
-def session_tool_args(cfg: dict, *, project: str = "", root: str = "", denied_reads=()) -> list[str]:
-    """The CLI arguments that give a session coordinator its read-only tools ([] with the mode off).
-    They take the place of the stateless turn's `--tools ""`."""
+def full_tools(cfg: dict, session_mode: str) -> bool:
+    """Whether this coordinator turn gets the full tools: a session wake with coordinator.session.tools full."""
+    return session_on(cfg) and session_mode in ("new", "resume") and tools_mode(cfg) == "full"
+
+
+def without_edit_deny(argv: list[str]) -> list[str]:
+    """`argv` without the read-only turn's `--disallowedTools Edit Write NotebookEdit` (providers/claude.build)."""
+    seq = ["--disallowedTools", "Edit", "Write", "NotebookEdit"]
+    for i in range(len(argv) - len(seq) + 1):
+        if argv[i:i + len(seq)] == seq:
+            return argv[:i] + argv[i + len(seq):]
+    return argv
+
+
+def session_tool_args(cfg: dict, *, project: str = "", root: str = "", denied_reads=(), session_mode: str = "",
+                      protected=(), web: bool = True) -> list[str]:
+    """The CLI arguments that give a session coordinator its tools ([] with the mode off): the full
+    set for a session wake (full_tools), else the read-only set. They take the place of the stateless
+    turn's `--tools ""`."""
     if not session_on(cfg):
         return []
-    import json
-    allow = [f"Read(/{os.path.abspath(root)}/**)"] if root else []
     deny = [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]
+    if full_tools(cfg, session_mode):
+        from .providers.claude import WEB_TOOLS, WORKER_TOOLS
+        tools = [*WORKER_TOOLS, *(WEB_TOOLS if web else ())]
+        return ["--tools", ",".join(tools), "--allowedTools", ANSWER_TOOL, *tools,
+                *(["--disallowedTools", ",".join(deny)] if deny else []),
+                "--settings", json.dumps(hook_settings(denied_reads, full=True, protected=protected,
+                                                       timeout_s=tool_timeout_s(cfg)))]
+    allow = [f"Read(/{os.path.abspath(root)}/**)"] if root else []
     args = ["--tools", ",".join(CLI_TOOLS), "--allowedTools", ANSWER_TOOL, *allow, *_rules(project or "*")]
     if deny:   # one comma-separated value, so a later flag is no rule
         args += ["--disallowedTools", ",".join(deny)]
@@ -127,13 +213,106 @@ def _answer_check(payload: dict) -> dict | None:
     return _deny(why) if why else None
 
 
+def _protected_hit(path: str, protected: list[str]) -> str:
+    """The protected path `path` writes ("" for none): the file itself, a sibling CHARTER* file, a file
+    under a protected folder, or the database's -wal/-shm/-journal companion."""
+    real = os.path.realpath(path)
+    for f in protected:
+        f = os.path.realpath(f)
+        name = os.path.basename(f)
+        if real == f or real.startswith(f.rstrip(os.sep) + os.sep) or real.startswith(f + "-") \
+                or name.startswith("CHARTER") and os.path.dirname(real) == os.path.dirname(f) \
+                and os.path.basename(real).startswith("CHARTER"):
+            return f
+    return ""
+
+
+def _protected_why(f: str) -> str:
+    name = os.path.basename(f)
+    how = ("change it with the `charter_update` action, which takes the user's word for a Restriction"
+           if name.startswith("CHARTER") else
+           "change memory with the `memory_add` and `memory_forget` actions" if name in ("MEMORY.md", "memory") else
+           "change settings with the `config_set` action or `ttp config KEY VALUE` (both refuse the user-only "
+           "keys: spend caps, providers.<name>.write_fence and the rest; ask the user for those)"
+           if name == "project.json" else
+           "the state database (tasks, kv) changes only through actions and the ttp CLI (task_add, task_update, "
+           "`ttp task ...`)")
+    return f"a coordinator never writes {name} directly, so the daemon's checks stay in the path; {how}"
+
+
+def _named(cmd: str, f: str, cwd: str) -> bool:
+    """Whether the command text names protected path `f`: its absolute or cwd-relative path, or (a
+    file) its distinctive name."""
+    name = os.path.basename(f)
+    rel = os.path.relpath(f, cwd) if cwd else f
+    keys = {f, os.path.realpath(f), rel} | ({"CHARTER"} if name.startswith("CHARTER") else
+                                           {name} if name in ("MEMORY.md", "project.json", "project.db") else set())
+    return any(k and k not in (".", "..") and k in cmd for k in keys)
+
+
+def _pushes(cmd: str, depth: int = 0) -> bool:
+    """Whether `cmd` runs `git push`: a git command (by any path, under wrappers) whose subcommand is
+    push, also inside `sh -c`, ssh, eval and the like (any later word `git ... push` there)."""
+    from . import gitguard
+    from .hook import _segments
+    for seg in _segments(cmd):
+        if os.path.basename(seg[0]) == "git" and gitguard.split(seg[1:])[1] == "push":
+            return True
+        if os.path.basename(seg[0]) in SHELLS:
+            inner = " ".join(seg[1:])
+            if depth < 3 and _pushes(inner, depth + 1) or re.search(r"\bgit\b.*\bpush\b", inner, re.S):
+                return True
+    return False
+
+
+def full_refusal(tool: str, args: dict, cwd: str) -> str | None:
+    """Why a full-tools coordinator may not make this call before the worker checks run (None: go on)."""
+    protected = [d for d in os.environ.get(PROTECTED_ENV, "").split(os.pathsep) if d]
+    if tool in EDITS:
+        path = str(args.get("file_path") or args.get("notebook_path") or "")
+        if not path:
+            return "the edit names no file"
+        hit = _protected_hit(path if os.path.isabs(path) else os.path.join(cwd, path), protected)
+        return _protected_why(hit) if hit else None
+    if tool != "Bash":
+        return None
+    cmd = str(args.get("command") or "")
+    limit = positive(os.environ.get(TIMEOUT_ENV), TOOL_TIMEOUT_S)
+    asked = positive(args.get("timeout"), 0) / 1000
+    if asked > limit or args.get("run_in_background"):
+        return (f"a coordinator's foreground command runs at most {int(limit)} s (coordinator.session.tool_timeout_s); "
+                "run longer work with `ttp detach <name> -- <cmd>` or give it to a worker task")
+    if _pushes(cmd):
+        return ("a coordinator makes no raw `git push`: code changes go on a work branch through a worker task, "
+                "its review and the push queue (`ttp push`), as a worker's do")
+    if bash_refusal(cmd) is None:   # a listed read-only ttp command
+        return None
+    hit = next((f for f in protected if _named(cmd, f, cwd)), "")
+    return (_protected_why(hit) + "; read it with Read or Grep") if hit else None
+
+
+def _full_pre_tool_use(tool: str, args: dict, payload: dict):
+    from . import hook
+    if tool == ANSWER_TOOL:   # the turn's structured answer, checked as in read-only mode
+        return _answer_check(payload)
+    why = full_refusal(tool, args, str(payload.get("cwd") or os.getcwd()))
+    if why:
+        return hook._deny(why)
+    if tool in EDITS or tool == "Bash":   # a worker's own checks
+        return hook.pre_tool_use(payload)[0]
+    return None
+
+
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
-    """Deny every coordinator tool call outside its read-only list; no opinion on the rest, so the
-    CLI's own allow rules still apply. Any error denies."""
+    """Deny every coordinator tool call outside its tools (the read-only list, or with FULL_ENV the
+    full set under full_refusal and a worker's checks); no opinion on the rest, so the CLI's own allow
+    rules still apply. Any error denies."""
     from .hook import _deny
     try:
         tool = str(payload.get("tool_name") or "")
         args = payload.get("tool_input") or {}
+        if os.environ.get(FULL_ENV) == "1" and tool not in FILE_TOOLS:
+            return _full_pre_tool_use(tool, args, payload), None
         if tool in FILE_TOOLS:
             denied = [d for d in os.environ.get(DENIED_ENV, "").split(os.pathsep) if d]
             search = tool != "Read"
@@ -149,6 +328,36 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         return _deny(f"a session coordinator has read-only tools only; {tool or 'this tool'} is not one"), None
     except Exception as e:   # fail closed
         return _deny(f"the coordinator tool check failed ({type(e).__name__})"), None
+
+
+def post_tool_use(payload: dict, failed: bool = False) -> tuple[None, None]:
+    """Log a full-tools coordinator's mutating call (Edit, Write, a Bash command off the read-only
+    list) with its exit to the run's AUDIT file and progress.md (the web app's run view). A failed
+    call's exit code is read from its error ("Exit code N"), else 1. Never blocks the call."""
+    try:
+        run = os.environ.get("TTP_RUN_DIR")
+        tool = str(payload.get("tool_name") or "")
+        args = payload.get("tool_input") or {}
+        if not run or os.environ.get(FULL_ENV) != "1" or payload.get("agent_id"):
+            return None, None
+        if tool == "Bash" and bash_refusal(str(args.get("command") or "")) is not None:
+            what = str(args.get("command") or "")
+        elif tool in EDITS:
+            what = str(args.get("file_path") or args.get("notebook_path") or "")
+        else:
+            return None, None
+        m = re.search(r"[Ee]xit code (\d+)", str(payload.get("error") or ""))
+        code = (int(m.group(1)) if m else 1) if failed else 0
+        from pathlib import Path
+        from . import timefmt
+        from .project import durable_append
+        durable_append(Path(run) / AUDIT, json.dumps({"ts": time.time(), "tool": tool, "target": what[:2000],
+                                                      "exit": code}) + "\n")
+        line = " ".join(what.split())[:200]
+        durable_append(Path(run) / "progress.md", f"{timefmt.clock()} coordinator {tool} exit {code}: {line}\n")
+    except Exception:
+        pass
+    return None, None
 
 
 def wake_budget(cfg: dict, turn_usd: float | None, turn_timeout_s: float) -> tuple[float | None, float]:

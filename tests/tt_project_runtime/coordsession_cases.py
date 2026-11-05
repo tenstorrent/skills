@@ -489,9 +489,10 @@ def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsy
 # The session role's own room over the stateless coordinator role budget (coordinator_role_budget.txt,
 # which stays the stateless role's cap): the order-ledger block the session always carries plus
 # prompts/coordinator-session.md (2900, +100 for its Context-block line, user msg #1785), plus the
-# session-only `self_change` row of coordinator.md's action table (1300, selfimprove.py). Session mode
-# only; it never widens coordinator_role(p)'s cap.
-SESSION_ROLE_ROOM = 2900 + 100 + 1300
+# session-only `self_change` row of coordinator.md's action table (1300, selfimprove.py), plus the
+# session prompt's Tools section (800, coordtools.py). Session mode only; it never widens
+# coordinator_role(p)'s cap.
+SESSION_ROLE_ROOM = 2900 + 100 + 1300 + 800
 
 _CS_CHARTER = ("# demo\n\n## Goals\nShip v1.\n\n## Restrictions\n- Never push to main (user msg #1).\n\n"
                "## Policies\nLabel every number.\n")

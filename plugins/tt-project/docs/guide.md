@@ -438,6 +438,18 @@ prolonged whole-box outage.
   running or finished task keeps) comes back as the answer tool's result, so the coordinator fixes
   or drops it in the same turn. An action resent unchanged goes through and is refused after the
   turn as before; at most 2 answers a wake are sent back.
+  `tools` (`full`, the default, or `read_only`) sets what a session wake may use (coordtools.py).
+  With `full` it gets a worker's tools (Bash, Read, Edit, Write, Skill, ToolSearch and the web
+  tools unless `no_internet`) under a worker's PreToolUse checks, so it can edit, build, ssh to the
+  machines its charter allows and run the `ttp` CLI. Direct writes to the charter, the memory
+  files, `harness/project.json` and the state database are denied, each naming the action or
+  command that applies the same checks (`charter_update`, `memory_add`, `config_set`, `ttp config`);
+  any raw `git push` is denied: code goes through a work branch, review and the push queue. A
+  foreground command stops at `tool_timeout_s` (300, at most 600); a longer or background one is
+  denied with a pointer to `ttp detach` or a worker task. Each mutating call (the command or file,
+  its exit code) goes to the run's `tool-audit.jsonl` and `progress.md`, which the web run view
+  shows. `read_only` keeps `Read` and a list of read-only `ttp` commands. Moving to `read_only`
+  needs no word; back to `full` needs the user's. A stateless turn has no tools either way.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
   refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown
   of `coordinator.rejection_cooldown_s` (default 900; 0 turns it off). Inside it, an event with the

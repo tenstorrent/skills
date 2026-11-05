@@ -1896,6 +1896,17 @@ def _coord_pre_tool_use(payload: dict):
 HANDLERS[COORD_EVENT := "CoordPreToolUse"] = _coord_pre_tool_use   # a session coordinator's tools (coordtools.py)
 
 
+def _coord_post(failed: bool):
+    def handle(payload: dict):
+        from . import coordtools
+        return coordtools.post_tool_use(payload, failed)
+    return handle
+
+
+# A full-tools session coordinator's audit log of its mutating calls (coordtools.post_tool_use).
+HANDLERS.update(CoordPostToolUse=_coord_post(False), CoordPostToolUseFailure=_coord_post(True))
+
+
 def main(argv: list[str]) -> int:
     event = argv[1] if len(argv) > 1 else ""
     try:

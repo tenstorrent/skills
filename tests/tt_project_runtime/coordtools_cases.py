@@ -38,7 +38,7 @@ def test_mode_off_coordinator_argv_is_unchanged(env, monkeypatch):
 
 
 def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
-    argv, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
+    argv, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on", "tools": "read_only"})
     assert "--safe-mode" not in argv, "safe mode turns hooks off"
     assert argv[argv.index("--tools") + 1] == "Read,Bash"
     for flag in ("--restricted", "--strict-mcp-config", "--disallowedTools"):
@@ -444,3 +444,149 @@ def test_the_answer_check_runs_through_the_coordinator_hook_entry_point(env, tmp
                           capture_output=True, text=True, cwd=str(RUNTIME), timeout=60)
     out = json.loads(hook.stdout)["hookSpecificOutput"]
     assert out["permissionDecision"] == "deny" and "no task #424242" in out["permissionDecisionReason"]
+
+
+def _settings(argv):
+    return json.loads(argv[argv.index("--settings") + 1])
+
+
+def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypatch):
+    from ttp import coordsession
+    argv, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
+    assert argv[argv.index("--tools") + 1] == "Bash,Read,Edit,Write,Skill,ToolSearch,WebFetch,WebSearch"
+    assert "--safe-mode" not in argv and "--restricted" in argv
+    assert not any(argv[i:i + 3] == ["--disallowedTools", "Edit", "Write"] for i in range(len(argv))), \
+        "the read-only turn's Edit/Write deny goes"
+    allowed = argv[argv.index("--allowedTools") + 1:argv.index("--allowedTools") + 10]
+    assert {"StructuredOutput", "Bash", "Edit", "Write"} <= set(allowed)
+    s = _settings(argv)
+    assert s["hooks"]["PreToolUse"][0]["hooks"][0]["command"].endswith("CoordPreToolUse")
+    assert s["hooks"]["PostToolUse"][0]["hooks"][0]["command"].endswith("CoordPostToolUse")
+    assert s["hooks"]["PostToolUseFailure"][0]["hooks"][0]["command"].endswith("CoordPostToolUseFailure")
+    deny = s["permissions"]["deny"]
+    assert f"Edit(/{p.charter_path})" in deny and f"Edit(/{p.harness / 'memory'}/**)" in deny
+    assert f"Edit(/{p.config_path})" in deny and f"Edit(/{p.state / 'project.db'})" in deny
+    assert s["env"]["TTP_COORD_FULL_TOOLS"] == "1" and s["env"]["BASH_MAX_TIMEOUT_MS"] == "300000"
+    assert str(p.charter_path) in s["env"]["TTP_COORD_PROTECTED"].split(os.pathsep)
+    # read_only (or any unknown value) keeps the read-only set; so does a session's stateless fallback.
+    for cfg in ({"mode": "on", "tools": "read_only"}, {"mode": "on", "tools": "everything"}):
+        argv, _, _, _ = _coord_argv(env, monkeypatch, cfg)
+        assert argv[argv.index("--tools") + 1] == "Read,Bash", cfg
+        assert "TTP_COORD_FULL_TOOLS" not in _settings(argv)["env"]
+    monkeypatch.setattr(coordsession, "decide", lambda *a, **k: ("stateless", "test"))
+    argv, _, _, _ = _coord_argv(env, monkeypatch, {"mode": "on"})
+    assert argv[argv.index("--tools") + 1] == "Read,Bash"
+    # The stateless turn (mode off) still has no tools at all.
+    argv, _, _, _ = _coord_argv(env, monkeypatch, None)
+    assert argv[argv.index("--tools") + 1] == "" and "--settings" not in argv
+
+
+def _full_env(tmp_path, monkeypatch, timeout_s="300"):
+    from ttp import coordtools
+    harness, state, run = tmp_path / "harness", tmp_path / "state", tmp_path / "run"
+    for d in (harness / "memory", state, run):
+        d.mkdir(parents=True)
+    protected = [harness / "CHARTER.md", harness / "MEMORY.md", harness / "memory", harness / "project.json",
+                 state / "project.db"]
+    monkeypatch.setenv(coordtools.FULL_ENV, "1")
+    monkeypatch.setenv(coordtools.PROTECTED_ENV, os.pathsep.join(map(str, protected)))
+    monkeypatch.setenv(coordtools.TIMEOUT_ENV, timeout_s)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.delenv(coordtools.DENIED_ENV, raising=False)
+    return harness, state, run
+
+
+def _decide(tmp_path, tool, **args):
+    from ttp import coordtools
+    out, _ = coordtools.pre_tool_use({"tool_name": tool, "tool_input": args, "cwd": str(tmp_path)})
+    return "deny" if out and out["hookSpecificOutput"].get("permissionDecision") == "deny" else "allow"
+
+
+def test_full_tools_hook_allows_writes_and_denies_protected_files_and_pushes(tmp_path, monkeypatch):
+    harness, state, _ = _full_env(tmp_path, monkeypatch)
+    for tool, args in (("Write", {"file_path": str(tmp_path / "a.py"), "content": "x"}),
+                       ("Edit", {"file_path": str(tmp_path / "b.md"), "old_string": "a", "new_string": "b"}),
+                       ("Read", {"file_path": str(harness / "CHARTER.md")}), ("StructuredOutput", {"actions": []}),
+                       ("Skill", {"skill": "x"}), ("WebFetch", {"url": "https://example.com"})):
+        assert _decide(tmp_path, tool, **args) == "allow", tool
+    allowed = ["echo hi > out.txt && mkdir -p build", "ssh box1 'ls /tmp'", "ttp task demo add 'fix x'",
+               "git commit -m 'push the fix'", "git status && ./push.sh", "ttp lock box1 -- make", "ttp status",
+               "rm -rf build", "git fetch origin"]
+    for cmd in allowed:
+        assert _decide(tmp_path, "Bash", command=cmd) == "allow", cmd
+    for path in (harness / "CHARTER.md", harness / "CHARTER-notes.md", harness / "MEMORY.md",
+                 harness / "memory" / "fact.md", harness / "project.json", state / "project.db",
+                 state / "project.db-wal", "harness/CHARTER.md", harness / "memory" / ".." / "project.json"):
+        for tool in ("Write", "Edit", "MultiEdit"):
+            assert _decide(tmp_path, tool, file_path=str(path)) == "deny", (tool, path)
+    denied = ["sed -i s/a/b/ harness/CHARTER.md", f"python3 -c \"open('{harness}/project.json','w')\"",
+              "sqlite3 state/project.db 'delete from tasks'", "echo x >> harness/MEMORY.md",
+              f"rm {harness}/memory/fact.md", "cp /tmp/x CHARTER.md",
+              # a raw git push, every way: plain, by path, wrapped, nested in a shell or ssh, to a tag
+              "git push origin HEAD:smartonTT/x", "/usr/bin/git -C repo push --tags", "env A=1 git push",
+              "timeout 60 git push origin main", "sh -c 'cd r && git push origin main'",
+              "ssh box1 'cd r; git push origin v1'", "bash -c \"bash -c 'git push'\"", "true; git push -f",
+              # the worker's own checks still run
+              "ttp say hi", "/usr/bin/gh pr ready 1"]
+    for cmd in denied:
+        assert _decide(tmp_path, "Bash", command=cmd) == "deny", cmd
+    # read_only mode: the old list holds
+    monkeypatch.delenv("TTP_COORD_FULL_TOOLS")
+    assert _decide(tmp_path, "Write", file_path=str(tmp_path / "a.py")) == "deny"
+    assert _decide(tmp_path, "Bash", command="echo hi > out.txt") == "deny"
+
+
+def test_a_long_foreground_coordinator_command_is_cut_at_its_time_limit(tmp_path, monkeypatch):
+    from ttp import coordtools
+    _full_env(tmp_path, monkeypatch, timeout_s="120")
+    assert _decide(tmp_path, "Bash", command="make", timeout=100_000) == "allow"
+    assert _decide(tmp_path, "Bash", command="make", timeout=600_000) == "deny"
+    assert _decide(tmp_path, "Bash", command="make", run_in_background=True) == "deny"
+    out, _ = coordtools.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "make", "timeout": 600_000}})
+    assert "ttp detach" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    # The CLI's own Bash ceiling is the limit, so a call naming no timeout is cut there too.
+    cfg = {"coordinator": {"session": {"mode": "on", "tool_timeout_s": 90}}}
+    s = coordtools.hook_settings(full=True, timeout_s=coordtools.tool_timeout_s(cfg))
+    assert s["env"]["BASH_MAX_TIMEOUT_MS"] == s["env"]["BASH_DEFAULT_TIMEOUT_MS"] == "90000"
+    assert coordtools.tool_timeout_s({}) == 300
+    assert coordtools.tool_timeout_s({"coordinator": {"session": {"tool_timeout_s": 5000}}}) == 600
+    assert coordtools.tool_timeout_s({"coordinator": {"session": {"tool_timeout_s": "x"}}}) == 300
+
+
+def test_full_tools_log_each_mutating_call(tmp_path, monkeypatch):
+    from ttp import coordtools
+    _, _, run = _full_env(tmp_path, monkeypatch)
+    calls = [({"tool_name": "Bash", "tool_input": {"command": "make install"}}, False),
+             ({"tool_name": "Bash", "tool_input": {"command": "ttp lock b -- false"}, "error": "Exit code 2\nboom"}, True),
+             ({"tool_name": "Edit", "tool_input": {"file_path": "/x/y.py"}}, False),
+             ({"tool_name": "Bash", "tool_input": {"command": "ttp status"}}, False),   # a read: not logged
+             ({"tool_name": "Read", "tool_input": {"file_path": "/x/y.py"}}, False),
+             ({"tool_name": "Bash", "tool_input": {"command": "rm x"}, "agent_id": "a1"}, False)]
+    for payload, failed in calls:
+        assert coordtools.post_tool_use(payload, failed) == (None, None)
+    rows = [json.loads(line) for line in (run / coordtools.AUDIT).read_text().splitlines()]
+    assert [(r["tool"], r["target"], r["exit"]) for r in rows] == [
+        ("Bash", "make install", 0), ("Bash", "ttp lock b -- false", 2), ("Edit", "/x/y.py", 0)]
+    progress = (run / "progress.md").read_text()
+    assert "coordinator Bash exit 2: ttp lock b -- false" in progress and "ttp status" not in progress
+    # Through the hook's entry point too.
+    hook = subprocess.run([sys.executable, "-m", "ttp.hook", "CoordPostToolUseFailure"],
+                          input=json.dumps({"tool_name": "Write", "tool_input": {"file_path": "/x/z"}, "error": "no"}),
+                          capture_output=True, text=True, cwd=str(RUNTIME), timeout=30,
+                          env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    assert hook.returncode == 0
+    assert json.loads((run / coordtools.AUDIT).read_text().splitlines()[-1])["exit"] == 1
+    monkeypatch.delenv("TTP_COORD_FULL_TOOLS")   # read_only mode logs nothing
+    coordtools.post_tool_use({"tool_name": "Bash", "tool_input": {"command": "rm y"}})
+    assert len((run / coordtools.AUDIT).read_text().splitlines()) == 4
+
+
+def test_session_tools_key_loosens_only_on_the_users_word():
+    from ttp import coordinator as coord, coordtools
+    assert coord.NEEDS_USER["coordinator.session.tools"] == "restriction"
+    assert "coordinator.session.tools" in coord.SAFE_WHEN_OFF
+    assert coord.OFF_VALUE["coordinator.session.tools"] == "read_only"
+    assert coordtools.tools_mode_of(" Read_Only ") == "read_only"
+    with pytest.raises(ValueError):
+        coordtools.tools_mode_of("all")
+    assert coordtools.tools_mode({}) == "full"

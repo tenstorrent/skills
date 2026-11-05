@@ -114,6 +114,7 @@ from . import topup
 from . import probevars
 from . import onhost
 from . import coordsession
+from . import coordtools
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -496,6 +497,8 @@ USER_SETTABLE = {
     "coordinator.conclusion_floor": lambda v: tierfloor.floor_of(v),
     # The persistent coordinator session (coordsession.py): off, on ('shadow' reserved).
     "coordinator.session.mode": lambda v: coordsession.mode_of(v),
+    # A session coordinator's tools (coordtools.py): full or read_only. Back to full only on the user's word.
+    "coordinator.session.tools": lambda v: coordtools.tools_mode_of(v),
 }
 
 
@@ -1560,7 +1563,8 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
 # judgement. `ttp config` refuses it inside a run, as every NEEDS_USER key.
 SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS}
 NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
-SAFE_WHEN_OFF = {relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
+NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe side, needs no word
+SAFE_WHEN_OFF = {"coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
                  "delivery.never_force"}
@@ -1570,7 +1574,7 @@ SAFE_WHEN_OFF = {relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_
 HELD_SETTING = {k: {"spend": "gate", "access": "gate", "merge": "speaks"}.get(v, "people")
                 for k, v in NEEDS_USER.items() if k != relay.AGENT_KEY and k not in SANDBOX_KEYS}
 # The value that turns a SAFE_WHEN_OFF key off (the safe side), where it is not False, "" or [].
-OFF_VALUE = {"delivery.own_push": "off", "delivery.rebase_replace": "new_branch", "delivery.never_force": True}
+OFF_VALUE = {"coordinator.session.tools": "read_only", "delivery.own_push": "off", "delivery.rebase_replace": "new_branch", "delivery.never_force": True}
 
 
 def tasks_made(db, since: float, review: bool = False) -> list[float]:
