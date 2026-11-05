@@ -25,8 +25,12 @@ that lacks git or tar, or whose slots are full is skipped, never a failure. So i
 runs (device_busy, a lock-based safety gate, never a neighbour or site check): any of its device locks
 (`<alias>-device`, the device names of its machines-list `shared` entry, the project's `device.locks` on it)
 held, reserved or waited for, here or in the user's shared locks, or a running job row in the status of a
-broker this project watches on it (a heal check with preset broker on that machine). A broker whose status
-does not read within BROKER_TIMEOUT_S, or reads no job rows, never keeps a run off: the locks alone decide.
+broker this project watches on it (a heal check with preset broker on that machine), or a process on it
+that holds a Tenstorrent device node (DEVICE_NODES) open and is no check run of the pool (_device_holders,
+in the host's probe: a device test that takes no lock). A broker whose status does not read within
+BROKER_TIMEOUT_S, or reads no job rows, never keeps a run off: the locks alone decide. Nor does a holder scan
+that cannot run or finish within DEVICE_SCAN_S: the run says so. The scan reads, without sudo, only what the
+ssh user may (/proc/<pid>/fd of its own processes, and others' where the host lets it).
 Runs already on the host go on. The skip shows in one line in `ttp status` and the web app (skip_lines)
 while it is fresh (SKIP_SHOW_S). Its slots:
 the lanes its cores and available memory give (checklane.default_slots) less the remote checks
@@ -52,6 +56,7 @@ import fcntl
 import json
 import os
 import re
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -67,6 +72,7 @@ SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # set for the local rerun of a run that did not pass on a spill host
 PROBE_TIMEOUT_S = 30
 DEVICE_SUFFIX = "-device"
+DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
 BROKER_TIMEOUT_S = 10.0   # one read of a broker's status; past it the device locks alone decide
 SPILL_MARK = {"checks_spill": True}   # in the label of a pool check run's hold of a host's lock (_hold)
 SKIP_SHOW_S = 900   # a host skipped for a device job shows in `ttp status` and the web app this long after
@@ -80,6 +86,57 @@ _PROBE = ("command -v git >/dev/null 2>&1 && command -v tar >/dev/null 2>&1 || e
           "n=$(find \"${TMPDIR:-/tmp}\" -maxdepth 1 -name 'ttp-check.*' -type d "
           f"-mmin -{RUNNING_MAX_AGE_MIN} 2>/dev/null | wc -l)\n"
           "echo \"ttp-spill $c ${m:-0} $n\"\n")
+DEVICE_NODES = "/dev/tenstorrent*"   # a host's Tenstorrent device nodes (a glob); a process holding one open is a tenant
+NODES_ENV = "TTP_TEST_DEVICE_NODES"   # tests: the device node glob instead of DEVICE_NODES
+DEVICE_SCAN_S = 15   # the holder scan's share of PROBE_TIMEOUT_S; past it the scan is cut and fails open
+DEVICE_HOLDERS_SHOWN = 3   # holders named in a skip reason; the rest are counted
+# One line per holder process ("ttp-spill-dev <pid> <device> <command name>") but the pool's own check runs (their
+# working folder, or the PWD they inherited, in a ttp-check.* folder of the host's temp folder: $2 as given, $3
+# resolved), then "ttp-spill-dev-end". GNU find reads
+# each /proc/<pid>/fd the ssh user may read; an unreadable one is skipped.
+_SCAN = ("find /proc -maxdepth 0 -lname x -printf '' >/dev/null 2>&1 || { echo 'ttp-spill-dev-end nofind'; exit 0; }\n"
+         "find /proc/[0-9]*/fd -maxdepth 1 -lname \"$1\" -printf '%h %l\\n' 2>/dev/null"
+         " | awk '{split($1, a, \"/\"); if (!s[a[3]]++) print a[3], $2}' |\n"
+         "while read -r p dev; do\n"
+         "  case $(readlink /proc/$p/cwd 2>/dev/null) in \"$2\"/ttp-check.*|\"$3\"/ttp-check.*) continue;; esac\n"
+         "  case $(tr '\\0' '\\n' </proc/$p/environ 2>/dev/null | sed -n 's/^PWD=//p') in\n"
+         "    \"$2\"/ttp-check.*|\"$3\"/ttp-check.*) continue;; esac\n"
+         "  echo \"ttp-spill-dev $p $dev $(head -c 40 /proc/$p/comm 2>/dev/null | tr -c 'A-Za-z0-9._+:\\n-' '_')\"\n"
+         "done\n"
+         "echo ttp-spill-dev-end\n")
+
+
+def _probe_script() -> str:
+    """The host's probe: its slots line (_PROBE), then the device holder scan (_SCAN, bounded by DEVICE_SCAN_S
+    with `timeout`; none there: not run) when a DEVICE_NODES node exists, and the scan's exit code."""
+    glob = os.environ.get(NODES_ENV) or DEVICE_NODES
+    return (_PROBE + f"set -- {glob}\n"
+            "t=${TMPDIR:-/tmp}; t=${t%/}\n"
+            "if [ ! -e \"$1\" ]; then echo 'ttp-spill-dev-end none'\n"
+            "elif ! command -v timeout >/dev/null 2>&1; then echo 'ttp-spill-dev-end notimeout'\n"
+            f"else timeout -k 2 {DEVICE_SCAN_S} sh -c {shlex.quote(_SCAN)} _ {shlex.quote(glob)} \"$t\" \"$(cd \"$t\" 2>/dev/null && pwd -P)\" </dev/null; "
+            "echo \"ttp-spill-dev-rc $?\"; fi\n")
+
+
+def _device_holders(out: str) -> tuple[str, str]:
+    """From a probe's output: (why the host is device-busy, "") when the scan names a holder, ("", why the scan
+    did not read) when it was cut, could not run or printed no end line, else ("", "")."""
+    held = re.findall(r"^ttp-spill-dev (\d+) (\S+) ?(.*)$", out, re.M)
+    end = re.search(r"^ttp-spill-dev-end ?(\S*)$", out, re.M)
+    rc = re.search(r"^ttp-spill-dev-rc (\d+)$", out, re.M)
+    if held:
+        named = ", ".join(f"pid {p} ({c or '?'}) holds {d}" for p, d, c in held[:DEVICE_HOLDERS_SHOWN])
+        more = len(held) - DEVICE_HOLDERS_SHOWN
+        return DEVICE_WHY + named + (f" and {more} more process(es)" if more > 0 else ""), ""
+    if end and end.group(1) in ("", "none"):
+        return "", ""
+    if rc and rc.group(1) in ("124", "137"):
+        return "", f"its device holder scan timed out after {DEVICE_SCAN_S} s"
+    if end and end.group(1) == "nofind":
+        return "", "its device holder scan cannot run (no GNU find there)"
+    if end and end.group(1) == "notimeout":
+        return "", "its device holder scan cannot run (no timeout command there)"
+    return "", f"its device holder scan did not finish (exit {rc.group(1) if rc else 'unknown'})"
 
 
 def hosts_of(v: Any) -> list[str]:
@@ -274,26 +331,30 @@ def paused_elsewhere(p, alias: str, machine: Any = None) -> tuple[str, dict] | N
     return None
 
 
-def probe(alias: str) -> tuple[int, str]:
-    """(free slots, "") on `alias`, or (0, why it cannot take a check now)."""
+def probe(alias: str) -> tuple[int, str, str]:
+    """(free slots, "", note) on `alias`, or (0, why it cannot take a check now, note): why names a device
+    holder the probe's scan found (_device_holders); note says why that scan did not read, else ""."""
     from . import checklane
     try:
-        r = subprocess.run(remotecheck._ssh(alias, _PROBE), stdin=subprocess.DEVNULL, capture_output=True,
+        r = subprocess.run(remotecheck._ssh(alias, _probe_script()), stdin=subprocess.DEVNULL, capture_output=True,
                            text=True, timeout=PROBE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return 0, f"ssh timed out after {PROBE_TIMEOUT_S} s"
+        return 0, f"ssh timed out after {PROBE_TIMEOUT_S} s", ""
     except OSError as e:
-        return 0, f"cannot run ssh: {e}"
+        return 0, f"cannot run ssh: {e}", ""
     if r.returncode == 255:
-        return 0, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}"
+        return 0, f"ssh cannot reach it: {(r.stderr.strip().splitlines() or ['exit 255'])[-1][:200]}", ""
     if r.returncode == 3:
-        return 0, "it lacks git or tar"
+        return 0, "it lacks git or tar", ""
     m = re.search(r"^ttp-spill (\d+) (\d+) (\d+)$", r.stdout, re.M)
     if r.returncode != 0 or not m:
-        return 0, f"its probe failed (exit {r.returncode})"
+        return 0, f"its probe failed (exit {r.returncode})", ""
+    busy, note = _device_holders(r.stdout)
+    if busy:
+        return 0, busy, ""
     cores, mem_kib, running = (int(x) for x in m.groups())
     n = checklane.default_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None)
-    return (n - running, "") if running < n else (0, f"its {n} check slot(s) are busy")
+    return (n - running, "", note) if running < n else (0, f"its {n} check slot(s) are busy", note)
 
 
 def claim_dir() -> Path:
@@ -536,9 +597,11 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
         if not why:
             why = device_busy(p, cfg, alias)
             _note_skip(alias, why, p.name)
-        free = 0
+        free, note = 0, ""
         if not why:
-            free, why = probe(alias)
+            free, why, note = probe(alias)
+            if why.startswith(DEVICE_WHY):
+                _note_skip(alias, why, p.name)
         if not why and (got := _claim(alias, free, {**rec, "host": alias})) is not None:
             got.lock = _hold(p, cfg, alias, what)
             if got.lock is None:
@@ -547,9 +610,11 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
                 continue
             tell(f"spilling to {alias}: the slots here stayed busy for {after_s(cfg):g} s "
                  f"({_source(cfg, alias)}); the checks run there on a copy of the commit"
+                 + (f"; {note}, so its device locks alone decided" if note else "")
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))
             return got
-        skipped.append(f"{alias} ({why or 'this machine holds its free slots'})")
+        skipped.append(f"{alias} ({why or 'this machine holds its free slots'}"
+                       + (f"; {note}" if note else "") + ")")
     if skipped:
         tell("no spill host could take the checks, waiting here: " + "; ".join(skipped))
     return None

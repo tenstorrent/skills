@@ -819,6 +819,110 @@ def test_spill_broker_job_rows_are_read_from_lists_counts_or_one_job():
         assert rj(quiet) == "", quiet
 
 
+def test_spill_probe_device_holder_scan_names_outside_holders_and_reports_a_scan_that_did_not_read():
+    """_device_holders on fake probe output: a holder the scan names makes the host busy with its pid and
+    command name (more than DEVICE_HOLDERS_SHOWN are counted, a cut scan's holders still count); a scan that
+    ended with none, or a host with no device node, is not busy; a scan cut, unable to run or with no end line
+    is not busy either, and says why."""
+    from ttp import checkspill
+    head = "ttp-spill 8 16000000 0\n"
+    busy, note = checkspill._device_holders(
+        head + "ttp-spill-dev 4242 /dev/tenstorrent/0 run.sh\nttp-spill-dev-end\nttp-spill-dev-rc 0\n")
+    assert (busy, note) == ("a device job runs there: pid 4242 (run.sh) holds /dev/tenstorrent/0", "")
+    many = "".join(f"ttp-spill-dev {i} /dev/tenstorrent/{i} t{i}\n" for i in range(1, 6))
+    busy, note = checkspill._device_holders(head + many + "ttp-spill-dev-rc 124\n")
+    assert busy.startswith("a device job runs there: pid 1 (t1) holds /dev/tenstorrent/1, pid 2 (t2)") and note == ""
+    assert busy.endswith("pid 3 (t3) holds /dev/tenstorrent/3 and 2 more process(es)"), busy
+    for quiet in ("ttp-spill-dev-end\nttp-spill-dev-rc 0\n", "ttp-spill-dev-end none\n"):
+        assert checkspill._device_holders(head + quiet) == ("", ""), quiet
+    for out, said in (("ttp-spill-dev-rc 124\n", "timed out after 15 s"), ("ttp-spill-dev-rc 137\n", "timed out"),
+                      ("ttp-spill-dev-end nofind\nttp-spill-dev-rc 0\n", "cannot run (no GNU find there)"),
+                      ("ttp-spill-dev-end notimeout\n", "cannot run (no timeout command there)"),
+                      ("ttp-spill-dev-rc 2\n", "did not finish (exit 2)"), ("", "did not finish (exit unknown)"),
+                      ("ttp-spill-dev 12\nttp-spill-dev-rc 0\n", "did not finish (exit 0)")):
+        busy, note = checkspill._device_holders(head + out)
+        assert busy == "" and said in note and note.startswith("its device holder scan "), (out, note)
+
+
+def _node_holder(node, cwd=None, env=None):
+    """A process holding device node `node` open (in `cwd`, with `env`), once it has it open."""
+    hold = "import sys, time; f = open(sys.argv[1], 'rb'); print('open', flush=True); time.sleep(120)"
+    proc = subprocess.Popen([sys.executable, "-c", hold, str(node)], stdout=subprocess.PIPE, text=True, cwd=cwd,
+                            env=env)
+    assert proc.stdout.readline() == "open\n"
+    return proc
+
+
+def test_spill_skips_a_host_where_a_process_outside_the_pool_holds_a_device_node_open(env, tmp_path, monkeypatch):
+    """A device test that takes no lock: the host's probe finds a process holding one of its device nodes
+    open, so a new run skips the host, saying which pid and command, and `ttp status` shows it. The pool's
+    own check runs holding one (their folder, or the PWD they inherited, a ttp-check.* folder of the host's
+    temp folder) do not count, one named so elsewhere does, and once the outside holder ends the host takes runs again."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    nodes = tmp_path / "dev"
+    nodes.mkdir()
+    (nodes / "tenstorrent0").write_text("")
+    monkeypatch.setenv(checkspill.NODES_ENV, str(nodes / "tenstorrent*"))
+    cfg = p.config()
+    told: list[str] = []
+    own = remote / "ttp-check.own00001"
+    own.mkdir()
+    procs = [_node_holder(nodes / "tenstorrent0", cwd=own),
+             _node_holder(nodes / "tenstorrent0", cwd=tmp_path, env={**os.environ, "PWD": str(own)})]
+    try:
+        got = checkspill.pick(p, cfg, told.append, "pytest -q")
+        assert got is not None and got.host == "check-host-a", told
+        assert "device holder scan" not in told[-1], told
+        got.close()
+        elsewhere = tmp_path / "ttp-check.notours1"   # named like a pool run, but not in the host's temp folder
+        elsewhere.mkdir()
+        outside = _node_holder(nodes / "tenstorrent0", cwd=elsewhere, env={**os.environ, "PWD": str(elsewhere)})
+        procs.append(outside)
+        assert checkspill.pick(p, cfg, told.append, "pytest -q") is None
+        why = f"check-host-a (a device job runs there: pid {outside.pid} (python"
+        assert told[-1].startswith("no spill host could take the checks, waiting here: " + why), told[-1]
+        assert f"holds {nodes}/tenstorrent0" in told[-1] and str(procs[0].pid) not in told[-1], told[-1]
+        line = f"spill host check-host-a takes no new checks: a device job runs there: pid {outside.pid} (python"
+        assert [x for x in checkspill.skip_lines() if x.startswith(line)], checkspill.skip_lines()
+        outside.kill()
+        outside.wait()
+        again = checkspill.pick(p, cfg, told.append, "pytest -q")
+        assert again is not None and again.host == "check-host-a", told
+        again.close()
+        assert checkspill.skip_lines() == []
+    finally:
+        for x in procs:
+            x.kill()
+            x.wait()
+
+
+def test_spill_device_holder_scan_that_times_out_or_cannot_run_never_keeps_a_run_off_and_is_told(
+        env, tmp_path, monkeypatch):
+    """The holder scan cut at DEVICE_SCAN_S (a fake `timeout` that exits 124), or a host with no `timeout`
+    command, keeps no run off the host: the run spills there and says the device locks alone decided."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    nodes = tmp_path / "dev"
+    nodes.mkdir()
+    (nodes / "tenstorrent0").write_text("")
+    monkeypatch.setenv(checkspill.NODES_ENV, str(nodes / "tenstorrent*"))
+    fake = tmp_path / "faketimeout"
+    fake.mkdir()
+    (fake / "timeout").write_text("#!/bin/sh\nexit 124\n")
+    (fake / "timeout").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{fake}{os.pathsep}{os.environ['PATH']}")
+    told: list[str] = []
+    got = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    assert got is not None and got.host == "check-host-a", told
+    got.close()
+    assert ("its device holder scan timed out after 15 s, so its device locks alone decided" in told[-1]), told
+    assert checkspill.skip_lines() == []
+    script = checkspill._probe_script().replace("command -v timeout", "command -v no-such-timeout-cmd")
+    out = subprocess.run(["sh", "-c", script], capture_output=True, text=True, timeout=30).stdout
+    assert checkspill._device_holders(out) == ("", "its device holder scan cannot run (no timeout command there)")
+
+
 def test_a_spill_run_past_the_wall_cap_or_on_a_stalled_link_runs_again_here(env, tmp_path, monkeypatch):
     """A spill host slower than the wall-time cap (or an ssh link that stalls there) is the host's
     environment, not the change's: the checks run again here, only that result counts, and no task
