@@ -28,6 +28,8 @@ PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route",
 LEARNED = ("harness_facts", "suite_timings", "generic_fixes")
 LIST_SOURCES = ("inputs", "harness", "default_rule")
 MODES = ("light", "full")
+INPUTS = Path("bringup/agentic_evals/inputs.json")
+DEFAULT_RUN_TIMEOUT_HOURS = 12
 EFFORT_STATUS = ("done", "running", "not_run")
 CHANGES = ("kept", "dropped", "none")
 PROBLEM_STATUS = ("solved", "open")
@@ -226,6 +228,22 @@ def check_serving_config(evals: Path, problems: list) -> None:
                       f"{name} planned {clients} agents against max_num_seqs {seqs}; the rest queue")
 
 
+def operator_inputs(problems: list) -> dict:
+    """The operator's goal-12 inputs, read from the target checkout the gate runs in."""
+    if not INPUTS.is_file():
+        return {}
+    inputs = read(INPUTS, problems)
+    if inputs.get("mode", "light") not in MODES:
+        problems.append((2, f"{INPUTS} mode must be one of {', '.join(MODES)}"))
+    return inputs
+
+
+def run_timeout_hours(inputs: dict) -> float:
+    limits = [inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS),
+              (inputs.get("compute") or {}).get("run_timeout_hours")]
+    return min(limit for limit in limits if number(limit))
+
+
 def check_cohorts(evals: Path, problems: list) -> None:
     cohorts = read(evals / "cohorts.json", problems)
     if not cohorts:
@@ -248,21 +266,24 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
     check_efforts(evals, problems)
     check_serving_config(evals, problems)
     check_cohorts(evals, problems)
+    inputs = operator_inputs(problems)
     plan = read(evals / "plan.json", problems) if (evals / "plan.json").is_file() else {}
-    if (evals / "plan.json").is_file() and (plan.get("mode") not in MODES or not plan.get("schedule")):
-        problems.append((2, f"plan.json needs mode ({', '.join(MODES)}) and the schedule"))
+    mode = inputs.get("mode", "light")
+    if (evals / "plan.json").is_file() and (plan.get("mode") != mode or not plan.get("schedule")):
+        problems.append((2, f"plan.json needs mode {mode!r} (from inputs, default light) and the schedule"))
     decisions = read(evals / "estimate.json", problems).get("evals") or {}
     release = plan.get("release") if isinstance(plan, dict) else None
     if (evals / "plan.json").is_file() and any((row or {}).get("decision") == "go" for row in decisions.values()):
-        limit, projected = plan.get("release_hours", 12), (release or {}).get("projected_hours")
-        per_suite = projected if isinstance(projected, dict) else {"the release run": projected}
-        if not (isinstance(release, dict) and release.get("rehearsal") and per_suite
-                and all(number(hours) for hours in per_suite.values())):
+        limit, projected = run_timeout_hours(inputs), (release or {}).get("projected_hours")
+        per_run = projected if isinstance(projected, dict) else {"the release run": projected}
+        if not (isinstance(release, dict) and release.get("rehearsal") and per_run
+                and all(number(hours) for hours in per_run.values())):
             problems.append((2, "plan.json release needs its rehearsal runs and projected_hours"))
         else:
-            for name, hours in per_suite.items():
+            for name, hours in per_run.items():
                 if hours > limit:
-                    problems.append((2, f"{name} projected at {hours} h against {limit} h; release a smaller list"))
+                    problems.append((2, f"{name} projected at {hours} h against run_timeout_hours {limit}; "
+                                        "release a smaller list"))
     learned = read(evals / "learned.json", problems)
     if learned and not all(isinstance(learned.get(key), list) for key in LEARNED):
         problems.append((2, f"learned.json needs {', '.join(LEARNED)} as lists, empty when there is nothing"))

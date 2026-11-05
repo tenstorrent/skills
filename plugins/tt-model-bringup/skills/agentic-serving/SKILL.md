@@ -91,8 +91,10 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - `release_spec`, optional: where the release values come from. Without it, find the release
   configuration for each eval yourself, in the release workflow and the serving harness;
 - `stage_budget_hours` (default 24 for `light`, 48 for `full`), covering survey to the start of the
-  release run, and `release_hours` (default 12): the release run's limit after that, for all
-  suites together in `light` and for each suite in `full`;
+  release run;
+- `run_timeout_hours` (default 12): the longest any single run may take. The release is one run of
+  all suites in `light` and one run per suite in `full`, so it bounds both. A CI grant may state a
+  lower limit of its own in `compute.run_timeout_hours`; the smaller applies;
 - `permissions`: standing decisions the stage would otherwise stop to ask for, such as
   `release_route_repairs` (may the stage publish fixes to the release route) and
   `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
@@ -110,13 +112,13 @@ stage must not depend on them. Record what was actually used in `doc/agentic_eva
 
 - **`light`, 24 h.** Make every suite run validly at mid size (its full-load list) and leave a
   release configuration whose whole release run, all suites together, finishes within
-  `release_hours` on one machine.
+  `run_timeout_hours` on one machine.
   Efforts go first to validity, then to whatever makes that release run fit. The final step runs
   it.
 - **`full`, 48 h.** Everything `light` does, then speed work, estimates for the full suites from
-  measured runs, and per suite the largest task list that finishes within `release_hours` on one
+  measured runs, and per suite the largest task list that finishes within `run_timeout_hours` on one
   machine: the full suite when it fits. The final step runs those lists, one suite after another,
-  so the release run may take up to `release_hours` per suite.
+  each suite its own run of up to `run_timeout_hours`.
 
 The release run starts before the stage time limit ends and may finish after it. Both modes end
 holding the last rung they banked; a mode that cannot reach its goal reports how far it got with
@@ -218,7 +220,7 @@ rule so another run picks the same tasks. Never take a prefix of a sorted list.
 | smoke | 2 | 2 | 2 | fixed |
 | nightly | about 10 | about 5 | about 10 | the harness: main's usual nightly sizes; read them for this model |
 | full load | agents per server | agents per server | agents per server | the agent, from [Batch and agents](#batch-and-agents) |
-| larger (`full`) | — | multiples of full load | multiples of full load | the agent, from `release_hours`; a larger list also projects the full suite |
+| larger (`full`) | — | multiples of full load | multiples of full load | the agent, from `run_timeout_hours`; a larger list also projects the full suite |
 | full suite | 198 | 500 | 89 | fixed |
 
 **Read every score with its error.** Report the 95% interval, about ±2·√(p(1−p)/n), and say when a
@@ -256,18 +258,18 @@ time measured there projects the next rung to finish before the release run must
    once the smoke rung is banked and share the device through the queue; a rung never waits for
    an effort.
 6. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
-   `release_hours`. They set the release lists.
+   `run_timeout_hours`. They set the release lists.
 7. **Combine and rehearse.** Freeze the release configuration: serving settings, task lists,
    limits, route and commits. Then run each suite on it end to end, at the full-load size or the
    release lists themselves if they fit, and check what a longer run adds: disk for every task,
    concurrent sandboxes, image pulls, verifiers. Fix what fails and rehearse again. Nothing changes
    after the last clean rehearsal.
 8. **Release run**, started before the stage time limit and allowed to finish after it, within
-   `release_hours`, through the same route every earlier run used. It must land without help:
+   `run_timeout_hours`, through the same route every earlier run used. It must land without help:
    start it only on the rehearsed configuration and only when its projection, with each suite's
-   slow tail at the agent limit, fits `release_hours` with margin. Otherwise release a smaller
+   slow tail at the agent limit, fits `run_timeout_hours` with margin. Otherwise release a smaller
    list that does. It runs the evals with a `go` decision: in `light` their full-load lists, all
-   within `release_hours` together; in `full` each one's largest fitting list. A failure during it is reported, not fixed: the
+   within `run_timeout_hours` together; in `full` each one's largest fitting list. A failure during it is reported, not fixed: the
    release result is what it ran.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
@@ -342,7 +344,7 @@ Write these to `doc/agentic_evals/`:
   `used_device_hours`, `change` (`kept`, `dropped`, `none`), `problem_status` (`solved`, `open`),
   `confirmed` and `evidence`; and `rankings`, each with `after`, `order` (`problem`,
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
-- `plan.json`, with the `mode`, the schedule updated after every run, `release_hours`, and
+- `plan.json`, with the `mode`, the schedule updated after every run, and
   `release`: the frozen configuration, the `rehearsal` runs that ran it end to end, and
   `projected_hours` with each suite's slow tail: one number in `light`, one per eval in `full`
 - `runs/<arm>/` (manifest and collected results)

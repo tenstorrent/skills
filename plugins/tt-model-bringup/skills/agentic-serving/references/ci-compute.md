@@ -83,8 +83,9 @@ is shared state when several explorers dispatch — register at launch, not at c
 `queued` + `in_progress` against `max_parallel`. Collect into `doc/agentic_evals/runs/<arm>/` with
 the prediction, dispatched inputs, published SHAs and run id.
 
-`run_timeout_hours` is enforced by CI, not by you: a run that reaches it is killed and returns
-nothing. Use it as a planning bound — do not dispatch what the top of its estimate exceeds. Split
+`compute.run_timeout_hours` is the CI job limit, enforced by CI, not by you: a run that reaches it
+is killed and returns nothing. When it is lower than the stage's `run_timeout_hours`, it is the
+limit for runs on CI. Use it as a planning bound — do not dispatch what the top of its estimate exceeds. Split
 suites on task boundaries so parts stay scorable, and give a multi-eval run per-eval timeouts
 summing under the cap.
 

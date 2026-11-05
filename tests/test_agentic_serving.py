@@ -25,11 +25,15 @@ def evidence():
     }
 
 
-def check(model, stage, data):
+def check(model, stage, data, inputs=None):
+    """Run the gate from a target checkout at `model`, with `inputs` as the operator's inputs.json."""
     (model / 'doc').mkdir(parents=True, exist_ok=True)
     (model / 'doc/agentic_serving.json').write_text(json.dumps(data))
+    if inputs is not None:
+        (model / 'bringup/agentic_evals').mkdir(parents=True, exist_ok=True)
+        (model / 'bringup/agentic_evals/inputs.json').write_text(json.dumps(inputs))
     result = subprocess.run([sys.executable, str(CHECKER), '--model-dir', str(model), '--stage', stage],
-                            text=True, capture_output=True)
+                            text=True, capture_output=True, cwd=model)
     return result.returncode, result.stderr
 
 
@@ -76,7 +80,7 @@ def goal12(model, **overrides):
     evals = model / 'doc/agentic_evals'
     (evals / 'full/swe').mkdir(parents=True, exist_ok=True)
     files = {
-        'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'start_hours': 20}], 'release_hours': 12,
+        'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'start_hours': 20}],
                       'release': {'rehearsal': ['runs/rehearsal-swe'], 'projected_hours': 9.5}},
         'REPORT.md': '# Report',
         'estimate.json': {'evals': {'swe': {'decision': 'go', 'reason': 'fits'}}},
@@ -388,20 +392,39 @@ def test_agent_replay_reports_hits_and_prefill_amplification(tmp_path):
     ('full', {'rehearsal': ['runs/r'], 'projected_hours': {'swe': 11, 'terminal': 14}}, 'terminal projected'),
 ])
 def test_release_needs_a_rehearsal_and_a_projection_that_fits(tmp_path, mode, release, message):
-    plan = {'mode': mode, 'schedule': [{}], 'release_hours': 12, 'release': release}
+    plan = {'mode': mode, 'schedule': [{}], 'release': release}
     goal12(tmp_path, **{'plan.json': plan})
-    code, stderr = check(tmp_path, 'agentic-evals', evidence())
+    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': mode})
     assert code == 2 and message in stderr
 
 
 def test_full_mode_projects_each_suite_against_release_hours(tmp_path):
-    plan = {'mode': 'full', 'schedule': [{}], 'release_hours': 12,
+    plan = {'mode': 'full', 'schedule': [{}],
             'release': {'rehearsal': ['runs/r'], 'projected_hours': {'swe': 11.5, 'terminal': 9}}}
     goal12(tmp_path, **{'plan.json': plan})
-    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
+    assert check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'full'}) == (0, '')
 
 
 def test_no_release_needed_when_every_eval_stopped(tmp_path):
     goal12(tmp_path, **{'plan.json': {'mode': 'light', 'schedule': [{}]},
                         'estimate.json': {'evals': {'swe': {'decision': 'stop', 'reason': 'r', 'functional_at': 5}}}})
     assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
+
+
+@pytest.mark.parametrize('inputs, passes', [
+    ({'run_timeout_hours': 8}, False),
+    ({'run_timeout_hours': 10}, True),
+    ({'compute': {'run_timeout_hours': 10}}, True),
+    ({'run_timeout_hours': 14, 'compute': {'run_timeout_hours': 9}}, False),
+])
+def test_release_limit_comes_from_the_operator_inputs(tmp_path, inputs, passes):
+    """projected 9.5 h: run_timeout_hours from inputs.json, the smaller of stage and CI limits."""
+    goal12(tmp_path)
+    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs=inputs)
+    assert (code == 0) == passes, stderr
+
+
+def test_plan_mode_must_match_the_operator_inputs(tmp_path):
+    goal12(tmp_path)
+    code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs={'mode': 'full'})
+    assert code == 2 and "mode 'full'" in stderr
