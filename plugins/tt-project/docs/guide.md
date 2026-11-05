@@ -420,7 +420,11 @@ prolonged whole-box outage.
   reasons, user corrections), saved as `state/coord-session/<session id>.md`. The next session's
   first message carries the standing memory, the open order ledger, that handover note and the last
   20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
-  backstop.
+  backstop. A resumed wake sends only the digest sections
+  that changed since the session's last wake that ended ok, each whole, plus the new events and one
+  line naming the sections left out. A new session, a daemon restart, a stateless, failed or
+  compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
+  digest on the next wake.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
   refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown
   of `coordinator.rejection_cooldown_s` (default 900; 0 turns it off). Inside it, an event with the

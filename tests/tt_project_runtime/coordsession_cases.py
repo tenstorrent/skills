@@ -598,3 +598,155 @@ def test_coordsession_note_and_chat_lines_keep_to_their_caps(env):
     assert "order 29 " in lines and "order 10 " in lines and "order 9 " not in lines and "still unhandled" not in lines
     small = "\n".join(coordsession.chat_lines(p.db, "", 20, 1500))
     assert "order 29 " in small and "order 10 " not in small and len(small) < 2500 and "older left out" in small
+
+
+def _cs_parts(tasks="- #1 | queued | t", paused=True, at="10:00"):
+    parts = [("budget", f"# STATE at {at}\n## Project budget\n- ok"), ("tasks", f"## Open tasks (id | status)\n{tasks}")]
+    parts += [("paused", "## Paused resources (held)\n- box: paused")] if paused else []
+    return parts + [("events", "\n# NEW EVENTS\n- [user message #1] hi\n\nRespond with the JSON actions object only.")]
+
+
+def test_coordsession_delta_omits_unchanged_sections_and_sends_a_changed_one_whole():
+    from ttp import coordsession as cs
+    calls = []
+    full = lambda: calls.append(1) or _cs_parts()
+    sent, ack, why = cs.wake_digest("new", None, _cs_parts(), full, "seen0", "seen1", "g1")
+    assert sent == _cs_parts() and why == "full: new session" and calls == [1]
+    state = {"id": "s1", cs.DIGEST: ack}
+    # Nothing changed but the clock: the time header, the delta line and the new events only.
+    sent, ack2, why = cs.wake_digest("resume", state, _cs_parts(at="10:05"), full, "seen1", "seen2", "g1")
+    assert calls == [1] and why == "delta: 3 unchanged, 0 gone", why
+    assert [k for k, _ in sent] == ["budget", cs.DELTA, "events"] and sent[0][1] == "# STATE at 10:05"
+    assert "Unchanged, not repeated: Project budget, Open tasks, Paused resources." in sent[1][1], sent[1][1]
+    assert ack2["sections"] == ack["sections"] and ack2["seen"] == "seen2"
+    # A changed section is sent whole; a section gone is named.
+    rows = "- #1 | running | t\n- #2 | queued | u"
+    sent, _, why = cs.wake_digest("resume", {cs.DIGEST: ack2}, _cs_parts(rows, paused=False), full, "seen2", "s3", "g1")
+    assert dict(sent)["tasks"] == f"## Open tasks (id | status)\n{rows}" and "paused" not in dict(sent)
+    assert "Unchanged, not repeated: Project budget. Gone (now empty): Paused resources." in dict(sent)[cs.DELTA]
+    # A changed budget is sent whole, its time header with it.
+    changed = [("budget", "# STATE at 10:09\n## Project budget\n- red")] + _cs_parts()[1:]
+    assert dict(cs.wake_digest("resume", state, changed, full, "seen1", "x", "g1")[0])["budget"] == changed[0][1]
+    # Any state the saved hashes may not match sends the whole digest, uncollapsed (full()).
+    for st, seen, gen, reason in ((state, "seen1", "g2", "daemon restarted"),
+                                  (state, "other", "g1", "another turn's digest since"),
+                                  ({"id": "s1"}, "seen1", "g1", "no acknowledged digest"),
+                                  ({cs.DIGEST: {"sections": "x"}}, "seen1", "g1", "no acknowledged digest"),
+                                  ("garbage", "seen1", "g1", "no acknowledged digest")):
+        calls.clear()
+        sent, _, why = cs.wake_digest("resume", st, _cs_parts(at="11:00"), full, seen, "n", gen)
+        assert why == f"full: {reason}" and calls == [1] and sent == _cs_parts(), why
+    assert cs.asked_full([{"type": "reply"}, {"type": "noop", "key": cs.FULL_ASK}])
+    assert not cs.asked_full([{"type": "noop"}]) and not cs.asked_full(None)
+
+
+def test_coordsession_only_an_ok_session_wake_keeps_its_digest_acknowledged():
+    from types import SimpleNamespace
+    from ttp import coordsession as cs
+    use = SimpleNamespace(session_id="s1", input_tokens=1, cache_read_tokens=0, cache_write_tokens=0, output_tokens=1)
+    ack = {"sections": {"tasks": ["h", "Open tasks"]}, "seen": "f", "gen": "g"}
+    turn = {"mode": "resume", "why": "continued", "digest": ack}
+    st = cs.record(_cs_state(), use, "s1", turn, True, 1.0)
+    assert st[cs.DIGEST] == ack
+    assert cs.DIGEST not in cs.record(st, use, "s1", turn, False, 2.0), "a failed wake acknowledges nothing"
+    assert cs.DIGEST not in cs.record(st, use, "s1", {"mode": "resume", "why": "continued"}, True, 2.0)
+    assert cs.DIGEST not in cs.record(st, use, "s1", {"mode": "stateless", "why": "spend guard tripped"}, True, 2.0), \
+        "a stateless turn the session did not see: its next wake gets the whole digest"
+    assert cs.DIGEST not in cs.fail(_cs_cfg(), st, 3.0)[0]
+
+
+def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_rollover_fallback_or_ask(env, monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import coordsession
+    from ttp.daemon import Daemon
+    p = make(env)
+    _sessions(env, monkeypatch)
+    p.set_config("coordinator.session.mode", "on")
+    p.set_config("coordinator.debounce_s", 0)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    d = Daemon(p.base)
+    n = [0]
+
+    def wake(daemon=None):
+        n[0] += 1
+        p.db.post("in", f"m{n[0]}", chat="c1")
+        rid = _cs_wake(p, daemon or d)
+        note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+        return note["turn"].get("session"), (p.runs / str(rid) / "prompt.md").read_text(), note["digest"]
+
+    s, prompt, size = wake()
+    assert s["mode"] == "new" and s["sent"] == "full: new session" and "Since your last wake" not in prompt
+    assert "as last turn" not in prompt.split("# STATE", 1)[1], "the whole digest, uncollapsed"
+    full_chars = s["sent_chars"]
+    s, prompt, size = wake()
+    assert s["mode"] == "resume" and s["sent"].startswith("delta: "), s
+    assert "Since your last wake in this session" in prompt and "## Open tasks" in prompt, "changed: sent whole"
+    same = prompt.split("Unchanged, not repeated: ")[1].split(".")[0].split(", ")
+    assert same and "Open tasks" not in same and "- [user message #" in prompt
+    for label in same:
+        assert f"## {label}" not in prompt, label
+    assert s["sent_chars"] < full_chars and s["sent_chars"] < size["chars"]
+    assert p.db.kv(coordsession.KEY)[coordsession.DIGEST]["sections"] == s["digest"]["sections"]
+    # A daemon restart: the whole digest.
+    d = Daemon(p.base)
+    s, prompt, _ = wake()
+    assert s["mode"] == "resume" and s["sent"] == "full: daemon restarted" and "Since your last wake" not in prompt
+    assert wake()[0]["sent"].startswith("delta: ")
+    # A rollover: a new session with the whole digest.
+    p.set_config("coordinator.session.rollover_tokens", 1)
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 5})
+    s, prompt, _ = wake()
+    assert s["mode"] == "new" and s["sent"] == "full: new session" and "Since your last wake" not in prompt
+    p.set_config("coordinator.session.rollover_tokens", 140000)
+    assert wake()[0]["sent"].startswith("delta: ")
+    # A fallback to a stateless turn: today's digest then, the whole digest on the next session wake.
+    p.db.set_kv(coordsession.GUARD_KEY, {"tripped": True, "until": time.time() + 600})
+    s, prompt, _ = wake()
+    assert s["mode"] == "stateless" and "sent" not in s and "Since your last wake" not in prompt
+    p.db.set_kv(coordsession.GUARD_KEY, {"tripped": False})
+    s, prompt, _ = wake()
+    assert s["mode"] == "resume" and s["sent"] == "full: no acknowledged digest", s
+    # The session asks for the whole digest, or compacts its history: the next wake sends it whole.
+    monkeypatch.setenv("TTP_FAKE_ACTIONS", json.dumps([{"type": "noop", "key": coordsession.FULL_ASK}]))
+    assert wake()[0]["sent"].startswith("delta: ")
+    monkeypatch.delenv("TTP_FAKE_ACTIONS")
+    assert wake()[0]["sent"] == "full: no acknowledged digest"
+    assert wake()[0]["sent"].startswith("delta: ")
+    monkeypatch.setattr(Daemon, "_compacted", lambda self, r: True)
+    wake()
+    monkeypatch.setattr(Daemon, "_compacted", lambda self, r: False)
+    assert wake()[0]["sent"] == "full: no acknowledged digest"
+    # Mode off: today's digest, and nothing of the delta runs.
+    p.set_config("coordinator.session.mode", "off")
+    monkeypatch.setattr(coordsession, "wake_digest", lambda *a: pytest.fail("off sends no delta"))
+    s, prompt, _ = wake()
+    assert s is None and "Since your last wake" not in prompt
+
+
+def test_coordsession_delta_digest_size_on_recorded_wakes():
+    """Recorded wakes (digestdelta_replay.json, sizes and hashes only) replayed through wake_digest:
+    each wake resumes the session of the wake before. Prints prompt tokens per wake, full vs delta."""
+    from ttp import coordsession as cs
+    wakes = json.loads((_CASES / "digestdelta_replay.json").read_text())["wakes"]
+
+    def parts(w):
+        out = []
+        for sec in w:
+            if sec[0] == "head":
+                out.append((cs.HEAD, "# STATE ".ljust(sec[1], "t") + "\n" + sec[3].ljust(sec[2], "b")))
+            else:
+                out.append((sec[0], f"## {sec[0]}\n{sec[2]}".ljust(sec[1], "x")))
+        return out
+
+    state, full_chars, sent_chars = None, 0, 0
+    for i, w in enumerate(wakes):
+        got = parts(w)
+        sent, ack, why = cs.wake_digest("resume" if i else "new", state, got, lambda: got, "f", "f", "g")
+        full_chars += len("\n".join(t for _, t in got))
+        sent_chars += len("\n".join(t for _, t in sent))
+        assert why.startswith("delta: ") if i else why == "full: new session", why
+        state = {cs.DIGEST: ack}
+    full_tok, delta_tok = full_chars // len(wakes) // 4, sent_chars // len(wakes) // 4
+    print(f"digest prompt tokens per wake over {len(wakes)} recorded wakes: full {full_tok}, delta {delta_tok}")
+    assert len(wakes) >= 100 and delta_tok < full_tok

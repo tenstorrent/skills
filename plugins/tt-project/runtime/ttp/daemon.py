@@ -2775,7 +2775,8 @@ class Daemon:
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
                   note: dict | None = None, resume: str | None = None,
                   context: str | None = None, cache_ttl: str = "", min_effort: str | None = None,
-                  handoff_guard: bool = True, session_prompt: dict | None = None) -> int:
+                  handoff_guard: bool = True, session_prompt: dict | None = None,
+                  session_digest: dict | None = None) -> int:
         """`session_prompt` (a coordinator turn with coordinator.session.mode on): {"system", "context",
         "cached"}, the session's own byte-stable prompt (coordsession.session_prompt_parts) that a
         resumed or new session wake runs on instead of `system` and `context`, and the cached digest
@@ -2784,7 +2785,8 @@ class Daemon:
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
         system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
         picks it per coordinator turn (cachettl.py). Unset, every run but the coordinator's takes
-        budget.worker_cache_ttl ("off": none set)."""
+        budget.worker_cache_ttl ("off": none set). `session_digest` (a coordinator turn in session
+        mode): {"parts", "full", "seen", "shown"} for coordsession.wake_digest."""
         if system is not None and append_system is not None:   # both would be run_dir/system.md
             raise ValueError("start_run takes `system` or `append_system`, not both")
         if self.cfg_status == "unavailable":
@@ -2885,6 +2887,17 @@ class Daemon:
             state = self.p.db.kv(coordsession.KEY)
             if session_mode == "resume":
                 thread = str((state or {}).get("id") or "")
+            ack, sent_why = None, ""
+            if session_digest is not None and session_mode in ("resume", "new"):
+                try:   # only what changed since the session's last acknowledged wake, else the whole digest
+                    sent, ack, sent_why = coordsession.wake_digest(
+                        session_mode, state, session_digest["parts"],
+                        session_digest["full"], session_digest["seen"], session_digest["shown"],
+                        f"{self.boot}:{self._started}")
+                    prompt = "\n".join(text for _, text in sent)
+                except Exception as e:   # today's digest, unacknowledged: the next session wake sends it whole
+                    ack, sent_why = None, f"digest failed: {type(e).__name__}: {e}"[:200]
+                    log(self.p, f"coordinator session {sent_why}")
             if session_mode in ("new", "resume") and session_prompt:
                 system, context = session_prompt["system"], session_prompt["context"]
                 try:   # the rollover handover (coordsession.py): no order, promise or decision is lost
@@ -2896,7 +2909,8 @@ class Daemon:
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "session": {
                 "mode": session_mode, "why": why, "key": key, "model": model, "effort": effort,
-                "provider": provider}}}
+                "provider": provider, **({"digest": ack} if ack else {}),
+                **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
         elif role == "coordinator" and not resume and prov.cache_key_per_session:
             try:   # the agent's cache follows its session: continue the last turn's while warm
                 last = self.p.db.one("SELECT provider, status, session_id, started, ended, note, input_tokens, "
@@ -4494,7 +4508,8 @@ class Daemon:
             return   # its breaker holds the next turn until the login is back; the messages stay queued
         session = (note.get("turn") or {}).get("session")
         if isinstance(session, dict) and self._coord_session_end(r, usage, session,
-                                                                 status == "ok" and isinstance(actions, list), out):
+                                                                 status == "ok" and isinstance(actions, list), out,
+                                                                 actions):
             return   # a failed resume: its messages and events stay queued for the stateless rerun
         if status != "ok" or not isinstance(actions, list):
             if turnsize.over_budget(status, usage) and self._turn_over_budget(note):
@@ -4554,13 +4569,17 @@ class Daemon:
         except Exception:   # bookkeeping: without it the next routine turn runs
             log(self.p, "coordinator quiet state not saved: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
-    def _coord_session_end(self, r: dict, usage, session: dict, ok: bool, out: dict | None = None) -> bool:
+    def _coord_session_end(self, r: dict, usage, session: dict, ok: bool, out: dict | None = None,
+                          actions=None) -> bool:
         """Saves the persistent session (coordsession.py) after a coordinator wake, and the wake's
         `session_note` (its rollover handover) as state/coord-session/<session id>.md. True for a resumed
         wake that failed: nothing of it is applied and the next wake reruns its batch stateless at
-        once, with no backoff; repeated failures pause the mode and raise an issue."""
+        once, with no backoff; repeated failures pause the mode and raise an issue. A wake that asked
+        for the whole digest, or whose session compacted its history, leaves no digest acknowledged."""
         db, now = self.p.db, time.time()
         try:
+            if session.get("digest") and (coordsession.asked_full(actions) or self._compacted(r)):
+                session = {k: v for k, v in session.items() if k != "digest"}
             state = db.kv(coordsession.KEY)
             if session.get("mode") == "resume" and not ok:
                 state, paused = coordsession.fail(self.cfg, state, now)
@@ -4582,6 +4601,14 @@ class Daemon:
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         return False
+
+    def _compacted(self, r: dict) -> bool:
+        """The agent compacted the run's session history (Claude's stream-json `compact_boundary`)."""
+        try:
+            with open(self._run_dir(r) / "output.jsonl", "rb") as f:
+                return any(b'"compact_boundary"' in line for line in f)
+        except OSError:
+            return True   # unknown: the next session wake sends the whole digest
 
     def _quiet_fp(self, gates: dict) -> str:
         """The state quietgate compares across turns, with only the ledger fields a probe never rewrites."""
@@ -8591,14 +8618,25 @@ class Daemon:
             flagged = correction.flag(db, self.cfg, msgs, now)   # likely corrections, tagged in the digest
             speed = slowcomplaint.on_messages(self.p, self.cfg, msgs, now, gates)   # a speed complaint: measured review
             # Every turn sees background sections the previous turn saw as one line each.
+            baseline = db.kv(coord.DIGEST_SEEN_KEY) or {}
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
-                                              db.kv(coord.DIGEST_SEEN_KEY) or {}, flagged)
+                                              baseline, flagged)
             # The sections rendered from the prompt snapshot end the cached context block.
             cached, parts = coord.split_cached(parts)
             must = mustact.block(db, [e["id"] for e in evs])
             parts = ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
             prompt = "\n".join(text for _, text in parts)
+            session_digest = None
+            if coordsession.on(self.cfg, provider):   # a session wake may send only what changed
+
+                def whole() -> list:
+                    got = coord.split_cached(coord.digest_parts(self.p, gates, [e["id"] for e in evs],
+                                                                [m["id"] for m in msgs], None, flagged)[0])[1]
+                    return got + ([(slowcomplaint.SECTION, speed)] if speed else [])
+
+                session_digest = {"parts": parts, "full": whole, "seen": coordsession.fingerprint(baseline),
+                                  "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
             session_prompt = None
             if coordsession.on(self.cfg, provider):   # the session's byte-stable prompt and its schema
@@ -8610,7 +8648,7 @@ class Daemon:
                            read_only=True, schema=coordsession.schema() if session_prompt else coord.ACTIONS_SCHEMA,
                            system=head, context=context, session_prompt=session_prompt,
                            cache_ttl=cachettl.setting(c),
-                           budget_usd=budget,
+                           budget_usd=budget, session_digest=session_digest,
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],
                                  "budget_usd": budget, **({"sizing": sized["info"]} if sized["info"] else {}),
                                  "default_chat": default_chat, **({"unblock": unblock} if unblock else {}),

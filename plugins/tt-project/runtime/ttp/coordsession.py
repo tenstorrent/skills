@@ -28,7 +28,16 @@ verbatim, then the full digest. The agent's own auto-compaction is only a backst
 sits below a known context window.
 
 The sibling spend guard trips kv GUARD_KEY ({"tripped": true, "until": ts}): while it is tripped,
-every wake is stateless. A missing key is not tripped. Mode "shadow" is reserved; it acts as off."""
+every wake is stateless. A missing key is not tripped. Mode "shadow" is reserved; it acts as off.
+
+The delta digest: a resumed wake sends only the digest sections whose text changed since the
+session's last acknowledged wake (one that ended ok), each whole, and every new event, plus one line
+naming the sections it leaves out and the ones gone. The section hashes that wake was sent are kept in
+KEY (DIGEST), so they are on disk. The whole digest, built without the per-turn collapsing
+(coordinator.COLLAPSIBLE), goes to a new session (a rollover), and to a resumed one whenever the
+saved hashes may not match what it saw: none saved, a stateless turn or a failed or compacted wake
+since, another turn's digest since (the collapse baseline moved), a daemon restart, or the session
+asked for it with the action {"type": "noop", "key": FULL_ASK}."""
 from __future__ import annotations
 
 import hashlib
@@ -49,6 +58,11 @@ CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the 
 NOTE_DIR = "coord-session"
 # The agents whose coordinator turns may resume one session (the fake stands in for Claude in tests).
 PROVIDERS = ("claude", "fake")
+DIGEST = "digest"   # in KEY: {"sections": {key: [hash, label]}, "seen": collapse baseline, "gen": daemon start}
+FULL_ASK = "full_digest"
+ALWAYS = ("events",)   # digest sections every wake sends
+HEAD = "budget"        # its first line is the STATE time header, sent every wake; the rest is hashed
+DELTA = "session_delta"
 
 
 def mode_of(value) -> str:
@@ -155,9 +169,13 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
     st.setdefault("failures", [])
     mode = turn.get("mode")
     st["last_why"] = str(turn.get("why") or "")
+    ack = turn.get("digest") if ok and isinstance(turn.get("digest"), dict) else None
+    st.pop(DIGEST, None)   # a stateless, failed or unacknowledged wake: the next session wake sends it whole
     if mode == "stateless":
         st.pop("rerun", None)
         return st
+    if ack:
+        st[DIGEST] = ack
     if mode == "new":   # failed-resume times stay: fail() bounds them to the hour across rollovers
         st.update({"started": now, "wakes": 0, "prev": st.get("id") or ""})
         st.pop("handover", None)
@@ -184,10 +202,92 @@ def fail(cfg: dict, state, now: float) -> tuple[dict, bool]:
     st = dict(state) if isinstance(state, dict) else {}
     fails = [t for t in (st.get("failures") or []) if isinstance(t, (int, float)) and now - t < 3600] + [now]
     st.update({"failures": fails, "last_ok": False, "rerun": True, "last_why": "resume failed"})
+    st.pop(DIGEST, None)
     if len(fails) >= _num(s.get("max_failures_per_h"), DEFAULTS["max_failures_per_h"]):
         st.update({"paused_until": now + _num(s.get("pause_h"), DEFAULTS["pause_h"]) * 3600, "failures": []})
         return st, True
     return st, False
+
+
+def _sha(text: str) -> str:
+    return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:16]
+
+
+def fingerprint(seen) -> str:
+    """The per-turn collapse baseline (coordinator.DIGEST_SEEN_KEY) as one hash."""
+    return _sha(json.dumps(seen or {}, sort_keys=True, default=str))
+
+
+def _keyed(parts: list[tuple[str, str]]) -> list[tuple[str, str]]:
+    """`parts` with a repeated section key numbered, so each part has a hash of its own."""
+    count: dict = {}
+    out = []
+    for key, text in parts:
+        count[key] = count.get(key, 0) + 1
+        out.append((key if count[key] == 1 else f"{key}#{count[key]}", text))
+    return out
+
+
+def _label(text: str) -> str:
+    first = text.lstrip("\n").split("\n", 1)[0].lstrip("#").strip()
+    return re.split(r"[:(]", first)[0].strip()[:60] or "?"
+
+
+def _body(key: str, text: str) -> str:
+    """What is hashed of a section: HEAD without its time header line."""
+    return (text.split("\n", 1)[1] if "\n" in text else "") if key == HEAD else text
+
+
+def sections(parts: list[tuple[str, str]]) -> dict:
+    """{key: [hash, label]} of a digest's (section, text) parts."""
+    return {k: [_sha(_body(k, t)), _label(_body(k, t) or t)] for k, t in _keyed(parts)}
+
+
+def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str) -> tuple[list | None, str]:
+    """(the parts a resumed wake sends, why), or (None, why) when it must send the whole digest.
+    `seen_fp`: fingerprint() of the collapse baseline this digest was built on; `gen`: the daemon's."""
+    got = (state if isinstance(state, dict) else {}).get(DIGEST)
+    if not isinstance(got, dict) or not isinstance(got.get("sections"), dict):
+        return None, "no acknowledged digest"
+    if got.get("gen") != gen:
+        return None, "daemon restarted"
+    if got.get("seen") != seen_fp:
+        return None, "another turn's digest since"
+    before, now = got["sections"], sections(parts)
+    sent, same = [], []
+    for key, text in _keyed(parts):
+        old = before.get(key)
+        if key in ALWAYS or not isinstance(old, list) or old[:1] != now[key][:1]:
+            sent.append((key, text))
+        else:
+            same.append(now[key][1])
+            if key == HEAD:
+                sent.append((key, text.split("\n", 1)[0]))
+    gone = [str(v[1]) for k, v in before.items() if k not in now and isinstance(v, list) and len(v) > 1]
+    line = ("## Since your last wake in this session only the changed sections follow, each whole. "
+            f"Unchanged, not repeated: {', '.join(same) or 'none'}"
+            + (f". Gone (now empty): {', '.join(gone)}" if gone else "")
+            + f'. For the whole digest on the next wake, add the action {{"type": "noop", "key": "{FULL_ASK}"}}.')
+    at = 1 if sent and sent[0][0] == HEAD else 0
+    return sent[:at] + [(DELTA, line)] + sent[at:], f"delta: {len(same)} unchanged, {len(gone)} gone"
+
+
+def wake_digest(mode: str, state, parts: list[tuple[str, str]], full, seen_fp: str, shown_fp: str,
+                gen: str) -> tuple[list[tuple[str, str]], dict, str]:
+    """(the digest parts a session wake sends, the ack record() saves once it ends ok, why).
+    `parts`: the digest as built for the turn; `full()`: the whole digest, uncollapsed;
+    `shown_fp`: fingerprint() of the baseline this turn leaves for the next."""
+    sent, why = delta(parts, state, seen_fp, gen) if mode == "resume" else (None, "new session")
+    if sent is None:
+        parts = full()
+        sent, why = parts, f"full: {why}"
+    return sent, {"sections": sections(parts), "seen": shown_fp, "gen": gen}, why
+
+
+def asked_full(actions) -> bool:
+    """The session asked for the whole digest on its next wake."""
+    return any(isinstance(a, dict) and a.get("type") == "noop" and a.get("key") == FULL_ASK
+               for a in actions or [])
 
 
 def status_line(cfg: dict, state) -> str:
