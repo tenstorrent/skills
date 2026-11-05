@@ -13,12 +13,14 @@ an open obligation. Each is cancelled with its reason in blocked_reason and one 
 event, and recorded under KEY with its undo, `ttp task <project> requeue <id>` (requeue clears the
 reason). review_lines() lists each record once in the daily review; digest_lines() shows the backlog.
 
-covering() (coordinator task_add): a new status, report, summary, check-on, digest, page or dashboard task
-(REPORT_RE on its title's head) is refused when an open task of the same kind, or one done or failed in the
-last COVER_S, covers the same target (_target: the head's words without the report words, message
-references and dates); a queued one takes the new spec instead (merged). force with a reason adds it, and
-a hop of a continue chain (task_add `continues`) is never refused: it carries unfinished work. An urgent
-or user-ordered request is merged into a queued task but never refused.
+covering() (coordinator task_add): a new status, report, summary, check-on, digest or recap task (REPORT_RE
+on its title's head; never a code task or a fix title) is refused when an open task of the same kind, or one
+done or failed in the last COVER_S, covers the same target (_target: the head's words without the report
+words, message references and dates, else the words after a head of report words only; an empty target
+matches nothing, and a one-word target covers only the same word); a queued one takes the new spec, reply
+chat and better priority instead (merged; two different reply chats are never merged). force with a reason
+adds it, and a hop of a continue chain (task_add `continues`) is never refused: it carries unfinished work.
+An urgent or user-ordered request is merged into a queued task but never refused.
 
 A project pause stops expiry and its time is no age; a task naming a paused resource never expires."""
 from __future__ import annotations
@@ -38,8 +40,14 @@ SHOWN = 8                      # oldest queued ids named in the digest line
 TERMINAL = ("done", "failed", "cancelled", "superseded")
 DEAD_DEP = re.compile(r"^dependency #\d+ (?:failed|cancelled|does not exist)|^a dependency is not a task id")
 USER_RE = re.compile(r"\b(?:user|owner)(?:'s)?\s+(?:msgs?|messages?|orders?|words)\b|\buser-ordered\b", re.I)
-REPORT_RE = re.compile(r"\b(?:status|reports?|summary|summaries|summari[sz]e|check[- ]on|checking on|digest|recap|"
-                       r"page|dashboard)\b", re.I)
+REPORT_RE = re.compile(r"\b(?:status|reports?|summary|summaries|summari[sz]e|check[- ]on|checking on|digest|recap)\b",
+                       re.I)
+# Code work naming a report word is no report request: a fix or change verb leads it, or the word names a
+# thing (a status page, a status field), not the report kind.
+_CODE_RE = re.compile(r"^\s*(?:fix|add|implement|build|refactor|rewrite|repair|debug|port|remove|rename|change|"
+                      r"improve|speed up|wire)\b", re.I)
+_THING_RE = re.compile(r"\b(?:status|report|summary|digest)\s+(?:page|dashboard|field|bar|column|line|code|"
+                       r"icon|badge|endpoint|api|button|chart|view|table schema|generator|parser)s?\b", re.I)
 _HEAD_END = re.compile(r"\s(?:\(|-|—)\s?|[:;(]")
 _NOISE = [re.compile(p, re.I) for p in (
     r"\b(?:user|owner)(?:'s)?\s+(?:msgs?|messages?)\s*#?\d+(?:\s*(?:,|and)\s*#?\d+)*",
@@ -47,7 +55,7 @@ _NOISE = [re.compile(p, re.I) for p in (
     r"\b(?:today|tonight|now|daily|nightly|weekly|hourly|again|new|latest|current)\b")]
 _STOP = {"a", "an", "the", "of", "on", "for", "to", "in", "and", "with", "from", "post", "send", "write",
          "update", "refresh", "publish", "give", "make", "do", "run", "check", "checking", "status", "report",
-         "reports", "summary", "summaries", "summarise", "summarize", "digest", "recap", "page", "dashboard"}
+         "reports", "summary", "summaries", "summarise", "summarize", "digest", "recap"}
 
 
 def settings(cfg: dict) -> tuple[float, float]:
@@ -94,12 +102,16 @@ def candidates(db: DB, cfg: dict, now: float | None = None) -> list[tuple[dict, 
     paused = set(db.paused_resources())
     pauses = projpause.windows(db, min(float(t["created"] or now) for t in rows), now)
     states = {r["id"]: r["status"] for r in db.q("SELECT id, status FROM tasks")}
+    # A task expired before and open again was requeued (the recorded undo): it ages from that requeue,
+    # never from its creation, so the undo sticks for a fresh expire_h (dead_dep_h when blocked again).
+    back = {int(r["task"]): float(r.get("at") or 0) for r in db.kv(KEY, []) or [] if r.get("task")}
     out = []
     for t in rows:
         if _kept(t, owners) or task_resources(t) & paused:   # held by a pause: the user's hold, not staleness
             continue
+        requeued = max(back[t["id"]], float(t["updated"] or 0)) if t["id"] in back else 0.0
         if t["status"] == "blocked":
-            since = float(t["updated"] or t["created"] or now)
+            since = max(float(t["updated"] or t["created"] or now), requeued)
             if dead_s > 0 and DEAD_DEP.match(t["blocked_reason"] or "") and now - since >= dead_s:
                 out.append((t, f"blocked {(now - since) / 3600:.0f} h on {t['blocked_reason']}"))
             continue
@@ -108,7 +120,7 @@ def candidates(db: DB, cfg: dict, now: float | None = None) -> list[tuple[dict, 
             continue
         if any(states.get(dep) not in TERMINAL for dep in dependency_ids(t) if dep in states):
             continue
-        created = float(t["created"] or now)
+        created = max(float(t["created"] or now), requeued)
         age = now - created - sum(max(0.0, e - max(b, created)) for b, e in pauses)   # paused time is no age
         if age >= age_s:
             out.append((t, f"queued {age / 3600:.0f} h without starting (queue.expire_h {age_s / 3600:g})"))
@@ -181,34 +193,48 @@ def digest_lines(db: DB, since: float, now: float | None = None) -> list[str]:
     return out
 
 
-def _head(title: str) -> str:
+def _split(title: str) -> tuple[str, str]:
+    """(head, the rest after the head's end)."""
     title = re.sub(r"^\s*(?:\[[^\]]*\]\s*)?(?:continue\s*:\s*)?", "", title or "", flags=re.I)
     m = _HEAD_END.search(title)
-    return title[:m.start()] if m and m.start() > 0 else title
+    return (title[:m.start()], title[m.end():]) if m and m.start() > 0 else (title, "")
+
+
+def _head(title: str) -> str:
+    return _split(title)[0]
 
 
 def is_report(title: str) -> bool:
-    """A status, report, summary, check-on, digest, page or dashboard task, by its title's head."""
-    return bool(REPORT_RE.search(_head(title)))
+    """A status, report, summary, check-on, digest or recap task, by its title's head; never code work."""
+    head = _head(title)
+    return not _CODE_RE.match(head) and bool(REPORT_RE.search(_THING_RE.sub(" ", head)))
+
+
+def _words(text: str) -> frozenset:
+    for rx in _NOISE:
+        text = rx.sub(" ", text)
+    return frozenset(w for w in re.findall(r"[a-z0-9][\w.-]*", text.lower()) if w not in _STOP)
 
 
 def _target(title: str) -> frozenset:
-    head = _head(title)
-    for rx in _NOISE:
-        head = rx.sub(" ", head)
-    return frozenset(w for w in re.findall(r"[a-z0-9][\w.-]*", head.lower()) if w not in _STOP)
+    """The head's words without report words, message references and dates; a head of report words only
+    ('Status report: X') takes its target from the text after it."""
+    head, rest = _split(title)
+    return _words(head) or _words(_head(rest))
 
 
 def same_target(a: str, b: str) -> bool:
-    """Both report titles name the same target: equal word sets, or one inside the other."""
+    """Both report titles name the same target: equal word sets, or a target of 2+ words inside the other.
+    An empty target matches nothing."""
     ta, tb = _target(a), _target(b)
-    return ta == tb or bool(ta and tb and (ta <= tb or tb <= ta))
+    small, big = sorted((ta, tb), key=len)
+    return bool(small) and (ta == tb or (len(small) >= 2 and small <= big))
 
 
 def covering(db: DB, title: str, kind: str, skip: Any = (), now: float | None = None) -> dict | None:
     """The open task of `kind`, or one done or failed in the last COVER_S, that covers the target of the
     report task `title`; None when `title` is no report task or nothing covers it."""
-    if not is_report(title):
+    if kind == "code" or not is_report(title):
         return None
     now = time.time() if now is None else now
     skip = {str(s) for s in (skip or ())}
@@ -220,11 +246,21 @@ def covering(db: DB, title: str, kind: str, skip: Any = (), now: float | None = 
     return None
 
 
-def merge(db: DB, task: dict, title: str, spec: str, now: float | None = None) -> bool:
-    """Fold a repeated report request into the queued task that covers it; False when it is not queued."""
+def merge(db: DB, task: dict, title: str, spec: str, reply_chat: str | None = None, priority: Any = None,
+          now: float | None = None) -> bool:
+    """Fold a repeated report request into the queued task that covers it: its spec is appended, its reply
+    chat taken when the task has none, and the better (lower) priority kept. False when the task is not
+    queued or answers another chat (the request is then added as its own task)."""
     now = time.time() if now is None else now
     add = f"\n\nMerged request (a repeat task_add): {title}\n{spec}".rstrip()
+    chat = reply_chat or None
+    try:
+        prio = int(priority) if priority is not None else None
+    except (TypeError, ValueError):
+        prio = None
     with db.tx():
-        return bool(db.conn.execute("UPDATE tasks SET spec=COALESCE(spec,'')||?, updated=? WHERE id=? AND "
-                                    "status='queued'", (add, now, task["id"])).rowcount)
-
+        return bool(db.conn.execute(
+            "UPDATE tasks SET spec=COALESCE(spec,'')||?, updated=?, reply_chat=COALESCE(reply_chat, ?), "
+            "priority=MIN(COALESCE(priority, 3), COALESCE(?, priority, 3)) "
+            "WHERE id=? AND status='queued' AND (? IS NULL OR reply_chat IS NULL OR reply_chat=?)",
+            (add, now, chat, prio, task["id"], chat, chat)).rowcount)

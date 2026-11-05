@@ -163,7 +163,8 @@ def test_queuetrim_repeated_report_task_is_merged_refused_or_forced(env):
 def test_queuetrim_targets_ignore_message_refs_dates_and_report_words(env):
     from ttp import queuetrim
     assert queuetrim.same_target("TYO2 page (user msg #5642): read every result", "TYO2 page rows (owner msg #5726)")
-    assert queuetrim.same_target("daily status report 2026-11-04", "Status report")
+    # Two targets of report words only are empty: they match nothing.
+    assert not queuetrim.same_target("daily status report 2026-11-04", "Status report")
     assert not queuetrim.same_target("status of #9036", "status of #9040")
     assert not queuetrim.same_target("TYO2 page rows", "TYO2 page consistency")
     assert queuetrim.is_report("[daily-review] summary of the day")
@@ -192,3 +193,80 @@ def test_queuetrim_pauses_hold_work_without_ageing_it(env):
     db.x("UPDATE tasks SET created=? WHERE id=?", (now - 80 * 3600, plain))
     assert [t["id"] for t, _ in queuetrim.candidates(db, p.config(), now)] == [plain]
     assert db.task(held)["status"] == "queued"
+
+
+def test_queuetrim_requeued_task_ages_from_its_requeue_not_its_creation(env):
+    from ttp import queuetrim
+    p = make(env)
+    db = p.db
+    stale = _qt_aged(p, "tidy the old notes", 50, kind="work")
+    live = _qt_aged(p, "dead dependency", 1)
+    db.update_task(live, status="failed")
+    dead = _qt_aged(p, "waits on a dead one", 30, depends_on=[live])
+    db.x("UPDATE tasks SET status='blocked', blocked_reason=? WHERE id=?", (f"dependency #{live} failed", dead))
+    t0 = time.time()
+    assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0)] == \
+        [f"task {stale} expired", f"task {dead} expired"]
+    # The recorded undo: requeued an hour later (the dead one is blocked again on its dependency).
+    assert db.requeue(stale) == "" and db.requeue(dead) == ""
+    db.x("UPDATE tasks SET updated=? WHERE id=?", (t0 + 3600, stale))
+    db.x("UPDATE tasks SET status='blocked', blocked_reason=?, updated=? WHERE id=?",
+         (f"dependency #{live} failed", t0 + 3600, dead))
+    for later in (600, 23 * 3600):   # the next passes, within a fresh grace: kept
+        assert queuetrim.expire(db, p.config(), p.name, t0 + 3600 + later) == [], later
+    assert db.task(stale)["status"] == "queued" and db.task(dead)["status"] == "blocked"
+    # A fresh dead_dep_h, then a fresh expire_h after the requeue: expired again.
+    assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0 + 3600 + 25 * 3600)] == \
+        [f"task {dead} expired"]
+    assert queuetrim.expire(db, p.config(), p.name, t0 + 3600 + 47 * 3600) == []
+    assert [x.split(":")[0] for x in queuetrim.expire(db, p.config(), p.name, t0 + 3600 + 48.5 * 3600)] == \
+        [f"task {stale} expired"]
+
+
+def test_queuetrim_report_targets_never_match_on_empty_or_one_word_subsets(env):
+    from ttp import queuetrim
+    p = make(env)
+    db = p.db
+    # A head of report words only takes its target from the text after ':'.
+    assert not queuetrim.same_target("Status report: galaxy box upgrade", "Status report: web app login")
+    assert not queuetrim.same_target("Weekly summary: spend", "Summary: build failures")
+    assert queuetrim.same_target("Status report: galaxy box upgrade", "galaxy box upgrade status")
+    # A one-word target does not cover a longer one; two shared words do.
+    assert not queuetrim.same_target("spend status", "spend chart axis status")
+    assert queuetrim.same_target("galaxy box status", "galaxy box upgrade summary")
+    # page and dashboard are no report kinds; a fix or code title is no report.
+    for title in ("fix the status page", "fix the dashboard spend chart", "TYO2 page rows", "spend dashboard",
+                  "the status page shows stale rows"):
+        assert not queuetrim.is_report(title), title
+    q = db.add_task("Status report: galaxy box upgrade", "Post it.", kind="work")
+    assert queuetrim.covering(db, "Status report: web app login", "work") is None
+    db.add_task("fix the status page", "It shows stale rows.", kind="work")
+    assert queuetrim.covering(db, "fix the dashboard spend chart", "work") is None
+    db.add_task("galaxy box status", "Post it.", kind="code")
+    assert queuetrim.covering(db, "galaxy box status", "code") is None
+    assert queuetrim.covering(db, "Summary: galaxy box upgrade", "work")["id"] == q
+
+
+def test_queuetrim_merge_keeps_the_request_reply_chat_priority_and_obligations(env):
+    from ttp import coordinator as coord, obligations
+    p = make(env)
+    db = p.db
+    q = db.add_task("Soak run status report", "Read the soak logs and post the table.", kind="work", priority=3)
+    oid = obligations.add(p, "post the soak table", [], by="coordinator")
+    got = coord.apply(p, [{"type": "task_add", "title": "Status of the soak run", "kind": "work", "priority": 1,
+                           "reply_chat": "c1", "spec": f"Collect the counts per host (obligation {oid})."}])
+    assert any(g.startswith(f"task_add: merged into queued task #{q}") for g in got), got
+    t = db.task(q)
+    assert (t["reply_chat"], t["priority"]) == ("c1", 1), (t["reply_chat"], t["priority"])
+    assert str(q) in obligations.get(db, oid)["owners"]
+    assert db.one("SELECT COUNT(*) n FROM tasks")["n"] == 1
+    # Another chat's request is never folded into a task that answers c1: it is added as its own task.
+    assert coord.apply(p, [{"type": "task_add", "title": "soak run summary", "kind": "work", "reply_chat": "c2",
+                            "spec": "Count the restarts."}]) == []
+    new = db.one("SELECT * FROM tasks WHERE id!=?", (q,))
+    assert new["reply_chat"] == "c2" and db.task(q)["reply_chat"] == "c1"
+    # A lower-priority request never lowers the merged task's priority.
+    q2 = db.add_task("power table status", "Post it.", kind="work", priority=2)
+    coord.apply(p, [{"type": "task_add", "title": "power table summary", "kind": "work", "priority": 4,
+                     "spec": "Add the idle column."}])
+    assert db.task(q2)["priority"] == 2 and "idle column" in db.task(q2)["spec"]

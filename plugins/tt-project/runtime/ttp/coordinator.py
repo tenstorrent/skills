@@ -2257,7 +2257,18 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 cover = None if forced or a.get("continues") is not None else \
                     queuetrim.covering(db, title, a.get("kind") or "work", skip=skip)
                 if cover:
-                    if queuetrim.merge(db, cover, title, a.get("spec") or ""):
+                    try:   # the obligations its spec names: the merged task owns them, as a new one would
+                        owes = obligations.spec_check(db, a.get("spec") or "")
+                    except ValueError:
+                        owes, cover = [], None   # refused with its reason below, never merged away
+                if cover:
+                    if queuetrim.merge(db, cover, title, a.get("spec") or "", a.get("reply_chat"), a.get("priority")):
+                        batch_tasks[cover["id"]] = db.task(cover["id"])["reply_chat"]
+                        for oid in owes:
+                            obligations.attach(p, oid, [cover["id"]])
+                            batch_obls.append(oid)
+                            notes.append(f"task_add: #{cover['id']} attached as an owner of obligation {oid}, which "
+                                         f"the merged spec names")
                         raise InfoRejection(f"merged into queued task #{cover['id']} '{cover['title'][:120]}', which "
                                             f"covers the same report target; its spec now carries this request")
                     # An urgent or user-ordered request is only ever merged, never refused.
