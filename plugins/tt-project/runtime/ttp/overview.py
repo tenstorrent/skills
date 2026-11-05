@@ -427,8 +427,9 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         elif row["paused"] and not at_target:
             # Nothing upgrades a paused project by itself: the host-side takeover merges its files now.
             row.update(merge_pending=True, merge_owner="the host-side takeover (project paused)", takeover_at=now)
-        elif row["upgrading"] and not at_target:
-            # Its own upgrade of the release runs now: owned by its daemon until that try's window ends.
+        elif row["upgrading"] and not at_target and not daemon.startswith("stale"):
+            # Its own upgrade of the release runs now (a frozen daemon owns nothing): owned by its daemon
+            # until that try's window ends.
             row.update(merge_pending=True, merge_owner="this project's daemon",
                        takeover_at=float(auto["ts"]) + UPGRADE_RUN_S)
         elif (not at_target and row["daemon_alive"] and (where.get("upgrade") or {}).get("auto", True)

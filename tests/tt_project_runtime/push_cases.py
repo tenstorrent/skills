@@ -8365,8 +8365,8 @@ def test_after_push_deploy_project_mid_its_own_upgrade_is_owned_not_unowned(env,
     """Release 0.2.863's deploy: a project whose own automatic upgrade of the release was running
     ("upgrading now", owner its daemon) was judged unowned and alerted. It is pending, owned by its
     daemon until that try's window ends, also while the upgrade restarts the daemon; past the window
-    plus the grace it is missed."""
-    from ttp import deploy, overview, release
+    plus the grace it is missed. A daemon frozen meanwhile (a stale heartbeat) owns nothing."""
+    from ttp import deploy, overview, project, release
     p = make(env)
     _deploy_lib('0.5.0')
     _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
@@ -8384,6 +8384,12 @@ def test_after_push_deploy_project_mid_its_own_upgrade_is_owned_not_unowned(env,
     down = overview.deployed(names=['alpha'], now=now)['projects'][0]
     assert deploy.assess(rec, down, now)[0] == 'pending', down
     assert deploy.assess(rec, row, rec['due'] + 1)[:2] == ('failed', 'missed')
+    db.set_kv('daemon', {'pid': os.getpid(), 'host': 'testhost'})    # frozen mid-upgrade: not owned
+    old = now - 3600
+    os.utime(tmp_path / 'alpha' / project.FOLDER / 'state' / 'heartbeat', (old, old))
+    stale = overview.deployed(names=['alpha'], now=now)['projects'][0]
+    assert stale['daemon_state'].startswith('stale') and not stale.get('merge_owner'), stale
+    assert deploy.assess({}, stale, now)[0] == 'failed'
 
 
 def test_a_project_stuck_across_releases_is_one_alert_tracking_the_newest(env, tmp_path):
