@@ -108,6 +108,7 @@ from . import (   # one name per line: two changes adding names merge without a 
 from . import urgent
 from . import probevars
 from . import onhost
+from . import coordsession
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
 from . import schedule as sched
@@ -469,6 +470,8 @@ USER_SETTABLE = {
     relay.AGENT_KEY: lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),
     # The tier and effort every conclusion run starts at, at least (tierfloor.py): 'standard/high', 'off'.
     "coordinator.conclusion_floor": lambda v: tierfloor.floor_of(v),
+    # The persistent coordinator session (coordsession.py): off, on ('shadow' reserved).
+    "coordinator.session.mode": lambda v: coordsession.mode_of(v),
 }
 
 

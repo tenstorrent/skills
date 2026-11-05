@@ -45,6 +45,7 @@ from . import rejcool
 from . import stalegate
 from . import indexignore
 from . import lanewait
+from . import coordsession
 from . import chainprio
 from . import churnwatch
 from . import alerts
@@ -2780,7 +2781,23 @@ class Daemon:
         # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
         thread = ""
-        if role == "coordinator" and not resume and prov.cache_key_per_session:
+        session_mode = ""   # coordinator.session.mode on: this wake's coordsession.decide()
+        if role == "coordinator" and not resume and coordsession.on(self.cfg, provider):
+            key = coordsession.prefix_key(system, context, schema, provider)
+            try:
+                session_mode, why = coordsession.decide(
+                    self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
+                    lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
+                    guard=self.p.db.kv(coordsession.GUARD_KEY))
+            except Exception as e:   # the stateless turn is always safe
+                session_mode, why = "stateless", f"decide failed: {type(e).__name__}: {e}"[:200]
+                log(self.p, f"coordinator session {why}")
+            if session_mode == "resume":
+                thread = str((self.p.db.kv(coordsession.KEY) or {}).get("id") or "")
+            note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "session": {
+                "mode": session_mode, "why": why, "key": key, "model": model, "effort": effort,
+                "provider": provider}}}
+        elif role == "coordinator" and not resume and prov.cache_key_per_session:
             try:   # the agent's cache follows its session: continue the last turn's while warm
                 last = self.p.db.one("SELECT provider, status, session_id, started, ended, note, input_tokens, "
                                      "cache_read_tokens, cache_write_tokens FROM runs WHERE role='coordinator' "
@@ -2965,7 +2982,9 @@ class Daemon:
             stdin = None
             if system is not None and context is not None:
                 cached = prov.cached_input(context, prompt, cache_ttl, log=lambda m: log(self.p, m))
-                if cached:
+                if cached and session_mode == "resume":
+                    pass   # the session's first wake sent this same context block: only the digest follows
+                elif cached:
                     argv, stdin = _before_stdin(argv, cached[0]), cached[1]
                 else:
                     system = coord.join_prompt(system, context)
@@ -4341,6 +4360,10 @@ class Daemon:
             return
         if status == "auth":
             return   # its breaker holds the next turn until the login is back; the messages stay queued
+        session = (note.get("turn") or {}).get("session")
+        if isinstance(session, dict) and self._coord_session_end(r, usage, session,
+                                                                 status == "ok" and isinstance(actions, list)):
+            return   # a failed resume: its messages and events stay queued for the stateless rerun
         if status != "ok" or not isinstance(actions, list):
             if turnsize.over_budget(status, usage) and self._turn_over_budget(note):
                 return
@@ -4385,6 +4408,30 @@ class Daemon:
                            float(db.kv("last_coordinator_turn", 0)) or None)
         except Exception:   # bookkeeping: without it the next routine turn runs
             log(self.p, "coordinator quiet state not saved: " + traceback.format_exc().replace("\n", " | ")[:1000])
+
+    def _coord_session_end(self, r: dict, usage, session: dict, ok: bool) -> bool:
+        """Saves the persistent session (coordsession.py) after a coordinator wake. True for a resumed
+        wake that failed: nothing of it is applied and the next wake reruns its batch stateless at
+        once, with no backoff; repeated failures pause the mode and raise an issue."""
+        db, now = self.p.db, time.time()
+        try:
+            state = db.kv(coordsession.KEY)
+            if session.get("mode") == "resume" and not ok:
+                state, paused = coordsession.fail(self.cfg, state, now)
+                db.set_kv(coordsession.KEY, state)
+                log(self.p, f"coordinator run {r['id']}: the resumed session failed; its batch reruns stateless")
+                if paused:
+                    s = coordsession.settings(self.cfg)
+                    self.observe("daemon:coord-session",
+                                 f"The persistent coordinator session failed {s['max_failures_per_h']} resumes within "
+                                 f"an hour: coordinator turns run stateless for the next {s['pause_h']} h "
+                                 f"(coordinator.session.pause_h).",
+                                 "normal", whole=True, key="coord-session-paused")
+                return True
+            db.set_kv(coordsession.KEY, coordsession.record(state, usage, r.get("session_id") or "", session, ok, now))
+        except Exception:   # bookkeeping: the next wake decides from what is saved
+            log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        return False
 
     def _quiet_fp(self, gates: dict) -> str:
         """The state quietgate compares across turns, with only the ledger fields a probe never rewrites."""
@@ -8096,6 +8143,9 @@ class Daemon:
             return
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
+        # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
+        rerun = bool((db.kv(coordsession.KEY) or {}).get("rerun")) and \
+            coordsession.on(self.cfg, self.cfg.get("core_provider", "claude"))
         try:
             # The same unchanged cause as a just-rejected action is counted, not woken (rejcool.py).
             queued = rejcool.screen_queued(db, self.cfg, queued, now, user_spoke=bool(msgs))
@@ -8147,13 +8197,13 @@ class Daemon:
             if now - newest < debounce and now - oldest < 4 * debounce:
                 return
             own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
-            if not msgs and self._burst_hold(own, now):
+            if not msgs and not rerun and self._burst_hold(own, now):
                 return
-            if not msgs and self._batch_hold(own, now):
+            if not msgs and not rerun and self._batch_hold(own, now):
                 return
-            if not msgs and self._event_hold(own, now):
+            if not msgs and not rerun and self._event_hold(own, now):
                 return
-        if not msgs:
+        if not msgs and not rerun:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
                 # routine batch or wake is settled without a model run (quietgate.py).
@@ -8178,7 +8228,7 @@ class Daemon:
             except Exception:   # the gate only saves money: a failure runs the turn
                 log(self.p, "coordinator quiet gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
         seen_now: dict = {}
-        if evs and not msgs:
+        if evs and not msgs and not rerun:
             try:
                 # A batch a turn that decided nothing already met, against the same state, is settled
                 # without a model run (turngate.py). A batch with an effort trigger always runs; the
