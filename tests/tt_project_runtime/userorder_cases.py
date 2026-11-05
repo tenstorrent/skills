@@ -107,7 +107,8 @@ def test_an_order_from_an_older_message_never_replaces_a_newer_one_and_uncited_t
     now = time.time()
     new = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user','b')", (now - 10,))
     old = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user','a')", (now - 100,))
-    assert userorder.record(p.db, 1, new, ["rig"]) == []   # no open task #1: nothing kept
+    gone = p.db.one("SELECT COALESCE(MAX(id), 0) + 1000 AS n FROM tasks")["n"]
+    assert userorder.record(p.db, gone, new, ["rig"]) == []   # no such open task: nothing kept
     coord.apply(p, [{"type": "task_add", "title": "t1", "spec": "s", "resources": ["rig"]},
                     {"type": "task_add", "title": "t2", "spec": "s", "resources": ["rig"]}])
     t1, t2 = (p.db.one("SELECT id FROM tasks WHERE title=?", (t,))["id"] for t in ("t1", "t2"))

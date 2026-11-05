@@ -54,6 +54,8 @@ def record(db, task_id: int, msg_id: int, resources, now: float | None = None) -
     now = time.time() if now is None else now
     row = db.one("SELECT ts FROM messages WHERE id=? AND direction='in'", (int(msg_id),))
     ts = float(row["ts"]) if row and row["ts"] else now
+    if not _open(db, task_id):
+        return []   # no open task to carry the order
     orders = _orders(db)
     done = []
     for res in sorted({str(r) for r in resources or [] if r}):
