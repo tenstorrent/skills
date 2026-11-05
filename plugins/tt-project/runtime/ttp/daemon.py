@@ -1114,6 +1114,7 @@ class Daemon:
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._urgent_own_logged: dict[int, int] = {}   # task -> run whose own-wait hold check_urgent_start logged
+        self._urgent_woke_from: dict[int, tuple] = {}   # task -> (its woke text, when that wake made it due); pruned by check_urgent_start
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
         self._stall_probes: dict[str, list] = {}   # probe (or a caller's key) -> its re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
@@ -7600,8 +7601,13 @@ class Daemon:
         """The short form of the wait a queued task sleeps on by its own hand-off ("" for none): its
         retry_when (its own checks, a detached job, any probe) or its retry timer while not_before is
         ahead, or a retry_when not yet woken whose last probe answer was "not yet" (NOT_YET_RCS) in
-        the moment between its timer running out and probe_waiting putting it back to sleep."""
+        the moment between its timer running out and probe_waiting putting it back to sleep. Only a
+        waiting hand-off not yet woken, with no start gate (deferral) in force, is its own wait: the
+        daemon's own backoffs (resource busy, a failed start, a lock retry) set not_before too."""
         res = load_result(t["result"]) if t.get("result") else {}
+        d = deferral(t)
+        if res.get("status") != "waiting" or "woke" in res or d.get("when") or (d.get("after") or 0) > now:
+            return ""
         probe = str(res.get("retry_when") or "").strip()
         if (t.get("not_before") or 0) > now:
             return f"`{probe[:100]}`" if probe else f"its retry timer, {((t['not_before'] - now) / 60):.0f} min left"
@@ -7621,7 +7627,7 @@ class Daemon:
         run); no urgent_start for a task already raised as ready_not_started or slot_wait for the same run
         and hold (_stuck_raised), nor for one asleep on its own wait (_own_wait: a retry_when, its own
         checks or detached job, a retry timer), which is only logged, once per run, as held by its own
-        wait; its wait counts from when that wait passed (not_before)."""
+        wait; a woken wait counts from when it was woken (its earliest not_before since that wake)."""
         now = time.time()
         if now - getattr(self, "_urgent_start_checked", 0.0) < every_s:
             return
@@ -7635,6 +7641,9 @@ class Daemon:
         db = self.p.db
         rows = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','running') AND spec LIKE '%urgent:%'")
                 if urgent.extra_ok(t, now) and (coord.task_resources(t) or holds_device(t, self.cfg))]
+        for seen in (self._urgent_own_logged, self._urgent_woke_from):   # only tasks still watched
+            for tid in set(seen) - {t["id"] for t in rows}:
+                del seen[tid]
         if not rows:
             return
         core = self.cfg.get("core_provider", "claude")
@@ -7656,8 +7665,13 @@ class Daemon:
                         log(self.p, f"urgent start: task {tid} held by its own wait: {own}")
                     continue
                 waited = urgent.waited_s(db, t, now)
-                if t.get("not_before"):   # counted from when its own wait (timer or retry_when wake) passed
-                    waited = min(waited, max(now - float(t["not_before"]), 0.0))
+                res = load_result(t["result"]) if t.get("result") else {}
+                if res.get("status") == "waiting" and "woke" in res:   # counted from when its own wait was woken
+                    since = float(t.get("not_before") or now)
+                    if (prev := self._urgent_woke_from.get(tid)) and prev[0] == res["woke"]:
+                        since = min(since, prev[1])   # its earliest not_before: a later backoff never resets it
+                    self._urgent_woke_from[tid] = (res["woke"], since)
+                    waited = min(waited, max(now - since, 0.0))
                 fp = f"urgent_start:{tid}:{rid}"
                 if waited < mins * 60 or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)) \
                         or self._stuck_raised(tid, rid, unstarted.READY_KIND, "slot_wait"):
@@ -12637,6 +12651,7 @@ class Daemon:
         prev.pop(SPEC_WAKE_NOW_KEY, None)
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
                               result=dump_result({**prev, **extra, "woke": why}))
+        self._urgent_woke_from[tid] = (why, min(task["not_before"] or now, now))   # check_urgent_start counts from it
         gate = self.gates.get(task["provider"] or self.cfg.get("core_provider", "claude"))
         held = gate and (not gate.allow_new_work or (task["origin"] in ("schedule", "harness")
                                                       and not gate.allow_optional))

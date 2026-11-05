@@ -708,6 +708,57 @@ def test_an_urgent_task_asleep_on_its_own_wait_is_never_held_by_nothing_and_coun
     assert got[asleep]["fingerprint"] == f"urgent_start:{asleep}:{rid}" and "held by nothing now" in got[asleep]["text"]
 
 
+def test_the_daemons_own_backoffs_and_start_gates_are_never_an_urgent_tasks_own_wait(env, monkeypatch):
+    """check_urgent_start: not_before set by the daemon (a dispatch backoff: resource busy +30 s, a
+    failed start +60 s, a lock retry) or a start_after deferral is not the task's own wait: an urgent
+    task in a backoff loop still raises urgent_start, a deferred one is held by its start gate, and a
+    woken waiting task counts from its wake, which a later backoff never resets."""
+    from ttp.daemon import Daemon, dump_result
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    d.settling = lambda: False
+    start = time.time()
+
+    def add(title, labels=()):
+        tid = p.db.add_task(title, "s\nurgent: the user ordered it", kind="work", tier="light", origin="user")
+        p.db.x("UPDATE tasks SET labels=?, created=? WHERE id=?",
+               (json.dumps(["resource:box-a", *labels]), start - 3600, tid))
+        return tid
+    backoff, gated = add("dispatch backs off"), add("deferred", [f"start_after:{start + 1800:.0f}"])
+    woken = add("woken, then backs off")
+    p.db.update_task(gated, not_before=start + 1800)
+    p.db.update_task(woken, not_before=start + 3600,
+                     result=dump_result({"status": "waiting", "retry_when": "ttp checks --result /tmp/x"}))
+    logged = []
+    monkeypatch.setattr("ttp.daemon.log", lambda _p, line: logged.append(line))
+
+    def check(at, nb):
+        monkeypatch.setattr(time, "time", lambda: at)
+        p.db.update_task(backoff, not_before=nb)
+        d._urgent_start_checked = at - 60
+        d.check_urgent_start()
+        return {e["task"]: e for e in p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'urgent_start:%'")}
+    got = check(start + 20, start + 40)   # resource busy: +30 s ahead of its last try
+    assert backoff in got and "held by" in got[backoff]["text"], (got, logged)
+    assert gated in got and "held by its start gate" in got[gated]["text"], got
+    assert not [x for x in logged if f"task {backoff} held by its own wait" in x
+                or f"task {gated} held by its own wait" in x], logged
+    assert woken not in got, "asleep on its own wait"
+    # Woken at +60 s; dispatch then backs off, not_before 20 s ahead and 10 s behind in turn.
+    monkeypatch.setattr(time, "time", lambda: start + 60)
+    d._wake_waiting(p.db.task(woken), "probe passed", start + 60)
+    for i, at in enumerate(range(120, 60 + 5 * 60, 30)):
+        p.db.update_task(woken, not_before=start + at + (20 if i % 2 else -10))
+        assert woken not in check(start + at, start + at), at
+    p.db.update_task(woken, not_before=start + 60 + 5 * 60 + 25)
+    got = check(start + 60 + 5 * 60 + 5, start)
+    assert woken in got, "counted from its wake, not from the latest backoff"
+
+
 def test_an_expect_claim_with_no_owner_open_20_min_is_never_announced_not_started(env):
     """A claim is promise-shaped but owes no work: an expect claim still open 20 min on raises no
     announced_not_started and shows in neither the promises digest nor the sweep's items."""
