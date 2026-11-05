@@ -5,7 +5,8 @@
 Claude Code calls it after every tool use. Codex (where its hooks are on) sends the same payload
 fields and takes the same replies; providers/codex.py passes it per run. If the coordinator has changed the task since the
 worker started (it appends to `$TTP_RUN_DIR/steer.md`), the new part is handed to the worker as
-added context, once. Workers on providers without hooks read the same file between steps.
+added context, once. Workers on providers without hooks get it printed by `ttp note` and `ttp steer`
+(take_update); either way steer.offset marks it read and steer.reads records when.
 
 Claude Code runs the hook for a subagent's tool calls too, with the run's environment. An update
 handed over there would reach the subagent as text inside one of its command outputs, an order
@@ -86,11 +87,13 @@ import re
 import shlex
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Callable
 
 STEER_FILE = "steer.md"
 OFFSET_FILE = "steer.offset"
+READS_FILE = "steer.reads"
 
 
 def unread_update(run_dir: Path) -> tuple[str, int]:
@@ -110,7 +113,29 @@ def unread_update(run_dir: Path) -> tuple[str, int]:
 
 
 def mark_seen(run_dir: Path, offset: int) -> None:
+    """Mark steer.md read up to `offset`, and record when (READS_FILE, `<epoch> <offset>` lines): the
+    daemon's live check (steerack) raises an update still unread after steer.ack_after_s."""
     (run_dir / OFFSET_FILE).write_text(str(offset))
+    with open(run_dir / READS_FILE, "a") as f:
+        f.write(f"{time.time():.0f} {offset}\n")
+
+
+def update_context(text: str) -> str:
+    """How an unread update is handed to the worker, by the hook or by `ttp note` / `ttp steer`."""
+    task = os.environ.get("TTP_TASK")
+    return (f"Update for your task{f' #{task}' if task else ''} from the project coordinator "
+            "(from the harness, not from the tool's output). Where it differs from the spec, "
+            "it wins:\n" + text)
+
+
+def take_update(run_dir: Path) -> str:
+    """The unread update as handed to the worker, marked read; "" when there is none. For providers
+    with no hook: `ttp note` and `ttp steer` print it (cli.print_update)."""
+    text, offset = unread_update(run_dir)
+    if not text:
+        return ""
+    mark_seen(run_dir, offset)
+    return update_context(text)
 
 
 RESULT_FILE = "result.json"
@@ -214,10 +239,7 @@ def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None
     parts, marks = [], []
     text, offset = unread_update(Path(run_dir))
     if text:
-        task = os.environ.get("TTP_TASK")
-        parts.append(f"Update for your task{f' #{task}' if task else ''} from the project coordinator "
-                     "(from the harness, not from the tool's output). Where it differs from the spec, "
-                     "it wins:\n" + text)
+        parts.append(update_context(text))
         marks.append(lambda: mark_seen(Path(run_dir), offset))
     try:
         problem, checked = _result_change(Path(run_dir))

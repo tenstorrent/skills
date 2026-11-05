@@ -471,6 +471,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # passes, 1 sends the run back with the output (handoff_check_max_sendbacks times, then the task
     # goes to review), anything else is a broken check: accepted, the coordinator told once.
     "worker": {"handoff_checks": [], "handoff_check_max_sendbacks": 2},
+    # A running worker that has not read a coordinator update (steer.md) for ack_after_s raises one
+    # steer_unread event to the coordinator (steerack.py); 0: off.
+    "steer": {"ack_after_s": 300},
     # The project's own host-reaching commands (a script in its harness bin/ that wraps ssh), which a
     # fenced Claude worker runs outside the Bash sandbox as a simple command, as it runs ssh (fencefree.py):
     # each a name in bin/ or {command, env: [VAR, ...]} (also frees `VAR=... name ...`).

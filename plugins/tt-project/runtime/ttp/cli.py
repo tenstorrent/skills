@@ -2218,6 +2218,32 @@ def cmd_note(a) -> None:
     durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} {a.text}\n")
     from . import upstream
     upstream.maybe_fallback()   # the daemon cannot reach a forward target: send its notes from this run
+    print_update()
+
+
+def print_update() -> bool:
+    """Print the run's unread coordinator update (steer.md), marking it read: how a worker whose
+    provider has no hook gets it, at each `ttp note` and `ttp steer`. Only in a worker's own run
+    (TTP_RUN_DIR), never in a model-free completion. True when one was printed."""
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    if not run_dir:
+        return False
+    from .hook import take_update
+    try:
+        text = take_update(Path(run_dir))
+    except OSError:
+        return False
+    if text:
+        print(f"\n{text}\n\nAct on it now, before your next step.")
+    return bool(text)
+
+
+def cmd_steer(a) -> None:
+    """`ttp steer`: print the coordinator's unread update for this run, if any (see print_update)."""
+    if not os.environ.get("TTP_RUN_DIR"):
+        die("ttp steer only works inside a tt-project run")
+    if not print_update():
+        print("no new update for your task")
 
 
 def cmd_notify(a) -> None:
@@ -11575,7 +11601,7 @@ COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
-    ("inside a run", ("note", "notify", "progress", "checks", "checks-shard", "lock", "host-run", "detach", "devq",
+    ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "lock", "host-run", "detach", "devq",
                       "push", "land", "clip", "sandbox", "pool-wait", "pool-admit", "skill", "killscan", "svcscan", "leftover-procs",
                       "said", "hostcheck")),
     ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
@@ -11742,6 +11768,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--ack", type=int, metavar="ID",
                    help="mark messages up to ID read; later ones stay unread until acknowledged")
     s.set_defaults(fn=cmd_listen)
+
+    s = sub.add_parser("steer", help="print the coordinator's unread update for this run (also printed by ttp note)")
+    s.set_defaults(fn=cmd_steer)
 
     s = sub.add_parser("note", help="append a progress note, or send one to another project")
     s.add_argument("text", nargs="?", help="the note, one line")

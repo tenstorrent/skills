@@ -2529,7 +2529,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   guard, full-suite and `ttp say` refusals) as per-run config, never by editing your Codex home. Codex
   runs such a hook only when trusted, so the run trusts it for that call alone, and only when the
   hook is the run's sole hook source: if your Codex home, the repository's `.codex/` folder or an
-  enabled plugin may add hooks, the worker runs without it and reads `steer.md` between steps (an
+  enabled plugin may add hooks, the worker runs without it and gets updates from `ttp note` and `ttp steer` (an
   isolated worker skips your config, so only the home `hooks.json` and the repository count then).
   A build without hooks or the trust flag keeps that older behaviour. Tested live on codex-cli 0.160.
 - Not on Codex: worker plugins (`plugin_dirs`). Codex loads plugins only from those installed in
@@ -2537,8 +2537,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   changing your Codex setup; plugins you install yourself load as usual. A `plugin_dirs` set for
   Codex (or for a Cursor build without `--plugin-dir`) raises one low alert per value and a
   `ttp doctor` line saying workers run without them.
-- Not yet on Cursor: worker plugins, worker isolation, coordinator updates reaching a running
-  worker, and isolation of coordinator turns from your own CLI config and MCP servers. Cursor
+- Coordinator updates reach a running worker on every provider: through the hook after a tool call
+  (Claude Code, Codex where the hook runs), else printed by the worker's next `ttp note` or `ttp steer`.
+  One still unread after `steer.ack_after_s` (300 s; 0: off) raises one `steer_unread` event to the
+  coordinator, naming the task and the update; it is marked handled once the worker reads it.
+- Not yet on Cursor: worker plugins, worker isolation, and isolation of coordinator turns from your own CLI config and MCP servers. Cursor
   enforces the `no_internet` restriction only through its sandbox (when the build lists
   `--sandbox` and `--add-dir` and the host can run it; `ttp doctor` says when not) and has no
   plan-window meter; without ask mode it has no

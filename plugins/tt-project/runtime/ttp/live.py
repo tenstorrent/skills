@@ -111,7 +111,7 @@ def judge(prov: Provider, ev: dict) -> dict[str, tuple[str, str]]:
     else:
         out["resume"] = (FAIL, (r.get("error") or "the resumed run did not recall the code word")[:200])
     if not (getattr(prov, "steer_hook", False) or ev.get("hook_used")):
-        out["steer"] = (UNSUPPORTED, "no hook: the worker reads steer.md between steps")
+        out["steer"] = (UNSUPPORTED, "no hook: the worker gets it from ttp note or ttp steer")
     elif ev.get("steer_delivered"):
         out["steer"] = (PASS, "" if w.get("steer_word_seen") else "handed over; the agent did not echo it")
     else:

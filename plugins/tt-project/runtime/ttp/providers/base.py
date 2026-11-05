@@ -222,7 +222,7 @@ class Provider:
     # prefix: coordinator turns continue the last turn's session while warm (cachettl.pick_thread).
     cache_key_per_session = False
     # Workers get coordinator updates (steer.md) from a hook after each tool call (ttp.hook); without
-    # one, the worker prompt has them read the file between steps.
+    # one, `ttp note` and `ttp steer` print them (cli.print_update). Either marks them read (steerack).
     steer_hook = False
 
     def reach_host(self, env: dict | None = None) -> str:

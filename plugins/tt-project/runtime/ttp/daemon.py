@@ -51,6 +51,7 @@ from . import stalegate
 from . import indexignore
 from . import plangate
 from . import lanewait
+from . import steerack
 from . import coordsession
 from . import thenwaits
 from . import chainprio
@@ -1023,6 +1024,7 @@ class Daemon:
         self._reap_errors: dict[int, int] = {}
         self._lean_reap = False   # this reap retries one an earlier daemon was cut off in: optional checks skipped
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
+        self._steer_unread: dict[int, dict] = {}   # run id -> its unread steer.md stretch (steerack)
         self._window_provs: dict[int, tuple] = {}            # run id -> (provider, env) reading its windows
         self._windows_read: dict[tuple[str, str], float] = {}   # (provider, account) -> newest reading recorded
         self._escalated: dict[int, tuple[int, int]] = {}   # run id -> (size, mtime_ns) of its ESCALATE_FILE relayed
@@ -1750,7 +1752,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
@@ -4066,6 +4068,12 @@ class Daemon:
                          r["id"]))
             self._suggest_split(r, usage.cache_read_tokens or 0)
             self._record_running_windows(r, out)
+
+    def check_steer_reads(self) -> None:
+        """A running worker that has not read its coordinator update (steer.md past steer.offset) for
+        steer.ack_after_s raises one steer_unread event (steerack)."""
+        steerack.check(self.p.db, self.cfg, self.p.db.q("SELECT * FROM runs WHERE status='running'"),
+                       self._steer_unread)
 
     def _record_running_windows(self, r: dict, out: Path) -> None:
         """A provider whose running runs report the account's plan windows (Codex: with each model
@@ -12771,7 +12779,8 @@ class Daemon:
         """{"started": spec digest the run started on, "text": its unread updates} when the task's spec
         changed after the run started and the steer.md update carrying the change was not read before
         the run ended; else None. A worker with the update hook (provider steer_hook) has read up to its
-        steer.offset; one without reads steer.md between steps, so only an update newer than its
+        steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
+        that offset too) or reads steer.md itself, so only an update newer than its
         result.json is surely unread. A model-free on_pass is checked in _probe_passed instead."""
         from .hook import STEER_FILE, unread_update
         from .prompts import spec_digest
