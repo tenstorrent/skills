@@ -11,8 +11,12 @@ fail again once on the base (the change's merge base with the push target). Per 
 - fails on the head rerun and on the base: pre-existing. Reported by name; it does not block.
 - fails on the head rerun and passes on the base (or is not there): new. It blocks.
 
-A rerun that cannot tell (out of time, an exit other than 0, 1 or 5, an incomplete list, a head
-rerun that selected none or not all of the ids) keeps the failure. A base result saved earlier (BASE_FILE) counts only when it ran on this same host for the
+A rerun that cannot tell (out of time, an exit other than 0, 1, 5 or 75, an incomplete list, a head
+rerun that selected none or not all of the ids) keeps the failure. A rerun that exits 75 (BUSY: its
+checks.wrap_cmd lock or queue gave it no slot, an admission timeout) ran nothing: it is retried on the
+same host after a backoff (checks.judge_busy_tries, default 3; checks.judge_busy_wait_s, default 600 s in
+all). Still busy, its ids are `busy`: neither new nor excused, so the checks run ends neither passed nor
+failed (exit 75, run it again later), never as a failure of the head. A base result saved earlier (BASE_FILE) counts only when it ran on this same host for the
 same base commit. A failing id in the active quarantine is excused without a rerun unless the change
 touches its file.
 
@@ -40,6 +44,10 @@ RERUN_S = 600.0     # checks.judge_rerun_s: the time limit of one rerun
 BASE_KEEP_S = 7 * 86400.0
 EVIDENCE_MAX = 5    # sightings kept per quarantined test
 NO_TESTS = 5        # pytest's exit status when nothing was selected
+BUSY = 75           # a rerun's exit when its wrapper's lock or queue admitted it nowhere: it ran nothing
+BUSY_TRIES = 3      # checks.judge_busy_tries: reruns of one busy rerun
+BUSY_WAIT_S = 600.0  # checks.judge_busy_wait_s: the backoff sleeps of one rerun, in all
+BUSY_FIRST_S = 30.0  # the first backoff; each next one doubles
 EVENT = "checks_flaky_test"   # the queued fix note to the coordinator
 _COUNT = re.compile(r"\b(\d+) (passed|failed|errors?)\b")   # the counts in pytest's summary line
 
@@ -55,14 +63,17 @@ def _ran(output: str) -> tuple[int, int] | None:
 
 
 def settings(cfg: dict) -> dict:
-    """checks.judge (default on), checks.quarantine_days, checks.judge_max_ids, checks.judge_rerun_s."""
+    """checks.judge (default on), checks.quarantine_days, checks.judge_max_ids, checks.judge_rerun_s,
+    checks.judge_busy_tries, checks.judge_busy_wait_s."""
     c = (cfg or {}).get("checks") or {}
 
     def num(key, default):
         v = c.get(key)
         return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else default
     return {"on": c.get("judge") is not False, "days": num("quarantine_days", DAYS),
-            "max_ids": int(num("judge_max_ids", MAX_IDS)), "rerun_s": num("judge_rerun_s", RERUN_S)}
+            "max_ids": int(num("judge_max_ids", MAX_IDS)), "rerun_s": num("judge_rerun_s", RERUN_S),
+            "busy_tries": int(num("judge_busy_tries", BUSY_TRIES)),
+            "busy_wait_s": num("judge_busy_wait_s", BUSY_WAIT_S)}
 
 
 def host() -> str:
@@ -165,19 +176,40 @@ def save_base(state: Path, where: str, base: str, verdicts: dict[str, bool], now
         _save(path, d)
 
 
+def rerun(run, at: str, ids: list[str], tries: int = BUSY_TRIES, wait_s: float = BUSY_WAIT_S,
+          sleep=time.sleep) -> tuple[int | None, str]:
+    """`run(at, ids)`, again after a doubling backoff while it exits BUSY, at most `tries` more times and
+    `wait_s` of sleeps in all. Each try runs on this same host (`run` is bound to it)."""
+    got, slept, back = run(at, ids), 0.0, BUSY_FIRST_S
+    for _ in range(max(0, tries)):
+        if got[0] != BUSY or slept >= wait_s:
+            break
+        pause = min(back, wait_s - slept)
+        sleep(pause)
+        slept, back = slept + pause, back * 2
+        got = run(at, ids)
+    return got
+
+
 def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
-          touched=lambda _id: True) -> dict:
+          touched=lambda _id: True, tries: int = BUSY_TRIES, wait_s: float = BUSY_WAIT_S,
+          sleep=time.sleep) -> dict:
     """Judge a check's failing `ids`. `run(at, ids)` reruns ids at "head" or "base" on this host and
-    returns (exit code or None, output). The verdict: {new, pre_existing, flaky, quarantined, base, host};
-    the check blocks while `new` is not empty."""
-    v = {"new": [], "pre_existing": [], "flaky": [], "quarantined": [], "base": base, "host": where}
+    returns (exit code or None, output); one that exits BUSY is retried (rerun). The verdict: {new,
+    pre_existing, flaky, quarantined, busy, base, host}; the check blocks while `new` is not empty, and
+    is undecided (neither passed nor failed) while `busy` is not."""
+    v = {"new": [], "pre_existing": [], "flaky": [], "quarantined": [], "busy": [], "base": base, "host": where}
     q = active(state, now)
     todo = []
     for i in ids:
         (v["quarantined"] if i in q and not touched(i) else todo).append(i)
     if not todo:
         return v
-    again = failed_of(*run("head", todo), todo, "head")
+    got = rerun(run, "head", todo, tries, wait_s, sleep)
+    if got[0] == BUSY:
+        v["busy"] = todo
+        return v
+    again = failed_of(*got, todo, "head")
     if again is None:
         v["new"] = todo
         return v
@@ -188,18 +220,26 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
     known = saved_base(state, where, base, still, now) if base else {}
     need = [i for i in still if i not in known]
     if need and base:
-        bad = failed_of(*run("base", need), need)
+        got = rerun(run, "base", need, tries, wait_s, sleep)
+        if got[0] == BUSY:   # no slot for the base: not proven new, never excused either
+            v["busy"] = need
+        bad = None if got[0] == BUSY else failed_of(*got, need)
         if bad is not None:
             fresh = {i: i in bad for i in need}
             save_base(state, where, base, fresh, now)
             known.update(fresh)
     v["pre_existing"] = [i for i in still if known.get(i) is True]
-    v["new"] = [i for i in still if known.get(i) is not True]
+    v["new"] = [i for i in still if known.get(i) is not True and i not in v["busy"]]
     return v
 
 
 def blocks(v: dict) -> bool:
     return bool(v.get("new"))
+
+
+def undecided(v: dict) -> bool:
+    """No id proven new, but some could not be judged for want of a slot: the run is neither passed nor failed."""
+    return not blocks(v) and bool(v.get("busy"))
 
 
 def lines(v: dict) -> list[str]:
@@ -216,6 +256,9 @@ def lines(v: dict) -> list[str]:
                    + ", ".join(v["quarantined"]))
     if v.get("new"):
         out.append("new on this head (failed again on its rerun, not on the base), blocking: " + ", ".join(v["new"]))
+    if v.get("busy"):
+        out.append(f"not judged: their rerun found no free slot on this host (exit {BUSY}) after its retries, "
+                   "so they are neither excused nor counted as new: " + ", ".join(v["busy"]))
     return out
 
 

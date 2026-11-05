@@ -265,3 +265,54 @@ def test_checks_result_passed_fails_a_release_run_that_excused_a_failure(env, tm
     assert passed(True, {**excused, "ts": 5.0}) == 1, "an earlier run's record is no record of this one"
     assert passed(True, {}) == 0
     assert passed(False, excused) == 0, "a landing check's excused pass still counts for its landing"
+
+
+def _busy_run(results: dict, calls: list):
+    # run(at, ids): pops the next (rc, output) queued for `at` in `results`.
+    def run(at, ids):
+        calls.append((at, list(ids)))
+        return results[at].pop(0)
+    return run
+
+
+def test_gate_judge_retries_a_busy_base_rerun_on_the_same_host_then_judges_it(tmp_path):
+    from ttp import gatejudge
+    i = "tests/test_a.py::test_a"
+    fail = (1, f"FAILED {i} - assert 0\n1 failed in 0.1s\n")
+    calls, slept = [], []
+    run = _busy_run({"head": [fail], "base": [(75, "ADMISSION TIMEOUT\n"), fail]}, calls)
+    v = gatejudge.judge([i], run, tmp_path, "b" * 40, "h1", 1000.0, sleep=slept.append)
+    assert v["pre_existing"] == [i] and not v["new"] and not v.get("busy")
+    assert [c[0] for c in calls] == ["head", "base", "base"] and slept == [gatejudge.BUSY_FIRST_S]
+    assert not gatejudge.blocks(v) and not gatejudge.undecided(v)
+
+
+def test_gate_judge_a_base_rerun_still_busy_is_undecided_never_new(tmp_path):
+    from ttp import gatejudge
+    i = "tests/test_a.py::test_a"
+    fail = (1, f"FAILED {i} - assert 0\n1 failed in 0.1s\n")
+    calls, slept = [], []
+    run = _busy_run({"head": [fail], "base": [(75, "")] * 9}, calls)
+    v = gatejudge.judge([i], run, tmp_path, "b" * 40, "h1", 1000.0, tries=2, wait_s=600, sleep=slept.append)
+    assert v["busy"] == [i] and not v["new"] and not v["pre_existing"]
+    assert not gatejudge.blocks(v) and gatejudge.undecided(v)
+    assert len(calls) == 4 and slept == [30.0, 60.0], "tries caps the retries; the backoff doubles"
+    assert any("no free slot" in line for line in gatejudge.lines(v))
+
+
+def test_gate_judge_a_busy_head_rerun_is_undecided_and_the_wait_is_capped(tmp_path):
+    from ttp import gatejudge
+    i = "tests/test_a.py::test_a"
+    calls, slept = [], []
+    run = _busy_run({"head": [(75, "")] * 9, "base": []}, calls)
+    v = gatejudge.judge([i], run, tmp_path, "b" * 40, "h1", 1000.0, tries=5, wait_s=50, sleep=slept.append)
+    assert v["busy"] == [i] and not v["new"] and gatejudge.undecided(v)
+    assert [c[0] for c in calls] == ["head"] * 3 and slept == [30.0, 20.0], "wait_s caps the total backoff"
+
+
+def test_gate_judge_busy_settings_come_from_checks_config():
+    from ttp import gatejudge
+    s = gatejudge.settings({"checks": {"judge_busy_tries": 1, "judge_busy_wait_s": 5}})
+    assert s["busy_tries"] == 1 and s["busy_wait_s"] == 5
+    d = gatejudge.settings({})
+    assert d["busy_tries"] == gatejudge.BUSY_TRIES and d["busy_wait_s"] == gatejudge.BUSY_WAIT_S

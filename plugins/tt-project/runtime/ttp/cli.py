@@ -3154,6 +3154,7 @@ def cmd_checks(a) -> None:
     harness-tagged check configured it runs the default harness plan (push.default_harness_checks). Its pass is recorded as such and never counts for a PR,
     an on_pass hand-off or `ttp push --own`; its failures open no check gap."""
     from . import addedtests, checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
+    from . import gatejudge
     from . import shorttmp
     if getattr(a, "gap", None):
         from . import checkgaps
@@ -3349,6 +3350,7 @@ def cmd_checks(a) -> None:
     ran_cpu = 0.0   # the CPU its children had used when its commands started (checkcap.record_cost)
     spilled = None   # the spill host's claim when the checks run there (checkspill)
     worker_loss = None   # test workers lost again on the rerun: an infrastructure fault (workerloss)
+    gate_busy = None     # the gate's rerun found no slot after its retries (gatejudge.undecided): no verdict
     tree_gone = ""   # the clean checkout was removed under a check: killed, never a failure of the change
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
@@ -3703,6 +3705,10 @@ def cmd_checks(a) -> None:
                                 stderr=subprocess.STDOUT, env=e, pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else (),
                                 timeout=min(t, left) if (left := checkwall.deadline_left(deadline)) is not None else t),
                             run_env.get("TMPDIR") if os.environ.get("TTP_CHECKS_TMP_FD") else None)) is not None:
+                        if gatejudge.undecided(judged):
+                            gate_busy = judged
+                            out.write(_check_took(c, rc, began))
+                            break
                         passed, failed = True, None
                         excused.append(judged)
                         out.write(_check_took(c, rc, began))
@@ -3837,6 +3843,17 @@ def cmd_checks(a) -> None:
             write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": "test-worker-lost"})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
+        # The gate's rerun found no slot (an admission timeout): no verdict, never a failure of the head.
+        if gate_busy is not None and not passed and not _CHECK_STOP.get("stopped"):
+            said = (f"{failed!r}: the tests gate could not judge {', '.join(gate_busy['busy'])}: their rerun found no "
+                    "free slot on this host after its retries. Run the checks again later; the change is neither "
+                    "passed nor failed")
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "infra_fault": "gate-rerun-busy"})
             print(f"ttp checks: {said}", file=sys.stderr)
             sys.exit(75)
         # A check host ssh could not reach (or that could not take the tree) is the environment, as a
@@ -5101,7 +5118,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
                 tree.close()
     now = time.time()
     v = {"check": str(c), "head": head,
-         **gatejudge.judge(ids, run, p.state, mb, gatejudge.host(), now, touched)}
+         **gatejudge.judge(ids, run, p.state, mb, gatejudge.host(), now, touched, s["busy_tries"], s["busy_wait_s"])}
     for line in gatejudge.lines(v):
         print(f"ttp checks: {line}", flush=True)
         out.write(f"ttp checks: {line}\n")
@@ -5110,7 +5127,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
                                                          "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
         if new:   # one fix note per newly quarantined test
             pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c)), queued=True)
-    return None if gatejudge.blocks(v) else v
+    return None if gatejudge.blocks(v) else v   # undecided (gatejudge.undecided): the caller stops at exit 75
 
 
 def _log_since(out, log, start: int) -> str:
