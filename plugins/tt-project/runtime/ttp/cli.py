@@ -8418,7 +8418,7 @@ def cmd_pause(a) -> None:
                                         where=p) \
                 if a.cmd == "pause" else None
             print(f"{p.name}: " + pause_resource(p, a.resource, a.cmd == "pause", reason=getattr(a, "reason", None) or "",
-                                                 by=_pause_by(p), end=end))
+                                                 by=_pause_by(p), end=end, via=f"ttp {a.cmd} --resource"))
         except ValueError as e:
             die(str(e))
         return

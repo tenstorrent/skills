@@ -92,6 +92,7 @@ CLEARED_TEXT = {
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
     "notifier": "Desktop notifications deliver again.",
     "tick-step": "Daemon tick step {arg} runs again.",
+    "pause-gone": "Machine change #{arg} is closed, or the resource pause its undo resumes is back.",
     "account-mismatch": "{arg}'s current account has plan readings of its own again, is known to be billed by use, or the old readings aged out.",
 }
 # Conditions only the user can clear, alerted below high: tracked and shown in the top section like a
@@ -108,8 +109,10 @@ CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coor
 # tick-step: a daemon tick step that keeps failing (Daemon._run_step); its next success clears it.
 # chat-silent: a relay chat with no listener that stopped reading (chatgone.py); its next read clears it.
 # lock-wait: a lock a waiter has waited on past locks.wait_alert_min (lockreap.py); the wait's end clears it.
+# pause-gone: an open machine-ledger entry resumes a project pause that is gone (pausegone.py); the entry
+# closing or the pause coming back clears it.
 STATUS_CONDITIONS = ("budget", "limit", "deploy", "deploy-behind", "deploy-pending", "daemon-hang", "account-mismatch",
-                     "tick-step", "chat-silent", "lock-wait")
+                     "tick-step", "chat-silent", "lock-wait", "pause-gone")
 
 
 def _urgent(severity: str | None) -> bool:
@@ -288,6 +291,8 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         return chatgone.holds(db, arg)
     if kind == "tick-step":   # Daemon._run_step keeps the step while it keeps failing
         return arg in (db.kv("tick_steps_failing", {}) or {})
+    if kind == "pause-gone":   # pausegone.check keeps the entry while it is open and its pause gone
+        return arg in (db.kv("pause_gone", {}) or {})
     if key == "daemon-hang":   # ttp.watchdog's incident lasts until a daemon completes a tick after it
         return bool(db.kv("daemon_hang"))
     if key == "push_queue_dying":   # a batch a reboot cut short did not finish either
@@ -319,7 +324,7 @@ def _checkable(key: str) -> bool:
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "daemon-hang", "paused", "fleethold",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "notifier", "chat-silent", "user-step")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step")
 
 
 def _since(ep: dict) -> float:

@@ -116,6 +116,7 @@ from . import workernotify
 from . import provallow
 from . import hostrun
 from .db import (
+    PAUSE_REMOVED_KIND,
     PAUSED_RESOURCES_KEY,
     SEVERITY_RANK,
     SHARED_SEEN_KEY,
@@ -3415,6 +3416,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # A re-pause keeps the user's pause theirs (pause_resource), so its end is chosen as theirs.
                 owner = "user" if "user" in (by, (held or {}).get("by")) else by
                 line = pause_resource(p, name, a["paused"], reason=a.get("reason") or a.get("text") or "", by=by, key=key,
+                                      via="coordinator resource_pause",
                                       end=_own_end(pauseends.from_action(a, p=p, by=owner), by == "user")
                                       if a["paused"] else None)
                 if "machine-wide" in line:   # a no-op under a fleet hold: never told to the user as a new pause
@@ -4420,14 +4422,15 @@ def _resource_names(names, action: str, problems: list) -> list[str]:
 
 
 def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: str = "user",
-                   key: str | None = None, db=None, end: dict | None = None) -> str:
+                   key: str | None = None, db=None, end: dict | None = None, via: str = "") -> str:
     """Pause or resume one resource for the project's tasks. While paused, no task labelled with it
     is dispatched and `ttp lock` refuses it; running workers whose task uses it are told mid-run.
     Resuming it makes tasks that handed off `waiting` on the pause due now. A shared resource
     (shared.py) is paused for every project that names it; their daemons tell their own workers
     (sync_shared_pauses). `db` is the caller's own connection when it runs on another thread (the
     web app). `end` (pauseends.from_action, which the action, `ttp pause` and the web app require)
-    replaces the pause's end; left out, a pause keeps the end it has. Returns a line for the user."""
+    replaces the pause's end; left out, a pause keeps the end it has. `via` names the path (the CLI, the
+    coordinator's action, the web app) in the event a dropped or replaced pause leaves. Returns a line for the user."""
     name = (name or "").strip()
     if not RESOURCE_RE.fullmatch(name):
         raise ValueError(f"not a resource name: {name!r}")
@@ -4455,7 +4458,8 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
                 "by": "user" if "user" in (by, was.get("by")) else by,
                 **({"project": p.name} if is_shared else {})}
 
-    with db.tx():
+    cause = {"via": via or "pause_resource", "by": by, "reason": reason}
+    with db.tx(), db.pause_cause(**cause):
         cur = db.paused_resources(shared=False)
         seen = db.kv(SHARED_SEEN_KEY) or {}
         if paused:
@@ -4471,6 +4475,8 @@ def pause_resource(p: Project, name: str, paused: bool, reason: str = "", by: st
                 return (f"{name} has no pause of its own; it is held machine-wide by hold {hold['id']}: lift that "
                         f"with `machine` {hold.get('alias')}" if hold else f"{name} is not paused")
             since = min(float(x.get("since") or 0) for x in (cur.get(name), was) if x)
+            if was is not None and name not in cur:   # a shared pause's file went: no kv write records it
+                db.pause_event(PAUSE_REMOVED_KIND, name, was, {**cause, "via": cause["via"] + " (shared)"})
             cur.pop(name, None)
             seen.pop(name, None)
             woken = _wake_pause_waiters(db, name, since)
@@ -4552,7 +4558,8 @@ def sync_shared_pauses(p: Project, db=None) -> None:
         for name in sorted((set(seen) | left) - set(cur)):
             still = shared.read_pause(name) if name in left else None
             if still is not None:
-                with db.tx():
+                with db.tx(), db.pause_cause("sync_shared_pauses", "daemon",
+                                             f"{name} is no longer shared: its pause is kept as this project's own"):
                     local = db.paused_resources(shared=False)
                     was = local.get(name) or {}
                     local[name] = {**{k: still[k] for k in pauseends.END_FIELDS if k in still},

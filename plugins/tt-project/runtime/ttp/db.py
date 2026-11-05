@@ -30,6 +30,9 @@ TIER_SOURCES = {
     "premise_check": "a code task's premise check (premise.py): light",
 }
 PAUSED_RESOURCES_KEY = "paused_resources"   # kv: see DB.paused_resources
+# Event of every write that drops or replaces a resource pause (DB.set_kv): `data` names the resource, the
+# path (`via`), the actor (`by`) and the reason, so no pause disappears silently.
+PAUSE_REMOVED_KIND, PAUSE_REPLACED_KIND = "resource_pause_removed", "resource_pause_replaced"
 PAUSE_BOOT_KEY = "pause_until_boot"   # kv: {"boot", "since"} of a `ttp pause --until-reboot`; see DB.set_paused
 KV_CORRUPT = "corrupt:"   # kv: corrupt:<key>:<ts> holds a value of <key> that was not JSON (DB._quarantine_kv)
 SHARED_SEEN_KEY = "shared_pauses_seen"   # kv: {resource: pause} of the shared pauses this project acted on
@@ -820,6 +823,10 @@ END""")
                 self.x("INSERT OR REPLACE INTO kv(key,value,ts) VALUES(?,?,?)",
                        (f"{KV_CORRUPT}{key}:{ts:.6f}", raw if isinstance(raw, str) else repr(raw), ts))
                 self.x("DELETE FROM kv WHERE key=?", (key,))
+                if key == PAUSED_RESOURCES_KEY:   # which pauses it held is unreadable: one event for them all
+                    self.pause_event(PAUSE_REMOVED_KIND, "*", None, cause={
+                        "via": "kv quarantine", "by": "daemon",
+                        "reason": f"the stored pauses were not readable; kept as kv {KV_CORRUPT}{key}:{ts:.6f}"})
                 if not self.one("SELECT 1 FROM messages WHERE ref=? LIMIT 1", (f"kv_corrupt:{key}",)):
                     self.post("out", f"The stored state `{key}` was not readable and was reset to its default; "
                                      f"the raw value is kept as kv `{KV_CORRUPT}{key}:{ts:.6f}`.",
@@ -848,8 +855,61 @@ END""")
     def set_kv(self, key: str, value: Any) -> None:
         if key in DICT_KV and value is not None and not isinstance(value, dict):
             raise ValueError(f"kv {key} holds an object of entries, not {json.dumps(value)[:60]}")
+        if key == PAUSED_RESOURCES_KEY:
+            with self.tx():   # the pauses it drops or replaces are recorded with the write
+                was = self.kv(key, {})
+                self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
+                       "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
+                self._pause_changes(was if isinstance(was, dict) else {}, value if isinstance(value, dict) else {})
+            return
         self.x("INSERT INTO kv(key,value,ts) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET "
                "value=excluded.value, ts=excluded.ts", (key, json.dumps(value), time.time()))
+
+    @contextmanager
+    def pause_cause(self, via: str, by: str, reason: str = "") -> Iterator[None]:
+        """Name the path, actor and reason of the resource pauses the writes inside drop or replace
+        (their PAUSE_REMOVED_KIND / PAUSE_REPLACED_KIND events). A write outside one is recorded too,
+        with the calling function as its path and an unknown actor."""
+        prev = getattr(self, "_pause_cause_now", None)
+        self._pause_cause_now = {"via": via, "by": by, "reason": " ".join(str(reason or "").split())[:300]}
+        try:
+            yield
+        finally:
+            self._pause_cause_now = prev
+
+    def _pause_cause(self) -> dict:
+        cause = getattr(self, "_pause_cause_now", None)
+        if cause:
+            return cause
+        frame, via = sys._getframe(1), "unknown"
+        while frame is not None:   # the first caller outside this module and contextlib
+            name = frame.f_globals.get("__name__", "")
+            if name != __name__ and name != "contextlib":
+                via = f"{name.rpartition('.')[2]}.{frame.f_code.co_name}"
+                break
+            frame = frame.f_back
+        return {"via": via, "by": "unknown", "reason": ""}
+
+    def pause_event(self, kind: str, name: str, was: Any, cause: dict | None = None) -> None:
+        """Record that resource pause `name` (entry `was`) was removed or replaced (`kind`)."""
+        cause = cause or self._pause_cause()
+        was = was if isinstance(was, dict) else {"value": was}
+        what = "removed" if kind == PAUSE_REMOVED_KIND else "replaced"
+        self.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+               (time.time(), "daemon", kind, "low",
+                f"Pause of `{name}` {what} by {cause['by']} via {cause['via']}: "
+                f"{cause['reason'] or 'no reason given'}.",
+                json.dumps({"resource": name, **cause, "was": {k: was.get(k) for k in
+                                                              ("reason", "by", "since", "generation", "until")}}),
+                "handled"))
+
+    def _pause_changes(self, was: dict, now: dict) -> None:
+        cause = None
+        for name in sorted(was):
+            if name in now and now[name] == was[name]:
+                continue
+            cause = cause or self._pause_cause()
+            self.pause_event(PAUSE_REPLACED_KIND if name in now else PAUSE_REMOVED_KIND, name, was[name], cause)
 
     def set_paused(self, on: bool, boot: str | None = None, by: str = "unknown", reason: str = "",
                    via: str = "", end: str = "") -> None:

@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import pausegone
 from . import urgentfup
 from . import checksettle
 from . import checksgone
@@ -2169,6 +2170,10 @@ class Daemon:
             self.power_cycle_notices(now)
         except Exception:
             log(self.p, "power-cycle notices failed\n" + traceback.format_exc())
+        try:
+            pausegone.check(self.p, self.alert)   # an open ledger entry whose project pause is gone
+        except Exception:
+            log(self.p, "ledger pause check failed\n" + traceback.format_exc())
         try:
             self._machine_probes.tick(now)
             pages = machine_ledger.route(now, claimer=self.p.name, budgets=outagetask.budgets(self.cfg),

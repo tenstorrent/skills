@@ -286,7 +286,7 @@ def migrate(p: Project, now: float) -> list[str]:
             return w
         return {**w, "until": until, "end_default": True}
 
-    with db.tx():
+    with db.tx(), db.pause_cause("pause end migration", "daemon", "a pause without an end got the default end"):
         cur = db.paused_resources(shared=False)
         for name, v in cur.items():
             if isinstance(v, dict) and not (v.get("until") or v.get("end_when")):
@@ -445,7 +445,8 @@ class PauseEnds:
                 if not cur.get("shared"):
                     local = db.paused_resources(shared=False)
                     local.pop(name, None)
-                    db.set_kv(PAUSED_RESOURCES_KEY, local)
+                    with db.pause_cause("pause end_when heal end", "daemon", why):
+                        db.set_kv(PAUSED_RESOURCES_KEY, local)
                     self._ended(name, entry)
             if entry is None:
                 continue
@@ -484,7 +485,8 @@ class PauseEnds:
                 if name not in local or _sig(local[name]) != entry["sig"]:
                     return False
                 local.pop(name)
-                db.set_kv(PAUSED_RESOURCES_KEY, local)
+                with db.pause_cause("pause user_end", "daemon", entry["why"]):
+                    db.set_kv(PAUSED_RESOURCES_KEY, local)
                 self._ended(name, entry)
             self._after(name, entry)
             self.log(f"pause of {name} {entry['why']}: lifted")
