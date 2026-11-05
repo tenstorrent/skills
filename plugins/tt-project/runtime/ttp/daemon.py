@@ -247,6 +247,7 @@ from .providers import fence_on as provider_fence_on, get_provider
 from .providers.base import (
     FUNDS_RE,
     Provider,
+    RunUsage,
     last_json_object,
     scratch_dir,
     service_path,
@@ -588,6 +589,7 @@ NET_LOST_RE = re.compile(r"Can't reach the API server|ENOTFOUND|EAI_AGAIN")
 # difference is at least this share of the run's own token-priced cost, less the slack (in dollars).
 SESSION_NET_AGREE = 0.5
 SESSION_NET_SLACK_USD = 0.05
+COORD_RENET_KEY = "coord_session_renet"   # Daemon.renet_coord_sessions ran (once per project)
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
 NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
@@ -1232,6 +1234,13 @@ class Daemon:
                             f"{filled['legacy']} marked legacy")
         except Exception:  # a report backfill must never keep the daemon from starting
             log(self.p, "cache telemetry backfill error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # resumed coordinator session wakes booked at the session's running total, once
+            if changed := self.renet_coord_sessions():
+                log(self.p, f"re-netted {len(changed)} resumed coordinator session wake(s): "
+                            f"${sum(c[1] for c in changed):.2f} booked -> ${sum(c[2] for c in changed):.2f} ("
+                            + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
+        except Exception:   # a spend correction must never keep the daemon from starting
+            log(self.p, "coordinator session re-net error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
             if closed := pushq.close_strays(self.p):
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
@@ -2887,8 +2896,14 @@ class Daemon:
                 session_mode, why = "stateless", f"decide failed: {type(e).__name__}: {e}"[:200]
                 log(self.p, f"coordinator session {why}")
             state = self.p.db.kv(coordsession.KEY)
+            session_cap = None
             if session_mode == "resume":
                 thread = str((state or {}).get("id") or "")
+                if thread and budget_usd is not None and prov.caps_budget:
+                    # The CLI holds a resumed session's running total, not this wake's, to
+                    # --max-budget-usd: the wake keeps its own cap on top of what the session booked.
+                    session_cap = round(self._session_booked(thread, None) + float(budget_usd), 2)
+                    argv = _with_flag(argv, "--max-budget-usd", f"{session_cap:.2f}")
             ack, sent_why = None, ""
             if session_digest is not None and session_mode in ("resume", "new"):
                 try:   # only what changed since the session's last acknowledged wake, else the whole digest
@@ -2917,6 +2932,7 @@ class Daemon:
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "session": {
                 "mode": session_mode, "why": why, "key": key, "model": model, "effort": effort,
                 "provider": provider, **({"digest": ack} if ack else {}),
+                **({"cap_usd": session_cap} if session_cap is not None else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
         elif role == "coordinator" and not resume and prov.cache_key_per_session:
             try:   # the agent's cache follows its session: continue the last turn's while warm
@@ -4111,18 +4127,18 @@ class Daemon:
         book only what this run added beyond the earlier runs of the session. Netted only when the
         report covers what those runs booked and the difference agrees with this run's own tokens
         priced at the project's rate; even then never below that price. Otherwise the full report
-        is booked: over-booking is the safe failure, under-booking lets spend run away."""
-        session = (json.loads(r["note"] or "{}").get("resumes") or {}).get("session")
+        is booked: over-booking is the safe failure, under-booking lets spend run away. A resumed
+        coordinator session wake (note.turn.session.mode 'resume') is netted the same way, over the
+        session's earlier wakes (runs.session_id, task IS NULL). Its token counts need no netting:
+        they come from the result's own usage, which covers this run only (the cumulative
+        modelUsage and duration_api_ms are not read)."""
+        note = json.loads(r["note"] or "{}")
+        session = (note.get("resumes") or {}).get("session") or _resumed_coord_session(r, note)
         reported = float(usage.cost_usd or 0)
         basis = usage.extra.get("cost_basis")   # chat runs (providers/chat.py)
         if not session or reported <= 0 or basis == "pricing" or (usage.estimated and basis != "fallback"):
             return usage.cost_usd
-        # By runs.session_id; rows from before that column fall back to the session id in their note.
-        booked = sum(float(o["cost_usd"] or 0) for o in self.p.db.q(
-            "SELECT cost_usd, session_id, note FROM runs WHERE id<? AND task IS ? AND "
-            "(session_id=? OR (session_id IS NULL AND note LIKE ?))",
-            (r["id"], r["task"], session, f"%{session}%"))
-            if o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session)
+        booked = self._session_booked(session, r["task"], r["id"])
         if booked <= 0:
             return usage.cost_usd
         own = bud.estimate_cost(self.p.db, self.cfg, r["provider"], r["model"] or "", {
@@ -4133,6 +4149,46 @@ class Daemon:
             usage.extra["session_cost_usd"] = reported
             usage.cost_usd = round(max(delta, own, 0.0), 6)
         return usage.cost_usd
+
+    def _session_booked(self, session: str, task, before: int | None = None) -> float:
+        """What the runs of `session` (of `task`, None for the coordinator's) booked, those before run
+        `before` only when given. By runs.session_id; rows from before that column fall back to the
+        session id in their note."""
+        return sum(float(o["cost_usd"] or 0) for o in self.p.db.q(
+            "SELECT cost_usd, session_id, note FROM runs WHERE id<? AND task IS ? AND "
+            "(session_id=? OR (session_id IS NULL AND note LIKE ?))",
+            (before if before is not None else 1 << 62, task, session, f"%{session}%"))
+            if o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session)
+
+    def renet_coord_sessions(self) -> list[tuple[int, float, float]]:
+        """Once per project (kv COORD_RENET_KEY): resumed coordinator session wakes booked before
+        _net_of_session covered them carry the session's running total. Re-net each, oldest first, with
+        the same agreement check, so spend, caps and stats count each wake once. A row already netted
+        (its note has session_cost_usd) is left alone, so a second pass changes nothing. Returns
+        (run id, booked before, booked after) of each row changed."""
+        db = self.p.db
+        if db.kv(COORD_RENET_KEY):
+            return []
+        changed = []
+        for r in db.q("SELECT * FROM runs WHERE role='coordinator' AND task IS NULL AND session_id IS NOT NULL "
+                      "AND status!='running' AND cost_usd>0 AND note LIKE '%\"resume\"%' ORDER BY id"):
+            note = json.loads(r["note"] or "{}")
+            if "session_cost_usd" in note or not _resumed_coord_session(r, note):
+                continue
+            usage = RunUsage(cost_usd=float(r["cost_usd"]), input_tokens=r["input_tokens"] or 0,
+                             output_tokens=r["output_tokens"] or 0, cache_read_tokens=r["cache_read_tokens"] or 0,
+                             cache_write_tokens=r["cache_write_tokens"] or 0,
+                             estimated=bool(r["cost_estimated"]) or (r["cost_basis"] or "reported") != "reported")
+            before = usage.cost_usd
+            if self._net_of_session(r, usage) == before or "session_cost_usd" not in usage.extra:
+                continue
+            note["session_cost_usd"] = usage.extra["session_cost_usd"]
+            db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (usage.cost_usd, json.dumps(note), r["id"]))
+            changed.append((r["id"], before, usage.cost_usd))
+        db.set_kv(COORD_RENET_KEY, {"at": time.time(), "runs": len(changed),
+                                    "usd_before": round(sum(c[1] for c in changed), 6),
+                                    "usd_after": round(sum(c[2] for c in changed), 6)})
+        return changed
 
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
@@ -4449,7 +4505,8 @@ class Daemon:
                 or json.loads(r.get("note") or "{}").get("resumes")):
             return
         try:
-            got = localspend.calibrate(usage.session_id, usage.cost_usd)
+            # A resumed coordinator wake's log holds its whole session: compared with the session's total.
+            got = localspend.calibrate(usage.session_id, usage.extra.get("session_cost_usd", usage.cost_usd))
         except Exception as e:  # noqa: BLE001 - a price check never breaks finishing a run
             log(self.p, f"price table check failed: {e}")
             return
@@ -16665,6 +16722,23 @@ def _cost_basis(usage) -> str:
     if how == "pricing":
         return "tokens"
     return "reported" if not usage.estimated or (how == "fallback" and usage.cost_usd) else "tokens"
+
+
+def _with_flag(argv: list[str], flag: str, value: str) -> list[str]:
+    """argv with the value after `flag` replaced; unchanged when the flag is absent."""
+    if flag not in argv[:-1]:
+        return argv
+    i = argv.index(flag)
+    return argv[:i + 1] + [value] + argv[i + 2:]
+
+
+def _resumed_coord_session(r: dict, note: dict) -> str:
+    """The session a coordinator session-mode wake resumed (note.turn.session.mode 'resume'), else ''."""
+    if r["role"] != "coordinator" or r["task"] is not None:
+        return ""
+    turn = note.get("turn") if isinstance(note.get("turn"), dict) else {}
+    session = turn.get("session") if isinstance(turn.get("session"), dict) else {}
+    return str(r["session_id"] or "") if session.get("mode") == "resume" else ""
 
 
 def _has_tokens(usage) -> bool:

@@ -212,11 +212,11 @@ def _cs_daemon(env, monkeypatch):
     head, context = coord.prompt_parts(p)
     holder = {"d": Daemon(p.base)}
 
-    def turn(digest="EVENTS"):
+    def turn(digest="EVENTS", **kw):
         d = holder["d"]
         d.cfg = p.config()
         rid = d.start_run("coordinator", digest, "fake", "light", str(p.base), read_only=True,
-                          schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl="auto")
+                          schema=coord.ACTIONS_SCHEMA, system=head, context=context, cache_ttl="auto", **kw)
         _finish_runs(p, d)
         r = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
         spec = json.loads((p.runs / str(rid) / "run.json").read_text())
@@ -961,3 +961,93 @@ def test_coordsession_an_unchanged_memory_adds_nothing_and_a_failed_resume_sends
     assert coordsession.resume_memory(p, {**after, "sent": pending}, "")[0] == "", "nothing new once sent"
     assert coordsession.resume_memory(p, {**after, "sent": sent}, f"[{bench}] The bench runs on Fridays.")[0] == "", \
         "a line the digest already carries is not repeated"
+
+
+# Resumed session wakes: booked at their own cost, not the session's running total ----------------
+
+def _cs_capped_fake(monkeypatch):
+    """The fake agent with Claude Code's per-run cap flag (--max-budget-usd), so the cap it gets shows."""
+    from ttp.providers.fake import Fake
+    build = Fake.build
+    monkeypatch.setattr(Fake, "caps_budget", True, raising=False)
+    monkeypatch.setattr(Fake, "build", lambda self, **kw: (
+        build(self, **kw)[0] + ["--max-budget-usd", f"{float(kw['budget_usd']):.2f}"], {}))
+
+
+def test_coordsession_resumed_wakes_book_their_own_cost_and_cap_and_keep_the_guard_quiet(env, monkeypatch):
+    """Like Claude Code, the fake reports a resumed session's running total: each wake books only what
+    it added, gets the per-wake cap on top of what the session booked, and the spend guard reads the
+    netted figures."""
+    from ttp import coordguard
+    p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
+    _cs_capped_fake(monkeypatch)
+    p.set_config("coordinator.session.mode", "on")
+    t0 = time.time() - 1
+    got = []
+    for total in (1.0, 1.6, 2.1):   # the session's running total after each wake
+        monkeypatch.setenv("TTP_FAKE_COST", str(total))
+        got.append(turn("EVENTS", budget_usd=3.0))
+    (first, a0, _, s0), (second, a1, _, s1), (third, a2, _, s2) = got
+    assert [s0["mode"], s1["mode"], s2["mode"]] == ["new", "resume", "resume"]
+    assert first["session_id"] == second["session_id"] == third["session_id"]
+    assert [round(r["cost_usd"], 6) for r, *_ in got] == [1.0, 0.6, 0.5], "a wake booked the session total"
+    assert json.loads(third["note"])["session_cost_usd"] == 2.1 and "session_cost_usd" not in json.loads(first["note"])
+    caps = [a[a.index("--max-budget-usd") + 1] for a in (a0, a1, a2)]
+    assert caps == ["3.00", "4.00", "4.60"], caps
+    assert "cap_usd" not in s0 and s1["cap_usd"] == 4.0 and s2["cap_usd"] == 4.6
+    # Allowance $2.40 at the first hour: the netted $2.10 is under it, the summed totals ($4.70) are not.
+    p.db.set_kv(coordguard.BASELINE_KEY, {"at": t0, "turns": 10, "usd": 8.0, "days": 1.0,
+                                          "usd_turn": 0.8, "usd_day": 0.0})
+    p.db.set_kv(coordguard.KEY, {"tripped": False, "trips": []})
+    assert abs(coordguard.spend(p.db, t0)[0] - 2.1) < 1e-6
+    assert coordguard.check(p.db, p.config(), time.time()) is None and not coordguard.tripped(p.db)
+
+
+def _cs_booked_run(p, session, cost, mode, *, out=0, task=None, role="coordinator", basis="reported"):
+    note = {"turn": {"session": {"mode": mode, "why": "continued"}}}
+    return p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,output_tokens,"
+                  "session_id,cost_basis,note) VALUES(?,?,'claude','opus',?,?,'ok',?,?,?,?,?)",
+                  (task, role, time.time() - 600, time.time() - 500, cost, out, session, basis, json.dumps(note)))
+
+
+def test_coordsession_a_resumed_wake_s_report_is_netted_only_when_its_tokens_agree(env):
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 1.0)   # 200k output tokens price at $1.00
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _cs_booked_run(p, "S", 4.0, "new")
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status,session_id,note) VALUES("
+                 "'coordinator','claude','opus',?,'running','S',?)",
+                 (time.time(), json.dumps({"turn": {"session": {"mode": "resume"}}})))
+    r = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    from ttp.providers.base import RunUsage
+    assert d._net_of_session(r, RunUsage(cost_usd=5.0, output_tokens=200_000)) == 1.0
+    # Its own tokens price at $8.00: a $1.00 delta disagrees, so the report is this wake's own cost.
+    assert d._net_of_session(r, RunUsage(cost_usd=5.0, output_tokens=1_600_000)) == 5.0
+    assert d._net_of_session(r, RunUsage(cost_usd=3.0)) == 3.0, "a report below the session's booking was netted"
+    for note in ({"turn": {"session": {"mode": "new"}}}, {"turn": {"session": {"mode": "stateless"}}}, {}):
+        assert d._net_of_session(dict(r, note=json.dumps(note)), RunUsage(cost_usd=5.0)) == 5.0, note
+    assert d._net_of_session(dict(r, task=1), RunUsage(cost_usd=5.0)) == 5.0, "a task's run netted over the coordinator's"
+
+
+def test_coordsession_wakes_booked_at_the_running_total_are_re_netted_once(env):
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 1.0)
+    from ttp.daemon import COORD_RENET_KEY, Daemon
+    d = Daemon(p.base)
+    ids = [_cs_booked_run(p, "S1", 1.0, "new"), _cs_booked_run(p, "S1", 1.6, "resume"),
+           _cs_booked_run(p, "S2", 0.9, "new"), _cs_booked_run(p, "S1", 2.1, "resume"),
+           _cs_booked_run(p, "S2", 1.5, "resume", out=1_600_000),   # its tokens price at $8: per-run, kept
+           _cs_booked_run(p, "S3", 2.0, "resume", basis="elapsed"),   # an estimate, kept
+           _cs_booked_run(p, "S1", 9.0, "resume", task=1, role="worker")]   # not a coordinator wake
+    p.db.x("UPDATE runs SET session_id=NULL WHERE id=?", (ids[-1],))
+    changed = d.renet_coord_sessions()
+    assert [(i, round(a, 6), round(b, 6)) for i, a, b in changed] == [(ids[1], 1.6, 0.6), (ids[3], 2.1, 0.5)]
+    cost = {r["id"]: round(r["cost_usd"], 6) for r in p.db.q("SELECT id, cost_usd FROM runs")}
+    assert [cost[i] for i in ids] == [1.0, 0.6, 0.9, 0.5, 1.5, 2.0, 9.0]
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (ids[3],))["note"])["session_cost_usd"] == 2.1
+    assert p.db.kv(COORD_RENET_KEY)["runs"] == 2
+    assert d.renet_coord_sessions() == [], "ran twice"
+    p.db.x("DELETE FROM kv WHERE key=?", (COORD_RENET_KEY,))
+    assert d.renet_coord_sessions() == [], "a netted row was netted again"
+    assert {r["id"]: round(r["cost_usd"], 6) for r in p.db.q("SELECT id, cost_usd FROM runs")} == cost
