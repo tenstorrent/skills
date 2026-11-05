@@ -2844,7 +2844,8 @@ def test_the_coordinator_digest_shows_the_global_daily_total(env, tmp_path):
     other.spend("fake", 340.0, "task:1", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
     d = coord.digest(p, {"fake": g}, [], [])
-    assert "$1.20 of $100.0 today" in d and "global daily cap (whole account): $341.20 of $1000 today (" in d, d
+    assert "$1.20 of $100.0 today" in d, d
+    assert "global daily cap (whole account, per provider): fake $341.20 of $1000 today (" in d, d
     # Off: the money line stays as before.
     p.set_config("budget.global_daily_usd", 0)
     p.set_config("budget.day_start", "")
@@ -4698,6 +4699,36 @@ def test_the_project_caps_line_shows_billed_plan_paid_and_total_once(env):
     assert bud.caps_spend({"spent_24h": 1.0, "spent_7d": 2.0}, 0, 0, plan_paid=3.0).startswith("no dollar cap: ")
     assert "$2.00 of $50 billed by use per 7 days (+$3.00 paid by plans, not billed; $5.00 total)" in \
         bud.caps_spend({"spent_24h": 1.0, "spent_7d": 2.0}, 0, 50, plan_paid=3.0)
+
+
+def test_the_caps_line_names_each_providers_global_total_and_puts_the_reached_one_first(env):
+    """Each provider's gate carries its own global total (globalcap.total counts one provider's
+    spend). With an in-house 'chat' gate at $0 found first and the 'claude' gate red at $2013 of
+    $2000, the line once showed '$0.00 of $2000 today' as the whole account's total while dispatch
+    held claude work. It names each provider and lists the reached one first; the project caps part
+    is unchanged."""
+    p = make(env)
+    from ttp import budget as bud
+    now = time.time()
+    b = p.config()["budget"]
+
+    def caps(prov, today, level, reasons):
+        return bud.Gate(provider=prov, level=level, regime="caps", max_parallel=6, max_tier="deep",
+                        allow_optional=True, reasons=reasons, numbers={
+                            "spent_24h": 10.0, "spent_7d": 10.0, "daily_cap": 0, "weekly_cap": 0,
+                            "global_today": today, "global_cap": 2000.0, "global_stale": [],
+                            "global_includes": "2 project(s)"}).as_dict()
+    gates = {"chat": caps("chat", 0.0, "green", []),
+             "claude": caps("claude", 2013.0, "red", ["global daily cap reached: $2013 of $2000 today"])}
+    line = bud.caps_line(p.db, gates, b, now)
+    assert "global daily cap (whole account, per provider): claude $2013.00 of $2000 today " \
+           "(2 project(s), reached); chat $0.00 of $2000 today (2 project(s))" in line, line
+    assert line.startswith(bud.caps_line(p.db, {"chat": gates["chat"]}, b, now).split(" · global daily cap")[0]), line
+    # Without a global total the line is the project caps alone.
+    for g in gates.values():
+        for k in [k for k in g["numbers"] if k.startswith("global_")]:
+            del g["numbers"][k]
+    assert "global daily cap" not in bud.caps_line(p.db, gates, b, now)
 
 
 def _claude_run_with_reading(p, account, tmp_path, util=0.0, resets_at=None, reinit=False):

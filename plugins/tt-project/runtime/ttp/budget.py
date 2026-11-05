@@ -493,18 +493,29 @@ def caps_line(db: DB, gates: dict, b: dict, now: float) -> str:
     """The project dollar caps, once for all usage-billed providers together: the numbers of any
     caps-regime gate in `gates` (dicts; the caps count every provider's billed spend, so they are the
     same in each), else the billed spend itself; the 7 days' plan-paid spend beside it, so the total
-    is the ledger's; and the global daily cap when one is set."""
+    is the ledger's; and the global daily cap when one is set, per provider: each gate's global total
+    counts only its own provider's spend across the account (globalcap.total), so the line names each
+    provider and lists the one nearest its cap first."""
     n = next((g.get("numbers") or {} for g in gates.values() if g.get("regime") not in ("windows", "plan")), None)
     if n is None:
         n = {"spent_24h": round(db.spent_since(now - DAY, billed=True), 2),
              "spent_7d": round(db.spent_since(now - WEEK, billed=True), 2)}
     plan = any(g.get("regime") == "windows" for g in gates.values())
     out = caps_spend(n, b.get("daily_usd"), b.get("weekly_usd"), plan, plan_paid=round(plan_paid(db, now - WEEK), 2))
-    if "global_today" in n:
-        stale = f", {len(n['global_stale'])} machine(s) stale" if n.get("global_stale") else ""
-        out += (f" · global daily cap (whole account): ${n['global_today']:.2f} of "
-                f"${float(n.get('global_cap') or 0):.0f} today ({n.get('global_includes') or 'this account'}{stale})")
-    return out
+    totals = [(prov, (g.get("numbers") or {})) for prov, g in gates.items() if "global_today" in (g.get("numbers") or {})]
+    if not totals:
+        return out
+
+    def share(m: dict) -> float:
+        cap = float(m.get("global_cap") or 0)
+        return float(m.get("global_today") or 0) / cap if cap > 0 else 0.0
+    parts = []
+    for prov, m in sorted(totals, key=lambda t: (-share(t[1]), t[0])):
+        stale = f", {len(m['global_stale'])} machine(s) stale" if m.get("global_stale") else ""
+        reached = ", reached" if share(m) >= 1.0 else ""
+        parts.append(f"{prov} ${float(m['global_today']):.2f} of ${float(m.get('global_cap') or 0):.0f} today "
+                     f"({m.get('global_includes') or 'this account'}{stale}{reached})")
+    return out + " · global daily cap (whole account, per provider): " + "; ".join(parts)
 
 
 def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: dict, now: float,
