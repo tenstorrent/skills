@@ -81,6 +81,42 @@ def test_host_run_allows_an_entry_with_more_words_after_it(env, monkeypatch, cap
     assert "ok" in capfd.readouterr().out
 
 
+@pytest.mark.parametrize("argv", [
+    [sys.executable, "-c", "print('ok')", "reboot.target"],   # a word appended to an exact entry
+    [sys.executable, "-c", "print('ok')", ";", "reboot"],      # a shell-metacharacter variant
+    [sys.executable, "-c", "print('ok'); import os"],         # the last word extended
+    [sys.executable, "-c"],                                   # a word short
+])
+def test_host_run_exact_entry_allows_only_its_own_words_client_and_daemon_side(env, monkeypatch, capfd, argv):
+    from ttp import cli, hostrun
+    exact = [sys.executable, "-c", "print('ok')"]
+    p = _hostrun_setup(env, monkeypatch, [{"cmd": shlex.join(exact), "exact": True, "timeout_s": 30},
+                                          {"cmd": "/bin/true", "exact": False}])
+    ents, why = hostrun.entries(p)
+    assert why == "" and ents == [(exact, 30), (["/bin/true"], None)] and [e.exact for e in ents] == [True, False]
+    assert _hostrun_with_daemon(p, exact, []) == 0 and "ok" in capfd.readouterr().out
+    assert hostrun.limit_for(p, exact, ents) == 30
+    assert hostrun.allowed(["/bin/true", "x"], ents), "exact false keeps prefix matching"
+    assert hostrun.request(p, argv) == hostrun.REFUSED and "refused" in capfd.readouterr().err
+    q = p.state / hostrun.QUEUE   # written straight into the queue, past the client: the daemon refuses it too
+    rid = secrets.token_hex(16)
+    (q / f"{rid}.json").write_text(json.dumps({"argv": argv, "task": "9"}))
+    hostrun.serve(p, wait=True)
+    assert json.loads((q / f"{rid}.out.json").read_text())["rc"] == hostrun.REFUSED
+    cli.main(["config", "demo", "runner.host_commands", json.dumps([{"cmd": "/bin/id -u", "exact": True}])])
+    assert p.config()["runner"]["host_commands"] == [{"cmd": "/bin/id -u", "exact": True}]
+
+
+def test_doctor_warns_on_a_plain_sudo_entry_only(env, monkeypatch):
+    from ttp import hostrun
+    raw = ["sudo -n systemctl enable --now a.service", "/usr/bin/sudo -n /usr/sbin/tool status",
+           {"cmd": "sudo -n systemctl restart a.service", "exact": True}, {"cmd": "sudo -n /usr/sbin/tool info"},
+           "/bin/true", "'sudo", {"cmd": "sudo -n x", "exact": "yes"}]
+    warns = hostrun.sudo_prefix_warnings(raw)
+    assert [w.split(" ")[2] for w in warns] == ["1", "2", "4"] and all("make it exact" in w for w in warns)
+    assert hostrun.sudo_prefix_warnings("sudo reboot") == hostrun.sudo_prefix_warnings(None) == []
+
+
 def test_host_run_times_out_a_command_past_the_config_limit(env, monkeypatch, capfd):
     from ttp import hostrun
     cmd = [sys.executable, "-c", "import time; time.sleep(30)"]
@@ -193,6 +229,9 @@ def test_host_run_plain_entry_keeps_the_600_s_cap_and_a_dict_entry_sets_its_own(
     ({"cmd": "/bin/power-cycle", "timeout_s": "900"}, "must be a number"),
     ({"cmd": "/bin/power-cycle", "timeout_s": True}, "must be a number"),
     ({"cmd": "/bin/power-cycle", "timeout": 900}, "unknown key timeout"),
+    ({"cmd": "/bin/power-cycle", "exact": "yes"}, "exact must be true or false"),
+    ({"cmd": "/bin/power-cycle", "exact": 1}, "exact must be true or false"),
+    ({"exact": True}, "must be a string"),
     ({"cmd": ["/bin/power-cycle"]}, "must be a string"),
     ({"timeout_s": 900}, "must be a string"),
     ("'/bin/power-cycle", "does not split"),

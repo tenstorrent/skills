@@ -244,9 +244,11 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   sets the list (`ttp config` or chat's `config_set`, each refusing a shell string or a bad entry by name), never a worker. Each run goes to `state/host-run.jsonl` with its task id. A plain
   entry runs under `runner.host_command_timeout_s` (at most 600 s); an entry
   `{"cmd": "<command>", "timeout_s": N}` sets its own limit, up to 3600 s (over it, or malformed:
-  refused and named, never clamped); `--timeout S` asks for less. Anything that may run past about
-  9 minutes (a tool call stops at 10): `ttp host-run --detach -- <command...>` returns its id at once
-  and the run goes on without the worker; hand off `waiting` with retry_when
+  refused and named, never clamped); `--timeout S` asks for less. An entry with `"exact": true`
+  (`{"cmd": "sudo -n <command>", "exact": true}`) runs only a request of exactly its words, so
+  nothing can be appended: use it for privileged commands (`ttp doctor` warns on a plain sudo
+  entry). Anything that may run past about 9 minutes (a tool call stops at 10):
+  `ttp host-run --detach -- <command...>` returns its id at once and the run goes on without the worker; hand off `waiting` with retry_when
   `ttp host-run --status <id>` (0 ended, 1 running, 4 unknown or lost), then read
   `ttp host-run --result <id>` (its output, its exit code). A lock that must cover the whole run:
   `ttp detach <name> --lock <res> -- ttp host-run -- <command...>`, not `ttp lock` around `--detach`

@@ -2278,8 +2278,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `ttp host-run` accepts, refusing a shell string or a bad entry by name. An entry is a command string (the words a request must equal or start with),
   limited by `runner.host_command_timeout_s` (default 120 s, at most 600 s), or
   `{"cmd": "<command>", "timeout_s": N}`, which gives that command its own limit of up to 3600 s,
-  for example `{"cmd": "sudo -n /usr/local/sbin/power-cycle", "timeout_s": 1200}`. An entry whose
-  `timeout_s` is over 3600, below 1, or not a number, or that is otherwise malformed, is
+  for example `{"cmd": "sudo -n /usr/local/sbin/power-cycle", "timeout_s": 1200}`. A dict entry with
+  `"exact": true` matches only a request of exactly its words, so nothing can be appended to it:
+  use it for a privileged command, e.g. `{"cmd": "sudo -n systemctl restart <unit>", "exact": true}`
+  (`ttp doctor` warns on a plain entry that starts with sudo). An entry whose `exact` is not true
+  or false, or whose `timeout_s` is over 3600, below 1, or not a number, or that is otherwise malformed, is
   refused by `ttp config` and, when read, named in each refusal; it is never clamped. The longest
   matching entry sets the limit; `--timeout S` asks for less, and a longer ask is cut to the
   entry's limit with a note. A command that may run past about 9 minutes (a worker's tool call

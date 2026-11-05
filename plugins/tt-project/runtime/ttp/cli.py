@@ -10820,6 +10820,8 @@ def cmd_doctor(a) -> None:
     from . import hostrun
     if (dpid := _read_pid(p.state / "daemon.pid")) and _is_daemon(dpid) and (fenced := hostrun.fence_problem(p, dpid)):
         print(f"host-run: {fenced}")
+    for line in hostrun.sudo_prefix_warnings((p.config().get("runner") or {}).get("host_commands")):
+        print(f"host-run: {line}")
     from . import sandbox
     print(f"process sandbox for checks: {sandbox.notice() or 'on (own PID namespace per check command)'}")
     from .project import config_problems
@@ -11465,7 +11467,8 @@ def main(argv: list[str] | None = None) -> None:
                                         "outside the sandbox, through the daemon", description=(
         "A sandboxed worker cannot gain privileges (sudo fails with 'no new privileges'). The daemon runs a "
         "command listed in config runner.host_commands (each entry: the command's first words, which the "
-        "request must equal or start with; set by the user or the coordinator) on the host, under "
+        "request must equal or start with, or only equal for {\"cmd\": ..., \"exact\": true}; set by the user or the "
+        "coordinator) on the host, under "
         "runner.host_command_timeout_s (at most 600 s; an entry {\"cmd\": ..., \"timeout_s\": N} sets its own, "
         "at most 3600 s), logs it to state/host-run.jsonl with the task id, and prints its output; the exit "
         "code is the command's (126 refused, 124 timed out, 75 no answer from the daemon). A command that may "

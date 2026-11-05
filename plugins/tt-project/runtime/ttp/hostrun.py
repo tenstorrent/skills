@@ -14,9 +14,12 @@ command runs with shell=False, the daemon's own environment and cwd (never the w
 {"cmd": "<command>", "timeout_s": N}: that command's own limit, up to ENTRY_MAX_TIMEOUT_S; an entry over
 it, at or below zero, not a number or otherwise malformed is refused when read, named in the refusal,
 never clamped. The longest matching entry gives the limit; a caller's --timeout below it wins, above it
-is cut to it (and told so). Only the user or the coordinator sets the list (`ttp config`, or the coordinator's
-config_set, which chat may use): both store only a list check_list accepts, refusing a shell string, a non-list or
-any entry entry() refuses, named. `ttp config` refuses it in a worker run, and the daemon runs nothing
+is cut to it (and told so). A dict entry with "exact": true matches only a request whose words equal its
+own, word for word: nothing can be appended to it (name a privileged command this way, so a worker cannot
+add an argument it runs as root); `ttp doctor` warns on a plain (prefix) entry that starts with sudo. Only the
+user or the coordinator sets the list (`ttp config`, or the coordinator's config_set, which chat may use): both
+store only a list check_list accepts, refusing a shell string, a non-list or any entry entry() refuses, named.
+`ttp config` refuses it in a worker run, and the daemon runs nothing
 while configwho records a worker as its setter. Every request, run or refused, goes to
 state/host-run.jsonl with its task id, run id, words, exit code and length.
 
@@ -65,8 +68,14 @@ _running: set[str] = set()
 _mu = threading.Lock()
 
 
+class Entry(tuple):
+    """An allowed command as (words, own limit or None), which unpacks and compares as that pair; .exact:
+    a request must equal the words, never only start with them."""
+    exact = False
+
+
 def entries(p: Project) -> tuple[list[tuple[list[str], int | None]], str]:
-    """The allowed commands as (words, own limit or None for a plain entry), and what is wrong: why
+    """The allowed commands as Entry (words, own limit or None for a plain entry), and what is wrong: why
     there are none, and each entry refused as malformed (named, so the setter can fix it)."""
     raw = (p.config().get("runner") or {}).get("host_commands") or []
     if not isinstance(raw, list) or not raw:
@@ -84,18 +93,22 @@ def entries(p: Project) -> tuple[list[tuple[list[str], int | None]], str]:
         if err:
             bad.append(f"entry {i} {json.dumps(e)[:160]} refused: {err}")
         else:
-            out.append((words, limit))
+            out.append(ent := Entry((words, limit)))
+            ent.exact = isinstance(e, dict) and e.get("exact") is True
     why = "; ".join(bad) or ("" if out else f"config {KEY} has no valid entry")
     return out, why
 
 
 def entry(e) -> tuple[list[str], int | None, str]:
     """One runner.host_commands entry as (words, own limit or None, error): a command string, or
-    {"cmd": <string>, "timeout_s": <1..ENTRY_MAX_TIMEOUT_S>}. Anything else is an error, never clamped."""
+    {"cmd": <string>, "timeout_s": <1..ENTRY_MAX_TIMEOUT_S>, "exact": <true or false>} (either key optional).
+    Anything else is an error, never clamped."""
     cmd, limit = e, None
     if isinstance(e, dict):
-        if extra := sorted(set(e) - {"cmd", "timeout_s"}):
-            return [], None, f"unknown key {', '.join(map(str, extra))} (an entry has cmd and timeout_s)"
+        if extra := sorted(set(e) - {"cmd", "timeout_s", "exact"}):
+            return [], None, f"unknown key {', '.join(map(str, extra))} (an entry has cmd, timeout_s and exact)"
+        if not isinstance(e.get("exact", False), bool):
+            return [], None, f"exact must be true or false, not {json.dumps(e['exact'])}"
         cmd, v = e.get("cmd"), e.get("timeout_s")
         if v is not None:
             if isinstance(v, bool) or not isinstance(v, (int, float)) or v != v:
@@ -104,7 +117,7 @@ def entry(e) -> tuple[list[str], int | None, str]:
                 return [], None, f"timeout_s {v:g} is outside 1..{ENTRY_MAX_TIMEOUT_S} s"
             limit = int(v)
     if not isinstance(cmd, str):
-        return [], None, "the command must be a string (or {\"cmd\": ..., \"timeout_s\": N})"
+        return [], None, "the command must be a string (or {\"cmd\": ..., \"timeout_s\": N, \"exact\": true})"
     try:
         words = shlex.split(cmd)
     except ValueError as err:
@@ -133,6 +146,18 @@ def check_list(v) -> list:
     return v
 
 
+def sudo_prefix_warnings(raw) -> list[str]:
+    """For `ttp doctor`: each valid plain (prefix) entry of a runner.host_commands list `raw` that starts with
+    sudo, which a request may extend with any words the daemon then runs as root."""
+    out = []
+    for i, e in enumerate(raw if isinstance(raw, list) else [], 1):
+        words, _, err = entry(e)
+        if not err and os.path.basename(words[0]) == "sudo" and not (isinstance(e, dict) and e.get("exact") is True):
+            out.append(f"{KEY} entry {i} {json.dumps(e)[:160]} runs sudo and is a prefix: a request may append "
+                       f"any words; make it exact ({{\"cmd\": ..., \"exact\": true}}) unless it needs them")
+    return out
+
+
 def allowlist(p: Project) -> tuple[list[list[str]], str]:
     """The allowed commands as word lists, and why there are none (or which entries were refused)."""
     out, why = entries(p)
@@ -142,7 +167,7 @@ def allowlist(p: Project) -> tuple[list[list[str]], str]:
 def limit_for(p: Project, argv: list[str], ents: list[tuple[list[str], int | None]]) -> int:
     """The limit of the longest entry `argv` matches (on a tie, the longer limit): its own timeout_s, else
     the plain limit (timeout_of)."""
-    hits = [(len(w), timeout_of(p) if lim is None else lim) for w, lim in ents if argv[:len(w)] == w]
+    hits = [(len(e[0]), timeout_of(p) if e[1] is None else e[1]) for e in ents if matches(argv, e)]
     return max(hits)[1] if hits else timeout_of(p)
 
 
@@ -156,9 +181,15 @@ def asked(limit: int, want) -> tuple[int, str]:
     return max(1, int(want)), ""
 
 
-def allowed(argv: list[str], allow: list[list[str]]) -> bool:
-    """Whether `argv` equals an allowed entry or starts with all of its words."""
-    return bool(argv) and any(argv[:len(e)] == e for e in allow)
+def matches(argv: list[str], e) -> bool:
+    """Whether `argv` equals entry `e` (an Entry) word for word or, unless it is exact, starts with all its words."""
+    words = e[0]
+    return argv == words if getattr(e, "exact", False) else argv[:len(words)] == words
+
+
+def allowed(argv: list[str], ents) -> bool:
+    """Whether `argv` matches an allowed entry (an Entry of entries())."""
+    return bool(argv) and any(matches(argv, e) for e in ents)
 
 
 def fence_problem(p: Project, pid: int | None = None) -> str:
@@ -201,7 +232,7 @@ def _run(p: Project, rid: str, m: dict, ents: list[tuple[list[str], int | None]]
     try:
         if not (isinstance(argv, list) and all(isinstance(w, str) for w in argv)):
             out["stderr"] = "ttp host-run: a malformed request\n"
-        elif not allowed(argv, [w for w, _ in ents]):
+        elif not allowed(argv, ents):
             out["stderr"] = (f"ttp host-run: refused: {shlex.join(argv)} is not in config {KEY}; ask the "
                              f"coordinator to add it (a worker cannot)\n")
         elif fenced := fence_problem(p):   # sudo would only fail with its own, less plain error; checked
@@ -334,7 +365,7 @@ def request(p: Project, argv: list[str], wait_s: float | None = None, timeout: f
     """The worker's part: queue `argv`, wait for the daemon's answer, print it and return its exit code.
     `detach`: return once the daemon started it, printing its id and how to poll it."""
     ents, why = entries(p)
-    if not allowed(argv, [w for w, _ in ents]):
+    if not allowed(argv, ents):
         print(f"ttp host-run: refused: {shlex.join(argv)} is not in config {KEY}"
               f"{f' ({why})' if why else ''}. Name the exact command in your hand-off so the coordinator "
               f"can add it; a worker cannot.", file=sys.stderr)
