@@ -1059,6 +1059,7 @@ class Daemon:
         self._root_checked = 0.0   # when clear_root_checkout last looked at the project root
         self._root_head_checked = 0.0   # when guard_root_head last looked at the project root's HEAD
         self._pruned_upto = 0.0   # the latest finish the last worktree sweep saw
+        self._gone_failed: set[str] = set()   # gone kept worktree records whose clearing failed, logged once
         self._local_only_due = 0.0   # when done code tasks' branches are next checked for remote copies
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
         self._review_swept = 0.0     # when sweep_reviews last ran
@@ -10409,12 +10410,19 @@ class Daemon:
                                  # archiving is costly: one worktree per tick step, within half the
                                  # heartbeat's staleness, telling the watchdogs per file; the rest next tick
                                  archive_limit=1, deadline=now + HEARTBEAT_STALE_S / 2, progress=self._progress,
-                                 reserve_bytes=self._archive_reserve())
+                                 reserve_bytes=self._archive_reserve(), full_view=True)
         if any(r.get("deferred") for r in results):
             self._prune_more = "force" if force else "plain"
         for r in results:
             if "run" in r:
                 self._run_swept(r, logged, now)
+                continue
+            if r.get("gone"):   # a failure is logged once, not every sweep
+                if r["why"] is None or r["path"] not in self._gone_failed:
+                    log(self.p, f"worktree {r['path']}: its folder was deleted outside the harness; "
+                                + (f"kept record not cleared ({r['why']})" if r["why"] else
+                                   f"cleared its kept record, so branch {r['branch'] or '?'} can be checked out again"))
+                (self._gone_failed.add if r["why"] else self._gone_failed.discard)(r["path"])
                 continue
             key = str(r["task"])
             if r.get("unlocked") is not None:

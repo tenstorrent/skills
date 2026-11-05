@@ -1904,6 +1904,53 @@ def review_over(p: Project, task: dict) -> bool:
         "SELECT id FROM events WHERE task=? AND status='queued' LIMIT 1", (r["id"],)) for r in rows)
 
 
+def _listing(d: Path) -> set[str] | None:
+    """The names in folder `d`, or None when it is missing or unreadable."""
+    try:
+        return set(os.listdir(d))
+    except OSError:
+        return None
+
+
+def gone_kept(p: Project) -> list[dict]:
+    """The project repository's worktree records that keep() locked (KEEP_LOCK) whose folder is really
+    gone (deleted outside the harness): no prune removes a locked record, so its branch would stay
+    'already checked out' for good. Only a record under p.worktrees or the runs dir, both readable,
+    whose own parent folder is listed and lacks it: a missing or unreadable parent is a partial view,
+    and its record stays. Call only where the whole tree is in view (the daemon's sweep)."""
+    bases = [b.resolve() for b in (p.worktrees, p.runs) if _listing(b) is not None]
+    out = []
+    for rec in _records(p).values():
+        if not (rec["locked"] or "").startswith(KEEP_LOCK):
+            continue
+        path = Path(rec["path"])
+        if not any(path.is_relative_to(b) and path != b for b in bases):
+            continue
+        names = _listing(path.parent)
+        if names is not None and path.name not in names and not os.path.lexists(path):
+            out.append(rec)
+    return out
+
+
+def _forget_gone(p: Project, dry_run: bool) -> list[dict]:
+    """Unlock and drop each gone_kept() record (that one record only: `git worktree remove` of a
+    missing folder deletes just its admin dir), so its branch can be checked out again. Results as
+    sweep's, with `gone` set."""
+    out = []
+    for rec in gone_kept(p):
+        m = re.fullmatch(r"t(\d+)", Path(rec["path"]).name)
+        res = {"task": int(m.group(1)) if m else None, "path": rec["path"], "branch": rec["branch"],
+               "status": "gone", "updated": None, "cleared": [], "gone": True, "why": None}
+        if not dry_run:
+            try:
+                _git(p.root, "worktree", "unlock", rec["path"], timeout=git_timeout(p))
+                _git(p.root, "worktree", "remove", rec["path"], timeout=git_timeout(p))
+            except Exception as e:
+                res["why"] = f"error: {e}"[:300]
+        out.append(res)
+    return out
+
+
 HARNESS_LOCKS = ("initializing",)   # worktree lock reasons git or the harness sets; cleared once stale
 ARCHIVE_MAX_MB = 200   # disk.worktree_archive_max_mb: unnamed untracked files archived per task, the rest dropped
 
@@ -1946,7 +1993,7 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
           skip=lambda task: False, leftovers_max_mb: float | None = None, archive_max_mb: float | None = None,
           patch_tracked: bool = False, archive_limit: int | None = None, deadline: float | None = None,
           reserve_bytes: float = 0, progress=lambda: None, dry_run: bool = False,
-          skip_run=lambda w: False) -> list[dict]:
+          skip_run=lambda w: False, full_view: bool = False) -> list[dict]:
     """Tidy the worktrees of finished tasks (done, failed, cancelled) with no run or process still
     going, and the worktrees workers made inside finished runs' directories (run_worktrees; reported
     with `run` set, kept while run_held says so; `skip_run(w)` leaves one out): clear their build and
@@ -1979,7 +2026,9 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
     and, while archiving, per file. An archive that does not fit with `reserve_bytes` free on
     state/'s filesystem is skipped and the worktree kept (archive.NoRoom; `why` names the sizes); an
     archiving cut off part way is finished or rolled back first (archive.recover). Neither a skipped
-    nor a failed archive (`why` 'error: ...') counts against `archive_limit`."""
+    nor a failed archive (`why` 'error: ...') counts against `archive_limit`.
+    `full_view` (the daemon, which sees the whole tree): a record keep() locked whose folder was
+    deleted outside the harness is unlocked and dropped (gone_kept; reported with `gone` set)."""
     import fcntl
     import time
     from . import archive
@@ -2151,6 +2200,11 @@ def sweep(p: Project, *, older_than_s: float = 0, names: list[str] | None = None
             try:
                 prune_rebase_starts(p, open_tasks)
             except Exception:
+                pass
+        if full_view:
+            try:
+                out += _forget_gone(p, dry_run)
+            except Exception:   # git's records unreadable now: the next sweep tries again
                 pass
         for w in stray_worktrees(p):
             if skip_run(w):
