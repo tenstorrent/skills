@@ -875,6 +875,11 @@ def test_a_held_slots_label_read_mid_rewrite_is_read_again_and_never_counts_the_
     slot, other = tmp_path / "board.0.lock", tmp_path / "board.1.lock"
     f = locks.try_take([slot], "task #2 (run 2)", "cmd")
     good, torn, reads = slot.read_text(), [1], []
+    # the new text's start, cut inside its holder's value, over the old one's tail: never parses, whatever
+    # the label's length (a cut at half its length landed on a key boundary for some pids and times)
+    tear = good[:good.index("task #2") + len("task")] + '"command": "cmd"}'
+    with pytest.raises(ValueError):
+        json.loads(tear)
     real = pathlib.Path.read_text
 
     def read_text(self, *a, **kw):
@@ -883,7 +888,7 @@ def test_a_held_slots_label_read_mid_rewrite_is_read_again_and_never_counts_the_
         reads.append(1)
         if torn and torn[0] > 0:
             torn[0] -= 1
-            return good[:len(good) // 2] + '"command": "cmd"}'   # the new text's start, the old one's tail
+            return tear
         return real(self, *a, **kw)
     monkeypatch.setattr(pathlib.Path, "read_text", read_text)
     try:
