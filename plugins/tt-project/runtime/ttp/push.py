@@ -958,8 +958,9 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     TTP_PUSH_BRANCH is the name of that branch on the remote (or the local branch `ttp land` moves),
     short, without refs/heads/, so a check can refuse content by where it goes rather than by the
     branch checked out; empty for `ttp checks`."""
+    from .checkcap import RUN_ONLY_ENV   # a `ttp checks` run's own state stays out of its checks
     output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
-    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH" and k not in RUN_ONLY_ENV}
     if pp := check_pythonpath(os.environ):
         env["PYTHONPATH"] = pp
     return checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or "",

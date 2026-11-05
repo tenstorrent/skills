@@ -7689,6 +7689,33 @@ def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again
     assert mark.exists()
 
 
+def test_check_commands_never_see_the_checks_runs_own_preempt_rerank_and_reexec_env(env, tmp_path, monkeypatch, capsys):
+    """#6289: what only a `ttp checks` run reads (checkcap.RUN_ONLY_ENV: the label a preemption sets, its
+    asked request, its rerank and re-execution marks) stays in the run but never reaches its check commands,
+    so a `ttp checks` nested in them is not labelled preempted nor kept from its own rerank or re-execution."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, '{"since": 1.0, "asked": "x"}')
+    monkeypatch.setenv(checkcap.RERANK_ENV, "1")
+    monkeypatch.setenv(checkcap.REEXEC_ENV, "0.0.1")
+    assert {checkcap.PREEMPTED_ENV, checkcap.PREEMPT_ASKED_ENV, checkcap.RERANK_ENV} <= set(checkcap.RUN_ONLY_ENV)
+    mark, dump = tmp_path / "ran-once", tmp_path / "env.txt"
+    req = checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    script = (f'if [ -e {mark} ]; then env > {dump}; exit 0; fi; touch {mark}; '
+              f'printf \'{{"by": "urgent u", "task": "77", "at": %s}}\' "$(($(date +%s) + 1))" > {req}; sleep 60')
+    cli.main(["checks", "--", "sh", "-c", script])
+    out = capsys.readouterr().out
+    assert "preempted by urgent #77" in out and "passed" in out.rsplit("preempted by", 1)[1], out
+    assert os.environ[checkcap.PREEMPTED_ENV] == "urgent #77", "the run itself keeps its label"
+    seen = {line.split("=", 1)[0] for line in dump.read_text().splitlines() if "=" in line}
+    assert "TTP_RUN_DIR" in seen, "the dump is the check's environment"
+    assert not seen & set(checkcap.RUN_ONLY_ENV), sorted(seen & set(checkcap.RUN_ONLY_ENV))
+    assert os.environ[checkcap.RERANK_ENV] == "1" and os.environ[checkcap.REEXEC_ENV] == "0.0.1"
+
+
 def test_an_urgent_checks_run_past_its_grace_preempts_one_routine_run_of_its_own_project_first(env, monkeypatch):
     """#6246 (1): every cap slot and the urgent slot held, an urgent run that has waited past
     checks.preempt_after_s asks exactly one routine run to step back: its own project's first, even over a

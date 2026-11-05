@@ -161,6 +161,10 @@ PREEMPT_ASKED_ENV = "TTP_CHECKS_PREEMPT_ASKED"   # this urgent request asked alr
 PREEMPTED_ENV = "TTP_CHECKS_PREEMPTED"   # this routine run was preempted: "urgent #<task>" (label())
 RERANK_ENV = "TTP_CHECKS_RERANKED"   # these waiting checks re-executed once as urgent (reranked)
 RERANK_S = 30.0   # a waiting routine run reads its task's priority again at most this often (reranked)
+# What only this `ttp checks` run reads (its own re-queue, re-execution and label): never passed to the check
+# commands it starts (push.check_env), so a `ttp checks` nested in them is not labelled preempted nor kept from
+# its own rerank or re-execution.
+RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV)
 
 
 def slot_dir() -> Path:
