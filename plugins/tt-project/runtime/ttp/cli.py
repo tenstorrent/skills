@@ -961,9 +961,14 @@ def _wait_for_daemon(p: Project, timeout: float = 20) -> None:
 
 
 def web_line(p: Project) -> str:
+    """Doctor's web app line. Workers run doctor and its output stays in their logs and transcripts, so
+    the access token shows only its first 4 characters; `ttp web` prints the full link for the user."""
     from .weblink import link
     url = link(p)
-    return f"web app: {url}" if url else "web app: not running yet (check `ttp status`)"
+    if not url:
+        return "web app: not running yet (check `ttp status`)"
+    base, _, tok = url.partition("#token=")
+    return f"web app: {base} (token {tok[:4]}…; the full link: `ttp web {p.name}`)"
 
 
 # talking ------------------------------------------------------------------------------------------

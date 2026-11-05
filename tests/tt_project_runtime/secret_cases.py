@@ -1139,6 +1139,26 @@ def test_a_second_sigint_during_the_withdrawal_still_prints_the_report(env, monk
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_doctor_masks_the_web_app_token_and_points_to_ttp_web(env, monkeypatch, capsys):
+    """Workers run doctor: its output stays in their logs and transcripts, so the web app's access token
+    shows only a 4-character prefix there; `ttp web` keeps the full link for the user."""
+    from ttp import cli, web
+    p = make(env)
+    p.db.set_kv("web", {"port": 18700})
+    tok = web.token(p)
+    monkeypatch.setattr(cli, "need", lambda *a: p)
+    cli.cmd_doctor(types.SimpleNamespace(name="demo"))
+    out = capsys.readouterr().out
+    assert tok not in out and "#token=" not in out, out
+    line = next(l for l in out.splitlines() if l.startswith("web app:"))
+    assert line == f"web app: http://127.0.0.1:18700/ (token {tok[:4]}…; the full link: `ttp web demo`)", line
+    from ttp import weblink
+    assert weblink.link(p) == f"http://127.0.0.1:18700/#token={tok}"   # the user-facing link is unchanged
+    p.db.set_kv("web", {})
+    monkeypatch.setattr(p, "config", lambda: {"web": {}})
+    assert cli.web_line(p) == "web app: not running yet (check `ttp status`)"
+
+
 def test_doctor_reports_an_unreadable_secret_store_in_one_line_and_runs_its_later_checks(env, monkeypatch, capsys):
     from ttp import cli, project
     p = make(env)
