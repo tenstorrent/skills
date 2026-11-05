@@ -4824,8 +4824,9 @@ while True:
 
 def test_a_daemon_review_precheck_of_a_just_finished_task_is_not_a_finished_task_s_lane_while_its_review_is_open(
         env, tmp_path, monkeypatch, capsys):
-    from ttp import checkcap, checklane, daemon, locks, testslots, worktree
+    from ttp import checkcap, checklane, cli, daemon, locks, testslots, worktree
     from ttp.daemon import Daemon
+    from ttp.runner import proc_start
     assert checklane.PRECHECK_LABEL == daemon.PRECHECK_LABEL
     p = make(env)
     _lane_env(monkeypatch)
