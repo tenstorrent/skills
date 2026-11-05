@@ -10,8 +10,8 @@ all, the connection included) and its output is capped at 4,000 characters. tt-s
 host's own environment: device masking stays as the host sets it.
 
 Aliases: `local`, the daemon's own host, or a `ttp machines` alias; any other name is refused. The
-own host (`local`, machines.names_here, or a name resolving to an address of this machine) runs here
-with no ssh. Any other alias is reached only through the project's own access, coordinator.session.
+own host (`local`, a name of this machine, or a name resolving to an address of this machine on ssh's
+port 22, never a loopback tunnel end on another port) runs here with no ssh. Any other alias is reached only through the project's own access, coordinator.session.
 host_access.<alias> (or `*`): a list is a helper's argv prefix (its program in the project folder),
 to which the check's argv is appended word by word; a string is an ssh config file in the project
 folder (`ssh -F <file> -o BatchMode=yes -o ConnectTimeout=5 -- <alias> <quoted argv>`). The default
@@ -166,17 +166,40 @@ def _local_address(name: str) -> bool:
     return False
 
 
+def ssh_port(alias: str) -> int | None:
+    """The port `ssh -G` reports for `alias` (no connection); None when it cannot say."""
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", alias):
+        return None
+    try:
+        r = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True, timeout=10,
+                           stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    m = re.search(r"^port\s+(\d+)\s*$", r.stdout, re.M | re.I) if r.returncode == 0 else None
+    return int(m.group(1)) if m else None
+
+
 def own_host(alias: str, known: dict | None = None) -> bool:
     """Whether `alias` is the daemon's own host: `local`, a name of this machine, a machines-list entry
-    whose host field is one, an ssh alias whose HostName is one, or a name resolving to a local address."""
+    whose host field is one, or an ssh alias whose HostName is or resolves to an address of this machine
+    on ssh's own port (22). A loopback HostName on another port is a tunnel end (LocalForward or reverse
+    tunnel) to some other host, so it is remote, as is a loopback name with such a port."""
     from . import machines
-    if alias == LOCAL or machines.names_here(alias, known):
+    loopback = {"localhost", "127.0.0.1", "::1"}
+    mine = machines.local_names() - loopback
+    known = machines.load() if known is None else known
+    v = alias.lower()
+    if alias == LOCAL or v in mine or any(
+            a.lower() == v and str(m.get("hostname") or "").strip().lower() in mine for a, m in known.items()):
         return True
     try:
         real = machines.ssh_hostname(alias)
     except Exception:
         real = alias
-    return _local_address(real)
+    r = str(real).strip().lower()
+    if not (r in loopback or r in mine or _local_address(real)):
+        return False
+    return ssh_port(alias) in (None, 22)
 
 
 def access(cfg: dict, root: Path, alias: str) -> list[str]:

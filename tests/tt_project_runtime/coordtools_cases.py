@@ -190,6 +190,39 @@ def test_hostcheck_own_host_runs_here_and_remote_uses_project_access(tmp_path, m
         pass
 
 
+def test_hostcheck_loopback_tunnel_end_is_remote_never_this_host(tmp_path, monkeypatch):
+    from ttp import hostcheck as hc, machines
+    known = {"tunnel-box": {"tags": []}, "box1": {"tags": [], "hostname": "127.0.0.1"}}
+    cfg = {"coordinator": {"session": {"host_access": {"*": "ssh.conf"}}}}
+    for loop in ("127.0.0.1", "::1", "localhost"):
+        monkeypatch.setattr(machines, "ssh_hostname", lambda alias, loop=loop: loop)
+        monkeypatch.setattr(hc, "ssh_port", lambda alias: 2222)
+        for alias in ("tunnel-box", "box1", "localhost"):   # an ssh alias, a loopback machines entry, a name
+            assert not hc.own_host(alias, known), (loop, alias)
+            argv, here = hc.command(cfg, tmp_path, "tunnel-box", "uptime", [], known)
+            assert not here and argv[0] == "ssh" and argv[-2:] == ["tunnel-box", "uptime"], (loop, argv)
+        for port in (22, None):   # ssh's own port on loopback is this host's own sshd
+            monkeypatch.setattr(hc, "ssh_port", lambda alias, port=port: port)
+            assert hc.command(cfg, tmp_path, "tunnel-box", "uptime", [], known) == (["uptime"], True)
+    # `local` and this machine's own name never ask ssh, whatever its config says.
+    monkeypatch.setattr(hc, "ssh_port", lambda alias: 2222)
+    assert hc.own_host("local", known) and hc.own_host(socket.gethostname(), known)
+
+
+def test_hostcheck_ssh_port_reads_ssh_g(monkeypatch):
+    from ttp import hostcheck as hc
+    seen = []
+
+    def fake(argv, **kw):
+        seen.append(argv)
+        return subprocess.CompletedProcess(argv, 0, "user u\nhostname 127.0.0.1\nport 2222\n", "")
+    monkeypatch.setattr(hc.subprocess, "run", fake)
+    assert hc.ssh_port("tunnel-box") == 2222 and seen == [["ssh", "-G", "tunnel-box"]]
+    assert hc.ssh_port("-oProxyCommand=id") is None and len(seen) == 1
+    monkeypatch.setattr(hc.subprocess, "run", lambda argv, **kw: subprocess.CompletedProcess(argv, 255, "", "x"))
+    assert hc.ssh_port("tunnel-box") is None
+
+
 def test_hostcheck_run_times_out_caps_output_and_marks_unreachable(tmp_path, monkeypatch):
     from ttp import hostcheck as hc
     long_text = "x" * 10_000
