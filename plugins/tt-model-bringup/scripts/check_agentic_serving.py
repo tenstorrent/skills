@@ -24,7 +24,7 @@ SURVEY_CHECKS = ("time_split", "busy_rows", "live_prefill_rows", "trace_captures
                  "generation_share", "prefill_under_load", "host_contention")
 SURVEY_CALCULATIONS = ("batch", "agents", "suite_hours", "task_lists", "agent_timeout", "output_cap", "bytes",
                        "cache_agents", "block_cost", "prefill_padding")
-PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route", "isolation_smoke")
+PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route", "smoke")
 LEARNED = ("harness_facts", "suite_timings", "generic_fixes")
 LIST_SOURCES = ("inputs", "harness", "default_rule")
 MODES = ("light", "full")
@@ -251,18 +251,21 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
     plan = read(evals / "plan.json", problems) if (evals / "plan.json").is_file() else {}
     if (evals / "plan.json").is_file() and (plan.get("mode") not in MODES or not plan.get("schedule")):
         problems.append((2, f"plan.json needs mode ({', '.join(MODES)}) and the schedule"))
+    decisions = read(evals / "estimate.json", problems).get("evals") or {}
     release = plan.get("release") if isinstance(plan, dict) else None
-    if (evals / "plan.json").is_file():
-        limit = plan.get("release_hours", 12)
-        if not (isinstance(release, dict) and release.get("rehearsal") and number(release.get("projected_hours"))):
+    if (evals / "plan.json").is_file() and any((row or {}).get("decision") == "go" for row in decisions.values()):
+        limit, projected = plan.get("release_hours", 12), (release or {}).get("projected_hours")
+        per_suite = projected if isinstance(projected, dict) else {"the release run": projected}
+        if not (isinstance(release, dict) and release.get("rehearsal") and per_suite
+                and all(number(hours) for hours in per_suite.values())):
             problems.append((2, "plan.json release needs its rehearsal runs and projected_hours"))
-        elif release["projected_hours"] > limit:
-            problems.append((2, f"release projected at {release['projected_hours']} h against {limit} h; "
-                                "release a smaller list"))
+        else:
+            for name, hours in per_suite.items():
+                if hours > limit:
+                    problems.append((2, f"{name} projected at {hours} h against {limit} h; release a smaller list"))
     learned = read(evals / "learned.json", problems)
     if learned and not all(isinstance(learned.get(key), list) for key in LEARNED):
         problems.append((2, f"learned.json needs {', '.join(LEARNED)} as lists, empty when there is nothing"))
-    decisions = read(evals / "estimate.json", problems).get("evals") or {}
     if not decisions:
         problems.append((2, "estimate.json has no per-eval decisions"))
     for name, row in decisions.items():

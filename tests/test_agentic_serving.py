@@ -68,7 +68,7 @@ CHECKS = ('time_split', 'busy_rows', 'live_prefill_rows', 'trace_captures', 'ser
           'generation_share', 'prefill_under_load', 'host_contention')
 CALCULATIONS = ('batch', 'agents', 'suite_hours', 'task_lists', 'agent_timeout', 'output_cap', 'bytes', 'cache_agents',
                 'block_cost', 'prefill_padding')
-PREFLIGHT = ('release_values', 'registry', 'disk', 'admission', 'release_route', 'isolation_smoke')
+PREFLIGHT = ('release_values', 'registry', 'disk', 'admission', 'release_route', 'smoke')
 
 
 def goal12(model, **overrides):
@@ -382,12 +382,26 @@ def test_agent_replay_reports_hits_and_prefill_amplification(tmp_path):
     assert summary['preemptions'] == 0
 
 
-@pytest.mark.parametrize('release, message', [
-    ({'projected_hours': 9.5}, 'rehearsal'),
-    ({'rehearsal': ['runs/r'], 'projected_hours': 13}, 'smaller list'),
+@pytest.mark.parametrize('mode, release, message', [
+    ('light', {'projected_hours': 9.5}, 'rehearsal'),
+    ('light', {'rehearsal': ['runs/r'], 'projected_hours': 13}, 'smaller list'),
+    ('full', {'rehearsal': ['runs/r'], 'projected_hours': {'swe': 11, 'terminal': 14}}, 'terminal projected'),
 ])
-def test_release_needs_a_rehearsal_and_a_projection_that_fits(tmp_path, release, message):
-    plan = {'mode': 'light', 'schedule': [{}], 'release_hours': 12, 'release': release}
+def test_release_needs_a_rehearsal_and_a_projection_that_fits(tmp_path, mode, release, message):
+    plan = {'mode': mode, 'schedule': [{}], 'release_hours': 12, 'release': release}
     goal12(tmp_path, **{'plan.json': plan})
     code, stderr = check(tmp_path, 'agentic-evals', evidence())
     assert code == 2 and message in stderr
+
+
+def test_full_mode_projects_each_suite_against_release_hours(tmp_path):
+    plan = {'mode': 'full', 'schedule': [{}], 'release_hours': 12,
+            'release': {'rehearsal': ['runs/r'], 'projected_hours': {'swe': 11.5, 'terminal': 9}}}
+    goal12(tmp_path, **{'plan.json': plan})
+    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')
+
+
+def test_no_release_needed_when_every_eval_stopped(tmp_path):
+    goal12(tmp_path, **{'plan.json': {'mode': 'light', 'schedule': [{}]},
+                        'estimate.json': {'evals': {'swe': {'decision': 'stop', 'reason': 'r', 'functional_at': 5}}}})
+    assert check(tmp_path, 'agentic-evals', evidence()) == (0, '')

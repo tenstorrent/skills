@@ -20,7 +20,7 @@ Read these on the stage-11 benchmark and the smoke run, and again on every later
 | `cache_bytes` | Bytes per cache block by layer group, and how full each is | Little idle |
 | `memory_headroom` | Minimum free DRAM under load, and weights held twice | Pool sized from the minimum |
 | `cutoffs` | Share of tasks ending at the time limit or the output cap, split into still progressing and looping | Near 0 |
-| `eval_validity` | Network isolation, fetched fixes, infrastructure failures | Isolated, no fetches |
+| `eval_validity` | Trajectory audit: fetched fixes, network use, infrastructure failures | No fetched fixes, no infrastructure failures |
 | `accuracy_drift` | KL against HF on long agent prompts | At the noise floor |
 | `generation_share` | Per model call on the smoke: output tokens × served step ÷ call wall, and what fills the rest (tool commands, container round trips, prefill waits) | Known; it bounds what any serving change can save |
 | `prefill_under_load` | Prefilled tokens ÷ the agents' final context tokens, prefill tok/s at real context lengths, decode rate while a long prompt prefills | Prefilled close to the final contexts; decode not stalled |
@@ -37,7 +37,7 @@ eval.
 | Key | Question | Formula |
 |---|---|---|
 | `batch` | Which batch for N agents? | The validated batch with the least time per call: output tokens ÷ its per-user rate + time outside generation; usually the smallest at or above N |
-| `agents` | How many agents per server? | min(`max_num_seqs`, pool tokens ÷ working set per agent, host trial limit) |
+| `agents` | How many agents per server? | min(`max_num_seqs`, pool tokens ÷ working set per agent, task sandboxes the host can run at once) |
 | `suite_hours` | Will each suite finish? | tasks ÷ agents × measured time per task, from the smoke and then from the largest rung so far; the serving formula tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents covers only generation |
 | `task_lists` | Which tasks per rung, and how many at full load? | Inputs, else the harness's lists, else the skill's default rule; full load = `agents`; 95% interval ±2·√(p(1−p)/n) |
 | `agent_timeout` | What agent time limit? | turns × turn time at the served speed, never below the release limit |
@@ -47,7 +47,7 @@ eval.
 | `block_cost` | What does the block size cost? | Recompute per returning turn ≈ block ÷ 2 |
 | `prefill_padding` | How much prefill is useful? | live rows ÷ batch rows |
 
-`suite_hours` is the first go or stop estimate. Update it after every rung and effort, and record
+`suite_hours` is the first go or stop estimate for the release run. Update it after every rung and effort, and record
 the ratio of prediction to measurement.
 
 ## Shortfalls carried in
@@ -63,7 +63,7 @@ Most problems the checks raise are found and proven by a test of minutes, not a 
 
 | Test | What it measures | Finds |
 |---|---|---|
-| Preflight | Registry, disk, release route, isolated 2-task smoke with a trajectory audit | Pull and permission failures, network leaks |
+| Preflight | Registry, disk, admission, release route, a 2-task smoke with a trajectory audit | Pull and permission failures, fetched fixes |
 | Op profile at the target batch | Time per op and per layer type, ranked | Slow kernels at the serving batch |
 | Per-layer split at batch 1 | Non-matmul ops ranked by share | Reshape and layout overhead |
 | Paired exactness check | Tokens, recurrent state and logits, candidate against baseline | Accepts a speedup without an eval |

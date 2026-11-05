@@ -30,8 +30,9 @@ one shape. Layouts, sharding and traces chosen for batch 1 alone are often wrong
 batch, and by the serving stages they are already fixed.
 
 Work through the set in order of importance: batch 1 first, then the largest batch the device
-holds, then any in between. Batch 1 stays the regression row. Record any batch the device cannot hold and why — active users pad up to the next
-supported batch, so an omitted batch is served by the one above it.
+holds, then any in between. Batch 1 stays the regression row. Record any batch the device cannot
+hold and why: active users pad up to the next supported batch, so an omitted batch is served by
+the one above it.
 
 ## Memory
 
@@ -90,15 +91,14 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - `release_spec`, optional: where the release values come from. Without it, find the release
   configuration for each eval yourself, in the release workflow and the serving harness;
 - `stage_budget_hours` (default 24 for `light`, 48 for `full`), covering survey to the start of the
-  release run, and `release_hours` (default 12), the release run's own limit after that;
+  release run, and `release_hours` (default 12): the release run's limit after that, for all
+  suites together in `light` and for each suite in `full`;
 - `permissions`: standing decisions the stage would otherwise stop to ask for, such as
   `release_route_repairs` (may the stage publish fixes to the release route) and
   `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
 - reference scores per eval. Without one, look for a published score for this model; when there is
   none, the suite grades NA and the report says so;
 - the eval harness: default the tt-inference-server agentic runner on its main branch;
-- `compute`.
-
 - `compute`, optional.
 
 By default the stage runs on one machine: the local device, which every earlier stage used. Plan,
@@ -108,17 +108,19 @@ stage must not depend on them. Record what was actually used in `doc/agentic_eva
 
 ### Modes
 
-- **`light`, 24 h.** Make every suite run validly at a mid size and leave a release configuration
-  whose whole release run, all suites together, finishes within `release_hours` on one machine.
+- **`light`, 24 h.** Make every suite run validly at mid size (its full-load list) and leave a
+  release configuration whose whole release run, all suites together, finishes within
+  `release_hours` on one machine.
   Efforts go first to validity, then to whatever makes that release run fit. The final step runs
   it.
 - **`full`, 48 h.** Everything `light` does, then speed work, estimates for the full suites from
   measured runs, and per suite the largest task list that finishes within `release_hours` on one
-  machine: the full suite when it fits. The final step runs those lists, one suite after another.
+  machine: the full suite when it fits. The final step runs those lists, one suite after another,
+  so the release run may take up to `release_hours` per suite.
 
-The release run starts before the stage time limit ends and may finish after it, within
-`release_hours`. Both modes end holding the last rung they banked; a mode that cannot reach its goal reports how
-far it got with `functional_at` and the estimate that stopped it.
+The release run starts before the stage time limit ends and may finish after it. Both modes end
+holding the last rung they banked; a mode that cannot reach its goal reports how far it got with
+`functional_at` and the estimate that stopped it.
 
 ### Time
 
@@ -239,8 +241,8 @@ time measured there projects the next rung to finish before the release run must
    [the survey](references/survey.md) on the stage-11 data and one smoke run at release limits.
    The preflight proves the release values and their source, the registry, disk and admission
    (tasks × declared task storage plus the admission reserve against free disk; concurrent trials
-   against the host limit), the release route, and an isolated 2-task smoke with a trajectory
-   audit. For a model new to the harness, it first adds the entries above. Write `survey.json` and
+   against the host limit), the route the release run will use (by default the harness on this
+   machine), and a 2-task smoke with a trajectory audit. For a model new to the harness, it first adds the entries above. Write `survey.json` and
    `preflight.json`, rank the problems found as [Ranking](#ranking) says, and write the first go or
    stop estimate per eval to `estimate.json`.
 2. **Smoke rung: 2 tasks per suite** on the stock harness and route. Each suite must produce a valid
@@ -252,19 +254,19 @@ time measured there projects the next rung to finish before the release run must
 5. **Efforts**, ranked against the last banked rung, in the time the plan leaves them. They start
    once the smoke rung is banked and share the device through the queue; a rung never waits for
    an effort.
-6. **Combine and rehearse.** Freeze the release configuration: serving settings, task lists,
+6. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
+   `release_hours`. They set the release lists.
+7. **Combine and rehearse.** Freeze the release configuration: serving settings, task lists,
    limits, route and commits. Then run each suite on it end to end, at the full-load size or the
    release lists themselves if they fit, and check what a longer run adds: disk for every task,
    concurrent sandboxes, image pulls, verifiers. Fix what fails and rehearse again. Nothing changes
    after the last clean rehearsal.
-7. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
-   `release_hours`.
 8. **Release run**, started before the stage time limit and allowed to finish after it, within
    `release_hours`, through the same route every earlier run used. It must land without help:
    start it only on the rehearsed configuration and only when its projection, with each suite's
    slow tail at the agent limit, fits `release_hours` with margin. Otherwise release a smaller
-   list that does. Run: in `light` the mid-size lists of all suites within `release_hours` in total, in
-   `full` each suite's largest fitting list. A failure during it is reported, not fixed: the
+   list that does. It runs the evals with a `go` decision: in `light` their full-load lists, all
+   within `release_hours` together; in `full` each one's largest fitting list. A failure during it is reported, not fixed: the
    release result is what it ran.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
@@ -310,13 +312,11 @@ decides against the current ranking whether it continues.
 - **Evidence is written once**, by the effort, when it ends. No sub-agent maintains or audits the
   evidence while the stage runs; one closure review at the end, boxed at 1 h.
 
-The coordinator holds the current best, the slot ledger and the budget, chooses which efforts run
-together, and reads wide where efforts read deep, as [Look at the whole run](#look-at-the-whole-run)
-asks. Every dispatched run registers with it at launch. Charge an effort for the device jobs it
-ran, by the slots they occupied; a server that stays up between jobs is not effort time. At each
-effort boundary the coordinator re-reads `inputs.json` and `steering.md` (operator prose, if
-present) and logs what it applied to `steering.log`. When blocked, it writes the reason to
-`blocked.json` at once.
+The coordinator holds the current best, the device queue and the schedule, chooses which efforts
+run together, and reads wide where efforts read deep, as
+[Look at the whole run](#look-at-the-whole-run) asks. Every run registers with it at launch. At
+each effort boundary it re-reads `inputs.json` and `steering.md` (operator prose, if present) and
+logs what it applied to `steering.log`.
 
 ### Sharing the local device
 
@@ -331,7 +331,7 @@ Write these to `doc/agentic_evals/`:
 
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
 - `preflight.json`: `release_values` (with their source), `registry`, `disk`, `admission`,
-  `release_route` and `isolation_smoke`, each with `ok`
+  `release_route` and `smoke` (with its trajectory audit), each with `ok`
 - `cohorts.json`: per eval `source` (`inputs`, `harness` or `default_rule`), `rule`, and `rungs`
   mapping each rung run to its task names
 - `efforts.json`: `efforts`, each with `problem`, `owner`, `goal`, `plan`, `predicted`
@@ -343,11 +343,11 @@ Write these to `doc/agentic_evals/`:
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
 - `plan.json`, with the `mode`, the schedule updated after every run, `release_hours`, and
   `release`: the frozen configuration, the `rehearsal` runs that ran it end to end, and
-  `projected_hours` with each suite's slow tail
+  `projected_hours` with each suite's slow tail: one number in `light`, one per eval in `full`
 - `runs/<arm>/` (manifest and collected results)
-- `estimate.json`: per eval `decision` (`go` or `stop`), `reason` and `functional_at`, the size of
-  the largest task list that completed with valid scores
-- `full/<eval>/results.json` with `actual_hours` next to the prediction
+- `estimate.json`: per eval `decision` (`go`: it is in the release run; `stop`: it is not),
+  `reason` and `functional_at`, the size of the largest task list that completed with valid scores
+- `full/<eval>/results.json`: the release run's results, with `actual_hours` next to the projection
 - `serving_config.json`: the measured `max_concurrency`, `prefix_caching`, `max_num_seqs`,
   `validated_batches`, per run in `batch_by_eval` its `batch` and `planned_clients`, the agent and
   request time limits and output cap, and `release_limits`

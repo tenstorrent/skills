@@ -88,6 +88,7 @@ nothing. Use it as a planning bound — do not dispatch what the top of its esti
 suites on task boundaries so parts stay scorable, and give a multi-eval run per-eval timeouts
 summing under the cap.
 
-Infrastructure failures (runner offline, image pull, full disk, unrelated timeout) are
-re-dispatched, not scored. Crashes, loops and malformed output are measurements. This holds for the release run too, and
-the release route is proven in the survey's preflight, not first used at the end.
+Infrastructure failures (runner offline, image pull, full disk, unrelated timeout) in rungs and
+efforts are re-dispatched, not scored. Crashes, loops and malformed output are measurements. The
+release run is planned to land without re-dispatch, as the skill's stage order says, on a route
+proven in the preflight and rehearsed.
