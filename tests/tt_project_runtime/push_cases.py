@@ -12191,6 +12191,26 @@ def test_push_queue_checks_see_the_target_branch(env, monkeypatch):
     assert set(log.read_text().split()) == {"proj"}
 
 
+def test_ttp_land_past_the_upgrade_bound_holds_the_upgrade_only_inside_its_steps(env, monkeypatch):
+    """`ttp land` holds a push: lock too: its checks and the branch move are steps (push.Steps), its wait
+    for a checks slot is not, so an automatic upgrade past upgrade.push_hold_min goes only then."""
+    from ttp import push, release
+    land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
+    past, seen = {"upgrade": {"push_hold_min": 1e-6}}, {}
+    for mod, name, where in ((push, "check_slot", "slot wait"), (push, "_run_one", "checks"),
+                             (land, "_move", "land")):
+        def wrapped(*a, _real=getattr(mod, name), _where=where, **kw):
+            seen.setdefault(_where, release.push_hold(p, cfg=past))
+            return _real(*a, **kw)
+        monkeypatch.setattr(mod, name, wrapped)
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 0, said
+    assert set(seen) == {"slot wait", "checks", "land"}, seen
+    for step in ("checks", "land"):
+        assert seen[step].startswith(f"{release.PUSH_HELD}in its {step} step since"), seen
+    assert seen["slot wait"] == "", "waiting for a checks slot is between steps"
+
+
 def test_ttp_land_checks_see_the_local_branch_it_moves(env, monkeypatch):
     log2 = env["tmp"] / "landed"
     land, p, repo, t, head = _land_setup(env, monkeypatch, [f'echo "$TTP_PUSH_BRANCH" >> {log2}'])
@@ -12281,10 +12301,10 @@ def test_ttp_land_starts_over_while_the_branch_moves_and_stops_after_its_tries(e
     land, p, repo, t, head = _land_setup(env, monkeypatch, ["true"])
     real, moves = land._checks, []
 
-    def moving(p_, wt, new, base, say, branch=""):
+    def moving(p_, wt, new, base, say, branch="", steps=None):
         if len(moves) < want:
             moves.append(_on_proj(repo, f"m{len(moves)}-{want}.txt", "m\n"))
-        return real(p_, wt, new, base, say, branch)
+        return real(p_, wt, new, base, say, branch, steps)
     monkeypatch.setattr(land, "_checks", moving)
     want = 1
     said = []
@@ -12490,10 +12510,10 @@ def test_ttp_land_root_lands_on_master_in_a_temp_clone_and_the_projects_own_mast
     _git_out(clone, "branch", "-f", "master", tip)
     real, moves = land._checks, []
 
-    def moving(p_, wt, new, base, say, branch=""):
+    def moving(p_, wt, new, base, say, branch="", steps=None):
         if not moves:
             moves.append(on_master("m.txt", "m\n"))
-        return real(p_, wt, new, base, say, branch)
+        return real(p_, wt, new, base, say, branch, steps)
     monkeypatch.setattr(land, "_checks", moving)
     said = []
     assert land.land(p, clone, head, t, said.append, recorded=False) == 0, said

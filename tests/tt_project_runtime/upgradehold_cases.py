@@ -288,3 +288,36 @@ def test_the_push_hold_bound_is_configurable():
     assert release.push_hold_s({"upgrade": {"push_hold_min": 5}}) == 300
     for bad in (0, -1, "x", None):
         assert release.push_hold_s({"upgrade": {"push_hold_min": bad}}) == release.PUSH_HOLD_MIN * 60
+
+
+def test_a_push_queue_batch_past_the_bound_holds_the_upgrade_only_inside_its_steps(env, monkeypatch):
+    """The push queue's batch takes the branch lock itself (Batch.push_phase), not through push.push: its
+    rebase, checks and push are marked too, and only its wait for a checks slot lets an upgrade go."""
+    from ttp import batch, push, pushq, release
+    s = _pq(env, monkeypatch)
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    _pq_hand_off(env, s)
+    bid = _pq_batch(s)
+    marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (bid,))["marker"])
+    past = {"upgrade": {"push_hold_min": 1e-6}}      # every live push is past the bound
+    seen = {}
+
+    def sample(where):
+        seen.setdefault(where, release.push_hold(s.p, cfg=past))
+
+    for cls_or_mod, name, where in ((batch.Batch, "_prepare", "rebase"), (push, "check_slot", "slot wait"),
+                                    (batch.Batch, "_run_check", "checks"), (batch.Batch, "_mark_pushing", "push")):
+        real = getattr(cls_or_mod, name)
+
+        def wrapped(*a, _real=real, _where=where, **kw):
+            sample(_where)
+            return _real(*a, **kw)
+        monkeypatch.setattr(cls_or_mod, name, wrapped)
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    assert batch.run_batch(s.p, marker) == 0
+    assert push._read(marker)["outcome"] == "pushed"
+    assert set(seen) == {"rebase", "slot wait", "checks", "push"}, seen
+    for step in ("rebase", "checks", "push"):
+        assert seen[step].startswith(f"{release.PUSH_HELD}in its {step} step since"), seen
+    assert seen["slot wait"] == "", "waiting for a checks slot is between steps"

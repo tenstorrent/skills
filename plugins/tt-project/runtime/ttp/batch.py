@@ -1029,6 +1029,7 @@ class Batch:
         self.rounds = 0
         self.cfg: dict | None = None
         self.target_lock = None
+        self.steps = push.Steps(None)           # its steps marked on target_lock: an upgrade goes between them
         self.detail_tip: dict | None = None     # the tip's own failing check, for tip_failed
         self.tip_passed = False                 # the tip passed its checks alone this round
         self.tip_tried = 0                      # leading entries shown not to fix a failing tip (tip_failed)
@@ -1120,6 +1121,7 @@ class Batch:
         if self.target_lock is None:
             who = ", ".join(locks.holders_now(push.lock_paths(self.p, self.remote, self.branch), self.p)) or "another push"
             return self._all("requeued", "busy", f"{push.lock_name(self.remote, self.branch)} is busy (held by {who})")
+        self.steps = push.Steps(self.target_lock, say)
         why = push.refusal(self.repo, self.remote, self.branch, push.allow_protected(self.d))
         if why.startswith("refusing"):
             return self._all("refused", "refused", why)
@@ -1129,6 +1131,7 @@ class Batch:
         while rnd < rounds:
             rnd += 1
             self.rounds += 1
+            self.steps.go("rebase")
             tip = push._fetch(self.repo, self.remote, self.branch)
             if not tip:
                 return self._all("requeued", "error", f"cannot fetch {self.target}", keep=("refused",))
@@ -1207,6 +1210,7 @@ class Batch:
         if head is None:
             return self._close(0, "yielded" if self.yielded_to else "tip_failed" if failed is None else "nothing",
                                carried, failed)
+        self.steps.go("push")
         if push._fetch(self.repo, self.remote, self.branch) != tip:
             return "moved"
         self._mark_pushing(tip, head, k, carried, failed)
@@ -1461,6 +1465,7 @@ class Batch:
         self._settling. An entry already on `onto` goes as it is, and one with merges keeps them
         (--rebase-merges): a plain rebase flattens a merge landing and rewrites its commits, so their
         tags drop out. The commits in `drop` (on `onto` already: _landed) are left out of the replay."""
+        self.steps.go("rebase")
         wt = self.wt
         version_files = self.cfg["files"] if self.cfg else []
         if push.descends(wt, onto, top):
@@ -1566,6 +1571,15 @@ class Batch:
         if fault := envfault.precheck(cmds, self.wt, env):
             raise envfault.Fault(fault)
 
+    def _slot(self, at: str) -> checkcap.Slot:
+        """The host-wide checks slot for commit `at`. Its wait is between steps (push.Steps), so an upgrade
+        past upgrade.push_hold_min may go then; once it is held the checks step is marked."""
+        self.steps.between()
+        slot = push.check_slot(at, say, checkcap.label(self.p.name, f"push batch {self.id}"),
+                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
+        self.steps.go("checks")
+        return slot
+
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
@@ -1617,8 +1631,7 @@ class Batch:
             return None
         self._runners([c for c, _, _ in run], env)
         suite_out: list[str] = []
-        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
+        slot = self._slot(head)
         started = time.time()   # a wait for the host-wide slot is not check time
         slow = Path(self.check_run_dir) / slowtests.FILE if self.check_run_dir else None
         if slow:
@@ -1766,8 +1779,7 @@ class Batch:
             f"{' '.join(ids)}")
         env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
         self._runners([cmd], env)
-        slot = push.check_slot(tip, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
+        slot = self._slot(tip)
         try:
             for n in range(1, TIP_RERUNS + 1):
                 rc, tail = self._run_ids(tip, cmd, ids, "tip", env, slot.env())
@@ -1825,8 +1837,7 @@ class Batch:
                     self.checks["cap_reused"] = self.checks.get("cap_reused", 0) + 1
                 else:
                     if slot is None:
-                        slot = push.check_slot(head, say, checkcap.label(self.p.name, f"push batch {self.id}"),
-                                               priority=push.priority_key(self.repo, self.remote, self.branch), proj=self.p)
+                        slot = self._slot(head)
                         started = time.time()
                     say(f"cap probe of {head[:10]}: {cmd}")
                     rc, tail, _ = _stream(_check_argv(cmd, self.wt), self.wt,

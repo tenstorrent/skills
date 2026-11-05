@@ -138,11 +138,13 @@ def _replay(wt: Path, commits: list[str], say: Callable[[str], None]) -> int:
     return 0
 
 
-def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None], branch: str = "") -> int:
+def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None], branch: str = "",
+            steps: push.Steps | None = None) -> int:
     """delivery.push_checks on `new` in scratch worktree `wt`, as `ttp push` runs them on its rebased
     head: 0 when they pass. With none configured, only a docs-only change passes. They take the priority
     slot of local branch `branch` of the repository `wt` belongs to on the host checks queue, as a push
-    to the push branch does (_slot_key)."""
+    to the push branch does (_slot_key). Waiting for a runner or that slot is between `steps`."""
+    steps = steps or push.Steps(None)
     d = p.config().get("delivery") or {}
     checks = push.with_host(push.check_list(push.repo_checks(d, wt, p)[0]), d.get("checks_host"))
     if not checks:
@@ -162,6 +164,7 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
         say(f"{new[:10]}: {push.NONE_APPLY}; not landing: {push.NONE_APPLY_FIX}")
         return CHECKS_FAILED
     env = push.check_env("target", base, branch=branch)
+    steps.between()
     if why := push.runner_wait(todo, wt, env, say, p):
         return why
     try:
@@ -170,6 +173,7 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
         say(f"{e}; not landing")
         return CHECKS_FAILED
     with slot:
+        steps.go("checks")
         started = time.time()
         env = {**env, **slot.env()}
         for line in push.sandbox_lines(todo):
@@ -287,9 +291,10 @@ def land(p: Project, repo: Path, head: str, tid: int | None = None,
                      else push.wait_of(wait), say=say)
     if lock is None:
         return BUSY
+    steps = push.Steps(lock, say)   # an automatic upgrade past upgrade.push_hold_min goes between them only
     try:
         for n in range(1, MOVE_TRIES + 1):
-            rc = _attempt(p, repo, branch, full, tid, say)
+            rc = _attempt(p, repo, branch, full, tid, say, steps=steps)
             if rc != MOVED or n == MOVE_TRIES:
                 return rc
             say(f"starting over on {branch}'s new tip ({n + 1} of {MOVE_TRIES})")
@@ -299,7 +304,7 @@ def land(p: Project, repo: Path, head: str, tid: int | None = None,
 
 
 def _attempt(p: Project, repo: Path, branch: str, full: str, tid: int | None, say: Callable[[str], None],
-             dry: bool = False) -> int:
+             dry: bool = False, steps: push.Steps | None = None) -> int:
     """One landing of `full` on `branch`'s current tip, under the landing lock (`dry`: a dry run)."""
     base = push._local_tip(repo, branch)
     if _git(repo, "merge-base", "--is-ancestor", full, base).returncode == 0:
@@ -322,12 +327,14 @@ def _attempt(p: Project, repo: Path, branch: str, full: str, tid: int | None, sa
         return LANDED
     if dry:
         return _dry(p, repo, branch, base, full, commits, tid, say)
-    return push.in_check_scratch(p, lambda: _land(p, repo, branch, base, full, commits, tid, say), "ttp land",
+    return push.in_check_scratch(p, lambda: _land(p, repo, branch, base, full, commits, tid, say, steps), "ttp land",
                                  repo)
 
 
 def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: list[str], tid: int | None,
-          say: Callable[[str], None]) -> int:
+          say: Callable[[str], None], steps: push.Steps | None = None) -> int:
+    steps = steps or push.Steps(None)
+    steps.go("rebase")
     with tempfile.TemporaryDirectory(prefix="ttp-land-") as tmp:
         wt = Path(tmp) / "wt"
         if _git(repo, "worktree", "add", "-q", "--detach", str(wt), base if commits else full).returncode:
@@ -342,8 +349,9 @@ def _land(p: Project, repo: Path, branch: str, base: str, full: str, commits: li
                 say(f"every commit of {full[:10]} is already on local branch {branch}")
                 record(p, tid, full, base, branch)
                 return LANDED
-            if rc := _checks(p, wt, new, base, say, branch):
+            if rc := _checks(p, wt, new, base, say, branch, steps):
                 return rc
+            steps.go("land")
             if rc := _move(p, repo, branch, base, new, say):
                 return rc
         finally:
