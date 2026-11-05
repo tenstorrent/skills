@@ -6,14 +6,17 @@ A reboot wakes a waiting task only when what it waits on was local and transient
 a local detached job (`ttp detach --check` without `--host`), its own `ttp checks --result`, a local
 device runner job (`ttp devq probe`), a process (a pid, `pgrep`, `ps`) or a path under /tmp, /run,
 /dev/shm, /proc or a run folder, outside any ssh command or `--host` command (those paths are on the other host); or a detached job of its own from the
-earlier boot never wrote its .rc (the daemon checks that part). A timer, a probe of another host,
+earlier boot never wrote its .rc (the daemon checks that part). A probe script it runs from a run folder
+is judged by what it contains, as an inline probe is; one it cannot read counts as a run-folder file. A timer, a probe of another host,
 a CI run or another project's reply (`ttp ack-wait probe`) is as it was: the task stays asleep on
 its timer and probe. `survives_reboot` keeps it asleep whatever its probe says.
 """
 from __future__ import annotations
 
+import os
 import re
 import shlex
+import stat
 from pathlib import Path
 
 # A path a reboot clears or that names a process of the earlier boot.
@@ -25,6 +28,9 @@ _PUNCT = ";&|()`"
 # `ttp detach --check` options that take a value (as cli._check_options reads them).
 _CHECK_VALUED = ("--rows", "--after", "--mirror")
 _ASSIGN_RE = re.compile(r"[A-Za-z_]\w*=")
+# A probe script from a run folder larger than this is not read: it counts as a run-folder file.
+_SCRIPT_MAX = 64 * 1024
+_SHELLS = {"sh", "bash", "dash", "zsh", "ksh", ".", "source"}
 
 
 def _commands(probe: str) -> list[list[str]] | None:
@@ -121,10 +127,53 @@ def _transient_words(words: list[str], run_dirs: tuple[str, ...]) -> str:
     return ""
 
 
-def transient(probe: str, run_dirs: tuple[str, ...] = ()) -> str:
+def _script_word(words: list[str], run_dirs: tuple[str, ...]) -> int | None:
+    """The index of the run-folder script these words run (`/…/state/runs/7/probe.sh`, also after
+    VAR=value, `timeout [opts] N` or a shell such as `bash -e`), or None when they run none."""
+    i = 0
+    while i < len(words) and _ASSIGN_RE.match(words[i]):
+        i += 1
+    if i < len(words) and words[i].rsplit("/", 1)[-1] == "timeout":
+        i += 1
+        while i < len(words) and words[i].startswith("-"):
+            i += 2 if words[i] in ("-k", "-s") else 1   # these two take a value
+        i += 1   # the duration
+    if i < len(words) and words[i].rsplit("/", 1)[-1] in _SHELLS:
+        i += 1
+        while i < len(words) and words[i].startswith("-") and words[i] != "-c":
+            i += 1
+    if i >= len(words):
+        return None
+    w = words[i]
+    if not w.startswith("/") or not (_RUN_DIR_RE.search(w) or any(d and w.startswith(d.rstrip("/") + "/") for d in run_dirs)):
+        return None
+    return i
+
+
+def _read_script(path: str) -> str | None:
+    """A probe script's text, or None when it is missing, not a regular file, over _SCRIPT_MAX bytes,
+    unreadable or not text. Never blocks: a FIFO is not opened for reading."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _SCRIPT_MAX:
+            return None
+        data = os.read(fd, _SCRIPT_MAX + 1)
+        return None if len(data) > _SCRIPT_MAX else data.decode("utf-8")
+    except (OSError, UnicodeDecodeError):
+        return None
+    finally:
+        os.close(fd)
+
+
+def transient(probe: str, run_dirs: tuple[str, ...] = (), _depth: int = 0) -> str:
     """Why a retry_when depends on local state a reboot ends (see the module doc), or '' when it does
     not. `run_dirs`: run folder paths of this project. A probe that does not parse is judged on its
-    whole text, so it wakes when in doubt."""
+    whole text, so it wakes when in doubt. A script it runs from a run folder is judged by its text
+    (one level deep), each line as a command; one it cannot read is a file in a run folder."""
     probe = probe.strip() if isinstance(probe, str) else ""
     if not probe:
         return ""
@@ -132,7 +181,16 @@ def transient(probe: str, run_dirs: tuple[str, ...] = ()) -> str:
     if cmds is None:
         return _transient_words(probe.split(), run_dirs)
     for cmd in cmds:
-        why = _transient_words(_local_part(cmd), run_dirs)
+        words = _local_part(cmd)
+        i = _script_word(words, run_dirs) if _depth == 0 else None
+        text = _read_script(words[i]) if i is not None else None
+        if text is not None:
+            # each line its own command, so an ssh on one line does not hide the next one's local probe
+            why = transient(text.replace("\\\n", " ").replace("\n", "\n;"), run_dirs, _depth + 1)
+            if why:
+                return why
+            words = words[:i] + words[i + 1:]
+        why = _transient_words(words, run_dirs)
         if why:
             return why
     return ""

@@ -203,3 +203,77 @@ def test_a_bare_timer_wait_whose_job_each_reboot_cuts_is_blocked_by_the_third(en
     t = p.db.task(tid)
     assert t["status"] == "blocked" and i == 3, (i, dict(t))
     assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"
+
+
+_DURABLE_SCRIPT = ("#!/bin/sh\n# done once the remote job wrote its marker\n"
+                   "ssh box 'test -e /tmp/soak.done' \\\n  && ttp ci --repo o/r --branch b\n"
+                   'test "$(date +%s)" -ge 1900000000\n')
+
+
+def _probe_script(run_dir, how):
+    """A probe script in a run folder, made as `how` says; returns its path."""
+    path = run_dir / "probe.sh"
+    if how == "durable":
+        path.write_text(_DURABLE_SCRIPT)
+    elif how == "transient":   # an ssh line does not hide the next line's local process check
+        path.write_text(_DURABLE_SCRIPT + "ssh box true\nkill -0 4242\n")
+    elif how == "oversize":
+        path.write_text(_DURABLE_SCRIPT + "#" * (64 * 1024) + "\n")
+    elif how == "unreadable":
+        if os.geteuid() == 0:
+            pytest.skip("root reads a mode-000 file")
+        path.write_text(_DURABLE_SCRIPT)
+        path.chmod(0)
+    elif how == "binary":
+        path.write_bytes(b"\x7fELF\xff\xfe" + bytes(range(256)))
+    elif how == "fifo":   # opened without blocking, and never read
+        os.mkfifo(path)
+    return path
+
+
+@pytest.mark.parametrize("how, why", [
+    ("durable", ""),
+    ("transient", "a process"),
+    ("oversize", None),   # None: judged as before, as a file in its run folder
+    ("unreadable", None),
+    ("binary", None),
+    ("fifo", None),
+    ("missing", None),
+])
+def test_a_run_folder_probe_script_is_judged_by_its_contents(tmp_path, how, why):
+    from ttp import rebootwait as rw
+    run_dir = tmp_path / "state" / "runs" / "7"
+    run_dir.mkdir(parents=True)
+    path = _probe_script(run_dir, how)
+    runs = (str(tmp_path / "state" / "runs"),)
+    if why is None:
+        why = rw.transient(f"test -e {path}", runs)
+        assert why in ("a file in a run folder", "a path a reboot clears"), why
+    for probe in (str(path), f"sh {path}", f"timeout -k 5 30 bash -e {path}", f"X=1 {path} --quiet"):
+        assert rw.transient(probe, runs) == why, probe
+        assert rw.stays_asleep({"retry_when": probe}, runs) is (why == ""), probe
+    # the rest of the probe still counts, and a script read as data is not run
+    assert rw.transient(f"{path} && pgrep soak", runs) == why or "a process"
+    assert rw.transient(f"test -s {path}", runs) == rw.transient(f"test -e {run_dir}/x", runs) != ""
+    assert rw.transient(f"bash -c {path}", runs) == rw.transient(f"test -e {run_dir}/x", runs)
+
+
+def test_a_run_folder_script_running_another_run_folder_script_wakes(tmp_path):
+    from ttp import rebootwait as rw
+    run_dir = tmp_path / "state" / "runs" / "7"
+    run_dir.mkdir(parents=True)
+    inner = _probe_script(run_dir, "durable")
+    outer = run_dir / "outer.sh"
+    outer.write_text(f"{inner}\n")
+    assert rw.transient(str(outer)) == rw.transient(f"test -e {inner}") != "", "one level deep only"
+
+
+@pytest.mark.parametrize("how, wakes", [("durable", False), ("transient", True), ("missing", True)])
+def test_a_reboot_wakes_a_run_folder_script_wait_only_when_its_script_probes_transient_state(env, how, wakes):
+    p = make(env)
+    tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
+    run_dir = p.runs / f"script-{tid}"
+    run_dir.mkdir(parents=True)
+    _waiting_from_before_the_boot(p, tid, job=False, retry_when=str(_probe_script(run_dir, how)))
+    _boot_daemon(p)
+    assert _woken(p, tid) is wakes, dict(p.db.task(tid))
