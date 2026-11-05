@@ -8714,6 +8714,34 @@ def test_a_failing_check_prestage_starts_nothing_exits_non_zero_and_shows_its_ta
     assert len(started) == 1 and "pre-stage" not in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("fails", [True, False], ids=["fails", "passes"])
+def test_a_check_prestage_on_busy_test_slots_runs_on_one_worker_instead_of_being_skipped(env, tmp_path, monkeypatch,
+                                                                                         capsys, fails):
+    """No test slot free within SLOT_WAIT_S: the pre-stage still runs, on one worker without a slot. Its
+    failure starts nothing (no full run queued behind the busy slots); its pass starts the full checks."""
+    from ttp import checkprestage, cli, testslots
+    seen = tmp_path / "slots"
+    waits = []
+    monkeypatch.setattr(testslots, "acquire", lambda *a, **kw: waits.append(a[2] if len(a) > 2 else kw.get("wait_s")))
+    p, run, started = _prestage_setup(env, tmp_path, monkeypatch,
+                                      f"echo ${testslots.SLOTS_ENV} > {seen}; echo guard-ran >&2; exit {int(fails) * 3}")
+    if fails:
+        with pytest.raises(SystemExit) as failed:
+            cli.main(["checks", "--detach", "--", "true"])
+        assert failed.value.code == 1
+    else:
+        cli.main(["checks", "--detach", "--", "true"])
+    out = capsys.readouterr().out
+    assert waits == [checkprestage.SLOT_WAIT_S] and checkprestage.SLOT_WAIT_S <= 10, "a short wait, not a skip"
+    assert "runs on one worker without a slot" in out and "skipped" not in out
+    assert seen.read_text().strip() == "1", "one worker"
+    if fails:
+        assert not started and "NOT started" in out and "guard-ran" in out
+        assert not (run / cli.CHECKS_PID).exists()
+    else:
+        assert len(started) == 1 and "pre-stage passed" in out
+
+
 @pytest.mark.parametrize("cmd", ["no-such-prestage-command-xyz", 17, {"run": "true", "timeout_s": -1}],
                          ids=["cannot-run", "malformed", "bad-timeout"])
 def test_a_check_prestage_that_cannot_run_never_holds_the_full_checks_back(env, tmp_path, monkeypatch, capsys, cmd):

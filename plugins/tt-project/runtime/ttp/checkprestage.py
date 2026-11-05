@@ -3,7 +3,9 @@ runs in the foreground before the full checks are started in the background. A f
 found in the same run (the worker fixes it at once) instead of after the whole detached suite, which
 costs a hand-off and a later wake. It only adds an early run: the full checks still run every
 command unchanged, and nothing it does marks a check as passed. A timeout, a pre-stage that cannot
-be started or a malformed setting never holds the full checks back.
+be started or a malformed setting never holds the full checks back. It runs on a host test slot
+when one is free within SLOT_WAIT_S, else on one worker without a slot: it is small and bounded, and
+a busy host is when a full run it saves costs most.
 
 With delivery.check_prestage unset, a project whose own checks run pytest here gets a derived pre-stage
 (`derive`): the DERIVE_MAX tests that failed in the most distinct detached `ttp checks` runs of the
@@ -12,6 +14,7 @@ pre-stage that times out records the tests it cut off as slow (`_learn_from_time
 leaves them out instead of timing out the same way. No such failures: no pre-stage. `''` or false turns it off; an explicit command is used as it is."""
 from __future__ import annotations
 
+import contextlib
 import json
 import math
 import os
@@ -21,10 +24,11 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import boundedchild, checkcap, testslots
+from . import boundedchild, testslots
 
 KEY = "check_prestage"
 DEFAULT_TIMEOUT_S = 90.0     # under the 120 s a Bash tool call gets by default, so the caller outlives it
+SLOT_WAIT_S = 5.0   # the longest it waits for a test slot before it runs on one worker without one
 MAX_TIMEOUT_S = 900.0
 TAIL_LINES = 60
 CANNOT_RUN = (126, 127)   # the shell found no such command or could not run it: a setting fault
@@ -249,21 +253,22 @@ def run(v, cwd: str, env: dict, say, what: str = f"delivery.{KEY}", ok: tuple = 
     if spec is None:
         return 0
     cmd, timeout = spec
-    # It runs on the host's test slots (testslots) like the full checks; still none free after a
-    # foreground wait, the detached full checks start without it and wait for theirs.
+    # It runs on the host's test slots (testslots) like the full checks; none free within SLOT_WAIT_S,
+    # on one worker without a slot, so a busy host never skips it (a full run it saves takes a slot).
     grant = testslots.acquire(f"ttp checks pre-stage (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()})",
-                              say, checkcap.FOREGROUND_WAIT_S)
+                              say, SLOT_WAIT_S)
+    k, slot_env = (grant.k, grant.env()) if grant is not None \
+        else (1, {testslots.XDIST_ENV: "1", testslots.SLOTS_ENV: "1"})
     if grant is None:
-        say("pre-stage skipped: the host's test slots stayed busy; starting the full checks without it")
-        return 0
+        say("the host's test slots are busy: the pre-stage runs on one worker without a slot")
     say(f"pre-stage {(shown or cmd)!r} ({what}, up to {timeout:.0f} s) before the full checks start in the background")
     t0 = time.monotonic()
     # Its output goes to a file, not a pipe, so a process it leaves running cannot hold the run open;
     # boundedchild kills its whole group however the run ends (a SIGTERM or SIGHUP to `ttp checks` too).
-    with grant, tempfile.NamedTemporaryFile(prefix="ttp-prestage-") as out:
-        script = f"exec >{shlex.quote(out.name)} 2>&1\n{testslots.clamped(cmd, grant.k)}"
+    with grant or contextlib.nullcontext(), tempfile.NamedTemporaryFile(prefix="ttp-prestage-") as out:
+        script = f"exec >{shlex.quote(out.name)} 2>&1\n{testslots.clamped(cmd, k)}"
         res = boundedchild.run(testslots.low_priority(["/bin/sh", "-c", script]), timeout, cwd=cwd,
-                               env={**env, **grant.env()}, text=False, stderr="stdout")
+                               env={**env, **slot_env}, text=False, stderr="stdout")
         if res.error.startswith("could not start"):
             say(f"pre-stage not started ({res.error.partition(': ')[2]}); starting the full checks without it")
             return 0
