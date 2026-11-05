@@ -477,6 +477,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("TTP_HOST", "testhost")
     monkeypatch.setenv("TTP_TEST_LOCAL_TZ", "UTC")   # home zones: never the zone of the machine running the tests
     monkeypatch.setenv("TTP_TEST_CLEAR_HOLD_S", "0")   # alerts clear on the first healthy sweep (alerts_cases tests the window)
+    monkeypatch.setenv("TTP_TEST_BUDGET_SETTLE_S", "0")   # a budget red alerts on its first read (budget_cases tests the settle)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")   # wait loops (runner, ttp lock, listen) check often
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")   # suites never wait on the load of the host running the tests (loadguard tests set it)
     monkeypatch.setenv("TTP_CHECKS_POOL_DIRS", str(tmp_path / "pool"))   # never this host's real pool runs (the suite's own run folder among them)
@@ -23804,7 +23805,7 @@ def test_a_red_budget_alert_clears_once_the_gate_leaves_red(env):
     assert len(ep) == 1 and ep[0]["cleared"], ep
     assert attention(p.db, time.time()) == []
     said = p.db.q("SELECT text, severity FROM messages WHERE kind IN ('alert','resolved')")
-    assert said[-1] == {"text": "Cleared: Budget for fake is out of red; new work starts again.",
+    assert said[-1] == {"text": "Cleared: Budget for fake: no dollar cap or spend limit holds new work any more.",
                         "severity": "low"}, said
     assert not any("is now green" in m["text"] for m in said), "leaving red is said once, by the cleared alert"
 

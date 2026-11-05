@@ -109,6 +109,21 @@ def red_class(reason: str) -> str | None:
     return "spend limit" if "reports its spend limit reached" in reason else None
 
 
+# Red classes only the user can clear: a dollar cap they set, or funds (the provider's spend limit).
+# Only these reach the user as a budget alert (Daemon.update_gates). Every other red (a plan window's
+# line, the runaway guard, a provider switching to the dollar caps) lifts by itself: the gate's status
+# line in `ttp status` and the web app's Budget tab, never an alert.
+USER_CLEARS = ("cap", "global cap", "spend limit")
+
+
+def user_held(g: Gate | dict) -> list[str]:
+    """The gate's red reasons only the user can clear (USER_CLEARS), while it holds new work; else []."""
+    d = g if isinstance(g, dict) else asdict(g)
+    if d.get("level") != "red" or d.get("allow_new_work", True):
+        return []
+    return [r for r in d.get("reasons") or [] if red_class(r) in USER_CLEARS]
+
+
 def red_share(g: Gate, cls: str) -> float | None:
     """How far a red class's measured value is toward its limit (1 = at it), None when not measured."""
     n = g.numbers or {}

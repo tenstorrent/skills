@@ -621,10 +621,10 @@ def test_the_default_plan_turn_guard_fires_below_the_coordinators_own_turn_limit
 
 
 
-def test_a_runaway_guard_hovering_at_its_limit_alerts_once_per_episode(env, monkeypatch):
-    """Replays a flap: the coordinator guard crosses its $4 limit, drops just under it and crosses
-    again. One alert per episode: it ends only below 80% of the limit, and a repeat within an hour
-    of that end is no new alert. Gating is unchanged: every crossing stops new work."""
+def test_a_cap_hovering_at_its_limit_alerts_once_per_episode(env, monkeypatch):
+    """Replays a flap: the daily cap crosses its $4 limit, drops just under it and crosses again. One
+    alert per episode: it ends only below 80% of the limit, and a repeat within an hour of that end
+    is no new alert. Gating is unchanged: every crossing stops new work."""
     p = make(env)
     from ttp import budget as bud
     from ttp.daemon import Daemon, RED_REPEAT_S
@@ -632,10 +632,9 @@ def test_a_runaway_guard_hovering_at_its_limit_alerts_once_per_episode(env, monk
     alerts = lambda: [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert'")]  # noqa: E731
 
     def settle(spent: float) -> bud.Gate:
-        gate = bud.Gate(provider="fake", regime="caps", numbers={"guard_ratio": round(spent / 4.0, 3)})
+        gate = bud.Gate(provider="fake", regime="caps", numbers={"cap_ratio": round(spent / 4.0, 3)})
         if spent > 4.0:
-            bud._raise(gate, "red", f"runaway guard: coordinator spent ${spent:.2f} on self-started turns in the "
-                                    f"last hour (limit $4; turns for user messages not counted)")
+            bud._raise(gate, "red", f"cap reached: ${spent:.2f}/24h of $4")
             gate.allow_new_work, gate.max_parallel = False, 0
         monkeypatch.setattr(bud, "evaluate", lambda *a, **k: gate)
         d.update_gates()
@@ -645,19 +644,141 @@ def test_a_runaway_guard_hovering_at_its_limit_alerts_once_per_episode(env, monk
     for spent in (4.07, 3.9, 4.33, 3.5, 4.12, 3.95, 4.2):   # clears briefly, but stays above 80% ($3.20)
         g = settle(spent)
         assert (g.level == "red") == (spent > 4.0) and g.allow_new_work == (spent <= 4.0), "gating changed"
-    assert len(alerts()) == 1 and alerts()[0].startswith("Budget for fake is now red: runaway guard"), alerts()
+    assert len(alerts()) == 1 and alerts()[0].startswith("Budget for fake is now red: cap reached"), alerts()
     settle(2.5)                                             # below 80%: the episode ends
     assert settle(4.1).level == "red"                       # red again within the hour: the same episode
     assert len(alerts()) == 1, alerts()
     settle(2.0)
     eps = p.db.kv("budget_red_episodes")
-    assert not eps["fake"]["runaway guard"]["open"], eps
-    eps["fake"]["runaway guard"]["cleared"] -= RED_REPEAT_S + 60   # clear for over an hour
+    assert not eps["fake"]["cap"]["open"], eps
+    eps["fake"]["cap"]["cleared"] -= RED_REPEAT_S + 60   # clear for over an hour
     p.db.set_kv("budget_red_episodes", eps)
     settle(2.0)
-    assert "runaway guard" not in p.db.kv("budget_red_episodes")["fake"], "an episode long over is forgotten"
+    assert "cap" not in p.db.kv("budget_red_episodes")["fake"], "an episode long over is forgotten"
     settle(4.4)
-    assert len(alerts()) == 2 and alerts()[1].startswith("Budget for fake is now red: runaway guard"), alerts()
+    assert len(alerts()) == 2 and alerts()[1].startswith("Budget for fake is now red: cap reached"), alerts()
+
+
+def _settling_gates(p, monkeypatch):
+    """A daemon with the real alert settle, and a way to feed it gates: settle(reasons, holds=True)
+    makes a red gate from the reasons (green when none); age(s) moves every red class's start back."""
+    from ttp import budget as bud
+    from ttp.daemon import Daemon
+    monkeypatch.delenv("TTP_TEST_BUDGET_SETTLE_S")
+    d = Daemon(p.base)
+
+    def settle(reasons: list[str], holds: bool = True, lane: bool = False) -> bud.Gate:
+        gate = bud.Gate(provider="fake", regime="caps", numbers={"cap_ratio": 0.5, "guard_ratio": 0.5})
+        for r in reasons:
+            if r.startswith(("cap reached", "runaway guard", "global daily cap")):
+                bud._raise(gate, "red", r)
+            else:
+                gate.reasons.append(r)
+        if gate.level == "red":
+            gate.allow_new_work, gate.max_parallel = not holds, 0 if holds else 2
+            gate.numbers.update({k: 1.2 for k, pre in (("cap_ratio", "cap reached"), ("guard_ratio", "runaway guard"))
+                                 if any(r.startswith(pre) for r in reasons)})
+            if lane:
+                gate.lane = {"max_parallel": 2, "max_tier": "deep", "allow_optional": True}
+        monkeypatch.setattr(bud, "evaluate", lambda *a, **k: gate)
+        d.update_gates()
+        return gate
+
+    def age(s: float) -> None:
+        eps = p.db.kv("budget_red_episodes")
+        for ep in eps["fake"].values():
+            if "red_since" in ep:
+                ep["red_since"] -= s
+        p.db.set_kv("budget_red_episodes", eps)
+    return d, settle, age
+
+
+def _budget_alerts(p) -> list[str]:
+    return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref='budget:fake'")]
+
+
+def test_a_provider_that_stops_reporting_plan_windows_is_a_status_line_not_a_red_alert(env, monkeypatch):
+    """A plan provider moving to the dollar caps, red only for the coordinator turn guard that move
+    brings (urgent work still starts), is the gate's status line: no alert however long it lasts."""
+    from ttp import alerts as al
+    from ttp.daemon import BUDGET_SETTLE_S
+    p = make(env)
+    _, settle, age = _settling_gates(p, monkeypatch)
+    lapsed = "fake stopped reporting plan windows; its spend counts toward the dollar caps"
+    guard = ("runaway guard: coordinator spent $9.00 on self-started turns in the last hour (limit $4; turns "
+             "for user messages not counted); urgent and user-ordered tasks still start")
+    settle([])
+    settle([lapsed])
+    for _ in range(3):
+        settle([lapsed, guard], lane=True)
+        age(BUDGET_SETTLE_S + 1)
+    settle([lapsed, guard], lane=True)
+    assert _budget_alerts(p) == [], "a status change alerted the user"
+    assert lapsed in p.db.kv("gates")["fake"]["reasons"], "the status line names the change"
+    assert not al.holds(p.db, "budget:fake", 0, time.time()), "nothing only the user can clear holds it"
+
+
+def test_a_cap_red_alerts_once_only_after_it_still_holds_work_past_the_settle(env, monkeypatch):
+    from ttp.daemon import BUDGET_SETTLE_S
+    p = make(env)
+    _, settle, age = _settling_gates(p, monkeypatch)
+    cap = "cap reached: $120.00/24h of $100"
+    settle([])
+    settle([cap])
+    assert _budget_alerts(p) == [], "alerted before the settle re-read"
+    age(BUDGET_SETTLE_S - 5)
+    settle([cap])
+    assert _budget_alerts(p) == [], "alerted before the settle ended"
+    age(10)
+    settle([cap, "fake stopped reporting plan windows; its spend counts toward the dollar caps"])
+    said = _budget_alerts(p)
+    assert len(said) == 1 and said[0].startswith(f"Budget for fake is now red: {cap}. ") \
+        and "plan windows" not in said[0], "the alert names only what holds the work"
+    age(BUDGET_SETTLE_S + 1)
+    settle([cap])
+    assert len(_budget_alerts(p)) == 1, "the same episode alerted twice"
+    # A red cap that holds no new work (nothing waits on it) is no alert either.
+    p.db.x("DELETE FROM kv WHERE key='budget_red_episodes'")
+    settle([cap], holds=False)
+    age(BUDGET_SETTLE_S + 1)
+    settle([cap], holds=False)
+    assert len(_budget_alerts(p)) == 1, "a red that holds no work alerted"
+
+
+def test_a_one_tick_cap_flap_is_no_alert(env, monkeypatch):
+    """Red, green, red: each red is one read, so neither still holds after the settle. The start
+    of a run of red reads resets at each break, however old the episode."""
+    from ttp.daemon import BUDGET_SETTLE_S
+    p = make(env)
+    _, settle, age = _settling_gates(p, monkeypatch)
+    cap = "cap reached: $120.00/24h of $100"
+    for _ in range(4):
+        settle([cap])
+        age(BUDGET_SETTLE_S + 1)
+        settle([])
+    settle([cap])
+    assert _budget_alerts(p) == [], _budget_alerts(p)
+
+
+def test_a_cap_alert_is_withdrawn_once_only_a_self_lifting_red_holds(env, monkeypatch):
+    """Once no cap or funds reason holds work, readers drop the alert at once and the sweep closes it
+    with one cleared line, though the gate stays red for the runaway guard."""
+    from ttp import alerts as al
+    from ttp.daemon import BUDGET_SETTLE_S
+    p = make(env)
+    d, settle, age = _settling_gates(p, monkeypatch)
+    cap = "cap reached: $120.00/24h of $100"
+    guard = "runaway guard: $60.00 spent in the last hour (long runs pro rata), ceiling $50.00/h"
+    settle([cap, guard])
+    age(BUDGET_SETTLE_S + 1)
+    settle([cap, guard])
+    assert len(_budget_alerts(p)) == 1 and al.holds(p.db, "budget:fake", 0, time.time())
+    settle([guard])
+    assert p.db.kv("gates")["fake"]["level"] == "red"
+    assert not al.holds(p.db, "budget:fake", 0, time.time()), "the alert outlived what only the user clears"
+    d.sweep_alerts()
+    said = p.db.q("SELECT text FROM messages WHERE ref='budget:fake' ORDER BY id")
+    assert said[-1]["text"] == "Cleared: Budget for fake: no dollar cap or spend limit holds new work any more.", said
 
 
 
@@ -1145,14 +1266,14 @@ def test_plan_pacing_changes_do_not_alert_the_user(env, monkeypatch):
         settle(level)
     assert alerts() == before, "pacing between green and yellow alerted the user"
     settle("red")
-    assert alerts() == before + 1, "hitting the plan limit must alert"
+    assert alerts() == before, "a plan line lifts by itself: the gate's status line, no alert"
 
 
 
-def test_only_reaching_the_plan_line_alerts_once_per_window_and_no_level_wakes(env, monkeypatch):
+def test_reaching_the_plan_line_is_a_status_line_and_no_level_wakes(env, monkeypatch):
     """Green, yellow and orange flips post nothing and leave the wake state alone; reaching the line
-    alerts once, and again only in the next window. Red with nothing held that needs a decision leaves
-    the wake state alone too (gatewake.held): dispatch enforces the gate."""
+    alerts no one: the window resets by itself. Red with nothing held that needs a decision leaves the
+    wake state alone too (gatewake.held): dispatch enforces the gate."""
     p = make(env)
     from ttp import budget as bud
     from ttp.daemon import Daemon, wake_fingerprint
@@ -1164,7 +1285,7 @@ def test_only_reaching_the_plan_line_alerts_once_per_window_and_no_level_wakes(e
         gate = bud.Gate(provider="fake", level=level, regime="windows", numbers={
             "limit": 90.0, "plan": [{"window": "five_hour", "utilization": util, "resets_at": resets[0]}]})
         if level == "red":
-            gate.allow_new_work = False
+            gate.reasons, gate.allow_new_work, gate.max_parallel = ["five_hour window at 90%"], False, 0
         monkeypatch.setattr(bud, "evaluate", lambda *a, **k: gate)
         d.update_gates()
         return wake_fingerprint(p, p.db.kv("gates"))
@@ -1174,14 +1295,13 @@ def test_only_reaching_the_plan_line_alerts_once_per_window_and_no_level_wakes(e
         assert settle(level) == fp, f"{level} changed what wakes the coordinator"
     assert alerts() == [], alerts()
     assert settle("red", 90.0) == fp, "a red gate holding nothing that needs a decision changed the wake state"
-    assert len(alerts()) == 1 and alerts()[0].startswith("Budget for fake is now red"), alerts()
     settle("orange", 89.0)
     settle("red", 90.0)
-    assert len(alerts()) == 1, "the same plan window alerted twice"
     resets[0] += 5 * 3600
     settle("green", 0.0)
     settle("red", 90.0)
-    assert len(alerts()) == 2, "a new plan window reaching the line must alert"
+    assert alerts() == [], alerts()
+    assert p.db.kv("gates")["fake"]["reasons"] == ["five_hour window at 90%"], "the status line names the line"
 
 
 
@@ -2136,24 +2256,15 @@ def test_deferred_task_does_not_hold_back_idle_slot_wake(env):
 
 
 
-def test_a_plan_window_red_marker_commits_with_its_alert_or_not_at_all(env, monkeypatch):
-    """A marker saved without its alert would silence that plan window's red alert for good."""
+def test_a_red_episodes_alerted_mark_commits_with_its_alert_or_not_at_all(env, monkeypatch):
+    """A mark saved without its alert would silence that cap's red alert for the whole episode."""
     import sqlite3
-    import time as _t
-    from ttp import budget as bud
     from ttp.daemon import Daemon
     p = make(env)
+    p.set_config("budget.daily_usd", 10)
     d = Daemon(p.base)
     d.update_gates()
-    p.db.spend("fake", 150.0, "task:1")
-    evaluate = bud.evaluate
-
-    def at_line(*a, **kw):
-        g = evaluate(*a, **kw)
-        g.numbers = {**(g.numbers or {}), "limit": 90,
-                     "plan": [{"window": "5h", "utilization": 95, "resets_at": _t.time() + 3600}]}
-        return g
-    monkeypatch.setattr(bud, "evaluate", at_line)
+    p.db.spend("fake", 50.0, "task:1")
     post = d.p.db.post
 
     def locked(*a, **kw):
@@ -2163,11 +2274,12 @@ def test_a_plan_window_red_marker_commits_with_its_alert_or_not_at_all(env, monk
     monkeypatch.setattr(d.p.db, "post", locked)
     with pytest.raises(sqlite3.OperationalError):
         d.update_gates()
-    assert not p.db.kv("budget_red_sent")
+    assert not (p.db.kv("budget_red_episodes") or {}).get("fake")
     monkeypatch.setattr(d.p.db, "post", post)
     d.update_gates()
+    d.update_gates()
     assert len(p.db.q("SELECT id FROM messages WHERE ref='budget:fake'")) == 1
-    assert "5h" in p.db.kv("budget_red_sent")["fake"]
+    assert p.db.kv("budget_red_episodes")["fake"]["cap"]["alerted"] is True
 
 
 

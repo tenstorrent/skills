@@ -265,6 +265,12 @@ METER_EVERY_S = 600
 # the same reason red again this soon after that end is no new alert.
 RED_CLEAR_RATIO = 0.8
 RED_REPEAT_S = 3600
+# A red only the user can clear is alerted only once it still holds new work this long after it began.
+BUDGET_SETTLE_S = 120.0
+
+
+def budget_settle_s() -> float:
+    return float(os.environ.get("TTP_TEST_BUDGET_SETTLE_S") or BUDGET_SETTLE_S)   # tests of other alerts: 0
 CLEAN_STOP_KEY = "clean_stop"   # kv: {boot, ts} of the daemon's last clean stop
 SCHEDULE_BUDGET_KEY = "schedule_budget_raised"   # kv: schedule -> when its own-budget skip last raised (_schedule_skip)
 SCHEDULE_BUDGET_SOURCE = "daemon:schedule-budget"
@@ -6372,7 +6378,7 @@ class Daemon:
             except Exception:
                 pass
         windows = bud.plan_windows(self.p.db)
-        gates, news, red_sent, episodes = {}, [], {}, {}
+        gates, news, episodes = {}, [], {}
         now = time.time()
         # A declared billing kind (providers.<name>.billing) counts for spend from when it is recorded.
         try:
@@ -6391,30 +6397,31 @@ class Daemon:
                 g.max_parallel, g.allow_new_work, g.allow_optional, g.lane = 0, False, False, {}
             prev = self.gates.get(prov) or _saved_gate(saved.get(prov))
             provider_paused = any(r.startswith("provider limit") for r in g.reasons + (prev.reasons if prev else []))
-            # Green, yellow and orange are the budget working as designed (more or fewer workers);
-            # only red is news to the user, once per plan window or per episode of its other reasons.
-            # Its alert clears itself once the gate leaves red.
-            new_episode, episodes[prov] = self._red_episodes(prov, g, now)
-            first, mark = False, None
-            if prev and prev.level != "red" and g.level == "red" and not provider_paused:   # a pause has its own alert
-                plan_first, mark = self._first_red_in_window(prov, g)
-                classed = any(bud.red_class(r) for r in g.reasons)
-                first = bool(plan_first) or new_episode or (plan_first is None and not classed)
-                if not first:
-                    log(self.p, f"budget for {prov} red again in the same episode, no new alert: {'; '.join(g.reasons)}")
-            if mark is not None:
-                red_sent[prov] = mark
-            if first:
-                capped = any("cap reached" in r for r in g.reasons)
+            # Green, yellow and orange are the budget working as designed (more or fewer workers). Red
+            # is news to the user only for what only the user can clear (bud.user_held: a dollar cap
+            # they set, funds) and only once it still holds new work BUDGET_SETTLE_S after it began
+            # (a one-tick flap is no alert): once per episode of its class (_red_episodes). Every other
+            # red, and a provider moving from plan windows to the dollar caps, is the gate's status line.
+            # The alert clears itself once no such reason holds (alerts.holds).
+            episodes[prov] = self._red_episodes(prov, g, now)
+            held = [] if provider_paused else bud.user_held(g)   # a pause has its own alert
+            settle = budget_settle_s()
+            due = {c for c in map(bud.red_class, held) if not episodes[prov][c].get("alerted", True)
+                   and now - float(episodes[prov][c].get("red_since", now)) >= settle}
+            if held and not due and prev and prev.level != "red":
+                log(self.p, f"budget for {prov} red, no new alert yet (settling or same episode): {'; '.join(held)}")
+            if due:
+                for c in due:
+                    episodes[prov][c]["alerted"] = True
+                capped = any("cap reached" in r for r in held)
                 hint = f"New work on {prov} waits; running work finishes and replies to you continue. " + (
                     "It starts again by itself when the budget day resets. "
-                    if any(r.startswith("global daily cap") for r in g.reasons) else
+                    if any(r.startswith("global daily cap") for r in held) else
                     "It starts again by itself once the gate leaves red. ") + (
                     "The caps are in the web app's Budget tab." if capped
                     else "The web app's Budget tab shows what spent it.")
-                # Every red gate lifts by itself (a window resets, a cap's day or hour passes): a
-                # status line that clears itself, never "needs you" (alerts.STATUS_CONDITIONS).
-                news.append((f"Budget for {prov} is now red: {'; '.join(g.reasons)}. " + hint,
+                # A status line that clears itself, never "needs you" (alerts.STATUS_CONDITIONS).
+                news.append((f"Budget for {prov} is now red: {'; '.join(held)}. " + hint,
                              "low", f"budget:{prov}"))
             gates[prov] = g
         # The global cap counts only for providers billed by usage: a project whose providers are all
@@ -6427,11 +6434,9 @@ class Daemon:
         # count it as cleared.
         with self.p.db.tx():
             self.p.db.set_kv("gates", {k: v.as_dict() for k, v in gates.items()})
-            if red_sent:   # the window's marker commits with its alert, or neither does
-                self.p.db.set_kv("budget_red_sent",
-                                 {**(self.p.db.kv("budget_red_sent", {}) or {}), **red_sent})
             known = self.p.db.kv("budget_red_episodes", {}) or {}
-            if any((known.get(k) or {}) != v for k, v in episodes.items()):   # so is an episode's start
+            # An episode's start and its alerted mark commit with its alert, or neither does.
+            if any((known.get(k) or {}) != v for k, v in episodes.items()):
                 self.p.db.set_kv("budget_red_episodes", {**known, **episodes})
             for text, sev, ref in news:
                 self.p.db.post("out", text, chat=None, kind="alert", severity=sev, ref=ref)
@@ -6464,48 +6469,35 @@ class Daemon:
                         f"released {len(done['released'])}, {len(done['tasks'])} tied task(s) for the coordinator"
                         + ("" if done.get("event") else "; same budget kind, nothing to re-plan: no event"))
 
-    def _red_episodes(self, prov: str, g: bud.Gate, now: float) -> tuple[bool, dict]:
-        """Whether the gate starts a new red episode of one of its reason classes (bud.red_class: the
-        runaway guard, a dollar cap, ...), and the provider's new budget_red_episodes entry for the
-        caller to save in the alert's transaction. An episode ends only once its measured value falls
-        below RED_CLEAR_RATIO of its limit (unmeasured: once the class leaves red), and the same
-        class red again within RED_REPEAT_S of that end continues it: a value hovering at its limit
-        is one alert, not one per crossing. Gating is unchanged: new work still waits at the limit."""
+    def _red_episodes(self, prov: str, g: bud.Gate, now: float) -> dict:
+        """The provider's new budget_red_episodes entry for the caller to save in the alert's
+        transaction: per red class (bud.red_class: the runaway guard, a dollar cap, ...) whether its
+        episode is open, since when the class has been red without a break (red_since: the alert's
+        settle) and whether it was alerted. An episode ends only once its measured value falls below
+        RED_CLEAR_RATIO of its limit (unmeasured: once the class leaves red), and the same class red
+        again within RED_REPEAT_S of that end continues it: a value hovering at its limit is one
+        alert, not one per crossing. Gating is unchanged: new work still waits at the limit. An
+        episode saved before the alerted mark existed counts as alerted."""
         old = (self.p.db.kv("budget_red_episodes", {}) or {}).get(prov) or {}
         red = {c for c in map(bud.red_class, g.reasons) if c} if g.level == "red" else set()
-        new, out = False, {}
+        out = {}
         for cls in sorted(red | set(old)):
             ep = dict(old.get(cls) or {})
             if cls in red:
                 if not ep or (not ep.get("open") and now - float(ep.get("cleared") or 0) >= RED_REPEAT_S):
-                    new, ep = True, {"since": now}
+                    ep = {"since": now, "alerted": False}
                 ep["open"] = True
-            elif ep.get("open"):
-                share = bud.red_share(g, cls)
-                if share is None or share < RED_CLEAR_RATIO:
-                    ep.update(open=False, cleared=now)
-            elif now - float(ep.get("cleared") or 0) >= RED_REPEAT_S:
-                continue   # long over: a next red is news again
+                ep.setdefault("red_since", now)
+            else:
+                ep.pop("red_since", None)   # a break: the next red settles afresh
+                if ep.get("open"):
+                    share = bud.red_share(g, cls)
+                    if share is None or share < RED_CLEAR_RATIO:
+                        ep.update(open=False, cleared=now)
+                elif now - float(ep.get("cleared") or 0) >= RED_REPEAT_S:
+                    continue   # long over: a next red is news again
             out[cls] = ep
-        return new, out
-
-    def _first_red_in_window(self, prov: str, g: bud.Gate) -> tuple[bool | None, dict | None]:
-        """Whether a red gate at a plan line is the first in that plan window, and the provider's
-        new budget_red_sent entry (or None) for the caller to save in the alert's transaction. The
-        line holds until the window resets, so one alert per window is enough. (None, None) when
-        no window is at its line: red for another reason (_red_episodes)."""
-        n = g.numbers or {}
-        line = float(n.get("limit") or 100)
-        at_line = [r for r in n.get("plan") or [] if r.get("resets_at") and r["utilization"] >= line]
-        if not at_line:
-            return None, None
-        sent = self.p.db.kv("budget_red_sent", {}) or {}
-        mine = {w: t for w, t in (sent.get(prov) or {}).items() if float(t) > time.time()}
-        # A window's reset time may move by seconds between readings; the next window's is hours on.
-        if all(abs(float(mine.get(r["window"], 0)) - float(r["resets_at"])) < 600 for r in at_line):
-            return False, None
-        mine.update({r["window"]: r["resets_at"] for r in at_line})
-        return True, mine
+        return out
 
     # schedules and watchers ------------------------------------------------------------------------
     def run_schedules(self) -> None:

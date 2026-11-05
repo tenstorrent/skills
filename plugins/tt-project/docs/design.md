@@ -67,8 +67,10 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    latest reading plus what running work and the new run may still add stays under the line, from
    burn measured in its own readings, never from an assumed rate. At the line nothing new starts
    until the window resets. Gate changes below red are pacing: they alert no one and wake no
-   coordinator; reaching the line alerts once per window, and the alert clears as the gate leaves
-   red. A provider that
+   coordinator. Reaching the line, the runaway guard and a provider moving to the dollar caps are
+   status lines too: a budget alert goes only to what only the user clears (a dollar cap, funds),
+   once it still holds new work two minutes on, and it is withdrawn once that no longer holds. A
+   provider that
    reported plan windows in the last week stays on the plan regime; old readings never fall back to
    dollar caps. Usage-billed accounts have dollar caps. Cancelled runs are decisions, not waste.
 7. A limit or logout pauses a provider with one clear alert; it is never counted as task failure.

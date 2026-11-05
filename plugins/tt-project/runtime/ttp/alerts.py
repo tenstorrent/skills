@@ -57,7 +57,7 @@ LOGOUT_REMIND_S = (3600.0, 4 * 3600.0, 12 * 3600.0)   # a logout is reminded thi
 WAITER_TTL = 1800.0     # a project's report into a logout claim counts this long (it renews every few minutes)
 # What the chat hears once an episode clears.
 CLEARED_TEXT = {
-    "budget": "Budget for {arg} is out of red; new work starts again.",
+    "budget": "Budget for {arg}: no dollar cap or spend limit holds new work any more.",
     "lock-wait": "Nobody has waited long on lock {arg} any more.",
     "lock-cycle": "The lock-order cycle {arg} broke: a party let go, the others go on.",
     "auth": "{arg} is logged in again; its queued work starts.",
@@ -194,11 +194,14 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
             return False
         return float((db.kv(f"limited:{arg}") or {}).get("until") or 0) > now
     if kind == "budget":
-        if (db.kv("gates", {}).get(arg) or {}).get("level") == "red":
+        # Only what only the user can clear holds it (budget.user_held): a gate still red for a reason
+        # that lifts by itself (the runaway guard, a plan window's line) withdraws the alert.
+        from .budget import USER_CLEARS, user_held
+        if user_held(db.kv("gates", {}).get(arg) or {}):
             return True
         # A dip inside an open red episode (Daemon._red_episodes) is not out of red: one flap, one alert.
-        return any(isinstance(e, dict) and e.get("open")
-                   for e in ((db.kv("budget_red_episodes", {}) or {}).get(arg) or {}).values())
+        return any(isinstance(e, dict) and e.get("open") and cls in USER_CLEARS
+                   for cls, e in ((db.kv("budget_red_episodes", {}) or {}).get(arg) or {}).items())
     if kind == "account-mismatch":   # the gate keeps the flag while the login has no plan readings of its own
         return bool(((db.kv("gates", {}).get(arg) or {}).get("numbers") or {}).get("account_mismatch"))
     if kind == "relayed":   # conditions told to the chat while the coordinator could not run: while one is open

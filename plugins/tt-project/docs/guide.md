@@ -103,8 +103,9 @@ prolonged whole-box outage.
   (50) % used. Projects on one machine sharing an account never use two for one window.
   `ttp config <name> budget.reset_credits_auto false` turns it off.
 - In that last stretch deep tasks run at the standard tier. `ttp status` and the web app say when
-  the line holds new starts back. You get an alert only when the project reaches the line, once
-  per window; it clears by itself when the window resets.
+  the line holds new starts back; it clears by itself when the window resets. Budget alerts come
+  only for what only you can clear (a dollar cap you set, funds), once it still holds new work two
+  minutes on; they are withdrawn once it no longer does.
 - Usage-billed accounts: $100 per 24 hours and $200 per 7 days per project by default
   (`budget.daily_usd`, `budget.weekly_usd`). With `budget.day_start` set, the daily cap counts
   the budget day instead of the last 24 hours. A new run
