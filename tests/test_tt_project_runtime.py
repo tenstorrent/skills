@@ -27154,8 +27154,6 @@ DURABLE_EXEMPT = {
     ("cli.py", "tmp.write_text(str(os.getpid()))"): "names a process, which a reboot ends",
     ("cli.py", "os.replace(tmp, lock)"): "names a process, which a reboot ends",
     ("cli.py", 'open(log, "w")'): "the output of `ttp clip`, for reading; the command's exit code is passed on",
-    ("cli.py", "SOURCE_FILE).write_text"): "part of a copied runtime tree; committed or re-installed by setup",
-    ("cli.py", '".gitignore").write_text'): "committed to the harness right after",
     ("cli.py", "spec.write_text"): "the upgrade commit's scratch pathspec list, deleted right after; a lost one only redoes the commit",
     ("cli.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
