@@ -116,13 +116,17 @@
 ## Health
 
 - Daemon not running → its service restarts it. Hung (alive, but its heartbeat untouched for
-  `watchdog.hang_s`, 900 s by default, never below 600) → `ttp.watchdog`, run every 5 min (a systemd
+  `watchdog.hang_s`, 900 s by default, never below 600; 600 s once the daemon itself reported a stall in
+  a named tick step, `state/tick-stall.json`) → `ttp.watchdog`, run every 5 min (a systemd
   user timer, a launchd agent or the crontab entry), sends it SIGUSR1, saves its thread stacks under
   `state/incidents/` (the daemon writes every stack dump to `state/daemon-stacks.log`: on SIGUSR1,
   on SIGUSR2 for a dump by hand, and when a tick overruns or stalls; past 1 MiB it moves to `.1` at
   daemon start), restarts it through its service (`systemctl --user restart` with a 60 s timeout,
-  then stop, kill and start) and sends one `daemon-hang` alert naming the dump and the restart's
-  outcome; it clears once a daemon ticks again. Each restart within `watchdog.window_s` (6 h) doubles
+  then stop, kill and start) and sends one `daemon-hang` alert naming the step, the dump and the
+  restart's outcome (low when it worked, high when not); it clears once a daemon ticks again. A run
+  whose reap the hang cut off is reaped once more with its optional checks skipped (a low
+  `reap-lean:` line), and quarantined (failed, its output kept, a low `reap-quarantine:` line) if that
+  is cut off or fails too. Each restart within `watchdog.window_s` (6 h) doubles
   the next wait; the `watchdog.restarts`-th (3) sends one high alert. systemd's `WatchdogSec` is only
   the backstop. Only a service installed before the watchdog needs `ttp restart <name>` (which adds
   it); still down → `ttp logs <name>`.

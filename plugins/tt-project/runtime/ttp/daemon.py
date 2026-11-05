@@ -300,6 +300,9 @@ SCHEDULE_GRACE_S = 30   # past its own bounds (command timeout, builtin deadline
 # Under state/: every thread's stack, on SIGUSR1 or SIGUSR2 (register_stack_dump) and on a tick overrun
 # or stall (check_overrun). ttp.watchdog copies each new dump to state/incidents/.
 STACKS_FILE = "daemon-stacks.log"
+# Under state/: {pid, step, at, moved} written by check_overrun when a tick step stalls. ttp.watchdog
+# restarts a daemon still stalled there WATCHDOG_S after its last progress (watchdog.stalled_step).
+STALL_FILE = "tick-stall.json"
 STACKS_MAX_BYTES = 1 << 20          # a longer one is moved to <name>.1 when the daemon starts
 RESULT_FILE = "result.json"
 NOTIFY_FILE = "notify.jsonl"      # `ttp notify` lines a run left for the user (relay_worker_notifies)
@@ -534,6 +537,10 @@ ROOT_RECHECK_S = 300   # an open root-checkout alert's condition is looked at ag
 PAGED_KEY = "watch_paged:"   # kv per command schedule: {"<project>\t<line key>": {at, first, n}} (pageto)
 PROGRESS_KEY = "progress_raised"   # kv: driver key -> its stalled streak's first report (watch_progress)
 STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised} (Daemon.check_stall)
+# kv: run id -> {pid, started, lean} of a reap in progress (Daemon._reap_mark). One an earlier daemon
+# left was cut off (a hang the watchdog restarted, a kill): reaped once more lean, then quarantined.
+REAP_KEY = "reaping"
+dbmod.DICT_KV.add(REAP_KEY)
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
 STALL_LIST_MAX = 30    # ready tasks listed in one stall observation
@@ -964,6 +971,7 @@ class Daemon:
         self._thread_scan = 0.0
         self._slack_rejects: dict[int, int] = {}   # outbound message id -> times Slack refused it
         self._reap_errors: dict[int, int] = {}
+        self._lean_reap = False   # this reap retries one an earlier daemon was cut off in: optional checks skipped
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
         self._window_provs: dict[int, tuple] = {}            # run id -> (provider, env) reading its windows
         self._windows_read: dict[tuple[str, str], float] = {}   # (provider, account) -> newest reading recorded
@@ -1485,6 +1493,10 @@ class Daemon:
             faulthandler.dump_traceback(file=fh, all_threads=True)
         self._overrun = {"began": began, "moved": moved, "step": step, "stacks": str(path),
                          "stalled": stalled or bool(same and o.get("stalled"))}
+        if stalled:   # for ttp.watchdog: a stall in a named step restarts sooner than a silent hang
+            wall = time.time()
+            durable_write(self.p.state / STALL_FILE, json.dumps({"pid": os.getpid(), "step": step or "",
+                                                                 "at": wall, "moved": wall - (now - moved)}))
         log(self.p, f"{what}, in step {step or '(none yet)'}; "
                     f"every thread's stack is in {path}")
         return self._overrun
@@ -3168,6 +3180,8 @@ class Daemon:
         running = self.p.db.q("SELECT * FROM runs WHERE status='running'")
         for gone in set(self._stale_since) - {r["id"] for r in running}:
             self._stale_since.pop(gone, None)
+        if (marks := self.p.db.kv(REAP_KEY)) and set(marks) - {str(r["id"]) for r in running}:
+            self.p.db.set_kv(REAP_KEY, {k: v for k, v in marks.items() if k in {str(r["id"]) for r in running}})
         for r in running:
             try:
                 # Liveness first: a runner writes exit.json before it exits, so a run found dead here
@@ -3176,10 +3190,10 @@ class Daemon:
                 alive = self._run_alive(r)
                 exit_file = self._run_dir(r) / "exit.json"
                 if exit_file.exists():
-                    self.finish_run(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
+                    self._reap(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
                 elif not alive:
                     self._end_orphan(r)
-                    self.finish_run(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r)})
+                    self._reap(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r)})
                 elif why := self._hung(r, up):
                     self._end_hung(r, why)
                 self._reap_errors.pop(r["id"], None)
@@ -3187,10 +3201,71 @@ class Daemon:
                 # One run whose end cannot be processed must not hold up the others or wedge the loop.
                 n = self._reap_errors[r["id"]] = self._reap_errors.get(r["id"], 0) + 1
                 log(self.p, f"run {r['id']} reap error {n}: " + traceback.format_exc().replace("\n", " | ")[:2000])
-                if n >= 3:
+                lean = self._reap_unmark(r["id"])
+                if lean:   # its retry after a cut-off reap failed too: quarantined, never looped
+                    self._quarantine_run(r, "its lean retry failed")
+                elif n >= 3:
                     self._abandon_run(r)
         self._tell_reboot()
         self._tell_down()
+
+    def _reap(self, r: dict, exit_info: dict) -> None:
+        """finish_run under a reap marker (_reap_mark): a reap an earlier daemon was cut off in (a hang the
+        watchdog restarted, a kill) runs once more lean, skipping the optional checks that may have held
+        it (coordinator.apply's restriction checks, the root checkout report); a second cut-off one is
+        quarantined. The finish transaction commits whole or not at all, so nothing is applied twice."""
+        mode = self._reap_mark(r)
+        if mode == "quarantine":
+            self._quarantine_run(r, "its lean retry was cut off too")
+            self._reap_unmark(r["id"])
+            return
+        self._lean_reap = mode == "lean"
+        try:
+            self.finish_run(r, exit_info)
+        finally:
+            self._lean_reap = False
+        self._reap_unmark(r["id"])
+
+    def _reap_mark(self, r: dict) -> str:
+        """Record, committed before the finish transaction, that this daemon starts reaping run r.
+        Returns "full", "lean" (an earlier daemon's reap of it never finished) or "quarantine" (an
+        earlier lean one never finished either)."""
+        db, me = self.p.db, {"pid": os.getpid(), "started": self._started}
+        marks = db.kv(REAP_KEY) or {}
+        was = marks.get(str(r["id"])) or {}
+        mine = was and int(was.get("pid") or 0) == me["pid"] and was.get("started") == me["started"]
+        if was and not mine and was.get("lean"):
+            return "quarantine"
+        lean = bool(was.get("lean")) if mine else bool(was)
+        db.set_kv(REAP_KEY, {**marks, str(r["id"]): {**me, "lean": lean, "at": time.time()}})
+        if lean and not mine:
+            what = f"task #{r['task']}" if r["task"] else r["role"]
+            log(self.p, f"run {r['id']} ({what}): an earlier daemon's reap of it never finished (pid "
+                        f"{was.get('pid')}); reaping it once more with its optional checks skipped")
+            db.post("out", f"Run {r['id']} ({what}) is processed again after the daemon was restarted while "
+                           f"processing it; its optional checks (restriction audit, root checkout report) are "
+                           f"skipped this once.", kind="info", severity="low", ref=f"reap-lean:{r['id']}")
+        return "lean" if lean else "full"
+
+    def _reap_unmark(self, run_id: int) -> bool:
+        """Drop run_id's reap marker; whether it was a lean retry."""
+        marks = self.p.db.kv(REAP_KEY) or {}
+        was = marks.pop(str(run_id), None)
+        if was is not None:
+            self.p.db.set_kv(REAP_KEY, marks)
+        return bool((was or {}).get("lean"))
+
+    def _quarantine_run(self, r: dict, how: str) -> None:
+        """A run whose reap was cut off and whose lean retry failed too: closed by _abandon_run instead of
+        looping. Its run dir keeps its output and hand-off; a coordinator turn's messages stay queued."""
+        why = (f"run {r['id']} quarantined: its reap was cut off and {how}; its output stays in "
+               f"{r['dir'] or 'its run dir'}")
+        log(self.p, why)
+        self._abandon_run(r, why)
+        what = f"task #{r['task']}" if r["task"] else r["role"]
+        self.p.db.post("out", f"Run {r['id']} ({what}) was quarantined: the daemon was cut off twice while "
+                              f"processing it ({how}). Its output stays on disk.", kind="info", severity="low",
+                       ref=f"reap-quarantine:{r['id']}")
 
     def _note_down(self) -> None:
         """At start, before the first tick rewrites the heartbeat: keep a down notice when the last
@@ -3456,11 +3531,11 @@ class Daemon:
             log(self.p, f"run {r['id']} lost its supervisor and its agent; ending the agent's tools (group {pid})")
             _end_group(pid, ORPHAN_GRACE_S)
 
-    def _abandon_run(self, r: dict) -> None:
+    def _abandon_run(self, r: dict, why: str = "") -> None:
         """Last resort for a run whose end keeps failing to process: close it so it cannot block the
         loop. Its task fails with the reason and the coordinator decides; a coordinator turn backs off."""
         db, now = self.p.db, time.time()
-        why = f"run {r['id']} ended but its result could not be processed (details in the daemon log)"
+        why = why or f"run {r['id']} ended but its result could not be processed (details in the daemon log)"
         try:
             source = self._source_for(r)
         except Exception:
@@ -4143,7 +4218,7 @@ class Daemon:
                     # Before the hand-off, so its note on the root's dirty paths (_note_dirty_main) skips
                     # what this alert already reported.
                     try:
-                        if root_now:
+                        if root_now and not self._lean_reap:
                             self.check_root_checkout(r, root_before, root_now)
                     except Exception:   # a report only: the run's end stands
                         log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
@@ -4227,7 +4302,7 @@ class Daemon:
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=coord.user_turn(db, note.get("messages") or []),
-                               turn=r.get("id"), messages=note.get("messages") or [])
+                               turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap)
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         problems = list(problems)

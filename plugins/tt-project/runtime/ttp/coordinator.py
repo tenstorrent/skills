@@ -2115,7 +2115,7 @@ def _clock(ts: float, where=None) -> str:
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
-          turn: int | None = None, messages: list[int] | None = None) -> list[str]:
+          turn: int | None = None, messages: list[int] | None = None, lean: bool = False) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
@@ -2124,7 +2124,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
 
     A turn cut off before its database transaction commits is applied again from its output. Its
     file writes carry `turn`.<action index> so the replay does not repeat them, while the same
-    text sent again by a later turn is still written."""
+    text sent again by a later turn is still written. `lean`: the daemon applies this turn again after
+    it was cut off applying it (Daemon._reap): the optional restriction checks, which may have held it,
+    are skipped and a note says so."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
@@ -3386,9 +3388,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             db.update_task(before["id"], **{f: before[f] for f in upd if f != "updated"})
             problems.append(f"task_update: #{before['id']} rejected: it waits_on ask:new, but no ask_user of this "
                             f"turn went through")
-    if user_turn and rules_added and not restr_edited and restr_before:
+    if lean and ((user_turn and rules_added and not restr_edited and restr_before) or loosened):
+        notes.append("restriction checks skipped: the daemon was cut off applying this turn once and applied "
+                     "it again without them")
+    elif user_turn and rules_added and not restr_edited and restr_before:
         _restriction_conflicts(p, restr_before, rules_added)
-    if loosened:
+    if loosened and not lean:
         try:   # a hint for the next turn: it never undoes the charter edit
             restriction_audit.restriction_tools(p, loosened, list(batch_tasks), notes)
         except Exception as e:

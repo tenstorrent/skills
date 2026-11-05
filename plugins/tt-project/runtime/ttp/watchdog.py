@@ -7,15 +7,21 @@ only the backstop behind it.
 One stale look is not enough: a laptop waking from sleep shows an old heartbeat until the daemon's
 next tick. The daemon counts as hung only when two looks at least CONFIRM_S apart saw the same
 heartbeat and it is older than the hang threshold: config `watchdog.hang_s` (900 s by default, never
-below WATCHDOG_S, well above any single tick step; a long tick's steps refresh the heartbeat).
+below WATCHDOG_S, well above any single tick step; a long tick's steps refresh the heartbeat). A daemon
+whose own tick watch reported a stall in a named step after that heartbeat (STALL_FILE, written TICK_STALL_S
+after its last progress) is hung at WATCHDOG_S already: twice the stale threshold, so with the timer's
+5-minute looks it is restarted 10 to 15 minutes after its last progress. A step that keeps telling the
+watchdogs it moves is never restarted (check_overrun alerts it instead).
 
 A hung daemon is then, with no model: sent SIGUSR1, which makes it write every thread's stack
 (faulthandler, registered at daemon start) to state/daemon-stacks.log; the new part of that file is
 saved as an incident file under state/incidents/. It is restarted through its service (systemd: the
 hung pid is killed, then `systemctl --user restart` with a timeout; past it, stop, kill and start;
 launchd and cron: the pid is ended and the service starts a new one), and one alert per incident
-under the key `daemon-hang` names the project, the dump and whether the restart worked. It clears
-itself once a daemon completes a tick again. Each restart within `watchdog.window_s` doubles the threshold for the next one (up to
+under the key `daemon-hang` names the project, the step it was stuck in, the dump and whether the restart
+worked: low when it did, high when it did not. It clears itself once a daemon completes a tick again.
+The new daemon reaps a run whose reap the hang cut off once more without its optional checks, and
+quarantines it if that is cut off too (Daemon._reap_mark), so a restart never re-enters the same hang. Each restart within `watchdog.window_s` doubles the threshold for the next one (up to
 16 times), and the `watchdog.restarts`-th restart in that window escalates once with a high alert.
 """
 from __future__ import annotations
@@ -28,8 +34,8 @@ import sys
 import time
 from pathlib import Path
 
-from .daemon import (HEARTBEAT_STALE_S, STACKS_FILE, WATCHDOG_S, _alive, _is_daemon, _read_pid, heartbeat, log,
-                     start_marker)
+from .daemon import (HEARTBEAT_STALE_S, STACKS_FILE, STALL_FILE, WATCHDOG_S, _alive, _is_daemon, _read_pid,
+                     heartbeat, log, start_marker)
 from .project import Project, durable_write
 
 CONFIRM_S = 60
@@ -61,10 +67,23 @@ def settings(p: Project) -> dict:
             "window_s": num("window_s", 21600, 0)}
 
 
-def threshold(p: Project, cfg: dict, now: float) -> float:
-    """The staleness that counts as hung now: hang_s, doubled for each restart within the window."""
+def threshold(p: Project, cfg: dict, now: float, stalled: bool = False) -> float:
+    """The staleness that counts as hung now: hang_s (WATCHDOG_S for a daemon stalled in a named step,
+    stalled_step), doubled for each restart within the window."""
     recent = [t for t in p.db.kv(RESTARTS_KEY, []) or [] if now - float(t) < cfg["window_s"]]
-    return cfg["hang_s"] * 2 ** min(len(recent), 4)
+    return (min(cfg["hang_s"], WATCHDOG_S) if stalled else cfg["hang_s"]) * 2 ** min(len(recent), 4)
+
+
+def stalled_step(p: Project, pid: int, since: float) -> str | None:
+    """The tick step daemon pid reported itself stalled in (STALL_FILE) after its last progress the
+    watchdog saw (`since`), else None. "" when it stalled before its first step."""
+    try:
+        rec = json.loads((p.state / STALL_FILE).read_text())
+        if int(rec.get("pid") or 0) == pid and float(rec.get("at") or 0) >= since:
+            return str(rec.get("step") or "")
+    except (OSError, ValueError, TypeError, AttributeError):
+        pass
+    return None
 
 
 def last_tick(p: Project, pid: int) -> float | None:
@@ -100,10 +119,11 @@ def check(p: Project, now: float | None = None, grace_s: float = TERM_GRACE_S,
         mark.write_text(json.dumps({"pid": pid, "since": since, "seen": now}))
         return "stale"
     cfg = settings(p)
-    if now - since <= threshold(p, cfg, now) or now - float(prev.get("seen") or now) < CONFIRM_S:
+    step = stalled_step(p, pid, since)
+    if now - since <= threshold(p, cfg, now, step is not None) or now - float(prev.get("seen") or now) < CONFIRM_S:
         return "stale"
     mark.unlink(missing_ok=True)
-    return _recover(p, pid, since, now, cfg, grace_s, dump_wait_s)
+    return _recover(p, pid, since, now, cfg, grace_s, dump_wait_s, step)
 
 
 def _clear_if_ticking(p: Project, pid: int) -> None:
@@ -116,10 +136,12 @@ def _clear_if_ticking(p: Project, pid: int) -> None:
         p.db.set_kv(HANG_KEY, None)
 
 
-def _recover(p: Project, pid: int, since: float, now: float, cfg: dict, grace_s: float, dump_wait_s: float) -> str:
+def _recover(p: Project, pid: int, since: float, now: float, cfg: dict, grace_s: float, dump_wait_s: float,
+             step: str | None = None) -> str:
     mins = int((now - since) // 60)
-    log(p, f"watchdog: daemon pid={pid} alive but completed no tick for {mins} min; dumping its stacks and "
-           f"restarting it")
+    where = f" (stalled in tick step {step or '(before the steps)'})" if step is not None else ""
+    log(p, f"watchdog: daemon pid={pid} alive but completed no tick for {mins} min{where}; dumping its stacks "
+           f"and restarting it")
     dump = save_dump(p, pid, now, mins, dump_wait_s)
     ok, how = _restart(p, pid, grace_s)
     log(p, f"watchdog: {'restarted' if ok else 'restart failed'}: {how}")
@@ -127,11 +149,11 @@ def _recover(p: Project, pid: int, since: float, now: float, cfg: dict, grace_s:
     restarts = [float(t) for t in db.kv(RESTARTS_KEY, []) or [] if now - float(t) < cfg["window_s"]] + [now]
     db.set_kv(RESTARTS_KEY, restarts)
     db.set_kv(HANG_KEY, {"pid": pid, "at": now, "dump": str(dump), "restarted": ok, "how": how})
-    told = (f"Project {p.name}: its daemon (pid {pid}) was alive but completed no tick for {mins} min. Its "
-            f"stacks are in {dump}. ")
+    told = (f"Project {p.name}: its daemon (pid {pid}) was alive but completed no tick for {mins} min{where}. "
+            f"Its stacks are in {dump}. ")
     told += (f"The watchdog restarted it ({how}); running workers were kept." if ok else
              f"The watchdog could not restart it: {how}.")
-    db.post("out", told, kind="alert", severity="normal" if ok else "high", ref=HANG_REF)
+    db.post("out", told, kind="alert", severity="low" if ok else "high", ref=HANG_REF)
     last = float(db.kv(ESCALATED_KEY, 0) or 0)
     if len(restarts) >= cfg["restarts"] and now - last >= cfg["window_s"]:
         db.set_kv(ESCALATED_KEY, now)

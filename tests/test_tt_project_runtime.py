@@ -12083,7 +12083,7 @@ def test_the_watchdog_ends_a_stuck_daemon_after_two_looks_and_says_so(env, monke
         proc.wait()
     assert not (p.state / "watchdog.json").exists()
     msg = p.db.one("SELECT kind, severity, text FROM messages WHERE ref='daemon-hang'")
-    assert msg["kind"] == "alert" and msg["severity"] == "normal" and "restarted it" in msg["text"], dict(msg)
+    assert msg["kind"] == "alert" and msg["severity"] == "low" and "restarted it" in msg["text"], dict(msg)
     assert "cron service starts a new daemon" in msg["text"]
     # An old daemon that registered no stack dump is not sent SIGUSR1 (its default action ends it).
     assert "did not register a stack dump" in pathlib.Path(p.db.kv("daemon_hang")["dump"]).read_text()
@@ -12120,7 +12120,7 @@ def test_a_restart_that_times_out_is_escalated_and_reported(env, monkeypatch, st
     msg = p.db.one("SELECT severity, text FROM messages WHERE ref='daemon-hang'")
     assert "timed out" in msg["text"]
     if start_ok:
-        assert found == "restarted" and msg["severity"] == "normal"
+        assert found == "restarted" and msg["severity"] == "low"
     else:
         assert found == "restart failed" and msg["severity"] == "high" and "could not restart" in msg["text"]
 
@@ -12151,7 +12151,7 @@ def test_a_hung_systemd_daemon_is_killed_before_its_restart_so_the_restart_is_pl
     unit = f"{service.unit_name(p)}.service"
     assert p.db.kv("daemon_hang")["how"] == f"killed hung pid {proc.pid}, systemctl --user restart {unit}"
     msg = p.db.one("SELECT severity, text FROM messages WHERE ref='daemon-hang'")
-    assert msg["severity"] == "normal" and "escalated" not in msg["text"]
+    assert msg["severity"] == "low" and "escalated" not in msg["text"]
 
 
 def test_a_daemon_that_hangs_again_soon_backs_off_and_escalates_once(env, monkeypatch):

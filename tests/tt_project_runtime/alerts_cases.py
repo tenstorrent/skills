@@ -579,7 +579,7 @@ def test_a_daemon_hung_inside_a_tick_is_dumped_restarted_alerted_once_and_cleare
     text = dump.read_text()
     assert "most recent call first" in text and "in tick" in text and "hung_daemon.py" in text, text
     alerts_sent = p.db.q("SELECT severity, text FROM messages WHERE ref='daemon-hang' AND kind='alert'")
-    assert len(alerts_sent) == 1 and alerts_sent[0]["severity"] == "normal"
+    assert len(alerts_sent) == 1 and alerts_sent[0]["severity"] == "low"
     assert "demo" in alerts_sent[0]["text"] and str(dump) in alerts_sent[0]["text"]
     assert "restarted it" in alerts_sent[0]["text"]
     assert alerts.holds(p.db, "daemon-hang", now, now)
