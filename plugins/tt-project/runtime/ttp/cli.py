@@ -1898,6 +1898,11 @@ def cmd_stats(a) -> None:
         s["winner"] = effortab.winner(p.config())
         print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
         return
+    if a.coord_session:
+        from . import coordstats
+        s = coordstats.report(p.db, p.runs, timefmt.home(p), a.days)
+        print(json.dumps(s, indent=1) if a.json else coordstats.text(s, p.name))
+        return
     if a.tools:
         s = bud.tool_output_stats(p.db, p.runs, a.days)
         print(json.dumps(s, indent=1) if a.json else bud.tool_output_text(s))
@@ -11414,6 +11419,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--effort-ab", action="store_true",
                    help="the effort A/B instead (effort_ab.enabled): per arm, $ per landed change, output tokens and "
                         "calls per run, review and checks fail rates, fix-review hops, tier-up retries, end rule")
+    s.add_argument("--coord-session", action="store_true",
+                   help="the persistent coordinator session instead, per day: wakes, $/wake, context growth and tool "
+                        "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")
     s.add_argument("--runs", action="store_true",
                    help="worker runs instead: provider, model, tier, outcome (with any route fallback), wall time, cost")
     s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")

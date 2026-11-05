@@ -403,7 +403,11 @@ prolonged whole-box outage.
   stateless turn, so each message and event is handled once; `max_failures_per_h` (3) failed resumes
   within an hour run every turn stateless for `pause_h` (6) hours and raise an issue. While the
   session spend guard has tripped, turns are stateless. `ttp status --verbose` shows the session's
-  short id, wakes, context size and last decision.
+  short id, wakes, context size and last decision. `ttp stats <name> --coord-session` reports each
+  day's wakes, $/wake, context growth and tool calls per wake, rollovers and cache-read share beside
+  the stateless baseline (the 7 days before the first session wake: turns/day, $/turn), and flags
+  the break-even (at most 2 tool calls and 20k context growth per wake) and a day costing more
+  than the baseline's $/day.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
   refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown
   of `coordinator.rejection_cooldown_s` (default 900; 0 turns it off). Inside it, an event with the

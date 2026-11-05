@@ -298,3 +298,93 @@ def test_coordsession_the_failure_cap_trips_across_the_new_sessions_between_fail
     assert st["paused_until"] > time.time() + 5 * 3600, st
     assert seen.count("coord-session-paused") == 1, seen
     assert wake()["mode"] == "stateless"
+
+
+def _cstat_run(p, started, cost, session=None, sid="", fc=None, tools=None, read=0, inp=0, write=0):
+    """A finished coordinator run for `ttp stats --coord-session`: its session note, first-call context
+    and a transcript holding `tools` tool_use blocks (None: no transcript)."""
+    note = {**({"turn": {"session": {"mode": session, "why": "x"}}} if session else {}),
+            **({"cache_telemetry": {"calls": 3, "first_context": fc}} if fc is not None else {})}
+    rid = p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,cost_usd,input_tokens,cache_read_tokens,"
+                 "cache_write_tokens,note,session_id,boot_id) VALUES(NULL,'coordinator','claude',?,?,'ok',?,?,?,?,?,?,'x')",
+                 (started, started + 30, cost, inp, read, write, json.dumps(note), sid))
+    d = p.runs / str(rid)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), rid))
+    if tools is not None:
+        d.mkdir(parents=True, exist_ok=True)
+        with open(d / "output.jsonl", "w") as f:
+            for i in range(tools):   # a stream repeats a message per block: each tool_use counts once
+                ev = json.dumps({"type": "assistant", "message": {"id": f"m{i}", "content": [
+                    {"type": "tool_use", "id": f"t{i}", "name": "Bash", "input": {}}]}})
+                f.write(ev + "\n" + ev + "\n")
+            f.write('{"type": "assistant", "message": {"content": [{"type": "text", "text": "done"}]}}\nnot json\n[]\n')
+    return rid
+
+
+def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_baseline(env):
+    from ttp import coordstats
+    p = make(env)
+    day = 86400
+    t0 = 1793750400.0   # 2026-11-04 00:00 UTC
+    first = t0 + 3600
+    for i in range(14):   # the baseline: 14 stateless turns at $0.50 in the 7 days before the first session wake
+        _cstat_run(p, first - 7 * day + i * day / 2, 0.5)
+    _cstat_run(p, first - 8 * day, 9.0)   # before the baseline's window
+    # 2026-11-04: a new session, two resumes, a stateless rerun and a coordinator run outside the session.
+    _cstat_run(p, first, 0.3, "new", "s1", 50000, tools=2, read=40000, inp=1000, write=9000)
+    _cstat_run(p, first + 600, 0.1, "resume", "s1", 60000, tools=1, read=58000, inp=2000)
+    _cstat_run(p, first + 1200, 0.1, "resume", "s1", 75000, tools=0, read=70000, inp=5000)
+    _cstat_run(p, first + 1800, 0.2, "stateless", inp=10000)
+    _cstat_run(p, first + 2400, 0.4)
+    # 2026-11-05 (today): a resume that grew 35k context with 4 tool calls, then a rollover.
+    _cstat_run(p, t0 + day + 600, 0.2, "resume", "s1", 110000, tools=4, read=100000)
+    _cstat_run(p, t0 + day + 1200, 0.3, "new", "s2", 50000, read=40000, inp=500)
+    now = t0 + day + 3600
+    s = coordstats.report(p.db, p.runs, "UTC", 7, now=now)
+    assert s["first_session_wake"] == first
+    assert s["baseline"] == {"since": first - 7 * day, "until": first, "turns": 14, "days": 7.0,
+                             "turns_per_day": 2.0, "usd_per_turn": 0.5, "usd_per_day": 1.0}
+    d1, d2 = s["by_day"]
+    assert d1 == {"day": "2026-11-04", "partial": False, "wakes": 4, "resumed": 2, "rollovers": 1, "stateless": 1,
+                  "usd": 0.7, "usd_per_wake": 0.175, "growth_per_wake": 12500.0, "growth_wakes": 2,
+                  "tool_calls_per_wake": 1.0, "tool_call_wakes": 3, "cache_read_ratio": round(168000 / 195000, 3),
+                  "coordinator_usd": 1.1, "over_baseline": True, "break_even": True}
+    assert d2["day"] == "2026-11-05" and d2["partial"] and (d2["wakes"], d2["resumed"], d2["rollovers"]) == (2, 1, 1)
+    assert d2["growth_per_wake"] == 35000.0 and d2["tool_calls_per_wake"] == 4.0 and d2["tool_call_wakes"] == 1
+    assert d2["break_even"] is False and d2["over_baseline"] is False and d2["coordinator_usd"] == 0.5
+    assert d2["cache_read_ratio"] == round(140000 / 140500, 3)
+    # The previous wake of a session counts from before the window: day 2 alone still grows by 35k.
+    [only] = coordstats.report(p.db, p.runs, "UTC", 0.5, now=now)["by_day"]
+    assert only["day"] == "2026-11-05" and only["growth_per_wake"] == 35000.0
+    out = coordstats.text(s, "demo")
+    assert "2.0 turns/day, $0.500/turn, $1.00/day" in out
+    assert "2026-11-04: 4 wakes (2 resumed, 1 new, 1 stateless), $0.175/wake, context growth +12.5k/wake" in out
+    assert "1.0 tool calls/wake, cache reads 86%; break-even" in out and ": met; coordinator $1.10" in out
+    assert "OVER baseline" in out and "2026-11-05 (so far):" in out and ": missed; coordinator $0.50" in out
+    # The day bounds follow the home zone: 01:00 UTC on 11-04 is still 11-03 in Los Angeles.
+    assert coordstats.report(p.db, p.runs, "America/Los_Angeles", 7, now=now)["by_day"][0]["day"] == "2026-11-03"
+
+
+def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsys):
+    from ttp import cli, coordstats
+    p = make(env)
+    now = time.time()
+    s = coordstats.report(p.db, p.runs, "UTC", 7, now=now)
+    assert s["by_day"] == [] and s["first_session_wake"] is None and s["baseline"]["turns_per_day"] is None
+    assert "no session-mode wakes" in coordstats.text(s) and "n/a turns/day" in coordstats.text(s)
+    # A session wake with no baseline, no transcript and no first-call context: unknown, not a pass.
+    _cstat_run(p, now - 60, 0.1, "new", "s1")
+    [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=now)["by_day"]
+    assert d["break_even"] is None and d["over_baseline"] is None and d["cache_read_ratio"] is None
+    _cstat_run(p, now - 30, 0.1, "resume", "s1", tools=1)
+    [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=now)["by_day"]
+    assert d["growth_per_wake"] is None and d["break_even"] is None, "no first-call context: growth unknown"
+    for bad in ('{"turn": "session", "cache_telemetry": 5}', '{"turn": {"session": "on"}}', '[1]', 'not json'):
+        p.db.x("INSERT INTO runs(role,started,status,cost_usd,note) VALUES('coordinator',?,'ok',0.1,?)", (now - 10, bad))
+    [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=now)["by_day"]
+    assert d["wakes"] == 2 and d["coordinator_usd"] == 0.6, "broken notes are no session wakes but still cost"
+    cli.main(["stats", "demo", "--coord-session"])
+    out = capsys.readouterr().out
+    assert "Coordinator session of demo" in out and "wakes" in out and "break-even" in out and "unknown" in out
+    cli.main(["stats", "demo", "--coord-session", "--json"])
+    assert json.loads(capsys.readouterr().out)["by_day"][0]["wakes"] >= 1
