@@ -2292,3 +2292,101 @@ def test_the_sweep_ends_a_done_tasks_detached_checks_only_when_nothing_waits_on_
     finally:
         for x in procs:
             _stop_checks_group(x)
+
+
+def _requeued_proc(p, project=None):
+    """A process a detached job re-spawned in a session of its own: (proc, its start ticks)."""
+    from ttp.runner import proc_start
+    e = {**os.environ, "TTP_PROJECT": str(project or p.base)}
+    proc = subprocess.Popen(["sleep", "300"], env=e, start_new_session=True)
+    for _ in range(50):
+        if (tok := proc_start(proc.pid)) is not None:
+            return proc, tok
+        time.sleep(0.05)
+    raise AssertionError("no start ticks")
+
+
+def _reap(*procs):
+    for x in procs:
+        x.kill()
+        x.wait()
+
+
+def test_detach_stop_also_stops_the_groups_a_job_lists_in_its_requeue_pid_file(env, tmp_path):
+    """`<rc>.requeue-pid` (`<pid> <start ticks>` lines): `ttp detach --stop` of the job also kills each listed
+    process's group while its start ticks match; a reused pid (other ticks), another project's process, an
+    exited pid and garbled lines are skipped without a word."""
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    run_dir = p.runs / f"rq-{tid}"
+    run_dir.mkdir(parents=True)
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time() - 60, "ok", str(run_dir)))
+    run = p.db.one("SELECT id FROM runs WHERE dir=?", (str(run_dir),))["id"]
+    r = _ttp_run(p, "detach", "job", "--", "sleep", "300", env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "job.rc").resolve()
+    pgid = int(rc.with_suffix(".started").read_text().split()[0])
+    (mine, tok), (reused, tok2) = _requeued_proc(p), _requeued_proc(p)
+    foreign, tok3 = _requeued_proc(p, project=tmp_path / "other" / "tt-project")
+    try:
+        Path(str(rc) + ".requeue-pid").write_text(
+            f"{mine.pid} {tok}\n{reused.pid} {int(tok2) + 1}\n{foreign.pid} {tok3}\n{_dead_pid()} 5\n"
+            f"garbage\n{mine.pid}\n-3 x\n\n")
+        r = _ttp_run(p, "detach", "--stop", "job", env={**_as(tid, run), "TTP_RUN_DIR": str(run_dir)})
+        assert r.returncode == 0 and "stopped detached job job" in r.stdout, r.stderr
+        assert f"requeued groups stopped: {mine.pid}" in r.stdout, r.stdout
+        assert mine.wait(5) == -signal.SIGKILL
+        assert reused.poll() is None and foreign.poll() is None
+        ev = json.loads(_stopped_events(p)[-1]["data"])
+        assert ev["requeued"] == [mine.pid]
+    finally:
+        _end_group(pgid)
+        _reap(mine, reused, foreign)
+
+
+def test_a_missing_or_garbled_requeue_pid_file_stops_nothing_extra(env, tmp_path):
+    from ttp import jobstop
+    p = make(env)
+    rc = p.runs / "rq" / "job.rc"
+    rc.parent.mkdir(parents=True)
+    assert jobstop.requeued(p, rc) == [] and jobstop.end_requeued(p, rc, "test") == []
+    proc, tok = _requeued_proc(p)
+    try:
+        side = Path(str(rc) + ".requeue-pid")
+        for text in (f"{proc.pid}\n", f"{proc.pid} {tok} extra\n", f"x{proc.pid} {tok}\n", f"{proc.pid} t{tok}\n",
+                     "\0\xff\n", f"{proc.pid} {int(tok) - 1}\n", f"1 {tok}\n"):
+            side.write_text(text)
+            assert jobstop.requeued(p, rc) == [], text
+        side.write_text(f"{proc.pid} {tok}\n")
+        assert jobstop.requeued(p, rc) == [(proc.pid, proc.pid)]
+        side.unlink()
+        side.mkdir()   # unreadable as a file
+        assert jobstop.requeued(p, rc) == []
+        assert proc.poll() is None
+    finally:
+        _reap(proc)
+
+
+def test_stop_pids_also_stops_the_requeued_groups_of_the_listed_processes_job(env, tmp_path):
+    """`ttp detach --stop-pids`: a listed process that runs in a detached job (TTP_DETACH_RC) takes the
+    groups that job's `<rc>.requeue-pid` lists with it, only those whose start ticks match."""
+    p = make(env)
+    tid = p.db.add_task("driver", "s", kind="work", tier="light", origin="user")
+    res = p.root / "results" / f"t{tid}"
+    res.mkdir(parents=True)
+    rc = res / "drive.rc"
+    e = {**os.environ, "TTP_TASK": str(tid), "TTP_TASK_ID": str(tid), "TTP_PROJECT": str(p.base),
+         "TTP_DETACH_RC": str(rc)}
+    driver = subprocess.Popen(["sleep", "300"], env=e, start_new_session=True)
+    (child, tok), (reused, tok2) = _requeued_proc(p), _requeued_proc(p)
+    try:
+        time.sleep(0.2)
+        Path(str(rc) + ".requeue-pid").write_text(f"{child.pid} {tok}\n{reused.pid} {int(tok2) + 7}\n")
+        f = _pidfile(res / "driver.pids", driver.pid)
+        r = _ttp_run(p, "detach", "--stop-pids", str(f), env={"TTP_TASK": str(tid), "TTP_PIDNS": "", "TTP_CGROUP": ""})
+        assert r.returncode == 0 and f"requeued groups stopped: {child.pid}" in r.stdout, r
+        assert driver.wait(5) == -signal.SIGTERM and child.wait(5) == -signal.SIGKILL
+        assert reused.poll() is None
+    finally:
+        _reap(driver, child, reused)

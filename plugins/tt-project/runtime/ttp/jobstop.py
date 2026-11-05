@@ -49,6 +49,12 @@ is open. A stop by the owner records who stopped it, the run that started the jo
 why (`--why`, else a default) in <name>.lost and the stop event. A sandboxed caller, which cannot signal
 the job, queues the request (QUEUE) and the daemon carries it out on its next tick, checking it again.
 A stopped job is never relaunched at boot: its resume record is marked stopped (detach.mark_stopped).
+
+A detached job registers each process it re-spawns outside its own group as `<pid> <start ticks>` lines in
+`<rc>.requeue-pid` (requeued, end_requeued): `ttp detach --stop` (end) and `ttp detach --stop-pids`
+(stop_pids, through the TTP_DETACH_RC of each listed process) also stop those groups, each only while its
+start ticks still match.
+
 `ttp detach --stop <run>/checks.rc` (or `checks` from the run) stops a run's detached `ttp checks`,
 which have no detach record, by the same rule (stop_checks: may_stop, then end_checks); a group holding
 the caller, a running worker, another task's or another project's process is refused (checks_refused).
@@ -297,6 +303,54 @@ def _free(slots: list[Path], pgid: int, pids: set[int], note=None) -> tuple[list
 
 # The stop ---------------------------------------------------------------------------------------
 
+REQUEUE = ".requeue-pid"   # <rc>.requeue-pid: extra process groups a detached job re-spawned (requeued)
+JOB_ENV = "TTP_DETACH_RC"  # progress.JOB_ENV: the .rc path `ttp detach` sets in its job's environment
+
+
+def requeued(p: Project, rc: Path) -> list[tuple[int, int]]:
+    """(pid, its process group) of each live process `<rc>.requeue-pid` lists: one `<pid> <start ticks>`
+    line per process a detached job re-spawned outside its own group, the ticks being field 22 of
+    /proc/<pid>/stat when it started. A line counts only while that pid's start ticks still match (a
+    reused pid never does); a missing file, a malformed line, an exited process, and a group holding
+    this process, one of its parents or a running worker (_guarded), or a process of another project, are
+    skipped without a word."""
+    from .runner import proc_start
+    try:
+        lines = Path(str(rc) + REQUEUE).read_text(errors="replace").splitlines()[:PIDS_MAX]
+    except OSError:
+        return []
+    out, guarded = [], None
+    for line in lines:
+        words = line.split()
+        if len(words) != 2 or not all(w.isdigit() for w in words) or int(words[0]) <= 1:
+            continue
+        pid = int(words[0])
+        if proc_start(pid) != str(int(words[1])) or (st := _stat(pid)) is None or st[0] <= 1:
+            continue
+        guarded = _guarded(p) if guarded is None else guarded
+        if (st[0] == os.getpgrp() or guarded & ({pid} | set(members(st[0])))
+                or procowner.foreign_env(p.base, procowner.environ(pid))):
+            continue
+        if (pid, st[0]) not in out:
+            out.append((pid, st[0]))
+    return out
+
+
+def end_requeued(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "jobstop.end") -> list[int]:
+    """Stop the process groups `<rc>.requeue-pid` names (requeued): SIGSTOP to each, then SIGKILL, each
+    logged (detach.signalled). The groups signalled."""
+    targets = requeued(p, rc)
+    for sig in (signal.SIGSTOP, signal.SIGKILL):
+        for pid, pgid in targets:
+            try:
+                os.killpg(pgid, sig)
+            except OSError:
+                continue
+            detach.signalled(rc, sig, pgid, reason, f"{why}; its requeued process {pid}", by=BY,
+                             state=p.state, task=task)
+    return sorted({g for _, g in targets})
+
+
 def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "jobstop.end",
         fields: dict | None = None) -> dict | None:
     """Stop the running job at this .rc (steps 1-5 above). Its summary, also logged as an event, or None
@@ -323,15 +377,19 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
     ids, note = end_broker_jobs(pids)
     if pgid:
         detach.stop(rc, pgid, why, reason=reason, by=BY, task=task, state=p.state)
+    extra = end_requeued(p, rc, why, task, reason)
     freed, held = _free(slots, pgid, set(pids), lambda pid, s: detach.signalled(
         rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
         task=task))
     out = {"task": task, "job": rc.stem, "rc": str(rc), "pgid": pgid, "broker_jobs": ids, "freed": freed,
-           "held": held, "note": note if pgid else "no live process group found for it", **(fields or {})}
+           "held": held, "requeued": extra, "note": note if pgid else "no live process group found for it",
+           **(fields or {})}
     text = (f"stopped detached job {rc.stem}" + (f" (task #{task})" if task else "") + f": {why}; "
             + (f"SIGSTOP then SIGKILL to group {pgid} from {BY} pid {os.getpid()} ({reason})" if pgid else "group ?")
             + f"; broker jobs ended: {', '.join(ids) or 'none'}; locks freed: {', '.join(freed) or 'none'}"
-            + (f"; still held: {', '.join(held)}" if held else "") + (f"; {out['note']}" if out["note"] else ""))
+            + (f"; still held: {', '.join(held)}" if held else "")
+            + (f"; requeued groups stopped: {', '.join(map(str, extra))}" if extra else "")
+            + (f"; {out['note']}" if out["note"] else ""))
     out["text"] = text
     if not p.db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
@@ -1126,6 +1184,11 @@ def stop_pids(p: Project, pidfile: str | Path, task: int, targets: list[tuple[in
     def same(pid, tok):
         return _stat(pid) is not None and proc_start(pid) == tok
 
+    rcs = []   # the detached jobs (TTP_DETACH_RC) the targets ran in: their requeued groups stop with them
+    for pid, tok in targets:
+        rc = (procowner.environ(pid) or {}).get(JOB_ENV) if same(pid, tok) else None
+        if rc and Path(rc).is_absolute() and Path(rc) not in rcs:
+            rcs.append(Path(rc))
     for sig, wait in ((signal.SIGTERM, PIDS_TERM_S), (signal.SIGKILL, FREE_WAIT_S)):
         sent = []
         for pid, tok in targets:
@@ -1141,14 +1204,16 @@ def stop_pids(p: Project, pidfile: str | Path, task: int, targets: list[tuple[in
         if sig == signal.SIGTERM:
             killed = [pid for pid, tok in targets if same(pid, tok)]
     left = [pid for pid, tok in targets if same(pid, tok)]
+    extra = sorted({g for rc in rcs for g in end_requeued(p, rc, why, task, "jobstop.stop_pids")})
     pids = [pid for pid, _ in targets]
     text = (f"stopped the processes of pid file {pidfile} (task #{task}): {why}; "
             f"SIGTERM to {', '.join(map(str, pids)) or 'none'}"
             + (f"; SIGKILL after {PIDS_TERM_S:g}s to {', '.join(map(str, killed))}" if killed else "")
             + (f"; already gone: {', '.join(map(str, gone))}" if gone else "")
-            + (f"; still running: {', '.join(map(str, left))}" if left else ""))
+            + (f"; still running: {', '.join(map(str, left))}" if left else "")
+            + (f"; requeued groups stopped: {', '.join(map(str, extra))}" if extra else ""))
     out = {"task": task, "job": Path(pidfile).name, "pidfile": str(pidfile), "pids": pids, "killed": killed,
-           "gone": gone, "left": left, "text": text}
+           "gone": gone, "left": left, "requeued": extra, "text": text}
     if pids:
         fp = "pids_stopped:" + hashlib.sha256(f"{pidfile}:{targets}".encode()).hexdigest()[:16]
         p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
