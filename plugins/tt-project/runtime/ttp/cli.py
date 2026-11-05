@@ -7156,13 +7156,16 @@ def _detach_stop(what: str, given: str | None = None) -> int:
     (jobstop.end), recording `given` with why it was allowed: 0 once stopped or when it no longer runs, 2 when
     no record names it, 3 when refused (jobstop.may_stop).
     A sandboxed caller, which cannot signal it, queues the stop for the daemon. A bare name is a job of
-    $TTP_RUN_DIR; with no job recorded, a driver a project's own launcher started (_launcher_stop)."""
+    $TTP_RUN_DIR; with no job recorded, a run's detached `ttp checks` (checks.rc beside a checks.pid:
+    _detach_stop_checks), else a driver a project's own launcher started (_launcher_stop)."""
     from . import detach, jobstop
     from .push import _boxed
     rc = Path(what).expanduser().resolve()
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not detach._entry(rc) and "/" not in what and run_dir:
         rc = (Path(run_dir) / (what if what.endswith(".rc") else f"{what}.rc")).resolve()
+    if not detach._entry(rc) and rc.name == CHECKS_RC and (rc.parent / CHECKS_PID).is_file():
+        return _detach_stop_checks(rc, given)
     if not detach._entry(rc):
         return _launcher_stop(what, rc)
     base = rc.parent.parent.parent.parent if rc.parent.parent.name == "runs" else None
@@ -7189,6 +7192,32 @@ def _detach_stop(what: str, given: str | None = None) -> int:
                     fields=jobstop.stop_fields(p, rc, caller, run, text))
     print(r["text"] if r else f"{rc.stem}: not running; nothing to stop")
     return 0
+
+
+def _detach_stop_checks(rc: Path, given: str | None) -> int:
+    """`ttp detach --stop <run>/checks.rc`: stop the run's detached `ttp checks` (jobstop.stop_checks: the
+    may_stop rule, then end_checks). 0 once stopped or when they no longer run, 1 when they still run, 2
+    outside a tt-project run, 3 when refused. A sandboxed caller queues the stop for the daemon."""
+    from . import jobstop
+    from .push import _boxed
+    run_dir = rc.parent
+    base = run_dir.parent.parent.parent if run_dir.parent.name == "runs" else None
+    if base is None or not (base / "state").is_dir():
+        print(f"ttp detach --stop: {rc} is not the checks of a tt-project run", file=sys.stderr)
+        return 2
+    p = Project(base)
+    caller, run = os.environ.get("TTP_TASK") or "", os.environ.get("TTP_RUN_ID") or ""
+    if _boxed():
+        ok, why = jobstop.may_stop(p, rc, caller, run)
+        if not ok:
+            print(f"ttp detach --stop: {why}", file=sys.stderr)
+            return 3
+        jobstop.request(p, rc, caller, run, given)
+        print(f"checks of run {run_dir.name}: queued; the daemon stops them within seconds ({why})")
+        return 0
+    code, text, _ = jobstop.stop_checks(p, run_dir, caller, run, given)
+    print(text if code != 3 else f"ttp detach --stop: {text}", file=sys.stderr if code == 3 else sys.stdout)
+    return code
 
 
 def _launcher_stop(what: str, rc: Path) -> int:
@@ -12117,7 +12146,8 @@ def main(argv: list[str] | None = None) -> None:
                    help="stop a running job (its group, its matching broker jobs, its lock slots), logged; allowed "
                    "when its task has ended, for the job's own task (from any of its runs; it records who stopped "
                    "it, both runs and --why), or for an open priority-1 task whose resources its locks hold; "
-                   "refused (exit 3) otherwise; idempotent; never relaunched at boot afterwards. With no job recorded, a driver a launcher of the "
+                   "refused (exit 3) otherwise; idempotent; never relaunched at boot afterwards. A run's checks.rc (or `checks`) "
+                   "with a checks.pid beside it stops that run's detached `ttp checks` by the same rule. With no job recorded, a driver a launcher of the "
                    "project's own started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id> folder "
                    "gets a STOP file beside it, then SIGTERM and SIGKILL if it does not exit (exit 2: none found)")
     s.add_argument("--why", metavar="TEXT", help="with --stop: the reason recorded in the job's .lost and stop event")

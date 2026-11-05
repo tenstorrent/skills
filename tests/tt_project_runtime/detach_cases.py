@@ -2167,3 +2167,128 @@ def test_detach_check_host_on_the_own_machine_reads_a_relative_prefix_from_home(
     seen = detach._remote_sh("box-self", "jobs/live.pid", "jobs/mark")
     assert seen and seen["marker"] and seen.get("alive") == str(os.getpid()), seen
     assert not (tmp_path / "ssh-called").exists(), "the own host was asked over ssh"
+
+
+def _json_checks_run(p, tid, name, env=None):
+    """A run of task tid whose detached `ttp checks` (a sleeping group leader, TTP_TASK tid) left a JSON
+    checks.pid as `ttp checks --detach` writes it: (run dir, run id, process)."""
+    from ttp.runner import proc_start
+    rid = _add_run(p, tid, name)
+    d = p.runs / name
+    proc = subprocess.Popen(["sleep", "300"], start_new_session=True,
+                            env={**os.environ, "TTP_TASK": str(tid), "TTP_PROJECT": str(p.base), **(env or {})})
+    (d / "checks.pid").write_text(json.dumps({"pid": proc.pid, "started": proc_start(proc.pid), "ts": time.time()}))
+    return d, rid, proc
+
+
+def _stop_checks_group(proc):
+    if proc.poll() is None:
+        os.killpg(proc.pid, signal.SIGKILL)
+    proc.wait(timeout=10)
+
+
+def test_detach_stop_stops_a_runs_detached_checks_named_by_their_json_pid_file(env, tmp_path):
+    """`ttp detach --stop <run>/checks.rc` (no detach record; checks.pid is JSON) applies may_stop and stops
+    the checks through end_checks; it never falls through to the launcher's plain-pid reader."""
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="running")
+    d, rid, proc = _json_checks_run(p, tid, "checks-open")
+    try:
+        r = _ttp_run(p, "detach", "--stop", str(d / "checks.rc"))
+        assert r.returncode == 3 and "refused" in r.stderr and "names no pid" not in r.stderr, r.stderr
+        r = _ttp_run(p, "detach", "--stop", str(d / "checks.rc"), env={"TTP_TASK": str(tid + 1)})
+        assert r.returncode == 3 and proc.poll() is None, r.stderr
+        r = _ttp_run(p, "detach", "--stop", "checks", "--why", "stale", env={**_as(tid, rid), "TTP_RUN_DIR": str(d)})
+        assert r.returncode == 0 and "stopped the detached checks of run checks-open" in r.stdout, (r.stdout, r.stderr)
+        assert proc.wait(timeout=10) == -signal.SIGTERM
+        (ev,) = _stopped_events(p)
+        data = json.loads(ev["data"])
+        assert (data["job"], data["stopped_by"], data["caller_run"], ev["task"]) == ("checks", tid, rid, tid), data
+        assert "stale" in data["why"]
+        r = _ttp_run(p, "detach", "--stop", str(d / "checks.rc"), env=_as(tid, rid))
+        assert r.returncode == 0 and "no longer run" in r.stdout and len(_stopped_events(p)) == 1, r.stdout
+    finally:
+        _stop_checks_group(proc)
+    done = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(done, status="done")
+    d2, _, proc2 = _json_checks_run(p, done, "checks-done")
+    try:
+        r = _ttp_run(p, "detach", "--stop", str(d2 / "checks.rc"))
+        assert r.returncode == 0 and f"task #{done} is done" in r.stdout and proc2.wait(timeout=10), r.stderr
+    finally:
+        _stop_checks_group(proc2)
+
+
+def test_detach_stop_of_checks_refuses_a_group_of_another_project_or_task(env, tmp_path):
+    """may_stop allows a done task's checks, but a group carrying another project's TTP_PROJECT or another
+    task's TTP_TASK is never signalled (exit 3), from the CLI or the daemon's queued request."""
+    from ttp import jobstop
+    p = make(env)
+    tid = p.db.add_task("done", "s", kind="work", tier="light", origin="user")
+    p.db.update_task(tid, status="done")
+    other = tmp_path / "other-project"
+    (other / "state").mkdir(parents=True)
+    for i, extra in enumerate(({"TTP_PROJECT": str(other)}, {"TTP_TASK": str(tid + 7)})):
+        d, _, proc = _json_checks_run(p, tid, f"checks-foreign{i}", env=extra)
+        try:
+            r = _ttp_run(p, "detach", "--stop", str(d / "checks.rc"))
+            assert r.returncode == 3 and "nothing was signalled" in r.stderr and proc.poll() is None, r.stderr
+            jobstop.request(p, d / "checks.rc", "", "")
+            assert jobstop.serve_requests(p) == [] and proc.poll() is None
+            assert jobstop.sweep_done_checks(p, time.time() + 3600) == [] and proc.poll() is None
+        finally:
+            _stop_checks_group(proc)
+
+
+def test_the_sweep_ends_a_done_tasks_detached_checks_only_when_nothing_waits_on_them(env, tmp_path):
+    """sweep_done_checks stops a done task's live detached checks past the grace, and keeps those an open
+    task's `ttp checks --result` wait, the task's own hand-off or a joined checks run still consume, those
+    of a live task, those inside the grace and those whose checks.rc is written."""
+    from ttp import checkjoin, jobstop
+    p = make(env)
+    later = time.time() + 3600
+
+    def task(status, result=None):
+        t = p.db.add_task(status, "s", kind="work", tier="light", origin="user")
+        p.db.update_task(t, status=status, **({"result": json.dumps(result)} if result else {}))
+        return t
+
+    procs = []
+    try:
+        stale = task("done")
+        d_stale, _, pr_stale = _json_checks_run(p, stale, "c-stale")
+        waited = task("done")
+        d_waited, _, pr_waited = _json_checks_run(p, waited, "c-waited")
+        task("waiting", {"status": "waiting", "retry_when": f"ttp checks --result {d_waited}"})
+        later_wait = task("done")
+        d_then, _, pr_then = _json_checks_run(p, later_wait, "c-then")
+        task("waiting", {"status": "waiting", "retry_when": "landed:#1",
+                         "then": [{"retry_when": f"ttp checks --result {d_then}/"}]})
+        own = task("done")
+        d_own, _, pr_own = _json_checks_run(p, own, "c-own")
+        p.db.update_task(own, result=json.dumps({"status": "done", "on_pass_cmd": f"ttp checks --settle {d_own} --head x"}))
+        joined = task("done")
+        d_joined, _, pr_joined = _json_checks_run(p, joined, "c-joined")
+        lead = checkjoin.register(p.state, task=str(joined), head="h", commit_ts=0, key="k", group="g",
+                                  run=d_joined.name, arrived=0, pid=pr_joined.pid)
+        follower = checkjoin.register(p.state, task="99", head="h", commit_ts=0, key="k", group="g2", run="r",
+                                      arrived=0, pid=os.getpid())
+        checkjoin.update(follower, phase=checkjoin.JOINED, follows=checkjoin.read(lead)["id"])
+        live = task("waiting")
+        d_live, _, pr_live = _json_checks_run(p, live, "c-live")
+        ending = task("done")
+        d_ending, _, pr_ending = _json_checks_run(p, ending, "c-ending")
+        (d_ending / "checks.rc").write_text("0\n")
+        procs = [pr_stale, pr_waited, pr_then, pr_own, pr_joined, pr_live, pr_ending]
+        assert jobstop.sweep_done_checks(p) == [] and all(x.poll() is None for x in procs), "stopped inside the grace"
+        (r,) = jobstop.sweep_done_checks(p, later)
+        assert r["task"] == stale and "nothing waits on its checks" in r["text"] and pr_stale.wait(timeout=10)
+        assert all(x.poll() is None for x in procs[1:]), [x.poll() for x in procs]
+        checkjoin.update(follower, outcome={"passed": True})   # the follower has its result: nothing waits now
+        (r,) = jobstop.sweep_done_checks(p, later)
+        assert r["task"] == joined and pr_joined.wait(timeout=10)
+        assert jobstop.sweep_done_checks(p, later) == [] and len(_stopped_events(p)) == 2
+    finally:
+        for x in procs:
+            _stop_checks_group(x)
