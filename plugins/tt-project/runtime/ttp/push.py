@@ -90,10 +90,15 @@ class Check(str):
     turns it off), for a check that is silent longer by design. `"pytest": true` marks a check as one pytest run
     (pytest_runs) the matcher cannot see, such as one behind a wrapper with no `--` before the pytest
     command, so it resumes and records its test times; `false` turns that detection off; left out, it is
-    detected from the command. `"ignore_paths": "<glob or list>"` names
+    detected from the command. `"spill": true` lets a check spill to the account's test-pool hosts
+    (checkspill) even with `"host": "local"`, `false` keeps it here; `"spill_wrap_cmd": "<command>"` is the
+    wrapper it runs behind there (default `checks.spill_wrap_cmd`; spill_wrap_of). `"ignore_paths": "<glob or list>"` names
     paths the check cannot be affected by: it decides only whether a pass carries across a rebase
     (verdictcarry), never what the check covers or whether it runs on a fresh head. `wrap` (with_wrap,
-    never part of the config form) is the argv a local check runs behind: `checks.wrap_cmd` for the commands after `--`."""
+    never part of the config form) is the argv a local check runs behind: `checks.wrap_cmd` for the commands after `--`;
+    `spill_host` and `remote_wrap` (spill_to, never part of the config form) are the spill host it runs on
+    instead and the wrapper it runs behind there; `keep_here` marks a malformed entry that named a host or
+    spill key, which never spills."""
     if_exists = ""
     if_changed: tuple[str, ...] = ()
     ignore_paths: tuple[str, ...] = ()
@@ -106,11 +111,17 @@ class Check(str):
     cwd = ""
     silent_s: float | None = None
     pytest: bool | None = None
+    spill: bool | None = None
+    spill_wrap_cmd = ""
+    spill_host = ""
+    remote_wrap: tuple[str, ...] = ()
+    keep_here = False
 
     def config(self) -> str | dict:
         """The form project.json keeps."""
         if not (self.if_exists or self.if_changed or self.purpose or self.host or self.env or not self.sandbox
-                or self.cwd or self.silent_s is not None or self.ignore_paths or self.pytest is not None):
+                or self.cwd or self.silent_s is not None or self.ignore_paths or self.pytest is not None
+                or self.spill is not None or self.spill_wrap_cmd):
             return str(self)
         out: dict = {"run": str(self)}
         if self.if_exists:
@@ -133,11 +144,15 @@ class Check(str):
             out["ignore_paths"] = list(self.ignore_paths)
         if self.pytest is not None:
             out["pytest"] = self.pytest
+        if self.spill is not None:
+            out["spill"] = self.spill
+        if self.spill_wrap_cmd:
+            out["spill_wrap_cmd"] = self.spill_wrap_cmd
         return out
 
 
 CHECK_KEYS = {"run", "if_exists", "if_changed", "purpose", "host", "env", "sandbox", "cwd", "silent_s", "ignore_paths",
-              "pytest"}
+              "pytest", "spill", "spill_wrap_cmd"}
 PURPOSES = ("candidate", "harness")   # `ttp checks --purpose`; candidate is the default and publication evidence
 
 
@@ -175,6 +190,10 @@ def _check(c: Any) -> Check | None:
         out.silent_s = c.get("silent_s")
         out.ignore_paths = _globs(c.get("ignore_paths"))
         out.pytest = c.get("pytest")
+        out.spill = c.get("spill")
+        out.spill_wrap_cmd = str(c.get("spill_wrap_cmd") or "").strip()
+    elif {"host", "spill", "spill_wrap_cmd"} & set(map(str, c)):
+        out.keep_here = True   # where or behind what it may run elsewhere is unreadable: it never spills
     return out
 
 
@@ -230,6 +249,43 @@ def wrap_problem(wrap: tuple[str, ...], cwd: str | Path, env: dict | None = None
         ok = shutil.which(exe, path=(env if env is not None else os.environ).get("PATH")) is not None
     return "" if ok else (f"{WRAP_KEY}: the wrapper {exe!r} is missing or not executable, so the commands "
                           f"after `--` were not run (never unwrapped); fix the path or unset {WRAP_KEY}")
+
+
+SPILL_WRAP_KEY = "checks.spill_wrap_cmd"
+
+
+def _words(v: Any, key: str) -> tuple[str, ...]:
+    if v is None or v == "":
+        return ()
+    if not isinstance(v, str):
+        raise ValueError(f"{key} must be a command string, not {type(v).__name__}")
+    try:
+        return tuple(shlex.split(v))
+    except ValueError as e:
+        raise ValueError(f"{key} {v!r} does not parse: {e}") from e
+
+
+def spill_wrap_of(c: Any, cfg: dict | None) -> tuple[str, ...]:
+    """The wrapper check `c` runs behind on a spill host, as argv words: its own `spill_wrap_cmd`, else
+    `checks.spill_wrap_cmd`; () for none. A relative path is the project's own, in the copy of the commit
+    there (remotecheck). ValueError when it does not parse: the check then never spills."""
+    if own := getattr(c, "spill_wrap_cmd", ""):
+        return _words(own, f"{str(c)!r}: spill_wrap_cmd")
+    checks = (cfg or {}).get("checks")
+    return _words(checks.get("spill_wrap_cmd") if isinstance(checks, dict) else None, SPILL_WRAP_KEY)
+
+
+def spill_to(checks: list, host: str, cfg: dict | None) -> list:
+    """`checks` run on spill host `host` (checkspill), each behind its remote wrapper (spill_wrap_of), never
+    this machine's checks.wrap_cmd; a check with host "local" that opted in (`spill: true`) goes too."""
+    out = []
+    for c in checks:
+        c2 = Check(str(c))
+        if isinstance(c, Check):
+            c2.__dict__.update(c.__dict__)
+        c2.spill_host, c2.remote_wrap = host, spill_wrap_of(c2, cfg)
+        out.append(c2)
+    return out
 
 
 WRAP_LANE_KEY = "checks.wrap_lane"
@@ -329,8 +385,8 @@ def checks_host_of(v: Any) -> str:
 
 
 def remote_host(c: Any) -> str:
-    """The machine check `c` runs on, or "" for this one."""
-    host = getattr(c, "host", "") or getattr(c, "default_host", "")
+    """The machine check `c` runs on, or "" for this one: its spill host (spill_to) first."""
+    host = getattr(c, "spill_host", "") or getattr(c, "host", "") or getattr(c, "default_host", "")
     return "" if host == remotecheck.LOCAL else host
 
 
@@ -509,7 +565,7 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if host := remote_host(cmd):
-        return remotecheck.argv(str(cmd), host, exports, commit)
+        return remotecheck.argv(str(cmd), host, exports, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()))
     cmd = venv_cmd(cmd, top, env) if top else cmd
     cmd = remotecheck.exports(exports) + testslots.clamp_for(cmd, env)
     bash = shutil.which("bash")
@@ -1280,7 +1336,7 @@ def _form_problem(c: dict) -> str | None:
     extra = sorted(set(map(str, c)) - CHECK_KEYS)
     if extra:
         return (f"{c!r}: unknown key(s) {', '.join(extra)}; a check object takes only run, if_exists, if_changed, "
-                "purpose, host, env, sandbox, cwd, silent_s, ignore_paths and pytest")
+                "purpose, host, env, sandbox, cwd, silent_s, ignore_paths, pytest, spill and spill_wrap_cmd")
     cond = c.get("if_exists")
     if cond is not None and not _inside(cond):
         return f"{c!r}: if_exists must be a path or glob inside the repository"
@@ -1299,6 +1355,14 @@ def _form_problem(c: dict) -> str | None:
         return f"{c!r}: {why}"
     if "sandbox" in c and not isinstance(c["sandbox"], bool):
         return f"{c!r}: sandbox must be true or false"
+    if "spill" in c and not isinstance(c["spill"], bool):
+        return f"{c!r}: spill must be true or false (leave it out for the default: a check with host local stays here)"
+    if "spill_wrap_cmd" in c:
+        try:
+            if not _words(c["spill_wrap_cmd"], "spill_wrap_cmd"):
+                return f"{c!r}: spill_wrap_cmd must be a non-empty command"
+        except ValueError as e:
+            return f"{c!r}: {e}"
     if "pytest" in c and not isinstance(c["pytest"], bool):
         return f"{c!r}: pytest must be true or false (leave it out to detect a pytest run from the command)"
     if "silent_s" in c and (isinstance(c["silent_s"], bool) or not isinstance(c["silent_s"], (int, float))

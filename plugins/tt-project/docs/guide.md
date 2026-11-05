@@ -1375,7 +1375,13 @@ nothing running is interrupted:
   runs: here every command still runs behind it, and a run that waits may spill and runs there without it
   (`ttp config <project> checks.wrap_needs_device false`); never set it for a wrapper that holds a device. Both
   set: the named commands skip the wrapper everywhere, the rest keep it here, and a run with any wrapped command
-  spills only because of `checks.wrap_needs_device: false`. A run that does not pass on a spill host runs again here, and that result
+  spills only because of `checks.wrap_needs_device: false`. `checks.spill_wrap_cmd` (default none) is the wrapper
+  checks run behind on a spill host (a relative path in the copy of the commit there, else a name on its PATH);
+  a wrapped command with one may spill without `checks.wrap_needs_device: false`. Per check (`delivery.push_checks`
+  entries too), `"spill": true` lets it spill even with `"host": "local"`, `"spill": false` keeps it here (left out:
+  a check with host `local` stays here, others follow the pool rules), and `"spill_wrap_cmd"` overrides the
+  project's remote wrapper. A remote wrapper missing or not executable on the host is a host fault: the check never
+  runs unwrapped. A run that does not pass on a spill host runs again here, and that result
   counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
   age, alive or dead, what it checks and whether its task has finished) and its waiters in queue order, the next

@@ -3391,7 +3391,11 @@ def cmd_checks(a) -> None:
         # The slots here stayed busy and a spill host took the run: its checks run there (remotecheck).
         spilled = getattr(slot, "spill", None) if slot is not None and not hit else None
         if spilled:
-            todo = push.with_host(todo, spilled.host)
+            todo = push.spill_to(todo, spilled.host, cfg)
+            for w in dict.fromkeys(c.remote_wrap for c in todo if c.remote_wrap):
+                said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
+                print(f"ttp checks: {said}", flush=True)
+                out.write(f"ttp checks: {said}\n")
         if join_rec and todo and not hit and not handover:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}

@@ -14,7 +14,10 @@ ssh failing (an unreachable host, a refused key, a dropped connection) or a host
 the tree is an environment fault, not the change's, and so is a host that is paused (paused: this
 project's, a shared or another project's pause; nothing reaches it over ssh): this exits FAULT_RC, which the callers
 (`ttp checks`, `ttp push`, the push queue) treat as envfault does a missing runner. A command's own
-exit FAULT_RC is reported as 1, so it never reads as a fault.
+exit FAULT_RC is reported as 1, so it never reads as a fault. A check spilled with a remote wrapper
+(--wrap: push.spill_to) runs behind it there; a wrapper missing or not executable on the host (a
+relative path in the copy of the commit, else a name on the host's PATH) is a fault too: the check
+never runs unwrapped.
 
 `host` is an ssh alias (a machines-list alias is one): `ssh <host>` must reach it without a prompt."""
 from __future__ import annotations
@@ -30,6 +33,7 @@ import sys
 from pathlib import Path
 
 FAULT_RC = 75
+NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
 LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_host is set
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -61,11 +65,12 @@ def env_problem(v) -> str:
     return ""
 
 
-def argv(cmd: str, host: str, env: dict | None = None, commit: str = "") -> list[str]:
+def argv(cmd: str, host: str, env: dict | None = None, commit: str = "", wrap: tuple[str, ...] = ()) -> list[str]:
     """The local command that runs check `cmd` on `host` (main): on `commit` when given (the commit a
-    `ttp checks` run records), else on the checkout's HEAD."""
+    `ttp checks` run records), else on the checkout's HEAD; behind `wrap` there when given."""
     return [sys.executable, "-c", _BOOT, str(Path(__file__).resolve().parents[1]), "--host", host,
-            "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []), "--", cmd]
+            "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []),
+            *(["--wrap", json.dumps(list(wrap))] if wrap else []), "--", cmd]
 
 
 def _ssh(host: str, script: str) -> list[str]:
@@ -137,15 +142,22 @@ def exports(env: dict) -> str:
     return "".join(f'export {k}="' + re.sub(r'([\\"`])', r"\\\1", v) + '"\n' for k, v in sorted(env.items()))
 
 
-def _run_script(q: str, exports_: str, cmd: str, mark: str) -> str:
+def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...] = ()) -> str:
     """The host's side of a check run in directory `q`: the command in a process group of its own
     (setsid, else perl's setpgrp), with stdin from /dev/null and Ctrl-C and quit at their default, and a watcher that stops that group (TERM,
     then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
     local side stops or dies, and the command would run on. Then the exit-code marker, and the
-    directory is removed."""
-    run = f"bash -e -o pipefail -c {shlex.quote(cmd)}"
-    return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}"
-            f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- sh -e -c {shlex.quote(cmd)}; fi\n"
+    directory is removed. With `wrap`, the command runs behind it, and a wrapper that is missing or not
+    executable there prints the marker's NO_WRAP form instead of starting anything."""
+    w = " ".join(map(shlex.quote, wrap))
+    run = f"{w} bash -e -o pipefail -c {shlex.quote(cmd)}".lstrip()
+    has = ""
+    if wrap:
+        exe = shlex.quote(wrap[0])
+        test = f"[ -f {exe} ] && [ -x {exe} ]" if "/" in wrap[0] else f"command -v {exe} >/dev/null 2>&1"
+        has = f"if ! {{ {test}; }}; then printf '\\n%s%s\\n' {mark} {NO_WRAP}; exit 96; fi\n"
+    return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}{has}"
+            f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"
             # A background job's stdin is /dev/null unless redirected: the watcher reads ssh's from fd 3.
             "exec 3<&0\n"
             # It also starts with SIGINT and SIGQUIT ignored, which no shell can undo: reset both first.
@@ -174,7 +186,7 @@ def _stop(_sig, _frame) -> None:
 
 
 def main(args: list[str]) -> int:
-    host, env, commit = "", {}, ""
+    host, env, commit, wrap = "", {}, "", ()
     while args and args[0] != "--":
         flag, value, args = args[0], args[1] if len(args) > 1 else "", args[2:]
         if flag == "--host":
@@ -183,6 +195,8 @@ def main(args: list[str]) -> int:
             env = json.loads(value or "{}")
         elif flag == "--commit":
             commit = value
+        elif flag == "--wrap":
+            wrap = tuple(str(w) for w in json.loads(value or "[]"))
     cmd = " ".join(args[1:])
     if host_problem(host) or host == LOCAL or env_problem(env) or not cmd:
         _say(f"usage: --host <ssh alias> [--env <json>] -- <command> ({host_problem(host) or env_problem(env)})")
@@ -235,17 +249,20 @@ def main(args: list[str]) -> int:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
         mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
-        script = _run_script(q, exports(env), cmd, mark)
+        script = _run_script(q, exports(env), cmd, mark, wrap)
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
         proc = subprocess.Popen(_ssh(host, script), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
-        rc, held = None, b""
+        rc, held, no_wrap = None, b"", False
         out = sys.stdout.buffer
         for raw in iter(proc.stdout.readline, b""):
             text = raw.decode(errors="replace").strip()
             if text.startswith(mark) and text[len(mark):].isdigit():
                 rc = int(text[len(mark):])
                 held = b""   # the blank line printed before the marker is ours
+                continue
+            if text == mark + NO_WRAP:
+                no_wrap, held = True, b""
                 continue
             if held:
                 out.write(held)
@@ -254,6 +271,9 @@ def main(args: list[str]) -> int:
                 out.write(raw)
             out.flush()
         proc.wait()
+        if no_wrap:
+            return _fault(host, f"the spill wrapper {wrap[0]!r} is missing or not executable there, so the "
+                                "check did not run (never unwrapped)")
         if rc is None:
             return _fault(host, f"ssh ended before the command reported its exit code (ssh exit {proc.returncode})")
         if rc == FAULT_RC:

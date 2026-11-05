@@ -1177,3 +1177,123 @@ def test_spill_device_gate_never_counts_a_pool_check_runs_hold_on_a_bare_alias_a
             d.close()
     finally:
         h.close()
+
+
+def test_a_check_opts_in_to_spilling_and_runs_behind_its_remote_wrapper_there(env):
+    """`spill: true` lets a check with host "local" spill, `false` keeps any check here; a check behind
+    checks.wrap_cmd (a device wrapper) spills only with a remote wrapper (its own spill_wrap_cmd, else
+    checks.spill_wrap_cmd), and spill_to runs it there behind that wrapper, never this machine's."""
+    from ttp import checkspill, project, push
+    c = push.check_list(["make t", {"run": "make a", "host": "local"}, {"run": "make b", "host": "local", "spill": True},
+                         {"run": "make c", "spill": False}, {"run": "make d", "spill": True, "spill_wrap_cmd": "./w.sh -x"},
+                         {"run": "make e", "spill": True, "cwd": "authoring"}])
+    assert [checkspill.spillable(c[i:i + 1]) for i in range(6)] == [True, False, True, False, True, False]
+    assert not checkspill.spillable(c) and checkspill.spillable([c[0], c[2], c[4]])
+    assert not checkspill.spillable(push.check_list([{"run": "make x", "host": "check-host-a", "spill": True}]))
+    assert not checkspill.spillable(push.with_host(c[:1], "check-host-a")), "delivery.checks_host stays there"
+    assert checkspill.spillable(push.with_host(c[2:3], "check-host-a")), "host local beats checks_host"
+    assert push.checks_of([{"run": "make b", "host": "local", "spill": True, "spill_wrap_cmd": "./w.sh -x"}]) == [
+        {"run": "make b", "host": "local", "spill": True, "spill_wrap_cmd": "./w.sh -x"}]
+    # A device-needing wrapper with no remote wrapper stays here; a remote wrapper lets it spill.
+    wrapped = push.with_wrap(push.check_list(["make test"]), ("/opt/devwrap",))
+    assert not checkspill.spillable(wrapped) and not checkspill.spillable(wrapped, {"checks": {"wrap_needs_device": True}})
+    cfg = {"checks": {"spill_wrap_cmd": "tools/pool-wrap --cpu"}}
+    assert checkspill.spillable(wrapped, cfg)
+    assert checkspill.spillable(push.with_wrap(c[4:5], ("/opt/devwrap",))), "its own remote wrapper"
+    for bad in ("a 'b", 3, ["x"]):   # a remote wrapper that does not parse never lets it spill
+        assert not checkspill.spillable(wrapped, {"checks": {"spill_wrap_cmd": bad}}), bad
+        assert any("checks.spill_wrap_cmd" in x for x in project.config_problems({"checks": {"spill_wrap_cmd": bad}})), bad
+    assert not project.config_problems(cfg)
+    for bad in ({"spill": "yes"}, {"spill_wrap_cmd": ""}, {"spill_wrap_cmd": 3}, {"spill_wrap_cmd": "a 'b"}):
+        assert push.check_problems([{"run": "make t", **bad}]), bad
+        assert not checkspill.spillable(push.check_list([{"run": "make t", "host": "local", **bad}])), bad
+    # spill_to: each runs on the spill host behind its own wrapper, else the project's; host local too.
+    t, b, d = push.spill_to([c[0], c[2], c[4]], "pool-a", cfg)
+    assert [push.remote_host(x) for x in (t, b, d)] == ["pool-a"] * 3
+    assert t.remote_wrap == ("tools/pool-wrap", "--cpu") and d.remote_wrap == ("./w.sh", "-x")
+    assert b.config() == {"run": "make b", "host": "local", "spill": True}, "the record keeps the configured form"
+    argv = push.check_argv(push.spill_to(wrapped, "pool-a", cfg)[0])
+    assert json.loads(argv[argv.index("--wrap") + 1]) == ["tools/pool-wrap", "--cpu"] and argv[-1] == "make test"
+    assert "/opt/devwrap" not in argv, "never this machine's wrapper there"
+    assert "--wrap" not in push.check_argv(push.spill_to(c[:1], "pool-a", {})[0]), "no remote wrapper: none"
+
+
+def test_a_remote_wrapper_missing_on_the_host_is_a_fault_and_the_command_never_runs_unwrapped(tmp_path):
+    """--wrap: the command runs behind the wrapper (a path in the copy of the commit, or a name on the
+    host's PATH); one missing or not executable there exits FAULT_RC without starting the command."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "w.sh").write_text('#!/bin/sh\necho "wrapped by w.sh: $1"\nshift\nexec "$@"\n')
+    (repo / "w.sh").chmod(0o755)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "w"], check=True)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote)}
+    ran = tmp_path / "ran"
+
+    def go(wrap):
+        r = subprocess.run(remotecheck.argv(f"echo ran >> {ran}; exit 3", "box1", {}, "", wrap), cwd=repo, env=penv,
+                           capture_output=True, text=True, timeout=60)
+        return r.returncode, r.stdout
+    rc, out = go(("./w.sh", "cpu"))
+    assert rc == 3 and "wrapped by w.sh: cpu" in out and ran.read_text() == "ran\n", out
+    ran.unlink()
+    for wrap in (("./nope.sh",), ("tools/nope",), ("ttp-no-such-wrapper-xyz", "--cpu")):
+        rc, out = go(wrap)
+        assert rc == remotecheck.FAULT_RC and f"{remotecheck.SIG}box1" in out and "never unwrapped" in out, (wrap, out)
+        assert not ran.exists(), wrap
+    rc, out = go(("sh", "-c", 'echo "named: $0"; exec "$@"', "x"))
+    assert rc == 3 and ran.exists(), out
+    assert _rc_left(tmp_path) == []
+
+
+def test_a_host_local_check_that_opts_in_spills_behind_its_remote_wrapper_and_a_missing_one_reruns_here(
+        env, tmp_path, monkeypatch):
+    """A push check with host "local" and `spill: true` spills when the lane here stays busy and runs
+    there behind its spill_wrap_cmd; with that wrapper missing on the host the spill is a host fault,
+    never a verdict: the check runs again here and only that pass counts. Without `spill` it never spills."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "pool-wrap.sh").write_text('#!/bin/sh\necho pool-wrapped >> "$WRAP_LOG"\nexec "$@"\n')
+    (repo / "pool-wrap.sh").chmod(0o755)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "wrap"], check=True)
+    wlog, log = tmp_path / "wrap.log", tmp_path / "where.log"
+    monkeypatch.setenv("WRAP_LOG", str(wlog))
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [{"run": cmd, "host": "local", "spill": True,
+                                           "spill_wrap_cmd": "./pool-wrap.sh"}])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert "/ttp-check." in log.read_text() and wlog.read_text() == "pool-wrapped\n"
+    assert "on check-host-a the checks run behind their spill wrapper ./pool-wrap.sh" in (run / "checks.log").read_text()
+    # The remote wrapper missing there: a host fault, the run goes on here and its pass counts.
+    log.unlink()
+    wlog.unlink()
+    p.set_config("delivery.push_checks", [{"run": cmd, "host": "local", "spill": True,
+                                           "spill_wrap_cmd": "./missing-wrap.sh"}])
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    text = (run / "checks.log").read_text()
+    assert "missing-wrap.sh' is missing or not executable there" in text and "did not pass on spill host" in text, text
+    assert "/ttp-check." not in log.read_text().splitlines()[-1] and len(log.read_text().splitlines()) == 1
+    assert not wlog.exists()
+    # Without the opt-in a host-local check waits here.
+    p.set_config("delivery.push_checks", [{"run": cmd, "host": "local", "spill_wrap_cmd": "./pool-wrap.sh"}])
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: pytest.fail("no spill host is tried"))
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.0, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec

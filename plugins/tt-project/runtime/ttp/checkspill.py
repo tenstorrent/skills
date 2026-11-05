@@ -35,12 +35,15 @@ per slot it uses there (spill/<alias>.<n>.json in the checks slot folder), so it
 take more. A claim whose remote ttp-check.* folder is not made yet (the few seconds of its copy) is
 counted by neither, so the host can take one run more than its slots in that gap: a bound, not a guard.
 
-Only a run whose every check would run here spills: none with a host of its own (`host`,
-delivery.checks_host), none run in the authoring worktree ("cwd": "authoring"), none behind
-checks.wrap_cmd (the project's lock or queue wrapper, which may hold a device or a machine here) unless
-the project says its wrappers need no device (`checks.wrap_needs_device: false`; unset or true: the
-need is unknown or real, so it stays here; on a spill host it runs without the wrapper, which is this
-machine's), and never a light run (it never waits). A run that does not pass on a spill host runs again here (OFF_ENV):
+Only a run whose every check may spill spills (check_spills): none with a host of its own (`host`,
+delivery.checks_host; `"host": "local"` too unless the check says `"spill": true`), none that says
+`"spill": false`, none run in the authoring worktree ("cwd": "authoring"), none behind checks.wrap_cmd
+(the project's lock or queue wrapper, which may hold a device or a machine here) unless it has a remote
+wrapper (the check's `spill_wrap_cmd`, else checks.spill_wrap_cmd: push.spill_wrap_of) or the project
+says its wrappers need no device (`checks.wrap_needs_device: false`; unset or true: the need is unknown
+or real, so it stays here), and never a light run (it never waits). On a spill host a check never runs
+behind this machine's checks.wrap_cmd: it runs behind its remote wrapper when it has one (push.spill_to),
+a wrapper missing there being a host fault (remotecheck), else unwrapped. A run that does not pass on a spill host runs again here (OFF_ENV):
 a spill host's own environment never fails a change, only a pass there counts.
 """
 from __future__ import annotations
@@ -156,9 +159,15 @@ def wrapped_ok(cfg: dict | None) -> bool:
 
 
 def wrap_problems(checks: Any) -> list[str]:
-    """Config check of checks.wrap_needs_device."""
+    """Config check of checks.wrap_needs_device and checks.spill_wrap_cmd."""
+    from . import push
     v = checks.get(NO_DEVICE_KEY) if isinstance(checks, dict) else None
-    return [] if v is None or isinstance(v, bool) else [f"checks.{NO_DEVICE_KEY}: {v!r} is not true or false"]
+    out = [] if v is None or isinstance(v, bool) else [f"checks.{NO_DEVICE_KEY}: {v!r} is not true or false"]
+    try:
+        push.spill_wrap_of(None, {"checks": checks})
+    except ValueError as e:
+        out.append(str(e))
+    return out
 
 
 def after_of(v: Any) -> float:
@@ -178,14 +187,27 @@ def after_s(cfg: dict | None) -> float:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else SPILL_AFTER_S
 
 
-def spillable(cmds: list, cfg: dict | None = None) -> bool:
-    """Whether every check of `cmds` would run on this machine, in a clean checkout, and unwrapped unless
-    `cfg` says its wrappers need no device (wrapped_ok)."""
+def check_spills(c: Any, cfg: dict | None = None) -> bool:
+    """Whether check `c` may run on a spill host: it would run on this machine (its host "local" only
+    with `"spill": true`), in a clean checkout, does not say `"spill": false`, and is unwrapped unless it
+    has a remote wrapper (push.spill_wrap_of; one that does not parse keeps it here) or `cfg` says its
+    wrappers need no device (wrapped_ok)."""
     from . import cleantree, push
-    wrapped = wrapped_ok(cfg)
-    return bool(cmds) and all(not push.remote_host(c) and getattr(c, "host", "") != remotecheck.LOCAL
-                              and not cleantree.authoring(c) and (wrapped or not getattr(c, "wrap", ()))
-                              for c in cmds)
+    opt = getattr(c, "spill", None)
+    if opt is False or getattr(c, "keep_here", False) or push.remote_host(c) or cleantree.authoring(c):
+        return False
+    if getattr(c, "host", "") == remotecheck.LOCAL and opt is not True:
+        return False
+    try:
+        remote_wrap = push.spill_wrap_of(c, cfg)
+    except ValueError:
+        return False
+    return bool(remote_wrap) or wrapped_ok(cfg) or not getattr(c, "wrap", ())
+
+
+def spillable(cmds: list, cfg: dict | None = None) -> bool:
+    """Whether every check of `cmds` may run on a spill host (check_spills)."""
+    return bool(cmds) and all(check_spills(c, cfg) for c in cmds)
 
 
 def _charter_names(p, alias: str) -> bool:
