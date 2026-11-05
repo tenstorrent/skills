@@ -40,7 +40,7 @@ def _ordered(env, tmp_path, cite=False):
     return p, ids, msg, run_dir, other_dir
 
 
-def _probe(monkeypatch, p, task, res):
+def _order_probe(monkeypatch, p, task, res):
     from ttp import cli
     monkeypatch.setenv("TTP_PROJECT", str(p.base))
     monkeypatch.setenv("TTP_TASK", str(task))
@@ -53,13 +53,13 @@ def _probe(monkeypatch, p, task, res):
 def test_a_newer_user_order_holds_only_older_tasks_on_its_resource_at_ttp_lock(env, tmp_path, monkeypatch, capsys,
                                                                                  cite):
     p, ids, msg, _, _ = _ordered(env, tmp_path, cite)
-    assert _probe(monkeypatch, p, ids["old"], "rig") == 75
+    assert _order_probe(monkeypatch, p, ids["old"], "rig") == 75
     out = capsys.readouterr().out
     assert f"user msg #{msg}" in out and f"task #{ids['order']}" in out, out
-    assert _probe(monkeypatch, p, ids["old"], "rig-device") == 75   # a resource on the ordered machine
+    assert _order_probe(monkeypatch, p, ids["old"], "rig-device") == 75   # a resource on the ordered machine
     for task, res in ((ids["order"], "rig"), (ids["respec"], "rig"), (ids["newer"], "rig"),
                       (ids["other"], "bench"), (ids["old"], "bench")):
-        assert _probe(monkeypatch, p, task, res) == 0, (task, res, capsys.readouterr())
+        assert _order_probe(monkeypatch, p, task, res) == 0, (task, res, capsys.readouterr())
     # A real take is refused (exit 75) and runs nothing; the order's own task takes it.
     ran = tmp_path / "ran"
     take = _lock(_lock_env(env, p, TTP_TASK=str(ids["old"])), "rig", cmd=("touch", str(ran)))
@@ -70,7 +70,7 @@ def test_a_newer_user_order_holds_only_older_tasks_on_its_resource_at_ttp_lock(e
     assert take.returncode == 0 and ran.exists()
     # The order's task ends: the hold ends with it.
     p.db.update_task(ids["order"], status="done")
-    assert _probe(monkeypatch, p, ids["old"], "rig") == 0
+    assert _order_probe(monkeypatch, p, ids["old"], "rig") == 0
 
 
 def test_a_user_order_holds_older_queued_tasks_at_dispatch_and_steers_older_running_ones(env, tmp_path):
