@@ -100,9 +100,8 @@ def _load(path: Path) -> dict:
 
 
 def _save(path: Path, d: dict) -> None:
-    tmp = path.with_name(path.name + ".tmp")
-    tmp.write_text(json.dumps(d, indent=1, sort_keys=True))
-    tmp.replace(path)
+    from .project import durable_write
+    durable_write(path, json.dumps(d, indent=1, sort_keys=True))
 
 
 def active(state: Path, now: float | None = None) -> dict:
