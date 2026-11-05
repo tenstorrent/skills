@@ -52,7 +52,7 @@ from pathlib import Path
 
 from . import register
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_output, price_row, request_rejected,
-                   status_check, stderr_tail, strict_schema, drop_nulls)
+                   status_check, stderr_tail, strict_schema, drop_nulls, head80, jsonl_from)
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -405,6 +405,34 @@ class Codex(Provider):
         if last is None:
             return None, limits
         return (tuple(max(a - b, 0) for a, b in zip(last, base)) if base else last), limits
+
+    def activity(self, output_path, offset=0):
+        """`codex exec --json`: item.started is a call, item.completed its result (a command that
+        exited non-zero or an item that failed is an error); an item only seen completed is both."""
+        lines, offset = jsonl_from(Path(output_path), offset, (b'"item.started"', b'"item.completed"'))
+        events = []
+        for ev in lines:
+            item = ev.get("item") if isinstance(ev.get("item"), dict) else {}
+            kind = item.get("type") or item.get("item_type") or ""
+            if kind in ("agent_message", "reasoning", "todo_list", "error", ""):
+                continue
+            if kind == "command_execution":
+                head = item.get("command") or ""
+            elif kind == "file_change":
+                head = " ".join(str(c.get("path") or "") for c in item.get("changes") or [] if isinstance(c, dict))
+            elif kind == "mcp_tool_call":
+                kind, head = f"{item.get('server') or ''}.{item.get('tool') or ''}", item.get("arguments") or ""
+            else:
+                head = item.get("query") or ""
+            call = {"kind": "call", "id": str(item.get("id") or ""), "tool": kind, "input_head": head80(head),
+                    "is_error": None, "ts": None}
+            if ev.get("type") == "item.started":
+                events.append(call)
+            else:
+                code = item.get("exit_code")
+                failed = item.get("status") == "failed" or (isinstance(code, int) and code != 0)
+                events.append({**call, "kind": "result", "is_error": failed})
+        return events, offset
 
     def windows_so_far(self, output_path, since=None, env=None, now=None):
         # The newest reading a model call wrote to the rollout, while fresh; else none, and the

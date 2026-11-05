@@ -45,6 +45,7 @@ from . import checksettle
 from . import coordwrites
 from . import checksgone
 from . import userorder
+from . import runwatch
 from . import resumefirst
 from . import rejcool
 from . import stalegate
@@ -1031,6 +1032,7 @@ class Daemon:
         self._lean_reap = False   # this reap retries one an earlier daemon was cut off in: optional checks skipped
         self._metered: dict[int, tuple[int, float]] = {}   # run id -> (output size, when) last priced
         self._steer_unread: dict[int, dict] = {}   # run id -> its unread steer.md stretch (steerack)
+        self._runwatch_at = 0.0   # when watch_runs last refreshed state/runwatch.json
         self._window_provs: dict[int, tuple] = {}            # run id -> (provider, env) reading its windows
         self._windows_read: dict[tuple[str, str], float] = {}   # (provider, account) -> newest reading recorded
         self._escalated: dict[int, tuple[int, int]] = {}   # run id -> (size, mtime_ns) of its ESCALATE_FILE relayed
@@ -1758,7 +1760,7 @@ class Daemon:
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
-        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+        for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
@@ -4093,6 +4095,15 @@ class Daemon:
         steer.ack_after_s raises one steer_unread event (steerack)."""
         steerack.check(self.p.db, self.cfg, self.p.db.q("SELECT * FROM runs WHERE status='running'"),
                        self._steer_unread)
+
+    def watch_runs(self, every_s: float = 60) -> None:
+        """Keep state/runwatch.json, the live record of each running worker and reviewer run
+        (runwatch.py), at most once per `every_s`; model-free."""
+        now = time.time()
+        if now - self._runwatch_at < every_s:
+            return
+        self._runwatch_at = now
+        runwatch.tick(self.p, now)
 
     def _record_running_windows(self, r: dict, out: Path) -> None:
         """A provider whose running runs report the account's plan windows (Codex: with each model

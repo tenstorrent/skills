@@ -49,7 +49,7 @@ from ..budget import Window
 from .. import fencefree
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
                    cli_output, find_binary, last_json_object, request_rejected, status_check, strict_schema,
-                   drop_nulls)
+                   drop_nulls, head80, jsonl_from)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -405,6 +405,27 @@ class Claude(Provider):
         for d in dirs:
             out += ["--plugin-dir", d]
         return out
+
+    def activity(self, output_path, offset=0):
+        """stream-json: an assistant message's tool_use blocks are calls, a user message's
+        tool_result blocks their results (is_error: a failed command or a refused call)."""
+        lines, offset = jsonl_from(Path(output_path), offset, (b'"tool_use"', b'"tool_result"'))
+        events = []
+        for ev in lines:
+            content = (ev.get("message") or {}).get("content")
+            for b in content if isinstance(content, list) else []:
+                if not isinstance(b, dict):
+                    continue
+                if b.get("type") == "tool_use":
+                    inp = b.get("input") if isinstance(b.get("input"), dict) else {}
+                    key = next((k for k in ("command", "file_path", "pattern", "path", "url", "query",
+                                            "description", "skill") if isinstance(inp.get(k), str)), None)
+                    events.append({"kind": "call", "id": str(b.get("id") or ""), "tool": str(b.get("name") or ""),
+                                   "input_head": head80(inp[key] if key else inp), "is_error": None, "ts": None})
+                elif b.get("type") == "tool_result":
+                    events.append({"kind": "result", "id": str(b.get("tool_use_id") or ""), "tool": "",
+                                   "input_head": "", "is_error": bool(b.get("is_error")), "ts": None})
+        return events, offset
 
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         u = RunUsage()

@@ -89,6 +89,7 @@ def remote_hosts() -> list[str]:
 
 
 LISTEN_GAVE_UP = 75   # `ttp listen --timeout` on another machine: still unreachable when the timeout ran out
+RUNWATCH_STALE_S = 180   # `ttp runs live` reads afresh once the daemon's runwatch record is older than this
 LISTEN_GRACE_S = 60     # a listener reconnecting within this says nothing about the drop
 LISTEN_CONNECTED_S = 25  # an ssh session that lasted this long had connected (ConnectTimeout is 20 s)
 LISTEN_REPLACED = 3   # a newer listener for the same chat took over; this one stops and does not reconnect
@@ -2059,6 +2060,24 @@ def cmd_selfchange(a) -> None:
         out = {"metrics": selfimprove.summary(p.db, where=p), "items": selfimprove.items(p.db)}
         lines = out["metrics"]
     print(json.dumps(out, indent=1, default=str) if a.json else "\n".join(lines))
+
+
+def cmd_runs_live(a) -> None:
+    """What each running worker and reviewer run is doing (runwatch.py): the daemon's record, or a
+    fresh read-only one when the daemon has not kept it within RUNWATCH_STALE_S."""
+    from . import runwatch
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp runs live <name>`")
+    data = runwatch.load(p)
+    if not data.get("updated") or time.time() - float(data["updated"]) > RUNWATCH_STALE_S:
+        data = runwatch.tick(p, write=False)
+    task = int(str(a.task).lstrip("#")) if a.task else None
+    if a.json:
+        runs = [e for e in data["runs"].values() if task is None or e.get("task") == task]
+        print(json.dumps({"updated": data.get("updated"), "runs": runs}, indent=1))
+    else:
+        print(runwatch.text(data, task))
 
 
 def cmd_eta(a) -> None:
@@ -12093,6 +12112,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--days", type=float, default=2, help="done tasks updated within this many days")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_push_audit)
+
+    s = sub.add_parser("runs", help="running worker and reviewer runs")
+    rs = s.add_subparsers(dest="runs_cmd", required=True)
+    s = rs.add_parser("live", help="what each running worker or reviewer run is doing now, model-free: its note, "
+                                   "tool call, changed files, last checks line, spend, wall share and steer state")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.add_argument("--task", help="only this task's runs (#12 or 12)")
+    s.add_argument("--json", action="store_true", help="print JSON (the state/runwatch.json entries)")
+    s.set_defaults(fn=cmd_runs_live)
 
     s = sub.add_parser("eta", help="expected finish of a task or obligation from its critical path (measured "
                                    "medians): quote it, and set retry and deadline wakes at it")

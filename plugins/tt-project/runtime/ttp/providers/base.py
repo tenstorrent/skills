@@ -5,6 +5,7 @@ they never run anything themselves (the detached runner does), so they stay easy
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -470,6 +471,13 @@ class Provider:
         "read_at"}), only while fresh: [] leaves the gate on its other readings (the meter's)."""
         return []
 
+    def activity(self, output_path: Path, offset: int = 0) -> tuple[list[dict], int]:
+        """Tool events a running run wrote to its output after byte `offset`, and the offset to read
+        from next: {"kind": "call" | "result", "id", "tool", "input_head" (80 chars), "is_error"
+        (None on a call), "ts" (None when the stream has no time)}. Only whole lines count, so a line
+        still being written is read next time. None here: runwatch falls back to progress.md and git."""
+        return [], offset
+
     def resolved_session(self, argv: list[str], cwd: str, env: dict | None = None) -> dict | None:
         """The model and reasoning effort a run started with `argv` in `cwd` would actually use, asked
         from the agent without starting a model turn: {"model", "effort"}, or {"error"} when the
@@ -500,6 +508,36 @@ class Provider:
 
 
 _CLI_OUTPUT: dict[tuple, str] = {}
+
+
+def jsonl_from(path: Path, offset: int, needles: tuple[bytes, ...]) -> tuple[list[dict], int]:
+    """The JSON objects on whole lines of `path` after byte `offset` that hold one of `needles` (the
+    rest are skipped unparsed, which keeps a large stream cheap), and the offset after the last whole
+    line. A missing file reads as nothing."""
+    out: list[dict] = []
+    try:
+        with open(path, "rb") as f:
+            f.seek(offset)
+            for raw in f:
+                if not raw.endswith(b"\n"):
+                    break
+                offset += len(raw)
+                if any(n in raw for n in needles):
+                    try:
+                        ev = json.loads(raw)
+                    except ValueError:
+                        continue
+                    if isinstance(ev, dict):
+                        out.append(ev)
+    except OSError:
+        pass
+    return out, offset
+
+
+def head80(value) -> str:
+    """The first 80 characters of a tool input, on one line."""
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True)
+    return " ".join(text.split())[:80]
 
 
 def cli_output(*argv: str) -> str:
