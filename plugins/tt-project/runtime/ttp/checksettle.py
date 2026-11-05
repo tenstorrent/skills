@@ -43,7 +43,7 @@ def _head_of(top: str) -> str:
 def settle(run_dir: Path, head: str) -> tuple[int, str, dict | None]:
     """(0, what, hand-off to write) on a pass for `head`, else (1, why, None)."""
     from . import prguard
-    from .cli import CHECKS_RC
+    from .cli import CHECKS_RC, _checks_release_excused
     head = (head or "").strip().lower()
     if not HEAD_RE.fullmatch(head):
         return 1, f"--head {head!r} is no commit hash (7 to 40 hex characters)", None
@@ -59,6 +59,8 @@ def settle(run_dir: Path, head: str) -> tuple[int, str, dict | None]:
         rec = None
     if not prguard.candidate_record(rec) or rec.get("passed") is not True or not isinstance(rec.get("head"), str):
         return 1, f"{prguard.CHECKS_FILE} in {run_dir} records no passed candidate checks", None
+    if why := _checks_release_excused(run_dir):
+        return 1, why, None
     checked = rec["head"].lower()
     if not checked.startswith(head):
         return 1, f"refused: the checks passed on {checked[:12]}, not on {head[:12]}, the head the hand-off names", None

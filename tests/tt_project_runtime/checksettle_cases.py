@@ -238,3 +238,17 @@ def test_the_settle_fill_runs_no_raw_git_under_the_finish_write_lock(env, monkey
     plain.mkdir()
     subprocess.run(["git", "init", "-q", str(empty)], check=True, capture_output=True)
     assert dmod._clean_head(str(plain)) == "" and dmod._clean_head(str(empty)) == ""
+
+
+def test_checks_settle_refuses_a_release_run_that_excused_a_failure(env, tmp_path):
+    # A release run's on_pass never settles on a pass the tests gate excused (gatejudge).
+    p = make(env)
+    from ttp import checksettle
+    tid, path, run_dir, head = _work_checks_wait(p, tmp_path)
+    check = json.loads((run_dir / "checks.json").read_text())
+    (run_dir / "checks.json").write_text(json.dumps({**check, "release": True, "landing_only": True,
+                                                     "excused": [{"check": "pytest", "flaky": ["t.py::a"]}]}))
+    rc, what, out = checksettle.settle(run_dir, head)
+    assert rc == 1 and out is None and "excused" in what, what
+    (run_dir / "checks.json").write_text(json.dumps({**check, "release": True}))
+    assert checksettle.settle(run_dir, head)[0] == 0

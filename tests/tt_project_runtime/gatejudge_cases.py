@@ -200,3 +200,58 @@ def test_ttp_checks_quarantines_a_flaky_failure_and_notes_the_coordinator_once(e
     notes = p.db.q("SELECT text FROM events WHERE kind=? AND status='queued'", (gatejudge.EVENT,))
     assert len(notes) == 1 and "test_flaky" in notes[0]["text"]
     assert "quarantined test tests/test_gate.py::test_flaky" in cli.status_text(p)
+
+
+def test_a_detached_release_check_keeps_release_across_a_daemon_restart(env, monkeypatch):
+    # checks.pid records --release and the daemon's restart (reboot, shared failure, rebase) passes it
+    # on: a restarted release run that lost it would excuse failures and exit 0.
+    import argparse
+    from ttp import cli, worktree
+    from ttp import daemon as dmod
+    p = make(env)
+    run_dir = env["tmp"] / "rel"
+    run_dir.mkdir()
+    argvs = []
+    real = subprocess.Popen
+
+    def popen(argv, **kw):   # the launcher's child: recorded, then a stand-in that waits for its go
+        argvs.append(list(argv))
+        return real([sys.executable, "-c", "import sys; sys.stdin.read()"], **kw)
+    monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    a = argparse.Namespace(fresh=False, full=False, light=False, no_device=False, release=True, purpose=None,
+                           cmd=["true"])
+    pid = cli._checks_start(a, run_dir, "", "a" * 40, {**os.environ, "TTP_PROJECT": str(p.base)})
+    os.waitpid(pid, 0)
+    info = cli._read_checks_pid(run_dir)
+    assert "--release" in argvs[0] and info["release"] is True
+    monkeypatch.setattr(worktree, "is_git", lambda _p: True)
+    monkeypatch.setattr(worktree, "_git", lambda _p, *args: "a" * 40 if args[0] == "rev-parse" else "")
+    d = dmod.Daemon(p.base)
+    started = []
+    monkeypatch.setattr(d, "_start_checks", lambda path, out, run_id, tid, extra: started.append(extra) or True)
+    assert d._restart_checks(1, run_dir, {**info, "worktree": str(env["tmp"])}, "r1") == ""
+    assert "--release" in started[0] and started[0][-1] == "true"
+    assert d._restart_checks(1, run_dir, {**info, "worktree": str(env["tmp"]), "release": False}, "r1") == ""
+    assert "--release" not in started[1]
+
+
+def test_checks_result_passed_fails_a_release_run_that_excused_a_failure(env, tmp_path, capsys):
+    from ttp import cli
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "checks.rc").write_text("0\n")
+
+    def passed(pid_release, rec):
+        (run_dir / "checks.pid").write_text(json.dumps({"pid": os.getpid(), "start": 0, "ts": 10.0,
+                                                        "release": pid_release}))
+        (run_dir / "checks.json").unlink(missing_ok=True)
+        if rec is not None:
+            (run_dir / "checks.json").write_text(json.dumps({"passed": True, "ts": 20.0, **rec}))
+        return cli._checks_passed(run_dir)
+    excused = {"excused": [{"check": _FAIL, "pre_existing": ["tests/t.py::test_a"]}], "landing_only": True}
+    assert passed(True, excused) == 1 and "excused" in capsys.readouterr().out
+    assert passed(False, {**excused, "release": True}) == 1, "checks.json's release mark alone also holds"
+    assert passed(True, None) == 1, "a release run with no record of its own run"
+    assert passed(True, {**excused, "ts": 5.0}) == 1, "an earlier run's record is no record of this one"
+    assert passed(True, {}) == 0
+    assert passed(False, excused) == 0, "a landing check's excused pass still counts for its landing"

@@ -3908,7 +3908,8 @@ def cmd_checks(a) -> None:
                                                      **({"fallback_lane": fell_back} if fell_back else {}),
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {}),
-                                                     **({"excused": excused, "landing_only": True} if excused else {})})
+                                                     **({"excused": excused, "landing_only": True} if excused else {}),
+                                                     **({"release": True} if getattr(a, "release", False) else {})})
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
@@ -5416,6 +5417,7 @@ def _checks_start(a, run_dir: Path, top: str, head: str, env: dict, req: str = "
                                               "fresh": bool(a.fresh), "full": bool(getattr(a, "full", False)),
                                               "light": bool(getattr(a, "light", False)),
                                               "no_device": bool(getattr(a, "no_device", False)),
+                                              "release": bool(getattr(a, "release", False)),
                                               **_harness_purpose(a), "req": req, "pidns": pid_ns(), "arrived": arrived,
                                               "check_run_dir": str(output), "check_report_dir": str(checkdirs.reports(output))})
         except BaseException:
@@ -5549,15 +5551,41 @@ def _checks_settle(run_dir: Path, head: str | None) -> int:
 def _checks_passed(run_dir: Path) -> int:
     """`ttp checks --result RUN_DIR --passed`: the same report, but exit 0 only when the run's checks
     finished and passed (checks.rc 0); 1 when they failed, died or still run. A pass-only test for an
-    on_pass_cmd: plain --result exits 0 on a failure too, as a wait must."""
+    on_pass_cmd: plain --result exits 0 on a failure too, as a wait must. A release run passes only
+    when its own checks.json excused nothing (gatejudge.counts_as_passed)."""
     if _checks_result(run_dir) != 0:
         return 1
     try:
         rc = (run_dir / CHECKS_RC).read_text().strip()
     except OSError:
         rc = ""
+    if rc == "0" and (why := _checks_release_excused(run_dir)):
+        print(f"ttp checks: not passed: {why}")
+        return 1
     print(f"ttp checks: {'passed' if rc == '0' else 'not passed (exit code ' + (rc or 'none') + ')'}")
     return 0 if rc == "0" else 1
+
+
+def _checks_release_excused(run_dir: Path) -> str:
+    """Why a release run's exit 0 in `run_dir` is no pass, else "": its checks.json (this run's, not
+    an earlier one's) is missing or excused a failure (gatejudge). A release run is one checks.pid or
+    checks.json marks `release`; any other run's exit 0 stands."""
+    from . import gatejudge, prguard
+    info = _read_checks_pid(run_dir)
+    try:
+        rec = json.loads((run_dir / prguard.CHECKS_FILE).read_text())
+    except (OSError, ValueError):
+        rec = None
+    if not isinstance(rec, dict) or float(rec.get("ts") or 0) < float(info.get("ts") or 0):
+        rec = None
+    if not info.get("release") and not (rec or {}).get("release"):
+        return ""
+    if rec is None:
+        return f"a release check left no {prguard.CHECKS_FILE} of its own run"
+    if not gatejudge.counts_as_passed(rec, True):
+        return "a release check counts no excused failure as passed: " + \
+            ", ".join(str(x.get("check")) for x in rec.get("excused") or [] if isinstance(x, dict))
+    return ""
 
 
 def _checks_result(run_dir: Path) -> int:
