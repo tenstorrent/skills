@@ -1830,7 +1830,8 @@ running work is interrupted only by the preemption below:
   that need no judgment are settled in the batch and judged by those checks: version lines, lines
   both sides added at one spot, and changes of different lines that git calls a conflict only
   because they are adjacent (also a block one side added right beside a line the other only
-  reworded or deleted, each line as its side wrote it). A conflict only in the shared release files (the version files,
+  reworded or deleted, each line as its side wrote it), and edits of different cells of one Markdown
+  table row. A conflict only in the shared release files (the version files,
   changesets, the release changeset, a CHANGELOG.md) is settled mechanically: both sides' notes
   stay, a changeset both sides created keeps a file each, and the approval holds as long as the
   change's own diff outside those files is still the approved one. A change that really overlaps another goes back to its review to

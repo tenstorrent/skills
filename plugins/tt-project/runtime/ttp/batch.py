@@ -61,9 +61,10 @@ DEFAULT_AFTER_PUSH_TIMEOUT_S = 1800
 STALE = "(stale plugin version)"   # the `cmd` of a check failure that is push.stale_versions
 SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds",
-                 "imports": "names both sides import", "release": "release notes both sides wrote"}
+                 "imports": "names both sides import", "release": "release notes both sides wrote",
+                 "cells": "different cells of a table row"}
 RELEASE_KINDS = {"version", "release"}   # settlements in the shared release files only (release_kind)
-MERGED_KINDS = {"added", "hunks", "imports"}   # settlements that keep both sides' changes: kept only when the checks pass
+MERGED_KINDS = {"added", "hunks", "imports", "cells"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 # sequence.editor of a rebase that leaves out an entry's commits already on the target (Batch._landed):
 # drops each todo `pick` whose commit one of the shas before the todo file's path starts with
@@ -305,7 +306,7 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 
 def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
            hunks: bool = False, kinds: set | None = None, superseded: bool = False,
-           near: bool = False, imports: bool = False) -> str | None:
+           near: bool = False, imports: bool = False, cells: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
     With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
@@ -314,9 +315,10 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     whose change on our side theirs already makes, comments and spacing aside, takes theirs
     (_superseded). With `near`, both sides' added lines are not kept (by the added or hunks rule)
     when one nearly repeats the other (_near). With `imports`, a Python conflict made only of import
-    statements keeps every name each side imports (_imports). None when any other conflict
+    statements keeps every name each side imports (_imports). With `cells`, a conflict of Markdown
+    table rows where the two sides changed different cells takes both (_cells). None when any other conflict
     remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
-    settled ("added", "taken_in", "hunks"). The conflict markers carry a random tag, so file content
+    settled ("added", "taken_in", "hunks", "cells"). The conflict markers carry a random tag, so file content
     never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
     git ends every side of a conflict at the end of the file with a newline; the result ends as the
     sides had it (the side that changed it from the base wins)."""
@@ -352,7 +354,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         while j < len(lines) and lines[j].rstrip("\r\n") != sep:
             old.append(lines[j])
             j += 1
-        if old and not (taken_in or hunks or superseded or imports):
+        if old and not (taken_in or hunks or superseded or imports or cells):
             return None                 # the base section is not empty: a real conflict
         j, theirs_lines = j + 1, []
         while j < len(lines) and lines[j].rstrip("\r\n") != end:
@@ -379,6 +381,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         elif old and imports and py and (both := _imports(mine, old, theirs_lines)) is not None:
             res += both
             how = "imports"
+        elif old and cells and (both := _cells(mine, old, theirs_lines)) is not None:
+            res += both
+            how = "cells"
         else:                           # a real conflict
             return None
         if kinds is not None:
@@ -420,6 +425,39 @@ def _hunks(mine: list[str], old: list[str], theirs: list[str], py: bool, near: b
         out += old[pos:i1] + new
         pos = i2
     return out + old[pos:]
+
+
+_CELL_SEP = re.compile(r"(?<!\\)\|")   # a Markdown table's cell separator: a `|` not escaped as `\|`
+
+
+def _cells(mine: list[str], old: list[str], theirs: list[str]) -> list[str] | None:
+    """Both sides' changes of one conflict's Markdown table rows, when they changed different cells:
+    the same rows on each side (same count, each a `|`-delimited row with as many cells as its old
+    row), and no cell both sides changed to different text. A row only one side changed is taken
+    from it. None otherwise: an added or removed row, a cell edited on both sides, or no table."""
+    if not (len(mine) == len(old) == len(theirs)):
+        return None
+    out = []
+    for o, b, t in zip(mine, old, theirs):
+        if o == t or t == b:
+            out.append(o)
+            continue
+        if o == b:
+            out.append(t)
+            continue
+        rows = [x.rstrip("\r\n") for x in (o, b, t)]
+        if not all(r.lstrip().startswith("|") and r.rstrip().endswith("|") for r in rows):
+            return None
+        co, cb, ct = (_CELL_SEP.split(r) for r in rows)
+        if not len(co) == len(cb) == len(ct):
+            return None
+        row = []
+        for x, y, z in zip(co, cb, ct):
+            if x != y and z != y and x != z:
+                return None
+            row.append(z if x == y else x)
+        out.append("|".join(row) + o[len(rows[0]):])
+    return out
 
 
 def _edge_ok(k: int, new: list[str], e1: int, e2: int, edit: list[str], old: list[str]) -> bool:
@@ -754,7 +792,8 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
     test). `taken_in`, `hunks`, `superseded`, `near`, `imports` and `kinds` are merge3's; a version line taken adds "version" to
-    `kinds`. A file both sides created is never settled."""
+    `kinds`. With `hunks`, a Markdown file also settles table rows by cell (merge3's `cells`). A
+    file both sides created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
         return False                    # deleted on one side, or created on both
@@ -772,7 +811,8 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
             how.add("version")
         b, t = vb, vt
     merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how,
-                    superseded=superseded, near=near, imports=imports)
+                    superseded=superseded, near=near, imports=imports,
+                    cells=hunks and path.lower().endswith(".md"))
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):

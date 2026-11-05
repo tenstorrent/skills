@@ -2213,6 +2213,71 @@ def test_merge3_hunks_takes_both_changes_only_where_they_touch_different_lines(e
         == "def f(x):\n    if x and y:\n        return 2\n    return 0\n"
 
 
+def test_merge3_cells_takes_both_sides_cells_of_one_table_row_only_where_they_differ():
+    """A recorded send-back: two changes each edited a different cell of one Markdown table row, which
+    git calls a conflict on the whole line. With `cells`, the row takes each side's cell; a cell both
+    changed differently, a row added or removed, a changed cell count or a line that is no table row
+    stays a conflict. An escaped `\\|` is no cell separator."""
+    from ttp.batch import merge3
+    base = "# T\n\n| Item | Claude | Codex |\n| --- | --- | --- |\n| Mode | `--a` | `-s ro` |\n| End | x | y |\n"
+    ours = base.replace("`--a` |", "`--a`. With `b`, also `--b`. |")
+    theirs = base.replace("`-s ro`", "`-s full`")
+    assert merge3(ours, base, theirs, hunks=True) is None, "without cells, git's conflict stands"
+    kinds = set()
+    got = merge3(ours, base, theirs, cells=True, kinds=kinds)
+    assert got == base.replace("`--a` |", "`--a`. With `b`, also `--b`. |").replace("`-s ro`", "`-s full`")
+    assert kinds == {"cells"}
+    assert merge3(ours, base, base.replace("`--a`", "`--c`"), cells=True) is None, "one cell changed on both sides"
+    assert merge3(ours, base, theirs.replace("| End | x | y |\n", "| End | x | y |\n| New | 1 | 2 |\n"),
+                  cells=True) is not None, "a row added below the conflict is git's clean merge"
+    assert merge3(ours, base, theirs.replace("| Mode |", "| Mode | extra |"), cells=True) is None, "a cell added"
+    assert merge3(ours, base, base.replace("| Mode | `--a` | `-s ro` |\n", ""), cells=True) is None, "a row removed"
+    prose = "a b c\n"
+    assert merge3("a B c\n", prose, "a b C\n", cells=True) is None, "no table row"
+    esc = "| k | a \\| b | c |\n"
+    assert merge3(esc.replace("a \\|", "A \\|"), esc, esc.replace("| c |", "| C |"), cells=True) == \
+        "| k | A \\| b | C |\n"
+    assert merge3(esc.replace("a \\|", "a |"), esc, esc.replace("| c |", "| C |"), cells=True) is None, \
+        "unescaping a pipe changes the cell count"
+
+
+@pytest.mark.parametrize("case", ["cells", "same_cell", "own_logic"])
+def test_a_push_batch_replays_heads_in_order_and_keeps_an_approval_only_when_the_overlap_needs_no_judgment(
+        env, monkeypatch, case):
+    """Replayed push conflicts of approved heads in one batch. e2 is replayed onto e1, not onto the old tip.
+    `cells`: the tip and the change each edited a different cell of one docs table row (a send-back
+    that cost a review run): settled by cells, the checks run on the result and both land with no
+    model. `same_cell` (both rewrote one cell) and `own_logic` (both changed one line of a function)
+    still go back to the review as a conflict."""
+    files = {"cells": "docs/providers.md", "same_cell": "docs/providers.md", "own_logic": "pkg/m.py"}
+    path = files[case]
+    base = ("| Item | Claude | Codex |\n| --- | --- | --- |\n| Mode | `--a` | `-s ro` |\n" if case != "own_logic"
+            else "def f(x):\n    return x + 1\n")
+    tip = {"cells": base.replace("`--a` |", "`--a`, also `--b` |"), "same_cell": base.replace("`-s ro`", "`-s rw`"),
+           "own_logic": base.replace("x + 1", "x + 2")}[case]
+    change = {"cells": base.replace("`-s ro`", "`-s full`"), "same_cell": base.replace("`-s ro`", "`-s full`"),
+              "own_logic": base.replace("x + 1", "x * 3")}[case]
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    (other / path).parent.mkdir(parents=True)
+    _commit(other, path, base)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {path: tip}), _entry(repo, "e2", {path: change})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    if case == "cells":
+        assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+        d = m["results"][1]["detail"]
+        assert d["settled"] == [path] and d["settled_by"] == ["cells"], d
+        assert _git_out(origin, "show", f"proj:{path}") == \
+            base.replace("`--a` |", "`--a`, also `--b` |").replace("`-s ro`", "`-s full`").rstrip("\n")
+        subjects = _git_out(origin, "log", "--format=%s", "proj").splitlines()
+        assert subjects.index(next(s for s in subjects if s.startswith("e2:"))) < \
+            subjects.index(next(s for s in subjects if s.startswith("e1:"))), "e2 replayed on top of e1"
+    else:
+        assert _statuses(m) == ["pushed", "conflict"], m
+        assert m["results"][1]["detail"]["files"] == [path], m
+        assert _git_out(origin, "show", f"proj:{path}") == tip.rstrip("\n")
+
+
 def test_merge3_keeps_the_final_newline_as_the_sides_had_it(env):
     """git ends each side of a conflict at the end of the file with a newline. The settled result ends
     as the sides had it: without one where none had it, with one where a side added it."""
