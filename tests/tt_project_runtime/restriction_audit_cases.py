@@ -452,3 +452,40 @@ def test_an_exceeded_audit_budget_fails_open_and_notes_the_cut(env, monkeypatch)
     assert time.monotonic() - t0 < 4, "the restriction audit held the turn past its budget"
     got = [n for n in p.db.kv(coord.NOTES_KEY, []) if "restriction tools:" in n]
     assert len(got) == 1 and "cut short at its 0.5 s budget while indexing the tool lines" in got[0], got
+
+
+def test_a_slow_restriction_audit_never_holds_a_daemon_reap_pass_past_its_bound(env, monkeypatch):
+    """The stalled frame was reap_runs -> finish_run -> _finish_coordinator -> coordinator.apply ->
+    restriction_tools: a coordinator turn loosening a Restrictions item, reaped by the daemon with a tool
+    scan that would take 8 s unbounded, ends the pass within the audit's budget, the turn applied and the
+    cut-short note in the turn's notes."""
+    from ttp import coordinator as coord, restriction_audit
+    from ttp.daemon import Daemon
+    p, tasks = _soak_guard(env)
+    for i in range(40):
+        (p.root / "bin" / f"tool{i}.sh").write_text("#!/bin/sh\necho ok\n")
+    real_add = restriction_audit.WordIndex.add
+
+    def slow_add(self, lines):
+        time.sleep(0.2)
+        real_add(self, lines)
+
+    monkeypatch.setattr(restriction_audit.WordIndex, "add", slow_add)
+    monkeypatch.setattr(restriction_audit, "AUDIT_BUDGET_S", 0.5)
+    mids, src = _turn_said(p, "the soak test may run on a shared rack at night")
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _GUARD_SOAK + " (user msg #7)",
+           "text": "Run the soak test on a shared rack only at night.", "source": src}
+    run_dir = env["tmp"] / f"run-coord-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"actions": [act], "summary": "loosened the soak ban"}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+                 ("coordinator", "fake", time.time(), "running", str(run_dir), "x", json.dumps({"messages": mids})))
+    d = Daemon(p.base)
+    t0 = time.monotonic()
+    d.reap_runs()
+    assert time.monotonic() - t0 < 4, "a slow restriction audit held the daemon's reap pass past its bound"
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] != "running"
+    assert "only at night" in p.charter_path.read_text(), "the turn was not applied"
+    got = [n for n in p.db.kv(coord.NOTES_KEY, []) if "restriction tools:" in n]
+    assert len(got) == 1 and "cut short at its 0.5 s budget while indexing the tool lines" in got[0], got
