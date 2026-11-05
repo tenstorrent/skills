@@ -5557,6 +5557,28 @@ def _checks_result(run_dir: Path) -> int:
     return 0
 
 
+def cmd_pool_wait(a) -> None:
+    """Run the command that waits for a test-pool slot (a check script's or shard's own pick of a free test
+    host), recording that wait in its push check's waits folder while it runs (checkwait.POOL): the check's
+    time limit does not count it, its pool-wait bound (delivery.push_pool_wait_s) does. Outside a push check
+    it only runs the command. Exits with the command's code (128 + the signal for one a signal ended)."""
+    from . import checkwait
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd:
+        die("usage: ttp pool-wait [--what <pool>] -- <command that returns once a slot is free>")
+    token = checkwait.begin(f"test-pool slot {a.what}".strip(), pool=True)
+    try:
+        rc = subprocess.call(cmd)
+    except OSError as e:
+        print(f"ttp pool-wait: {e}", file=sys.stderr)
+        rc = 127
+    except KeyboardInterrupt:
+        rc = 130
+    finally:
+        checkwait.end(token)
+    sys.exit(128 - rc if rc < 0 else rc)
+
+
 def cmd_clip(a) -> None:
     """Run one command with its whole output in a file, and print only what a model needs: a test
     run's failures, else the head and tail, plus the file's path. Exits with the command's code.
@@ -11018,7 +11040,8 @@ COMMAND_GROUPS = (
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
                   "machines", "logs", "doctor")),
     ("inside a run", ("note", "notify", "progress", "checks", "lock", "host-run", "detach", "devq", "push", "land",
-                      "clip", "sandbox", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
+                      "clip", "sandbox", "pool-wait", "skill", "killscan", "svcscan", "leftover-procs", "said",
+                      "hostcheck")),
     ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -11456,6 +11479,12 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--lines", type=int, default=40, help="at most this many lines of an ordinary excerpt")
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --")
     s.set_defaults(fn=cmd_clip)
+
+    s = sub.add_parser("pool-wait", help="run the command a push check (or its shard) uses to wait for a test-pool "
+                                         "slot, so the check's time limit does not count that wait; its code")
+    s.add_argument("--what", default="", help="the pool's name, for the record")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="the command, after --, that returns once a slot is free")
+    s.set_defaults(fn=cmd_pool_wait)
 
     s = sub.add_parser("sandbox", help="run a command (a test suite) in its own PID namespace, where it cannot see "
                                        "or signal other processes; nothing it starts outlives it")
