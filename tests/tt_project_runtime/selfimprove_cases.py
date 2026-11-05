@@ -233,10 +233,12 @@ def test_selfimprove_the_self_change_action_applies_with_its_guardrails(env, mon
     assert len(rec) == 1 and rec[0]["check_at"] > time.time() + 2.9 * 86400, "default: measured in 3 days"
     for k in ("metric", "fresh_project", "generic"):
         assert k in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"], k
-    # The prompt row shows only with the persistent session on: mode off keeps today's prompt.
+    # The prompt row shows only in the persistent session's role: the stateless role keeps today's prompt.
     assert "session" not in prompts.coordinator_features(p)
     p.set_config("coordinator.session.mode", "on")
     assert "session" in prompts.coordinator_features(p)
+    assert "`self_change`" not in prompts.coordinator_role(p)
+    assert "`self_change`" in prompts.coordinator_session_role(p)
 
 
 def test_selfimprove_claude_counts_each_tool_call_once(env, tmp_path):

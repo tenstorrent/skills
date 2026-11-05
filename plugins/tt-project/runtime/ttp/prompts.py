@@ -129,8 +129,9 @@ def change_windows(charter: str) -> str:
 
 def coordinator_role(p: Project) -> str:
     """The coordinator's role prompt (prompts/coordinator.md) with the rules for this project's
-    features only."""
-    return feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), coordinator_features(p))
+    features only. The persistent session's own rules (`session`) go only in its role, coordinator_session_role:
+    this stateless role keeps its landed size budget."""
+    return feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), coordinator_features(p) - {"session"})
 
 
 def coordinator_session_role(p: Project) -> str:
