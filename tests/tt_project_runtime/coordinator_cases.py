@@ -20703,6 +20703,8 @@ def test_config_set_accepts_checks_nice_and_ionice_and_rejects_bad_values(env):
                       {"type": "config_set", "key": "checks.ionice", "value": "best-effort:8"}])
     assert len(probs) == 4
     assert p.config()["checks"] == {"nice": 15, "ionice": "best-effort:3"}
+    assert not apply(p, [{"type": "config_set", "key": "checks.nice", "value": "false"}])
+    assert p.config()["checks"]["nice"] is False, "false turns the check commands' lowered priority off"
 
 
 def _promise_text(tasks, owners):

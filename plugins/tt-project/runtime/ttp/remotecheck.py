@@ -163,13 +163,24 @@ def shipped(files: list[str], literal: dict) -> str:
     return out + "".join(f"export {k}={shlex.quote(v)}\n" for k, v in sorted(literal.items()))
 
 
-def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...] = ()) -> str:
+def _priority(prio: tuple[list, list] | None) -> str:
+    """The host's lines that put the command (in "$@") behind `nice` and `ionice` (testslots.priority_args),
+    each only where the host has it: the lowest priority there too, so its live services go first."""
+    if not prio:
+        return ""
+    return "".join(f"if command -v {words[0]} >/dev/null 2>&1; then set -- {' '.join(map(shlex.quote, words))} \"$@\"; fi\n"
+                   for words in reversed(prio) if words)
+
+
+def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...] = (),
+                prio: tuple[list, list] | None = None) -> str:
     """The host's side of a check run in directory `q`: the command in a process group of its own
     (setsid, else perl's setpgrp), with stdin from /dev/null and Ctrl-C and quit at their default, and a watcher that stops that group (TERM,
     then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
     local side stops or dies, and the command would run on. Then the exit-code marker, and the
     directory is removed. With `wrap`, the command runs behind it, and a wrapper that is missing or not
-    executable there prints the marker's NO_WRAP form instead of starting anything."""
+    executable there prints the marker's NO_WRAP form instead of starting anything. With `prio`, it all
+    runs behind the host's `nice` and `ionice` (_priority)."""
     w = " ".join(map(shlex.quote, wrap))
     run = f"{w} bash -e -o pipefail -c {shlex.quote(cmd)}".lstrip()
     has = ""
@@ -179,6 +190,7 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
         has = f"if ! {{ {test}; }}; then printf '\\n%s%s\\n' {mark} {NO_WRAP}; exit 96; fi\n"
     return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}{has}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"
+            f"{_priority(prio)}"
             # A background job's stdin is /dev/null unless redirected: the watcher reads ssh's from fd 3.
             "exec 3<&0\n"
             # It also starts with SIGINT and SIGQUIT ignored, which no shell can undo: reset both first.
@@ -288,7 +300,8 @@ def main(args: list[str]) -> int:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
         mark = f"ttp-remote-rc:{secrets.token_hex(8)}:"
-        script = _run_script(q, exports(env) + extra, cmd, mark, wrap)
+        from . import testslots
+        script = _run_script(q, exports(env) + extra, cmd, mark, wrap, testslots.priority_args(testslots._cfg()))
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
         proc = subprocess.Popen(_ssh(host, script), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)

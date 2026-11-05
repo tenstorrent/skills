@@ -1811,12 +1811,21 @@ def ionice_args(cfg: dict | None = None) -> list:
     return list(IONICE)
 
 
+def priority_args(cfg: dict | None = None) -> tuple[list, list] | None:
+    """(the `nice` argv words, the `ionice` argv words) a check command runs behind, or None when
+    checks.nice is false (the project's or the account's): check commands then run at normal priority."""
+    acct = project.load_account_settings().get("checks") or {}
+    if _section(cfg, "checks").get("nice") is False or acct.get("nice") is False:
+        return None
+    return ["nice", "-n", str(nice_level(cfg))], ["ionice", *ionice_args(cfg)]
+
+
 def low_priority(argv: list) -> list:
     """A check command's argv under `nice` (nice_level) and `ionice` (ionice_args) where they exist, so a
-    host's live services go first; either missing is skipped. checks.nice false (account setting)
+    host's live services go first; either missing is skipped. checks.nice false (priority_args)
     runs it as it is."""
-    if (project.load_account_settings().get("checks") or {}).get("nice") is False:
+    prio = priority_args(_cfg())
+    if prio is None:
         return list(argv)
-    cfg = _cfg()
-    return ((["nice", "-n", str(nice_level(cfg))] if shutil.which("nice") else [])
-            + (["ionice", *ionice_args(cfg)] if shutil.which("ionice") else []) + list(argv))
+    nice, ionice = prio
+    return (nice if shutil.which("nice") else []) + (ionice if shutil.which("ionice") else []) + list(argv)

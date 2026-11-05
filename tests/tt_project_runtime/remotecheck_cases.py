@@ -91,6 +91,35 @@ def test_a_remote_check_runs_on_a_git_checkout_of_exactly_head_and_cleans_up(tmp
     assert _rc_left(tmp_path) == []
 
 
+
+def test_a_remote_check_runs_at_nice_19_and_idle_io_on_the_host(tmp_path):
+    """The command on the host runs behind its `nice -n 19` and `ionice -c3` (testslots.priority_args), not
+    only the local ssh client: its niceness there is 19, its IO class idle where the host has ionice."""
+    repo = _rc_repo(tmp_path)
+    rc, said = _rc_run(tmp_path, repo, "echo nice=$(nice); command -v ionice >/dev/null && ionice -p $$ || true")
+    assert rc == 0 and "nice=19" in said, said
+    if shutil.which("ionice"):
+        assert "idle" in said, said
+
+
+def test_a_remote_check_s_priority_prefix_skips_a_tool_the_host_lacks_and_none_when_off(tmp_path):
+    """Each of nice and ionice goes in front only where the host has it (macOS: no ionice), nice outermost;
+    checks.nice false (no priority words) adds nothing."""
+    from ttp import remotecheck
+    prio = (["nice", "-n", "19"], ["ionice", "-c3"])
+    assert remotecheck._priority(None) == "" and "nice" not in remotecheck._run_script("/t", "", "x", "M:")
+    only = tmp_path / "only"
+    only.mkdir()
+    for tool in ("nice", "ionice"):
+        (only / tool).write_text("#!/bin/sh\n")
+        (only / tool).chmod(0o755)
+        script = "set -- bash -c x\n" + remotecheck._priority(prio) + 'echo "$@"\n'
+        out = subprocess.run(["/bin/sh", "-c", script], env={"PATH": str(only)}, capture_output=True, text=True)
+        assert out.stdout.split() == {"nice": ["nice", "-n", "19", "bash", "-c", "x"],
+                                      "ionice": ["nice", "-n", "19", "ionice", "-c3", "bash", "-c", "x"]}[tool], out
+    assert remotecheck._priority(prio) in remotecheck._run_script("/t", "", "x", "M:", ("srun",), prio)
+
+
 def test_a_remote_check_given_a_commit_copies_that_commit_not_the_moved_head(tmp_path):
     """--commit (the commit a `ttp checks` run records): the host gets that commit though HEAD moved
     since; a commit this checkout lacks, or an option-like value, copies nothing and fails (exit 2)."""

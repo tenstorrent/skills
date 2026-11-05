@@ -6200,7 +6200,7 @@ def cmd_checks_shard(a) -> None:
     checks.wrap_cmd, and its local fallback, start each shard as `ttp checks-shard -- <cmd>` on the host
     it runs on (over ssh too), so the shard takes that host's checks slot or counts as a pool run there.
     Exits with the command's code (128 + the signal for one a signal ended)."""
-    from . import checkcap
+    from . import checkcap, testslots
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
         die("ttp checks-shard: give the command after --")
@@ -6208,7 +6208,7 @@ def cmd_checks_shard(a) -> None:
     try:
         with checkcap.shard(checkcap.label(name, "pool shard"), " ".join(cmd)[:300], project_name=name,
                             tell=lambda line: print(f"ttp checks-shard: {line}", file=sys.stderr, flush=True)) as env:
-            rc = subprocess.run(cmd, env={**os.environ, **env}).returncode
+            rc = subprocess.run(testslots.low_priority(cmd), env={**os.environ, **env}).returncode
     except checkcap.Unavailable as e:
         die(f"ttp checks-shard: {e}")
     except OSError as e:

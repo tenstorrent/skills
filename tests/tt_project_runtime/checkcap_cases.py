@@ -5942,6 +5942,36 @@ def test_check_commands_start_at_nice_19_and_idle_io_by_default_and_skip_a_missi
     monkeypatch.setattr(testslots.shutil, "which", real)
 
 
+
+def test_checks_nice_false_in_the_project_or_the_account_runs_check_commands_as_they_are(env, monkeypatch):
+    """checks.nice false, the project's or the account's, turns the lowered priority off (priority_args None);
+    a number or nothing keeps it on, at nice 19 and idle IO by default."""
+    from ttp import project, testslots
+    monkeypatch.setattr(testslots.shutil, "which", lambda name: f"/usr/bin/{name}")
+    monkeypatch.setattr(testslots, "_cfg", lambda: {"checks": {"nice": False}})
+    assert testslots.priority_args({"checks": {"nice": False}}) is None
+    assert testslots.low_priority(["pytest"]) == ["pytest"], "the project's off switch"
+    monkeypatch.setattr(testslots, "_cfg", lambda: {"checks": {"nice": 0}})
+    assert testslots.low_priority(["pytest"]) == ["nice", "-n", "0", "ionice", "-c3", "pytest"], "0 is a level, not off"
+    assert testslots.priority_args(None) == (["nice", "-n", "19"], ["ionice", "-c3"])
+    project.set_account_setting("checks.nice", False)
+    assert testslots.priority_args(None) is None and testslots.low_priority(["pytest"]) == ["pytest"], "the account's"
+
+
+def test_a_pool_shard_runs_its_command_at_the_checks_low_priority(env, monkeypatch):
+    """`ttp checks-shard` (a pool shard, here or on a host over ssh) starts its command behind
+    testslots.low_priority, as every other check command."""
+    import contextlib
+    from ttp import checkcap, cli, testslots
+    monkeypatch.setattr(testslots, "low_priority", lambda argv: ["nice", "-n", "19", *argv])
+    monkeypatch.setattr(checkcap, "shard", lambda *a, **k: contextlib.nullcontext({}))
+    ran = []
+    monkeypatch.setattr(cli.subprocess, "run", lambda cmd, **k: ran.append(cmd) or subprocess.CompletedProcess(cmd, 0))
+    with pytest.raises(SystemExit) as e:
+        cli.cmd_checks_shard(types.SimpleNamespace(cmd=["--", "pytest", "-q"]))
+    assert e.value.code == 0 and ran == [["nice", "-n", "19", "pytest", "-q"]]
+
+
 @pytest.mark.parametrize("cores,want", [(1, 2), (4, 2), (16, 2), (32, 4), (64, 8), (256, 8)])
 def test_a_project_s_test_worker_ceiling_defaults_to_min_8_and_cores_over_8_at_least_2(env, monkeypatch, cores, want):
     from ttp import checkcap, project, testslots

@@ -292,13 +292,15 @@ def _repo_list(v: Any) -> list[str]:
 
 
 def _checks_nice(v):
-    """checks.nice as config_set takes it: a whole number 0-19."""
+    """checks.nice as config_set takes it: a whole number 0-19, or false (check commands at normal priority)."""
+    if v is False or str(v).strip().lower() in ("false", "off", "no"):
+        return False
     try:
         n = int(str(v).strip())
     except ValueError:
         n = -1
     if isinstance(v, bool) or not 0 <= n <= 19:
-        raise ValueError(f"checks.nice: {v!r} is not a whole number 0-19")
+        raise ValueError(f"checks.nice: {v!r} is not a whole number 0-19 or false")
     return n
 
 
