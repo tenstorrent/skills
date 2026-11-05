@@ -314,7 +314,7 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
     names (its title or spec has the file's path or name) is left out. Open tasks' start_when probes and
     schedule prechecks are scanned too. `loosened` entries may carry a fifth field, `exception`: the new
     text excepts the item, which still stands, so its own terms (identifiers, distinctive words, quotes,
-    cites) match. Per item with such files: one priority-1 harness task naming them (label TASK_LABEL +
+    cites, and the words it shares with the exception) match. Per item with such files: one priority-1 harness task naming them (label TASK_LABEL +
     a key of the change: a change that already queued one queues none) and one queued restriction_tools
     event for the next digest. Model-free; it edits no tool. Returns the event texts.
     Bounded by `budget_s` (AUDIT_BUDGET_S) of wall clock: past it the scan fails open, keeps what it found
@@ -379,8 +379,12 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
         advisory, exception = bool(rest and rest[0]), len(rest) > 1 and bool(rest[1])
         if (over == "unsourced" or advisory) and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
-        # an exception leaves the item standing: its own identifiers, distinctive words, quotes and cites
+        # an exception leaves the item standing: its own identifiers, quotes and cites, and its distinctive
+        # words the exception names too (its scope; the item's other words say what still holds)
         ids, words, exact = tool_terms(old, "", "", idx) if exception else tool_terms(old, new, charter, idx)
+        if exception:
+            from .coordinator import _rule_words
+            words &= _rule_words(new)
         rare = distinctive_words(words, idx)
         on = idx.hits(words)
         hits = []

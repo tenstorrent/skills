@@ -371,17 +371,34 @@ def test_a_loosened_item_queues_one_task_naming_a_guard_file_and_a_task_probe(en
     assert len(tasks()) == 1
 
 
-def test_a_lifting_both_hold_text_queues_the_update_task_too(env):
-    """A Restrictions text sent with `both_hold` on the user's word that permits what a standing ban
-    forbids (an exception in effect) queues the same one update task for the guard still citing it."""
+def test_an_item_added_after_an_unchanged_item_queues_no_update_task(env):
+    """A new Restrictions item added after a standing one it overlaps (`both_hold`, as the append guard
+    asks, on the user's word) is an addition: the standing item stays word for word and unchanged, no
+    update task or restriction_tools event names a tool by that item's keywords."""
     from ttp import coordinator as coord
+    for said, text in (("the soak test may run on rack-a with soak_leg.sh",
+                        "Workers may run the soak test on rack-a with `soak_leg.sh`."),
+                       ("workers may use the spare build boxes for CPU test runs", _SPARE_ITEM)):
+        p, tasks = _soak_guard(env)
+        mids, src = _turn_said(p, said)
+        act = {"type": "charter_update", "section": "Restrictions", "both_hold": True, "text": text, "source": src}
+        assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+        charter = p.charter_path.read_text()
+        assert text.split()[1] in charter and charter.count(_GUARD_SOAK + " (user msg #7)") == 1, charter
+        assert tasks() == [] and not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'"), tasks()
+
+
+def test_a_scoped_exception_matches_tools_only_on_words_it_shares_with_the_item(env):
+    """An `excepts` exception matches tools on the item's cites, identifiers and the rule words the
+    exception names too; a tool line naming only the item's other words is no hit."""
+    from ttp import restriction_audit
     p, tasks = _soak_guard(env)
-    mids, src = _turn_said(p, "the soak test may run on rack-a with soak_leg.sh")
-    act = {"type": "charter_update", "section": "Restrictions", "both_hold": True,
-           "text": "Workers may run the soak test on rack-a with `soak_leg.sh`.", "source": src}
-    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
-    got = tasks()
-    assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"] and _GUARD_SOAK in got[0]["spec"], got
+    (p.root / "bin" / "soak-guard.sh").write_text("#!/bin/sh\necho 'refused: a shared rack is banned'; exit 1\n")
+    exc = "Workers may run the soak test on rack-a with `soak_leg.sh`."
+    assert restriction_audit.restriction_tools(p, [(_GUARD_SOAK, exc, "", False, True)], []) == []
+    (p.root / "bin" / "soak-guard.sh").write_text("#!/bin/sh\necho 'refused: no soak test here'; exit 1\n")
+    assert len(restriction_audit.restriction_tools(p, [(_GUARD_SOAK, exc, "", False, True)], [])) == 1
+    assert len(tasks()) == 1 and "bin/soak-guard.sh:2" in tasks()[0]["spec"], tasks()
 
 
 # The audit runs on the daemon's tick thread (coordinator.apply in reap_runs): it tokenizes the tool lines

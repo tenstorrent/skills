@@ -3031,9 +3031,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                 "a Brief or harness-gate source is not the user's words" if a.get("source")
                                 else restriction_source.NO_SOURCE), end, said)
                         notes.append(overlap)
-                    elif text and a.get("both_hold") and not (quote or replaces) and _may_lift(text):
-                        lifted = [x for x, _ in _append_conflicts(p.charter_path.read_text(), section, text,
-                                                                   lifts_only=True)]
                     elif text and not (replaces or a.get("both_hold") or refused):
                         # the user's verbatim words (or agent-ordered) behind a lift: the harness fixes its form
                         fixed, why_not = (_repair_lift(p, section, text, end, _verbatim_said(db, cite, agent))
@@ -3139,8 +3136,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             loosened += [(o, n, why, loose_drop) for o, n in restriction_audit.replaced_items(gone, into)]
                     elif text and not quote and not a.get("both_hold") and not excepts:
                         rules_added.append((target, text))
-                    if lifted and (excepts or uturn or ok is not None) and target.lower().startswith("restriction"):
-                        # an exception on the user's word: tools enforcing the excepted item still refuse it
+                    if lifted and target.lower().startswith("restriction"):
+                        # an `excepts` exception on the user's word: tools enforcing the excepted item still
+                        # refuse it. A `both_hold` item is an addition, its neighbours unchanged: no update task
                         loosened += [(x, text, "", False, True) for x in lifted]
                     if retired:
                         db.post("out", f"Retired the charter restriction {retired}: "
