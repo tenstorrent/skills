@@ -190,22 +190,16 @@ def test_a_job_over_before_the_boot_does_not_wake_its_task_after_a_reboot(env, h
     assert _woken(p, tid) is wakes, dict(p.db.task(tid))
 
 
-@pytest.mark.parametrize("probe, wakes", [
-    ('test "$(date +%s)" -ge 1900000000', False),   # a bare timer: noted, sleeps on
-    ("exit 1", True),   # any other wait with a job the reboot cut short wakes as before
-])
-def test_a_bare_timer_wait_sleeps_through_a_reboot_with_a_note_of_the_job_it_cut(env, probe, wakes):
+def test_a_bare_timer_wait_whose_job_each_reboot_cuts_is_blocked_by_the_third(env):
+    """A bare-timer wait gets no reboot exemption when its own job was cut short: each such reboot
+    counts toward max_reboot_losses, so a job that takes the host down is blocked, not relaunched."""
     p = make(env)
     tid = p.db.add_task("soak test", "s", kind="work", tier="light", origin="user")
-    _waiting_from_before_the_boot(p, tid, job=True, retry_when=probe)
-    _boot_daemon(p)
+    for i in range(1, 6):
+        _waiting_from_before_the_boot(p, tid, boot=f"boot-{i}", retry_when='test "$(date +%s)" -ge 1900000000')
+        _boot_daemon(p, f"boot-{i + 1}")
+        if p.db.task(tid)["status"] == "blocked":
+            break
     t = p.db.task(tid)
-    assert _woken(p, tid) is wakes, dict(t)
-    (run_dir,) = [pathlib.Path(r["dir"]) for r in p.db.q("SELECT dir FROM runs WHERE task=?", (tid,))]
-    note = run_dir / "progress.md"
-    if wakes:
-        assert "bare timer" not in (note.read_text() if note.exists() else "")
-    else:
-        assert t["not_before"] > time.time() + 3000 and "woke" not in json.loads(t["result"])
-        assert "the host reboot cut short detached job soak" in note.read_text()
-        assert not p.db.q("SELECT id FROM events WHERE task=?", (tid,)), "a model was called for it"
+    assert t["status"] == "blocked" and i == 3, (i, dict(t))
+    assert t["blocked_reason"] == "lost to a host reboot 3 times; it may be causing them"

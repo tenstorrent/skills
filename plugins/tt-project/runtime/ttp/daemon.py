@@ -11501,11 +11501,6 @@ class Daemon:
                 continue   # asleep on its retry_when: the same checks or resumable jobs run again
             if rebootwait.stays_asleep(prev, (str(self.p.runs),)) and not self._job_without_rc(t["id"]):
                 continue   # nothing it waits on died with the host: its timer and probe stand
-            if time_gate(str(prev.get("retry_when") or "")) is not None:
-                # A bare timer waits on no job: one of its own the reboot cut short is noted for the run
-                # that timer wakes, and nothing wakes now (a model call that could only re-arm the timer).
-                self._note_cut_jobs(t["id"])
-                continue
             probe = str(prev.get("retry_when") or "")
             rcs = rebootwait.local_jobs(probe)
             lost = self._lost_jobs(t["id"], rcs)
@@ -11850,18 +11845,6 @@ class Daemon:
             return detach.lost(rc).stat().st_mtime < at
         except OSError:
             return False
-
-    def _note_cut_jobs(self, tid: int) -> None:
-        """Note on task tid, for its next run, the detached jobs of its own the reboot cut short."""
-        boot = self._last_earlier_boot(tid)
-        cut = self._cut_jobs(tid, boot) if boot else []
-        if not cut:
-            return
-        names = ", ".join(rc.stem for rc in cut[:5]) + (f" and {len(cut) - 5} more" if len(cut) > 5 else "")
-        why = (f"the host reboot cut short detached job{'s' if len(cut) > 1 else ''} {names}; the task's "
-               "retry_when is a bare timer, so it sleeps on to it and this run decides whether to relaunch")
-        _task_note(cut[0].parent, why)
-        log(self.p, f"task {tid}: {why}")
 
     def _lost_jobs(self, tid: int, rcs: list[Path]) -> list[Path]:
         """Of the local detached jobs task tid waits on (`rcs`) and those its runs on the earlier boot
