@@ -2114,3 +2114,31 @@ def test_detach_check_host_on_the_own_machine_reads_it_here_with_no_ssh(env, tmp
     with contextlib.redirect_stdout(io.StringIO()):   # a remote host still goes over ssh
         assert cli._detach_check_remote("box-far", [str(rdir / "done")]) == 255
     assert "box-far" in (tmp_path / "ssh-called").read_text()
+
+
+def test_detach_check_host_on_the_own_machine_reads_a_relative_prefix_from_home(env, tmp_path, monkeypatch):
+    """On the daemon's own host the check runs where ssh would, in HOME: a prefix relative to HOME, as
+    `ttp detach --remote <own alias> --dir <relative dir>` keeps, names the same job from any folder."""
+    from ttp import cli, detach
+    from ttp import machines as mm
+    make(env)
+    mm.add("box-self", hostname="testhost")   # TTP_HOST: this machine
+    b = tmp_path / "bin"
+    b.mkdir()
+    (b / "ssh").write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path / "ssh-called"}"\nexit 255\n')
+    (b / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{b}:{os.environ['PATH']}")
+    home, elsewhere = tmp_path / "home", tmp_path / "elsewhere"
+    (home / "jobs").mkdir(parents=True)
+    elsewhere.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.chdir(elsewhere)
+    (home / "jobs" / "live.pid").write_text(f"{os.getpid()}\n")
+    (home / "jobs" / "done.rc").write_text("0\n")
+    (home / "jobs" / "mark").write_text("")
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        assert cli._detach_check_remote("box-self", ["jobs/live"]) == 1, out.getvalue()
+        assert cli._detach_check_remote("box-self", ["jobs/done"]) == 0, out.getvalue()
+    seen = detach._remote_sh("box-self", "jobs/live.pid", "jobs/mark")
+    assert seen and seen["marker"] and seen.get("alive") == str(os.getpid()), seen
+    assert not (tmp_path / "ssh-called").exists(), "the own host was asked over ssh"

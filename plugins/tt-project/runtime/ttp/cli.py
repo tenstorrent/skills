@@ -7073,14 +7073,16 @@ def _rows_verdict(n: int | None, rows: str, after: int, one_ended: bool, where: 
 def _ssh_sh(host: str, script: str, args: list, timeout: float = 60,
             here: bool = True) -> subprocess.CompletedProcess | None:
     """Run `script` with sh on `host` over ssh, with `args` as its $1...; None when ssh cannot run.
-    With `here`, on this machine itself (netwait.own) it runs here, with no ssh: a read never waits on
-    a route to itself. A start keeps ssh, so its job outlives the caller's session."""
+    With `here`, on this machine itself (netwait.own) it runs here in HOME, with no ssh: a read never
+    waits on a route to itself. A start keeps ssh, so its job outlives the caller's session."""
     from . import netwait
     words = ["sh", "-c", script, "sh", *map(str, args)]
     remote = "sh -c " + " ".join(shlex.quote(x) for x in words[2:])
-    cmd = words if here and netwait.own(host) else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, remote]
-    try:
-        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+    local = here and netwait.own(host)
+    cmd = words if local else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, remote]
+    try:   # here it runs in HOME, as ssh does, so a relative path names the same file
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout,
+                              cwd=os.path.expanduser("~") if local else None)
     except (OSError, subprocess.SubprocessError):
         return None
 
