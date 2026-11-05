@@ -5803,10 +5803,11 @@ def _lock_answers(a, answers: list[tuple[str, int, str | dict]]) -> None:
 
 
 def _urgent_priority(p, task: str) -> int | None:
-    """urgent.PRIORITY when `task` (an id) is urgent, else None: the lock and device queues order only by it."""
+    """urgent.queue_priority of `task` (an id): ORDERED_PRIORITY for a user-ordered urgent task, PRIORITY for
+    another urgent one, else None: the lock and device queues order only by it."""
     from . import urgent
     try:
-        return urgent.PRIORITY if task.strip().isdigit() and urgent.is_urgent(p.db.task(int(task))) else None
+        return urgent.queue_priority(p.db.task(int(task))) if task.strip().isdigit() else None
     except Exception:   # an unreadable task only loses the urgent place, never the command
         return None
 

@@ -109,6 +109,7 @@ from . import extchange
 from . import failover
 from . import tierfloor
 from . import premise
+from . import preempt
 from . import outagetask
 from . import grants
 from . import ends
@@ -4928,8 +4929,15 @@ class Daemon:
                 or (status == "shutdown" and isinstance(result, dict) and result.get("status"))):
             ended, status = status, "ok"
         elif status == "shutdown":
-            # The project was stopped, not the task: it resumes on the next start, on its own branch.
-            db.update_task(task["id"], status="queued", blocked_reason="interrupted by `ttp stop --kill`; resumes")
+            # The project was stopped, or the run preempted for urgent work (preempt.py), not the task: it
+            # resumes on the next start, on its own branch, at its place in the queue.
+            try:
+                said = (run_dir / "STOP").read_text().strip()
+            except OSError:
+                said = ""
+            db.update_task(task["id"], status="queued", blocked_reason=(
+                "preempted for user-ordered urgent work; resumes" if said == preempt.STOP_TEXT
+                else "interrupted by `ttp stop --kill`; resumes"))
             return
         if refused in ("model_mismatch", "pin_unverified", "instructions_missing"):
             # A mismatch or strict unverifiable pin: nothing ran or was spent. Retrying the same
@@ -8688,6 +8696,11 @@ class Daemon:
             busy[run_prov] = busy.get(run_prov, 0) + 1
             if gate.regime == "caps":
                 ctx["committed"] += cost
+        if any(f == "full" for f in fate.values()) and preempt.enabled(self.cfg):
+            try:
+                self._preempt_for_urgent(ready, fate, ctx, core)
+            except Exception:   # preemption never stops dispatch
+                log(self.p, "urgent preemption failed\n" + traceback.format_exc())
         # A task a gate kept out this tick cannot start, so it must not hold `ttp lock` commands off.
         for task in ready:
             if task["id"] not in reached:
@@ -8697,6 +8710,44 @@ class Daemon:
                 self._log_slot_fill(free, ready, fate, ctx, core)
             except Exception:   # the audit log never stops dispatch
                 log(self.p, "scheduler log failed\n" + traceback.format_exc())
+
+    def _preempt_for_urgent(self, ready: list[dict], fate: dict[int, str], ctx: dict, core: str) -> list[int]:
+        """Each ready user-ordered urgent task (urgent.extra_ok) this pass held only by full worker and burst
+        slots, that would start with a slot free (re-checked with no slot taken, nothing reserved), gets one:
+        a stop already asked of a run of its provider counts as freeing one, else the lowest-priority
+        routine run is preempted (preempt.pick: never urgent work, a review, a push or a run holding a
+        lock). The preempted task is queued again with its work kept (_finish_worker); the urgent task
+        takes the slot on the next pass, ahead of it (db.ready_tasks). Returns the preempted run ids."""
+        db, now, out = self.p.db, ctx["now"], []
+        freeing: dict[str, int] = {}
+        held = None
+        for t in ready:
+            if fate.get(t["id"]) != "full" or not urgent.extra_ok(t, now):
+                continue
+            prov = ctx.get("slot", {}).get(t["id"]) or t["provider"] or core
+            if self._start_hold(t, prov, dict(ctx, busy={}, holds={}, full={}, full_why={}, branch={},
+                                              slot={})) is not None:
+                continue   # something besides the slots holds it: a preemption would free nothing for it
+            if prov not in freeing:
+                freeing[prov] = preempt.stopping(db, prov)
+            if freeing[prov] > 0:
+                freeing[prov] -= 1
+                continue
+            if held is None:
+                held = preempt.lock_holders(preempt.lock_dirs(self.p, self.cfg))
+            got = preempt.pick(db, prov, ctx.get("owners") or {}, held)
+            if not got:
+                log(self.p, f"urgent task {t['id']}: every {prov} slot taken and no run may be preempted")
+                continue
+            r, v = got["run"], got["task"]
+            runner.request_stop(Path(r["dir"]) if r["dir"] else self.p.runs / str(r["id"]), preempt.STOP_TEXT)
+            out.append(r["id"])
+            text = (f"#{v['id']} {v['title'][:80]} (p{v['priority']}, run {r['id']}) preempted so user-ordered "
+                    f"urgent #{t['id']} {t['title'][:80]} starts now; it is queued again with its work kept")
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "task_preempted", "low", text, "handled", v["id"]))
+            log(self.p, text)
+        return out
 
     def _log_slot_fill(self, free: int, ready: list[dict], fate: dict[int, str], ctx: dict, core: str) -> None:
         """One schedlog line for this slot fill: the ready tasks dispatch walked, in its order, that started or
@@ -8810,11 +8861,16 @@ class Daemon:
         gate = ctx["gate"] = bud.for_task(gate, bool(getattr(gate, "lane", None)) and self._priority_task(task, ctx))
         if "owners" not in ctx:   # an obligation's required owner ranks ahead of urgent work (db.ready_tasks)
             ctx["owners"] = self._owner_due()
-        # Deadline work (urgent.extra_ok: a fresh `urgent:` line or the template-merge task, or an
-        # obligation's required owner; not priority alone) may take budget.urgent_extra_slots beyond
-        # them, unless the gate allows no slot.
-        extra = urgent.extra_slots(self.cfg) if gate.max_parallel > 0 and (
-            urgent.extra_ok(task, now) or task["id"] in ctx["owners"]) else 0
+        # Deadline work may take budget.urgent_extra_slots burst slots beyond them. A stated urgent task
+        # (urgent.extra_ok: a fresh `urgent:` line or the template-merge task, not priority alone) at any
+        # level but red (an orange plan gate of 0 slots included, as critical work; the turn guard's red
+        # lifted by for_task is no such red); the dollar caps still hold it below. An obligation's
+        # required owner only while the gate allows a slot.
+        if urgent.extra_ok(task, now):
+            ok = gate.allow_new_work and (gate.level != "red" or bool(getattr(gate, "lane", None)))
+        else:
+            ok = gate.max_parallel > 0 and task["id"] in ctx["owners"]
+        extra = urgent.extra_slots(self.cfg) if ok else 0
         slots, kept = gate.max_parallel + extra, 0
         if not urgent.is_urgent(task) and task["id"] not in ctx["owners"]:
             # routine work leaves a slot for urgent work ready or due soon

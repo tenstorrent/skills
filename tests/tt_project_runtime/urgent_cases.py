@@ -20,9 +20,9 @@ def test_a_task_is_urgent_at_priority_one_or_with_an_urgent_spec_line_only():
               {"priority": 3, "spec": "Urgent: None"}, {"priority": 3, "spec": "urgent: n/a"}):
         assert not urgent.is_urgent(t), t
         assert urgent.why(t or {}) == "", t
-    assert urgent.extra_slots({}) == 1 and urgent.extra_slots({"budget": {"urgent_extra_slots": 0}}) == 0
+    assert urgent.extra_slots({}) == 2 and urgent.extra_slots({"budget": {"urgent_extra_slots": 0}}) == 0
     assert urgent.extra_slots({"budget": {"urgent_extra_slots": -2}}) == 0
-    assert urgent.extra_slots({"budget": {"urgent_extra_slots": "x"}}) == 1
+    assert urgent.extra_slots({"budget": {"urgent_extra_slots": "x"}}) == 2
 
 
 def test_only_the_harness_template_merge_task_leads_the_urgent_lane():

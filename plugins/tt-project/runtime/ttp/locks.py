@@ -1365,7 +1365,8 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
-    (ticket_priority), then arrival.
+    (ticket_priority), then arrival. A waiter below URGENT_PRIORITY (a user-ordered urgent task's,
+    urgent.queue_priority, or an open obligation's owner) goes before the other groups' waiters too.
 
     `urgent_max` > 0: urgent waiters (task priority URGENT_PRIORITY or better) go first, taking turns
     by group among themselves, but at most `urgent_max` turns in a row (counting the ones already
@@ -1402,9 +1403,14 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     out = []
     while groups:
         want = (True if hot else None) if first else (run < urgent_max if hot and cold else None)  # None: either
+        cand = [g for g, ts in groups.items() if want is None or any(_urgent(t) == want for t in ts)]
+        if want is not False:   # a user-ordered waiter (below URGENT_PRIORITY) goes first, in any group
+            best = min(ticket_priority(groups[g][0]) for g in cand)
+            if best < URGENT_PRIORITY:
+                cand = [g for g in cand if ticket_priority(groups[g][0]) == best]
         rank = ((lambda g: (min(ticket_priority(t) for t in groups[g] if _urgent(t)), key[g])) if first and want
                 else key.__getitem__)
-        g = min((g for g, ts in groups.items() if want is None or any(_urgent(t) == want for t in ts)), key=rank)
+        g = min(cand, key=rank)
         ts = groups[g]
         t = ts.pop(0 if want is None else next(i for i, t in enumerate(ts) if _urgent(t) == want))
         out.append(t)
@@ -1479,8 +1485,8 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
         return not dropped(ticket)
     if fair:
         q = fair_order(locks_dir, resource, q, urgent_max, aged_before)
-    else:   # urgent waiters (an urgent task's) first, arrival order within: none, and it is plain arrival
-        q = sorted(q, key=lambda t: not _urgent(t))
+    else:   # urgent waiters (an urgent task's) first, a user-ordered one (priority 0) before them, arrival
+        q = sorted(q, key=lambda t: min(ticket_priority(t), URGENT_PRIORITY + 1))   # order within: plain arrival
     q = landing_first(q)
     ahead = [t for t in q[:q.index(ticket)] if not (past_multi and is_multi(t))]
     if is_shared(ticket):

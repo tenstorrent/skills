@@ -94,7 +94,7 @@ from . import checkwait, diskgate, hostcpu, locks, obligations, poll_s, project,
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
-OBLIGATION_MARK = " [owns an open obligation: first in its project]"   # on its queue ticket
+OBLIGATION_MARK = " [owed to the user: goes first]"   # on its queue ticket (an obligation owner or user-ordered urgent)
 PRIORITY = "checks-push"   # check-slots/checks-push.<key>.lock: one priority slot per push branch
 CORES_PER_SLOT = 16       # the default cap's floor: one slot per this many cores, at least one
 CORES_PER_SLOT_MAX = 8    # its ceiling: one slot per this many cores
@@ -422,15 +422,16 @@ def task_priority(p) -> int | None:
 
 def task_rank(p) -> tuple[int | None, list[str]]:
     """(task_priority(p), the ids of the open obligations behind an OBLIGATION_PRIORITY boost, else []).
-    An urgent task (urgent.is_urgent: an `urgent:` spec line) ranks at least urgent.PRIORITY."""
+    An urgent task (urgent.is_urgent) ranks at least urgent.PRIORITY, a user-ordered one (a fresh `urgent:`
+    line) urgent.ORDERED_PRIORITY, as an obligation owner."""
     task = os.environ.get("TTP_TASK") or ""
     if p is None or not task.isdigit():
         return None, []
     try:
         t = p.db.task(int(task))
         prio = int(t["priority"]) if t and t.get("priority") is not None else None
-        if t and urgent.is_urgent(t):
-            prio = urgent.PRIORITY if prio is None else min(prio, urgent.PRIORITY)
+        if t and (q := urgent.queue_priority(t)) is not None:   # a user-ordered one ORDERED_PRIORITY
+            prio = q if prio is None else min(prio, q)
     except Exception:   # an unreadable database only loses the ordering, never the slot
         return None, []
     try:

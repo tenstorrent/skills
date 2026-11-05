@@ -1033,7 +1033,8 @@ def test_a_held_label_naming_a_kernel_thread_is_holder_unverifiable_and_its_run_
 
 def test_an_urgent_lock_waiter_goes_ahead_of_routine_ones_and_only_an_urgent_task_gets_the_mark(env, tmp_path):
     """locks.my_turn (arrival order): a waiter at task priority 1 or better takes the next slot before
-    earlier routine waiters; cli._urgent_priority gives that mark only to an urgent task's waiter."""
+    earlier routine waiters; cli._urgent_priority gives that mark only to an urgent task's waiter, and a
+    user-ordered one (a fresh `urgent:` line: urgent.queue_priority) priority 0, ahead of plain p1."""
     from ttp import cli, locks
     q = tmp_path / "q"
     routine = locks.enqueue(q, "r", "routine", priority=3)
@@ -1050,7 +1051,7 @@ def test_an_urgent_lock_waiter_goes_ahead_of_routine_ones_and_only_an_urgent_tas
     a = p.db.add_task("routine", "s", kind="work", origin="user", priority=2)
     b = p.db.add_task("urgent", "s\n  Urgent: the user asked twice", kind="work", origin="user", priority=3)
     c = p.db.add_task("p1", "s", kind="work", origin="user", priority=1)
-    assert [cli._urgent_priority(p, str(t)) for t in (a, b, c)] == [None, 1, 1]
+    assert [cli._urgent_priority(p, str(t)) for t in (a, b, c)] == [None, 0, 1]
     assert cli._urgent_priority(p, "") is None and cli._urgent_priority(p, "99999") is None
     assert cli._urgent_priority(p, "#12") is None, "only a plain task id"
 

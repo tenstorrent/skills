@@ -76,7 +76,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "reset_credit_expiry_hours": 48.0,
         "reset_credit_expiry_use_pct": 50.0,
         "max_parallel_workers": 6,          # on a plan, all of them run until the last stretch before the line
-        "urgent_extra_slots": 1,            # worker slots an urgent task may take beyond them (ttp/urgent.py; 0: off)
+        "urgent_extra_slots": 2,            # worker slots an urgent task may take beyond them (ttp/urgent.py; 0: off)
+        "urgent_preempt": True,             # preempt the lowest-priority routine run for user-ordered urgent work (ttp/preempt.py)
         "task_default_usd": {"light": 2.0, "standard": 8.0, "deep": 25.0},
         "run_timeout_s": {"light": 1200, "standard": 3600, "deep": 7200},
         "stall_s": {"light": 900, "standard": 1800, "deep": 2700},

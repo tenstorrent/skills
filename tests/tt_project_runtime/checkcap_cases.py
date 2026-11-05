@@ -1886,8 +1886,9 @@ def test_suite_slot_frees_to_the_most_urgent_waiter_not_the_first_arrival(env, m
 
 
 def test_suite_slot_ranks_an_urgent_spec_line_as_p1_ahead_of_earlier_p3s_fifo_within_a_priority(env, monkeypatch):
-    # A spec's `urgent:` line ranks a task's checks as p1 (urgent.is_urgent), via the rank the real
-    # callers pass (checkcap.task_rank); `urgent: no` does not; a running holder is never stopped.
+    # A spec's fresh `urgent:` line (user-ordered: urgent.queue_priority) ranks a task's checks as p0, ahead
+    # of plain p1, via the rank the real callers pass (checkcap.task_rank); `urgent: no` does not; a running
+    # holder is never stopped.
     import threading
     from ttp import checkcap, checklane, locks, testslots
     p = make(env)
@@ -1902,11 +1903,11 @@ def test_suite_slot_ranks_an_urgent_spec_line_as_p1_ahead_of_earlier_p3s_fifo_wi
     for tid in (holder, early, later, hot, p1, not_hot):
         monkeypatch.setenv("TTP_TASK", str(tid))
         rank[tid] = checkcap.task_rank(p)[0]
-    assert rank == {holder: 3, early: 3, later: 3, hot: 1, p1: 1, not_hot: 3}, rank
+    assert rank == {holder: 3, early: 3, later: 3, hot: 0, p1: 1, not_hot: 3}, rank
     monkeypatch.setenv("TTP_TASK", str(add("urgent p5", "urgent: deadline", 5)))
-    assert checkcap.task_rank(p) == (1, [])
+    assert checkcap.task_rank(p) == (0, [])
     monkeypatch.setenv("TTP_TASK", str(add("urgent p1", "urgent: x", 1)))
-    assert checkcap.task_rank(p) == (1, []), "never ranked below its own priority"
+    assert checkcap.task_rank(p) == (0, []), "a user-ordered line outranks its own priority"
 
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
     monkeypatch.delenv(testslots.HELD_ENV, raising=False)
@@ -1938,7 +1939,7 @@ def test_suite_slot_ranks_an_urgent_spec_line_as_p1_ahead_of_earlier_p3s_fifo_wi
     for t in ts:
         t.join(30)
     assert got == [hot, p1, early, later, not_hot], \
-        "p1 (an urgent line or priority 1) before earlier p3s; FIFO within a priority"
+        "a user-ordered urgent line, then p1, before earlier p3s; FIFO within a priority"
 
 
 def test_suite_slot_status_line_shows_the_holder_s_time_against_its_cap_and_the_waiting_order(env, monkeypatch):

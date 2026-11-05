@@ -10,25 +10,31 @@ an older release, so it leads the lane, ahead of priority-1 work. One holds the 
 - Worker start: db.ready_tasks puts urgent tasks before every other ready task (obligation owners
   included), and among them a fresh `urgent:` line (stated), then obligation owners, before priority
   alone, so a deadline task never waits behind a project's routine priority-1 work. With every worker
-  slot of its provider taken, a stated one (extra_ok) starts in up to budget.urgent_extra_slots (default 1; 0: off) slots beyond the gate's max_parallel. The spend gate
-  (allow_new_work, a gate of 0 slots, the dollar caps), the auth gate, pauses and resource locks
-  still hold it; a running run is never interrupted. The coordinator turn guard's red is no such
-  hold: it holds routine work only, and urgent and user-ordered tasks (user_ordered) start under the
-  rest of the gate (budget.for_task).
+  slot of its provider taken, a stated one (extra_ok: user-ordered) starts in up to budget.urgent_extra_slots
+  (default EXTRA_SLOTS; 0: off) burst slots beyond the gate's max_parallel, at green, yellow or orange (a
+  plan gate of 0 slots included, as critical work); never at red (allow_new_work), past the dollar caps, the
+  auth gate, a pause or a resource lock. With the burst slots full too, dispatch preempts the lowest-priority
+  routine run of its provider at a safe point (preempt.py; budget.urgent_preempt, default on): stopped
+  with its work kept and queued again at its place, never urgent work, a review, a push or a run holding
+  a lock. The coordinator turn guard's red is no such hold: it holds routine work only, and urgent and
+  user-ordered tasks (user_ordered) start under the rest of the gate (budget.for_task).
 - Review: an urgent code task's review is queued as soon as it hands off (done or needs_review)
   at priority 1; the review sweeps skip review.sweep_after_s and review.unreviewed_per_pass for it,
   and an urgent task in review for WAIT_S raises the review_stall event (Daemon._raise_review_stalls).
 - Push queue: an approved head of an urgent review or of the urgent task it reviews starts its batch
   at once (pushq.due); the guard against a running batch or deploy stays.
 - Waiting lists: exclusive-resource reservations (Daemon._slot_plan), `ttp lock` waiters
-  (locks.my_turn, also ahead of routine landings: locks.landing_first) and device runner queues
-  (devq.Runner.next_job) serve urgent waiters first.
+  (locks.my_turn, also ahead of routine landings: locks.landing_first), `ttp checks` slots (checkcap) and
+  device runner queues (devq.Runner.next_job) serve urgent waiters first, a user-ordered one
+  (queue_priority: ORDERED_PRIORITY) ahead of the other urgent ones, in any project.
 - Premise: an urgent code task checks its `premise:` line in its own run, not in a question first
   (premise.tend). The coordinator and plan prompts split an urgent goal into tasks that start at once.
   Held locks, holds, pauses and recovery owners are untouched.
 - Visibility: `ttp status` and the web app mark urgent tasks with how long each has waited
   (waited_s); Daemon.check_slot_wait raises one event when a ready urgent task has been held by
-  anything for coordinator.urgent_slot_wait_min (default 10), naming the hold. A wait on another
+  anything for coordinator.urgent_slot_wait_min (default 10), naming the hold, and
+  Daemon.check_urgent_start one for a user-ordered one with a machine or device resource that has not
+  started, or not got its `ttp lock`, within coordinator.urgent_start_wait_min (default START_WAIT_MIN). A wait on another
   task's lane has its own lane_wait event, not a second one here. A hold only time or the user can
   clear (the spend gate allowing no new work: the runaway guard, a cap, a plan window at its line)
   wakes nobody: such a wake would be a self-started coordinator turn adding to the guard's count.
@@ -53,7 +59,9 @@ SINCE_LABEL = "urgent_since:"   # when a task_update added the spec's `urgent:` 
 STALE_S = 86400                 # an `urgent:` line this old shows its age (shown_why)
 # A claim that the user is there right now: true only when it was written.
 PRESENT_RE = re.compile(r"\b(?:the\s+)?user\s+is\s+(?:present|here|online|around|available|at the keyboard)(?:\s+(?:right\s+)?now)?\b", re.I)
-EXTRA_SLOTS = 1                 # default of budget.urgent_extra_slots
+EXTRA_SLOTS = 2                 # default of budget.urgent_extra_slots (burst slots past the cap)
+ORDERED_PRIORITY = 0            # lock and checks queue priority of a user-ordered urgent task (queue_priority)
+START_WAIT_MIN = 5              # default of coordinator.urgent_start_wait_min
 RESERVE_SLOTS = 1               # default of budget.urgent_reserve_slots
 RESERVE_DUE_S = 3600            # a waiting urgent task due within this long keeps the reserve
 WAIT_S = 600                    # an urgent task in review this long raises review_stall
@@ -172,6 +180,15 @@ def extra_ok(task: dict | None, now: float) -> bool:
     or a fresh `urgent:` line, not priority alone, so a project's routine priority-1 work never holds
     the one extra slot a deadline task needs."""
     return leads(task) or stated(task, now)
+
+
+def queue_priority(task: dict | None, now: float | None = None) -> int | None:
+    """A `ttp lock` or `ttp checks` waiter's task priority for its queue ticket: ORDERED_PRIORITY for a
+    user-ordered urgent task (extra_ok), PRIORITY for other urgent work, else None (routine)."""
+    now = time.time() if now is None else now
+    if extra_ok(task, now):
+        return ORDERED_PRIORITY
+    return PRIORITY if is_urgent(task) else None
 
 
 def extra_slots(cfg: dict) -> int:

@@ -207,15 +207,15 @@ def stop_runs(db, runs_dir: Path, task: int | None = None, why: str = "cancel") 
 
 
 def stop_reason(run_dir: Path) -> str | None:
-    """"shutdown" when the whole project was stopped (the task goes back to the queue), else
-    "stopped" (a cancel). None while there is no STOP file."""
+    """"shutdown" when the whole project was stopped or the run preempted for urgent work (preempt.STOP_TEXT):
+    the task goes back to the queue; else "stopped" (a cancel). None while there is no STOP file."""
     try:
         text = (run_dir / "STOP").read_text().strip()
     except OSError:
         # The run dir itself is gone (deleted under a live run, e.g. a test's temp dir): nobody can
         # read its output or hand-off any more, so the agent must not run on unattended.
         return None if run_dir.is_dir() else "stopped"
-    return "shutdown" if text == "shutdown" else "stopped"
+    return "shutdown" if text in ("shutdown", "preempt") else "stopped"
 
 
 def _write_exit(run_dir: Path, info: dict) -> None:
