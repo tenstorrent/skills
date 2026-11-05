@@ -4855,3 +4855,55 @@ def test_the_coordinator_turn_guard_holds_routine_work_only_and_a_dollar_cap_hol
     p.set_config("budget.hourly_floor_usd", 2)
     g = bud.evaluate(p.db, p.config(), "claude", [], now=now)
     assert any("spent in the last hour" in r for r in g.reasons) and g.lane == {}, g.reasons
+
+
+@pytest.mark.parametrize("spelling", ["same", "respaced_and_quoted"])
+def test_passed_checks_record_the_newest_hand_offs_on_pass_when_a_later_wake_re_armed_the_probe(
+        env, monkeypatch, tmp_path, spelling):
+    """A later wake that hands off again on the same checks (the probe written again, perhaps spaced or
+    quoted otherwise) with a newer on_pass: a pass records that newer on_pass, model-free."""
+    p = make(env)
+    from ttp import daemon as dmod, push
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    tid, _ = _checks_wait_task(p, tmp_path, {"status": "done", "summary": "old summary"})
+    run_dir = tmp_path / f"run-{tid}"
+    later = tmp_path / f"run-{tid}-later"
+    later.mkdir()
+    now = time.time()
+    p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
+           (tid, "worker", "fake", now - 30, now - 20, "ok", str(later)))
+    probe = json.loads((run_dir / "result.json").read_text())["retry_when"]
+    if spelling != "same":
+        probe = f'{push._own_ttp(p)}   checks  --result "{run_dir}"'
+    hand = {"status": "waiting", "summary": "checks still running", "waiting_for": "my checks",
+            "retry_after_s": 900, "retry_when": probe, "on_pass": DONE_ON_PASS}
+    (later / "result.json").write_text(json.dumps(hand))
+    p.db.update_task(tid, result=json.dumps({**hand, "waiting_since": now - 20}))
+    _settle_probe(d, tid)
+    task = p.db.task(tid)
+    res = json.loads(task["result"])
+    assert task["status"] == "done", (task["status"], res.get("woke"), res)
+    assert res["summary"] == "parser fixed; checks pass" and res["run_status"] == "model-free"
+    assert len(p.db.q("SELECT id FROM runs WHERE task=?", (tid,))) == 2, "a model run was started"
+
+
+@pytest.mark.parametrize("a, b, same", [
+    ("/x/harness/bin/ttp checks --result /r/1", "ttp  checks --result '/r/1/'", True),
+    ('ttp checks --result "/r/a b"', "ttp checks --result '/r/a b'", True),
+    ("ttp detach --check --host h --rows f d/n", "ttp detach --rows f --check --host=h d/n", True),
+    ("ttp lock --probe a -- make x y", "ttp lock --probe a -- make y x", False),
+    ("ttp checks --result /r/1", "ttp checks --result /r/2", False),
+    ("ttp checks --result /r/1", "ttp push --result /r/1", False),
+    ("ttp x --a=--b", "ttp x --a --b", False),
+    ("ttp x pos --flag", "ttp x --flag pos", False),
+    ('test "$(date +%s)" -ge 5', "test '$(date +%s)' -ge 5", False),
+    ('test "$(date +%s)"  -ge 5', 'test "$(date +%s)" -ge 5', True),
+    ("ttp a && ttp b", "ttp b && ttp a", False),
+    ("ssh h 'test -e /m'", 'ssh h "test -e /m"', True),
+    ("ssh h 'test -e /m'", "ssh h test -e /m", False),
+    (None, None, True), (None, "true", False)])
+def test_same_probe_compares_probes_after_normalising_their_formatting(a, b, same):
+    from ttp.daemon import _same_probe
+    assert _same_probe({"retry_when": a}, {"retry_when": b}) is same
+    assert _same_probe({"retry_when": a}, {"retry_when": "other", "retry_when_orig": b}) is same

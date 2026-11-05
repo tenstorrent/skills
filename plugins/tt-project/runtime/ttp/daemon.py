@@ -13073,7 +13073,7 @@ class Daemon:
             return "fail", rc, "\n".join(lines)[-1500:] or "(no output)", run_dir
         if rc != "0":
             return None
-        full = _read_result(run_dir / RESULT_FILE) or {}
+        full = self._wait_handoff(task, prev, r["id"]) or _read_result(run_dir / RESULT_FILE) or {}
         on_pass = full["on_pass"] if "on_pass" in full else default_on_pass(task, full)
         if on_pass is None and prev.get("on_pass_cmd") is None:
             return None
@@ -13095,6 +13095,17 @@ class Daemon:
             return "unclear", ("the checked commit is no longer the head of its worktree and branch, or it is not clean, "
                                "or its checks were a harness qualification (`ttp checks --purpose harness`)")
         return "pass", r, run_dir, with_waiting_followups(on_pass, full), head
+
+    def _wait_handoff(self, task: dict, prev: dict, since: int) -> dict | None:
+        """The result.json of the newest of the task's runs since run `since` (the one whose checks it
+        waits on) that set the wait it holds (`prev`): a later wake that re-armed the same checks probe
+        wrote the on_pass to record, not the run that started them. None when no such run wrote one."""
+        for row in self.p.db.q("SELECT dir FROM runs WHERE task=? AND id>=? AND role!='coordinator' "
+                               "AND dir IS NOT NULL ORDER BY id DESC LIMIT 20", (task["id"], since)):
+            full = _read_result(Path(row["dir"]) / RESULT_FILE)
+            if full and full.get("status") == "waiting" and _same_probe(full, prev):
+                return full
+        return None
 
     def _on_pass_env(self, tid: int) -> dict:
         """The environment a task's on_pass_cmd runs with (and its dry run): the probes' (_probe_env), no
@@ -16848,9 +16859,50 @@ def _spec_hold_text(hold: dict, p) -> str:
 def _same_probe(full: dict, prev: dict, key: str = "retry_when") -> bool:
     """Whether a run's result.json `full` wrote the retry_when (or `key`) the task waits on (`prev`): the
     same one, or the one a resource move or `ttp task set-when` rewrote (kept as `<key>_orig`, None when
-    the run wrote none)."""
-    probe = full.get(key)
-    return probe == prev.get(key) or f"{key}_orig" in prev and probe == prev[f"{key}_orig"]
+    the run wrote none). Probes compare after normalising (_probe_form): the same probe written twice
+    with other spacing, quoting, ttp path or option order is the same wait."""
+    probe = _probe_form(full.get(key))
+    return probe == _probe_form(prev.get(key)) or f"{key}_orig" in prev and probe == _probe_form(prev[f"{key}_orig"])
+
+
+def _probe_form(probe):
+    """A probe as _same_probe compares it: its shell words (quotes and spacing aside), a first word
+    naming ttp by any path as `ttp`, trailing slashes off absolute paths, and for a plain ttp probe its
+    `--option [value]` groups before any `--` in option-name order (a stable sort: repeats keep theirs).
+    A probe with `$`, a backtick or a backslash keeps its quotes (they change what it runs), and one
+    with shell operators keeps its word order. Non-text (None) and unsplittable text stay as they are."""
+    if not isinstance(probe, str):
+        return probe
+    literal = not any(c in probe for c in "$`\\")
+    try:
+        words = shlex.split(probe, posix=literal)
+    except ValueError:
+        return probe
+    if not words:
+        return ()
+    words = [w.rstrip("/") if len(w) > 1 and w.startswith("/") and w.endswith("/") else w for w in words]
+    if words[0].strip("'\"") == "ttp" or words[0].strip("'\"").endswith("/ttp"):
+        words[0] = "ttp"
+    if words[0] != "ttp" or any(c in probe for c in ";&|<>()`$"):
+        return tuple(words)
+    end = words.index("--") if "--" in words else len(words)
+    head, groups, i = [], [], 1
+    while i < end:
+        w = words[i]
+        if w.startswith("--") and len(w) > 2:
+            name, eq, val = w.partition("=")
+            if eq:
+                groups.append((name, val))
+            elif i + 1 < end and not words[i + 1].startswith("-"):
+                groups.append((name, words[i + 1]))
+                i += 1
+            else:
+                groups.append((name,))
+        else:
+            head.append(w)
+        i += 1
+    groups.sort(key=lambda g: g[0])
+    return "ttp", tuple(head), tuple(groups), tuple(words[end:])
 
 
 def _wait_key(result: dict) -> str:
