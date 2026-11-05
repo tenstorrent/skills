@@ -8357,6 +8357,7 @@ class Daemon:
             if task["kind"] == "review" and self._precheck_failed(task):
                 fate[task["id"]] = "other"
                 continue
+            task, unpinned = self._floor_unpin(task)   # a floor run's cheap pin (no requirement) is dropped
             provider = task["provider"] or core
             if not provallow.allows(self.cfg, provider):   # an older pin outside providers_allowed waits, unspent
                 held = provallow.held(self.cfg, provider)[:500]
@@ -8525,8 +8526,11 @@ class Daemon:
                     note[waitgate.USE] = gated
                 if picked:
                     note["pick"] = picked
-                if floor:
-                    note[tierfloor.KEY] = floor
+                kept = self._floor_keeps_core(task, tier, picked)
+                if floor or kept or unpinned:
+                    note[tierfloor.KEY] = {**(floor or {"why": tierfloor.reasons(task, self.cfg)}),
+                                           **({"kept_core": kept} if kept else {}),
+                                           **({"unpinned": unpinned} if unpinned else {})}
                 if routed:
                     note[route.KEY] = routed
                 try:
@@ -8771,6 +8775,35 @@ class Daemon:
         log(self.p, f"task {task['id']}: {tierfloor.note(got)}")
         return {**got, "task": task}
 
+    def _floor_keeps_core(self, task: dict, tier: str, picked: dict | None) -> str:
+        """The routed model (route.py) a floor run (tierfloor.target) skips to run on the core provider,
+        or '' when its tier routes nowhere or it is no floor run."""
+        to = route.target(self.cfg, tier)
+        if not to or not route.eligible(task, picked):
+            return ""
+        try:
+            return f"{to[0]}:{to[1]}" if tierfloor.target(self.p.db, self.cfg, task) else ""
+        except Exception as e:   # the floor must never hold a task back
+            log(self.p, f"task {task['id']}: tier floor not applied: {e}")
+            return ""
+
+    def _floor_unpin(self, task: dict) -> tuple[dict, str]:
+        """A floor run's pin that is no requirement, to the chat provider or its provider's light-tier
+        model (tierfloor.unpin), dropped with a spec note: (the task as it now starts, why or '')."""
+        try:
+            got = tierfloor.unpin(self.p.db, self.cfg, task)
+            if not got:
+                return task, ""
+            text = tierfloor.unpin_note({**got, "reasons": tierfloor.reasons(task, self.cfg)})
+            spec = task.get("spec") or ""
+            upd = {**got["clear"], **({"spec": f"{spec}\n\n{text}" if spec else text} if text not in spec else {})}
+            self.p.db.update_task(task["id"], **upd)
+        except Exception as e:   # the floor must never hold a task back
+            log(self.p, f"task {task['id']}: tier floor pin not dropped: {e}")
+            return task, ""
+        log(self.p, f"task {task['id']}: {text}")
+        return {**task, **upd}, got["why"]
+
     def _floor_need(self, task: dict, wake: str | None, prev: dict) -> dict | None:
         """The floor ({tier, effort}, tierfloor.target) this start of a conclusion run must reach, or None.
         A stale wake (the same wait handed back) or a light wake its hand-off asked for (tierfloor.poll_wake)
@@ -8788,7 +8821,7 @@ class Daemon:
         (route.py), or None: `fallback` is none when it starts there, else why it starts on the core
         provider (a cool-down after a fallback, or the auth gate holding the endpoint)."""
         to = route.target(self.cfg, tier)
-        if not to or not route.eligible(task, picked):
+        if not to or not route.eligible(task, picked) or self._floor_keeps_core(task, tier, picked):
             return None
         name, model = to
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None

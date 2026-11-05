@@ -477,6 +477,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                    "LEFT JOIN tasks t ON t.id=r.task WHERE r.status='running' ORDER BY r.id")
     for w in working:
         w["note"] = last_note(w.pop("dir"))
+        w["floor"] = run_floor(w["run_note"])
         w["wake"] = run_wake(w.pop("run_note"))
     spend = {"spent_24h": round(db.spent_since(now - DAY), 2), "spent_7d": round(db.spent_since(now - WEEK), 2),
              "top_7d": top if top and top["usd"] else None, "in_flight": round(bud.in_flight(db), 2)}
@@ -623,6 +624,26 @@ def run_wake(note: str | None) -> str | None:
     except (ValueError, AttributeError):
         return None
     return str(wake.get("tier")) if isinstance(wake, dict) and wake.get("tier") else None
+
+
+def run_floor(note: str | None) -> str | None:
+    """The tier floor's lift of a run (tierfloor.py), from its run note, as one phrase: 'floor
+    light->standard (device or machine resource); kept off chat:glm-x'; None when it had none."""
+    try:
+        f = json.loads(note or "{}").get("conclusion_floor")
+    except (ValueError, AttributeError):
+        return None
+    if not isinstance(f, dict):
+        return None
+    parts = [f"floor {f['from']}->{f['tier']}" if f.get("from") and f.get("tier") != f.get("from")
+             else "floor" + (f" effort {f['effort']}" if f.get("effort") else "")]
+    if f.get("why"):
+        parts[0] += f" ({'; '.join(map(str, f['why']))})"
+    if f.get("kept_core"):
+        parts.append(f"kept off {f['kept_core']}")
+    if f.get("unpinned"):
+        parts.append(f"pin dropped: {f['unpinned']}")
+    return "; ".join(parts)
 
 
 def attention(db: DB, now: float, p: Project | None = None) -> list[dict]:

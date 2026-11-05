@@ -1,16 +1,23 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-r"""The tier floor for conclusion runs: a run whose output is a conclusion the user reads never runs on
-the light tier or below high effort.
+r"""The tier floor for conclusion runs: a run whose output is a conclusion the user reads, a verdict, or an
+action on a device or machine never runs on the light tier, below high effort or on a cheaper model.
 
 Model-free, applied at each start after the effort pick (effort.py: Jev's or the rules' pick, a retry's
 tier-up) and the coordinator's tier, so tasks already queued are lifted too. A task is a conclusion run
 when any of these holds (a code task's premise check, premise.py, never is: the daemon reads it): its kind is `question` or `plan`; it answers a user chat (`reply_chat`); its
 spec has a line starting `conclusion:`; or it is a run of an llm schedule whose output is posted to the
-user (the daily review, or a schedule named for a review, summary, digest, report or brief). Such a run
+user (the daily review, or a schedule named for a review, summary, digest, report or brief). The same
+floor holds a verdict run (a review, or a spec asking for a verdict, a pass/fail call, a k/N table or
+cell results: VERDICT) and a device or machine run (a `needs_device` label, a `resource:`/`exclusive:`
+label naming a `*-device` resource, a configured device lock or a machine in `ttp machines`, or a spec
+ordering a reset, power cycle, soak or device job: DEVICE_SPEC). Such a run
 gets tier max(its own, floor tier) and effort max(its own, floor effort), the nearest effort its
-provider takes. The floor is coordinator.conclusion_floor (default DEFAULT: standard, high). A review
-keeps its diff-sized tier; a task whose pin the user's own words require (pin_required) stays as it is.
+provider takes. The floor is coordinator.conclusion_floor (default DEFAULT: standard, high). A review's
+diff-sized tier is lifted the same way; a task whose pin the user's own words require (pin_required)
+stays as it is. A floor run never routes to the chat provider (route.py; the run note's
+`conclusion_floor.kept_core` names the model it skipped), and a pin that is no requirement to the chat
+provider or to its provider's light-tier model is dropped at dispatch (unpin), with a spec note.
 A waiting conclusion task's wake whose wait is over may write the answer, so it runs at the floor too;
 only a poll stays a light check: a stale wake (the same wait handed back) or a wake whose hand-off asked
 for `wake_tier: light` and was not escalated (poll_wake; the daemon's own light relaunch after a reboot
@@ -48,6 +55,10 @@ NOTE_PREFIX = "[tier floor]"
 SOURCE = "conclusion_floor"   # tasks.tier_source
 KINDS = ("question", "plan")
 LINE = re.compile(r"(?im)^[ \t>*#\d.)-]*conclusion\s*:")
+VERDICT = re.compile(r"(?i)\b(?:verdicts?|pass/fail|k/n(?:\s+table)?|cell\s+results?|results?\s+per\s+cell)\b")
+DEVICE_SPEC = re.compile(r"(?i)\b(?:glx_reset|tt-smi|power[- ]cycl\w*|soak(?:s|ed|ing)?|device\s+(?:jobs?|runs?|tests?)|"
+                         r"reboot(?:s|ed|ing)?|reset(?:s|ting)?\s+(?:the\s+|a\s+|each\s+|every\s+)?"
+                         r"(?:device|chip|board|card|galaxy|tray|host|node|machine|box)e?s?)\b")
 REPORT = re.compile(r"(?i)\b(review|summar(?:y|ies|ise|ize)|digest|reports?|brief(?:ing)?)\b")
 DAILY_REVIEW = "daily-review"
 HELD_NOTE = "held: tier floor waits for the budget gate to allow"   # + the floor tier (blocked_reason)
@@ -94,18 +105,49 @@ def _labels(task: dict) -> list[str]:
         return []
 
 
-def reasons(task: dict) -> list[str]:
-    """Why `task` is a conclusion run (empty: it is not)."""
+def _spec(task: dict) -> str:
+    """The spec without the floor's own notes, so a note's words never make a task a floor run."""
+    return "\n".join(x for x in (task.get("spec") or "").splitlines() if not x.lstrip().startswith(NOTE_PREFIX))
+
+
+def device_run(task: dict, cfg: dict | None = None) -> bool:
+    """A `needs_device` label, or a resource naming a `*-device` lock, a machine tagged `device`
+    (effort.device_task), a configured device lock or any machine in `ttp machines`."""
+    from . import effort, locks, machines
+    if effort.device_task(task):
+        return True
+    names = set(effort._resource_names(task))
+    if not names:
+        return False
+    try:
+        if cfg is not None and names & locks.device_locks(cfg):
+            return True
+        return bool(names & set(machines.load()))
+    except Exception:   # an unreadable machines list must never hold a task back
+        return False
+
+
+def reasons(task: dict, cfg: dict | None = None) -> list[str]:
+    """Why `task` is a floor run (empty: it is not)."""
     from . import premise
     if premise.is_check(task):
         return []   # the daemon reads its answer, not the user (premise.py)
     out = []
+    spec = _spec(task)
     if task.get("kind") in KINDS:
         out.append(f"kind {task['kind']}")
     if task.get("reply_chat"):
         out.append("answers a chat")
-    if LINE.search(task.get("spec") or ""):
+    if LINE.search(spec):
         out.append("conclusion: line")
+    if task.get("kind") == "review":
+        out.append("review verdict")
+    elif VERDICT.search(spec) and not out:
+        out.append("verdict")
+    if device_run(task, cfg):
+        out.append("device or machine resource")
+    elif DEVICE_SPEC.search(spec):
+        out.append("device action")
     if task.get("origin") == "schedule":
         name = next(iter(_labels(task)), "")
         if name == DAILY_REVIEW or REPORT.search(name.replace("-", " ").replace("_", " ")):
@@ -126,9 +168,9 @@ def poll_wake(prev: dict) -> bool:
 
 
 def target(db, cfg: dict, task: dict) -> dict | None:
-    """The floor ({tier, effort}) `task` must start at, or None when it is no conclusion run, the floor is
-    off, it is a review or the user's own words require its pin."""
-    if task.get("kind") == "review" or not reasons(task):
+    """The floor ({tier, effort}) `task` must start at, or None when it is no floor run, the floor is
+    off or the user's own words require its pin."""
+    if not reasons(task, cfg):
         return None
     fl = floor(cfg)
     if fl["tier"] == "light" and not fl["effort"]:
@@ -144,7 +186,7 @@ def lift(db, cfg: dict, task: dict, provider: str) -> dict | None:
     fl = target(db, cfg, task)
     if not fl:
         return None
-    why = reasons(task)
+    why = reasons(task, cfg)
     own = task.get("tier") if task.get("tier") in TIERS else "standard"
     tier = max(own, fl["tier"], key=TIERS.index)
     tiers = ((cfg.get("providers") or {}).get(provider) or {}).get("tiers") or {}
@@ -182,3 +224,26 @@ def apply(db, cfg: dict, task: dict, got: dict) -> dict:
     if upd:
         db.update_task(task["id"], **upd)
     return {**task, **upd}
+
+
+def unpin(db, cfg: dict, task: dict) -> dict | None:
+    """For a floor run whose pin is no requirement: the pins to drop ({"provider": None, "model": None} or
+    {"model": None}) when it pins the chat provider (route.TO) or its provider's light-tier model, with
+    `why`; None otherwise. It then runs on the core provider at its tier's model."""
+    from . import route
+    prov, model = str(task.get("provider") or ""), str(task.get("model") or "")
+    if not (prov or model) or not target(db, cfg, task):
+        return None
+    core = cfg.get("core_provider") or "claude"
+    if prov == route.TO and core != route.TO:
+        return {"clear": {"provider": None, "model": None}, "why": f"pinned to the {route.TO} provider"}
+    tiers = ((cfg.get("providers") or {}).get(prov or core) or {}).get("tiers") or {}
+    light = str((tiers.get("light") or {}).get("model") or "")
+    above = {str((tiers.get(t) or {}).get("model") or "") for t in TIERS if t != "light"}
+    if model and model == light and model not in above:
+        return {"clear": {"model": None}, "why": f"pinned to the light-tier model {model}"}
+    return None
+
+
+def unpin_note(got: dict) -> str:
+    return f"{NOTE_PREFIX} pin dropped: {got['why']} (conclusion: {'; '.join(got.get('reasons') or [])})"

@@ -20580,6 +20580,7 @@ def test_runs_lost_on_the_same_boot_still_trip_the_runaway_guard(env, tmp_path):
 
 def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     p = make(env)
+    p.set_config("coordinator.conclusion_floor", "off")   # the sizing rule alone; the floor's lift is below
     from ttp import daemon as dmod
     from ttp import worktree
     d = dmod.Daemon(p.base)
@@ -20629,6 +20630,14 @@ def test_a_review_runs_at_the_tier_its_diff_needs(env, monkeypatch):
     risky = review(f"Review branch {small_branch}.", tier="standard")
     d.dispatch()
     assert started[risky][1] == "standard"
+    # With the tier floor on (the default) a review verdict never runs light, whatever its diff.
+    p.set_config("review.risky_paths", [])
+    p.set_config("coordinator.conclusion_floor", "standard/high")
+    d.cfg = p.config()
+    floored = review(f"Review branch {small_branch}.", tier="standard")
+    d.dispatch()
+    assert notes[floored]["review_tier"]["tier"] == "light" and started[floored][1] == "standard"
+    assert notes[floored]["conclusion_floor"]["why"] == ["review verdict"]
 
 
 def test_a_re_review_whose_fix_delta_is_unmeasured_runs_standard(env):

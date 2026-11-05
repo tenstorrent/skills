@@ -1677,7 +1677,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     for w in h["working"][:8]:
         what = f"#{w['task']} {w['title']}" if w["task"] else w["role"]
         lines.append(f"  running {since(w['started'], now)}: {what}" + (f" ({w['wake']} wake)" if w.get("wake") else "")
-                     + (f" — {w['note']}" if w["note"] else ""))
+                     + (f" [{w['floor']}]" if w.get("floor") else "") + (f" — {w['note']}" if w["note"] else ""))
     if stuck or h.get("drivers_stalled"):
         lines.append("stuck, the project is on it:")
     for t in stuck[:8]:

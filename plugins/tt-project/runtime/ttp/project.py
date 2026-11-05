@@ -299,8 +299,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # the first usable of provider_failover_to (provider names), then the core provider.
                     "provider_failover_after_h": 4, "provider_failover_to": [],
                     # Tier floor for conclusion runs (tierfloor.py): a question or plan task, a chat
-                    # answer, a spec with a `conclusion:` line or a report schedule's run starts at least
-                    # at this tier and effort ('standard/high'; 'off' turns the floor off).
+                    # answer, a spec with a `conclusion:` line, a report schedule's run, a review or
+                    # verdict and a device or machine run starts at least at this tier and effort, never
+                    # on the chat provider ('standard/high'; 'off' turns the floor off).
                     "conclusion_floor": {"tier": "standard", "effort": "high"}},
     "notify": {"slack": False, "slack_min_severity": "high", "chat_min_severity": "normal"},
     # gone_after_s: a relay chat with no `ttp listen` running that left a message unread this long

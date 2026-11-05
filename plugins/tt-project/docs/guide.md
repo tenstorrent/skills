@@ -757,11 +757,17 @@ conclusion floor, `coordinator.conclusion_floor` (default `standard/high`: the s
 high effort or more, the nearest effort its provider takes). A conclusion run is a `question` or
 `plan` task, a task that answers a chat, a task whose spec has a line starting `conclusion:`, or a
 run of an llm schedule that reports to the user (the daily review, or a schedule named for a
-review, summary, digest, report or brief). The daemon lifts it at each start, after the effort
+review, summary, digest, report or brief). The same floor holds a verdict run (a review, whatever
+its diff size, or a spec asking for a verdict, a pass/fail call, a k/N table or cell results) and a
+device or machine run (a `needs_device` label, a `resource:` or `exclusive:` label naming a
+`*-device` resource, a configured device lock or a machine in `ttp machines`, or a spec ordering a
+reset, power cycle, soak or device job). Such a run never routes to the chat provider (its run note
+names the routed model it skipped, `kept_core`), and a pin that is no requirement to the chat
+provider or to its provider's light-tier model is dropped at dispatch with a `[tier floor] pin
+dropped: ...` spec line. `ttp status` and the web app's Running list show each running lift. The daemon lifts it at each start, after the effort
 pick, so tasks already queued are lifted too; a lift that changes the tier moves a default budget
 to the new tier's default, sets `tier_source` to `conclusion_floor` and adds a spec line such as
-`[tier floor] light->standard (conclusion: kind question)`. Reviews keep their diff-sized tier,
-a pin the user's own words require (`pin_required`) stays, and a failed try still retries a tier
+`[tier floor] light->standard (conclusion: kind question)`. A pin the user's own words require (`pin_required`) stays, and a failed try still retries a tier
 up. A waiting conclusion task's wake whose wait is over runs at the floor too, since it may write
 the answer. A poll stays a light check at the light tier's effort: a stale wake (the same wait
 handed back), or a wake whose hand-off asked for `wake_tier: light` and was not escalated. Such a

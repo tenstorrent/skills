@@ -208,14 +208,15 @@ def test_retry_tier_up_still_applies_on_top_of_the_floor(env, monkeypatch):
     assert args[3] == "standard" and kw["note"]["pick"]["by"] == "retry" and "conclusion_floor" not in kw["note"]
 
 
-def test_the_floor_keeps_required_pins_and_reviews_and_follows_the_config(env, monkeypatch):
+def test_the_floor_keeps_required_pins_lifts_reviews_and_follows_the_config(env, monkeypatch):
     p, d, started = _floor_daemon(env, monkeypatch)
     pinned = p.db.add_task("What is the answer?", "x", kind="question", tier="light", origin="coordinator",
                            provider="claude", labels=["pin:required"])
     review = p.db.add_task("Review #1", "x", kind="review", tier="light", origin="daemon", provider="claude")
     from ttp import tierfloor
     assert tierfloor.lift(p.db, p.config(), p.db.task(pinned), "claude") is None
-    assert tierfloor.lift(p.db, p.config(), p.db.task(review), "claude") is None
+    got = tierfloor.lift(p.db, p.config(), p.db.task(review), "claude")
+    assert (got["tier"], got["why"]) == ("standard", ["review verdict"]), "a review verdict never runs light"
     # A project that sets its own floor: deep at xhigh; one that turns it off keeps light.
     q = p.db.add_task("Status?", "x", kind="question", tier="light", origin="coordinator", provider="claude")
     p.set_config("coordinator.conclusion_floor", {"tier": "deep", "effort": "xhigh"})
@@ -291,7 +292,7 @@ def test_a_conclusion_tasks_poll_wake_keeps_the_light_tier_its_hand_off_asked_fo
 
     assert wake(waits) == [("light", None, "light")], "a probe-pass wake of a light hand-off is a poll"
     kw = started[0][1]
-    assert "the hand-off it writes when the wait is over is the conclusion" in worker_task(
+    assert "a verdict or a device or machine action, so the work it does when the wait is over is that" in worker_task(
         p, p.db.task(t), str(p.base), None, wake=kw["note"]["wake"])
     # A reboot that cut its detached job: the daemon's own light relaunch wake is a poll too.
     cut = {**waits, "wake_tier": "light", "woke": "the host rebooted and cut short detached job x"}
@@ -305,3 +306,92 @@ def test_a_conclusion_tasks_poll_wake_keeps_the_light_tier_its_hand_off_asked_fo
     assert wake({k: v for k, v in waits.items() if k != "wake_tier"}) == [("standard", "high", "standard")]
     p.db.update_task(t, spec=p.db.task(t)["spec"] + "\n\n## Update\nAlso compare against the old build.")
     assert wake(waits) == [("standard", "high", "standard")], "a spec change is new work at the task's own tier"
+
+
+def test_tier_floor_lifts_device_and_verdict_runs_and_leaves_mechanical_ones(env, monkeypatch):
+    from ttp import machines, tierfloor
+    monkeypatch.setattr(machines, "load", lambda: {"box1": {"tags": []}})
+    cfg = {"device": {"locks": ["dev-lock"]}}
+    dev = lambda **k: tierfloor.reasons({"kind": "work", "spec": "Copy the log.", **k}, cfg)
+    for labels in (["needs_device"], ["resource:box1-device"], ["exclusive:dev-lock"], ["resource:box1"]):
+        assert dev(labels=json.dumps(labels)) == ["device or machine resource"], labels
+    for spec in ("Run tt-smi -glx_reset on the box.", "Power cycle the host via its BMC.",
+                 "Start the 12 h soak.", "Submit the device job and report.", "Reset the board, then rerun."):
+        assert tierfloor.reasons({"kind": "work", "spec": spec}) == ["device action"], spec
+    for spec in ("Give a pass/fail call per model.", "Report a k/N table of the runs.",
+                 "Post the cell results.", "verdict: whether the fix holds"):
+        assert tierfloor.reasons({"kind": "work", "spec": spec}) == ["verdict"], spec
+    assert tierfloor.reasons({"kind": "review", "spec": "x"}) == ["review verdict"]
+    # Mechanical work stays off: a resource that is no machine or device, a git reset, a rerun a standard run judges,
+    # and the floor's own note in the spec.
+    for t in ({"kind": "work", "spec": "Copy the log.", "labels": json.dumps(["resource:build-cache"])},
+              {"kind": "code", "spec": "git reset --hard the scratch branch, then rebuild."},
+              {"kind": "work", "spec": "Rerun the failed tests; a standard run judges them."},
+              {"kind": "work", "spec": "Copy it.\n\n[tier floor] light->standard (conclusion: verdict; device action)"}):
+        assert tierfloor.reasons(t, cfg) == [], t
+
+
+def test_device_verdict_and_chat_runs_start_at_the_floor_and_mechanical_light_work_stays_light(env, monkeypatch):
+    p, d, started = _floor_daemon(env, monkeypatch)
+    ids = [p.db.add_task("Reset the box", "Reset the board and rerun the smoke test.", tier="light",
+                         origin="coordinator", provider="claude", labels=["needs_device"]),
+           p.db.add_task("Cells", "Run the sweep and report the cell results.", tier="light",
+                         origin="coordinator", provider="claude"),
+           p.db.add_task("Answer", "Read the log and answer.", tier="light", origin="coordinator",
+                         provider="claude", reply_chat="c1"),
+           p.db.add_task("Copy the log", "Copy the build log to the run folder.", tier="light",
+                         origin="coordinator", provider="claude")]
+    d.dispatch()
+    assert [a[3] for a, _ in started] == ["standard", "standard", "standard", "light"]
+    whys = [kw["note"].get("conclusion_floor", {}).get("why") for _, kw in started]
+    assert whys == [["device or machine resource"], ["verdict"], ["answers a chat"], None]
+    for i in ids[:3]:
+        assert p.db.task(i)["tier_source"] == "conclusion_floor" and "[tier floor]" in p.db.task(i)["spec"]
+    assert p.db.task(ids[3])["tier"] == "light" and "[tier floor]" not in p.db.task(ids[3])["spec"]
+
+
+def test_a_floor_run_never_routes_to_the_chat_model_and_a_mechanical_one_still_does(env, monkeypatch):
+    p, d, _ = _floor_daemon(env, monkeypatch)
+    d.cfg = dict(d.cfg, core_provider="claude", providers={**d.cfg["providers"], "chat": {
+        "tiers": {"light": {"route": True, "model": "glm-x"}, "standard": {"route": True, "model": "glm-x"}}}})
+    now = time.time()
+    dev = p.db.task(p.db.add_task("Soak", "Start the soak.", tier="standard", origin="coordinator"))
+    rev = p.db.task(p.db.add_task("Review #1", "x", kind="review", tier="standard", origin="daemon"))
+    chat = p.db.task(p.db.add_task("Answer", "x", tier="standard", origin="coordinator", reply_chat="c1"))
+    mech = p.db.task(p.db.add_task("Copy", "Copy the log.", tier="light", origin="coordinator"))
+    for t in (dev, chat):
+        assert d._route(t, "standard", None, now) is None
+        assert d._floor_keeps_core(t, "standard", None) == "chat:glm-x"
+    assert d._route(rev, "standard", None, now) is None, "reviews never route"
+    assert d._route(mech, "light", None, now)["to"] == "chat" and d._floor_keeps_core(mech, "light", None) == ""
+    # The project turned the floor off: its routing is its own choice again.
+    d.cfg = dict(d.cfg, coordinator={**d.cfg["coordinator"], "conclusion_floor": "off"})
+    assert d._route(dev, "standard", None, now)["to"] == "chat"
+
+
+def test_a_floor_runs_cheap_pin_is_dropped_unless_the_user_required_it(env, monkeypatch):
+    from ttp import tierfloor, web
+    p, d, started = _floor_daemon(env, monkeypatch)
+    to_chat = p.db.add_task("Verdict", "Give the pass/fail call.", tier="standard", origin="coordinator",
+                            provider="chat", model="glm-x")
+    light_model = p.db.add_task("Answer", "x", tier="standard", origin="coordinator", provider="claude",
+                                model="sonnet", reply_chat="c1", priority=4)
+    required = p.db.add_task("Pinned", "Run the device job.", tier="standard", origin="coordinator",
+                             provider="claude", model="sonnet", labels=["pin:required"], priority=5)
+    mech = p.db.add_task("Copy", "Copy the log.", tier="light", origin="coordinator", provider="claude",
+                         model="sonnet", priority=5)
+    cfg = dict(d.cfg, core_provider="claude")
+    assert tierfloor.unpin(p.db, cfg, p.db.task(to_chat))["clear"] == {"provider": None, "model": None}
+    assert tierfloor.unpin(p.db, cfg, p.db.task(light_model))["clear"] == {"model": None}
+    assert tierfloor.unpin(p.db, cfg, p.db.task(required)) is None, "a pin the user required wins"
+    assert tierfloor.unpin(p.db, cfg, p.db.task(mech)) is None, "mechanical work keeps its pin"
+    d.cfg = cfg
+    task, why = d._floor_unpin(p.db.task(light_model))
+    assert task["model"] is None and p.db.task(light_model)["model"] is None and "light-tier model sonnet" in why
+    assert "[tier floor] pin dropped" in p.db.task(light_model)["spec"]
+    assert d._floor_unpin(p.db.task(light_model)) == (p.db.task(light_model), ""), "once"
+    note = json.dumps({"conclusion_floor": {"tier": "standard", "from": "light", "why": ["device action"],
+                                            "kept_core": "chat:glm-x", "unpinned": why}})
+    assert web.run_floor(note) == ("floor light->standard (device action); kept off chat:glm-x; "
+                                   f"pin dropped: {why}")
+    assert web.run_floor(json.dumps({"wake": {"tier": "light"}})) is None and web.run_floor("bad") is None
