@@ -18,6 +18,8 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from . import gitmemo
+
 SETTLE_S = 20         # the wait before the one rerun: a rewrite in progress ends
 RETRY_S = 600         # a push stopped by it is tried again after this
 MAX_SCRIPTS = 20      # more named scripts than this: not a torn read, never judged
@@ -35,7 +37,7 @@ def scripts(text: str) -> list[str]:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=60)
+    return gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=60)
 
 
 def _temp_roots() -> list[Path]:
