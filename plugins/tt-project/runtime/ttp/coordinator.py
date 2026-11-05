@@ -3132,8 +3132,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         # the user's word, or `over` retiring the item: its enforcing tools are stale
                         why = ("" if uturn or ok is not None else over if len(over) >= OVER_MIN
                                else "unsourced" if retired else None)
-                        if why is not None and quote and _loosens(quote, text):
-                            loosened.append((quote, text, why, loose_drop))
+                        if why is not None and quote:   # per item: an insertion beside the quote loosens nothing
+                            loosened += [(o, n, why, loose_drop) for o, n in restriction_audit.replaced_items(quote, text)]
                         if why is not None and gone:
                             into = text if target.lower().startswith("restriction") else ""
                             loosened += [(o, n, why, loose_drop) for o, n in restriction_audit.replaced_items(gone, into)]

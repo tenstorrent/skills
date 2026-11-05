@@ -489,3 +489,53 @@ def test_a_slow_restriction_audit_never_holds_a_daemon_reap_pass_past_its_bound(
     assert "only at night" in p.charter_path.read_text(), "the turn was not applied"
     got = [n for n in p.db.kv(coord.NOTES_KEY, []) if "restriction tools:" in n]
     assert len(got) == 1 and "cut short at its 0.5 s budget while indexing the tool lines" in got[0], got
+
+
+_SPARE = "Workers may use the spare build boxes for CPU test runs. (user msg #9)"
+_PR = "Never open pull requests. (user msg #1)"
+_SOAK = _GUARD_SOAK + " (user msg #7)"
+
+
+def test_item_changes_tells_an_inserted_item_from_a_changed_one():
+    """Items match by their text (bullet, case, spacing and end punctuation aside): an insertion after an
+    unchanged item, at the top or at the end is added and its neighbours unchanged; a reorder changes
+    nothing; an item reworded next to an insertion is the only change; a dropped item is removed."""
+    from ttp.restriction_audit import item_changes
+    old = f"- {_SOAK}\n- {_PR}\n"
+    assert item_changes(old, f"- {_SOAK}\n- {_SPARE}\n- {_PR}\n") == ([_SPARE], [], [])
+    assert item_changes(old, f"- {_SPARE}\n- {_SOAK}\n- {_PR}\n") == ([_SPARE], [], [])
+    assert item_changes(old, f"* {_SOAK.upper()}\n-   {_PR.rstrip('.')}\n- {_SPARE}\n") == ([_SPARE], [], [])
+    assert item_changes(old, f"- {_PR}\n- {_SOAK}\n") == ([], [], [])
+    reworded = "Never run the soak test on a shared rack before 18:00. (user msg #7)"
+    assert item_changes(old, f"- {reworded}\n- {_SPARE}\n- {_PR}\n") == ([_SPARE], [(_SOAK, reworded)], [])
+    assert item_changes(old, f"- {_SPARE}\n- {_PR}\n") == ([_SPARE], [], [_SOAK])
+    # A quoted edit that keeps the item and appends one: the same pure addition.
+    assert item_changes(_SOAK, f"{_SOAK}\n- {_SPARE}") == ([_SPARE], [], [])
+
+
+def test_an_item_inserted_beside_a_guarded_item_queues_no_update_task(env):
+    """A quoted edit that keeps a guarded item word for word and adds a permitting item after it, before
+    it, or a `replaces` of the section that inserts one, loosens nothing: no update task names the
+    guard. Rewording the guarded item beside the insertion queues one task, for that item only."""
+    from ttp import coordinator as coord
+    for text in (f"{_SOAK}\n- {_SPARE}", f"{_SPARE}\n- {_SOAK}"):
+        p, tasks = _soak_guard(env)
+        mids, src = _turn_said(p, "workers may use the spare build boxes for CPU test runs")
+        act = {"type": "charter_update", "section": "Restrictions", "quote": _SOAK, "text": text, "source": src}
+        assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+        assert "spare build boxes" in p.charter_path.read_text() and p.charter_path.read_text().count(_GUARD_SOAK) == 1
+        assert tasks() == [] and not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'"), tasks()
+    p, tasks = _soak_guard(env)
+    mids, src = _turn_said(p, "workers may use the spare build boxes for CPU test runs")
+    act = {"type": "charter_update", "section": "Restrictions", "replaces": "Restrictions",
+           "text": f"- {_SOAK}\n- {_SPARE}\n- {_PR}", "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+    assert "spare build boxes" in p.charter_path.read_text() and tasks() == [], tasks()
+    p, tasks = _soak_guard(env)
+    mids, src = _turn_said(p, "the soak test may run on a shared rack at night; workers may use the spare build boxes")
+    night = "Run the soak test on a shared rack only at night. (user msg #7)"
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _SOAK,
+           "text": f"{night}\n- {_SPARE}", "source": src}
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+    got = tasks()
+    assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"] and "spare build boxes" not in got[0]["spec"], got

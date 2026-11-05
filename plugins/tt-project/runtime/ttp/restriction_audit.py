@@ -19,6 +19,7 @@ for the coordinator's one-time ask to loosen it. Only the user's own words loose
 from __future__ import annotations
 
 import bisect
+import difflib
 import hashlib
 import json
 import re
@@ -33,6 +34,7 @@ _TOOL_TERM_RE = re.compile(r"`([^`\n]{3,60})`|(?<![\w/.-])([A-Za-z0-9-]*[A-Za-z0
 _CODE_SPAN = re.compile(r"`([^`\n]*)`")
 TOOL_SCAN_FILES = 2000   # files read per check at most (bin/ and hooks/ trees)
 TOOL_SCAN_BYTES = 262144   # a larger file is not a tool script
+CHANGED_RATIO = 0.6   # word-for-word likeness at which a left-over old item is changed, not removed
 
 
 def tool_term_ids(text: str) -> set[str]:
@@ -248,25 +250,50 @@ def still_stated(charter: str, old: str) -> str:
     return min(found, default="")   # "Brief" before "Restrictions" when items differ
 
 
+def item_changes(old: str, new: str) -> tuple[list[str], list[tuple[str, str]], list[str]]:
+    """How the Restrictions items of `new` differ from those of `old`: (added items, changed items as
+    (old item, the new item it became), removed items). Items are matched by their text compared
+    loosely (_loose: bullet, case, spacing and end punctuation aside), so an item in both, in any order,
+    is unchanged. A left-over old item became the left-over new item that shares the most of its rule
+    words (_widens), or else the one most like it word for word (CHANGED_RATIO or more; any, when
+    `old` is one item and one new item is left); with none it was removed. A left-over new item no
+    old item became was added, so an insertion's neighbours stay unchanged."""
+    from .coordinator import _items, _loose, _rule_words, _widens
+    olds = [x for x in (" ".join(old[s:e].split()) for s, e, _ in _items(old)) if x]
+    news = [x for x in (" ".join(new[s:e].split()) for s, e, _ in _items(new)) if x]
+    left = list(news)
+    gone = []
+    for o in olds:
+        same = next((n for n in left if _loose(n) == _loose(o)), None)
+        if same is None:
+            gone.append(o)
+        else:
+            left.remove(same)
+    words = lambda x: re.findall(r"[^\s.,;:!?()\"]+", _loose(x))
+    like = lambda a, b: difflib.SequenceMatcher(a=words(a), b=words(b), autojunk=False).ratio()
+    changed, removed = [], []
+    for o in gone:
+        near = [n for n in left if _widens(o, _rule_words(n))]
+        to = max(near, key=lambda n: len(_rule_words(o) & _rule_words(n)), default="")
+        if not to and left:
+            to = max(left, key=lambda n: like(o, n))
+            to = to if like(o, to) >= CHANGED_RATIO or len(olds) == len(left) == 1 else ""
+        if to:
+            changed.append((o, to))
+        else:
+            removed.append(o)
+    became = {n for _, n in changed}
+    return [n for n in left if n not in became], changed, removed
+
+
 def replaced_items(body: str, text: str) -> list[tuple[str, str]]:
-    """The items of a Restrictions section a `replaces` retired that its new `text` loosens or drops,
-    as (old item, the new item it became or ""). An item equal to a new item, compared loosely, is
-    left out; one only contained in a new item (extended with an exception) is not. Any other item
-    is paired with the new item that shares the most of its rule words (_widens), and judged as a
-    quoted edit to it (_loosens); an item with no such new item was dropped."""
-    from .coordinator import _items, _loose, _loosens, _rule_words, _widens
-    olds = [" ".join(body[s:e].split()) for s, e, _ in _items(body)]
-    news = [" ".join(text[s:e].split()) for s, e, _ in _items(text)]
-    kept = {_loose(n) for n in news}
-    out = []
-    for old in olds:
-        if not old or _loose(old) in kept:
-            continue
-        near = [n for n in news if _widens(old, _rule_words(n))]
-        new = max(near, key=lambda n: len(_rule_words(old) & _rule_words(n)), default="")
-        if _loosens(old, new):
-            out.append((old, new))
-    return out
+    """The items of `body` (a quoted Restrictions edit, or a section a `replaces` retired) that its new
+    `text` loosens or drops (_loosens), as (old item, the new item it became or ""), from item_changes:
+    an unchanged item, in any order, or a pure addition is never one; an item only contained in a new
+    item (extended with an exception) is changed."""
+    from .coordinator import _loosens
+    _, changed, removed = item_changes(body, text)
+    return [(o, n) for o, n in changed + [(r, "") for r in removed] if _loosens(o, n)]
 
 
 AUDIT_BUDGET_S = 5.0   # wall clock of one restriction_tools call: it runs on the daemon's tick thread
