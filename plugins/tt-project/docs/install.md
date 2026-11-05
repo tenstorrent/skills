@@ -104,6 +104,14 @@ claude plugin marketplace remove tenstorrent-skills    # also uninstalls its plu
 codex plugin remove tt-project@tenstorrent-skills && codex plugin marketplace remove tenstorrent-skills
 ```
 
+Each `ttp setup` (and so each automatic upgrade) also keeps Claude Code on the release it installs:
+`~/.tt-project/lib/current` is a one-plugin `tenstorrent-skills` marketplace, and a
+`tenstorrent-skills` directory marketplace that holds an older tt-project is repointed there (the
+settings files are backed up first, as `<file>.ttp-backup-<time>`), then the plugin cache is
+refreshed with `claude plugin update`. It leaves other marketplaces alone, and also a
+`tenstorrent-skills` registration that serves another installed or enabled plugin: rerun the
+install line for that one.
+
 When you follow a branch, Claude Code can also update in place (then run `ttp setup` as above):
 
 ```bash

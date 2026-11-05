@@ -9079,6 +9079,9 @@ def cmd_setup(a) -> None:
     line = shortcut.remove() if a.no_shortcut else shortcut.install()
     if line:
         print(line)
+    from . import claudemarket
+    for ln in claudemarket.reconcile(cur, __version__):
+        print(ln)
     from . import notifier
     for ln in notifier.refresh(send_test=True, always=True):   # an installed notifier runs this code from now on
         print(ln)
@@ -9140,7 +9143,7 @@ def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None
 
 
 from .release import SETUP_JOURNAL  # noqa: E402  (release.hold_reason holds automatic upgrades while it exists)
-SETUP_PARTS = ("runtime", "template", "bin", "skills")    # skills: readable by workers of any project
+SETUP_PARTS = ("runtime", "template", "bin", "skills", ".claude-plugin")    # skills: readable by workers of any project
 
 
 def _install_parts(src_root: Path, lib: Path) -> None:
@@ -9150,6 +9153,9 @@ def _install_parts(src_root: Path, lib: Path) -> None:
             _copy_tree(src, lib / part)
     for f in (lib / "bin").iterdir():
         f.chmod(0o755)
+    if (lib / ".claude-plugin").is_dir():
+        from . import claudemarket
+        claudemarket.write(lib)     # Claude Code's tt-project marketplace points here (claudemarket.py)
 
 
 SETUP_LOCK = ".setup.lock"      # in HOME_DIR/lib: its flock holder runs `ttp setup` or _recover_setup
