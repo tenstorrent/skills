@@ -203,6 +203,7 @@ def test_post_landing_live_step_continues_are_proposed_as_deploys_never_auto_hop
 def test_post_landing_continues_without_a_live_step_and_plain_continues_keep_their_paths(env):
     from ttp import chaincap
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     # Post-landing, no live step: no hop, no split, a review, and the plain NOT-queued words.
     tid, _, done, reviews = _finish_with_followups(env, p, "notes change", lambda tid: [
         {"title": "continue: changelog", "spec": f"Wait landed:#{tid}, then update the changelog."}])
@@ -284,6 +285,7 @@ def test_a_continue_titled_to_land_push_or_fix_the_change_is_still_a_split(env):
         assert not chaincap.post_landing({"title": title, "spec": "After it lands, deploy it."}, 7), title
     assert chaincap.post_landing({"title": "continue: deploy the fix", "spec": "After it lands, deploy."}, 7)
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     tid, branch, _, reviews = _finish_with_followups(env, p, "parser fix", lambda tid: [
         {"title": "continue: push the change, then deploy it", "spec": "After it lands, deploy it on each host."}])
     assert chaincap.split_head(p.db.task(tid)) == _git_out(env["repo"], "rev-parse", branch).strip()
@@ -310,6 +312,7 @@ def test_a_continue_that_asks_measures_or_waits_on_its_landing_is_no_split_and_g
     no daemon hop. A review the coordinator queued ahead stays the one review."""
     from ttp import chaincap
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     cases = [
         ("digest cache", lambda tid: [{"title": f"continue: measure coordinator write_per_turn after #{tid} lands",
                                        "spec": "Read the turn stats a day later."}]),
@@ -873,6 +876,7 @@ def test_follow_ups_without_branch_delivery_keep_their_kind_and_a_code_parents_h
     code parent's hop is queued as before (kind code, its tier, continues the parent)."""
     from ttp.db import continues_id
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     parent = _harness_done(env, p, "Audit the queue", {"title": "continue: audit the queue",
                                                        "spec": "Read the next 50 events and fix what is wrong."})
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (parent,))
@@ -1191,3 +1195,121 @@ def test_a_non_code_hop_with_new_metrics_still_gets_its_continue_queued(env):
     tid = _harness_done(env, p, "check the gate", fup, metrics={"checked": 4})
     assert p.db.q("SELECT id FROM tasks WHERE parent=?", (tid,)), "a non-code hop with new metrics was not continued"
     assert not p.db.q("SELECT id FROM events WHERE kind=?", (chaincap.NO_COMMIT_EVENT,))
+
+
+def _cont_fup(title="continue: finish the parser", spec="Handle the nested case in parse()."):
+    return lambda tid: [{"title": title, "spec": spec}]
+
+
+def test_a_lone_continue_re_queues_the_same_task_with_its_worktree_branch_and_a_fresh_budget(env):
+    """A done code task whose change is neither approved nor landed and whose only follow-up is a
+    `continue:` hop with progress is re-queued: the same id, branch and worktree, the follow-up appended
+    as an `## Update`, a fresh per-task budget, its attempts unchanged and its last summary kept for the
+    prompt. No new task, no review yet; its next hand-off without a continue gets its review."""
+    from ttp import chaincap, worktree
+    from ttp.daemon import Daemon
+    from ttp.prompts import worker_prompt
+    from ttp.providers.base import RunUsage as Usage
+    p = make(env)
+    def before(tid, head):   # the run's cost, recorded before the finish in the same round
+        p.db.update_task(tid, spent_usd=3.0)
+        (env["tmp"] / f"run-{tid}" / "result.json").write_text(json.dumps(
+            {"status": "done", "summary": "parser works", "followups": _cont_fup()(tid)}))
+    tid, branch, done, reviews = _finish_code(env, p, "parser", {"parser.py": 5}, before=before)
+    t = p.db.task(tid)
+    assert t["status"] == "queued" and t["branch"] == branch and not _hops_of(p, tid) and not reviews
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == 1
+    assert t["spec"].startswith("spec of parser") and "## Update" in t["spec"]
+    assert "Handle the nested case in parse()." in t["spec"] and "continue: finish the parser" in t["spec"]
+    assert int(t["attempts"] or 0) == 0
+    base = p.config()["budget"]["task_default_usd"]["standard"]
+    assert abs(t["budget_usd"] - (3.0 + base)) < 0.01
+    assert len(chaincap.requeues(t)) == 1 and f"{chaincap.BUDGET_BASE_LABEL}{base:g}" in t["labels"]
+    assert "Re-queued by the daemon" in done["text"] and "parser works" in t["result"]
+    ev = p.db.one("SELECT * FROM events WHERE kind=? AND task=?", (chaincap.AUTO_EVENT, tid))
+    assert json.loads(ev["data"])["requeued"] and not chaincap.auto_continued(p.db, tid)
+    path, br = worktree.ensure(p, t)
+    assert br == branch and path.name == f"t{tid}" and (path / "parser.py").exists()
+    assert "parser works" in worker_prompt(p, t, str(path), br)
+    # A re-queue is a hop of its chain for max_hops.
+    assert chaincap.hop_count(chaincap.chain(p.db, tid)) == 1
+    # The second run ends without a continue: the review of the same task, by its id.
+    (path / "parser.py").write_text("nested\n")
+    _git_out(path, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "nested")
+    p.db.update_task(tid, status="running")
+    run_dir = env["tmp"] / f"run-{tid}-2"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps({"status": "done", "summary": "parser done"}))
+    Daemon(p.base)._finish_worker({"task": tid}, Usage(cost_usd=1.0), "ok", run_dir)
+    assert p.db.task(tid)["status"] == "done"
+    (rev,) = p.db.q("SELECT * FROM tasks WHERE kind='review' AND depends_on=?", (json.dumps([tid]),))
+    assert rev["title"] == f"Review #{tid}: parser" and branch in rev["spec"]
+
+
+def test_an_approved_or_landed_task_still_gets_a_new_continue_task(env):
+    """Once its change is approved (a push queue row) or landed, a done task's continue is a new task
+    that continues it, as before: re-queueing would reopen a change already reviewed."""
+    from ttp import chaincap
+    p = make(env)
+    for n, sql in enumerate((
+            "INSERT INTO push_queue(task,branch,head,target,created,updated) VALUES(?,'b','h','t',0,0)",
+            "INSERT INTO task_landings(marker,task,sha,target,ts) VALUES('m'||?,?,'s','t',0)",
+            "INSERT INTO task_superseded(task,head,sha,ts) VALUES(?,'h','s',0)")):
+        title = f"lexer {n}"
+
+        def before(tid, head, sql=sql, title=title):
+            p.db.x(sql, (tid,) * sql.count("?"))
+            (env["tmp"] / f"run-{tid}" / "result.json").write_text(json.dumps(
+                {"status": "done", "summary": f"{title} works", "followups": _cont_fup()(tid)}))
+        tid, _, done, _ = _finish_code(env, p, title, {f"lexer{n}.py": 5}, before=before)
+        assert chaincap.approved_or_landed(p.db, tid)
+        t = p.db.task(tid)
+        assert t["status"] == "done" and not chaincap.requeues(t), sql
+        # Approved: the daemon's new hop; landed: the follow-up left for a new task, as before.
+        assert len(_hops_of(p, tid)) == 1 if n == 0 else "NOT queued by the daemon" in done["text"], sql
+
+
+def test_requeue_is_off_for_a_non_code_task_or_by_config(env):
+    from ttp import chaincap
+    p = make(env)
+    tid = p.db.add_task("notes", "s", kind="harness", origin="user")
+    p.db.update_task(tid, status="done", branch="b")
+    fup = {"title": "continue: more", "spec": "x"}
+    assert not chaincap.requeue(p, p.config(), p.db.task(tid), fup, "progress", 0)
+    p.db.update_task(tid, kind="code")
+    p.set_config("chains.requeue", False)
+    assert not chaincap.requeue(p, p.config(), p.db.task(tid), fup, "progress", 0)
+    p.set_config("chains.requeue", True)
+    assert chaincap.requeue(p, p.config(), p.db.task(tid), fup, "progress", 0)
+    # A task no longer done (another writer moved it) is never re-queued twice.
+    assert not chaincap.requeue(p, p.config(), p.db.task(tid), fup, "progress", 0)
+
+
+def test_max_hops_counts_re_queues_and_progress_counts_only_runs_since_the_last(env):
+    from ttp import chaincap
+    p = make(env)
+    p.set_config("chains.max_hops", 2)
+    tid = _chain_root(p, "root", 1.0)
+    p.db.update_task(tid, labels=json.dumps(["requeued:100", "requeued:200"]))
+    ch = chaincap.chain(p.db, tid)
+    assert chaincap.hop_count(ch) == 2 and chaincap.requeues(p.db.task(tid)) == [100, 200]
+    assert chaincap.cap_hit(p, p.config(), ch)[0]
+
+
+def test_a_done_hand_off_whose_continue_only_waits_is_refused(env):
+    from ttp import chaincap, hook
+    for title in ("continue: wait for checks", "continue: poll the detached job",
+                  "continue: report checks results", "Continue: watch the landing",
+                  "continue: await the push", "continue: confirm CI"):
+        assert chaincap.waits_only({"title": title, "spec": "s"}), title
+        path = env["tmp"] / "result.json"
+        path.write_text(json.dumps({"status": "done", "summary": "x" * 40,
+                                    "followups": [{"title": title, "spec": "s"}]}))
+        why = hook.handoff_problem(path)
+        assert why and chaincap.WAITS_ONLY_HINT in why, title
+    for title in ("continue: fix the parser then wait for checks", "continue: add tests",
+                  "next: wait for checks", "continue: rebase and check CI"):
+        assert not chaincap.waits_only({"title": title, "spec": "s"}), title
+    path.write_text(json.dumps({"status": "waiting", "summary": "x" * 40, "retry_when": "true",
+                                "followups": [{"title": "continue: wait for checks", "spec": "s"}]}))
+    assert not (hook.handoff_problem(path) or "").count(chaincap.WAITS_ONLY_HINT)

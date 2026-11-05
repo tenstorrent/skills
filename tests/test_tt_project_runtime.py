@@ -32359,6 +32359,7 @@ def _hop(env, p, tid, files, result):
 
 def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_its_parents_summary(env):
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     from ttp import chaincap
     from ttp.prompts import worker_prompt
     light = {"status": "done", "summary": "feature: part done, checks left",
@@ -32392,6 +32393,7 @@ def test_a_daemon_queued_continue_hop_carries_its_parent_branch_head_and_changed
     the merge base with the base ref) to the hop's spec, model-free and bounded; with no branch to read
     the hop is queued with its spec as written."""
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     from ttp import chaincap
     _commit_files(env["repo"], {"lib.py": "".join(f"line {i}\n" for i in range(1, 21)), "old.py": "x\n"}, "base")
 
@@ -32430,6 +32432,7 @@ def test_a_daemon_queued_continue_hop_carries_its_parent_branch_head_and_changed
 
 def test_a_continue_hop_with_progress_is_queued_by_the_daemon_without_a_coordinator_turn(env):
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     from ttp import audit, chaincap
     from ttp import coordinator as coord
     from ttp.db import continues_id
@@ -32496,6 +32499,7 @@ def test_the_last_hop_of_a_split_chain_gets_its_one_review_listing_the_chain(env
     """A split chain is reviewed once, at the head of the first hop that ends without a split: that
     review names each split hop and their follow-ups and reads the chain's first spec."""
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     from ttp import chaincap
     root, branch, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
     (hop1,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
@@ -32597,6 +32601,7 @@ def test_a_split_hop_starts_at_once_and_never_waits_on_its_own_chains_landing(en
     from ttp import coordinator as coord
     from ttp import daemon as dmod
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     root, branch, done, reviews = _finish_code(env, p, "feature", {"a.py": 10}, result=_cont("feature"))
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
@@ -32625,6 +32630,7 @@ def test_a_split_hop_starts_at_once_and_never_waits_on_its_own_chains_landing(en
 
 def test_a_daemon_queued_code_hop_whose_predecessor_already_landed_starts_at_once(env, monkeypatch):
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     branches = {}
 
     def land(tid, head):
@@ -32649,6 +32655,7 @@ def test_a_daemon_queued_code_hop_waits_for_no_landing_where_its_review_pushes_n
     from ttp import daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     _git_out(env["repo"], "branch", "work")
     for title, setup in (("parser", ()), ("widget", (("delivery.push_branch", "work"), ("delivery.push_allowed", False)))):
         for key, val in setup:

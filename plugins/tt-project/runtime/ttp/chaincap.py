@@ -51,6 +51,13 @@ covers only the commits after it (reviewed_split). The notice, and a local_only 
 still carries, go to the next digest (NOTICES_KEY) without waking the coordinator. Anything else
 still goes to it.
 
+Re-queue (requeue): the lone `continue:` hop of a done code task whose change no review approved and that
+has not landed is no new task. The same task goes back to the queue, so it keeps its id, worktree, branch
+and review chain: the follow-up's spec is appended as an `## Update`, its per-task budget is topped up to
+a fresh one, its attempt count stays and its last hand-off (the prompt's previous attempt) stays. Each
+re-queue counts as a hop under the caps (REQUEUED_LABEL), and its progress counts only the runs since.
+An approved or landed task still gets a new hop.
+
 The daemon appends branch_brief to the queued hop's spec, model-free: the parent branch's head and
 its changed files with their hunk line ranges against the base ref, so the hop starts with less
 orientation. It is bounded (BRIEF_MAX_LINES) and left out when the parent has no branch here.
@@ -77,7 +84,7 @@ MIN_REASON = 20
 HARD = ("max_hops", "max_usd")   # caps no `reason` lifts (spend safety); max_stalls and review.area_fail_cap take one
 REASON_HINT = ("add a `reason` field to the task_add that names what changed, in these words: new evidence, "
                f"a different approach or a narrower scope (at least {MIN_REASON} characters); it then passes in the same action")
-DEFAULTS = {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True}
+DEFAULTS = {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "requeue": True}
 CAP_EVENT = "continue_cap"
 OVERRIDE_EVENT = "continue_cap_override"
 AUTO_EVENT = "continue_auto"
@@ -97,6 +104,8 @@ BRIEF_MAX_RANGES = 8   # hunk ranges listed per file before '...'
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 SPLIT_LABEL = "split:"   # a done code task that ended as a split: split:<its head>
 SPLIT_REVIEW_LABEL = "split_review:"   # a review of a split head on its own, as its hop stalled: split_review:<head>
+REQUEUED_LABEL = "requeued:"   # a code task re-queued for its own `continue:` hop (requeue): requeued:<unix time>
+BUDGET_BASE_LABEL = "budget_base:"   # its per-task budget before its first re-queue: what each re-queue tops up to
 HOP_WAIT_S = 3600   # a hop deferred longer than this stalls (hop_stall): its split head is reviewed without it
 # A split hand-off's own words: a summary that opens "Split at/here/..." or names the split line, a head
 # commit subject that says WIP.
@@ -125,7 +134,7 @@ WAIT_KEYS = ("start_when", "retry_when", "wait", "waiting_for")
 
 def caps(cfg: dict) -> dict:
     c = cfg.get("chains") or {}
-    out: dict = {"auto": c.get("auto", True) not in (False, 0, "off", "false")}
+    out: dict = {k: c.get(k, True) not in (False, 0, "off", "false") for k in ("auto", "requeue")}
     for k in ("max_hops", "max_stalls", "max_usd"):
         try:
             out[k] = max(0.0, float(c.get(k, DEFAULTS[k])))
@@ -172,6 +181,22 @@ def is_review_fix(task: dict) -> bool:
         or bool(FIX_TITLE.match(title))
 
 
+def requeues(task: dict | None) -> list[int]:
+    """The times code task `task` was re-queued for its own `continue:` hop (REQUEUED_LABEL), oldest first."""
+    try:
+        labels = json.loads((task or {}).get("labels") or "[]")
+    except ValueError:
+        return []
+    return sorted(int(lb[len(REQUEUED_LABEL):]) for lb in labels if isinstance(lb, str)
+                  and lb.startswith(REQUEUED_LABEL) and lb[len(REQUEUED_LABEL):].isdigit()) \
+        if isinstance(labels, list) else []
+
+
+def hop_count(ch: list[dict]) -> int:
+    """The hops of chain `ch`: its tasks after the root, and each re-queue of one of them."""
+    return max(len(ch) - 1, 0) + sum(len(requeues(t)) for t in ch)
+
+
 def chain(db: DB, task_id: int) -> list[dict]:
     """The lineage ending at `task_id`, root first. Reviews are not hops: a review starts none."""
     out: list[dict] = []
@@ -192,10 +217,13 @@ def _metrics(task: dict | None) -> dict:
 
 def run_windows(db: DB, task: dict, now: float | None = None) -> list[tuple[int, int]]:
     """The whole seconds `task`'s runs spanned (a running one up to now); with no run recorded, from its
-    creation to now."""
+    creation to now. A re-queued task's (requeue) only since its last re-queue."""
     now = time.time() if now is None else now
-    rows = db.q("SELECT started, ended FROM runs WHERE task=? AND started IS NOT NULL", (task["id"],))
-    spans = [(float(r["started"]), float(r["ended"] or now)) for r in rows] or [(float(task.get("created") or 0), now)]
+    since = max(requeues(task), default=0)
+    rows = db.q("SELECT started, ended FROM runs WHERE task=? AND started IS NOT NULL AND started>=?",
+                (task["id"], since))
+    spans = [(float(r["started"]), float(r["ended"] or now)) for r in rows] \
+        or [(float(since or task.get("created") or 0), now)]
     return [(int(a), -int(-b // 1)) for a, b in spans]
 
 
@@ -364,7 +392,7 @@ def cap_hit(p, cfg: dict, ch: list[dict]) -> tuple[str, str]:
     if not ch:
         return "", ""
     c, root = caps(cfg), ch[0]
-    hops, usd = len(ch) - 1, spend(ch)
+    hops, usd = hop_count(ch), spend(ch)
     head = f"the continue chain of #{root['id']} ({str(root['title'])[:80]}) "
     if c["max_hops"] and hops + 1 > c["max_hops"]:
         return "max_hops", head + f"has {hops} hops; chains.max_hops is {c['max_hops']:g}"
@@ -400,13 +428,13 @@ def check_add(p, cfg: dict, prev: int, reason) -> str:
     if not why:
         return ""
     hard = cap in HARD
-    data = {"root": ch[0]["id"], "tip": prev, "hops": len(ch) - 1, "usd": round(spend(ch), 2), "why": why, "cap": cap}
+    data = {"root": ch[0]["id"], "tip": prev, "hops": hop_count(ch), "usd": round(spend(ch), 2), "why": why, "cap": cap}
     if not hard and reason_ok(reason):
         db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
              (time.time(), "coordinator", OVERRIDE_EVENT, "low", f"{why}; passed with reason: {str(reason)[:300]}",
               json.dumps({**data, "reason": str(reason)[:300]}), "handled", prev))
         return f"task_add continues #{prev} past its cap ({why}) with reason: {str(reason)[:200]}"
-    fp = f"{CAP_EVENT}:{ch[0]['id']}:{len(ch) - 1}"
+    fp = f"{CAP_EVENT}:{ch[0]['id']}:{hop_count(ch)}"
     way = (f"chains.{cap} is hard: no `reason` lifts it" if hard else
            "a task_add that continues it passes only with a `reason` naming what changed")
     if not db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
@@ -504,6 +532,24 @@ QUESTION_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:\s*(?:then\s+)?
 # 'after' or 'once' this task lands (AFTER_LANDING's own-task forms, any step).
 OWN_LANDING = re.compile(r"(?i)\b(?:after|once|when)\s+(?:it|this\s+(?:task|change)|the\s+change|#(\d+))\s+"
                          r"(?:lands|has\s+landed|is\s+landed|is\s+pushed|reaches\s+the\s+push\s+branch)\b")
+
+
+# A `continue:` follow-up that only waits: on checks, CI, a detached job or run, a push or a landing (waits_only).
+WAIT_TITLE = re.compile(r"(?i)^\s*(?:continue|mechanical)\s*:\s*(?:then\s+)?(?:(?:wait|await|poll|watch)\b"
+                        r"|(?:report|record|collect|read|check|confirm)\s+(?:on\s+)?(?:the\s+|its\s+|my\s+)?"
+                        r"(?:[\w-]+\s+)?(?:checks?|ci|push(?:es)?|landing|job|run|results?|outcome)\b)")
+# Words of a step that changes something: such a follow-up does more than wait.
+WORK_STEP = re.compile(r"(?i)\b(?:fix|implement|add|write|edit|change|refactor|rebase|resolve|rename|remove|"
+                       r"delete|port|build|split|trim)\w*")
+WAITS_ONLY_HINT = "hand off waiting with retry_when and on_pass_cmd"
+
+
+def waits_only(fup: dict) -> bool:
+    """Whether `continue:` follow-up `fup` only waits (WAIT_TITLE) with no step that changes something in its
+    title or spec (WORK_STEP): a waiting hand-off (retry_when, on_pass_cmd) does that without a new run."""
+    fup = fup if isinstance(fup, dict) else {}
+    title = str(fup.get("title") or "")
+    return bool(WAIT_TITLE.match(title)) and not WORK_STEP.search(f"{title}\n{fup.get('spec') or ''}")
 
 
 def code_hop(fup: dict, task_id: int) -> bool:
@@ -750,8 +796,61 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
     return new["id"], why
 
 
+def approved_or_landed(db: DB, task_id: int) -> bool:
+    """Whether task `task_id`'s change was approved by a review (a push queue row) or landed (on the push
+    branch, or under other commits): its `continue:` hop is then a new task, never a re-queue."""
+    return bool(db.one("SELECT 1 FROM push_queue WHERE task=? UNION ALL SELECT 1 FROM task_landings WHERE task=? "
+                       "UNION ALL SELECT 1 FROM task_superseded WHERE task=? LIMIT 1", (task_id, task_id, task_id)))
+
+
+def requeue(p, cfg: dict, task: dict, fup: dict, why: str, attempts: int, now: float | None = None) -> bool:
+    """Re-queue done code task `task` for `fup`, its lone `continue:` hop that hop_ready passed (`why`), when
+    its change is neither approved nor landed (approved_or_landed): the same task, so its id, worktree,
+    branch and review chain stay. The follow-up's spec is appended as an `## Update`, its per-task budget
+    tops up to a fresh one (its BUDGET_BASE_LABEL, the budget it had before its first re-queue), its
+    attempts go back to `attempts` (the count before this run) and its result (the last hand-off) stays.
+    An AUTO_EVENT records it. Whether it was re-queued; False leaves the task as it was."""
+    from . import budget as bud
+    db = p.db
+    if not caps(cfg)["requeue"] or task.get("kind") != "code" or not task.get("branch") \
+            or approved_or_landed(db, task["id"]):
+        return False
+    now = time.time() if now is None else now
+    try:
+        labels = json.loads(task.get("labels") or "[]")
+    except ValueError:
+        labels = []
+    labels = labels if isinstance(labels, list) else []
+    base = next((float(lb[len(BUDGET_BASE_LABEL):]) for lb in labels if isinstance(lb, str)
+                 and lb.startswith(BUDGET_BASE_LABEL) and re.fullmatch(r"\d+(?:\.\d+)?", lb[len(BUDGET_BASE_LABEL):])),
+                None)
+    if base is None:
+        base = float(task.get("budget_usd") or bud.task_default_usd(cfg, task.get("tier")))
+        labels.append(f"{BUDGET_BASE_LABEL}{base:g}")
+    title = str(fup.get("title") or "").strip()[:200]
+    spec = str(fup.get("spec") or "").strip()
+    update = f"## Update\nContinue ({title}), re-queued by the daemon after your last hand-off:\n{spec}"
+    rows = db.conn.execute("UPDATE tasks SET status='queued', spec=?, labels=?, budget_usd=?, attempts=?, "
+                           "not_before=NULL, blocked_reason=NULL, updated=? WHERE id=? AND status='done'",
+                           (f"{str(task.get('spec') or '').rstrip()}\n\n{update}", json.dumps(
+                               [*labels, f"{REQUEUED_LABEL}{int(now)}"]),
+                            round(float(task.get("spent_usd") or 0) + base, 2), int(attempts), now,
+                            task["id"])).rowcount
+    if not rows:
+        return False
+    ch = chain(db, task["id"])
+    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+         (now, f"task:{task['id']}", AUTO_EVENT, "low",
+          f"#{task['id']} re-queued by the daemon for its continue {title!r} ({why})",
+          json.dumps({"root": ch[0]["id"] if ch else task["id"], "next": task["id"], "requeued": True,
+                      "hops": hop_count(ch), "why": why}), "handled", task["id"]))
+    return True
+
+
 def auto_continued(db: DB, task_id: int) -> bool:
-    return bool(db.one("SELECT 1 FROM events WHERE kind=? AND task=?", (AUTO_EVENT, task_id)))
+    """Whether the daemon queued a new hop after task `task_id` (a re-queue of the task itself is none)."""
+    return bool(db.one("SELECT 1 FROM events WHERE kind=? AND task=? AND COALESCE(json_extract(CASE WHEN "
+                       "json_valid(data) THEN data END, '$.requeued'), 0) = 0", (AUTO_EVENT, task_id)))
 
 
 def add_notice(db: DB, text: str) -> None:

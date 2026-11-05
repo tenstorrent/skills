@@ -148,6 +148,11 @@ def handoff_problem(path: Path) -> str | None:
         from . import thenwaits
         if why := thenwaits.problem(data):
             return f"{RESULT_FILE}: {why}"
+    if data.get("status") == "done" and isinstance(data.get("followups"), list):
+        from . import chaincap
+        if wait := next((f for f in data["followups"] if isinstance(f, dict) and chaincap.waits_only(f)), None):
+            return (f"its `continue:` follow-up {str(wait.get('title'))[:120]!r} only waits (checks, a detached job "
+                    f"or a landing), which costs a new run: {chaincap.WAITS_ONLY_HINT} instead")
     return None
 
 

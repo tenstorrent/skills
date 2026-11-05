@@ -359,7 +359,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # With auto, a done hop with progress whose only proposal is the next `continue:` hop gets it
     # queued by the daemon, with no coordinator turn. With urgent_followups, an urgent task's (or an
     # obligation owner's) continue and next-step follow-ups are queued at once under the same caps (urgentfup).
-    "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True},
+    # With requeue, a code task whose change is neither approved nor landed is re-queued for that hop
+    # itself (chaincap.requeue: same id, worktree and branch) instead of a new task.
+    "chains": {"max_hops": 8, "max_stalls": 2, "max_usd": 40.0, "auto": True, "urgent_followups": True,
+               "requeue": True},
     # Each Jev use (e.g. "screen") is switched off once its net saving over window_days is not
     # positive, judged after min_calls calls or once its first call is a window old, or once idle_calls
     # calls in the window changed none of the rules' decisions; uses.<use> = "on" or "off" forces it

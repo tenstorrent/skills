@@ -5812,7 +5812,15 @@ class Daemon:
         # its hop takes the branch over, and the chain's last hop gets the one review.
         ready = self._continue_ready(dict(task, **upd), fups) \
             if new == "done" and not approval and not notes and sev == "normal" else ""
-        split = self._split(dict(task, **upd), result, fups) if new == "done" and task["kind"] == "code" else ""
+        # A code task whose change is neither approved nor landed is re-queued for that hop instead
+        # (chaincap.requeue): the same task, worktree and branch, so no split, review or new hop now.
+        requeued = bool(ready) and task["kind"] == "code" \
+            and self._requeue_continue(db.task(task["id"]) or dict(task, **upd), fups[0], ready, int(task["attempts"] or 0))
+        if requeued:
+            text += (f"\nRe-queued by the daemon for its continue ({ready}): the same task, branch and worktree, "
+                     f"with the follow-up appended to its spec.")
+        split = self._split(dict(task, **upd), result, fups) \
+            if new == "done" and task["kind"] == "code" and not requeued else ""
         if split:
             text += (f"\nSplit at head {split[:12]}: no review of it; its continue hop builds on this branch, and "
                      f"the chain's last hop gets the one review.")
@@ -5823,12 +5831,12 @@ class Daemon:
         # are not warmed by gitmemo. All git in this transaction ends within gitmemo.TX_GIT_S (_finish_tx).
         review = self._auto_review(dict(task, **upd), summary) \
             if (new == "done" or new == "review" and (urgent.is_urgent(task) or obligations.owned_open(db, task["id"]))) \
-            and task["kind"] == "code" and not split else None
+            and task["kind"] == "code" and not split and not requeued else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
         stale = self._fix_without_commits(dict(task, **upd)) \
-            if new in ("done", "review") and task["kind"] == "code" else []
+            if new in ("done", "review") and task["kind"] == "code" and not requeued else []
         for r in stale:
             why = (f"fix #{task['id']} ended with no new commits on {task['branch']} after the head "
                    f"{r['base']} its review saw: nothing new to re-review")
@@ -5897,14 +5905,15 @@ class Daemon:
         # code hop whose branch has changes and is no split (they already landed under other commits)
         # starts from the base. With changes and no review that is neither, it stays with the
         # coordinator, or its commits would never be reviewed or delivered.
-        changes = bool(ready) and not fix and not split and task["kind"] == "code" and self._has_changes(task)
+        changes = bool(ready) and not requeued and not fix and not split and task["kind"] == "code" \
+            and self._has_changes(task)
         landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
         refused: list[str] = []
         hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready, refused) \
-            if ready and not fix and (review or split or not changes or landed_now) else None
+            if ready and not requeued and not fix and (review or split or not changes or landed_now) else None
         # An urgent task's (or an obligation owner's) next steps are queued now, under the same caps (urgentfup).
         quick, unqueued = self._urgent_followups(db.task(task["id"]) or dict(task, **upd), fups,
-                                                 {id(fups[0])} if hop else set()) \
+                                                 {id(fups[0])} if hop or requeued else set()) \
             if new == "done" and not approval and task["kind"] != "review" and fups else ([], {})
         if not ready and not quick and new == "done" and task["kind"] == "code" and not approval and not notes \
                 and sev == "normal" and self._lone_continue(task, fups):
@@ -5913,6 +5922,8 @@ class Daemon:
                     text += f"\n{chaincap.NO_COMMIT_TRIGGER}: its continue was not queued."
             except Exception:
                 log(self.p, f"no-commit check after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+        if requeued:
+            folded.add(id(fups[0]))
         if hop:
             folded.add(id(fups[0]))
             text += f"\nContinue hop #{hop[0]} queued by the daemon ({hop[1]})" + (
@@ -5921,7 +5932,7 @@ class Daemon:
             folded.add(id(f))
             text += f"\nFollow-up #{nid} queued by the daemon ({urgentfup.why(db, task)}): {str(f['title'])[:120]}."
         left = [f for f in fups if chaincap.CONT_TITLE.match(str(f["title"])) and id(f) not in folded]
-        if hop or quick and not left:
+        if hop or requeued or quick and not left:
             pass
         elif new == "done" and left:
             # A post-landing live step (a deploy, install or rollout) is no hop: it is proposed as deploy tasks.
@@ -5938,11 +5949,12 @@ class Daemon:
         # Every proposal queued as an urgent next step and nothing else to read: no turn either.
         settled = bool(quick) and len(fups) <= MAX_FOLLOWUPS and all(id(f) in folded for f in fups) \
             and not notes and sev == "normal" and not hcheck_text
-        routine = ((review is not None and plain) or fix is not None or hop is not None or settled) and not stale
+        routine = ((review is not None and plain) or fix is not None or hop is not None or requeued or settled) \
+            and not stale
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
         text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
-        if hop or quick:
+        if hop or requeued or quick:
             chaincap.add_notice(db, text)
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
             # A plain needs_review hand-off: the daemon reviews it, so it raises no effort (coordinator._routine_review).
@@ -15223,6 +15235,15 @@ class Daemon:
         except Exception:
             log(self.p, f"continue hop after #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
             return ""
+
+    def _requeue_continue(self, task: dict, fup: dict, why: str, attempts: int) -> bool:
+        """chaincap.requeue for a done code task _continue_ready passed; False when it cannot be done (a new
+        hop is then queued as before)."""
+        try:
+            return chaincap.requeue(self.p, self.cfg, task, fup, why, attempts)
+        except Exception:
+            log(self.p, f"continue re-queue of #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return False
 
     @staticmethod
     def _lone_continue(task: dict, fups: list[dict]) -> bool:

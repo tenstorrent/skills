@@ -13815,6 +13815,7 @@ def test_a_failed_review_never_hands_its_findings_to_a_hop_that_waits_on_the_rev
     so it could never fix the branch, and its re-review would have run on the same head. The fix
     goes to a new Fix review task, and the re-review waits on that."""
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     root, branch, rev, hop = _split_with_a_landing_hop(env, p)
     spec = p.db.task(hop)["spec"]
     _fail_review(env, p, rev, [{"title": "refuse an open review", "spec": "abandon refuses a task under review"}])
@@ -13832,6 +13833,7 @@ def test_a_failed_review_still_gives_a_working_split_hop_its_findings(env):
     """No regression: a hop that builds on the branch (no landed wait on its chain) still takes the
     findings, and the re-review waits on it."""
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     root, branch, _, _ = _finish_code(env, p, "parser", {"a.py": 10}, result=_cont("parser"))
     (hop,) = p.db.q("SELECT * FROM tasks WHERE parent=?", (root,))
     rev = p.db.add_task(f"Review #{root}: parser", f"Independently review code task #{root}, branch {branch}.",

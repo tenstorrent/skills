@@ -445,6 +445,7 @@ def test_a_daemon_queued_continue_hop_reads_no_git_inside_the_finish_transaction
     and the overlaps of the spec auto_hop builds (follow-up spec + brief: the parent's changed files,
     tracked paths, a symbol's git grep). _prefetch_git now reads them all before the transaction."""
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     from ttp import chaincap, overlap, worktree
     from ttp.daemon import Daemon
     from ttp.providers.base import RunUsage as Usage

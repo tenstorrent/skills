@@ -115,6 +115,7 @@ def test_the_hand_off_lint_never_asks_the_remote_inside_a_transaction(env, monke
 def test_a_continue_hop_naming_its_unpublished_branch_is_still_queued_by_the_daemon(env):
     from ttp.daemon import Daemon
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     _with_origin(env)
     _own_push(p, None)
 
