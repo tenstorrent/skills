@@ -114,9 +114,6 @@ a CI repository, which needs the implementation pushed where the runners can fet
 loop. Either way, record the grant you actually used in `doc/agentic_evals/compute.json` so a
 reader can tell a thin result from a small grant.
 
-Read [harness facts](references/harness-facts.md) before the survey. It holds what earlier runs
-measured about the route, the hosts and suite durations. Check its values against this run and
-record any that differ in `learned.json`; do not spend an effort re-deriving one.
 
 ### Harness
 
@@ -153,7 +150,7 @@ Record the limits in `serving_config.json`, with the release values as `release_
 Record `planned_clients` for every run before it starts: how many agents it runs at once.
 
 - **Agents** never exceed `max_num_seqs`, the agents the pool holds (pool tokens ÷ working set per
-  agent, measured by the replay), or the host's trial limit in harness facts. Extra agents queue
+  agent, measured by the replay), or the number of task sandboxes the host can run at once (Docker networks, CPU, disk). Extra agents queue
   and slow every agent.
 - **Batch**: serve each run on the validated batch that finishes its agents soonest. Per model
   call, time is output tokens ÷ that batch's measured per-user rate plus the call's time outside
@@ -225,8 +222,8 @@ first hour, in parallel up to `max_parallel`, one suite per runner.
 3. **Nightly rung.** The first deliverable: the lists the release grades, scored against the
    references. Record `functional_at`.
 4. **Full-load rung**, for target `full_load` or `full`: one run per suite that fills a server. It
-   measures suite time, agent capacity and the slow tail at real load; its time replaces the
-   suite-time prior.
+   measures suite time, agent capacity and the slow tail at real load; its measured time
+   replaces the estimate for larger rungs.
 5. **Efforts, `effort_budget_hours`, hard stop**, ranked against the last banked rung. They start
    once the smoke rung is banked and run while rungs are on CI; a rung never waits for an effort.
 6. **Combine, about 2 h.** Re-check the current best, then one scored probe.
@@ -318,11 +315,10 @@ Write these to `doc/agentic_evals/`:
   request time limits and output cap, and `release_limits`
 - `compute.json`: the grant as used — `max_parallel`, peak runs in flight, and for a CI grant the
   published refs and every dispatched run id, so each result traces back to a run
-- `learned.json`: what the next model's stage 12 should not rediscover. `harness_facts`, each with
-  `fact`, `value`, `source` and whether it matched harness facts; `suite_timings`, per run `eval`,
-  `tasks`, `agents`, `batch`, `wall_hours`, `agent_hours`, `timeouts` and `score`; and
-  `generic_fixes`, each a branch and SHA with what it fixes. The skill's harness facts are updated
-  from it between versions.
+- `learned.json`: what the next model's stage 12 should not rediscover: `harness_facts`
+  (host and harness limits found, each with its evidence), `suite_timings` (per run `eval`,
+  `tasks`, `agents`, `batch`, `wall_hours`, `agent_hours`, `timeouts`, `score`) and
+  `generic_fixes` (branch, SHA and what each fixes).
 - `REPORT.md`, leading with `functional_at` and the score and interval per suite, then each
   effort's predictions next to its results
 

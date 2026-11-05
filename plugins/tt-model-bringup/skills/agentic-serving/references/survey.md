@@ -38,7 +38,7 @@ eval.
 |---|---|---|
 | `batch` | Which batch for N agents? | The validated batch with the least time per call: output tokens ÷ its per-user rate + time outside generation; usually the smallest at or above N |
 | `agents` | How many agents per server? | min(`max_num_seqs`, pool tokens ÷ working set per agent, host trial limit) |
-| `suite_hours` | Will each suite finish? | From the nearest suite-timing prior in harness facts: tasks ÷ agents × per-task wall, tail at the agent limit; after a rung, from its measured wall. The serving formula tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents is a cross-check, and covers only generation |
+| `suite_hours` | Will each suite finish? | tasks ÷ agents × measured time per task, from the smoke and then from the largest rung so far; the serving formula tasks × (uncached tokens ÷ prefill tok/s + output tokens × step ÷ busy rows) ÷ agents covers only generation |
 | `task_lists` | Which tasks per rung, and how many at full load? | Inputs, else the harness's lists, else the skill's default rule; full load = `agents`; 95% interval ±2·√(p(1−p)/n) |
 | `agent_timeout` | What agent time limit? | turns × turn time at the served speed, never below the release limit |
 | `output_cap` | What output cap? | Longest answer so far plus headroom, never below the release cap |
