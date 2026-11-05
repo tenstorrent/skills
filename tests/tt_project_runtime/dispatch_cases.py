@@ -1392,17 +1392,17 @@ def test_the_spend_gate_still_holds_an_urgent_task(env, monkeypatch, tmp_path, r
 
 def test_an_urgent_task_held_by_anything_raises_one_slot_wait_naming_the_hold_at_ten_minutes(
         env, monkeypatch, tmp_path, reap_tmp_processes):
-    """coordinator.urgent_slot_wait_min (default 10): an urgent task held by the spend gate (not the
+    """coordinator.urgent_slot_wait_min (default 10): an urgent task held by a paused resource (not the
     slots) raises one event naming that hold, counted from when it was queued; a routine one none."""
-    import dataclasses
+    from ttp import coordinator as coord
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
     try:
         assert d.cfg["coordinator"]["urgent_slot_wait_min"] == 10
-        core = d.cfg.get("core_provider", "claude")
-        d.gates[core] = dataclasses.replace(d.gates[core], allow_new_work=False)
+        coord.pause_resource(p, "board", True, reason="maintenance", by="user")
         hot = p.db.add_task("urgent fix", "Fix it.\nurgent: a demo in an hour", kind="work", tier="light",
-                            origin="user", priority=3)
-        p.db.add_task("routine", "s", kind="work", tier="light", origin="user", priority=3)
+                            origin="user", priority=3, labels=["resource:board"])
+        p.db.add_task("routine", "s", kind="work", tier="light", origin="user", priority=3,
+                      labels=["resource:board"])
         start = time.time()
 
         def check(minutes):
@@ -1413,9 +1413,115 @@ def test_an_urgent_task_held_by_anything_raises_one_slot_wait_naming_the_hold_at
 
         assert check(1) == [] and check(9) == []
         (ev,) = check(10)
-        assert ev["task"] == hot and ev["severity"] == "normal"
-        assert "urgent: a demo in an hour" in ev["text"] and "held by the spend gate (no new work)" in ev["text"]
+        assert ev["task"] == hot and ev["severity"] == "normal" and ev["status"] == "queued"
+        assert "urgent: a demo in an hour" in ev["text"] and "pause on resource board" in ev["text"]
         assert len(check(11)) == 1 and len(check(30)) == 1, "raised again for the same wait"
+    finally:
+        monkeypatch.undo()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def _held_by_guard(d, core, now, reasons):
+    import dataclasses
+    from ttp import budget as bud
+    g = dataclasses.replace(d.gates[core], level="red", allow_new_work=False, max_parallel=0,
+                            reasons=list(reasons), cause=reasons[0])
+    assert bud.red_class(reasons[0]) is not None or reasons[0].startswith("provider limit")
+    d.gates[core] = g
+
+
+def test_an_urgent_task_held_only_by_the_runaway_guard_wakes_nobody_and_is_listed_in_the_digest(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """The runaway guard (or any spend limit only time or the user clears) holding a ready urgent task
+    raises no urgent-wait event, which would be a self-started coordinator turn adding to the guard:
+    the next digest lists it, one line per task, with when the guard is expected to clear. Once a hold
+    the coordinator can clear takes over (a pause), the event is raised as before."""
+    from ttp import coordinator as coord, urgent
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    core = d.cfg.get("core_provider", "claude")
+    try:
+        start = time.time()
+        # A self-started coordinator turn that ended 20 minutes ago is the newest run the guard counts.
+        p.db.x("INSERT INTO runs(task,role,provider,status,started,ended,cost_usd) VALUES(NULL,'coordinator',?,"
+               "'done',?,?,4.09)", (core, start - 1500, start - 1200))
+        _held_by_guard(d, core, start, ["runaway guard: coordinator spent $4.09 on self-started turns in the "
+                                        "last hour (limit $4; turns for user messages not counted)"])
+        hot = p.db.add_task("urgent fix", "Fix it.\nurgent: a demo in an hour", kind="work", tier="light",
+                            origin="user", priority=3)
+        other = p.db.add_task("urgent too", "s", kind="work", tier="light", origin="user", priority=1)
+        p.db.add_task("routine", "s", kind="work", tier="light", origin="user", priority=3)
+
+        def check(minutes):
+            d._slot_wait_checked = start + minutes * 60 - 60
+            monkeypatch.setattr(time, "time", lambda: start + minutes * 60)
+            d.check_slot_wait()
+            return _slot_wait_events(p)
+
+        assert check(9) == [] and not p.db.kv(urgent.SPEND_HELD_KEY), "listed before the wait threshold"
+        assert check(10) == [] and check(30) == [], "the runaway guard alone woke the coordinator"
+        held = p.db.kv(urgent.SPEND_HELD_KEY)
+        assert sorted(held) == sorted([str(hot), str(other)])
+        assert held[str(hot)]["clears_at"] == start - 1200 + 3600, "an hour after the newest counted run ended"
+        assert "runaway guard: coordinator spent $4.09" in held[str(hot)]["held"]
+        lines = urgent.spend_held_lines(p, p.db, start + 30 * 60)
+        assert lines[0].startswith("## Urgent tasks held only by a spend limit") and len(lines) == 3
+        line = next(x for x in lines if x.startswith(f"- #{hot} "))
+        assert "urgent: a demo in an hour" in line and "waited 30 min" in line and "expected to clear by" in line
+        assert "runaway guard's hour rolls over" in line
+        parts, _ = coord.digest_parts(p, {k: g.as_dict() for k, g in d.gates.items()}, [], [])
+        assert any(k == "urgent_spend_held" and f"- #{hot} " in body for k, body in parts)
+
+        # A task that left the queue drops out of the digest; a cap only the user raises has no clear time.
+        p.db.update_task(other, status="done")
+        _held_by_guard(d, core, start, ["cap reached: daily $50"])
+        assert check(31) == []
+        held = p.db.kv(urgent.SPEND_HELD_KEY)
+        assert list(held) == [str(hot)] and held[str(hot)]["clears_at"] is None
+        assert "no clear time known (the cap's period rolls over or the user raises it)" in \
+            urgent.spend_held_lines(p, p.db, start + 31 * 60)[1]
+
+        # The gate lifts but the run does not fit the dollar caps: also a limit only time or the user clears.
+        p.db.x("DELETE FROM runs WHERE role='coordinator'")
+        d.update_gates()
+        assert d.gates[core].allow_new_work and d.gates[core].regime == "caps"
+        monkeypatch.setattr(type(d), "_fits_caps", staticmethod(lambda gate, usd: False))
+        assert check(32) == []
+        assert "the user raises a cap" in p.db.kv(urgent.SPEND_HELD_KEY)[str(hot)]["clears"]
+        monkeypatch.undo()
+        monkeypatch.setattr(time, "time", lambda: start + 32 * 60)
+
+        # A pause holds it instead: a hold the coordinator can act on wakes it.
+        coord.pause_resource(p, "board", True, reason="maintenance", by="user")
+        p.db.update_task(hot, labels=["resource:board"])
+        (ev,) = check(33)
+        assert ev["task"] == hot and "pause on resource board" in ev["text"]
+        assert p.db.kv(urgent.SPEND_HELD_KEY) == {}
+    finally:
+        monkeypatch.undo()
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_an_urgent_task_held_by_a_busy_resource_still_wakes_the_coordinator(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """A resource another task holds (the lock-style hold) is one the coordinator can act on: the
+    urgent-wait event is raised as before and nothing is listed as spend-held."""
+    from ttp import urgent
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    _board_slots(p, d, 1)
+    try:
+        holder = _board_add(p, "holds the board", 3)
+        d.dispatch()
+        assert _slot_tasks(p) == [holder]
+        hot = _board_add(p, "urgent fix", 1)
+        start = time.time()
+        d._slot_wait_checked = start + 600 - 60
+        monkeypatch.setattr(time, "time", lambda: start + 600)
+        d.check_slot_wait()
+        (ev,) = _slot_wait_events(p)
+        assert ev["task"] == hot and "resource board" in ev["text"] and f"#{holder}" in ev["text"]
+        assert p.db.kv(urgent.SPEND_HELD_KEY) in (None, {})
     finally:
         monkeypatch.undo()
         drain(d)

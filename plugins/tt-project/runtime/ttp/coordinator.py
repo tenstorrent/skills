@@ -1165,6 +1165,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                          + (f" ({end})" if (end := pauseends.describe(v, p, pauseends.passed_at(db, name, v), now))
                             else ""))
     section("paused", lines)
+    section("urgent_spend_held", urgent.spend_held_lines(p, db, now))
     section("resources", machines.digest_lines(db, paused, now))
     lines = []
     for res, got in shared.mismatches(p).items():

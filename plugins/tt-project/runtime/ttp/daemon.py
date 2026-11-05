@@ -7050,7 +7050,12 @@ class Daemon:
         preempted: dispatch already starts these tasks first when a slot frees (db.ready_tasks).
         An urgent task (urgent.is_urgent) is raised once it has waited that long since it was queued
         (urgent.waited_s) and anything holds it now (_start_hold: slots, the spend or auth gate, a pause,
-        a lock, a branch), the event naming that hold; the same fingerprint, so one event per wait."""
+        a lock, a branch), the event naming that hold; the same fingerprint, so one event per wait.
+        Held only by the spend gate allowing no new work (the runaway guard, a cap, a plan window at its
+        line) or by its run not fitting the dollar caps (limits only time or the user clears), it raises
+        nothing: that wake would be a self-started coordinator turn, adding to the very guard that holds
+        it. It is kept in urgent.SPEND_HELD_KEY, with when the hold is expected to clear
+        (budget.hold_clears), for the next turn's digest."""
         now = time.time()
         last = getattr(self, "_slot_wait_checked", 0.0)
         if now - last < every_s:
@@ -7059,6 +7064,8 @@ class Daemon:
         mins = float(self.cfg["coordinator"].get("urgent_slot_wait_min", 10) or 0)
         if mins <= 0 or self.cfg_status == "unavailable" or self.settling() or now - last > STALL_GAP_S:
             self._slot_waits = {}
+            if mins <= 0 and self.p.db.kv(urgent.SPEND_HELD_KEY):
+                self.p.db.set_kv(urgent.SPEND_HELD_KEY, {})
             return
         db = self.p.db
         due = obligations.owner_due(db)
@@ -7071,6 +7078,7 @@ class Daemon:
                    "GROUP BY provider")},
                "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t in hot + gated}}}
         full, other = {}, {}   # held only by the slots; an urgent task held by anything else (its words)
+        spend = {}   # an urgent task held by the spend gate allowing no new work: no wake (docstring)
         for t in gated:   # dependencies met, a worker slot free and nothing else holds it: only its kept gate
             if self._start_hold(t, t["provider"] or core, ctx) is None:
                 labels, d = convgate.stored(t)
@@ -7083,8 +7091,25 @@ class Daemon:
             why = self._start_hold(t, t["provider"] or core, ctx)
             if why == "gate" and t["id"] in ctx.get("full", {}):
                 full[t["id"]] = t
+            elif urgent.is_urgent(t) and (why == "caps" or why == "gate" and not ctx["gate"].allow_new_work):
+                spend[t["id"]] = (t, self._hold_words(t, why, ctx), None if why == "caps" else ctx["gate"])
             elif why and urgent.is_urgent(t):
                 other[t["id"]] = (t, self._hold_words(t, why, ctx))
+        listed = {}
+        for tid, (t, held, g) in spend.items():
+            waited = urgent.waited_s(db, t, now)
+            if waited < mins * 60:
+                continue
+            at, clears = (None, "running work ends or a cap's period rolls over, or the user raises a cap") \
+                if g is None else bud.hold_clears(db, g, now, (self._provider_pause(g.provider) or {}).get("until"))
+            listed[str(tid)] = {"title": t["title"][:80], "why": urgent.why(t)[:120], "held": held[:240],
+                                "clears_at": at, "clears": clears, "since": round(now - waited)}
+        if listed != (was := db.kv_dict(urgent.SPEND_HELD_KEY)[0]):
+            db.set_kv(urgent.SPEND_HELD_KEY, listed)
+            for tid, h in listed.items():
+                if tid not in was:
+                    log(self.p, f"urgent wait: task {tid} held only by the spend gate ({h['held'][:160]}); "
+                                f"listed in the digest, no wake")
         seen = getattr(self, "_slot_waits", {})
         self._slot_waits = {tid: seen.get(tid, now) for tid in full}
         for tid, (t, held) in other.items():

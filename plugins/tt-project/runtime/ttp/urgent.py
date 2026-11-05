@@ -26,17 +26,25 @@ an older release, so it leads the lane, ahead of priority-1 work. One holds the 
 - Visibility: `ttp status` and the web app mark urgent tasks with how long each has waited
   (waited_s); Daemon.check_slot_wait raises one event when a ready urgent task has been held by
   anything for coordinator.urgent_slot_wait_min (default 10), naming the hold. A wait on another
-  task's lane has its own lane_wait event, not a second one here."""
+  task's lane has its own lane_wait event, not a second one here. A hold only time or the user can
+  clear (the spend gate allowing no new work: the runaway guard, a cap, a plan window at its line)
+  wakes nobody: such a wake would be a self-started coordinator turn adding to the guard's count.
+  The task is listed in the next turn's digest instead (SPEND_HELD_KEY, spend_held_lines)."""
 from __future__ import annotations
 
 import json
 import re
 
+from . import db as dbmod, timefmt
 from .release import UPGRADE_TASK_TITLE
 
 PRIORITY = 1                    # a task at this priority or better is urgent
 # A spec line `urgent: <why>`; `urgent: no` (none, not, false, n/a) says it is not.
 LINE = re.compile(r"^[ \t]*urgent:[ \t]*(?!(?:no|none|not|false|n/?a)\b)(\S.*)$", re.I | re.M)
+# kv: {task id: {title, why, held, clears_at, clears, since}} of ready urgent tasks the spend gate alone
+# holds past coordinator.urgent_slot_wait_min (Daemon.check_slot_wait rewrites it each check).
+SPEND_HELD_KEY = "urgent_spend_held"
+dbmod.DICT_KV.add(SPEND_HELD_KEY)
 SINCE_LABEL = "urgent_since:"   # when a task_update added the spec's `urgent:` line (else: the task's creation)
 STALE_S = 86400                 # an `urgent:` line this old shows its age (shown_why)
 # A claim that the user is there right now: true only when it was written.
@@ -225,3 +233,24 @@ def mark(db, task: dict, now: float) -> str:
         return "urgent"
     m = int(s // 60)
     return f"urgent, waited {m // 60}h{m % 60:02d}m" if m >= 60 else f"urgent, waited {m}m"
+
+
+def spend_held_lines(p, db, now: float) -> list[str]:
+    """The digest's lines for SPEND_HELD_KEY: one per task still queued, with when its hold is expected
+    to clear. No action is asked: only time or the user clears these holds."""
+    held, _ = db.kv_dict(SPEND_HELD_KEY)
+    rows = {str(t["id"]): t for t in db.q("SELECT id, status FROM tasks WHERE status='queued'")} if held else {}
+    lines = []
+    for tid, h in sorted(held.items(), key=lambda kv: int(kv[0]) if kv[0].isdigit() else 0):
+        if tid not in rows or not isinstance(h, dict):
+            continue
+        at = h.get("clears_at")
+        when = (f"expected to clear by {timefmt.short(float(at), p, now)}" if isinstance(at, (int, float))
+                else "no clear time known") + f" ({h.get('clears') or 'when the spend gate allows new work'})"
+        waited = max(now - float(h.get("since") or now), 0) / 60
+        lines.append(f"- #{tid} {h.get('title') or ''} (urgent: {h.get('why') or 'yes'}), waited {waited:.0f} min; "
+                     f"held by {h.get('held') or 'the spend gate'}; {when}")
+    if lines:
+        lines.insert(0, "## Urgent tasks held only by a spend limit (time or the user clears it; it starts first "
+                        "once that clears; never raise the limit, say why it waits when asked)")
+    return lines

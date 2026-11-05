@@ -116,6 +116,37 @@ def red_share(g: Gate, cls: str) -> float | None:
     return None
 
 
+def hold_clears(db: DB, g: Gate, now: float, pause_until: float | None = None) -> tuple[float | None, str]:
+    """When a gate allowing no new work is expected to let it start again, and what clears it, from
+    its reasons: (the latest known time or None when one has none, words). Every such hold is a spend
+    limit that only time or the user clears (check_slot_wait lists these in the digest, never wakes
+    the coordinator). The runaway guard measures the last hour: it clears an hour after the newest
+    run it counts ended, if nothing more is counted meanwhile."""
+    at: list[float | None] = []
+    words: list[str] = []
+    for r in g.reasons:
+        if r.startswith("runaway guard"):
+            newest = db.one("SELECT MAX(ended) e FROM runs WHERE provider=? AND ended>=?", (g.provider, now - HOUR))
+            at.append(float((newest or {}).get("e") or now) + HOUR)
+            words.append("the runaway guard's hour rolls over, if nothing more is counted")
+        elif r.startswith("provider limit"):
+            at.append(pause_until)
+            words.append("the provider limit ends")
+        elif " window at " in r and "the project stops at" in r:
+            row = next((w for w in g.numbers.get("plan") or [] if r.startswith(f"{w['window']} window at")), {})
+            at.append(row.get("resets_at"))
+            words.append(f"the {row.get('window') or 'plan'} window resets")
+        elif red_class(r) in ("cap", "global cap"):
+            at.append(None)
+            words.append("the cap's period rolls over or the user raises it")
+        elif red_class(r) == "spend limit":
+            at.append(None)
+            words.append("the provider lifts its spend limit")
+    if not words:
+        return None, "the spend gate allows new work again"
+    return (None if None in at else max(at)), "; ".join(dict.fromkeys(words))
+
+
 def _raise(g: Gate, level: str, reason: str) -> None:
     if LEVELS.index(level) > LEVELS.index(g.level):
         g.level, g.cause = level, reason
