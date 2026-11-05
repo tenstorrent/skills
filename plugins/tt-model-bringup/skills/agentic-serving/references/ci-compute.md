@@ -1,6 +1,7 @@
 # CI compute for goal 12
 
-Read when `compute.kind` is `github_actions`. Runners do not share your filesystem — they fetch the
+Optional. The stage runs on one machine by default and must work without this. Read it only when
+`compute.kind` is `github_actions`. Runners do not share your filesystem — they fetch the
 implementation from Git refs — so a grant needs a publish step as well as a dispatch step. Small
 and fast checks can stay on the local device; CI is for what needs the grant.
 

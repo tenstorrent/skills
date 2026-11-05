@@ -76,7 +76,7 @@ def goal12(model, **overrides):
     evals = model / 'doc/agentic_evals'
     (evals / 'full/swe').mkdir(parents=True, exist_ok=True)
     files = {
-        'plan.json': {'target': 'full_load'},
+        'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'latest_start_hours': 12}]},
         'REPORT.md': '# Report',
         'estimate.json': {'evals': {'swe': {'decision': 'go', 'reason': 'fits'}}},
         'full/swe/results.json': {'actual_hours': 6.5},
@@ -286,10 +286,11 @@ def test_task_lists_need_source_rule_and_tasks(tmp_path, row):
     assert code == 2 and 'selection rule' in stderr
 
 
-def test_plan_needs_a_target(tmp_path):
-    goal12(tmp_path, **{'plan.json': {'target': 'everything'}})
+@pytest.mark.parametrize('plan', [{'mode': 'everything', 'schedule': [{}]}, {'mode': 'full'}])
+def test_plan_needs_a_mode_and_a_schedule(tmp_path, plan):
+    goal12(tmp_path, **{'plan.json': plan})
     code, stderr = check(tmp_path, 'agentic-evals', evidence())
-    assert code == 2 and 'target' in stderr
+    assert code == 2 and 'mode' in stderr
 
 
 def test_learned_needs_its_lists(tmp_path):

@@ -27,7 +27,7 @@ SURVEY_CALCULATIONS = ("batch", "agents", "suite_hours", "task_lists", "agent_ti
 PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route", "isolation_smoke")
 LEARNED = ("harness_facts", "suite_timings", "generic_fixes")
 LIST_SOURCES = ("inputs", "harness", "default_rule")
-TARGETS = ("nightly", "full_load", "full")
+MODES = ("light", "full")
 EFFORT_STATUS = ("done", "running", "not_run")
 CHANGES = ("kept", "dropped", "none")
 PROBLEM_STATUS = ("solved", "open")
@@ -249,8 +249,8 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
     check_serving_config(evals, problems)
     check_cohorts(evals, problems)
     plan = read(evals / "plan.json", problems) if (evals / "plan.json").is_file() else {}
-    if plan is not None and (evals / "plan.json").is_file() and plan.get("target") not in TARGETS:
-        problems.append((2, f"plan.json needs target ({', '.join(TARGETS)})"))
+    if (evals / "plan.json").is_file() and (plan.get("mode") not in MODES or not plan.get("schedule")):
+        problems.append((2, f"plan.json needs mode ({', '.join(MODES)}) and the schedule"))
     learned = read(evals / "learned.json", problems)
     if learned and not all(isinstance(learned.get(key), list) for key in LEARNED):
         problems.append((2, f"learned.json needs {', '.join(LEARNED)} as lists, empty when there is nothing"))

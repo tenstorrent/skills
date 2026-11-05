@@ -82,18 +82,15 @@ long prompts prefill, and the engine's host time per step against task-container
 Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the target checkout:
 
 - evals: default `r1_gpqa_diamond`, `swe_bench_verified` and `terminal_bench_2_1`;
-- `target`: where the stage ends, see [Stage order](#stage-order). `nightly` stops once the
-  nightly task lists score; `full_load` (default) adds one run per suite that fills a server;
-  `full` goes on to the full suites;
+- `mode`: `light` (default) or `full`, see [Modes](#modes);
 - `task_lists`, optional: task names per eval and rung, replacing the lists
   [Task lists](#task-lists) would choose;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
 - `release_spec`, optional: where the release values come from. Without it, find the release
   configuration for each eval yourself, in the release workflow and the serving harness;
-- `stage_budget_hours` (default 24), `effort_budget_hours` (default 16) and `suite_budget_hours`
-  (default 8). The stage budget covers survey to release dispatch. Rung runs draw on the suite
-  budget, not the effort budget; each release suite runs to completion within `suite_budget_hours`;
+- `stage_budget_hours` (default 24 for `light`, 48 for `full`), covering survey to the end of the
+  release run, and `release_hours` (default 12);
 - `permissions`: standing decisions the stage would otherwise stop to ask for, such as
   `release_route_repairs` (may the stage publish fixes to the release route) and
   `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
@@ -102,17 +99,44 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - the eval harness: default the tt-inference-server agentic runner on its main branch;
 - `compute`.
 
-`compute` is the hardware the operator grants, on top of the local device, which stays available
-for the quick checks the earlier stages ran there. Without a grant, local is all there is. With
-one, `max_parallel` is how many runs may be in flight: a ceiling to fill when the plan needs it,
-not a quota to spend. Re-plan when the grant changes.
+- `compute`, optional.
 
-A grant dispatches runs one of two ways. `commands` takes operator-supplied `submit`, `status` and
-`collect` shell commands and is the general form. `kind: "github_actions"` dispatches a workflow in
-a CI repository, which needs the implementation pushed where the runners can fetch it; see
-[CI compute](references/ci-compute.md) for the input shape, the publish contract and the polling
-loop. Either way, record the grant you actually used in `doc/agentic_evals/compute.json` so a
-reader can tell a thin result from a small grant.
+By default the stage runs on one machine: the local device, which every earlier stage used. Plan,
+size and time everything for it. `compute` may grant more machines; then
+[CI compute](references/ci-compute.md) says how to use them, and the plan may shorten, but the
+stage must not depend on them. Record what was actually used in `doc/agentic_evals/compute.json`.
+
+### Modes
+
+- **`light`, 24 h.** Make every suite run validly at a mid size and leave a release configuration
+  whose whole release run, all suites together, finishes within `release_hours` on one machine.
+  Efforts go first to validity, then to whatever makes that release run fit. The final step runs
+  it.
+- **`full`, 48 h.** Everything `light` does, then speed work, estimates for the full suites from
+  measured runs, and per suite the largest task list that finishes within `release_hours` on one
+  machine: the full suite when it fits. The final step runs those lists, one suite after another.
+
+Both modes end holding the last rung they banked; a mode that cannot reach its goal reports how
+far it got with `functional_at` and the estimate that stopped it.
+
+### Time
+
+The device is the scarce resource and the clock is fixed. Manage both.
+
+- **Plan the clock first.** In `plan.json`, write the schedule: survey, rungs, efforts, and the
+  release run with its estimated length and the latest time it may start. Nothing may take that
+  reserve. Update the plan after every run with measured times.
+- **One job on the device at a time, and always one.** Queue the next device job before the
+  current one ends. While a long run holds the device, agents analyse, write code and prepare the
+  next job; they do not sleep waiting for it.
+- **Estimate before running, compare after.** Every run gets a predicted duration from the last
+  measured run; record predicted against measured and correct the next estimate by the ratio.
+- **Stop what cannot finish.** When a run's progress projects past its slot or past the release
+  reserve, stop it and keep its partial results. A run with no model calls for 30 minutes is
+  stalled: look at why before waiting longer.
+- **Count device time from the queue log**, by the jobs that held the device. A server left up
+  between jobs is not effort time.
+- **Blocked on one thing, keep working on the rest.** Write the block to `blocked.json` at once.
 
 
 ### Harness
@@ -188,7 +212,7 @@ rule so another run picks the same tasks. Never take a prefix of a sorted list.
 | smoke | 2 | 2 | 2 | fixed |
 | nightly | 10 | 5 | 10 | fixed, the sizes main runs nightly |
 | full load | agents per server | agents per server | agents per server | the agent, from [Batch and agents](#batch-and-agents) |
-| larger | — | multiples of full load, or 100 to project 500 | multiples of full load | the agent, from the target and the budget |
+| larger (`full`) | — | multiples of full load, or 100 to project 500 | multiples of full load | the agent, from `release_hours` |
 | full suite | 198 | 500 | 89 | fixed |
 
 **Read every score with its error.** Report the 95% interval, about ±2·√(p(1−p)/n), and say when a
@@ -206,9 +230,7 @@ tests do not.
 
 Test size grows one rung at a time, so each problem a larger run could hit shows on the smallest
 list that reveals it. A suite moves up a rung when it scored validly on the current one and the
-time measured there projects the next rung inside the budget left. The stage ends at its `target`,
-or earlier on a measured stop, and always holds the last rung it banked. Dispatch on CI from the
-first hour, in parallel up to `max_parallel`, one suite per runner.
+time measured there projects the next rung inside the time left before the release reserve.
 
 1. **Survey and preflight, about 2 h.** Answer every check and calculation in
    [the survey](references/survey.md) on the stage-11 data and one smoke run at release limits.
@@ -222,15 +244,17 @@ first hour, in parallel up to `max_parallel`, one suite per runner.
    scored trajectory. A suite that cannot becomes the first problem in the ranking.
 3. **Nightly rung.** The first deliverable: the lists the release grades, scored against the
    references. Record `functional_at`.
-4. **Full-load rung**, for target `full_load` or `full`: one run per suite that fills a server. It
-   measures suite time, agent capacity and the slow tail at real load; its measured time
-   replaces the estimate for larger rungs.
-5. **Efforts, `effort_budget_hours`, hard stop**, ranked against the last banked rung. They start
-   once the smoke rung is banked and run while rungs are on CI; a rung never waits for an effort.
+4. **Full-load rung**: one run per suite that fills the server. It measures suite time, agent
+   capacity and the slow tail at real load; its time replaces the estimate for larger runs.
+5. **Efforts**, ranked against the last banked rung, in the time the plan leaves them. They start
+   once the smoke rung is banked and share the device through the queue; a rung never waits for
+   an effort.
 6. **Combine, about 2 h.** Re-check the current best, then one scored probe.
-7. **Larger rungs and full suites**, for target `full`, through the same workflow every earlier run
-   used, split on task boundaries so each dispatch finishes inside the grant's per-run timeout. An
-   infrastructure failure is re-dispatched; the release coordinator must allow that.
+7. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
+   `release_hours`.
+8. **Release run**, through the same route every earlier run used, inside the reserve the plan
+   kept for it: in `light` the mid-size lists of all suites within `release_hours` in total, in
+   `full` each suite's largest fitting list. An infrastructure failure is run again.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
 that decided it.
@@ -245,7 +269,7 @@ Rank in two tiers.
    the suite sizes the release runs, not at sample size. Agents per server is always a candidate,
    priced against the pool and the measured call times.
 
-For each problem estimate the device hours it needs, local and CI; agent time is not counted. When
+For each problem estimate the device hours it needs; agent time is not counted. When
 a number cannot be calculated, guess and mark it. Name how the effort will confirm success without
 the full suites, and the value that counts. Adjust where judgement says otherwise and record why.
 Rank every problem, even past the budget; problems found later, by efforts, rungs or the
@@ -263,7 +287,7 @@ decides against the current ranking whether it continues.
 
 - **Fastest test first.** Prefer a short test to a scored sample. The replay test
   (`scripts/agent_replay.py`) answers capacity and caching questions in minutes. Estimate a
-  sample's CI time before dispatching and size it to what it has to separate; one run may test
+  sample's device time before running it and size it to what it has to separate; one run may test
   several changes when its results separate what each contributed.
 - **Accepting a change.** A paired exactness check plus the confirmation accepts an exact change. A
   change that alters outputs needs a scored pair against the current best.
@@ -287,7 +311,7 @@ present) and logs what it applied to `steering.log`. When blocked, it writes the
 
 Parallel efforts reach the local device only through one queue in `doc/agentic_evals/device_queue/`,
 which runs one job at a time as [tt-device-usage](../tt-device-usage/SKILL.md) requires and logs
-each job's owner, start, end and exit status. Keep local jobs short and send long runs to CI. After
+each job's owner, start, end and exit status. After
 a hang or crash, reset and check the device before the next job.
 
 ### Outputs
@@ -306,7 +330,7 @@ Write these to `doc/agentic_evals/`:
   `used_device_hours`, `change` (`kept`, `dropped`, `none`), `problem_status` (`solved`, `open`),
   `confirmed` and `evidence`; and `rankings`, each with `after`, `order` (`problem`,
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
-- `plan.json`, with the `target`
+- `plan.json`, with the `mode` and the schedule, updated after every run
 - `runs/<arm>/` (manifest and collected results)
 - `estimate.json`: per eval `decision` (`go` or `stop`), `reason` and `functional_at`, the size of
   the largest task list that completed with valid scores
