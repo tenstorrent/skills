@@ -309,6 +309,8 @@ def attach(p, oid: str, tids: list[int], now: float | None = None) -> list[int]:
         if o.get("dropped"):
             raise ValueError(f"obligation {oid} was dropped")
         new = _attach(p, o, tids, now)
+        if (o.get("promise") or {}).get("order") is not None:   # an order's owners are its tasks (_kept)
+            o["promise"]["tasks"] = sorted(set(o["promise"]["tasks"]) | {int(t) for t in tids})
         p.db.set_kv(KV, st)
     return new
 
@@ -938,11 +940,11 @@ def _retire(db, now: float, why: str, *fps: str, prefix: str | None = None) -> i
                            (json.dumps({"retired": why, "at": now}), *args)).rowcount
 
 
-def _raise(db, now: float, fp: str, kind: str, text: str, task: int | None) -> bool:
+def _raise(db, now: float, fp: str, kind: str, text: str, task: int | None, data: dict | None = None) -> bool:
     if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         return False
-    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-         (now, "daemon", kind, fp, "high", text[:4000], "queued", task))
+    db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
+         (now, "daemon", kind, fp, "high", text[:4000], "queued", task, json.dumps(data) if data else None))
     return True
 
 
@@ -1111,7 +1113,11 @@ def lines(db, now: float | None = None, where=None, open_only: bool = False) -> 
         elif o.get("dropped"):
             state = f"dropped ({o['dropped']['why'][:80]})"
         elif o.get("promise"):
-            state = "promised; " + _promise_state(o, now, where)
+            pr = o["promise"]
+            state = ("claimed; " if pr.get("claim") else f"ordered ({pr.get('class')}); " if pr.get("order") is not None
+                     else "promised; ") + _promise_state(o, now, where)
+            if pr.get("order") is not None and not pr.get("started"):
+                state += f"; not started (start by {timefmt.long(pr['start_by'], where)})"
         else:
             late = {t for t, _ in overdue(o, now, cover)
                     if not (o["owners"].get(t) or {}).get("job") or now - o["owners"][t]["job"]["at"] >= CLOCK_S}
@@ -1381,12 +1387,16 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
     pr = o.get("promise")
     if not pr or not _open(o):
         return False
+    if pr.get("claim"):
+        return _check_claim(p, o, now, raised)
     fp = f"obligation:{o['id']}:promise"
     kept = _kept(p.db, o, st)
     if kept:
         o["receipt"] = {"at": now, "task": None, "evidence": kept}
         _retire(p.db, now, "promise kept", prefix=fp)
         return True
+    if pr.get("order") is not None:
+        return _check_order(p, o, now, raised)
     if now < pr["due"] or pr.get("raised") is not None:
         return False
     from . import timefmt
@@ -1399,7 +1409,7 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
               f"(new ETA and why). Then close it: `obligation` with key {o['id']} and `evidence` (what was sent) "
               f"or `why` (no longer owed). A new promise in the update is tracked anew.")
     fp += f":{int(pr['due'])}"   # a promise given a new due time can fall due once more
-    if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None):
+    if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None, _must(o)):
         raised.append(fp)
     return True
 
@@ -1450,7 +1460,8 @@ def promise_outcomes(db, since: float, now: float | None = None) -> dict:
     """The promises that fell due between `since` and `now` and how each ended: kept on time (its receipt
     came by the due time), kept late (after it; the longest delay in hours), dropped, or still open."""
     now = time.time() if now is None else now
-    due = [o for o in items(db) if o.get("promise") and since <= float(o["promise"]["due"]) <= now]
+    due = [o for o in items(db) if o.get("promise") and not o["promise"].get("claim")
+           and since <= float(o["promise"]["due"]) <= now]
     late = [(float(o["receipt"]["at"]) - float(o["promise"]["due"])) / 3600 for o in due
             if o["receipt"] and float(o["receipt"]["at"]) > float(o["promise"]["due"])]
     kept = sum(bool(o["receipt"]) for o in due)
@@ -1536,3 +1547,286 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
                                      f"#{', #'.join(map(str, _owner_ids(o)))} finish")
         p.db.set_kv(KV, st)
     return notes
+
+
+# orders and claims --------------------------------------------------------------------------------
+# An order (add_order): a user message that asks for something, recorded by the coordinator's
+# `obligation` action with `order` (the message id), `action_class` (read, change or device), optional
+# `due` (else promise_default_h after it is recorded) and `start_by` (else ORDER_START_S after the
+# message), and its owner tasks. It is promise-shaped (the `promise` field with `order`), so it has no
+# owner clocks and closes like a promise (_kept). check() raises one high `order_late` event when no
+# owner run has started by its start_by, and one high `order_overdue` event at its due time.
+# A claim (record_claims): a coordinator reply or notify saying something is done, live, running or
+# landed can carry `claims`, each `{text, task | action | expect, due}`. A `task` (or `action`: the index
+# of a task_add of the same batch) holds once it ends done; an `expect` probe (start_when rules:
+# read-only, under a minute) holds once it exits 0. It runs model-free (the daemon's check_claims) and
+# is judged at its due: exit 1 is "not yet", 75, 255 or a timeout keep waiting up to CLAIM_WAIT_S more.
+# A miss raises one high `claim_failed` event. Overdue promises and orders, late orders and failed
+# claims carry `must_act` in their event data: the coordinator wake they start must act on each
+# (mustact.py).
+ORDER_LATE_KIND = "order_late"
+ORDER_KIND = "order_overdue"
+CLAIM_KIND = "claim_failed"
+MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND)
+ORDER_CLASSES = ("read", "change", "device")
+ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
+CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, 255, timeout) past its due: failed after this
+CLAIM_WAITING = (75, 255, "timeout", None)
+
+
+def _must(o: dict) -> dict:
+    return {"must_act": {"key": o["id"], "chat": o["promise"]["chat"], "tasks": _owner_ids(o)}}
+
+
+def _when(value, what: str) -> float:
+    try:
+        return _due(value)
+    except ValueError as e:
+        raise ValueError(f"{what}: {str(e).replace('milestone due', 'a time')}") from e
+
+
+def _hours(p) -> float:
+    try:
+        return default_h(p.config())
+    except Exception:   # an unreadable config keeps the default
+        return PROMISE_DEFAULT_H
+
+
+def _owners_known(db, tids) -> list[int]:
+    ids = sorted({int(t) for t in tids or []})
+    for tid in ids:
+        if not db.task(tid):
+            raise ValueError(f"no task #{tid}")
+    return ids
+
+
+def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, action_class: str | None = None,
+              chat: str | None = None, now: float | None = None) -> str:
+    """Record the order user message `message` carries, or update the open one recorded for it. Returns
+    a note."""
+    from . import timefmt
+    now = time.time() if now is None else now
+    text = " ".join(str(text or "").split())[:TEXT_MAX]
+    if not text:
+        raise ValueError("an order needs `text`: what the user asked for")
+    if action_class not in ORDER_CLASSES:
+        raise ValueError(f"an order needs `action_class`: one of {', '.join(ORDER_CLASSES)}")
+    row = p.db.one("SELECT ts, chat FROM messages WHERE id=? AND direction='in'", (int(message),))
+    if not row:
+        raise ValueError(f"order: #{message} is not a user message")
+    due_at = _when(due, "order due") if due not in (None, "") else None
+    start_at = _when(start_by, "order start_by") if start_by not in (None, "") else float(row["ts"]) + ORDER_START_S
+    with p.db.tx():
+        ids = _owners_known(p.db, owners)
+        st = _load(p.db)
+        o = next((x for x in st["items"].values() if _open(x) and (x.get("promise") or {}).get("order") == int(message)), None)
+        if o:
+            pr = o["promise"]
+            pr["tasks"] = sorted(set(pr["tasks"]) | set(ids))
+            pr["class"] = action_class
+            if due_at is not None and due_at != pr["due"]:
+                pr.update(due=due_at, timed=True, raised=None, set_at=now)
+            if start_by not in (None, "") and start_at != pr["start_by"]:
+                pr.update(start_by=start_at, late=None)
+            note = f"order {o['id']} (message #{message}) updated"
+        else:
+            oid = f"o{st['next']}"
+            st["next"] += 1
+            o = st["items"][oid] = {
+                "id": oid, "text": text, "by": "coordinator", "created": now, "owners": {}, "receipt": None,
+                "dropped": None, "episode": 0, "raised": None, "covered": [],
+                "promise": {"chat": _chat(chat or row["chat"]), "message": int(message),
+                            "due": due_at if due_at is not None else now + _hours(p) * 3600,
+                            "timed": due_at is not None, "tasks": ids, "obligations": [], "raised": None,
+                            "set_at": now, "order": int(message), "class": action_class, "start_by": start_at,
+                            "started": None, "late": None}}
+            note = f"order {oid} recorded from message #{message}"
+        pr = o["promise"]
+        p.db.set_kv(KV, st)
+    return (note + f": due {timefmt.long(pr['due'], p)}, start by {timefmt.long(pr['start_by'], p)}, "
+            + (f"owned by #{', #'.join(map(str, pr['tasks']))}" if pr["tasks"] else "no owner task yet"))
+
+
+def _order_line(o: dict) -> str:
+    pr = o["promise"]
+    ids = _owner_ids(o)
+    return (f"Order {o['id']} from the user (message #{pr['order']}, chat {pr['chat']}, {pr.get('class')}): "
+            f"{o['text']}\nOwner: " + (f"#{', #'.join(map(str, ids))}" if ids else "no task"))
+
+
+def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
+    """An open order's start and due checks (after _kept found it not done). Returns whether `o` changed."""
+    from . import timefmt
+    pr, db, changed = o["promise"], p.db, False
+    ids = _owner_ids(o)
+    if pr.get("started") is None and ids:
+        q = ",".join("?" * len(ids))
+        if db.one(f"SELECT id FROM runs WHERE task IN ({q}) LIMIT 1", ids):
+            pr["started"], changed = now, True
+            _retire(db, now, "order started", prefix=f"obligation:{o['id']}:order:late")
+    if pr.get("started") is None and now >= pr["start_by"] and pr.get("late") is None:
+        pr["late"], changed = now, True
+        fp = f"obligation:{o['id']}:order:late:{int(pr['start_by'])}"
+        text = (_order_line(o) + f"\nNo owner run started by {timefmt.long(pr['start_by'], p)}. Start it now "
+                f"(`task_update` with `wake_now` on its owner, or `task_add` naming {o['id']}; `obligation` with key "
+                f"{o['id']} and `owners` attaches it), or tell the user in that chat why it waits and until when.")
+        if _raise(db, now, fp, ORDER_LATE_KIND, text, ids[0] if ids else None, _must(o)):
+            raised.append(fp)
+    if now >= pr["due"] and pr.get("raised") is None:
+        pr["raised"], changed = now, True
+        fp = f"obligation:{o['id']}:order:{int(pr['due'])}"
+        text = (_order_line(o) + f"\nIt is overdue (due {timefmt.long(pr['due'], p)}"
+                + ("" if pr["timed"] else ", the default for an order naming no time")
+                + f"). Send the result or an honest update in that chat now, without being asked (new time and "
+                  f"why), re-order it or escalate. Then close it: `obligation` with key {o['id']} and `evidence` "
+                  f"(what was delivered) or `why` (no longer owed); `due` with key {o['id']} sets a new time.")
+        if _raise(db, now, fp, ORDER_KIND, text, ids[0] if ids else None, _must(o)):
+            raised.append(fp)
+    return changed
+
+
+def check_claims(claims, p, new_tasks=None) -> None:
+    """Static checks of a reply's or notify's `claims` before it is sent; raises on the first bad one.
+    `new_tasks`: the action indexes of this batch's task_add actions, when known."""
+    from .coordinator import check_start_when
+    if not isinstance(claims, list):
+        raise ValueError("`claims` is a list of {text, task | action | expect, due}")
+    for c in claims:
+        if not isinstance(c, dict) or not " ".join(str(c.get("text") or "").split()):
+            raise ValueError("each claim needs `text`: what you told the user holds")
+        backing = [k for k in ("task", "action", "expect") if c.get(k) not in (None, "")]
+        if len(backing) != 1:
+            raise ValueError("each claim needs exactly one backing: `task` (its id), `action` (the index of a "
+                             "task_add in this batch) or `expect` (a read-only probe, exit 0 = it holds)")
+        if c.get("task") not in (None, "") and not p.db.task(int(c["task"])):
+            raise ValueError(f"claim: no task #{c['task']}")
+        if c.get("action") not in (None, "") and new_tasks is not None and int(c["action"]) not in new_tasks:
+            raise ValueError(f"claim: action {c['action']} is not a task_add of this batch")
+        if c.get("expect") not in (None, ""):
+            check_start_when(str(c["expect"]), p)
+        if c.get("due") not in (None, ""):
+            _when(c["due"], "claim due")
+
+
+def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[int, int],
+                  now: float | None = None) -> list[str]:
+    """Track the claims the batch's replies and notifies carried: (message id, chat, claims) each.
+    `new_tasks`: action index -> the task its task_add created. Returns a note per claim."""
+    now = time.time() if now is None else now
+    notes: list[str] = []
+    todo = []
+    for mid, chat, claims in sent:
+        for c in claims or []:
+            task = int(c["task"]) if c.get("task") not in (None, "") else None
+            if c.get("action") not in (None, ""):
+                task = new_tasks.get(int(c["action"]))
+                if task is None:
+                    notes.append(f"claim not tracked: action {c['action']} added no task ({str(c['text'])[:80]})")
+                    continue
+            expect = str(c["expect"]) if c.get("expect") not in (None, "") else None
+            due = _when(c["due"], "claim due") if c.get("due") not in (None, "") else \
+                now if expect else now + _hours(p) * 3600
+            todo.append((mid, _chat(chat), " ".join(str(c["text"]).split())[:TEXT_MAX], task, expect, due,
+                         c.get("due") not in (None, "")))
+    if not todo:
+        return notes
+    with p.db.tx():
+        st = _load(p.db)
+        for mid, chat, text, task, expect, due, timed in todo:
+            if any(_open(x) and (x.get("promise") or {}).get("claim") and x["promise"]["message"] == mid
+                   and x["text"] == text for x in st["items"].values()):
+                continue   # the same turn applied again
+            oid = f"o{st['next']}"
+            st["next"] += 1
+            st["items"][oid] = {
+                "id": oid, "text": text, "by": "coordinator", "created": now, "owners": {}, "receipt": None,
+                "dropped": None, "episode": 0, "raised": None, "covered": [],
+                "promise": {"chat": chat, "message": mid, "due": due, "timed": timed,
+                            "tasks": [task] if task else [], "obligations": [], "raised": None, "set_at": now,
+                            "claim": {"task": task, "expect": expect, "last": None, "at": None}}}
+            notes.append(f"claim {oid} from message #{mid} tracked: " + (f"#{task} ends done" if task else
+                                                                         f"`{expect[:80]}` exits 0"))
+        p.db.set_kv(KV, st)
+    return notes
+
+
+def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
+    """Close a claim that holds, or raise its one claim_failed event. Returns whether `o` changed."""
+    from . import timefmt
+    pr = o["promise"]
+    c, db, fp = pr["claim"], p.db, f"obligation:{o['id']}:claim"   # + its due: a new due can fail once more
+    if c.get("task"):
+        t = db.task(int(c["task"]))
+        status = t["status"] if t else "gone"
+        if status == "done":
+            o["receipt"] = {"at": now, "task": int(c["task"]), "evidence": f"#{c['task']} ended done"}
+            _retire(db, now, "claim held", prefix=fp)
+            return True
+        if status in ("failed", "cancelled", "gone"):
+            miss = f"#{c['task']} is {status}"
+        elif now >= pr["due"]:
+            miss = f"#{c['task']} is still {status} at its due time"
+        else:
+            return False
+    else:
+        if c.get("last") == 0:
+            o["receipt"] = {"at": now, "task": None, "evidence": f"`{c['expect'][:120]}` exited 0"}
+            _retire(db, now, "claim held", prefix=fp)
+            return True
+        answered = c.get("at") is not None and c["at"] >= pr["due"]
+        if now < pr["due"] or (not answered or c.get("last") in CLAIM_WAITING) and now < pr["due"] + CLAIM_WAIT_S:
+            return False
+        miss = (f"its check `{c['expect'][:200]}` exited {c['last']}" if answered and c["last"] not in CLAIM_WAITING
+                else f"its check `{c['expect'][:200]}` could not answer ({c.get('last')}) for "
+                     f"{CLAIM_WAIT_S // 60} min after its due time")
+    if pr.get("raised") is not None:
+        return False
+    pr["raised"] = now
+    text = (f"Claim {o['id']} you told the user (chat {pr['chat']}, message #{pr['message']}, due "
+            f"{timefmt.long(pr['due'], p)}) does not hold: {miss}. You said: {o['text']}\n"
+            f"Correct it in that chat now (what is true, what is being done, by when), and fix or re-order the "
+            f"work. Then close it: `obligation` with key {o['id']} and `evidence` or `why`.")
+    fp += f":{int(pr['due'])}"
+    if _raise(db, now, fp, CLAIM_KIND, text, int(c["task"]) if c.get("task") else None, _must(o)):
+        raised.append(fp)
+    return True
+
+
+def due_claims(db, now: float | None = None) -> list[tuple[str, str]]:
+    """(id, probe) of the open claims whose expect probe the daemon runs now: from their due time on,
+    until they hold or fail."""
+    now = time.time() if now is None else now
+    return [(o["id"], o["promise"]["claim"]["expect"]) for o in items(db)
+            if _open(o) and (pr := o.get("promise") or {}).get("claim") and pr["claim"].get("expect")
+            and pr.get("raised") is None and now >= pr["due"]]
+
+
+def claim_result(p, oid: str, rc, now: float | None = None) -> list[str]:
+    """Record a run of claim `oid`'s probe (its exit code, "timeout" or "could not start") and judge it at
+    once. Returns the fingerprints raised."""
+    now = time.time() if now is None else now
+    raised: list[str] = []
+    with p.db.tx():
+        st = _load(p.db)
+        o = st["items"].get(oid)
+        if not o or not _open(o) or not (o.get("promise") or {}).get("claim"):
+            return raised
+        o["promise"]["claim"].update(last=rc, at=now)
+        _check_claim(p, o, now, raised)
+        p.db.set_kv(KV, st)
+    return raised
+
+
+def set_due(p, oid: str, due, now: float | None = None) -> str:
+    """Give an open order, promise or claim a new due time: it can fall due once more."""
+    from . import timefmt
+    now = time.time() if now is None else now
+    at = _when(due, f"{oid} due")
+    with p.db.tx():
+        st = _load(p.db)
+        o = _need(st, oid)
+        if not o.get("promise") or not _open(o):
+            raise ValueError(f"{oid} is not an open order, promise or claim")
+        o["promise"].update(due=at, timed=True, raised=None, set_at=now)
+        p.db.set_kv(KV, st)
+    return f"{oid} now due {timefmt.long(at, p)}"

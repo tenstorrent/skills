@@ -239,3 +239,67 @@ def test_obligation_wake_settled_without_a_model_turn_is_reowned_once(env, monke
         new = [t for t in ob.get(p.db, oid)["owners"] if int(t) != tid]
         assert len(new) == 1 and p.db.task(int(new[0]))["origin"] == "daemon", (oid, new)
     assert p.db.one("SELECT COUNT(*) n FROM tasks WHERE origin='daemon'")["n"] == 2
+
+
+def _order_setup(env, monkeypatch):
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    mid = p.db.post("in", "please build the deliverable", chat="c1")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now, mid))
+
+    def raised(kinds):
+        q = ",".join("?" * len(kinds))
+        return p.db.q(f"SELECT * FROM events WHERE kind IN ({q}) ORDER BY id", kinds)
+    return p, d, now, tid, check, mid, raised
+
+
+def test_order_late_and_overdue_raise_once_with_must_act_and_survive_restart(env, monkeypatch):
+    """An order no owner run started by start_by raises one order_late; at its due, one order_overdue.
+    Both carry must_act; a new daemon (restart) reads the same ledger and raises nothing twice."""
+    import json
+    from ttp import obligations as ob
+    from ttp.daemon import Daemon
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    note = ob.add_order(p, "build the deliverable", mid, [tid], due=now + 7200, action_class="change", now=now)
+    oid = note.split()[1]
+    kinds = (ob.ORDER_LATE_KIND, ob.ORDER_KIND)
+    check(now + 600)
+    assert raised(kinds) == []
+    check(now + ob.ORDER_START_S + 60)
+    late = raised(kinds)
+    assert [e["kind"] for e in late] == [ob.ORDER_LATE_KIND]
+    assert json.loads(late[0]["data"])["must_act"] == {"key": oid, "chat": "c1", "tasks": [tid]}
+    d2 = Daemon(p.base)   # a restart: the ledger is on disk
+    monkeypatch.setattr(time, "time", lambda: now + 7300)
+    d2._obligations_at = 0.0
+    d2.check_obligations()
+    d2._obligations_at = 0.0
+    d2.check_obligations()
+    assert [e["kind"] for e in raised(kinds)] == [ob.ORDER_LATE_KIND, ob.ORDER_KIND]
+    assert ob.get(p.db, oid)["promise"]["order"] == mid
+
+
+def test_order_started_owner_retires_the_late_event(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    ob.add_order(p, "build it", mid, [tid], action_class="read", now=now)
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?,?,?,?)", (tid, "worker", now + 60, "running"))
+    check(now + ob.ORDER_START_S + 60)
+    assert raised((ob.ORDER_LATE_KIND,)) == []
+
+
+def test_claim_expect_probe_miss_raises_claim_failed_once(env, monkeypatch):
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    out = p.db.post("out", "it is live", chat="c1", kind="reply")
+    notes = ob.record_claims(p, [(out, "c1", [{"text": "the service is live", "expect": "false"}])], {}, now=now)
+    oid = notes[0].split()[1]
+    assert ob.due_claims(p.db, now) == [(oid, "false")]
+    assert ob.claim_result(p, oid, 75, now + 10) == []   # cannot answer yet: keeps waiting
+    fps = ob.claim_result(p, oid, 1, now + 20)
+    assert len(fps) == 1 and ob.claim_result(p, oid, 1, now + 30) == []
+    ev = raised((ob.CLAIM_KIND,))
+    assert len(ev) == 1 and oid in ev[0]["text"]
+    out2 = p.db.post("out", "done", chat="c1", kind="reply")
+    n2 = ob.record_claims(p, [(out2, "c1", [{"text": "it passes", "expect": "true"}])], {}, now=now)
+    ob.claim_result(p, n2[0].split()[1], 0, now + 5)
+    assert ob.get(p.db, n2[0].split()[1])["receipt"]

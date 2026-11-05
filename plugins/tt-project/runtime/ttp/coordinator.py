@@ -233,6 +233,11 @@ ACTIONS_SCHEMA: dict[str, Any] = {
                 "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
                 "due": {"type": ["number", "string"]}, "evidence_required": {"type": "string"}},
                 "required": ["key", "due", "evidence_required"]}}},
+            "order": {"type": "integer"}, "action_class": {"type": "string", "enum": list(obligations.ORDER_CLASSES)},
+            "due": {"type": ["number", "string"]}, "start_by": {"type": ["number", "string"]},
+            "claims": {"type": "array", "items": {"type": "object", "properties": {
+                "text": {"type": "string"}, "task": {"type": "integer"}, "action": {"type": "integer"},
+                "expect": {"type": "string"}, "due": {"type": ["number", "string"]}}, "required": ["text"]}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -521,6 +526,8 @@ EFFORT_EVENT_TRIGGERS = {
     "deferral_expired": "stuck", "deferral_probe_broken": "stuck", "deferral_job_failed": "stuck",
     "no_progress": "stuck", "stall": "stuck", "change_probe": "stuck",
     "missing_task_ref": "stuck", obligations.PROMISE_KIND: "stuck", mitigate.OVERDUE: "stuck",
+    obligations.ORDER_KIND: "stuck", obligations.ORDER_LATE_KIND: "stuck", obligations.CLAIM_KIND: "stuck",
+    "must_act_rewake": "stuck",
     "review_stall": "stuck", "review_failed_unhandled": "stuck", "review_nofix": "stuck", "review_unqueued": "stuck", "landed_wait_dead": "stuck", "lane_wait": "stuck", askrethink.KIND: "stuck", selfblock.KIND: "stuck",
     "wait_stale": "stuck", "hold_probe_broken": "stuck", "probe_never_passes": "stuck",
     "start_resource_stale": "resource", "job_underuse": "resource",
@@ -2160,7 +2167,8 @@ def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list
 
 
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
-          turn: int | None = None, messages: list[int] | None = None, lean: bool = False) -> list[str]:
+          turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
+          applied: list | None = None) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
@@ -2171,7 +2179,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     file writes carry `turn`.<action index> so the replay does not repeat them, while the same
     text sent again by a later turn is still written. `lean`: the daemon applies this turn again after
     it was cut off applying it (Daemon._reap): the optional restriction checks, which may have held it,
-    are skipped and a note says so."""
+    are skipped and a note says so. `applied`, when given, is filled with the indexes of the actions
+    that went through (mustact.settle)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
@@ -2189,6 +2198,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     batch_obls: list[str] = []
     delivered: list[tuple[int, str | None, list]] = []   # replies with `delivers` (obligations.deliver)
     explicit: set[int] = set()   # replies naming `owners` or `delivers`: their promise is never auto-attached
+    claimed: list[tuple[int, str | None, list]] = []   # (message, chat, claims) of replies and notifies
+    new_tasks: dict[int, int] = {}   # action index -> the task its task_add created (a claim's `action`)
     # config_set goes first so a cap raised in this turn counts for this turn's task_add actions, then
     # charter_update so a task added or updated in this turn reads the new charter.
     # The index stays the original one so replay keys do not change.
@@ -2215,6 +2226,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             if t == "reply":
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
+                if a.get("claims"):
+                    obligations.check_claims(a["claims"], p)
                 chat = a.get("chat") or default_chat
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
@@ -2222,6 +2235,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 sent.append((replies[-1], chat, a["text"]))
+                if a.get("claims"):
+                    claimed.append((replies[-1], chat, a["claims"]))
                 workernotify.handled(db, said)
                 if a.get("delivers"):
                     delivered.append((replies[-1], chat, list(a["delivers"])))
@@ -2481,6 +2496,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          labels=labels, not_before=after,
                                          parent=followup["id"] if followup else old["id"] if split else None)
                     batch_tasks[new_id] = a.get("reply_chat") or None
+                    new_tasks[i] = new_id
                     for r in {r["id"]: r for n, r in autos.items() if n not in started}.values():
                         db.update_task(r["id"], status="cancelled", blocked_reason=f"replaced by review #{new_id}")
                         _take_over_dependents(db, r["id"], new_id)
@@ -2961,10 +2977,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     raise ValueError(f"notify rejected: {why}")
                 if why := msgparts.too_long(a["text"], "notify"):
                     raise ValueError(why)
+                if a.get("claims"):
+                    obligations.check_claims(a["claims"], p)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
+                if a.get("claims"):
+                    claimed.append((sent[-1][0], None, a["claims"]))
                 workernotify.handled(db, said)
             elif t == "memory_add" and a.get("memory_kind") == settled.KIND:
                 rec = settled.from_action(p, a, key)
@@ -3373,7 +3393,14 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                           json.dumps({"key": key, "value": value, "before": before, "messages": said}), "handled"))
             elif t == "obligation":
                 oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
-                if not oid:
+                if a.get("order") is not None and not oid:   # the order a user message carries
+                    notes.append(obligations.add_order(p, str(a.get("text") or ""), int(a["order"]), owners,
+                                                       due=a.get("due"), start_by=a.get("start_by"),
+                                                       action_class=a.get("action_class")))
+                elif a.get("due") not in (None, "") and oid and not owners \
+                        and not any(str(a.get(f) or "").strip() for f in ("evidence", "why", "justify")):
+                    notes.append(obligations.set_due(p, oid, a["due"]))
+                elif not oid:
                     oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
                                           milestones=a.get("milestones") or [])
                     notes.append(f"obligation {oid} recorded")
@@ -3492,6 +3519,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         notes += obligations.record_promises(p, sent, batch_tasks, batch_obls, explicit=explicit)
     except Exception as e:
         notes.append(f"promise not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # a reply already went out: tracking its claims never undoes or rejects it
+        notes += obligations.record_claims(p, claimed, new_tasks)
+    except Exception as e:
+        notes.append(f"claim not recorded: {type(e).__name__}: {str(e)[:200]}")
     try:   # flag only: a reply naming a cause of slowness with no fix in this batch (causefix)
         causefix.check(db, [(mid, "reply" if mid in replies else "notify", text) for mid, _, text in sent],
                        [a for i, a in enumerate(actions) if i not in failed and isinstance(a, dict)], turn=turn)
@@ -3511,6 +3542,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     # Rejections go back to the coordinator in its next digest, never into the user's chat: a reply
     # already sent is corrected there by the coordinator itself, only when it told the user otherwise.
     db.set_kv(REJECTED_REPLY_KEY, bool(problems and replies))
+    if applied is not None:
+        applied[:] = [i for i in range(len(actions)) if i not in failed]
     return settle_refusals(problems, actions)
 
 
