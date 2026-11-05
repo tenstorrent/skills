@@ -648,7 +648,7 @@ def finished_holders(p, cfg: dict | None, now: float | None = None) -> list[dict
                     continue
                 grace = done_grace_s(cfg, rec)
                 out.append({"lane": str(path), "pid": rec.get("pid"), "task": task, "run": _run_of(rec.get("holder")),
-                            "status": row["status"], "since": since, "ended_s": ended, "held_s": now - since,
+                            "precheck": _precheck_of(rec.get("holder")), "status": row["status"], "since": since, "ended_s": ended, "held_s": now - since,
                             "grace_s": grace, "stop": ended >= grace, "command": str(rec.get("command") or "")})
     return out
 
@@ -685,9 +685,15 @@ def stop_finished(p, h: dict) -> dict | None:
     when it is not, or it already ended."""
     from . import jobstop, jobuse
     from .cli import _read_checks_pid
-    if not (h.get("run") and h.get("task") and isinstance(h.get("pid"), int)):
+    if not (h.get("task") and isinstance(h.get("pid"), int)):
         return None
-    row = p.db.one("SELECT dir, task FROM runs WHERE id=?", (int(h["run"]),))
+    if h.get("run"):
+        row = p.db.one("SELECT dir, task FROM runs WHERE id=?", (int(h["run"]),))
+    elif re.fullmatch(r"t(\d+)-[0-9a-f]{7,40}", str(h.get("precheck") or "")):
+        # the daemon's own review precheck: its run folder is state/prechecks/t<task>-<head> (no runs row)
+        row = {"dir": str(p.state / "prechecks" / h["precheck"]), "task": h["precheck"][1:].split("-")[0]}
+    else:
+        return None
     if not row or not row["dir"] or str(row["task"]) != str(h["task"]):
         return None
     pid = _read_checks_pid(Path(row["dir"])).get("pid")
@@ -920,6 +926,12 @@ def _live_tickets(base: str) -> list[Path]:
     except OSError:
         return []
     return [d / n for n in names if locks._ticket_live(d / n) and not locks._waiter_gone(d / n)]
+
+
+def _precheck_of(text) -> str:
+    """The run folder name (t<task>-<head>) of a daemon review precheck's lane label, else ''."""
+    m = re.search(r"\brun (?:precheck-)?(t\d+-[0-9a-f]{7,40})\b", str(text or ""))
+    return m.group(1) if m else ""
 
 
 def _run_of(text: str) -> str:

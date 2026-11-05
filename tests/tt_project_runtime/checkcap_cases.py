@@ -4877,7 +4877,16 @@ def test_a_daemon_review_precheck_of_a_just_finished_task_is_not_a_finished_task
         texts = [r["text"] for r in ev()]
         assert len(texts) == 1 and f"pid {proc.pid} of task #{tid}" in texts[0], texts
         h = checklane.finished_holders(p, {"checks": {"done_holder_grace_s": 0}}, later + 60)
-        assert h and h[0]["stop"] and checklane.stop_finished(p, h[0]) is None and proc.poll() is None
+        assert h and h[0]["stop"] and h[0]["precheck"] == token
+        assert checklane.stop_finished(p, h[0]) is None and proc.poll() is None, "no checks.pid in its folder"
+        (out / cli.CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid())}))
+        assert checklane.stop_finished(p, h[0]) is None, "another pid is never stopped"
+        (out / cli.CHECKS_PID).write_text(json.dumps({"pid": proc.pid, "started": proc_start(proc.pid)}))
+        assert checklane.stop_finished(p, {**h[0], "precheck": f"t{tid + 1}-{head[:12]}"}) is None
+        r = checklane.stop_finished(p, h[0])
+        assert r and r["pgid"] == proc.pid and proc.wait(30) is not None, "past grace its precheck is stopped"
+        assert not [x for b in testslots.suite_bases(p.name) for l in testslots._lanes_of(b)
+                    for x in locks.holder_records([l]) if x.get("alive") is not False], "lane freed"
     finally:
         _stop(proc)
 
