@@ -360,6 +360,17 @@ def test_a_valid_session_answer_is_not_changed(env, tmp_path, monkeypatch):
     assert _answer(p, tmp_path, monkeypatch, ok) == (None, "")
     assert not (tmp_path / "run" / "answer-precheck.json").exists()
     assert _answer(p, tmp_path, monkeypatch, []) == (None, "")
+    # A batch that requeues a failed dependency, or cancels a duplicate, before the action that needs it:
+    # apply runs them in order and accepts both, so the check does too.
+    gone = p.db.add_task("old probe", "s", origin="user")
+    p.db.update_task(gone, status="failed")
+    seq = [{"type": "task_update", "id": gone, "status": "queued"},
+           {"type": "task_update", "id": tid, "status": "queued", "depends_on": [gone]},
+           {"type": "task_update", "id": run, "status": "cancelled"},
+           {"type": "task_add", "title": "bench", "spec": "again", "depends_on": [gone]}]
+    assert _answer(p, tmp_path, monkeypatch, seq) == (None, "")
+    from ttp import coordinator as coord
+    assert coord.apply(p, seq) == []
 
 
 def test_session_answer_check_refuses_what_apply_refuses_and_never_traps_the_turn(env, tmp_path, monkeypatch):

@@ -35,13 +35,19 @@ def problems(p, actions: list) -> list[tuple[int, str]]:
     """(action index, why) of each action coord.apply would refuse, by the checks it can make without
     a side effect; [] when it finds none. Reads the project's tasks and config only."""
     from . import coordinator as coord
-    from .db import TERMINAL_TASK_STATES, dependency_ids
+    from .db import TERMINAL_TASK_STATES, _first_dead, dependency_ids
     from .providers.base import normalize_action
     db, cfg, out = p.db, p.config(), []
     # A config_set in the batch is applied first and may change a cap: the caps are left to apply then.
     caps = not any(isinstance(a, dict) and a.get("type") == "config_set"
                    and "tasks_per_day" in str(a.get("key") or "") for a in actions)
     left: dict[bool, int] = {}
+    # The statuses this batch's task_updates set: apply runs them in order, so a dependency requeued
+    # or a duplicate cancelled earlier in the batch counts as such (no refusal apply would not make).
+    states = {r["id"]: r["status"] for r in db.q("SELECT id, status FROM tasks")}
+
+    def dead(deps: list):
+        return _first_dead(deps, states)
     for i, raw in enumerate(actions):
         if not isinstance(raw, dict):
             continue
@@ -80,15 +86,15 @@ def problems(p, actions: list) -> list[tuple[int, str]]:
                 new_status = status if status in REQUEUE else task["status"]
                 if a.get("depends_on") is not None:
                     deps = coord._new_dependencies(db, task, a["depends_on"])
-                    if status not in REQUEUE and task["status"] == "blocked" and db.dead_dependency(dependency_ids(task)):
+                    if status not in REQUEUE and task["status"] == "blocked" and dead(dependency_ids(task)):
                         new_status = "queued"   # apply releases a task blocked on a dead dependency
                 if new_status == "queued" and (status in REQUEUE or a.get("depends_on") is not None):
-                    dead = db.dead_dependency(deps)
-                    if dead:
-                        dep, why = dead
+                    if found := dead(deps):
+                        dep, why = found
                         raise ValueError(f"#{tid} rejected: depends on #{dep} which "
                                          f"{'does not exist' if why == 'does not exist' else 'is ' + why}; "
                                          f"drop or replace depends_on")
+                states[tid] = new_status
             elif t == "task_add":
                 title = str(a.get("title") or "").strip()
                 missing = [f for f, v in (("title", title), ("spec", str(a.get("spec") or "").strip())) if not v]
@@ -99,10 +105,10 @@ def problems(p, actions: list) -> list[tuple[int, str]]:
                 if (a.get("kind") or "work") not in kinds:
                     raise ValueError(f"{coord.UNKNOWN_KIND} {str(a.get('kind'))[:40]!r} is not one of "
                                      f"{', '.join(sorted(kinds))}")
-                dup = db.one("SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled')",
-                             (title,))
-                if dup and str(dup["id"]) != str(a.get("continues")):
-                    raise ValueError(f"duplicate of open task #{dup['id']}")
+                dup = [r["id"] for r in db.q("SELECT id FROM tasks WHERE title=?", (title,))
+                       if states.get(r["id"]) not in TERMINAL_TASK_STATES]
+                if dup and str(dup[0]) != str(a.get("continues")):
+                    raise ValueError(f"duplicate of open task #{dup[0]}")
                 if a.get("continues") is not None:
                     try:
                         old = db.task(int(a["continues"]))
@@ -111,9 +117,8 @@ def problems(p, actions: list) -> list[tuple[int, str]]:
                     if not old:
                         raise ValueError(f"task_add continues: no task #{a['continues']}")
                 deps = coord._new_dependencies(db, None, a.get("depends_on") or [])
-                dead = db.dead_dependency(deps)
-                if dead:
-                    raise ValueError(f"task_add rejected: depends on #{dead[0]} which is {dead[1]}; "
+                if found := dead(deps):
+                    raise ValueError(f"task_add rejected: depends on #{found[0]} which is {found[1]}; "
                                      f"drop or replace depends_on")
                 if caps:
                     review = a.get("kind") == "review"
