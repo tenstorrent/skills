@@ -395,3 +395,65 @@ def test_a_floor_runs_cheap_pin_is_dropped_unless_the_user_required_it(env, monk
     assert web.run_floor(note) == ("floor light->standard (device action); kept off chat:glm-x; "
                                    f"pin dropped: {why}")
     assert web.run_floor(json.dumps({"wake": {"tier": "light"}})) is None and web.run_floor("bad") is None
+
+
+def test_a_light_or_chat_routed_runs_notify_is_refused_and_a_standard_runs_is_queued(env, monkeypatch, capsys):
+    """A light-tier or chat-routed worker run never posts to the user's chat: the daemon marks it at start
+    (workernotify.ENV) and `ttp notify` refuses its low and normal notifies, user steps included, saying to
+    hand the text off; `--severity high` still reaches the coordinator. A standard run's notify is queued."""
+    from ttp import cli, workernotify
+    from ttp.daemon import ESCALATE_FILE, NOTIFY_FILE, Daemon
+    from ttp.providers import claude
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")   # never a real agent
+    monkeypatch.setenv(workernotify.ENV, "inherited")   # a stale value from the daemon's own environment
+    p = make(env)
+    d = Daemon(p.base)
+
+    def run_env(role, tier):
+        tid = p.db.add_task("t", "s", kind="review" if role == "reviewer" else "work", tier=tier, origin="user")
+        rid = d.start_run(role, "go", "claude", tier, str(p.root), task=p.db.task(tid))
+        (p.runs / str(rid) / "STOP").touch()
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    assert run_env("worker", "light")[workernotify.ENV] == "on the light tier"
+    assert run_env("reviewer", "light")[workernotify.ENV] == "on the light tier"
+    assert workernotify.ENV not in run_env("worker", "standard"), "never an inherited value"
+    cfg = p.config()
+    assert workernotify.no_post(cfg, "worker", "standard", "chat") == "routed to the chat provider"
+    assert workernotify.no_post(cfg, "worker", "deep", "chat") == "routed to the chat provider"
+    assert workernotify.no_post(cfg, "worker", "standard", "claude") == ""
+    assert workernotify.no_post(cfg, "worker", "deep", "codex") == ""
+    assert workernotify.no_post(cfg, "coordinator", "light", "claude") == "", "the coordinator's own channel"
+    assert workernotify.no_post({**cfg, "core_provider": "chat"}, "worker", "standard", "chat") == "", \
+        "a project whose core provider is chat posts as any core run"
+
+    def notify(run_dir, why, *args):
+        monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+        if why:
+            monkeypatch.setenv(workernotify.ENV, why)
+        else:
+            monkeypatch.delenv(workernotify.ENV, raising=False)
+        try:
+            cli.main(["notify", *args])
+        except SystemExit as e:
+            return int(e.code or 0), capsys.readouterr()
+        return 0, capsys.readouterr()
+
+    for why in ("on the light tier", "routed to the chat provider"):
+        run_dir = p.runs / why.replace(" ", "-")
+        run_dir.mkdir(parents=True)
+        for args in (["done: 3 files"], ["--severity", "low", "fyi"], ["--severity", "normal", "x"],
+                     ["--step", "sign-in", "--check", "true", "sign in"]):
+            rc, out = notify(run_dir, why, *args)
+            assert rc != 0 and f"this run is {why}" in out.err and "hand-off" in out.err, (why, args, out)
+        assert not (run_dir / NOTIFY_FILE).exists(), "nothing queued for the user's chat"
+        rc, out = notify(run_dir, why, "--severity", "high", "the broker is down")
+        assert rc == 0 and (run_dir / ESCALATE_FILE).exists(), "high still goes to the coordinator"
+        assert not (run_dir / NOTIFY_FILE).exists()
+    run_dir = p.runs / "standard"
+    run_dir.mkdir(parents=True)
+    rc, out = notify(run_dir, "", "done: 3 files")
+    assert rc == 0 and "queued for the user" in out.out
+    assert json.loads((run_dir / NOTIFY_FILE).read_text().splitlines()[0])["text"] == "done: 3 files"
+    rc, out = notify(run_dir, "  ", "--severity", "low", "fyi")   # a blank value marks nothing
+    assert rc == 0 and len((run_dir / NOTIFY_FILE).read_text().splitlines()) == 2

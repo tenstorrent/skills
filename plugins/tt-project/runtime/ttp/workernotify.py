@@ -6,7 +6,17 @@ reply or notify naming the task (#<id>), or drops it with a task_update whose te
 (handled). Otherwise, once notify.hold_s has passed, post_due posts it unchanged and model-free. The
 list lives in kv and each post removes its entry in the same transaction, so a daemon restart during
 the hold neither loses nor doubles it. A hand-off that queues no coordinator turn of its own (a waiting
-one, a routine or quiet one: recorded 'handled') has its notifies posted at once (release_unqueued)."""
+one, a routine or quiet one: recorded 'handled') has its notifies posted at once (release_unqueued).
+
+Who may post: a worker or reviewer run on the light tier, or routed to the chat provider (route.TO,
+unless it is the project's core provider), never writes text the user's chat shows. The daemon marks
+such a run at start (ENV: why, from no_post) and `ttp notify` refuses its low and normal notifies,
+user steps included, telling it to hand the text off: the coordinator, a run at least at the standard
+tier, decides what the user reads. `--severity high` still goes to the coordinator, and the daemon's
+own model-free notices are unaffected. A refusal, not a relay through a standard run: the hand-off
+already reaches the coordinator, so a relay would add a paid run per notify for no new path.
+Known gaps: the mark is an environment value, so a run that unsets it, or writes the notify file
+itself, is not refused; this guards against a model's habit, not a hostile run."""
 from __future__ import annotations
 
 import hashlib
@@ -22,6 +32,25 @@ HELD_ENDS = ("blocked", "waiting", "failed", "needs_review")
 DROPPED = "notify dropped:"
 HOLD_S = 900
 _TASK_REF = re.compile(r"#(\d+)\b")
+ENV = "TTP_NO_USER_POST"   # set by the daemon on a run that must not post to the user's chat: why
+
+
+def no_post(cfg: dict, role: str, tier: str, provider: str) -> str:
+    """Why a run of `role` on `tier` and `provider` must not post to the user's chat, or "" if it may."""
+    from . import route
+    if role not in ("worker", "reviewer"):
+        return ""
+    if provider == route.TO and (cfg.get("core_provider") or "claude") != route.TO:
+        return f"routed to the {route.TO} provider"
+    if tier == "light":
+        return "on the light tier"
+    return ""
+
+
+def refusal(why: str) -> str:
+    return (f"ttp notify: this run is {why}, so it does not post to the user's chat. Put the text in your "
+            "hand-off (its summary, or `question` if you hand off blocked): the coordinator decides what the "
+            "user reads. `--severity high` still reaches the coordinator now")
 
 
 def hold_s(cfg: dict) -> float:

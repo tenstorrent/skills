@@ -3070,6 +3070,10 @@ class Daemon:
             # inherited "1" (the runner adds its own environment under this one).
             if task and role != "coordinator":
                 env["TTP_NO_DEVICE"] = "0" if holds_device(task, self.cfg) else "1"
+            # A light-tier or chat-routed run hands its text off instead of posting it (workernotify.no_post).
+            env.pop(workernotify.ENV, None)   # never an inherited value
+            if why := workernotify.no_post(self.cfg, role, tier, provider):
+                env[workernotify.ENV] = why
             if task and role in ("worker", "reviewer") and handoff_guard:
                 from .hook import HANDOFF_GUARD_ENV, NO_BRANCH_ENV
                 env[HANDOFF_GUARD_ENV] = "1"

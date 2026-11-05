@@ -2213,6 +2213,9 @@ def cmd_notify(a) -> None:
         die("ttp notify only works inside a tt-project run")
     if a.severity == "critical":
         die("ttp notify: critical is the coordinator's; use --severity high to escalate to it")
+    from . import workernotify
+    if a.severity != "high" and (why := os.environ.get(workernotify.ENV, "").strip()):
+        die(workernotify.refusal(why))
     text = a.text.strip()
     if not text:
         die("empty notify")

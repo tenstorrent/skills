@@ -809,6 +809,13 @@ allows only a tier below the floor, a conclusion run stays queued (`held: tier f
 budget gate to allow standard`) and starts at the floor once the gate eases. Set it per project with
 `ttp config <name> coordinator.conclusion_floor deep/xhigh`, or `off`.
 
+A light-tier worker or reviewer run, or one routed to the chat provider (unless chat is the project's
+core provider), never posts to the user's chat: `ttp notify` refuses its low and normal notifies,
+user steps included, and tells it to put the text in its hand-off, where the coordinator decides what
+the user reads. `--severity high` still reaches the coordinator, and the daemon's own model-free
+notices are unaffected. The route is a refusal rather than a relay through a standard run: the
+hand-off already reaches the coordinator, so a relay would add a paid run for no new path.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat
