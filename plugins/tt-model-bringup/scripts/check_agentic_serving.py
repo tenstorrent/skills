@@ -297,9 +297,9 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
     if (evals / "plan.json").is_file() and any((row or {}).get("decision") == "go" for row in decisions.values()):
         limit, projected = run_timeout_hours(inputs), (release or {}).get("projected_hours")
         per_run = projected if isinstance(projected, dict) else {"the release run": projected}
-        if not (isinstance(release, dict) and release.get("rehearsal") and per_run
+        if not (isinstance(release, dict) and release.get("dry_run") and per_run
                 and all(number(hours) for hours in per_run.values())):
-            problems.append((2, "plan.json release needs its rehearsal runs and projected_hours"))
+            problems.append((2, "plan.json release needs its dry_run and projected_hours"))
         else:
             for name, hours in per_run.items():
                 if hours > limit:

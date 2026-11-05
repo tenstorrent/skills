@@ -149,9 +149,9 @@ holding the last rung they banked; a mode that cannot reach its goal reports how
 The device is the scarce resource and the clock is fixed. Manage both.
 
 - **Plan the clock first.** In `plan.json`, write the schedule: survey, rungs, efforts, the
-  rehearsal and the start of the release run, which must fall inside the stage time limit, with
-  the release run's estimated length. Schedule the rehearsal early enough to fix what it finds and
-  rehearse again before that start; efforts end when the rehearsal must begin. Update
+  dry run and the start of the release run, which must fall inside the stage time limit, with the
+  release run's estimated length. Leave room before the start for a dry run, a fix and a second
+  dry run; efforts end when the first dry run must begin. Update
   the plan after every run with measured times.
 - **One job on the device at a time, and always one.** Queue the next device job before the
   current one ends. While a long run holds the device, agents analyse, write code and prepare the
@@ -280,14 +280,15 @@ time measured there projects the next rung to finish before the release run must
    an effort.
 6. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
    `run_timeout_hours`. They set the release lists.
-7. **Combine and rehearse.** Freeze the release configuration: serving settings, task lists,
-   limits, route and commits. Then run each suite on it end to end, at the full-load size or the
-   release lists themselves if they fit, and check what a longer run adds: disk for every task,
-   concurrent sandboxes, image pulls, verifiers. Fix what fails and rehearse again. Nothing changes
-   after the last clean rehearsal.
+7. **Combine and dry run.** Freeze the release configuration: serving settings, task lists,
+   limits, route and commits. Then launch the release exactly as it will run and stop it once it is
+   clearly running: the server loads the frozen settings, every task environment in the release
+   lists is pulled or built, the planned number of sandboxes start together, and each suite's first
+   agents get model replies. No scores; suite lengths come from the measured rungs. Fix what fails
+   and dry-run again. Nothing changes after the last clean dry run.
 8. **Release run**, started before the stage time limit and allowed to finish after it, within
    `run_timeout_hours`, through the same route every earlier run used. It must land without help:
-   start it only on the rehearsed configuration and only when its projection, with each suite's
+   start it only on the configuration that passed the dry run and only when its projection, with each suite's
    slow tail at the agent limit, fits `run_timeout_hours` with margin. Otherwise release a smaller
    list that does. It runs the evals with a `go` decision: in `light` their full-load lists, all
    within `run_timeout_hours` together; in `full` each one's largest fitting list. A failure during it is reported, not fixed: the
@@ -345,8 +346,8 @@ logs what it applied to `steering.log`.
 ### Devices
 
 The local device is primary. The schedule in `plan.json` must work with it alone, and the
-rehearsal and release run use it unless the operator says otherwise, so the release lands on the
-machine it was rehearsed on.
+dry run and release run use it unless the operator says otherwise, so the release lands on the
+machine its dry run launched on.
 
 Devices from `compute` are secondary. Use them only through the operator's commands, and follow
 their `instructions` and limits; they define what each device is and how it is used. They take work the plan would otherwise run one after another on
@@ -381,7 +382,7 @@ Write these to `doc/agentic_evals/`:
   `confirmed` and `evidence`; and `rankings`, each with `after`, `order` (`problem`,
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
 - `plan.json`, with the `mode`, the schedule updated after every run, and
-  `release`: the frozen configuration, the `rehearsal` runs that ran it end to end, and
+  `release`: the frozen configuration, the `dry_run` that launched it, and
   `projected_hours` with each suite's slow tail: one number in `light`, one per eval in `full`
 - `runs/<arm>/` (manifest and collected results)
 - `estimate.json`: per eval `decision` (`go`: it is in the release run; `stop`: it is not),
