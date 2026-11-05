@@ -2051,7 +2051,7 @@ def cmd_selfchange(a) -> None:
         out = {"reviewed": lines}
         lines = lines or ["no self-change due"]
     else:
-        out = {"metrics": selfimprove.summary(p.db), "items": selfimprove.items(p.db)}
+        out = {"metrics": selfimprove.summary(p.db, where=p), "items": selfimprove.items(p.db)}
         lines = out["metrics"]
     print(json.dumps(out, indent=1, default=str) if a.json else "\n".join(lines))
 

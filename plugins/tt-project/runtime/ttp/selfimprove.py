@@ -4,41 +4,49 @@
 only general fixes go upstream to tt-project). Model-free throughout:
 
 - wake(): the per-wake record, kept on the coordinator run's row (runs.note "wake"): cost, tool calls,
-  rejected actions, claims made, checked and failed (CLAIM_EVENTS since the last wake), orders late (open
+  rejected actions, claims failed (work a reply announced that the daemon found not started:
+  unstarted.announced's events since the last wake), orders late (open
   obligations past a deadline) and the minutes from order to first start (tasks a chat asked for whose
   first run started since the last wake, the longest). The daily review reads them (`ttp selfchange`).
 - classify(): a fix is general when it needs a plugin file (runtime, template, skill) or the miss would
   recur in a fresh project from the template (the coordinator's `fresh_project`); all else is local.
 - guard(): a local change stays in its scope (LOCAL_KINDS) and never names Restrictions, a cap, a budget,
-  a gate, required checks, a review or the ask gate; a config one names a key chat may set. An undo run
-  here is one plain `ttp` command (no shell).
+  a gate, required checks, a review or the ask gate; a config one names a key chat may set. The undo is
+  the change's own inverse (UNDO_FORM): config `ttp config <project> <key> <value>` of the same key,
+  memory `ttp memory --forget <name>` of the entry it adds; a charter note or schedule names in words
+  the charter_update or schedule_set that restores it (no CLI edits either).
 - add() (the `self_change` action): a general fix is filed upstream with its evidence; a local one is
   recorded in kv KEY as {miss evidence, metric, baseline, check_at, undo}. The change itself is made by
   its own action or task in the same batch, under that action's gates.
 - review(): at check_at the change is measured over the wakes since it was made, against its baseline
   (the mean over the same span before). It is kept when the metric (lower is better) dropped, else
-  reverted: a config, memory, schedule or charter-note change by its undo command, a prompt, script or
-  code change by a harness task (its review and required checks apply). Either way it is a Tried ledger
-  entry (tried.entries). A kept one marked `generic`, or whose miss class another project on this machine
+  reverted, never by running its undo as a command: a config or memory change by the coordinator's own
+  config_set or memory_forget action (coordinator.apply, so their gates apply again), a charter note or
+  schedule by an observation asking the coordinator to send its charter_update or schedule_set, a
+  prompt, script or code change by a harness task (its review and required checks apply). A revert that
+  fails stays open (retried at the next review) and is raised to the coordinator once. Kept or reverted,
+  it is a Tried ledger entry (tried.entries). A kept one marked `generic`, or whose miss class another project on this machine
   recorded too (MISSES), goes upstream with its numbers."""
 from __future__ import annotations
 
 import json
-import os
 import re
 import shlex
-import subprocess
 import time
+
+from .unstarted import ANNOUNCED_KIND
 
 KEY = "self_changes"               # kv: {"next": n, "items": [record, ...]}
 LAST_WAKE_KEY = "self_wake_last"   # kv: when the last wake record was taken
 METRICS = ("cost_usd", "tool_calls", "rejected", "claims_failed", "orders_late", "order_to_start_min")
-CLAIM_EVENTS = ("claim_checked", "claim_failed")
 LOCAL_KINDS = ("prompt", "memory", "charter_note", "schedule", "config", "script", "code")
-UNDO_KINDS = ("memory", "charter_note", "schedule", "config")   # reverted by running the undo here
+ACTION_UNDO = ("memory", "config")             # reverted here by the coordinator's own gated action
+COORD_UNDO = ("charter_note", "schedule")      # the coordinator reverts it (no CLI edits either)
+UNDO_FORM = {"config": "ttp config <project> <key> <value>", "memory": "ttp memory --forget <name>"}
+REVERT_KIND = "observation"                    # a revert for the coordinator: rides with its next turn
+MEMORY_SLACK_S = 3600                          # a memory entry created this long before the record is its own
 MIN_CHECK_S = 12 * 3600
 DEFAULT_CHECK = "3d"
-UNDO_TIMEOUT_S = 120
 MISSES = "selfmisses.jsonl"        # in project.HOME_DIR: {ts, project, cls}, one line per recorded miss
 MISS_DAYS = 30
 KEEP = 200                         # records kept
@@ -60,23 +68,44 @@ def classify(files, fresh_project: bool = False) -> tuple[str, str]:
     return "local", "no plugin file and specific to this project"
 
 
-def guard(kind: str, target: str, undo: str, settable=None) -> None:
+def inverse(kind: str, target: str, undo: str, project: str = "") -> dict | None:
+    """The coordinator action an ACTION_UNDO undo stands for (UNDO_FORM, of this change's own target);
+    ValueError for any other command. None for the other kinds, which never run their undo."""
+    if kind not in ACTION_UNDO:
+        return None
+    try:
+        argv = shlex.split(undo) if not _SHELL.search(undo) else []
+    except ValueError:
+        argv = []
+    if kind == "config" and len(argv) == 5 and argv[:2] == ["ttp", "config"] and argv[2] == project \
+            and argv[3] == target:
+        return {"type": "config_set", "key": target, "value": argv[4]}
+    if kind == "memory" and argv == ["ttp", "memory", "--forget", target]:
+        return {"type": "memory_forget", "name": target}
+    raise ValueError(f"its undo must be `{UNDO_FORM[kind]}` of this change's own {'key' if kind == 'config' else 'entry'}"
+                     f" ({target!r}{', project ' + repr(project) if kind == 'config' else ''}), one command, no shell")
+
+
+def guard(kind: str, target: str, undo: str, settable=None, project: str = "") -> None:
     """ValueError when a local self-change leaves its scope (module doc)."""
     if kind not in LOCAL_KINDS:
         raise ValueError(f"kind {kind!r} is not a local self-change scope ({', '.join(LOCAL_KINDS)})")
-    for what, text in (("target", target), ("undo", undo)):
+    undo = str(undo or "").strip()
+    named = " ".join(a for a in undo.split() if a != project) if project else undo   # a project's own name
+    for what, text in (("target", target), ("undo", named)):
         if m := _GUARDED.search(text or ""):
             raise ValueError(f"its {what} names {m.group(0).strip(' ._-')!r}: a self-change never touches "
                              "Restrictions, caps, budgets, gates, required checks, reviews or the ask gate")
-    if not str(undo or "").strip():
+    if not undo:
         raise ValueError("it needs an undo (`command`) that restores the state before it")
-    if kind in UNDO_KINDS:
-        if _SHELL.search(undo) or not undo.strip().startswith("ttp "):
-            raise ValueError("its undo runs model-free: give one plain `ttp ...` command, no shell syntax")
+    if kind in COORD_UNDO and re.match(r"(ttp|git|sh|bash)\b", undo):
+        raise ValueError(f"a {kind} change has no undo command: name in words the "
+                         f"{'charter_update' if kind == 'charter_note' else 'schedule_set'} that restores it")
+    act = inverse(kind, target, undo, project)
     if kind == "config":
         if settable is None:
             raise ValueError("a config self-change needs the settable-key check")
-        settable(target)   # raises when chat may not set it
+        settable(target)(act["value"])   # raises when chat may not set the key or that value
 
 
 def _since_last(db, started: float) -> float:
@@ -88,11 +117,8 @@ def wake(db, usage, actions, problems, started: float, now: float | None = None)
     from . import obligations
     now = time.time() if now is None else now
     prev = _since_last(db, started)
-    claims = sum(len(a.get("claims") or []) for a in actions or []
-                 if isinstance(a, dict) and a.get("type") in ("reply", "notify") and isinstance(a.get("claims"), list))
-    got = {r["kind"]: int(r["n"]) for r in db.q(
-        f"SELECT kind, COUNT(*) n FROM events WHERE kind IN ({','.join('?' * len(CLAIM_EVENTS))}) "
-        "AND ts > ? AND ts <= ? GROUP BY kind", (*CLAIM_EVENTS, prev, now))}
+    failed = int(db.one("SELECT COUNT(*) n FROM events WHERE kind = ? AND source = 'daemon' AND ts > ? AND ts <= ?",
+                        (ANNOUNCED_KIND, prev, now))["n"])
     late = 0
     for o in obligations.items(db):
         if o.get("receipt") is None and o.get("dropped") is None:
@@ -108,8 +134,7 @@ def wake(db, usage, actions, problems, started: float, now: float | None = None)
     db.set_kv(LAST_WAKE_KEY, now)
     return {"cost_usd": round(float(getattr(usage, "cost_usd", 0) or 0), 4),
             "tool_calls": int((getattr(usage, "extra", None) or {}).get("tool_calls") or 0),
-            "rejected": len(problems or []), "claims_made": claims,
-            "claims_checked": sum(got.values()), "claims_failed": got.get("claim_failed", 0),
+            "rejected": len(problems or []), "claims_failed": failed,
             "orders_late": late, "order_to_start_min": round(max(starts), 1) if starts else None,
             "starts": len(starts)}
 
@@ -196,7 +221,7 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
                       f"Files: {', '.join(map(str, files)) or 'none named'}\nGeneral because {why}.")
         return f"self_change {cls}: general ({why}): filed upstream ({'new note' if n else 'already filed'}), " \
                "not recorded as a local change"
-    guard(kind, target, undo, settable)
+    guard(kind, target, undo, settable, p.name)
     if check_at is None or check_at - now < MIN_CHECK_S:
         raise ValueError(f"start_after (when to measure it) must be at least {MIN_CHECK_S // 3600} h out")
     before = wakes(p.db, now - (check_at - now), now)
@@ -217,17 +242,45 @@ def add(p, a: dict, check_at: float | None, settable=None, now: float | None = N
     return f"self-change {rec['id']} recorded: {metric} baseline {rec['baseline']} over {len(before)} wakes"
 
 
-def _revert(p, rec: dict) -> tuple[str, str]:
-    """Undo a change that did not help: ("reverted" | "revert_failed", how). No db transaction is open."""
-    if rec["kind"] in UNDO_KINDS:
+def _ask_coordinator(p, rec: dict, text: str, now: float) -> int | None:
+    """Raise one observation per change for the coordinator (REVERT_KIND); its id, None when raised before."""
+    fp = f"self_change_revert:{rec['id']}"
+    if p.db.one("SELECT 1 FROM events WHERE fingerprint = ?", (fp,)):
+        return None
+    return p.db.x("INSERT INTO events(ts, source, kind, fingerprint, severity, text, status) "
+                  "VALUES(?, 'daemon', ?, ?, 'normal', ?, 'queued')", (now, REVERT_KIND, fp, text[:4000]))
+
+
+def _revert(p, rec: dict, now: float) -> tuple[str, str]:
+    """Undo a change that did not help (module doc): ("reverted" | "revert_failed", how). No db transaction
+    is open."""
+    from . import coordinator
+    why = f"self-change {rec['id']} reverted: it did not lower {rec['metric']}"
+    if rec["kind"] in ACTION_UNDO:
         try:
-            r = subprocess.run(shlex.split(rec["undo"]), cwd=str(p.root), capture_output=True, text=True,
-                               timeout=UNDO_TIMEOUT_S, env={**os.environ, "TTP_PROJECT": p.name})
-        except (OSError, ValueError, subprocess.TimeoutExpired) as e:
-            return "revert_failed", f"undo did not run: {type(e).__name__}"
-        tail = " ".join((r.stderr or r.stdout or "").split())[-200:]
-        return ("reverted", "undo ran") if r.returncode == 0 else \
-            ("revert_failed", f"undo exited {r.returncode}: {tail}")
+            act = inverse(rec["kind"], rec["target"], rec["undo"], p.name)
+            if act["type"] == "config_set":
+                coordinator.settable(act["key"])(act["value"])   # still settable, and to that value
+            else:
+                live = next((e for e in p._memory_entries() if e["name"] == act["name"]), None)
+                if live is None:
+                    return "reverted", "its memory entry is already gone"
+                from .project import _stamp_ts
+                if _stamp_ts(live["created"]) < float(rec["ts"]) - MEMORY_SLACK_S:
+                    raise ValueError(f"memory entry {act['name']!r} is older than the change, not one it added")
+                act["why"] = why
+            problems = coordinator.apply(p, [act])
+        except Exception as e:   # noqa: BLE001 - any refusal leaves the change open, raised to the coordinator
+            problems = [f"{type(e).__name__}: {e}"]
+        if problems:
+            return "revert_failed", " ".join(" ".join(problems).split())[:300]
+        return "reverted", f"{act['type']} applied"
+    if rec["kind"] in COORD_UNDO:
+        ev = _ask_coordinator(p, rec, f"Revert self-change {rec['id']} ({rec['kind']} {rec['target']}): it did not "
+                              f"lower {rec['metric']} ({rec.get('baseline')} before). Send the "
+                              f"{'charter_update' if rec['kind'] == 'charter_note' else 'schedule_set'} that "
+                              f"restores it: {rec['undo']}\nThe change was: {rec['change']}", now)
+        return "reverted", f"asked the coordinator to revert it (event #{ev})"
     tid = p.db.add_task(f"revert self-change {rec['id']}: {rec['change'][:80]}",
                         f"Revert self-change {rec['id']} ({rec['kind']} {rec['target']}): it did not lower "
                         f"{rec['metric']}. Undo: {rec['undo']}\nThe change was: {rec['change']}",
@@ -255,7 +308,13 @@ def review(p, now: float | None = None) -> list[str]:
                 upd["upstream"] = bool(n)
                 how += ", filed upstream" if n else ", already upstream"
         else:
-            upd["status"], how = _revert(p, rec)
+            upd["status"], how = _revert(p, rec, now)
+            if upd["status"] == "revert_failed":   # unresolved: open again, retried at the next review
+                upd.update(status="open", revert_error=how, revert_tries=int(rec.get("revert_tries") or 0) + 1)
+                _ask_coordinator(p, rec, f"Self-change {rec['id']} ({rec['kind']} {rec['target']}) did not lower "
+                                 f"{rec['metric']}, and its revert failed: {how}. Revert it with its own action "
+                                 f"(undo: {rec['undo']}); the daily review retries it meanwhile.", now)
+                how = f"revert failed, still open: {how}"
         with p.db.tx():   # the record may have moved meanwhile: update it by id
             st = _load(p.db)
             for r in st["items"]:
@@ -272,7 +331,7 @@ def tried_entries(db, since: float, where=None) -> list[dict]:
     from .tried import subject_key
     out = []
     for r in items(db):
-        if r.get("status") in ("kept", "reverted", "revert_failed") and float(r.get("measured") or 0) >= since:
+        if r.get("status") in ("kept", "reverted") and float(r.get("measured") or 0) >= since:
             ts = float(r["measured"])
             out.append({"id": r["id"], "what": f"self-change {r['id']}", "status": "", "ts": ts,
                         "date": timefmt.long(ts, where), "title": r["change"][:200], "spec": r["miss"],
@@ -282,14 +341,16 @@ def tried_entries(db, since: float, where=None) -> list[dict]:
     return out
 
 
-def summary(db, now: float | None = None, days: float = 1.0) -> list[str]:
+def summary(db, now: float | None = None, days: float = 1.0, where=None) -> list[str]:
     """The daily review's view: mean per metric over the last `days` against the `days` before, and the
-    open self-changes."""
+    open self-changes (times in the zone of `where`, the project: timefmt)."""
+    from . import timefmt
     now = time.time() if now is None else now
     cur, prev = wakes(db, now - days * 86400, now), wakes(db, now - 2 * days * 86400, now - days * 86400)
     out = [f"wakes: {len(cur)} (before: {len(prev)})"]
-    out += [f"{m}: {mean(cur, m)} (before: {mean(prev, m)})" for m in METRICS + ("claims_made", "claims_checked")]
+    out += [f"{m}: {mean(cur, m)} (before: {mean(prev, m)})" for m in METRICS]
     out += [f"open {r['id']}: {r['change'][:80]} | {r['metric']} baseline {r.get('baseline')}, measured "
-            f"{time.strftime('%Y-%m-%d %H:%M', time.localtime(float(r['check_at'])))}"
+            f"{timefmt.long(float(r['check_at']), where)}" + (f" (revert failed: {r['revert_error']})"
+                                                               if r.get("revert_error") else "")
             for r in items(db) if r.get("status") == "open"]
     return out

@@ -44,19 +44,32 @@ def test_selfimprove_guardrails_refuse_restrictions_caps_gates_checks_reviews_an
         ("prompt", "ask gate rules", "git revert abc"),
         ("prompt", "coordinator.md", "ttp config BUDGET.DAILY_USD 9"),   # upper case and the undo too
         ("code", "the session mode", "git revert abc"),
-        ("memory", "a fact", "ttp memory forget m1; rm -rf x"),       # shell syntax in a direct undo
-        ("memory", "a fact", "rm m1"),                                  # not a ttp command
-        ("memory", "a fact", ""),                                       # no undo
+        ("memory", "m1", "ttp memory --forget m1; rm -rf x"),         # shell syntax in a direct undo
+        ("memory", "m1", "rm m1"),                                      # not a ttp command
+        ("memory", "m1", ""),                                           # no undo
         ("model", "x", "ttp x"),                                        # not a local scope
-        ("config", "no.such.key", "ttp config no.such.key 1"),          # chat may not set it
-        ("config", "delivery.own_push", "ttp config delivery.own_push on"),
+        ("config", "no.such.key", "ttp config demo no.such.key 1"),     # chat may not set it
+        ("config", "delivery.own_push", "ttp config demo delivery.own_push on"),
+        # The undo is the change's own inverse, nothing else: another key, project, subcommand or entry.
+        ("config", "coordinator.effort", "ttp config demo coordinator.model opus"),
+        ("config", "coordinator.effort", "ttp config other coordinator.effort high"),
+        ("config", "coordinator.effort", "ttp config demo coordinator.effort high extra"),
+        ("config", "coordinator.effort", "ttp stop demo"),
+        ("memory", "m1", "ttp memory --forget m2"),
+        ("memory", "m1", "ttp note --to other m1"),
+        ("memory", "m1", "ttp memory --forget 'm1'  x"),
+        # A charter note or schedule has no undo command: the coordinator reverts it by its own action.
+        ("charter_note", "Notes: batch status", "ttp charter --undo 3"),
+        ("schedule", "nightly", "ttp schedules nightly --off"),
+        ("schedule", "nightly", "git revert abc"),
     ]
     for kind, target, undo in refused:
         with pytest.raises(ValueError):
-            guard(kind, target, undo, settable)
-    guard("prompt", "coordinator.md: batch status lines", "git revert abc1234", settable)
-    guard("memory", "a stale fact", "ttp memory forget m7", settable)
-    guard("config", "coordinator.effort", "ttp config coordinator.effort high", settable)
+            guard(kind, target, undo, settable, "demo")
+    guard("prompt", "coordinator.md: batch status lines", "git revert abc1234", settable, "demo")
+    guard("memory", "fact-stale", "ttp memory --forget fact-stale", settable, "demo")
+    guard("config", "coordinator.effort", "ttp config demo coordinator.effort high", settable, "demo")
+    guard("schedule", "nightly", "schedule_set nightly back to every 24h", settable, "demo")
 
 
 def test_selfimprove_wake_record_counts_cost_tools_rejections_claims_late_orders_and_start_delay(env):
@@ -64,11 +77,16 @@ def test_selfimprove_wake_record_counts_cost_tools_rejections_claims_late_orders
     from ttp import selfimprove
     p = make(env)
     now = time.time()
+    from ttp import unstarted
     p.db.set_kv(selfimprove.LAST_WAKE_KEY, now - 600)
-    for kind in ("claim_checked", "claim_checked", "claim_failed"):
-        p.db.x("INSERT INTO events(ts, source, kind, text, status) VALUES(?, 'daemon', ?, 'x', 'new')", (now - 60, kind))
-    p.db.x("INSERT INTO events(ts, source, kind, text, status) VALUES(?, 'daemon', 'claim_failed', 'old', 'new')",
-           (now - 900,))
+    # claims_failed: work a reply announced that the daemon found not started (unstarted.announced),
+    # counted only when raised since the last wake.
+    early = p.db.add_task("announced long ago", "s", reply_chat="c1")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 3000, early))
+    assert len(unstarted.announced(p, now - 900)) == 1, "raised before the last wake"
+    late = p.db.add_task("announced, never started", "s", reply_chat="c1")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 1500, late))
+    assert len(unstarted.announced(p, now - 60)) == 1
     tid = p.db.add_task("asked in chat", "s", reply_chat="c1")
     p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 1800, tid))
     p.db.x("INSERT INTO runs(task, role, status, started) VALUES(?, 'worker', 'running', ?)", (tid, now - 300))
@@ -76,10 +94,9 @@ def test_selfimprove_wake_record_counts_cost_tools_rejections_claims_late_orders
     p.db.x("INSERT INTO runs(task, role, status, started) VALUES(?, 'worker', 'running', ?)", (old, now - 5000))
     p.db.x("INSERT INTO runs(task, role, status, started) VALUES(?, 'worker', 'running', ?)", (old, now - 100))
     use = SimpleNamespace(cost_usd=0.42, extra={"tool_calls": 7})
-    acts = [{"type": "reply", "text": "x", "claims": [{"a": 1}, {"b": 2}]}, {"type": "noop"}]
-    rec = selfimprove.wake(p.db, use, acts, ["task_add: refused"], now - 120, now)
-    assert rec == {"cost_usd": 0.42, "tool_calls": 7, "rejected": 1, "claims_made": 2, "claims_checked": 3,
-                   "claims_failed": 1, "orders_late": 0, "order_to_start_min": 25.0, "starts": 1}, rec
+    rec = selfimprove.wake(p.db, use, [{"type": "noop"}], ["task_add: refused"], now - 120, now)
+    assert rec == {"cost_usd": 0.42, "tool_calls": 7, "rejected": 1, "claims_failed": 1, "orders_late": 0,
+                   "order_to_start_min": 25.0, "starts": 1}, rec
     assert p.db.kv(selfimprove.LAST_WAKE_KEY) == now
     # The daemon keeps it on the coordinator run's note; wakes() reads it back.
     _si_wake(p, now - 10, cost_usd=2.0)
@@ -96,7 +113,7 @@ def test_selfimprove_a_helping_change_is_kept_and_one_that_did_not_is_reverted(e
         _si_wake(p, now - h * 3600, tool_calls=4, rejected=1)
     a = {"kind": "config", "name": "coordinator.effort", "text": "lower effort", "metric": "tool_calls",
          "evidence": "3 wakes in a row re-read the same status", "key": "Repeat Status!",
-         "command": "ttp config coordinator.effort high", "files": ["tt-project/project.json"]}
+         "command": f"ttp config {p.name} coordinator.effort high", "files": ["tt-project/project.json"]}
     note = selfimprove.add(p, a, now + 2 * 86400, settable=settable, now=now)
     assert note.startswith("self-change s1 recorded: tool_calls baseline 4.0 over 3 wakes"), note
     b = {**a, "kind": "code", "name": "scripts/poll.sh", "text": "poll less", "metric": "rejected",
@@ -112,19 +129,13 @@ def test_selfimprove_a_helping_change_is_kept_and_one_that_did_not_is_reverted(e
     for h in (10, 20, 30):   # after: fewer tool calls, the same rejections, a higher cost
         _si_wake(p, now + h * 3600, tool_calls=2, rejected=1, cost_usd=3.0)
     assert selfimprove.review(p, now + 3600) == [], "nothing is due before its check time"
-    ran = []
-
-    def fake_run(argv, **k):
-        ran.append((argv, k.get("env", {}).get("TTP_PROJECT")))
-        return subprocess.CompletedProcess(argv, 2, "", "boom")
-    monkeypatch.setattr(selfimprove.subprocess, "run", fake_run)
     lines = selfimprove.review(p, now + 3 * 86400)
     assert lines[0] == "s1 tool_calls 4.0 -> 2.0 (3 wakes): kept", lines
     assert lines[1].startswith("s2 rejected 1.0 -> 1.0 (3 wakes): revert task #"), lines
-    assert lines[2].endswith("undo exited 2: boom"), lines
+    assert lines[2].endswith("config_set applied"), lines
     st = {r["id"]: r for r in selfimprove.items(p.db)}
-    assert [st[k]["status"] for k in ("s1", "s2", "s3")] == ["kept", "reverted", "revert_failed"]
-    assert ran == [(["ttp", "config", "coordinator.effort", "high"], p.name)], "only the direct undo runs, no shell"
+    assert [st[k]["status"] for k in ("s1", "s2", "s3")] == ["kept", "reverted", "reverted"]
+    assert p.config()["coordinator"]["effort"] == "high", "the config revert really restores the old value"
     revert = p.db.one("SELECT * FROM tasks WHERE title LIKE 'revert self-change s2%'")
     assert revert["kind"] == "harness" and "git revert deadbee" in revert["spec"], "code reverts go through review"
     assert selfimprove.review(p, now + 4 * 86400) == [], "each is measured once"
@@ -133,6 +144,49 @@ def test_selfimprove_a_helping_change_is_kept_and_one_that_did_not_is_reverted(e
     assert ledger["s1"]["outcome"] == "kept" and ledger["s2"]["outcome"] == "rejected"
     assert tried.describe(ledger["s2"]).startswith("self-change s2 'poll less' was rejected")
     assert "rejected 1.0 -> 1.0" in ledger["s2"]["result"]
+
+
+def test_selfimprove_each_undo_kind_reverts_by_its_own_gated_path(env, monkeypatch):
+    from ttp import selfimprove, tried
+    from ttp.coordinator import settable
+    _si_home(env, monkeypatch)
+    p = make(env)
+    now = time.time()
+    for h in (40, 30, 20):
+        _si_wake(p, now - h * 3600, cost_usd=1.0)
+    for h in (10, 20, 30):   # after: a higher cost, so every change is reverted
+        _si_wake(p, now + h * 3600, cost_usd=3.0)
+    added = p.add_memory("check the broker before a device run", title="broker first").stem
+    older = p.add_memory("a fact the user gave", title="user fact").stem
+    p.set_config("coordinator.effort", "low")
+    base = {"text": "a change", "metric": "cost_usd", "evidence": "costly wakes", "key": "cost"}
+    due = now + 2 * 86400
+    for a, at in (({"kind": "config", "name": "coordinator.effort",
+                    "command": f"ttp config {p.name} coordinator.effort high"}, now),
+                  ({"kind": "memory", "name": added, "command": f"ttp memory --forget {added}"}, now),
+                  ({"kind": "memory", "name": older, "command": f"ttp memory --forget {older}"}, now + 7200),
+                  ({"kind": "schedule", "name": "nightly", "command": "schedule_set nightly back to 24h"}, now)):
+        selfimprove.add(p, {**base, **a}, due, settable=settable, now=at)
+    lines = selfimprove.review(p, now + 3 * 86400)
+    assert lines[0].endswith("config_set applied") and lines[1].endswith("memory_forget applied"), lines
+    assert "revert failed, still open" in lines[2] and "older than the change" in lines[2], lines
+    assert "asked the coordinator to revert it" in lines[3], lines
+    assert p.config()["coordinator"]["effort"] == "high"
+    names = [e["name"] for e in p._memory_entries()]
+    assert added not in names and older in names, "only the entry the change added is forgotten"
+    st = {r["id"]: r for r in selfimprove.items(p.db)}
+    assert [st[k]["status"] for k in ("s1", "s2", "s3", "s4")] == ["reverted", "reverted", "open", "reverted"]
+    evs = {r["fingerprint"]: r["text"] for r in p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'self_change_revert:%'")}
+    assert set(evs) == {"self_change_revert:s3", "self_change_revert:s4"}, evs
+    assert "schedule_set" in evs["self_change_revert:s4"] and "back to 24h" in evs["self_change_revert:s4"]
+    # A failed revert is unresolved: no Tried entry while the change is live; the next review retries it,
+    # raising the coordinator only once.
+    assert "s3" not in {e["id"] for e in tried.entries(p.db, now=now + 3 * 86400 + 5)}
+    again = selfimprove.review(p, now + 4 * 86400)
+    assert len(again) == 1 and again[0].startswith("s3 ") and "still open" in again[0], again
+    assert st["s3"]["revert_tries"] == 1 and selfimprove.items(p.db)[2]["revert_tries"] == 2
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE fingerprint = 'self_change_revert:s3'")["n"] == 1
+    assert any("revert failed" in ln for ln in selfimprove.summary(p.db, now + 4 * 86400, where=p))
 
 
 def test_selfimprove_general_fixes_and_helpful_repeats_go_upstream(env, monkeypatch):
@@ -168,9 +222,10 @@ def test_selfimprove_the_self_change_action_applies_with_its_guardrails(env, mon
     from ttp import coordinator as coord, prompts, selfimprove
     _si_home(env, monkeypatch)
     p = make(env)
-    ok = {"type": "self_change", "kind": "memory", "name": "a stale fact", "text": "drop the stale fact",
-          "metric": "rejected", "evidence": "rejected twice", "key": "stale-fact", "command": "ttp memory forget m3"}
-    bad = {**ok, "kind": "config", "name": "budget.daily_usd", "command": "ttp config budget.daily_usd 5"}
+    ok = {"type": "self_change", "kind": "memory", "name": "fact-stale", "text": "add a fact",
+          "metric": "rejected", "evidence": "rejected twice", "key": "stale-fact",
+          "command": "ttp memory --forget fact-stale"}
+    bad = {**ok, "kind": "config", "name": "budget.daily_usd", "command": f"ttp config {p.name} budget.daily_usd 5"}
     problems = coord.apply(p, [ok, bad, {**ok, "metric": "happiness"}, {**ok, "start_after": "2h"}])
     assert len(problems) == 3 and all(x.startswith("self_change: ") for x in problems), problems
     assert "budget" in problems[0] and "metric 'happiness'" in problems[1] and "12 h" in problems[2]
