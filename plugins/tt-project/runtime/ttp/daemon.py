@@ -13176,16 +13176,33 @@ class Daemon:
         slots, in dispatch's pick order (db.ready_tasks), and the ready `resource:` tasks that use it per
         command. A contender is ready now, or waits only because the resource was busy, whatever its
         retry timer says: a hand-off waiting on nothing but `ttp lock --probe` of its exclusive resources,
-        or a run that lost the race for its slot. A task that needs a paused resource is none: a pause wins."""
+        or a run that lost the race for its slot. A task that needs a paused resource is none: a pause wins.
+        Nor is a task a newer user order holds off a lock (userorder.py) for that lock: the order's task goes first."""
         def canon(r: str) -> str:
             return locks.canonical(self.cfg, r)
         paused = {canon(r) for r in self.p.db.paused_resources()}
+        try:
+            orders = userorder.active(self.p.db)
+            marks = userorder._respecs(self.p.db) if orders else {}
+        except Exception as e:   # a broken order record never stops dispatch (as in _resource_hold)
+            log(self.p, f"slot contenders: user orders not read: {e}")
+            orders = {}
+
+        def held(t: dict) -> set[str]:
+            if not orders:
+                return set()
+            try:
+                return {canon(r) for r in coord.task_resources(t)
+                        if userorder.holding(self.p.db, self.cfg, t, [r], orders, marks)}
+            except Exception:
+                return set()
         excl: dict[str, list[dict]] = {}
         users: dict[str, list[dict]] = {}
         for t in self.p.db.ready_tasks(later=True):
             if {canon(r) for r in coord.task_resources(t)} & paused:
                 continue
             due = not t["not_before"] or t["not_before"] <= now
+            off = held(t)
             mine = {canon(r) for r in _exclusive(t)}
             if mine and not due:
                 prev = load_result(t["result"])
@@ -13195,14 +13212,14 @@ class Daemon:
                     bool(names) and {canon(n) for n in names} <= mine
                 if not due:
                     continue
-                for lock in mine:
+                for lock in mine - off:
                     excl.setdefault(lock, []).append(t)
                 continue
             if not due:   # a task still on its retry timer takes no slot and uses the resource for nothing yet
                 continue
-            for lock in mine:
+            for lock in mine - off:
                 excl.setdefault(lock, []).append(t)
-            for lock in {canon(r) for r in _shared(t)} - mine:
+            for lock in {canon(r) for r in _shared(t)} - mine - off:
                 users.setdefault(lock, []).append(t)
         return excl, users
 

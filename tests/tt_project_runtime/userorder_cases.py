@@ -83,9 +83,39 @@ def test_a_user_order_holds_older_queued_tasks_at_dispatch_and_steers_older_runn
     assert f"user msg #{msg}" in dmod.hold_reason(hold) and f"#{ids['order']}" in dmod.hold_reason(hold)
     for k in ("order", "respec", "newer", "other"):
         assert (d._resource_hold(p.db.task(ids[k])) or {}).get("kind") != "order", k
+    assert d._resource_hold(p.db.task(ids["order"])) is None   # the order's own task is free to start
     steer = (run_dir / "steer.md").read_text()
     assert "Newer user order" in steer and f"user msg #{msg}" in steer and "ttp lock --probe rig" in steer
     assert not (other_dir / "steer.md").exists()   # a running task on another resource is not told
+
+
+def test_an_order_held_task_never_reserves_the_ordered_resource_ahead_of_the_orders_task(env):
+    """An older exclusive task that outranks the order's task (better priority) and that the order holds
+    off the resource is no slot contender there: it reserves nothing, so the order's task is free."""
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    from ttp import locks
+    p = make(env)
+    now = time.time()
+    assert coord.apply(p, [{"type": "task_add", "title": "old soak", "spec": "soak rig", "tier": "light",
+                            "resources": ["rig"], "exclusive": True, "priority": 1}]) == []
+    old = p.db.one("SELECT id FROM tasks WHERE title='old soak'")["id"]
+    p.db.x("UPDATE tasks SET created=?", (now - 600,))
+    msg = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user','power-cycle rig now')",
+                 (now - 60,))
+    assert coord.apply(p, [{"type": "task_add", "title": "power-cycle rig", "spec": "power-cycle rig",
+                            "tier": "light", "resources": ["rig"], "exclusive": True, "priority": 3,
+                            "user_msg": msg}]) == []
+    order = p.db.one("SELECT id FROM tasks WHERE title='power-cycle rig'")["id"]
+    d = dmod.Daemon(p.base)
+    assert (d._resource_hold(p.db.task(old)) or {}).get("kind") == "order"
+    assert d._resource_hold(p.db.task(order)) is None
+    lock = locks.canonical(d.cfg, "rig")
+    assert d._slot_reservers(time.time()).get(lock) in (None, order)
+    assert old not in [t["id"] for t in d._slot_contenders(time.time())[0].get(lock, [])]
+    # Without the order (its task ended), the older task outranks again and reserves the resource.
+    p.db.update_task(order, status="done")
+    assert d._slot_reservers(time.time()).get(lock) == old
 
 
 def test_the_digest_lists_the_open_tasks_that_predate_a_user_order_until_respecified(env, tmp_path):

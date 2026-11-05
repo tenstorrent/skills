@@ -102,15 +102,17 @@ def predates(db, task: dict, order: dict, respecs: dict | None = None) -> bool:
     return stamp < float(order.get("ts") or 0)
 
 
-def holding(db, cfg: dict | None, task: dict | None, names) -> tuple[str, str, dict] | None:
+def holding(db, cfg: dict | None, task: dict | None, names, orders: dict | None = None,
+            marks: dict | None = None) -> tuple[str, str, dict] | None:
     """(name asked, ordered resource, order) of the first newer user order that holds `task` off one
-    of `names`; None when none does."""
+    of `names`; None when none does. A caller checking many tasks passes `orders` (active) and `marks`
+    (respecs), read once."""
     if not task:
         return None
-    orders = active(db)
+    orders = active(db) if orders is None else orders
     if not orders:
         return None
-    marks = _respecs(db)
+    marks = _respecs(db) if marks is None else marks
     for name in names:
         for res, o in sorted(orders.items()):
             if same(cfg, name, res) and predates(db, task, o, marks):
