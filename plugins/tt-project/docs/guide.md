@@ -371,8 +371,10 @@ prolonged whole-box outage.
   changing reason, probe (`retry_when`) or owner (the task or ask they name), going on for 24 h, or
   reaching `coordinator.repeat_waits_24h` (8) in 24 h (the last two once per run of waits), where
   a wait on a live `ttp detach` job or an unpaused `ttp lock` resource counts only past
-  `coordinator.live_waits_max` (6) waits on the same ones in 24 h or once the job's log stops growing; a
-  rejected action; free worker slots while every queued task is held by a dependency or a paused
+  `coordinator.live_waits_max` (6) waits on the same ones in 24 h or once the job's log stops growing,
+  and a wait held elsewhere never counts (a user step or a pause the user set, a peer that is recovering or
+  listed in the harness's `peer_recovery.json`, or a machine under a known outage recorded only by other
+  projects); a rejected action; free worker slots while every queued task is held by a dependency or a paused
   resource or deferred on purpose (`start_after`, `start_when`), at least one of them held (planned
   deferrals alone are routine); a high or critical event or alert; resource trouble (not waits only); a costly or irreversible step (an ask timing out, a task's budget spent, PR findings
   or a clean PR, a failed push, the budget gate entering or leaving red); an idle wake finding
@@ -438,7 +440,10 @@ prolonged whole-box outage.
   ask passes `coordinator.ask_rethink_h`, or a day passes since that outcome. An outcome stored
   in an older format is no cover. A waiting task on a user-pause probe is never reported
   as a stale wait. A sweep whose items are all unchanged since the last model sweep (within 24 h),
-  each with a model-free end, is skipped model-free with a receipt naming each item's end. A pause
+  each with a model-free end, is skipped model-free with a receipt naming each item's end. A re-check
+  an outcome asked for that comes due skips the same way only within
+  `coordinator.blocker_sweep_recheck_skip_h` (6) of the last model sweep and with each item's updated
+  time and probe answer as at the last sweep; the receipt carries it on until a model sweep runs. A pause
   the coordinator set counts when its `end_when` probe answers (not broken), a heal check's health
   end lifts it, or, with neither, its `until` falls before the next sweep is due. The daily review lists everything stuck over 6 h with its sweep outcome.
 - Course check: a digest section, shown only when something trips, with model-free signs the project

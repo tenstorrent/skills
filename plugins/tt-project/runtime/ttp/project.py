@@ -505,7 +505,8 @@ EXTRA_KEYS = {
     "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs", "hourly_coordinator_usd",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
-    # blocker_sweep_h, blocker_sweep_min_gap_h, review_backlog_h: the blocker sweep's timing (sweep.py).
+    # blocker_sweep_h, blocker_sweep_min_gap_h, review_backlog_h: the blocker sweep's timing (sweep.py);
+    # blocker_sweep_recheck_skip_h: how soon after a model sweep a due re-check may skip model-free (sweepskip.py; 6).
     # user_pause_marker: regex for the marker file a user-pause probe tests for (userpause.py; default `user-*`).
     # promise_default_h: when a chat promise that names no time is due (obligations.py; default 6).
     # mitigation_due_h: when a live-impact mitigation is due after it is filed (mitigate.py; default 4, 0 off).
@@ -523,7 +524,7 @@ EXTRA_KEYS = {
     # budget and timeout), "host_access" ({alias: helper argv in the project folder | ssh config file
     # there}, default none) and "log_paths" ({name: absolute path} `ttp hostcheck log-tail` may read).
     "coordinator": {"session", "agent_orders_as_user", "max_review_tasks_per_day", "charter_approval_days", "approval_lookback_days", "reask_window_days", "blocker_sweep_h", "blocker_sweep_min_gap_h",
-                    "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
+                    "blocker_sweep_recheck_skip_h", "review_backlog_h", "user_pause_marker", "promise_default_h", "mitigation_due_h", "course_check",
                     "progress_check", "probe_stall_dispose_h", "echo_paths",
                     "reply_terms", "reply_max_terms", "reply_soft_chars"},   # plain-reply check (plainreply.py)
     # hold_s: how long a worker's normal notify from a blocked, waiting, failed or needs_review run waits

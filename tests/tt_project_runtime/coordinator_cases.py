@@ -16235,6 +16235,82 @@ def test_blocker_sweep_skip_still_turns_on_a_real_change_and_names_it(env, monke
     assert eid and recs == [], f"{case}: a model sweep, no receipt"
 
 
+def _recheck_sweep(p, monkeypatch):
+    """_held_sweep, then a turn's outcome asks to re-check the until-blocked task 2 h after the model sweep at
+    T0; returns the fixture and T1, a minute after that re-check came due (well within the 6-h floor)."""
+    from ttp import sweep
+    d, db, t0, at, run, ids = _held_sweep(p, monkeypatch)
+    sweep.record(db, {"id": ids["until"], "outcome": "still_blocked", "until": "the window opens",
+                      "until_probe": "test -e out/window"}, t0 + 2 * 3600, t0 + 30)
+    return d, db, t0, at, run, ids, t0 + 2 * 3600 + 60
+
+
+def test_blocker_sweep_due_only_by_a_recheck_skips_within_the_floor_and_turns_once_past_it(env, monkeypatch):
+    """A re-check that comes due with every item as it was and the model sweep under 6 h old writes a receipt
+    and runs no turn; the receipt carries the re-check on, so the next sweep due once the model sweep is 6 h
+    old runs a turn for it, and the model sweep clears it."""
+    from ttp import sweep, sweepskip
+    p = make(env)
+    d, db, t0, at, run, ids, t1 = _recheck_sweep(p, monkeypatch)
+    at(t1)
+    assert (sweep.due(db, d.cfg, t1) or "").startswith(f"next check due: task:{ids['until']}")
+    eid, recs = run(t1)
+    assert eid is None, "due only by time, every item unchanged, the model sweep 2 h old: no turn"
+    [rec] = recs
+    assert rec["model"] == t0 and rec["why"].startswith("next check due")
+    last = db.kv(sweepskip.LAST_KEY)
+    assert last["ts"] == t1 and last["rechecks"] == [f"next check due: task:{ids['until']}"]
+    # The next interval sweep (6 h after the receipt) finds the model sweep past the floor: a turn.
+    t2 = t1 + 6 * 3600 + 60
+    at(t2)
+    got = sweepskip.check(db, d.cfg, sweep.items(db, t2, d.cfg), t2, d._probe_rc.get)
+    assert not got["skip"] and "next check due" in got["why"] and "6 h old" in got["why"], got["why"]
+    eid, recs = run(t2)
+    assert eid and len(recs) == 1 and db.kv(sweepskip.MODEL_KEY)["ts"] == t2
+    assert db.kv(sweepskip.LAST_KEY)["rechecks"] == [], "the model sweep judged the re-check"
+
+
+def _recheck_turn(case, d, db, t1, ids):
+    if case == "changed item":
+        db.update_task(ids["until"], blocked_reason="the lab window moved")
+    elif case == "new event":
+        db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+             (t1 - 60, "daemon", "task_failed", "normal", "#9 failed", "queued"))
+    elif case == "model sweep past the floor":
+        d.cfg.setdefault("coordinator", {})["blocker_sweep_recheck_skip_h"] = 1
+    elif case == "floor off":
+        d.cfg.setdefault("coordinator", {})["blocker_sweep_recheck_skip_h"] = 0
+    elif case == "updated time moved":
+        db.x("UPDATE tasks SET updated=? WHERE id=?", (t1 - 30, ids["waiting"]))
+    elif case == "probe exit code changed":
+        d._probe_rc[ids["waiting"]] = (75, t1 - 60, "test -e out/w")
+    elif case == "no stamps on record":
+        db.x("DELETE FROM kv WHERE key=?", ("blocker_sweep_last",))
+
+
+@pytest.mark.parametrize("case, why", [
+    ("changed item", "items changed"), ("new event", "another event needs a turn"),
+    ("model sweep past the floor", "the last model sweep is 1 h old"),
+    ("floor off", "the last model sweep is 0 h old"),
+    ("updated time moved", "re-written since the last sweep: task:"),
+    ("probe exit code changed", "re-written since the last sweep: task:"),
+    ("no stamps on record", "no item stamps on record"),
+])
+def test_blocker_sweep_due_by_a_recheck_still_turns_on_any_change_or_past_the_floor(env, monkeypatch, case, why):
+    """From a re-check that skips, a changed item, a new event, a model sweep older than the floor (or the floor
+    off), an item re-written or re-probed since the last sweep, or no stamps on record queues the model sweep."""
+    from ttp import sweep, sweepskip
+    p = make(env)
+    d, db, t0, at, run, ids, t1 = _recheck_sweep(p, monkeypatch)
+    at(t1)
+    assert sweepskip.check(db, d.cfg, sweep.items(db, t1, d.cfg), t1, d._probe_rc.get)["skip"], "the control skips"
+    _recheck_turn(case, d, db, t1, ids)
+    got = sweepskip.check(db, d.cfg, sweep.items(db, t1, d.cfg), t1, d._probe_rc.get)
+    assert not got["skip"] and why in got["why"], got["why"]
+    eid, recs = run()
+    assert eid and recs == [], f"{case}: a model sweep, no receipt"
+
+
 def test_task_add_of_a_review_of_an_accepted_head_is_refused_unless_forced_with_a_reason(env, monkeypatch):
     from ttp import coordinator as coord, reviewreuse
     p = make(env)

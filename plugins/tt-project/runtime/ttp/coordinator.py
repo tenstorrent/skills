@@ -26,7 +26,6 @@ from zoneinfo import ZoneInfo
 
 from . import budget as bud, locks
 from . import (   # one name per line: two changes adding names merge without a conflict
-    ackwait,
     anchors,
     askauto,
     askrethink,
@@ -57,6 +56,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     forbidden,
     gitmemo,
     heal,
+    heldwait,
     hostcycle,
     jevuse,
     landed,
@@ -4051,6 +4051,7 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
     waits_seen = dict(seen_before.get("waits") or {})
     # While the run-start breaker is open, runs that never started fold into its one alert.
     never_started = " AND COALESCE(note,'') NOT LIKE '%\"never_started\": true%'" if startbreaker.is_open(db) else ""
+    held_paused, held_outages = heldwait.state(db, now)
     for t in db.q("SELECT DISTINCT task FROM events WHERE task IS NOT NULL AND ts>?", (last,)):
         fails = db.one("SELECT COUNT(*) n FROM runs WHERE task=? AND role!='coordinator' AND ended>? AND status IN "
                        f"({','.join('?' * len(machines.BAD_RUNS))}) AND COALESCE(note,'') NOT LIKE '%lost_to_reboot%'"
@@ -4058,9 +4059,9 @@ def effort_triggers(db, cfg: dict, event_ids: list[int], wake_due: str | None,
             db.one("SELECT COUNT(*) n FROM events WHERE task=? AND kind='task_failed' AND ts>?", (t["task"], since))["n"]
         if fails_at and fails >= fails_at:
             add("repeated failures")
-        # A reply wait whose peer is recovering is not judged until the peer can act again.
-        if not ackwait.peer_recovering(load_result((db.task(t["task"]) or {}).get("result")).get("retry_when"),
-                                       cfg, harness)[0] \
+        # A wait held elsewhere (the user, a recovering or listed peer, another project's known outage) is
+        # not judged until it is held here again: no turn can move it (heldwait.py).
+        if not heldwait.why(db, cfg, db.task(t["task"]), harness, now, held_paused, held_outages) \
                 and wait_raises(db, t["task"], waits_seen, waits_at, now, live_max(cfg)):
             add("repeated waits")
     seen["waits"] = {k: v for k, v in waits_seen.items()   # a finished task's waits are over

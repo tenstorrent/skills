@@ -22,14 +22,20 @@ without a turn (end()):
 The turn is skipped only when every item has such an end, the items and each one's status, spec,
 reason and end are what they were at the last sweep a turn ran (MODEL_KEY; less the times the daemon
 re-writes when it puts a task back to sleep, _parts), that sweep was less than MAX_AGE_H ago, and
-nothing else needs a turn: no signal() request pending, no re-check a sweep outcome asked for came due
-(its `next` or the daily re-check, which the receipt's clock would otherwise pass), no inbound message
+nothing else needs a turn: no signal() request pending, no inbound message
 unhandled, no other queued event but routine ones (quietgate.routine_kinds), no task pushing past
 coordinator.review_backlog_h, no loop and no ask held past ask_rethink_h. A new or changed item (a pause:
 its reason, `until` or `end_when`), a broken or stale probe, a deferral past defer_max_days, a pause the
 coordinator set with none of those ends or past its end, a dependency or probe task that failed, was
 cancelled or does not exist, a review past its expected time, or an item with no model-free end starts
 the sweep turn as before; its reason names the items changed and their fields.
+
+A re-check a sweep outcome asked for (its `next` or the daily re-check) that came due is a sweep due only by
+time: a receipt stands in for its turn only while the last model sweep is less than
+coordinator.blocker_sweep_recheck_skip_h (RECHECK_SKIP_H, 6; 0: never) old and each item's stamp (_stamp: its
+updated time, its probe and that probe's last exit code) is what it was at the last sweep, a turn or a skip
+(LAST_KEY). The receipt carries the re-check on, so once the model sweep is that old the next sweep due runs a
+turn for it (the charter's high-effort re-evaluation at least every 6 hours).
 
 A skip writes a receipt (RECEIPTS_KEY: each item and what ends it, with the estimated saving, the
 quiet gate's mean coordinator turn) and sets sweep.STATE_KEY `receipt`, which the sweep's clock counts
@@ -49,7 +55,9 @@ from .db import DB, dependency_ids, deferral, load_result
 
 MODEL_KEY = "blocker_sweep_model"        # kv: {ts, n, fps: {key: fp}, parts: {key: {field: h}}}: the last sweep a turn ran
 RECEIPTS_KEY = "blocker_sweep_receipts"  # kv: [{ts, model, why, items: [[key, end]], usd}]
+LAST_KEY = "blocker_sweep_last"         # kv: {ts, stamps: {key: h}, rechecks: [line]}: the last sweep, a turn or a skip
 MAX_AGE_H = 24.0
+RECHECK_SKIP_H = 6.0   # coordinator.blocker_sweep_recheck_skip_h: a due re-check skips only this soon after a model sweep
 KEEP_S = 8 * 86400
 DEFER_MAX_DAYS = 14.0
 MAX_HOLD_S = 6 * 3600.0
@@ -208,6 +216,33 @@ def _fp(db: DB, i: dict, e: str | None, paused: dict | None = None) -> str:
     return _h([i["key"], *_parts(db, i, e, paused).values()])
 
 
+def _stamp(i: dict, probe_of: Probe) -> str:
+    """What a re-check skip also needs unchanged since the last sweep (turn or skip): the item's updated time
+    and its probe with its last exit code (a start_when watch, or the task's last probe answer)."""
+    w = i.get("watch") or {}
+    got = probe_of(i["task"]) if i.get("task") else None
+    got = [got[0], got[2]] if isinstance(got, (tuple, list)) and len(got) >= 3 else None
+    return _h([i.get("updated"), w.get("probe"), w.get("rc"), got])
+
+
+def _recheck(cfg: dict, model: dict, last: dict, stamps: dict, due: list[str], now: float) -> list[str]:
+    """Why a re-check a turn asked for still needs a turn ([] when a receipt may stand in for it): one came due
+    since the clock or a re-check skip carried one, and the last model sweep is RECHECK_SKIP_H old or more, or an
+    item's stamp (_stamp) differs from the last sweep's (or none is on record)."""
+    held = [str(x) for x in (last.get("rechecks") or [])] if _f(last.get("ts"), 0) >= _f(model.get("ts"), 0) else []
+    lines = due + [x for x in held if x not in due]
+    if not lines:
+        return []
+    floor = _f((cfg.get("coordinator") or {}).get("blocker_sweep_recheck_skip_h"), RECHECK_SKIP_H)
+    if floor <= 0 or now - _f(model.get("ts"), 0) >= floor * 3600:
+        return [f"{lines[0]} (the last model sweep is {floor:g} h old)"]
+    was = last.get("stamps")
+    if not isinstance(was, dict):
+        return [f"{lines[0]} (no item stamps on record)"]
+    moved = sorted(k for k in stamps if was.get(k) != stamps[k]) + sorted(k for k in was.keys() - stamps.keys())
+    return [f"{lines[0]} (re-written since the last sweep: {', '.join(moved[:5])})"] if moved else []
+
+
 def _changed(model: dict, fps: dict, parts: dict) -> list[str]:
     """What changed since the model sweep: "key field/field" for a changed item (the key alone when the model
     sweep kept no fields), "+key" for a new one, "-key" for one gone."""
@@ -230,9 +265,14 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
     got = {i["key"]: end(db, cfg, i, now, probe_of, asks, paused, project) for i in live}
     parts = {i["key"]: {f: _h(v) for f, v in _parts(db, i, got[i["key"]], paused).items()} for i in live}
     fps = {i["key"]: _fp(db, i, got[i["key"]], paused) for i in live}
-    out = {"skip": False, "why": "", "ends": got, "fps": fps, "parts": parts}
+    stamps = {i["key"]: _stamp(i, probe_of or (lambda _tid: None)) for i in live}
     model = db.kv(MODEL_KEY) or {}
+    model = model if isinstance(model, dict) else {}
+    last = db.kv(LAST_KEY) or {}
+    last = last if isinstance(last, dict) else {}
     state = db.kv(sweep.STATE_KEY, {}) or {}
+    due = [s for s in sweep._signals(db, state, live, now) if s.startswith(RECHECKS)]
+    out = {"skip": False, "why": "", "ends": got, "fps": fps, "parts": parts, "stamps": stamps, "rechecks": due}
     prev = state.get("items") or {}
     backlog = _f((cfg.get("coordinator") or {}).get("review_backlog_h"), sweep.REVIEW_BACKLOG_H) * 3600
     routine = sorted(quietgate.routine_kinds(cfg))
@@ -242,9 +282,10 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
         (lambda: now - _f(model.get("ts"), 0) >= MAX_AGE_H * 3600, "the last model sweep is 24 h old"),
         (lambda: _changed(model, fps, parts), "items changed: {}"),
         (lambda: bool(db.kv(sweep.SIGNAL_KEY, [])), "a signal is pending"),
-        # A re-check a turn asked for (an outcome's `next`, a daily re-check) came due since the clock:
-        # a receipt would move the clock past it and lose it.
-        (lambda: [s for s in sweep._signals(db, state, live, now) if s.startswith(RECHECKS)], "{}"),
+        # A re-check a turn asked for (an outcome's `next`, a daily re-check) came due since the clock, or an
+        # earlier re-check skip carried one: a receipt stands in for it only soon after a model sweep, with every
+        # item as it was at the last sweep; the receipt carries it on (LAST_KEY) until a model sweep judges it.
+        (lambda: _recheck(cfg, model, last, stamps, due, now), "{}"),
         (lambda: db.one("SELECT id FROM messages WHERE direction='in' AND handled=0 LIMIT 1"), "a message waits"),
         (lambda: db.one(f"SELECT id FROM events WHERE status='queued' AND kind NOT IN "
                         f"({','.join('?' * (len(routine) + 1))}) LIMIT 1", (sweep.SWEEP_KIND, *routine)),
@@ -266,7 +307,9 @@ def check(db: DB, cfg: dict, live: list[dict], now: float, probe_of: Probe | Non
 def swept(db: DB, got: dict, now: float) -> None:
     """A sweep turn was queued: what later skips must match."""
     n = int((db.kv(sweep.STATE_KEY, {}) or {}).get("n") or 0)
-    db.set_kv(MODEL_KEY, {"ts": now, "n": n, "fps": got["fps"], "parts": got.get("parts") or {}})
+    with db.tx():
+        db.set_kv(MODEL_KEY, {"ts": now, "n": n, "fps": got["fps"], "parts": got.get("parts") or {}})
+        db.set_kv(LAST_KEY, {"ts": now, "stamps": got.get("stamps") or {}, "rechecks": []})
 
 
 def skip(db: DB, got: dict, why: str, now: float) -> dict:
@@ -274,9 +317,14 @@ def skip(db: DB, got: dict, why: str, now: float) -> dict:
     model = db.kv(MODEL_KEY) or {}
     rec = {"ts": now, "model": _f(model.get("ts"), 0), "why": sweep._clip(why, 200),
            "items": [[k, e] for k, e in sorted(got["ends"].items())], "usd": quietgate._turn_usd(db)}
+    last = db.kv(LAST_KEY) or {}
+    held = [str(x) for x in (last.get("rechecks") or [])] \
+        if isinstance(last, dict) and _f(last.get("ts"), 0) >= _f(model.get("ts"), 0) else []
     with db.tx():
         keep = [r for r in (db.kv(RECEIPTS_KEY) or []) if isinstance(r, dict) and now - _f(r.get("ts"), 0) < KEEP_S]
         db.set_kv(RECEIPTS_KEY, keep + [rec])
+        db.set_kv(LAST_KEY, {"ts": now, "stamps": got.get("stamps") or {},
+                             "rechecks": held + [x for x in got.get("rechecks") or [] if x not in held]})
         db.set_kv(sweep.STATE_KEY, {**(db.kv(sweep.STATE_KEY, {}) or {}), "receipt": now})
     return rec
 
