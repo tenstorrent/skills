@@ -183,7 +183,7 @@
       "destination": "skills/multichip/SKILL.md",
       "blob": "664b6e6b1383d948226185bfa7ba139b9ff1c9b2",
       "source_sha256": "a7430e0f96204dfcd0b70aa689ee88d8ddf61e37a9260ffdfae6ca799f6e6494",
-      "packaged_sha256": "fa962dbedf9ad2772c3ef56205f08cf354861c6d22336c9e4cbf53199ffa0a5e"
+      "packaged_sha256": "b0c77f3f567c5b1bed4859d918f9572b12203761731c001281678d23d01eb99f"
     },
     {
       "source": ".agents/skills/multichip/agents/openai.yaml",
@@ -274,7 +274,7 @@
       "destination": "skills/vllm-integration/SKILL.md",
       "blob": "05d9e19f7cfbb596d209c504cc49e063b9361da1",
       "source_sha256": "a23a516ab0e8afc3a5dd6ddd72a42781997fb454872139e70605ecbd234e114c",
-      "packaged_sha256": "5ee2281885d545ebeee88ec8ad066b841baa3c36f9d11520552fcccb0b9f5d8e"
+      "packaged_sha256": "5c3e2de754229d9a5376f5cdf1937be5c49d57e7ae8f7db862429e0ed210fa4b"
     },
     {
       "source": ".agents/skills/vllm-integration/agents/openai.yaml",

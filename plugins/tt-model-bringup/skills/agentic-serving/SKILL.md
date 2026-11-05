@@ -162,8 +162,9 @@ Record `planned_clients` for every run before it starts: how many agents it runs
 - Choose only among the batches the model supports: `validated_batches` from stage 10. When a
   validated batch has no measured per-user rate, measure it with a short serving run before
   choosing it, or choose among the measured ones and say so.
-- The adapter serves one batch per server. A run on another batch needs its own server: restart
-  for it rather than serve a small run on the largest batch.
+- When the adapter declares `tt_supported_decode_batch_sizes`, one server pads each decode step
+  only to the smallest captured bucket that holds the live rows. Otherwise it pads every step to
+  `max_num_seqs`: start a server at the chosen batch rather than serve a small run on the largest.
 
 Record the batch and `planned_clients` of each run in `serving_config.json`.
 

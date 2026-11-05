@@ -33,6 +33,21 @@ The report labels the profile, concurrent requests and server slots separately. 
 
 Use the run contract's server-control hook to prepare and record the largest configured server before accuracy, then step down through the remaining batches. Switching and warmup count toward the stage budget. Preserve ITL, end-to-end latency, percentiles, request throughput, completion counts and wall time in the report details.
 
+## Diagnose slow benchmarks and evals
+
+Before a long run, use a small representative subset to estimate wall time from measured TTFT,
+TPOT/tokens-per-user, input/output lengths, concurrency and sample count. For high input length,
+output length, batch or concurrency cases, passing is not sufficient: compare host-observed TTFT
+and token cadence with device prefill/decode intervals and check whether an unexamined optimization
+could materially shorten the run.
+
+If device time explains the wall time, return to the relevant prefill, decode, sampling or
+multi-device optimization. If it does not, measure queue wait, request scheduling, trace
+compilation/selection, synchronization, HTTP/client overhead, serialization, retries, timeouts and
+eval-framework or task-environment setup. Fix the dominant overhead and repeat the small probe
+before committing the stage budget to the full workload. Keep first-use and warmed measurements
+separate, and do not shorten valid inputs or outputs to make the run finish.
+
 ## Deliver the report
 
 The runner writes the single final report at `doc/benchmark/run/REPORT.md`, with results and reference links at the top and supporting measurements below. Keep `identity.json` and `RUN_NOTES.md` in `doc/benchmark/`; the runner retains its configuration, manifest, raw outputs and summary under `run/`.

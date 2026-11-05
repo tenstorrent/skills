@@ -347,5 +347,5 @@ configuration and must not be recorded as one. Tune batch 1 first, then the larg
 any in between.
 
 Record any batch the device cannot hold, with the reason. Later stages measure every validated
-batch and run the full evals on the largest, so an unrecorded
-drop silently moves where the scores come from.
+batch and choose among them per run, so an unrecorded drop silently changes which batch a run can
+use.
