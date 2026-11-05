@@ -406,7 +406,7 @@ def test_release_needs_a_rehearsal_and_a_projection_that_fits(tmp_path, mode, re
     assert code == 2 and message in stderr
 
 
-def test_full_mode_projects_each_suite_against_release_hours(tmp_path):
+def test_full_mode_projects_each_suite_against_run_timeout_hours(tmp_path):
     plan = {'mode': 'full', 'schedule': [{}],
             'release': {'rehearsal': ['runs/r'], 'projected_hours': {'swe': 11.5, 'terminal': 9}}}
     goal12(tmp_path, **{'plan.json': plan})
@@ -454,3 +454,11 @@ def test_vllm_stage_does_not_require_the_stage_10_measurements(tmp_path):
     data = evidence()
     del data['serving']['prefill_by_length'], data['serving']['host_contention']
     assert check(tmp_path, 'vllm', data) == (0, '')
+
+
+def test_growing_contexts_without_prefix_caching_records_load_only(tmp_path):
+    data = evidence()
+    data['serving'].update(prefix_caching=False, reason='recurrent_state: state not recoverable from KV blocks')
+    del data['serving']['growing_contexts']['late_hit_fraction']
+    code, stderr = check(tmp_path, 'vllm', data)
+    assert code == 1 and 'recurrent_state' in stderr and 'growing_contexts' not in stderr

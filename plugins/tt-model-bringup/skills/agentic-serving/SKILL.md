@@ -68,7 +68,8 @@ fixed-shape benchmarks. Record them under `serving` in stages 09 and 10.
   that shape. Record `concurrency`, `final_context_tokens`, `preemptions`, prefilled tokens against
   the conversations' final context tokens, and `late_hit_fraction`: the hit fraction over the last
   quarter of requests, when contexts are largest. It should hold 0.9 like the whole-run fraction;
-  a cache that works for short contexts and fails as they grow shows only here.
+  a cache that works for short contexts and fails as they grow shows only here. With prefix caching
+  off by a documented exclusion, record the same load without the hit fractions.
 
 Stage 10 also records two measurements that goal 12 prices; neither has a pass bar:
 
@@ -217,7 +218,8 @@ Record `planned_clients` for every run before it starts: how many agents it runs
   only to the smallest captured bucket that holds the live rows. Otherwise it pads every step to
   `max_num_seqs`: start a server at the chosen batch rather than serve a small run on the largest.
 
-Record the batch and `planned_clients` of each run in `serving_config.json`.
+Record the batch and `planned_clients` of each run in `serving_config.json`; with decode buckets,
+the batch is the bucket the run's agents fill, next to the server's `max_num_seqs`.
 
 ### Task lists
 

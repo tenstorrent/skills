@@ -85,7 +85,7 @@ def check_serving(evidence: dict, stage: str, problems: list) -> None:
         elif fraction < MIN_HIT_FRACTION:
             reason = serving.get("reason") or ("live conversations exceeded the pool" if serving.get("pool_bound") else None)
             shortfall(problems, reason, f"cache reuse is {fraction:.0%} of the reusable ceiling")
-    check_growing_contexts(evidence, serving.get("growing_contexts"), problems)
+    check_growing_contexts(evidence, serving.get("growing_contexts"), serving.get("prefix_caching") is True, problems)
     if stage == "optimized-vllm":
         for key in ("prefill_by_length", "host_contention"):
             if not isinstance(serving.get(key), dict) or not serving[key]:
@@ -97,18 +97,19 @@ def check_serving(evidence: dict, stage: str, problems: list) -> None:
         shortfall(problems, serving.get("trace_reason"), f"traces rebuilt per request after warm-up: {traces}")
 
 
-def check_growing_contexts(evidence: dict, row, problems: list) -> None:
+def check_growing_contexts(evidence: dict, row, caching: bool, problems: list) -> None:
+    """Load that grows to the working set. Hit fractions apply only when prefix caching is on."""
     workload = evidence.get("workload") or {}
-    keys = ("concurrency", "final_context_tokens", "late_hit_fraction")
+    keys = ("concurrency", "final_context_tokens") + (("late_hit_fraction",) if caching else ())
     if not (isinstance(row, dict) and all(isinstance(row.get(key), (int, float)) for key in keys)):
-        problems.append((2, "serving.growing_contexts needs concurrency, final_context_tokens and late_hit_fraction "
-                            "from conversations growing to the working set"))
+        problems.append((2, f"serving.growing_contexts needs {', '.join(keys)} from conversations growing to the "
+                            "working set"))
         return
     reason = row.get("reason")
     if row["concurrency"] < workload.get("target_concurrency", 0) or \
             row["final_context_tokens"] < workload.get("working_set_tokens", 0):
         shortfall(problems, reason, "growing-context traffic stayed below the target concurrency or working set")
-    if row["late_hit_fraction"] < MIN_HIT_FRACTION:
+    if caching and row["late_hit_fraction"] < MIN_HIT_FRACTION:
         shortfall(problems, reason or ("live conversations exceeded the pool" if row.get("pool_bound") else None),
                   f"cache reuse fell to {row['late_hit_fraction']:.0%} as contexts grew")
 
