@@ -22,10 +22,12 @@ MIN_HIT_FRACTION = 0.9
 SURVEY_CHECKS = ("time_split", "busy_rows", "live_prefill_rows", "trace_captures", "served_step", "prefix_hits",
                  "cache_pressure", "cache_bytes", "memory_headroom", "cutoffs", "eval_validity", "accuracy_drift",
                  "generation_share", "prefill_under_load", "host_contention")
-SURVEY_CALCULATIONS = ("batch", "agents", "suite_hours", "cohort", "agent_timeout", "output_cap", "bytes",
+SURVEY_CALCULATIONS = ("batch", "agents", "suite_hours", "task_lists", "agent_timeout", "output_cap", "bytes",
                        "cache_agents", "block_cost", "prefill_padding")
 PREFLIGHT = ("release_values", "registry", "disk", "admission", "release_route", "isolation_smoke")
 LEARNED = ("harness_facts", "suite_timings", "generic_fixes")
+LIST_SOURCES = ("inputs", "harness", "default_rule")
+TARGETS = ("nightly", "full_load", "full")
 EFFORT_STATUS = ("done", "running", "not_run")
 CHANGES = ("kept", "dropped", "none")
 PROBLEM_STATUS = ("solved", "open")
@@ -229,8 +231,11 @@ def check_cohorts(evals: Path, problems: list) -> None:
     if not cohorts:
         return
     for name, row in cohorts.items():
-        if not (isinstance(row, dict) and row.get("rule") and row.get("tasks")):
-            problems.append((2, f"cohorts.json {name!r} needs the selection rule and its tasks"))
+        rungs = row.get("rungs") if isinstance(row, dict) else None
+        if not (row.get("source") in LIST_SOURCES and row.get("rule") and isinstance(rungs, dict) and rungs
+                and all(isinstance(tasks, list) and tasks for tasks in rungs.values())):
+            problems.append((2, f"cohorts.json {name!r} needs source ({', '.join(LIST_SOURCES)}), the selection rule "
+                                "and the tasks of each rung"))
 
 
 def check_evals(model_dir: Path, carried: int, problems: list) -> None:
@@ -243,6 +248,9 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
     check_efforts(evals, problems)
     check_serving_config(evals, problems)
     check_cohorts(evals, problems)
+    plan = read(evals / "plan.json", problems) if (evals / "plan.json").is_file() else {}
+    if plan is not None and (evals / "plan.json").is_file() and plan.get("target") not in TARGETS:
+        problems.append((2, f"plan.json needs target ({', '.join(TARGETS)})"))
     learned = read(evals / "learned.json", problems)
     if learned and not all(isinstance(learned.get(key), list) for key in LEARNED):
         problems.append((2, f"learned.json needs {', '.join(LEARNED)} as lists, empty when there is nothing"))

@@ -87,8 +87,12 @@ minute).
 
 Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the target checkout:
 
-- evals: default `r1_gpqa_diamond`, `swe_bench_verified` and `terminal_bench_2_1`, scored on
-  cohorts chosen as [Cohorts](#cohorts) says;
+- evals: default `r1_gpqa_diamond`, `swe_bench_verified` and `terminal_bench_2_1`;
+- `target`: where the stage ends, see [Stage order](#stage-order). `nightly` stops once the
+  nightly task lists score; `full_load` (default) adds one run per suite that fills a server;
+  `full` goes on to the full suites;
+- `task_lists`, optional: task names per eval and rung, replacing the lists
+  [Task lists](#task-lists) would choose;
 - `batch_sizes`, see [Decode batches](#decode-batches): stage 10 validates a tuned configuration
   per batch and stage 11 measures a profile for each surviving one;
 - `release_spec`, optional: where the release values come from. Without it, find the release
@@ -99,7 +103,8 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - `permissions`: standing decisions the stage would otherwise stop to ask for, such as
   `release_route_repairs` (may the stage publish fixes to the release route) and
   `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
-- reference scores;
+- reference scores per eval. Without one, look for a published score for this model; when there is
+  none, the suite grades NA and the report says so;
 - the eval harness: default the tt-inference-server agentic runner on its main branch;
 - `compute`.
 
@@ -129,6 +134,24 @@ whose trajectory fetched its fix or reached the network is quarantined, not scor
 
 A real harness defect is fixed on a generic branch named for the defect, not the model, and listed
 in `learned.json` so the next model finds it.
+
+### Models new to the harness
+
+The stage must work for a model tt-inference-server does not know yet. When the model has no entry,
+the stage adds what serving and scoring it needs, as one commit on the harness branch the compute
+grant publishes, and runs the preflight smoke from that commit. Read the current harness for where
+each part lives; on the runs so far it was:
+
+- the implementation spec (`workflows/model_spec.py`) and the device entry
+  (`workflows/model_specs/*/llm.yaml`) with the serving values the stage chose: `max_num_seqs`,
+  block sizes and count, prefill threshold, prefix caching, model overrides;
+- the eval entries (`reference_config/evals/eval_config.py`): the nightly task list per eval from
+  [Task lists](#task-lists), limits at the release values, and concurrent trials from
+  [Batch and agents](#batch-and-agents);
+- the reference score per eval, or none;
+- any new config file force-added, since the harness ignores `*.json`.
+
+Change only these entries. This commit is the release spec that `serving_config.json` describes.
 
 ### Eval settings
 
@@ -161,56 +184,84 @@ Record `planned_clients` for every run before it starts: how many agents it runs
 - Predict with the measured generation share, not the rate ratio alone. Gemma's per-user rates
   promised 3.3× for SWE at batch 8 against 32; wall time fell 8% because generation was under half
   of agent time. Batch 8 still scored 17 of 32 against 15 with no timeout kills.
+- Choose only among the batches the model supports: `validated_batches` from stage 10. When a
+  validated batch has no measured per-user rate, measure it with a short serving run before
+  choosing it, or choose among the measured ones and say so.
 - The adapter serves one batch per server. A run on another batch needs its own server: restart
   for it rather than serve a small run on the largest batch.
 
 Record the batch and `planned_clients` of each run in `serving_config.json`.
 
-### Cohorts
+### Task lists
 
-A cohort is the task set a rung scores. Choose it by rule before any score is seen, and record the
-rule and the task names in `cohorts.json`.
+Each eval runs a growing series of task lists, one per rung. Choose each list before any score on
+it is seen, and record the tasks, the rule and the source in `cohorts.json`.
 
-- **Representative.** Start from the harness's own CI subset for the eval (main's `ci-nightly`
-  list), then fill round-robin across the eval's strata (repositories for SWE-bench, categories
-  for Terminal-Bench) so every stratum appears. Never take a prefix of a sorted list:
-  `sorted(all500)[:32]` is 22 astropy and 10 django, two repositories of twelve.
-- **Sized by the server, read with its error.** The first full cohort has as many tasks as the
-  server holds agents. Report every score with its 95% interval, about ±2·√(p(1−p)/n): ±17 points
-  at 32 tasks, ±44 at 5. Separating the model from a reference by d needs about 4·p(1−p)/d² tasks;
-  say when a cohort cannot.
-- **Aggregates, not single tasks.** The same task's duration moved 0.08× to 15× between two runs.
-  Conclude from score, suite wall and total agent time, or from repeated attempts; never rank work
-  from one run's per-task times.
-- **Shape follows the claim.** Concurrency needs enough simultaneous conversations to load the pool
-  and scheduler, precision and long context need long free-running replies, caching needs repeated
-  multi-turn traffic. Real trajectories through the replay test show capacity; short synthetic
-  32-agent tests did not.
+Where a list comes from, first match wins, per eval and rung:
+
+1. `task_lists` in `inputs.json`;
+2. the model's own lists in tt-inference-server, for the nightly rung (its `ci-nightly` list);
+3. the default rule below.
+
+**Default rule.** Take the eval's full task list at the pinned dataset commit. Group tasks by
+stratum (repository for SWE-bench, category for Terminal-Bench, none for GPQA) and order each group
+by a hash of the task name with a fixed seed. Then take one task from each group in turn, groups in
+name order. Every list is the start of the same sequence, so each rung extends the one before it
+and two runs pick the same tasks. A task already scored on the current configuration is not run
+again. When the harness does not expose Terminal-Bench categories, use one group and say so.
+
+| Rung | GPQA Diamond | SWE-bench Verified | Terminal-Bench | Size set by |
+|---|---|---|---|---|
+| smoke | 2 | 2 | 2 | fixed |
+| nightly | 10 | 5 | 10 | fixed, the sizes main runs nightly |
+| full load | agents per server | agents per server | agents per server | the agent, from [Batch and agents](#batch-and-agents) |
+| larger | — | multiples of full load, or 100 to project 500 | multiples of full load | the agent, from the target and the budget |
+| full suite | 198 | 500 | 89 | fixed |
+
+Never take a prefix of a sorted list: `sorted(all500)[:32]` is 22 astropy and 10 django, two
+repositories of twelve.
+
+**Read every score with its error.** Report the 95% interval, about ±2·√(p(1−p)/n): ±17 points at
+32 tasks, ±44 at 5. Separating the model from a reference by d needs about 4·p(1−p)/d² tasks; say
+when a list cannot.
+
+**Aggregates, not single tasks.** The same task's duration moved 0.08× to 15× between two runs.
+Conclude from score, suite wall and total agent time, or from repeated attempts; never rank work
+from one run's per-task times.
+
+**Shape follows the claim.** Concurrency needs enough simultaneous conversations to load the pool
+and scheduler, precision and long context need long free-running replies, caching needs repeated
+multi-turn traffic. Real trajectories through the replay test show capacity; short synthetic
+32-agent tests did not.
 
 ### Stage order
 
-Each rung banks a result and the next is optional, so the stage always ends holding a working
-version. Dispatch on CI from the first hour, in parallel up to `max_parallel`.
+Test size grows one rung at a time, so each problem a larger run could hit shows on the smallest
+list that reveals it. A suite moves up a rung when it scored validly on the current one and the
+time measured there projects the next rung inside the budget left. The stage ends at its `target`,
+or earlier on a measured stop, and always holds the last rung it banked. Dispatch on CI from the
+first hour, in parallel up to `max_parallel`, one suite per runner.
 
 1. **Survey and preflight, about 2 h.** Answer every check and calculation in
    [the survey](references/survey.md) on the stage-11 data and one smoke run at release limits.
    The preflight proves the release values and their source, the registry, disk and admission
-   (cohort × declared task storage plus the admission reserve against free disk; concurrent trials
+   (tasks × declared task storage plus the admission reserve against free disk; concurrent trials
    against the host limit), the release route, and an isolated 2-task smoke with a trajectory
-   audit. Write `survey.json` and `preflight.json`, rank the problems found as
-   [Ranking](#ranking) says, and write the first go or stop estimate per eval to `estimate.json`.
-2. **Rung 0: two tasks per suite** on the stock harness and route, served on the batch the rule
-   picks for two agents. Each suite must produce a valid scored trajectory. A suite that cannot
-   becomes the first problem in the ranking.
-3. **Rung 1: one full cohort per suite**, dispatched as soon as rung 0 passes for that suite. This
-   is the stage's first deliverable: record `functional_at` and the measured suite hours, and
-   replace the suite-time prior with them.
-4. **Efforts, `effort_budget_hours`, hard stop**, ranked against the banked rung. They may start
-   once rung 0 is banked and run while rung 1 is on CI; a rung never waits for an effort.
-5. **Combine, about 2 h.** Re-check the current best, then one scored probe.
-6. **Rung 2 and release.** Larger cohorts, then the full suites, when the projection from the last
-   measured rung fits the budget left. Run them through the same workflow every earlier run used,
-   split on task boundaries so each dispatch finishes inside the grant's per-run timeout. An
+   audit. For a model new to the harness, it first adds the entries above. Write `survey.json` and
+   `preflight.json`, rank the problems found as [Ranking](#ranking) says, and write the first go or
+   stop estimate per eval to `estimate.json`.
+2. **Smoke rung: 2 tasks per suite** on the stock harness and route. Each suite must produce a valid
+   scored trajectory. A suite that cannot becomes the first problem in the ranking.
+3. **Nightly rung.** The first deliverable: the lists the release grades, scored against the
+   references. Record `functional_at`.
+4. **Full-load rung**, for target `full_load` or `full`: one run per suite that fills a server. It
+   measures suite time, agent capacity and the slow tail at real load; its time replaces the
+   suite-time prior.
+5. **Efforts, `effort_budget_hours`, hard stop**, ranked against the last banked rung. They start
+   once the smoke rung is banked and run while rungs are on CI; a rung never waits for an effort.
+6. **Combine, about 2 h.** Re-check the current best, then one scored probe.
+7. **Larger rungs and full suites**, for target `full`, through the same workflow every earlier run
+   used, split on task boundaries so each dispatch finishes inside the grant's per-run timeout. An
    infrastructure failure is re-dispatched; the release coordinator must allow that.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
@@ -284,7 +335,8 @@ Write these to `doc/agentic_evals/`:
 - `survey.json`: `checks`, `calculations` and `shortfalls`, as the survey reference names them
 - `preflight.json`: `release_values` (with their source), `registry`, `disk`, `admission`,
   `release_route` and `isolation_smoke`, each with `ok`
-- `cohorts.json`: per eval `rule` and `tasks` for each rung
+- `cohorts.json`: per eval `source` (`inputs`, `harness` or `default_rule`), `rule`, and `rungs`
+  mapping each rung run to its task names
 - `efforts.json`: `efforts`, each with `problem`, `owner`, `goal`, `plan`, `predicted`
   (`saving_hours` per eval, `device_hours`, `basis`: `measured`, `calculated` or `guess`),
   `unblocks` for a validity problem, `confirm` (`method`, `success`), `box_hours`, `re_estimate`
@@ -292,10 +344,10 @@ Write these to `doc/agentic_evals/`:
   `used_device_hours`, `change` (`kept`, `dropped`, `none`), `problem_status` (`solved`, `open`),
   `confirmed` and `evidence`; and `rankings`, each with `after`, `order` (`problem`,
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
-- `plan.json`
+- `plan.json`, with the `target`
 - `runs/<arm>/` (manifest and collected results)
-- `estimate.json`: per eval `decision` (`go` or `stop`), `reason` and `functional_at`, the largest
-  cohort that completed with valid scores
+- `estimate.json`: per eval `decision` (`go` or `stop`), `reason` and `functional_at`, the size of
+  the largest task list that completed with valid scores
 - `full/<eval>/results.json` with `actual_hours` next to the prediction
 - `serving_config.json`: the measured `max_concurrency`, `prefix_caching`, `max_num_seqs`,
   `validated_batches`, per run in `batch_by_eval` its `batch` and `planned_clients`, the agent and

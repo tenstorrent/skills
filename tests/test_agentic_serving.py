@@ -66,7 +66,7 @@ def test_shortfall_is_critical_without_a_reason_and_advisory_with_one(tmp_path, 
 CHECKS = ('time_split', 'busy_rows', 'live_prefill_rows', 'trace_captures', 'served_step', 'prefix_hits',
           'cache_pressure', 'cache_bytes', 'memory_headroom', 'cutoffs', 'eval_validity', 'accuracy_drift',
           'generation_share', 'prefill_under_load', 'host_contention')
-CALCULATIONS = ('batch', 'agents', 'suite_hours', 'cohort', 'agent_timeout', 'output_cap', 'bytes', 'cache_agents',
+CALCULATIONS = ('batch', 'agents', 'suite_hours', 'task_lists', 'agent_timeout', 'output_cap', 'bytes', 'cache_agents',
                 'block_cost', 'prefill_padding')
 PREFLIGHT = ('release_values', 'registry', 'disk', 'admission', 'release_route', 'isolation_smoke')
 
@@ -76,15 +76,15 @@ def goal12(model, **overrides):
     evals = model / 'doc/agentic_evals'
     (evals / 'full/swe').mkdir(parents=True, exist_ok=True)
     files = {
-        'plan.json': {},
+        'plan.json': {'target': 'full_load'},
         'REPORT.md': '# Report',
         'estimate.json': {'evals': {'swe': {'decision': 'go', 'reason': 'fits'}}},
         'full/swe/results.json': {'actual_hours': 6.5},
         'survey.json': {'checks': {k: {'value': 1, 'healthy': True} for k in CHECKS},
                         'calculations': {k: 1 for k in CALCULATIONS}, 'shortfalls': []},
         'preflight.json': {k: {'ok': True} for k in PREFLIGHT},
-        'cohorts.json': {'swe': {'rule': 'ci-nightly plus round-robin over repositories',
-                                 'tasks': ['astropy__astropy-14508', 'django__django-14034']}},
+        'cohorts.json': {'swe': {'source': 'default_rule', 'rule': 'hash order within repositories, round-robin',
+                                 'rungs': {'smoke': ['astropy__astropy-14508', 'django__django-14034']}}},
         'learned.json': {'harness_facts': [], 'suite_timings': [], 'generic_fixes': []},
         'efforts.json': {
             'efforts': [
@@ -275,10 +275,21 @@ def test_stop_with_a_banked_cohort_passes_and_without_one_is_advisory(tmp_path):
     assert code == 1 and 'no cohort completed' in stderr
 
 
-def test_cohort_needs_a_rule(tmp_path):
-    goal12(tmp_path, **{'cohorts.json': {'swe': {'tasks': ['a']}}})
+@pytest.mark.parametrize('row', [
+    {'source': 'default_rule', 'rungs': {'smoke': ['a']}},
+    {'source': 'guess', 'rule': 'r', 'rungs': {'smoke': ['a']}},
+    {'source': 'inputs', 'rule': 'r', 'rungs': {'smoke': []}},
+])
+def test_task_lists_need_source_rule_and_tasks(tmp_path, row):
+    goal12(tmp_path, **{'cohorts.json': {'swe': row}})
     code, stderr = check(tmp_path, 'agentic-evals', evidence())
     assert code == 2 and 'selection rule' in stderr
+
+
+def test_plan_needs_a_target(tmp_path):
+    goal12(tmp_path, **{'plan.json': {'target': 'everything'}})
+    code, stderr = check(tmp_path, 'agentic-evals', evidence())
+    assert code == 2 and 'target' in stderr
 
 
 def test_learned_needs_its_lists(tmp_path):
