@@ -859,6 +859,102 @@ def test_a_full_disk_never_lets_daemon_log_raise_and_the_failing_step_is_counted
     assert "dropped" not in (p.logs / "daemon.log").read_text().splitlines()[-1]
 
 
+def test_daemon_log_rotates_at_its_limit_keeping_one_old_copy(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "LOG_MAX_BYTES", 400)
+    monkeypatch.setattr(dmod, "_LOG_FAIL", {"t": float("-inf"), "n": 0})
+    for i in range(60):
+        dmod.log(p, f"line {i:03d} " + "x" * 30)
+    names = sorted(f.name for f in p.logs.iterdir() if f.name.startswith("daemon.log"))
+    assert names == ["daemon.log", "daemon.log.1"], names
+    cur, old = (p.logs / "daemon.log").read_text(), (p.logs / "daemon.log.1").read_text()
+    assert len(cur) < 400 + 60 and 400 <= len(old) < 400 + 60   # one line past the limit at most
+    assert cur.splitlines()[-1].endswith("line 059 " + "x" * 30)
+    numbers = [int(ln.split()[2]) for ln in (old + cur).splitlines()]
+    assert numbers == list(range(numbers[0], 60))   # nothing lost or doubled across the rotation
+
+
+def test_ttp_logs_reads_only_the_tail_and_spans_the_rotation(env, monkeypatch):
+    p = make(env)
+    from ttp import cli
+    p.logs.mkdir(parents=True, exist_ok=True)
+    (p.logs / "daemon.log.1").write_text("old 1\nold 2\nold 3\n")
+    (p.logs / "daemon.log").write_text("new 1\nnew 2\n")
+    assert cli.log_tail(p.logs, 18) == "old 2\nold 3\nnew 1\nnew 2\n"[-18:]
+    assert cli.log_tail(p.logs, 6) == "new 2\n"   # the current file alone covers it
+    assert cli.log_tail(p.logs, 10_000) == "old 1\nold 2\nold 3\nnew 1\nnew 2\n"
+    assert cli.log_tail(p.logs, 0) == ""
+    (p.logs / "daemon.log").unlink()   # just rotated, nothing written since
+    assert cli.log_tail(p.logs, 6) == "old 3\n"
+    (p.logs / "daemon.log.1").unlink()
+    assert cli.log_tail(p.logs, 6) is None
+    (p.logs / "daemon.log").write_bytes("é".encode() * 10)   # a cut inside a character drops its half
+    assert cli.log_tail(p.logs, 5) == "éé"
+    big = p.logs / "daemon.log"
+    big.write_bytes(b"y" * 1_000_000 + b"\nthe end\n")
+    monkeypatch.setattr(pathlib.Path, "read_text", lambda *a, **k: pytest.fail("read the whole file"))
+    monkeypatch.setattr(pathlib.Path, "read_bytes", lambda *a, **k: pytest.fail("read the whole file"))
+    assert cli.log_tail(p.logs, 8) == "the end\n"
+
+
+def test_daemon_log_rotation_failures_never_raise_and_drop_no_line_they_need_not(env, monkeypatch, capsys):
+    import errno
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "LOG_MAX_BYTES", 100)
+    monkeypatch.setattr(dmod, "_LOG_FAIL", {"t": float("-inf"), "n": 0})
+    p.logs.mkdir(parents=True, exist_ok=True)
+    log = p.logs / "daemon.log"
+    log.write_text("a" * 99 + "\n")
+    real_replace, real_open = os.replace, dmod.open_append
+
+    def no_rename(*a):
+        raise PermissionError(errno.EACCES, "denied")
+    monkeypatch.setattr(dmod.os, "replace", no_rename)   # the rename fails: the line goes to the current file
+    dmod.log(p, "kept in place")
+    assert log.read_text().endswith(" kept in place\n") and not (p.logs / "daemon.log.1").exists()
+    assert dmod._LOG_FAIL["n"] == 0
+    monkeypatch.setattr(dmod.os, "replace", real_replace)
+    opens = []
+
+    def full_after_rename(path, *a, **k):   # the rename works, the new file cannot be created
+        opens.append(path)
+        if len(opens) > 1:
+            raise OSError(errno.ENOSPC, "No space left on device", str(path))
+        return real_open(path, *a, **k)
+    monkeypatch.setattr(dmod, "open_append", full_after_rename)
+    dmod.log(p, "dropped")
+    assert dmod._LOG_FAIL["n"] == 1 and "daemon.log" in capsys.readouterr().err
+    assert (p.logs / "daemon.log.1").read_text().endswith(" kept in place\n") and not log.exists()
+    monkeypatch.setattr(dmod, "open_append", real_open)
+    dmod.log(p, "back")
+    lines = log.read_text().splitlines()
+    assert "1 line(s) dropped" in lines[0] and lines[1].endswith(" back"), lines
+    assert dmod._LOG_FAIL["n"] == 0
+
+
+def test_daemon_log_left_rotated_by_another_writer_is_not_rotated_again(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    monkeypatch.setattr(dmod, "LOG_MAX_BYTES", 100)
+    p.logs.mkdir(parents=True, exist_ok=True)
+    log, old = p.logs / "daemon.log", p.logs / "daemon.log.1"
+    log.write_text("b" * 199 + "\n")
+    real_open = dmod.open_append
+
+    def rotated_meanwhile(path, *a, **k):   # another process rotates between this open and the size check
+        f = real_open(path, *a, **k)
+        if not old.exists():
+            os.replace(log, old)
+            log.write_text("fresh\n")
+        return f
+    monkeypatch.setattr(dmod, "open_append", rotated_meanwhile)
+    dmod.log(p, "after")
+    assert old.read_text() == "b" * 199 + "\n"   # the other writer's old copy is kept
+    assert log.read_text().splitlines()[0] == "fresh" and log.read_text().endswith(" after\n")
+
+
 def _close_daemon_lock(d):
     if isinstance(getattr(d, "_lock_fd", None), int):
         os.close(d._lock_fd)   # the process ended: its lock with it

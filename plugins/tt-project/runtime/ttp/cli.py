@@ -8977,10 +8977,34 @@ def cmd_secret_env(a) -> None:
     sys.exit(128 - rc if rc < 0 else rc)
 
 
+def log_tail(logs: Path, n: int) -> str | None:
+    """The last `n` bytes of daemon.log, continued from the end of its rotated copy (daemon.LOG_OLD)
+    when the current file is shorter; None when neither exists. Reads only those bytes."""
+    out, seen = b"", []
+    for name in ("daemon.log", "daemon.log.1"):
+        want = max(n, 0) - len(out)
+        if seen and want <= 0:
+            break
+        try:
+            with open(logs / name, "rb") as f:
+                st = os.fstat(f.fileno())
+                if (st.st_dev, st.st_ino) in seen:   # rotated while read: that copy was read already
+                    break
+                seen.append((st.st_dev, st.st_ino))
+                if want > 0:
+                    f.seek(max(0, st.st_size - want))
+                    out = f.read(want) + out
+        except FileNotFoundError:
+            continue
+    if not seen:
+        return None
+    return out.lstrip(bytes(range(0x80, 0xC0))).decode(errors="replace")   # no half character at the cut
+
+
 def cmd_logs(a) -> None:
     p = need(a.name, sys.argv[1:])
-    f = p.logs / "daemon.log"
-    print(f.read_text()[-a.bytes:] if f.exists() else "(no log yet)")
+    text = log_tail(p.logs, a.bytes)
+    print("(no log yet)" if text is None else text)
 
 
 def stale_install_warning(cwd: Path | None = None) -> str:

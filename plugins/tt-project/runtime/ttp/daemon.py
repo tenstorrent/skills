@@ -625,6 +625,8 @@ def _raised_at(e: BaseException) -> str:
 
 
 LOG_FAIL_S = 300   # a daemon.log that cannot be written says so on stderr at most this often
+LOG_MAX_BYTES = 16 * 1024 * 1024   # past this daemon.log rotates to LOG_OLD; one old copy is kept
+LOG_OLD = "daemon.log.1"
 _LOG_FAIL = {"t": float("-inf"), "n": 0}   # when stderr last said so; lines dropped since the last one written
 # A finish round's log lines (Daemon._finish_rounds): written once it commits or fails, dropped when
 # it rolls back to run again (GitMiss), so a retried round never logs a line twice.
@@ -652,12 +654,39 @@ def log(p: Project, msg: str) -> None:
     _log_write(p, stamp, msg)
 
 
+def _log_rotated(path: Path, f) -> bool:
+    """Rotate daemon.log to LOG_OLD once the file open as `f` has reached LOG_MAX_BYTES; True when the
+    caller must reopen `path`. No lock, as for activity.jsonl: an appender holding the old file open
+    finishes its line there, and readers read both copies. A copy another process already rotated is
+    left alone. A rename that fails keeps the current file and is tried again on the next line."""
+    st = os.fstat(f.fileno())
+    if st.st_size < LOG_MAX_BYTES:
+        return False
+    try:
+        cur = os.stat(path, follow_symlinks=False)
+        if (cur.st_dev, cur.st_ino) == (st.st_dev, st.st_ino):
+            os.replace(path, path.with_name(LOG_OLD))
+        return True
+    except FileNotFoundError:
+        return True
+    except OSError:
+        return False
+
+
 def _log_write(p: Project, stamp: str, msg: str) -> None:
     line = f"{stamp} {redact.scrub(msg)}\n"
     path = p.logs / "daemon.log"
     try:
         p.logs.mkdir(parents=True, exist_ok=True)
-        with open_append(p.logs / "daemon.log") as f:
+        f = open_append(path)
+        try:
+            if _log_rotated(path, f):
+                f.close()
+                f = open_append(path)
+        except BaseException:
+            f.close()
+            raise
+        with f:
             if _LOG_FAIL["n"]:   # a failed flush may have left part of a line: end it first
                 f.write(("\n" if _log_torn(path) else "") + f"{stamp} daemon.log: {_LOG_FAIL['n']} line(s) "
                         "dropped or cut short while it could not be written\n")
