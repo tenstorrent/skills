@@ -2112,8 +2112,8 @@ running work is interrupted only by the preemption below:
   servers (your own, or the project's `mcp_servers`) stay usable. Claude Code's bundled skills are
   listed by name only and stay callable; plugin skills stay fully listed. A Claude Code without
   `--tools` gets a denylist instead. Coordinator turns, Codex and Cursor are not changed by this.
-- Host loopback is reachable from Claude workers by default. On Linux the Bash sandbox (the write
-  fence) runs each command in a network namespace of its own, so the host's 127.0.0.1 ports (an ssh
+- Host loopback is reachable from Claude workers by default. With `providers.claude.write_fence:
+  true`, on Linux the Bash sandbox (the write fence) runs each command in a network namespace of its own, so the host's 127.0.0.1 ports (an ssh
   `HostName 127.0.0.1` with a `Port`, a `LocalForward` end, a reverse tunnel's listening port, a
   local web server) would refuse connections. Each fenced command therefore gets forwarders on its
   own 127.0.0.1, through the sandbox's proxy, for the host's loopback listeners at run start and the
@@ -2364,7 +2364,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   only the secret names, the task and the time. A request the daemon has not started within 90 s, or
   when the worker's call is stopped (SIGINT or SIGTERM), is withdrawn and never runs later; one
   already started keeps running.
-- A sandboxed worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged
+- Workers run without a sandbox by default (no bwrap, no network or PID namespace; sudo works).
+  `providers.<name>.write_fence: true` turns the provider's write fence on (Claude's Bash sandbox,
+  Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. A sandboxed
+  worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged
   command the project allows runs on the host through the daemon: `ttp host-run -- <command...>`
   prints its output and exits with its code (126 refused, 124 timed out, 75 no answer from the
   daemon). Only commands in config `runner.host_commands` run, set by the user or the coordinator
@@ -2417,10 +2420,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   elapsed share of its budget (flagged estimated).
   A run that wrote no output and reported no tokens is booked at $0 (except on an older Cursor
   build, which prints nothing until it ends).
-- Codex workers run in Codex's workspace-write sandbox, with the project's state folder, the
-  repository's git folder and the shared lock folder (`~/.tt-project/locks`, for `ttp lock` on
-  resources shared across projects) added as writable roots. Coordinator turns use its read-only
-  sandbox.
+- Codex workers run in `danger-full-access` (no sandbox) by default. With `providers.codex.write_fence:
+  true` or the `no_internet` restriction they run in Codex's workspace-write sandbox, with the
+  project's state folder, the repository's git folder and the shared lock folder
+  (`~/.tt-project/locks`, for `ttp lock` on resources shared across projects) added as writable
+  roots. Coordinator turns use its read-only sandbox.
 - Codex and Cursor coordinator turns run from an empty scratch directory, so the project's
   AGENTS.md and rules stay out of them. Codex's shell and web search tools are off, and Cursor
   runs in ask mode, when the installed CLI offers those switches.

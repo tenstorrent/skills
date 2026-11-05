@@ -405,6 +405,12 @@ class Provider:
         when an OS sandbox fences them. Shown by `ttp doctor`; changes nothing."""
         return "no write sandbox"
 
+    def launch_sandbox(self, argv: list[str]) -> str:
+        """The OS sandbox launch `argv` starts the agent in, read from the argv itself ("" for none):
+        recorded with each run (run.json `sandbox`, the daemon log's run start line)."""
+        return "bwrap" if any(os.path.basename(str(w)) == "bwrap" or str(w).startswith("--unshare")
+                              for w in argv) else ""
+
     def fenced(self, on: bool = True, restrictions: dict | None = None) -> bool:
         """Whether a worker run is write-fenced, as fence_args decides it: `on` False (fence_on) drops an
         optional fence; a missing dependency or a mode without a sandbox (write_fence) leaves it off."""

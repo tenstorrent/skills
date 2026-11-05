@@ -160,6 +160,11 @@ class Cursor(Provider):
             out += ["--add-dir", str(d)]
         return out
 
+    def launch_sandbox(self, argv):
+        i = argv.index("--sandbox") if "--sandbox" in argv else None
+        on = i is not None and argv[i + 1:i + 2] == ["enabled"]
+        return super().launch_sandbox(argv) or ("cursor-sandbox" if on else "")
+
     def write_fence(self, restrictions=None) -> str:
         return self._sandbox_gap(restrictions)
 

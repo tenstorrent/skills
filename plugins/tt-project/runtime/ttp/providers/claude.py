@@ -292,6 +292,17 @@ class Claude(Provider):
         argv[i] = json.dumps({**settings, "sandbox": sandbox_settings([cwd, *dirs] if cwd else list(dirs), freed)})
         return argv, True
 
+    def launch_sandbox(self, argv):
+        if out := super().launch_sandbox(argv):
+            return out
+        i = argv.index("--settings") + 1 if "--settings" in argv else 0
+        try:
+            settings = json.loads(argv[i]) if i else {}
+        except (IndexError, ValueError):
+            return ""
+        on = isinstance(settings, dict) and (settings.get("sandbox") or {}).get("enabled")
+        return "claude-bash-sandbox" if on else ""
+
     def isolation_args(self) -> list[str]:
         # Flag settings (the harness hook) and --plugin-dir load whatever the sources are.
         return ["--strict-mcp-config", "--setting-sources", "project,local"]
@@ -632,7 +643,10 @@ def worker_settings(denied_reads=()) -> dict:
     `denied_reads` gets a Read deny rule (`//` starts an absolute path in a rule); deny rules hold
     under bypassPermissions."""
     out = {**hook_settings(), "skillOverrides": {name: "name-only" for name in BUNDLED_SKILLS},
-           "autoMemoryEnabled": False}
+           "autoMemoryEnabled": False,
+           # No Bash sandbox, even one the user's own settings turn on; fence_args replaces this when the
+           # project turns the write fence on (providers.claude.write_fence).
+           "sandbox": {"enabled": False}}
     if denied_reads:
         out["permissions"] = {"deny": [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]}
     return out

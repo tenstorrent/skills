@@ -11,11 +11,7 @@
   only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
   naming it and why.
-- Host names do not resolve in your sandbox: run anything reaching another host or GitHub (ssh, git
-  fetch/ls-remote/push, curl, a script using them) as one bare command, which runs outside it
-  (e.g. `ttp lock <res> -- <cmd>`, absolute paths, no cd, pipe, `;`, `&&` or subshell). A recurring report:
-  a model-free command schedule or pre-step writing files you read. A port unreachable only in the
-  sandbox is no outage or ask: use 127.0.0.1, not `localhost`.
+- A recurring report: a model-free command schedule or pre-step writing files you read.
 - `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
   code, boxes, models or scripts get plain follow-ups.

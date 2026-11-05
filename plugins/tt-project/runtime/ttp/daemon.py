@@ -3091,6 +3091,7 @@ class Daemon:
             tout = timeout_s or self.cfg["budget"]["run_timeout_s"].get(tier, 3600)
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
+                    "sandbox": prov.launch_sandbox(argv) or "none",   # read from argv: what a verifier checks
                     "model": model, "effort": effort,
                     **({"pin": pin, "pin_verify": (task or {}).get("pin_verify")
                         or self.cfg["runner"]["pin_verify"]} if pin else {}),
@@ -3144,7 +3145,8 @@ class Daemon:
                 db.set_kv(cachettl.KEY, cachettl.record(db.kv(cachettl.KEY), cache_fp))
             except Exception as e:   # bookkeeping: the next turn then goes at 1h again
                 log(self.p, f"run {run_id}: prompt cache turn not recorded: {e}")
-        log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']}")
+        log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']} "
+                    f"sandbox={prov.launch_sandbox(argv) or 'none'}")
         return run_id
 
     def _run_dir(self, r: dict) -> Path:

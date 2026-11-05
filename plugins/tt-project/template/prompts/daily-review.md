@@ -1,9 +1,7 @@
 # Daily review
 
-Assess the last day of this project, then hand off. Host names do not resolve in your sandbox: run
-a command or script reaching another host or GitHub (ssh, git fetch/ls-remote/push, curl) as one
-bare command (e.g. `ttp lock <res> -- <cmd>`, absolute paths, no cd, pipe, `;`, `&&` or subshell). A
-report needing one every day: a model-free command schedule or pre-step writing files you read.
+Assess the last day of this project, then hand off. A report needing a host's data every day: a
+model-free command schedule or pre-step writing files you read.
 
 1. Progress against the charter's goals. What moved, what stalled, why.
 2. Spend: `ttp status <name> --json` → budget. Top spenders, runs without durable progress,

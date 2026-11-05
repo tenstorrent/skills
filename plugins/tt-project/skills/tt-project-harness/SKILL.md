@@ -216,17 +216,20 @@ read the one for the lever you change.
 ## Test runs never reach other processes
 
 - On a shared host a test suite's own process-kill code (cleanup by pid, `pkill` in a fixture) can
-  hit other users' live jobs. `ttp checks`, `delivery.push_checks` and the push queue run every
-  local check in a process sandbox: its own PID namespace and /proc, so it sees and can signal only
-  its own process tree, and nothing it starts outlives it.
-- Run other test commands the same way: `ttp sandbox -- <command>`.
+  hit other users' live jobs; the kill guard refuses such calls by name. Checks run unsandboxed by
+  default. A project that sets `sandbox.checks: true` has `ttp checks`, `delivery.push_checks` and the
+  push queue run every local check in a process sandbox: its own PID namespace and /proc, so it sees
+  and can signal only its own process tree, and nothing it starts outlives it (sudo fails inside).
+- Run other test commands the same way: `ttp sandbox -- <command>` (a plain run unless the project
+  turned the sandbox on, or `TTP_NO_DEVICE=1` hides the device nodes).
 - A reaper or cleanup script signals only processes it can prove are this project's: `TTP_PROJECT`
   (the full path of `<root>/tt-project`) or a `TTP_RUN_DIR` inside it, or its own run record with pid
   and start time. Never by a task or run id in an env, command line, run folder name or log: ids
   overlap across projects. Skip processes still writing output.
 - It needs unprivileged user namespaces and `unshare` or `bwrap`. Where the host allows none, checks
-  run as before and say why; `ttp doctor` names the setting. `"sandbox": false` on a push_checks
-  entry is only for a check that needs the host's process table, and is reported each run.
+  run as before and say why; `ttp doctor` names the setting. Under `sandbox.checks: true`,
+  `"sandbox": false` on a push_checks entry is only for a check that needs the host's process table,
+  and is reported each run.
 
 ## Resetting a Blackhole Galaxy host
 
@@ -237,8 +240,10 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   run (no root, no NOPASSWD rule for it), no reset runs and the output says so.
 - Check sudo rights with `sudo -n -l` (or `sudo -n -l <command>`), never `sudo -n true`: a host
   may grant NOPASSWD only for specific commands.
-- A worker's sandbox and every `ttp detach` job cannot gain privileges ('no new privileges': sudo
-  fails). A privileged command the project allows runs on the host through the daemon:
+- Runs are unsandboxed by default: sudo, ssh and the host's network work as in a plain shell. Only
+  in a project that turned its provider's write fence on (`providers.<name>.write_fence: true`) do a
+  worker's sandbox and its `ttp detach` jobs not gain privileges ('no new privileges': sudo fails);
+  `ttp lock` then refuses to wrap sudo. A privileged command the project allows then runs on the host through the daemon:
   `ttp host-run -- <command...>` prints its output and exits with its code (126 refused, 124 timed
   out). Only commands in config `runner.host_commands` run, each entry the command's first words
   (name them fully, e.g. `sudo -n /usr/sbin/<tool> <read-only verb>`); the user or the coordinator
@@ -258,7 +263,7 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   inside a run and the coordinator sets it only in a turn carrying the user's word. A user's
   harness-wide order (such as unsandboxed runs) applies to every project; a project never opts out
   on its own judgement: it records the workaround it relied on instead.
-- A fenced Claude worker's `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox
+- A fenced Claude worker's (write_fence true) `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox
   only as a simple command on its own (also after `timeout N`); the hook refuses them beside `&&`, `;`,
   a pipe, a file redirect or a substitution. A project's own host-reaching command (a script in its
   harness `bin/` that wraps ssh) is freed the same way by config `sandbox.fence_freed_commands`
