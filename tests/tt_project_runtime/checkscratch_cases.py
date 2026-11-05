@@ -374,9 +374,9 @@ def test_a_clean_tree_removed_under_a_detached_check_reports_killed_not_test_fai
 
 def test_check_scratch_holder_survives_a_proc_locks_read_that_misses_its_line(env, monkeypatch, capsys):
     """The kernel hands out /proc/locks a page per read, so while other locks come and go the holder's
-    line can slip past one read (under host load a wait said 'pid (unknown) still holds' after naming
-    the pid): a read with no lock on the inode is retried, at most three reads, and the wait's last
-    message keeps the last holder it saw."""
+    line can slip past a read or two in a row (under host load a wait said 'pid (unknown) still holds'
+    after naming the pid): a read with no lock on the inode is retried, at most HOLDER_READS reads, and
+    the wait's last message keeps the last holder it saw."""
     from ttp import checkdirs
     folder = make(env).state / checkdirs.FOLDER
     folder.mkdir(parents=True, exist_ok=True)
@@ -397,7 +397,9 @@ def test_check_scratch_holder_survives_a_proc_locks_read_that_misses_its_line(en
         table([], [line])
         assert checkdirs._holder(fd) == 4242 and len(reads) == 2
         table([], [], [], [line])
-        assert checkdirs._holder(fd) is None and len(reads) == 3, "bounded: three reads"
+        assert checkdirs._holder(fd) == 4242 and len(reads) == 4, "misses come in runs: keep reading"
+        table(*[[]] * checkdirs.HOLDER_READS, [line])
+        assert checkdirs._holder(fd) is None and len(reads) == checkdirs.HOLDER_READS, "bounded"
         table([f"1: POSIX  ADVISORY  WRITE 4242 {dev}:{st.st_ino} 0 EOF\n"], [line])
         assert checkdirs._holder(fd) == 4242, "a POSIX lock alone is no FLOCK holder: read again"
         table([line.replace("4242", "4141"), stranger])

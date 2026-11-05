@@ -37,6 +37,7 @@ OWNER = 'owner.json'
 TRASH = '.trash-'   # an allocation claimed for removal; removed with no folder lock held
 WAIT_S = 5.0        # longest wait for the folder-wide lock
 PROC_LOCKS = '/proc/locks'           # names a bare flock's holder (Linux)
+HOLDER_READS = 20   # /proc/locks reads before a held lock's holder is unknown (a read misses ~1 in 100 under churn)
 PSEUDO = ('/proc', '/sys', '/dev')   # their filesystems are never descended into on removal
 
 
@@ -312,14 +313,14 @@ def _holder(fd: int) -> int | None:
     names the superblock's device, which on btrfs differs from the st_dev stat gives: an exact device
     match wins, else the one FLOCK on that inode number. The kernel hands that table out a page per
     read, so while other locks come and go a line can slip between two pages: a read that finds no
-    lock on the inode at all is retried."""
+    lock on the inode at all is retried, up to HOLDER_READS reads (the caller found the lock held)."""
     pid = _read(fd, LOCK).get('pid')
     if isinstance(pid, int) and pid > 0:
         return pid
     try:
         st = os.stat(LOCK, dir_fd=fd, follow_symlinks=False)
         dev = (os.major(st.st_dev), os.minor(st.st_dev))
-        for _ in range(3):
+        for _ in range(HOLDER_READS):
             others = set()
             for line in _proc_locks():
                 parts = line.split()
