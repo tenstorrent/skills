@@ -666,7 +666,9 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # push_load_wait_s: push checks' longest wait under the load guard (testslots.push_load_wait_s).
         # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
         # spill_wrap_cmd: the wrapper a check runs behind on a spill host (push.spill_wrap_of; default "", none).
-        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
+        # spill_beside_device: spill hosts a device job keeps no spill off (checkspill.beside_device; default none).
+        return {"nice", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
+                "spill_beside_device", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s"}

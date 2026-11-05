@@ -700,6 +700,102 @@ def test_spill_keeps_new_runs_off_a_host_whose_device_lock_is_held_and_shows_why
         before.close()
 
 
+def test_spill_beside_device_takes_a_listed_host_with_a_device_job_but_keeps_pauses_and_lock_holds(
+        env, tmp_path, monkeypatch):
+    """checks.spill_beside_device: a listed host whose device lock is held, or whose probe finds a device
+    holder, still takes the run, and the run and its `ttp status` line say it runs beside a device job; an
+    unlisted host is skipped as before; a listed host that is paused or whose machine lock is held is still
+    skipped; "*" covers every host; a malformed value is a config problem and lists nothing."""
+    from ttp import checkspill, cli, db as dbm, locks, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    told: list[str] = []
+    devs = [_device_hold(p, "check-host-a-device"), _device_hold(p, "check-host-b-device")]
+    try:
+        assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None, "unlisted: skipped as today"
+        assert "check-host-a (a device job runs there" in told[-1] and "check-host-b (a device job" in told[-1]
+        p.set_config("checks.spill_beside_device", ["check-host-b"])
+        cfg = p.config()
+        assert not checkspill.beside_device(cfg, "check-host-a") and checkspill.beside_device(cfg, "check-host-b")
+        got = checkspill.pick(p, cfg, told.append, "pytest -q")
+        try:
+            assert got is not None and got.host == "check-host-b", told
+            assert "check-host-a (a device job runs there" in told[-1], "the unlisted host is still skipped"
+            assert "spilling to check-host-b" in told[-1] and \
+                "beside a device job (checks.spill_beside_device lists it): check-host-b-device: busy" in told[-1]
+            line = [x for x in checkspill.status_lines(p.name) if "check-host-b" in x]
+            assert line and "(beside a device job, checks.spill_beside_device: check-host-b-device: busy" in line[0]
+            assert "beside a device job" in cli.status_text(p, verbose=True)
+            assert not [x for x in checkspill.skip_lines() if "spill host check-host-b " in x], "taken, not skipped"
+        finally:
+            if got is not None:
+                got.close()
+        p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-b": {"reason": "user hold", "by": "user", "since": 1}})
+        assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None, "a pause still stops it"
+        assert "check-host-b (paused: user hold)" in told[-1], told[-1]
+        p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {})
+        held = locks.try_take(_spill_lock_paths(p, "check-host-b"), "task #9 (run 1)", "make bench")
+        assert held is not None
+        try:
+            assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None, "a held lock still stops it"
+            assert "check-host-b (busy (held by task #9" in told[-1], told[-1]
+        finally:
+            held.close()
+        p.set_config("checks.spill_beside_device", "*")
+        got = checkspill.pick(p, p.config(), told.append, "pytest -q")
+        try:
+            assert got is not None and got.host == "check-host-a" and "beside a device job" in told[-1], told
+        finally:
+            got.close()
+    finally:
+        for d in devs:
+            d.close()
+    got = checkspill.pick(p, p.config(), told.append, "pytest -q")
+    try:
+        assert got is not None and "beside a device job" not in told[-1], "no device job: nothing to say"
+        assert "beside" not in checkspill.status_lines(p.name)[0]
+    finally:
+        got.close()
+    assert checkspill.beside_of('["check-host-a", "check-host-a"]') == ["check-host-a"]
+    assert checkspill.beside_of(["check-host-a", "*"]) == "*"
+    for bad in ("check-host-a", 3, {"check-host-a": True}, ["-oProxyCommand=x"]):
+        try:
+            checkspill.beside_of(bad)
+        except ValueError as e:
+            assert "checks.spill_beside_device" in str(e), e
+        else:
+            raise AssertionError(bad)
+        assert not checkspill.beside_device({"checks": {"spill_beside_device": bad}}, "check-host-a"), bad
+        assert [x for x in project.config_problems({"checks": {"spill_beside_device": bad}})
+                if "spill_beside_device" in x], bad
+
+
+def test_spill_beside_device_lets_a_listed_host_take_a_run_while_its_probe_finds_a_device_holder(
+        env, tmp_path, monkeypatch):
+    """A device test that takes no lock on a host checks.spill_beside_device lists: the probe's holder scan
+    keeps no run off, and the run says it runs beside that holder; unlisted, the host is skipped."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    nodes = tmp_path / "dev"
+    nodes.mkdir()
+    (nodes / "tenstorrent0").write_text("")
+    monkeypatch.setenv(checkspill.NODES_ENV, str(nodes / "tenstorrent*"))
+    outside = _node_holder(nodes / "tenstorrent0", cwd=tmp_path)
+    told: list[str] = []
+    try:
+        assert checkspill.pick(p, p.config(), told.append, "pytest -q") is None
+        p.set_config("checks.spill_beside_device", ["check-host-a"])
+        got = checkspill.pick(p, p.config(), told.append, "pytest -q")
+        try:
+            assert got is not None and got.host == "check-host-a", told
+            assert f"beside a device job (checks.spill_beside_device lists it): pid {outside.pid}" in told[-1], told
+            assert "device locks alone decided" not in told[-1]
+        finally:
+            got.close()
+    finally:
+        outside.kill()
+        outside.wait()
+
+
 def test_spill_device_gate_sees_every_device_lock_of_the_host_and_only_that_host(env, tmp_path, monkeypatch):
     """The gate reads the host's device locks wherever a device job takes them: this project's own
     `<alias>-device`, one another project holds in the user's shared locks, a reservation of it, and a

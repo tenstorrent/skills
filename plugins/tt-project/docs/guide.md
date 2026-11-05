@@ -1440,7 +1440,11 @@ running work is interrupted only by the preemption below:
   is held, reserved or waited for (a pool check run's own hold of the host's lock is none, even when `device.locks`
   lists the bare alias), or a broker heal check (preset broker) of the project on that machine
   reports a running job row; a broker status that cannot be read never keeps a run off. Runs already there go
-  on, and `ttp status` and the web app show the skip in one line with the host and the reason. The account's pool, `checks.spill_hosts`
+  on, and `ttp status` and the web app show the skip in one line with the host and the reason.
+  `checks.spill_beside_device` (ssh aliases, or `"*"` for every spill host; default none) names hosts where the
+  project's own rules let its CPU-only checks run beside a device job: there the device job keeps no run off, a
+  pause or a held machine lock still does, and the run and its `ttp status` line say it runs beside a device job
+  (`ttp config <project> checks.spill_beside_device '["host-a"]'`). The account's pool, `checks.spill_hosts`
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps

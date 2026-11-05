@@ -31,6 +31,10 @@ in the host's probe: a device test that takes no lock). A broker whose status do
 BROKER_TIMEOUT_S, or reads no job rows, never keeps a run off: the locks alone decide. Nor does a holder scan
 that cannot run or finish within DEVICE_SCAN_S: the run says so. The scan reads, without sudo, only what the
 ssh user may (/proc/<pid>/fd of its own processes, and others' where the host lets it).
+A project whose own rules let CPU-only checks run beside device jobs on a host lists it in
+`checks.spill_beside_device` (ssh aliases, or "*" for every spill host; default none: beside_device): there
+neither the device locks, the broker nor the holder scan keep a run off (its pause and machine lock still
+do), and the run and its `ttp status` line say it runs beside a device job.
 Runs already on the host go on. The skip shows in one line in `ttp status` and the web app (skip_lines)
 while it is fresh (SKIP_SHOW_S). Its slots follow what it has idle now (checklane.host_slots): the runs
 its idle cores (cores less the 1-minute load average) and available memory fit, at most the runs its
@@ -67,6 +71,7 @@ from . import remotecheck
 
 KEY = "checks_spill_hosts"
 ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
+BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
 NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
 AFTER_KEY = "checks_spill_after_s"
 SPILL_AFTER_S = 60.0
@@ -217,11 +222,49 @@ def wrapped_ok(cfg: dict | None) -> bool:
     return isinstance(checks, dict) and checks.get(NO_DEVICE_KEY) is False
 
 
+def beside_of(v: Any) -> str | list[str]:
+    """A `checks.spill_beside_device` value set by `ttp config`: "*" (every spill host) or a list (or a
+    JSON-encoded list) of ssh aliases; a list naming "*" is "*". ValueError for anything else."""
+    if isinstance(v, str) and v.strip() == "*":
+        return "*"
+    if isinstance(v, str) and v.strip().startswith("["):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            pass
+    if not isinstance(v, (list, tuple)):
+        raise ValueError(f"checks.{BESIDE_KEY}: {v!r} is not a list of ssh aliases (e.g. [\"check-host-a\"]) "
+                         "or \"*\"; nothing was changed")
+    out = [str(x).strip() if isinstance(x, str) else x for x in v]
+    if "*" in out:
+        return "*"
+    if bad := [why for x in out if (why := remotecheck.host_problem(x))]:
+        raise ValueError(f"checks.{BESIDE_KEY}: " + "; ".join(bad) + "; nothing was changed")
+    return list(dict.fromkeys(out))
+
+
+def beside_device(cfg: dict | None, alias: str) -> bool:
+    """Whether the project lets its checks spill to `alias` while a device job runs there
+    (checks.spill_beside_device names it, or is "*"); unset or malformed: no."""
+    checks = (cfg or {}).get("checks")
+    v = checks.get(BESIDE_KEY) if isinstance(checks, dict) else None
+    try:
+        got = beside_of(v) if v is not None else []
+    except ValueError:
+        return False
+    return got == "*" or alias in got
+
+
 def wrap_problems(checks: Any) -> list[str]:
-    """Config check of checks.wrap_needs_device and checks.spill_wrap_cmd."""
+    """Config check of checks.wrap_needs_device, checks.spill_wrap_cmd and checks.spill_beside_device."""
     from . import push
     v = checks.get(NO_DEVICE_KEY) if isinstance(checks, dict) else None
     out = [] if v is None or isinstance(v, bool) else [f"checks.{NO_DEVICE_KEY}: {v!r} is not true or false"]
+    if (b := checks.get(BESIDE_KEY) if isinstance(checks, dict) else None) is not None:
+        try:
+            beside_of(b)
+        except ValueError as e:
+            out.append(str(e).replace("; nothing was changed", ""))
     try:
         push.spill_wrap_of(None, {"checks": checks})
     except ValueError as e:
@@ -333,9 +376,10 @@ def paused_elsewhere(p, alias: str, machine: Any = None) -> tuple[str, dict] | N
     return None
 
 
-def probe(alias: str) -> tuple[int, str, str]:
+def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     """(free slots, "", note) on `alias`, or (0, why it cannot take a check now, note): why names a device
-    holder the probe's scan found (_device_holders); note says why that scan did not read, else ""."""
+    holder the probe's scan found (_device_holders); note says why that scan did not read, else "". With
+    `beside_device` a holder found keeps no run off: it is the note instead (starting DEVICE_WHY)."""
     from . import checklane
     try:
         r = subprocess.run(remotecheck._ssh(alias, _probe_script()), stdin=subprocess.DEVNULL, capture_output=True,
@@ -352,8 +396,9 @@ def probe(alias: str) -> tuple[int, str, str]:
     if r.returncode != 0 or not m:
         return 0, f"its probe failed (exit {r.returncode})", ""
     busy, note = _device_holders(r.stdout)
-    if busy:
+    if busy and not beside_device:
         return 0, busy, ""
+    note = busy or note
     cores, mem_kib, running = (int(x) for x in m.groups()[:3])
     load = float(m[4]) if m[4] and m[4] != "-" else None
     n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, load, running)
@@ -502,10 +547,17 @@ def skip_dir() -> Path:
     return checkcap.slot_dir() / "spill-skips"
 
 
-def _note_skip(alias: str, why: str, project_name: str) -> None:
-    """Record that `alias` took no new checks because of a device job (skip_lines shows it); "" clears it."""
+def _note_skip(alias: str, why: str, project_name: str, own_only: bool = False) -> None:
+    """Record that `alias` took no new checks because of a device job (skip_lines shows it); "" clears it
+    (with `own_only`, only a skip `project_name` recorded)."""
     f = skip_dir() / f"{alias}.json"
     try:
+        if not why and own_only:
+            try:
+                if json.loads(f.read_text() or "{}").get("project") != project_name:
+                    return
+            except (ValueError, AttributeError):
+                return
         if not why:
             f.unlink(missing_ok=True)
             return
@@ -600,16 +652,24 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
     skipped = []
     for alias in hosts(cfg):
-        why = allowed(p, cfg, alias) or lock_busy(p, cfg, alias)
-        if not why:
+        beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
+        why, dev = allowed(p, cfg, alias) or lock_busy(p, cfg, alias), ""
+        if not why and beside:
+            dev = device_busy(p, cfg, alias)
+            _note_skip(alias, "", p.name, own_only=True)   # this project's earlier skip no longer holds
+        elif not why:
             why = device_busy(p, cfg, alias)
             _note_skip(alias, why, p.name)
         free, note = 0, ""
         if not why:
-            free, why, note = probe(alias)
+            free, why, note = probe(alias, beside)
             if why.startswith(DEVICE_WHY):
                 _note_skip(alias, why, p.name)
-        if not why and (got := _claim(alias, free, {**rec, "host": alias})) is not None:
+            if note.startswith(DEVICE_WHY):
+                dev, note = dev or note, ""
+        dev = dev[len(DEVICE_WHY):] if dev.startswith(DEVICE_WHY) else dev
+        if not why and (got := _claim(alias, free, {**rec, "host": alias,
+                                                    **({"beside": dev[:300]} if dev else {})})) is not None:
             got.lock = _hold(p, cfg, alias, what)
             if got.lock is None:
                 got.close()
@@ -618,6 +678,7 @@ def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
             tell(f"spilling to {alias}: the slots here stayed busy for {after_s(cfg):g} s "
                  f"({_source(cfg, alias)}); the checks run there on a copy of the commit"
                  + (f"; {note}, so its device locks alone decided" if note else "")
+                 + (f"; beside a device job (checks.{BESIDE_KEY} lists it): {dev}" if dev else "")
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))
             return got
         skipped.append(f"{alias} ({why or 'this machine holds its free slots'}"
@@ -657,5 +718,6 @@ def status_lines(project_name: str, now: float | None = None) -> list[str]:
         mins = max(0, int((now - float(r.get("since") or now)) // 60))
         out.append(f"checks of {who} running on spill host {r['host']} for {mins} min"
                    + (f": {r['what']}" if r.get("what") else "")
+                   + (f" (beside a device job, checks.{BESIDE_KEY}: {r['beside']})" if r.get("beside") else "")
                    + (f" (claim's pid {r.get('pid')}: {FOREIGN})" if pid_state(r.get("pid")) == UNKNOWN else ""))
     return out

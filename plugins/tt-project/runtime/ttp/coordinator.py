@@ -400,6 +400,8 @@ USER_SETTABLE = {
     # Ordered ssh aliases a run whose slots here stay busy may spill to (checkspill); a list, never a scalar.
     "delivery.checks_spill_hosts": lambda v: checkspill.hosts_of(v),
     "delivery.checks_spill_after_s": lambda v: checkspill.after_of(v),
+    # Spill hosts (or "*") the project lets its checks run on beside a device job (checkspill.beside_device).
+    "checks.spill_beside_device": lambda v: checkspill.beside_of(v),
     # The files holding the version that `ttp push` bumps once above the tip, plus a changeset.
     "delivery.version_bump": lambda v: push.bump_of(v),
     # The daemon-owned push queue: reviews approve, the daemon pushes in batches, then runs after_push.
