@@ -392,9 +392,9 @@ def _note_skip(alias: str, why: str, project_name: str) -> None:
             f.unlink(missing_ok=True)
             return
         f.parent.mkdir(parents=True, exist_ok=True)
-        tmp = f.with_name(f"{f.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps({"host": alias, "why": why[:300], "at": time.time(), "project": project_name}))
-        os.replace(tmp, f)
+        from . import project
+        project.durable_write(f, json.dumps({"host": alias, "why": why[:300], "at": time.time(),
+                                             "project": project_name}), sync=False)
     except OSError:
         pass
 
