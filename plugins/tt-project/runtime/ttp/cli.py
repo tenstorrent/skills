@@ -2002,7 +2002,7 @@ def cmd_audit(a) -> None:
             return
         try:
             rec = coordfix.declare(run, " ".join(a.rest), a.serves or "", a.undo or "")
-        except ValueError as e:
+        except (ValueError, OSError) as e:
             die(str(e))
         print(f"ttp audit why: recorded for this run's next changes (serves {rec['serves']}; undo: {rec['undo']})")
         return
