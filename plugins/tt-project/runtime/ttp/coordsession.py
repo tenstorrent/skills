@@ -33,8 +33,8 @@ every wake is stateless. A missing key is not tripped. Mode "shadow" is reserved
 The delta digest: a resumed wake sends only the digest sections whose text changed since the
 session's last acknowledged wake (one that ended ok), each whole, and every new event, plus one line
 naming the sections it leaves out and the ones gone. The section hashes that wake was sent are kept in
-KEY (DIGEST), so they are on disk. The whole digest, built without the per-turn collapsing
-(coordinator.COLLAPSIBLE), goes to a new session (a rollover), and to a resumed one whenever the
+KEY (DIGEST), so they are on disk. The whole digest, the turn's one build without the per-turn
+collapsing (coordinator.COLLAPSIBLE, rendered beside the collapsed parts), goes to a new session (a rollover), and to a resumed one whenever the
 saved hashes may not match what it saw: none saved, a stateless turn or a failed or compacted wake
 since, another turn's digest since (the collapse baseline moved), a daemon restart, or the session
 asked for it with the action {"type": "noop", "key": FULL_ASK}."""
@@ -272,14 +272,15 @@ def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str) -> tuple[
     return sent[:at] + [(DELTA, line)] + sent[at:], f"delta: {len(same)} unchanged, {len(gone)} gone"
 
 
-def wake_digest(mode: str, state, parts: list[tuple[str, str]], full, seen_fp: str, shown_fp: str,
-                gen: str) -> tuple[list[tuple[str, str]], dict, str]:
+def wake_digest(mode: str, state, parts: list[tuple[str, str]], full: list[tuple[str, str]], seen_fp: str,
+                shown_fp: str, gen: str) -> tuple[list[tuple[str, str]], dict, str]:
     """(the digest parts a session wake sends, the ack record() saves once it ends ok, why).
-    `parts`: the digest as built for the turn; `full()`: the whole digest, uncollapsed;
-    `shown_fp`: fingerprint() of the baseline this turn leaves for the next."""
+    `parts`: the digest as built for the turn; `full`: the same build without the per-turn collapsing
+    (coordinator.digest_parts' `whole`, never a second build); `shown_fp`: fingerprint() of the
+    baseline this turn leaves for the next."""
     sent, why = delta(parts, state, seen_fp, gen) if mode == "resume" else (None, "new session")
     if sent is None:
-        parts = full()
+        parts = list(full)
         sent, why = parts, f"full: {why}"
     return sent, {"sections": sections(parts), "seen": shown_fp, "gen": gen}, why
 

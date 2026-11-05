@@ -608,14 +608,14 @@ def _cs_parts(tasks="- #1 | queued | t", paused=True, at="10:00"):
 
 def test_coordsession_delta_omits_unchanged_sections_and_sends_a_changed_one_whole():
     from ttp import coordsession as cs
-    calls = []
-    full = lambda: calls.append(1) or _cs_parts()
+    full = _cs_parts() + [("ends", "## Temporary instructions possibly over\n- x")]   # the uncollapsed build
     sent, ack, why = cs.wake_digest("new", None, _cs_parts(), full, "seen0", "seen1", "g1")
-    assert sent == _cs_parts() and why == "full: new session" and calls == [1]
+    assert sent == full and why == "full: new session"
+    ack = cs.wake_digest("new", None, _cs_parts(), _cs_parts(), "seen0", "seen1", "g1")[1]
     state = {"id": "s1", cs.DIGEST: ack}
     # Nothing changed but the clock: the time header, the delta line and the new events only.
     sent, ack2, why = cs.wake_digest("resume", state, _cs_parts(at="10:05"), full, "seen1", "seen2", "g1")
-    assert calls == [1] and why == "delta: 3 unchanged, 0 gone", why
+    assert why == "delta: 3 unchanged, 0 gone", why
     assert [k for k, _ in sent] == ["budget", cs.DELTA, "events"] and sent[0][1] == "# STATE at 10:05"
     assert "Unchanged, not repeated: Project budget, Open tasks, Paused resources." in sent[1][1], sent[1][1]
     assert ack2["sections"] == ack["sections"] and ack2["seen"] == "seen2"
@@ -627,15 +627,14 @@ def test_coordsession_delta_omits_unchanged_sections_and_sends_a_changed_one_who
     # A changed budget is sent whole, its time header with it.
     changed = [("budget", "# STATE at 10:09\n## Project budget\n- red")] + _cs_parts()[1:]
     assert dict(cs.wake_digest("resume", state, changed, full, "seen1", "x", "g1")[0])["budget"] == changed[0][1]
-    # Any state the saved hashes may not match sends the whole digest, uncollapsed (full()).
+    # Any state the saved hashes may not match sends the whole digest, uncollapsed (`full`).
     for st, seen, gen, reason in ((state, "seen1", "g2", "daemon restarted"),
                                   (state, "other", "g1", "another turn's digest since"),
                                   ({"id": "s1"}, "seen1", "g1", "no acknowledged digest"),
                                   ({cs.DIGEST: {"sections": "x"}}, "seen1", "g1", "no acknowledged digest"),
                                   ("garbage", "seen1", "g1", "no acknowledged digest")):
-        calls.clear()
         sent, _, why = cs.wake_digest("resume", st, _cs_parts(at="11:00"), full, seen, "n", gen)
-        assert why == f"full: {reason}" and calls == [1] and sent == _cs_parts(), why
+        assert why == f"full: {reason}" and sent == full, why
     assert cs.asked_full([{"type": "reply"}, {"type": "noop", "key": cs.FULL_ASK}])
     assert not cs.asked_full([{"type": "noop"}]) and not cs.asked_full(None)
 
@@ -742,7 +741,7 @@ def test_coordsession_delta_digest_size_on_recorded_wakes():
     state, full_chars, sent_chars = None, 0, 0
     for i, w in enumerate(wakes):
         got = parts(w)
-        sent, ack, why = cs.wake_digest("resume" if i else "new", state, got, lambda: got, "f", "f", "g")
+        sent, ack, why = cs.wake_digest("resume" if i else "new", state, got, got, "f", "f", "g")
         full_chars += len("\n".join(t for _, t in got))
         sent_chars += len("\n".join(t for _, t in sent))
         assert why.startswith("delta: ") if i else why == "full: new session", why
@@ -750,3 +749,44 @@ def test_coordsession_delta_digest_size_on_recorded_wakes():
     full_tok, delta_tok = full_chars // len(wakes) // 4, sent_chars // len(wakes) // 4
     print(f"digest prompt tokens per wake over {len(wakes)} recorded wakes: full {full_tok}, delta {delta_tok}")
     assert len(wakes) >= 100 and delta_tok < full_tok
+
+
+def test_coordsession_whole_digest_keeps_the_lines_of_one_shot_section_builders(env, monkeypatch):
+    """The whole digest (new session, daemon restart) comes from the turn's one digest build: a
+    second build would find the ends and coverage builders already told and leave their lines out."""
+    from ttp import coordinator as coord
+    from ttp import ends, responsibilities
+    from ttp.daemon import Daemon
+    p = make(env)
+    _sessions(env, monkeypatch)
+    p.set_config("coordinator.session.mode", "on")
+    p.set_config("coordinator.debounce_s", 0)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    assert coord.apply(p, [{"type": "memory_add", "text": "Hold releases.", "memory_kind": "restriction",
+                            "until": "the freeze is lifted"}], turn=2) == []
+    builds = []
+    real = coord.digest_parts
+    monkeypatch.setattr(coord, "digest_parts", lambda *a, **k: builds.append(1) or real(*a, **k))
+    n = [0]
+
+    def wake(d):
+        n[0] += 1
+        ends.digest_lines(p, 0, time.time())   # the entry recorded, then due: listed once
+        p.db.set_kv(ends.LISTED_KEY, {k: v - ends.RECHECK_S - 1 for k, v in (p.db.kv(ends.LISTED_KEY) or {}).items()})
+        p.db.set_kv(responsibilities.TOLD_KV, None)
+        monkeypatch.setattr(responsibilities, "digest_lines", lambda db, n=n[0]: (
+            [] if db.kv(responsibilities.TOLD_KV) else db.set_kv(responsibilities.TOLD_KV, [f"m{n}"]) or
+            [f"## Health coverage changed: wake {n}"]))   # told once, like the real builder
+        p.db.post("in", f"m{n[0]}", chat="c1")
+        builds.clear()
+        rid = _cs_wake(p, d)
+        note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+        return note["turn"]["session"], (p.runs / str(rid) / "prompt.md").read_text()
+
+    for d, sent in ((Daemon(p.base), "full: new session"), (Daemon(p.base), "full: daemon restarted")):
+        s, prompt = wake(d)
+        assert s["sent"] == sent, s
+        assert builds == [1], "the digest is built once per turn"
+        assert "## Temporary instructions possibly over" in prompt and "until the freeze is lifted" in prompt, sent
+        assert f"## Health coverage changed: wake {n[0]}" in prompt, sent

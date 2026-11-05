@@ -8619,8 +8619,10 @@ class Daemon:
             speed = slowcomplaint.on_messages(self.p, self.cfg, msgs, now, gates)   # a speed complaint: measured review
             # Every turn sees background sections the previous turn saw as one line each.
             baseline = db.kv(coord.DIGEST_SEEN_KEY) or {}
+            session_on = coordsession.on(self.cfg, provider)
+            whole: list | None = [] if session_on else None   # the same build, uncollapsed (built once)
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
-                                              baseline, flagged)
+                                              baseline, flagged, whole)
             # The sections rendered from the prompt snapshot end the cached context block.
             cached, parts = coord.split_cached(parts)
             must = mustact.block(db, [e["id"] for e in evs])
@@ -8628,14 +8630,10 @@ class Daemon:
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
             prompt = "\n".join(text for _, text in parts)
             session_digest = None
-            if coordsession.on(self.cfg, provider):   # a session wake may send only what changed
-
-                def whole() -> list:
-                    got = coord.split_cached(coord.digest_parts(self.p, gates, [e["id"] for e in evs],
-                                                                [m["id"] for m in msgs], None, flagged)[0])[1]
-                    return got + ([(slowcomplaint.SECTION, speed)] if speed else [])
-
-                session_digest = {"parts": parts, "full": whole, "seen": coordsession.fingerprint(baseline),
+            if session_on:   # a session wake may send only what changed
+                full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole or [])[1]
+                        + ([(slowcomplaint.SECTION, speed)] if speed else []))
+                session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                                   "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
             session_prompt = None

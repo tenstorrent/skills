@@ -985,12 +985,15 @@ def machine_events(db, event_ids: list[int]) -> bool:
 
 
 def ledger_section(p: Project, db, seen: dict | None, machine_event: bool,
-                   now: float) -> tuple[list[str], dict] | None:
+                   now: float, whole: list | None = None) -> tuple[list[str], dict] | None:
     """The machine ledger's digest lines and what to store for the next turn under LEDGER_SEEN_KEY;
     None when there is nothing to show. Whole (ledger_whole) on a turn with a machine event or without
     `seen`; else only the lines new or reworded since the previous turn, and a count of the ones gone.
-    The line naming machines without a recovery owner is shown once anyway."""
+    The line naming machines without a recovery owner is shown once anyway. `whole` (a list): gets
+    the whole lines too, from the same items (digest_items names a gap only once)."""
     items = machine_ledger.digest_items(p, now)
+    if whole is not None and items:
+        whole.extend(ledger_whole(p, items, now))
     kept = [(k, ln) for k, ln in items if k != machine_ledger.GAP_ITEM]
     store = {"lines": {k: _sha(ln) for k, ln in kept}}
     before = (seen or {}).get(LEDGER_SEEN_KEY)
@@ -1094,20 +1097,28 @@ def with_cached(context: str, cached: str) -> str:
 
 
 def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int],
-                 seen: dict | None = None, corrections: dict | None = None) -> tuple[list[tuple[str, str]], dict]:
+                 seen: dict | None = None, corrections: dict | None = None,
+                 whole: list | None = None) -> tuple[list[tuple[str, str]], dict]:
     """The turn's digest as (section, text) pairs in order, and the hash of each COLLAPSIBLE section,
     to store as `seen` for the next turn. With `seen`, a collapsible section whose hash is unchanged
     is shown as one line. `corrections`: {message id: why} of the likely corrections among `msg_ids`
-    (correction.flag; worked out here when not given)."""
+    (correction.flag; worked out here when not given). `whole` (a list): gets the same digest's
+    (section, text) pairs without the per-turn collapsing, from this one pass: some section builders
+    write state when they run (ends, responsibilities), so a second build would leave their lines out."""
     db = p.db
     now = time.time()
     home = timefmt.home(p)
     shown: list[tuple[str, list[str]]] = []
+    uncollapsed: list[tuple[str, list[str]]] = []
     shas: dict = {}
 
-    def section(key: str, body: list[str], ident: str | None = None, short: str | None = None) -> None:
+    def section(key: str, body: list[str], ident: str | None = None, short: str | None = None,
+                full: list[str] | None = None) -> None:
         """`ident`: what makes a collapsible section different for the coordinator (no counters or
-        clocks); `short`: its one line when it is as the previous turn saw it."""
+        clocks); `short`: its one line when it is as the previous turn saw it; `full`: the body
+        before a collapse done outside (the open-task rows)."""
+        if full or body:
+            uncollapsed.append((key, full or body))
         if not body:
             return
         if key in COLLAPSIBLE and ident is not None:
@@ -1206,7 +1217,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("shared", lines)
     from . import checklane
     section("checks_wait", checklane.long_wait_lines(p.name, p.config(), now))
-    ledger = ledger_section(p, db, seen, machine_events(db, event_ids), now)
+    ledger_lines: list[str] = []
+    ledger = ledger_section(p, db, seen, machine_events(db, event_ids), now, ledger_lines)
+    if ledger_lines:
+        uncollapsed.append(("machine_ledger", ledger_lines))
     if ledger:
         shown.append(("machine_ledger", ledger[0]))
         shas[LEDGER_SEEN_KEY] = ledger[1]
@@ -1296,8 +1310,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     lines += setting_held
     if not rows:
         lines.append("- (none)")
+    rows_whole = lines
     lines, shas[TASK_ROWS_SEEN_KEY] = collapse_rows(p, db, lines, rows, seen, event_ids, msg_ids, now)
-    section("tasks", lines)
+    section("tasks", lines, full=rows_whole)
     section("user_orders", userorder.digest_lines(p))
     events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
               if event_ids else [])
@@ -1450,6 +1465,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append("- (none: periodic check — keep work flowing if the charter has unfinished goals)")
     lines.append("\nRespond with the JSON actions object only.")
     section("events", lines)
+    if whole is not None:
+        whole.extend((key, "\n".join(body)) for key, body in uncollapsed)
     return [(key, "\n".join(body)) for key, body in shown], shas
 
 
