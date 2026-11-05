@@ -2750,7 +2750,7 @@ def _commands_hash(cmds: list) -> str:
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
-def _spill_to(todo: list, host: str, cfg: dict | None) -> list:
+def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
     """`todo` run on spill host `host` (checkspill, push.spill_to), each local check marked `spilled`: its
     pass is recorded, and found, under the same key as a run here (_command_key), so a later local `ttp checks`
     of the same tree (a review's pre-started checks, the reviewer's own) reuses it instead of running
