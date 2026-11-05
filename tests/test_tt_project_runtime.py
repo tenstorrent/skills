@@ -27149,6 +27149,7 @@ DURABLE_EXEMPT = {
     ("devq.py", 'open(lockf, "a")'): "a flock guard file, never written",
     ("devq.py", 'runner.lock", "a")'): "a flock guard file, never written",
     ("detach.py", '.lock", "a")'): "the queue folder's flock guard file, never written",
+    ("onhost.py", '.lock", "a")'): "the started-on-host record's flock guard file, never written",
     ("prbody.py", 'os.fdopen(fd, "w"'): "a PR body handed to the project's body check in a private temp file, deleted once the check ends; never state",
     ("watchdog.py", "mark.write_text"): "names a process, which a reboot ends",
     ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
