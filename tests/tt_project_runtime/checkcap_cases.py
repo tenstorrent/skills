@@ -6915,3 +6915,125 @@ def test_a_precheck_of_a_done_task_whose_review_is_open_is_kept(env, monkeypatch
     checklane, lane, rec = _waiting_precheck_lane(p, tid, head, now - 7000, monkeypatch)
     monkeypatch.setattr(checklane.locks, "holder_records", lambda paths: [rec])
     assert checklane.finished_holders(p, {}, now) == []
+
+
+def test_urgent_first_puts_every_urgent_waiter_of_any_project_ahead_by_priority_then_arrival(tmp_path, monkeypatch):
+    """#5893: under locks.URGENT_FIRST (the default checks.priority_turns) urgent checks of another project
+    go ahead of older routine and aged waiters, the most urgent priority first, then the oldest."""
+    from ttp import checkcap, locks, project
+    d = tmp_path / "slots"
+    for n, (label, g, pr) in enumerate([("b3", "B", 3), ("a2", "A", 2), ("c1", "C", 1), ("b0", "B", 0),
+                                        ("a1", "A", 1), ("c4", "C", None)]):
+        locks.enqueue(d, "r", label, since=1000.0 + n, group=g, priority=pr)
+    names = lambda **k: [x.read_text() for x in locks.fair_order(d, "r", urgent_max=locks.URGENT_FIRST, **k)]
+    assert names()[:3] == ["b0", "c1", "a1"], "priority 0 first, then the priority-1 waiters by arrival"
+    assert names(aged_before=1001.5)[:3] == ["b0", "c1", "a1"], "aged routine waiters stay behind urgent ones"
+    assert names(aged_before=1001.5)[3:5] == ["b3", "a2"], "then the aged ones by arrival"
+    assert sorted(names()[3:]) == ["a2", "b3", "c4"]
+    monkeypatch.delenv("TTP_CHECKS_PRIORITY_TURNS", raising=False)
+    monkeypatch.setattr(project, "load_account_settings", lambda: {})
+    assert checkcap.priority_turns() == checkcap.PRIORITY_TURNS == locks.URGENT_FIRST
+
+
+def test_the_test_pool_host_line_serves_a_later_p1_of_another_project_before_an_earlier_p3(env, monkeypatch):
+    """#5893: testslots.acquire's host line is locks.urgent_order: a priority-1 run that arrived later takes
+    a free slot ahead of an earlier priority-3 waiter of another project; a later priority-3 run waits."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (2, 1))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    early = locks.enqueue(checkcap.slot_dir(), testslots.TESTS.resource, "c p3", time.time() - 600, group="C",
+                          priority=3)
+    try:
+        assert testslots.acquire("b p3", project_name="B", priority=3, wait_s=0) is None, "behind the earlier p3"
+        g = testslots.acquire("b p1", project_name="B", priority=1, wait_s=0)
+        assert g is not None and g.k == 1, "the later p1 goes first"
+        g.close()
+    finally:
+        locks.dequeue(early)
+
+
+def test_pool_room_keeps_a_slot_for_an_urgent_run_of_another_project_parked_for_test_slots(env, monkeypatch):
+    """#5893: testslots.pool_room leaves the pool's free slot to an urgent PARKED run of another project
+    (urgent_parked): no room for a routine run or a later urgent one, room for a more urgent or older one."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (1, 1))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    assert testslots.pool_room({}, "A") and testslots.urgent_parked("A") == 0
+    t0 = time.time() - 60
+    parked = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "B task #9 ttp checks", t0, group="B", priority=1)
+    try:
+        assert testslots.urgent_parked("A") == 1 and testslots.urgent_parked("B") == 0, "only other projects'"
+        assert not testslots.pool_room({}, "A"), "a routine run leaves the slot to the parked urgent one"
+        assert not testslots.pool_room({}, "A", priority=3)
+        assert not testslots.pool_room({}, "A", priority=1), "a later run as urgent waits behind it"
+        assert testslots.pool_room({}, "A", priority=1, since=t0 - 10), "an older urgent run goes first"
+        assert testslots.pool_room({}, "A", priority=0), "a more urgent run goes first"
+        assert testslots.pool_room({}, "B"), "that urgent run itself has room"
+    finally:
+        locks.dequeue(parked)
+    routine = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "B routine", t0, group="B", priority=3)
+    try:
+        assert testslots.pool_room({}, "A"), "a routine parked run keeps nothing"
+    finally:
+        locks.dequeue(routine)
+
+
+def test_a_checks_wait_ends_once_its_task_moves_the_branch_off_the_head_and_never_on_a_detached_head(tmp_path):
+    """#5893: cli._HeadMoved (asked by _checks_slot_take's stop) is "" while the branch tip is the head,
+    the reason once a new commit moves it, and "" for a wait that began on a detached HEAD."""
+    from ttp import cli
+    repo = tmp_path / "r"
+    git = ["git", "-C", str(repo), "-c", "user.name=t", "-c", "user.email=t@e"]
+    subprocess.run(["git", "init", "-q", "-b", "work", str(repo)], check=True)
+    (repo / "a").write_text("1\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "a"], check=True)
+    rev = lambda: subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    head = rev()
+    moved = cli._HeadMoved(str(repo), head)
+    assert moved() == ""
+    (repo / "a").write_text("2\n")
+    subprocess.run([*git, "commit", "-qam", "b"], check=True)
+    assert moved() == "", "asked again within HEAD_MOVED_S: git is not read"
+    moved.at = 0
+    why = moved()
+    assert head[:12] in why and rev()[:12] in why and "on work" in why, why
+    assert cli._HeadMoved(str(repo), head)() == "", "a wait that began off its head never ends this way"
+    subprocess.run([*git, "checkout", "-q", "--detach"], check=True)
+    detached = cli._HeadMoved(str(repo), rev())
+    subprocess.run([*git, "commit", "-q", "--allow-empty", "-m", "c"], check=True)
+    detached.at = 0
+    assert detached() == "", "a detached HEAD never ends a wait"
+
+
+def test_an_urgent_check_waiting_ten_minutes_raises_one_urgent_check_wait_event(env, monkeypatch, tmp_path):
+    """#5893: an urgent checks run of this project waiting checkcap.URGENT_WAIT_S in the host-wide checks
+    queue raises one urgent_check_wait event naming the queue, and none again on a later tick."""
+    from ttp import checkcap, daemon as dm, locks
+    p = make(env)
+    sd = tmp_path / "check-slots"
+    monkeypatch.setattr(checkcap, "slot_dir", lambda: sd)
+    t0 = time.time()
+    tickets = [locks.enqueue(sd, checkcap.RESOURCE, f"{p.name} task #42 (run 7) ttp checks", t0 - 700,
+                             group=p.name, priority=1),
+               locks.enqueue(sd, checkcap.RESOURCE, f"{p.name} task #43 ttp checks", t0 - 700, group=p.name,
+                             priority=3),
+               locks.enqueue(sd, checkcap.RESOURCE, "other task #5 ttp checks", t0 - 700, group="other", priority=1),
+               locks.enqueue(sd, checkcap.RESOURCE, f"{p.name} task #44 ttp checks", t0 - 60, group=p.name,
+                             priority=1)]
+    events = lambda: p.db.q("SELECT text, task, status FROM events WHERE kind=?", (checkcap.URGENT_WAIT,))
+    try:
+        d = dm.Daemon(p.base)
+        d.check_urgent_check_wait()
+        got = events()
+        assert len(got) == 1 and got[0]["task"] == 42 and got[0]["status"] == "queued", got
+        assert "host-wide checks queue" in got[0]["text"] and "12 min" in got[0]["text"], got[0]["text"]
+        d._urgent_check_wait_checked = 0
+        d.check_urgent_check_wait()
+        dm.Daemon(p.base).check_urgent_check_wait()
+        assert len(events()) == 1, "one event per wait"
+    finally:
+        for t in tickets:
+            locks.dequeue(t)
