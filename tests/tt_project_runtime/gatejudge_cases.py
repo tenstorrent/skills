@@ -48,6 +48,28 @@ def test_gate_judge_sorts_pre_existing_flaky_and_new_failures(tmp_path):
     assert v["new"] == [a]
 
 
+def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of_it(tmp_path):
+    from ttp import gatejudge
+    a, b = "tests/test_a.py::test_p[x1]", "tests/test_a.py::test_q"
+    # Nothing selected on the head (exit 5, e.g. a parametrize id that changed): not flaky, still new.
+    calls = []
+
+    def none_ran(at, ids):
+        calls.append(at)
+        return 5, "no tests ran in 0.1s\n"
+    v = gatejudge.judge([a], none_ran, tmp_path, "b1", "host-a", 1000.0)
+    assert v["new"] == [a] and v["flaky"] == [] and calls == ["head"]
+    assert gatejudge.active(tmp_path, 1000.0) == {}
+    # Exit 0 with fewer passed than rerun (the selection missed one), or no summary: cannot tell.
+    for out in ("1 passed in 0.1s\n", "\n"):
+        v = gatejudge.judge([a, b], lambda at, ids: (0, out), tmp_path, "b1", "host-a", 1000.0)
+        assert v["new"] == [a, b] and v["flaky"] == []
+    # Both reported passed: flaky, as before.
+    v = gatejudge.judge([a, b], lambda at, ids: (0, "2 passed, 9 deselected in 0.1s\n"), tmp_path, "b1",
+                        "host-a", 1000.0)
+    assert v["flaky"] == [a, b] and v["new"] == []
+
+
 def test_gate_judge_uses_a_saved_base_result_only_from_the_same_host(tmp_path):
     from ttp import gatejudge
     a = "tests/test_a.py::test_pre"

@@ -11,8 +11,8 @@ fail again once on the base (the change's merge base with the push target). Per 
 - fails on the head rerun and on the base: pre-existing. Reported by name; it does not block.
 - fails on the head rerun and passes on the base (or is not there): new. It blocks.
 
-A rerun that cannot tell (out of time, an exit other than 0, 1 or 5, an incomplete list) keeps the
-failure. A base result saved earlier (BASE_FILE) counts only when it ran on this same host for the
+A rerun that cannot tell (out of time, an exit other than 0, 1 or 5, an incomplete list, a head
+rerun that selected none or not all of the ids) keeps the failure. A base result saved earlier (BASE_FILE) counts only when it ran on this same host for the
 same base commit. A failing id in the active quarantine is excused without a rerun unless the change
 touches its file.
 
@@ -41,6 +41,7 @@ BASE_KEEP_S = 7 * 86400.0
 EVIDENCE_MAX = 5    # sightings kept per quarantined test
 NO_TESTS = 5        # pytest's exit status when nothing was selected
 EVENT = "checks_flaky_test"   # the queued fix note to the coordinator
+_PASSED = re.compile(r"\b(\d+) passed\b")   # the count in pytest's summary line
 
 
 def settings(cfg: dict) -> dict:
@@ -72,10 +73,15 @@ def judgeable(rc: int | None, output: str, cfg: dict) -> list[str]:
     return ids if complete and ids and len(ids) <= s["max_ids"] else []
 
 
-def failed_of(rc: int | None, output: str, ids: list[str]) -> set[str] | None:
-    """Which of `ids` failed in a rerun of them: none on exit 0 or 5 (nothing selected: not there),
-    those listed on exit 1 with a complete list, None when the rerun cannot tell."""
-    if rc in (0, NO_TESTS):
+def failed_of(rc: int | None, output: str, ids: list[str], at: str = "base") -> set[str] | None:
+    """Which of `ids` failed in a rerun of them: none on exit 0, or on exit 5 at the base (nothing
+    selected: not there), those listed on exit 1 with a complete list, None when the rerun cannot
+    tell. At the head the ids just failed, so a rerun that selected none of them, or reports fewer
+    passed than it reran (a name selection that missed one), proves nothing."""
+    if rc == 0 and at == "head":
+        got = [int(n) for n in _PASSED.findall(output)]
+        return set() if got and got[-1] >= len(set(ids)) else None
+    if rc == 0 or (rc == NO_TESTS and at == "base"):
         return set()
     if rc != 1:
         return None
@@ -159,7 +165,7 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
         (v["quarantined"] if i in q and not touched(i) else todo).append(i)
     if not todo:
         return v
-    again = failed_of(*run("head", todo), todo)
+    again = failed_of(*run("head", todo), todo, "head")
     if again is None:
         v["new"] = todo
         return v
