@@ -453,8 +453,10 @@ def _pid_queued(pid, project_name: str = "") -> str:
 
 def _parked(rec: dict) -> str:
     """What a lane holder parked outside the host queue waits on (checkcap.acquire's `parks`, its lane
-    labelled testslots.PARKED_WAITS), else ""."""
-    return testslots.PARKED_WAITS + ", outside the host queue" if rec.get("waits") == testslots.PARKED_WAITS else ""
+    labelled testslots.PARKED_WAITS), with the gate that holds it (testslots.gate_lanes), else ""."""
+    if rec.get("waits") != testslots.PARKED_WAITS:
+        return ""
+    return testslots.PARKED_WAITS + ", outside the host queue" + (f"; held by {g}" if (g := rec.get("gate")) else "")
 
 
 def wrap_key(wrap) -> str:

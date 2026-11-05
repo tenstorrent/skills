@@ -6118,9 +6118,10 @@ def test_a_project_can_set_its_own_test_run_max(env):
 
 
 def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env, monkeypatch):
-    """Above checks.load_guard x the cores no run takes test slots, priority-1 and push runs included;
-    it waits saying why (its lane's wait note too), running grants are left alone, and once the load
-    drops it starts. A nested run keeps its parent's grant; 0 or an unreadable load never holds one."""
+    """Above checks.load_guard x the cores no routine run takes test slots, nor a priority-1 or push run
+    while another holds the one load pass (#5992); it waits saying why (its lane's wait note too), running
+    grants are left alone, and once the load drops it starts. A nested run keeps its parent's grant; 0 or
+    an unreadable load never holds one."""
     import threading
     from ttp import checkcap, locks, project, testslots
     _slot_sizes(monkeypatch, 32, 4)
@@ -6132,8 +6133,12 @@ def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env,
     assert running and running.k == 4
     load[0] = 82.0
     told = []
-    for kw in ({}, {"priority": 1}, {"push_key": "origin feature"}):
-        assert testslots.acquire("new", told.append, wait_s=0.2, project_name="pb", **kw) is None, kw
+    pass_holder = locks.try_take([testslots.load_pass_path()], "an urgent run past the guard", "load-guard pass")
+    try:
+        for kw in ({}, {"priority": 1}, {"push_key": "origin feature"}):
+            assert testslots.acquire("new", told.append, wait_s=0.2, project_name="pb", **kw) is None, kw
+    finally:
+        pass_holder.close()
     assert told and all("overloaded" in t and "82.0" in t and "64 cores" in t for t in told), told
     assert locks._slot_labels([Path(running.files[0].name)]), "a running suite keeps its slots"
     monkeypatch.setenv(testslots.HELD_ENV, "3")
@@ -6174,6 +6179,124 @@ def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env,
     monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD")
     project.set_account_setting("checks.load_guard", 2)
     assert testslots.load_guard() == "", "the account setting"
+
+
+def _host_of_64(monkeypatch, load: float = 0.0):
+    """A 64-core host with the default pool and grant (32, 8), a project ceiling of 8 test workers and a
+    lane cap of 4 (checks.test_project_max), at a fixed 1-minute `load` (load guard on)."""
+    from ttp import checkcap
+    for k in ("TTP_TEST_POOL", "TTP_TEST_RUN_MAX", "TTP_TEST_RUN_MIN", "TTP_TEST_PROJECT_SLOTS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.02")
+    monkeypatch.setenv("TTP_TEST_PROJECT_WORKERS", "8")
+    monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "4")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: load)
+    monkeypatch.setattr(checkcap, "live_cores_on", lambda: False)
+    monkeypatch.setattr(checkcap, "extra_max", lambda: 0)
+
+
+def test_a_second_full_run_of_a_project_starts_beside_the_first_within_its_worker_ceiling(env, monkeypatch):
+    """#5992: with 64 cores, a lane cap of 4 and 8 project test workers, a run that starts while another
+    of its project waits takes its share (max(run_min, 8 // 4) = 4), not all 8, so the waiting one starts
+    beside it; a run alone still takes the whole ceiling."""
+    from ttp import checkcap, locks, testslots
+    _host_of_64(monkeypatch)
+    assert testslots.sizes({}) == (32, 8) and testslots.project_max({}, project_name="pa") == 8
+    alone = testslots.acquire("alone", project_name="pa", wait_s=0, full=True)
+    assert alone and alone.k == 8, "a run alone takes the project's whole ceiling"
+    alone.close()
+    parked = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "second", time.time(), group="pa")
+    try:
+        first = testslots.acquire("first", project_name="pa", wait_s=0, full=True)
+        assert first and first.k == 4, "another run of its project waits: its share"
+        assert testslots.pool_room({}, "pa", full=True), "the waiting run has room beside it"
+        locks.dequeue(parked)
+        second = testslots.acquire("second", project_name="pa", wait_s=0, full=True)
+        assert second and second.k == 4, "the second full run starts beside the first"
+        assert not testslots.pool_room({}, "pa", full=True), "the ceiling of 8 is full now"
+        other = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "other project", time.time(), group="pb")
+        try:
+            assert not testslots.project_waits("pa"), "another project's waiter is no waiter of this one"
+        finally:
+            locks.dequeue(other)
+    finally:
+        locks.dequeue(parked)
+        for g in ("first", "second"):
+            (locals().get(g) or testslots.Grant()).close()
+
+
+def test_over_the_load_guard_a_routine_run_waits_and_one_push_or_urgent_run_starts(env, monkeypatch):
+    """#5992: while the host's load is above checks.load_guard, a routine run takes no test slots, a
+    push-queue run or an urgent one (priority 1) starts, one at a time (the load pass goes with its
+    grant), and pool_gate/load_held agree with acquire."""
+    from ttp import testslots
+    _host_of_64(monkeypatch, load=84.5)
+    assert testslots.load_guard()
+    told = []
+    assert testslots.acquire("routine", told.append, wait_s=0.2, project_name="pa", full=True) is None
+    assert told and "overloaded" in told[-1]
+    assert testslots.pool_gate({}, "pa", full=True).startswith("host load: ")
+    assert not testslots.pool_gate({}, "pa", full=True, priority=1), "an urgent run passes the guard"
+    push = testslots.acquire("push queue", told.append, wait_s=0.2, project_name="pa", push_key="origin feature")
+    try:
+        assert push and push.k == 8 and any(f.name == str(testslots.load_pass_path()) for f in push.files)
+        assert testslots.acquire("urgent", wait_s=0.2, project_name="pb", priority=1, full=True) is None, \
+            "one at a time: the pass is held"
+        assert testslots.pool_gate({}, "pb", full=True, priority=1).startswith("host load: ")
+        assert testslots.load_held(push=True), "a second push run waits too"
+    finally:
+        push and push.close()
+    urgent = testslots.acquire("urgent", wait_s=0.2, project_name="pb", priority=1, full=True)
+    try:
+        assert urgent and urgent.k == 8, "the pass freed with the push run's grant: the urgent run starts"
+    finally:
+        urgent and urgent.close()
+    assert not testslots.load_held(1), "every grant let the pass go"
+
+
+def test_slot_status_names_the_gate_that_holds_a_parked_run(env, tmp_path, monkeypatch):
+    """#5992: a run parked for its test slots (cli._checks_slot_take) records the gate pool_gate found on
+    its lane, and status prints it (checklane._parked): the project's budget with its holder, or the
+    host's load; once it starts the gate is cleared."""
+    import io
+    import threading
+    from ttp import checkcap, checklane, cli, locks, testslots
+    p = make(env)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 30.0)
+    _budget_of_one(monkeypatch)
+    full = testslots.acquire("the budget holder", project_name=p.name)
+    got = []
+    t = threading.Thread(target=lambda: got.append(
+        cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, False, cmds=["true"], top=str(p.base))))
+
+    def waits_on():
+        return [h.get("waits_on") for lane in checklane.lane_status(p.name) for h in lane["lanes"]]
+    t.start()
+    try:
+        assert _wait_for(lambda: any("held by its project's test-worker budget: 0 of 1 free" in str(w)
+                                     for w in waits_on())), waits_on()
+        assert "the budget holder" in str(waits_on()), "the gate names the holder"
+        assert "test-worker budget: 0 of 1 free" in " ".join(checklane.lane_lines(p.name))
+        full.close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None
+        recs = [r for b in testslots.suite_bases(p.name) for r in locks.holder_records(testslots._lanes_of(b))]
+        assert recs and all(not r.get("gate") for r in recs), "started: no gate left on its lane"
+    finally:
+        full.close()
+        t.join(30)
+        got and got[0] and got[0].close()
+    rec = {"waits": testslots.PARKED_WAITS, "gate": "host load: the host is overloaded"}
+    assert checklane._parked(rec).endswith("; held by host load: the host is overloaded")
 
 
 def _budget_of_one(monkeypatch):
@@ -6263,7 +6386,7 @@ def test_a_checks_run_parked_for_its_test_budget_reads_so_in_status_until_it_sta
         return [h for lane in checklane.lane_status(p.name) for h in lane["lanes"]]
     t.start()
     try:
-        assert _wait_for(lambda: [h.get("waits_on") for h in holders()]
+        assert _wait_for(lambda: [str(h.get("waits_on")).split("; held by")[0] for h in holders()]
                          == [testslots.PARKED_WAITS + ", outside the host queue"])
         assert checkcap.state()["running"] == [] and checkcap.state()["queued"] == []
         line = " ".join(checklane.lane_lines(p.name))
@@ -6750,11 +6873,13 @@ def test_own_push_checks_take_the_own_branch_lane_at_once_while_a_long_run_holds
 def test_a_push_lanes_load_guard_wait_ends_at_its_bound_on_the_reserved_lane_alone(env, monkeypatch):
     """Push checks (testslots.acquire's push_key) wait under load_guard at most checks.push_load_wait_s
     (default 300 s), then start on their branch's reserved lane alone, one per lane at a time. Task
-    checks, priority-1 ones included, keep waiting; "off" restores the unbounded wait."""
+    checks, priority-1 ones included, keep waiting; "off" restores the unbounded wait. That bound is for
+    while another urgent or push run holds the one load pass (load_passes, #5992)."""
     from ttp import locks, project, testslots
     _slot_sizes(monkeypatch, 8, 2)
     monkeypatch.delenv(testslots.PUSH_LOAD_WAIT_ENV, raising=False)
     monkeypatch.setattr(testslots, "load_guard", lambda: "the host is overloaded")
+    monkeypatch.setattr(testslots, "load_passes", lambda *a, **k: False)   # another run holds the pass
     assert testslots.push_load_wait_s({}) == testslots.PUSH_LOAD_WAIT_S == 300.0, "bounded by default"
     assert testslots.acquire("push", project_name="pa", push_key="remote b", wait_s=0.3) is None, \
         "under the default bound it still waits"
