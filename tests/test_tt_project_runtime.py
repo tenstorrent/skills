@@ -43193,6 +43193,53 @@ def test_deployed_accepts_only_every_daemons_own_receipt(env, tmp_path, capsys):
         x.close()
 
 
+def test_deployed_read_only_accepts_a_newer_release_that_contains_the_target(env, tmp_path, capsys, monkeypatch):
+    """A probe for an older fix passes once every project runs a newer release that contains its commit:
+    by git in the current checkout where it can tell, else by version order. Older stays pending."""
+    import subprocess
+    from ttp.cli import main
+
+    def git(*a):
+        return subprocess.run(["git", "-C", str(repo), *a], check=True, capture_output=True, text=True).stdout.strip()
+
+    repo = tmp_path / "src"
+    repo.mkdir()
+    git("init", "-q")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "fix")
+    fix = git("rev-parse", "HEAD")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "later")
+    later = git("rev-parse", "HEAD")
+    git("checkout", "-q", "--orphan", "side")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", "elsewhere")
+    other = git("rev-parse", "HEAD")
+    _deploy_lib("0.6.0", later)
+    _, a = _deploy_project(tmp_path, "alpha", "0.6.0", commit=later)
+    before = _tree(tmp_path / "alpha")
+
+    def run(*args):
+        capsys.readouterr()
+        with pytest.raises(SystemExit) as e:
+            main(["deployed", *args])
+        return e.value.code, capsys.readouterr().out
+
+    # outside a checkout that knows the commits: version order decides
+    code, out = run("0.5.0", "--commit", other)
+    assert code == 0 and "alpha\tok: runs 0.6.0" in out and "which contains 0.5.0" in out, out
+    monkeypatch.chdir(repo)
+    code, out = run("0.5.0", "--commit", fix[:9])
+    assert code == 0 and "alpha\tok: runs 0.6.0" in out, out
+    # git shows the newer release lacks the commit: not deployed
+    code, out = run("0.5.0", "--commit", other)
+    assert code == 1 and f"pending: daemon runs 0.6.0 ({later[:12]}), which does not contain {other[:12]}" in out, out
+    # an older running release is still pending, and the exact release still passes
+    code, out = run("0.7.0")
+    assert code == 1 and "alpha\tpending:" in out, out
+    code, out = run("0.6.0", "--commit", later)
+    assert code == 0 and "alpha\tok: running 0.6.0" in out, out
+    assert _tree(tmp_path / "alpha") == before   # still read only
+    a.close()
+
+
 def test_deployed_counts_a_deferred_merge_as_pending_with_owner_and_resume_time(env, tmp_path):
     from ttp import overview, release, timefmt
     _deploy_lib("0.5.0")

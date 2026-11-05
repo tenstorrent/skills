@@ -7638,13 +7638,13 @@ def cmd_overview(a) -> None:
 
 def cmd_deployed(a) -> None:
     """Probe for a deploy (and a retry_when): exit 0 once every project `ttp list` shows on this machine
-    runs the target version and commit by its daemon's own receipt and completed a tick since; 1 while
-    any is pending (a deferred merge, a restart not yet done), one line each with owner and resume time;
-    2 when it cannot tell. Read only unless --after-push records owned pending merges and alerts
+    runs the target version and commit (or a newer release that contains it) by its daemon's own receipt
+    and completed a tick since; 1 while any is pending (a deferred merge, a restart not yet done), one line
+    each with owner and resume time; 2 when it cannot tell. Read only unless --after-push records owned pending merges and alerts
     in the reporting project (done/pending exit 0, failed exit 1)."""
     from . import overview as ov
     names = [n.strip() for n in (a.projects or "").split(",") if n.strip()] or None
-    data = ov.deployed(a.version, a.commit, names, a.fresh_s, allow_newer=a.after_push)
+    data = ov.deployed(a.version, a.commit, names, a.fresh_s, allow_newer=True)
     if a.after_push:
         from . import deploy
         p = here()

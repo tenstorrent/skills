@@ -391,6 +391,19 @@ def _concerns(auto: dict, target: str, commit: str | None) -> bool:
     return not commit or not c or _same_commit(c, commit)
 
 
+def _contains(commit: str | None, running: str | None) -> bool | None:
+    """The running release's commit has the target `commit` in its history, by git in the caller's
+    checkout; None when git cannot tell there (no commit, not a repository, a commit it does not have)."""
+    import subprocess
+    if not commit or not running or running == "unknown":
+        return None
+    try:
+        r = subprocess.run(["git", "merge-base", "--is-ancestor", commit, running], capture_output=True, timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return {0: True, 1: False}.get(r.returncode)
+
+
 def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: float, here: str,
                   fresh_s: float = DEPLOY_FRESH_S, allow_newer: bool = False) -> dict:
     """Whether project `name` runs `target` (and `commit`, when given): {"name", "state": OK, PENDING or
@@ -469,7 +482,12 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
             return done(CANNOT, f"receipt unverified: {r.get('why') or 'unknown provenance'}")
         rv, rc = str(r.get("version") or "?"), r.get("commit")
         row.update(running_version=rv, running_commit=rc, instance=r.get("instance"))
-        if not (allow_newer and is_newer(rv, target)) and (rv != target or (commit and not _same_commit(rc, commit))):
+        # A newer release passes when it holds the target commit: by git where it can tell, else by version.
+        newer = allow_newer and is_newer(rv, target)
+        if newer and _contains(commit, rc) is False:
+            return done(PENDING, f"daemon runs {rv} ({(rc or '?')[:12]}), which does not contain {commit[:12]}",
+                        "the next release that contains it", "when it is deployed")
+        if not newer and (rv != target or (commit and not _same_commit(rc, commit))):
             running = f"{rv} ({(rc or '?')[:12]})"
             if not at_target:
                 reason, owner, resumes = _behind(name, db, state, files, now, where, target, commit)
@@ -487,16 +505,19 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         row["tick_done"] = tick
         row["settling"] = not tick or tick < installed_at
         if not tick:
-            return done(PENDING, f"daemon runs {target} but has not completed a tick yet", "this project's daemon",
+            return done(PENDING, f"daemon runs {rv} but has not completed a tick yet", "this project's daemon",
                         "at its first completed tick")
         if tick < installed_at:
-            return done(PENDING, f"daemon runs {target} but has not completed a tick since the files were installed",
+            return done(PENDING, f"daemon runs {rv} but has not completed a tick since the files were installed",
                         "this project's daemon", "at its next completed tick")
         if now - tick > fresh_s:
-            return done(PENDING, f"daemon runs {target} but its last completed tick was {_ago(now - tick)} ago "
+            return done(PENDING, f"daemon runs {rv} but its last completed tick was {_ago(now - tick)} ago "
                                  f"(over {_ago(fresh_s)}; daemon {daemon})", "this project's daemon",
                         "at its next completed tick")
-        return done(OK, f"running {target} ({(rc or '?')[:12]}), last tick {_ago(max(now - tick, 0))} ago")
+        ago = _ago(max(now - tick, 0))
+        if newer:
+            return done(OK, f"runs {rv} ({(rc or '?')[:12]}), which contains {target}, last tick {ago} ago")
+        return done(OK, f"running {target} ({(rc or '?')[:12]}), last tick {ago} ago")
     except sqlite3.Error as e:
         return done(CANNOT, f"database unreadable: {e}")
     finally:
