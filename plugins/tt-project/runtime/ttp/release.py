@@ -26,6 +26,7 @@ TASK_EVERY_H = 6        # upgrade.task_every_h: at most one upgrade task per pro
 STALE_S = 6 * 3600      # a finish task blocked, or with no run or update this long, no longer holds off a host upgrade
 MERGE_RETRY_H = 6       # upgrade.merge_retry_h: a host-side upgrade queues a merge task once the last ended this long ago
 KV_RELEASE, KV_AUTO = "release", "upgrade_auto"
+KV_CHECKED = "release_checked"   # {}: its row time is when the daemon last compared releases (check_release)
 SETUP_JOURNAL = ".setup.journal"   # in HOME_DIR/lib while `ttp setup` copies a release in (cli._recover_setup)
 COPY_TRIES = 3          # an --auto upgrade whose template copy fails is held and retried, failed at the third
 RECHECK = "rechecked soon"   # the tail of a hold_reason line check_release looks at again in HELD_RECHECK_S

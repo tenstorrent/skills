@@ -313,15 +313,30 @@ def _age(s: float) -> str:
     return _ago(s) if s < 3600 else f"{int(s // 3600)} h" if s < 86400 else f"{int(s // 86400)} d"
 
 
+def _next_check(db: _RO, now: float) -> float | None:
+    """When the project's daemon next compares the installed release with its harness: its last check
+    (release.KV_CHECKED) plus release.CHECK_S, in the past when that check is overdue. A daemon that
+    records no check time (an older release): the last drift change, a check too, while that bounds
+    a time still ahead; else None (unknown, but a ticking daemon checks within CHECK_S of now)."""
+    from .release import CHECK_S, KV_CHECKED, KV_RELEASE
+    _, checked = db.kv(KV_CHECKED)
+    if checked:
+        return checked + CHECK_S
+    _, seen = db.kv(KV_RELEASE)
+    return seen + CHECK_S if seen and seen + CHECK_S >= now else None
+
+
 def _behind(name: str, db: _RO, state: Path, files: str, now: float, where, target: str,
             commit: str | None) -> tuple[str, str, str]:
     """(reason, owner, resumes) for a project whose harness files are not at the `target` (`commit`) yet.
     The owner is one that can act on that project: its daemon, task or coordinator, never the deploy's."""
     from . import timefmt
-    from .release import CHECK_S, KV_AUTO, KV_RELEASE, STALE_S, task_activity
+    from .release import KV_AUTO, STALE_S, task_activity
     at = lambda ts: timefmt.short(max(ts, now), where, now)  # noqa: E731
-    _, seen = db.kv(KV_RELEASE)
-    next_check = f"at {at(seen + CHECK_S)} (its next release check)" if seen else "at its next release check (hourly)"
+    due = _next_check(db, now)
+    next_check = ("at its next release check (hourly)" if due is None else
+                  f"at {at(due)} (its next release check)" if due >= now else
+                  f"at its release check, overdue since {timefmt.short(due, where, now)}")
     tid = _holder(db, state)
     if tid:
         t, last = task_activity(db, tid)
@@ -436,12 +451,12 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
               and cur.get("outcome") not in ("running", "failed")):
             # Its live daemon merges the release by itself: at its next release check, or when a deferred
             # merge's wait ends. Past that deadline deploy.assess reports it missed.
-            from .release import CHECK_S, KV_RELEASE
+            from .release import CHECK_S
             if cur.get("outcome") == "deferred":
                 at = float(cur.get("until") or 0) or now + CHECK_S
-            else:
-                _, seen = db.kv(KV_RELEASE)
-                at = seen + CHECK_S if seen else now + CHECK_S
+            else:   # its real next check; unknown: a ticking daemon checks within CHECK_S of now
+                due = _next_check(db, now)
+                at = now + CHECK_S if due is None else due
             row.update(merge_pending=True, merge_owner="this project's daemon", takeover_at=at)
         if not pid:
             if not at_target:

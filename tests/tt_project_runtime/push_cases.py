@@ -8392,6 +8392,70 @@ def test_after_push_deploy_project_mid_its_own_upgrade_is_owned_not_unowned(env,
     assert deploy.assess({}, stale, now)[0] == 'failed'
 
 
+@pytest.mark.parametrize('case', ['settled_old_daemon', 'settled_recorded', 'frozen', 'overdue'])
+def test_after_push_deploy_takeover_follows_the_daemons_real_release_check(env, tmp_path, monkeypatch, case):
+    """The release row's time changes only when drift changes: a project whose drift settled hours ago
+    read 'resumes at <now> (its next release check)', its takeover was already past at the after_push and
+    the first tick took over a ticking daemon's own upgrade. The takeover is its daemon's real next check
+    (release.KV_CHECKED plus CHECK_S; a daemon recording none: within CHECK_S of now) and the line says
+    when; a frozen daemon still fails; a check that is really overdue reads so and hands over past the grace."""
+    from ttp import daemon, deploy, overview, release, timefmt
+    p = make(env)
+    _deploy_lib('0.5.0')
+    base, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    now = time.time()
+    db.set_kv(release.KV_RELEASE, {'installed': '0.4.9', 'current': '0.4.8', 'key': '0.4.9 x'})
+    db.x("UPDATE kv SET ts=? WHERE key=?", (now - 2 * 3600, release.KV_RELEASE))    # settled 2 h ago
+    checked = {'settled_recorded': now - 600, 'frozen': now - 600, 'overdue': now - release.CHECK_S - 60}
+    if case in checked:
+        db.set_kv(release.KV_CHECKED, {})
+        db.x("UPDATE kv SET ts=? WHERE key=?", (checked[case], release.KV_CHECKED))
+    if case == 'frozen':
+        old = now - daemon.HEARTBEAT_STALE_S - 60
+        os.utime(base / 'state' / 'heartbeat', (old, old))
+    launches = _fake_takeovers(monkeypatch, deploy)
+    report = overview.deployed(names=['alpha'], now=now)
+    row = report['projects'][0]
+    result = deploy.record(p, report, now)
+    deploy.tick(p, lambda *a, **k: None, now + deploy.PROBE_S)
+    if case == 'frozen':
+        assert row['daemon_state'].startswith('stale') and not row.get('merge_owner'), row
+        assert result['projects'][0]['outcome'] == 'failed', result
+        return
+    assert row['merge_owner'] == "this project's daemon", row
+    short = lambda ts: timefmt.short(ts, overview._settings(base), now)  # noqa: E731
+    if case == 'overdue':
+        assert row['takeover_at'] == checked[case] + release.CHECK_S < now, row
+        assert row['resumes'] == f"at its release check, overdue since {short(checked[case] + release.CHECK_S)}", row
+        assert not launches and result['projects'][0]['outcome'] == 'pending', 'the grace still applies'
+        deploy.tick(p, lambda *a, **k: None, now + deploy.GRACE_S + deploy.PROBE_S)
+        assert launches, 'past the grace a genuinely overdue check is taken over'
+        return
+    want = now + release.CHECK_S if case == 'settled_old_daemon' else checked[case] + release.CHECK_S
+    assert abs(row['takeover_at'] - want) < 1 and row['takeover_at'] > now + deploy.GRACE_S, row
+    assert row['resumes'] == (f'at {short(want)} (its next release check)' if case == 'settled_recorded'
+                              else 'at its next release check (hourly)'), row
+    assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result
+    assert not launches, 'no host-side takeover of a ticking daemon at the first tick after a push'
+
+
+def test_release_check_records_when_it_ran_for_the_deploy_takeover(env, monkeypatch):
+    """Each release check, held or not, records its time (release.KV_CHECKED); a tick before the check
+    is due records nothing: the deploy's takeover reads the daemon's real next check from it."""
+    from ttp import release
+    p, d, _ = _release_daemon(env, monkeypatch)
+    ts = lambda: (p.db.one("SELECT ts FROM kv WHERE key=?", (release.KV_CHECKED,)) or {}).get("ts")  # noqa: E731
+    before = time.time()
+    d.check_release()
+    first = ts()
+    assert first and first >= before
+    d.check_release()
+    assert ts() == first, "not due yet: no check, no record"
+    d._release_due = 0
+    d.check_release()
+    assert ts() >= first and ts() >= d._release_due - release.CHECK_S
+
+
 def test_a_project_stuck_across_releases_is_one_alert_tracking_the_newest(env, tmp_path):
     """Replays alerts #469-#476: a project stuck behind release after release got one alert per release.
     It is one ongoing alert per project, updated in place with the newest release it misses, that clears

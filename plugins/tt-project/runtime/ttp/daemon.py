@@ -9153,6 +9153,7 @@ class Daemon:
             return
         self._release_due = now + release.CHECK_S
         db = self.p.db
+        db.set_kv(release.KV_CHECKED, {})   # its time bounds the next check for a deploy's takeover (overview)
         release.guard_harness(self.p.harness)    # harnesses made before the guard get it without an upgrade
         self.check_older_release()   # first: drift must see a lib/current it restored
         try:
