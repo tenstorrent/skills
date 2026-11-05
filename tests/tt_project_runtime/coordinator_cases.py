@@ -4661,7 +4661,8 @@ def test_a_user_turns_task_add_with_a_null_title_or_spec_keeps_its_message_once(
     # A rejection the next turn cannot fix from its output (a duplicate) handles the message as before.
     p.db.add_task("busy", "s", origin="user")
     mid2 = p.db.post("in", "add busy", chat="c1")
-    dup = SimpleNamespace(structured={"actions": [{"type": "task_add", "title": "busy", "spec": "s"}]},
+    dup = SimpleNamespace(structured={"actions": [{"type": "task_add", "title": "busy", "spec": "s"},
+                                                  {"type": "noop", "no_order": "already open as a task"}]},
                           error="", final_text="")
     d._finish_coordinator({"id": 3, "dir": "x"}, dup, "ok", {"messages": [mid2]})
     assert p.db.one("SELECT handled FROM messages WHERE id=?", (mid2,))["handled"] == 1
@@ -17119,8 +17120,8 @@ def test_routine_turns_are_skipped_while_every_open_task_is_held_and_nothing_cha
         ran = len(notes) > n
         if ran:
             rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
-            usage = SimpleNamespace(structured={"actions": [{"type": "noop"}], "summary": ""}, error="",
-                                    final_text="", cost_usd=0.2)
+            usage = SimpleNamespace(structured={"actions": [{"type": "noop", "no_order": "a greeting"}], "summary": ""},
+                                    error="", final_text="", cost_usd=0.2)
             d._finish_coordinator({"id": rid, "dir": "x"}, usage, "ok", notes[-1])
         assert p.db.one("SELECT status FROM events WHERE id=?", (eid,))["status"] == "handled"
         return ran

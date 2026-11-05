@@ -342,3 +342,160 @@ def test_an_unstarted_order_raises_one_start_late_signal(env, monkeypatch):
         check(at)
         unstarted.announced(p, at)
     assert [e["kind"] for e in raised(kinds)] == [ob.ORDER_LATE_KIND]
+
+
+def _turn(d, rid, actions, mids):
+    """One coordinator turn with `actions` for user messages `mids`, through the daemon's apply path."""
+    from types import SimpleNamespace
+    out = SimpleNamespace(structured={"actions": actions, "summary": ""}, error="", final_text="", cost_usd=0.0)
+    d._finish_coordinator({"id": rid, "dir": "x"}, out, "ok", {"messages": list(mids)})
+
+
+def test_a_turn_handling_a_user_message_needs_its_order_or_a_no_order_reason_once(env, monkeypatch):
+    """A user message's turn records its order (add or link) or a `no_order` with a reason on an applied
+    reply or noop. Missing both, it is refused once and the message comes back to the next turn; a
+    second miss is let through. A relayer's findings need neither."""
+    from ttp import coordinator as coord, obligations as ob, turnrules
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+
+    def handled(m):
+        return p.db.one("SELECT handled FROM messages WHERE id=?", (m,))["handled"]
+
+    def refused():
+        return [x for x in p.db.kv(coord.REJECTED_KEY, []) or [] if x.startswith(turnrules.PREFIX)]
+    reply = {"type": "reply", "chat": "c1", "text": "on it"}
+    _turn(d, 1, [reply], [mid])
+    assert handled(mid) == 0 and len(refused()) == 1 and f"#{mid}" in refused()[0]
+    assert f"user message #{mid} is shown to you again, once: record its order" in coord.digest(p, {}, [], [])
+    _turn(d, 2, [reply], [mid])   # the same miss again: let through, the message is handled
+    assert handled(mid) == 1 and refused() == []
+
+    def fresh(text="please do it"):
+        return p.db.post("in", text, chat="c1")
+    # Each of these records the order or a reason: nothing is refused, the message is handled.
+    m = fresh()
+    cases = [
+        (m, [reply, {"type": "obligation", "order": m, "text": "do it", "owners": [tid], "action_class": "change"}]),
+    ]
+    oid = ob_add(p, tid)
+    m2 = fresh()
+    cases.append((m2, [reply, {"type": "obligation", "key": oid, "order": m2}]))   # link to an open obligation
+    m3 = fresh("thanks")
+    cases.append((m3, [dict(reply, no_order="thanks only", order=m3)]))
+    m4 = fresh("what is running?")
+    cases.append((m4, [reply, {"type": "noop", "no_order": "a status question, answered"}]))   # covers the turn
+    for rid, (m, actions) in enumerate(cases, start=10):
+        _turn(d, rid, actions, [m])
+        assert handled(m) == 1 and refused() == [], (m, actions, p.db.kv(coord.REJECTED_KEY))
+    assert m2 in ob.get(p.db, oid)["orders"] and m2 in ob.order_messages(p.db)
+    # Bypasses: each is refused once and the message comes back.
+    bad = [
+        [dict(reply, no_order="   ")],                                              # a blank reason
+        [{"type": "task_add", "title": "t", "spec": "s", "no_order": "x"}],          # not a reply or noop
+        [dict(reply, no_order="answered", order=999999)],                            # names another message
+        [dict(reply, text="x" * 30000, no_order="answered")],                       # its reply was refused
+        [{"type": "obligation", "order": None, "key": "", "text": "untracked note"}],  # an obligation, not an order
+    ]
+    for rid, actions in enumerate(bad, start=30):
+        m = fresh()
+        _turn(d, rid, actions, [m])
+        assert handled(m) == 0 and len(refused()) == 1 and f"#{m}" in refused()[0], (actions, p.db.kv(coord.REJECTED_KEY))
+    # A relayer's findings are no order.
+    f = p.db.post("in", "", chat="c1", kind="finding")
+    _turn(d, 50, [reply], [f])
+    assert handled(f) == 1 and refused() == []
+
+
+def ob_add(p, tid):
+    from ttp import obligations as ob
+    return ob.add(p, "an open obligation", [tid])
+
+
+def test_a_change_or_device_order_is_never_owned_by_a_question_plan_or_review_task(env, monkeypatch):
+    """Owner fit, model-free: a change or device order refuses a question, plan or review task as its
+    owner, wherever the coordinator names one (the order itself, a later attach, a task_add whose spec
+    names it, a class change); a read order takes any task, a change order a code, harness or work task."""
+    import pytest
+    from ttp import coordinator as coord, obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    kinds = {k: p.db.add_task(f"a {k} task", "s", kind=k, tier="light", origin="coordinator")
+             for k in ("question", "plan", "review", "code", "harness")}
+    for cls in ("change", "device"):
+        for k in ob.UNFIT_OWNER_KINDS:
+            with pytest.raises(ValueError, match=f"is a {k} task, which cannot carry a {cls} order"):
+                ob.add_order(p, "do it", mid, [kinds[k]], action_class=cls)
+    assert ob.order_messages(p.db) == set()
+    for k in ("question", "plan", "review"):   # a read order: any owner
+        m = p.db.post("in", "what does it say?", chat="c1")
+        assert "recorded" in ob.add_order(p, "read it", m, [kinds[k]], action_class="read")
+    note = ob.add_order(p, "change it", mid, [kinds["code"], tid], action_class="change")
+    oid = note.split()[1]
+    # A later attach through the coordinator's action, and a task_add whose spec names the order.
+    probs = coord.apply(p, [{"type": "obligation", "key": oid, "owners": [kinds["plan"]]}])
+    assert len(probs) == 1 and "is a plan task, which cannot carry a change order" in probs[0], probs
+    assert str(kinds["plan"]) not in ob.get(p.db, oid)["owners"]
+    n = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
+    probs = coord.apply(p, [{"type": "task_add", "title": "look at it", "spec": f"answer for obligation {oid}", "kind": "question"}])
+    assert len(probs) == 1 and f"its spec names order {oid}" in probs[0], probs
+    assert p.db.one("SELECT COUNT(*) n FROM tasks")["n"] == n, "the refused task_add created a task"
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "owners": [kinds["harness"]]}]) == []
+    # The same message's order turned into a device order keeps the fit of the owners it has.
+    q = p.db.post("in", "read the log", chat="c1")
+    ob.add_order(p, "read the log", q, [kinds["question"]], action_class="read")
+    with pytest.raises(ValueError, match="is a question task, which cannot carry a device order"):
+        ob.add_order(p, "read the log", q, [], action_class="device")
+
+
+def test_a_reply_reporting_a_run_already_cited_in_that_chat_is_refused_unless_repeat(env):
+    """A reply names the runs whose results it reports in `cites`; a run an earlier reply to the same chat
+    cited is refused (not sent) unless `repeat` is true. Another chat, a new run, or `repeat` go out; a
+    cite of no run or of a non-id is refused. Plain coordinator.apply: the stateless turn path."""
+    from ttp import coordinator as coord
+    p = make(env)
+    r1, r2 = (p.db.x("INSERT INTO runs(task, role, status, started) VALUES(NULL, 'worker', 'ok', ?)", (time.time(),))
+              for _ in range(2))
+
+    def replies(chat):
+        return p.db.one("SELECT COUNT(*) n FROM messages WHERE direction='out' AND kind='reply' AND chat=?", (chat,))["n"]
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": "bench: 12 ms", "cites": [r1]}]) == []
+    assert replies("c1") == 1
+    probs = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "again: bench 12 ms", "cites": [r2, r1]}])
+    assert len(probs) == 1 and f"run {r1}'s result went to this chat" in probs[0] and replies("c1") == 1, probs
+    # the same batch: the second reply of one run is refused too
+    probs = coord.apply(p, [{"type": "reply", "chat": "c1", "text": "new: 9 ms", "cites": [r2]},
+                            {"type": "reply", "chat": "c1", "text": "new: 9 ms (repeat)", "cites": [r2]}])
+    assert len(probs) == 1 and f"run {r2}'s result" in probs[0] and replies("c1") == 2, probs
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": "as asked: 12 ms", "cites": [r1], "repeat": True}]) == []
+    assert coord.apply(p, [{"type": "reply", "chat": "c2", "text": "bench: 12 ms", "cites": [r1]}]) == []
+    assert replies("c1") == 3 and replies("c2") == 1
+    for bad, why in (([999999], "no run #999999"), (["r1"], "list of run ids"), ([True], "list of run ids"),
+                     ("12", "list of run ids")):
+        probs = coord.apply(p, [{"type": "reply", "chat": "c3", "text": "x", "cites": bad}])
+        assert len(probs) == 1 and why in probs[0], (bad, probs)
+    assert replies("c3") == 0
+
+
+def test_the_daily_audit_counts_user_orders_unstarted_past_30_minutes_over_7_days_and_the_week_before(env, monkeypatch):
+    from ttp import audit, obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    assert ob.order_audit_line(p.db, now) == ""
+    day = 86400
+
+    def order(age_s, started_after_s):
+        m = p.db.post("in", "do it", chat="c1")
+        p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - age_s, m))
+        oid = ob.add_order(p, "do it", m, [tid], action_class="change", now=now - age_s).split()[1]
+        if started_after_s is not None:
+            st = p.db.kv(ob.KV)
+            st["items"][oid]["promise"]["started"] = now - age_s + started_after_s
+            p.db.set_kv(ob.KV, st)
+    order(2 * day, 600)           # started in time
+    order(3 * day, 3600)          # started late
+    order(1 * day, None)          # never started
+    order(600, None)              # too new to say
+    order(9 * day, 7200)          # the week before: late
+    order(10 * day, 60)           # the week before: in time
+    order(20 * day, None)         # out of both windows
+    line = ob.order_audit_line(p.db, now)
+    assert line == "user orders unstarted past 30 min: 2 of 3 in the last 7 days (1 of 2 in the 7 days before)", line
+    assert line in "\n".join(audit.lines(p.db, now))

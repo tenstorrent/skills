@@ -120,6 +120,7 @@ from . import workernotify
 from . import provallow
 from . import hostrun
 from . import userorder
+from . import turnrules
 from .db import (
     PAUSE_REMOVED_KIND,
     PAUSED_RESOURCES_KEY,
@@ -242,7 +243,9 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "due": {"type": ["number", "string"]}, "start_by": {"type": ["number", "string"]},
             "claims": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"}, "task": {"type": "integer"}, "action": {"type": "integer"},
-                "expect": {"type": "string"}, "due": {"type": ["number", "string"]}}, "required": ["text"]}}},
+                "expect": {"type": "string"}, "due": {"type": ["number", "string"]}}, "required": ["text"]}},
+            "no_order": {"type": "string"}, "cites": {"type": "array", "items": {"type": "integer"}},
+            "repeat": {"type": "boolean"}},
             "required": ["type"]}},
         "summary": {"type": "string"},
     },
@@ -1483,7 +1486,8 @@ def fixable_rejection(problem: str) -> bool:
     keeps that turn's user messages for the next one, once (daemon._keep_messages). Not a rejection the
     work itself settles, nor a dropped resource name, which still adds the task (SETTLED_REJECTIONS)."""
     text = str(problem)
-    return text.startswith("task_add: ") and not text[len("task_add: "):].startswith(SETTLED_REJECTIONS)
+    return text.startswith(turnrules.PREFIX) or \
+        (text.startswith("task_add: ") and not text[len("task_add: "):].startswith(SETTLED_REJECTIONS))
 
 
 def settle_refusals(problems: list[str], actions: list) -> list[str]:
@@ -2262,11 +2266,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if a.get("claims"):
                     obligations.check_claims(a["claims"], p)
                 chat = a.get("chat") or default_chat
+                cites = turnrules.check_cites(db, a, chat)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
+                turnrules.record_cites(db, chat, cites, replies[-1])
                 sent.append((replies[-1], chat, a["text"]))
                 if a.get("claims"):
                     claimed.append((replies[-1], chat, a["claims"]))
@@ -2495,6 +2501,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why := cells.problem(a.get("spec")):
                     raise ValueError(f"task_add rejected: {why}")
                 kind, pr_ask = _delivery_kind(a.get("kind") or "work", title + "\n" + (a.get("spec") or ""))
+                for oid in owes:   # an order its spec names is one this kind can carry (obligations.unfit_owner)
+                    if why := obligations.unfit_owner(db, ((obligations.get(db, oid) or {}).get("promise") or {})
+                                                      .get("class"), [], kind=kind):
+                        raise ValueError(f"task_add rejected: its spec names order {oid}, and {why}")
                 pin = _task_pin(cfg, a, pin_of(old or followup))
                 labels += _pin_mark(db, a.get("pin_required"), pin, old or followup)
                 clash = _file_overlaps(p, kind, a.get("spec") or "", {old["id"]} if old else set())
@@ -3449,6 +3459,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(obligations.add_order(p, str(a.get("text") or ""), int(a["order"]), owners,
                                                        due=a.get("due"), start_by=a.get("start_by"),
                                                        action_class=a.get("action_class")))
+                elif a.get("order") is not None:   # `key` stands for the order the message carries
+                    with db.tx():
+                        notes.append(obligations.link_order(p, oid, int(a["order"])))
+                        if owners:
+                            obligations.attach(p, oid, owners)
+                            batch_obls.append(oid)
                 elif a.get("due") not in (None, "") and oid and not owners \
                         and not any(str(a.get(f) or "").strip() for f in ("evidence", "why", "justify")):
                     notes.append(obligations.set_due(p, oid, a["due"]))

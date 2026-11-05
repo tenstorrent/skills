@@ -308,6 +308,8 @@ def attach(p, oid: str, tids: list[int], now: float | None = None) -> list[int]:
             raise ValueError(f"obligation {oid} already has a receipt")
         if o.get("dropped"):
             raise ValueError(f"obligation {oid} was dropped")
+        if why := unfit_owner(p.db, (o.get("promise") or {}).get("class"), tids):
+            raise ValueError(f"order {oid}: {why}")
         new = _attach(p, o, tids, now)
         if (o.get("promise") or {}).get("order") is not None:   # an order's owners are its tasks (_kept)
             o["promise"]["tasks"] = sorted(set(o["promise"]["tasks"]) | {int(t) for t in tids})
@@ -1574,6 +1576,12 @@ ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
 CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, 255, timeout) past its due: failed after this
 CLAIM_WAITING = (75, 255, "timeout", None)
+# A change or device order is owned by a task that can make the change or run the job: a question,
+# plan or review task is refused as its owner, model-free (unfit_owner), when the coordinator names it.
+# Owners the daemon attaches itself (attach_carriers: a review carrying an owner's work on) are hops, not
+# this choice, and are not checked.
+UNFIT_OWNER_KINDS = ("question", "plan", "review")
+ORDER_AUDIT_DAYS = 7
 
 
 def _must(o: dict) -> dict:
@@ -1592,6 +1600,20 @@ def _hours(p) -> float:
         return default_h(p.config())
     except Exception:   # an unreadable config keeps the default
         return PROMISE_DEFAULT_H
+
+
+def unfit_owner(db, cls: str | None, tids, kind: str | None = None) -> str | None:
+    """Why tasks `tids` cannot own an order of class `cls`, or None when they fit. `kind`: the kind of a
+    task not added yet (a task_add naming the order), checked instead of reading `tids`."""
+    if cls not in ("change", "device"):
+        return None
+    pairs = [("this task_add", kind)] if kind is not None else \
+        [(f"#{t}", (db.task(int(t)) or {}).get("kind")) for t in tids or []]
+    for who, k in pairs:
+        if k in UNFIT_OWNER_KINDS:
+            return (f"{who} is a {k} task, which cannot carry a {cls} order: own it with a task that makes the "
+                    f"change or runs the job (code, harness or work)")
+    return None
 
 
 def _owners_known(db, tids) -> list[int]:
@@ -1622,6 +1644,8 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
         ids = _owners_known(p.db, owners)
         st = _load(p.db)
         o = next((x for x in st["items"].values() if _open(x) and (x.get("promise") or {}).get("order") == int(message)), None)
+        if why := unfit_owner(p.db, action_class, sorted(set(ids) | set((o or {}).get("promise", {}).get("tasks") or []))):
+            raise ValueError(f"order (message #{message}): {why}")
         if o:
             pr = o["promise"]
             pr["tasks"] = sorted(set(pr["tasks"]) | set(ids))
@@ -1647,6 +1671,63 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
         p.db.set_kv(KV, st)
     return (note + f": due {timefmt.long(pr['due'], p)}, start by {timefmt.long(pr['start_by'], p)}, "
             + (f"owned by #{', #'.join(map(str, pr['tasks']))}" if pr["tasks"] else "no owner task yet"))
+
+
+def link_order(p, oid: str, message: int) -> str:
+    """Record that open obligation `oid` already stands for the order user message `message` carries
+    (order_messages). Returns a note."""
+    if not p.db.one("SELECT 1 FROM messages WHERE id=? AND direction='in'", (int(message),)):
+        raise ValueError(f"order: #{message} is not a user message")
+    with p.db.tx():
+        st = _load(p.db)
+        o = _need(st, oid)
+        if not _open(o):
+            raise ValueError(f"obligation {oid} is closed: record the order as a new one (`order` with no `key`)")
+        o["orders"] = sorted(set(o.get("orders") or []) | {int(message)})[-50:]
+        p.db.set_kv(KV, st)
+    return f"obligation {oid} linked to the order of message #{message}"
+
+
+def order_messages(db) -> set[int]:
+    """The user messages whose order the ledger holds: recorded (add_order) or linked (link_order)."""
+    out: set[int] = set()
+    for o in items(db):
+        if (o.get("promise") or {}).get("order") is not None:
+            out.add(int(o["promise"]["order"]))
+        out |= {int(m) for m in o.get("orders") or []}
+    return out
+
+
+def order_starts(db, since: float, until: float, now: float | None = None) -> tuple[int, int]:
+    """(orders whose message came between `since` and `until`, those whose first owner run started more
+    than ORDER_START_S after the message or not at all by `now`)."""
+    now = time.time() if now is None else now
+    orders = {int(o["promise"]["order"]): o["promise"] for o in items(db) if (o.get("promise") or {}).get("order") is not None}
+    if not orders:
+        return 0, 0
+    ids = list(orders)
+    ts = {r["id"]: float(r["ts"]) for r in db.q(f"SELECT id, ts FROM messages WHERE id IN ({','.join('?' * len(ids))})", ids)}
+    n = late = 0
+    for m, pr in orders.items():
+        at = ts.get(m)
+        if at is None or not since <= at < until or (pr.get("started") is None and now - at <= ORDER_START_S):
+            continue   # out of the window, or too new to say
+        n += 1
+        late += (float(pr["started"]) if pr.get("started") is not None else now) - at > ORDER_START_S
+    return n, late
+
+
+def order_audit_line(db, now: float | None = None) -> str:
+    """The daily audit's line: user orders unstarted past ORDER_START_S over the last ORDER_AUDIT_DAYS days,
+    and the days before them (before and after a change); '' with no order in either window."""
+    now = time.time() if now is None else now
+    span = ORDER_AUDIT_DAYS * 86400
+    n, late = order_starts(db, now - span, now, now)
+    n0, late0 = order_starts(db, now - 2 * span, now - span, now)
+    if not n and not n0:
+        return ""
+    return (f"user orders unstarted past {ORDER_START_S // 60} min: {late} of {n} in the last {ORDER_AUDIT_DAYS} days"
+            f" ({late0} of {n0} in the {ORDER_AUDIT_DAYS} days before)")
 
 
 def _order_line(o: dict) -> str:

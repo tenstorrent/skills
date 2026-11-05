@@ -20,6 +20,10 @@ batch (a task, priority, resources, `config_set`) or says `no fix because <why>`
 An overdue promise gets the deliverable or an honest update in its chat, unasked, and closes
 (`obligation` with its `key` and `evidence`). Record a user order as `obligation` with `order` (message id),
 `text`, `owners`, `action_class` (read|change|device), optional `start_by`/`due`; `key` and `due` alone moves a due.
+Each user message a turn handles gets its order (`key`+`order` links an open obligation) or `no_order` with the
+reason on a reply or noop (`order` names it); else it comes back once. A change or device order's owner is no
+question, plan or review task. A reply reporting a run's result lists its run ids in `cites`; one already
+cited in that chat is refused unless `repeat` is true (the user asked again).
 A reply or notify saying something holds carries `claims`: `{text, task|action|expect, due}` (`action`: a
 task_add index of this batch; `expect`: read-only probe, exit 0 = holds). Act on every `Must act now` item
 in the same turn: start, re-order or close it, or tell its chat what is

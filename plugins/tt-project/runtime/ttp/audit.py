@@ -485,6 +485,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(fixes)
     if promised := obligations.audit_line(db, since, now):
         out.append(promised)
+    if orders := obligations.order_audit_line(db, now):
+        out.append(orders)
     if chains := chaincap.audit_line(db, since, TOP):
         out.append(chains)
     if shared := sharedchecks.audit_line(db, since):

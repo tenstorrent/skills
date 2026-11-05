@@ -40,6 +40,7 @@ from . import ackwait
 from . import pausegone
 from . import urgentfup
 from . import topup
+from . import turnrules
 from . import checksettle
 from . import coordwrites
 from . import checksgone
@@ -4533,6 +4534,12 @@ class Daemon:
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         problems = list(problems)
+        try:   # each user message's order, or why it carries none: refused once (turnrules.order_gap)
+            failed = set(range(len(actions))) - set(applied)
+            if gap := turnrules.order_gap(db, obligations.order_messages(db), actions, failed, ids):
+                problems.append(gap)
+        except Exception:   # bookkeeping: the turn is applied either way
+            log(self.p, "order check failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         if ids and not self._keep_messages(r, ids, problems):
             db.x(f"UPDATE messages SET handled=1 WHERE id IN ({','.join('?' * len(ids))})", ids)
         evs = note.get("events", [])
@@ -4629,7 +4636,8 @@ class Daemon:
                                      [changes, outages])
 
     def _keep_messages(self, r: dict, ids: list, problems: list[str]) -> bool:
-        """A user turn whose task_add was rejected for a reason it can fix (coord.fixable_rejection)
+        """A user turn whose task_add was rejected for a reason it can fix, or that recorded no order and no
+        `no_order` for a user message (coord.fixable_rejection, turnrules.order_gap),
         leaves its messages unhandled, so the next turn sees them again with the rejection, instead of
         the user getting neither a task nor a reply. Once per message (KV_KEPT_MESSAGES): after that the
         message is handled and the rejection still reaches the next digest. Marks the rejection, in
@@ -4644,10 +4652,12 @@ class Daemon:
         db.set_kv(KV_KEPT_MESSAGES, (kept + sorted(int(i) for i in ids))[-200:])
         shown = ", ".join(f"#{i}" for i in ids)
         for i in fix:
-            problems[i] += (f" [user message {shown} is shown to you again, once: add the task it asked for "
-                            f"(or reply why not); the rest of that turn was applied, do not repeat it]")
+            todo = "record its order or `no_order` with the reason" if problems[i].startswith(turnrules.PREFIX) \
+                else "add the task it asked for (or reply why not)"
+            problems[i] += (f" [user message {shown} is shown to you again, once: {todo}; the rest of that turn "
+                            f"was applied, do not repeat it]")
         log(self.p, f"coordinator turn {r.get('id')}: messages {shown} kept for the next turn: a task_add "
-                    f"was rejected for a reason it can fix")
+                    f"or its order was rejected for a reason it can fix")
         return True
 
     def _log_decided(self, r: dict, note: dict, decided: int) -> None:
