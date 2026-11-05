@@ -1736,10 +1736,14 @@ def test_worker_ttp_lock_child_shows_no_new_privs(env, tmp_path):
     p = make(env)
     run_dir = p.base / "state" / "runs" / "9"
     run_dir.mkdir(parents=True)
-    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir))
-    r = subprocess.run([sys.executable, str(TTP), "lock", "rig", "--", "grep", "^NoNewPrivs", "/proc/self/status"],
-                       env=worker, capture_output=True, text=True, timeout=60)
+    worker = _lock_env(env, p, TTP_TASK="7", TTP_RUN_DIR=str(run_dir), TTP_SANDBOXED="1")
+    argv = [sys.executable, str(TTP), "lock", "rig", "--", "grep", "^NoNewPrivs", "/proc/self/status"]
+    r = subprocess.run(argv, env=worker, capture_output=True, text=True, timeout=60)
     assert r.returncode == 0 and r.stdout.split() == ["NoNewPrivs:", "1"], r
+    # A worker of an unsandboxed run (the default) keeps its privileges, so sudo still works in it.
+    plain = {k: v for k, v in worker.items() if k != "TTP_SANDBOXED"}
+    r = subprocess.run(argv, env=plain, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.split() == ["NoNewPrivs:", "0"], r
 
 
 def test_root_client_refuses_state_changing_clients_of_root_services(monkeypatch):

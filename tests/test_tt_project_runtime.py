@@ -15275,7 +15275,8 @@ def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
 def _write_fence(name):
     """A `before` hook (or a call on a project) that turns provider `name`'s opt-in write fence on."""
     def on(p):
-        p.set_config("providers", {**(p.config().get("providers") or {}), name: {"write_fence": True}})
+        providers = p.config().get("providers") or {}
+        p.set_config("providers", {**providers, name: {**(providers.get(name) or {}), "write_fence": True}})
     return on
 
 

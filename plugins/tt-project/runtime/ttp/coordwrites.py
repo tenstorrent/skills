@@ -16,6 +16,7 @@ import subprocess
 from pathlib import Path
 
 from . import gitmemo
+from .project import durable_write
 
 FILE = "coord-writes.json"   # in the run dir: the snapshot taken before the turn
 GIT_S = 10.0
@@ -42,7 +43,7 @@ def snapshot(folders: list[Path]) -> dict:
 
 
 def save(run_dir: Path, folders: list[Path]) -> None:
-    (run_dir / FILE).write_text(json.dumps(snapshot(folders)))
+    durable_write(run_dir / FILE, json.dumps(snapshot(folders)))
 
 
 def changed(run_dir: Path) -> list[str]:

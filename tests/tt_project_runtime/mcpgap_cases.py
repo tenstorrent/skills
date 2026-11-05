@@ -336,6 +336,7 @@ def test_iso_run_envs_compare_equal_while_the_hosts_listeners_change(env, monkey
     host_listens(5002)
     assert loopproxy.ports_env() != first
     p = make(env)
+    _write_fence("claude")(p)   # only a fenced run gets TTP_LOOPBACK_PORTS; the fence is opt-in
     _claude_mcp_config(tmp_path, monkeypatch, p)
     host_listens(5003)
     _, a_env = _iso_run(p, monkeypatch)
