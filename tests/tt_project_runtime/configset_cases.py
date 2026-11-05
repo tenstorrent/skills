@@ -89,3 +89,65 @@ def test_config_empty_value_keeps_the_who_may_gates(env, monkeypatch, capsys):
     assert "only the user may change" in capsys.readouterr().err
     sec, _, k = key.partition(".")
     assert k in p.raw_config()[sec]
+
+
+@pytest.mark.parametrize("key,raw,want", [
+    ("budget.compact_window_tokens", "0", 0),          # daemon: 0 is off for every tier
+    ("budget.compact_window_tokens", "120000", 120000),  # daemon: one window for every tier
+    ("budget.split_reread_tokens", "0", 0),            # daemon: 0 is off for every tier
+    ("budget.split_reread_tokens", "3000000", 3000000),
+    ("waiting.wake_gate", "false", False),             # waitgate.settings: off
+    ("budget.resume_lost", "false", False),            # daemon: not an object, a lost run starts fresh
+])
+def test_config_takes_the_plain_form_the_reader_reads(env, capsys, key, raw, want):
+    """An object-typed key whose reader also takes a plain value (KEY_EXTRA_FORMS) is set to it."""
+    from ttp import cli, waitgate
+    p = make(env)
+    cli.main(["config", "demo", key, raw])
+    sec, _, k = key.partition(".")
+    assert p.raw_config()[sec][k] == want and type(p.raw_config()[sec][k]) is type(want)
+    if key == "waiting.wake_gate":
+        assert waitgate.settings(p.config())["enabled"] is False
+
+
+@pytest.mark.parametrize("key,raw,forms", [
+    ("budget.compact_window_tokens", "-1", "a JSON object ({...}) or a non-negative number"),
+    ("budget.compact_window_tokens", '"100000"', "or a non-negative number"),
+    ("budget.compact_window_tokens", "true", "or a non-negative number"),
+    ("budget.compact_window_tokens", "[1]", "or a non-negative number"),
+    ("budget.split_reread_tokens", "-5", "or a non-negative number"),
+    ("budget.split_reread_tokens", "off", "or a non-negative number"),
+    ("budget.split_reread_tokens", "1e999", "or a non-negative number"),
+    ("waiting.wake_gate", "true", "a JSON object ({...}) or false (off)"),   # waitgate.settings has no true form
+    ("waiting.wake_gate", "0", "or false (off)"),
+    ("waiting.wake_gate", "off", "or false (off)"),
+    ("budget.resume_lost", "0", "or false (off)"),
+    ("budget.resume_lost", "true", "or false (off)"),
+])
+def test_config_still_refuses_other_forms_naming_the_allowed_ones(env, capsys, key, raw, forms):
+    from ttp import cli
+    p = make(env)
+    before = p.config_path.read_text()
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", key, raw])
+    err = capsys.readouterr().err
+    assert f"{key} needs " in err and forms in err and "nothing was written" in err, err
+    assert p.config_path.read_text() == before
+
+
+def test_config_set_and_the_web_settings_path_run_the_same_type_check(env, monkeypatch):
+    """Project.set_config applies key_type_problem, so the coordinator's config_set and the web app's
+    /api/config (both call it after their own per-key validator) refuse a mistyped value alike."""
+    from ttp import coordinator as coord
+    p = make(env)
+    with pytest.raises(ValueError, match="sandbox.fence_freed_commands needs a JSON list"):
+        p.set_config("sandbox.fence_freed_commands", "")
+    with pytest.raises(ValueError, match="waiting.wake_gate needs a JSON object"):
+        p.set_config("waiting.wake_gate", "off")
+    assert "wake_gate" not in (p.raw_config().get("waiting") or {})
+    monkeypatch.setitem(coord.USER_SETTABLE, "waiting.wake_gate", lambda v: v)   # a pass-through validator
+    errs = coord.apply(p, [{"type": "config_set", "key": "waiting.wake_gate", "value": "off"}])
+    assert errs and "waiting.wake_gate needs" in str(errs), errs
+    assert "wake_gate" not in (p.raw_config().get("waiting") or {})
+    assert coord.apply(p, [{"type": "config_set", "key": "waiting.wake_gate", "value": False}]) == []
+    assert p.raw_config()["waiting"]["wake_gate"] is False

@@ -9543,13 +9543,11 @@ def cmd_config(a) -> None:
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
         _refuse_user_only_in_run(k)
-    from .project import key_type_problem
-    if why := key_type_problem(a.key, val):
-        die(why)
     try:
         from . import configwho
         p.set_config(a.key, val, by=configwho.from_env())
-    except (RuntimeError, ValueError) as e:   # project.json unreadable with no last good copy; a section given one value
+    except (RuntimeError, ValueError) as e:   # project.json unreadable with no last good copy; a section given
+        # one value; a list- or object-typed key given another form (key_type_problem)
         die(str(e))
     print(f"{a.key} = {json.dumps(val)}")
 

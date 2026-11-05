@@ -191,7 +191,9 @@ prolonged whole-box outage.
   from the account settings only). `ttp config --account KEY` reads one; an
   empty value removes it. The same holds for a project's own keys: `ttp config <name> KEY ''` removes KEY
   from `project.json`, so its default applies again, and a key whose default is a list or an object
-  refuses a value of another type without writing it. `ttp spend-today [--json]` prints this machine's tt-project spend for the
+  refuses a value of another type without writing it, except the plain forms its reader takes
+  (`budget.compact_window_tokens` and `budget.split_reread_tokens`: one non-negative number for every tier;
+  `budget.resume_lost` and `waiting.wake_gate`: `false`, off). The chat's config_set and the web app check alike. `ttp spend-today [--json]` prints this machine's tt-project spend for the
   budget day by provider and account hash, and its other Claude Code sessions as estimated; it is
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.

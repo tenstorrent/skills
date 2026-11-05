@@ -720,11 +720,30 @@ def section_value_problem(dotted: str, value: Any) -> str | None:
 # Provider keys with no built-in default whose value is still of one JSON type (providers.<name>.<key>).
 PROVIDER_KEY_TYPES: dict[str, type] = {"write_dirs": list}
 
+# List- or object-typed keys whose readers also take a plain form ({dotted key: forms}), each form as its
+# reader reads it: "number" a non-negative number for every tier, "false" off. Nothing else is taken.
+KEY_EXTRA_FORMS: dict[str, tuple[str, ...]] = {
+    "budget.compact_window_tokens": ("number",),   # daemon worker start: one window, 0 off
+    "budget.split_reread_tokens": ("number",),     # daemon split check: one split line, 0 off
+    "budget.resume_lost": ("false",),              # daemon lost-run resume: not an object, starts fresh
+    "waiting.wake_gate": ("false",),               # waitgate.settings: false, every wake starts a turn
+}
+FORM_NAMES = {"number": "a non-negative number", "false": "false (off)"}
+
+
+def _extra_form(form: str, value: Any) -> bool:
+    if form == "false":
+        return value is False
+    return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+            and value >= 0)
+
 
 def key_type_problem(dotted: str, value: Any) -> str | None:
     """Why `value` cannot be saved at `dotted`: a key whose default is a list or an object (or a provider
     key in PROVIDER_KEY_TYPES) given another JSON type, e.g. "" turning sandbox.fence_freed_commands
-    into a string. Sections are section_value_problem's. None when fine or the key has no such type."""
+    into a string, other than a plain form its reader takes (KEY_EXTRA_FORMS). Sections are
+    section_value_problem's. None when fine or the key has no such type. Project.set_config applies it,
+    so `ttp config`, the coordinator's config_set and the web app refuse alike."""
     parts = dotted.split(".")
     if _is_section(parts):
         return None
@@ -734,10 +753,13 @@ def key_type_problem(dotted: str, value: Any) -> str | None:
         for part in parts:
             node = node.get(part) if isinstance(node, dict) else None
         want = type(node) if isinstance(node, (list, dict)) else None
-    if want is None or isinstance(value, want):
+    extra = KEY_EXTRA_FORMS.get(dotted, ())
+    if want is None or isinstance(value, want) or any(_extra_form(f, value) for f in extra):
         return None
     name = "a JSON list" if want is list else "a JSON object"
-    return (f"{dotted} needs {name} ({'[...]' if want is list else '{...}'}), not {json.dumps(value)[:60]}; "
+    names = [f"{name} ({'[...]' if want is list else '{...}'})", *(FORM_NAMES[f] for f in extra)]
+    need = names[0] if len(names) == 1 else ", ".join(names[:-1]) + " or " + names[-1]
+    return (f"{dotted} needs {need}, not {json.dumps(value)[:60]}; "
             f"nothing was written ('' removes it, back to its default)")
 
 
@@ -1495,7 +1517,7 @@ class Project:
             # Writing the one key would make a project.json of defaults and that key alone.
             raise RuntimeError(f"{self.config_path} is missing or not valid JSON and there is no last good copy: "
                                f"restore it before changing settings")
-        if why := section_value_problem(dotted, value):
+        if why := section_value_problem(dotted, value) or key_type_problem(dotted, value):
             raise ValueError(why)
         if dotted in HOST_WIDE_KEYS:
             raise ValueError(f"{dotted} is host-wide, one value for every project on this machine: "
