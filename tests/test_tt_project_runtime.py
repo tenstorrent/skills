@@ -16711,6 +16711,14 @@ def _gone(pid):
         return False
 
 
+def _pid_in(path):
+    """The pid on a pid file's first line, None while the file is missing or not written yet."""
+    try:
+        return int(path.read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
 def _json_or_none(path):
     try:
         return json.loads(path.read_text())
@@ -16729,8 +16737,12 @@ def test_a_killed_supervisor_ends_its_agent_and_the_handoff_still_counts(env):
         "sh", "-c", f'printf %s {shlex.quote(handoff)} > "$TTP_RUN_DIR/result.json"; exec sleep 120'))
     agent = None
     try:
-        assert _wait(lambda: _json_or_none(run_dir / "result.json") and (run_dir / "child.pid").exists())
-        agent = int((run_dir / "child.pid").read_text().split()[0])
+        # child.pid exists a moment before its pid is in it (the runner writes it in place): wait for
+        # the pid itself, and stop at once if the runner died, so a loaded host only takes longer.
+        assert _wait(lambda: proc.poll() is not None or (
+            _json_or_none(run_dir / "result.json") and _pid_in(run_dir / "child.pid")), 300)
+        assert proc.poll() is None, f"the runner ended early (rc {proc.returncode})"
+        agent = _pid_in(run_dir / "child.pid")
         proc.kill()           # the supervisor dies after the hand-off (kill -9, OOM) and stops renewing its lease
         proc.wait()
         os.utime(run_dir / "lease", (time.time() - 999, time.time() - 999))
@@ -16738,7 +16750,11 @@ def test_a_killed_supervisor_ends_its_agent_and_the_handoff_still_counts(env):
         assert _wait(lambda: _gone(agent), 15), "the agent kept running without its supervisor"
     finally:
         if agent and not _gone(agent):
-            os.killpg(agent, signal.SIGKILL)
+            with contextlib.suppress(ProcessLookupError):
+                os.killpg(agent, signal.SIGKILL)
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "lost"
     t = p.db.task(tid)
     assert t["status"] == "done" and "pushed the fix" in t["result"], "a finished task was queued to be redone"
