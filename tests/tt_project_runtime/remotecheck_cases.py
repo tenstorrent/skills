@@ -1408,7 +1408,8 @@ def test_a_host_local_check_that_opts_in_spills_behind_its_remote_wrapper_and_a_
 
 def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_load(monkeypatch):
     """#5893: a spill host's slots follow what it has idle now (checklane.host_slots), and checkspill.probe
-    reads both its 3-field line (no load: default_slots less running) and its 4-field line (with load)."""
+    reads both its 3-field line (no load: default_slots less running) and its 4-field line (with load), each
+    followed by a device holder scan that found none."""
     from ttp import checklane, checkspill
     assert checklane.host_slots(64, 200, 10, 0) == 6
     assert checklane.host_slots(64, 200, 60, 2) == 0, "a busy host fits no run"
@@ -1416,16 +1417,16 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
     assert checklane.host_slots(64, 200, None, 1) == checklane.default_slots(64, 200) - 1, "no load read"
     out = {}
     monkeypatch.setattr(checkspill.subprocess, "run",
-                        lambda *a, **k: subprocess.CompletedProcess(a, 0, out["line"] + "\n", ""))
+                        lambda *a, **k: subprocess.CompletedProcess(a, 0, out["line"] + "\nttp-spill-dev-end none\n", ""))
     gib = 1024 * 1024
     out["line"] = f"ttp-spill 64 {200 * gib} 1"
-    assert checkspill.probe("h") == (checklane.default_slots(64, 200) - 1, "")
+    assert checkspill.probe("h") == (checklane.default_slots(64, 200) - 1, "", "")
     out["line"] = f"ttp-spill 64 {200 * gib} 0 10.5"
-    assert checkspill.probe("h") == (checklane.host_slots(64, 200, 10.5, 0), "")
+    assert checkspill.probe("h") == (checklane.host_slots(64, 200, 10.5, 0), "", "")
     out["line"] = f"ttp-spill 64 {200 * gib} 0 -"
-    assert checkspill.probe("h") == (checklane.default_slots(64, 200), ""), "an unread load: '-'"
+    assert checkspill.probe("h") == (checklane.default_slots(64, 200), "", ""), "an unread load: '-'"
     out["line"] = f"ttp-spill 64 {200 * gib} 2 60"
-    n, why = checkspill.probe("h")
+    n, why, _ = checkspill.probe("h")
     assert n == 0 and "load 60 of 64 cores" in why, why
     out["line"] = "ttp-spill 64 x 2"
     assert checkspill.probe("h")[0] == 0 and "probe failed" in checkspill.probe("h")[1]
