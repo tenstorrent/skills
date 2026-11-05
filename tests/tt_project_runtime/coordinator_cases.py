@@ -16613,7 +16613,7 @@ def test_must_act_claim_failed_by_the_claim_tick_wakes_the_coordinator(env, monk
                               now=time.time())
     oid = line.split()[1]
     answers = iter([None, 1])
-    monkeypatch.setattr(d, "_probe_now", lambda probe: next(answers) if probe == "probe-x" else 0)
+    monkeypatch.setattr(d, "_probe_now", lambda probe, key=None: next(answers) if probe == "probe-x" else 0)
     d._claims_at = 0.0
     d.check_claims()
     assert p.db.q("SELECT id FROM events WHERE kind=?", (ob.CLAIM_KIND,)) == []

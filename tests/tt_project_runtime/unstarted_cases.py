@@ -537,3 +537,20 @@ def test_user_ordered_urgent_device_work_not_started_or_stuck_in_ttp_lock_raises
     finally:
         os.close(fd)
         locks.record_wait(run_dir, "42:1.0", start + 8 * 60, start + 20 * 60)
+
+
+def test_an_expect_claim_with_no_owner_open_20_min_is_never_announced_not_started(env):
+    """A claim is promise-shaped but owes no work: an expect claim still open 20 min on raises no
+    announced_not_started and shows in neither the promises digest nor the sweep's items."""
+    from ttp import obligations as ob, sweep, unstarted
+    p = make(env)
+    _no_events(p)
+    now = time.time()
+    out = p.db.post("out", "it is live", chat="c1", kind="reply")
+    [line] = ob.record_claims(p, [(out, "c1", [{"text": "the service is live", "expect": "true",
+                                                 "due": now + 3600}])], {}, now=now)
+    oid = line.split()[1]
+    assert ob.get(p.db, oid)["receipt"] is None
+    assert unstarted.announced(p, now + 1200) == [] and _unstarted_events(p, unstarted.ANNOUNCED_KIND) == []
+    assert ob.open_promises(p.db) == [] and ob.promise_lines(p.db, now + 1200) == []
+    assert not [i for i in sweep.items(p.db, now + 1200) if i.get("promise") == oid]

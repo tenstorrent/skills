@@ -1108,7 +1108,7 @@ class Daemon:
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
-        self._stall_probes: dict[str, list] = {}   # probe -> its stall re-check: [Pending, started, answer or None]
+        self._stall_probes: dict[str, list] = {}   # probe (or a caller's key) -> its re-check: [Pending, started, answer or None]
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._git_attempts: dict[int, gitmemo.Attempt] = {}   # task -> its finish's gitreplay attempt, from the warm-up
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
@@ -7960,8 +7960,8 @@ class Daemon:
             return
         self._claims_at = now
         try:
-            for oid, probe in obligations.due_claims(self.p.db, now):
-                rc = self._probe_now(probe)
+            for oid, probe, key in obligations.due_claims(self.p.db, now):
+                rc = self._probe_now(probe, key)
                 if rc is not None:
                     obligations.claim_result(self.p, oid, rc, now)
         except Exception:
@@ -8272,18 +8272,20 @@ class Daemon:
         except Exception:   # a sweep that cannot start must not stop the tick
             log(self.p, "blocker sweep failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
 
-    def _probe_now(self, probe: str) -> int | str | None:
+    def _probe_now(self, probe: str, key: str | None = None) -> int | str | None:
         """A probe stall's re-check of `probe`, run off the tick (probespawn) so a stalled probe never holds
         it: None while it starts or runs (judged on a later pass), then its exit code, "timeout" (killed
         after PROBE_TIMEOUT_S) or "could not start", kept for every pass until STALL_PROBE_KEEP_S after
         its start (_drop_stall_probes). At most STALL_PROBES_AT_ONCE run at once: a probe past them
-        starts on a later pass."""
+        starts on a later pass. `key` (default: the probe) names the cached run: a caller that must not
+        take another caller's earlier answer (check_claims) passes its own."""
         now = time.time()
-        run = self._stall_probes.get(probe)
+        key = probe if key is None else key
+        run = self._stall_probes.get(key)
         if run is None:
             if sum(r[2] is None for r in self._stall_probes.values()) >= STALL_PROBES_AT_ONCE:
                 return None
-            self._stall_probes[probe] = [probespawn.Pending(landed.probe_command(probe, self.p), cwd=str(self.p.root),
+            self._stall_probes[key] = [probespawn.Pending(landed.probe_command(probe, self.p), cwd=str(self.p.root),
                                                             env=self._probe_env(), stdout=False), now, None]
             return None
         if run[2] is None:

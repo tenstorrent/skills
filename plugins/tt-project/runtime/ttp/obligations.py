@@ -1426,7 +1426,9 @@ def _promise_state(o: dict, now: float, where) -> str:
 
 
 def open_promises(db) -> list[dict]:
-    return [o for o in items(db) if o.get("promise") and _open(o)]
+    """The open promises and orders. Claims are promise-shaped too but left out: no work is owed on one,
+    the daemon's check_claims judges it model-free and its miss raises claim_failed."""
+    return [o for o in items(db) if (pr := o.get("promise")) and not pr.get("claim") and _open(o)]
 
 
 def promise_lines(db, now: float | None = None, where=None) -> list[str]:
@@ -1792,11 +1794,13 @@ def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
     return True
 
 
-def due_claims(db, now: float | None = None) -> list[tuple[str, str]]:
-    """(id, probe) of the open claims whose expect probe the daemon runs now: from their due time on,
-    until they hold or fail."""
+def due_claims(db, now: float | None = None) -> list[tuple[str, str, str]]:
+    """(id, probe, cache key) of the open claims whose expect probe the daemon runs now: from their due
+    time on, until they hold or fail. The key names the claim and its due, so a run of the same probe
+    by another caller (a probe stall's re-check, another claim) or for an earlier due is never taken
+    as this claim's answer."""
     now = time.time() if now is None else now
-    return [(o["id"], o["promise"]["claim"]["expect"]) for o in items(db)
+    return [(o["id"], o["promise"]["claim"]["expect"], f"claim:{o['id']}:{int(o['promise']['due'])}") for o in items(db)
             if _open(o) and (pr := o.get("promise") or {}).get("claim") and pr["claim"].get("expect")
             and pr.get("raised") is None and now >= pr["due"]]
 

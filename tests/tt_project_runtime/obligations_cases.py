@@ -293,7 +293,7 @@ def test_claim_expect_probe_miss_raises_claim_failed_once(env, monkeypatch):
     out = p.db.post("out", "it is live", chat="c1", kind="reply")
     notes = ob.record_claims(p, [(out, "c1", [{"text": "the service is live", "expect": "false"}])], {}, now=now)
     oid = notes[0].split()[1]
-    assert ob.due_claims(p.db, now) == [(oid, "false")]
+    assert ob.due_claims(p.db, now) == [(oid, "false", f"claim:{oid}:{int(now)}")]
     assert ob.claim_result(p, oid, 75, now + 10) == []   # cannot answer yet: keeps waiting
     fps = ob.claim_result(p, oid, 1, now + 20)
     assert len(fps) == 1 and ob.claim_result(p, oid, 1, now + 30) == []
@@ -303,3 +303,42 @@ def test_claim_expect_probe_miss_raises_claim_failed_once(env, monkeypatch):
     n2 = ob.record_claims(p, [(out2, "c1", [{"text": "it passes", "expect": "true"}])], {}, now=now)
     ob.claim_result(p, n2[0].split()[1], 0, now + 5)
     assert ob.get(p.db, n2[0].split()[1])["receipt"]
+
+
+def test_a_claim_never_takes_another_callers_earlier_probe_answer_and_its_own_run_decides(env, monkeypatch):
+    """Another caller ran the claim's probe string shortly before its due and got 1 (cached for
+    STALL_PROBE_KEEP_S): check_claims runs its own probe under its own key and fails nothing on that
+    answer; its fresh run after the due decides the claim."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    out = p.db.post("out", "it is live", chat="c1", kind="reply")
+    due = now + 120
+    [line] = ob.record_claims(p, [(out, "c1", [{"text": "the service is live", "expect": "true", "due": due}])],
+                              {}, now=now)
+    oid = line.split()[1]
+    d._stall_probes["true"] = [None, due - 30, 1]   # a probe stall's re-check answered 1 before the due
+    monkeypatch.setattr(time, "time", lambda: due + 5)
+    d._claims_at = 0.0
+    d.check_claims()
+    assert raised((ob.CLAIM_KIND,)) == [] and ob.get(p.db, oid)["promise"]["claim"]["last"] is None
+    [key] = [k for k in d._stall_probes if k != "true"]
+    assert key == f"claim:{oid}:{int(due)}"
+    d._stall_probes[key][0].wait(_load_scaled(30))
+    d._claims_at = 0.0
+    d.check_claims()
+    assert raised((ob.CLAIM_KIND,)) == [] and ob.get(p.db, oid)["receipt"]["evidence"] == "`true` exited 0"
+
+
+def test_an_unstarted_order_raises_one_start_late_signal(env, monkeypatch):
+    """An order whose owner never starts gets its order_late at start_by and no announced_not_started
+    (at 10 min or later) on top: one start-late wake per order. Its owner, announced in a reply, is
+    not raised again as an announced task either."""
+    from ttp import obligations as ob, unstarted
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    p.db.update_task(tid, reply_chat="c1")
+    ob.add_order(p, "build the deliverable", mid, [tid], action_class="change", now=now)
+    kinds = (ob.ORDER_LATE_KIND, unstarted.ANNOUNCED_KIND)
+    for at in (now + 660, now + ob.ORDER_START_S + 60, now + ob.ORDER_START_S + 900):
+        check(at)
+        unstarted.announced(p, at)
+    assert [e["kind"] for e in raised(kinds)] == [ob.ORDER_LATE_KIND]

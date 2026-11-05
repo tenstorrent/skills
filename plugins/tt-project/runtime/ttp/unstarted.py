@@ -127,12 +127,16 @@ def parked(db, task: dict | None, now: float) -> str:
 
 
 def _subjects(db, now: float) -> list[dict]:
-    """The open promises and announced tasks to check: {key, what, created, owners}."""
+    """The open promises and announced tasks to check: {key, what, created, owners}. An order is no subject
+    (its owners still count as owned): obligations' order_late at its start_by is its one start-late
+    signal. Claims never come here (open_promises leaves them out)."""
     from . import obligations
     out, owned = [], set()
     for o in obligations.open_promises(db):
         ids = obligations._owner_ids(o)
         owned |= set(ids)
+        if o["promise"].get("order") is not None:
+            continue   # an order's one start-late signal is its own order_late at start_by
         if now - float(o["created"]) <= MAX_AGE_S:
             out.append({"key": o["id"], "what": f"promise {o['id']} in chat {o['promise']['chat']} ({o['text'][:160]})",
                         "created": float(o["created"]), "owners": ids})
