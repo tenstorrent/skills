@@ -18,7 +18,9 @@ def write_report(output, config, summary):
     manifest = json.loads(Path(config['manifest']).read_text())
     roofline_error = None
     try:
-        roofline = load_roofline(output, required=('1', '32') if summary['status'] == 'completed' else ())
+        measured = sorted(summary.get('concurrencies') or [1, 8, 16, 32], reverse=True)
+        roofline = load_roofline(output, required=tuple(str(c) for c in measured)
+                                 if summary['status'] == 'completed' else ())
     except (ValueError, OSError) as exc:
         if summary['status'] == 'completed':
             raise
@@ -26,7 +28,7 @@ def write_report(output, config, summary):
         # fails; the run remains incomplete and no invalid percentage is shown.
         roofline, roofline_error = {}, str(exc)
     lines = [f"# Benchmark: {config['model']}", '',
-             f"Status: {summary['status']}. Accuracy concurrency: 32.", '',
+             f"Status: {summary['status']}. Accuracy concurrency: {summary.get('accuracy_concurrency', 'unrecorded')}.", '',
              '| Benchmark | Samples / full | Metric | Subset % | Published full % | Difference pp | Source |',
              '|---|---:|---|---:|---:|---:|---|']
     notes = []
@@ -50,10 +52,10 @@ def write_report(output, config, summary):
         utilization = [f"{roofline[batch][phase]['percent']:.2f}" if roofline.get(batch, {}).get(phase) else '—'
                        for phase in ('prefill', 'decode')]
         capacity = row.get('server_max_num_seqs', 'Unrecorded')
-        profile = 'Single user' if batch == '1' and capacity == 1 else '32 users' if batch == '32' and capacity == 32 else 'Serving'
+        profile = 'Single user' if batch == '1' and capacity == 1 else f'{batch} users' if str(capacity) == batch else 'Serving'
         lines.append(f"| {profile} | {batch} | {capacity} | {row['requested_input_tokens']} / {row['requested_output_tokens']} | {row.get('mean_ttft_ms', 0):.2f} | {tpot:.2f} | {1000/tpot if tpot else 0:.2f} | {row.get('output_throughput', 0):.2f} | " + ' | '.join(utilization) + ' |')
     lines += ['', 'Scores use fixed subsets; published figures cover the full dataset. Missing references are shown as unavailable. The bringup owner decides whether these results meet their needs.', '',
-              'Roofline estimates divide modeled work by full-phase elapsed wall time and the participating hardware’s peak rate. Both phases are required for both serving profiles; — indicates incomplete accounting. HTTP concurrency is not a fixed device batch size.', '']
+              'Roofline estimates divide modeled work by full-phase elapsed wall time and the participating hardware’s peak rate. Both phases are required for every serving profile; — indicates incomplete accounting. HTTP concurrency is not a fixed device batch size.', '']
     if roofline_error:
         lines += [f'Phase accounting error: {cell(roofline_error)}', '']
     if notes:

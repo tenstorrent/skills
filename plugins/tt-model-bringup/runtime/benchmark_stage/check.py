@@ -40,8 +40,8 @@ def check(model_dir, hf_model=''):
     layers = identity.get('layer_count')
     if not isinstance(layers, int) or layers < 1 or layers != identity.get('configured_layer_count'):
         raise ValueError('identity must verify all configured model layers')
-    if identity.get('prefix_caching') is not False:
-        raise ValueError('performance evidence must disable prefix caching')
+    if not isinstance(identity.get('prefix_caching'), bool):
+        raise ValueError('performance evidence must record whether prefix caching is enabled')
     summary = read(evidence / 'run/summary.json')
     config = read(evidence / 'run/run_config.json')
     if config.get('model') != identity['model']:
@@ -53,6 +53,16 @@ def check(model_dir, hf_model=''):
     if digest({k: v for k, v in manifest.items() if k != 'manifest_sha256'}) != manifest['manifest_sha256']:
         raise ValueError('subset manifest checksum mismatch')
     accuracy = summary.get('accuracy', {})
+    concurrencies = summary.get('concurrencies') or config.get('concurrencies', [1, 8, 16, 32])
+    if (not isinstance(concurrencies, list) or not concurrencies
+            or not all(isinstance(c, int) and not isinstance(c, bool) and c > 0 for c in concurrencies)):
+        raise ValueError('run summary records no usable concurrencies')
+    concurrencies = sorted(concurrencies, reverse=True)
+    accuracy_concurrency = summary.get('accuracy_concurrency', concurrencies[0])
+    if accuracy_concurrency != concurrencies[0]:
+        raise ValueError('accuracy must run on the largest measured profile')
+    if config.get('concurrencies') and sorted(config['concurrencies'], reverse=True) != concurrencies:
+        raise ValueError('measured concurrencies differ from run configuration')
     execution = config.get('accuracy_execution', 'sequential')
     if execution not in ('sequential', 'shared') or summary.get('accuracy_execution', 'sequential') != execution:
         raise ValueError('accuracy execution mode differs from run configuration')
@@ -63,7 +73,7 @@ def check(model_dir, hf_model=''):
         group = manifest['groups'][task]
         if result.get('subset_sha256') != manifest['manifest_sha256']:
             raise ValueError(f'{task}: subset mismatch')
-        if result.get('responses') != group['sample_count'] or result.get('expected_samples') != group['sample_count'] or result.get('concurrency') != 32:
+        if result.get('responses') != group['sample_count'] or result.get('expected_samples') != group['sample_count'] or result.get('concurrency') != accuracy_concurrency:
             raise ValueError(f'{task}: incomplete accuracy requests or wrong concurrency')
         if result.get('model') != identity['model']:
             raise ValueError(f'{task}: accuracy model mismatch')
@@ -124,7 +134,7 @@ def check(model_dir, hf_model=''):
     osl = config.get('output_tokens', 128)
     if not isinstance(osl, int) or osl < 2:
         raise ValueError('performance output length must permit decode timing')
-    for batch in ('1', '32'):
+    for batch in (str(c) for c in concurrencies):
         result = summary.get('performance', {}).get(batch, {})
         server = read(evidence / 'run' / f'perf-b{batch}-server.json')
         validate_server(server, int(batch), config['model'], config['base_url'],
@@ -148,7 +158,7 @@ def check(model_dir, hf_model=''):
         raise ValueError('report metrics/references name a task that was not run')
     for task, raw in results.items():
         benchmark_rows(config, manifest, task, raw)
-    load_roofline(evidence / 'run', required=('1', '32'))
+    load_roofline(evidence / 'run', required=tuple(str(c) for c in concurrencies))
     return evidence
 
 

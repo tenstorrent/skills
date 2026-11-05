@@ -66,7 +66,7 @@ For serving, follow [vLLM stack setup](../vllm-integration/references/serving-st
 
 ## Execution
 
-The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
+The twelve [goal templates](../../prompts/model_bringup_multigoal) run in order:
 
 1. Functional decoder — `functional-decoder`
 2. Fused decoder — `graph-fusing`
@@ -79,6 +79,7 @@ The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
 9. vLLM integration — `vllm-integration`
 10. Optimized vLLM — `optimize`
 11. Benchmarks — `benchmark-model`
+12. Agentic evals — `agentic-serving`
 
 For an optional standalone TTI release handoff once serving is ready, use
 [`tti-release`](../tti-release/SKILL.md).
@@ -87,8 +88,8 @@ When the authorized hardware is one chip, stages 4 and 5 are recorded as skipped
 operator in the run record and the full-model goal starts from `tt/optimized_decoder.py`;
 single-chip is then the target topology, not a fallback, and the later stages say so.
 
-`tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
-requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
+`tt-device-usage`, `tt-enable-tracing`, `qualitative-check`, `stage-review` and `agentic-serving`
+provide shared requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation
 stages 1–10 require independent review with `clean-pass`; findings require repairs and rereview.
 The final benchmark stage produces results for the bringup owner and checks measurement
 completeness without an accuracy acceptance review. Preserve original goal
@@ -159,7 +160,7 @@ The [hook API](../../telemetry-hooks.md) contains no endpoint or upload implemen
 
 ## Evidence gates
 
-Stages 6, 7, 9, 10 and 11 have sibling `.check.sh` scripts. Run from the target checkout with
+Stages 6, 7, 9, 10, 11 and 12 have sibling `.check.sh` scripts. Run from the target checkout with
 `MODEL_DIR` set to its exact autoport path. They resolve their own package resources. Exit 0 passes;
 1 is advisory; 2 is critical; other exits mean checker/environment failure. The runner retries
 checker errors once and stops by default; it runs bounded remediation goals for failed checks.

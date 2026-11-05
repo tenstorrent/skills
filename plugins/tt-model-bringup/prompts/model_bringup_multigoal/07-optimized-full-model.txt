@@ -1,4 +1,4 @@
-/goal Use $multichip, $optimize, and $tt-device-usage for the HF_MODEL full model in the current tt-metal checkout.
+/goal Use $multichip, $optimize, $agentic-serving, and $tt-device-usage for the HF_MODEL full model in the current tt-metal checkout.
 
 As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
 
@@ -13,7 +13,7 @@ Goal completion requirements:
 - Preserve or improve doc/context_contract.json. Reduce advertised capability only for a hard physical limit, with evidence and the largest feasible value.
 - Preserve valid non-aligned prompt-length support through the optimized generator path. Faster code that only accepts aligned chunk/page/tile lengths is not complete.
 - Refresh AIME24 chat-template prefill, teacher-forcing decode, and autoregressive evidence. run_prefill_check and run_teacher_forcing meet top-5 >= 98% and top-100 = 100%.
-- Measure before/after warmed batch-1 TTFT and trace-verified decode t/s/u and report them at the top of README.md. Keep traced teacher-forcing decode and token-out decode as separate numbers when sampling/token feedback/readback are included.
+- Measure before/after warmed TTFT and trace-verified decode t/s/u across the supported batches, batch 1 first then the largest, and report them at the top of README.md. Keep traced teacher-forcing decode and token-out decode as separate numbers when sampling/token feedback/readback are included.
 - Compute the decoder-layer stack lower bound from optimized multichip layer latencies. Token-out decode uses persistent token/position/RoPE/page-table inputs, nonblocking trace replay, no per-token host sync/readback, and enabled persistent-buffer/CCL optimizations.
 - If token-out decode is >10-15% slower than layer-stack lower bound plus terminal work, split and close the largest avoidable gap.
 - If force-argmax, full-vocab all-gather, generic `TopKDeviceOperation`, or another sampler op dominates token-out decode, fix the LM-head/sampling contract before completing the goal.

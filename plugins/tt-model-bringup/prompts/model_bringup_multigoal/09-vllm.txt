@@ -1,6 +1,6 @@
-/goal Use $vllm-integration and $tt-device-usage for HF_MODEL.
+/goal Use $vllm-integration, $agentic-serving, and $tt-device-usage for HF_MODEL.
 
-As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
+Subagents are authorized when a selected skill requests or recommends them.
 
 This goal creates the vLLM state. Start from the completed datatype-sweep stage and work on models/autoports/<model>/tt/generator_vllm.py plus vLLM TT plugin registration.
 
@@ -16,6 +16,7 @@ Goal completion requirements:
 - The mixed-shape trace reuse check from $vllm-integration passes on the same running server. Evidence includes actual chunk start positions, concurrent decode, and capture/retirement counts mapped to execution signatures.
 - run_vllm_server succeeds with the final sampling profile defined by $vllm-integration.
 - Sampling tests, qualitative outputs, primary single-user, CI serving-burst, prefix-cache and prefill-burst artifacts exist under readiness_vllm/.
+- `serving` in doc/agentic_serving.json records prefix reuse and trace captures on multi-turn traffic.
 - `supports_async_decode=True`, decode trace is enabled, and stale-token/current-position/page-table tests pass through the adapter. Full-model split sampling is already present.
 - The qualitative outputs are read and judged for coherence, topic, repetition, gibberish, wrong-language drift, and request contamination.
 - Record server command, TT config, max model length, max-num-seqs, sampling profile, workload shape, raw benchmark path, TTFT/TPOT/ITL P50/P99, throughput, and TPOT-derived t/s/u.
@@ -23,7 +24,6 @@ Goal completion requirements:
 - Serving performance is compared against full-model teacher-forcing only as a lower bound, with no avoidable vLLM-specific decode overhead left in the measured path.
 - Runtime fallback and process cleanup are audited; leftover vLLM/EngineCore processes are not left holding devices.
 - models/autoports/<model>/doc/vllm_integration/README.md and work_log.md record commands, serving status, qualitative verdict, benchmark metrics, limitations, and exact artifacts.
-- model serves through the shared vLLM path with evidence.
 - Primary single-user vLLM TTFT and decode t/s/u are reported at the top of README.md, with CI serving-burst metrics secondary and workload shapes next to every number.
 - Any host-sampling mode needed by shared tests is explicit and optional; it must not replace the on-device traced sampling path used for performance.
 - $stage-review returns `clean-pass`; findings fixed/rereviewed. Local commit stage-owned touched-repo changes; never push; log SHAs.

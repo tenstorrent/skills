@@ -1,4 +1,4 @@
-/goal Use $graph-fusing and $tt-device-usage for the HF_MODEL functional decoder in the current tt-metal checkout.
+/goal Use $graph-fusing, $agentic-serving, and $tt-device-usage for the HF_MODEL functional decoder in the current tt-metal checkout.
 
 As the user, I explicitly authorize you to use subagents when a selected skill requests or recommends them.
 

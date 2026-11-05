@@ -43,8 +43,9 @@ Select only the tasks to run in the configuration. Profile names describe the
 available tasks, not generation settings for a model family. Determine chat
 formatting, thinking mode, sampling and output budgets from the exact model's
 published protocol or intended use. Runtime depends on model speed and generated
-length. The full GPQA profile is available for larger evaluations; it is not
-necessary for the one-hour stage.
+length. When any answer ends at the output budget, raise the budget before
+reporting accuracy. The full GPQA profile is available for larger evaluations;
+it is not necessary inside the stage budget.
 
 Reuse the same documents on each model. For a new benchmark, freeze a manifest
 before observing scores:
@@ -87,7 +88,7 @@ and sampling options for the model you are benchmarking:
   "manifest": "/operator-selected/subset/manifest.json",
   "tasks": ["mmlu_pro", "gsm8k_cot", "ifeval"],
   "vllm_cli": "/operator-selected/client-env/bin/vllm",
-  "budget_seconds": 3600,
+  "budget_seconds": 7200,
   "performance_server_command": ["/client/bin/python", "/model/tools/benchmark_server.py"],
   "roofline_command": ["/client/bin/python", "/model/tools/collect_roofline.py"],
   "output_tokens": 128,
@@ -142,8 +143,8 @@ Run into a new directory:
 ```
 
 The runner freezes a copy of the configuration and manifest. Accuracy uses fresh
-requests at concurrency 32. A watchdog terminates owned client subprocesses when
-the one-hour budget expires and writes a failed summary. Preserve that evidence;
+requests at the largest configured batch. A watchdog terminates owned client subprocesses when
+the budget expires and writes a failed summary. Preserve that evidence;
 use a new output directory for a rerun. The servers remain owned by the enclosing bringup; the control hook follows its cleanup policy.
 
 Set `accuracy_execution` to `shared` when every task has the same complete
@@ -160,27 +161,29 @@ Malformed responses or empty answers with a normal stop fail the run. Preserve
 upstream extraction results, including apparent scorer mistakes; document a
 protocol limitation without hand-correcting scores.
 
-## Single-user and 32-user server profiles
+## Server profiles per batch
 
 The headline rows use different server configurations:
+
+One row per configured batch size, default 1, 8, 16 and 32:
 
 | Profile | Concurrent requests | Server `max_num_seqs` | Input / output tokens |
 |---|---:|---:|---:|
 | Single user | 1 | 1 | 4096 / 128 |
-| 32 users | 32 | 32 | 4096 / 128 |
+| N users | N | N | 4096 / 128 |
 
-Use the best validated single-user serving settings from optimized-vLLM. Keep the
+Use the optimized-vLLM configuration validated for each batch. Keep the
 same implementation, checkpoint, precision, hardware and full context capacity
-for both profiles. Changing request concurrency alone does not select a one-slot
+for every profile. Changing request concurrency alone does not select a smaller
 decode trace or cache configuration.
 
-The runner prepares the 32-slot server before accuracy, retains it for the
-32-user performance profile, then switches to the single-user profile. Configure `performance_server_command` as an argument
-array for a server-control script in the model checkout. The runner calls it as:
+The runner prepares the largest configured server before accuracy, retains it for
+that batch's performance profile, then steps down through the smaller batches.
+Configure `performance_server_command` as an argument array for a server-control
+script in the model checkout. The runner calls it once per batch, largest first:
 
 ```text
-<performance_server_command> --max-num-seqs 32 --base-url <url> --output <run>/perf-b32-server.json
-<performance_server_command> --max-num-seqs 1  --base-url <url> --output <run>/perf-b1-server.json
+<performance_server_command> --max-num-seqs <N> --base-url <url> --output <run>/perf-b<N>-server.json
 ```
 
 Adapt the model's existing server launcher. The hook should reuse the running
@@ -213,9 +216,9 @@ setup separately. For a standalone benchmark, prepare the environment and initia
 server before invoking the runner and record that setup time separately.
 
 Every launch, reload, compilation and warmup performed by the runner counts toward
-the one-hour limit, including a launch needed by the first 32-slot selection. For
-example, if the supplied server has one slot, the initial switch to 32 slots and
-the later switch back to one slot both count. The timer never pauses for server
+the stage limit, including a launch needed by the first server selection. For
+example, if the supplied server has one slot, the initial switch to the largest batch
+and every later switch both count. The timer never pauses for server
 selection, collection or reporting. Report the starting server configuration so
 the measured stage runtime can be interpreted.
 
@@ -267,18 +270,16 @@ Prepare an implementation-specific collector before the timed run:
 Follow the serving skill's profiler restrictions: do not use Tracy, the live
 device profiler or `ReadDeviceProfiler` to obtain these host wall times.
 
-Configure `roofline_command` as an argument array. The runner calls it while the
+Configure `roofline_command` as an argument array. The runner calls it for each batch while the
 corresponding server is still running:
 
 ```text
-<roofline_command> --run-dir <run> --concurrency 32 --action check
-<roofline_command> --run-dir <run> --concurrency 32 --action collect
-<roofline_command> --run-dir <run> --concurrency 1  --action check
-<roofline_command> --run-dir <run> --concurrency 1  --action collect
+<roofline_command> --run-dir <run> --concurrency <N> --action check
+<roofline_command> --run-dir <run> --concurrency <N> --action collect
 ```
 
-`check` runs immediately after server selection, before accuracy on the 32-slot
-server and before warmup on the one-slot server. Read `perf-bN-server.json`, verify
+`check` runs immediately after server selection, before accuracy on the largest
+server and before warmup on each smaller one. Read `perf-bN-server.json`, verify
 that the running server's timing instrumentation and the model/hardware accounting
 are ready, and fail with an actionable error if they are not. It must not silently
 enable a different precision, layer count or context capacity.
@@ -286,12 +287,12 @@ enable a different precision, layer count or context capacity.
 `collect` runs after that profile's measured requests, before any server switch.
 Read `perf-bN.json`, flush and copy the matching raw timing evidence into `run/`,
 and add the profile to `roofline.json`, preserving any profile already collected.
-All four calls run within the same one-hour deadline. The runner requires valid
+All calls, for every batch, run within the same stage deadline. The runner requires valid
 accounting for the current profile before it proceeds to the next one.
 
-The collector output maps concurrency (`"1"`, `"32"`) to entries with:
+The collector output maps each configured batch (`"1"`, `"8"`, ...) to entries with:
 
-- `performance_sha256`: SHA-256 of the corresponding `perf-b1.json` or `perf-b32.json` file bytes, binding accounting to this run.
+- `performance_sha256`: SHA-256 of the corresponding `perf-bN.json` file bytes, binding accounting to this run.
 - `server_identity_sha256`: `benchmark_stage.subsets.digest` of the corresponding parsed `perf-bN-server.json` object.
 - `requests`, `input_tokens`, `output_tokens`: the measured request and token counts, matching `completed`, `total_input_tokens` and `total_output_tokens` in `perf-bN.json`.
 - `prefill`: `flops`, `seconds`, `peak_flops_per_second`.
@@ -320,7 +321,7 @@ doc/benchmark/
     <task>/                     upstream results, scored samples and raw responses
     perf-b{1,32}*.json           raw performance measurements, warmups and server identities
     configuration-*.log          retained effective server configuration evidence
-    roofline.json               required full-phase accounting for both profiles
+    roofline.json               required full-phase accounting for every profile
     roofline-b{1,32}-*.log      collector readiness and collection commands/results
     <phase evidence artifacts> retained raw timings, request mapping and work calculations
 ```
@@ -344,8 +345,8 @@ judge the model's accuracy.
   "configured_layer_count": 32,
   "source_commits": {"tt-metal": "commit", "vllm": "commit"},
   "hardware": "observed chip topology",
-  "server_command": ["vllm", "serve", "organization/model", "--max-num-seqs", "32", "--max-model-len", "131072", "--no-enable-prefix-caching"],
-  "prefix_caching": false,
+  "server_command": ["vllm", "serve", "organization/model", "--max-num-seqs", "32", "--max-model-len", "131072"],
+  "prefix_caching": true,
   "max_num_seqs": 32,
   "max_model_len": 131072
 }

@@ -174,7 +174,7 @@ On Galaxy 4x8, do not blindly flatten to TP=8. Make an explicit 2D plan:
 - Identify which collectives cross rows and which cross columns.
 - Estimate activation, weight, expert, and KV-cache memory with all layers loaded.
 - Compare communication volume against the 1D alternative.
-- Record why the selected strategy should improve single-user latency.
+- Record why the selected strategy suits the target workload (concurrency × context) and single-user latency.
 
 GPT-OSS `MeshConfig` is the preferred shape for representing this plan. Galaxy Llama is useful for validating where reductions and gathers happen in an optimized 2D decoder, not for copying bespoke ops.
 

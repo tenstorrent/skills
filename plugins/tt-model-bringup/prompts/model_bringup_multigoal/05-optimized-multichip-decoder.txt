@@ -1,4 +1,4 @@
-/goal Use $optimize and $tt-device-usage for the HF_MODEL multichip decoder in the current tt-metal checkout.
+/goal Use $optimize, $agentic-serving, and $tt-device-usage for the HF_MODEL multichip decoder in the current tt-metal checkout.
 
 Subagents are authorized when a selected skill requests or recommends them.
 

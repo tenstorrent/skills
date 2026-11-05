@@ -244,8 +244,9 @@ def valid_gate_fixture(tmp_path):
     write('run/manifest.json', manifest)
     write('identity.json', server_fixture(32))
     write('run/run_config.json', dict(model='org/model', base_url='http://unused', tasks=tasks,
-                                     budget_seconds=3600, output_tokens=128))
-    summary = dict(status='completed', elapsed_seconds=30, accuracy={}, performance={})
+                                     budget_seconds=3600, output_tokens=128, concurrencies=[1, 32]))
+    summary = dict(status='completed', elapsed_seconds=30, accuracy={}, performance={},
+                   concurrencies=[1, 32], accuracy_concurrency=32)
     for task in tasks:
         stage = dict(model='org/model', subset_sha256=manifest['manifest_sha256'],
                      responses=2, expected_samples=2, concurrency=32, finish_reasons={'stop': 2})
@@ -628,7 +629,7 @@ def test_runner_collects_each_profile_before_switching_with_same_deadline(tmp_pa
     source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', performance_server_command=['server-control'],
-        manifest=str(source), tasks=[], roofline_command=['collector'])))
+        manifest=str(source), tasks=[], roofline_command=['collector'], concurrencies=[1, 32])))
     deadlines = []
     events = []
     def completed(argv, log, deadline):
@@ -694,7 +695,8 @@ def test_runner_switches_server_capacity_before_each_performance_profile(tmp_pat
     manifest.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {'ifeval': {'tasks': ['ifeval'], 'sample_count': 1, 'population': 1}}}))
     config_path = tmp_path / 'config.json'
     config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused',
-        manifest=str(manifest), tasks=['ifeval'], performance_server_command=['server-control'], roofline_command=['collector'])))
+        manifest=str(manifest), tasks=['ifeval'], performance_server_command=['server-control'],
+        roofline_command=['collector'], concurrencies=[1, 32])))
     events = []
     def completed(argv, log, deadline):
         if fake_roofline_command(argv): return
@@ -839,3 +841,35 @@ def test_roofline_percentage_is_a_result_not_an_acceptance_threshold(tmp_path):
     assert results['1']['prefill']['percent'] == .025
     assert results['1']['decode']['percent'] == 200  # Do not clamp modeled estimates.
     assert check(root) == evidence
+
+
+def test_default_concurrencies_sweep_largest_first_with_accuracy_on_the_largest(tmp_path, monkeypatch):
+    """Default is 1/8/16/32: every batch is measured, accuracy runs once on the largest."""
+    from benchmark_stage import run as runner
+    source = tmp_path / 'manifest.json'
+    source.write_text(json.dumps({'manifest_sha256': 'fixture', 'groups': {}}))
+    config_path = tmp_path / 'config.json'
+    config_path.write_text(json.dumps(dict(model='org/model', base_url='http://unused', tasks=[],
+        manifest=str(source), performance_server_command=['server-control'], roofline_command=['collector'])))
+    events = []
+    def completed(argv, log, deadline):
+        if fake_server_command(argv):
+            events.append(('server', int(argv[argv.index('--max-num-seqs') + 1])))
+            return
+        if argv[0] == 'collector':
+            fake_roofline_command(argv)
+            return
+        count = int(argv[argv.index('--num-prompts') + 1])
+        batch = int(argv[argv.index('--max-concurrency') + 1])
+        path = Path(argv[argv.index('--result-dir') + 1]) / argv[argv.index('--result-filename') + 1]
+        if 'warmup' not in path.name:
+            events.append(('measure', batch))
+        path.write_text(json.dumps(dict(performance_fixture(count), model_id='org/model', max_concurrency=batch)))
+    monkeypatch.setattr(runner, 'command', completed)
+    assert runner.run(config_path=config_path, output=tmp_path / 'run')['status'] == 'completed'
+    servers = [c for kind, c in events if kind == 'server']
+    assert servers == [32, 16, 8, 1], f'profiles must be measured largest first, saw {servers}'
+    assert [c for kind, c in events if kind == 'measure'] == [32, 16, 8, 1]
+    summary = json.loads((tmp_path / 'run/summary.json').read_text())
+    assert summary['concurrencies'] == [32, 16, 8, 1]
+    assert summary['accuracy_concurrency'] == 32

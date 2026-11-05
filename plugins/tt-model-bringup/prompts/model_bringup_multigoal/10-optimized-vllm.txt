@@ -1,4 +1,4 @@
-/goal Use $vllm-integration, $optimize, and $tt-device-usage for HF_MODEL vLLM serving in this tt-metal checkout.
+/goal Use $vllm-integration, $optimize, $agentic-serving, and $tt-device-usage for HF_MODEL vLLM serving in this tt-metal checkout.
 
 Subagents are authorized when a selected skill requests or recommends them.
 

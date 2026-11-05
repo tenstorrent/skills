@@ -68,9 +68,21 @@ def run(*, config_path, output):
         config['source_manifest'] = str(source_manifest)
         config['manifest'] = str(frozen_manifest)
         (output / 'run_config.json').write_text(json.dumps(config, indent=2) + '\n')
-    budget = min(float(config.get('budget_seconds', 3600)), 3600)
-    if not 0 < budget <= 3600:
-        raise ValueError('budget_seconds must be positive and at most 3600')
+    concurrencies = config.get('concurrencies', [1, 8, 16, 32])
+    if (not isinstance(concurrencies, list) or not concurrencies
+            or not all(isinstance(c, int) and not isinstance(c, bool) and c > 0 for c in concurrencies)
+            or len(set(concurrencies)) != len(concurrencies)):
+        raise ValueError('concurrencies must be a non-empty list of unique positive integers')
+    # Measure largest first: the biggest server is the baseline every smaller
+    # profile validates against, and accuracy runs once on it.
+    concurrencies = sorted(concurrencies, reverse=True)
+    accuracy_concurrency = concurrencies[0]
+    # Each profile costs a server switch, warmup and roofline collection. The
+    # per-profile allowance is what the original two-profile hour allowed.
+    cap = 1800.0 * len(concurrencies)
+    budget = min(float(config.get('budget_seconds', cap)), cap)
+    if not 0 < budget <= cap:
+        raise ValueError(f'budget_seconds must be positive and at most {cap:.0f}')
     deadline = started + budget
     summary = {'schema_version': 1, 'status': 'running', 'accuracy': {}, 'performance': {}}
     def interrupted(signum, frame):
@@ -79,7 +91,7 @@ def run(*, config_path, output):
     try:
         server_command = config.get('performance_server_command')
         if not isinstance(server_command, list) or not server_command or not all(isinstance(arg, str) for arg in server_command):
-            raise ValueError('performance_server_command is required to select and record 32-slot and one-slot servers')
+            raise ValueError('performance_server_command is required to select and record one server per configured batch')
         roofline_command = config.get('roofline_command')
         if not isinstance(roofline_command, list) or not roofline_command or not all(
                 isinstance(arg, str) and arg.strip() for arg in roofline_command):
@@ -102,11 +114,13 @@ def run(*, config_path, output):
             phase_accounting(capacity, 'check')
             return server
 
-        baseline_server = select_server(32)
+        baseline_server = select_server(accuracy_concurrency)
         execution = config.get('accuracy_execution', 'sequential')
         if execution not in ('sequential', 'shared'):
             raise ValueError('accuracy_execution must be sequential or shared')
         summary['accuracy_execution'] = execution
+        summary['concurrencies'] = concurrencies
+        summary['accuracy_concurrency'] = accuracy_concurrency
         batches = [config['tasks']] if execution == 'shared' else [[task] for task in config['tasks']]
         for batch in batches:
             generation = config.get('generation', {}).get(batch[0], {})
@@ -116,15 +130,16 @@ def run(*, config_path, output):
             argv = [sys.executable, '-m', 'benchmark_stage', 'evaluate', '--model', config['model'],
                     '--base-url', config['base_url'], '--manifest', config['manifest'],
                     '--task', ','.join(batch), '--output', str(task_output),
-                    '--generation', json.dumps(generation)]
+                    '--generation', json.dumps(generation),
+                    '--concurrency', str(accuracy_concurrency)]
             if execution == 'shared':
                 argv.append('--shared')
             command(argv, output / ('accuracy-shared.log' if execution == 'shared' else f'{batch[0]}.log'), deadline)
             for task in batch:
                 result = json.loads((output / task / 'results.json').read_text())
                 summary['accuracy'][task] = result['benchmark_stage']
-        for concurrency in (32, 1):
-            server = baseline_server if concurrency == 32 else select_server(1, baseline_server)
+        for concurrency in concurrencies:
+            server = baseline_server if concurrency == accuracy_concurrency else select_server(concurrency, baseline_server)
             for warmup in (True, False):
                 name = f'perf-b{concurrency}' + ('-warmup' if warmup else '')
                 requests = concurrency if warmup else max(8, concurrency * 3)
@@ -156,7 +171,7 @@ def run(*, config_path, output):
             # Flush and retain this server's timings before a profile switch can
             # destroy its in-memory counters or task-local logs.
             phase_accounting(concurrency, 'collect')
-        load_roofline(output, required=('1', '32'))
+        load_roofline(output, required=tuple(str(c) for c in concurrencies))
         summary['status'] = 'completed'
     except BaseException as exc:
         summary['status'] = 'failed'

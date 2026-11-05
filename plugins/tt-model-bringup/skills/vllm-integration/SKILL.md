@@ -40,7 +40,7 @@ Serving requests may have any valid prompt length up to that supported context. 
 
 The plugin also reads the adapter's `tt_supported_decode_batch_sizes` (the captured decode buckets); without it every decode step is padded to `max_num_seqs`. Declare the prepared buckets there and document the key in the serving contract.
 
-Preserve larger-batch serving capability. The headline performance target is still batch-1 single-user latency, but the adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to 32 concurrent sequences when the target hardware, memory, and harness allow it. If 32 cannot run, record the largest tested value and the hard physical limit.
+Preserve larger-batch serving capability. The headline performance target is the target workload in [`agentic-serving`](../agentic-serving/SKILL.md); batch-1 single-user latency is a regression row. The adapter must not assume `max_num_seqs=1` or batch size 1 in cache allocation, page tables, scheduler inputs, sampling, async decode, or output formatting. Test serving up to the largest batch in `batch_sizes` (default 1, 8, 16, 32) when the target hardware, memory, and harness allow it. If it cannot run, record the largest tested value and the hard physical limit.
 
 ## Serving dependency
 
@@ -112,7 +112,7 @@ degenerate text does not establish page-table correctness.
 
 ## Prefix Caching
 
-Prefix caching is required unless one of the two documented exclusions in [prefill features](references/prefill-features.md) applies (`block_output`, or `recurrent_state` for models whose linear-attention or recurrent state cannot be rebuilt from KV blocks); an excluded model records the exclusion in its serving contract row and skips the resume check and the `prefix_cache` stage. Otherwise declare `model_capabilities["supports_prefix_caching"] = True` and serve with `--enable-prefix-caching` once the generator meets the continuation contract in that document: a cache hit arrives as `start_pos` equal to the cached length over the request's own page table, the same path chunked prefill and preemption resume use. Prove it twice: the generator-level resume check (`run_prefill_resume_check`, with its negative controls failing) and the served `prefix_cache` readiness stage (hit counters from `/metrics`, warm/cold TTFT, first-token agreement, shared-prefix hit rate), with the sampling and qualitative stages run against the same caching-enabled server. The only accepted reasons to declare `False` are the two exclusions in that document, named in the serving contract row. A pinned plugin that vetoes or breaks caching for a model that meets the contract is a `plugin_owned` row, not a reason to declare `False`. Do not add a capability key, environment variable, or `--additional-config` option to gate it.
+Prefix caching is required unless one of the two documented exclusions in [prefill features](references/prefill-features.md) applies (`block_output`, or `recurrent_state` for models whose linear-attention or recurrent state cannot be rebuilt from KV blocks); an excluded model records the exclusion in its serving contract row and skips the resume check and the `prefix_cache` stage. Otherwise declare `model_capabilities["supports_prefix_caching"] = True` and serve with `--enable-prefix-caching` once the generator meets the continuation contract in that document: a cache hit arrives as `start_pos` equal to the cached length over the request's own page table, the same path chunked prefill and preemption resume use. Prove it twice: the generator-level resume check (`run_prefill_resume_check`, with its negative controls failing) and the served `prefix_cache` readiness stage (hit counters from `/metrics`, warm/cold TTFT, first-token agreement, shared-prefix hit rate), with the sampling and qualitative stages run against the same caching-enabled server. The only accepted reasons to declare `False` are the two exclusions in that document, named in the serving contract row. A pinned plugin that vetoes or breaks caching for a model that meets the contract is a `plugin_owned` row, not a reason to declare `False`. Do not add a capability key, environment variable, or `--additional-config` option to gate it. Check reuse on multi-turn traffic as [`agentic-serving`](../agentic-serving/SKILL.md) describes.
 
 ## Batched Prefill
 
@@ -241,7 +241,7 @@ Check stages:
 
 - `sampling`: runs the canonical TT plugin pytest suite against the live server. `--sampling-profile full` runs the whole suite; `--sampling-profile smoke` runs a small integration sanity subset for slow bring-up loops.
 - `qualitative`: saves greedy and sampled completions for prompts from `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/vllm_prompts.txt`; use `$qualitative-check` to ensure the prompts are sent in the HF-declared model format, compare against controls, and judge coherence, topic, repetition, gibberish, and wrong-language drift.
-- `benchmark`: runs the primary single-user decode profile by default: 128-token input, 128-token output, one prompt, `--max-concurrency 1`, `ignore_eos`, percentile metrics `ttft,tpot,itl,e2el`, and a completed-prompt gate. Use `vllm_benchmark.json` for headline decode t/s/u and comparisons to full-model or older agentic/custom-benchmark reports. This is the primary optimization target.
+- `benchmark`: runs the primary single-user decode profile by default: 128-token input, 128-token output, one prompt, `--max-concurrency 1`, `ignore_eos`, percentile metrics `ttft,tpot,itl,e2el`, and a completed-prompt gate. Use `vllm_benchmark.json` for headline decode t/s/u and comparisons to full-model or older agentic/custom-benchmark reports. This is the single-user regression row.
 - `prefix_cache`: sends one ~2300-token prompt cold, warm, warm, resets the prefix cache, and repeats; reads prefix-cache counters from `/metrics` around each request, records TTFT, first-token logprob and greedy output, runs the shared-prefix `vllm bench serve` workload, and writes `prefix_cache_check.json` with the verdict defined in [prefill features](references/prefill-features.md). Every run also writes `vllm_run_summary.json`.
 - `prefill_burst`: runs 32 x 128-token prompts at concurrency 32 so the scheduler forms multi-row prefill steps and writes `vllm_prefill_burst_benchmark.json`; pass `--prefill-burst-serial-result` with the same workload measured with batched prefill disabled to record the TTFT ratios the gate reads.
 - `benchmark`: also runs the vLLM-nightly-shaped CI serving-burst profile by default: 100-token inputs, 100-token outputs, 32 prompts, no explicit `--max-concurrency`, `ignore_eos`, and the same metric set. Use `vllm_ci_serving_benchmark.json` for vLLM-nightly parity, serving-capacity context, and larger-batch/concurrency coverage. Do not use it as the headline decode t/s/u because burst admission and chunked prefill can affect TPOT. The readiness runner passes `--temperature 0.0` by default so both benchmark profiles are greedy. Use `--benchmark-use-server-generation-config` only when intentionally reproducing exact nightly/server-generation-config behavior, and label those numbers as sampled/default-generation-config rather than greedy single-user t/s/u.
@@ -250,7 +250,7 @@ When optimizing decode serving overhead, benchmark with the exact same runner, p
 
 Keep teacher-forcing and serving performance separate. A readiness/PERF teacher-forcing number is useful as a decoder/generator lower bound; vLLM throughput includes serving orchestration, sampling, token feedback, request handling, and readback. If serving is much slower than teacher forcing, remove avoidable serving-specific overhead before retuning the decoder stack: fallback sampling, stale-input refreshes, per-token page-table copies, blocking trace replay, synchronizations, readbacks, and adapter-side reconstruction.
 
-`--max-num-seqs` is passed to both server launch and sampling pytest (`--tt-max-num-seqs`). Do not leave it at 1 except for the primary single-user benchmark or a focused debugging run. Final serving evidence should include a larger value, normally up to 32, unless hardware or memory capacity prevents it.
+`--max-num-seqs` is passed to both server launch and sampling pytest (`--tt-max-num-seqs`). Do not leave it at 1 except for the primary single-user benchmark or a focused debugging run. Final serving evidence covers every batch in `batch_sizes` unless hardware or memory capacity prevents it.
 
 For final vLLM-integration evidence, use `--sampling-profile full`. The normal debugging order is smoke first, then full: use `--sampling-profile smoke` for faster inner-loop iteration, rerun only failing pytest node ids or targeted requests while fixing failures, and run `--sampling-profile full` after the smoke and targeted checks pass. For MoE bring-up loops where the full profile is impractical, record the final status as `smoke-gated`; do not present it as equivalent to the full sampling gate unless the project owner explicitly accepts that coverage.
 
@@ -296,7 +296,7 @@ Done means all of these are true and recorded:
 - Exact successful `run_vllm_server` invocation.
 - Served max context, matching `doc/context_contract.json`, with any hard-physical-limit reduction evidence.
 - Non-aligned prompt-length evidence through serving: a valid request length that is not divisible by internal chunk/page/block alignment succeeds without capping or truncating the advertised context.
-- Served batch/concurrency coverage, including the largest tested `max_num_seqs` up to 32 and any hard-physical-limit reduction evidence.
+- Served batch/concurrency coverage, including every validated batch in `batch_sizes` and any hard-physical-limit reduction evidence.
 - Capability flags with evidence: no unproven `supports_async_decode=True`, and on-device sampling verified for the measured mode. Every declared `model_capabilities` key is documented by the pinned plugin.
 - Prefix caching: `supports_prefix_caching=True` with `readiness/prefill_resume_check.json` (controls failed), `readiness_vllm/prefix_cache_check.json` (status pass), `readiness_vllm/vllm_run_summary.json` showing the server enabled it, and sampling and qualitative verdicts from the caching-enabled server; or a serving-contract row naming a documented exclusion; or a `plugin_owned` row with its justification record when the pinned plugin blocks it.
 - Batched prefill: batched-equals-solo generator evidence, the warmup bucket list with program-cache counts, and `readiness_vllm/vllm_prefill_burst_benchmark.json` with its `serial_reference` ratios.
@@ -337,3 +337,15 @@ The README should lead with vLLM sampling status, qualitative verdict, primary s
 | Plugin and vLLM changes | [plugin changes](references/plugin-changes.md) |
 | Prefix caching and batched prefill | [prefill features](references/prefill-features.md) |
 | Resumed-prefill check | `${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/run_prefill_resume_check.py` |
+
+## Per-batch serving configurations
+
+Validate and record one serving configuration per configured batch size, from
+`bringup/agentic_evals/inputs.json` when set and otherwise 1, 8, 16 and 32. Each is tuned for its
+own batch: the single-user configuration with a larger `--max-num-seqs` is not a tuned batch-16
+configuration and must not be recorded as one. Tune batch 1 first, then the largest batch, then
+any in between.
+
+Record any batch the device cannot hold, with the reason. Later stages measure every validated
+batch and run the full evals on the largest, so an unrecorded
+drop silently moves where the scores come from.

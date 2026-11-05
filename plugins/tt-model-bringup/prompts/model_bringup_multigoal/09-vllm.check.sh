@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 TT_MODEL_BRINGUP_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+PYTHON="${PYTHON:-$(command -v python3 || command -v python)}"
 # Runner-side gate for the vLLM integration stage: served qualitative outputs
 # (greedy and sampled) must exist and must not be mechanically degenerate. A
 # serving path that doubles tokens or collapses to one token is a serving bug,
@@ -13,18 +14,24 @@ else
   echo "Neither MODEL_DIR nor HF_MODEL is set; cannot scope the check to the target model." >&2
   exit 3
 fi
-python "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/runtime/readiness_check/check_degenerate_output.py" \
   "${scope_args[@]}" --missing-artifacts critical --scope vllm || exit $?
 
-python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
+"$PYTHON" "${TT_MODEL_BRINGUP_ROOT}/scripts/check_context_contract.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" \
-  --stage vllm --require-contract || exit $?
+  --stage vllm --require-contract || rc=$?
+rc=${rc:-0}
+[ "$rc" -ge 2 ] && exit "$rc"
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_serving_contract.py" \
-  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract
-contract_rc=$?
-[ "$contract_rc" -gt 1 ] && exit "$contract_rc"
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --require-contract || contract=$?
+[ "${contract:-0}" -ge 2 ] && exit "$contract"
+[ "${contract:-0}" -gt "$rc" ] && rc=$contract
 
 python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_prefill_features.py" \
   --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || exit $?
-exit "$contract_rc"
+
+python "${TT_MODEL_BRINGUP_ROOT}/scripts/check_agentic_serving.py" \
+  --model-dir "${MODEL_DIR:-}" --hf-model "${HF_MODEL:-}" --stage vllm || serving=$?
+[ "${serving:-0}" -gt "$rc" ] && rc=$serving
+exit "$rc"
