@@ -6042,6 +6042,38 @@ def cmd_pool_admit(a) -> None:
     sys.exit(0 if ok else pooladmit.SHORT)
 
 
+def cmd_pool_shard(a) -> None:
+    """Run one shard of a project's own test pool on the first pool without a fresh stall mark; a shard
+    that makes no file progress for its stall window is ended, its job cancelled, the pool marked, and its
+    files run on the next pool (poolshard). The time before its first file is a test-pool wait of its push
+    check, not run time. Exits with the finished run's code, poolshard.STALLED when every pool stalled."""
+    from . import poolshard
+    cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
+    if not cmd or not a.pool:
+        die("usage: ttp pool-shard --shard <id> --pool <alias> [--pool <alias>...] [--cancel <cmd>] -- <command>")
+    done_re = a.done_re or poolshard.DONE_RE
+    try:
+        re.compile(done_re)
+    except re.error as e:
+        die(f"pool-shard: --done-re is no regular expression: {e}")
+    win = None
+    if a.window is not None:
+        win = poolshard._num(a.window)
+        if win is None:
+            die(f"pool-shard: --window wants seconds (a number over 0), not {a.window!r}")
+
+    def stop(_sig, _frame):
+        raise SystemExit(143)
+    signal.signal(signal.SIGTERM, stop)
+    signal.signal(signal.SIGHUP, stop)
+    try:
+        rc = poolshard.run(cmd, a.pool, a.shard, cancel=a.cancel, what=a.what, win=win, done_re=done_re,
+                           tell=lambda line: print(f"ttp pool-shard: {line}", file=sys.stderr, flush=True))
+    except OSError as e:
+        die(f"pool-shard: could not start {cmd[0]!r}: {e}", 127)
+    sys.exit(rc)
+
+
 def cmd_clip(a) -> None:
     """Run one command with its whole output in a file, and print only what a model needs: a test
     run's failures, else the head and tail, plus the file's path. Exits with the command's code.
@@ -11704,7 +11736,7 @@ COMMAND_GROUPS = (
                   "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "host-run", "detach", "devq", "push", "land", "clip", "sandbox", "pool-wait", "pool-admit",
-                      "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
+                      "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
     ("probes (retry_when, start_when)", ("landed", "eta", "ci", "ack-wait", "ssh-preflight", "broker-released",
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
@@ -12190,6 +12222,20 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--what", default="", help="the pool's name: its timing history")
     s.add_argument("--ran", metavar="SECONDS", help="record a passing run's seconds on K slots instead")
     s.set_defaults(fn=cmd_pool_admit)
+
+    s = sub.add_parser("pool-shard", help="run one shard of a project's own test pool; a shard with no file done "
+                                          "in its stall window is ended and its files run on the next pool")
+    s.add_argument("--shard", default="0", help="the shard's id, for the log and the stall mark")
+    s.add_argument("--pool", action="append", default=[], help="a pool alias to run on, in order (repeat it; "
+                                                                "{pool} in the command is replaced by it)")
+    s.add_argument("--cancel", default="", help="a shell command that cancels the shard's batch job (TTP_POOL, "
+                                                "TTP_POOL_SHARD set), run after a stalled shard is ended")
+    s.add_argument("--what", default="", help="the set of files, for the measured seconds per file")
+    s.add_argument("--window", metavar="SECONDS", help="the stall window (default: checks.pool_shard_stall_s, "
+                                                       "else 4x the median per file, at least 600 s)")
+    s.add_argument("--done-re", default=None, help="the regular expression of a line saying a file is done")
+    s.add_argument("cmd", nargs=argparse.REMAINDER, help="the shard's command, after --")
+    s.set_defaults(fn=cmd_pool_shard)
 
     s = sub.add_parser("sandbox", help="run a command (a test suite); in its own PID namespace only where the project "
                                        "turned it on (sandbox.checks) or, under TTP_NO_DEVICE=1, to hide device nodes")

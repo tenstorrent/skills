@@ -1355,6 +1355,19 @@ running work is interrupted only by the preemption below:
   Why this design: refusing the cut run is the simplest rule that never starts a run certain to
   time out, and it leaves the project's own pool in charge of where its shards go. The limit is
   never scaled for a cut run: that would let one run hold a push longer than the project set.
+  A gate that runs its test files on a pool of hosts starts each shard as `ttp pool-shard --shard <id>
+  --pool <alias> [--pool <alias>...] [--cancel <cmd>] -- <cmd...>` (`{pool}` and `{shard}` in the
+  command are filled in; TTP_POOL and TTP_POOL_SHARD are set). The shard prints one line per file
+  done (`PASS`/`FAIL` at the start, or pytest's `[ NN%]` progress; `--done-re` changes it). Its time
+  before the first file (a queued batch job, setup) is a test-pool wait: the push log shows it and
+  `delivery.push_pool_wait_s` bounds it, and like any pool wait it counts against the check's limit. A shard with
+  no file done for its stall window is ended with its process group, `--cancel` cancels its batch
+  job, the stall goes to `~/.tt-project/check-slots/pool-stalls.log` with the shard id and pool alias, and
+  its files run again on the next `--pool` given; when every pool stalls it exits 124. The window is
+  `checks.pool_shard_stall_s` (account setting) when set, else four times the median seconds per file
+  measured on this machine, at least `checks.pool_shard_stall_floor_s` (default 600 s). A stalled
+  pool is skipped by later shards for 30 min or until a file is done there; when every pool given
+  is marked, the one marked longest ago is tried.
 - A check is a command, which runs on every head. One that only makes sense once a file exists
   (a test file a later change adds) can opt in to being skipped where it does not apply:
   `{"run": "pytest tests/test_new.py", "if_exists": "tests/test_new.py"}`. `if_exists` is a
