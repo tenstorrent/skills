@@ -434,8 +434,14 @@ prolonged whole-box outage.
   20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
   backstop. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
-  line naming the sections left out. Open tasks goes row by row: only its new and changed rows (an age
-  or read time alone is no change), and a line counting the rest and naming the tasks no longer open.
+  line naming the sections left out. List sections whose rows have a stable key (Open tasks, promises,
+  memory and correction entries, attached chats) go row by row (`row_delta`, default on; `false` sends
+  every changed section whole): the added and changed rows, each whole, and a line naming every added,
+  changed and removed row by its key and counting the rest; an age or read time alone is no change. Such
+  a section still goes whole when a row has no key or a key repeats, its list is cut short by its row
+  limit, its heading changed in more than its counts, more than half its rows changed or its rows only
+  changed order. Sections without row keys (course check, resources, ETA lines and the like) always go
+  whole when they change, so one changed line there resends the section.
   A new session, a daemon restart, a stateless, failed or
   compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
   digest on the next wake. A session wake's answer is checked before its turn ends: an action the

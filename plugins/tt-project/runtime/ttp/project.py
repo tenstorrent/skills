@@ -280,10 +280,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # starts once its last call's context reaches its first prompt plus
                     # rollover_growth_tokens, at most context_window_tokens (0: by model) less
                     # rollover_margin_tokens (rollover_tokens above 0: a fixed limit instead);
-                    # max_failures_per_h failed resumes within an hour run every turn stateless for pause_h hours.
+                    # max_failures_per_h failed resumes within an hour run every turn stateless for pause_h hours;
+                    # row_delta false sends each changed digest section whole (else keyed lists go by row).
                     "session": {"mode": "off", "rollover_tokens": 0, "rollover_growth_tokens": 100000,
                                 "context_window_tokens": 0, "rollover_margin_tokens": 40000,
-                                "max_failures_per_h": 3, "pause_h": 6},
+                                "max_failures_per_h": 3, "pause_h": 6, "row_delta": True},
                     "turn_budget_usd": 1.0,
                     # The most the daemon raises one turn's cap to, once, for a single item that went
                     # over turn_budget_usd alone (0: twice turn_budget_usd); never above the hourly

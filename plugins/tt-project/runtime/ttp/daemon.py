@@ -2929,7 +2929,7 @@ class Daemon:
                     sent, ack, sent_why = coordsession.wake_digest(
                         session_mode, state, session_digest["parts"],
                         session_digest["full"], session_digest["seen"], session_digest["shown"],
-                        f"{self.boot}:{self._started}")
+                        f"{self.boot}:{self._started}", coordsession.row_delta_on(self.cfg))
                     prompt = "\n".join(text for _, text in sent)
                 except Exception as e:   # today's digest, unacknowledged: the next session wake sends it whole
                     ack, sent_why = None, f"digest failed: {type(e).__name__}: {e}"[:200]

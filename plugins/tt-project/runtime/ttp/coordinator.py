@@ -503,6 +503,8 @@ USER_SETTABLE = {
     "coordinator.session.mode": lambda v: coordsession.mode_of(v),
     # A session coordinator's tools (coordtools.py): full or read_only. Back to full only on the user's word.
     "coordinator.session.tools": lambda v: coordtools.tools_mode_of(v),
+    # Per-row updates of the keyed digest lists on resumed session wakes: true (default) or false.
+    "coordinator.session.row_delta": lambda v: coordsession.row_delta_of(v),
 }
 
 
@@ -1417,7 +1419,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             lines.append(f"- {m['kind']} #{m['id']}, {(now - m['ts']) / 3600:.1f}h ago: {clip(m['text'], SENT_CHARS)}")
     section("sent", lines)
     lines = []
-    chats = db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT 10")
+    chats = db.q("SELECT id, label, last_active FROM chats ORDER BY last_active DESC LIMIT ?",
+                 (coordsession.CHATS_SHOWN,))
     if chats:
         lines.append("## Chats attached")
     for c in chats:

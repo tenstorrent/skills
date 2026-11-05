@@ -196,7 +196,10 @@ def test_coordsession_mode_is_chat_settable(env, capsys):
     assert p.config()["coordinator"]["session"] == {"mode": "off", "rollover_tokens": 0,
                                                    "rollover_growth_tokens": 100000, "context_window_tokens": 0,
                                                    "rollover_margin_tokens": 40000,
-                                                   "max_failures_per_h": 3, "pause_h": 6}
+                                                   "max_failures_per_h": 3, "pause_h": 6, "row_delta": True}
+    assert settable("coordinator.session.row_delta")(" Off ") is False and settable("coordinator.session.row_delta")(True)
+    with pytest.raises(ValueError):
+        settable("coordinator.session.row_delta")("sometimes")
     p.set_config("coordinator.session.mode", settable("coordinator.session.mode")("on"))
     assert p.config()["coordinator"]["session"]["mode"] == "on"
     assert p.config()["coordinator"]["session"]["rollover_growth_tokens"] == 100000, "the other defaults stay"
@@ -652,7 +655,7 @@ def test_coordsession_delta_omits_unchanged_sections_and_sends_a_changed_one_who
     rows = "- #1 | running | t\n- #2 | queued | u"
     sent, _, why = cs.wake_digest("resume", {cs.DIGEST: ack2}, _cs_parts(rows, paused=False), full, "seen2", "s3", "g1")
     assert dict(sent)["tasks"] == f"## Open tasks (id | status)\n{rows}" and "paused" not in dict(sent)
-    assert "(Open tasks: only" not in dict(sent)[cs.DELTA]
+    assert "by row" not in dict(sent)[cs.DELTA]
     assert "Unchanged, not repeated: Project budget. Gone (now empty): Paused resources." in dict(sent)[cs.DELTA]
     # A changed budget is sent whole, its time header with it.
     changed = [("budget", "# STATE at 10:09\n## Project budget\n- red")] + _cs_parts()[1:]
@@ -682,30 +685,34 @@ def test_coordsession_open_tasks_names_the_open_tasks_past_its_row_limit(env):
     assert "past this list" not in rows()
     extra = [p.db.add_task(f"x{n}", "s", origin="user") for n in range(2)]
     assert rows().split("\n")[-1] == cs.cut_line(extra) == f"{cs._CUT} {cs.OPEN_ROWS} rows, 2: #{extra[0]}, #{extra[1]})"
-    before = cs.rows(coord.digest_parts(p, {}, [], [])[0])
-    top = p.db.add_task("urgent", "s", origin="user", priority=0)
+    # A list cut short by its limit is sent whole: no row hashes, so no task is ever called closed.
+    assert "tasks" not in cs.rows(coord.digest_parts(p, {}, [], [])[0])
+    p.db.add_task("urgent", "s", origin="user", priority=0)
     parts = coord.digest_parts(p, {}, [], [])[0]
-    got = cs._row_delta(dict(parts)["tasks"], before)
-    assert f"#{top} |" in got and "no longer" not in got and f"#{late}" in got.split("\n")[-1], got
+    assert cs._row_delta("tasks", dict(parts)["tasks"], {"head": "x", "rows": {}}) is None
+    assert f"#{late}" in dict(parts)["tasks"].split("\n")[-1]
 
 
-def test_coordsession_delta_sends_only_new_and_changed_open_task_rows():
-    """Open tasks rows are compared one by one against the acknowledged row hashes, ages left out: a
-    new, changed or removed row reaches the session; an unchanged row, or one whose only change is its
-    age or read time, is not resent."""
+def _cs_rowparts(head, *rows, key="tasks"):
+    return [("budget", "# STATE at 10:00\n## Project budget\n- ok"), (key, "\n".join((head,) + rows)),
+            ("events", "\n# NEW EVENTS\n- (none)")]
+
+
+def test_coordsession_delta_sends_open_task_rows_added_changed_and_removed_by_key():
+    """Open tasks rows are compared one by one against the acknowledged row hashes, ages left out: the
+    added and changed rows are sent whole and every added, changed or removed row is named by its key;
+    an unchanged row, or one whose only change is its age or read time, is not resent."""
     from ttp import coordsession as cs
     head = "## Open tasks (id | status | tier | priority | age | title | last note)"
-
-    def parts(*rows):
-        return [("budget", "# STATE at 10:00\n## Project budget\n- ok"), ("tasks", "\n".join((head,) + rows)),
-                ("events", "\n# NEW EVENTS\n- (none)")]
-
+    parts = lambda *rows: _cs_rowparts(head, *rows)
     a = "- #10 | running | standard | p2 | 1.2h | code: a | checks: running (read 09:58 PST)"
     b = "- #11 | queued (starts when #10 lands) | light | p3 | 0.4h | review: b | "
     c = "- #12 | blocked | standard | p1 | 30.0h | work: c | needs a sign-in"
     d = "- #110 | pushing | light | p2 | 2.0h | review: d | passed"
-    ack = cs.wake_digest("new", None, parts(a, b, c, d), parts(a, b, c, d), "f", "f", "g")[1]
-    assert set(ack["rows"]) == {"#10", "#11", "#12", "#110"}
+    more = tuple(f"- #{n} | running | deep | p2 | 5.0h | code: a long-running task {n} | its checks run"
+                 for n in (3, 4, 5, 6))
+    ack = cs.wake_digest("new", None, parts(a, b, c, d, *more), parts(a, b, c, d, *more), "f", "f", "g")[1]
+    assert list(ack["keyed"]["tasks"]["rows"]) == ["#10", "#11", "#12", "#110", "#3", "#4", "#5", "#6"]
     st = {cs.DIGEST: ack}
 
     def tasks(*rows):
@@ -715,56 +722,115 @@ def test_coordsession_delta_sends_only_new_and_changed_open_task_rows():
     # Only ages and read times moved: the section counts as unchanged and is not sent at all.
     aged = [r.replace("1.2h", "1.4h").replace("09:58", "10:04").replace("30.0h", "30.2h").replace("2.0h", "2.1h")
             for r in (a, b, c, d)]
-    got, line, ack2 = tasks(*aged)
+    got, line, ack2 = tasks(*aged, *more)
     assert got is None and "Unchanged, not repeated: Project budget, Open tasks." in line, line
-    assert ack2["rows"] == ack["rows"]
-    # A changed row (b now running), a new one (#13) and a removed one (#12): only those two rows are sent,
-    # with their current ages; #10 and #110 are not repeated, and #12 is named no longer open.
+    assert ack2["keyed"] == ack["keyed"]
+    # Changed (#11 now running), added (#13) and removed (#12): the two rows are sent whole with their
+    # current ages, every one is named by key, and the rows as last shown are not repeated.
     b2 = "- #11 | running | light | p3 | 0.6h | review: b | "
     e = "- #13 | queued | standard | p2 | 0.0h | code: e | "
-    got, line, ack2 = tasks(aged[0], b2, aged[3], e)
-    lines = got.split("\n")
-    assert lines[0] == head and lines[2:] == [b2, e], got
-    assert lines[1] == ("(only new and changed rows follow; 2 as last shown, not repeated, their ages grown since; "
-                        "no longer open: #12)"), lines[1]
-    assert "(Open tasks: only its new and changed rows)" in line and "#10 |" not in got and "#110" not in got
-    assert set(ack2["rows"]) == {"#10", "#11", "#110", "#13"}
-    # A row folded into a group line is not gone; a removed group line is counted.
+    got, line, ack2 = tasks(aged[0], b2, aged[3], *more, e)
+    assert got.split("\n") == [head, "(rows since your last wake, by key: added #13; changed #11; removed (no "
+                               "longer open): #12; 6 as last shown, not repeated, their ages grown since)", b2, e], got
+    assert "(by row, as their key line says: Open tasks)" in line
+    assert list(ack2["keyed"]["tasks"]["rows"]) == ["#10", "#11", "#110", "#3", "#4", "#5", "#6", "#13"]
+    # A row folded into a group line is not gone (the group line, keyed by its hash, is added); a removed
+    # group line is counted.
     group = "- pushing, 1 as last turn (oldest in the push queue since 09:00 PST): #110 review: d"
-    more = tuple(f"- #{n} | running | deep | p2 | 5.0h | code: a long-running task {n} | its checks run"
-                 for n in (3, 4))
     st = {cs.DIGEST: cs.wake_digest("new", None, [], parts(a, group, *more), "f", "f", "g")[1]}
     got = tasks(a, d, *more)[0]
-    assert got.split("\n")[1:] == ["(only new and changed rows follow; 3 as last shown, not repeated, their ages "
-                                   "grown since; 1 other lines gone)", d], got
+    assert got.split("\n")[1:] == ["(rows since your last wake, by key: added #110; removed 1 other line; 5 as "
+                                   "last shown, not repeated, their ages grown since)", d], got
     st = {cs.DIGEST: cs.wake_digest("new", None, [], parts(a, d, *more), "f", "f", "g")[1]}
-    assert "no longer open" not in tasks(a, group, *more)[0]
-    # #1 gone is not hidden by #10 still open, and a task shown twice keeps both of its lines.
+    got = tasks(a, group, *more)[0]
+    assert "no longer open" not in got and got.split("\n")[-1] == group, got
+    # #1 gone is not hidden by #10 still open.
     st = {cs.DIGEST: cs.wake_digest("new", None, [], parts("- #1 | queued | x", a, *more), "f", "f", "g")[1]}
-    got = tasks(a, b, b.replace("queued", "queued again"), *more)[0]
-    assert got.split("\n")[2:] == [b, b.replace("queued", "queued again")] and "no longer open: #1)" in got, got
-    # A task pushed past the row limit while still open is named on the cut line, never called no longer
-    # open; a task that closes still is. With the cut line unable to name them all, a missing task is only
-    # no longer listed.
-    st = {cs.DIGEST: cs.wake_digest("new", None, [], parts(a, b, c, *more), "f", "f", "g")[1]}
-    got = tasks(e, a, b, *more, cs.cut_line([12]))[0]
-    assert "no longer" not in got and "#12)" in got.split("\n")[-1], got
-    got = tasks(e, a, *more, cs.cut_line([12]))[0]
-    assert "; no longer open: #11)" in got, got
-    many = cs.cut_line(list(range(200, 200 + cs.CUT_NAMED + 3)))
-    assert many.endswith(" and 3 more)") and "#12" not in many
-    got = tasks(e, a, b, *more, many)[0]
-    assert "; no longer listed (closed, or open past the row limit): #12)" in got and "no longer open" not in got
-    # An acknowledged digest saved without row hashes (before this change) sends a changed section whole.
-    old = {k: v for k, v in ack.items() if k != "rows"}
-    st = {cs.DIGEST: old}
-    assert tasks(aged[0], b2)[0] == "\n".join((head, aged[0], b2))
-    # Every full-digest fallback still sends the whole section, rows and all.
-    st = {cs.DIGEST: ack}
-    for state, gen in ((st, "g2"), ({}, "g"), (None, "g")):
-        sent, _, why = cs.wake_digest("resume", state, parts(b2), parts(a, b2), "f", "f", gen)
-        assert why.startswith("full: ") and dict(sent)["tasks"] == "\n".join((head, a, b2)), why
-    assert dict(cs.wake_digest("new", st, parts(b2), parts(a, b2), "f", "f", "g")[0])["tasks"] == "\n".join((head, a, b2))
+    assert "removed (no longer open): #1;" in tasks(a, *more)[0]
+
+
+def test_coordsession_delta_sends_a_keyed_section_whole_when_rows_cannot_stand_alone():
+    """Each case a row update could mislead goes whole: a heading changed in more than its counts, a line
+    with no key or a repeated key, a majority of rows changed, rows only reordered, a list cut short by
+    its row limit, an acknowledged digest without row hashes, and per-row updates set off."""
+    from ttp import coordsession as cs
+    head = "## Open tasks (id | status | age)"
+    rows = [f"- #{n} | running | 1.0h" for n in range(1, 9)]
+    st = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts(head, *rows), "f", "f", "g")[1]}
+
+    def sent(parts, state=None, row_delta=True):
+        out, _, why = cs.wake_digest("resume", state or st, parts, [], "f", "f", "g", row_delta)
+        assert why.startswith("delta: "), why
+        return dict(out)
+    one = rows[:3] + ["- #4 | blocked | 1.0h"] + rows[4:]
+    assert "(rows since your last wake" in sent(_cs_rowparts(head, *one))["tasks"]   # the control: one row
+    whole = lambda parts, **kw: sent(parts, **kw)["tasks"] == dict(parts)["tasks"]
+    assert whole(_cs_rowparts("## Open tasks (id | status | age | eta)", *one))         # heading changed
+    pr = [f"- o{n} item {n} [due Fri]" for n in range(1, 9)]                         # a line with no key...
+    pst = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts("## Promises", *pr, key="promises"), "f", "f",
+                                     "g")[1]}
+    loose = _cs_rowparts("## Promises", *pr, "  (and a wrapped second line)", key="promises")
+    assert sent(loose, pst)["promises"] == dict(loose)["promises"] and "promises" not in cs.rows(loose)
+    assert whole(_cs_rowparts(head, *one, rows[0]))                                   # ...or a key twice
+    assert whole(_cs_rowparts(head, *[r.replace("running", "queued") for r in rows[:5]], *rows[5:]))  # 5 of 8
+    assert whole(_cs_rowparts(head, *rows[1:], rows[0]))                              # reordered only
+    assert whole(_cs_rowparts(head, *one, cs.cut_line([20])))                         # past the row limit
+    assert whole(_cs_rowparts(head, *one), row_delta=False)                           # the setting off
+    old = {cs.DIGEST: {k: v for k, v in st[cs.DIGEST].items() if k != "keyed"}}       # before this change
+    assert whole(_cs_rowparts(head, *one), state=old)
+    assert "by row" not in sent(_cs_rowparts(head, *rows[1:], rows[0]))[cs.DELTA]
+    # Only the counts in a heading changed: rows still go one by one.
+    counted = sent(_cs_rowparts("## Open tasks (id | status | age), 9 open", *one),
+                   {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts("## Open tasks (id | status | age), 8 open",
+                                                                         *rows), "f", "f", "g")[1]})
+    assert "changed #4;" in counted["tasks"], counted
+    # A section without row keys is sent whole when it changes.
+    plain = [("resources", "## Paused resources (held)\n- box: paused\n- rig: paused")]
+    ack = cs.wake_digest("new", None, [], plain, "f", "f", "g")[1]
+    later = [("resources", "## Paused resources (held)\n- box: paused\n- rig: free")]
+    assert "resources" not in ack["keyed"] and sent(later, {cs.DIGEST: ack})["resources"] == later[0][1]
+    assert cs.row_delta_on({}) and cs.row_delta_on({"coordinator": {"session": {"row_delta": True}}})
+    assert not any(cs.row_delta_on({"coordinator": {"session": {"row_delta": v}}}) for v in (False, "off", 0))
+
+
+def test_coordsession_promises_memory_and_chats_go_by_row_and_the_first_wake_after_a_resume_whole():
+    """Promises, memory and correction entries and attached chats use the same per-row update; a new
+    session, a daemon restart (the session resumed under a new daemon) and a failed or compacted wake
+    since send the whole digest."""
+    from ttp import coordsession as cs
+    ph = "## Promises made in chat: 6 open (send each deliverable or an honest update in its chat)"
+    pr = [f"- o{n} report on item {n} [chat c1, message #{n}; due Thu 18:00 PST]" for n in range(1, 7)]
+    st = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts(ph, *pr, key="promises"), "f", "f", "g")[1]}
+    now = _cs_rowparts(ph.replace("6 open", "6 open, 1 OVERDUE"), *pr[1:], pr[0] + " OVERDUE 0.5 h")
+    assert dict(cs.wake_digest("resume", st, [(k.replace("tasks", "promises"), t) for k, t in now], [], "f", "f",
+                               "g")[0])["promises"] == now[1][1]   # the heading gained more than a count
+    later = pr[:2] + [pr[2].replace("report", "send the report")] + pr[4:] + ["- o9 a new one [chat c2; due Fri]"]
+    got = dict(cs.wake_digest("resume", st, _cs_rowparts(ph, *later, key="promises"), [], "f", "f", "g")[0])
+    assert got["promises"].split("\n")[1:] == ["(rows since your last wake, by key: added o9; changed o3; removed "
+                                               "(no longer open): o4; 4 as last shown, not repeated, their ages "
+                                               "grown since)", later[2], later[-1]], got["promises"]
+    mh = "## Decisions and facts recorded or changed since the cached prompt"
+    mem = [f"[fact-{n}] fact number {n} holds for every project" for n in range(6)]
+    st = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts(mh, *mem, key="memory_recent_added"), "f", "f",
+                                    "g")[1]}
+    got = dict(cs.wake_digest("resume", st, _cs_rowparts(mh, *mem[:5], "[fact-5] retired, ignore",
+                                                         key="memory_recent_added"), [], "f", "f", "g")[0])
+    assert got["memory_recent_added"].split("\n")[1:] == ["(rows since your last wake, by key: changed [fact-5]; 5 as "
+                                                          "last shown, not repeated, their ages grown since)",
+                                                          "[fact-5] retired, ignore"]
+    ch = [f"- c{n} (chat), active {n} min ago" for n in range(cs.CHATS_SHOWN)]
+    assert "chats" in cs.rows([("chats", "\n".join(["## Chats attached"] + ch[:-1]))])
+    assert "chats" not in cs.rows([("chats", "\n".join(["## Chats attached"] + ch))])   # at its row limit
+    # The first wake of a session, after a daemon restart, and after a failed or compacted wake: whole.
+    head = "## Open tasks (id | status)"
+    rows = [f"- #{n} | running" for n in range(1, 9)]
+    full = _cs_rowparts(head, *rows[:7], "- #8 | blocked")
+    ack = cs.wake_digest("new", None, [], _cs_rowparts(head, *rows), "f", "f", "g")[1]
+    failed = cs.record({"id": "s1", cs.DIGEST: ack}, None, "s1", {"mode": "resume"}, False, 0.0)
+    for mode, state, gen in (("new", {cs.DIGEST: ack}, "g"), ("resume", {cs.DIGEST: ack}, "g2"),
+                             ("resume", failed, "g")):
+        sent, _, why = cs.wake_digest(mode, state, full, full, "f", "f", gen)
+        assert why.startswith("full: ") and sent == full, why
 
 
 def test_coordsession_only_an_ok_session_wake_keeps_its_digest_acknowledged():
