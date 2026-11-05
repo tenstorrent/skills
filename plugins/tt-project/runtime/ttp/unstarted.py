@@ -7,7 +7,8 @@ announced(): each open promise (obligations.py's records, no second ledger) and 
 waiting task announced in a reply (reply_chat set) that no open promise owns, and each `ready:` follow-up
 of a hand-off (_ready_followups: owned by the later task that takes it up, else 'none'). When ANNOUNCED_S after it
 was made (ANNOUNCED_P1_S when an owner has priority 1) no owner task has a run started since then, and
-no owner is held by a recorded external condition (external_hold), one keyed `announced_not_started`
+no owner is held by a recorded external condition (external_hold) or by the push queue (an owner in status
+pushing with an open queue row: started while the queue is alive on it, pushq.holding), one keyed `announced_not_started`
 event names it, its owner ('none' when it has none), its age and what parks it (parked). The event is
 retired (handled, so it wakes no turn) once an owner starts, the promise closes or the task ends, or an
 owner becomes held externally: nothing is left for a turn to decide. One per promise or task, never
@@ -171,6 +172,7 @@ def announced(p, now: float | None = None, paused: dict | None = None) -> list[s
     now = time.time() if now is None else now
     db = p.db
     paused = db.paused_resources() if paused is None else paused
+    from . import pushq
     from .obligations import _retire
     raised, live = [], set()
     for s in _subjects(db, now):
@@ -179,8 +181,13 @@ def announced(p, now: float | None = None, paused: dict | None = None) -> list[s
         tasks = {t["id"]: t for t in db.q(f"SELECT * FROM tasks WHERE id IN ({','.join('?' * len(s['owners']))})",
                                           s["owners"])} if s["owners"] else {}
         held = [h for t in tasks.values() if (h := external_hold(db, t, paused))]
+        # A pushing owner the push queue holds is the daemon's to deliver: started while the queue is
+        # alive on it, else held by it (a dead batch or stalled queue pages through its own events).
+        queue = {i: q for i, t in tasks.items() if t["status"] == "pushing" and (q := pushq.holding(db, i))}
+        held += [f"#{i} in a {w}, paged by the push queue's own events" for i, (live, w) in queue.items() if not live]
+        pushing = any(live for live, _ in queue.values())
         done = any(t["status"] == "done" for t in tasks.values())   # its work ended: promise_overdue covers delivery
-        if done or _runs_since(db, s["owners"], s["created"]) or held:
+        if done or pushing or _runs_since(db, s["owners"], s["created"]) or held:
             _retire(db, now, "owner started" if not held else f"owner held: {held[0]}", fp)
             continue
         prio = min((t["priority"] for t in tasks.values()), default=None)

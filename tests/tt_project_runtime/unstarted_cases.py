@@ -203,6 +203,66 @@ def test_announced_owner_held_externally_raises_nothing(env, hold):
     assert _unstarted_events(p, "announced_not_started") == []
 
 
+def _pushing_owner(p, batched: bool):
+    """A promise owned by an approved review in status pushing with an open push-queue row: batched in
+    an unfinished batch whose marker does not exist (dead by pushq.alive), or approved."""
+    from ttp import obligations as ob
+    o = _promise(p, chat="c4")
+    tid = p.db.add_task("Review #1: the change", "s", kind="review", tier="light", origin="coordinator")
+    ob.attach(p, o["id"], [tid])
+    p.db.update_task(tid, status="pushing")
+    t0 = float(o["created"])
+    p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', ?, 'origin/x', ?)",
+           (str(p.base / "no-such-marker.json"), t0))
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, batch, created, updated) "
+           "VALUES(?, 'ttp/t', ?, 'origin/x', ?, ?, ?, ?)",
+           (tid, "a" * 40, "batched" if batched else "approved", "b1" if batched else None, t0, t0))
+    return tid, t0
+
+
+def test_announced_owner_pushing_in_a_live_push_queue_counts_as_started(env, monkeypatch):
+    """An owner the push queue delivers is the daemon's work: no announced_not_started while its batch
+    runs or it waits in a queue that is not stalled (old code: 'pushing without starting')."""
+    from ttp import pushq, unstarted
+    p = make(env)
+    _no_events(p)
+    tid, t0 = _pushing_owner(p, batched=True)
+    monkeypatch.setattr(pushq, "alive", lambda marker: (True, {"phase": "checks"}))
+    assert unstarted.announced(p, t0 + 1800) == []
+    p.db.x("UPDATE push_queue SET status='approved', batch=NULL")
+    assert unstarted.announced(p, t0 + 1900) == []
+    assert _unstarted_events(p, "announced_not_started") == []
+    p.db.x("DELETE FROM push_queue")   # pushing with no queue row holding it: nothing will pick it up
+    assert len(unstarted.announced(p, t0 + 2000)) == 1
+    assert "pushing without starting" in _unstarted_events(p, "announced_not_started")[0]["text"]
+
+
+@pytest.mark.parametrize("stall", ["dead batch", "dying", "not landing"])
+def test_announced_owner_pushing_in_a_dead_push_queue_pages_through_the_queue_event(env, stall):
+    """A dead batch or a stalled queue holds a pushing owner: no announced_not_started (the queue is
+    not alive, so the owner is not started), while the queue's own events page it."""
+    from ttp import pushq, unstarted
+    p = make(env)
+    _no_events(p)
+    tid, t0 = _pushing_owner(p, batched=stall == "dead batch")
+    alerts = []
+    if stall == "dead batch":
+        assert pushq.holding(p.db, tid) == (False, "push batch b1 not running")
+        p.db.set_kv(pushq.KV, {"deaths": pushq.DYING_AFTER - 1})
+        b = p.db.one("SELECT * FROM push_batches WHERE id='b1'")
+        pushq._died(p, b, {}, lambda kind, text, **k: alerts.append(kind), "died", t0 + 60)
+        assert alerts == ["push_queue_dying"]
+        assert p.db.one("SELECT 1 FROM events WHERE kind='push_batch_died'")
+    elif stall == "dying":
+        p.db.set_kv(pushq.KV, {"deaths": pushq.DYING_AFTER})
+    else:
+        p.db.set_kv(pushq.KV, {"landing_told": t0 + 30})
+    live, words = pushq.holding(p.db, tid)
+    assert not live and ("stalled" in words), words
+    assert unstarted.announced(p, t0 + 1800) == []
+    assert _unstarted_events(p, "announced_not_started") == []
+
+
 def _notes(p):
     from ttp import coordinator as coord
     return [n for n in p.db.kv(coord.NOTES_KEY) or [] if "without start_after" in n]

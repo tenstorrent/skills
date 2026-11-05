@@ -1353,6 +1353,26 @@ def alive(marker: Path) -> tuple[bool, dict]:
     return False, m
 
 
+def holding(db, task_id: int) -> tuple[bool, str] | None:
+    """Whether the queue holds `task_id` (an open row) and whether it is alive on it, with words; None
+    when no open row holds it. Alive: the batch holding it runs, or the row waits (approved or
+    held) while the queue is not stalled (fewer than DYING_AFTER deaths in a row, no landing alert
+    since the row came). A dead batch or a stalled queue pages through its own events (push_batch_died,
+    push_queue_dying, LANDING_ALERT)."""
+    row = db.one("SELECT status, batch, created FROM push_queue WHERE task=? AND status IN ('approved','batched','held') "
+                 "ORDER BY id DESC LIMIT 1", (task_id,))
+    if not row:
+        return None
+    if row["status"] == "batched":
+        b = db.one("SELECT marker FROM push_batches WHERE id=? AND finalized IS NULL", (row["batch"],))
+        live = bool(b) and alive(Path(b["marker"]))[0]
+        return live, f"push batch {row['batch']} {'running' if live else 'not running'}"
+    st = _state(db)
+    stalled = (int(st.get("deaths") or 0) >= DYING_AFTER
+               or float(st.get("landing_told") or 0) >= float(row["created"]))
+    return not stalled, f"push queue ({row['status']}{', stalled' if stalled else ''})"
+
+
 def _reap(bid: str) -> None:
     child = _children.get(bid)
     if child is not None and child.poll() is not None:
