@@ -21,6 +21,7 @@ import secrets as pysecrets
 import shlex
 import shutil
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -571,9 +572,31 @@ def detect_provider() -> str:
 
 def _copy_tree(src: Path, dst: Path) -> None:
     """Copy `src` over `dst`, each file renamed into place (replace_copy): an installed script a shell
-    is running is never rewritten under it."""
-    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-                    copy_function=replace_copy)
+    is running is never rewritten under it. Skips `.claude` folders and entries that are neither files
+    nor folders, nor symlinks to them (devices, FIFOs, sockets: sandbox placeholders a worker leaves
+    behind when its working directory was inside the tree), with one line on stderr naming them."""
+    skipped: list[str] = []
+
+    def ignore(folder: str, names: list[str]) -> set[str]:
+        out = {n for n in names if n == "__pycache__" or n.endswith(".pyc")}
+        for n in names:
+            if n in out:
+                continue
+            try:
+                mode = os.lstat(os.path.join(folder, n)).st_mode
+                if stat.S_ISLNK(mode):     # copied as its target: a link to a FIFO would block the copy too
+                    mode = os.stat(os.path.join(folder, n)).st_mode
+            except OSError:
+                continue
+            if n == ".claude" and stat.S_ISDIR(mode) or not (stat.S_ISREG(mode) or stat.S_ISDIR(mode)):
+                out.add(n)
+                skipped.append(os.path.relpath(os.path.join(folder, n), src))
+        return out
+
+    shutil.copytree(src, dst, dirs_exist_ok=True, ignore=ignore, copy_function=replace_copy)
+    if skipped:
+        print(f"ttp: copying {src}: skipped {len(skipped)} special entr{'y' if len(skipped) == 1 else 'ies'}"
+              f" ({', '.join(sorted(skipped)[:5])}{', ...' if len(skipped) > 5 else ''})", file=sys.stderr)
 
 
 def _git(cwd: Path, *args: str) -> str:
