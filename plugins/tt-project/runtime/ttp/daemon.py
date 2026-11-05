@@ -4506,7 +4506,8 @@ class Daemon:
             return
         try:
             # A resumed coordinator wake's log holds its whole session: compared with the session's total.
-            got = localspend.calibrate(usage.session_id, usage.extra.get("session_cost_usd", usage.cost_usd))
+            got = localspend.calibrate(usage.session_id,
+                                       (getattr(usage, "extra", None) or {}).get("session_cost_usd", usage.cost_usd))
         except Exception as e:  # noqa: BLE001 - a price check never breaks finishing a run
             log(self.p, f"price table check failed: {e}")
             return
