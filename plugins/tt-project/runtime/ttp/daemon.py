@@ -7621,7 +7621,7 @@ class Daemon:
         run); no urgent_start for a task already raised as ready_not_started or slot_wait for the same run
         and hold (_stuck_raised), nor for one asleep on its own wait (_own_wait: a retry_when, its own
         checks or detached job, a retry timer), which is only logged, once per run, as held by its own
-        wait; urgent.waited_s counts from when that wait passed."""
+        wait; its wait counts from when that wait passed (not_before)."""
         now = time.time()
         if now - getattr(self, "_urgent_start_checked", 0.0) < every_s:
             return
@@ -7655,7 +7655,9 @@ class Daemon:
                         self._urgent_own_logged[tid] = rid
                         log(self.p, f"urgent start: task {tid} held by its own wait: {own}")
                     continue
-                waited = urgent.waited_s(db, t, now)   # since its own wait passed, if it had one
+                waited = urgent.waited_s(db, t, now)
+                if t.get("not_before"):   # counted from when its own wait (timer or retry_when wake) passed
+                    waited = min(waited, max(now - float(t["not_before"]), 0.0))
                 fp = f"urgent_start:{tid}:{rid}"
                 if waited < mins * 60 or db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)) \
                         or self._stuck_raised(tid, rid, unstarted.READY_KIND, "slot_wait"):

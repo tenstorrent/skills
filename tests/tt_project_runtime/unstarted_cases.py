@@ -656,9 +656,8 @@ def test_an_urgent_task_asleep_on_its_own_wait_is_never_held_by_nothing_and_coun
         env, monkeypatch):
     """check_urgent_start: a queued urgent task asleep on its own retry_when (its timer ahead, or past
     with the probe's last answer "not yet") raises no urgent_start, however long ago its last run
-    ended; once the wait passes (_wake_waiting) urgent.waited_s counts from the wake. An urgent task
+    ended; once the wait passes (_wake_waiting) its wait counts from the wake. An urgent task
     with no wait still raises 'held by nothing now'."""
-    from ttp import urgent
     from ttp.daemon import Daemon, dump_result
     p = make(env)
     _no_events(p)
@@ -690,7 +689,6 @@ def test_an_urgent_task_asleep_on_its_own_wait_is_never_held_by_nothing_and_coun
     got = check(start + 60)
     assert set(got) == {plain} and got[plain]["severity"] == "high", got
     assert "held by nothing now" in got[plain]["text"], got[plain]["text"]
-    assert urgent.waited_s(p.db, p.db.task(asleep), start + 60) == 0, "asleep: no wait counted"
     assert [x for x in logged if f"task {asleep} held by its own wait: `{probe}`" in x], logged
     check(start + 120)
     assert len([x for x in logged if f"task {asleep} held by its own wait" in x]) == 1, "logged once per run"
@@ -706,7 +704,6 @@ def test_an_urgent_task_asleep_on_its_own_wait_is_never_held_by_nothing_and_coun
     monkeypatch.setattr(time, "time", lambda: start + 1200)
     d._wake_waiting(p.db.task(asleep), "probe passed", start + 1200)
     assert asleep not in check(start + 1200 + 4 * 60)
-    assert 4 * 60 <= urgent.waited_s(p.db, p.db.task(asleep), start + 1200 + 4 * 60) < 5 * 60
     got = check(start + 1200 + 5 * 60 + 5)
     assert got[asleep]["fingerprint"] == f"urgent_start:{asleep}:{rid}" and "held by nothing now" in got[asleep]["text"]
 
