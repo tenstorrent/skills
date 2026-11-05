@@ -240,6 +240,7 @@ def text(ov: dict) -> str:
 
 # `ttp deployed`: a deploy is accepted only from what each daemon reports it runs ---------------------
 DEPLOY_FRESH_S = 300    # the receipt's instance must have completed a tick this recently
+UPGRADE_RUN_S = 900     # an automatic upgrade of the release started this recently still runs
 OK, PENDING, CANNOT = 0, 1, 2
 
 
@@ -416,7 +417,7 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
             row["upgrade_error"] = auto.get("why") or "the last upgrade failed"
         # Its own upgrade restarts the daemon: down meanwhile is a step, not a fault (as release.line).
         row["upgrading"] = (auto.get("outcome") == "running" and bool(auto.get("key")) and
-                            _concerns(auto, target, commit) and now - float(auto.get("ts") or 0) < 900)
+                            _concerns(auto, target, commit) and now - float(auto.get("ts") or 0) < UPGRADE_RUN_S)
         if tid:
             from .release import STALE_S, task_activity
             task, last = task_activity(db, tid)
@@ -426,6 +427,10 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         elif row["paused"] and not at_target:
             # Nothing upgrades a paused project by itself: the host-side takeover merges its files now.
             row.update(merge_pending=True, merge_owner="the host-side takeover (project paused)", takeover_at=now)
+        elif row["upgrading"] and not at_target:
+            # Its own upgrade of the release runs now: owned by its daemon until that try's window ends.
+            row.update(merge_pending=True, merge_owner="this project's daemon",
+                       takeover_at=float(auto["ts"]) + UPGRADE_RUN_S)
         elif (not at_target and row["daemon_alive"] and (where.get("upgrade") or {}).get("auto", True)
               and cur.get("outcome") not in ("running", "failed")):
             # Its live daemon merges the release by itself: at its next release check, or when a deferred

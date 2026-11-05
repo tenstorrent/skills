@@ -8318,6 +8318,74 @@ def test_after_push_deploy_pending_success_does_not_page_push_queue(env, tmp_pat
     assert p.db.one("SELECT after_push FROM push_batches")['after_push'] == 'ok'
 
 
+@pytest.mark.parametrize('case', ['future', 'in_grace', 'past_grace', 'no_owner', 'stale_daemon'])
+def test_after_push_deploy_fails_only_past_the_takeover_grace_unowned_or_stale(env, tmp_path, case):
+    """A project behind whose live daemon owns its upgrade with a takeover time is a low note (exit 0)
+    until that time plus deploy.GRACE_S. Past it (once the host-side takeover is spent), with no owner,
+    or with a daemon that stopped ticking (a stale heartbeat), the deploy fails and alerts; the alert
+    clears once the project runs the release."""
+    from ttp import daemon, deploy, overview
+    p = make(env)
+    _deploy_lib('0.5.0')
+    base, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    now = time.time()
+    if case == 'no_owner':      # upgrade.auto off: nothing upgrades it by itself
+        cfg = json.loads((base / 'harness' / 'project.json').read_text())
+        (base / 'harness' / 'project.json').write_text(json.dumps(dict(cfg, upgrade={'auto': False})))
+    if case == 'stale_daemon':  # its process lives, but no tick step has finished for a while
+        old = now - daemon.HEARTBEAT_STALE_S - 60
+        os.utime(base / 'state' / 'heartbeat', (old, old))
+    report = overview.deployed(names=['alpha'], now=now)
+    row = report['projects'][0]
+    if case in ('future', 'in_grace', 'past_grace'):
+        assert row['merge_owner'] == "this project's daemon" and row['takeover_at'] > now, row
+        row['takeover_at'] = {'future': row['takeover_at'], 'in_grace': now - 5,
+                              'past_grace': now - deploy.GRACE_S - 60}[case]
+    result = deploy.record(p, report, now)
+    alerts = lambda: p.db.q("SELECT severity FROM alerts WHERE key='deploy-behind:alpha'")  # noqa: E731
+    if case in ('future', 'in_grace'):
+        assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result
+        assert not alerts()
+        return
+    if case == 'past_grace':    # missed: the host-side takeover runs first; once spent, it fails
+        rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+        assert deploy.assess(rec, row, now)[:2] == ('failed', 'missed')
+        assert result['rc'] == 0 and not alerts()
+        p.db.set_kv(deploy.TAKEOVERS, {'alpha': {'tries': deploy.TAKEOVER_TRIES, 'rc': 'exit 1',
+                                                 'ended': now - deploy.TAKEOVER_SETTLE_S - 1}})
+        result = deploy.record(p, report, now)
+    assert result['rc'] == 1 and result['projects'][0]['outcome'] == 'failed', result
+    assert [a['severity'] for a in alerts()] == ['high' if case == 'stale_daemon' else 'normal']
+    assert deploy.holds_behind(p.db, 'alpha', time.time())
+    _deploy_catch_up(base, db, '0.5.0', DEPLOY_C, time.time())
+    assert not deploy.holds_behind(p.db, 'alpha', time.time())
+
+
+def test_after_push_deploy_project_mid_its_own_upgrade_is_owned_not_unowned(env, tmp_path):
+    """Release 0.2.863's deploy: a project whose own automatic upgrade of the release was running
+    ("upgrading now", owner its daemon) was judged unowned and alerted. It is pending, owned by its
+    daemon until that try's window ends, also while the upgrade restarts the daemon; past the window
+    plus the grace it is missed."""
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    now = time.time()
+    db.set_kv(release.KV_AUTO, {'key': f'0.5.0 {DEPLOY_C}', 'outcome': 'running', 'ts': now - 60})
+    report = overview.deployed(names=['alpha'], now=now)
+    row = report['projects'][0]
+    assert row['upgrading'] and row['merge_owner'] == "this project's daemon", row
+    assert row['takeover_at'] == now - 60 + overview.UPGRADE_RUN_S
+    result = deploy.record(p, report, now)
+    assert result['rc'] == 0 and result['projects'][0]['outcome'] == 'pending', result
+    assert not p.db.q("SELECT * FROM alerts WHERE key='deploy-behind:alpha'")
+    rec = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']
+    db.set_kv('daemon', {'pid': 0, 'host': 'testhost'})    # the upgrade restarts its daemon
+    down = overview.deployed(names=['alpha'], now=now)['projects'][0]
+    assert deploy.assess(rec, down, now)[0] == 'pending', down
+    assert deploy.assess(rec, row, rec['due'] + 1)[:2] == ('failed', 'missed')
+
+
 def test_a_project_stuck_across_releases_is_one_alert_tracking_the_newest(env, tmp_path):
     """Replays alerts #469-#476: a project stuck behind release after release got one alert per release.
     It is one ongoing alert per project, updated in place with the newest release it misses, that clears
