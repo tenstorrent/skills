@@ -27185,6 +27185,8 @@ DURABLE_EXEMPT = {
     ("checkcap.py", "_preempt_path(best[0]).write_text("): "an urgent run's preempt request, read only while both live; one lost to a crash only leaves that run waiting as before",
     ("shared.py", '.guard", "a")'): "a flock guard file, never written",
     ("globalcap.py", 'global-spend.lock", "a")'): "a flock guard file, never written",
+    ("poolshard.py", 'pool-shards.lock", "a")'): "a flock guard file, never written",
+    ("poolshard.py", "open(d / LOG, \"a\")"): "the pool stall log, one line per stall or clear, read only by people; the marks and history it describes are written durably",
     ("localspend.py", 'session-spend.lock", "a")'): "a flock guard file, never written",
     ("hook.py", "OFFSET_FILE).write_text"): "a lost offset re-delivers messages, never drops one",
     ("hook.py", 'READS_FILE, "a")'): "the read times of updates, for reports: steer.offset decides what is read",

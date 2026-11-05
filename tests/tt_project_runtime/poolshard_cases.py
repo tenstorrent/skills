@@ -29,7 +29,7 @@ def _fake_pool(tmp_path):
     return [str(script), "{pool}"]
 
 
-def _alive(pid: int) -> bool:
+def _shard_alive(pid: int) -> bool:
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
@@ -59,7 +59,7 @@ def test_pool_shard_with_no_file_progress_is_ended_its_job_cancelled_and_its_fil
     assert "re-running its files on pool-ok after a stall on pool-stuck" in out.err, out.err
     assert (tmp_path / "cancelled").read_text() == "pool-stuck head.1\n"
     stuck_pid = int((tmp_path / "started").read_text().split("\n")[0].split()[1])
-    assert not _alive(stuck_pid), "the stalled shard's process is gone"
+    assert not _shard_alive(stuck_pid), "the stalled shard's process is gone"
     log = (ps._dir() / ps.LOG).read_text()
     assert "\tstall\tpool-stuck\thead.1\tno file done in 1 s" in log, log
     assert ps.marked("pool-stuck") and not ps.marked("pool-ok")
@@ -158,13 +158,13 @@ def test_pool_shard_stall_guard_holds_when_the_shard_closes_its_output_or_leaves
     quiet = ["sh", "-c", f"echo $$ > {tmp_path}/quiet; exec >/dev/null 2>&1; exec sleep 600"]
     t0 = time.monotonic()
     assert ps.run(quiet, ["pool-a"], "q", win=1, tell=lambda _: None, out=io.StringIO(), grace=1.0) == ps.STALLED
-    assert time.monotonic() - t0 < 10 and not _alive(int((tmp_path / "quiet").read_text()))
+    assert time.monotonic() - t0 < 10 and not _shard_alive(int((tmp_path / "quiet").read_text()))
     ps.clear("pool-a")
     left = ["sh", "-c", f"sleep 600 & echo $! > {tmp_path}/left; echo 'PASS a'; echo 'PASS b'; exit 3"]
     t0 = time.monotonic()
     assert ps.run(left, ["pool-a"], "l", win=30, tell=lambda _: None, out=io.StringIO()) == 3
     assert time.monotonic() - t0 < 10 and not ps.marked("pool-a")
-    assert _wait_for(lambda: not _alive(int((tmp_path / "left").read_text())))
+    assert _wait_for(lambda: not _shard_alive(int((tmp_path / "left").read_text())))
     import threading
     hung = ["sh", "-c", f"echo $$ > {tmp_path}/hung; echo 'PASS a'; exec sleep 600"]
     done = []
@@ -183,4 +183,4 @@ def test_pool_shard_stall_guard_holds_when_the_shard_closes_its_output_or_leaves
     monkeypatch.setattr(ps.queue.Queue, "get", get)
     with pytest.raises(SystemExit):
         ps.run(hung, ["pool-a"], "h", win=60, tell=lambda _: None, out=io.StringIO(), grace=1.0)
-    assert not _alive(int((tmp_path / "hung").read_text()))
+    assert not _shard_alive(int((tmp_path / "hung").read_text()))
