@@ -56,6 +56,8 @@ DECLARED_KEEP = 20
 # A plan_spans memo that misses reads this much further back, so the wider windows asked for next
 # in the same tick (the hour, the day, the week, each PLAN_MEMORY_S further back) slice the same rows.
 MEMO_EXTRA_S = 8 * DAY
+# Entries a memo holds at most (the ledger's are keyed by their window's other bounds too): past it, it starts over.
+MEMO_MAX = 64
 
 
 def declared(cfg: Mapping, provider: str) -> str:
@@ -106,12 +108,24 @@ def _q(conn: sqlite3.Connection, sql: str, args: Iterable = ()) -> list[tuple]:
     return [tuple(r) for r in conn.execute(sql, tuple(args)).fetchall()]
 
 
+def table_stamp(conn: sqlite3.Connection, table: str) -> tuple:
+    """A value that changes whenever `table` is written, by any connection: its count in table_writes
+    (db.py's triggers). A database without that table (opened only by an older runtime) falls back to
+    one that changes at any write: this connection's (total_changes) or another one's (data_version)."""
+    try:
+        got = conn.execute("SELECT n FROM table_writes WHERE name=?", (table,)).fetchone()
+    except sqlite3.OperationalError:
+        return ("any", conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0])
+    return (table, got[0] if got else 0)
+
+
 def _since(conn: sqlite3.Connection, memo: dict | None, sql: str, at: int, lookback: float,
            provider: str | None, parse: Any = None) -> Any:
     """_q(conn, sql, (lookback, provider, provider)) for a query of the rows whose column `at` is at or
     after `lookback`, ordered by it. With `memo` (a dict its caller keeps for this connection), rows
-    read once are reused for any later lookback they cover until the database is written: by this
-    connection (total_changes) or by another one (PRAGMA data_version). With `parse` (rows -> a
+    read once are reused for any later lookback they cover until the table they come from is written,
+    by any connection (table_stamp). Rows read inside a transaction are not kept: one that rolls back
+    would take back the writes they saw and the count with them. With `parse` (rows -> a
     structure of lists sorted by column `at`, and `parse.cut(structure, lookback)` -> its part at or
     after lookback), returns that part instead of the rows; it is parsed once per memo entry."""
     def done(rows: list[tuple], start: float | None) -> Any:
@@ -127,7 +141,7 @@ def _since(conn: sqlite3.Connection, memo: dict | None, sql: str, at: int, lookb
 
     if memo is None:
         return done(_q(conn, sql, (lookback, provider, provider)), None)
-    stamp = (conn.total_changes, conn.execute("PRAGMA data_version").fetchone()[0])
+    stamp = table_stamp(conn, sql.split(" FROM ", 1)[1].split()[0])
     hit = memo.get((sql, provider))
     if hit and hit[0] == stamp and hit[1] <= lookback:
         return done(hit[2], hit[1]) if parse else hit[2][bisect.bisect_left(hit[3], lookback):]
@@ -137,6 +151,9 @@ def _since(conn: sqlite3.Connection, memo: dict | None, sql: str, at: int, lookb
     if any(type(k) not in (int, float) for k in keys):
         memo.pop((sql, provider), None)   # sorted as SQL sorts mixed types, which bisect cannot slice
         return done(_q(conn, sql, (lookback, provider, provider)), None)
+    if conn.in_transaction:
+        memo.pop((sql, provider), None)
+        return parse.cut(parse(rows), lookback) if parse else rows[bisect.bisect_left(keys, lookback):]
     memo[(sql, provider)] = (stamp, start, rows, keys)
     return done(rows, start) if parse else rows[bisect.bisect_left(keys, lookback):]
 
@@ -236,6 +253,35 @@ def is_plan(spans: Spans, provider: str, account: str, ts: float) -> bool:
     return any(_covered(s, ts) for (p, _), s in spans.items() if p == provider)
 
 
+def _ledger(conn: sqlite3.Connection, memo: dict | None, since: float, until: float | None, provider: str | None,
+            exclude: Mapping[str, float] | None, estimated_only: bool) -> list[tuple]:
+    """The ledger rows counted as spend in [since, until) (db.counted_spend). With `memo`, rows read once
+    from MEMO_EXTRA_S before are sliced for any later `since` until the ledger is written (table_stamp);
+    the rule's other bounds are part of the memo's key. Not kept inside a transaction (see _since)."""
+    from .db import counted_spend     # db imports this module; which ledger rows count is decided there
+    if until is not None and until <= since:
+        return []
+    start = since - MEMO_EXTRA_S
+    where, args = counted_spend(since if memo is None else start, until, provider, exclude, estimated_only)
+    sql = f"SELECT provider, COALESCE(account,''), ts, usd FROM ledger WHERE {where} ORDER BY ts"
+    if memo is None or not where.startswith("ts>=?"):
+        return _q(conn, sql, counted_spend(since, until, provider, exclude, estimated_only)[1])
+    key, stamp = ("ledger", sql, tuple(args[1:])), table_stamp(conn, "ledger")
+    hit = memo.get(key)
+    if not (hit and hit[0] == stamp and hit[1] <= since):
+        rows = _q(conn, sql, args)
+        keys = [r[2] for r in rows]
+        if any(type(k) not in (int, float) for k in keys):   # sorted as SQL sorts mixed types: ask SQL
+            memo.pop(key, None)
+            return _q(conn, sql, counted_spend(since, until, provider, exclude, estimated_only)[1])
+        hit = (stamp, start, rows, keys)
+        if not conn.in_transaction:
+            if len(memo) >= MEMO_MAX:
+                memo.clear()
+            memo[key] = hit
+    return hit[2][bisect.bisect_left(hit[3], since):]
+
+
 def billed_by_account(conn: sqlite3.Connection, since: float, until: float | None = None,
                       provider: str | None = None, exclude: Mapping[str, float] | None = None,
                       estimated_only: bool = False, running_at: float | None = None,
@@ -243,10 +289,8 @@ def billed_by_account(conn: sqlite3.Connection, since: float, until: float | Non
     """Billed spend in [since, until) per (provider, account). `exclude` maps provider -> time up to
     which its rows are left out. With `running_at`, runs still going add what they were priced at
     so far, when their account was billed by use when they started. `memo`: see _since."""
-    from .db import counted_spend     # db imports this module; which ledger rows count is decided there
-    where, args = counted_spend(since, until, provider, exclude, estimated_only)
-    rows = [(p or "", a, float(ts), float(usd or 0)) for p, a, ts, usd in _q(
-        conn, f"SELECT provider, COALESCE(account,''), ts, usd FROM ledger WHERE {where}", args)]
+    rows = [(p or "", a, float(ts), float(usd or 0)) for p, a, ts, usd in _ledger(
+        conn, memo, since, until, provider, exclude, estimated_only)]
     if running_at is not None:
         rows += [(p or "", a, float(st or running_at), float(usd or 0)) for p, a, st, usd in _q(
             conn, "SELECT provider, COALESCE(account,''), started, cost_usd FROM runs WHERE status='running' "

@@ -39,7 +39,7 @@ from . import ackwait, credits
 from . import globalcap as gcap
 from . import timefmt
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
-from .billing import PLAN_LAPSE_RUNS, billed_by_account, declared
+from .billing import PLAN_LAPSE_RUNS, billed_by_account, declared, table_stamp
 from .db import DB
 
 LEVELS = ("green", "yellow", "orange", "red")
@@ -733,12 +733,29 @@ def note_account(db: DB, provider: str, account: str) -> None:
         db.set_kv(ACCOUNT_KV + provider, {"account": account, "ts": time.time()})
 
 
+def _latest_run_accounts(db: DB) -> list:
+    """The latest run with an account per provider. Kept in the DB's billing memo until a run's
+    provider, account or start is written (billing.table_stamp 'runs.account'), not inside a transaction."""
+    memo = getattr(db, "billing_memo", None)
+    sql = ("SELECT provider, account, started FROM runs WHERE id IN (SELECT MAX(id) FROM runs "
+           "WHERE account IS NOT NULL AND account!='' GROUP BY provider)")
+    if memo is None:
+        return db.q(sql)
+    stamp = table_stamp(db.conn, "runs.account")
+    hit = memo.get("latest_run_accounts")
+    if hit and hit[0] == stamp:
+        return hit[1]
+    rows = [dict(r) for r in db.q(sql)]
+    if not db.conn.in_transaction:
+        memo["latest_run_accounts"] = (stamp, rows)
+    return rows
+
+
 def current_accounts(db: DB) -> dict[str, str]:
     """The account each provider is on now: the newer of the daemon's last look and the account its
     latest run started under (the provider's own account label: login, organization, billing)."""
     seen: dict[str, tuple[float, str]] = {}
-    for r in db.q("SELECT provider, account, started FROM runs WHERE id IN (SELECT MAX(id) FROM runs "
-                  "WHERE account IS NOT NULL AND account!='' GROUP BY provider)"):
+    for r in _latest_run_accounts(db):
         seen[r["provider"]] = (float(r["started"] or 0), r["account"])
     for r in db.q("SELECT key, value FROM kv WHERE key LIKE ?", (ACCOUNT_KV + "%",)):
         v = json.loads(r["value"] or "{}")

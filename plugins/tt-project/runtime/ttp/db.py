@@ -145,6 +145,39 @@ CREATE TABLE IF NOT EXISTS snapshots (
   utilization REAL, resets_at REAL);
 CREATE INDEX IF NOT EXISTS snapshots_ts ON snapshots(ts);
 
+-- Writes so far to each table the spend reads keep rows of (billing._since, table_stamp): the idle tick
+-- reuses them while only other tables are written. Counted by any connection's writes, raw SQL too;
+-- runs only where an ended run changes (running ones are read live).
+CREATE TABLE IF NOT EXISTS table_writes (name TEXT PRIMARY KEY, n INTEGER NOT NULL);
+CREATE TRIGGER IF NOT EXISTS snapshots_writes_insert AFTER INSERT ON snapshots BEGIN
+  INSERT INTO table_writes(name, n) VALUES('snapshots', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS snapshots_writes_update AFTER UPDATE ON snapshots BEGIN
+  INSERT INTO table_writes(name, n) VALUES('snapshots', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS snapshots_writes_delete AFTER DELETE ON snapshots BEGIN
+  INSERT INTO table_writes(name, n) VALUES('snapshots', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS ledger_writes_insert AFTER INSERT ON ledger BEGIN
+  INSERT INTO table_writes(name, n) VALUES('ledger', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS ledger_writes_update AFTER UPDATE ON ledger BEGIN
+  INSERT INTO table_writes(name, n) VALUES('ledger', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS ledger_writes_delete AFTER DELETE ON ledger BEGIN
+  INSERT INTO table_writes(name, n) VALUES('ledger', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS runs_writes_insert AFTER INSERT ON runs
+WHEN NEW.ended IS NOT NULL BEGIN
+  INSERT INTO table_writes(name, n) VALUES('runs', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS runs_writes_delete AFTER DELETE ON runs
+WHEN OLD.ended IS NOT NULL BEGIN
+  INSERT INTO table_writes(name, n) VALUES('runs', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS runs_writes_update AFTER UPDATE OF provider, account, started, ended, status, cost_usd ON runs
+WHEN OLD.ended IS NOT NULL OR NEW.ended IS NOT NULL BEGIN
+  INSERT INTO table_writes(name, n) VALUES('runs', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+-- 'runs.account': any run's provider, account or start changed, running ones too (budget.current_accounts).
+CREATE TRIGGER IF NOT EXISTS runs_account_writes_insert AFTER INSERT ON runs BEGIN
+  INSERT INTO table_writes(name, n) VALUES('runs.account', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS runs_account_writes_delete AFTER DELETE ON runs BEGIN
+  INSERT INTO table_writes(name, n) VALUES('runs.account', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+CREATE TRIGGER IF NOT EXISTS runs_account_writes_update AFTER UPDATE OF id, provider, account, started ON runs BEGIN
+  INSERT INTO table_writes(name, n) VALUES('runs.account', 1) ON CONFLICT(name) DO UPDATE SET n=n+1; END;
+
 CREATE TABLE IF NOT EXISTS kv (key TEXT PRIMARY KEY, value TEXT, ts REAL);
 
 -- Successful detached pushes, retained after their markers and task worktrees are pruned.
@@ -1239,6 +1272,7 @@ def counted_spend(since_ts: float, until_ts: float | None = None, provider: str 
     if estimated_only:
         sql += " AND estimated=1"
     return sql, args
+
 
 
 SEVERITY_RANK = {"info": 0, "low": 0, "normal": 1, "high": 2, "critical": 3}

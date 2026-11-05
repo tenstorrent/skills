@@ -351,9 +351,9 @@ def _billing_db(tmp_path):
     return d, now
 
 
-def test_billing_memo_matches_the_uncached_reads_and_ends_at_any_write(tmp_path):
-    """The plan readings and runs billed_by_account reads are reused within a tick (DB.billing_memo)
-    only while nothing wrote the database: totals always equal the uncached path's."""
+def test_billing_memo_matches_the_uncached_reads_and_ends_when_its_tables_are_written(tmp_path):
+    """The ledger rows, plan readings and runs billed_by_account reads are reused (DB.billing_memo) only
+    while nothing wrote their tables: totals always equal the uncached path's."""
     import sqlite3 as sq
     from ttp import billing
     d, now = _billing_db(tmp_path)
@@ -365,15 +365,15 @@ def test_billing_memo_matches_the_uncached_reads_and_ends_at_any_write(tmp_path)
 
     for since in (now - 3600, now - 86400, now - 7 * 86400, now - 3 * 86400):
         both(since)
-    assert len(d.billing_memo) == 4   # per query one entry of rows and one of their parsed form, sliced for every later window
+    assert len(d.billing_memo) == 5   # the ledger's rows, and per plan query its rows and their parsed form, sliced for every later window
     before = both(now - 7 * 86400)
-    other = sq.connect(str(tmp_path / "b.db"))   # another connection's commit: PRAGMA data_version
+    other = sq.connect(str(tmp_path / "b.db"))   # another connection's commit: table_writes
     other.execute("DELETE FROM snapshots WHERE ts > ?", (now - 86400 * 5,))
     other.commit()
     other.close()
     after = both(now - 7 * 86400)
     assert after != before
-    # this connection's own write: total_changes
+    # this connection's own write
     d.conn.executemany("INSERT INTO snapshots(ts,provider,account,window) VALUES(?,?,?,?)",
                        [(now - 86400 * 5 + i * 600, "claude", "a", "5h") for i in range(700)])
     assert both(now - 7 * 86400) != after
@@ -450,3 +450,204 @@ def test_billing_memo_is_dropped_when_the_transaction_that_wrote_rolls_back(tmp_
     d._rolled_back()
     assert not d.conn.in_transaction
     assert billing.plan_spans(d.conn, since, None, d.billing_memo) == billing.plan_spans(d.conn, since, None)
+
+
+def _traced(conn):
+    """The statements `conn` runs from now on, as a list it appends to."""
+    seen: list[str] = []
+    conn.set_trace_callback(seen.append)
+    return seen
+
+
+_KEPT = ("ts, usd FROM ledger", "COALESCE(account,''), ts FROM snapshots", "FROM runs WHERE ended>=", "MAX(id) FROM runs")
+
+
+def _spend_reads(stmts):
+    """The statements of the spend reads kept across ticks (billing._ledger, plan_spans, budget._latest_run_accounts)."""
+    return [q for q in stmts if any(t in q for t in _KEPT)]
+
+
+def test_spend_reads_are_kept_across_writes_to_other_tables_and_refresh_when_their_own_change(tmp_path):
+    """Each kept spend read (ledger rows, plan readings, ended runs, the latest run accounts) is reused while
+    only other tables are written, and read again, equal to the uncached answer, once its own table is
+    written: by this connection, by another one, or by a running run that changes its account."""
+    import sqlite3 as sq
+    from ttp import billing, budget
+    d, now = _billing_db(tmp_path)
+
+    seen: list[str] = []
+
+    def both():
+        seen.clear()
+        d.conn.set_trace_callback(seen.append)
+        cached = {s: billing.billed_by_account(d.conn, s, running_at=now, memo=d.billing_memo) for s in (now - 86400, now - 7 * 86400)}
+        accounts = budget.current_accounts(d)
+        d.conn.set_trace_callback(None)
+        assert cached == {s: billing.billed_by_account(d.conn, s, running_at=now) for s in cached}
+        return cached, accounts
+
+    both()
+    d.set_kv("unrelated", {"x": 1})
+    d.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)", (now, "d", "info", "low", "t", "new"))
+    d.conn.execute("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(1,'worker','claude',?,'running','')", (now,))
+    first = both()
+    assert first[1] == {"claude": "a"}
+    assert _spend_reads(seen) == [q for q in seen if "MAX(id) FROM runs" in q], seen   # a run without an account started: only its query
+
+    other = sq.connect(str(tmp_path / "b.db"))
+    for table, write in (
+            ("FROM ledger", lambda c: c.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)",
+                                                (now - 60, "claude", "z", "x", 3.0))),
+            ("FROM snapshots", lambda c: c.execute("DELETE FROM snapshots WHERE rowid IN (SELECT rowid FROM snapshots ORDER BY ts DESC LIMIT 20)")),
+            ("FROM runs WHERE ended", lambda c: c.execute("UPDATE runs SET cost_usd=0 WHERE id IN (SELECT id FROM runs WHERE ended IS NOT NULL LIMIT 50)")),
+            ("MAX(id) FROM runs", lambda c: c.execute("UPDATE runs SET account='b' WHERE status='running'"))):
+        for conn in (d.conn, other):
+            before = both()
+            assert not _spend_reads(seen), seen
+            write(conn)
+            if conn is other:
+                other.commit()
+            after = both()
+            assert any(table in q for q in seen), (table, seen)
+            if table == "MAX(id) FROM runs":
+                assert after[1] == {"claude": "b"}
+            elif table == "FROM ledger":
+                assert after != before
+            if table == "MAX(id) FROM runs":
+                d.conn.execute("UPDATE runs SET account='' WHERE status='running'")
+                both()
+    other.close()
+
+
+def test_ledger_rows_read_inside_a_transaction_are_not_kept(tmp_path):
+    """Spend a transaction wrote is counted while it is open and gone once it rolls back."""
+    from ttp import billing
+    d, now = _billing_db(tmp_path)
+    total = lambda: sum(billing.billed_by_account(d.conn, now - 86400, memo=d.billing_memo).values())
+    base = total()
+    d.conn.execute("BEGIN")
+    d.conn.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)", (now - 60, "claude", "z", "x", 7.0))
+    assert total() == base + 7.0
+    d.conn.execute("ROLLBACK")
+    assert total() == base
+
+
+def test_a_dispatch_after_new_spend_sees_that_spend(env):
+    """The kept spend reads never hide new spend from the caps: spend another process books between two
+    ticks (a worker ending) stops the next dispatch that would pass the cap."""
+    import sqlite3 as sq
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1")
+    d = Daemon(p.base)
+    d.update_gates()
+    d.update_gates()
+    assert any(k[0] == "ledger" for k in d.p.db.billing_memo), "the idle tick keeps the ledger's rows"
+    other = sq.connect(str(p.db.path))
+    other.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)", (time.time() - 60, "fake", "", "task:0", 99.0))
+    other.commit()
+    other.close()
+    task = p.db.add_task("t", "s", kind="work", tier="light", origin="user", budget_usd=5.0)
+    d.update_gates()
+    try:
+        d.dispatch()
+        started = p.db.q("SELECT task FROM runs WHERE role!='coordinator'")
+    finally:
+        _stop_all(p)
+    assert not started and p.db.task(task)["status"] != "running", started
+    assert p.db.spent_since(time.time() - 3600, billed=True) == 99.0
+
+
+def test_an_idle_tick_reads_the_spend_tables_again_only_after_they_change(env):
+    """Once warm, idle ticks re-read no ledger, plan reading or run rows; new spend is read on the next tick."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    p.db.x("UPDATE messages SET handled=1")
+    now = time.time()
+    for i in range(50):
+        p.db.spend("fake", 0.1, "task:0", ts=now - 3600 * i)
+    d = Daemon(p.base)
+    d.tick()
+    d.tick()
+    seen = _traced(d.p.db.conn)
+    for _ in range(3):
+        d.tick()
+    assert not _spend_reads(seen), _spend_reads(seen)
+    p.db.spend("fake", 0.1, "task:0")
+    d.tick()
+    assert any("FROM ledger" in q for q in _spend_reads(seen)), seen
+
+
+def _synthetic_history(p, tasks, runs):
+    """A project with a long history and nothing to do: ended tasks, runs, spend, plan readings, events,
+    messages, pushes, machine changes and obligations, as a busy project has after weeks."""
+    import json as _j
+    from ttp import machine_ledger as ml, project as projmod
+    now, db = time.time(), p.db
+    with db.tx():
+        for i in range(tasks):
+            db.conn.execute("INSERT INTO tasks(created,updated,title,spec,kind,status,priority,spent_usd,depends_on,labels,result) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+                            (now - 86400 * 30 + i * 600, now - 86400 * 30 + i * 600 + 300, f"task {i}", "spec " * 100,
+                             "code", "done", 3, 1.5, "[]", "[]", _j.dumps({"summary": "x" * 400})))
+        for i in range(runs):
+            t0 = now - 86400 * 30 + i * 200
+            db.conn.execute("INSERT INTO runs(task,role,provider,model,account,started,ended,status,cost_usd,dir) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                            (1 + i % tasks, "worker" if i % 5 else "coordinator", "claude", "m", "acct",
+                             t0, t0 + 150, "done", 0.4, str(p.runs / str(100000 + i))))
+        for i in range(runs * 5 // 3):
+            ts = now - 86400 * 30 + i * 120
+            db.conn.execute("INSERT INTO ledger(ts,provider,account,source,usd) VALUES(?,?,?,?,?)", (ts, "claude", "acct", "run", 0.05))
+            db.conn.execute("INSERT INTO snapshots(ts,provider,account,window,utilization,resets_at) VALUES(?,?,?,?,?,?)",
+                            (ts, "claude", "acct", "five_hour", 0.3, now + 3600))
+        for i in range(runs * 5 // 2):
+            db.conn.execute("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                            (now - 86400 * 30 + i * 80, "daemon", "info", "low", "event " * 10, "handled"))
+        for i in range(tasks):
+            db.conn.execute("INSERT INTO messages(ts,direction,text,handled) VALUES(?,?,?,1)",
+                            (now - 86400 * 30 + i * 500, "in" if i % 2 else "out", "hello " * 20))
+            db.conn.execute("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+                            (1 + i, f"b{i}", "0" * 40, "main", "pushed", now - 86400 * 20 + i * 600, now - 86400 * 20 + i * 600))
+    projmod.HOME_DIR.mkdir(parents=True, exist_ok=True)
+    projmod.write_json(ml._path(ml.LEDGER), {"next": 3001, "changes": [
+        {"id": i + 1, "alias": f"m{i % 30}", "what": "change " * 20, "undo": "none: x", "by": "x", "added": now - 86400,
+         "closed": now if i % 3 else None} for i in range(3000)]})
+    db.set_kv("obligations", {"items": {f"o{i}": {"text": "promise " * 30, "status": "open" if i % 4 == 0 else "met", "created": now}
+                                        for i in range(600)}})
+
+
+@pytest.mark.skipif(not os.environ.get("TTP_BENCH_IDLE_TICK"), reason="benchmark: set TTP_BENCH_IDLE_TICK=1 to run")
+def test_benchmark_idle_tick_cpu_with_and_without_the_kept_spend_reads(env, monkeypatch):
+    """Idle per-tick CPU on a project with weeks of history, with the spend reads kept across ticks and
+    with nothing kept (every tick reads them again, as before). Prints both; the target is 3x lower."""
+    from ttp import db as dbmod
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.db.x("UPDATE messages SET handled=1")
+    _synthetic_history(p, int(os.environ.get("TTP_BENCH_TASKS", "4000")), int(os.environ.get("TTP_BENCH_RUNS", "12000")))
+    n = int(os.environ.get("TTP_BENCH_TICKS", "20"))
+
+    def cpu_per_tick():
+        d = Daemon(p.base)
+        for _ in range(3):
+            d.tick()
+        t0 = time.process_time()
+        for _ in range(n):
+            d.tick()
+        return (time.process_time() - t0) / n * 1000
+
+    after = cpu_per_tick()
+
+    class Forgets(dict):
+        def __setitem__(self, k, v):
+            pass
+    init = dbmod.DB.__init__
+
+    def forgetful(self, *a, **k):
+        init(self, *a, **k)
+        self.billing_memo = Forgets()
+    monkeypatch.setattr(dbmod.DB, "__init__", forgetful)
+    before = cpu_per_tick()
+    print(f"\nidle tick CPU: {before:.1f} ms with nothing kept, {after:.1f} ms with the spend reads kept ({before / after:.1f}x)")
+    assert after * 3 <= before
