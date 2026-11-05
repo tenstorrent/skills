@@ -1136,3 +1136,26 @@ def test_a_second_sigint_during_the_withdrawal_still_prints_the_report(env, monk
     _never_ran(p, rd)
     assert int_after is signal.default_int_handler   # both handlers are restored
     assert signal.getsignal(signal.SIGTERM) is not secretroute._raise_stopped
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
+def test_doctor_reports_an_unreadable_secret_store_in_one_line_and_runs_its_later_checks(env, monkeypatch, capsys):
+    from ttp import cli, project
+    p = make(env)
+    p.set_config("runner.host_commands", ["sudo -n systemctl restart a.service"])   # a later doctor line
+    monkeypatch.setattr(cli, "need", lambda *a: p)
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "secrets-home")
+    project.HOME_DIR.mkdir()
+    store = project.secrets_path()
+    store.write_text(json.dumps({"jev": {"key": _EP_KEY}}))
+    store.chmod(0)
+    try:
+        cli.cmd_doctor(types.SimpleNamespace(name="demo"))
+    finally:
+        store.chmod(0o600)
+    out = capsys.readouterr().out
+    lines = [l for l in out.splitlines() if str(store) in l]   # the Slack line says "unknown here" without it
+    assert len(lines) == 1 and lines[0].startswith(f"jev: key unknown, cannot read the secrets store at {store}: "), out
+    assert _EP_KEY not in out, out
+    assert "host-run: runner.host_commands entry 1" in out, "doctor runs on to the host-run checks"
+    assert "process sandbox for checks:" in out, "and on to the checks after them"

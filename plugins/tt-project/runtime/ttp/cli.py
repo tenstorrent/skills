@@ -11201,9 +11201,13 @@ def cmd_doctor(a) -> None:
                 print(f"  `codex mcp list` with the workers' arguments: {', '.join(on) or 'none'} enabled"
                       + (f" · not listed but on: {', '.join(n for n in on if n not in names)}"
                          if any(n not in names for n in on) else ""))
-    sec = load_secrets()
-    print(f"jev: {'key saved' if (sec.get('jev') or {}).get('key') else 'no key (rules-only screening)'}"
-          f" · enabled in project: {p.config()['jev'].get('enabled')}")
+    from .project import SecretsUnreadable
+    try:   # an unreadable store is one line here, never the end of doctor (its message names no contents)
+        sec = load_secrets()
+        jev = 'key saved' if (sec.get('jev') or {}).get('key') else 'no key (rules-only screening)'
+    except SecretsUnreadable as e:
+        jev = f"key unknown, {e}"
+    print(f"jev: {jev} · enabled in project: {p.config()['jev'].get('enabled')}")
     from .daemon import SLACK_ERROR_KEY
     from .slack import status as slack_status
     print(slack_status(p.config(), p.db.kv(SLACK_ERROR_KEY))["line"] + " · `ttp notifier test --slack` sends a test")
