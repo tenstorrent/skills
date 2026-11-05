@@ -796,11 +796,23 @@ def auto_hop(p, cfg: dict, task: dict, fup: dict, why: str | None = None,
     return new["id"], why
 
 
+PUSHQ_WITHDRAWN = ("cancelled", "rejected", "withdrawn")
+
+
 def approved_or_landed(db: DB, task_id: int) -> bool:
-    """Whether task `task_id`'s change was approved by a review (a push queue row) or landed (on the push
-    branch, or under other commits): its `continue:` hop is then a new task, never a re-queue."""
-    return bool(db.one("SELECT 1 FROM push_queue WHERE task=? UNION ALL SELECT 1 FROM task_landings WHERE task=? "
-                       "UNION ALL SELECT 1 FROM task_superseded WHERE task=? LIMIT 1", (task_id, task_id, task_id)))
+    """Whether task `task_id`'s change was approved by a review or landed (on the push branch, or under other
+    commits): its `continue:` hop is then a new task, never a re-queue. Judged over landed.carriers (the
+    task, its reviews, their fixes and re-reviews, ...; DB reads only, no git), as pushq.approve keys a push
+    queue row by the reviewing task: a row of any of them or of their branches not withdrawn, or a landing
+    landed.recorded finds."""
+    from . import landed
+    carry = landed.carriers(db, task_id)
+    ids, branches = list(carry), sorted({v[0] for v in carry.values() if v[0]})
+    if db.one("SELECT 1 FROM push_queue WHERE (task IN (%s) OR branch IN (%s)) AND status NOT IN (%s) LIMIT 1"
+              % (",".join("?" * len(ids)), ",".join("?" * len(branches)) or "NULL",
+                 ",".join("?" * len(PUSHQ_WITHDRAWN))), [*ids, *branches, *PUSHQ_WITHDRAWN]):
+        return True
+    return bool(landed.recorded(db, task_id, carry)[0])
 
 
 def requeue(p, cfg: dict, task: dict, fup: dict, why: str, attempts: int, now: float | None = None) -> bool:

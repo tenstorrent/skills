@@ -1248,25 +1248,62 @@ def test_a_lone_continue_re_queues_the_same_task_with_its_worktree_branch_and_a_
 
 def test_an_approved_or_landed_task_still_gets_a_new_continue_task(env):
     """Once its change is approved (a push queue row) or landed, a done task's continue is a new task
-    that continues it, as before: re-queueing would reopen a change already reviewed."""
+    that continues it, as before: re-queueing would reopen a change already reviewed. pushq.approve keys
+    the row by the reviewing task, and a fix of that review may land it: both count through
+    landed.carriers, as do rows under the task's own id or branch."""
     from ttp import chaincap
+
+    def review(tid):
+        return p.db.add_task(f"Review #{tid}: x", f"Independently review code task #{tid}.", kind="review",
+                             depends_on=[tid])
+
+    def fix(tid):
+        rv = review(tid)
+        return p.db.add_task(f"Fix review #{rv}", "s", kind="code", labels=[f"review_fix:{rv}"])
+
+    q = "INSERT INTO push_queue(task,branch,head,target,status,landed_sha,created,updated) VALUES(?,?,'h','t',?,?,0,0)"
+    cases = (   # (name, writes the record for code task tid on branch br)
+        ("own approved", lambda tid, br: p.db.x(q, (tid, "b", "approved", None))),
+        ("own landing", lambda tid, br: p.db.x(
+            "INSERT INTO task_landings(marker,task,sha,target,ts) VALUES('m'||?,?,'s','t',0)", (tid, tid))),
+        ("own superseded", lambda tid, br: p.db.x(
+            "INSERT INTO task_superseded(task,head,sha,ts) VALUES(?,'h','s',0)", (tid,))),
+        ("review approved", lambda tid, br: p.db.x(q, (review(tid), br, "approved", None))),
+        ("review pushing", lambda tid, br: p.db.x(q, (review(tid), br, "pushing", None))),
+        ("fix landed", lambda tid, br: p.db.x(q, (fix(tid), "ttp/other", "landed", "s" * 40))),
+        ("branch held", lambda tid, br: p.db.x(q, (999, br, "held", None))))
     p = make(env)
-    for n, sql in enumerate((
-            "INSERT INTO push_queue(task,branch,head,target,created,updated) VALUES(?,'b','h','t',0,0)",
-            "INSERT INTO task_landings(marker,task,sha,target,ts) VALUES('m'||?,?,'s','t',0)",
-            "INSERT INTO task_superseded(task,head,sha,ts) VALUES(?,'h','s',0)")):
+    for n, (name, record) in enumerate(cases):
         title = f"lexer {n}"
 
-        def before(tid, head, sql=sql, title=title):
-            p.db.x(sql, (tid,) * sql.count("?"))
+        def before(tid, head, record=record, title=title):
+            record(tid, p.db.task(tid)["branch"])
             (env["tmp"] / f"run-{tid}" / "result.json").write_text(json.dumps(
-                {"status": "done", "summary": f"{title} works", "followups": _cont_fup()(tid)}))
+                {"status": "done", "summary": f"{title} works", "followups": _cont_fup(
+                    f"continue: finish {title}", f"Handle the nested case {n} in lex().")(tid)}))
         tid, _, done, _ = _finish_code(env, p, title, {f"lexer{n}.py": 5}, before=before)
-        assert chaincap.approved_or_landed(p.db, tid)
+        assert chaincap.approved_or_landed(p.db, tid), name
         t = p.db.task(tid)
-        assert t["status"] == "done" and not chaincap.requeues(t), sql
-        # Approved: the daemon's new hop; landed: the follow-up left for a new task, as before.
-        assert len(_hops_of(p, tid)) == 1 if n == 0 else "NOT queued by the daemon" in done["text"], sql
+        assert t["status"] == "done" and not chaincap.requeues(t), name
+        # A new hop task carries the continue on (from the base once landed under other commits).
+        assert p.db.one("SELECT 1 FROM tasks WHERE id>? AND title=?", (tid, f"continue: finish {title}")), name
+
+
+def test_a_withdrawn_push_queue_row_of_a_review_still_re_queues(env):
+    """A review's push queue row that was cancelled approves nothing: the lone continue re-queues."""
+    from ttp import chaincap
+    p = make(env)
+
+    def before(tid, head):
+        rv = p.db.add_task(f"Review #{tid}: x", f"Independently review code task #{tid}.", kind="review",
+                           depends_on=[tid])
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) "
+               "VALUES(?,?,'h','t','cancelled',0,0)", (rv, p.db.task(tid)["branch"]))
+        (env["tmp"] / f"run-{tid}" / "result.json").write_text(json.dumps(
+            {"status": "done", "summary": "lexer works", "followups": _cont_fup()(tid)}))
+    tid, _, _, _ = _finish_code(env, p, "lexer", {"lexer.py": 5}, before=before)
+    assert not chaincap.approved_or_landed(p.db, tid)
+    assert p.db.task(tid)["status"] == "queued" and chaincap.requeues(p.db.task(tid))
 
 
 def test_requeue_is_off_for_a_non_code_task_or_by_config(env):
