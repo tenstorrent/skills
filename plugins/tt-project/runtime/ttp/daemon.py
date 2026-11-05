@@ -2718,8 +2718,11 @@ class Daemon:
                   schema: dict | None = None, system: str | None = None, append_system: str | None = None,
                   note: dict | None = None, resume: str | None = None,
                   context: str | None = None, cache_ttl: str = "", min_effort: str | None = None,
-                  handoff_guard: bool = True) -> int:
-        """`handoff_guard` (a task's worker or reviewer run): the provider's Stop hook refuses to end
+                  handoff_guard: bool = True, session_prompt: dict | None = None) -> int:
+        """`session_prompt` (a coordinator turn with coordinator.session.mode on): {"system", "context",
+        "cached"}, the session's own byte-stable prompt (coordsession.session_prompt_parts) that a
+        resumed or new session wake runs on instead of `system` and `context`, and the cached digest
+        sections a new session's first message carries. `handoff_guard` (a task's worker or reviewer run): the provider's Stop hook refuses to end
         the run without a valid result.json (ttp.hook.stop). `context` (with `system`): stable text that follows the system prompt, sent as a block of
         its own with a cache breakpoint after it where the provider can mark one (else it ends the
         system prompt). `cache_ttl` (`5m`, `1h`) sets the provider's prompt cache lifetime; `auto`
@@ -2812,7 +2815,8 @@ class Daemon:
         thread = ""
         session_mode = ""   # coordinator.session.mode on: this wake's coordsession.decide()
         if role == "coordinator" and not resume and coordsession.on(self.cfg, provider):
-            key = coordsession.prefix_key(system, context, schema, provider)
+            sp = session_prompt or {}
+            key = coordsession.prefix_key(sp.get("system", system), sp.get("context", context), schema, provider)
             try:
                 session_mode, why = coordsession.decide(
                     self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
@@ -2821,8 +2825,18 @@ class Daemon:
             except Exception as e:   # the stateless turn is always safe
                 session_mode, why = "stateless", f"decide failed: {type(e).__name__}: {e}"[:200]
                 log(self.p, f"coordinator session {why}")
+            state = self.p.db.kv(coordsession.KEY)
             if session_mode == "resume":
-                thread = str((self.p.db.kv(coordsession.KEY) or {}).get("id") or "")
+                thread = str((state or {}).get("id") or "")
+            if session_mode in ("new", "resume") and session_prompt:
+                system, context = session_prompt["system"], session_prompt["context"]
+                try:   # the rollover handover (coordsession.py): no order, promise or decision is lost
+                    if session_mode == "new":
+                        prompt = coordsession.seed(self.p, state, why, session_prompt.get("cached") or "") + "\n\n" + prompt
+                    elif why == "handover":
+                        prompt = prompt + "\n\n" + coordsession.handover_ask(state)
+                except Exception:   # the digest alone still runs the wake
+                    log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "session": {
                 "mode": session_mode, "why": why, "key": key, "model": model, "effort": effort,
                 "provider": provider}}}
@@ -4423,7 +4437,7 @@ class Daemon:
             return   # its breaker holds the next turn until the login is back; the messages stay queued
         session = (note.get("turn") or {}).get("session")
         if isinstance(session, dict) and self._coord_session_end(r, usage, session,
-                                                                 status == "ok" and isinstance(actions, list)):
+                                                                 status == "ok" and isinstance(actions, list), out):
             return   # a failed resume: its messages and events stay queued for the stateless rerun
         if status != "ok" or not isinstance(actions, list):
             if turnsize.over_budget(status, usage) and self._turn_over_budget(note):
@@ -4478,8 +4492,9 @@ class Daemon:
         except Exception:   # bookkeeping: without it the next routine turn runs
             log(self.p, "coordinator quiet state not saved: " + traceback.format_exc().replace("\n", " | ")[:1000])
 
-    def _coord_session_end(self, r: dict, usage, session: dict, ok: bool) -> bool:
-        """Saves the persistent session (coordsession.py) after a coordinator wake. True for a resumed
+    def _coord_session_end(self, r: dict, usage, session: dict, ok: bool, out: dict | None = None) -> bool:
+        """Saves the persistent session (coordsession.py) after a coordinator wake, and the wake's
+        `session_note` (its rollover handover) as state/coord-session/<session id>.md. True for a resumed
         wake that failed: nothing of it is applied and the next wake reruns its batch stateless at
         once, with no backoff; repeated failures pause the mode and raise an issue."""
         db, now = self.p.db, time.time()
@@ -4497,6 +4512,10 @@ class Daemon:
                                  f"(coordinator.session.pause_h).",
                                  "normal", whole=True, key="coord-session-paused")
                 return True
+            if ok and session.get("mode") in ("new", "resume") and isinstance(out, dict) and out.get("session_note"):
+                sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
+                if path := coordsession.save_note(self.p, sid, out.get("session_note")):
+                    log(self.p, f"coordinator run {r['id']}: session handover saved to {path}")
             db.set_kv(coordsession.KEY, coordsession.record(state, usage, r.get("session_id") or "", session, ok, now))
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
@@ -8517,10 +8536,15 @@ class Daemon:
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
             prompt = "\n".join(text for _, text in parts)
             head, context = coord.prompt_parts(self.p)
+            session_prompt = None
+            if coordsession.on(self.cfg, provider):   # the session's byte-stable prompt and its schema
+                s_head, s_context = coordsession.session_prompt_parts(self.p)
+                session_prompt = {"system": s_head, "context": s_context, "cached": cached}
             context = coord.with_cached(context, cached)
             burst = bursthold.carried(db, evs)
             rid = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
-                           read_only=True, schema=coord.ACTIONS_SCHEMA, system=head, context=context,
+                           read_only=True, schema=coordsession.schema() if session_prompt else coord.ACTIONS_SCHEMA,
+                           system=head, context=context, session_prompt=session_prompt,
                            cache_ttl=cachettl.setting(c),
                            budget_usd=budget,
                            note={"messages": [m["id"] for m in msgs], "events": [e["id"] for e in evs],

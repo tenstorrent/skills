@@ -89,6 +89,8 @@ def _main(role: str, args: list[str] | None = None) -> int:
                     actions.append({"type": "task_add", "title": f"do: {text}"[:80], "spec": text, "tier": "light",
                                     "reply_chat": chat})
             out = {"actions": actions or [{"type": "noop"}]}
+        if os.environ.get("TTP_FAKE_SESSION_NOTE") and "## Session handover" in prompt:
+            out["session_note"] = os.environ["TTP_FAKE_SESSION_NOTE"]   # a persistent session's handover
     else:
         run_dir = Path(os.environ["TTP_RUN_DIR"])
         if os.environ.get("TTP_FAKE_SHELL"):

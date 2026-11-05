@@ -130,6 +130,16 @@ def coordinator_role(p: Project) -> str:
     return feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), coordinator_features(p))
 
 
+def coordinator_session_role(p: Project) -> str:
+    """The persistent session's role (coordinator.md, then prompts/coordinator-session.md: how wakes
+    continue one session and the rollover handover), under the coordinator role's size budget. It
+    always carries the order ledger's rules: the first open order or the last closed one would
+    otherwise change the prompt and start a new session without a handover."""
+    on = coordinator_features(p) | {"obligations"}
+    role = feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), on)
+    return f"{role}\n\n{_read(p, 'coordinator-session.md', on)}".rstrip() + "\n"
+
+
 # kind-review.md's two delivery sections; a review's prompt carries only the one its project uses.
 REVIEW_PUSH_SECTIONS = ("## Pushing a reviewed change", "## Approving into the push queue")
 

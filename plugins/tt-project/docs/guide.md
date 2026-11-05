@@ -409,7 +409,15 @@ prolonged whole-box outage.
   day's wakes, $/wake, context growth and tool calls per wake, rollovers and cache-read share beside
   the stateless baseline (the 7 days before the first session wake: turns/day, $/turn), and flags
   the break-even (at most 2 tool calls and 20k context growth per wake) and a day costing more
-  than the baseline's $/day.
+  than the baseline's $/day. In session mode the system prompt is the
+  Restrictions, the coordinator role with `prompts/coordinator-session.md` and the charter verbatim:
+  the same bytes every wake while the charter is unchanged, so the prompt cache holds. Once the
+  context reaches `rollover_tokens`, one last resumed wake also returns a `session_note` (at most
+  4,000 tokens: open threads, promises in their chat wording, pending checks, decisions with their
+  reasons, user corrections), saved as `state/coord-session/<session id>.md`. The next session's
+  first message carries the standing memory, the open order ledger, that handover note and the last
+  20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
+  backstop.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
   refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown
   of `coordinator.rejection_cooldown_s` (default 900; 0 turns it off). Inside it, an event with the

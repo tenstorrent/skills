@@ -46,3 +46,4 @@
 +480: a user order and reply/notify claims in the ledger; Must act now items are acted on in the same turn (mustact.py)
 +230: the worker sandbox is the user's (config_set row): a harness-wide order binds every project, no opt-out
 +180: Restrictions gate accepts ordered exceptions with no new risk class and the owner's cited record words; `"ask": N` closes the cited gate ask (#5959, #6066)
++2900: the persistent session role (coordinator-session.md, its order-ledger rules always on; session mode only)

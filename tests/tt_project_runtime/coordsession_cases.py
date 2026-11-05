@@ -23,7 +23,7 @@ def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
         "no session": (None, "k1", "m", "high", yes),
         "prefix changed": (_cs_state(), "k2", "m", "high", yes),
         "model or effort changed": (_cs_state(), "k1", "m2", "high", yes),
-        "context reached 140000 tokens": (_cs_state(context_tokens=140000), "k1", "m", "high", yes),
+        "context reached 140000 tokens": (_cs_state(context_tokens=140000, handover=True), "k1", "m", "high", yes),
         "last run not ok": (_cs_state(last_ok=False), "k1", "m", "high", yes),
         "session not saved": (_cs_state(), "k1", "m", "high", lambda s: False),
     }
@@ -31,7 +31,14 @@ def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
         assert cs.decide(_cs_cfg(), state, key, model, effort, saved, now) == ("new", why), why
     assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "low", yes, now) == ("new", "model or effort changed")
     assert cs.decide(_cs_cfg(), _cs_state(id=""), "k1", "m", "high", yes, now) == ("new", "no session")
-    assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(), "k1", "m", "high", yes, now)[0] == "new"
+    # At rollover_tokens one handover wake resumes the session first (its session_note), then a new one.
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=140000), "k1", "m", "high", yes, now) == ("resume", "handover")
+    assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "handover")
+    assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(handover=True), "k1", "m", "high", yes, now)[0] == "new"
+    # A session that cannot resume rolls over at once, without the handover wake.
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=140000, last_ok=False), "k1", "m", "high", yes, now) == \
+        ("new", "last run not ok")
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=140000), "k2", "m", "high", yes, now) == ("new", "prefix changed")
     assert cs.decide(_cs_cfg(), _cs_state(context_tokens=139999), "k1", "m", "high", yes, now)[0] == "resume"
     # Garbage state never raises: it starts a session.
     for bad in ("x", [], 7, {"id": None}):
@@ -388,3 +395,110 @@ def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsy
     assert "Coordinator session of demo" in out and "wakes" in out and "break-even" in out and "unknown" in out
     cli.main(["stats", "demo", "--coord-session", "--json"])
     assert json.loads(capsys.readouterr().out)["by_day"][0]["wakes"] >= 1
+
+
+_CS_CHARTER = ("# demo\n\n## Goals\nShip v1.\n\n## Restrictions\n- Never push to main (user msg #1).\n\n"
+               "## Policies\nLabel every number.\n")
+
+
+def _cs_session_project(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    sessions = _sessions(env, monkeypatch)
+    p.charter_path.write_text(_CS_CHARTER)
+    p.set_config("coordinator.session.mode", "on")
+    p.set_config("coordinator.debounce_s", 0)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    d = Daemon(p.base)
+
+    def wake(text):
+        p.db.post("in", text, chat="c1")
+        rid = _cs_wake(p, d)
+        assert rid and p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+        run = p.runs / str(rid)
+        return (json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["turn"]["session"],
+                (run / "system.md").read_text(), (run / "prompt.md").read_text())
+    return p, d, sessions, wake
+
+
+def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with_each_part(env, monkeypatch):
+    from ttp import coordsession, obligations
+    from ttp.prompts import restrictions_block
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    monkeypatch.setenv("TTP_FAKE_SESSION_NOTE", "1. Open threads: task #7 waits on its review (msg #2).")
+    rules = restrictions_block(p, advisory=False)
+    assert "Never push to main (user msg #1)." in rules
+    first, system1, prompt1 = wake("first order")
+    assert first["mode"] == "new" and rules in system1 and "# Persistent session" in system1
+    assert "## Session handover" not in prompt1
+    sid = p.db.kv(coordsession.KEY)["id"]
+    oid = obligations.add(p, "Report the soak result by 17:00 PST")
+    second, system2, _ = wake("second order")
+    assert second["mode"] == "resume", second
+    assert not (p.state / coordsession.NOTE_DIR).exists(), "no note outside a handover"
+    # The context reaches rollover_tokens: one last resumed wake asks for and saves the handover.
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 150000})
+    last, _, prompt3 = wake("third order")
+    assert (last["mode"], last["why"]) == ("resume", "handover") and coordsession.HANDOVER_HEAD in prompt3
+    note = p.state / coordsession.NOTE_DIR / f"{sid}.md"
+    assert note.read_text().strip() == os.environ["TTP_FAKE_SESSION_NOTE"]
+    assert coordsession.load_note(p, sid).strip() == os.environ["TTP_FAKE_SESSION_NOTE"]
+    # The next wake starts the new session, seeded with the ledger, the handover and the chat verbatim.
+    new, system4, prompt4 = wake("fourth order")
+    assert (new["mode"], new["why"]) == ("new", "context reached 150000 tokens"), new
+    st = p.db.kv(coordsession.KEY)
+    assert st["id"] != sid and st["prev"] == sid and "handover" not in st
+    seed = prompt4.split("# NEW COORDINATOR SESSION", 1)[1]
+    assert "## Order ledger" in seed and "Report the soak result by 17:00 PST" in seed and oid in seed
+    assert f"## Handover from the previous session {sid[:8]}" in seed and os.environ["TTP_FAKE_SESSION_NOTE"] in seed
+    assert "chat exchanges, verbatim" in seed
+    for text in ("first order", "ack: first order", "second order", "ack: third order"):
+        assert text in seed, text
+    assert seed.index("first order") < seed.index("third order")
+    assert "## Last 3 chat exchanges, verbatim" in seed
+    assert "fourth order" in seed.split("## Last 3 chat exchanges", 1)[1], "the digest follows the seed"
+    # The Restrictions stay verbatim after the rollover, in the same byte-stable system prompt.
+    assert rules in system4 and system4 == system1 == system2
+    assert coordsession.HANDOVER_HEAD not in prompt4
+
+
+def test_coordsession_system_prompt_is_byte_identical_between_wakes_with_an_unchanged_charter(env, monkeypatch):
+    from ttp import coordsession
+    from ttp.prompts import coordinator_session_role
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    parts = coordsession.session_prompt_parts(p)
+    first, system1, _ = wake("one")
+    p.add_memory("The soak runs nightly.", kind="decision")   # memory and time move, the prompt does not
+    second, system2, prompt2 = wake("two")
+    assert coordsession.session_prompt_parts(p) == parts
+    assert second["mode"] == "resume" and second["key"] == first["key"] and system2 == system1
+    assert "The soak runs nightly." not in system2
+    # A charter change gives a new prefix: a new session, its Restrictions block updated.
+    p.charter_path.write_text(_CS_CHARTER.replace("Ship v1.", "Ship v2."))
+    third, system3, _ = wake("three")
+    assert (third["mode"], third["why"]) == ("new", "prefix changed") and "Ship v2." in system3
+    assert "Ship v1." in system1 and system3 != system1
+    # The session role stays under the coordinator role budget (sa17).
+    assert len(coordinator_session_role(p)) <= _role_budget()
+
+
+def test_coordsession_note_and_chat_lines_keep_to_their_caps(env):
+    from ttp import coordsession
+    p = make(env)
+    assert coordsession.save_note(p, "s1", "  ") == "" and coordsession.save_note(p, "", "x") == ""
+    path = coordsession.save_note(p, "../a b", "x" * (coordsession.NOTE_CHARS + 500))
+    assert path and Path(path).parent == p.state / coordsession.NOTE_DIR and Path(path).name == "_a_b.md"
+    text = Path(path).read_text()
+    assert len(text) <= coordsession.NOTE_CHARS + 100 and "4,000-token note cap" in text
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    for i in range(30):
+        mid = p.db.post("in", f"order {i} " + "y" * 200, chat="c1")
+        p.db.x("UPDATE messages SET handled=1 WHERE id=?", (mid,))
+        p.db.post("out", f"ack {i}", chat="c1", kind="reply")
+    p.db.post("in", "still unhandled", chat="c1")
+    lines = "\n".join(coordsession.chat_lines(p.db, "", 20, 100000))
+    assert "order 29 " in lines and "order 10 " in lines and "order 9 " not in lines and "still unhandled" not in lines
+    small = "\n".join(coordsession.chat_lines(p.db, "", 20, 1500))
+    assert "order 29 " in small and "order 10 " not in small and len(small) < 2500 and "older left out" in small
