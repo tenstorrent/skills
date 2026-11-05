@@ -1138,7 +1138,6 @@ def test_a_second_sigint_during_the_withdrawal_still_prints_the_report(env, monk
     assert signal.getsignal(signal.SIGTERM) is not secretroute._raise_stopped
 
 
-@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
 def test_doctor_masks_the_web_app_token_and_points_to_ttp_web(env, monkeypatch, capsys):
     """Workers run doctor: its output stays in their logs and transcripts, so the web app's access token
     shows only a 4-character prefix there; `ttp web` keeps the full link for the user."""
@@ -1159,6 +1158,7 @@ def test_doctor_masks_the_web_app_token_and_points_to_ttp_web(env, monkeypatch, 
     assert cli.web_line(p) == "web app: not running yet (check `ttp status`)"
 
 
+@pytest.mark.skipif(os.geteuid() == 0, reason="root reads a mode-000 file")
 def test_doctor_reports_an_unreadable_secret_store_in_one_line_and_runs_its_later_checks(env, monkeypatch, capsys):
     from ttp import cli, project
     p = make(env)
