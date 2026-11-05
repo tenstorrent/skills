@@ -1063,6 +1063,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if payload.get("tool_name") in EDIT_TOOLS:
         why = harness_gh_edit(payload)
         return (_deny(why) if why else None), None
+    if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
+        from . import aitag
+        why = aitag.tool_problem(str(payload["tool_name"]), payload.get("tool_input"), aitag.project_config())
+        return (_deny(why) if why else None), None
     if payload.get("tool_name") != "Bash":
         return None, None
     cmd = str((payload.get("tool_input") or {}).get("command") or "")

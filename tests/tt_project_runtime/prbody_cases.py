@@ -170,7 +170,7 @@ def test_pr_body_check_covers_rest_api_writes_of_a_pr_body(env, tmp_path, monkey
     # Reads, writes without a body and other endpoints are not checked.
     for args in (("api", "repos/acme/widgets/pulls/7"), ("api", "-X", "GET", "repos/acme/widgets/pulls", "-f", "body=x"),
                  ("api", "-X", "PATCH", "repos/acme/widgets/pulls/7", "-f", "title=t"),
-                 ("api", "repos/acme/widgets/issues/7/comments", "-f", "body=no type")):
+                 ("api", "repos/acme/widgets/issues/7/comments", "-f", "body=no type [authored by AI]")):
         rc, err, ran = gh(*args)
         assert rc == 0 and ran, (args, err)
     assert seen() == []
@@ -205,7 +205,7 @@ def test_pr_body_check_covers_graphql_pr_mutations(env, tmp_path, monkeypatch):
     rc, err, ran = gh("api", "graphql", "--input", str(inp))
     assert rc == 1 and ran == [] and seen() == ["edit  no type"], err
     # A mutation that leaves the body alone, and other GraphQL calls, are not checked.
-    for q in (upd % 'title:"t"', "query{viewer{login}}", 'mutation{addComment(input:{subjectId:"I_1",body:"x"}){clientMutationId}}'):
+    for q in (upd % 'title:"t"', "query{viewer{login}}", 'mutation{addComment(input:{subjectId:"I_1",body:"x [authored by AI]"}){clientMutationId}}'):
         rc, err, ran = gh("api", "graphql", "-f", "query=" + q)
         assert rc == 0 and ran, (q, err)
     assert seen() == []

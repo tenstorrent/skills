@@ -298,6 +298,7 @@ GQL_ID_RE = re.compile(r'\bid\s*:\s*(?:"((?:[^"\\]|\\.)*)"|\$(\w+))')
 # A `body:` argument: a block string, a string or a variable.
 GQL_BODY_RE = re.compile(r'\bbody\s*:\s*(?:"""((?:[^"\\]|\\.|"(?!""))*)"""|"((?:[^"\\\n]|\\.)*)"|\$(\w+))')
 GQL_INPUT_VAR_RE = re.compile(r"\binput\s*:\s*\$(\w+)")
+GQL_MUTATION_RE = re.compile(r"\bmutation\b")
 
 
 class _Unread(Exception):
@@ -353,7 +354,8 @@ def api_problem(endpoint: str, method: str, args: list[str], cfg: dict, real: st
 
 
 def _read(path: str, stdin_text: str | None, cwd: str | None, what: str) -> str:
-    if path == "-":
+    from .prguard import STDIN_PATHS
+    if path in STDIN_PATHS:   # gh's stdin, as the wrapper read it
         if stdin_text is None:
             raise _Unread(f"the {what} from stdin")
         return stdin_text
@@ -404,16 +406,23 @@ def _rest_bodies(args: list[str], stdin_text: str | None, cwd: str | None) -> li
     return bodies
 
 
+def graphql_bodies_any(args: list[str], stdin_text: str | None, cwd: str | None, keep=None) -> list[str]:
+    """Every body the GraphQL mutations of a `gh api graphql` call set that `keep(query)` keeps (aitag)."""
+    return _graphql_bodies(args, stdin_text, cwd, issues=False,
+                           match=lambda q: GQL_MUTATION_RE.search(q) and (keep is None or keep(q)))[1]
+
+
 def _graphql_bodies(args: list[str], stdin_text: str | None, cwd: str | None, real: str | None = None,
-                    host: list[str] = ()) -> tuple[str, list[str]]:
+                    host: list[str] = (), match=GQL_PR_RE.search, issues: bool = True) -> tuple[str, list[str]]:
     """The action and the PR bodies a GraphQL createPullRequest or updatePullRequest sets, and an
-    updateIssue's unless every node it names is a plain issue."""
+    updateIssue's unless every node it names is a plain issue (`issues`). Only the queries `match`
+    keeps are read."""
     fields = _api_fields(args, stdin_text, cwd)
     queries = [get() for k, get in fields if k == "query"]
     data = _api_input(args, stdin_text, cwd) or {}
     if isinstance(data.get("query"), str):
         queries.append(data["query"])
-    queries = [q for q in queries if GQL_PR_RE.search(q)]
+    queries = [q for q in queries if match(q)]
     if not queries:
         return "edit", []
     variables = dict(data.get("variables") or {}) if isinstance(data.get("variables"), dict) else {}
@@ -438,7 +447,7 @@ def _graphql_bodies(args: list[str], stdin_text: str | None, cwd: str | None, re
     action = "create" if any("createPullRequest" in q for q in queries) else "edit"
     bodies = []
     for q in queries:
-        if not GQL_PR_ONLY_RE.search(q) and _plain_issues(q, variable, value, real, host):
+        if issues and not GQL_PR_ONLY_RE.search(q) and _plain_issues(q, variable, value, real, host):
             continue
         for block, string, var in GQL_BODY_RE.findall(q):
             if var:

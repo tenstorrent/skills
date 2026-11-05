@@ -778,6 +778,11 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                     return f"refused: the gh alias {cmd!r} runs a shell command that may change a PR's draft state"
                 return None
             return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed, seen, cfg)
+    if cmd in ("pr", "issue", "api"):   # what others read ends with the AI-authorship tag (aitag)
+        from . import aitag
+        why = aitag.gh_problem(cmd, rest, _project_config() if cfg is None else cfg, stdin_text)
+        if why:
+            return why
     if cmd == "pr" and rest:
         sub, more = rest[0], rest[1:]
         if sub == "create":
@@ -839,7 +844,7 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     inputs = _opts(args, ("--input",))
     body = ""
     for f in inputs:
-        if f == "-":
+        if f in STDIN_PATHS:
             body += stdin_text or ""
         else:
             try:
@@ -849,7 +854,7 @@ def _check_api(args: list[str], real: str, db, stdin_text: str | None, allowed: 
     for f in _opts(args, ("-F", "--field")):   # a typed field `key=@file` (or `@-`) reads its value
         _, eq, val = f.partition("=")
         if eq and val.startswith("@"):
-            if val == "@-":
+            if val[1:] in STDIN_PATHS:
                 body += " " + (stdin_text or "")
                 continue
             try:
@@ -1019,6 +1024,8 @@ STDIN_COMMANDS = frozenset((("secret", "set"), ("variable", "set"), ("gist", "cr
                             ("extension", "exec"), ("codespace", "ssh")))
 # What gh reads as stdin: `-` and the paths that name fd 0.
 STDIN_PATHS = frozenset(("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
+# Posts whose body the AI-authorship check (aitag) reads, from stdin too.
+AITAG_STDIN = frozenset((("issue", "create"), ("issue", "comment"), ("pr", "comment"), ("pr", "review")))
 
 
 def needs_stdin(args: list[str]) -> bool:
@@ -1148,6 +1155,10 @@ def main(argv: list[str], own_dir: str) -> int:
         given, _ = _scan(args[2:], CREATE_VALUES if args[1] == "create" else EDIT_VALUES)
         if "-" in (given.get("--body-file"), given.get("-F")):   # the body check reads it, then gh
             stdin_text = sys.stdin.read()
+    stdin_raw = None   # bytes gh gets as they came, when the AI-authorship check read them (aitag)
+    if stdin_text is None and needs_stdin(args) and (args[:1] == ["api"] or tuple(args[:2]) in AITAG_STDIN):
+        stdin_raw = sys.stdin.buffer.read()
+        stdin_text = stdin_raw.decode("utf-8", "replace")
     db, allowed, seen = None, set(), []
     try:
         db = _project_db()
@@ -1167,11 +1178,14 @@ def main(argv: list[str], own_dir: str) -> int:
         return 1
     if allowed and db is not None:
         # The approval is spent once the PR has left draft with it.
-        rc = subprocess.run([real, *args], input=stdin_text, text=True).returncode
+        rc = subprocess.run([real, *args], input=stdin_text if stdin_raw is None else stdin_raw,
+                            text=stdin_raw is None).returncode
         log_call(state, seen, args, refused=False, rc=rc)
         if rc == 0:
             spend(db, allowed)
         return rc
+    if stdin_raw is not None:
+        return subprocess.run([real, *args], input=stdin_raw).returncode
     if stdin_text is not None:
         return subprocess.run([real, *args], input=stdin_text, text=True).returncode
     os.execv(real, [real, *args])

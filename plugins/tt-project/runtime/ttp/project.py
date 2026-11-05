@@ -589,6 +589,7 @@ EXTRA_KEYS = {
                  "checks_spill_hosts", "checks_spill_after_s",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
+                 "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)
                  "rebase_replace", "never_force",   # whether a rebase replaces its branch (rebase_replace)
                  "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
     "jev": {"via", "url", "model"},
@@ -1051,6 +1052,8 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     out += prestage_problems(delivery.get("check_prestage"))
     from .prbody import problems as pr_body_problems
     out += pr_body_problems(delivery.get("pr_body_check"))
+    from .aitag import problems as ai_tag_problems
+    out += ai_tag_problems(delivery.get("ai_tag"))
     if delivery.get("checks_host") not in (None, ""):
         from .remotecheck import host_problem
         out += [f"delivery.checks_host: {p}" for p in [host_problem(delivery["checks_host"])] if p]

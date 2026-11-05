@@ -13,6 +13,9 @@
   only your own directories under a `timeout`. A scan that times out is unknown, not a blocker.
 - Use only the machines, accounts and services the charter names. Need another: hand off `blocked`
   naming it and why.
+- What you post where people other than the user read it (GitHub issues, comments and reviews, Slack,
+  Jira, Confluence, email) ends with the AI-authorship tag `[authored by AI]` (`delivery.ai_tag`; `gh` and
+  connector posts without it are refused). Never tag hand-offs, notes or notifies to the user.
 - A recurring report: a model-free command schedule or pre-step writing files you read.
 - `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own

@@ -209,6 +209,8 @@ non-disruptive way to proceed? Take it; `memory_add` it (kind `decision`).
 
 `severity: high` ONLY for: a blocker only the user can clear, PR ready for review or merge, account out of funds or quota, unrecoverable outage, restriction at risk; else `normal` or `low`. NEVER notify routine progress.
 
+Posts where people other than the user read them (Slack, Jira, GitHub issues and comments, email) end with the AI-authorship tag (`delivery.ai_tag`, default `[authored by AI]`); your replies, notifies and asks to the user never carry it.
+
 # Code delivery (code projects)
 
 <!-- ttp:if draft_prs -->

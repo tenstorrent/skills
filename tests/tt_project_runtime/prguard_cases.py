@@ -132,14 +132,15 @@ def test_gh_pre_hooks_can_only_refuse_and_the_draft_guard_still_runs_after_them(
              'case "$*" in *secret*) echo "public text names a secret" >&2; exit 3;; esac\n')
     _gh_hook(p, "20-off", "#!/bin/sh\nexit 1\n", mode=0o644)      # not executable: skipped
     _gh_hook(p, ".30-hidden", "#!/bin/sh\nexit 1\n")               # hidden: skipped
-    rc, err, ran = gh("pr", "comment", "7", "-b", "a secret")
+    rc, err, ran = gh("pr", "comment", "7", "-b", "a secret [authored by AI]")
     assert rc == 1 and ran == [] and "public text names a secret" in err and "gh.d/10-public-text (exit 3)" in err, err
-    rc, err, ran = gh("pr", "comment", "7", "-b", "fine")
-    assert rc == 0 and ran == ["pr comment 7 -b fine"], err
+    rc, err, ran = gh("pr", "comment", "7", "-b", "fine [authored by AI]")
+    assert rc == 0 and ran == ["pr comment 7 -b fine [authored by AI]"], err
     # A passing hook grants nothing: the draft guard still refuses an unapproved ready.
     rc, err, ran = gh("pr", "ready", "7")
     assert rc == 1 and ran == [] and "without the user's recorded approval" in err, err
-    assert seen.read_text().splitlines() == ["pr comment 7 -b a secret", "pr comment 7 -b fine", "pr ready 7"]
+    assert seen.read_text().splitlines() == ["pr comment 7 -b a secret [authored by AI]",
+                                             "pr comment 7 -b fine [authored by AI]", "pr ready 7"]
     # A hook that cannot start refuses, naming it.
     broken = _gh_hook(p, "40-broken", "#!/nonexistent/interpreter\n")
     rc, err, ran = gh("pr", "list")
@@ -158,7 +159,7 @@ def test_gh_pre_hooks_and_gh_get_the_same_stdin_and_a_slow_hook_or_stdin_refuses
     (fake / "gh").chmod(0o755)
     for n in ("10-a", "20-b"):
         _gh_hook(p, n, f"#!/bin/sh\ncat > {tmp_path / n}.stdin\n")
-    data = bytes(range(256)) * 600 + "Type: fix\n".encode()            # over one read, not UTF-8
+    data = bytes(range(256)) * 600 + "Type: fix [authored by AI]\n".encode()   # over one read, not UTF-8
     r = _gh_main(p, tmp_path, ["issue", "comment", "7", "--body-file", "-"], data, fake=fake)
     assert r.returncode == 0, r.stderr
     assert [(tmp_path / f).read_bytes() for f in ("10-a.stdin", "20-b.stdin", "gh.stdin")] == [data] * 3
@@ -250,7 +251,7 @@ def test_gh_api_stdin_forms_still_reach_hooks_and_gh_intact(env, tmp_path):
     _gh_hook(p, "10-a", f"#!/bin/sh\ncat > {tmp_path / 'hook.stdin'}\n")
     ep = "repos/<owner>/<repo>/issues/7/comments"
     for i, extra in enumerate((["--input", "-"], ["--input=-"], ["-F", "body=@-"], ["--field=body=@-"])):
-        data = f'{{"body": "comment {i}"}}\n'.encode()
+        data = f'{{"body": "comment {i} [authored by AI]"}}\n'.encode()
         r = _gh_main(p, tmp_path, ["api", ep, *extra], data, fake=fake)
         assert r.returncode == 0, (extra, r.stderr)
         assert (tmp_path / "hook.stdin").read_bytes() == data and (tmp_path / "gh.stdin").read_bytes() == data, extra
@@ -267,7 +268,7 @@ def test_gh_body_file_dev_stdin_reaches_gh_intact(env, tmp_path):
     for hooked in (False, True):
         if hooked:
             _gh_hook(p, "10-a", f"#!/bin/sh\ncat > {tmp_path / 'hook.stdin'}\n")
-        data = f"hello body {hooked}\n".encode()
+        data = f"hello body {hooked} [authored by AI]\n".encode()
         r = _gh_main(p, tmp_path, ["pr", "comment", "7", "--body-file", "/dev/stdin"], data, fake=fake)
         assert r.returncode == 0, (hooked, r.stderr)
         assert (tmp_path / "gh.stdin").read_bytes() == data, hooked

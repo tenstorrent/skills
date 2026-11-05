@@ -306,7 +306,8 @@ def test_isolated_worker_without_a_listed_connector_keeps_todays_strict_args(env
     assert argv[i - 2] == "--mcp-config" and argv[i:i + 3] == ["--strict-mcp-config", "--setting-sources",
                                                                "project,local"]
     assert "deniedMcpServers" not in argv[argv.index("--settings") + 1]
-    assert not any("mcp__" in a for a in argv) and "ENABLE_CLAUDEAI_MCP_SERVERS" not in run_env
+    # the PreToolUse hook matcher names mcp__ tools (aitag); no connector tool is allowed or denied
+    assert not any("mcp__" in a.replace('|mcp__.*"', "") for a in argv) and "ENABLE_CLAUDEAI_MCP_SERVERS" not in run_env
     assert p.db.one("SELECT 1 FROM messages WHERE ref LIKE 'mcp_connectors_strict:%'") is None
     # A run that lists a connector but cannot keep it (no host list) gets exactly the same flags.
     (p.state / "mcp_list.json").unlink()
@@ -405,7 +406,7 @@ def test_isolated_worker_with_a_connector_stays_strict_without_a_trusted_host_li
         (p.state / mcpgap.CACHE).unlink(missing_ok=True)
         setup()
         argv, run_env = _iso_run(p, monkeypatch)
-        assert "--strict-mcp-config" in argv and not any("mcp__" in a for a in argv), name
+        assert "--strict-mcp-config" in argv and not any("mcp__" in a.replace('|mcp__.*"', "") for a in argv), name
         assert "deniedMcpServers" not in argv[argv.index("--settings") + 1], name
         if name == "no list":   # one low alert a day, whatever the reason
             alert = p.db.one("SELECT text, severity FROM messages WHERE ref='mcp_connectors_strict:claude'")

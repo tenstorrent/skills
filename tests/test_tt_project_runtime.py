@@ -29405,7 +29405,7 @@ def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path)
     worker, _ = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None,
                                              read_only=False, schema=None, restrictions={})
     pre = json.loads(worker[worker.index("--settings") + 1])["hooks"]["PreToolUse"][0]
-    assert pre["matcher"] == "Bash|Edit|Write|MultiEdit|NotebookEdit"
+    assert pre["matcher"] == "Bash|Edit|Write|MultiEdit|NotebookEdit|mcp__.*"
     assert pre["hooks"][0]["command"].endswith("ttp.hook PreToolUse")
 
 

@@ -2128,6 +2128,17 @@ running work is interrupted only by the preemption below:
   cannot tell (offline, no auth, a timeout). `repositories/<id>/...` paths are covered like
   `repos/<owner>/<repo>/...` and, naming no repo, are always checked. Put the project's own rules (such as labels its
   PR bodies must start with) in the command, never in the plugin.
+- `delivery.ai_tag` (default `[authored by AI]`; `""` turns it off) is the AI-authorship tag that
+  everything a run posts where people other than the user read it ends with. Prompts state the rule,
+  and two model-free guards refuse a post whose last text line lacks the tag (or a similar disclosure
+  such as "Generated with Claude Code"; trailing HTML and a hidden `<!-- ttp -->` line may follow):
+  the worker `gh` wrapper for `gh issue create`, `gh issue comment`, `gh pr comment`, `gh pr review`
+  and comment, review or issue posts through `gh api` (REST and GraphQL); and, for Claude Code runs, a
+  PreToolUse hook on connector tools (`mcp__*`) whose name says they send, post, draft or create a
+  message, comment, issue, page or email (Slack, Jira, Confluence, mail). PR bodies, edits of an
+  issue's or PR's own body and commit messages are left as they are, and messages to the user (the
+  chat relay, `ttp notify`, the web app) are never tagged. Posts the harness cannot see (a script
+  posting over HTTP, another CLI, Codex or Cursor connector tools) rely on the prompt rule.
 - Change windows: the template charter's Policies line `- Change windows: none` means disruptive
   work (restarts, rollouts, anything that disturbs others) may run whenever it is safe, and waiting
   for a lull is never a blocker. A team that works in change windows lists them on that line
