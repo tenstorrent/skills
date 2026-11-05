@@ -61,7 +61,8 @@ DEFAULT_AFTER_PUSH_TIMEOUT_S = 1800
 STALE = "(stale plugin version)"   # the `cmd` of a check failure that is push.stale_versions
 SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds",
-                 "imports": "names both sides import"}
+                 "imports": "names both sides import", "release": "release notes both sides wrote"}
+RELEASE_KINDS = {"version", "release"}   # settlements in the shared release files only (release_kind)
 MERGED_KINDS = {"added", "hunks", "imports"}   # settlements that keep both sides' changes: kept only when the checks pass
 REPLAYED = "Ttp-Replayed-From"     # trailer of a commit the batch settled: the entry commit it replays
 # sequence.editor of a rebase that leaves out an entry's commits already on the target (Batch._landed):
@@ -767,6 +768,84 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
     return True
 
 
+def release_kind(path: str, cfg: dict | None) -> str | None:
+    """Which shared release file `path` is under the delivery.version_bump `cfg` (push.bump_of):
+    "version" (a file holding the version), "changeset" (a changeset, or the release changeset) or
+    "changelog" (a CHANGELOG.md where a change needs a bump); None for the change's own files. Every
+    change of a batch writes these, so their conflicts are the batch's own, never the change's."""
+    if not cfg:
+        return None
+    if path in cfg["files"]:
+        return "version"
+    cs = cfg.get("changeset_dir") or ""
+    if path == cfg.get("changeset_file") or (cs and path.startswith(cs + "/") and path.endswith(".md")):
+        return "changeset"
+    if os.path.basename(path) == "CHANGELOG.md" and push._under(path, cfg.get("paths") or []):
+        return "changelog"
+    return None
+
+
+def release_excludes(cfg: dict | None) -> list[str]:
+    """git pathspecs that leave out every release file of `cfg` (release_kind)."""
+    if not cfg:
+        return []
+    out = [f":(exclude){f}" for f in cfg["files"]]
+    out += [f":(exclude){x}" for x in (cfg.get("changeset_dir"), cfg.get("changeset_file")) if x]
+    return out + [f":(exclude,glob){d + '/' if d else ''}**/CHANGELOG.md" for d in (cfg.get("paths") or [""])]
+
+
+def _union(ours: str, base: str, theirs: str) -> str:
+    """`ours` and then each line `theirs` added to `base` that `ours` lacks: release notes are a list."""
+    have, was = set(ours.splitlines()), set(base.splitlines())
+    more = [ln for ln in theirs.splitlines() if ln not in was and ln not in have and ln.strip()]
+    if not more:
+        return ours
+    return ours + ("" if not ours or ours.endswith("\n") else "\n") + "\n".join(more) + "\n"
+
+
+def settle_release(wt: Path, path: str, cfg: dict | None, kinds: set | None = None) -> bool:
+    """Settle a stopped rebase's conflict in a changeset or CHANGELOG (release_kind) of `wt`
+    mechanically: True when settled. Both sides' notes are kept: a changeset both sides created
+    keeps ours at `path` and theirs as a file of its own beside it (changesets stay separate files);
+    an edit on both sides merges, or takes ours plus the lines theirs added (_union). A side that
+    deleted the file is a real conflict. Adds "release" to `kinds`."""
+    if release_kind(path, cfg) not in ("changeset", "changelog"):
+        return False
+    ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
+    if ours is None or theirs is None:
+        return False
+    try:
+        o, b, t = ours.decode(), (base or b"").decode(), theirs.decode()
+    except UnicodeDecodeError:
+        return False
+    if "\0" in o + b + t:
+        return False
+    if o == t:
+        text = o
+    elif base is None and path != cfg.get("changeset_file") and release_kind(path, cfg) == "changeset":
+        stem, n = path[:-3], 2
+        while (wt / f"{stem}-{n}.md").exists() or _show(wt, 0, f"{stem}-{n}.md") is not None:
+            n += 1
+        durable_write(wt / f"{stem}-{n}.md", t)
+        _git(wt, "add", "--", f"{stem}-{n}.md")
+        text = o
+    else:
+        text = merge3(o, b, t, hunks=True) if base is not None else None
+        text = _union(o, b, t) if text is None else text
+    durable_write(wt / path, text)
+    if kinds is not None:
+        kinds.add("release")
+    return True
+
+
+def own_diff(repo: Path, a: str, b: str, cfg: dict | None) -> str:
+    """The change a..b makes outside the release files (release_excludes), without context, blob ids
+    or line numbers: two replays of one change onto different bases give the same text."""
+    out = _git(repo, "diff", "--no-color", "--no-ext-diff", "--no-renames", "-U0", a, b, "--", ".",
+               *release_excludes(cfg)).stdout
+    return "\n".join("@@" if ln.startswith("@@") else ln for ln in out.splitlines() if not ln.startswith("index "))
+
+
 def _patch_ids(repo: Path, revs: list[str]) -> dict[str, str]:
     """{commit: its `git patch-id --stable`} for the non-merge commits `revs` names, in their order."""
     try:
@@ -1391,6 +1470,13 @@ class Batch:
             new, files = (h, None) if gone and len(gone) == len(own) else self._rebase(h, top, drop=set(gone))
             if files is None and self._settling[0]:
                 self.settled[i] = {"settled": sorted(set(self._settling[0])), "settled_by": sorted(self._settling[1])}
+                if not gone and all(release_kind(f, self.cfg) for f in self._settling[0]) \
+                        and own_diff(self.repo, h, new, self.cfg) != own_diff(self.repo, base, top, self.cfg):
+                    # Only release files conflicted, so the approval holds only while the change itself
+                    # is the one reviewed; a replay that changed it goes back as a conflict.
+                    new, files = h, ["(the rebase settled only release files, but the change's own diff "
+                                     "is no longer the approved one)"]
+                    self.settled.pop(i)
             if files is not None:
                 say(f"entry {e.get('id')} ({e.get('branch')}) conflicts with {h[:10]} in {', '.join(files)}")
                 self._set(i, "conflict", files=files, onto=h, _after=len(carried))
@@ -1483,7 +1569,8 @@ class Batch:
             files = [f for f in _git(wt, "diff", "--name-only", "-z", "--diff-filter=U").stdout.split("\0")
                      if f] if stopped else []
             kinds: set = set()
-            real = [f for f in files if not settle(wt, f, version_files, hunks=True, imports=True, kinds=kinds)]
+            real = [f for f in files if not settle_release(wt, f, self.cfg, kinds)
+                    and not settle(wt, f, version_files, hunks=True, imports=True, kinds=kinds)]
             if real or not files:       # a real conflict, or a stop that is no conflict at all
                 if stopped:
                     _git(wt, "rebase", "--abort")

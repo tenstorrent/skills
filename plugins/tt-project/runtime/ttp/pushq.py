@@ -828,6 +828,105 @@ def dep_waits(p: Project, rows: list[dict], now: float) -> dict[int, dict]:
     return out
 
 
+_idents_seen: dict[tuple[str, str], dict | None] = {}
+
+
+def _idents(p: Project, tip: str, head: str) -> dict | None:
+    """{(author name, email, author date): (sha, committer time)} of tip..head's commits (merges
+    aside), cached; None when git cannot tell in STACK_GIT_S. A rebase, amend or reword keeps a
+    commit's author ident and moves its committer time (batch._rewritten matches commits the same way)."""
+    if (tip, head) in _idents_seen:
+        return _idents_seen[(tip, head)]
+    try:
+        r = _git(p, "log", "--no-merges", "--format=%H%x00%an%x00%ae%x00%ad%x00%ct", "--date=raw",
+                 f"{tip}..{head}", timeout=STACK_GIT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    out = {}
+    for line in r.stdout.splitlines():
+        f = line.split("\0")
+        if len(f) == 5 and f[4].isdigit():
+            out[(f[1], f[2], f[3])] = (f[0], int(f[4]))
+    if len(_idents_seen) > 512:
+        _idents_seen.clear()
+    _idents_seen[(tip, head)] = out
+    return out
+
+
+def overlap_waits(p: Project, rows: list[dict], now: float, tip: str) -> tuple[dict[int, dict], dict[int, int]]:
+    """Approvals whose own commits overlap another open change's: (waits, before). An approval
+    carrying an older copy of a commit (same author ident, older committer time) that another open
+    review's head or code task's branch holds a newer rewrite of would conflict with that change's
+    landing and lose its approval each time it lands. If the other is approved too (in `rows`), it
+    goes first: before = {row id: that row's id}, and the later one is rebased once onto it. Else
+    waits = {row id: {"task", "head", "why"}} until it lands (its commits are then on the tip), it
+    ends, or DEP_WAIT_S has passed since the approval. A git answer it cannot get holds nothing."""
+    if not rows or not tip:
+        return {}, {}
+    db = p.db
+    terminal = ",".join("?" * len(TERMINAL_TASK_STATES))
+    others: dict[str, dict] = {}   # branch: {"task", "head", "row"}
+    try:
+        refs = _git(p, "for-each-ref", "--format=%(refname:short)%00%(objectname)", "refs/heads",
+                    timeout=STACK_GIT_S).stdout
+    except (OSError, subprocess.SubprocessError):
+        refs = ""
+    heads = dict(ln.split("\0", 1) for ln in refs.splitlines() if "\0" in ln)
+    for t in db.q(f"SELECT id, branch FROM tasks WHERE COALESCE(branch, '')!='' AND status NOT IN ({terminal}) "
+                  "ORDER BY id", TERMINAL_TASK_STATES):
+        if t["branch"] in heads:
+            others.setdefault(t["branch"], {"task": t["id"], "head": heads[t["branch"]], "row": None})
+    for q in db.q(f"SELECT q.id, q.task, q.branch, q.head FROM push_queue q JOIN tasks t ON t.id=q.task "
+                  f"WHERE q.status IN ({','.join('?' * len(OPEN_ROWS))}) AND t.status NOT IN ({terminal}) "
+                  "ORDER BY q.id", (*OPEN_ROWS, *TERMINAL_TASK_STATES)):
+        others[q["branch"]] = {"task": q["task"], "head": q["head"], "row": None}
+    for r in rows:
+        others[r["branch"]] = {"task": r["task"], "head": r["head"], "row": r["id"]}
+    waits: dict[int, dict] = {}
+    before: dict[int, int] = {}
+    for r in rows:
+        mine = _idents(p, tip, r["head"]) or {}
+        for branch, o in others.items() if mine else ():
+            if branch == r["branch"] or o["task"] == r["task"] or o["head"] == r["head"]:
+                continue
+            theirs = _idents(p, tip, o["head"]) or {}
+            stale = [k for k, (sha, ct) in mine.items() if k in theirs and theirs[k][0] != sha and theirs[k][1] > ct]
+            if not stale:
+                continue
+            if o["row"] is not None:
+                before.setdefault(r["id"], o["row"])
+            elif now - float(r["created"]) < DEP_WAIT_S and r["id"] not in waits:
+                waits[r["id"]] = {"task": o["task"], "head": o["head"], "why": (
+                    f"review #{r['task']}'s approval waits for #{o['task']} to land {branch} "
+                    f"({_short(o['head'])}): it carries an older copy of {len(stale)} commit"
+                    f"{'s' if len(stale) != 1 else ''} that change has since rewritten, so it is rebased onto "
+                    f"that landing once")}
+    return waits, before
+
+
+def _ordered(rows: list[dict], before: dict[int, int], approved: set[int]) -> list[dict]:
+    """`rows` with each row that another must follow (overlap_waits' before) placed ahead of it; a row
+    whose predecessor is approved but not among `rows` waits for a batch that takes both."""
+    by = {r["id"]: r for r in rows}
+    out: list[dict] = []
+    seen: set = set()
+
+    def put(r: dict) -> None:
+        if r["id"] in seen:
+            return
+        seen.add(r["id"])
+        if (b := before.get(r["id"])) in by:
+            put(by[b])
+        elif b in approved:
+            return
+        out.append(r)
+    for r in rows:
+        put(r)
+    return out
+
+
 def _tracking_tip(p: Project, remote: str, branch: str) -> str:
     """The target's tip as last fetched: no network in the tick."""
     return _commit(p, f"refs/remotes/{remote}/{branch}")
@@ -871,12 +970,15 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     rows = _approved(db, f"{remote}/{branch}")
     if not rows:
         return [], "nothing approved"
-    if deps := dep_waits(p, rows, now):
+    deps = dep_waits(p, rows, now)
+    laps, before = overlap_waits(p, [r for r in rows if r["id"] not in deps], now, _tracking_tip(p, remote, branch))
+    if deps := {**laps, **deps}:
         waiting, rows = [r for r in rows if r["id"] in deps], [r for r in rows if r["id"] not in deps]
         if not rows:
-            return [], "; ".join(f"review #{r['task']}'s approval waits for review #{deps[r['id']]['task']} to "
-                                 f"land its sent-back head {_short(deps[r['id']]['head'])}, which it is built on"
-                                 for r in waiting)
+            return [], "; ".join(deps[r["id"]].get("why") or (
+                f"review #{r['task']}'s approval waits for review #{deps[r['id']]['task']} to "
+                f"land its sent-back head {_short(deps[r['id']]['head'])}, which it is built on") for r in waiting)
+    approved = {r["id"] for r in rows}
     paused = db.paused_resources()
     if push.lock_name(remote, branch) in paused or "push" in paused:
         return [], "the push resource is paused"
@@ -950,6 +1052,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
                f"earlier unlanded one" + (f" ({hot} an urgent review)" if hot else ""))
     else:
         rows = [r for r in rows if r["id"] in fast] + [r for r in rows if r["id"] not in fast]   # they lead
+    if before:   # overlapping approvals: the one holding the newer commits goes first (overlap_waits)
+        rows = _ordered(rows, before, approved)
+        if not rows:
+            return [], "overlapping approvals wait for a batch that takes them in order"
     if clean and len(rows) > cap:
         cap = min(len(rows), cap * BATCH_GROW)   # one merged-result check run covers the backlog
     taken, held = _one_solo(p, rows, cap, _solo_paths(d), _tracking_tip(p, remote, branch), fast)

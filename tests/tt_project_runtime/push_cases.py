@@ -16731,3 +16731,120 @@ def test_push_queue_batch_checks_run_at_nice_19_and_idle_io_like_ttp_checks(env,
     rc, tail, _ = batch._stream(batch._check_argv(f"{shlex.quote(sys.executable)} {probe}", tmp_path), tmp_path)
     assert rc == 0, tail
     assert "nice 19" in tail and "io idle" in tail, tail
+
+
+def _manifest(version, description="d"):
+    return json.dumps({"name": "p", "version": version, "description": description}, indent=2) + "\n"
+
+
+def test_a_push_batch_keeps_the_approval_when_only_the_version_manifests_conflict(env, monkeypatch):
+    """An entry that bumped the plugin version itself, while the target took another version: the
+    conflict is only in the shared version files, settled mechanically (one bump per batch), and the
+    approval holds (no send-back, no new review)."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    head = _entry(repo, "e1", {"plugins/p/f1.txt": "1\n", "plugins/p/.claude-plugin/plugin.json": _manifest("0.1.7"),
+                               "plugins/p/rt/__init__.py": '"""p"""\n__version__ = "0.1.7"\n'})
+    _land_as(other, {"plugins/p/.claude-plugin/plugin.json": _manifest("0.1.4"),
+                     "plugins/p/rt/__init__.py": '"""p"""\n__version__ = "0.1.4"\n'}, "p 0.1.4")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert _versions(origin) == ("0.1.5", "0.1.5")
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "1"
+
+
+def test_a_push_batch_keeps_the_approval_when_only_changesets_conflict(env, monkeypatch):
+    """Both sides wrote a changeset of the same name, and both appended to the release changeset: each
+    is settled mechanically, the changesets stay separate files, and the approval holds."""
+    from ttp import batch
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    (other / ".changeset").mkdir()
+    _land_as(other, {".changeset/notes.md": "- base\n"}, "release notes")
+    head = _entry(repo, "e1", {"plugins/p/f1.txt": "1\n", ".changeset/fix.md": "- entry fix\n",
+                               ".changeset/notes.md": "- base\n- entry note\n"})
+    _land_as(other, {".changeset/fix.md": "- target fix\n", ".changeset/notes.md": "- base\n- target note\n"},
+             "target notes")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    assert m["results"][0]["detail"].get("settled_by") == ["release"], m["results"]
+    assert _git_out(origin, "show", "proj:.changeset/fix.md") == "- target fix"
+    assert _git_out(origin, "show", "proj:.changeset/fix-2.md") == "- entry fix"
+    assert _git_out(origin, "show", "proj:.changeset/notes.md").splitlines() == ["- base", "- target note", "- entry note"]
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "1"
+    assert batch.release_kind("plugins/p/CHANGELOG.md", {"files": [], "paths": ["plugins/p"]}) == "changelog"
+    assert batch.release_kind("plugins/p/f1.txt", {"files": [], "paths": ["plugins/p"]}) is None
+
+
+def test_a_push_batch_sends_back_a_release_only_settlement_that_changed_the_change(env, monkeypatch):
+    """A replay whose only conflicts were release files, but whose own diff is no longer the approved
+    one, is sent back: the approval covered that diff only."""
+    from ttp import batch
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    head = _entry(repo, "e1", {"plugins/p/f1.txt": "1\n", ".changeset/fix.md": "- entry fix\n"})
+    real, calls = batch.own_diff, []
+
+    def changed(*a):   # the replay's own diff (asked first) differs from the approved one
+        calls.append(a)
+        return real(*a) + ("\n+a line the review never saw" if len(calls) == 1 else "")
+    monkeypatch.setattr(batch, "own_diff", changed)
+    (other / ".changeset").mkdir()
+    _land_as(other, {".changeset/fix.md": "- target fix\n"}, "target notes")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert "no longer the approved one" in m["results"][0]["detail"]["files"][0], m["results"]
+
+
+def test_a_push_batch_still_sends_back_a_real_conflict_beside_a_release_file_conflict(env, monkeypatch):
+    """A conflict in the change's own code still sends it back, even when release files conflict too."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    _land_as(other, {"plugins/p/f1.txt": "base\n"}, "f1")
+    head = _entry(repo, "e1", {"plugins/p/f1.txt": "mine\n", ".changeset/fix.md": "- entry fix\n"})
+    (other / ".changeset").mkdir()
+    _land_as(other, {"plugins/p/f1.txt": "theirs\n", ".changeset/fix.md": "- target fix\n"}, "target")
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["plugins/p/f1.txt"], m["results"]
+
+
+def test_a_push_batch_sends_back_the_later_of_two_overlapping_members_once(env, monkeypatch):
+    """Two approvals edit the same line: the earlier lands and the later conflicts once with it (one
+    rebase and one re-review), not with the target."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    _land_as(other, {"plugins/p/f1.txt": "base\n"}, "f1")
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "one\n"}), _entry(repo, "e2", {"plugins/p/f1.txt": "two\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["pushed", "conflict"], m
+    assert m["results"][1]["detail"]["files"] == ["plugins/p/f1.txt"], m["results"]
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "one"
+
+
+def test_an_approval_carrying_an_older_copy_of_another_changes_commits_goes_after_it(env, monkeypatch):
+    """The #5784 case: an approval's branch carries an older copy of a commit that another open change
+    holds a newer rewrite (reworded) of. While that change is still under review the approval waits
+    for it to land, rather than conflicting with each of its landings; once both are approved the
+    rewrite's goes first in the batch, whatever their priority; DEP_WAIT_S bounds the wait."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0)
+    now = time.time()
+    shared = _commit(s.path, "shared.txt", "shared\n") or _git_out(s.path, "rev-parse", "HEAD")
+    _commit(s.path, "docs.txt", "docs\n")
+    child_head = _git_out(s.path, "rev-parse", "HEAD")
+    sib, sib_path, sib_branch = _code_task(s.p, "sibling", status="waiting")
+    _git_out(sib_path, "cherry-pick", shared)
+    sib_head = _rewrite(sib_path, shared, {}, message="shared, reworded", later=120, args=("--amend",))
+    s.p.db.update_task(s.review, status="pushing")
+    with s.p.db.tx():
+        [child] = pushq.approve(s.p, s.review, None, {"entries": [{"branch": s.branch, "head": child_head}],
+                                                      "target": "origin/proj"})
+    got, why = pushq.due(s.p, now + 1)
+    assert got == [] and f"waits for #{sib} to land {sib_branch}" in why and "older copy of 1 commit that change has since rewritten" in why, why
+    assert [r["id"] for r in pushq.due(s.p, now + pushq.DEP_WAIT_S + 2)[0]] == [child], "bounded"
+    review2 = s.p.db.add_task("review sibling", "r", kind="review", origin="coordinator", priority=9)
+    s.p.db.update_task(review2, status="pushing")
+    s.p.db.update_task(s.review, priority=1)
+    with s.p.db.tx():
+        [sib_row] = pushq.approve(s.p, review2, None, {"entries": [{"branch": sib_branch, "head": sib_head}],
+                                                       "target": "origin/proj"})
+    assert [r["id"] for r in pushq.due(s.p, now + 1)[0]] == [sib_row, child], "the rewrite's owner goes first"
+    s.p.db.update_task(sib, status="done")
+    s.p.db.x("DELETE FROM push_queue WHERE id=?", (sib_row,))
+    assert [r["id"] for r in pushq.due(s.p, now + 1)[0]] == [child], "the other change ended"

@@ -1703,8 +1703,14 @@ nothing running is interrupted:
   `delivery.push_checks` once and pushes without force. Then the reviews are `done`. Conflicts
   that need no judgment are settled in the batch and judged by those checks: version lines, lines
   both sides added at one spot, and changes of different lines that git calls a conflict only
-  because they are adjacent. A change that really overlaps another goes back to its review to
-  resolve the conflict; a failed check fails the
+  because they are adjacent. A conflict only in the shared release files (the version files,
+  changesets, the release changeset, a CHANGELOG.md) is settled mechanically: both sides' notes
+  stay, a changeset both sides created keeps a file each, and the approval holds as long as the
+  change's own diff outside those files is still the approved one. A change that really overlaps another goes back to its review to
+  resolve the conflict. An approval that carries an older copy of commits another open change has
+  since rewritten goes after that change (in the same batch when both are approved, else it waits
+  for that landing, at most two hours), so it is rebased and re-reviewed once instead of losing
+  its approval at each of the other's landings; a failed check fails the
   review and wakes the coordinator. The batch finds the first change that fails by checking
   prefixes, pushes the ones before it, and checks the ones after it once more without it, pushing
   them too when they pass. A failed pytest check first reruns only its failing tests once at the
