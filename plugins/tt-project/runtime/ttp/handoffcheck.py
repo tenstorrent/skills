@@ -15,7 +15,15 @@ coordinator, its result kept. Any other exit or a timeout is a broken check: the
 Checks run on a hand-off whose status is done, needs_review, blocked or failed (a wait posts nothing
 and its later hand-off is checked). They run before the transaction that records the hand-off
 (prefetch, from Daemon._prefetch_lint), so the write lock never waits on them; verdict reads that
-answer and runs them itself only when prefetch did not."""
+answer and runs them itself only when prefetch did not.
+
+They also run in the worker's own session first (at_stop, from the Claude Code Stop hook in hook.py), so
+a rejection is fixed by the session that wrote the hand-off rather than by a new cold run. The daemon
+passes each task run its send-backs so far and the cap (SENDBACKS_ENV, "used/cap"); a check that exits 1
+refuses the stop with its output while used + the run's own refusals (STOP_FILE) stay under the cap,
+and the daemon counts those refusals as send-backs. A broken check, a timeout (the checks get
+STOP_BUDGET_S in all) or any fault of the hook lets the run end: the daemon's check stays the final
+gate. A check sees AT_ENV=stop there, with the run's own variables (RUN_VARS) left out."""
 from __future__ import annotations
 
 import hashlib
@@ -37,6 +45,12 @@ DEFAULT_MAX_SENDBACKS = 2
 OUTPUT_CHARS = 2000               # the tail of a check's output the next run and the coordinator get
 EVENT_OUTPUT_CHARS = 1000         # of it, in a coordinator event
 INPUT_FILE = "handoff_check.json"   # the hand-off checked, when it is not the run's result.json as is
+SENDBACKS_ENV = "TTP_HANDOFF_CHECK_SENDBACKS"   # "used/cap", set by the daemon on a task run
+STOP_FILE = "handoff_check.stops"   # in the run dir: the stops the hook refused on a failed check
+AT_ENV = "TTP_HANDOFF_CHECK_AT"   # "stop" when the Stop hook runs the check in the worker's session
+STOP_BUDGET_S = 120               # all checks at a stop; one cut short is a timeout and never blocks
+RUN_VARS = ("TTP_RUN_DIR", "TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_PROJECT", "TTP_PIDNS", "TTP_CGROUP",
+            "TTP_LOCKS_HELD", "TTP_DETACHED", "TTP_OUTLIVES_RUN", "TTP_HANDOFF_GUARD", SENDBACKS_ENV)
 SEEN_TTL_S = 300
 KILL_WAIT_S = 5                   # the wait for a killed check's output; an escaped child is not waited for
 _seen: dict[tuple[str, int, str], tuple[float, dict]] = {}
@@ -123,10 +137,11 @@ def _tail(text: str) -> str:
     return text if len(text) <= OUTPUT_CHARS else "…" + text[-OUTPUT_CHARS:]
 
 
-def _run_one(p: Project, check: dict, task: dict, path: Path) -> tuple[int | str, str]:
+def _run_one(p: Project, check: dict, task: dict, path: Path,
+             base_env: dict | None = None) -> tuple[int | str, str]:
     """(exit code, or "timeout" or "error: ..."; its output's tail). The command's process group is
     killed on a timeout."""
-    env = dict(os.environ, TTP_RESULT_JSON=str(path), TTP_TASK_ID=str(task["id"]),
+    env = dict(os.environ if base_env is None else base_env, TTP_RESULT_JSON=str(path), TTP_TASK_ID=str(task["id"]),
                TTP_TASK_KIND=str(task.get("kind") or "work"))
     if task.get("kind") == "harness":   # the daemon's own verdict, so a check never asks for a merge the run cannot make
         from . import harnesstree
@@ -147,16 +162,24 @@ def _run_one(p: Project, check: dict, task: dict, path: Path) -> tuple[int | str
     return res.rc, out
 
 
-def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) -> dict:
+def run(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None, deadline: float | None = None,
+        base_env: dict | None = None) -> dict:
     """Runs the checks that apply, in order, up to the first that fails. {"failed": {name, output} or
-    None, "broken": [{name, run, why, output}]}; {} when none apply."""
+    None, "broken": [{name, run, why, output}]}; {} when none apply. By `deadline` (time.monotonic)
+    each check's timeout is cut to the time left, and none starts after it."""
     checks = applies(cfg, task, handoff)
     if not checks:
         return {}
     path = _input_file(handoff, run_dir)
     got: dict = {"failed": None, "broken": []}
     for c in checks:
-        rc, output = _run_one(p, c, task, path)
+        if deadline is not None:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                got["broken"].append({"name": c["name"], "run": c["run"], "why": "timeout", "output": ""})
+                break
+            c = dict(c, timeout_s=min(c["timeout_s"], left))
+        rc, output = _run_one(p, c, task, path, base_env)
         if rc == 0:
             continue
         if rc == 1:
@@ -186,6 +209,47 @@ def verdict(p: Project, cfg: dict, task: dict, handoff, run_dir: Path | None) ->
     if hit and hit[0] > time.time():
         return hit[1]
     return run(p, cfg, task, handoff, run_dir)
+
+
+def stop_sendbacks(run_dir: Path | None) -> int:
+    """The stops the Stop hook refused in this run on a failed check (at_stop)."""
+    try:
+        return max(0, int((run_dir / STOP_FILE).read_text())) if run_dir is not None else 0
+    except (OSError, ValueError):
+        return 0
+
+
+def at_stop(run_dir: Path) -> str | None:
+    """In the worker's Stop hook: the reason to refuse the stop when a check fails (exit 1) on the run's
+    result.json and the send-back cap leaves room, else None. The refusal is counted (STOP_FILE) before
+    it is returned: a count that cannot be written never refuses. Raises on faults; the hook fails open."""
+    try:
+        used, cap = (int(x) for x in os.environ.get(SENDBACKS_ENV, "").split("/"))
+    except ValueError:
+        return None
+    stops = stop_sendbacks(run_dir)
+    if used + stops >= cap:
+        return None
+    handoff = json.loads((run_dir / "result.json").read_text())
+    if not isinstance(handoff, dict) or handoff.get("status") not in STATUSES:
+        return None
+    p = Project(os.environ["TTP_PROJECT"])
+    if not p.exists():   # never a database made where no project is
+        return None
+    cfg = p.config()
+    task = p.db.task(int(os.environ["TTP_TASK"]))
+    if not task or not applies(cfg, task, handoff):
+        return None
+    env = {k: v for k, v in os.environ.items() if k not in RUN_VARS}
+    env[AT_ENV] = "stop"
+    bad = run(p, cfg, task, handoff, run_dir, time.monotonic() + STOP_BUDGET_S, env).get("failed")
+    if not bad:
+        return None
+    durable_write(run_dir / STOP_FILE, str(stops + 1))
+    out = bad["output"] or "(no output)"
+    return (f"tt-project: the project's hand-off check '{bad['name']}' rejected your hand-off (send-back "
+            f"{used + stops + 1} of {cap}); nothing was posted or queued. Fix what it names, write "
+            f"$TTP_RUN_DIR/result.json again, then stop. Its output:\n{out}")
 
 
 def reason(failed: dict, n: int, cap: int) -> str:

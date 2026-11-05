@@ -26,7 +26,9 @@ with no branch on record (NO_BRANCH_ENV) that names no PR, `published` change or
 `head` gets a warning naming those fields, since the daemon could queue no review of it. A Stop hook (Claude Code, task runs only: the
 daemon sets HANDOFF_GUARD_ENV) refuses to end a run whose result.json is missing or no hand-off, with
 a one-line reason; it lets the run end when `stop_hook_active` is set or after MAX_STOP_BLOCKS
-refusals, so it never loops, and stays silent in a subagent and outside a task run.
+refusals, so it never loops, and stays silent in a subagent and outside a task run. On a valid hand-off
+it runs the project's hand-off checks (handoffcheck.at_stop) and refuses the stop with a failed check's
+output, so the same session fixes it, within the task's send-back cap.
 
 Before a Bash call it denies the obvious ways around the harness's PR draft guard (prguard.py):
 gh called by a path or from a variable, a gh further down PATH (`which -a`, `hash -p`, or a PATH
@@ -226,14 +228,22 @@ def post_tool_use(payload: dict) -> tuple[dict | None, Callable[[], None] | None
 
 
 def stop(payload: dict) -> tuple[dict | None, Callable[[], None] | None]:
-    """Refuse to end a task run with no valid hand-off, at most MAX_STOP_BLOCKS times."""
+    """Refuse to end a task run with no valid hand-off, at most MAX_STOP_BLOCKS times; or one whose
+    hand-off fails one of the project's hand-off checks, within its send-back cap (handoffcheck.at_stop)."""
     run_dir = os.environ.get("TTP_RUN_DIR")
     if (not run_dir or os.environ.get(HANDOFF_GUARD_ENV) != "1" or not os.environ.get("TTP_TASK")
-            or payload.get("agent_id") or payload.get("stop_hook_active")):
+            or payload.get("agent_id")):
         return None, None
     rd = Path(run_dir)
     problem = handoff_problem(rd / RESULT_FILE)
     if not problem:
+        from . import handoffcheck
+        try:
+            why = handoffcheck.at_stop(rd)   # its own count bounds it, also when stop_hook_active is set
+        except Exception:   # a broken check or hook never holds the run: the daemon's check is the gate
+            why = None
+        return ({"decision": "block", "reason": why} if why else None), None
+    if payload.get("stop_hook_active"):
         return None, None
     try:
         blocks = int((rd / STOP_BLOCKS_FILE).read_text())

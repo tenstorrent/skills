@@ -229,6 +229,10 @@ prolonged whole-box outage.
   and branch kept, and its one coordinator event names the check and its output. Any other exit or a
   timeout is a broken check: the hand-off is accepted and the coordinator gets one
   `handoff_check_broken` event per check and failure. `ttp config` reports malformed entries.
+  In Claude Code runs the worker's Stop hook runs the same checks first: exit 1 refuses the stop with
+  the check's output, so the same session fixes it rather than a new run, and each refusal counts as
+  a send-back. There the command also sees `TTP_HANDOFF_CHECK_AT=stop`, and the checks get 120 s in
+  all; a broken or slow check lets the run end, and the daemon's run of the checks stays the final gate.
   The plugin ships one: `{"name": "leftover-procs", "run": "ttp leftover-procs {result}"}` sends a done
   hand-off back while a process runs in the task's own worktree (its resolved working directory is
   `tt-project/worktrees/t<id>` of this project or below it, so another project's task with the same

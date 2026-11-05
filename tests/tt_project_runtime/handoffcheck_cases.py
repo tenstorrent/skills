@@ -449,3 +449,164 @@ def test_a_harness_landed_verdict_is_given_only_to_harness_tasks_checks(env):
     p.config_path.write_text(json.dumps(cfg))
     _hc_hand_off(env, p, _hc_task(p), _GOOD)
     assert log.read_text().splitlines() == ["[]"]
+
+
+# In the worker's own session: the Stop hook runs the checks first (handoffcheck.at_stop, hook.stop).
+def _hc_session(env, p, tid, monkeypatch, sendbacks="0/2"):
+    run_dir = env["tmp"] / f"run-hc-stop-{tid}-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_HANDOFF_GUARD", "1")
+    if sendbacks is None:
+        monkeypatch.delenv("TTP_HANDOFF_CHECK_SENDBACKS", raising=False)
+    else:
+        monkeypatch.setenv("TTP_HANDOFF_CHECK_SENDBACKS", sendbacks)
+    return run_dir
+
+
+def _hc_stop(monkeypatch, run_dir, result, active=False):
+    from ttp import hook
+    (run_dir / "result.json").write_text(json.dumps(result))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdin", io.StringIO(json.dumps({"hook_event_name": "Stop", "stop_hook_active": active})))
+    monkeypatch.setattr(sys, "stdout", out)
+    assert hook.main(["hook", "Stop"]) == 0
+    return json.loads(out.getvalue()) if out.getvalue() else None
+
+
+def _hc_finish(p, tid, run_dir):
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage as Usage
+    p.db.update_task(tid, status="running")
+    d = Daemon(p.base)
+    with d.p.db.tx():
+        d._finish_worker({"task": tid, "id": 1, "note": "{}"}, Usage(cost_usd=1.0), "ok", run_dir)
+    return p.db.task(tid)
+
+
+def test_a_failing_hand_off_check_is_fixed_in_the_same_session_with_no_new_run(env, monkeypatch):
+    p = make(env)
+    log = _hc_setup(env, p, [{"name": "says what it verified", "run": "python3 SCRIPT {result}"}])
+    tid = _hc_task(p)
+    run_dir = _hc_session(env, p, tid, monkeypatch)
+    out = _hc_stop(monkeypatch, run_dir, _BAD)
+    assert out["decision"] == "block" and "says what it verified" in out["reason"]
+    assert "must say 'verified:'" in out["reason"] and "send-back 1 of 2" in out["reason"]
+    assert _hc_runs(log)[0] == {"task": str(tid), "kind": "work", "cwd": str(p.root)}
+    # The session fixes it; Claude Code marks that stop stop_hook_active, and the checks still run.
+    assert _hc_stop(monkeypatch, run_dir, _GOOD, active=True) is None
+    assert len(_hc_runs(log)) == 2
+    t = _hc_finish(p, tid, run_dir)
+    assert t["status"] == "done" and _hc_replies(p) == ["It is up (checked)."]
+    assert "woke" not in json.loads(t["result"]), "no new run"
+    assert handoffcheck_key() not in json.loads(t["result"]), "a pass clears the count"
+    assert len(_hc_runs(log)) == 3, "the daemon's check is still the final gate"
+
+
+def test_a_broken_or_slow_hand_off_check_never_blocks_the_stop(env, monkeypatch):
+    from ttp import handoffcheck
+    p = make(env)
+    _hc_setup(env, p, [{"name": "crashes", "run": "exit 3"}, {"name": "hangs", "run": "sleep 30", "timeout_s": 0.5}])
+    tid = _hc_task(p)
+    run_dir = _hc_session(env, p, tid, monkeypatch)
+    started = time.monotonic()
+    assert _hc_stop(monkeypatch, run_dir, _BAD) is None
+    assert time.monotonic() - started < 10
+    assert not (run_dir / handoffcheck.STOP_FILE).exists()
+    # One cut short by the Stop hook's own budget is a timeout too, and so is one past it.
+    _hc_setup(env, p, [{"name": "slow", "run": "sleep 30", "timeout_s": 60},
+                       {"name": "says what it verified", "run": "python3 SCRIPT {result}"}])
+    monkeypatch.setattr(handoffcheck, "STOP_BUDGET_S", 0.5)
+    started = time.monotonic()
+    assert _hc_stop(monkeypatch, run_dir, _BAD) is None
+    assert time.monotonic() - started < 10
+    # A fault of the hook itself (an unreadable project) lets the run end too.
+    _hc_setup(env, p, [{"name": "says what it verified", "run": "python3 SCRIPT {result}"}])
+    monkeypatch.setenv("TTP_PROJECT", str(env["tmp"] / "no-such-project"))
+    assert _hc_stop(monkeypatch, run_dir, _BAD) is None
+    assert not (env["tmp"] / "no-such-project").exists(), "no database is made there"
+    # Without the daemon's send-back count (an older daemon, or none apply) the hook runs no check.
+    run_dir = _hc_session(env, p, tid, monkeypatch, sendbacks=None)
+    assert _hc_stop(monkeypatch, run_dir, _BAD) is None
+    for bad in ("", "x/2", "1"):
+        run_dir = _hc_session(env, p, tid, monkeypatch, sendbacks=bad)
+        assert _hc_stop(monkeypatch, run_dir, _BAD) is None
+    # A wait is not checked at a stop either.
+    run_dir = _hc_session(env, p, tid, monkeypatch)
+    assert _hc_stop(monkeypatch, run_dir, {"status": "waiting", "summary": "x", "retry_when": "true"}) is None
+
+
+def test_stop_hook_send_backs_count_toward_the_cap_and_the_daemon_gate_still_rejects(env, monkeypatch):
+    from ttp import handoffcheck
+    p = make(env)
+    _hc_setup(env, p, [{"name": "says what it verified", "run": "python3 SCRIPT {result}"}])
+    # One send-back already used: the session gets one refusal, then the run may end.
+    tid = _hc_task(p)
+    run_dir = _hc_session(env, p, tid, monkeypatch, sendbacks="1/2")
+    assert "send-back 2 of 2" in _hc_stop(monkeypatch, run_dir, _BAD)["reason"]
+    assert _hc_stop(monkeypatch, run_dir, _BAD, active=True) is None, "capped: it never loops"
+    assert handoffcheck.stop_sendbacks(run_dir) == 1
+    p.db.update_task(tid, result=json.dumps({handoffcheck.KEY: 1}))
+    t = _hc_finish(p, tid, run_dir)
+    assert t["status"] == "review", "the daemon's gate rejects it and the cap counts the session's send-back"
+    assert _hc_replies(p) == []
+    # Room left: the daemon sends a still-failing hand-off back once more, counting the session's.
+    tid = _hc_task(p, chat="c2")
+    run_dir = _hc_session(env, p, tid, monkeypatch, sendbacks="0/3")
+    p.config_path.write_text(json.dumps({**json.loads(p.config_path.read_text()),
+                                         "worker": {**p.config()["worker"], "handoff_check_max_sendbacks": 3}}))
+    assert _hc_stop(monkeypatch, run_dir, _BAD)["decision"] == "block"
+    (run_dir / "result.json").write_text(json.dumps(_BAD))
+    t = _hc_finish(p, tid, run_dir)
+    res = json.loads(t["result"])
+    assert t["status"] == "queued" and "send-back 2 of 3" in res["woke"] and res[handoffcheck.KEY] == 2
+    assert _hc_replies(p, "c2") == []
+    # A spent cap refuses nothing in the session.
+    run_dir = _hc_session(env, p, tid, monkeypatch, sendbacks="3/3")
+    assert _hc_stop(monkeypatch, run_dir, _BAD) is None
+
+
+def test_task_runs_get_their_hand_off_check_send_backs_only_when_checks_apply(env, monkeypatch):
+    from ttp import daemon as dmod, handoffcheck
+    from ttp.daemon import Daemon
+    p = make(env)
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dmod.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    monkeypatch.setenv(handoffcheck.SENDBACKS_ENV, "9/9")   # never inherited
+    tid = _hc_task(p)
+
+    def run():
+        d = Daemon(p.base)
+        rid = d.start_run("worker", "go", "claude", "light", str(p.root), task=p.db.task(tid))
+        return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
+
+    assert handoffcheck.SENDBACKS_ENV not in run(), "no checks configured"
+    _hc_setup(env, p, [{"name": "c", "run": "true"}], handoff_check_max_sendbacks=3)
+    p.db.update_task(tid, result=json.dumps({handoffcheck.KEY: 2}))
+    assert run()[handoffcheck.SENDBACKS_ENV] == "2/3"
+    _hc_setup(env, p, [{"name": "c", "run": "true", "kinds": ["code"]}])
+    assert handoffcheck.SENDBACKS_ENV not in run(), "none apply to this kind"
+
+
+def test_leftover_procs_at_the_stop_hook_skips_the_sessions_own_children_only(tmp_path, monkeypatch):
+    from ttp import leftoverprocs
+    wt = tmp_path / "worktrees" / "t7"
+    wt.mkdir(parents=True)
+    procs = [{"pid": 100, "ppid": 1, "cwd": str(wt), "cmd": "claude"},          # the session
+             {"pid": 101, "ppid": 100, "cwd": str(wt), "cmd": "an mcp server"},  # its own child
+             {"pid": 102, "ppid": 1, "cwd": str(wt), "cmd": "a server it left"},
+             {"pid": 103, "ppid": 50, "cwd": str(wt), "cmd": "child of an ancestor outside it"},
+             {"pid": 50, "ppid": 1, "cwd": str(tmp_path), "cmd": "runner"}]
+    monkeypatch.setattr(leftoverprocs, "_ancestors", lambda: {100, 50})
+    monkeypatch.delenv("TTP_HANDOFF_CHECK_AT", raising=False)
+    rc, msg = leftoverprocs.check({"status": "done"}, wt, procs)
+    assert rc == 1 and all(f"pid {n} " in msg for n in (101, 102, 103))
+    monkeypatch.setenv("TTP_HANDOFF_CHECK_AT", "stop")
+    rc, msg = leftoverprocs.check({"status": "done"}, wt, procs)
+    assert rc == 1 and "pid 101 " not in msg and "pid 102 " in msg and "pid 103 " in msg

@@ -128,7 +128,9 @@ def test_the_stop_hook_runs_as_claude_code_runs_it(monkeypatch, tmp_path):
     from ttp.providers.claude import hook_settings
     s = hook_settings()
     stop = s["hooks"]["Stop"][0]["hooks"][0]
-    assert stop["command"].endswith("-m ttp.hook Stop") and stop["timeout"] <= 30
+    from ttp import handoffcheck
+    # Room for the hand-off checks' own budget (handoffcheck.at_stop), which ends them first.
+    assert stop["command"].endswith("-m ttp.hook Stop") and handoffcheck.STOP_BUDGET_S < stop["timeout"] <= 300
     run_dir = _guard_run(monkeypatch, tmp_path)
     env = {**os.environ, **s["env"]}
     r = subprocess.run(stop["command"], shell=True, input=json.dumps({"hook_event_name": "Stop"}), text=True,

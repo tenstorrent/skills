@@ -3023,6 +3023,13 @@ class Daemon:
             if task and role in ("worker", "reviewer") and handoff_guard:
                 from .hook import HANDOFF_GUARD_ENV, NO_BRANCH_ENV
                 env[HANDOFF_GUARD_ENV] = "1"
+                # Its Stop hook runs the project's hand-off checks first, within the send-back cap
+                # (handoffcheck.at_stop); none apply, or a hand-off a push already checked: no variable.
+                env.pop(handoffcheck.SENDBACKS_ENV, None)   # never an inherited value
+                row = self.p.db.task(task["id"]) or task
+                if handoffcheck.applies(self.cfg, row, {"status": "done"}) and not _push_rechecked(row):
+                    used = int(load_result(row.get("result")).get(handoffcheck.KEY) or 0)
+                    env[handoffcheck.SENDBACKS_ENV] = f"{used}/{handoffcheck.max_sendbacks(self.cfg)}"
                 # Its hook warns a code hand-off that names no change the daemon could review (hook.handoff_warning).
                 env.pop(NO_BRANCH_ENV, None)   # never an inherited value
                 if role == "worker" and task.get("kind") == "code" \
@@ -5246,6 +5253,8 @@ class Daemon:
         # review or push is queued; past the cap the task goes to review, its result kept. A broken one
         # never holds a hand-off back: the coordinator hears once per check.
         sent_back = int(load_result(task["result"]).get(handoffcheck.KEY) or 0)
+        if not _daemon_precheck(r, handoff) and not _push_rechecked(task):
+            sent_back += handoffcheck.stop_sendbacks(run_dir)   # the run's Stop hook sent its hand-off back
         hcheck_text = ""
         checked: dict = {}
         if status == "ok" and not waiting and not refusal and not push_quiet and not _daemon_precheck(r, handoff) \

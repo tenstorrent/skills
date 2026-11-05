@@ -536,6 +536,9 @@ def _read_json(path: Path) -> dict:
     return data if isinstance(data, dict) else {}
 
 
+STOP_HOOK_TIMEOUT_S = 150   # over handoffcheck.STOP_BUDGET_S: the hook ends the checks itself
+
+
 def hook_settings() -> dict:
     """Route tool-use and Stop events through `ttp.hook`, so coordinator updates reach a running worker,
     Bash calls cannot get around the PR draft guard and a task run does not end without a hand-off.
@@ -555,8 +558,10 @@ def hook_settings() -> dict:
                       # to the harness's gh wrapper and gh.d pre-hooks outside a harness task.
                       "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit",
                                       "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}],
-                      # Refuses to end a task run whose result.json is missing or no hand-off (twice at most).
-                      "Stop": [{"hooks": [{"type": "command", "command": f"{cmd} Stop", "timeout": 20}]}]},
+                      # Refuses to end a task run whose result.json is missing or no hand-off (twice at most),
+                      # or fails a hand-off check (the checks get handoffcheck.STOP_BUDGET_S in all).
+                      "Stop": [{"hooks": [{"type": "command", "command": f"{cmd} Stop",
+                                           "timeout": STOP_HOOK_TIMEOUT_S}]}]},
             "env": {"PYTHONPATH": runtime}}
 
 

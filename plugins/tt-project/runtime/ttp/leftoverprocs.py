@@ -7,7 +7,10 @@ A process is the task's only when its working directory, resolved (realpath), is
 worktree, <project>/tt-project/worktrees/t<id>, or below it, compared by whole path components. So
 t39 never claims a process in t390 or t3922, and a same-numbered task of another project on the host
 (its own worktrees/t<id>) is never this one's: a bare t<id> or a cwd substring never counts. A
-process of another user, a zombie, or this check and its ancestors never counts either.
+process of another user, a zombie, or this check and its ancestors never counts either. Run from the
+worker's Stop hook (TTP_HANDOFF_CHECK_AT=stop, handoffcheck.at_stop) the session itself still runs, so
+the direct children of an ancestor that runs in the worktree (the session's own servers) do not count;
+the daemon's run of the check after the session ended still sees any of them left.
 
 A process the hand-off means to leave running is listed in it as "leftover_procs":
 [{"pid": N, "stop": "<how it stops>", "ends": "<when>"}]; one with all three is not reported.
@@ -34,7 +37,7 @@ def _ancestors() -> set[int]:
 
 
 def listing() -> list[dict]:
-    """This user's live processes as {pid, cwd, cmd}; cwd as the kernel reports it (resolved later)."""
+    """This user's live processes as {pid, ppid, cwd, cmd}; cwd as the kernel reports it (resolved later)."""
     try:
         names = [n for n in os.listdir(PROC) if n.isdigit()]
     except OSError:
@@ -43,16 +46,17 @@ def listing() -> list[dict]:
     for name in names:
         d = PROC / name
         try:
-            if d.stat().st_uid != uid or (d / "stat").read_text().rsplit(")", 1)[1].split()[0] in ("Z", "X"):
+            stat = (d / "stat").read_text().rsplit(")", 1)[1].split()
+            if d.stat().st_uid != uid or stat[0] in ("Z", "X"):
                 continue
-            cwd = os.readlink(d / "cwd")
-        except (OSError, IndexError):
+            cwd, ppid = os.readlink(d / "cwd"), int(stat[1])
+        except (OSError, IndexError, ValueError):
             continue
         try:
             cmd = (d / "cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()
         except OSError:
             cmd = ""
-        out.append({"pid": int(name), "cwd": cwd, "cmd": cmd})
+        out.append({"pid": int(name), "ppid": ppid, "cwd": cwd, "cmd": cmd})
     return out
 
 
@@ -94,7 +98,13 @@ def check(result: dict, worktree: Path, procs: list[dict] | None = None) -> tupl
     if result.get("status") != "done":
         return 0, ""
     procs = listing() if procs is None else procs
-    bad = leftovers(worktree, procs, allowed(result) | _ancestors())
+    ancestors = _ancestors()
+    skip = allowed(result) | ancestors
+    if os.environ.get("TTP_HANDOFF_CHECK_AT") == "stop":
+        session = {int(pr["pid"]) for pr in procs
+                   if int(pr["pid"]) in ancestors and claims(str(pr.get("cwd") or ""), worktree)}
+        skip |= {int(pr["pid"]) for pr in procs if pr.get("ppid") in session}
+    bad = leftovers(worktree, procs, skip)
     if not bad:
         return 0, ""
     lines = "\n  ".join(f"pid {pr['pid']} cwd {pr.get('cwd')}: {(pr.get('cmd') or '')[:CMD_CHARS]}" for pr in bad)
