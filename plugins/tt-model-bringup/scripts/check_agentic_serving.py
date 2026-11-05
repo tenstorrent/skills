@@ -251,6 +251,14 @@ def check_evals(model_dir: Path, carried: int, problems: list) -> None:
     plan = read(evals / "plan.json", problems) if (evals / "plan.json").is_file() else {}
     if (evals / "plan.json").is_file() and (plan.get("mode") not in MODES or not plan.get("schedule")):
         problems.append((2, f"plan.json needs mode ({', '.join(MODES)}) and the schedule"))
+    release = plan.get("release") if isinstance(plan, dict) else None
+    if (evals / "plan.json").is_file():
+        limit = plan.get("release_hours", 12)
+        if not (isinstance(release, dict) and release.get("rehearsal") and number(release.get("projected_hours"))):
+            problems.append((2, "plan.json release needs its rehearsal runs and projected_hours"))
+        elif release["projected_hours"] > limit:
+            problems.append((2, f"release projected at {release['projected_hours']} h against {limit} h; "
+                                "release a smaller list"))
     learned = read(evals / "learned.json", problems)
     if learned and not all(isinstance(learned.get(key), list) for key in LEARNED):
         problems.append((2, f"learned.json needs {', '.join(LEARNED)} as lists, empty when there is nothing"))

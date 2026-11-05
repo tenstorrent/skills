@@ -76,7 +76,8 @@ def goal12(model, **overrides):
     evals = model / 'doc/agentic_evals'
     (evals / 'full/swe').mkdir(parents=True, exist_ok=True)
     files = {
-        'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'latest_start_hours': 12}]},
+        'plan.json': {'mode': 'light', 'schedule': [{'step': 'release', 'start_hours': 20}], 'release_hours': 12,
+                      'release': {'rehearsal': ['runs/rehearsal-swe'], 'projected_hours': 9.5}},
         'REPORT.md': '# Report',
         'estimate.json': {'evals': {'swe': {'decision': 'go', 'reason': 'fits'}}},
         'full/swe/results.json': {'actual_hours': 6.5},
@@ -379,3 +380,14 @@ def test_agent_replay_reports_hits_and_prefill_amplification(tmp_path):
     assert summary['prefilled_tokens'] == 260 and summary['final_context_tokens'] == 260
     assert summary['prefilled_per_final_context'] == 1.0
     assert summary['preemptions'] == 0
+
+
+@pytest.mark.parametrize('release, message', [
+    ({'projected_hours': 9.5}, 'rehearsal'),
+    ({'rehearsal': ['runs/r'], 'projected_hours': 13}, 'smaller list'),
+])
+def test_release_needs_a_rehearsal_and_a_projection_that_fits(tmp_path, release, message):
+    plan = {'mode': 'light', 'schedule': [{}], 'release_hours': 12, 'release': release}
+    goal12(tmp_path, **{'plan.json': plan})
+    code, stderr = check(tmp_path, 'agentic-evals', evidence())
+    assert code == 2 and message in stderr

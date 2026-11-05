@@ -124,9 +124,10 @@ far it got with `functional_at` and the estimate that stopped it.
 
 The device is the scarce resource and the clock is fixed. Manage both.
 
-- **Plan the clock first.** In `plan.json`, write the schedule: survey, rungs, efforts and the
-  start of the release run, which must fall inside the stage time limit, with the release run's
-  estimated length. Leave time before that start to prepare and check its configuration. Update
+- **Plan the clock first.** In `plan.json`, write the schedule: survey, rungs, efforts, the
+  rehearsal and the start of the release run, which must fall inside the stage time limit, with
+  the release run's estimated length. Schedule the rehearsal early enough to fix what it finds and
+  rehearse again before that start; efforts end when the rehearsal must begin. Update
   the plan after every run with measured times.
 - **One job on the device at a time, and always one.** Queue the next device job before the
   current one ends. While a long run holds the device, agents analyse, write code and prepare the
@@ -251,12 +252,20 @@ time measured there projects the next rung to finish before the release run must
 5. **Efforts**, ranked against the last banked rung, in the time the plan leaves them. They start
    once the smoke rung is banked and share the device through the queue; a rung never waits for
    an effort.
-6. **Combine, about 2 h.** Re-check the current best, then one scored probe.
+6. **Combine and rehearse.** Freeze the release configuration: serving settings, task lists,
+   limits, route and commits. Then run each suite on it end to end, at the full-load size or the
+   release lists themselves if they fit, and check what a longer run adds: disk for every task,
+   concurrent sandboxes, image pulls, verifiers. Fix what fails and rehearse again. Nothing changes
+   after the last clean rehearsal.
 7. **Larger rungs**, `full` mode only, growing each suite toward the largest list that fits
    `release_hours`.
 8. **Release run**, started before the stage time limit and allowed to finish after it, within
-   `release_hours`, through the same route every earlier run used: in `light` the mid-size lists of all suites within `release_hours` in total, in
-   `full` each suite's largest fitting list. An infrastructure failure is run again.
+   `release_hours`, through the same route every earlier run used. It must land without help:
+   start it only on the rehearsed configuration and only when its projection, with each suite's
+   slow tail at the agent limit, fits `release_hours` with margin. Otherwise release a smaller
+   list that does. Run: in `light` the mid-size lists of all suites within `release_hours` in total, in
+   `full` each suite's largest fitting list. A failure during it is reported, not fixed: the
+   release result is what it ran.
 
 A measured stop is a valid result at any rung. Report it with `functional_at` and the estimate
 that decided it.
@@ -332,7 +341,9 @@ Write these to `doc/agentic_evals/`:
   `used_device_hours`, `change` (`kept`, `dropped`, `none`), `problem_status` (`solved`, `open`),
   `confirmed` and `evidence`; and `rankings`, each with `after`, `order` (`problem`,
   `saving_hours`, `device_hours`, `unblocks`) and a `reason` when it departs from the two tiers
-- `plan.json`, with the `mode` and the schedule, updated after every run
+- `plan.json`, with the `mode`, the schedule updated after every run, `release_hours`, and
+  `release`: the frozen configuration, the `rehearsal` runs that ran it end to end, and
+  `projected_hours` with each suite's slow tail
 - `runs/<arm>/` (manifest and collected results)
 - `estimate.json`: per eval `decision` (`go` or `stop`), `reason` and `functional_at`, the size of
   the largest task list that completed with valid scores
