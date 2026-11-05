@@ -113,10 +113,11 @@ class _Est:
         if not t or t["status"] not in ("queued", "waiting"):
             return None
         if self._gates is None:
-            self._gates = self.db.kv("gates", {}) or {}
+            got = self.db.kv("gates", {})
+            self._gates = got if isinstance(got, dict) else {}
         prov = t.get("provider") or self.core
         g = self._gates.get(prov)
-        if not isinstance(g, dict) or g.get("allow_new_work", True):
+        if not isinstance(g, dict) or g.get("allow_new_work", True) is not False:
             return None
         if (g.get("lane") or {}).get("max_parallel"):   # the coordinator turn guard: routine work only
             if self._owners is None:
@@ -127,8 +128,10 @@ class _Est:
                     self._owners = set()
             if urgent.is_urgent(t) or urgent.user_ordered(t, self._owners):
                 return None
-        gate = bud.Gate(**{k: v for k, v in g.items() if k in bud.Gate.__dataclass_fields__})
-        return bud.hold_clears(self.db, gate, self.now, (self.db.kv(f"limited:{prov}") or {}).get("until"))
+        gate = bud.Gate(provider=prov, reasons=[r for r in g.get("reasons") or [] if isinstance(r, str)],
+                        numbers=g.get("numbers") if isinstance(g.get("numbers"), dict) else {})
+        lim = self.db.kv(f"limited:{prov}")
+        return bud.hold_clears(self.db, gate, self.now, lim.get("until") if isinstance(lim, dict) else None)
 
     def _held_none(self, tid: int, clears: str) -> dict:
         return self._none(tid, f"#{tid} is held by the spend cap until {clears}")

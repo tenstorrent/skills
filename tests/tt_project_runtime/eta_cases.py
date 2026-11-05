@@ -289,6 +289,13 @@ def test_eta_red_spend_gate_with_no_known_reset_gives_no_clock_time(env):
     _eta_gate(p, reasons=["cap reached: $5.00/today of $5, $40.00/7d of $40"],
               numbers={"day_end": now + 3600, "daily_cap": 5, "weekly_cap": 40, "spent_7d": 40})
     assert "held by the spend cap" in eta.estimate(p.db, t, now)["why"]
+    # A malformed stored gate holds what it says it holds and never breaks the estimate.
+    p.db.set_kv("gates", {"claude": {"allow_new_work": False, "reasons": None, "numbers": None}})
+    assert "held by the spend cap" in eta.estimate(p.db, t, now)["why"]
+    p.db.set_kv("gates", {"claude": {"allow_new_work": False, "reasons": ["cap reached: x"], "numbers": [1]}})
+    assert "held by the spend cap" in eta.estimate(p.db, t, now)["why"]
+    p.db.set_kv("gates", ["not", "a", "map"])
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 1500)
     # One known and one unknown reset: unknown.
     _eta_gate(p, reasons=["runaway guard: x", "global daily cap reached: y"], numbers={})
     assert eta.estimate(p.db, t, now)["end"] is None
