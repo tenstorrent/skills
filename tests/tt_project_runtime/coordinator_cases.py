@@ -16520,6 +16520,112 @@ def test_promise_replay_671_recorded_listed_overdue_and_raised_once(env, monkeyp
     assert [i["status"] for i in sweep.items(p.db, _pdt(12), p) if i["kind"] == "promise"] == ["promised"]
 
 
+def _must_act_setup(env, monkeypatch):
+    """The replay-671 promise, overdue: one promise_overdue event carrying must_act, a daemon whose
+    batching holds would all hold, and `turn(actions)`: one maybe_coordinate pass and, if it started a
+    turn, its finish with `actions`. Returns the turn's (prompt, note) or None."""
+    from types import SimpleNamespace
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, _, _, check = _ob_setup(env, monkeypatch)
+    p.set_config("home_timezone", "America/Los_Angeles")
+    _next_message_id(p, 671)
+    monkeypatch.setattr(time, "time", lambda: _pdt(11))
+    assert coord.apply(p, [{"type": "reply", "chat": "c1", "text": I_WILL_DELIVER}]) == []
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    check(_pdt(17, 20))
+    [ev] = _promise_events(p)
+    clock = [_pdt(17, 21)]
+    monkeypatch.setattr(time, "time", lambda: clock[0])
+    d.update_gates()
+    for hold in ("_burst_hold", "_batch_hold", "_event_hold"):
+        monkeypatch.setattr(d, hold, lambda *a: True)   # every batching hold would hold this batch
+    told: list = []
+    monkeypatch.setattr(d, "observe", lambda src, text, *a, **k: told.append((src, text, k.get("key"))))
+    started: list = []
+
+    def start_run(role, prompt, *a, **k):
+        started.append((prompt, k["note"]))
+        return p.db.x("INSERT INTO runs(role,started,status,note) VALUES('coordinator',?,'ok',?)",
+                      (clock[0], json.dumps(k["note"])))
+    monkeypatch.setattr(d, "start_run", start_run)
+
+    def turn(actions):
+        clock[0] += 120
+        n = len(started)
+        d.maybe_coordinate()
+        if len(started) == n:
+            return None
+        rid = p.db.one("SELECT MAX(id) id FROM runs")["id"]
+        usage = SimpleNamespace(structured={"actions": actions, "summary": ""}, error="", final_text="", cost_usd=0.2)
+        d._finish_coordinator({"id": rid, "dir": "x", "started": clock[0]}, usage, "ok", started[-1][1])
+        return started[-1]
+    return p, d, ev, ob.open_promises(p.db)[0], turn, told, check
+
+
+def test_must_act_overdue_promise_wakes_past_the_holds_rewakes_once_then_tells_its_chat(env, monkeypatch):
+    """An overdue promise wakes the coordinator although every batching hold would hold, with the
+    must-act block first in its prompt. A turn that ignores it re-wakes once; ignored again, the daemon
+    tells chat c1 model-free and raises one issue. Nothing about the same state wakes or posts twice."""
+    from ttp import mustact
+    p, d, ev, o, turn, told, check = _must_act_setup(env, monkeypatch)
+    prompt, note = turn([{"type": "noop"}])
+    assert prompt.startswith(f"## {mustact.SECTION}\n") and f"- {o['id']} in chat c1" in prompt
+    assert ev["id"] in note["events"]
+    [re1] = p.db.q("SELECT * FROM events WHERE kind=?", (mustact.REWAKE_KIND,))
+    assert re1["fingerprint"] == f"{ev['fingerprint']}:rewake" and re1["status"] == "queued"
+    infos = lambda: p.db.q("SELECT * FROM messages WHERE direction='out' AND kind='info' AND text LIKE 'Automatic%'")
+    assert infos() == [] and told == []
+    prompt, note = turn([{"type": "noop"}])
+    assert "(second wake: you did not act on it last turn)" in prompt and note["events"] == [re1["id"]]
+    [post] = infos()
+    assert post["chat"] == "c1" and "promise overdue" in post["text"] and "dogfood-2 candidate" in post["text"]
+    assert told == [("daemon:must-act", told[0][1], f"must-act:{ev['fingerprint']}")]
+    # The same state never wakes or posts again: no new turn, the check raises nothing new, and a
+    # replayed settle of the same events posts nothing.
+    assert turn([{"type": "noop"}]) is None
+    check(_pdt(23))
+    assert len(_promise_events(p)) == 1 and len(p.db.q("SELECT id FROM events WHERE kind=?", (mustact.REWAKE_KIND,))) == 1
+    assert mustact.settle(p, [ev["id"], re1["id"]], [{"type": "noop"}], [0]) == [] and len(infos()) == 1
+
+
+@pytest.mark.parametrize("acted", [
+    {"type": "reply", "chat": "c1", "text": "Not ready yet: the checks run until 19:00 PDT."},
+    {"type": "obligation", "key": "o1", "evidence": "sent the candidate sha abc123 in chat c1"}])
+def test_must_act_item_a_turn_acted_on_does_not_rewake(env, monkeypatch, acted):
+    from ttp import mustact
+    p, d, ev, o, turn, told, _ = _must_act_setup(env, monkeypatch)
+    assert o["id"] == "o1"
+    assert turn([acted]) is not None
+    assert p.db.q("SELECT id FROM events WHERE kind=?", (mustact.REWAKE_KIND,)) == []
+    assert turn([{"type": "noop"}]) is None and told == []
+
+
+def test_must_act_claim_failed_by_the_claim_tick_wakes_the_coordinator(env, monkeypatch):
+    """check_claims re-runs a due claim's probe off the tick: no answer yet records nothing; exit 1 raises
+    the one claim_failed event, which wakes the coordinator past the holds with the block."""
+    from ttp import obligations as ob, mustact
+    p, d, ev, o, turn, told, _ = _must_act_setup(env, monkeypatch)
+    assert turn([{"type": "obligation", "key": o["id"], "why": "superseded"}]) is not None
+    out = p.db.post("out", "the service is live", chat="c2", kind="reply")
+    [line] = ob.record_claims(p, [(out, "c2", [{"text": "the service is live", "expect": "probe-x"}])], {},
+                              now=time.time())
+    oid = line.split()[1]
+    answers = iter([None, 1])
+    monkeypatch.setattr(d, "_probe_now", lambda probe: next(answers) if probe == "probe-x" else 0)
+    d._claims_at = 0.0
+    d.check_claims()
+    assert p.db.q("SELECT id FROM events WHERE kind=?", (ob.CLAIM_KIND,)) == []
+    d.check_claims()   # throttled: within CLAIM_EVERY_S nothing runs
+    d._claims_at = 0.0
+    d.check_claims()
+    [cf] = p.db.q("SELECT * FROM events WHERE kind=?", (ob.CLAIM_KIND,))
+    assert oid in cf["text"] and ob.due_claims(p.db, time.time()) == []
+    prompt, note = turn([{"type": "reply", "chat": "c2", "text": "Correction: the service is not live yet."}])
+    assert prompt.startswith(f"## {mustact.SECTION}\n") and f"- {oid} in chat c2" in prompt and note["events"] == [cf["id"]]
+    assert p.db.q("SELECT id FROM events WHERE kind=?", (mustact.REWAKE_KIND,)) == []
+
+
 def test_promise_owner_task_links_resend_merges_and_done_plus_reply_closes(env, monkeypatch):
     """A batch task replying to the promise's chat owns it; the same promise sent again merges its tasks
     and obligations into the one record; once every owner is done, a later reply to that chat closes it
