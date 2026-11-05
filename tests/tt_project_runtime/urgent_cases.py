@@ -227,7 +227,7 @@ def test_the_tick_sweep_releases_parked_urgent_tasks_once_and_keeps_safety_and_r
 
 def test_convgate_keeps_user_cited_and_restriction_gates_before_device_words():
     """A gate citing the user's word or naming a guard, Restriction or charter rule is a safety class,
-    filed under it before any device word; a plain convenience gate and a bare landed wait still drop."""
+    filed under it before any device word; a plain convenience gate and a mixed landed probe still drop."""
     from ttp import convgate
     p1 = {"priority": 1, "spec": "s\nurgent: soon"}
     for why, when, cls in (
@@ -241,7 +241,7 @@ def test_convgate_keeps_user_cited_and_restriction_gates_before_device_words():
             ("needs the device free", "ttp lock --probe dev-x", "shared device or machine")):
         assert convgate.safety_class(why, when) == cls, (why, when)
         assert convgate.judge(p1, None, when or "true", why) == (False, cls), (why, when)
-    for why, when in (("later is tidier", "test -e /tmp/ready"), (None, "landed:#7"),
+    for why, when in (("later is tidier", "test -e /tmp/ready"), (None, "landed:#7 && test -e /tmp/ready"),
                       ("the users table is nicer sorted", None), ("message the team after", None),
                       ("wait for a lull in live traffic", None)):   # a lull is no safety class (user msg #1571)
         assert convgate.judge(p1, None, when or "true", why) == (True, None), (why, when)
@@ -265,7 +265,7 @@ def test_urgent_gates_citing_the_user_or_a_restriction_survive_task_add_and_the_
     guard = _parked(p, "guard", 1, when="bin/no-reset-guard")
     rule = _parked(p, "rule", 1, when="test -e /tmp/never-r", why="a Restriction keeps it off until then")
     plain = _parked(p, "plain", 1, when="test -e /tmp/never-p", why="after lunch")
-    chained = _parked(p, "chained", 1, when="landed:#1")
+    chained = _parked(p, "chained", 1, when="landed:#1 && test -e /tmp/never-c")
     d = Daemon(p.base)
     d.cfg = p.config()
     d.release_urgent_gates(time.time())
@@ -621,3 +621,47 @@ def test_an_urgent_follow_up_of_another_kind_stays_with_the_coordinator(env):
     assert [k["title"] for k in p.db.q("SELECT title FROM tasks WHERE parent=?", (tid,))] == ["next step: rerun it"]
     (ev,) = [e for e in _proposed(p, tid) if "which board" in e["text"]]
     assert ev["status"] == "queued" and "its kind question is not" in ev["text"], ev["text"]
+
+
+def test_an_urgent_gate_made_only_of_landed_checks_is_a_dependency_and_stays(env):
+    """A start_when made only of `landed:#<id>` and `ttp landed --task <id>` terms joined by && waits on
+    other tasks' landed work: an urgent task keeps it whatever its why says, at task_add, task_update and
+    the tick sweep, and the note says why. A convenience probe or a mixed one still drops."""
+    from ttp import convgate, coordinator as coord
+    from ttp.daemon import Daemon
+    from ttp.db import deferral
+    p1 = {"priority": 1, "spec": "s"}
+    chain = "ttp landed --task 5924 && ttp landed --task 5925 && landed:#5926 && ttp landed --task=5927"
+    for when in (chain, "landed:#7", "ttp landed --task 7", " landed:#3 &&landed:#4 "):
+        assert convgate.landed_only(when), when
+        assert convgate.judge(p1, None, when, "the batch is in") == (False, convgate.LANDED), when
+    for when in ("", "landed:#7 && test -e /tmp/x", "landed:#7 || true", "landed:#7 &&", "ttp landed --task 7; true",
+                 "ttp landed --task 7 --branch b", "landed:#7 && && landed:#8", "test -e /tmp/landed:#7",
+                 "ttp landed --task abc"):
+        assert not convgate.landed_only(when), when
+    assert convgate.judge(p1, None, "landed:#7 && test -e /tmp/x", "tidier") == (True, None)
+    p = make(env)
+    _no_events(p)
+    first, second = (p.db.add_task(x, "s", kind="code", tier="light", origin="user", priority=3) for x in "ab")
+    p.set_config("delivery.landed_probe", "test -e landed/{id}")   # how landed:#<id> is checked here
+    both = f"ttp landed --task {first} && ttp landed --task {second}"
+    tid, notes = _gate_add(p, "p1 after batch", 1, start_when=both, why="after the batch")
+    t = p.db.task(tid)
+    assert deferral(t).get("when") and f"start_safety:{convgate.LANDED}" in json.loads(t["labels"]), t["labels"]
+    assert any(f"#{tid}" in n and "kept" in n and "only landed checks" in n for n in notes), notes
+    assert not any("dropped" in n for n in notes), notes
+    tid2, notes = _gate_add(p, "p1 tidy", 1, start_when="test -e /tmp/never-t", why="after the batch")
+    assert deferral(p.db.task(tid2)) == {} and any("dropped" in n and "not only landed checks" in n for n in notes)
+    hot, _ = _gate_add(p, "hot", 1)
+    notes = coord.apply(p, [{"type": "task_update", "id": hot, "start_when": f"landed:#{first}", "why": "x"}]) \
+        + list(p.db.kv(coord.NOTES_KEY, []))
+    assert deferral(p.db.task(hot)).get("when") and any(f"#{hot}" in n and "kept" in n for n in notes), notes
+    parked = _parked(p, "parked", 1, when=f"landed:#{first} && ttp landed --task {second}", why="nicer in order")
+    mixed = _parked(p, "mixed", 1, when=f"landed:#{first} && test -e /tmp/never-m", why="nicer in order")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.release_urgent_gates(time.time())
+    assert deferral(p.db.task(parked)).get("when"), "a landed-only probe stays"
+    assert deferral(p.db.task(mixed)) == {}, "a mixed probe follows the why"
+    ev = p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'urgent_gate_released:%'")
+    assert [e["task"] for e in ev] == [mixed] and "not only landed checks" in ev[0]["text"]

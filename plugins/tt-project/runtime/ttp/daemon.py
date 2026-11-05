@@ -7083,7 +7083,8 @@ class Daemon:
             if self._start_hold(t, t["provider"] or core, ctx) is None:
                 labels, d = convgate.stored(t)
                 kept = convgate.safety_class(d.get("why"), d.get("when")) or convgate.kept_class(labels) \
-                    or convgate.tie_class(labels, d.get("when"))
+                    or convgate.tie_class(labels, d.get("when")) \
+                    or (convgate.LANDED if convgate.landed_only(d.get("when")) else None)
                 other[t["id"]] = (t, f"its start gate ({kept or 'no safety class'}): "
                                      f"{convgate.gate_words((d.get('after') or 0) > now and d.get('after'), d.get('when'), now)}"
                                      f"{'; ' + d['why'][:120] if d.get('why') else ''}, while a worker slot is free")
@@ -10359,7 +10360,7 @@ class Daemon:
                 db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                      (now, "daemon", "observation", f"urgent_gate_released:{t['id']}:{d.get('since') or 0:.0f}",
                       "low", f"Urgent #{t['id']} {t['title'][:80]} ({urgent.why(t)}): released its {words}, whose why "
-                      f"names no safety class; it starts once its dependencies are met.", "handled", t["id"]))
+                      f"names no safety class and whose probe is not only landed checks on other tasks; it starts once its dependencies are met.", "handled", t["id"]))
             startgate.forget(db, tid=t["id"])
             self._start_rc.pop(t["id"], None)
             log(self.p, f"task {t['id']} urgent: convenience gate released ({words[:200]})")

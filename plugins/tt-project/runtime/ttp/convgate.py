@@ -10,7 +10,9 @@ dependencies are met starts now. Its start gate (a `start_after` delay, a `start
 spend cap or provider window; a shared device or machine (a lock, hold or pause, a restart, upgrade,
 reboot or power cycle; a lull, live traffic or a neighbour alone is a convenience: user msg #1571);
 another person's work; a real dependency on another task's new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
-under it before any device word. Any other gate is a convenience and is dropped:
+under it before any device word. A probe made only of `landed:#<id>` and `ttp landed --task <id>`
+terms joined by && (`landed_only`) is a dependency on other tasks' landed work (LANDED), read from
+the probe whatever its why says. Any other gate is a convenience and is dropped:
 
 - task_add and task_update (coordinator._start_args callers, deferral_update) drop it at once, the
   task starts, and the reply note says so (`dropped_note`). A gate kept for a class records it in
@@ -45,6 +47,8 @@ from .project import USER_CITE
 
 LABEL = "start_safety"   # a kept gate's safety class (one of CLASSES' names); cleared with the deferral
 DEPENDENCY = "a dependency on another task's new file or symbol"   # the class of task_add's overlap chain
+LANDED = "a dependency on other tasks' landed work"   # the class of a probe made only of landed checks
+_LANDED_TERM = re.compile(r"landed:\s*#?\d+|ttp\s+landed\s+--task(?:=|\s+)#?\d+")
 
 # (class, words in the gate's why or the probe that name it)
 CLASSES = (   # the user's word and a Restriction first: a gate citing either files under it
@@ -98,6 +102,12 @@ def tie_class(labels: list, when: str | None) -> str | None:
     return DEPENDENCY if refs & named else None
 
 
+def landed_only(when: str | None) -> bool:
+    """Whether probe `when` is only `landed:#<id>` and `ttp landed --task <id>` terms joined by &&."""
+    terms = str(when or "").split("&&")
+    return bool(str(when or "").strip()) and all(_LANDED_TERM.fullmatch(t.strip()) for t in terms)
+
+
 def judge(task: dict, after, when: str | None, why: str | None, labels: list | None = None
           ) -> tuple[bool, str | None]:
     """(drop, class) for gate (`after`, `when`, `why`) of `task` (its priority and spec as they will be):
@@ -105,7 +115,8 @@ def judge(task: dict, after, when: str | None, why: str | None, labels: list | N
     found (also for a task that is not urgent, so a later raise keeps the gate)."""
     if not after and not when:
         return False, None
-    cls = safety_class(why, when) or kept_class(labels or []) or tie_class(labels or [], when)
+    cls = safety_class(why, when) or kept_class(labels or []) or tie_class(labels or [], when) \
+        or (LANDED if landed_only(when) else None)
     return (urgent.is_urgent(task) and cls is None), cls
 
 
@@ -131,8 +142,17 @@ def dropped_note(where: str, task: dict, after, when: str | None) -> str:
     return (f"{where}: dropped {gate_words(after, when)}: the task is urgent ({urgent.why(task) or 'priority 1'}) and "
             f"the gate's why names no safety class (data loss, a spend cap or provider window, a shared device or "
             f"machine, a charter Restriction, another person's work, the user's word, a dependency on another "
-            f"task's new file or symbol), so it starts as soon as its dependencies are met; to keep a gate, give "
+            f"task's new file or symbol) and its probe is not only landed checks on other tasks, so it starts as soon as its dependencies are met; to keep a gate, give "
             f"`why` naming its class")
+
+
+def kept_note(where: str, task: dict, after, when: str | None, cls: str | None) -> str:
+    """The reply note when an urgent task kept its gate for safety class `cls`; '' when not urgent or none."""
+    if not cls or not (after or when) or not urgent.is_urgent(task):
+        return ""
+    how = ("its probe is only landed checks on other tasks" if cls == LANDED and landed_only(when)
+           else "its why or probe names that class")
+    return (f"{where}: kept {gate_words(after, when)} although the task is urgent: the gate is {cls} ({how})")
 
 
 def stored(task: dict) -> tuple[list, dict]:

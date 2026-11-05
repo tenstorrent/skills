@@ -955,8 +955,10 @@ nothing running is interrupted:
   hold, pause, a lull for a restart, upgrade, reboot or power cycle), a charter Restriction (a guard,
   Restriction or charter rule), another person's work, the user's word (a cited user message or a
   `test -e <dir>/user-<x>` probe; it and a Restriction are filed before any device word), or a real dependency on another
-  task's new file or symbol (task_add's own overlap chain always counts). task_add and task_update drop any other gate at once and say so in their
-  reply note; a kept gate records its class in the `start_safety:<class>` label. Each tick, a
+  task's new file or symbol (task_add's own overlap chain always counts). A `start_when` made only of
+  `landed:#<id>` and `ttp landed --task <id>` terms joined by `&&` waits on other tasks' landed work and
+  always stays, whatever its `why` says. task_add and task_update drop any other gate at once; their
+  reply note says why a gate was kept or dropped; a kept gate records its class in the `start_safety:<class>` label. Each tick, a
   model-free sweep applies the same rule to queued tasks parked earlier (one low observation each, no
   coordinator wake). An urgent task held by a kept gate for 10 minutes while a slot is free raises one
   event naming the gate. `urgent: no` (or none, false, n/a) is not urgent.

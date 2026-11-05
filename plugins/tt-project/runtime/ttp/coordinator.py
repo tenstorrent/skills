@@ -2039,7 +2039,8 @@ def deferral_update(db, task: dict, a: dict, p: Project | None, labels: list | N
     held = json.loads(task["labels"] or "[]")   # its kept class counts for the same gate; its overlap tie always
     drop, safe = convgate.judge(as_now, after, when, why, held if same and a.get("why") is None
                                 else [lb for lb in held if str(lb).startswith(file_overlap.LABEL)])
-    note = convgate.dropped_note(f"task_update: #{task['id']}", as_now, after, when) if drop else ""
+    note = convgate.dropped_note(f"task_update: #{task['id']}", as_now, after, when) if drop \
+        else convgate.kept_note(f"task_update: #{task['id']}", as_now, after, when, safe)
     if drop:
         after, when = None, None
     after = float(f"{after:.0f}") if after else after   # whole seconds, as its label keeps it (not_before agrees)
@@ -2380,6 +2381,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 as_now = {"priority": int(a.get("priority") or 3), "spec": a.get("spec") or ""}
                 drop_gate, safe = convgate.judge(as_now, after, when, a.get("why"))
                 gate_dropped = (as_now, after, when) if drop_gate else None
+                gate_kept = (as_now, after, when, safe)
                 if drop_gate:   # an urgent task never sleeps on a convenience gate
                     after, when = None, None
                 if when and a.get("continues") is not None and (stuck := chaincap.own_wait(
@@ -2496,6 +2498,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                  f"clear it with task_update if the task does not need that")
                 if gate_dropped:
                     notes.append(convgate.dropped_note(f"task_add: #{new_id}", *gate_dropped))
+                elif kept := convgate.kept_note(f"task_add: #{new_id}", *gate_kept):
+                    notes.append(kept)
                 if hit := settled.turn_note(p, str(a.get("spec") or ""), f"task_add: #{new_id}"):
                     notes.append(hit)
                 if hit := correction.repeated(p, f"{title}\n{a.get('spec') or ''}"):
