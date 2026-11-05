@@ -10523,8 +10523,8 @@ class Daemon:
                                not_before=None if after or (t["not_before"] or 0) <= now else t["not_before"])
                 db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                      (now, "daemon", "observation", f"urgent_gate_released:{t['id']}:{d.get('since') or 0:.0f}",
-                      "low", f"Urgent #{t['id']} {t['title'][:80]} ({urgent.why(t)}): released its {words}, whose why "
-                      f"names no safety class and whose probe is not only landed checks on other tasks; it starts once its dependencies are met.", "handled", t["id"]))
+                      "low", f"Urgent #{t['id']} {t['title'][:80]} ({urgent.why(t)}): released its {words}, whose "
+                      f"{convgate.why_words(d.get('why'))} names no safety class and whose probe is not only landed checks on other tasks; it starts once its dependencies are met.", "handled", t["id"]))
             startgate.forget(db, tid=t["id"])
             self._start_rc.pop(t["id"], None)
             log(self.p, f"task {t['id']} urgent: convenience gate released ({words[:200]})")

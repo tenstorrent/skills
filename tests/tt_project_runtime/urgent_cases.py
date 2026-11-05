@@ -252,6 +252,42 @@ def test_convgate_keeps_user_cited_and_restriction_gates_before_device_words():
     assert convgate.safety_class("until the user says the device is free", None) == "shared device or machine"
 
 
+def test_convgate_files_owner_orders_and_cited_message_ids_under_the_users_word():
+    """A gate why citing a message id ('msg #N', '(#N)' next to user or owner) or the owner's order,
+    agent or quiet window is the user's word; a shared device or machine with a hold, quiet window or
+    measurement is a safety class; a plain convenience why still drops."""
+    from ttp import convgate
+    p1 = {"priority": 1, "spec": "s\nurgent: soon"}
+    for why in ("under the owner's order (user msg #1608, via the owner's agent), the account test pool must "
+                "start no check run on gx-7 while a device test or soak runs there",
+                "the owner's quiet window on gx-7 ends at 00:00",   # the #6009 gate why, alias replaced
+                "the owner's agent asked for this order", "per msg #1690, not before midnight",
+                "the user's order (#1690) holds it until then", "as the owner said (#12): after the window"):
+        assert convgate.judge(p1, 1e12, None, why) == (False, "the user's word"), why
+    for why in ("a hold on the shared device until the soak ends", "the shared machine's quiet window",
+                "a measurement runs on the shared device"):
+        assert convgate.judge(p1, 1e12, None, why) == (False, "shared device or machine"), why
+    for why in ("starts after the reviewer is free", "the owner of the table prefers it sorted",
+                "a quiet window is tidier", "after item (#4) in the list"):
+        assert convgate.judge(p1, 1e12, None, why) == (True, None), why
+
+
+def test_a_dropped_gate_note_quotes_the_why_it_judged(env):
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    tid, notes = _gate_add(p, "p1 tidy", 1, "s", start_after="2h", why="after lunch is tidier")
+    assert any(f"#{tid}" in n and "dropped" in n and "'after lunch is tidier'" in n for n in notes), notes
+    tid, notes = _gate_add(p, "p1 owner", 1, "s", start_after="2h", why="the owner's quiet window on gx-7 ends at 00:00")
+    assert not any("dropped" in n for n in notes) and "start_safety:the user's word" in p.db.task(tid)["labels"], notes
+    parked = _parked(p, "parked", 1, when="test -e /tmp/never-q", why="nicer after the standup")
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.release_urgent_gates(time.time())
+    ev = p.db.q("SELECT text FROM events WHERE fingerprint LIKE ?", (f"urgent_gate_released:{parked}:%",))
+    assert ev and "'nicer after the standup'" in ev[0]["text"], ev
+
+
 def test_urgent_gates_citing_the_user_or_a_restriction_survive_task_add_and_the_tick_sweep(env):
     from ttp.daemon import Daemon
     from ttp.db import deferral

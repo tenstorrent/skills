@@ -5,8 +5,9 @@
 An urgent task (urgent.is_urgent: priority 1 or better, or an `urgent: <why>` spec line) whose
 dependencies are met starts now. Its start gate (a `start_after` delay, a `start_when` probe, a
 `landed:#<id>` chain) stays only when the gate's `why` (or the probe itself) names a safety class
-(CLASSES): the user's own word (a cited user message, project.USER_CITE, or a `test -e
-<dir>/user-<x>` probe; a bare "until the user's ok" cites none); a charter Restriction (a guard, Restriction or charter rule); data loss; a
+(CLASSES): the user's own word (a cited user message, project.USER_CITE, a cited message id or the
+owner's order, agent or quiet window, _OWNER_CITE, or a `test -e <dir>/user-<x>` probe; a bare "until
+the user's ok" cites none); a charter Restriction (a guard, Restriction or charter rule); data loss; a
 spend cap or provider window; a shared device or machine (a lock, hold or pause, a restart, upgrade,
 reboot or power cycle; a lull, live traffic or a neighbour alone is a convenience: user msg #1571);
 another person's work; a real dependency on another task's new file or symbol. The user's word and a Restriction come first, so a gate citing either is filed
@@ -50,11 +51,16 @@ DEPENDENCY = "a dependency on another task's new file or symbol"   # the class o
 LANDED = "a dependency on other tasks' landed work"   # the class of a probe made only of landed checks
 _LANDED_TERM = re.compile(r"landed:\s*#?\d+|ttp\s+landed\s+--task(?:=|\s+)#?\d+")
 
+# The user's word beyond USER_CITE: a cited message id ('msg #N', '(#N)' next to user or owner) or the
+# owner's order, agent, word or quiet window (an owner's order relayed by their agent is the user's word).
+_OWNER_CITE = (r"\bmsgs?\s*#\d+|\b(?:user|owner)(?:'s)?\b[^\n.;()]{0,60}\(#\d+\)"
+               r"|\bowner(?:'s)?\s+(?:own\s+)?(?:orders?|agent|words?|quiet\s+(?:window|order)|request|instructions?)\b")
+
 # (class, words in the gate's why or the probe that name it)
 CLASSES = (   # the user's word and a Restriction first: a gate citing either files under it
     # Only a cited user message or a user marker probe: a bare "until the user's ok" cites no word of
     # theirs, so it files under another class it names or drops (selfblock.py raises the same wording).
-    ("the user's word", USER_CITE.pattern + r"|\btest -[ef] \S*/user-[\w.-]+"),
+    ("the user's word", USER_CITE.pattern + r"|\btest -[ef] \S*/user-[\w.-]+|" + _OWNER_CITE),
     ("charter restriction", r"\brestrictions?\b|\bcharter\b|\bguard\w*"),
     ("data loss", r"\bdata[ -]?loss\b|\blos(?:e|es|ing|t) (?:data|work|state|results?)\b|\bcorrupt\w*|\bbackups?\b"),
     ("spend cap or provider window", r"\bspend\w*|\bbudget\w*|\bcaps?\b|\bquotas?\b|\brate[ -]?limit\w*|\bcredits?\b"
@@ -137,10 +143,15 @@ def gate_words(after, when: str | None, now: float | None = None) -> str:
     return " and ".join(parts)
 
 
-def dropped_note(where: str, task: dict, after, when: str | None) -> str:
-    """The reply note when an urgent task's convenience gate was dropped."""
+def why_words(why: str | None) -> str:
+    """The gate's why as a note quotes it."""
+    return f"why {str(why)[:200]!r}" if why else "no why"
+
+
+def dropped_note(where: str, task: dict, after, when: str | None, why: str | None = None) -> str:
+    """The reply note when an urgent task's convenience gate (its `why` quoted) was dropped."""
     return (f"{where}: dropped {gate_words(after, when)}: the task is urgent ({urgent.why(task) or 'priority 1'}) and "
-            f"the gate's why names no safety class (data loss, a spend cap or provider window, a shared device or "
+            f"the gate's {why_words(why)} names no safety class (data loss, a spend cap or provider window, a shared device or "
             f"machine, a charter Restriction, another person's work, the user's word, a dependency on another "
             f"task's new file or symbol) and its probe is not only landed checks on other tasks, so it starts as soon as its dependencies are met; to keep a gate, give "
             f"`why` naming its class")
