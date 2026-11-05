@@ -241,8 +241,14 @@ def test_loopback_script_forwards_only_from_another_namespace(tmp_path):
     if not Path("/proc/self/ns/net").exists():
         pytest.skip("no network namespaces")
     bin_, log = _fake_socat(tmp_path)
+    # The script skips a port something already listens on, and this runs in the host's namespace: two
+    # bound, never listening sockets reserve free ports, so no other process on a shared host takes one.
+    held = [socket.socket() for _ in range(2)]
+    for s in held:
+        s.bind(("127.0.0.1", 0))
+    ports = [s.getsockname()[1] for s in held]
     base = {"PATH": f"{bin_}:{os.environ['PATH']}", "HTTPS_PROXY": "http://user:pw@localhost:3128",
-            PORTS_ENV: "40001 22 x 40002"}
+            PORTS_ENV: f"{ports[0]} 22 x {ports[1]}"}
     for netns, want in ((os.readlink("/proc/self/ns/net"), False), ("net:[1]", True), ("", False)):
         log.unlink(missing_ok=True)
         out = subprocess.run(["bash", "-c", 'set -u; . "$1"; echo "rc=$?"', "sh", str(SCRIPT)], capture_output=True,
@@ -259,11 +265,13 @@ def test_loopback_script_forwards_only_from_another_namespace(tmp_path):
             calls = log.read_text().splitlines() if log.exists() else []
         assert sorted(calls) == [f"TCP-LISTEN:{p},bind=127.0.0.1,fork,reuseaddr "
                                  f"PROXY:127.0.0.1:localhost:{p},proxyport=3128,proxyauth=user:pw"
-                                 for p in (40001, 40002)]
+                                 for p in sorted(ports)]
     log.unlink(missing_ok=True)
     out = subprocess.run(["bash", "-c", '. "$1"', "sh", str(SCRIPT)], capture_output=True, text=True, timeout=60,
                          env={**base, NETNS_ENV: "net:[1]", "HTTPS_PROXY": "http://proxy.example.com:3128"})
     assert out.returncode == 0 and not log.exists(), "only the sandbox's own loopback proxy carries them"
+    for s in held:
+        s.close()
 
 
 def test_loopback_live_connect_from_a_namespace_without_the_host_network(tmp_path):
