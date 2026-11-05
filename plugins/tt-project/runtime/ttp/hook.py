@@ -144,6 +144,10 @@ def handoff_problem(path: Path) -> str | None:
     if data.get("status") not in HANDOFF_STATES:
         return (f"{RESULT_FILE} status {data.get('status')!r} is not a hand-off state "
                 f"({', '.join(HANDOFF_STATES)})")
+    if "then" in data:
+        from . import thenwaits
+        if why := thenwaits.problem(data):
+            return f"{RESULT_FILE}: {why}"
     return None
 
 

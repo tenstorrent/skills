@@ -151,6 +151,7 @@ valid one: No `result.json`, no credit.
  "next_step": "if waiting: one short mechanical command a light wake runs",
  "on_pass": {"status": "done", "summary": "if waiting on your own `ttp checks --detach`: the final hand-off if they pass"},
  "on_pass_cmd": "if waiting: a check that writes the final hand-off (below)",
+ "then": [{"retry_when": "if waiting: the next wait of a known sequence (below)", "on_pass_cmd": "optional"}],
  "wait_kind": "if waiting: self (your own detached checks or jobs, a planned window), user (a user step) or external",
 <!-- /ttp:if wait -->
 <!-- ttp:if device -->
@@ -208,6 +209,10 @@ valid one: No `result.json`, no credit.
   `$TTP_RESULT` (else `on_pass`) ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
   never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
   when the check is mechanical. A checks pass alone: `ttp checks --result <run dir> --passed`.
+  A known sequence of waits (checks, then `landed:#<id>`; a job, then its verdict): list the later
+  ones in `then` (at most 4 stages, each a `retry_when`, optional `on_pass_cmd` and `retry_after_s`).
+  Once a stage passes (its on_pass_cmd exiting 0 without writing `$TTP_RESULT`), the daemon moves
+  to the next one model-free and records `on_pass` after the last; a failure wakes you.
 <!-- ttp:if remote -->
   For a job on another machine (a device job goes through a device runner instead, when one is
   listed), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`

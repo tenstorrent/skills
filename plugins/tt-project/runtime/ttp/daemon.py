@@ -50,6 +50,7 @@ from . import stalegate
 from . import indexignore
 from . import lanewait
 from . import coordsession
+from . import thenwaits
 from . import chainprio
 from . import churnwatch
 from . import alerts
@@ -323,7 +324,7 @@ ESCALATE_READ_MAX = 1 << 16       # bytes of ESCALATE_FILE read; lines past it c
 # What a waiting hand-off keeps across a run the account refused (limit, auth).
 WAIT_KEYS = ("retry_when", "retry_after_s", "waiting_for", "wake_tier", "next_step", "survives_reboot", "waits",
              "waiting_since", "stale_wakes", "wait_key", "on_pass_cmd", refwaits.FACTS_KEY, "spec_seen", "spec_wakes",
-             "spec_hold", "spec_urgent", "spec_urgent_woke")
+             "spec_hold", "spec_urgent", "spec_urgent_woke", thenwaits.KEY, thenwaits.STAGE_KEY)
 MAX_FOLLOWUPS, FOLLOWUP_SPEC_CHARS = 12, 4000   # per hand-off; each follow-up is its own event
 # What a review the daemon queues repeats of the code task's spec and hand-off.
 AUTO_REVIEW_SPEC_CHARS, AUTO_REVIEW_SUMMARY_CHARS = 2000, 1000
@@ -5186,6 +5187,8 @@ class Daemon:
                       f"#{task['id']} {task['title']}: waits on a step only the user can take with no model-free "
                       f"check that it is done (retry_when {str(result.get('retry_when') or 'none')[:200]}); give it "
                       f"one (a login or status check), or the task wakes only at its retry timer", "queued", task["id"]))
+        if rstatus == "waiting" and thenwaits.KEY in result:
+            result = self._check_then(task, r, run_dir, result)
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
             result = self._pin_handoff_probe(task, r, run_dir, result)
             result, how = checks_settle_fill(task, result, run_dir, push._own_ttp(self.p))
@@ -12461,6 +12464,8 @@ class Daemon:
             self._wake_waiting(task, f"{why}, but {SPEC_WOKE}", now,
                                extra={SPEC_SEEN_KEY: sha, "wake_tier": _own_tier(task), "escalated_wake": True})
             return
+        if self._staged_pass(task, now, why):
+            return
         try:
             got = self._checks_wait(task)
         except Exception as e:   # a wake is always safe; a broken check must not keep the task asleep
@@ -12526,7 +12531,8 @@ class Daemon:
             why += "; its on_pass_cmd was not run: its checks left no passing result for this task"
         else:
             try:
-                started = self._start_on_pass(task, now, said=why)
+                end = self._chain_end(task)   # the last `then` stage: the hand-off's on_pass, once it exits 0
+                started = self._start_on_pass(task, now, said=why, fallback=end[2] if end else None)
             except Exception as e:   # as above: a wake is always safe
                 started = f"it could not start: {type(e).__name__}: {e}"
             if started is True:
@@ -12535,6 +12541,95 @@ class Daemon:
                 why += f"; its on_pass_cmd was not run: {started}"
         more, extra = self._push_landing(task)
         self._wake_waiting(task, why + more, now, extra=extra)
+
+    def _staged_pass(self, task: dict, now: float, why: str) -> bool:
+        """A passed probe of a hand-off with `then` stages (thenwaits) whose current stage names no
+        on_pass_cmd (one that does runs it first: _poll_on_pass moves on once it exits 0). Its stage
+        passed (checks that passed on the head still checked out, a push that landed, any other probe
+        that exited 0): the next stage becomes its wait, or after the last one the hand-off's on_pass
+        is recorded, model-free. True when settled so; False leaves it to the usual paths (failed
+        checks wake the task at its own tier, a last stage with no on_pass wakes it)."""
+        prev = load_result(task["result"])
+        if prev.get("on_pass_cmd") is not None or not (prev.get(thenwaits.KEY) or thenwaits.at_end(prev)):
+            return False
+        probe = prev.get("retry_when")
+        waits_on = bud.result_wait(probe)
+        if not prev.get(thenwaits.KEY) and waits_on:
+            return False   # a last stage on checks or a push: _checks_wait / _push_wait record its on_pass
+        try:
+            if not self._stage_passed(task, prev, waits_on):
+                return False
+            if prev.get(thenwaits.KEY):
+                return self._next_stage(task, now, why)
+            end = self._chain_end(task)
+        except Exception as e:   # a wake is always safe
+            log(self.p, f"task {task['id']}: could not move to its next stage: {type(e).__name__}: {e}")
+            return False
+        if not end:
+            return False
+        r, run_dir, on_pass = end
+        from .providers.base import RunUsage
+        self._probe_rc.pop(task["id"], None)
+        self._prefetch_remote(task["id"], on_pass, run_dir)
+        for rnd in self._finish_rounds(task["id"]):
+            with rnd:
+                self._finish_worker(r, RunUsage(), "ok", run_dir, "model-free", handoff=on_pass)
+        log(self.p, f"task {task['id']} retry_when {why}; its last `then` stage passed: "
+                    f"recorded its on_pass ({on_pass['status']}) model-free")
+        return True
+
+    def _stage_passed(self, task: dict, prev: dict, waits_on: tuple | None) -> bool:
+        """Whether the passed probe of a `then` stage means the stage is over: checks of one of this
+        task's runs that passed on the head still checked out, a push that landed, any other probe."""
+        if waits_on and waits_on[0] == "checks":
+            from .cli import CHECKS_RC
+            run_dir = Path(waits_on[1])
+            if not self.p.db.one("SELECT id FROM runs WHERE task=? AND dir=? AND role!='coordinator'",
+                                 (task["id"], str(run_dir))):
+                return False
+            try:
+                if (run_dir / CHECKS_RC).read_text().strip() != "0":
+                    return False
+            except OSError:
+                return False
+            return bool(_checked_head(run_dir, task))
+        if waits_on and waits_on[0] == "push":
+            got = self._push_wait(task)
+            return bool(got) and got[0] == "pushed"
+        return True
+
+    def _next_stage(self, task: dict, now: float, why: str) -> bool:
+        """Make a waiting task's next `then` stage its wait (thenwaits.advance), with no model run. The
+        stage is stored with the task, so a restart or reboot keeps it. False when it has none left or
+        it moved meanwhile."""
+        tid, db = task["id"], self.p.db
+        with db.tx():
+            cur = db.task(tid) or {}
+            nxt = thenwaits.advance(load_result(cur.get("result"))) if cur.get("status") == "queued" else None
+            if nxt is None or load_result(cur["result"]).get("status") != "waiting":
+                return False
+            left = len(nxt.get(thenwaits.KEY) or [])
+            db.update_task(tid, result=dump_result(nxt), not_before=now + _retry_s(nxt),
+                           blocked_reason=f"its {why}; stage {nxt[thenwaits.STAGE_KEY] + 1} of "
+                                          f"{nxt[thenwaits.STAGE_KEY] + 1 + left} waits on: {nxt['retry_when'][:200]}")
+        self._probe_rc.pop(tid, None)
+        log(self.p, f"task {tid} {why}; moved to its next `then` stage {nxt[thenwaits.STAGE_KEY]} model-free "
+                    f"({left} left): {nxt['retry_when'][:300]}")
+        return True
+
+    def _chain_end(self, task: dict) -> tuple | None:
+        """For a task on the last stage of its `then` list: (run row, run dir, on_pass) when the run's
+        result.json it waits on names a valid on_pass, else None (a pass wakes it)."""
+        prev = load_result(task["result"])
+        if not thenwaits.at_end(prev):
+            return None
+        r = self.p.db.one("SELECT * FROM runs WHERE task=? AND role!='coordinator' AND dir IS NOT NULL "
+                          "ORDER BY id DESC LIMIT 1", (task["id"],))
+        full = _read_result(Path(r["dir"]) / RESULT_FILE) if r and r["dir"] else None
+        if not full or full.get("status") != "waiting" or not _same_probe(full, prev) \
+                or not isinstance(full.get("on_pass"), dict) or on_pass_problem(full["on_pass"]):
+            return None
+        return r, Path(r["dir"]), with_waiting_followups(full["on_pass"], full)
 
     def _push_wait(self, task: dict) -> tuple | None:
         """What a passed `ttp push --result <marker>` probe of this task settles when the marker says
@@ -12984,6 +13079,9 @@ class Daemon:
             except OSError:
                 tail = "(no output)"
             result = _read_result(out / RESULT_FILE)
+            if rc == 0 and result is None and prev.get(thenwaits.KEY) and said != JOB_FAILED \
+                    and self._next_stage(task, now, f"{said}; its on_pass_cmd exited 0"):
+                continue   # its next `then` stage is the wait now
             if rc == 0 and result is None and fallback is not None:
                 result = fallback   # its checks passed and the command succeeded: the hand-off's on_pass
             if isinstance(result, dict) and r and r["dir"]:
@@ -13150,6 +13248,32 @@ class Daemon:
         except Exception as e:
             log(self.p, f"task {r['task']}: the on_pass_cmd dry run could not run: {type(e).__name__}: {e}")
 
+    def _check_then(self, task: dict, r: dict, run_dir: Path, result: dict) -> dict:
+        """A waiting hand-off's `then` stages (thenwaits): a malformed list is dropped, said loudly (the
+        task then wakes once its own wait passes); a valid one gets each stage's run variables written
+        in as its retry_when is (_pin_handoff_probe)."""
+        why = thenwaits.problem(result)
+        if not why:
+            stages = []
+            for stage in result[thenwaits.KEY]:
+                try:
+                    probe = stage["retry_when"]
+                    pinned = probevars.pin(probe, "retry_when", self._handoff_env(task, r, run_dir)) \
+                        if "$" in probe else probe
+                except ValueError as e:
+                    why = f"`{thenwaits.KEY}` stage {len(stages) + 1}'s {e}"
+                    break
+                stages.append({**stage, "retry_when": pinned})
+            else:
+                return {**result, thenwaits.KEY: stages}
+        text = f"#{task['id']} {task['title']}: its waiting hand-off's {why}, so it was not stored; the task " \
+               f"wakes once its own retry_when passes"
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal", text[:1500],
+                     "queued", task["id"]))
+        log(self.p, f"task {task['id']} hand-off: `{thenwaits.KEY}` refused: {why}")
+        return {**{k: v for k, v in result.items() if k != thenwaits.KEY}, thenwaits.REFUSED_KEY: why[:300]}
+
     def _pin_handoff_probe(self, task: dict, r: dict, run_dir: Path, result: dict) -> dict:
         """A waiting hand-off's retry_when with the run's own variables ($TTP_RUN_DIR, ...: unset where
         probes run) written in from the run's environment (probevars.pin), the run's text kept as
@@ -13157,9 +13281,7 @@ class Daemon:
         probe = result["retry_when"]
         if "$" not in probe:
             return result
-        spec = _read_result(run_dir / "run.json") or {}
-        env = {**(spec["env"] if isinstance(spec.get("env"), dict) else {}), "TTP_RUN_DIR": str(run_dir),
-               "TTP_RUN_ID": str(r.get("id") or ""), **task_env(task["id"])}
+        env = self._handoff_env(task, r, run_dir)
         try:
             pinned = probevars.pin(probe, "retry_when", env)
         except ValueError as e:
@@ -13174,6 +13296,12 @@ class Daemon:
             return result
         log(self.p, f"task {task['id']} hand-off: retry_when's run variables written in: {pinned[:300]}")
         return {**result, "retry_when": pinned, "retry_when_orig": result.get("retry_when_orig", probe)}
+
+    def _handoff_env(self, task: dict, r: dict, run_dir: Path) -> dict:
+        """The run's own variables a waiting hand-off's probes are pinned with (probevars.pin)."""
+        spec = _read_result(run_dir / "run.json") or {}
+        return {**(spec["env"] if isinstance(spec.get("env"), dict) else {}), "TTP_RUN_DIR": str(run_dir),
+                "TTP_RUN_ID": str(r.get("id") or ""), **task_env(task["id"])}
 
     def _probe_env(self) -> dict:
         """Probes and on_pass commands run `ttp` (e.g. `ttp lock --probe device-a`) as a worker would,
@@ -16409,7 +16537,7 @@ def checks_settle_fill(task: dict, result: dict, run_dir: Path, ttp: str) -> tup
     and what was done ('' when it is no such wait)."""
     from .cli import _read_checks_pid
     if not isinstance(result, dict) or result.get("status") != "waiting" or result.get("on_pass_cmd") is not None \
-            or "on_pass" in result or not _checks_result_wait(result.get("retry_when")):
+            or "on_pass" in result or not _checks_result_wait(result.get("retry_when")) or result.get(thenwaits.KEY):
         return result, ""
     if default_on_pass(task, result) is not None:
         return result, ""
