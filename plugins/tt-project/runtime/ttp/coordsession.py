@@ -8,20 +8,24 @@ decide() picks each wake's mode from the saved session (kv KEY), model-free and 
 session alone. The session lives in the kv table, so a daemon restart resumes it.
 
 A rollover starts a new session when: there is none; the prefix key changed (system prompt, stable
-context, action schema or agent); the model or effort changed; the last context reached
-rollover_tokens (after its handover wake, below); the last session turn did not end ok; or its
-transcript is no longer saved (a host move). A resumed wake that fails is rerun at once as a stateless turn of the same queued batch
-(rerun), and max_failures_per_h failed resumes within an hour pause the mode for pause_h hours.
+context, action schema or agent); the model or effort changed; the last context reached limit()
+(after its handover wake, below); the last session turn did not end ok; or its transcript is no
+longer saved (a host move). The context is the last model call's prompt and answer, and the limit
+is the session's first prompt plus rollover_growth_tokens, at most the model's context window less
+rollover_margin_tokens, so a project with a large prompt still resumes; rollover_tokens above 0 sets
+a fixed limit instead. A resumed wake that fails is rerun at once as a stateless turn of the same
+queued batch (rerun), and max_failures_per_h failed resumes within an hour pause the mode for
+pause_h hours.
 
 Rollover handover (goal: no order, promise or decision is lost): in session mode the system prompt is
 session_prompt_parts(), the Restrictions, the role (coordinator.md and coordinator-session.md) and the
 charter verbatim, byte-stable across wakes so the prompt cache holds; nothing in it carries a time,
-memory or digest. Once the context reaches rollover_tokens, one more wake resumes the session with
+memory or digest. Once the context reaches limit(), one more wake resumes the session with
 HANDOVER_HEAD appended ("handover"): its answer's `session_note` is saved as state/coord-session/<id>.md
 (save_note), and the next wake starts the new session. The new session's first message (seed) is the
 standing memory, the open order ledger, that handover and the last CHAT_EXCHANGES chat exchanges
-verbatim, then the full digest. The agent's own auto-compaction is only a backstop: rollover_tokens
-sits below the context window.
+verbatim, then the full digest. The agent's own auto-compaction is only a backstop: limit()
+sits below a known context window.
 
 The sibling spend guard trips kv GUARD_KEY ({"tripped": true, "until": ts}): while it is tripped,
 every wake is stateless. A missing key is not tripped. Mode "shadow" is reserved; it acts as off."""
@@ -35,7 +39,9 @@ import time
 KEY = "coord_session"
 GUARD_KEY = "coord_session_guard"
 MODES = ("off", "on", "shadow")
-DEFAULTS = {"mode": "off", "rollover_tokens": 140000, "max_failures_per_h": 3, "pause_h": 6}
+DEFAULTS = {"mode": "off", "rollover_tokens": 0, "rollover_growth_tokens": 100000, "context_window_tokens": 0,
+            "rollover_margin_tokens": 40000, "max_failures_per_h": 3, "pause_h": 6}
+LONG_WINDOW = 1_000_000   # a model id ending "[1m]" (Claude's long-context variant)
 HANDOVER_HEAD = "## Session handover"
 NOTE_CHARS = 16000        # a session_note's cap, about 4,000 tokens
 CHAT_EXCHANGES = 20       # the chat exchanges a new session's first message carries verbatim
@@ -108,16 +114,38 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
         return "new", "session not saved"
     if st.get("handover"):   # its last wake wrote the session_note: the new session starts from it
         return "new", f"context reached {int(_num(st.get('handover_tokens') or st.get('context_tokens'), 0))} tokens"
-    if _num(st.get("context_tokens"), 0) >= _num(s.get("rollover_tokens"), DEFAULTS["rollover_tokens"]):
+    if _num(st.get("context_tokens"), 0) >= limit(cfg, st, model):
         return "resume", "handover"   # one last wake writes the session_note the new session starts from
     return "resume", "continued"
 
 
+def limit(cfg: dict, state, model: str = "") -> float:
+    """The context size at which the session rolls over: rollover_tokens when above 0, else the
+    session's first prompt (base_tokens) plus rollover_growth_tokens, at most the context window
+    (context_window_tokens; 0: LONG_WINDOW for a "[1m]" model, else unknown) less rollover_margin_tokens."""
+    s = settings(cfg)
+    fixed = _num(s.get("rollover_tokens"), 0)
+    if fixed > 0:
+        return fixed
+    st = state if isinstance(state, dict) else {}
+    out = _num(st.get("base_tokens"), 0) + _num(s.get("rollover_growth_tokens"), DEFAULTS["rollover_growth_tokens"])
+    window = _num(s.get("context_window_tokens"), 0) or (LONG_WINDOW if str(model or "").endswith("[1m]") else 0)
+    if window > 0:
+        out = min(out, window - _num(s.get("rollover_margin_tokens"), DEFAULTS["rollover_margin_tokens"]))
+    return out
+
+
+def _telemetry(usage, key: str) -> int:
+    v = ((getattr(usage, "extra", None) or {}).get("cache_telemetry") or {})
+    v = v.get(key) if isinstance(v, dict) else None
+    return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+
+
 def context_tokens(usage) -> int:
-    """The session's size after a turn: its prompt and answer. A turn of several model calls counts
-    each call's prompt, so this overstates it and rolls over early, never late."""
-    return sum(int(getattr(usage, k, 0) or 0) for k in
-               ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens"))
+    """The session's size after a turn: its last model call's prompt and answer. Without per-call
+    usage, the turn's sum, which overstates a turn of several calls and rolls over early, never late."""
+    keys = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")
+    return _telemetry(usage, "last_context") or sum(int(getattr(usage, k, 0) or 0) for k in keys)
 
 
 def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> dict:
@@ -133,6 +161,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
     if mode == "new":   # failed-resume times stay: fail() bounds them to the hour across rollovers
         st.update({"started": now, "wakes": 0, "prev": st.get("id") or ""})
         st.pop("handover", None)
+        st.pop("base_tokens", None)
         st.pop("handover_tokens", None)
     elif turn.get("why") == "handover":   # asked once: the next wake starts the new session
         st.update({"handover": True, "handover_tokens": int(_num(st.get("context_tokens"), 0))})
@@ -143,6 +172,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
     if ok:
         st["wakes"] = int(_num(st.get("wakes"), 0)) + 1
         st["context_tokens"] = context_tokens(usage)
+        if mode == "new":   # the fresh session's prompt: limit() allows growth over it
+            st["base_tokens"] = _telemetry(usage, "first_context")
     return st
 
 

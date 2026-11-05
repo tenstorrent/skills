@@ -494,6 +494,8 @@ class Claude(Provider):
         u.extra["cache_telemetry"].update(calls=len(prompts), first_context=prompts[0][1] if prompts else 0)
         if prompts:   # what the first call found cached: a cold start reads little (bud.cold_starts)
             u.extra["cache_telemetry"]["first_cache_read"] = prompts[0][0].get("cache_read_input_tokens", 0)
+            # The last call's prompt and answer: the session's real size (coordsession.context_tokens).
+            u.extra["cache_telemetry"]["last_context"] = prompts[-1][1] + prompts[-1][0].get("output_tokens", 0)
         for ev in self._events(output_path):
             if ev.get("type") == "assistant" and ev.get("error") == "authentication_failed":
                 u.auth_failed = True

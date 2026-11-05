@@ -400,8 +400,11 @@ prolonged whole-box outage.
   (Claude), each coordinator wake resumes one agent session instead of a fresh turn; `shadow` is
   reserved. A project's coordinator may set the mode itself (`config_set`). A new session starts
   when there is none, the system prompt, stable context or action schema changed, the model or
-  effort changed, the context reached `rollover_tokens` (140000), the last session turn did not end
-  ok, or its transcript is gone (a host move). A resumed wake that fails is rerun at once as a
+  effort changed, the context reached its limit, the last session turn did not end ok, or its
+  transcript is gone (a host move). The context is the last model call's prompt and answer; the
+  limit is the session's first prompt plus `rollover_growth_tokens` (100000), at most the model's
+  context window (`context_window_tokens`; 0 reads it from a `[1m]` model id, else no cap) less
+  `rollover_margin_tokens` (40000). `rollover_tokens` above 0 (default 0) sets a fixed limit instead. A resumed wake that fails is rerun at once as a
   stateless turn, so each message and event is handled once; `max_failures_per_h` (3) failed resumes
   within an hour run every turn stateless for `pause_h` (6) hours and raise an issue. While the
   session spend guard has tripped, turns are stateless. `ttp status --verbose` shows the session's
@@ -412,7 +415,7 @@ prolonged whole-box outage.
   than the baseline's $/day. In session mode the system prompt is the
   Restrictions, the coordinator role with `prompts/coordinator-session.md` and the charter verbatim:
   the same bytes every wake while the charter is unchanged, so the prompt cache holds. Once the
-  context reaches `rollover_tokens`, one last resumed wake also returns a `session_note` (at most
+  context reaches its limit, one last resumed wake also returns a `session_note` (at most
   4,000 tokens: open threads, promises in their chat wording, pending checks, decisions with their
   reasons, user corrections), saved as `state/coord-session/<session id>.md`. The next session's
   first message carries the standing memory, the open order ledger, that handover note and the last

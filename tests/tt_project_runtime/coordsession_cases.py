@@ -23,7 +23,7 @@ def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
         "no session": (None, "k1", "m", "high", yes),
         "prefix changed": (_cs_state(), "k2", "m", "high", yes),
         "model or effort changed": (_cs_state(), "k1", "m2", "high", yes),
-        "context reached 140000 tokens": (_cs_state(context_tokens=140000, handover=True), "k1", "m", "high", yes),
+        "context reached 100000 tokens": (_cs_state(context_tokens=100000, handover=True), "k1", "m", "high", yes),
         "last run not ok": (_cs_state(last_ok=False), "k1", "m", "high", yes),
         "session not saved": (_cs_state(), "k1", "m", "high", lambda s: False),
     }
@@ -31,15 +31,16 @@ def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
         assert cs.decide(_cs_cfg(), state, key, model, effort, saved, now) == ("new", why), why
     assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "low", yes, now) == ("new", "model or effort changed")
     assert cs.decide(_cs_cfg(), _cs_state(id=""), "k1", "m", "high", yes, now) == ("new", "no session")
-    # At rollover_tokens one handover wake resumes the session first (its session_note), then a new one.
-    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=140000), "k1", "m", "high", yes, now) == ("resume", "handover")
+    # At the limit (no first prompt recorded: rollover_growth_tokens) one handover wake resumes the
+    # session first (its session_note), then a new one.
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000), "k1", "m", "high", yes, now) == ("resume", "handover")
     assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "handover")
     assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(handover=True), "k1", "m", "high", yes, now)[0] == "new"
     # A session that cannot resume rolls over at once, without the handover wake.
-    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=140000, last_ok=False), "k1", "m", "high", yes, now) == \
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000, last_ok=False), "k1", "m", "high", yes, now) == \
         ("new", "last run not ok")
-    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=140000), "k2", "m", "high", yes, now) == ("new", "prefix changed")
-    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=139999), "k1", "m", "high", yes, now)[0] == "resume"
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000), "k2", "m", "high", yes, now) == ("new", "prefix changed")
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=99999), "k1", "m", "high", yes, now)[0] == "resume"
     # Garbage state never raises: it starts a session.
     for bad in ("x", [], 7, {"id": None}):
         assert cs.decide(_cs_cfg(), bad, "k1", "m", "high", yes, now) == ("new", "no session"), bad
@@ -96,6 +97,79 @@ def test_coordsession_record_counts_wakes_and_context_of_its_session():
     assert cs.status_line({}, None) == ""
 
 
+def _cs_stream(path, calls):
+    """A Claude stream-json transcript of one turn: one assistant message per (prompt, output) call."""
+    lines = [{"type": "system", "subtype": "init", "session_id": "s1", "model": "m"}]
+    for n, (prompt, out) in enumerate(calls):
+        lines.append({"type": "assistant", "message": {"id": f"msg{n}", "content": [], "usage": {
+            "input_tokens": 5, "cache_read_input_tokens": prompt - 5 if n else 0,
+            "cache_creation_input_tokens": 0 if n else prompt - 5, "output_tokens": out}}})
+    total = {"input_tokens": 5 * len(calls), "output_tokens": sum(o for _, o in calls),
+             "cache_read_input_tokens": sum(p - 5 for p, _ in calls[1:]),
+             "cache_creation_input_tokens": calls[0][0] - 5}
+    lines.append({"type": "result", "subtype": "success", "session_id": "s1", "result": "{}", "usage": total})
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    return path
+
+
+def test_coordsession_a_multi_call_turn_under_the_limit_resumes(tmp_path):
+    """The session's size is its last call's prompt and answer, not every call's prompt summed."""
+    from ttp import coordsession as cs
+    from ttp.providers.claude import Claude
+    turn = {"mode": "new", "why": "no session", "key": "k1", "model": "m", "effort": "high", "provider": "claude"}
+    use = Claude().parse(_cs_stream(tmp_path / "a.jsonl", [(30000, 500), (32000, 400), (35000, 600), (38000, 900)]))
+    assert use.extra["cache_telemetry"]["last_context"] == 38900
+    assert use.input_tokens + use.cache_read_tokens + use.cache_write_tokens + use.output_tokens > 100000, \
+        "the turn's sum alone would have rolled over"
+    st = cs.record(None, use, "", turn, True, 10.0)
+    assert (st["context_tokens"], st["base_tokens"]) == (38900, 30000)
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", lambda s: True, 20.0) == ("resume", "continued")
+    # A resumed wake keeps the session's first prompt as its base.
+    st = cs.record(st, use, "", {**turn, "mode": "resume", "why": "continued"}, True, 30.0)
+    assert st["base_tokens"] == 30000 and st["wakes"] == 2
+
+
+def test_coordsession_a_last_call_over_the_limit_rolls_over(tmp_path):
+    from ttp import coordsession as cs
+    from ttp.providers.claude import Claude
+    yes, turn = (lambda s: True), {"mode": "new", "why": "no session", "key": "k1", "model": "m",
+                                    "effort": "high", "provider": "claude"}
+    st = cs.record(None, Claude().parse(_cs_stream(tmp_path / "a.jsonl", [(30000, 500)])), "", turn, True, 10.0)
+    grown = Claude().parse(_cs_stream(tmp_path / "b.jsonl", [(60000, 500), (129600, 400)]))
+    st = cs.record(st, grown, "", {**turn, "mode": "resume", "why": "continued"}, True, 20.0)
+    assert (st["context_tokens"], st["base_tokens"]) == (130000, 30000)
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 30.0) == ("new", "context reached 130000 tokens")
+    # A rollover starts the next session's base afresh.
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "c.jsonl", [(20000, 100)])), "",
+                   {**turn, "why": "context reached 130000 tokens"}, True, 40.0)
+    assert (st["context_tokens"], st["base_tokens"], st["wakes"]) == (20100, 20000, 1)
+    # A known window caps the limit, and a fixed rollover_tokens replaces it.
+    st = {**_cs_state(), "base_tokens": 30000, "context_tokens": 110000}
+    assert cs.decide(_cs_cfg(context_window_tokens=150000), st, "k1", "m", "high", yes, 50.0)[0] == "new"
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 50.0)[0] == "resume"
+    assert cs.decide(_cs_cfg(rollover_tokens=110000), st, "k1", "m", "high", yes, 50.0)[0] == "new"
+    assert cs.limit(_cs_cfg(), st, "claude-x[1m]") == 130000, "growth stays the bound under a long window"
+    assert cs.limit(_cs_cfg(rollover_growth_tokens=2000000), st, "claude-x[1m]") == 960000
+    # Without per-call usage (another agent), the turn's sum still bounds it: early, never late.
+    from types import SimpleNamespace
+    use = SimpleNamespace(session_id="s", input_tokens=60000, cache_read_tokens=50000, cache_write_tokens=0,
+                          output_tokens=0, extra={"cache_telemetry": {"last_context": True}})
+    assert cs.context_tokens(use) == 110000
+
+
+def test_coordsession_a_fresh_prompt_above_the_old_140k_default_still_resumes(tmp_path):
+    """A project whose first call alone is 145k tokens resumes; its first wake grew to 186k."""
+    from ttp import coordsession as cs
+    from ttp.providers.claude import Claude
+    turn = {"mode": "new", "why": "no session", "key": "k1", "model": "m", "effort": "high", "provider": "claude"}
+    use = Claude().parse(_cs_stream(tmp_path / "a.jsonl",
+                                    [(145065, 800), (160000, 900), (172000, 700), (185500, 848)]))
+    st = cs.record(None, use, "", turn, True, 10.0)
+    assert (st["context_tokens"], st["base_tokens"]) == (186348, 145065)
+    assert cs.limit(_cs_cfg(), st, "m") == 245065
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", lambda s: True, 20.0) == ("resume", "continued")
+
+
 def test_coordsession_mode_is_chat_settable(env, capsys):
     from ttp import cli
     from ttp.coordinator import settable
@@ -106,11 +180,13 @@ def test_coordsession_mode_is_chat_settable(env, capsys):
         cli.cmd_chat_settable("coordinator.session.mode", "always")
     assert e.value.code == 1 and "refused" in capsys.readouterr().out
     p = make(env)
-    assert p.config()["coordinator"]["session"] == {"mode": "off", "rollover_tokens": 140000,
+    assert p.config()["coordinator"]["session"] == {"mode": "off", "rollover_tokens": 0,
+                                                   "rollover_growth_tokens": 100000, "context_window_tokens": 0,
+                                                   "rollover_margin_tokens": 40000,
                                                    "max_failures_per_h": 3, "pause_h": 6}
     p.set_config("coordinator.session.mode", settable("coordinator.session.mode")("on"))
     assert p.config()["coordinator"]["session"]["mode"] == "on"
-    assert p.config()["coordinator"]["session"]["rollover_tokens"] == 140000, "the other defaults stay"
+    assert p.config()["coordinator"]["session"]["rollover_growth_tokens"] == 100000, "the other defaults stay"
 
 
 def _cs_daemon(env, monkeypatch):

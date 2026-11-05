@@ -275,9 +275,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     "thread_warm_min": 10, "thread_max_turns": 8,
                     # The persistent coordinator session (coordsession.py): mode "on" resumes one
                     # Claude session each wake ("shadow" is reserved and acts as "off"); a new session
-                    # starts once its context reaches rollover_tokens; max_failures_per_h failed
-                    # resumes within an hour run every turn stateless for pause_h hours.
-                    "session": {"mode": "off", "rollover_tokens": 140000, "max_failures_per_h": 3, "pause_h": 6},
+                    # starts once its last call's context reaches its first prompt plus
+                    # rollover_growth_tokens, at most context_window_tokens (0: by model) less
+                    # rollover_margin_tokens (rollover_tokens above 0: a fixed limit instead);
+                    # max_failures_per_h failed resumes within an hour run every turn stateless for pause_h hours.
+                    "session": {"mode": "off", "rollover_tokens": 0, "rollover_growth_tokens": 100000,
+                                "context_window_tokens": 0, "rollover_margin_tokens": 40000,
+                                "max_failures_per_h": 3, "pause_h": 6},
                     "turn_budget_usd": 1.0,
                     # The most the daemon raises one turn's cap to, once, for a single item that went
                     # over turn_budget_usd alone (0: twice turn_budget_usd); never above the hourly
