@@ -397,6 +397,11 @@ def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsy
     assert json.loads(capsys.readouterr().out)["by_day"][0]["wakes"] >= 1
 
 
+# The session role's own room over the stateless coordinator role budget (coordinator_role_budget.txt,
+# which stays the stateless role's cap): the order-ledger block the session always carries plus
+# prompts/coordinator-session.md. Session mode only; it never widens coordinator_role(p)'s cap.
+SESSION_ROLE_ROOM = 2900
+
 _CS_CHARTER = ("# demo\n\n## Goals\nShip v1.\n\n## Restrictions\n- Never push to main (user msg #1).\n\n"
                "## Policies\nLabel every number.\n")
 
@@ -465,7 +470,7 @@ def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with
 
 def test_coordsession_system_prompt_is_byte_identical_between_wakes_with_an_unchanged_charter(env, monkeypatch):
     from ttp import coordsession
-    from ttp.prompts import coordinator_session_role
+    from ttp.prompts import coordinator_role, coordinator_session_role
     p, d, sessions, wake = _cs_session_project(env, monkeypatch)
     parts = coordsession.session_prompt_parts(p)
     first, system1, _ = wake("one")
@@ -479,8 +484,9 @@ def test_coordsession_system_prompt_is_byte_identical_between_wakes_with_an_unch
     third, system3, _ = wake("three")
     assert (third["mode"], third["why"]) == ("new", "prefix changed") and "Ship v2." in system3
     assert "Ship v1." in system1 and system3 != system1
-    # The session role stays under the coordinator role budget (sa17).
-    assert len(coordinator_session_role(p)) <= _role_budget()
+    # The session role keeps to the stateless budget plus its own room; the stateless role keeps the old cap (sa17).
+    assert len(coordinator_session_role(p)) <= _role_budget() + SESSION_ROLE_ROOM
+    assert len(coordinator_role(p)) <= _role_budget()
 
 
 def test_coordsession_note_and_chat_lines_keep_to_their_caps(env):
