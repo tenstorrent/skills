@@ -290,10 +290,13 @@ def lock_busy(p, cfg: dict, alias: str) -> str:
 
 
 def device_locks_of(cfg: dict, alias: str, known: dict | None = None) -> list[str]:
-    """The `ttp lock` resources that are `alias`'s device, each as the lock it is held by (locks.canonical):
-    `<alias>-device`, the device names its machines-list `shared` entry gives, and the config's
-    device.locks on it (the alias, `<alias>-...` or `<alias>:...`)."""
-    from . import locks, machines
+    """The `ttp lock` resources that are `alias`'s device: `<alias>-device`, the device names its
+    machines-list `shared` entry gives, and the config's device.locks on it (the alias, `<alias>-...` or
+    `<alias>:...`), each under its own name (another project holds it so in the shared locks) and, when that
+    is also a name of `alias` or device.hosts or device.runners puts it there, as the lock this project's
+    `ttp lock` takes for it (locks.canonical). A canonical lock of another host is not probed: its hold
+    would keep `alias` off the pool for no device job there."""
+    from . import hostmap, locks, machines
     known = machines.load() if known is None else known
     dev = locks.device_locks(cfg)
     names = [alias + DEVICE_SUFFIX]
@@ -301,7 +304,12 @@ def device_locks_of(cfg: dict, alias: str, known: dict | None = None) -> list[st
     if isinstance(got, list):
         names += [x for x in got if isinstance(x, str) and x and x != alias and (x.endswith(DEVICE_SUFFIX) or x in dev)]
     names += sorted(d for d in dev if d == alias or d.startswith((alias + "-", alias + ":")))
-    return list(dict.fromkeys(locks.canonical(cfg, n) for n in names))
+    tab = hostmap.table(cfg)
+    out = []
+    for n in names:
+        c = locks.canonical(cfg, n)
+        out += [n] + ([c] if c in names or tab.get(c) == alias else [])
+    return list(dict.fromkeys(out))
 
 
 def _lock_held(p, cfg: dict, res: str) -> str:

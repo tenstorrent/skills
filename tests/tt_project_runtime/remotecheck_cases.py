@@ -723,7 +723,8 @@ def test_spill_device_gate_sees_every_device_lock_of_the_host_and_only_that_host
         locks.unreserve(locks.reserve_path(d, "check-host-a-device"), "task #5 (run 3)")
     p.set_config("device.locks", ["check-host-a:board", "check-host-a:chip0", "check-host-ab-device"])
     cfg = p.config()
-    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device", "check-host-a:board"]
+    assert checkspill.device_locks_of(cfg, "check-host-a") == \
+        ["check-host-a-device", "check-host-a:board", "check-host-a:chip0"]
     h = _device_hold(p, "check-host-a:board")
     try:
         assert "check-host-a:board: busy" in checkspill.device_busy(p, cfg, "check-host-a")
@@ -735,6 +736,43 @@ def test_spill_device_gate_sees_every_device_lock_of_the_host_and_only_that_host
             assert checkspill.device_busy(p, cfg, "check-host-a") == "", other
         finally:
             h.close()
+
+
+def test_spill_device_gate_probes_the_hosts_shared_device_lock_when_device_locks_lists_another_name_first(
+        env, tmp_path, monkeypatch):
+    """device.locks lists another name first, so this project's `ttp lock <alias>-device` takes that
+    name's lock. Another project's hold of `<alias>-device` in the shared locks still keeps the host off
+    the pool, and a hold of only the other name does not, unless device.hosts puts that name on the host."""
+    from ttp import checkspill, shared
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("device.locks", ["other-device", "check-host-a-device"])
+    cfg = p.config()
+    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device"]
+    told: list[str] = []
+    h = _device_hold(p, "check-host-a-device", shared.root() / "check-host-a-device", "otherproj task #9 (run 1)")
+    try:
+        assert "check-host-a-device: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a")
+        assert checkspill.pick(p, cfg, told.append, "pytest -q") is None, "the only host is skipped"
+        assert "check-host-a (a device job runs there: check-host-a-device: busy" in told[-1], told
+    finally:
+        h.close()
+    for where in (None, shared.root() / "other-device"):   # this project's hold, then another project's
+        h = _device_hold(p, "other-device", where)
+        try:
+            assert checkspill.device_busy(p, cfg, "check-host-a") == "", where
+            got = checkspill.pick(p, cfg, told.append, "pytest -q")
+            assert got is not None and got.host == "check-host-a", told
+            got.close()
+        finally:
+            h.close()
+    p.set_config("device.hosts", {"other-device": "check-host-a"})   # the other name is this host after all
+    cfg = p.config()
+    assert checkspill.device_locks_of(cfg, "check-host-a") == ["check-host-a-device", "other-device"]
+    h = _device_hold(p, "other-device")
+    try:
+        assert "other-device: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a")
+    finally:
+        h.close()
 
 
 def test_spill_device_gate_reads_a_broker_job_row_and_an_unreadable_broker_never_blocks(env, tmp_path, monkeypatch):
