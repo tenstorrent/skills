@@ -381,3 +381,30 @@ def test_a_deadline_task_held_only_by_full_slots_raises_at_60_s_naming_what_fill
     assert f"they hold {gate.max_parallel + 1} runs (" in got[0]["text"] and " review" in got[0]["text"]
     assert d.kicks == [], "no free slot: nothing to kick"
     assert plain not in [e["task"] for e in check(start + 30 + unstarted.READY_URGENT_S + 70)]
+
+
+def test_a_deadline_task_held_by_full_slots_is_raised_only_with_its_resources_free_and_slot_waits_on(
+        env, monkeypatch):
+    """The full-slots event says the resources are free: a start with empty slots (as _log_slot_fill
+    checks) must find nothing else holding it, and coordinator.urgent_slot_wait_min 0 turns it off."""
+    from ttp import unstarted
+    p, d, check = _ready_setup(env, monkeypatch)
+    core = d.cfg.get("core_provider", "claude")
+    for i in range(d.gates[core].max_parallel + 1):
+        tid = p.db.add_task(f"busy {i}", "s", kind="work", tier="light", origin="user")
+        p.db.update_task(tid, status="running")
+        p.db.x("INSERT INTO runs(task, role, provider, status, started) VALUES(?,?,?,?,?)",
+               (tid, "worker", core, "running", time.time()))
+    hot = p.db.add_task("user deadline", "s\nurgent: the user waits on it", kind="work", tier="light",
+                        origin="user", priority=1)
+    start = time.time()
+    held = {"kind": "lock", "resource": "box-device", "holders": []}
+    monkeypatch.setattr(d, "_resource_hold", lambda task, reserve=False: held)
+    assert check(start + 30) == []
+    assert check(start + 30 + unstarted.READY_URGENT_S + 5) == [], "its lock is busy: no free-resources claim"
+    monkeypatch.setattr(d, "_resource_hold", lambda task, reserve=False: None)
+    d.cfg["coordinator"]["urgent_slot_wait_min"] = 0
+    assert check(start + 30 + unstarted.READY_URGENT_S + 70) == [], "slot-wait events turned off"
+    d.cfg["coordinator"]["urgent_slot_wait_min"] = 10
+    assert check(start + 200) == [], "a hold restarts its clock"
+    assert [e["task"] for e in check(start + 200 + unstarted.READY_URGENT_S + 5)] == [hot]

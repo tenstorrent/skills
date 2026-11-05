@@ -1773,3 +1773,39 @@ def test_schedlog_slot_users_name_what_fills_the_worker_slots(env):
     words = schedlog.slot_words(users)
     assert words.startswith("4 runs (") and "1 review" in words and "1 of them for a task no longer running" in words
     assert schedlog.entry(1, [], {}, [], 0, users)["slots"] == users and "slots" not in schedlog.entry(1, [], {}, [], 0)
+
+
+def test_dispatch_starts_work_when_obligations_are_unreadable(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """An unreadable obligation (e.g. an item missing a field) only loses the owners' boost, never the queue."""
+    from ttp import obligations
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        plain = p.db.add_task("routine work", "s", kind="work", tier="light", origin="user", priority=2)
+
+        def broken(db, *a, **k):
+            raise KeyError("receipt")
+        monkeypatch.setattr(obligations, "owner_due", broken)
+        d.dispatch()
+        assert _slot_tasks(p) == [plain]
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_an_obligation_owner_takes_the_extra_slot_past_full_slots_and_routine_priority_1_does_not(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=1)
+    try:
+        routine = [p.db.add_task(f"routine p1 {i}", "s", kind="work", tier="light", origin="coordinator",
+                                 priority=1) for i in range(2)]
+        d.dispatch()
+        assert _slot_tasks(p) == routine[:1], "routine priority 1 fills the only slot"
+        owner = p.db.add_task("owes a deliverable", "s", kind="work", tier="light", origin="user", priority=3)
+        _owe(p, owner, time.time() + 1800)
+        d.dispatch()
+        assert _slot_tasks(p) == [routine[0], owner], "the owner of a deliverable due within the hour takes it"
+        d.dispatch()
+        assert _slot_tasks(p) == [routine[0], owner], "routine priority 1 never takes an extra slot"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
