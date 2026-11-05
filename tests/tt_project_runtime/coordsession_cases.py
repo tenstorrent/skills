@@ -138,16 +138,20 @@ def test_coordsession_a_last_call_over_the_limit_rolls_over(tmp_path):
     grown = Claude().parse(_cs_stream(tmp_path / "b.jsonl", [(60000, 500), (129600, 400)]))
     st = cs.record(st, grown, "", {**turn, "mode": "resume", "why": "continued"}, True, 20.0)
     assert (st["context_tokens"], st["base_tokens"]) == (130000, 30000)
-    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 30.0) == ("new", "context reached 130000 tokens")
+    # Over the limit, one handover wake resumes the session (its session_note), then a new one starts.
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 30.0) == ("resume", "handover")
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "h.jsonl", [(130500, 300)])), "",
+                   {**turn, "mode": "resume", "why": "handover"}, True, 35.0)
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 36.0) == ("new", "context reached 130000 tokens")
     # A rollover starts the next session's base afresh.
     st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "c.jsonl", [(20000, 100)])), "",
                    {**turn, "why": "context reached 130000 tokens"}, True, 40.0)
     assert (st["context_tokens"], st["base_tokens"], st["wakes"]) == (20100, 20000, 1)
     # A known window caps the limit, and a fixed rollover_tokens replaces it.
     st = {**_cs_state(), "base_tokens": 30000, "context_tokens": 110000}
-    assert cs.decide(_cs_cfg(context_window_tokens=150000), st, "k1", "m", "high", yes, 50.0)[0] == "new"
-    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 50.0)[0] == "resume"
-    assert cs.decide(_cs_cfg(rollover_tokens=110000), st, "k1", "m", "high", yes, 50.0)[0] == "new"
+    assert cs.decide(_cs_cfg(context_window_tokens=150000), st, "k1", "m", "high", yes, 50.0) == ("resume", "handover")
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 50.0) == ("resume", "continued")
+    assert cs.decide(_cs_cfg(rollover_tokens=110000), st, "k1", "m", "high", yes, 50.0) == ("resume", "handover")
     assert cs.limit(_cs_cfg(), st, "claude-x[1m]") == 130000, "growth stays the bound under a long window"
     assert cs.limit(_cs_cfg(rollover_growth_tokens=2000000), st, "claude-x[1m]") == 960000
     # Without per-call usage (another agent), the turn's sum still bounds it: early, never late.
@@ -528,7 +532,7 @@ def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with
     second, system2, _ = wake("second order")
     assert second["mode"] == "resume", second
     assert not (p.state / coordsession.NOTE_DIR).exists(), "no note outside a handover"
-    # The context reaches rollover_tokens: one last resumed wake asks for and saves the handover.
+    # The context reaches its limit: one last resumed wake asks for and saves the handover.
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 150000})
     last, _, prompt3 = wake("third order")
     assert (last["mode"], last["why"]) == ("resume", "handover") and coordsession.HANDOVER_HEAD in prompt3
