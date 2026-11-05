@@ -2692,6 +2692,9 @@ def cmd_push(a) -> None:
     from . import push
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
+    from . import coordtools
+    if coordtools.coordinator_run() and not (a.queue or (a.free and not a.move_tag)):
+        die(f"ttp push: {coordtools.PUSH_REFUSAL}")   # also past the hook's text check (coordtools.py)
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
         os.environ[push.OWN_BRANCH_ENV] = "1"

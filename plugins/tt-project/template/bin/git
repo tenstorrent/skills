@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # git for tt-project runs: the real git further down PATH. Inside a run (TTP_TASK set), a call naming
 # `push` goes through ttp/gitguard.py first, which keeps a code task off the push branch while
-# delivery.code_tasks_may_push is off. Every other call execs the real git at once.
+# delivery.code_tasks_may_push is off. In a coordinator run (TTP_ROLE=coordinator, or full tools)
+# every push goes there too and is refused; a guard that fails to load refuses it as well.
+# Every other call execs the real git at once.
 # The real git is the first git on PATH that is no tt-project git wrapper: another project's
 # harness bin/ further down PATH holds a copy, and taking it would make the two exec each other.
 # Only a script can be a wrapper: a candidate whose first line is no `#!` line (the real git, a
@@ -28,7 +30,9 @@ if [ -z "$real" ]; then
     echo "git: not found on PATH" >&2
     exit 127
 fi
-if [ -n "${TTP_TASK:-}" ]; then
+coord=
+[ "${TTP_ROLE:-}" = coordinator ] || [ "${TTP_COORD_FULL_TOOLS:-}" = 1 ] && coord=1
+if [ -n "${TTP_TASK:-}" ] || [ -n "$coord" ]; then
     case " $* " in
     *" push "*)
         [ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3
@@ -38,6 +42,10 @@ if [ -n "${TTP_TASK:-}" ]; then
         "$TTP_PYTHON" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); import ttp.gitguard' "$rt" 2>/dev/null &&
             exec "$TTP_PYTHON" -I -c 'import sys; sys.path.insert(0, sys.argv[1]); from ttp.gitguard import main; sys.exit(main(sys.argv[2:]))' \
                 "$rt" "$real" "$@"
+        if [ -n "$coord" ]; then
+            echo "tt-project: a coordinator run pushes nothing (the push guard did not load)" >&2
+            exit 1
+        fi
         ;;
     esac
 fi

@@ -444,7 +444,10 @@ prolonged whole-box outage.
   machines its charter allows and run the `ttp` CLI. Direct writes to the charter, the memory
   files, `harness/project.json` and the state database are denied, each naming the action or
   command that applies the same checks (`charter_update`, `memory_add`, `config_set`, `ttp config`);
-  any raw `git push` is denied: code goes through a work branch, review and the push queue. A
+  any raw `git push` and any `ttp push` that lands or moves a tag is denied, by the hook and again
+  at run time by `ttp push` and the harness's `git` wrapper: code goes through a work branch, a
+  worker task, review and the push queue, and a channel tag moves only in a release cut task. A
+  coordinator run holds no device (`TTP_NO_DEVICE=1`), so the worker device-run rule binds it. A
   foreground command stops at `tool_timeout_s` (300, at most 600); a longer or background one is
   denied with a pointer to `ttp detach` or a worker task. Each mutating call (the command or file,
   its exit code) goes to the run's `tool-audit.jsonl` and `progress.md`, which the web run view

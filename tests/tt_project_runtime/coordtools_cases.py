@@ -590,3 +590,75 @@ def test_session_tools_key_loosens_only_on_the_users_word():
     with pytest.raises(ValueError):
         coordtools.tools_mode_of("all")
     assert coordtools.tools_mode({}) == "full"
+
+
+def test_full_tools_coordinator_lands_nothing_and_moves_no_tag(tmp_path, monkeypatch):
+    # The hook: every landing `ttp push`, also wrapped or nested; only the forms that move nothing pass.
+    _full_env(tmp_path, monkeypatch)
+    for cmd in ("cd wt && ttp push --detach", "ttp push --move-tag smartonTT/x-dogfood abc123", "ttp push",
+                "ttp push --land --detach", "ttp push --own", "ttp clip -- ttp push", "env A=1 ttp push --batch m",
+                "sh -c 'cd wt && ttp push'", "ssh box1 'ttp push --detach'", "ttp push --free --move-tag t c",
+                "ttp push --queue --detach", "/x/bin/ttp push --marker m"):
+        assert _decide(tmp_path, "Bash", command=cmd) == "deny", cmd
+    for cmd in ("ttp push --queue", "ttp push --free", "ttp push --result /r/m", "ttp push --result /r/m --pushed",
+                "ttp task demo add 'push the fix'"):
+        assert _decide(tmp_path, "Bash", command=cmd) == "allow", cmd
+    # `ttp push` itself, past the hook's text check: by the full-tools variable or the run's role.
+    from ttp import cli, coordtools
+    for var, val in ((coordtools.FULL_ENV, "1"), (coordtools.ROLE_ENV, "coordinator")):
+        monkeypatch.delenv(coordtools.FULL_ENV, raising=False)
+        monkeypatch.setenv(var, val)
+        monkeypatch.delenv("TTP_TASK", raising=False)
+        for args in (["push"], ["push", "--detach"], ["push", "--land"], ["push", "--own"],
+                     ["push", "--move-tag", "t", "c"], ["push", "--free", "--move-tag", "t", "c"],
+                     ["push", "--marker", "m"], ["push", "--batch", "m"]):
+            with pytest.raises(SystemExit) as e:
+                cli.main(args)
+            assert e.value.code not in (0, None), (var, args)
+        monkeypatch.delenv("TTP_PUSH_LAND", raising=False)
+    monkeypatch.setenv(coordtools.ROLE_ENV, "worker")
+    monkeypatch.delenv(coordtools.FULL_ENV, raising=False)
+    assert not coordtools.coordinator_run()
+
+
+def test_the_git_wrapper_refuses_a_coordinators_push_however_it_is_built(tmp_path):
+    from ttp import coordtools
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+    bare = tmp_path / "bin"
+    bare.mkdir()
+    shutil.copy(wrapper, bare / "git")   # no runtime beside it: the guard cannot load
+    base = {k: v for k, v in os.environ.items() if k not in ("TTP_TASK", coordtools.FULL_ENV, coordtools.ROLE_ENV)}
+
+    def run(bindir, extra, script="g=git; $g -C . push origin HEAD:refs/tags/v1"):
+        env = {**base, **extra, "TTP_PYTHON": sys.executable, "PATH": f"{bindir}:{base.get('PATH', '')}"}
+        return subprocess.run(["sh", "-c", script], cwd=tmp_path, env=env, capture_output=True, text=True, timeout=60)
+
+    for extra in ({coordtools.ROLE_ENV: "coordinator"}, {coordtools.FULL_ENV: "1"}):
+        for bindir in (wrapper.parent, bare):
+            out = run(bindir, extra)
+            assert out.returncode == 1 and "coordinator" in out.stderr, (extra, bindir, out.stderr)
+        out = run(wrapper.parent, extra, "git --version")
+        assert out.returncode == 0 and out.stdout.startswith("git version"), out.stderr
+    out = run(wrapper.parent, {coordtools.ROLE_ENV: "worker"})   # no run: the real git (no repo here)
+    assert "coordinator" not in out.stderr and "not a git repository" in out.stderr, out.stderr
+
+
+def test_a_coordinator_run_holds_no_device_and_the_device_rule_binds_it(env, tmp_path, monkeypatch):
+    from ttp import coordtools, machines, sandbox
+    _, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
+    run = max((d for d in p.runs.iterdir() if d.name.isdigit()), key=lambda d: int(d.name))
+    run_env = json.loads((run / "run.json").read_text())["env"]
+    assert run_env["TTP_NO_DEVICE"] == "1" and run_env[coordtools.ROLE_ENV] == "coordinator"
+    assert run_env["TTP_TASK"] == ""
+    pid = p.db.one("SELECT pid FROM runs WHERE id=?", (int(run.name),))["pid"]
+    for _ in range(200):   # its runner reads STOP and ends: none left behind
+        if not pid or subprocess.run(["kill", "-0", str(pid)], capture_output=True).returncode:
+            break
+        time.sleep(0.05)
+    _full_env(tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_NO_DEVICE", run_env["TTP_NO_DEVICE"])
+    monkeypatch.delenv("TTP_HOOK_REWRITE", raising=False)
+    monkeypatch.setattr(machines, "device_host", lambda *a, **k: True)
+    monkeypatch.setattr(sandbox, "status", lambda: (["/sb/unshare", "--pid"], ""))
+    assert _decide(tmp_path, "Bash", command="pytest tests/x.py") == "deny"
+    assert _decide(tmp_path, "Bash", command="ttp clip -- ttp sandbox -- pytest tests/x.py") == "allow"

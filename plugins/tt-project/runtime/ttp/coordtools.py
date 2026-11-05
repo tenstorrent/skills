@@ -11,14 +11,19 @@ credential reads, the kill guard, the device-run broker rule, no direct full sui
 and file edit, the run's PATH starts with the harness's gh and git wrappers, and it runs unsandboxed
 as every coordinator turn does. On top of them (full_refusal): no direct write to the project's
 charter, memory, project.json or state database (Edit/Write deny rules and the hook; the denial names
-the action or command that applies the same checks), no raw `git push` (code goes to a worker task,
-review and the push queue), and no foreground command past coordinator.session.tool_timeout_s
+the action or command that applies the same checks), no raw `git push` and no landing `ttp push` (a
+--land, --own, --detach or --move-tag push, or a plain one: code goes to a worker task, its review and
+the push queue; a channel tag moves only in a release cut task after its candidate checks; `ttp push
+--queue`, `--result` and `--free` stay), and no foreground command past coordinator.session.tool_timeout_s
 (TOOL_TIMEOUT_S; the CLI's own Bash timeout is set to it too): longer work goes to `ttp detach` or a
 worker. Every call that is not a read (Bash off the read-only list, Edit, Write) is logged with its
 exit to the run's AUDIT file and its progress.md, which the web app shows (post_tool_use). Accepted
 gaps, as for a worker: the Bash checks read the command text, so a command that builds a protected
 path or a push at run time (a variable, a glob, a script file) is not seen; the deny rules still fence
-the file tools. Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
+the file tools, and a push is refused again at run time: `ttp push` (cli.cmd_push) and the harness's git
+wrapper (gitguard.main) refuse a landing or any `git push` in a coordinator run (coordinator_run: FULL_ENV,
+or ROLE_ENV, which the daemon sets for every run). A coordinator run also holds no device
+(TTP_NO_DEVICE=1), so the worker device-run rule binds it. Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
 (also a session's stateless fallback) never gets them: the fallback keeps the read-only set below.
 
 Read-only tools ("read_only", any value but "full"): Read (and Grep/Glob where the CLI has them) on the project folder, and Bash for a fixed list of
@@ -60,6 +65,18 @@ ANSWER_TOOL = "StructuredOutput"
 READ_COMMANDS = (("status",), ("task", "*", "show"), ("task", "*", "list"), ("said",), ("eta",), ("landed",),
                  ("stats",), ("hostcheck",), ("machines", "list"), ("machines", "activity"), ("machines", "status"))
 FULL_ENV = "TTP_COORD_FULL_TOOLS"   # "1": the hook applies full_refusal, not the read-only list
+ROLE_ENV = "TTP_ROLE"   # the run's role, set for every run (daemon.start_run): "coordinator" in a coordinator's
+# `ttp push` forms that land or move nothing (cli.cmd_push): the only ones a coordinator may run
+PUSH_READS = (("--queue",), ("--free",), ("--result", "*"), ("--result", "*", "--pushed"), ("--help",), ("-h",))
+PUSH_REFUSAL = ("a coordinator lands nothing and moves no tag: code changes go on a work branch through a worker "
+                "task, its review and the push queue (the review lands them), and a channel tag moves only in a "
+                "release cut task once its candidate checks pass. Queue a task (`ttp task <project> add ...`)")
+
+
+def coordinator_run(env=None) -> bool:
+    """Whether this process runs in a coordinator run (its tools, or a command one of them started)."""
+    env = os.environ if env is None else env
+    return env.get(FULL_ENV) == "1" or env.get(ROLE_ENV) == "coordinator"
 PROTECTED_ENV = "TTP_COORD_PROTECTED"   # the files no tool writes directly, os.pathsep-separated
 TIMEOUT_ENV = "TTP_COORD_TOOL_TIMEOUT_S"
 POST_EVENT, FAIL_EVENT = "CoordPostToolUse", "CoordPostToolUseFailure"
@@ -250,19 +267,44 @@ def _named(cmd: str, f: str, cwd: str) -> bool:
     return any(k and k not in (".", "..") and k in cmd for k in keys)
 
 
-def _pushes(cmd: str, depth: int = 0) -> bool:
-    """Whether `cmd` runs `git push`: a git command (by any path, under wrappers) whose subcommand is
-    push, also inside `sh -c`, ssh, eval and the like (any later word `git ... push` there)."""
-    from . import gitguard
+def _runs(cmd: str, hit, inner_re: str, depth: int = 0) -> bool:
+    """Whether a segment of `cmd` is a `hit`, also inside `sh -c`, ssh, eval and the like (or any text
+    there matching `inner_re`)."""
     from .hook import _segments
     for seg in _segments(cmd):
-        if os.path.basename(seg[0]) == "git" and gitguard.split(seg[1:])[1] == "push":
+        if hit(seg):
             return True
         if os.path.basename(seg[0]) in SHELLS:
             inner = " ".join(seg[1:])
-            if depth < 3 and _pushes(inner, depth + 1) or re.search(r"\bgit\b.*\bpush\b", inner, re.S):
+            if depth < 3 and _runs(inner, hit, inner_re, depth + 1) or re.search(inner_re, inner, re.S):
                 return True
     return False
+
+
+def _git_push(seg: list[str]) -> bool:
+    from . import gitguard
+    return os.path.basename(seg[0]) == "git" and gitguard.split(seg[1:])[1] == "push"
+
+
+def _ttp_push(seg: list[str]) -> bool:
+    """A `ttp push` (also after `ttp clip --` and the like) other than a PUSH_READS form."""
+    for i, w in enumerate(seg[:-1]):
+        if os.path.basename(w) == "ttp" and seg[i + 1] == "push":
+            rest = seg[i + 2:]
+            return not any(len(rest) == len(f) and all(x == "*" or x == r for x, r in zip(f, rest))
+                           for f in PUSH_READS)
+    return False
+
+
+def _pushes(cmd: str) -> bool:
+    """Whether `cmd` runs `git push`: a git command (by any path, under wrappers) whose subcommand is
+    push, also inside `sh -c`, ssh, eval and the like (any later word `git ... push` there)."""
+    return _runs(cmd, _git_push, r"\bgit\b.*\bpush\b")
+
+
+def _lands(cmd: str) -> bool:
+    """Whether `cmd` runs a `ttp push` that may land or move a tag (any but PUSH_READS)."""
+    return _runs(cmd, _ttp_push, r"\bttp\s+push\b(?!\s+--(?:queue|free|result)\b)")
 
 
 def full_refusal(tool: str, args: dict, cwd: str) -> str | None:
@@ -282,9 +324,8 @@ def full_refusal(tool: str, args: dict, cwd: str) -> str | None:
     if asked > limit or args.get("run_in_background"):
         return (f"a coordinator's foreground command runs at most {int(limit)} s (coordinator.session.tool_timeout_s); "
                 "run longer work with `ttp detach <name> -- <cmd>` or give it to a worker task")
-    if _pushes(cmd):
-        return ("a coordinator makes no raw `git push`: code changes go on a work branch through a worker task, "
-                "its review and the push queue (`ttp push`), as a worker's do")
+    if _pushes(cmd) or _lands(cmd):
+        return PUSH_REFUSAL
     if bash_refusal(cmd) is None:   # a listed read-only ttp command
         return None
     hit = next((f for f in protected if _named(cmd, f, cwd)), "")

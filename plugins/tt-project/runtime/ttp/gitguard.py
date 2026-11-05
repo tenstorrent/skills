@@ -194,6 +194,14 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
 def main(argv: list[str]) -> int:
     """argv: the real git, then the arguments `git` was called with."""
     real, args = argv[0], argv[1:]
+    try:   # a coordinator run pushes nothing, however the command was built (coordtools.py)
+        from . import coordtools
+        if coordtools.coordinator_run() and split(args)[1] == "push":
+            print(f"tt-project: {coordtools.PUSH_REFUSAL}", file=sys.stderr)
+            return 1
+    except Exception:
+        print("tt-project: the coordinator push check failed: no push", file=sys.stderr)
+        return 1
     try:
         why = never_force_refusal(args, dict(os.environ), real)
     except Exception:   # a fault reading the project never stops git

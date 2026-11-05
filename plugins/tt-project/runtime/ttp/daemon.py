@@ -3194,8 +3194,12 @@ class Daemon:
             # A task that holds no device runs CPU tests only: hooks (the harness skill's pytest plugin)
             # skip tests that would open a device outside the broker. A device task gets "0", never an
             # inherited "1" (the runner adds its own environment under this one).
-            if task and role != "coordinator":
+            # A coordinator holds none: with full tools the worker device-run rule binds it (coordtools).
+            if role == "coordinator":
+                env["TTP_NO_DEVICE"] = "1"
+            elif task:
                 env["TTP_NO_DEVICE"] = "0" if holds_device(task, self.cfg) else "1"
+            env[coordtools.ROLE_ENV] = role   # always set: never an inherited value (coordtools.coordinator_run)
             # A light-tier or chat-routed run hands its text off instead of posting it (workernotify.no_post).
             # Always set, blank when unmarked: the runner lays this env over its own, so a popped key would
             # let a value in the daemon's environment through (runner.supervise).
