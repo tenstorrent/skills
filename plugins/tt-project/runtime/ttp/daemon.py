@@ -535,6 +535,8 @@ ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest 
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 ROOT_WAKE_KEY = "root_dirty_wake"   # in the task's result: its one wake to commit or revert paths it dirtied in the root
 ROOT_HEAD_KEY = "root_head"   # kv: the open alert on a project root left detached or off its branch (guard_root_head)
+# Task kinds whose commits left on a detached HEAD get a rescue branch recorded as their branch (_rescue_detached).
+RESCUE_KINDS = ("code", "work")
 MEMORY_ARCHIVED_KEY = "memory_archived_at"   # kv: when the daemon last archived hidden memory (archive_hidden_memory)
 LEASE_STATE_KEY = "lease_state"   # kv: the lease state last announced (lease.py), one event per change
 # Steps a host that does not hold the project lease skips: they start model work, push, or answer
@@ -2000,6 +2002,9 @@ class Daemon:
         log(self.p, text)
         self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                     (time.time(), "daemon", "observation", "normal", text, "queued", int(r["task"])))
+        task = self.p.db.task(int(r["task"])) or {}
+        if info and task.get("kind") in RESCUE_KINDS and not task.get("branch"):
+            self.p.db.update_task(task["id"], branch=info)   # its review and the push queue resolve it
         return True
 
     def _run_in_root(self, exclude: int = 0) -> int:
@@ -4730,6 +4735,7 @@ class Daemon:
         """What finishing a code or review task's hand-off asks the push remote (pushq.prefetch), asked
         now, before the transaction that records it: inside it the answer is read, never fetched, so
         the write lock never waits on the network. Best effort: an unanswered question reads as before."""
+        self._rescue_detached(task_id, result, run_dir)
         task = self._prefetch_lint(task_id, result, run_dir)
         if not isinstance(result, dict) or result.get("status") not in ("done", "needs_review"):
             return   # only a finished hand-off approves a push or gets its review
@@ -4739,6 +4745,26 @@ class Daemon:
             pushq.prefetch(self.p, task, self.cfg)
         except Exception as e:
             log(self.p, f"task {task_id}: asking the push remote before finishing failed: {type(e).__name__}: {e}")
+
+    def _rescue_detached(self, task_id: int, result, run_dir: Path | None = None) -> None:
+        """A code or work task finishing done or needs_review with no branch on record whose commits are on
+        a detached HEAD (worktree.rescue_detached) gets them kept on a rescue branch recorded as its branch,
+        before the transaction that queues its review: that review names it, and the push queue's approval
+        check (worktree.named_refs) resolves it. Best effort: git failing leaves the task as it was."""
+        task = self.p.db.task(task_id)
+        if not task or task["kind"] not in RESCUE_KINDS or task.get("branch") or not isinstance(result, dict) \
+                or result.get("status") not in ("done", "needs_review") or not worktree.is_git(self.p.root):
+            return
+        cwd = str((_read_result(run_dir / "run.json") or {}).get("cwd") or "") if run_dir else ""
+        try:
+            branch, head = worktree.rescue_detached(self.p, task, result, cwd)
+        except Exception as e:
+            log(self.p, f"task {task_id}: keeping its detached HEAD on a branch failed: {type(e).__name__}: {e}")
+            return
+        if branch:
+            self.p.db.update_task(task_id, branch=branch)
+            log(self.p, f"task {task_id}: its commits were on a detached HEAD at {head[:12]}; kept on branch "
+                        f"{branch}, now its branch on record")
 
     def _prefetch_lint(self, task_id: int, result, run_dir: Path | None = None) -> dict | None:
         """What the hand-off lint (handofflint.lint, in _finish_worker) reads from the remote, and the

@@ -2330,6 +2330,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # A review of work the daemon already queued a review for replaces it while it has not
                 # started; one already under way makes this a duplicate.
                 covered = _covered(db, deps, a.get("spec") or "") if review else set()
+                if quoted := _quote_heads(p, db, covered, a.get("spec") or ""):
+                    a = dict(a, spec=f"{(a.get('spec') or '').rstrip()}\n{quoted}")
                 autos = _auto_reviews(db, covered)
                 started = {n: r for n, r in autos.items() if r["status"] != "queued" or r["attempts"]}
                 if covered and set(started) == covered:
@@ -3874,6 +3876,25 @@ def _covered(db, deps: list, spec: str) -> set[int]:
         if names_branch(spec, r["branch"]):
             ids.add(r["id"])
     return ids
+
+
+def _quote_heads(p, db, covered: set[int], spec: str) -> str:
+    """For a review's spec, one line per task it covers whose branch on record the spec does not name:
+    "#N's change: branch B, head H.", so its reviewer reads that head and the push queue's approval check
+    (worktree.named_refs) resolves it. "" when there is none (or git cannot read a branch's head)."""
+    out = []
+    for i in sorted(covered):
+        t = db.task(i)
+        b = (t or {}).get("branch") or ""
+        if not b or t["kind"] == "review" or names_branch(spec, b):
+            continue
+        try:
+            head = worktree._branch_head(p, b)
+        except Exception:
+            head = ""
+        if head:
+            out.append(f"#{i}'s change: branch {b}, head {head[:12]}.")
+    return " ".join(out)
 
 
 def _draft_review(deps: list, spec: str) -> dict:

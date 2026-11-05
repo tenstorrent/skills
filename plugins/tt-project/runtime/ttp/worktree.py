@@ -141,14 +141,16 @@ def git_timeout(p: Project, scale: float = 1.0) -> float:
 
 def _records(p: Project, repo: Path | None = None) -> dict[str, dict]:
     """Path -> `git worktree list --porcelain`'s record of each worktree of the repository (`repo`,
-    default the project's) ({"path", "branch", "locked": its reason ("" when it has none) or None,
-    "prunable": bool}). Raises when git fails or times out: an unknown record is no missing one."""
+    default the project's) ({"path", "head", "branch" ("" when detached), "locked": its reason ("" when it has
+    none) or None, "prunable": bool}). Raises when git fails or times out: an unknown record is no missing one."""
     out: dict[str, dict] = {}
     rec: dict | None = None
     for line in _git(repo or p.root, "worktree", "list", "--porcelain", timeout=git_timeout(p)).splitlines() + [""]:
         key, _, val = line.partition(" ")
         if key == "worktree":
-            rec = {"path": val, "branch": "", "locked": None, "prunable": False}
+            rec = {"path": val, "head": "", "branch": "", "locked": None, "prunable": False}
+        elif rec is not None and key == "HEAD":
+            rec["head"] = val
         elif rec is not None and key == "branch":
             rec["branch"] = val.removeprefix("refs/heads/")
         elif rec is not None and key == "locked":
@@ -985,6 +987,55 @@ def restore_root(repo: Path, branch: str, run_id: int, timeout_s: float = 60, ta
         return True, rescue
     except (RuntimeError, OSError, subprocess.SubprocessError) as e:
         return False, str(e)[:300]
+
+
+RESCUE_TIMEOUT_S = 30
+
+
+def rescue_detached(p: Project, task: dict, result: dict | None, cwd: str = "",
+                    timeout_s: float = RESCUE_TIMEOUT_S) -> tuple[str, str]:
+    """For a task that ends with no branch on record: the commit it left its work on as a detached HEAD,
+    kept on branch rescue/t<id>-<sha12> (reused when it is there; never moved or forced), so its reviews
+    and the push queue resolve it (named_refs reads the branches of the tasks a review depends on). The
+    commit is, in this order: its hand-off's top-level `head` with no `branch` or `repo`; the HEAD of the
+    checkout it ran in (`cwd`), when that is a detached worktree of the project's repository other than
+    the root (restore_root keeps a detached root's commits); the HEAD of the one detached worktree whose
+    path names the task (a component <id>, .<id>, t<id> or t<id>-...). One that adds no commit beyond
+    the local and remote-tracking branches is no work to keep. (branch, head) or ("", "")."""
+    tid = int(task["id"])
+    heads: list[str] = []
+    res = result if isinstance(result, dict) else {}
+    named = res.get("head")
+    if isinstance(named, str) and re.fullmatch(r"[0-9a-fA-F]{7,40}", named.strip()) \
+            and not res.get("branch") and not res.get("repo"):
+        heads.append(named.strip().lower())
+    try:
+        recs = [r for r in _records(p).values() if not r["branch"] and r["head"]
+                and os.path.realpath(r["path"]) != os.path.realpath(p.root)]
+    except (RuntimeError, OSError, subprocess.SubprocessError):
+        recs = []
+    if cwd:
+        heads += [r["head"] for r in recs if os.path.realpath(r["path"]) == os.path.realpath(cwd)]
+    own = re.compile(rf"\.?t?{tid}(?:-.*)?")
+    mine = {r["head"] for r in recs if any(own.fullmatch(c) for c in Path(r["path"]).parts)}
+    heads += sorted(mine) if len(mine) == 1 else []
+    for head in dict.fromkeys(heads):
+        full = _git(p.root, "rev-parse", "--verify", "--quiet", f"{head}^{{commit}}", check=False, timeout=timeout_s)
+        if not full:
+            continue
+        branch = f"rescue/t{tid}-{full[:12]}"
+        if _git(p.root, "rev-parse", "--verify", "--quiet", f"refs/heads/{branch}", check=False,
+                timeout=timeout_s) == full:
+            return branch, full
+        if not _git(p.root, "rev-list", "-n", "1", full, "--not", "--branches", "--remotes", check=False,
+                    timeout=timeout_s):
+            continue   # every commit of it is on a branch already
+        try:
+            _git(p.root, "branch", branch, full, timeout=timeout_s)   # no -f: an existing one is kept
+        except RuntimeError:
+            continue
+        return branch, full
+    return "", ""
 
 
 def carried_head(p: Project, task: dict) -> str | None:

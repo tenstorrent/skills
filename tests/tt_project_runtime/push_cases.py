@@ -17071,3 +17071,98 @@ def test_an_approval_sharing_only_a_same_patch_copy_or_an_author_second_with_ano
     rows = pushq.due(s.p, now + 1)[0]
     assert [r["id"] for r in rows] == [child, sib_row], "priority order, nothing reordered"
     assert pushq.overlap_waits(s.p, rows, now + 1, pushq._tracking_tip(s.p, "origin", "proj")) == ({}, {})
+
+
+def _detached_finish(env, s, d, tid, result, cwd):
+    """Task `tid` hands off `result` from a run whose working directory was `cwd`, as the daemon finishes it."""
+    from ttp.providers.base import RunUsage as Usage
+    s.p.db.update_task(tid, status="running")
+    run_dir = env["tmp"] / f"run-{tid}-{time.monotonic_ns()}"
+    run_dir.mkdir()
+    (run_dir / "result.json").write_text(json.dumps(result))
+    (run_dir / "run.json").write_text(json.dumps({"cwd": str(cwd)}))
+    d._prefetch_remote(tid, result, run_dir)
+    d._finish_worker({"task": tid, "id": 7, "note": "{}"}, Usage(cost_usd=1.0), "ok", run_dir)
+    return s.p.db.task(tid)
+
+
+def test_a_code_task_done_on_a_detached_head_gets_a_rescue_branch_its_replacement_review_approves(env, monkeypatch):
+    """A code task with no branch on record that committed on a detached HEAD (a worktree of its own, or the
+    one its run worked in) gets a rescue branch recorded as its branch before its finish: the daemon's review
+    quotes that branch and head, a coordinator's replacement review that names neither gets them quoted, and
+    its approval of the head validates (without the branch: 'none of the reviewed refs (none)')."""
+    from ttp import coordinator as coord, pushq
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    d = Daemon(s.p.base)
+    det = s.p.db.add_task("detached fix", "fix it", kind="code", tier="light", origin="user")
+    wt = s.p.root / f".{det}" / "wt"
+    _git_out(s.p.root, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    _commit(wt, "fix.txt", "fix\n")
+    head = _git_out(wt, "rev-parse", "HEAD")
+    before = s.p.db.add_task(f"Review #{det} early", "check it", kind="review", origin="coordinator",
+                             depends_on=[det])
+    assert "none of the reviewed refs (none)" in \
+        pushq.check_approval(s.p, s.p.db.task(before), [{"branch": "x", "head": head}])["invalid"]
+    s.p.db.update_task(before, status="cancelled")
+    t = _detached_finish(env, s, d, det, {"status": "done", "summary": "committed in .wt"}, s.p.root)
+    branch = f"rescue/t{det}-{head[:12]}"
+    assert t["branch"] == branch and _git_out(s.p.root, "rev-parse", branch) == head
+    auto = s.p.db.one("SELECT * FROM tasks WHERE kind='review' AND title LIKE ? AND status='queued'",
+                      (f"Review #{det}:%",))
+    assert auto and f"branch {branch}, head {head[:12]}" in auto["spec"]
+    # A review_stall replacement the coordinator adds names no branch: its spec gets them quoted.
+    add = {"type": "task_add", "title": f"Review #{det} (replaces a stalled one)", "kind": "review",
+           "spec": f"Review the head of task #{det}'s branch.", "depends_on": [det]}
+    assert coord.apply(s.p, [add]) == []
+    rev = s.p.db.one("SELECT * FROM tasks WHERE title=?", (add["title"],))
+    assert f"#{det}'s change: branch {branch}, head {head[:12]}." in rev["spec"]
+    assert "invalid" not in pushq.check_approval(s.p, rev, [{"branch": branch, "head": head}])
+    got = _pq_hand_off(env, s, push=[{"branch": branch, "head": head}], task=rev["id"])
+    assert got["status"] == "pushing"
+    assert s.p.db.one("SELECT status FROM push_queue WHERE task=?", (rev["id"],))["status"] == "approved"
+    # A spec that names the branch already is left as written.
+    add2 = dict(add, title=f"Review #{det} again", spec=f"Review {branch}.")
+    s.p.db.update_task(rev["id"], status="cancelled")
+    assert coord.apply(s.p, [dict(add2, force=True, reason="test")]) == []
+    assert s.p.db.one("SELECT spec FROM tasks WHERE title=?", (add2["title"],))["spec"] == f"Review {branch}."
+
+
+def test_a_detached_head_is_rescued_once_only_with_new_commits_and_only_for_its_own_task(env, monkeypatch):
+    """The rescue branch is reused on a second finish (never a second branch or a moved one); a detached
+    HEAD with no commit beyond the branches is no work to keep; a detached worktree named for another task
+    is not this task's; the hand-off's top-level `head` (no branch) and the run's own detached checkout
+    count; a review task never gets one."""
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    s = _pq(env, monkeypatch)
+    d = Daemon(s.p.base)
+    mk = lambda title, kind="code": s.p.db.add_task(title, "s", kind=kind, tier="light", origin="user")
+    a, other, plain, rv, work = mk("a"), mk("other"), mk("plain"), mk("rv", "review"), mk("w", "work")
+    wt = s.p.root / f"t{other}-scratch"
+    _git_out(s.p.root, "worktree", "add", "-q", "--detach", str(wt), "HEAD")
+    assert worktree.rescue_detached(s.p, s.p.db.task(other), {}, "") == ("", ""), "no new commit: nothing kept"
+    _commit(wt, "o.txt", "o\n")
+    head = _git_out(wt, "rev-parse", "HEAD")
+    assert worktree.rescue_detached(s.p, s.p.db.task(a), {}, "") == ("", ""), "another task's worktree"
+    assert worktree.rescue_detached(s.p, s.p.db.task(rv), {}, str(wt)) == (f"rescue/t{rv}-{head[:12]}", head)
+    _git_out(s.p.root, "branch", "-D", f"rescue/t{rv}-{head[:12]}")
+    t = _detached_finish(env, s, d, rv, {"status": "done", "summary": "ok"}, wt)
+    assert not t["branch"], "a review never gets a branch"
+    # The run's own detached checkout, then a second finish reuses the branch.
+    t = _detached_finish(env, s, d, plain, {"status": "done", "summary": "ok"}, wt)
+    branch = f"rescue/t{plain}-{head[:12]}"
+    assert t["branch"] == branch
+    s.p.db.update_task(plain, branch=None)
+    assert worktree.rescue_detached(s.p, s.p.db.task(plain), {}, str(wt)) == (branch, head)
+    assert _git_out(s.p.root, "branch", "--list", f"rescue/t{plain}-*") == branch
+    # A top-level head with no branch names it (a commit on another task's rescue branch is kept already);
+    # one with a repo is another repository's change.
+    assert worktree.rescue_detached(s.p, s.p.db.task(work), {"head": head}, "") == ("", "")
+    _commit(wt, "w.txt", "w\n")
+    head = _git_out(wt, "rev-parse", "HEAD")
+    assert worktree.rescue_detached(s.p, s.p.db.task(work), {"head": head[:10], "repo": "o/r"}, "") == ("", "")
+    assert _detached_finish(env, s, d, work, {"status": "done", "summary": "ok", "head": head[:10]},
+                            s.p.root)["branch"] == f"rescue/t{work}-{head[:12]}"
+    # A failed hand-off keeps nothing on record.
+    assert not _detached_finish(env, s, d, a, {"status": "failed", "summary": "no"}, wt)["branch"]

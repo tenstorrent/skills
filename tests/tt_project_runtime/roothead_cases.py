@@ -140,3 +140,30 @@ def test_a_task_in_a_root_behind_the_push_branch_is_told_how_far_and_how_to_read
     _git_out(repo, "remote", "set-url", "origin", str(env["tmp"] / "gone.git"))
     prompts._root_fetched.clear()
     assert prompts.root_behind_line(p, str(p.root)) == ""
+
+
+def test_a_code_task_that_left_the_root_detached_gets_its_rescue_branch_on_record(env, monkeypatch):
+    """The daemon puts a root a code task's run left detached back on its branch and keeps the commits on a
+    rescue branch; with no branch of its own on record, that rescue branch becomes the task's branch, so its
+    review and the push queue resolve it. A task that has a branch keeps it."""
+    p = make(env)
+    from ttp import daemon as dm
+
+    class Proc:
+        pid = 4242
+    real = subprocess.Popen
+    monkeypatch.setattr(dm.subprocess, "Popen",
+                        lambda argv, *a, **k: Proc() if "ttp.runner" in argv else real(argv, *a, **k))
+    repo = env["repo"]
+    tip = _git_out(repo, "rev-parse", "HEAD")
+    d = dm.Daemon(p.base)
+    for kept in ("", "ttp/its-own"):
+        t = p.db.add_task(f"commits in the root {kept}", "s", kind="code", tier="light", origin="user")
+        p.db.update_task(t, branch=kept or None)
+        row = _root_run(p, d, t)
+        _git_out(repo, "checkout", "-q", "--detach", tip)
+        made = _roothead_commit(repo, f"made while detached {kept}")
+        _end_run(p, d, row)
+        rescue = f"rescue/root-run{row['id']}-{made[:12]}"
+        assert _git_out(repo, "rev-parse", rescue) == made
+        assert p.db.task(t)["branch"] == (kept or rescue)
