@@ -2733,10 +2733,20 @@ def test_a_cheaper_waiter_gets_an_overflow_lane_after_max_wait_and_only_then(env
         for cost, max_wait in (({"cls": checklane.SUITE}, 0.3), ({"cls": checklane.OTHER, "est_s": 900}, 0.3),
                                ({"cls": checklane.OTHER}, 0)):
             assert testslots.suite_hold("pa", repo=_LANE_REPO, cost=cost, max_wait=max_wait, wait_s=1) is None, cost
+        # Not before max_wait: a cheaper waiter whose wait ends first never gets the overflow lane.
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, cost={"cls": checklane.OTHER}, max_wait=60,
+                                    wait_s=0.3) is None
         told = []
+        # max_wait counts from the ticket's arrival, set inside the call; Grant.waited starts later (after
+        # the enqueue), so it can read short of max_wait on a busy host. Time the whole call instead; the
+        # slowed step between the two stands in for that host.
+        remember = checklane.remember_name
+        monkeypatch.setattr(checklane, "remember_name", lambda *a, **k: (time.sleep(0.2), remember(*a, **k))[1])
+        t0 = time.time()
         g = testslots.suite_hold("pa", repo=_LANE_REPO, cost={"cls": checklane.OTHER}, max_wait=0.3, wait_s=5,
                                  tell=told.append)
-        assert g and g.files and "-x." in g.files[0].name and g.waited >= 0.3
+        took = time.time() - t0
+        assert g and g.files and "-x." in g.files[0].name and took >= 0.3, took
         assert any("extra checks lane" in x and "#12" in x for x in told), told
         g.close()
     finally:
