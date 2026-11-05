@@ -641,6 +641,26 @@ def test_coordsession_delta_omits_unchanged_sections_and_sends_a_changed_one_who
     assert not cs.asked_full([{"type": "noop"}]) and not cs.asked_full(None)
 
 
+def test_coordsession_open_tasks_names_the_open_tasks_past_its_row_limit(env):
+    """digest_parts names the open tasks past the Open tasks row limit on one line, so a resumed wake's
+    row delta never calls a task pushed past the limit closed."""
+    from ttp import coordinator as coord, coordsession as cs
+    p = make(env)
+    ids = [p.db.add_task(f"t{n}", "s", origin="user") for n in range(cs.OPEN_ROWS)]
+    rows = lambda: dict(coord.digest_parts(p, {}, [], [])[0])["tasks"]
+    assert "past this list" not in rows()
+    late = p.db.add_task("late", "s", origin="user")
+    p.db.update_task(ids[0], status="done")
+    assert "past this list" not in rows()
+    extra = [p.db.add_task(f"x{n}", "s", origin="user") for n in range(2)]
+    assert rows().split("\n")[-1] == cs.cut_line(extra) == f"{cs._CUT} {cs.OPEN_ROWS} rows, 2: #{extra[0]}, #{extra[1]})"
+    before = cs.rows(coord.digest_parts(p, {}, [], [])[0])
+    top = p.db.add_task("urgent", "s", origin="user", priority=0)
+    parts = coord.digest_parts(p, {}, [], [])[0]
+    got = cs._row_delta(dict(parts)["tasks"], before)
+    assert f"#{top} |" in got and "no longer" not in got and f"#{late}" in got.split("\n")[-1], got
+
+
 def test_coordsession_delta_sends_only_new_and_changed_open_task_rows():
     """Open tasks rows are compared one by one against the acknowledged row hashes, ages left out: a
     new, changed or removed row reaches the session; an unchanged row, or one whose only change is its
@@ -695,6 +715,18 @@ def test_coordsession_delta_sends_only_new_and_changed_open_task_rows():
     st = {cs.DIGEST: cs.wake_digest("new", None, [], parts("- #1 | queued | x", a, *more), "f", "f", "g")[1]}
     got = tasks(a, b, b.replace("queued", "queued again"), *more)[0]
     assert got.split("\n")[2:] == [b, b.replace("queued", "queued again")] and "no longer open: #1)" in got, got
+    # A task pushed past the row limit while still open is named on the cut line, never called no longer
+    # open; a task that closes still is. With the cut line unable to name them all, a missing task is only
+    # no longer listed.
+    st = {cs.DIGEST: cs.wake_digest("new", None, [], parts(a, b, c, *more), "f", "f", "g")[1]}
+    got = tasks(e, a, b, *more, cs.cut_line([12]))[0]
+    assert "no longer" not in got and "#12)" in got.split("\n")[-1], got
+    got = tasks(e, a, *more, cs.cut_line([12]))[0]
+    assert "; no longer open: #11)" in got, got
+    many = cs.cut_line(list(range(200, 200 + cs.CUT_NAMED + 3)))
+    assert many.endswith(" and 3 more)") and "#12" not in many
+    got = tasks(e, a, b, *more, many)[0]
+    assert "; no longer listed (closed, or open past the row limit): #12)" in got and "no longer open" not in got
     # An acknowledged digest saved without row hashes (before this change) sends a changed section whole.
     old = {k: v for k, v in ack.items() if k != "rows"}
     st = {cs.DIGEST: old}

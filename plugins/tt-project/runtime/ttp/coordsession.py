@@ -50,8 +50,10 @@ The Open tasks section (ROWS) is compared row by row, each without its ages and 
 against the row hashes the acknowledged wake saved: a changed section sends its header, a line naming
 how many rows are as last shown and the tasks no longer open, then only the new and changed rows, each
 whole with its current age (the whole section when that is shorter). An unchanged row is not resent;
-one whose only change is its age counts as unchanged. An acknowledged digest without row hashes sends
-the section whole."""
+one whose only change is its age counts as unchanged. A task the section no longer shows is called no
+longer open only when known: one past the row limit is named on the section's cut_line(), and when that
+line cannot name them all, the missing tasks are called no longer listed. An acknowledged digest without
+row hashes sends the section whole."""
 from __future__ import annotations
 
 import hashlib
@@ -86,6 +88,17 @@ ROWS = "tasks"         # the Open tasks section (coordinator.digest_parts): sent
 TICKS = re.compile(r"\b\d+(?:\.\d+)?\s?(?:h|min|m|s)\b")
 _READ_RE = re.compile(r"\(read [^()]*\)")
 _TASK_RE = re.compile(r"- #(\d+) \| ")
+OPEN_ROWS = 60   # the Open tasks section's row limit
+CUT_NAMED = 40   # the most open tasks past it named one by one
+_CUT = "- (open tasks past this list's limit of"
+_CUT_UNNAMED = re.compile(r" and \d+ more\)$")
+
+
+def cut_line(ids: list[int]) -> str:
+    """The Open tasks line naming the open tasks past OPEN_ROWS (the first CUT_NAMED of them)."""
+    rest = len(ids) - CUT_NAMED
+    return (f"{_CUT} {OPEN_ROWS} rows, {len(ids)}: {', '.join(f'#{i}' for i in ids[:CUT_NAMED])}"
+            + (f" and {rest} more)" if rest > 0 else ")"))
 
 
 def mode_of(value) -> str:
@@ -301,12 +314,15 @@ def _row_delta(text: str, before: dict) -> str:
     sent = [ln for k, ln in now if before.get(k) != _sha(_unticked(ln))]
     keys = {k for k, _ in now}
     grouped = " ".join(ln for k, ln in now if k.startswith("~"))
-    # A task left out of this view is gone unless a group line still names it.
+    # A task left out of this view is gone unless a group line (or the line past the row limit) still
+    # names it; past the limit with some unnamed, a gone task may still be open.
     gone = [k for k in before if k.startswith("#") and k not in keys
             and not re.search(rf"{k.split('/')[0]}\b", grouped)]
+    unnamed = any(ln.startswith(_CUT) and _CUT_UNNAMED.search(ln) for _, ln in now)
+    said = "no longer listed (closed, or open past the row limit)" if unnamed else "no longer open"
     other = sum(1 for k in before if k.startswith("~") and k not in keys)
     note = (f"(only new and changed rows follow; {len(now) - len(sent)} as last shown, not repeated, their ages "
-            "grown since" + (f"; no longer open: {', '.join(gone)}" if gone else "")
+            "grown since" + (f"; {said}: {', '.join(gone)}" if gone else "")
             + (f"; {other} other lines gone" if other else "") + ")")
     return "\n".join([text.split("\n", 1)[0], note] + sent)
 

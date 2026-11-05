@@ -1280,7 +1280,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     if pinned:
         section("memory_pinned", [pinned], pinned.split(":")[0], pinned.split(":")[0] + " (as last turn)")
     lines = ["## Open tasks (id | status | tier | priority | age | title | last note)"]
-    rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id LIMIT 60")
+    rows = db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') ORDER BY priority, id "
+                f"LIMIT {coordsession.OPEN_ROWS}")
     in_review = db.review_since()
     setting_held = settinghold.digest_lines(rows)   # tasks held on a setting being asked about: one line each
     held_on = {}   # blocked tasks held on the same ask or resource: one line for them all
@@ -1313,6 +1314,11 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
     lines += setting_held
+    if len(rows) == coordsession.OPEN_ROWS:   # the open tasks past the limit, so none reads as closed
+        cut = [r["id"] for r in db.q("SELECT id FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
+                                     "ORDER BY priority, id LIMIT -1 OFFSET ?", (coordsession.OPEN_ROWS,))]
+        if cut:
+            lines.append(coordsession.cut_line(cut))
     if not rows:
         lines.append("- (none)")
     rows_whole = lines
