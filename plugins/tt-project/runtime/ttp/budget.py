@@ -142,7 +142,7 @@ def hold_clears(db: DB, g: Gate, now: float, pause_until: float | None = None) -
             at.append(row.get("resets_at"))
             words.append(f"the {row.get('window') or 'plan'} window resets")
         elif red_class(r) in ("cap", "global cap"):
-            at.append(None)
+            at.append(_cap_resets(g.numbers or {}, red_class(r)))
             words.append("the cap's period rolls over or the user raises it")
         elif red_class(r) == "spend limit":
             at.append(None)
@@ -150,6 +150,18 @@ def hold_clears(db: DB, g: Gate, now: float, pause_until: float | None = None) -
     if not words:
         return None, "the spend gate allows new work again"
     return (None if None in at else max(at)), "; ".join(dict.fromkeys(words))
+
+
+def _cap_resets(n: dict, cls: str) -> float | None:
+    """When a reached dollar cap's period ends, or None when no fixed end is known: the global cap's
+    budget day (global_resets_at), a project's daily cap's budget day (day_end) unless its rolling
+    7 d cap is reached too. A rolling 24 h period has no fixed end."""
+    if cls == "global cap":
+        return n.get("global_resets_at") or None
+    week_cap = float(n.get("weekly_cap") or 0)
+    if week_cap and float(n.get("spent_7d") or 0) >= week_cap:
+        return None
+    return n.get("day_end") or None
 
 
 def _raise(g: Gate, level: str, reason: str) -> None:

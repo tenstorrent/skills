@@ -215,3 +215,108 @@ def test_eta_long_promise_needs_urgent_work_and_a_long_due(env):
     cfg = {**p.config(), "coordinator": {"course_check": {"long_promise_h": 8}}}
     assert eta.course_lines(p.db, cfg, now)[0] == []                   # a configurable threshold
     assert eta.course_lines(p.db, {"coordinator": {"course_check": {"long_promise_h": 0}}}, now)[0] == []
+
+
+def _eta_gate(p, prov="claude", **g):
+    p.db.set_kv("gates", {prov: {"provider": prov, "level": "red", "allow_new_work": False, "max_parallel": 0,
+                                 "reasons": [], "numbers": {}, "lane": {}, **g}})
+
+
+def test_eta_red_spend_gate_starts_held_work_at_its_known_reset(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200, queue wait median 300
+    t = p.db.add_task("held urgent work", "s", kind="work", priority=1, reply_chat="c1")
+    green = eta.estimate(p.db, t, now)
+    assert green["end"] == pytest.approx(now + 300 + 1200)
+    # Green (or yellow) gate: unchanged.
+    _eta_gate(p, level="green", allow_new_work=True, max_parallel=6)
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(green["end"])
+    # The account-wide daily cap reached with a known reset two hours out: no earlier than reset + median.
+    reset = now + 7200
+    _eta_gate(p, reasons=["global daily cap reached: $10 of $10 today across the account; new work resumes "
+                          "at the reset in 2.0 h"], numbers={"global_resets_at": reset})
+    e = eta.estimate(p.db, t, now)
+    assert e["why"] is None and e["end"] >= reset + 1200 and e["end"] == pytest.approx(reset + 300 + 1200)
+    assert e["start"] == pytest.approx(reset + 300)
+    # A dependant waits for it, and the promise on it too.
+    d = p.db.add_task("after it", "s", kind="work", depends_on=[t])
+    assert eta.estimate(p.db, d, now)["end"] == pytest.approx(e["done"] + 300 + 1200)
+    o = _eta_promise(p, t, "c1", "I'll post here when it's live.", now)
+    assert eta.obligation_estimate(p.db, o, now)["end"] == pytest.approx(e["end"])
+    # A project's daily cap on a budget day; a plan window at its line: their resets.
+    _eta_gate(p, reasons=["cap reached: $5.00/today of $5"],
+              numbers={"day_end": now + 3600, "daily_cap": 5, "weekly_cap": 0})
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 3600 + 1500)
+    _eta_gate(p, regime="windows", reasons=["5h window at 97% (the project stops at 95%)"],
+              numbers={"plan": [{"window": "5h", "resets_at": now + 1800}]})
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 1800 + 1500)
+    # A later not_before stays the start; a running task is not held.
+    p.db.x("UPDATE tasks SET not_before=? WHERE id=?", (now + 5000, t))
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 5000 + 1500)
+    r = p.db.add_task("already running", "s", kind="work", status="running")
+    p.db.x("INSERT INTO runs(task, role, started, status) VALUES(?, 'worker', ?, 'running')", (r, now - 100))
+    assert eta.estimate(p.db, r, now)["end"] < now + 1800
+    # Another provider's red gate does not hold a task on this one.
+    _eta_gate(p, prov="other", reasons=["global daily cap reached: x"], numbers={"global_resets_at": reset})
+    p.db.x("UPDATE tasks SET not_before=NULL WHERE id=?", (t,))
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(green["end"])
+    # A task routed to that provider is held there.
+    p.db.x("UPDATE tasks SET provider='other' WHERE id=?", (t,))
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(reset + 1500)
+    # The core provider named by the project: a task with none runs there.
+    p.db.x("UPDATE tasks SET provider=NULL WHERE id=?", (t,))
+    assert eta.estimate(p.db, t, now, core="other")["end"] == pytest.approx(reset + 1500)
+
+
+def test_eta_red_spend_gate_with_no_known_reset_gives_no_clock_time(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)
+    t = p.db.add_task("held work", "s", kind="work", priority=1, reply_chat="c1")
+    # A rolling 24 h global cap has no fixed reset.
+    _eta_gate(p, reasons=["global daily cap reached: $10 of $10 today across the account"],
+              numbers={"global_resets_at": None})
+    e = eta.estimate(p.db, t, now)
+    f = eta.field(e, p, now)
+    assert e["end"] is None and eta.wake_at(e) is None
+    assert f.startswith("ETA: no estimate yet (") and "held by the spend cap" in f and ":" not in f[len("ETA:"):]
+    o = _eta_promise(p, t, "c1", "I'll post here when it's live.", now)
+    assert "held by the spend cap" in eta.field(eta.obligation_estimate(p.db, o, now), p, now)
+    # A daily cap on a budget day while the rolling 7 d cap is reached too: no fixed end either.
+    _eta_gate(p, reasons=["cap reached: $5.00/today of $5, $40.00/7d of $40"],
+              numbers={"day_end": now + 3600, "daily_cap": 5, "weekly_cap": 40, "spent_7d": 40})
+    assert "held by the spend cap" in eta.estimate(p.db, t, now)["why"]
+    # One known and one unknown reset: unknown.
+    _eta_gate(p, reasons=["runaway guard: x", "global daily cap reached: y"], numbers={})
+    assert eta.estimate(p.db, t, now)["end"] is None
+
+
+def test_eta_coordinator_guard_red_holds_routine_work_only_and_a_held_review(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)
+    _eta_gate(p, reasons=["coordinator turn guard: x"], lane={"max_parallel": 2, "max_tier": "standard"})
+    hot = p.db.add_task("urgent", "s", kind="work", priority=1)
+    asked = p.db.add_task("user asked", "s", kind="work", reply_chat="c1")
+    routine = p.db.add_task("routine", "s", kind="work", priority=5)
+    assert eta.estimate(p.db, hot, now)["end"] == pytest.approx(now + 1500)
+    assert eta.estimate(p.db, asked, now)["end"] == pytest.approx(now + 1500)
+    assert "held by the spend cap" in eta.estimate(p.db, routine, now)["why"]
+    # A code task in review whose queued review task the gate holds: the review leg starts at the reset.
+    _eta_history(p, now, kind="code", runs=(1000,), wait=100)
+    rvd = p.db.add_task("Review #x", "s", kind="review", status="done")
+    p.db.x("UPDATE tasks SET created=? WHERE id=?", (now - 5000, rvd))
+    p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'ok')",
+           (rvd, now - 4900, now - 3200))
+    c = p.db.add_task("the fix", "s", kind="code", status="review")
+    p.db.add_task(f"Review #{c}: the fix", "s", kind="review", depends_on=[c], labels=[f"auto_review:{c}"])
+    assert "held by the spend cap" in eta.estimate(p.db, c, now)["why"], "a routine review under the guard"
+    p.db.set_kv("gates", {})
+    before = eta.estimate(p.db, c, now)["end"]
+    _eta_gate(p, reasons=["global daily cap reached: y"], numbers={"global_resets_at": now + 7200})
+    e = eta.estimate(p.db, c, now)
+    assert e["why"] is None and e["end"] >= now + 7200 + 1800 and e["end"] > before

@@ -16,6 +16,10 @@ last WINDOW_S days), never a worst case or padding:
   window (else the leg is not part of its path). A task in review or with an approved row has only
   what is left of those; a done one whose open review task (db.reviews_task) has not approved it yet
   lands at that review task's own estimate plus the landing leg.
+- hold: a queued or waiting task whose provider's spend gate (kv `gates`) allows no new work starts no
+  earlier than the gate's known reset (budget.hold_clears: a cap's period end, a plan window's reset,
+  the runaway guard's hour, a provider limit's end); with no known reset it has no estimate and says it
+  is held by the spend cap. A coordinator turn guard's red holds routine work only (budget.for_task).
 A blocked, failed or cancelled task on the path, or a leg with no measured sample, gives no
 estimate ('no estimate yet', with why): never a guess.
 
@@ -92,12 +96,42 @@ def history(db, now: float | None = None) -> dict:
 
 
 class _Est:
-    def __init__(self, db, now: float, hist: dict | None = None):
+    def __init__(self, db, now: float, hist: dict | None = None, core: str | None = None):
         self.db, self.now = db, now
         self.h = history(db, now) if hist is None else hist
         self.memo: dict[int, dict] = {}
         self._review_since = None
         self._reviews = None
+        self.core = core or "claude"   # the provider of a task with none (config core_provider)
+        self._gates = None
+        self._owners = None
+
+    def _held(self, t: dict | None) -> tuple[float | None, str] | None:
+        """A queued or waiting task the spend gate of its provider holds: (the gate's known reset or
+        None, what clears it); None when nothing holds it."""
+        from . import budget as bud, urgent
+        if not t or t["status"] not in ("queued", "waiting"):
+            return None
+        if self._gates is None:
+            self._gates = self.db.kv("gates", {}) or {}
+        prov = t.get("provider") or self.core
+        g = self._gates.get(prov)
+        if not isinstance(g, dict) or g.get("allow_new_work", True):
+            return None
+        if (g.get("lane") or {}).get("max_parallel"):   # the coordinator turn guard: routine work only
+            if self._owners is None:
+                from .obligations import owner_due
+                try:
+                    self._owners = set(owner_due(self.db))
+                except Exception:
+                    self._owners = set()
+            if urgent.is_urgent(t) or urgent.user_ordered(t, self._owners):
+                return None
+        gate = bud.Gate(**{k: v for k, v in g.items() if k in bud.Gate.__dataclass_fields__})
+        return bud.hold_clears(self.db, gate, self.now, (self.db.kv(f"limited:{prov}") or {}).get("until"))
+
+    def _held_none(self, tid: int, clears: str) -> dict:
+        return self._none(tid, f"#{tid} is held by the spend cap until {clears}")
 
     def _run(self, t: dict) -> list[float]:
         return self.h["run"].get((t["kind"], t["tier"])) or self.h["kind"].get(t["kind"]) or []
@@ -184,6 +218,10 @@ class _Est:
             since = self._review_since.get(tid, now)
             if self.h["review"]:
                 left, over = self._left(self.h["review"], now - since)
+                if (rv := self._open_review(t)) and (hold := self._held(self.db.task(rv))):
+                    if hold[0] is None:
+                        return self._held_none(tid, hold[1])
+                    left, over = max(left, hold[0] - now + _med(self.h["review"])), False
                 legs.append(("review", left))
             done = now + sum(x for _, x in legs)
         else:
@@ -214,6 +252,10 @@ class _Est:
             else:
                 if st == "waiting" or t.get("not_before"):
                     start = max(start, float(t.get("not_before") or 0))
+                if hold := self._held(t):
+                    if hold[0] is None:
+                        return {**self._held_none(tid, hold[1]), "path": path}
+                    start = max(start, hold[0])
                 if st == "queued":
                     locks = _locks(t)
                     waits = [w for lk in locks if (w := _med(self.h["queue"].get(lk, [])) ) is not None]
@@ -233,8 +275,17 @@ class _Est:
         return {"done": done, "end": end, "path": path, "legs": legs, "why": None, "overrun": over, "start": begin}
 
 
-def estimate(db, tid: int, now: float | None = None, hist: dict | None = None) -> dict:
-    return _Est(db, time.time() if now is None else now, hist).task(int(tid))
+def estimate(db, tid: int, now: float | None = None, hist: dict | None = None, core: str | None = None) -> dict:
+    return _Est(db, time.time() if now is None else now, hist, core).task(int(tid))
+
+
+def core_of(where) -> str | None:
+    """The core provider of a project or its config (a task with no provider runs there)."""
+    try:
+        cfg = where.config() if hasattr(where, "config") else where
+        return str((cfg or {}).get("core_provider") or "") or None
+    except Exception:
+        return None
 
 
 def obligation_estimate(db, o: dict, now: float | None = None, est: _Est | None = None) -> dict:
@@ -338,7 +389,7 @@ def course_lines(db, cfg: dict | None, now: float | None = None) -> tuple[list[s
     rows = long_promises(db, cfg, now)
     if not rows:
         return [], []
-    est = _Est(db, now)
+    est = _Est(db, now, core=core_of(cfg))
     out, ident = [], []
     for r in rows:
         e = obligation_estimate(db, r["o"], now, est)
@@ -381,7 +432,7 @@ def state_lines(db, where, now: float | None = None, host=None) -> list[str]:
     proms = open_promises(db)
     if not hot and not proms:
         return []
-    est = _Est(db, now)
+    est = _Est(db, now, core=core_of(where))
     out = ["## Expected finish (critical path, measured medians; quote these, never padded worst cases)"]
     for t in hot[:10]:
         on = host(t) if host else ""

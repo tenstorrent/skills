@@ -368,7 +368,7 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
     from . import eta
     try:
         cfg = p.config()
-        est = eta._Est(p.db, now)
+        est = eta._Est(p.db, now, core=cfg.get("core_provider"))
     except Exception:
         return text, []
     waiting = []   # (task, honest status) of each covered task not started on its host

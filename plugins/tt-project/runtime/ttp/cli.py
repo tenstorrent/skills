@@ -1730,7 +1730,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     hot = [t for t in db.q("SELECT * FROM tasks WHERE status IN ('queued','review') ORDER BY priority, id")
            if urgent.is_urgent(t)]
     try:
-        est = eta._Est(db, now)
+        est = eta._Est(db, now, core=eta.core_of(p))
     except Exception:
         est = None
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA
@@ -2048,9 +2048,9 @@ def cmd_eta(a) -> None:
         die("no tt-project project here; name one: `ttp eta <task> <name>`")
     ref, now = str(a.target).lstrip("#"), time.time()
     if ref.isdigit():
-        e = eta.estimate(p.db, int(ref), now)
+        e = eta.estimate(p.db, int(ref), now, core=eta.core_of(p))
     elif (o := obligations.get(p.db, ref)) is not None:
-        e = eta.obligation_estimate(p.db, o, now)
+        e = eta.obligation_estimate(p.db, o, now, eta._Est(p.db, now, core=eta.core_of(p)))
     else:
         die(f"not a task id or obligation: {a.target}")
     if a.json:
