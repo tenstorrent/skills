@@ -111,8 +111,8 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
     if mode == "stateless":
         st.pop("rerun", None)
         return st
-    if mode == "new":
-        st.update({"started": now, "wakes": 0, "failures": []})
+    if mode == "new":   # failed-resume times stay: fail() bounds them to the hour across rollovers
+        st.update({"started": now, "wakes": 0})
     sid = str(getattr(usage, "session_id", "") or session_id or "")
     st.update({"id": sid or st.get("id") or "", "provider": turn.get("provider", ""),
                "model": turn.get("model", ""), "effort": turn.get("effort", ""), "key": turn.get("key", ""),

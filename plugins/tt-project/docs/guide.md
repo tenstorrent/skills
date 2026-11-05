@@ -347,16 +347,6 @@ prolonged whole-box outage.
   project's own choice and stays. The upgrade says once per project which it did. It cannot tell
   that earlier upgrade's mark from a model_tier "" set by hand on such a project: that one moves
   too, and `ttp config NAME coordinator.model MODEL` pins it back.
-- `coordinator.session` sets the persistent coordinator session (off by default): with `mode` `on`
-  (Claude), each coordinator wake resumes one agent session instead of a fresh turn; `shadow` is
-  reserved. A project's coordinator may set the mode itself (`config_set`). A new session starts
-  when there is none, the system prompt, stable context or action schema changed, the model or
-  effort changed, the context reached `rollover_tokens` (140000), the last session turn did not end
-  ok, or its transcript is gone (a host move). A resumed wake that fails is rerun at once as a
-  stateless turn, so each message and event is handled once; `max_failures_per_h` (3) failed resumes
-  within an hour run every turn stateless for `pause_h` (6) hours and raise an issue. While the
-  session spend guard has tripped, turns are stateless. `ttp status --verbose` shows the session's
-  short id, wakes, context size and last decision.
   `coordinator.turn_timeouts_s.<provider>.<effort>` sizes the turn after effort is resolved:
   low/medium/high/xhigh/max (or ultra) default to 300/600/900/1200/1500 seconds for Claude,
   and 300/600/1200/1800/2400 for Codex and Cursor; an unknown effort or provider gets 600.
@@ -402,6 +392,16 @@ prolonged whole-box outage.
   (`machine_change_overdue`) is normal, high only on a machine tagged `serving`, `live` or `server`
   past its end with no passing until-probe, and each project hears of one change once per episode,
   whether from its own daemon or relayed by another project's.
+- `coordinator.session` sets the persistent coordinator session (off by default): with `mode` `on`
+  (Claude), each coordinator wake resumes one agent session instead of a fresh turn; `shadow` is
+  reserved. A project's coordinator may set the mode itself (`config_set`). A new session starts
+  when there is none, the system prompt, stable context or action schema changed, the model or
+  effort changed, the context reached `rollover_tokens` (140000), the last session turn did not end
+  ok, or its transcript is gone (a host move). A resumed wake that fails is rerun at once as a
+  stateless turn, so each message and event is handled once; `max_failures_per_h` (3) failed resumes
+  within an hour run every turn stateless for `pause_h` (6) hours and raise an issue. While the
+  session spend guard has tripped, turns are stateless. `ttp status --verbose` shows the session's
+  short id, wakes, context size and last decision.
 - Rejected-action cooldown: when the daemon rejects a turn's action (not an information-only
   refusal), each event that woke that turn puts its key (event kind, source and task) in a cooldown
   of `coordinator.rejection_cooldown_s` (default 900; 0 turns it off). Inside it, an event with the

@@ -251,3 +251,50 @@ def test_coordsession_the_failure_cap_pauses_the_mode_and_raises_an_issue(env, m
         ("stateless", "paused after repeated failed resumes")
     # A wake that did not resume never takes the failed-resume path.
     assert not d._coord_session_end({"id": 9, "session_id": "s2"}, use, {"mode": "new"}, False)
+
+
+def test_coordsession_the_failure_cap_trips_across_the_new_sessions_between_failed_resumes(env, monkeypatch):
+    # The real cycle: new -> failed resume -> stateless rerun -> new ("last run not ok") -> failed
+    # resume -> ...: a new session between failures keeps their count, so the third one pauses.
+    from ttp import coordsession
+    from ttp.daemon import Daemon
+    from ttp.providers import fake
+    p = make(env)
+    sessions = _sessions(env, monkeypatch)
+    p.set_config("coordinator.session.mode", "on")
+    p.set_config("coordinator.debounce_s", 0)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    d = Daemon(p.base)
+    seen = []
+    real_observe = d.observe
+    monkeypatch.setattr(d, "observe", lambda source, text, *a, **k: (
+        seen.append(k.get("key")), real_observe(source, text, *a, **k))[1])
+    monkeypatch.setattr(fake.Fake, "session_saved", lambda self, s, cwd, env=None: True)
+    note = lambda i: json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (i,))["note"])["turn"]["session"]
+    n = 0
+
+    def wake():
+        nonlocal n
+        n += 1
+        p.db.post("in", f"msg {n}", chat="c1")
+        rid = _cs_wake(p, d)
+        assert rid
+        return note(rid)
+
+    for cycle in range(3):
+        first = wake()
+        assert first["mode"] == "new", (cycle, first)
+        # The transcript vanishes: the next wake resumes it and fails.
+        (sessions / f"{p.db.kv(coordsession.KEY)['id']}.jsonl").unlink()
+        assert wake()["mode"] == "resume"
+        st = p.db.kv(coordsession.KEY)
+        assert len(st.get("failures") or []) == (0 if cycle == 2 else cycle + 1), (cycle, st)
+        if cycle < 2:
+            assert not st.get("paused_until") and seen.count("coord-session-paused") == 0
+            assert wake() == {**note(p.db.one("SELECT MAX(id) n FROM runs")["n"]), "mode": "stateless",
+                              "why": "rerun of a failed resume"}
+    st = p.db.kv(coordsession.KEY)
+    assert st["paused_until"] > time.time() + 5 * 3600, st
+    assert seen.count("coord-session-paused") == 1, seen
+    assert wake()["mode"] == "stateless"
