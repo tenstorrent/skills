@@ -20,7 +20,7 @@ them.
   a rejection; a clock or power experiment uses the recipe's fidelity too.
 - Result metric: cooled wall ms/step of the full model on the plan's chips (TP over the box when the
   model needs it) and MFU against the nominal peak (the plan's figure, e.g. 1350 MHz). "MFU at the
-  delivered clock" is a diagnostic for the ledger, never a result row. Subset-depth profiles and
+  delivered clock" is a diagnostic only, never a result row. Subset-depth profiles and
   single-chip subset MFU runs rank the next item and are never reported as results.
 - Batch and sequence length as the recipe states them.
 - One change per commit, reviewed and verified on its own, so the history bisects.
@@ -76,7 +76,13 @@ chain whose measured cost beats the kernel's expected gain.
    percent of the step each.
 8. Verify: PCC harness on the forward and every gradient with relative errors (at the shard shapes
    on a multi-chip layout), loss match at the plan's layout, MFU rerun with the baseline command,
-   Tracy diff showing the targeted ops gone and nothing new.
+   Tracy diff showing the targeted ops gone and nothing new. For a change that is not bit-exact, the
+   gate is the **nearest** control, not the most authoritative one: the previous iteration's own
+   trajectory at the same seed isolates this one commit in seconds, while a torch reference measures
+   every difference between the two stacks at once and its drift term belongs to whichever of them
+   compounds. One such gate ran a 24B torch reference on CPU for 92 minutes, held all four chips and
+   answered the wrong question; the committed device-against-device comparison settled it with no
+   device time at all.
 9. Append a row to the result table and update the ranked cost table in the
    [document format](#document-format) and [report style](#report-style): what changed and by
    how much, in words and numbers, not a path. Record rejected candidates with their cost, the
@@ -168,6 +174,34 @@ work log and do it. "Try both" means both candidates are built and measured. The
 target and the hard constraints are the scope; a question to the user is for a hardware decision
 (a power limit, a board) or a constraint change, nothing else.
 
+## Keep the big rows first
+
+The loop's failure mode is not a wrong measurement, it is a run that spends its second day pricing
+3-12 ms rows while the two largest rows in the table sit closed on narrow evidence. Guard against it
+explicitly:
+
+- **A pre-check falsifies one mechanism, never a row.** "Work balance returns 0" and "the scalar
+  bytes return 7 %" say nothing about whether the kernel's reader can be restructured. A row is
+  closed only after a data-flow attempt on it: which operand is re-read per work item, what is
+  multicast within a core group, how many rows a work item keeps in L1, where the partials go. Until
+  then the row stays open and names the mechanisms still unpriced.
+- **The biggest row gets the next iteration.** An overhead or configuration item jumps the queue
+  only with the chain-deletion reason: its measured cost above the big kernel's expected gain. Three
+  consecutive iterations without a ΔMFU means the ranking is being avoided; take the top row and
+  rewrite its data flow.
+- **Never derive a hardware ceiling from your own rejection list.** Summing the ceilings of the
+  things you decided not to build and calling the total the achievable end state is circular: the
+  total is a statement about what you chose to price, not about the hardware. A ceiling claim needs
+  a roofline figure and a failed kernel attempt per remaining row, and it does not end the loop on
+  its own.
+- **A well-optimised training step reaches roughly 40-50 % of the nominal peak. Keep going until
+  you are there.** A run sitting in the low thirties has unexplored kernel work, not a ceiling, and
+  the table usually says where: base matmuls well under the delivered FLOP rate, attention still on
+  the library's data flow, norms and elementwise chains still on their own rows rather than folded
+  into a neighbour or onto a shard. Treat a plateau as a signal to go after a bigger row, not as
+  evidence that the board is finished. State the delivered-clock margin as the margin it is, and do
+  not let the power cap stand in for work you have not attempted. There is a way; find it.
+
 ## Measurement protocol
 
 MFU runs: no profiler environment variables, real shapes, real sequence length, the plan's FLOP
@@ -229,7 +263,7 @@ expensive to collect and to analyse. Instead profile the model at four depths an
 Before/after Tracy diffs for a change use the same four depths; a change whose benefit does not
 show at every depth is reported with the depth where it stops showing. Record the four raw
 measurements, the fit with residuals, the projection and the validation in the evidence directory,
-linked from the ledger.
+linked from the measurement-traps section.
 
 The depth fit exists to rank the next item. It does not go into the result: once the full model
 runs (single chip or the authorised box), each iteration's profile is one subset depth on the
@@ -265,14 +299,38 @@ placeholder tokens, and spent 19 commits on their hygiene). Numbers in tables; n
 `*_PENDING` tokens (a row is written when its number exists). Fixed layout:
 
 1. `doc/optimization/README.md`: the hard-constraints block, then `## Results`: one table, columns
-   iteration, what changed, ms/step, ΔMFU (points against the previous row), MFU, critical-chip
-   clock, verified (yes/no). "What changed" is the mechanism in a few words, never a path. Nothing
-   else in the file.
-2. `doc/perf_analysis.md`: `# Performance analysis` with one line of setup (model, recipe, metric,
-   denominator); `## Ranked cost table` (op or chain, class, ms/step, % of step, kernel name,
-   status: open / landed N / rejected N); `## Rejected` (candidate, cost, what was tried, why it
-   failed, retry when); `## Ledger` (anomalies, one bullet each). Tables are replaced each
-   iteration, not appended.
+   iteration, **tag**, what changed, ms/step, ΔMFU (points against the previous row), MFU,
+   critical-chip clock, **time since start**, verified (yes/no). Nothing else in the file.
+2. `doc/perf_analysis.md`: `# Performance analysis` with the setup as bullets (model, recipe,
+   metric, denominator, target); `## Results` (the same table); `## Where the step time goes` (op or chain, class, ms/step, % of step, kernel name,
+   status: open / landed N / rejected N); `## Tried and rejected` (candidate, cost, what was tried,
+   why it failed, retry when); `## Measurement traps hit in this run` (one bullet each). Tables are
+   replaced each iteration, not appended. Prose is a bullet or it is deleted; a section of
+   paragraphs is a defect.
+
+   **Tag** is what kind of change it was, so a reader can see at a glance where a run's wins come
+   from and a later run can compare. Use the narrowest that fits: `new kernel`, `mod kernel`,
+   `rm overhead op`, `layout change`, `lib config` (a library program config only, no kernel source
+   changed), `collective`, `run script mod`, `repricing` (table corrected, no code), `priced only`
+   (ceiling measured, not built), `gate` (correctness only), `rejected`, `misc`. A run whose tags
+   are mostly `lib config`, `repricing` and `rejected` is a run that has stopped optimising.
+
+   **Time since start** is hours from the plan commit, on every row including the rejected ones. It
+   is the only column that makes two bring-ups comparable, and it is the column that shows a
+   plateau: if the last row with a ΔMFU is twenty hours behind the newest row, the loop is stuck
+   and the next iteration must be the biggest row in the table, not another pre-check.
+
+   **"What changed" is a sentence a reader understands without the commit.** Name the thing, what it
+   does now, and what it did before; for a rejection, say what was tried and why it failed, in the
+   same cell. "RMSNorm core count alone — rejected at pre-check" and "RMSNorm reads gamma's one real
+   row, not the padded tile" are both too short to be useful. Write "give RMSNorm more cores without
+   changing its work item — rejected at pre-check: every core re-read the whole gamma, so traffic
+   scaled with the grid" and "RMSNorm now reads gamma as its one real row instead of the full padded
+   tile".
+
+   **No private vocabulary.** Section and column names are what an engineer who has not read this
+   skill would call them. "Ledger", "rung", "arm A" and similar in-house words do not go in the
+   model's documents; say "measurement traps", "the cheapest fix that works", "the baseline arm".
 3. `work_log.md`: one bullet per iteration, three lines at most:
    `N: <what changed and how> | <ms/step, ΔMFU> | harness <pass/fail>, loss <pass/fail> | <sha>`.
    A path only when there is a figure or table worth opening.
@@ -326,7 +384,8 @@ The loop ends when the measured step time is within the stated margin of the pla
 target, or the plan's hardware ceiling is reached (the delivered-clock margin stated on day 1, with
 the telemetry showing the cap in every result row), or every remaining item in the ranked table is
 useful math at a stated fraction of its own
-roofline with a documented blocker for the rest. "Near its roofline" needs, per item: the roofline
+roofline with a documented blocker for the rest. A sum of unbuilt ceilings is not a hardware
+ceiling, and "the target is unreachable" is not an exit. "Near its roofline" needs, per item: the roofline
 figure (bytes or FLOPs at the measured clock), the measured fraction, and the kernel attempt that
 failed to close the gap (a sweep of a library kernel's program configs is tuning, not an attempt).
 Collectives count as a remaining item until overlap with compute was tried. Without these the loop

@@ -30,7 +30,14 @@ Use this skill for the hardware-facing parts of training bring-up. It covers onl
   matches itself and never ends; several such loops accumulate per session.
 - Never `pkill -f <pattern>` from a command whose text contains the pattern (heredocs included): it
   kills the agent's own shell. Stop a background job through the harness, or `kill` a PID read from
-  the script's own pid file.
+  the script's own pid file. The same self-match makes `pgrep -f <pattern>` report the job as alive
+  after it has exited, because the check matches its own command line; confirm with
+  `ps -p <pid>` on the specific PID instead.
+- **The agent owns every process it starts and stops its own.** Asking the user to run `kill` is a
+  defect in the pipeline, not a workaround: a device job that outlives its launcher holds all four
+  chips against the next piece of work. Record the PID, stop it through the harness or by that PID,
+  and verify with `ps -p`. A long device job also needs a bound that matches what it needs, not a
+  blanket timeout, and must not be left detached at hand-back.
 - Every device command in a chain runs under `timeout` with a bound derived from its expected
   duration, so a hang ends the chain instead of the session.
 - The chain writes its result markers (`rc=`, `passed`, `ms/step`) to the evidence log; the agent
@@ -38,6 +45,15 @@ Use this skill for the hardware-facing parts of training bring-up. It covers onl
 - Before the chain launches: the build is fresh (binary timestamp after the last edit) and any
   patch has been applied and checked outside the chain. A patch script inside the background
   command once measured the unpatched op; a stale build hung the chip.
+- **A library target is not the artefact the run loads.** In tt-train, `cmake --build --target ttml`
+  relinks `libttml.a` but **not** the nanobind extension `_ttml.abi3.so` that python imports, so a
+  python training or benchmark run after that build silently executes the previous extension. Build
+  the target the run actually loads (`_ttml`, or `./build_metal.sh --build-tt-train`) and check its
+  timestamp. A four-run cooled A/B once measured the previous iteration's code in both arms and
+  reported a 3.5 ms "gain" that was noise between identical binaries.
+- **Prove the new path executed, do not infer it from a plausible number.** Put a one-shot
+  stderr line behind an environment variable in the new branch (how many tensors it batched, which
+  config it chose) and read it in the run's log before believing the measurement.
 
 ## Telemetry And Clock
 
