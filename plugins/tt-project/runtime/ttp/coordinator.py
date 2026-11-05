@@ -73,6 +73,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     pauseends,
     plainreply,
     plangate,
+    preempt,
     prguard,
     progress,
     projpause,
@@ -2906,6 +2907,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:
                             _append_update(Path(r["dir"], "steer.md"), spec, key)
+                    if upd.get("status") != "cancelled" and (why := preempt.restart_line(spec)):
+                        # The run went the wrong way: stopped at a safe point (after its `ttp lock`s), requeued
+                        # with this spec and its work kept, no attempt spent (preempt.request_restart).
+                        if refused := preempt.request_restart(p, db, cfg, task, why, spec, defer=db.after_commit):
+                            notes.append(f"task_update: {refused}")
+                        else:
+                            notes.append(f"task_update: #{task['id']} restarts at a safe point: {why}")
                 if upd.get("status") == "cancelled":
                     # Only once the cancel is saved: a turn cut off before that must not stop the run.
                     # The daemon asks a cancelled task's runs to stop if this never happens.

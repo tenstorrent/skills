@@ -12,6 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
+from . import preempt
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -754,6 +755,22 @@ def _reboot_note(reboot, tz: str | None = None) -> str:
 RUN_DIR_MARK = "<this run's dir>"
 
 
+def restart_block(p: Project, prev: dict) -> str:
+    """The top of a run after a coordinator restart (preempt.request_restart): why the last run was stopped and
+    the new instructions; "" when the last run was not restarted."""
+    got = prev.get(preempt.RESTART_KEY)
+    if not isinstance(got, dict):
+        return ""
+    at = got.get("at")
+    when = f" at {timefmt.long(at, timefmt.home(p))}" if isinstance(at, (int, float)) else ""
+    update = str(got.get("update") or "").strip()
+    return (f"# RESTARTED BY THE COORDINATOR\nThe coordinator stopped your last run of this task{when} and "
+            f"restarted it: {got.get('why') or 'no reason given'}\nThis costs no attempt. Your worktree, branch and "
+            "commits are kept: check `git status` and `git log`, keep what still fits and change course as told. "
+            "Detached jobs the last run started may still run: check them before starting new ones.\n"
+            + (f"New instructions (they win over the spec below where they differ):\n{update}\n" if update else ""))
+
+
 def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict | None = None,
                 conflict: dict | None = None) -> str:
     """The per-task part of a worker's prompt, after worker_system(): the rules for its kind, the
@@ -865,6 +882,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                  "workers, so do not install into it; its editable installs import the project root's code, not "
                  "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
     parts = [
+        restart_block(p, prev),
         _sections(_raw(p, f"kind-{kind}.md"), cfg),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"

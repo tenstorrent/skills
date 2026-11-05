@@ -1023,6 +1023,13 @@ running work is interrupted only by the preemption below:
   provider at a safe point (`budget.urgent_preempt`, on by default): the run's work is kept and its
   task goes back to the queue with no attempt spent, marked "preempted for user-ordered urgent work;
   resumes". Urgent work, reviews, pushes, harness tasks and runs holding a lock are never preempted.
+- Restart: when a running worker went the wrong way, the coordinator restarts it with a `task_update`
+  whose `spec` has a `restart: <why>` line, or `ttp task <project> restart <id> "<why>"`. The run
+  stops at a safe point (a run holding a `ttp lock` stops once it releases it) and the task is queued
+  again with the updated spec, its worktree, branch and attempts kept and no attempt spent; its next
+  run's prompt starts with the why and the new instructions. A run that ends on its own before the
+  stop keeps its outcome. At most `budget.restart_max` (3) restarts per task per
+  `budget.restart_window_h` (6); a later one is refused with the reason. Each is logged with its why.
 - Detection: an urgent task ready over 2 minutes with a free slot and nothing holding it makes the
   daemon run dispatch at once and raise one `ready_not_started` event. A deadline task (a fresh
   `urgent:` line or an obligation owner) whose resources are free but whose slots are all taken is

@@ -8086,6 +8086,21 @@ def cmd_task(a) -> None:
         runs = stop_runs(p.db, p.runs, tid)
         print("cancelled" + (f"; ending its running run{'s' if len(runs) > 1 else ''} "
                              f"{', '.join(map(str, runs))}" if runs else ""))
+    elif a.action == "restart":
+        from . import preempt
+        if not a.title.strip().isdigit() or not (a.probe or "").strip():
+            die(f'restart needs a task id and why: ttp task {p.name} restart <id> "<why and new instructions>"')
+        tid, why = int(a.title), " ".join(a.probe.split())[:500]
+        with p.db.tx():
+            t = p.db.task(tid)
+            if not t:
+                die(f"no task #{tid}")
+            refused = preempt.request_restart(p, p.db, p.config(), t, why, why, defer=p.db.after_commit)
+            if not refused:   # on record, so its next run reads it in the spec too
+                p.db.update_task(tid, spec=(t["spec"] or "") + "\n\n## Update\nrestart: " + why)
+        if refused:
+            die(refused)
+        print(f"task #{tid} restarts at a safe point (after any `ttp lock` it holds), its work kept: {why}")
     elif a.action == "requeue":
         if not a.title.strip().isdigit():
             die(f"requeue needs a task id, not {a.title!r}")
@@ -12459,8 +12474,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--dir", required=True, help="its project root on that machine")
     s.set_defaults(fn=cmd_adopt)
 
-    s = sub.add_parser("task", help="add, list, show, cancel or requeue tasks by hand (requeue: a blocked or "
-                                    "stopped task runs again; add may wait for --start-when or --start-after); "
+    s = sub.add_parser("task", help="add, list, show, cancel, requeue or restart tasks by hand (requeue: a blocked or "
+                                    "stopped task runs again; restart: a running one starts over with new instructions; add may wait for --start-when or --start-after); "
                                     "set-when re-points a task not yet started; superseded records a done task's "
                                     "work as landed under another commit (also a code task in review whose work "
                                     "landed, or a harness task in review whose commit is merged into the harness: "
@@ -12470,11 +12485,14 @@ def main(argv: list[str] | None = None) -> None:
                                     "checks leave it out; rejudge reruns the daemon's hand-off checks on a done or "
                                     "failed task's stored hand-off and corrects a wrong partial mark")
     s.add_argument("name", help="the project")
-    s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "set-when", "superseded",
+    s.add_argument("action", choices=["add", "list", "show", "cancel", "requeue", "restart", "set-when", "superseded",
                                           "abandon", "rejudge"],
                    help="what to do")
-    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/set-when/superseded/abandon/rejudge: the task id")
-    s.add_argument("probe", nargs="?", help="set-when: the new retry_when/start_when command (\"\" clears it); "
+    s.add_argument("title", nargs="?", default="", help="add: the title; show/cancel/requeue/restart/set-when/superseded/abandon/rejudge: the task id")
+    s.add_argument("probe", nargs="?", help="restart: why, with the new instructions (a running task stops at a "
+                   "safe point, after any `ttp lock` it holds, and is queued again with its work kept and no attempt "
+                   "spent; budget.restart_max per budget.restart_window_h); "
+                   "set-when: the new retry_when/start_when command (\"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work (for a harness task: "
                    "the commit merged into the harness; for a cancelled correction-class fix task: the done task '#<id>' "
                    "or commit that fixed the class instead; for a failed review: a commit on the push branch or --ref that "

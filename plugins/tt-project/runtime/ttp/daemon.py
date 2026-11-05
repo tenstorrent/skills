@@ -3429,6 +3429,10 @@ class Daemon:
             self._stale_since.pop(gone, None)
         if (marks := self.p.db.kv(REAP_KEY)) and set(marks) - {str(r["id"]) for r in running}:
             self.p.db.set_kv(REAP_KEY, {k: v for k, v in marks.items() if k in {str(r["id"]) for r in running}})
+        try:
+            preempt.release_pending(self.p, self.cfg, [r for r in running if r["role"] != "coordinator"])
+        except Exception:   # a pending restart never holds up reaping
+            log(self.p, "pending restarts failed\n" + traceback.format_exc())
         for r in running:
             try:
                 # Liveness first: a runner writes exit.json before it exits, so a run found dead here
@@ -5269,6 +5273,22 @@ class Daemon:
             return
         # A hand-off written before the run ended badly (supervisor killed, reboot, timeout, stall)
         # stands: the work it reports is done and redoing it would repeat it.
+        restart = preempt.take_restart(run_dir) if status == "shutdown" else None
+        if restart is not None:
+            # A coordinator restart (preempt.request_restart): the old run's direction is dropped, any hand-off
+            # with it; the task runs again on its own branch with the updated spec, no attempt spent.
+            # Its last wait is dropped too: the next run works at the task's tier, never as a wake of that wait.
+            why, prev = str(restart.get("why") or ""), load_result(task["result"])
+            earlier = str(prev.get("summary") or "")[:600]
+            prev = {k: v for k, v in prev.items() if k not in WAIT_KEYS + ("woke", "escalated_wake", "on_pass")}
+            prev.update({"status": "restarted", "summary": f"run {r['id']} stopped by a coordinator restart"
+                         + (f"; before it: {earlier}" if earlier else ""),
+                         preempt.RESTART_KEY: {"why": why, "update": str(restart.get("update") or "")[:4000],
+                                               "run": r["id"], "at": restart.get("at")}})
+            db.update_task(task["id"], status="queued", blocked_reason=f"restarted by the coordinator: {why}"[:500],
+                           result=dump_result(prev))
+            log(self.p, f"task {task['id']}: run {r['id']} stopped for a restart; queued again: {why}")
+            return
         if status not in ("ok", "killed", "resource_busy") and (
                 (handoff or {}).get("status") in HANDOFF_STATES
                 or (status == "shutdown" and isinstance(result, dict) and result.get("status"))):
