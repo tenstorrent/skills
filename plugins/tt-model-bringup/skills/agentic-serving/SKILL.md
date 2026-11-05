@@ -111,20 +111,21 @@ Optional operator inputs come from `bringup/agentic_evals/inputs.json` in the ta
 - `stage_budget_hours` (default 24 for `light`, 48 for `full`), covering survey to the start of the
   release run;
 - `run_timeout_hours` (default 12): the longest any single run may take. The release is one run of
-  all suites in `light` and one run per suite in `full`, so it bounds both. A CI grant may state a
-  lower limit of its own in `compute.run_timeout_hours`; the smaller applies;
+  all suites in `light` and one run per suite in `full`, so it bounds both;
 - `permissions`: standing decisions the stage would otherwise stop to ask for, such as
   `release_route_repairs` (may the stage publish fixes to the release route) and
   `account_fallback`. Ask for a missing one once, at the start, in `blocked.json`;
 - reference scores per eval. Without one, look for a published score for this model; when there is
   none, the suite grades NA and the report says so;
 - the eval harness: default the tt-inference-server agentic runner on its main branch;
-- `compute`, optional.
+- `compute`, optional: more devices, defined by the operator. Each entry names the device, its
+  device type, the `submit`, `status` and `collect` commands that run a job on it, any limit of its
+  own (such as a job timeout), and optionally `instructions`, a file explaining how to use it.
 
 By default the stage runs on one machine: the local device, which every earlier stage used. Plan,
-size and time everything for it. `compute` may grant more machines as secondary devices, used as
-[Devices](#devices) says; the plan may shorten, but the stage must not depend on them. Record what
-was actually used in `doc/agentic_evals/compute.json`.
+size and time everything for it. Devices in `compute` are secondary, used as [Devices](#devices)
+says; the plan may shorten, but the stage must not depend on them. Record what was actually used in
+`doc/agentic_evals/compute.json`.
 
 ### Modes
 
@@ -345,7 +346,8 @@ The local device is primary. The schedule in `plan.json` must work with it alone
 rehearsal and release run use it unless the operator says otherwise, so the release lands on the
 machine it was rehearsed on.
 
-Granted machines are secondary. They take work the plan would otherwise run one after another on
+Devices from `compute` are secondary. Use them only through the operator's commands, and follow
+their `instructions` and limits; they define what each device is and how it is used. They take work the plan would otherwise run one after another on
 the local device: a rung of one suite while another suite's rung runs locally, an effort's scored
 sample, or a second arm of a paired comparison. Give a secondary machine work whose result still
 counts if the machine disappears, and keep a local fallback in the schedule for anything on the
@@ -357,8 +359,8 @@ time as [tt-device-usage](../tt-device-usage/SKILL.md) requires and logs each jo
 end and exit status. Sub-agents do not pick devices or dispatch on their own: they hand a job to
 the coordinator, which places it on a queue by the schedule, so parallel efforts use parallel
 devices without two jobs ever sharing one. After a hang or crash, reset and check that device
-before its next job. [CI compute](references/ci-compute.md) covers the publish and dispatch steps
-for CI machines.
+before its next job. A job that fails on a secondary device for reasons outside the model is run
+again, there or locally; the release run is planned so it does not need that.
 
 ### Outputs
 
@@ -386,8 +388,8 @@ Write these to `doc/agentic_evals/`:
 - `serving_config.json`: the measured `max_concurrency`, `prefix_caching`, `max_num_seqs`,
   `validated_batches`, per run in `batch_by_eval` its `batch` and `planned_clients`, the agent and
   request time limits and output cap, and `release_limits`
-- `compute.json`: the grant as used — `max_parallel`, peak runs in flight, and for a CI grant the
-  published refs and every dispatched run id, so each result traces back to a run
+- `compute.json`: the devices as used — each job with its device, the id its `submit` returned and
+  the commits it ran, so each result traces back to a run
 - `learned.json`: what the next model's stage 12 should not rediscover: `harness_facts`
   (host and harness limits found, each with its evidence), `suite_timings` (per run `eval`,
   `tasks`, `agents`, `batch`, `wall_hours`, `agent_hours`, `timeouts`, `score`) and

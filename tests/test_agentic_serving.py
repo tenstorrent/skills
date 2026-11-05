@@ -422,11 +422,10 @@ def test_no_release_needed_when_every_eval_stopped(tmp_path):
 @pytest.mark.parametrize('inputs, passes', [
     ({'run_timeout_hours': 8}, False),
     ({'run_timeout_hours': 10}, True),
-    ({'compute': {'run_timeout_hours': 10}}, True),
-    ({'run_timeout_hours': 14, 'compute': {'run_timeout_hours': 9}}, False),
+    ({}, True),
 ])
 def test_release_limit_comes_from_the_operator_inputs(tmp_path, inputs, passes):
-    """projected 9.5 h: run_timeout_hours from inputs.json, the smaller of stage and CI limits."""
+    """projected 9.5 h against run_timeout_hours from inputs.json, default 12."""
     goal12(tmp_path)
     code, stderr = check(tmp_path, 'agentic-evals', evidence(), inputs=inputs)
     assert (code == 0) == passes, stderr

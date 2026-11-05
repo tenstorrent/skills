@@ -260,9 +260,8 @@ def operator_inputs(problems: list) -> dict:
 
 
 def run_timeout_hours(inputs: dict) -> float:
-    limits = [inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS),
-              (inputs.get("compute") or {}).get("run_timeout_hours")]
-    return min(limit for limit in limits if number(limit))
+    limit = inputs.get("run_timeout_hours", DEFAULT_RUN_TIMEOUT_HOURS)
+    return limit if number(limit) else DEFAULT_RUN_TIMEOUT_HOURS
 
 
 def check_cohorts(evals: Path, problems: list) -> None:
