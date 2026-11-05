@@ -27120,7 +27120,6 @@ DURABLE_EXEMPT = {
     ("cli.py", "spec.write_text"): "the upgrade commit's scratch pathspec list, deleted right after; a lost one only redoes the commit",
     ("cli.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
     ("machines.py", "os.replace(p+'.tmp',p)"): "runs on another machine, inside a command string",
-    ("locks.py", 'open(path, "a")'): "the lock file itself: its content only describes the holder",
     ("testslots.py", 'os.fdopen(fd, "a+")'): "a checks lane kept through a re-exec (adopt_lanes): the lock file itself, already open",
     ("locks.py", '.lock", "a")'): "a flock guard file, never written",
     ("locks.py", "tmp.write_text(str(n))"): "the priority-turn streak: only a count, a lost write shifts the bound by a turn",
