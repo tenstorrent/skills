@@ -13857,6 +13857,7 @@ def test_a_re_review_never_runs_when_its_fix_ends_with_no_new_commits(env, hando
     commit to the head its review saw leaves nothing to re-review: the re-review is blocked, not run on
     the same head, and the fix's hand-off wakes the coordinator saying so."""
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     root, branch, rev, _ = _split_with_a_landing_hop(env, p)
     _fail_review(env, p, rev, [{"title": "refuse an open review", "spec": "abandon refuses a task under review"}])
     fid, rid = _fix_and_re_review(p, rev)
@@ -13871,6 +13872,7 @@ def test_a_re_review_never_runs_when_its_fix_ends_with_no_new_commits(env, hando
 
 def test_a_re_review_runs_once_its_fix_adds_commits(env):
     p = make(env)
+    p.set_config("chains.requeue", False)   # the new-hop path, not chaincap.requeue
     root, branch, rev, _ = _split_with_a_landing_hop(env, p)
     _fail_review(env, p, rev, [{"title": "refuse an open review", "spec": "abandon refuses a task under review"}])
     fid, rid = _fix_and_re_review(p, rev)
