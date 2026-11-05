@@ -65,6 +65,7 @@ OFF_ENV = "TTP_CHECKS_NO_SPILL"   # set for the local rerun of a run that did no
 PROBE_TIMEOUT_S = 30
 DEVICE_SUFFIX = "-device"
 BROKER_TIMEOUT_S = 10.0   # one read of a broker's status; past it the device locks alone decide
+SPILL_MARK = {"checks_spill": True}   # in the label of a pool check run's hold of a host's lock (_hold)
 SKIP_SHOW_S = 900   # a host skipped for a device job shows in `ttp status` and the web app this long after
 _JOB_LISTS = ("jobs", "running_jobs", "active_jobs", "running")   # broker status: job rows (a list) or a count
 _JOB_ONE = ("current_job", "active_job", "running_job")   # broker status: the one job under way
@@ -314,15 +315,31 @@ def device_locks_of(cfg: dict, alias: str, known: dict | None = None) -> list[st
 def _lock_held(p, cfg: dict, res: str, shared_too: bool = True) -> str:
     """"" when nobody holds, reserves or waits for lock `res`, here (where this project's `ttp lock` takes
     it) or, with `shared_too`, in the user's shared locks (another project that shares it), else the probe's
-    line."""
+    line. A lock held only by pool check runs (_spill_only) counts as free."""
     from . import lockprobe, locks, shared
     dirs = list(dict.fromkeys([shared.locks_dir(p, res, cfg), *([shared.root() / res] if shared_too else [])]))
     for d in dirs:
         paths = list(dict.fromkeys([*locks.slot_paths(d, res, shared.slots(p, res, cfg)),
                                     *sorted(Path(d).glob(f"{res}.*.lock"))]))
-        if not (locks.probe(d, res, paths, shared=True) and locks.probe(d, res, paths)):
+        if not (locks.probe(d, res, paths, shared=True) and locks.probe(d, res, paths)) \
+                and not _spill_only(d, res, paths):
             return lockprobe.line(res, False, d, res, paths, p)
     return ""
+
+
+def _spill_only(d, res: str, paths: list) -> bool:
+    """Whether lock `res` in `d` is held only by pool check runs (_hold's label has SPILL_MARK), with nobody
+    waiting for it or reserving it: such a hold is no device job. A taken slot whose label lacks the mark or
+    does not read, or no holder found at all, is not."""
+    from . import locks
+    if locks.reserved_by(locks.reserve_path(d, res)) or locks.queued(d, res):
+        return False
+    try:
+        held = [locks.read_label(x) for x in paths if locks._slot_labels([x])] + locks.shared_holders(paths)
+    except (OSError, ValueError):
+        return False
+    return bool(held) and all(isinstance(h, dict) and all(h.get(k) == v for k, v in SPILL_MARK.items())
+                              for h in held)
 
 
 def _job_name(row: Any) -> str:
@@ -435,7 +452,8 @@ def _hold(p, cfg: dict, alias: str, what: str):
     who = shared.holder(p, res, hold.label(hold.who(os.environ.get("TTP_TASK")), os.environ.get("TTP_RUN_ID")), cfg)
     device = res in locks.device_locks(cfg) or res.endswith("-device") or alias.endswith("-device")
     try:
-        return (locks.try_take if device else locks.try_take_shared)(paths, who, f"ttp checks (spilled): {what}")
+        return (locks.try_take if device else locks.try_take_shared)(paths, who, f"ttp checks (spilled): {what}",
+                                                                     extra=SPILL_MARK)
     except OSError:
         return None
 

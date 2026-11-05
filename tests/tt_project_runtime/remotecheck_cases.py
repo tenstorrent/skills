@@ -1104,3 +1104,76 @@ def test_a_saturated_disk_sends_a_new_run_to_a_spill_host_before_any_wait_here(e
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     assert picks == [1], "the spill hosts were tried first, once"
     assert "/ttp-check." not in log.read_text(), "it ran here"
+
+
+def test_spill_device_gate_never_counts_a_pool_check_runs_hold_on_a_bare_alias_as_a_device_job(
+        env, tmp_path, monkeypatch):
+    """device.locks lists the bare machine alias, so a pool check run on that host holds the alias's lock
+    (_hold). That hold, another project's in the shared locks or this project's own, under the raw or the
+    canonical name, never reads as a device job. Any other hold of the alias still does, and so does one
+    dressed as a check run without its mark, a check run's hold with a device job waiting or a reservation,
+    and a held `<alias>-device`."""
+    from ttp import checkspill, locks, shared
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    told: list[str] = []
+
+    def spill_hold(res, where, who, take_shared=False):
+        paths = locks.slot_paths(where, res, 1)
+        take = locks.try_take_shared if take_shared else locks.try_take
+        got = take(paths, who, "ttp checks (spilled): pytest -q", extra=checkspill.SPILL_MARK)
+        assert got is not None
+        return got
+
+    for dev in (["check-host-a"], ["other-device", "check-host-a"]):
+        p.set_config("device.locks", dev)
+        cfg = p.config()
+        assert "check-host-a" in checkspill.device_locks_of(cfg, "check-host-a")
+        canon = locks.canonical(cfg, "check-host-a")
+        for res, where, who, sh in (
+                ("check-host-a", shared.root() / "check-host-a", "otherproj task #9 (run 1)", True),
+                ("check-host-a", shared.root() / "check-host-a", "otherproj task #9 (run 1)", False),
+                (canon, shared.locks_dir(p, canon, cfg), "task #4 (run 2)", False)):
+            h = spill_hold(res, where, who, sh)
+            try:
+                assert checkspill.device_busy(p, cfg, "check-host-a") == "", (dev, res, where)
+                if res != canon or where != shared.locks_dir(p, canon, cfg):   # its own hold: no free slot here
+                    got = checkspill.pick(p, cfg, told.append, "pytest -q")
+                    assert got is not None and got.host == "check-host-a", told
+                    got.close()
+            finally:
+                h.close()
+    cfg = p.config()
+    alias_dir = shared.root() / "check-host-a"
+    h = _device_hold(p, "check-host-a", alias_dir, "otherproj task #9 (run 1)")   # not a check run's hold
+    try:
+        assert "check-host-a: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a")
+        assert checkspill.pick(p, cfg, told.append, "pytest -q") is None
+    finally:
+        h.close()
+    f = locks.try_take(locks.slot_paths(alias_dir, "check-host-a", 1), "otherproj task #9 (run 1)",
+                       "ttp checks (spilled): pytest -q")   # the command text alone is no mark
+    try:
+        assert "check-host-a: busy" in checkspill.device_busy(p, cfg, "check-host-a")
+    finally:
+        f.close()
+    h = spill_hold("check-host-a", alias_dir, "otherproj task #9 (run 1)", True)
+    try:
+        g = locks.try_take_shared(locks.slot_paths(alias_dir, "check-host-a", 1), "otherproj task #8 (run 4)",
+                                  "soak")
+        try:
+            assert "check-host-a: busy" in checkspill.device_busy(p, cfg, "check-host-a"), "a hold beside it"
+        finally:
+            g.close()
+        locks.reserve(locks.reserve_path(alias_dir, "check-host-a"), "otherproj task #5 (run 3)")
+        try:
+            assert "reserved for otherproj task #5" in checkspill.device_busy(p, cfg, "check-host-a")
+        finally:
+            locks.unreserve(locks.reserve_path(alias_dir, "check-host-a"), "otherproj task #5 (run 3)")
+        assert checkspill.device_busy(p, cfg, "check-host-a") == ""
+        d = _device_hold(p, "check-host-a-device", shared.root() / "check-host-a-device", "otherproj task #9 (run 1)")
+        try:
+            assert "check-host-a-device: busy (held by" in checkspill.device_busy(p, cfg, "check-host-a")
+        finally:
+            d.close()
+    finally:
+        h.close()

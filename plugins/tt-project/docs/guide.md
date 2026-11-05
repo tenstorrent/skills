@@ -1358,7 +1358,8 @@ nothing running is interrupted:
   holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
   are skipped with the reason and the run keeps its place here. A device job means one of the host's device
   locks (`<alias>-device`, the device names of its machines-list `shared` entry, `device.locks` names on it)
-  is held, reserved or waited for, or a broker heal check (preset broker) of the project on that machine
+  is held, reserved or waited for (a pool check run's own hold of the host's lock is none, even when `device.locks`
+  lists the bare alias), or a broker heal check (preset broker) of the project on that machine
   reports a running job row; a broker status that cannot be read never keeps a run off. Runs already there go
   on, and `ttp status` and the web app show the skip in one line with the host and the reason. The account's pool, `checks.spill_hosts`
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
