@@ -140,6 +140,33 @@ def test_a_question_task_is_not_made_a_code_task_without_a_commit_on_its_own_bra
     assert _finish_question(env, p, tid, "failed") == [] and p.db.task(tid)["kind"] == "question"
 
 
+def test_an_urgent_continue_hop_on_an_earlier_hops_branch_gets_its_review_in_the_same_pass(env):
+    """A `continue:` hop (kind question, as its parent) that carried on the branch its parent hop made and
+    committed there: that branch is recovered, so the review is queued at once, not dropped for want of a
+    branch. A branch some task already holds on record is never taken."""
+    p = make(env)
+    _with_origin(env, clone=False)
+    hot = "urgent: owed to the user\nFix caps_line."
+    for held in (False, True):
+        root = p.db.add_task(f"o139 question {held}", "Is it fixed?", kind="question", tier="standard",
+                             origin="coordinator")
+        p.db.update_task(root, status="done")
+        hop = p.db.add_task(f"continue: fix it {held}", hot, kind="question", tier="standard",
+                            origin="coordinator", parent=root)
+        tid = _question_on_own_branch(env, p, f"hop {held}", hot, branch=f"ttp/t{root}-fix-{held}")
+        p.db.update_task(tid, status="done")   # the helper's task stands in for the parent's branch maker
+        if held:
+            p.db.update_task(tid, branch=f"ttp/t{root}-fix-{held}")
+        p.db.update_task(hop, status="running")
+        reviews = _finish_question(env, p, hop)
+        t = p.db.task(hop)
+        if held:
+            assert (reviews, t["kind"], t["branch"]) == ([], "question", None)
+        else:
+            assert (t["kind"], t["branch"]) == ("code", f"ttp/t{root}-fix-{held}")
+            assert [(r["priority"], r["origin"]) for r in reviews] == [(1, "daemon")]
+
+
 def test_the_review_sweeps_take_an_urgent_task_at_once_and_past_the_cap(env):
     from ttp.daemon import Daemon
     p = make(env)

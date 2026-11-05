@@ -1038,19 +1038,28 @@ def rescue_detached(p: Project, task: dict, result: dict | None, cwd: str = "",
     return "", ""
 
 
-def own_branch(p: Project, task: dict, timeout_s: float = RESCUE_TIMEOUT_S) -> str:
+def own_branch(p: Project, task: dict, timeout_s: float = RESCUE_TIMEOUT_S, earlier: tuple = (),
+               taken: frozenset = frozenset()) -> str:
     """The one local branch named after `task` (ttp/t<id>-...) that adds a commit its base lacks, or '' (none,
     several, or git failing): a task of a kind that gets no worktree (a question, say) whose worker made its
-    own task branch and committed its change there. Only that name ties the branch to this task."""
-    own = f"ttp/t{int(task['id'])}-"
+    own task branch and committed its change there. Only that name ties the branch to this task. With none,
+    the same for each id in `earlier` in turn (the earlier hops of a `continue:` chain, latest first, that hold
+    no branch on record): the hop that carried on an earlier hop's branch. A branch in `taken` (on record
+    for some task) is never one."""
     try:
-        names = [n for n in _git(p.root, "for-each-ref", "--format=%(refname:short)", "refs/heads/ttp/",
-                                 check=False, timeout=timeout_s).split() if n.startswith(own)]
-        if len(names) != 1:
-            return ""
-        base = resolve_base(p)
-        return names[0] if _git(p.root, "rev-list", "-n", "1", names[0], "--not", base, check=False,
-                                timeout=timeout_s) else ""
+        refs = _git(p.root, "for-each-ref", "--format=%(refname:short)", "refs/heads/ttp/", check=False,
+                    timeout=timeout_s).split()
+        base = None
+        for tid in (task["id"], *earlier):
+            names = [n for n in refs if n.startswith(f"ttp/t{int(tid)}-") and n not in taken]
+            if not names:
+                continue
+            if len(names) != 1:
+                return ""
+            base = base or resolve_base(p)
+            return names[0] if _git(p.root, "rev-list", "-n", "1", names[0], "--not", base, check=False,
+                                    timeout=timeout_s) else ""
+        return ""
     except (RuntimeError, OSError, subprocess.SubprocessError):
         return ""
 

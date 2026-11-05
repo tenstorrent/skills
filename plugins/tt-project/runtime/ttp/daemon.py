@@ -4931,7 +4931,8 @@ class Daemon:
 
     def _adopt_own_branch(self, task_id: int, result) -> None:
         """A task of a kind that gets no worktree (question, plan, work) finishing done or needs_review with
-        no branch on record, whose worker committed a change on its own task branch (worktree.own_branch),
+        no branch on record, whose worker committed a change on its own task branch, or as a `continue:` hop on
+        an earlier hop's that no task holds (worktree.own_branch),
         becomes a code task on that branch before the transaction that queues its review: a finished
         change always gets its review (an urgent or owed one at once), never only a stall alert. Best
         effort: git failing leaves the task as it was."""
@@ -4940,7 +4941,11 @@ class Daemon:
                 or not isinstance(result, dict) or result.get("status") not in ("done", "needs_review") \
                 or not worktree.is_git(self.p.root):
             return
-        branch = worktree.own_branch(self.p, task)
+        hops = chaincap.chain(self.p.db, task_id)[:-1]   # a continue hop may carry on an earlier hop's branch
+        earlier = tuple(t["id"] for t in reversed(hops) if t["kind"] != "code" and not t.get("branch"))
+        taken = frozenset(r["branch"] for r in self.p.db.q(
+            "SELECT DISTINCT branch FROM tasks WHERE branch IS NOT NULL AND id!=?", (task_id,)))
+        branch = worktree.own_branch(self.p, task, earlier=earlier, taken=taken)
         if branch:
             self.p.db.update_task(task_id, kind="code", branch=branch)
             log(self.p, f"task {task_id}: a {task['kind']} task that committed its change on its own branch "
