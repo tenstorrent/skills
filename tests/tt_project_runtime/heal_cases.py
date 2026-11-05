@@ -4540,3 +4540,91 @@ def test_a_check_whose_ssh_name_does_not_exist_escalates_at_once_as_a_route_fix_
     dns = heal.validate({"check": "echo 'ssh: Could not resolve hostname box-a: Temporary failure in name "
                                   "resolution' >&2; exit 255", "machine": "box-a"})
     assert heal.run(d, "svc3", dns, time.time())[0].startswith("ok (unknown"), "no resolver: not a broken name"
+
+
+def _down_pages(p, monkeypatch, alias, owner="other-project"):
+    """A daemon whose task waits on `alias` (owned by `owner`) over a stand-in ssh that never reaches
+    any host, and that logs each host it was asked for. Returns (daemon, task, notes sent, ssh log)."""
+    from ttp import daemon as dmod
+    from ttp import machines as mm
+    from ttp import upstream
+    mm.set_recovery(alias, owner=owner)
+    _ssh_255(p)
+    called = p.base / "ssh-called"
+    ssh = p.harness / "bin" / "ssh"
+    ssh.write_text(ssh.read_text().replace("host=$1; shift\n", f'host=$1; shift\necho "$host" >> "{called}"\n'))
+    sent: list = []
+    monkeypatch.setattr(upstream, "send", lambda source, tid, to, text, *a, **k: sent.append((to, text)) or "sent")
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, f"ssh -o BatchMode=yes {alias} test -e /tmp/marker")
+    _settle_probe(d, tid)
+    return d, tid, sent, called
+
+
+def test_an_unreachable_self_ssh_to_the_daemons_own_host_never_pages_it_down(env, monkeypatch):
+    """Upstream note: a daemon paged a machine's recovery owner 'Machine <alias> is down' for its own
+    host, which was up: ssh from the host to itself had no route. Its reachability is now read here,
+    with no ssh, so it never reads as down; the probe is broken (its route), not a down host."""
+    from ttp import downwait, netwait
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-self", hostname="testhost")   # TTP_HOST: this machine
+    d, tid, sent, called = _down_pages(p, monkeypatch, "box-self")
+    assert sent == [], "the own host's recovery owner was paged"
+    assert downwait.episodes(p.db) == {} and not p.db.q("SELECT 1 FROM events WHERE kind=?", (downwait.EVENT,))
+    assert d._probe_gap(tid) == d._poll_s(), "a wait on the own host backed off as if it were down"
+    assert "this machine itself, which is up" in (p.logs / "daemon.log").read_text()
+    asked = called.read_text().split() if called.exists() else []
+    assert asked == ["box-self"], f"the reachability check used ssh to the own host: {asked}"
+    assert netwait.answers("box-self") and netwait.answers(f"{__import__('getpass').getuser()}@box-self")
+    assert not netwait.answers("someone-else@box-self", {"PATH": str(p.harness / "bin")}), \
+        "another user's login on it is not this one's"
+
+
+def test_an_unreachable_remote_machine_still_pages_its_recovery_owner(env, monkeypatch):
+    from ttp import downwait
+    from ttp import machines as mm
+    p = make(env)
+    mm.add("box-far", hostname="far-host")
+    d, tid, sent, called = _down_pages(p, monkeypatch, "box-far")
+    assert len(sent) == 1 and sent[0][0] == "other-project" and "Machine box-far is down" in sent[0][1]
+    assert downwait.episodes(p.db)["box-far"]["action"] == "owner"
+    assert d._probe_gap(tid) == downwait.BACKOFF_S[0]
+    assert "box-far" in called.read_text().split(), "a remote host is still checked over ssh"
+
+
+def test_own_host_reads_the_ssh_route_and_never_counts_a_tunnel_proxy_or_other_user(env, monkeypatch):
+    """machines.own_host past the registry: `ssh -G`'s HostName names this machine or resolves to one of
+    its addresses, on port 22 with no jump host, proxy or other user; loopback is a tunnel's route."""
+    import getpass
+    from ttp import machines as mm
+    from ttp import netwait
+    monkeypatch.delenv("TTP_TEST_NO_SSH_CHECK")
+    me = getpass.getuser()
+    routes = {"via-fqdn": {"hostname": "testhost"},
+              "via-addr": {"hostname": "10.9.8.7"},
+              "far": {"hostname": "203.0.113.5"},
+              "tunnel": {"hostname": "127.0.0.1", "port": "2222"},
+              "loop": {"hostname": "localhost"},
+              "jump": {"hostname": "testhost", "proxyjump": "bastion"},
+              "proxied": {"hostname": "testhost", "proxycommand": "nc %h %p"},
+              "other-port": {"hostname": "testhost", "port": "2200"},
+              "as-other": {"hostname": "testhost", "user": "someone-else"},
+              "unknown": {}}
+    asked: list = []
+    monkeypatch.setattr(netwait, "_ssh_config", lambda a: asked.append(a) or {"port": "22", "user": me, **routes[a]})
+    monkeypatch.setattr(mm, "_local_address", lambda name, timeout: name == "10.9.8.7")
+    monkeypatch.setattr(mm, "_OWN", {})
+    got = {a: mm.own_host(a, known={}) for a in routes}
+    assert got == {"via-fqdn": True, "via-addr": True, "far": False, "tunnel": False, "loop": False, "jump": False,
+                   "proxied": False, "other-port": False, "as-other": False, "unknown": False}, got
+    assert mm.own_host(f"{me}@via-fqdn", known={}) and not mm.own_host("someone-else@via-fqdn", known={})
+    assert not mm.own_host("-oProxyCommand=x", known={}) and not mm.own_host("", known={})
+    n = len(asked)
+    assert mm.own_host("via-addr", known={}) and len(asked) == n, "a route answer is kept, not asked again"
+
+
+def test_local_address_is_never_loopback_or_a_foreign_address(env):
+    from ttp import machines as mm
+    assert not mm._local_address("127.0.0.1", 2) and not mm._local_address("::1", 2)
+    assert not mm._local_address("192.0.2.1", 2), "TEST-NET-1 is no address of this machine"

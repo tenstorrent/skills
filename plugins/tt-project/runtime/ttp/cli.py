@@ -7070,12 +7070,17 @@ def _rows_verdict(n: int | None, rows: str, after: int, one_ended: bool, where: 
     return 0 if one_ended or (n or 0) > after else 1
 
 
-def _ssh_sh(host: str, script: str, args: list, timeout: float = 60) -> subprocess.CompletedProcess | None:
-    """Run `script` with sh on `host` over ssh, with `args` as its $1...; None when ssh cannot run."""
-    remote = "sh -c " + " ".join(shlex.quote(x) for x in (script, "sh", *map(str, args)))
+def _ssh_sh(host: str, script: str, args: list, timeout: float = 60,
+            here: bool = True) -> subprocess.CompletedProcess | None:
+    """Run `script` with sh on `host` over ssh, with `args` as its $1...; None when ssh cannot run.
+    With `here`, on this machine itself (netwait.own) it runs here, with no ssh: a read never waits on
+    a route to itself. A start keeps ssh, so its job outlives the caller's session."""
+    from . import netwait
+    words = ["sh", "-c", script, "sh", *map(str, args)]
+    remote = "sh -c " + " ".join(shlex.quote(x) for x in words[2:])
+    cmd = words if here and netwait.own(host) else ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, remote]
     try:
-        return subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", host, remote],
-                              stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
+        return subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError):
         return None
 
@@ -7095,7 +7100,7 @@ def _detach_remote(a, ttp: str) -> None:
             "(name: letters, digits, . _ -)")
     run = Path(os.environ.get("TTP_RUN_DIR") or "").name or time.strftime("manual-%Y%m%d-%H%M%S")
     rdir = (a.dir or f"~/.ttp-detach/{run}").rstrip("/") or "/"
-    r = _ssh_sh(a.remote, _REMOTE_START, [rdir, a.name, *cmd])
+    r = _ssh_sh(a.remote, _REMOTE_START, [rdir, a.name, *cmd], here=False)
     if r is None or r.returncode == 255:
         die(f"ssh to {a.remote} failed{': ' + r.stderr.strip()[-300:] if r and r.stderr.strip() else ''}", 255)
     out = (r.stdout.strip().splitlines() or [""])[-1].split(" ", 2)

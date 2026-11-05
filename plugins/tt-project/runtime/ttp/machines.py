@@ -580,6 +580,80 @@ def names_here(value: str, known: dict[str, dict] | None = None) -> bool:
     return real != v and real in mine
 
 
+_OWN: dict[str, tuple[bool, float]] = {}   # ssh target -> (own_host's answer, when)
+OWN_TTL_S = 600
+
+
+def _local_address(name: str, timeout: float) -> bool:
+    """Whether `name` resolves (within `timeout`) to an address of this machine other than loopback:
+    one a socket can bind to here (no packet is sent)."""
+    import ipaddress
+    import socket
+    import threading
+    got: list = []
+
+    def look() -> None:
+        try:
+            got.extend({i[4][0] for i in socket.getaddrinfo(name, None)})
+        except (OSError, UnicodeError):
+            pass
+    t = threading.Thread(target=look, name="ttp-own-host", daemon=True)
+    t.start()
+    t.join(timeout)
+    for addr in list(got):
+        try:
+            ip = ipaddress.ip_address(addr.partition("%")[0])
+        except ValueError:
+            continue
+        if ip.is_loopback:
+            continue
+        try:
+            with socket.socket(socket.AF_INET6 if ip.version == 6 else socket.AF_INET, socket.SOCK_DGRAM) as s:
+                s.bind((addr, 0))
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def own_host(target: str, known: dict[str, dict] | None = None, timeout: float = SSH_CHECK_S) -> bool:
+    """Whether ssh target `target` (`alias` or `user@alias`) is the machine this runs on, as this user:
+    the alias is one of local_names, its machines-list `hostname` is, or (`ssh -G`, no connection) its
+    HostName is or resolves to an address of this machine, with no other port, jump host, proxy or user
+    in between. Loopback never counts: a route to it is usually a tunnel to another machine. Its reachability is checked here, never
+    over ssh to itself. TTP_TEST_NO_SSH_CHECK=1 (the test suite) skips the ssh and name lookups, whose
+    answers are kept OWN_TTL_S."""
+    import getpass
+    user, _, alias = str(target or "").strip().rpartition("@")
+    v = alias.lower()
+    if not v or v.startswith("-"):
+        return False
+    try:
+        me = getpass.getuser()
+    except Exception:
+        me = ""
+    if user and user != me:
+        return False
+    from . import netwait
+    mine = {n for n in local_names() if not netwait.loopback(n)}   # a loopback route is a tunnel's
+    known = load() if known is None else known
+    if v in mine or any(a.lower() == v and str(m.get("hostname") or "").strip().lower() in mine
+                        for a, m in known.items()):
+        return True
+    if os.environ.get("TTP_TEST_NO_SSH_CHECK") == "1" or not ALIAS_RE.fullmatch(alias):
+        return False
+    hit = _OWN.get(str(target))
+    if hit and time.time() - hit[1] < OWN_TTL_S:
+        return hit[0]
+    cfg = netwait._ssh_config(alias)
+    direct = bool(cfg) and cfg.get("port", "22") == "22" and (bool(user) or cfg.get("user", me) == me) \
+        and cfg.get("proxyjump", "none").lower() == "none" and cfg.get("proxycommand", "none").lower() == "none"
+    real = str(cfg.get("hostname") or "").lower() if direct else ""
+    ok = bool(real) and (real in mine or _local_address(real, timeout))
+    _OWN[str(target)] = (ok, time.time())
+    return ok
+
+
 def device_host(known: dict[str, dict] | None = None) -> bool:
     """Whether this machine's entry is tagged `device`."""
     hit = here(known)

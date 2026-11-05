@@ -10846,7 +10846,8 @@ class Daemon:
             self._down_n[tid] = self._down_n.get(tid, 0) + 1
             known = machines.load()
             down = [a for h in netwait.hosts(probe, out)[:netwait.HOSTS_MAX]
-                    if (a := downwait.machine_of(h, known)) and not self._host_up.get(h, (True, 0))[0]]
+                    if (a := downwait.machine_of(h, known)) and not self._host_up.get(h, (True, 0))[0]
+                    and not netwait.own(h)]   # ssh to this machine itself failing never makes it down
             if not down:
                 return
             checks = heal.checks(self.p.db)

@@ -2088,3 +2088,29 @@ def test_the_no_new_privs_preexec_is_none_off_linux(monkeypatch):
     from ttp import privlock
     monkeypatch.setattr(privlock.os, "uname", lambda: os.uname_result(("Darwin", "h", "r", "v", "m")))
     assert privlock.no_new_privs_preexec() is None and privlock.no_new_privs() is False
+
+
+def test_detach_check_host_on_the_own_machine_reads_it_here_with_no_ssh(env, tmp_path, monkeypatch):
+    """A task waiting on a job on the daemon's own host never waits on ssh to itself: its
+    `ttp detach --check --host <alias>` reads the job here, also when ssh to itself has no route."""
+    from ttp import cli
+    from ttp import machines as mm
+    make(env)
+    mm.add("box-self", hostname="testhost")   # TTP_HOST: this machine
+    b = tmp_path / "bin"
+    b.mkdir()
+    (b / "ssh").write_text(f'#!/bin/sh\necho "$*" >> "{tmp_path / "ssh-called"}"\n'
+                           'echo "ssh: Could not resolve hostname box-self" >&2; exit 255\n')
+    (b / "ssh").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{b}:{os.environ['PATH']}")
+    rdir = tmp_path / "jobs"
+    rdir.mkdir()
+    (rdir / "done.rc").write_text("0\n")
+    (rdir / "bad.rc").write_text("3\n")
+    with contextlib.redirect_stdout(io.StringIO()) as out:
+        assert cli._detach_check_remote("box-self", [str(rdir / "done")]) == 0, out.getvalue()
+        assert cli._detach_check_remote("box-self", [str(rdir / "bad")]) == 4, out.getvalue()
+    assert not (tmp_path / "ssh-called").exists(), "the own host was asked over ssh"
+    with contextlib.redirect_stdout(io.StringIO()):   # a remote host still goes over ssh
+        assert cli._detach_check_remote("box-far", [str(rdir / "done")]) == 255
+    assert "box-far" in (tmp_path / "ssh-called").read_text()

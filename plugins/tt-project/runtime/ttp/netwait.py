@@ -136,15 +136,28 @@ def hosts(probe: str, output: str = "") -> list[str]:
 
 
 def answers(alias: str, env: dict | None = None) -> bool:
-    """ssh reaches `alias`: anything but ssh's own 255 (or no answer at all) means the host answered."""
+    """ssh reaches `alias`: anything but ssh's own 255 (or no answer at all) means the host answered.
+    The machine this runs on (machines.own_host) answers without ssh: a missing route to itself never
+    reads as it being down."""
     if not alias or alias.startswith("-"):
         return False
+    if own(alias):
+        return True
     try:
         r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={CONFIRM_TIMEOUT_S}", alias, "true"],
                            env=env, stdin=subprocess.DEVNULL, capture_output=True, timeout=CONFIRM_TIMEOUT_S + 20)
     except (OSError, subprocess.SubprocessError):
         return False
     return r.returncode != UNREACHABLE_RC
+
+
+def own(alias: str) -> bool:
+    """machines.own_host, False when it cannot say."""
+    from . import machines
+    try:
+        return machines.own_host(alias)
+    except Exception:
+        return False
 
 
 def reach(aliases: list[str], env: dict | None = None) -> dict[str, bool]:
@@ -158,13 +171,18 @@ def reach(aliases: list[str], env: dict | None = None) -> dict[str, bool]:
 
 def confirm(probe: str, output: str = "", answered=None) -> str:
     """Why a probe's exit 255 is not ssh's own ("" when every host it names is unreachable): it names
-    no ssh host, or one answers, so its own remote command failed, or ssh says a name it needs does not
-    exist (sshfail.unresolved). `answered(alias)` checks one host."""
+    no ssh host, or this machine itself (own: it is up), or one answers, so its own remote command
+    failed, or ssh says a name it needs does not exist (sshfail.unresolved). `answered(alias)` checks
+    one host."""
+    names = hosts(probe, output)[:HOSTS_MAX]
+    self_ = [h for h in names if own(h)]
+    if self_:   # ssh from this machine to itself failed: it is up, the probe's route is what is broken
+        return (f"exit 255 from ssh to {', '.join(self_)}, this machine itself, which is up: check it here "
+                f"with no ssh (drop the ssh; `ttp detach --check --host` reads it here)")
     gone = sshfail.unresolved(output)
     if gone:   # no host was ever asked: the route itself is broken, and asking again changes nothing
         return (f"exit 255: ssh cannot resolve {gone}: no ssh Host entry or DNS name defines it here, a broken "
                 f"route to fix (check it with `ssh -G <alias>`), not an outage")
-    names = hosts(probe, output)[:HOSTS_MAX]
     if not names:
         return "exit 255 from a probe that names no ssh host"
     with ThreadPoolExecutor(len(names)) as ex:   # at once: in an outage each waits out its timeout

@@ -973,14 +973,16 @@ echo "end"
 
 def _remote_sh(host: str, pid: str = "", marker: str = "") -> dict | None:
     """What the remote host says of a job's remote side: {"boot", "marker" (bool), "alive" / "dead"
-    (the pid)}; None when ssh fails, times out or the answer is cut short."""
+    (the pid)}; None when ssh fails, times out or the answer is cut short. On this machine itself
+    (netwait.own) it is asked here, with no ssh."""
+    from . import netwait
     from .cli import REMOTE_BOOT_SH
-    script = _REMOTE_LIVE % REMOTE_BOOT_SH
-    remote = "sh -c " + " ".join(shlex.quote(x) for x in (script, "sh", pid or "", marker or ""))
+    words = ["sh", "-c", _REMOTE_LIVE % REMOTE_BOOT_SH, "sh", pid or "", marker or ""]
+    remote = "sh -c " + " ".join(shlex.quote(x) for x in words[2:])
+    cmd = words if netwait.own(host) else ["ssh", "-o", "BatchMode=yes", "-o",
+                                           f"ConnectTimeout={REMOTE_TIMEOUT_S // 2}", host, remote]
     try:
-        r = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", f"ConnectTimeout={REMOTE_TIMEOUT_S // 2}",
-                            host, remote], stdin=subprocess.DEVNULL, capture_output=True, text=True,
-                           timeout=REMOTE_TIMEOUT_S)
+        r = subprocess.run(cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=REMOTE_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
         return None
     lines = r.stdout.splitlines()
