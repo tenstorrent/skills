@@ -3390,7 +3390,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         _restriction_conflicts(p, restr_before, rules_added)
     if loosened:
         try:   # a hint for the next turn: it never undoes the charter edit
-            restriction_audit.restriction_tools(p, loosened, list(batch_tasks))
+            restriction_audit.restriction_tools(p, loosened, list(batch_tasks), notes)
         except Exception as e:
             notes.append(f"restriction tools not checked: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: marking what it delivered never undoes or rejects it

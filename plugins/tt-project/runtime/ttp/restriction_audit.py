@@ -18,6 +18,7 @@ for the coordinator's one-time ask to loosen it. Only the user's own words loose
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import json
 import re
@@ -87,13 +88,75 @@ CITE_STEMS = frozenset({"user", "word", "msg", "messag", "january", "february", 
                         "august", "september", "october", "november", "december"})
 
 
-def distinctive_words(words: set[str], lines: list[str] | tuple) -> set[str]:
+_TOKEN = re.compile(r"\w+")
+
+
+def _starts(w: str, low: str) -> bool:
+    """re.search(rf"\\b{re.escape(w)}", low): `w` starts a word of `low`."""
+    return re.search(rf"\b{re.escape(w)}", low) is not None
+
+
+class WordIndex:
+    """Word starts of `lines`, tokenized once: a stem that is all word characters starts a word of a
+    line exactly when one of the line's \\w+ tokens starts with it (a sorted-token range, no regex per
+    line); any other stem is searched only on the lines whose tokens start with its leading word part.
+    Each stem's lines are kept, so counting (distinctive_words) and matching (tool_hit) share one pass."""
+
+    def __init__(self, lines=()):
+        self.low: list[str] = []
+        self.nonblank = 0
+        self._by: dict[str, list[int]] = {}
+        self._keys: list[str] | None = None
+        self._memo: dict[str, frozenset[int]] = {}
+        self.add(lines)
+
+    def add(self, lines) -> None:
+        for x in lines:
+            i, low = len(self.low), x.lower()
+            self.low.append(low)
+            self.nonblank += bool(x.strip())
+            for t in set(_TOKEN.findall(low)):
+                self._by.setdefault(t, []).append(i)
+        self._keys, self._memo = None, {}
+
+    def lines_of(self, w: str) -> frozenset[int]:
+        """The indexes of the lines `w` starts a word of."""
+        if (got := self._memo.get(w)) is not None:
+            return got
+        head = _TOKEN.match(w)
+        if not head:   # no leading word part to narrow by: one search per line
+            got = frozenset(i for i, x in enumerate(self.low) if _starts(w, x))
+        else:
+            if self._keys is None:
+                self._keys = sorted(self._by)
+            keys, at, ids = self._keys, bisect.bisect_left(self._keys, head[0]), set()
+            while at < len(keys) and keys[at].startswith(head[0]):
+                ids.update(self._by[keys[at]])
+                at += 1
+            got = frozenset(ids if head[0] == w else (i for i in ids if _starts(w, self.low[i])))
+        self._memo[w] = got
+        return got
+
+    def words_on(self, i: int, words) -> list[str]:
+        """The stems of `words` that start a word of line `i`, sorted."""
+        return sorted(w for w in words if i in self.lines_of(w))
+
+    def hits(self, words) -> dict[int, list[str]]:
+        """Line index -> the sorted stems of `words` that start a word of it, for the lines with any."""
+        out: dict[int, list[str]] = {}
+        for w in sorted(words):
+            for i in self.lines_of(w):
+                out.setdefault(i, []).append(w)
+        return out
+
+
+def distinctive_words(words: set[str], lines: list[str] | tuple | WordIndex) -> set[str]:
     """The stems of `words` found (as word starts) on at most COMMON_SHARE of the non-blank `lines`,
-    or on at most COMMON_MIN of them: 'work', 'project' or 'fail' of a long item match almost any line."""
-    low = [x.lower() for x in lines if x.strip()]
-    most = max(COMMON_MIN, COMMON_SHARE * len(low))
-    return {w for w in words
-            if sum(1 for x in low if re.search(rf"\b{re.escape(w)}", x)) <= most}
+    or on at most COMMON_MIN of them: 'work', 'project' or 'fail' of a long item match almost any line.
+    `lines` may be a WordIndex, built once for several calls."""
+    idx = lines if isinstance(lines, WordIndex) else WordIndex(lines)
+    most = max(COMMON_MIN, COMMON_SHARE * idx.nonblank)
+    return {w for w in words if len(idx.lines_of(w)) <= most}
 
 
 _QUOTED = re.compile(r"[\"“]([^\"”\n]{4,80})[\"”]|(?<!\w)['‘]([^'’\n]{4,80})['’](?!\w)")
@@ -132,10 +195,11 @@ def enabled_schedules(text: str) -> str:
 
 
 def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozenset(),
-             rare: set[str] | None = None) -> list[str]:
+             rare: set[str] | None = None, on: list[str] | None = None) -> list[str]:
     """What a line names of the old item: an identifier, a quoted phrase or user-message cite of
     `exact` (exact_terms), or else two or more of its rule words (as word starts), one of them in
-    `rare` (distinctive_words) when given; [] when none."""
+    `rare` (distinctive_words) when given; [] when none. `on`: the sorted words of `words` the line
+    has, when already known (WordIndex.words_on)."""
     from .restriction_source import CITE_RE
     got = sorted(t for t in ids if t in line)
     low = line.lower()
@@ -145,7 +209,11 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
         got += sorted(t for t in exact if (t in cites if t.startswith("#") else t in folded))
     if got:
         return got
-    got = sorted(w for w in words if re.search(rf"\b{re.escape(w)}", low))
+    if on is None:   # one tokenizing pass: every word start's prefixes, no regex per word
+        heads = {t[:k] for t in set(_TOKEN.findall(low)) for k in range(1, len(t) + 1)}
+        on = sorted(w for w in words if ((h[0] in heads and (h[0] == w or _starts(w, low)))
+                                         if (h := _TOKEN.match(w)) else _starts(w, low)))
+    got = on
     return got if len(got) >= 2 and (rare is None or rare & set(got)) else []
 
 
@@ -201,7 +269,11 @@ def replaced_items(body: str, text: str) -> list[tuple[str, str]]:
     return out
 
 
-def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> list[str]:
+AUDIT_BUDGET_S = 5.0   # wall clock of one restriction_tools call: it runs on the daemon's tick thread
+
+
+def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
+                      notes: list[str] | None = None, budget_s: float | None = None) -> list[str]:
     """After Restrictions items were loosened or removed, name the project's own tools that still carry
     the old wording: files under bin/ and hooks/ (project root and harness), harness/schedules.json,
     and the command and heal check of each enabled schedule, whose lines name an identifier of the old item
@@ -217,17 +289,24 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
     text excepts the item, which still stands, so its own terms (identifiers, distinctive words, quotes,
     cites) match. Per item with such files: one priority-1 harness task naming them (label TASK_LABEL +
     a key of the change: a change that already queued one queues none) and one queued restriction_tools
-    event for the next digest. Model-free; it edits no tool. Returns the event texts."""
+    event for the next digest. Model-free; it edits no tool. Returns the event texts.
+    Bounded by `budget_s` (AUDIT_BUDGET_S) of wall clock: past it the scan fails open, keeps what it found
+    (an item's tools named so far still queue its task) and appends a cut-short note to `notes`."""
     from .coordinator import clip
+    end = time.monotonic() + (AUDIT_BUDGET_S if budget_s is None else budget_s)
     files: list[tuple[str, str]] = []   # (label, text)
     seen = 0
+    cut = ""   # what the budget left unscanned
     for base in (p.root, p.harness):
         for sub in ("bin", "hooks"):
             top = base / sub
-            if not top.is_dir():
+            if not top.is_dir() or cut:
                 continue
             for f in sorted(top.rglob("*")):
                 if seen >= TOOL_SCAN_FILES:
+                    break
+                if time.monotonic() > end:
+                    cut = "reading the tool files"
                     break
                 if not f.is_file() or any(x in f.parts for x in (".git", "__pycache__", "node_modules")):
                     continue
@@ -257,19 +336,33 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
         charter = p.charter_path.read_text()
     except OSError:
         charter = ""
-    out = []
+    idx, starts = WordIndex(), []   # one tokenizing pass over every tool line, shared by all items
+    for _, text in files:
+        if time.monotonic() > end:
+            cut = cut or "indexing the tool lines"
+            break
+        starts.append(len(idx.low))
+        idx.add(text.splitlines())
+    files = files[:len(starts)]
+    out, checked = [], 0
     for old, new, over, *rest in loosened:
+        if cut:
+            break
+        checked += 1
         advisory, exception = bool(rest and rest[0]), len(rest) > 1 and bool(rest[1])
         if (over == "unsourced" or advisory) and still_stated(charter, old):
             continue   # a dropped advisory copy of a rule the Brief or a sourced item still binds: tools stay right
-        lines = [x for _, t in files for x in t.splitlines()]
         # an exception leaves the item standing: its own identifiers, distinctive words, quotes and cites
-        ids, words, exact = tool_terms(old, "", "", lines) if exception else tool_terms(old, new, charter, lines)
-        rare = distinctive_words(words, lines)
+        ids, words, exact = tool_terms(old, "", "", idx) if exception else tool_terms(old, new, charter, idx)
+        rare = distinctive_words(words, idx)
+        on = idx.hits(words)
         hits = []
-        for label, text in files:
+        for (label, text), at in zip(files, starts):
+            if time.monotonic() > end:
+                cut = "matching the tool lines"
+                break
             line, got = next(((n, g) for n, x in enumerate(text.splitlines(), 1)
-                              if (g := tool_hit(x, ids, words, exact, rare))),
+                              if (g := tool_hit(x, ids, words, exact, rare, on.get(at + n - 1, [])))),
                              (0, []))
             probe = label.startswith(("schedule ", "task #"))   # no file: no line number
             if not line or label in named or (not probe and Path(label).name in named):
@@ -301,6 +394,11 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int]) -> li
         out.append(x)
         p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                (time.time(), "harness", "restriction_tools", "normal", x, "queued"))
+    if cut and notes is not None:
+        budget = AUDIT_BUDGET_S if budget_s is None else budget_s
+        notes.append(f"restriction tools: the tool scan was cut short at its {budget:g} s budget while {cut} "
+                     f"({checked} of {len(loosened)} changed Restrictions items reached, {len(starts)} tool files "
+                     "indexed); tools past the cut were not checked against the old wording")
     return out
 
 

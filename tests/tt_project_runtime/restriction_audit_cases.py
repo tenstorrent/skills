@@ -382,3 +382,73 @@ def test_a_lifting_both_hold_text_queues_the_update_task_too(env):
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
     got = tasks()
     assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"] and _GUARD_SOAK in got[0]["spec"], got
+
+
+# The audit runs on the daemon's tick thread (coordinator.apply in reap_runs): it tokenizes the tool lines
+# once and is bounded by AUDIT_BUDGET_S, failing open with a note.
+def _synthetic_words(n):
+    """`n` distinct letters-only words of 8 letters that no stemmer shortens."""
+    abc = "bcdfghjkmnpqrstvwxz"
+    return [f"zq{abc[i // len(abc) % len(abc)]}{abc[i % len(abc)]}vy{abc[i // 7 % len(abc)]}k" for i in range(n)]
+
+
+def test_a_large_tool_tree_and_a_long_item_scan_with_no_regex_per_word_per_line(env, monkeypatch):
+    """50,000 tool lines against a removed item of 300 rule words: the words are counted and matched from
+    one index (no re.search per word per line, which took minutes), with the same hits as before."""
+    from ttp import restriction_audit
+    p = make(env)
+    words = _synthetic_words(300)
+    (p.root / "bin").mkdir(exist_ok=True)
+    for f in range(10):   # every word on 1,000 lines (2%): too common, none distinctive but the rare pair
+        (p.root / "bin" / f"bulk{f}.sh").write_text(
+            "".join(f"echo {words[(f * 5000 + i) % 298]} {words[(f * 5000 + i * 7) % 298]} done\n" for i in range(5000)))
+    (p.root / "bin" / "guard.sh").write_text(f"#!/bin/sh\n# refuse: {words[298]} with {words[299]}\n")
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+    item = "Never " + " ".join(words) + "."
+    calls = {"search": 0}
+    real = restriction_audit.re
+
+    class Counting:
+        def __getattr__(self, name):
+            return getattr(real, name)
+
+        def search(self, *a, **k):
+            calls["search"] += 1
+            return real.search(*a, **k)
+
+    monkeypatch.setattr(restriction_audit, "re", Counting())
+    notes = []
+    out = restriction_audit.restriction_tools(p, [(item, "", "the rule was retired")], [], notes)
+    assert calls["search"] < 1000, calls
+    assert notes == [] and len(out) == 1, (notes, out)
+    assert f"bin/guard.sh:2 ({words[298]}, {words[299]})" in out[0] and "bulk" not in out[0], out
+
+
+def test_an_exceeded_audit_budget_fails_open_and_notes_the_cut(env, monkeypatch):
+    """A tool scan past its wall-clock budget stops, keeps what it found and writes a note; through
+    coordinator.apply (the daemon's finish step) the turn ends within the bound and the note is in the
+    turn's notes, though an unbounded scan here would take 8 s."""
+    from ttp import coordinator as coord, restriction_audit
+    p, tasks = _soak_guard(env)
+    notes = []
+    out = restriction_audit.restriction_tools(p, [(_GUARD_SOAK + " (user msg #7)", "", "")], [], notes, budget_s=0)
+    assert out == [] and tasks() == [], out
+    assert len(notes) == 1 and "the tool scan was cut short at its 0 s budget" in notes[0], notes
+    for i in range(40):
+        (p.root / "bin" / f"tool{i}.sh").write_text("#!/bin/sh\necho ok\n")
+    real_add = restriction_audit.WordIndex.add
+
+    def slow_add(self, lines):
+        time.sleep(0.2)
+        real_add(self, lines)
+
+    monkeypatch.setattr(restriction_audit.WordIndex, "add", slow_add)
+    monkeypatch.setattr(restriction_audit, "AUDIT_BUDGET_S", 0.5)
+    mids, src = _turn_said(p, "the soak test may run on a shared rack at night")
+    act = {"type": "charter_update", "section": "Restrictions", "quote": _GUARD_SOAK + " (user msg #7)",
+           "text": "Run the soak test on a shared rack only at night.", "source": src}
+    t0 = time.monotonic()
+    assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
+    assert time.monotonic() - t0 < 4, "the restriction audit held the turn past its budget"
+    got = [n for n in p.db.kv(coord.NOTES_KEY, []) if "restriction tools:" in n]
+    assert len(got) == 1 and "cut short at its 0.5 s budget while indexing the tool lines" in got[0], got
