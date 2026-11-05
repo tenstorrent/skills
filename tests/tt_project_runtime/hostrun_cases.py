@@ -107,6 +107,53 @@ def test_host_run_exact_entry_allows_only_its_own_words_client_and_daemon_side(e
     assert p.config()["runner"]["host_commands"] == [{"cmd": "/bin/id -u", "exact": True}]
 
 
+@pytest.mark.parametrize("argv", [
+    ["ttp", "lock", "r1", "--", sys.executable, "-c", "print('ok')", "x"],   # an extra word under an exact entry
+    ["ttp", "lock", "r1", "--", "/bin/false"],                              # a command not on the list
+    ["ttp", "lock", "--disruptive", "r1", "--", sys.executable, "-c", "print('ok')"],   # not the exact wrapper:
+    ["ttp", "lock", "r1,r2", "--", sys.executable, "-c", "print('ok')"],    # an option, several resources,
+    ["ttp", "lock", "r1", sys.executable, "-c", "print('ok')"],             # no `--`,
+    ["/usr/bin/ttp", "lock", "r1", "--", sys.executable, "-c", "print('ok')"],   # another program path,
+    ["ttp", "lock", "r1", "--", "ttp", "lock", "r2", "--", sys.executable, "-c", "print('ok')"],   # nested
+    ["ttp", "lock", "r1", "--"],
+])
+def test_host_run_lock_wrapper_refuses_extra_words_an_unlisted_command_and_other_wrappers(env, monkeypatch, capfd,
+                                                                                         argv):
+    from ttp import hostrun
+    exact = [sys.executable, "-c", "print('ok')"]
+    p = _hostrun_setup(env, monkeypatch, [{"cmd": shlex.join(exact), "exact": True}])
+    ents, _ = hostrun.entries(p)
+    assert hostrun.allowed(exact, ents) and hostrun.allowed(["ttp", "lock", "r1", "--", *exact], ents)
+    assert hostrun.request(p, argv) == hostrun.REFUSED and "refused" in capfd.readouterr().err
+    q = p.state / hostrun.QUEUE   # past the client: the daemon refuses it too
+    q.mkdir(parents=True, exist_ok=True)
+    rid = secrets.token_hex(16)
+    (q / f"{rid}.json").write_text(json.dumps({"argv": argv, "task": "9"}))
+    hostrun.serve(p, wait=True)
+    assert json.loads((q / f"{rid}.out.json").read_text())["rc"] == hostrun.REFUSED
+
+
+def test_host_run_lock_wrapper_runs_a_listed_command_with_its_limit_and_holds_the_lock(env, monkeypatch, capfd):
+    from ttp import hostrun
+    probe = [sys.executable, "-c", "import subprocess, sys; print('probe', subprocess.run([sys.executable, '-m', "
+             "'ttp', 'lock', '--probe', 'hr-res']).returncode)"]
+    p = _hostrun_setup(env, monkeypatch, [{"cmd": shlex.join(probe), "exact": True, "timeout_s": 45}, "/bin/true"])
+    ents, _ = hostrun.entries(p)
+    wrapped = ["ttp", "lock", "hr-res", "--", *probe]
+    assert hostrun.limit_for(p, wrapped, ents) == hostrun.limit_for(p, probe, ents) == 45
+    assert hostrun.allowed(["ttp", "lock", "hr-res", "--", "/bin/true", "x"], ents), "a plain entry stays a prefix"
+    monkeypatch.setenv("PYTHONPATH", str(RUNTIME))   # the daemon's own environment, which a bare command gets
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    assert _hostrun_with_daemon(p, probe, []) == 0 and "probe 0" in capfd.readouterr().out   # bare: no lock
+    assert _hostrun_with_daemon(p, wrapped, []) == 0
+    assert "probe 75" in capfd.readouterr().out, "the resource is held while the wrapped command runs"
+    run, env2 = hostrun.launch(p.base, wrapped, "12")
+    assert run == [sys.executable, "-m", "ttp", "lock", "hr-res", "--", *probe]
+    assert env2["TTP_PROJECT"] == str(p.base) and env2["TTP_TASK"] == "12" and "TTP_RUN_ID" not in env2
+    assert hostrun.launch(p.base, probe, "12") == (probe, None)
+    assert subprocess.run([sys.executable, "-m", "ttp", "lock", "--probe", "hr-res"]).returncode == 0, "released after"
+
+
 def test_doctor_warns_on_a_plain_sudo_entry_only(env, monkeypatch):
     from ttp import hostrun
     raw = ["sudo -n systemctl enable --now a.service", "/usr/bin/sudo -n /usr/sbin/tool status",

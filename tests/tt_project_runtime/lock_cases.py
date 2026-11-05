@@ -1817,9 +1817,11 @@ def test_worker_hook_points_sudo_under_ttp_lock_to_host_run(env, monkeypatch, tm
         return (out or {}).get("hookSpecificOutput", {}).get("permissionDecisionReason") or ""
     for cmd in ("ttp lock r -- sudo tt-smi -glx_reset", "timeout 60 ttp lock r -- bash -c 'sudo x'",
                 "ttp lock --timeout 5 r --disruptive -- su -c y", "ttp lock a -- ttp lock b -- doas z",
-                "ttp lock r pkexec z"):
+                "ttp lock r pkexec z", "ttp host-run --status x; ttp lock r -- sudo y",
+                "ttp lock r -- sudo ttp host-run"):
         assert "ttp host-run" in why(cmd), cmd
     for cmd in ("ttp lock r -- ssh box 'sudo -n tt-smi -s'", "ttp lock r -- ttp host-run -- sudo -n x",
+                "ttp host-run -- ttp lock r -- sudo -n x", "ttp host-run --detach -- ttp lock r -- sudo -n x",
                 "ttp lock --probe r", "ttp lock r -- make test"):
         assert "host-run" not in why(cmd), cmd
 

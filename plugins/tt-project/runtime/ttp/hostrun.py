@@ -16,10 +16,12 @@ it, at or below zero, not a number or otherwise malformed is refused when read, 
 never clamped. The longest matching entry gives the limit; a caller's --timeout below it wins, above it
 is cut to it (and told so). A dict entry with "exact": true matches only a request whose words equal its
 own, word for word: nothing can be appended to it (name a privileged command this way, so a worker cannot
-add an argument it runs as root); `ttp doctor` warns on a plain (prefix) entry that starts with sudo. Only the
-user or the coordinator sets the list (`ttp config`, or the coordinator's config_set, which chat may use): both
-store only a list check_list accepts, refusing a shell string, a non-list or any entry entry() refuses, named.
-`ttp config` refuses it in a worker run, and the daemon runs nothing
+add an argument it runs as root); `ttp doctor` warns on a plain (prefix) entry that starts with sudo. A request
+wrapped exactly as `ttp lock <one resource> -- <cmd...>` matches by its command (unlocked), and the daemon
+runs it through its own `ttp lock`, so the lock is held while the command runs (launch). Only the user or the
+coordinator sets the list (`ttp config`, or the coordinator's config_set, which chat may use): both store only a
+list check_list accepts, refusing a shell string, a non-list or any entry entry() refuses, named. `ttp config`
+refuses it in a worker run, and the daemon runs nothing
 while configwho records a worker as its setter. Every request, run or refused, goes to
 state/host-run.jsonl with its task id, run id, words, exit code and length.
 
@@ -48,7 +50,7 @@ import uuid
 from pathlib import Path
 
 from . import boundedchild, privlock
-from .project import Project, durable_append, durable_write, write_json
+from .project import NOTE_RUN_ENV, Project, durable_append, durable_write, write_json
 
 QUEUE = "host-run"           # under the project's state: <id>.json requests, <id>.out.json answers
 LOG = "host-run.jsonl"       # under the project's state: one line per request
@@ -64,6 +66,7 @@ MAX_RUNNING = 4
 OUT_CAP = 64_000             # bytes of stdout and of stderr kept in an answer
 REFUSED, TIMED_OUT, NO_ANSWER, UNKNOWN = 126, 124, 75, 4
 ID_RE = re.compile(r"^[0-9a-f]{32}$")
+LOCK_NAME_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:@+-]*$")   # one resource: no list (,) or choice (|)
 _running: set[str] = set()
 _mu = threading.Lock()
 
@@ -182,9 +185,34 @@ def asked(limit: int, want) -> tuple[int, str]:
 
 
 def matches(argv: list[str], e) -> bool:
-    """Whether `argv` equals entry `e` (an Entry) word for word or, unless it is exact, starts with all its words."""
+    """Whether `argv`, or the command of its `ttp lock <res> --` wrapper (unlocked), equals entry `e` (an Entry)
+    word for word or, unless it is exact, starts with all its words."""
     words = e[0]
-    return argv == words if getattr(e, "exact", False) else argv[:len(words)] == words
+    return any(a == words if getattr(e, "exact", False) else a[:len(words)] == words
+               for a in (argv, unlocked(argv)[0]))
+
+
+def unlocked(argv: list[str]) -> tuple[list[str], str]:
+    """The command an exact `ttp lock <one resource> -- <cmd...>` wrapper holds the lock for, and that
+    resource; any other argv (options, several resources, no `--`) as it came, with ""."""
+    if len(argv) > 4 and argv[:2] == ["ttp", "lock"] and argv[3] == "--" and LOCK_NAME_RE.match(argv[2]):
+        return argv[4:], argv[2]
+    return argv, ""
+
+
+def launch(base: Path, argv: list[str], task=None) -> tuple[list[str], dict | None]:
+    """What the daemon runs for `argv`, and its environment (None: the daemon's own): a lock wrapper runs
+    this runtime's `ttp lock` for project `base`, so the lock is held while the command runs. It runs
+    outside any worker run (no run variables), so the lock leaves the command unfenced."""
+    cmd, res = unlocked(argv)
+    if not res:
+        return argv, None
+    runtime = str(Path(__file__).resolve().parents[1])
+    env = {k: v for k, v in os.environ.items() if k not in ("TTP_RUN_ID", "TTP_RUN_DIR", NOTE_RUN_ENV)}
+    env.update(PYTHONPATH=runtime + os.pathsep + os.environ.get("PYTHONPATH", ""), TTP_PROJECT=str(base))
+    if isinstance(task, (str, int)) and str(task).isdigit():   # the lock's activity names the asking task
+        env["TTP_TASK"] = str(task)
+    return [sys.executable, "-m", "ttp", "lock", res, "--", *cmd], env
 
 
 def allowed(argv: list[str], ents) -> bool:
@@ -257,7 +285,8 @@ def _run(p: Project, rid: str, m: dict, ents: list[tuple[list[str], int | None]]
             why = "ran"
             limit = asked(limit_for(p, argv, ents), m.get("timeout"))[0]
             write_json(folder / f"{rid}.running", {**m, "limit": limit, "started": time.time()})
-            out = _answer(boundedchild.run(argv, limit, cwd=str(p.state), text=False), limit)   # its group is
+            run, env = launch(p.base, argv, m.get("task"))
+            out = _answer(boundedchild.run(run, limit, cwd=str(p.state), env=env, text=False), limit)   # its group is
             # killed past the limit
         write_json(folder / f"{rid}.out.json", out)
         _log(p, m, out["rc"], why, time.time() - t0)
@@ -294,7 +323,8 @@ def supervise(state: str, rid: str, argv: list[str]) -> None:
         pass
     m = m if isinstance(m, dict) else {"argv": argv}
     limit = int(m.get("limit") or DEFAULT_TIMEOUT_S)
-    out = _answer(boundedchild.run(argv, limit, cwd=state, text=False), limit)
+    run, env = launch(state_p.parent, argv, m.get("task"))
+    out = _answer(boundedchild.run(run, limit, cwd=state, env=env, text=False), limit)
     write_json(folder / f"{rid}.out.json", {**out, "detached": True, "secs": round(time.time() - t0, 2)})
     durable_write(folder / f"{rid}.rc", f"{out['rc']}\n")
     _log(state_p, m, out["rc"], "ran", time.time() - t0)

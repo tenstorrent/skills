@@ -2285,7 +2285,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   for example `{"cmd": "sudo -n /usr/local/sbin/power-cycle", "timeout_s": 1200}`. A dict entry with
   `"exact": true` matches only a request of exactly its words, so nothing can be appended to it:
   use it for a privileged command, e.g. `{"cmd": "sudo -n systemctl restart <unit>", "exact": true}`
-  (`ttp doctor` warns on a plain entry that starts with sudo). An entry whose `exact` is not true
+  (`ttp doctor` warns on a plain entry that starts with sudo). A request wrapped exactly as
+  `ttp host-run -- ttp lock <resource> -- <command...>` (one resource, no options) matches its command
+  under the same rules, so one entry covers both forms, and the daemon holds the lock while it runs. An entry whose `exact` is not true
   or false, or whose `timeout_s` is over 3600, below 1, or not a number, or that is otherwise malformed, is
   refused by `ttp config` and, when read, named in each refusal; it is never clamped. The longest
   matching entry sets the limit; `--timeout S` asks for less, and a longer ask is cut to the

@@ -877,10 +877,14 @@ def fenced_ssh(segments: list[list[str]], cmd: str) -> str | None:
 
 def lock_privileged(cmd: str) -> str | None:
     """Why a worker's `ttp lock <res> -- sudo ...` (or su, doas, pkexec, run0; also in a `sh -c` string) is
-    refused: `ttp lock` itself refuses it (privlock.py), and a privileged command goes through `ttp host-run`."""
+    refused: `ttp lock` itself refuses it (privlock.py), and a privileged command goes through `ttp host-run`.
+    A lock inside `ttp host-run -- ...` is the daemon's, under host-run's allowlist (hostrun.unlocked)."""
     from . import privlock
     for seg in _segments(cmd, strip=False):
         i = next((j for j, w in enumerate(seg) if os.path.basename(w) == "ttp" and seg[j + 1:j + 2] == ["lock"]), None)
+        if i is not None and any(os.path.basename(w) == "ttp" and seg[j + 1:j + 2] == ["host-run"]
+                                 for j, w in enumerate(seg[:i])):
+            continue
         inner = privlock.lock_command(seg[i:]) if i is not None else None
         if inner and (why := privlock.refusal(inner)):
             return why
