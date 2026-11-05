@@ -1049,10 +1049,19 @@ def no_commit_line(p: Project, task: dict) -> str:
             "Such a failure is substantive, never check_only for a gate that does not apply.\n")
 
 
+# An obligation's owner or milestone note (obligations._owner_note, _milestone_note) appended to a spec: up to
+# the next `## ` heading that is not one, or the end.
+_OBLIGATION_BLOCK = re.compile(r"\n*^#{2,3} Obligation .*?\n*(?=^## (?!Obligation )|\Z)", re.M | re.S)
+
+
 def spec_digest(task: dict) -> str:
     """A short fingerprint of the task's spec, kept with each run, so a resumed session learns of a
-    spec that changed while it was cut off."""
-    return hashlib.sha256(str(task["spec"] or task["title"]).encode()).hexdigest()[:16]
+    spec that changed while it was cut off. Appended `## Obligation` blocks are promise bookkeeping the
+    run also gets through steer.md: they change no digest, so they never wake a waiting task. A spec
+    without one keeps its digest byte for byte (obligations.attach strips the trailing space it follows)."""
+    spec, cut = _OBLIGATION_BLOCK.subn("\n\n", str(task["spec"] or ""))
+    spec = spec.rstrip() if cut else spec
+    return hashlib.sha256(str(spec or task["title"]).encode()).hexdigest()[:16]
 
 
 def worker_resume(p: Project, task: dict, lost: dict) -> str:

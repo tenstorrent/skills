@@ -95,6 +95,11 @@ def why(task: dict) -> str:
     return f"priority {_priority(task)}" if is_urgent(task) else ""
 
 
+def lines(spec: str | None) -> list[str]:
+    """The reasons of every `urgent:` line in the spec, in order."""
+    return [m.group(1).strip() for m in LINE.finditer(str(spec or ""))]
+
+
 def new_line(old_spec: str | None, new_spec: str | None) -> bool:
     """A spec update that changes the spec's `urgent:` reason (the first such line) to a new one."""
     m = LINE.search(str(new_spec or ""))

@@ -74,19 +74,21 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    unknown to its runner) is raised once per wait when it is first seen.
    A spec update sleeps with it (a `task_update` by the coordinator or the user; the hand-off keeps
    the digest of the spec it slept on): when the wait ends (the probe passes or another wake) the
-   run reads the new spec at the task's own tier. Only an urgent task (priority 1 or an `urgent:`
-   line) or a `task_update` with `wake_now: true` wakes once at once; another hold (a dependency,
-   start_after, start_when, a paused or busy resource, a gate) still holds it first, and at most 3
+   run reads the new spec at the task's own tier, priority 1 too. Only an update that adds an
+   `urgent:` line (once per wait: later ones on that wait apply when it ends) or a `task_update`
+   with `wake_now: true` wakes once at once; appended `## Obligation` notes change no digest.
+   Another hold (a dependency, start_after, start_when, a paused or busy resource, a gate) still
+   holds it first, and at most 3
    such wakes an hour wake one task. `wake_now` may name a tier (`light`, `standard`, `deep`): the
    wake runs at it, never above the task's own (`true`: its own). Requests before the wake run
    starts make one wake at the highest tier asked, and a `wake_now` within 30 minutes of the last
-   spec wake waits for that window to end (SPEC_WAKE_COALESCE_S; 5 minutes when the task is urgent).
+   spec wake waits for that window to end (SPEC_WAKE_COALESCE_S).
    A spec wake whose run hands back the same wait (`waiting_for`, `retry_when`, branch head)
    changed nothing: later spec wakes of that task sleep on its `retry_when` for
    `waiting.spec_wake_hold_s` (default 7200, 2 hours; 0: off) or until its own retry time, and its
    row says so. Its probe, its timer, a dependency or resource change and every other wake still
-   wake it; a `wake_now` during the hold waits for it to end unless the task is urgent and its
-   wait has changed.
+   wake it; a `wake_now` during the hold waits for it to end unless the update adds an `urgent:`
+   line and its wait has changed.
    A queued wait whose note names an ask or task (`ask #12`, `task #34`, `#34`) is kept current:
    once that ask is resolved or that task is done, the note says so and its probe (retry_when or
    start_when) runs again at once. Its probe, dependencies, start_when, not_before and attempts

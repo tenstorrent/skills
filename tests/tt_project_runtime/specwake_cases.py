@@ -328,7 +328,7 @@ def test_a_spec_only_update_starts_no_run_until_the_wait_ends_then_runs_at_its_o
 
 def test_an_urgent_or_wake_now_spec_update_wakes_a_sleeping_task_at_once(env, monkeypatch, tmp_path):
     from ttp import coordinator as coord
-    for how in ("wake_now", "urgent line", "priority 1", "wake_now alone"):
+    for how in ("wake_now", "urgent line", "wake_now alone"):
         p = make(env)
         d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path / how.replace(" ", "-"))
         act = {"type": "task_update", "id": tid}
@@ -336,8 +336,6 @@ def test_an_urgent_or_wake_now_spec_update_wakes_a_sleeping_task_at_once(env, mo
             act["spec"] = "urgent: the user is waiting on this" if how == "urgent line" else "also report memory"
         if how.startswith("wake_now"):
             act["wake_now"] = True
-        if how == "priority 1":
-            act["priority"] = 1
         assert coord.apply(p, [act]) == [], how
         assert _run_until(d, p, lambda: runs() == 2), f"{how}: no run at once"
         wake = _last_wake(p, tid)
@@ -557,44 +555,123 @@ def _age_spec_wakes(p, tid, by):
     p.db.update_task(tid, result=json.dumps({**res, "spec_wakes": [x - by for x in res.get("spec_wakes", [])]}))
 
 
-def test_an_urgent_or_p1_wake_now_takes_the_short_coalesce_window_and_the_hourly_guard(env, monkeypatch):
-    from ttp import daemon as dmod
-    assert dmod.SPEC_WAKE_URGENT_COALESCE_S < dmod.SPEC_WAKE_COALESCE_S
-    for how in ("urgent line", "priority 1"):
-        p = make(env)
-        tid = _spec_sleeper(p)
-        d = _spec_daemon(p, monkeypatch)
-        if how == "priority 1":
-            p.db.update_task(tid, priority=1)
-        for i in range(dmod.SPEC_WAKES_PER_H + 1):
-            spec = f"urgent: edit {i}" if how == "urgent line" else f"edit {i}"
-            _update(p, tid, spec=spec, wake_now=True)
-            d.probe_waiting()
-            if i:   # inside the short window it waits; just past it (still inside the normal one) it wakes
-                assert _asleep(p, tid), (how, i, "an urgent spec wake skipped the coalesce window")
-                _age_spec_wakes(p, tid, dmod.SPEC_WAKE_URGENT_COALESCE_S + 1)
-                d.probe_waiting()
-            assert (not _asleep(p, tid)) == (i < dmod.SPEC_WAKES_PER_H), (how, i)
-            _sleep_again(p, tid)
-        assert len(json.loads(p.db.task(tid)["result"])["spec_wakes"]) == dmod.SPEC_WAKES_PER_H, how
-
-
-def test_urgent_spec_changes_without_wake_now_coalesce_too(env, monkeypatch):
-    from ttp import daemon as dmod
+def test_a_priority_1_task_asleep_on_its_retry_when_sleeps_on_through_a_spec_update(env, monkeypatch):
+    # Standing priority 1 alone is no reason to wake: the update applies when its wait ends.
     p = make(env)
     tid = _spec_sleeper(p)
     p.db.update_task(tid, priority=1)
     d = _spec_daemon(p, monkeypatch)
-    _edit_spec(p, tid, "edit 1", wake_now=False)
+    for i in range(3):
+        _edit_spec(p, tid, f"also report memory {i}", wake_now=False)
+        d.probe_waiting()
+        assert _asleep(p, tid), f"spec update {i} woke a priority 1 task"
+    assert "spec_wakes" not in json.loads(p.db.task(tid)["result"])
+    # wake_now still wakes it, once.
+    _update(p, tid, wake_now=True)
     d.probe_waiting()
     assert not _asleep(p, tid)
     _sleep_again(p, tid)
-    _edit_spec(p, tid, "edit 2", wake_now=False)
     d.probe_waiting()
-    assert _asleep(p, tid), "a second urgent spec change inside the window woke it again"
-    _age_spec_wakes(p, tid, dmod.SPEC_WAKE_URGENT_COALESCE_S + 1)
+    assert _asleep(p, tid), "one wake_now woke it twice"
+
+
+def test_an_added_urgent_line_wakes_once_per_wait_without_the_coalesce_window(env, monkeypatch):
+    from ttp import daemon as dmod
+    p = make(env)
+    tid = _spec_sleeper(p)
+    d = _spec_daemon(p, monkeypatch)
+    _edit_spec(p, tid, "urgent: the user is waiting", wake_now=False)
+    d.probe_waiting()
+    assert not _asleep(p, tid), "an added urgent: line did not wake it"
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["spec_urgent"] == ["the user is waiting"] and res["spec_urgent_woke"] == dmod._wait_key(res), res
+    _sleep_again(p, tid)
+    for i, text in enumerate(("also report memory", "urgent: and the disk", "urgent: and the wall time")):
+        _edit_spec(p, tid, text, wake_now=False)
+        d.probe_waiting()
+        assert _asleep(p, tid), (i, "a second urgent spec wake on the same wait")
+    # Its wait changes (a new hand-off): the next added urgent: line wakes it at once, inside the 30 min window.
+    res = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**res, "retry_when": "exit 2", "waiting_for": "stage two"}))
+    _edit_spec(p, tid, "urgent: stage two blocks the user", wake_now=False)
+    d.probe_waiting()
+    res = json.loads(p.db.task(tid)["result"])
+    assert not _asleep(p, tid) and len(res["spec_wakes"]) == 2, res
+
+
+def test_a_wake_now_after_an_urgent_wake_on_the_same_wait_takes_the_coalesce_window(env, monkeypatch):
+    from ttp import daemon as dmod
+    p = make(env)
+    tid = _spec_sleeper(p)
+    d = _spec_daemon(p, monkeypatch)
+    _update(p, tid, spec="urgent: edit 0", wake_now=True)
     d.probe_waiting()
     assert not _asleep(p, tid)
+    _sleep_again(p, tid)
+    _update(p, tid, spec="urgent: edit 1", wake_now=True)
+    d.probe_waiting()
+    assert _asleep(p, tid), "a wake_now after the urgent wake on this wait skipped the coalesce window"
+    _age_spec_wakes(p, tid, dmod.SPEC_WAKE_COALESCE_S + 1)
+    d.probe_waiting()
+    assert not _asleep(p, tid) and "wake_now" not in json.loads(p.db.task(tid)["result"])
+
+
+def test_a_waiting_hand_off_keeps_the_urgent_line_it_slept_on_and_its_urgent_wake_only_on_the_same_wait(env, monkeypatch, tmp_path):
+    p = make(env)
+    p.set_config("waiting.spec_wake_hold_s", 0)   # only the one-per-wait rule keeps the next wake out
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path)
+    _edit_spec(p, tid, "urgent: the user is waiting", wake_now=False)
+    assert _run_until(d, p, lambda: runs() == 2 and idle()), "the added urgent: line did not start a run"
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["spec_urgent"] == ["the user is waiting"] and res["spec_urgent_woke"] == res["wait_key"]["key"], res
+    _edit_spec(p, tid, "urgent: and the disk use", wake_now=False)
+    for _ in range(3):
+        d.tick()
+        time.sleep(0.05)
+    assert runs() == 2 and idle(), "a second urgent spec wake on the same wait started a run"
+    # A worker cannot forge either key: a new wait drops the urgent wake it woke on.
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "stage two", "waiting_for": "stage two", "retry_after_s": 3600,
+         "retry_when": f"test -e {tmp_path / 'two'}", "spec_urgent": [], "spec_urgent_woke": "forged"}))
+    _age_spec_wakes(p, tid, 1801)
+    _update(p, tid, wake_now=True)
+    assert _run_until(d, p, lambda: runs() == 3 and idle())
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["spec_urgent"] == ["the user is waiting", "and the disk use"] and "spec_urgent_woke" not in res, res
+
+
+def test_a_hand_off_from_before_the_urgent_key_wakes_only_on_an_urgent_line_dated_after_it_slept(env, monkeypatch):
+    from ttp import daemon as dmod, urgent
+    p = make(env)
+    tid = _spec_sleeper(p)
+    t = p.db.task(tid)
+    t = {**dict(t), "spec": t["spec"] + "\nurgent: now"}
+    slept = {"status": "waiting", "waiting_since": time.time() + 1}   # after the task was made
+    for labels, want in (([], ""), ([f"{urgent.SINCE_LABEL}{time.time() - 600:.0f}"], ""),
+                         ([f"{urgent.SINCE_LABEL}{time.time() + 5:.0f}"], "now")):
+        assert dmod._urgent_added({**t, "labels": json.dumps(labels)}, slept) == want, labels
+    assert dmod._urgent_added(t, {**slept, "spec_urgent": ["now"]}) == ""
+    assert dmod._urgent_added({**t, "spec": t["spec"] + "\nurgent: later"}, {**slept, "spec_urgent": ["now"]}) == "later"
+    assert dmod._urgent_added({**t, "priority": 1, "spec": "plain"}, {**slept, "spec_urgent": []}) == ""
+
+
+def test_an_obligation_note_appended_to_a_spec_changes_no_digest_and_wakes_nothing(env, monkeypatch):
+    from ttp import obligations
+    from ttp.prompts import spec_digest
+    p = make(env)
+    tid = _spec_sleeper(p)
+    before = spec_digest(p.db.task(tid))
+    obligations.add(p, "the promised report", owners=[tid],
+                    milestones=[{"key": "m1", "due": time.time() + 7200, "evidence_required": "a file"}])
+    t = p.db.task(tid)
+    assert "## Obligation " in t["spec"] and spec_digest(t) == before
+    d = _spec_daemon(p, monkeypatch)
+    d.probe_waiting()
+    assert _asleep(p, tid)
+    # An update after the note still counts, and only its text does.
+    _edit_spec(p, tid, "also report memory", wake_now=False)
+    plain = {"spec": "start the job and report\n\n## Update\nalso report memory", "title": "x"}
+    assert spec_digest(p.db.task(tid)) == spec_digest(plain) != before
 
 
 def _spec_wake_flow(p, monkeypatch, tmp_path, second=None):
@@ -675,13 +752,13 @@ def test_an_urgent_wake_now_on_a_changed_wait_goes_past_the_spec_wake_hold(env, 
                                           (False, False, True, {"until": time.time() - 1})):
         p = make(env)
         tid = _spec_sleeper(p)
-        if urgent_:
-            p.db.update_task(tid, priority=1)
+        p.db.update_task(tid, priority=1)   # priority 1 alone is not urgent here: only an added urgent: line
         res = json.loads(p.db.task(tid)["result"])
         key = dmod._wait_key(res)
         res["spec_hold"] = hold or {"until": time.time() + 3600, "key": key if not changed else "0" * 16}
         p.db.update_task(tid, result=json.dumps(res))
-        _update(p, tid, spec="also report the peak memory", wake_now=True)
+        spec = "urgent: the user is waiting" if urgent_ else "also report the peak memory"
+        _update(p, tid, spec=spec, wake_now=True)
         _spec_daemon(p, monkeypatch).probe_waiting()
         assert (not _asleep(p, tid)) == wakes, (urgent_, changed, hold)
 
