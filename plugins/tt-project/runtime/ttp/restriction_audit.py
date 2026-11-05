@@ -125,12 +125,38 @@ CITE_WORDS = frozenset({"user", "users", "word", "words", "message", "messages",
                         "april", "june", "july", "august", "september", "october", "november", "december"})
 
 
+# Words that never say which machine, resource or condition a rule is about: common verbs of state, need
+# and validity, and generic nouns. A two-word hit (tool_hit) needs a specific anchor, a matched stem not of
+# these: the machine, alias or resource the item names, or another distinctive term of it (its condition
+# or clearance terms too). Any description shares 'remains valid' or 'requires machine admission' with a
+# rule; shared stems of these alone never hit, however many. Accepted gap: a rule whose only distinctive
+# words are listed here hits only on its identifiers, quoted phrases and cites.
+GENERIC_WORDS = frozenset("""
+remain require need keep stay hold apply become mean include ensure verify confirm check restore return
+continue follow provide make take give come show call find look change report record state note say said
+valid applicable available possible current specific general certain normal usual necessary enough
+result model value status machine host node device system thing case part place time hour minute week
+work worker project task user requirement verification restoration validity application""".split())
 _TOKEN = re.compile(r"\w+")
 
 
 def _whole(w: str, low: str) -> bool:
     """`w` is in `low` as whole words: no word character right before or after it ('rul' is never in 'rule')."""
     return re.search(rf"(?<!\w){re.escape(w)}(?!\w)", low) is not None
+
+
+def generic_stems() -> frozenset[str]:
+    """The _rule_words stems of GENERIC_WORDS and their -s, -ed, -ing, -ies and -ied forms."""
+    global _GENERIC_STEMS
+    if _GENERIC_STEMS is None:
+        from .coordinator import _stem
+        _GENERIC_STEMS = frozenset(_stem(f) for w in GENERIC_WORDS
+                                   for f in (w, w + "s", w + "d", w + "ed", w + "ing", w[:-1] + "ing",
+                                             w[:-1] + "ies", w[:-1] + "ied"))
+    return _GENERIC_STEMS
+
+
+_GENERIC_STEMS: frozenset[str] | None = None
 
 
 class WordIndex:
@@ -230,8 +256,9 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
              rare: set[str] | None = None, on: list[str] | None = None) -> list[str]:
     """What a line names of the old item, each as whole words (_whole: 'rul' is never in 'rule'): an
     identifier, a quoted phrase or user-message cite of `exact` (exact_terms), or else two or more of its
-    words, one of them in `rare` (distinctive_words) when given; [] when none. `on`: the sorted words of
-    `words` the line has, when already known (WordIndex.words_on)."""
+    words, one of them a specific anchor: not generic (generic_stems) and in `rare` (distinctive_words) when
+    given; [] when none. `on`: the sorted words of `words` the line has, when already known
+    (WordIndex.words_on)."""
     from .restriction_source import CITE_RE
     got = sorted(t for t in ids if _whole(t, line))
     low = line.lower()
@@ -245,7 +272,8 @@ def tool_hit(line: str, ids: set[str], words: set[str], exact: set[str] = frozen
         tokens = set(_TOKEN.findall(low))
         on = sorted(w for w in words if (w in tokens if (h := _TOKEN.match(w)) and h[0] == w else _whole(w, low)))
     got = on
-    return got if len(got) >= 2 and (rare is None or rare & set(got)) else []
+    anchor = set(got) - generic_stems()
+    return got if len(got) >= 2 and (anchor if rare is None else rare & anchor) else []
 
 
 def still_stated(charter: str, old: str) -> str:
@@ -336,7 +364,7 @@ def restriction_tools(p: Project, loosened: list[tuple], batch: list[int],
     of the item's changed clause or two of its words (tool_terms: only the words the change dropped or
     inserted, never words it kept or other items' words; an identifier the current charter still states
     anywhere is not one; a removed or retired item matches only its distinctive words, quoted phrases and
-    cites; two words hit only with one distinctive word among them),
+    cites; two words hit only with one distinctive, non-generic word among them: generic_stems),
     each named with the terms it matched. A disabled schedule, in the table or its schedules.json entry, is left out. `loosened`: (old item, new text, over[,
     advisory]), `over` empty for the user's word, else the end that retired the item; `advisory`: the dropped
     items were all unsourced (restriction_source.drops_unsourced), so whoever dropped them and with any `over`,

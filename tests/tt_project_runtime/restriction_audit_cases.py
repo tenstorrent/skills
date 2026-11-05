@@ -634,3 +634,53 @@ def test_an_item_inserted_beside_a_guarded_item_queues_no_update_task(env):
     assert coord.apply(p, [act], turn=1, user_turn=True, messages=mids) == []
     got = tasks()
     assert len(got) == 1 and "bin/soak-guard.sh:2" in got[0]["spec"] and "spare build boxes" not in got[0]["spec"], got
+
+
+# A retired conditional ban on one machine; a schedule description sharing only generic stems with it
+# ('verifi', 'remain', 'requir', 'machin') names neither the machine nor the condition.
+_BOX_ITEM = ("Never schedule device jobs on box-a while its cooling fan is replaced; the machine remains closed "
+             "until a thermal soak is verified, and reopening requires a written clearance.")
+_GENERIC_DESC = "a verified model result remains valid; restoration requires applicable machine admission"
+
+
+def _box_project(env, *descs):
+    """A project whose harness/schedules.json has one enabled entry per description, and the update tasks."""
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never merge. (user msg #1)\n")
+    (p.harness / "schedules.json").write_text(json.dumps(
+        [{"name": f"example-project-{i}", "enabled": True, "description": d, "command": "true"}
+         for i, d in enumerate(descs)], indent=1))
+    return p, lambda: [dict(r) for r in p.db.q("SELECT * FROM tasks WHERE labels LIKE '%restriction_tools:%'")]
+
+
+def test_shared_generic_stems_alone_never_match_a_retired_machine_ban(env):
+    """Two or more stems shared with the retired item, all generic verbs or nouns, are no hit, however
+    many: no restriction_tools event and no update task. A specific anchor (the machine, a distinctive
+    or condition term) among them still hits."""
+    from ttp import restriction_audit
+    p, tasks = _box_project(env, _GENERIC_DESC)
+    assert restriction_audit.restriction_tools(p, [(_BOX_ITEM, "", "the fan was replaced")], []) == []
+    assert tasks() == [] and not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'")
+    ids, words, exact = restriction_audit.tool_terms(_BOX_ITEM, "", "", [_GENERIC_DESC])
+    assert {"remain", "requir", "verifi", "machin"} <= words, words
+    for line in (_GENERIC_DESC, "the machine remains verified and requires a valid check before it remains held"):
+        assert restriction_audit.tool_hit(line, ids, words, exact) == [], line
+        assert restriction_audit.tool_hit(line, ids, words, exact, set(words)) == [], line
+    assert restriction_audit.tool_hit("the box-a machine remains held", ids, words, exact) == ["box-a", "machin", "remain"]
+    assert restriction_audit.tool_hit("a thermal soak is required", ids, words, exact) == ["requir", "soak", "thermal"]
+
+
+def test_a_tool_still_naming_the_machine_or_the_clearance_condition_is_found(env):
+    """A schedule still naming the retired ban's machine, and an open task's probe still carrying its
+    clearance condition, are both named in the one update task; the generic description is not."""
+    from ttp import restriction_audit
+    p, tasks = _box_project(env, _GENERIC_DESC, "hold device jobs on box-a")
+    held = p.db.add_task("example-project leg", "run it", kind="work",
+                         labels=["start_when:wait until the thermal soak passes before reopening"])
+    out = restriction_audit.restriction_tools(p, [(_BOX_ITEM, "", "the fan was replaced")], [])
+    assert len(out) == 1, out
+    (t,) = tasks()
+    assert "box-a" in t["spec"] and f"task #{held} start_when" in t["spec"], t["spec"]
+    rows = (p.harness / "schedules.json").read_text().splitlines()
+    named = {n for n, x in enumerate(rows, 1) if f"schedules.json:{n} (" in t["spec"]}
+    assert named == {n for n, x in enumerate(rows, 1) if "box-a" in x}, t["spec"]
