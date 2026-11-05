@@ -1277,7 +1277,14 @@ nothing running is interrupted:
   shrinks as they load the host; a running check keeps its slot. Whatever the cap (unless 0), a check starts only
   while the host's free cores now (busy cores read from /proc/stat over a few seconds) cover one check's
   measured cores; with no check running one always starts. Its test grant is then at most those free
-  cores (at least 2); `checks.live_cores 0` turns both off. A set cap wins: `ttp config
+  cores (at least 2); `checks.live_cores 0` turns both off. Nor does a new check start here while the
+  host's disk is saturated by writes, even with none running: while `Dirty:` in /proc/meminfo is over
+  `checks.dirty_max_mb` (default 2048) or `full avg60` in /proc/pressure/io is over `checks.io_full_max`
+  percent (default 10; a kernel without PSI skips only this signal). Both are account settings
+  (`ttp config --account checks.dirty_max_mb N`, or `TTP_CHECKS_DIRTY_MAX_MB` / `TTP_CHECKS_IO_FULL_MAX`;
+  0 turns that signal off). A run that may spill then tries the spill hosts first, else it keeps its
+  place and waits; running checks and the push branch's checks (its priority slot) go on. `ttp checks --slot-status` shows the values
+  and the reason. A set cap wins: `ttp config
   --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`; it is one value for every
   project (a project's own copy is ignored and `ttp config checks.host_max` shows the account's). While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,

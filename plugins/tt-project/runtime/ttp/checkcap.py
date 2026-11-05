@@ -53,7 +53,8 @@ Whatever the cap (unless it is off), a slot of the cap or beyond it is taken onl
 one check's price (cores_short: busy cores from /proc/stat over the last few seconds, less the price of
 each check granted within RAMP_S), so a saturated host starts no more suites; with no check running one
 always starts. The run's test grant then follows the same free cores (testslots.live_room).
-`checks.live_cores` 0 (TTP_CHECKS_LIVE_CORES) turns both off.
+`checks.live_cores` 0 (TTP_CHECKS_LIVE_CORES) turns both off. Nor is one taken while the host's disk is
+saturated by writes (diskgate: dirty page cache or IO pressure over their limits), even with no check running.
 
 Waiters take turns by project (locks.fair_order); within one, by task priority (1 first;
 a spec's `urgent:` line counts as 1, urgent.is_urgent), then arrival; a running check is never stopped.
@@ -87,7 +88,7 @@ import time
 from pathlib import Path
 from typing import Callable
 
-from . import checkwait, hostcpu, locks, obligations, poll_s, project, timefmt, urgent
+from . import checkwait, diskgate, hostcpu, locks, obligations, poll_s, project, timefmt, urgent
 
 RESOURCE = "checks"
 OBLIGATION_PRIORITY = 0   # an open obligation's required owner: before every task priority (1 and up)
@@ -710,7 +711,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     tell(f"queued for a host-wide checks slot: {len(locks.held_labels(every))} of {n + extra(n)} running, "
                          f"{ahead} ahead, {groups} project{'s' if groups != 1 else ''}"
                          + (", first in its project as an open obligation's owner" if queued_as != holder else "")
-                         + (f"; waiting for free cores: {short}" if (short := cores_short(every)) else ""))
+                         + (f"; waiting for free cores: {short}" if (short := cores_short(every)) else "")
+                         + (f"; waiting for the disk: {disk}" if (disk := diskgate.saturated()) else ""))
                 if not told and waiting:
                     waiting(True)
                 told = time.time()
@@ -794,7 +796,7 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
     """A slot of the cap, else one load opened beyond it, while fewer than cap plus extra() are held.
     The cap's own slots are tried first, so two takers racing never pass the cap with no extra open."""
     room = _room(n, every) if room is None else room
-    if room <= 0 or cores_short(every):
+    if room <= 0 or cores_short(every) or diskgate.saturated():
         return None
     f = locks.try_take(ps, holder, what, key=same)
     if f is None and (x := extra(n)):

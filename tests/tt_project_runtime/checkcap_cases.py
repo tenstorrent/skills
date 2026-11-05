@@ -6769,3 +6769,104 @@ def test_a_push_lanes_load_guard_wait_ends_at_its_bound_on_the_reserved_lane_alo
     project.set_account_setting("checks.push_load_wait_s", 60)
     assert testslots.push_load_wait_s({}) == 60.0, "the account's setting"
     assert testslots.push_load_wait_s({"checks": {"push_load_wait_s": 30}}) == 30.0, "the project's wins"
+
+
+def _fake_disk(monkeypatch, tmp_path, dirty_kb=0, full60=None, dirty_max=None, io_max=None):
+    """Fake /proc/meminfo and /proc/pressure/io for diskgate (full60 None: a kernel without PSI)."""
+    from ttp import diskgate
+    mem, psi = tmp_path / "meminfo", tmp_path / "pressure-io"
+    mem.write_text(f"MemTotal:       65536000 kB\nDirty:          {dirty_kb} kB\nWriteback:           0 kB\n")
+    if full60 is None:
+        psi.unlink(missing_ok=True)
+    else:
+        psi.write_text(f"some avg10=1.00 avg60=2.00 avg300=1.00 total=1\nfull avg10=0.50 avg60={full60} avg300=0.10 total=1\n")
+    monkeypatch.setattr(diskgate, "MEMINFO", mem)
+    monkeypatch.setattr(diskgate, "PSI_IO", psi)
+    for key, v in (("TTP_CHECKS_DIRTY_MAX_MB", dirty_max), ("TTP_CHECKS_IO_FULL_MAX", io_max)):
+        if v is None:
+            monkeypatch.delenv(key, raising=False)
+        else:
+            monkeypatch.setenv(key, str(v))
+
+
+def test_disk_gate_reads_dirty_and_io_pressure_against_their_limits(env, tmp_path, monkeypatch):
+    """diskgate: Dirty over checks.dirty_max_mb (default 2048) or io full avg60 over checks.io_full_max
+    (default 10) holds new local runs, named with the measured values; no PSI skips only that signal;
+    0 turns a signal off; the environment wins over the account setting; a bad value is the default."""
+    from ttp import diskgate, project
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=100 * 1024, full60="0.40")
+    r = diskgate.reading()
+    assert r["held"] == "" and r["dirty_max_mb"] == 2048.0 and r["io_full_max"] == 10.0, r
+    assert diskgate.line(r) == "disk: Dirty 0.1 GB (limit 2.0 GB), io full avg60 0.4% (limit 10%)"
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=int(7.6 * 1024 * 1024), full60="0.40")
+    why = diskgate.saturated()
+    assert why == "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)", why
+    assert diskgate.line().startswith("disk saturated: new local check runs held"), diskgate.line()
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=0, full60="24.50")
+    assert diskgate.saturated() == "io pressure full avg60 24.5% over 10% (checks.io_full_max)"
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=int(7.6 * 1024 * 1024), full60=None)
+    assert "Dirty 7.6 GB" in diskgate.saturated() and "io pressure" not in diskgate.saturated()
+    assert diskgate.io_full_avg60() is None and "io full avg60 no PSI" in diskgate.line(), "no PSI: only it skipped"
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=0, full60=None)
+    assert diskgate.saturated() == "", "no PSI and a clean page cache: nothing held"
+    monkeypatch.setattr(diskgate, "MEMINFO", tmp_path / "none")
+    assert diskgate.dirty_mb() is None and diskgate.saturated() == "", "nothing readable: no gate"
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=int(7.6 * 1024 * 1024), full60="50", dirty_max=0, io_max=0)
+    assert diskgate.saturated() == "" and "limit off" in diskgate.line(), "0 turns each signal off"
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=3000 * 1024, full60="5")
+    project.set_account_setting("checks.dirty_max_mb", 4096)
+    project.set_account_setting("checks.io_full_max", 4)
+    assert diskgate.saturated() == "io pressure full avg60 5.0% over 4% (checks.io_full_max)", "the account's limits"
+    monkeypatch.setenv("TTP_CHECKS_DIRTY_MAX_MB", "1024")
+    assert "Dirty 2.9 GB over the 1.0 GB limit" in diskgate.saturated(), "the environment wins"
+    for bad in ("x", "-1", "inf", "nan", ""):
+        monkeypatch.setenv("TTP_CHECKS_DIRTY_MAX_MB", bad)
+        assert diskgate._limit(diskgate.DIRTY_KEY, 2048.0) == 4096.0, bad
+    assert "checks.dirty_max_mb" in project.HOST_WIDE_KEYS and "io_full_max" in project.ACCOUNT_KEYS["checks"]
+
+
+def test_a_saturated_disk_holds_new_check_slots_but_never_running_ones_or_push_priority(env, tmp_path, monkeypatch):
+    """While the disk is saturated no new checks slot is taken, even with none running (unlike the cores
+    floor); the wait says why and ends with a slot once the disk clears; a slot already held is kept,
+    and the push branch's priority slot is not held."""
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.02)
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=0, full60="0.1")
+    running = checkcap.acquire("running")
+    try:
+        assert running.f is not None
+        _fake_disk(monkeypatch, tmp_path, dirty_kb=0, full60="30")
+        told = []
+        assert checkcap.acquire("new", tell=told.append, max_wait_s=0.3) is None, "held while saturated"
+        assert any("waiting for the disk: io pressure full avg60 30.0% over 10%" in x for x in told), told
+        assert "running" in " ".join(checkcap.locks.held_labels(checkcap.all_paths(4))), "the running one keeps its slot"
+        running.close()
+        assert checkcap.acquire("new", max_wait_s=0.3) is None, "none running: still held"
+        push = checkcap.acquire_priority("remote:branch", "push")
+        assert push.f is not None, "push priority checks are not held"
+        push.close()
+        threading.Timer(0.3, lambda: _fake_disk(monkeypatch, tmp_path, dirty_kb=0, full60="0.1")).start()
+        late = checkcap.acquire("new", max_wait_s=10)
+        assert late is not None and late.f is not None, "admitted once the disk clears, no failure"
+        late.close()
+    finally:
+        running.close()
+
+
+def test_slot_status_shows_the_disk_gate_with_its_values(env, tmp_path, monkeypatch, capsys):
+    import json as _json
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _fake_disk(monkeypatch, tmp_path, dirty_kb=3 * 1024 * 1024, full60=None)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--slot-status"])
+    assert e.value.code == 0
+    out = capsys.readouterr().out
+    assert ("disk saturated: new local check runs held (spill hosts first, else they wait): Dirty 3.0 GB over "
+            "the 2.0 GB limit (checks.dirty_max_mb); Dirty 3.0 GB (limit 2.0 GB), io full avg60 no PSI (limit 10%)") in out, out
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--slot-status", "--json"])
+    disk = _json.loads(capsys.readouterr().out)["disk"]
+    assert disk["dirty_mb"] == 3072.0 and disk["io_full_avg60"] is None and "Dirty 3.0 GB" in disk["held"], disk

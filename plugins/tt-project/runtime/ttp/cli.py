@@ -4238,8 +4238,9 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
-    from . import checkjoin, checkspill, hostload
-    followers = checkjoin.status_lines(p.state)   # joined or superseded waiters: they run no suite of their own
+    from . import checkjoin, checkspill, diskgate, hostload
+    followers = checkjoin.status_lines(p.state)
+    disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
     if as_json:
@@ -4248,6 +4249,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
+                          "disk": disk,
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
@@ -4256,6 +4258,7 @@ def _checks_lane_status(as_json: bool) -> int:
             print(f"  {line}")
         print("check runs per host:")
         print("\n".join(f"  {line}" for line in hostload.lines(s=load)))
+        print(f"  {diskgate.line(disk)}")
         if followers:
             print("following another run of their task (checkjoin), no suite of their own:")
             print("\n".join(followers))
@@ -4278,11 +4281,12 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     for that wrapper lock's one lane, at most checklane.project_cap of the project's at once, told with
     the holder and the queue position each minute. With `spill` and delivery.checks_spill_hosts set, a
     wait past delivery.checks_spill_after_s tries those hosts (checkspill.pick) and keeps its place here
-    when none can take the run: a slot whose `spill` claim names the host the checks then run on. Both
+    when none can take the run: a slot whose `spill` claim names the host the checks then run on; while
+    this host's disk is saturated (diskgate) it tries them before it waits here at all. Both
     settings are read again at each bound: hosts set while a run waits take it at its next bound.
     `yielder()`, asked while it waits, raises checkjoin.Yield when the task's same checks run or wait
     ahead, or a newer head's do: the wait ends holding nothing."""
-    from . import checkcap, checkjoin, checklane, checkspill, locks as lk
+    from . import checkcap, checkjoin, checklane, checkspill, diskgate, locks as lk
     foreground = not detached and not os.environ.get("TTP_DETACHED")
     key = f"checks:{os.getpid()}:{time.time()}"
 
@@ -4330,9 +4334,20 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     # take it too; with none set it still waits in bounds of checks_spill_after_s, in the same place.
     spill_to = bool(spill and p)
     told: set[str] = set()
+    first = True
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
+        # A disk saturated by writes holds new local runs (diskgate): the spill hosts are tried before any
+        # wait here; after it, each bound below tries them again.
+        if spill_to and first and checkspill.hosts(spill_cfg) and (disk := diskgate.saturated()):
+            tell(f"{disk}: trying the spill hosts first")
+            if (claim := checkspill.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
+                                         what)) is not None:
+                slot = checkcap.Slot()
+                slot.spill = claim
+                return slot
+        first = False
         if spill_to:   # a bounded wait here, then the spill hosts, then wait again in the same place
             limit = checkspill.after_s(spill_cfg) if limit is None else min(limit, checkspill.after_s(spill_cfg))
         try:

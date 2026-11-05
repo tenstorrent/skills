@@ -1069,3 +1069,38 @@ def test_missing_program_on_a_check_host_runs_command_v_there_with_the_checks_en
     err = capsys.readouterr().err
     assert e.value.code == 1 and "'remote-only-tool' is not installed on the check host box1" in err, err
     assert not (run / "checks.json").exists()
+
+
+def test_a_saturated_disk_sends_a_new_run_to_a_spill_host_before_any_wait_here(env, tmp_path, monkeypatch):
+    """While this host's disk is saturated (diskgate), a run that may spill tries the spill hosts before
+    it waits here at all, even with its lane free and a long checks_spill_after_s; with none free it
+    waits here and runs here once the disk clears, never failing for it."""
+    import threading
+    from ttp import checkcap, checkspill, cli, diskgate
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.checks_spill_after_s", 3600)
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    held = [True]
+    monkeypatch.setattr(diskgate, "saturated", lambda: "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb)"
+                        if held[0] else "")
+    real_acquire = checkcap.acquire
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no wait here before the spill hosts"))
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    text = (run / "checks.log").read_text()
+    assert "Dirty 7.6 GB over the 2.0 GB limit (checks.dirty_max_mb): trying the spill hosts first" in text, text
+    # No spill host free: it waits here (the gate in checkcap._take) and runs here once the disk clears.
+    monkeypatch.setattr(checkcap, "acquire", real_acquire)
+    monkeypatch.setattr(checkcap, "POLL_S", 0.02)
+    picks = []
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: picks.append(1) or None)
+    log.write_text("")
+    threading.Timer(1.0, lambda: held.__setitem__(0, False)).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert picks == [1], "the spill hosts were tried first, once"
+    assert "/ttp-check." not in log.read_text(), "it ran here"
