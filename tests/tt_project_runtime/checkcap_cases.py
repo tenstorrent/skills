@@ -1805,8 +1805,9 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     for kind in (testslots.TESTS, testslots.BUILDS):
         read |= {kind.setting(s)[1] for s in ("pool", "run_max", "project_max")}
     read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "stalled"}   # file names (checks.json), not keys
-    # project-only: the project's own lock or queue wrapper, set by the user per project, and its fallback lane
-    read -= {"wrap_cmd", "wrap_lane", "fallback_lane"}
+    # project-only: the project's own lock or queue wrapper (and the one its checks run behind on a spill host),
+    # set by the user per project, and its fallback lane
+    read -= {"wrap_cmd", "spill_wrap_cmd", "wrap_lane", "fallback_lane"}
     # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads
     read -= {"suite_concurrency"}
     assert "wrap_cmd" in project._known_keys(["checks"])
