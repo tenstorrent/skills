@@ -2965,6 +2965,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   printed until the run ends; the web app and `ttp status` mask it when they show it. The Claude Code
   and Codex session transcripts are masked at run end; Cursor and the `chat` provider keep none the
   harness knows of.
+- A run's outward writes are scanned before they leave, model-free (`ttp/outscan.py`), so a stored
+  secret or a token stays home even when text the run read asks to send it: every `gh` call through
+  the harness's `bin/gh` (its arguments, and the body, notes, `--input`, `-F` and gist files or stdin
+  it sends), `ttp note --to` / `--reply` and `ttp notify`. Each is checked for every stored secret
+  value (as is and JSON-escaped), common credential shapes (forge, chat and cloud tokens, private-key
+  headers) and the project's forbidden-data patterns. A hit is refused with one line naming its class
+  (the secret's slot, the shape or the pattern's label), never the text, and nothing is sent. A chat
+  post the daemon must still deliver gets the shapes masked as `[redacted:<shape>]`. It is a check on
+  these routes, not a sandbox: a tool that talks to the network directly is not scanned.
 
 ## Limits
 

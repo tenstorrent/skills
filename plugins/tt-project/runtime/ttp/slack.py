@@ -91,8 +91,9 @@ class Slack:
 
     @staticmethod
     def _body(project: str, text: str, thread_ts: str | None) -> str:
+        from .outscan import mask_shapes
         from .redact import scrub
-        return scrub(text if thread_ts else f"[{project}] {text}")[:39000]
+        return mask_shapes(scrub(text if thread_ts else f"[{project}] {text}"))[:39000]
 
     def post(self, project: str, text: str, thread_ts: str | None = None) -> str:
         return self.call("chat.postMessage", channel=self.dm_channel(), text=self._body(project, text, thread_ts),

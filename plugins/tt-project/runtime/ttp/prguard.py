@@ -1168,6 +1168,16 @@ def main(argv: list[str], own_dir: str) -> int:
     if stdin_text is None and needs_stdin(args) and (args[:1] == ["api"] or tuple(args[:2]) in AITAG_STDIN):
         stdin_raw = sys.stdin.buffer.read()
         stdin_text = stdin_raw.decode("utf-8", "replace")
+    from . import outscan
+    try:
+        if stdin_text is None and outscan.in_run() and outscan.gh_reads_stdin(args):
+            stdin_text = sys.stdin.read()   # scanned here, then passed on to gh
+        why = outscan.gh_problem(args, stdin_text)
+    except Exception as e:   # fails closed: a run's gh call may carry what the scan is for
+        why = f"refused: the leak scan failed ({type(e).__name__}); nothing was sent"
+    if why:
+        print(f"gh (tt-project): {why}", file=sys.stderr)
+        return 1
     db, allowed, seen = None, set(), []
     try:
         db = _project_db()

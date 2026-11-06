@@ -10,9 +10,6 @@ the run read. It looks for:
 - the project's own forbidden-data patterns (forbidden.py), when it declares any.
 
 It covers a run's outward writes (TTP_TASK set):
-- `git push` through the run's bin/git: the pre-push hook (gitguard.HOOK) runs pre_push(), which scans
-  the commit messages and added lines of the commits the push sends (never those already on a remote),
-  and tag messages;
 - every `gh` call through the run's bin/gh (prguard.main): its arguments, and the files and stdin it
   sends (--body-file, --notes-file, --input, -F, gist files);
 - `ttp note --to` / `--reply` and `ttp notify`.
@@ -26,9 +23,7 @@ from __future__ import annotations
 
 import os
 import re
-import subprocess
-from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 # Credential shapes. Written so this file's own text matches none of them (the plugin's leak test).
 SHAPES = [
@@ -46,7 +41,6 @@ SHAPES = [
 _SHAPES = [(label, re.compile(rx)) for label, rx in SHAPES]
 _ANY_SHAPE = re.compile("|".join(f"(?:{rx})" for _, rx in SHAPES))
 MAX_FILE_BYTES = 32 << 20     # a file gh sends that is bigger is scanned up to here
-ZERO = "0" * 40
 
 
 def _project():
@@ -163,65 +157,3 @@ def gh_problem(args: list[str], stdin_text: str | None) -> str | None:
     why = problem(f"gh {' '.join(args[:2])}".rstrip(), *texts)
     return why and f"refused: {why}"
 
-
-# --- git push (the pre-push hook) ----------------------------------------------------------------
-
-def _git(*args: str) -> str:
-    return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace").stdout
-
-
-def _on_remote(sha: str) -> bool:
-    return sha != ZERO and subprocess.run(["git", "cat-file", "-e", f"{sha}^{{commit}}"],
-                                          capture_output=True).returncode == 0
-
-
-def push_problem(lines: Iterable[str], p=None) -> str | None:
-    """Why the push whose pre-push input is `lines` (`<local ref> <sha> <remote ref> <sha>`) must not
-    run: a commit message or added line it sends, or a tag message, holds a leak. Run in the repository."""
-    hit = matcher(p)
-    for line in lines:
-        parts = line.split()
-        if len(parts) != 4 or parts[1] == ZERO:   # a delete sends nothing
-            continue
-        local_ref, sha, remote_ref, remote_sha = parts
-        if _git("cat-file", "-t", sha).strip() == "tag":
-            cls = hit(_git("cat-file", "-p", sha))
-            if cls:
-                return refusal("git push", cls, f"tag {remote_ref}")
-        span = [f"{remote_sha}..{sha}"] if _on_remote(remote_sha) else [sha, "--not", "--remotes"]
-        proc = subprocess.Popen(["git", "log", "-p", "--no-color", "--no-ext-diff", "--no-textconv",
-                                 "--format=%x00commit %h%n%B", *span, "--"],
-                                stdout=subprocess.PIPE, text=True, errors="replace")
-        commit, path, cls = "", "", None
-        try:
-            for out in proc.stdout:
-                if out.startswith("\0commit "):
-                    commit, path = out[8:].strip(), ""
-                elif out.startswith("+++ "):
-                    path = out[4:].strip().removeprefix("b/")
-                elif out.startswith("+") or not path:   # an added line, or the commit message
-                    cls = hit(out)
-                    if cls:
-                        break
-        finally:
-            proc.stdout.close()
-            proc.kill() if cls else None
-            proc.wait()
-        if cls:
-            where = f"commit {commit}" + (f" ({path})" if path else " (its message)")
-            return (refusal("git push", cls, where) + "; rewrite the commit, since a later commit that "
-                    "removes it still sends it")
-    return None
-
-
-def pre_push() -> int:
-    """The pre-push hook's entry: the ref lines on stdin. Exit 1 (with the reason) refuses the push."""
-    import sys
-    try:
-        why = push_problem(sys.stdin.read().splitlines(), _project())
-    except ValueError as e:
-        why = f"git push refused: {e}; nothing was sent"
-    if why:
-        print(f"tt-project: {why}", file=sys.stderr)
-        return 1
-    return 0
