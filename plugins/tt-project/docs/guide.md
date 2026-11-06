@@ -1211,6 +1211,12 @@ running work is interrupted only by the preemption below:
   owner is the push or checks run named in the check allocation's `owner.json`. The daemon ends it
   6 hours after it was queued or once that owner's marker file is gone, whichever comes first, with
   the reason in its .lost; put a tighter bound in the command itself (`timeout`).
+  A `ttp detach` run in a PID namespace that /proc does not show (as `unshare --pid` makes) is
+  queued the same way, so the pid in a job's record (detached.json) is the host's, stored with that
+  pid's start time: every pid check (stops, bounds, remote verdicts) takes a pid whose start time
+  differs as gone, and liveness itself reads the job's lock, never a pid. A check that needs a job to outlive it uses `ttp detach`, never
+  `setsid`, `nohup` or a `$$` pid file: those die with the check's sandbox, and the pid they record is
+  the namespace's, which names an unrelated process (or none) on the host.
   `ttp detach --stop <name>` with no job recorded stops a driver
   the project's own launcher started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id>
   folder, once its pid is verified (start time, user, project), gets a STOP file beside it, then SIGTERM and

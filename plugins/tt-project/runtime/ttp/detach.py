@@ -329,9 +329,8 @@ def bound(p: Project, now: float | None = None) -> None:
                    if marker and not os.path.lexists(marker) else "")
             if not why:
                 continue
-            try:
-                pid = int(started(rc).read_text().split()[0])
-            except (OSError, ValueError, IndexError):
+            pid = job_pid(rc)
+            if not pid:
                 continue   # not running its wrapper yet: the next tick
             stop(rc, pid, why, reason="detach.bound", state=p.state)
         elif not rc.exists():
@@ -551,7 +550,46 @@ def running_pid(rc: Path, this_boot) -> int:
             pid = int(started(rc).read_text().split()[0])
         except (OSError, ValueError, IndexError):
             pid = None
-    return pid if isinstance(pid, int) and pid > 1 else 0
+    return job_pid(rc, pid) if isinstance(pid, int) and pid > 1 else 0
+
+
+def foreign_pidns() -> bool:
+    """This process runs in a PID namespace other than the one /proc shows (a namespace no TTP_PIDNS
+    marks, as `unshare --pid` without --mount-proc makes): a pid it would record (a child's, a wrapper's
+    $$) names another process, or none, on the host, and the namespace ends its processes with its
+    first. A namespace with its own /proc (`ttp sandbox`) is told by sandbox.inside() instead. Linux only."""
+    try:
+        return int(os.readlink("/proc/self")) != os.getpid()
+    except (OSError, ValueError):
+        return False
+
+
+def job_pid(rc: Path, pid: int | None = None) -> int:
+    """The host pid of the job's wrapper (it leads the job's session and group): `pid`, else its registry
+    entry's, else the one <name>.started holds; 0 when none is known or that pid now names another process
+    (a recycled pid): one whose start time differs from the entry's pid_start, or, with none recorded, a
+    live one whose arguments do not name the job's .rc. A job is only ever started in the host's PID
+    namespace (cmd_detach queues one from a sandbox to the daemon), so its pid is never a namespace's."""
+    rc = Path(rc)
+    j = _entry(rc)
+    if pid is None:
+        pid = j.get("pid")
+    if not (isinstance(pid, int) and pid > 1):
+        try:
+            pid = int(started(rc).read_text().split()[0])
+        except (OSError, ValueError, IndexError):
+            return 0
+    if pid <= 1:
+        return 0
+    born, now = j.get("pid_start") if j.get("pid") == pid else None, locks.start_time(pid)
+    if born is not None:
+        return pid if now == str(born) else 0
+    if now is not None and Path(f"/proc/{pid}/cmdline").exists():
+        try:
+            return pid if str(rc).encode() in Path(f"/proc/{pid}/cmdline").read_bytes() else 0
+        except OSError:
+            pass
+    return pid
 
 
 def _restamp(rc: Path, pid: int, boot: str) -> None:
@@ -561,7 +599,8 @@ def _restamp(rc: Path, pid: int, boot: str) -> None:
         with registry(rc.parent) as jobs:
             for j in jobs:
                 if isinstance(j, dict) and j.get("rc") == str(rc):
-                    j.update(pid=pid, boot=boot, started=time.time(), queued=False, status="running")
+                    j.update(pid=pid, pid_start=locks.start_time(pid), boot=boot, started=time.time(),
+                             queued=False, status="running")
                     for k in ("exit", "ended", "why"):
                         j.pop(k, None)
     except OSError:
@@ -950,6 +989,8 @@ def tend(p: Project) -> None:
                             cmd = sandbox.wrap(cmd, True, {k: v for k, v in env.items() if k != sandbox.ENV})
                         pid = start(rc, log, cmd, m["cwd"], env, lock)
                         renice(pid, nice_level(p.config().get("runner"))[0])
+                        from .runner import boot_id
+                        _restamp(rc, pid, boot_id())   # its host pid and start time, never a namespace's
                 except (OSError, ValueError, TypeError) as e:   # its folder went, say: never retried each tick
                     why = f"the daemon could not start it: {e}"
                 finally:
@@ -1149,12 +1190,7 @@ def remote_verdict(rc: Path, memo: dict) -> str | None:
 def end_remote(rc: Path, why: str) -> None:
     """End a local job whose remote side is dead: kill its wrapper's process group and record why."""
     rc = Path(rc)
-    pid = _entry(rc).get("pid")
-    if not (isinstance(pid, int) and pid > 1):
-        try:
-            pid = int(started(rc).read_text().split()[0])
-        except (OSError, ValueError, IndexError):
-            pid = 0
+    pid = job_pid(rc)
     if pid > 1 and not locks.any_free([locks.job_lock(rc)]):
         stop(rc, pid, why, reason="detach.end_remote", by="daemon")
     else:

@@ -7326,10 +7326,12 @@ def cmd_detach(a) -> None:
     # A push check's (its run dir is a check's report folder): its sandbox, a PID namespace, would end
     # the job with the check, so the daemon starts it, bounded by its owner's life (detach.bound).
     check = detach.check_owner(rd, os.environ.get("TTP_PROJECT")) if state is None else None
+    # A PID namespace no TTP_PIDNS marks would end the job too, and the pid recorded would be the namespace's.
+    boxed = _boxed() or detach.foreign_pidns()
     from . import sandbox
-    if _boxed() and state is not None:   # this command's sandbox would end the job: the daemon starts it
+    if boxed and state is not None:   # this command's sandbox would end the job: the daemon starts it
         detach.enqueue(state, rc, logf, cmd, os.getcwd(), job_env)
-    elif check is not None and (_boxed() or sandbox.inside()):
+    elif check is not None and (boxed or sandbox.inside()):
         detach.enqueue(check[0], rc, logf, cmd, os.getcwd(), job_env, bound=detach.check_bound(check[1]))
     else:
         # The job inherits this lock and holds it while any of its processes lives, so a job gone
@@ -7351,7 +7353,8 @@ def cmd_detach(a) -> None:
         activity.append(state, activity.base(Project(state.parent).name, ev="job", id=aid, job=a.name,
                                              rcfile=str(rc), cmd=activity.head(cmd), start=time.time()))
     with detach.registry(rd) as jobs:
-        jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, "started": time.time(),
+        jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid,
+                 **({"pid_start": lk.start_time(pid)} if pid else {}), "started": time.time(),
                  "boot": boot_id(), "queued": pid is None, "status": "running" if pid else "queued",
                  "command": " ".join(cmd)[:300],
                  **({"resumable": True} if getattr(a, "resumable", False) else {}),

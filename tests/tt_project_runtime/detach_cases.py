@@ -2579,3 +2579,65 @@ def test_a_cpu_only_checks_queued_job_sees_no_device_nodes(env, tmp_path, monkey
     assert _wait_for_path(rc) and rc.read_text().strip() == "0", (report / "hidden.log").read_text()
     assert out.read_text() == ""
     assert (dev / "0").exists()
+
+
+def test_a_detach_in_a_private_pid_namespace_is_queued_and_records_the_host_pid(env, tmp_path):
+    """`ttp detach` run in a PID namespace of its own that no TTP_PIDNS marks (a check that started it with
+    setsid would record $$, the namespace's pid) queues the job: the daemon starts it in the host's
+    namespace, it outlives the namespace, and its record holds the wrapper's host pid and start time."""
+    from ttp import detach, locks
+    unshare = ["unshare", "--user", "--map-root-user", "--pid", "--fork"]
+    if shutil.which("unshare") is None or subprocess.run([*unshare, "true"], capture_output=True).returncode:
+        pytest.skip("no private PID namespace on this host")
+    p = make(env)
+    rd = p.state / "runs" / "1"
+    rd.mkdir(parents=True)
+    hb, go = tmp_path / "hb", tmp_path / "go"
+    job = f"while [ ! -e {shlex.quote(str(go))} ]; do echo beat >>{shlex.quote(str(hb))}; sleep 0.05; done"
+    e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(rd)}
+    for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED", "TTP_LOCKS_HELD"):
+        e.pop(k, None)
+    r = subprocess.run([*unshare, sys.executable, str(TTP), "detach", "gate", "--", "sh", "-c", job], env=e,
+                       cwd=str(tmp_path), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and "queued" in r.stdout, r
+    rc = rd / "gate.rc"
+    detach.tend(p)
+    assert _wait_for_path(hb), "the job never ran outside the namespace"
+    pid = detach._entry(rc)["pid"]
+    assert pid == int(detach.started(rc).read_text().split()[0])
+    assert detach._entry(rc)["pid_start"] == locks.start_time(pid) and detach.job_pid(rc) == pid
+    go.touch()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+
+
+def test_a_jobs_recycled_pid_counts_as_gone(env, tmp_path, monkeypatch):
+    """A registry pid that now names another process (its start time differs from the recorded one, or with
+    none recorded its arguments do not name the job) is no pid of the job: the bound and a remote verdict
+    never signal it, and a stale wrapper pid in <name>.started is treated the same."""
+    from ttp import detach, locks
+    p = make(env)
+    report = _check_report(p, tmp_path / "gone.json")
+    rc = report / "gate.rc"
+    other = subprocess.Popen(["sleep", "60"])
+    try:
+        born = locks.start_time(other.pid)
+        for entry, ok in (({"pid_start": born}, True), ({"pid_start": str(int(born) + 1)}, False), ({}, False)):
+            (report / "detached.json").write_text(json.dumps([{"rc": str(rc), "pid": other.pid, **entry}]))
+            assert detach.job_pid(rc) == (other.pid if ok else 0), entry
+        detach.started(rc).write_text(f"{other.pid}\n")
+        (report / "detached.json").write_text(json.dumps([{"rc": str(rc), "pid": None}]))
+        assert detach.job_pid(rc) == 0, "a .started pid whose process is not the job's wrapper"
+        killed = []
+        monkeypatch.setattr(os, "killpg", lambda pid, sig: killed.append(pid))
+        lock = locks.try_take([locks.job_lock(rc)], "test", "held")   # the job looks alive
+        try:
+            detach.end_remote(rc, "its remote side is gone")
+            (p.state / detach.BOUND).mkdir(parents=True, exist_ok=True)
+            (p.state / detach.BOUND / "q.json").write_text(json.dumps({**detach.check_bound(None), "rc": str(rc)}))
+            detach.bound(p, now=time.time() + detach.CHECK_JOB_S + 1)
+        finally:
+            lock.close()
+        assert killed == [], "a recycled pid was signalled"
+        assert other.poll() is None
+    finally:
+        _reap(other)
