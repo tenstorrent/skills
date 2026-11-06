@@ -213,9 +213,10 @@ def denied_reads(hidden: list[Path], own: list[Path]) -> list[str]:
 
 
 def _own_session(text: str, own: list[Path]) -> str:
-    # The text with each mention of the cell's own session folder (in any form) taken out.
+    # The text with each mention of the cell's own session folder (in any form) taken out, unless its
+    # path climbs out of it with `..`.
     for form in (f for o in own for f in _forms(o)):
-        text = re.sub(re.escape(form) + r"(?![A-Za-z0-9-])", "", text)
+        text = re.sub(re.escape(form) + r"(?![A-Za-z0-9-])(?![^\s\"'`]*/\.\.)", "", text)
     return text
 
 

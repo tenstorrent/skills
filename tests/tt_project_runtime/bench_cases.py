@@ -362,7 +362,8 @@ def test_bench_audit_and_deny_rules_leave_a_claude_cell_its_own_session_folder(e
     assert benchrun.audit(said(saved), task, hidden, session=own) == []
     assert benchrun.audit(said(f"~/{saved.relative_to(Path.home())}" if saved.is_relative_to(Path.home())
                                else saved), task, hidden, session=own) == []
-    for other in (old / "s.jsonl", earlier / "s.jsonl", Path(f"{own[-1]}-x") / "s.jsonl", projects):
+    for other in (old / "s.jsonl", earlier / "s.jsonl", Path(f"{own[-1]}-x") / "s.jsonl", projects,
+                  f"{own[-1]}/../{old.name}/s.jsonl", f"{own[-1]}/s/../../*/s.jsonl"):
         assert benchrun.audit(said(other), task, hidden, session=own) == [f"names {projects}"], other
     assert benchrun.audit(said(saved), task, hidden) == [f"names {projects}"], "no session given: flagged"
     rules = benchrun.denied_reads(hidden, own)
