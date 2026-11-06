@@ -2,21 +2,25 @@
 # SPDX-License-Identifier: Apache-2.0
 """A tests gate judges a change only by the failures new on its head. When a check's head run fails
 with a complete list of failing pytest ids, `ttp checks` reruns only those ids at once, on the same
-host and in the same checks slot, never through the queue again: once on the head, then the ones that
-fail again once on the base (the change's merge base with the push target). Per id:
+host and in the same checks slot, never through the queue again: once on the base (the change's merge
+base with the push target), then the rest once on the head. Per id:
 
-- passes on the head rerun: flaky. It goes into the project's quarantine (QUARANTINE_FILE: first
-  seen, evidence, expiry after checks.quarantine_days, default 7), which status shows, and one fix
-  note goes to the coordinator. It does not block.
-- fails on the head rerun and on the base the same way (same_failure: the same first error line, else the
-  same summary message, else the same failing location, and the same failing statement): pre-existing. Reported by name; it does not block.
-- fails on the head rerun and passes on the base (or is not there): new. It blocks.
-- fails on the head rerun and on the base another way: not proven either way, so the failure stands
-  (new, never `proven`). A test that broke differently on the head is a change's own failure until shown
-  otherwise.
+- fails on the base the same way as in the head's failed run (same_failure: the same first error line,
+  else the same summary message, else the same failing location, and the same failing statement):
+  pre-existing, failing on both. Reported by name; it does not block, and it is not rerun on the head to
+  confirm it (on a loaded host those reruns alone outlasted a push's checks).
+- passes on the base (or is not there) and on the head rerun: flaky. It goes into the project's
+  quarantine (QUARANTINE_FILE: first seen, evidence, expiry after checks.quarantine_days, default 7),
+  which status shows, and one fix note goes to the coordinator. It does not block.
+- passes on the base (or is not there) and fails on the head rerun: new. It blocks.
+- fails on the base another way, or the head's run shows no mark to compare: it reruns on the head. Failing
+  there the same way as on the base, it is pre-existing; failing another way, it is not proven either way,
+  so the failure stands (new, never `proven`). A test that broke differently on the head is a change's own
+  failure until shown otherwise.
 
 A rerun that cannot tell (out of time, an exit other than 0, 1, 5 or 75, an incomplete list, a head
-rerun that selected none or not all of the ids) keeps the failure. A rerun that exits 75 (BUSY: its
+rerun that selected none or not all of the ids) keeps the failure: a base rerun that cannot tell
+excuses nothing, so its ids rerun on the head as if they passed on the base. A rerun that exits 75 (BUSY: its
 checks.wrap_cmd lock or queue gave it no slot, an admission timeout) ran nothing: it is retried on the
 same host after a backoff (checks.judge_busy_tries, default 3; checks.judge_busy_wait_s, default 600 s in
 all). Still busy, its ids are `busy`: neither new nor excused, so the checks run ends neither passed nor
@@ -490,15 +494,17 @@ def rerun(run, at: str, ids: list[str], tries: int = BUSY_TRIES, wait_s: float =
 
 def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
           touched=lambda _id: True, tries: int = BUSY_TRIES, wait_s: float = BUSY_WAIT_S,
-          sleep=time.sleep) -> dict:
-    """Judge a check's failing `ids`. `run(at, ids)` reruns ids at "head" or "base" on this host and
-    returns (exit code or None, output); one that exits BUSY is retried (rerun). The verdict: {new, proven,
-    pre_existing, other_failure, flaky, quarantined, busy, base, host}; the check blocks while `new` is not empty, and
-    is undecided (neither passed nor failed) while `busy` is not. `proven` is the part of `new` a conclusive
-    head rerun failed and a real base result on this host passed or did not have; the rest of `new` is a
-    failure the reruns could not tell apart (a timeout, an odd exit, an incomplete list, no base, or a base
-    that failed it another way: `other_failure`, same_failure). Only a base failure the same as the head's
-    is `pre_existing`."""
+          sleep=time.sleep, head_out: str = "") -> dict:
+    """Judge a check's failing `ids`. `run(at, ids)` reruns ids at "base" or "head" on this host and
+    returns (exit code or None, output); one that exits BUSY is retried (rerun). The base goes first: an id
+    failing there (saved or rerun) the same way as in the head's failed run `head_out` (same_failure) is
+    pre-existing and never reruns on the head; the rest rerun on the head, and one failing on the base too
+    is compared with that rerun. The verdict: {new, proven, pre_existing, other_failure, flaky, quarantined,
+    busy, base, host}; the check blocks while `new` is not empty, and is undecided (neither passed nor
+    failed) while `busy` is not. `proven` is the part of `new` a conclusive head rerun failed and a real base
+    result on this host passed or did not have; the rest of `new` is a failure the reruns could not tell
+    apart (a timeout, an odd exit, an incomplete list, no base, or a base that failed it another way:
+    `other_failure`). Only a base failure the same as the head's is `pre_existing`."""
     v = {"new": [], "proven": [], "pre_existing": [], "other_failure": [], "flaky": [], "quarantined": [], "busy": [],
          "base": base, "host": where}
     q = active(state, now)
@@ -507,40 +513,45 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
         (v["quarantined"] if i in q and not touched(i) else todo).append(i)
     if not todo:
         return v
-    got = rerun(run, "head", todo, tries, wait_s, sleep)
-    if got[0] == BUSY:
-        v["busy"] = todo
-        return v
-    again = failed_of(*got, todo, "head")
-    if again is None:
-        v["new"] = todo
-        return v
-    v["flaky"] = [i for i in todo if i not in again]
-    still = [i for i in todo if i in again]
-    if not still:
-        return v
-    head_how = marks(got[1], still)
-    saved = _saved(state, where, base, still, now) if base else {}
+    saved = _saved(state, where, base, todo, now) if base else {}
     # A saved base failure without its mark (saved before marks were, or an output it could not read) cannot
     # be compared: run the base again.
     known = {i: bool(e.get("failed")) for i, e in saved.items()
              if not e.get("failed") or any((e.get("mark") or {}).values())}
     how = {i: saved[i]["mark"] for i in known if known[i]}
-    need = [i for i in still if i not in known]
+    need = [i for i in todo if i not in known]
+    base_busy: list[str] = []
     if need and base:
         got = rerun(run, "base", need, tries, wait_s, sleep)
-        if got[0] == BUSY:   # no slot for the base: not proven new, never excused either
-            v["busy"] = need
+        if got[0] == BUSY:   # no slot for the base: not proven pre-existing; the head rerun still runs
+            base_busy = need
         bad = None if got[0] == BUSY else failed_of(*got, need)
         if bad is not None:
             fresh, fresh_how = {i: i in bad for i in need}, marks(got[1], sorted(bad))
             save_base(state, where, base, fresh, now, fresh_how)
             known.update(fresh)
             how.update(fresh_how)
+    first = marks(head_out, [i for i in todo if known.get(i) is True]) if head_out else {}
+    v["pre_existing"] = [i for i in todo if known.get(i) is True and same_failure(first.get(i), how.get(i))]
+    rest = [i for i in todo if i not in v["pre_existing"]]
+    if not rest:
+        return v
+    got = rerun(run, "head", rest, tries, wait_s, sleep)
+    if got[0] == BUSY:
+        v["busy"] = rest
+        return v
+    again = failed_of(*got, rest, "head")
+    if again is None:
+        v["new"] = rest
+        return v
+    v["flaky"] = [i for i in rest if i not in again]
+    still = [i for i in rest if i in again]
+    head_how = marks(got[1], [i for i in still if known.get(i) is True])
     same = {i for i in still if known.get(i) is True and same_failure(head_how.get(i), how.get(i))}
-    v["pre_existing"] = [i for i in still if i in same]
+    v["pre_existing"] += [i for i in still if i in same]
     v["other_failure"] = [i for i in still if known.get(i) is True and i not in same]
-    v["new"] = [i for i in still if i not in same and i not in v["busy"]]
+    v["busy"] = [i for i in still if i in base_busy]   # no slot for the base: never excused, never new
+    v["new"] = [i for i in still if i not in same and i not in base_busy]
     v["proven"] = [i for i in v["new"] if known.get(i) is False]
     return v
 
@@ -565,7 +576,8 @@ def lines(v: dict) -> list[str]:
     if v.get("base_why"):
         out.append(f"base {str(v.get('base') or 'none')[:12]}: {v['base_why']}")
     if v.get("pre_existing"):
-        out.append(f"pre-existing on the base {str(v.get('base'))[:12]} too (same host), not blocking: "
+        out.append(f"failing on both: pre-existing on the base {str(v.get('base'))[:12]} too (same host, same "
+                   "failure), not rerun on the head when its run showed that failure, not blocking: "
                    + ", ".join(v["pre_existing"]))
     if v.get("flaky"):
         out.append("flaky (failed, then passed on a rerun at the same head), quarantined, not blocking: "
@@ -574,7 +586,7 @@ def lines(v: dict) -> list[str]:
         out.append("quarantined as flaky earlier and not touched by this change, not blocking: "
                    + ", ".join(v["quarantined"]))
     if (sure := proven(v)):
-        out.append("new on this head (failed again on its rerun, not on the base), blocking: " + ", ".join(sure))
+        out.append("new on this head (passed on the base, failed again on its rerun), blocking: " + ", ".join(sure))
     if (other := [i for i in v.get("other_failure") or [] if i in (v.get("new") or [])]):
         out.append(f"failed on the base {str(v.get('base'))[:12]} too but another way (another first error "
                    "line, message or location), so not pre-existing: blocking: " + ", ".join(other))

@@ -6346,8 +6346,8 @@ def _checks_stop(sig, _frame):
 
 def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: dict, head: str, base: str,
                   top: str, out, log, run_check, tmp_base, proven: list | None = None) -> dict | None:
-    """A failed check's failing tests rerun at once on this host (gatejudge): on the head, then those
-    failing again on the merge base with `base`. The verdict when none of them is new on the head (each
+    """A failed check's failing tests rerun at once on this host (gatejudge): on the merge base with
+    `base`, then on the head those not failing there the same way as in this run. The verdict when none of them is new on the head (each
     pre-existing, flaky or quarantined), else None: the failure stands. A remote check (a spill host's
     included) reruns on its own host, each rerun a copy of the commit there with the select plugin
     shipped along (remotecheck), and its base results are that host's. A blocking verdict with ids proven
@@ -6373,7 +6373,8 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         f = i.partition("::")[0]
         return changed is None or any(x == f or x.endswith("/" + f) for x in changed)
 
-    said = (f"the failing test(s) rerun at once on {remote or 'this host'}, on the head and then on the base: "
+    said = (f"the failing test(s) rerun at once on {remote or 'this host'}, on the base and then, only those "
+            "not failing there, on the head: "
             + " ".join(ids))
     print(f"ttp checks: {said}", flush=True)
     out.write(f"ttp checks: {said}\n")
@@ -6402,7 +6403,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
     now = time.time()
     v = {"check": str(c), "head": head,
          **gatejudge.judge(ids, run, p.state, mb, remote or gatejudge.host(), now, touched, s["busy_tries"],
-                           s["busy_wait_s"]), "base_why": base_why}
+                           s["busy_wait_s"], head_out=output), "base_why": base_why}
     for line in gatejudge.lines(v):
         print(f"ttp checks: {line}", flush=True)
         out.write(f"ttp checks: {line}\n")

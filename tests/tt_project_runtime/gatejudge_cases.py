@@ -27,8 +27,8 @@ def test_gate_judge_sorts_pre_existing_flaky_and_new_failures(tmp_path):
     v = gatejudge.judge([a, b, c], run, tmp_path, "base1", "host-a", 1000.0)
     assert v["pre_existing"] == [a] and v["flaky"] == [b] and v["new"] == [c]
     assert gatejudge.blocks(v)
-    # Only the failing ids rerun: all three on the head, only those failing again on the base.
-    assert calls == [("head", [a, b, c]), ("base", [a, c])]
+    # Only the failing ids rerun: all three on the base, only those not failing there on the head.
+    assert calls == [("base", [a, b, c]), ("head", [b, c])]
     # Each case alone: pre-existing and flaky never block, a new failure does.
     for head, base, blocking in (({a: True}, {a: True}, False), ({a: False}, {a: True}, False),
                                  ({a: True}, {a: False}, True)):
@@ -107,6 +107,31 @@ def test_gate_judge_proven_holds_only_ids_the_head_rerun_failed_again_and_the_ba
     assert v["new"] == [c] and v["proven"] == []
 
 
+def test_gate_judge_never_reruns_on_the_head_an_id_that_fails_on_the_base(tmp_path):
+    # Many failing files that fail on the base too, one failure that does not: only that one reruns on the
+    # head; the rest are failing on both and do not block, whether the base was rerun or saved earlier.
+    from ttp import gatejudge
+    pre = [f"tests/test_f{n}.py::test_x" for n in range(14)]
+    new, flaky = "tests/test_g.py::test_new", "tests/test_g.py::test_flaky"
+    calls = []
+    run = _fake_run({**{i: True for i in pre}, new: True}, {i: True for i in pre}, calls)
+    v = gatejudge.judge([*pre, new, flaky], run, tmp_path, "base1", "host-a", 1000.0)
+    assert calls == [("base", [*pre, new, flaky]), ("head", [new, flaky])]
+    assert v["pre_existing"] == pre and v["new"] == [new] and v["flaky"] == [flaky]
+    assert any(line.startswith("failing on both") and "not rerun on the head" in line for line in gatejudge.lines(v))
+    # Saved on this host for this base: neither rerun runs for them.
+    calls.clear()
+    v = gatejudge.judge(pre, run, tmp_path, "base1", "host-a", 1001.0)
+    assert calls == [] and v["pre_existing"] == pre and not gatejudge.blocks(v)
+    # No slot for the base: the head rerun still runs; failing again there is undecided, never excused or new.
+    i = pre[0]
+    v = gatejudge.judge([i, flaky], _busy_run({"base": [(75, "")] * 9, "head": [
+        (1, f"FAILED {i} - assert 0\n1 failed, 1 passed in 0.1s\n")]}, calls), tmp_path / "busy", "b2", "host-a",
+        1000.0, tries=1, wait_s=1, sleep=lambda s: None)
+    assert v["busy"] == [i] and v["flaky"] == [flaky] and not v["new"] and not v["pre_existing"]
+    assert gatejudge.undecided(v)
+
+
 def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of_it(tmp_path):
     from ttp import gatejudge
     a, b = "tests/test_a.py::test_p[x1]", "tests/test_a.py::test_q"
@@ -117,21 +142,26 @@ def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of
         calls.append(at)
         return 5, "no tests ran in 0.1s\n"
     v = gatejudge.judge([a], none_ran, tmp_path, "b1", "host-a", 1000.0)
-    assert v["new"] == [a] and v["flaky"] == [] and calls == ["head"]
+    assert v["new"] == [a] and v["flaky"] == [] and calls == ["base", "head"]
     assert gatejudge.active(tmp_path, 1000.0) == {}
     # Exit 0 with fewer passed than rerun (the selection missed one), or no summary: cannot tell.
     for out in ("1 passed in 0.1s\n", "\n"):
         v = gatejudge.judge([a, b], lambda at, ids: (0, out), tmp_path, "b1", "host-a", 1000.0)
         assert v["new"] == [a, b] and v["flaky"] == []
     # Exit 1 listing only the other id, with fewer run than rerun (the selection missed one): the
-    # unreported id stays new, even when the other fails on the base too.
+    # unreported id stays new. A base rerun that missed it excuses nothing either: it reruns on the head.
     fail_q = (1, f"FAILED {b} - assert 0\n1 failed, 9 deselected in 0.1s\n")
-    v = gatejudge.judge([a, b], lambda at, ids: fail_q, tmp_path, "b1", "host-a", 1000.0)
+    v = gatejudge.judge([a, b], lambda at, ids: fail_q if at == "head" else (0, "2 passed in 0.1s\n"),
+                        tmp_path / "q1", "b1", "host-a", 1000.0)
     assert v["new"] == [a, b] and v["flaky"] == [] and v["pre_existing"] == []
+    seen = []
+    v = gatejudge.judge([a, b], lambda at, ids: (seen.append((at, ids)), fail_q)[1], tmp_path / "q2", "b1",
+                        "host-a", 1000.0)
+    assert v["pre_existing"] == [b] and seen == [("base", [a, b]), ("head", [a])]
     assert gatejudge.active(tmp_path, 1000.0) == {}
     # One passed and one failed (both ran): the passed one is flaky, the other compared on the base.
     v = gatejudge.judge([a, b], lambda at, ids: (1, f"FAILED {b} - assert 0\n1 failed, 1 passed in 0.1s\n"),
-                        tmp_path, "b1", "host-a", 1000.0)
+                        tmp_path / "q3", "b1", "host-a", 1000.0)
     assert v["flaky"] == [a] and v["pre_existing"] == [b] and v["new"] == []
     # Both reported passed: flaky, as before.
     v = gatejudge.judge([a, b], lambda at, ids: (0, "2 passed, 9 deselected in 0.1s\n"), tmp_path, "b1",
@@ -322,6 +352,7 @@ def test_ttp_checks_lets_a_failure_on_base_and_head_land_but_records_no_pass(env
     cli.main(["checks", "--", _FAIL])
     out = capsys.readouterr().out
     assert "pre-existing on the base" in out and "tests/test_gate.py::test_pre" in out and "LANDING ONLY" in out
+    assert "(rerun on the base" in out and "(rerun on the head" not in out, "failing on the base: no head rerun"
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] and rec["landing_only"]
     assert rec["excused"][0]["pre_existing"] == ["tests/test_gate.py::test_pre"]
@@ -460,7 +491,7 @@ def test_gate_judge_retries_a_busy_base_rerun_on_the_same_host_then_judges_it(tm
     run = _busy_run({"head": [fail], "base": [(75, "ADMISSION TIMEOUT\n"), fail]}, calls)
     v = gatejudge.judge([i], run, tmp_path, "b" * 40, "h1", 1000.0, sleep=slept.append)
     assert v["pre_existing"] == [i] and not v["new"] and not v.get("busy")
-    assert [c[0] for c in calls] == ["head", "base", "base"] and slept == [gatejudge.BUSY_FIRST_S]
+    assert [c[0] for c in calls] == ["base", "base"] and slept == [gatejudge.BUSY_FIRST_S]
     assert not gatejudge.blocks(v) and not gatejudge.undecided(v)
 
 
@@ -481,10 +512,11 @@ def test_gate_judge_a_busy_head_rerun_is_undecided_and_the_wait_is_capped(tmp_pa
     from ttp import gatejudge
     i = "tests/test_a.py::test_a"
     calls, slept = [], []
-    run = _busy_run({"head": [(75, "")] * 9, "base": []}, calls)
+    run = _busy_run({"head": [(75, "")] * 9, "base": [(0, "1 passed in 0.1s\n")]}, calls)
     v = gatejudge.judge([i], run, tmp_path, "b" * 40, "h1", 1000.0, tries=5, wait_s=50, sleep=slept.append)
     assert v["busy"] == [i] and not v["new"] and gatejudge.undecided(v)
-    assert [c[0] for c in calls] == ["head"] * 3 and slept == [30.0, 20.0], "wait_s caps the total backoff"
+    assert [c[0] for c in calls] == ["base"] + ["head"] * 3 and slept == [30.0, 20.0], \
+        "wait_s caps the total backoff"
 
 
 def test_gate_judge_busy_settings_come_from_checks_config():
