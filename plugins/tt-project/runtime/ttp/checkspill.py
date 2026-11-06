@@ -53,7 +53,8 @@ says its wrappers need no device (`checks.wrap_needs_device: false`; unset or tr
 or real, so it stays here), and never a light run (it never waits). On a spill host a check never runs
 behind this machine's checks.wrap_cmd: it runs behind its remote wrapper when it has one (push.spill_to),
 a wrapper missing there being a host fault (remotecheck), else unwrapped. A run that does not pass on a spill host runs again
-(OFF_ENV): a spill host's own environment never fails a change, only a pass there counts. The rerun waits for a slot here
+(OFF_ENV): a spill host's own environment never fails a change, only a pass there counts, unless the tests gate proved
+its failures new there (they pass on the base on that host: gatejudge.known_new), which fails it. The rerun waits for a slot here
 as any run does and may spill to another listed host, never back to one its checks failed on (spill_off_add): a host fault
 there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free.
 With none left it runs here, whose result counts.

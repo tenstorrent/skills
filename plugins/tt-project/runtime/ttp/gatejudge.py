@@ -22,6 +22,11 @@ host fault there (exit 75 too) is busy alike. A base result saved earlier (BASE_
 same base commit. A failing id in the active quarantine is excused without a rerun unless the change
 touches its file.
 
+A blocking verdict is saved per head tree and check (NEW_FILE, save_new). It ends the run there: a spill
+host's run whose new failures it proved on that host's base is not run again here (the host's environment
+is ruled out), and a later `ttp checks` of the same tree and check fails at once, before it queues for a
+checks slot, telling the task to fix them (known_new; --fresh runs it again).
+
 Nothing in the repository is edited, skipped or loosened: the quarantine is a harness record only the
 gate reads. An excused check counts for this change's landing only: its pass is never recorded, so
 no later run, release check or required whole-suite pass reuses it, and `ttp checks --release`
@@ -40,6 +45,7 @@ from . import checkwait, sharedchecks
 
 QUARANTINE_FILE = "test_quarantine.json"   # in the project's state: {id: entry}
 BASE_FILE = "gate_base.json"               # in the project's state: {"host|base|id": {"failed", "ts"}}
+NEW_FILE = "gate_new.json"   # in the project's state: {"tree|check": {"head", "base", "host", "new", "ts"}} (save_new)
 DAYS = 7.0          # checks.quarantine_days: a quarantined test's expiry after it was last seen flaky
 MAX_IDS = 10        # checks.judge_max_ids: a check failing more tests than this is not judged (no flake)
 RERUN_S = 600.0     # checks.judge_rerun_s: the time limit of one rerun
@@ -183,6 +189,36 @@ def save_base(state: Path, where: str, base: str, verdicts: dict[str, bool], now
         for i, bad in verdicts.items():
             d[f"{where}|{base}|{i}"] = {"host": where, "failed": bad, "ts": now}
         _save(path, d)
+
+
+def save_new(state: Path, tree: str, check: str, v: dict, now: float) -> None:
+    """Record blocking verdict `v` (blocks: ids that failed on the head twice and passed on the base on the same
+    host) of `check` on the head tree `tree`, so a rerun of the same tree and check fails at once (known_new)
+    instead of taking a checks slot to fail again. Kept BASE_KEEP_S."""
+    if not tree or not v.get("new"):
+        return
+    path = Path(state) / NEW_FILE
+    with _locked(path):
+        d = {k: e for k, e in _load(path).items() if isinstance(e, dict) and now - float(e.get("ts") or 0) < BASE_KEEP_S}
+        d[f"{tree}|{check}"] = {"head": v.get("head") or "", "base": v.get("base") or "", "host": v.get("host") or "",
+                                "new": list(v["new"]), "ts": now}
+        _save(path, d)
+
+
+def known_new(state: Path, tree: str, check: str, now: float | None = None) -> dict | None:
+    """The saved blocking verdict (save_new) of `check` on head tree `tree`, else None. The same tree runs the
+    same code, so the tests proven new on it fail there again whatever the base: a change must fix them."""
+    now = time.time() if now is None else now
+    e = _load(Path(state) / NEW_FILE).get(f"{tree}|{check}") if tree else None
+    return e if isinstance(e, dict) and e.get("new") and now - float(e.get("ts") or 0) < BASE_KEEP_S else None
+
+
+def known_new_text(e: dict, check: str) -> str:
+    """known_new's record in words: what failed, where, and what to do."""
+    return (f"{check} already failed on this tree (head {str(e.get('head'))[:12]}): "
+            + ", ".join(e.get("new") or []) + f" failed on the head twice and passed on its base "
+            f"{str(e.get('base'))[:12]} on the same host ({e.get('host') or '?'}); the tests gate counts them as new. "
+            "Fix them and commit; --fresh runs the checks on this tree again")
 
 
 def rerun(run, at: str, ids: list[str], tries: int = BUSY_TRIES, wait_s: float = BUSY_WAIT_S,

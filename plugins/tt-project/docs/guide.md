@@ -1721,6 +1721,8 @@ running work is interrupted only by the preemption below:
   wait here (and try them again after the same bound). A run that does not pass on a spill host runs again in
   the same order, keeping off the hosts its checks failed on (one whose own fault ended them, such as a pause
   taken mid-run, gets one more try once free); a pass on another spill host counts, else the result here does.
+  A run whose failures the tests gate (below) proved new on that spill host, the base passing them there, fails
+  at once instead: the host is ruled out, so a rerun would only fail again while holding a slot.
   `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
   (each paused, busy with a device job, full or unreachable, or no pool at all) to a Slurm cluster instead of
@@ -1892,7 +1894,10 @@ running work is interrupted only by the preemption below:
   name); passing on the head rerun is flaky: it goes into the project's quarantine
   (`state/test_quarantine.json`: first seen, evidence, expiry after `checks.quarantine_days`, default 7),
   which `ttp status` shows, one fix note goes to the coordinator, and it does not block. Failing on the
-  head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell. A saved
+  head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell. Such a
+  blocking verdict is saved per head tree and check (`state/gate_new.json`, kept 7 days): a later `ttp checks`
+  of the same tree fails at once, before it queues for a checks slot, naming the tests to fix (`--fresh` runs
+  it again). A saved
   base result counts only when it ran on the same host for the same base commit. A quarantined test the
   change does not touch is excused without a rerun. Nothing in the repository is edited or skipped. An
   excused check counts for this change's landing only: the run reads `LANDING ONLY`, its pass is never

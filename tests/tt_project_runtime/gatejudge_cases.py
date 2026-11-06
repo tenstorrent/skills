@@ -427,3 +427,20 @@ def test_ttp_checks_a_base_rerun_still_busy_after_its_retries_exits_75_never_a_h
     rec = json.loads((run / "checks.json").read_text())
     assert not rec["passed"] and rec["infra_fault"] == "gate-rerun-busy", rec
     assert "new on this head" not in out.out + out.err
+
+
+def test_a_blocking_verdict_is_saved_per_tree_and_check_and_expires(tmp_path):
+    """#6509: save_new keeps a blocking verdict per head tree and check (only one with new ids); known_new
+    finds it for that tree and check alone until BASE_KEEP_S passes, and its text says to fix the tests."""
+    from ttp import gatejudge
+    v = {"new": ["t.py::test_x"], "head": "a" * 40, "base": "b" * 40, "host": "box"}
+    gatejudge.save_new(tmp_path, "tree1", "pytest", {**v, "new": []}, 100.0)
+    assert gatejudge.known_new(tmp_path, "tree1", "pytest", 101.0) is None, "a verdict that blocks nothing"
+    gatejudge.save_new(tmp_path, "tree1", "pytest", v, 100.0)
+    e = gatejudge.known_new(tmp_path, "tree1", "pytest", 101.0)
+    assert e and e["new"] == ["t.py::test_x"] and e["host"] == "box", e
+    assert gatejudge.known_new(tmp_path, "tree2", "pytest", 101.0) is None
+    assert gatejudge.known_new(tmp_path, "tree1", "pytest -x", 101.0) is None
+    assert gatejudge.known_new(tmp_path, "tree1", "pytest", 100.0 + gatejudge.BASE_KEEP_S + 1) is None
+    said = gatejudge.known_new_text(e, "pytest")
+    assert "t.py::test_x" in said and "aaaaaaaaaaaa" in said and "Fix them" in said and "--fresh" in said, said

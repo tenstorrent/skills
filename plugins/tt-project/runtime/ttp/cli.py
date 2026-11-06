@@ -3475,6 +3475,7 @@ def cmd_checks(a) -> None:
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
     excused = []   # checks whose failing tests the gate judged not new on this head (gatejudge): landing only
+    proven_new = []   # the gate's blocking verdicts (gatejudge.blocks): new on the head, the base passing on that host
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
@@ -3589,6 +3590,16 @@ def cmd_checks(a) -> None:
                 said = f"not queued for a checks slot: {c} would fail: {why}"
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
+                passed, failed, todo = False, c, []
+                break
+        # A tree whose failures the tests gate proved new (they passed on the base on the same host) fails
+        # the same way again: it fails here, before the wait, so it holds no checks slot (gatejudge.known_new).
+        for c in todo if p and not hit and not a.fresh and purpose == "candidate" \
+                and not getattr(a, "release", False) else []:
+            if (known := gatejudge.known_new(p.state, tree, str(c))):
+                said = f"not queued for a checks slot: {gatejudge.known_new_text(known, str(c))}"
+                print(f"ttp checks: {said}")
+                out.write(f"ttp checks: {said}\n")
                 passed, failed, todo = False, c, []
                 break
         # A runner the host lacks (pytest wiped from the python a check runs with) is an environment
@@ -3853,7 +3864,8 @@ def cmd_checks(a) -> None:
                                 _low_priority(argv), group, record=reap_rec, cwd=where, stdout=out,
                                 stderr=subprocess.STDOUT, env=e, pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else (),
                                 timeout=min(t, left) if (left := checkwall.deadline_left(deadline)) is not None else t),
-                            run_env.get("TMPDIR") if os.environ.get("TTP_CHECKS_TMP_FD") else None)) is not None:
+                            run_env.get("TMPDIR") if os.environ.get("TTP_CHECKS_TMP_FD") else None,
+                            proven_new)) is not None:
                         if gatejudge.undecided(judged):
                             gate_busy = judged
                             out.write(_check_took(c, rc, began))
@@ -3968,7 +3980,16 @@ def cmd_checks(a) -> None:
         # A spill host's own environment never fails a change (a fault there, a missing tool): what did
         # not pass there (a timeout included) runs again, in its place in the queue: here, whose verdict
         # counts, or on another spill host that is free (checkspill.kept_off), where only a pass counts.
-        if spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped"):
+        # Not when the tests gate proved its failures new there (the base passed them on that host): the host's
+        # environment is ruled out, so a rerun here would only fail again holding a slot (gatejudge.known_new).
+        if spilled and proven_new and not passed and not timed_out:
+            said = (f"the checks failed on spill host {spilled.host} with tests the base passes on that host: "
+                    + ", ".join(i for v in proven_new for i in v["new"])
+                    + "; not run again here: fix them and commit")
+            out.write(f"ttp checks: {said}\n")
+            out.flush()
+            print(f"ttp checks: {said}", flush=True)
+        elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped"):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out)
             said = (f"the checks did not pass on spill host {spilled.host} ({how}); running them again on "
@@ -5292,12 +5313,13 @@ def _checks_stop(sig, _frame):
 
 
 def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: dict, head: str, base: str,
-                  top: str, out, log, run_check, tmp_base) -> dict | None:
+                  top: str, out, log, run_check, tmp_base, proven: list | None = None) -> dict | None:
     """A failed check's failing tests rerun at once on this host (gatejudge): on the head, then those
     failing again on the merge base with `base`. The verdict when none of them is new on the head (each
     pre-existing, flaky or quarantined), else None: the failure stands. A remote check (a spill host's
     included) reruns on its own host, each rerun a copy of the commit there with the select plugin
-    shipped along (remotecheck), and its base results are that host's. Never for a release check
+    shipped along (remotecheck), and its base results are that host's. A blocking verdict is appended to
+    `proven` and saved for the head's tree (gatejudge.save_new). Never for a release check
     (`--release`), a harness run, a Slurm batch check or a command that is not one plain pytest run."""
     from . import cleantree, gatejudge, push, pushpass, pushq, worktree
     if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate") \
@@ -5357,7 +5379,14 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
                                                          "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
         if new:   # one fix note per newly quarantined test
             pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c)), queued=True)
-    return None if gatejudge.blocks(v) else v   # undecided (gatejudge.undecided): the caller stops at exit 75
+    if gatejudge.blocks(v):
+        tree = subprocess.run(["git", "-C", top, "rev-parse", f"{head}^{{tree}}"], capture_output=True, text=True)
+        if tree.returncode == 0:
+            gatejudge.save_new(p.state, tree.stdout.strip(), str(c), v, now)
+        if proven is not None:
+            proven.append(v)
+        return None
+    return v   # undecided (gatejudge.undecided): the caller stops at exit 75
 
 
 def _remote_select(c, pick: dict):

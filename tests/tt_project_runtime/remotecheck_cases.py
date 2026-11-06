@@ -2015,11 +2015,14 @@ def test_a_spilled_failure_on_base_and_head_is_judged_on_the_spill_host_and_land
     assert not gatejudge.saved_base(p.state, gatejudge.host(), base, ["tests/test_gate.py::test_pre"], time.time())
 
 
-def test_a_spilled_failure_new_on_the_head_is_judged_new_there_and_still_runs_again_here(env, tmp_path, monkeypatch):
-    """The spill host's gate finds a failure new on the head (it passes on the base there): no excuse, so the
-    checks run again here as before, and that result fails the change."""
+def test_a_spilled_failure_new_on_the_head_fails_the_change_and_a_rerun_of_its_tree_fails_before_the_queue(
+        env, tmp_path, monkeypatch):
+    """#6509: the spill host's gate finds a failure new on the head (it failed twice there and passes on the
+    base there): the host's environment is ruled out, so the run fails without running the checks again here
+    (no slot taken for a run that fails again). A later `ttp checks` of the same tree fails at once, before it
+    queues for a checks slot, naming the tests and telling the task to fix them; --fresh runs it again."""
     import threading
-    from ttp import cli
+    from ttp import cli, gatejudge
     base = "def test_ok():\n    pass\n\n\ndef test_x():\n    pass\n"
     p, repo, run = _spill_gate(env, tmp_path, monkeypatch, base,
                                base.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
@@ -2030,5 +2033,18 @@ def test_a_spilled_failure_new_on_the_head_is_judged_new_there_and_still_runs_ag
     assert e.value.code == 1
     text = (run / "checks.log").read_text()
     assert "rerun at once on check-host-a" in text and "new on this head" in text, text
-    assert "did not pass on spill host check-host-a" in text, text
+    assert "did not pass on spill host check-host-a" not in text, "no full rerun here"
+    assert "tests the base passes on that host: tests/test_gate.py::test_x" in text, text
+    assert not json.loads((run / "checks.json").read_text())["passed"]
+    tree = subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD^{tree}"], capture_output=True, text=True).stdout.strip()
+    known = gatejudge.known_new(p.state, tree, _GATE_FAIL)
+    assert known and known["new"] == ["tests/test_gate.py::test_x"] and known["host"] == "check-host-a", known
+    size = len(text)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks"])
+    assert e.value.code == 1
+    again = (run / "checks.log").read_text()[size:]
+    assert "not queued for a checks slot" in again and "tests/test_gate.py::test_x" in again \
+        and "Fix them" in again, again
+    assert "rerun at once" not in again and "check-host-a" in again, "it ran nothing: the saved verdict decided"
     assert not json.loads((run / "checks.json").read_text())["passed"]
