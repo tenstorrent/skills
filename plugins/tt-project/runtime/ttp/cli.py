@@ -5148,7 +5148,8 @@ def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str,
     """The commit the tests gate reruns failing tests on as the base of `head`, and why: the commit
     the head was built on. Its candidates, each only when it is an ancestor of the head: the fork point
     recorded when the task's worktree was made (worktree.fork_point, by TTP_TASK); the head's merge
-    base with the branch the task is stacked on (its pr_branch or rebases branch, local then origin);
+    base with the branch the task is stacked on (its pr_branch or rebases branch, local then origin),
+    these two only for a task with a worktree of its own (not a review or harness task);
     its merge base with `base`, the push branch tip (as before: may be the head itself). The first of
     them wins, unless a later one descends from it (the head merged or was rebased onto a newer tip):
     then the newest. ("", why) when none is known: no base rerun."""
@@ -5167,7 +5168,7 @@ def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str,
     cands, notes = [], []
     tid = os.environ.get("TTP_TASK") or ""
     task = p.db.task(int(tid)) if tid.isdigit() else None
-    if task:
+    if task and task.get("kind") not in worktree.NEVER_OWN_KINDS:   # a review runs in the change's tree
         if fork := worktree.fork_point(Path(top), task["id"]):
             if under(fork):
                 cands.append((fork, f"the fork point recorded when task #{task['id']}'s worktree was made"))

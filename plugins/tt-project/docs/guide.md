@@ -1966,8 +1966,10 @@ session and stateless coordinators on every provider.
   the same host and in the same checks slot, never through the queue: once on the head, then those
   failing again once on the head's base (each rerun bounded by `checks.judge_rerun_s`, default 600).
   The base is the commit the head was built on: the fork point recorded when the task's worktree was
-  made (`refs/ttp/fork-point/t<id>`), else the head's merge base with the branch the task is stacked on
-  (its `pr_branch` or `rebases:` branch), else its merge base with the push target; a candidate that is
+  made (`refs/ttp/fork-point/t<id>`; a continuing task inherits the one it continues, one started early
+  on an unlanded change has none), else the head's merge base with the branch the task is stacked on
+  (its `pr_branch` or `rebases:` branch), else its merge base with the push target (always, for a
+  review or harness task, or with no task); a candidate that is
   not an ancestor of the head (a fork point rebased away) is skipped, and a later candidate that
   descends from the first (the head merged or was rebased onto a newer tip) wins. The check output and
   its excused record name the base and why. Failing on both is pre-existing and does not block (reported by

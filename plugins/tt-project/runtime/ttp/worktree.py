@@ -472,10 +472,15 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
     rebase = (delivery_branch(task) or ("", False))[1]
     start = carried_head(p, task) if carried or rebase else None
     started = start if rebase else None
-    start = start or (None if carried else continued_head(p, task)) or carried_head(p, task)
-    start = start or (None if carried else early_head(p, task))
+    via = "stacked" if start else ""   # what it starts from, for its fork point (record_fork_point)
+    if not start and not carried and (start := continued_head(p, task)):
+        via = "continued"
+    if not start and (start := carried_head(p, task)):
+        via = "stacked"
+    if not start and not carried and (start := early_head(p, task)):
+        via = "early"
     try:
-        start = start or resolve_base(p)
+        start, via = start or resolve_base(p), via or "base"
     except RuntimeError:
         if not exists:
             raise
@@ -489,7 +494,10 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
     # sandbox's placeholder, another worktree being made) cannot refuse it; nothing reads that upstream.
     _git(p.root, "worktree", "add", "--no-track", "-B" if exists else "-b", branch, str(path), start,
          timeout=timeout, env=env)
-    record_fork_point(p.root, task["id"], "HEAD", path)
+    if via in ("stacked", "base"):
+        record_fork_point(p.root, task["id"], "HEAD", path)
+    elif via == "continued" and (old := continues_id(task)) and (inherited := fork_point(p.root, old)):
+        record_fork_point(p.root, task["id"], inherited)   # the lineage's fork, never the old head
     if started:
         record_rebase_start(p.root, task["id"], started)
 
@@ -621,7 +629,10 @@ FORK_POINT_REF = "refs/ttp/fork-point/t"   # + task id: the commit a task's work
 def record_fork_point(repo: Path, task_id: int, rev: str, where: Path | None = None) -> None:
     """Record the commit `rev` names (in `where`, else `repo`) as task `task_id`'s fork point
     (FORK_POINT_REF): the tests gate in `ttp checks` compares the task's head with it, the commit
-    the head was built on, even when that is a local branch past the push branch."""
+    the head was built on, even when that is a local branch past the push branch. _create records
+    the base or the stacked-on branch head it starts from; a task continuing another inherits that
+    one's fork point (never the old head: the earlier part's own failures stay new), and one started
+    early on an unlanded change records none."""
     sha = _git(where or repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", check=False)
     if sha:
         _git(repo, "update-ref", f"{FORK_POINT_REF}{task_id}", sha, check=False)

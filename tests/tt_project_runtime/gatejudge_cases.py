@@ -641,8 +641,18 @@ def test_a_task_worktree_records_its_fork_point_and_a_finished_tasks_is_pruned(e
     git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
     start = subprocess.run([*git, "rev-parse", worktree.resolve_base(p)], capture_output=True, text=True).stdout.strip()
     plain = p.db.add_task("plain", "s", kind="code")
-    worktree.ensure(p, dict(p.db.task(plain)))
+    path, branch = worktree.ensure(p, dict(p.db.task(plain)))
+    p.db.update_task(plain, branch=branch)
     assert worktree.fork_point(p.root, plain) == start
+    # A task continuing it starts from its head but inherits its fork point: the earlier part's own
+    # failures stay new on the continued head.
+    subprocess.run(["git", "-C", str(path), "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q",
+                    "--allow-empty", "-m", "part 1"], check=True)
+    cont = p.db.add_task("part 2", "s", kind="code", labels=[f"continues:{plain}"])
+    cpath, _ = worktree.ensure(p, dict(p.db.task(cont)))
+    part1 = subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    assert subprocess.run(["git", "-C", str(cpath), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip() == part1
+    assert worktree.fork_point(p.root, cont) == start != part1
     subprocess.run([*git, "branch", "merge/demo-batch", start], check=True)
     tip = subprocess.run([*git, "commit-tree", "-p", start, "-m", "batch", f"{start}^{{tree}}"],
                          capture_output=True, text=True).stdout.strip()
@@ -654,3 +664,20 @@ def test_a_task_worktree_records_its_fork_point_and_a_finished_tasks_is_pruned(e
     p.db.update_task(plain, status="done")
     assert plain in worktree.prune_rebase_starts(p, [])
     assert worktree.fork_point(p.root, plain) == "" and worktree.fork_point(p.root, stacked) == tip
+
+
+def test_ttp_checks_a_review_task_keeps_the_push_branch_base(env, tmp_path, monkeypatch, capsys):
+    # A review runs in the change's worktree: a fork point or pr_branch recorded for it never makes the
+    # change's own commits the base. Its gate compares with the push branch, as before.
+    from ttp import cli, worktree
+    p, run, git, commit, tid, tip = _stacked_repo(env, tmp_path, monkeypatch)
+    p.db.update_task(tid, kind="review", labels=json.dumps(["pr_branch:ttp/t1-demo"]))
+    subprocess.run([*git, "checkout", "-qb", "ttp/t1-demo"], check=True)
+    bad = commit(_GATE_BAD, "the change")
+    worktree.record_fork_point(Path.cwd(), tid, bad)
+    commit(_GATE_BAD + "\n\ndef helper():\n    return 1\n", "a review fix on top")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _FAIL])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert f"base {tip[:12]}: its merge base with the push branch" in out and "new on this head" in out, out
