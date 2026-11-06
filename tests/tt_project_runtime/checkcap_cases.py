@@ -6176,7 +6176,7 @@ def test_a_project_can_set_its_own_test_run_max(env):
 
 def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env, monkeypatch):
     """Above checks.load_guard x the cores no routine run takes test slots, nor a priority-1 or push run
-    while another holds the one load pass (#5992); it waits saying why (its lane's wait note too), running
+    while others hold every load pass it may take (#5992, #6556); it waits saying why (its lane's wait note too), running
     grants are left alone, and once the load drops it starts. A nested run keeps its parent's grant; 0 or
     an unreadable load never holds one."""
     import threading
@@ -6190,12 +6190,11 @@ def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env,
     assert running and running.k == 4
     load[0] = 82.0
     told = []
-    pass_holder = locks.try_take([testslots.load_pass_path()], "an urgent run past the guard", "load-guard pass")
-    try:
-        for kw in ({}, {"priority": 1}, {"push_key": "origin feature"}):
-            assert testslots.acquire("new", told.append, wait_s=0.2, project_name="pb", **kw) is None, kw
-    finally:
-        pass_holder.close()
+    # Other runs past the guard hold every pass these may take (the shared, urgent and floor ones).
+    passes = [locks.try_take([checkcap.slot_dir() / f"{n}.lock"], "a run past the guard", "load-guard pass")
+              for n in (testslots.LOAD_PASS, testslots.LOAD_URGENT, testslots.LOAD_FLOOR)]
+    for kw in ({}, {"priority": 1}, {"push_key": "origin feature"}):
+        assert testslots.acquire("new", told.append, wait_s=0.2, project_name="pb", **kw) is None, kw
     assert told and all("overloaded" in t and "82.0" in t and "64 cores" in t for t in told), told
     assert locks._slot_labels([Path(running.files[0].name)]), "a running suite keeps its slots"
     monkeypatch.setenv(testslots.HELD_ENV, "3")
@@ -6220,7 +6219,7 @@ def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env,
     finally:
         load[0] = 0.0
         t.join(20)
-        for g in (running, got.get("g"), lane):
+        for g in (running, got.get("g"), lane, *passes):
             if g is not None:
                 g.close()
     load[0] = 100.0
@@ -6299,14 +6298,16 @@ def test_over_the_load_guard_a_routine_run_waits_and_one_push_or_urgent_run_star
     assert testslots.pool_gate({}, "pa", full=True).startswith("host load: ")
     assert not testslots.pool_gate({}, "pa", full=True, priority=1), "an urgent run passes the guard"
     push = testslots.acquire("push queue", told.append, wait_s=0.2, project_name="pa", push_key="origin feature")
+    held = locks.try_take([checkcap.slot_dir() / f"{testslots.LOAD_URGENT}.lock"], "another urgent run")
     try:
         assert push and push.k == 8 and any(f.name == str(testslots.load_pass_path()) for f in push.files)
         assert testslots.acquire("urgent", wait_s=0.2, project_name="pb", priority=1, full=True) is None, \
-            "one at a time: the pass is held"
+            "one per pass: its urgent pass and the shared one are held"
         assert testslots.pool_gate({}, "pb", full=True, priority=1).startswith("host load: ")
         assert testslots.load_held(push=True), "a second push run waits too"
     finally:
         push and push.close()
+        held.close()
     urgent = testslots.acquire("urgent", wait_s=0.2, project_name="pb", priority=1, full=True)
     try:
         assert urgent and urgent.k == 8, "the pass freed with the push run's grant: the urgent run starts"
@@ -6316,17 +6317,47 @@ def test_over_the_load_guard_a_routine_run_waits_and_one_push_or_urgent_run_star
     floor.close()
 
 
+def test_two_urgent_runs_of_different_projects_both_start_past_the_load_guard_and_a_routine_one_waits(
+        env, monkeypatch):
+    """#6556: over the load guard two urgent runs (priority 1) of different projects never serialize behind
+    one load pass: the first takes the urgent pass, the second the shared one, while a routine run holds
+    the floor. The count stays bounded: a third urgent run, a push run and a routine run wait."""
+    from ttp import testslots
+    _host_of_64(monkeypatch, load=84.5)
+    floor = testslots.acquire("routine", wait_s=0.2, project_name="pa", priority=3, full=True)
+    first = second = None
+    try:
+        assert floor and Path(floor.files[-1].name).stem == testslots.LOAD_FLOOR
+        told = []
+        first = testslots.acquire("urgent a", told.append, wait_s=0.2, project_name="pb", priority=1, full=True)
+        second = testslots.acquire("urgent b", wait_s=0.2, project_name="pc", priority=1, full=True)
+        assert first and first.k == 8 and "pass for urgent runs" in " ".join(told), told
+        assert second and second.k == 8, "the second urgent run takes the shared load pass"
+        assert {Path(g.files[-1].name).stem for g in (first, second)} == {testslots.LOAD_URGENT, testslots.LOAD_PASS}
+        assert testslots.acquire("urgent c", wait_s=0.2, project_name="pd", priority=1, full=True) is None, \
+            "bounded: no third urgent pass"
+        assert testslots.acquire("push", wait_s=0.2, project_name="pd", push_key="origin feature") is None
+        assert testslots.acquire("routine 2", wait_s=0.2, project_name="pd", priority=3, full=True) is None, \
+            "a routine run still waits for the one floor pass"
+        assert testslots.pool_gate({}, "pd", full=True, priority=3).startswith(testslots.LOAD_GATE)
+    finally:
+        for g in (floor, first, second):
+            g and g.close()
+    assert not testslots.load_held(1) and not testslots.load_held(3), "every grant let its pass go"
+
+
 def test_a_run_owed_to_the_user_passes_the_load_guard_while_less_urgent_runs_hold_its_passes(env, monkeypatch):
     """#6490 (2): over the load guard a priority-0 run (owed to the user) has a pass of its own, so a
-    priority-1 run holding the shared load pass and a routine run on the floor pass never hold it; only
-    another priority-0 run does. pool_gate agrees with acquire."""
+    priority-1 runs holding the urgent and shared load passes (#6556) and a routine run on the floor pass
+    never hold it; only another priority-0 run does. pool_gate agrees with acquire."""
     from ttp import testslots
     _host_of_64(monkeypatch, load=84.5)
     urgent = testslots.acquire("urgent p1", wait_s=0.2, project_name="pa", priority=1, full=True)
+    urgent2 = testslots.acquire("urgent p1 b", wait_s=0.2, project_name="pe", priority=1, full=True)
     floor = testslots.acquire("routine", wait_s=0.2, project_name="pb", priority=3, full=True)
     owed = None
     try:
-        assert urgent and floor, "the urgent run takes the load pass, the routine one the floor"
+        assert urgent and urgent2 and floor, "the urgent runs take the urgent and load passes, the routine one the floor"
         assert testslots.pool_gate({}, "pc", full=True, priority=1).startswith(testslots.LOAD_GATE)
         assert testslots.pool_gate({}, "pc", full=True, priority=2).startswith(testslots.LOAD_GATE)
         assert not testslots.pool_gate({}, "pc", full=True, priority=0), "a run owed to the user passes"
@@ -6336,7 +6367,7 @@ def test_a_run_owed_to_the_user_passes_the_load_guard_while_less_urgent_runs_hol
         assert testslots.acquire("second p0", wait_s=0.2, project_name="pd", priority=0, full=True) is None, \
             "one priority-0 run at a time on its own pass"
     finally:
-        for g in (urgent, floor, owed):
+        for g in (urgent, urgent2, floor, owed):
             g and g.close()
 
 
@@ -7513,6 +7544,36 @@ def test_an_urgent_run_waiting_in_two_queues_raises_one_urgent_check_wait_event(
         for t in (parked, queued):
             if t:
                 locks.dequeue(t)
+
+
+def test_an_urgent_wait_under_the_load_guard_names_it_and_its_pass_holders_not_the_pools(env, monkeypatch):
+    """#6556: an urgent run parked 10+ minutes while the host load guard holds it (the pool has free slots,
+    every load pass it may take is held) is named as held by the load guard, with the load and the passes'
+    holders (project, task, run), not the test pool's slot holders; once a pass frees and the guard no
+    longer holds it, the pool's holders are named again."""
+    from ttp import checkcap, locks, testslots
+    _host_of_64(monkeypatch, load=84.5)
+    d = checkcap.slot_dir()
+    slot = locks.try_take(testslots.paths(32), "proj-x task #9 (run 3) ttp checks", "test slots")
+    passes = [locks.try_take([d / f"{n}.lock"], f"proj-{i} task #7{i} (run 5{i}) ttp checks", "load-guard pass")
+              for i, n in enumerate((testslots.LOAD_URGENT, testslots.LOAD_PASS, testslots.LOAD_FLOOR))]
+    parked = locks.enqueue(d, checkcap.PARKED, "pa task #42 (run 7) ttp checks", time.time() - 700, group="pa",
+                           priority=1)
+    try:
+        [w] = checkcap.urgent_waits("pa")
+        assert "84.5" in w["load"] and "64 cores" in w["load"], w
+        assert w["held_by"] == [f"proj-{i} task #7{i} (run 5{i}) ttp checks" for i in range(3)], w
+        text = checkcap.urgent_wait_text(w)
+        assert "the host load guard (" in text and "proj-0 task #70 (run 50)" in text, text
+        assert "proj-x task #9" not in text, "free slots: the pool's holders are not the block"
+        passes.pop(1).close()   # the shared pass frees: the guard no longer holds it
+        [w] = checkcap.urgent_waits("pa")
+        assert "load" not in w and w["held_by"] == ["proj-x task #9 (run 3) ttp checks"], w
+        assert "load guard" not in checkcap.urgent_wait_text(w)
+    finally:
+        locks.dequeue(parked)
+        for f in (slot, *passes):
+            f.close()
 
 
 def _pool_folder(pool: Path, held: bool) -> Path:

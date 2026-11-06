@@ -1508,7 +1508,9 @@ def urgent_waits(project_name: str | None, now: float | None = None, min_s: floa
     or more in a host-wide queue: the checks queue (RESOURCE), the parked runs' queue (PARKED) or the test
     pool's host line (testslots). Each: queue, ticket (its file name: the same for one run in every queue), holder (the waiter's
     label), waited_s and held_by (who holds what it waits for: the checks slots, or the test pool's slots,
-    each label with its count). Read only; an unreadable queue gives none."""
+    each label with its count). A parked or test-slot waiter the host load guard holds (testslots.load_held:
+    every pass it may take is held) also has load (the guard's reason), and held_by names those passes'
+    holders instead, not the pool's. Read only; an unreadable queue gives none."""
     from . import testslots
     gid = locks.group_id(project_name)
     now = time.time() if now is None else now
@@ -1533,14 +1535,24 @@ def urgent_waits(project_name: str | None, now: float | None = None, min_s: floa
                 holder = t.read_text().strip()
             except OSError:
                 holder = ""
-            out.append({"queue": queue, "ticket": t.name, "holder": holder or t.name,
-                        "priority": locks.ticket_priority(t), "waited_s": now - locks._arrival(t),
-                        "held_by": held_by})
+            w = {"queue": queue, "ticket": t.name, "holder": holder or t.name,
+                 "priority": locks.ticket_priority(t), "waited_s": now - locks._arrival(t), "held_by": held_by}
+            try:
+                if queue != RESOURCE and (load := testslots.load_held(w["priority"], since=locks._arrival(t))):
+                    passes = testslots.load_pass_paths(w["priority"], since=locks._arrival(t))
+                    w |= {"load": load, "held_by": locks.held_labels(passes)}
+            except OSError:
+                pass
+            out.append(w)
     return out
 
 
 def urgent_wait_text(w: dict) -> str:
     """One urgent_waits entry in words: the queue, the waiter, how long and what holds it."""
     held = "; ".join(w["held_by"][:8]) + (f"; and {len(w['held_by']) - 8} more" if len(w["held_by"]) > 8 else "")
-    return (f"urgent checks {w['holder']} (priority {w['priority']:g}) have waited {w['waited_s'] / 60:.0f} min in "
-            f"the host-wide {w['queue']} queue; held by: {held or 'nothing held right now (the next turn is due)'}")
+    head = (f"urgent checks {w['holder']} (priority {w['priority']:g}) have waited {w['waited_s'] / 60:.0f} min in "
+            f"the host-wide {w['queue']} queue; held by: ")
+    if w.get("load"):   # the load guard, not the pool's slots: name it and its passes' holders
+        return (head + f"the host load guard ({w['load']}); its load passes held by: "
+                + (held or "none right now (its next try takes one)"))
+    return head + (held or 'nothing held right now (the next turn is due)')

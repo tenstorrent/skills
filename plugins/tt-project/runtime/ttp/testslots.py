@@ -288,7 +288,8 @@ def load_guard() -> str:
             + " (checks.load_guard); no new suite starts until it drops, running ones go on")
 
 
-LOAD_PASS = "test-slots-load-pass"   # check-slots/test-slots-load-pass.lock: the one urgent run past the load guard
+LOAD_PASS = "test-slots-load-pass"   # check-slots/test-slots-load-pass.lock: the one push or urgent run past the load guard
+LOAD_URGENT = "test-slots-load-urgent"   # the one urgent run (priority 1 or better) past it beside LOAD_PASS's
 LOAD_OWED = "test-slots-load-owed"   # the one priority-0 run (owed to the user) past it beside LOAD_PASS's
 LOAD_FLOOR = "test-slots-load-floor"   # the one run of any priority past it, so the queue keeps moving
 LOAD_GATE = "host load: "   # pool_gate's reason while the load guard holds a run (gate_lanes records it)
@@ -301,13 +302,17 @@ def load_pass_path() -> Path:
 def load_pass_paths(priority: int | None = None, push: bool = False, since: float | None = None) -> list[Path]:
     """The passes a run may take past the load guard, in the order it tries them: a priority-0 run (an
     obligation owed to the user, checkcap.OBLIGATION_PRIORITY) its own one (LOAD_OWED), so a less urgent
-    holder of the shared pass never holds it; a push-queue or urgent run (locks.URGENT_PRIORITY or better)
-    the one load pass; and any run the floor pass (LOAD_FLOOR) while no run parked under the load guard goes
-    before it (floor_ahead), so a host whose load comes from other work still starts one check at a time
-    and its queue never stalls while its slots are free."""
+    holder of the shared pass never holds it; an urgent run (locks.URGENT_PRIORITY or better) its own one
+    (LOAD_URGENT), then a push-queue or urgent run the shared load pass, so two urgent runs of any projects
+    start side by side and leave none of them waiting on the other; and any run the floor pass (LOAD_FLOOR)
+    while no run parked under the load guard goes before it (floor_ahead), so a host whose load comes from
+    other work still starts one check at a time and its queue never stalls while its slots are free. A fixed
+    pass count, not urgent runs joining one pass, keeps the guard's bound: at most four suites start past it."""
     d, out = checkcap.slot_dir(), []
     if priority is not None and priority <= checkcap.OBLIGATION_PRIORITY:
         out.append(d / f"{LOAD_OWED}.lock")
+    if priority is not None and priority <= locks.URGENT_PRIORITY:
+        out.append(d / f"{LOAD_URGENT}.lock")
     if push or (priority is not None and priority <= locks.URGENT_PRIORITY):
         out.append(load_pass_path())
     if not floor_ahead(priority, since):
@@ -578,7 +583,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                                              "load-guard pass",
                                              extra={"priority": priority} if priority is not None else None)):
                     tell(f"{what}: past the load guard on its "
-                         + {LOAD_OWED: "pass for runs owed to the user", LOAD_PASS: "pass for an urgent or push-queue run"}
+                         + {LOAD_OWED: "pass for runs owed to the user", LOAD_URGENT: "pass for urgent runs",
+                            LOAD_PASS: "pass for an urgent or push-queue run"}
                          .get(Path(passed.name).stem, "floor pass, the one run it admits so the queue moves") + f"; {load}")
             if kind is TESTS and passed is None and (load := load_guard()):
                 if push_key and (bound := push_load_wait_s(cfg)) is not None and time.time() - start >= bound \

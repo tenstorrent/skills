@@ -914,7 +914,7 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     else:
         prio, owns = checkcap.task_rank(proj)
         # Its slot is taken once its test slots could be (pool_room) and the host's load lets a suite
-        # start (load_held: one urgent run passes the guard): it never holds one while it waits for either.
+        # start (load_held: one run per load pass passes the guard): it never holds one while it waits for either.
         cfg = proj.config() if proj else {}
         slot = checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
                                 priority=prio, state=state, owns=owns,
