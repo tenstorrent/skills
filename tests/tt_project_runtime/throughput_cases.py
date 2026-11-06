@@ -1605,3 +1605,78 @@ def test_throughput_books_a_passed_start_when_wait_to_its_gate_not_worker_slots(
     assert lc["count"] == 1 and abs(lc["p90_s"] - 2900) < 2
     assert df["count"] == 1 and abs(df["p90_s"] - 1950) < 2
     assert w["count"] == 2 and w["p90_s"] <= 61 and not w["slow"]
+
+
+def _tp_lanes_full(p, d, monkeypatch, tmp_path, now, **rec):
+    """Under the project cap 3, two p1 waits of 700 s each with both of checks.slots 2 held by the
+    project's own runs; each waits-log record written by checkcap.record_wait with `rec`, where a value
+    callable on the wait's start w0 is called on it."""
+    from ttp import checkcap
+    monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
+    p.set_config("checks.test_project_max", 3)
+    p.set_config("checks.slots", 2)
+    for i, w0 in enumerate((now - 5 * 3600, now - 3 * 3600)):
+        t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"lane wait {i}", w0, 700)
+        _tp_checks_run(p, monkeypatch, w0 - 60, 750)
+        _tp_checks_run(p, monkeypatch, w0 - 30, 900)
+        _tp_slot_wait(p, monkeypatch, t, w0, w0 + 690, cap=3,
+                      **{k: v(w0) if callable(v) else v for k, v in rec.items()})
+
+
+@pytest.mark.parametrize("rec", [
+    {"lane_at": lambda w0: w0 + 680, "lane_s": 30.0},       # bounded waits re-stamped lane_at; 30 s in the lane
+    {"lane_at": lambda w0: w0 + 680, "lane_s": 690.0, "pool_s": 600.0},     # the lane held by the host pool
+])
+def test_throughput_pool_gated_checks_waits_book_the_host_and_raise_no_checks_slots(env, monkeypatch, tmp_path,
+                                                                                   rec):
+    """[note 82418fd2fe098005]: a waits-log record's lane time is lane_s minus pool_s, the time the host-wide
+    test pool refused the lane, never granted_at - queued_at before a lane_at a bounded wait re-stamped.
+    With the project's own runs filling checks.slots, waits held by the host pool book HOST_CORES, own 0,
+    and plan() opens no checks.slots task."""
+    from ttp import slowcomplaint, throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    _tp_lanes_full(p, d, monkeypatch, tmp_path, now, **rec)
+    rep = throughput.measure(p.db, p.config(), now=now, gates={})
+    ck = _tp_lane(rep, "checks_slots")
+    assert ck["held_by"]["own"] == 0 and ck["held_by"][throughput.HOST_CORES] == 2, ck
+    assert (ck.get("holder"), ck["limit_key"]) == (throughput.HOST_CORES, None), ck
+    changes, kept = throughput.plan(p.db, p.config(), rep)
+    assert not [c for c in changes if c["key"].startswith("checks.")], changes
+    made = slowcomplaint._followups(p.db, {**rep, "kept": kept}, [1])
+    assert made["opened"] is None, made
+    assert not p.db.q("SELECT 1 FROM tasks WHERE title LIKE 'throughput: %'")
+
+
+@pytest.mark.parametrize("by", ["other-project", None])
+def test_throughput_a_checks_wait_cut_by_a_preemption_books_the_preempting_project(env, monkeypatch, tmp_path, by):
+    """A checks run preempted by another project's urgent task queues again from its first arrival; the
+    rerun's waits-log record carries the cut (checkcap.CUT_ENV, set by `ttp checks` on Preempted). Its span
+    from the cut is the preempting project's (OTHER_PROJECTS), even with the own lanes full; a cut by an
+    urgent task of the project itself stays own."""
+    from ttp import checkcap, throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    monkeypatch.setenv(checkcap.CUT_ENV, json.dumps({"at": 0, "by": by or p.name}))
+    _tp_lanes_full(p, d, monkeypatch, tmp_path, now, lane_at=lambda w0: w0 + 680)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    if by:
+        assert ck["held_by"]["own"] == 0 and ck["held_by"][throughput.OTHER_PROJECTS] == 2, ck
+        assert ck["limit_key"] is None, ck
+    else:
+        assert ck["held_by"]["own"] == 2 and ck["limit_key"] == "checks.slots", ck
+
+
+def test_throughput_a_true_own_lane_wait_still_books_own(env, monkeypatch, tmp_path):
+    """A record whose whole wait was in the project's own lane (lane_s 690, pool_s 0), granted its lane
+    late, is the project's own lanes: own, checks.slots."""
+    from ttp import throughput
+    from ttp.daemon import Daemon
+    p = make(env)
+    d, now = Daemon(p.base), time.time()
+    _tp_lanes_full(p, d, monkeypatch, tmp_path, now, lane_at=lambda w0: w0 + 685, lane_s=690.0, pool_s=0.0)
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert ck["slow"] and ck["held_by"]["own"] == 2, ck
+    assert "holder" not in ck and ck["limit_key"] == "checks.slots", ck

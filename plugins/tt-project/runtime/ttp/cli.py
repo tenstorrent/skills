@@ -4647,6 +4647,8 @@ def cmd_checks(a) -> None:
                     out.write(f"ttp checks: {checkwall.said(str(py_check), wall, wall_how, head)}\n")
         except checkcap.Preempted as e:
             preempted_by = str(e)
+            # Its rerun's wait from this slot's grant is the asker's project's, not its own (record_wait).
+            os.environ[checkcap.CUT_ENV] = json.dumps({"at": _CHECK_PREEMPT["since"], "by": checkcap.preempter()})
         finally:
             _CHECK_YIELD["slot"] = None
             if _CHECK_PREEMPT["since"] is not None:   # a request it never saw is for no later run
@@ -5610,6 +5612,13 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     urgent = checkcap.is_urgent(prio) and p is not None   # an adopted task's run never takes an urgent slot
     pool_first = urgent and spill_to and bool(checkspill.hosts(cfg))
     moved = _HeadMoved(top, head)   # its task replacing the head while it waits drops the run
+    # Its own lane wait over every bound and re-execution (_checks_slot_take; checkcap.record_wait's lane_s).
+    try:
+        lane_wait = json.loads(os.environ.pop(checkcap.LANE_WAIT_ENV, "") or "{}")
+        lane_wait = {"s": float(lane_wait["s"]), "pool": float(lane_wait["pool"]),
+                     "at": float(lane_wait["at"]) if lane_wait.get("at") is not None else None}
+    except (ValueError, KeyError, TypeError):
+        lane_wait = {"s": 0.0, "pool": 0.0, "at": None}
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
@@ -5648,7 +5657,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         try:
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
                                      cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder,
-                                     moved=moved, urgent=urgent and not pool_first)
+                                     moved=moved, urgent=urgent and not pool_first, lane_wait=lane_wait)
         except checksqueue.Parked:
             # Parked: it waits outside the queue holding nothing, then queues again at its first arrival.
             arrived = start if arrived is None else arrived
@@ -5669,6 +5678,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         except checkcap.Upgraded as e:
             if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
                 checkjoin.forget(p.state)
+            os.environ[checkcap.LANE_WAIT_ENV] = json.dumps(lane_wait)
             _checks_reexec(str(e), arrived, prio, spill, tell, out, getattr(e, "lanes", None),
                            getattr(e, "slot", None), rerank=isinstance(e, checkcap.Reranked), spill_off=spill_off)
             continue   # it could not re-execute: wait again with the code it runs
@@ -5781,7 +5791,8 @@ def _landing_check(p) -> str:
 
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
                       done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
-                      lock: str = "", restart: bool = False, yielder=None, moved=None, urgent: bool = False):
+                      lock: str = "", restart: bool = False, yielder=None, moved=None, urgent: bool = False,
+                      lane_wait: dict | None = None):
     """One wait of _checks_slot for the repository's lane (or `lock`'s), a host-wide checks slot and
     test-worker slots, at most `limit` seconds (None: no limit): the slot, or None once `limit` passed.
     With `restart` (detached checks), a newer runtime installed while it waits (checkcap.upgraded) ends the
@@ -5846,11 +5857,35 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     check=f"{head[:12]}.{_commands_hash(cmds)[:12]}",
                                     repo_name=testslots.repo_name(top) if p and key == repo and not lane.get("lock") else "",
                                     name=names["lock" if lane.get("lock") else "repo"] if key in (repo, "") else "", **lane)
+    # Its wait for its own lanes is the project's (checks.slots) only while it could run: the time the
+    # host's test pool refused it a lane past them (pool_room) is the host's. Both add up in `lane_wait`
+    # over every bound (each gives the lane back), so the waits log tells them apart (record_wait).
+    lane_wait = {"s": 0.0, "pool": 0.0, "at": None} if lane_wait is None else lane_wait
+    refused, asked = [None], time.time()
+
+    def pool_ok() -> bool:
+        ok = testslots.pool_room(cfg, p.name if p else None, priority=prio, since=arrived, cost=run_cost)
+        now = time.time()
+        if refused[0] is not None:
+            lane_wait["pool"] += now - refused[0]
+        refused[0] = None if ok else now
+        return ok
+
+    def lane_waited(got: bool) -> None:
+        now = time.time()
+        lane_wait["s"] += now - asked
+        if refused[0] is not None:
+            lane_wait["pool"] += now - refused[0]
+        refused[0] = None
+        if got:
+            lane_wait["at"] = now
     try:
+        waits = kept is None   # a re-execution that kept its lanes waits for none
         if kept is not None:
             suite, kept = kept, None
         elif in_tree:
             if (tree := hold(testslots.tree_key(top), 1, pending=True)) is None:
+                lane_waited(False)
                 return None
         if suite is None and lock and _wrap_lane_after(cfg):
             suite = testslots.Grant()   # checks.wrap_lane "after": the step inside the wrapper takes the lane
@@ -5862,13 +5897,13 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if suite is None and (suite := hold(repo, lanes_now, lock=lock,
                                             cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True, running=True,
-                                            landing=_landing_check(p),
-                                            startable=lambda: testslots.pool_room(
-                                                cfg, p.name if p else None, priority=prio, since=arrived,
-                                                cost=run_cost))) is None:
+                                            landing=_landing_check(p), startable=pool_ok)) is None:
+            lane_waited(False)
             if tree is not None:
                 tree.close()
             return None
+        if waits:
+            lane_waited(True)
         if tree is not None:
             suite.files += tree.files
             tree = None
@@ -5887,7 +5922,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
-            lane_at = time.time()   # the waits log counts only the time after it as the host's (throughput)
+            lane_at = lane_wait["at"] or time.time()   # its lane's grant (throughput: the host's time is after it)
             slot = kept_slot if kept_slot is not None else checkcap.acquire(checkcap.label(checkcap.queue_name(p)), f"ttp checks on {head[:12]}", tell,
                                     waiting, left, arrived,
                                     checkcap.queue_name(p), prio, same, done, stop,
@@ -5896,7 +5931,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
                                     urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),
-                                    small=checkcap.is_small(run_cost), progress=_checks_progress(out, cmds))
+                                    small=checkcap.is_small(run_cost), progress=_checks_progress(out, cmds),
+                                    waited={"lane_s": lane_wait["s"], "pool_s": lane_wait["pool"]})
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
@@ -5926,14 +5962,17 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             testslots.lane_waits(suite, "a running suite of its repository or project to end")
             tell and tell(f"granted, but its repository's lanes or the project's cap of running checks are full: "
                  f"handed its grants back to wait for a running suite to end")
+            asked = time.time()   # a wait for its own running suites: the project's (lane_waited)
             while not testslots.claim_running(suite, p.name if p else None, lanes_now,
                                               checklane.project_cap(cfg), mark=False):
                 if stop and (why := stop()):
                     raise checkcap.Cancelled(why)
                 if limit is not None and time.time() - t0 >= limit:
+                    lane_waited(False)
                     suite.close()
                     return None
                 time.sleep(testslots.poll_s(testslots.POLL_S))
+            lane_waited(False)
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
         if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(checkcap.queue_name(p)))):

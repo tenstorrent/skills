@@ -532,6 +532,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     slot_log: dict[int, list[tuple[float, float]]] = {}
     slot_cap: dict[tuple[int, float, float], int] = {}   # the cap in force a record stored at its grant
     slot_lane: dict[tuple[int, float, float], float] = {}   # when the record's run got its repository's lane
+    slot_rec: dict[tuple[int, float, float], dict] = {}   # its lane_s, pool_s, cut_at and cut_by (record_wait)
     own_names, others = {cfg.get("name")}, []   # other projects' host slot grants (times), from the host log
     try:
         from . import checkcap
@@ -543,6 +544,9 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                     slot_cap[(r["task"], r["queued_at"], r["granted_at"])] = r["cap"]
                 if isinstance(r.get("lane_at"), (int, float)) and not isinstance(r["lane_at"], bool):
                     slot_lane[(r["task"], r["queued_at"], r["granted_at"])] = float(r["lane_at"])
+                slot_rec[(r["task"], r["queued_at"], r["granted_at"])] = {
+                    k: float(r[k]) if k != "cut_by" else str(r[k]) for k in ("lane_s", "pool_s", "cut_at", "cut_by")
+                    if k in r and (k == "cut_by" or (isinstance(r[k], (int, float)) and not isinstance(r[k], bool)))}
         others = [g["ts"] for g in checkcap.grant_records(now, now - t0 + DAY)
                   if g.get("project") and g.get("project") not in own_names]
     except Exception:
@@ -611,16 +615,35 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         events, or known only from its reason text, the legacy default), else HOST_CORES or
         OTHER_PROJECTS. A waits-log record's time before its run got the repository's lane ("lane_at") is
         the project's own lanes (checks.slots); one with no lane_at is all own when the project's recorded
-        runs filled checks.slots in it; a wait mostly held so is own. A wait the host held (its waits-log
+        runs filled checks.slots in it; a record with "lane_s" (its own lane waits over every bound, which
+        give the lane back and take it again) is own only for lane_s less its "pool_s" (the host's test pool
+        refused it a lane: the host's), spread evenly over the record; a wait mostly held so is own. A rerun
+        of a preempted run ("cut_at", "cut_by") counts only from its old grant: the preempting project's,
+        OTHER_PROJECTS unless that is this project. A wait the host held (its waits-log
         time from the lane to the grant, or events whose lane holders all waited for a host-wide gate) is
         OTHER_PROJECTS when another project's host slot grant fell inside it (checkcap.grant_records), else
         the host's free-cores gate."""
         if state in ("at_limit", "serialized"):
             return "own"
-        spans, own_s = [], 0.0
+        spans, own_s, host_s, cut_s = [], 0.0, 0.0, 0.0
         for q, g in slot_log.get(task, ()):
+            rec = slot_rec.get((task, q, g), {})
+            if (cut := rec.get("cut_at")) is not None:   # before it: the preempted grant's own record
+                a, b = max(q, w0, cut), min(g, w1)
+                if b > a and rec.get("cut_by") == cfg.get("name"):
+                    own_s += b - a
+                elif b > a:
+                    cut_s += b - a
+                continue
             a, b = max(q, w0), min(g, w1)
             if b <= a:
+                continue
+            if (lane_s := rec.get("lane_s")) is not None:
+                mine = max(0.0, lane_s - rec.get("pool_s", 0.0)) * (b - a) / max(g - q, 1e-9)
+                own_s += min(mine, b - a)
+                host_s += b - a - min(mine, b - a)
+                if b - a > mine:
+                    spans.append((a, b))
                 continue
             if (lane_at := slot_lane.get((task, q, g))) is not None:
                 h = min(max(lane_at, a), b)
@@ -629,8 +652,11 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             own_s += h - a
             if b > h:
                 spans.append((h, b))
-        if own_s and own_s >= sum(b - a for a, b in spans):
+                host_s += b - h
+        if own_s and own_s >= host_s + cut_s:
             return "own"
+        if cut_s and cut_s >= host_s:
+            return OTHER_PROJECTS
         evs = [h for ts, h in slot_host.get(task, ()) if w0 <= ts <= w1 and h is not None]
         if evs and not all(evs):
             return "own"

@@ -12358,3 +12358,29 @@ def test_slot_status_lists_the_host_parked_queue_in_admission_order_with_owed_an
     finally:
         locks.dequeue(owed)
         locks.dequeue(routine)
+
+
+def test_a_preempted_checks_runs_rerun_logs_its_wait_as_cut_by_the_preempting_project(env, tmp_path, monkeypatch,
+                                                                                      capsys):
+    """[note 82418fd2fe098005]: a routine run preempted by another project's urgent run queues again at its
+    first arrival; its rerun's waits-log record carries cut_at (its old grant) and cut_by (the asker's project,
+    checkcap.preempt's request), so throughput books that wait to the preempting project, and its lane wait
+    (lane_s, of which pool_s the host's test pool held)."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.setenv(checkcap.CUT_ENV, "")
+    monkeypatch.setenv("TTP_TASK", "7")
+    mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
+              f'printf \'{{"by": "urgent u", "task": "77", "project": "other-project", "at": %s}}\' '
+              f'"$(($(date +%s) + 1))" > {req}; sleep 60')
+    cli.main(["checks", "--", "sh", "-c", script])
+    assert "preempted by urgent #77" in capsys.readouterr().out
+    rows = checkcap.wait_records(p.state)
+    assert len(rows) == 2 and "cut_at" not in rows[0], rows
+    assert rows[1]["cut_by"] == "other-project" and rows[0]["granted_at"] - 1 <= rows[1]["cut_at"], rows
+    assert all(r["lane_s"] >= 0 and 0 <= r["pool_s"] <= r["lane_s"] for r in rows), rows
+    assert checkcap.CUT_ENV in checkcap.RUN_ONLY_ENV and checkcap.LANE_WAIT_ENV in checkcap.RUN_ONLY_ENV
