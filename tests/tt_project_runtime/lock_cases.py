@@ -1230,7 +1230,7 @@ def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
             proc.wait()
 
 
-def test_run_to_end_fails_only_a_command_still_running_at_its_deadline(monkeypatch):
+def test_run_to_end_fails_only_a_command_still_running_at_its_deadline(monkeypatch, tmp_path):
     """The sandboxed lock-probe tests failed under load with TimeoutExpired on commands that had already
     ended with the right answer (unshare's 0, the probe's 75): the niced test process got the CPU back
     only after the deadline. A clock that jumps past it once the command ended stands in for that."""
@@ -1259,6 +1259,17 @@ def test_run_to_end_fails_only_a_command_still_running_at_its_deadline(monkeypat
     with pytest.raises(subprocess.TimeoutExpired):   # one still running at its deadline still fails, killed
         _run_to_end(["sleep", "30"], timeout=0.5)
     assert started[-1].returncode == -signal.SIGKILL
+    pidfile, t0 = tmp_path / "leftover.pid", time.monotonic()
+    try:   # a descendant still holding the pipes does not turn the timeout into a wait for its end
+        with pytest.raises(subprocess.TimeoutExpired):
+            _run_to_end(["sh", "-c", f"sleep 60 & echo $! > {pidfile}; exec sleep 30"], timeout=0.5)
+        assert time.monotonic() - t0 < 10
+    finally:
+        if pidfile.exists() and pidfile.read_text().strip():
+            try:
+                os.kill(int(pidfile.read_text()), signal.SIGKILL)
+            except ProcessLookupError:
+                pass
 
 
 def test_run_to_end_does_not_count_a_stall_of_the_host_against_a_running_command(monkeypatch):

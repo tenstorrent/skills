@@ -3556,7 +3556,7 @@ def _run_to_end(argv, timeout=30, **kw):
                 left -= min(time.monotonic() - last, 1.5)
                 if left <= 0:
                     proc.kill()
-                    proc.communicate()
+                    proc.wait()   # not communicate(): a descendant it left may hold its pipes open
                     raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
