@@ -8407,7 +8407,7 @@ def set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = 
 def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None = None,
               start_after: str | None = None) -> str:
     """Re-point the probe of a task that has not started: a waiting task's `retry_when`, else its
-    `start_when` deferral. An empty probe clears it. `start_after` (a delay, a time read in the home
+    `start_when` deferral. An empty probe or `now` clears it. `start_after` (a delay, a time read in the home
     zone, or `now`/\"\" to clear) sets its start_after deferral (not_before), alone or with the probe.
     Same checks as the coordinator's task_update, through the same coordinator.deferral_update
     (the push branch's log check needs `p`). `on_pass_cmd` sets (\"\" clears) a waiting task's
@@ -8420,6 +8420,8 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
     from .db import TERMINAL_TASK_STATES, deferral, dump_result, load_result
     if probe is None and on_pass_cmd is None and start_after is None:
         raise ValueError("set-when needs the probe command (\"\" clears it), --start-after or --on-pass-cmd")
+    if probe is not None and probe.strip().lower() == "now":
+        probe = ""   # `now` clears it, as for start_after and task_update; never a shell command (exit 127)
     with db.tx():   # BEGIN IMMEDIATE: the daemon cannot start the task between the check and the write
         task = db.task(tid)
         if not task:
@@ -12697,7 +12699,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("probe", nargs="?", help="restart: why, with the new instructions (a running task stops at a "
                    "safe point, after any `ttp lock` it holds, and is queued again with its work kept and no attempt "
                    "spent; budget.restart_max per budget.restart_window_h); "
-                   "set-when: the new retry_when/start_when command (\"\" clears it); "
+                   "set-when: the new retry_when/start_when command (now or \"\" clears it); "
                    "superseded: the commit on the push branch that carries the task's work (for a harness task: "
                    "the commit merged into the harness; for a cancelled correction-class fix task: the done task '#<id>' "
                    "or commit that fixed the class instead; for a failed review: a commit on the push branch or --ref that "

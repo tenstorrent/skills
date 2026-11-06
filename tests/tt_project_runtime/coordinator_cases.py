@@ -11132,6 +11132,32 @@ def test_ttp_task_set_when_start_after_now_or_empty_clears_a_deferral(env, capsy
         assert not _ready(p, tid)
 
 
+@pytest.mark.parametrize("word", ["now", " NOW ", "Now"])
+def test_ttp_task_set_when_now_clears_the_gate_like_empty_on_every_path(env, capsys, word):
+    # `now` is "start now", never a shell command: stored as a probe it exits 127 and never passes.
+    p = make(env)
+    from ttp import cli
+    from ttp import coordinator as coord
+    waiting = _due_waiting_task(p, "exit 1")
+    p.db.update_task(waiting, not_before=time.time() + 3600)
+    cli.main(["task", "demo", "set-when", str(waiting), word])
+    assert f"task #{waiting} retry_when cleared" in capsys.readouterr().out
+    assert "retry_when" not in json.loads(p.db.task(waiting)["result"])
+    for how in ("cli", "task_update", "task_add"):
+        if how == "task_add":
+            coord.apply(p, [{"type": "task_add", "title": f"gated {how}", "spec": "s", "start_when": word}])
+            tid = _added(p, f"gated {how}")
+        else:
+            coord.apply(p, [{"type": "task_add", "title": f"gated {how}", "spec": "s", "start_when": "exit 1"}])
+            tid = _added(p, f"gated {how}")
+            if how == "cli":
+                cli.main(["task", "demo", "set-when", str(tid), word])
+                assert f"task #{tid} start_when cleared" in capsys.readouterr().out
+            else:
+                assert coord.apply(p, [{"type": "task_update", "id": tid, "start_when": word}]) == []
+        assert not any(lb.startswith("start_when:") for lb in _labels(p, tid)) and _ready(p, tid), how
+
+
 def test_ttp_task_set_when_start_after_takes_a_delay_or_a_home_zone_time(env, capsys):
     from datetime import datetime, timedelta
     from zoneinfo import ZoneInfo
