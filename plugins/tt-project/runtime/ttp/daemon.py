@@ -1335,6 +1335,7 @@ class Daemon:
                 log(self.p, did)
         except Exception:
             log(self.p, "index ignore file error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        threading.Thread(target=self._codex_cache_once, daemon=True, name="codex-cache").start()
         self._wake = os.pipe()   # not inherited by children (PEP 446)
         for fd in self._wake:
             os.set_blocking(fd, False)
@@ -3954,6 +3955,13 @@ class Daemon:
                 log(self.p, "cli watch: failed\n" + traceback.format_exc())
         self._cli_watch = threading.Thread(target=work, daemon=True, name="cli-watch")
         self._cli_watch.start()
+
+    def _codex_cache_once(self) -> None:
+        """Codex's copy of tt-project on the release this daemon runs, once per release and off the start
+        path (codexmarket.once): a release `ttp setup` did not refresh it for."""
+        from . import codexmarket
+        for line in codexmarket.once():
+            log(self.p, line)
 
     def check_notifier(self) -> None:
         """Alert once while this machine's desktop notifier fails to deliver (notifier.DELIVERY: a refused

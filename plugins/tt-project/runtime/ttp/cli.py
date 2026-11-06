@@ -875,7 +875,8 @@ def ship_runtime(host: str) -> str:
     stage = f".tt-project/lib/{__version__}"
     subprocess.check_call(["ssh", "-o", "BatchMode=yes", host, f"rm -rf ~/{stage} && mkdir -p ~/{stage}"])
     mac = ["--no-xattrs", "--no-mac-metadata"] if sys.platform == "darwin" else []
-    parts = [d for d in ("runtime", "template", "bin", "skills") if (PLUGIN_ROOT / d).exists()]
+    parts = [d for d in ("runtime", "template", "bin", "skills", ".claude-plugin", ".codex-plugin")
+             if (PLUGIN_ROOT / d).exists()]   # the manifests: its setup makes the release Claude's and Codex's marketplace
     tar = subprocess.Popen(["tar", *mac, "--exclude", "__pycache__", "-C", str(PLUGIN_ROOT), "-czf", "-",
                             *parts], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                            env={**os.environ, "COPYFILE_DISABLE": "1"})
@@ -10717,6 +10718,8 @@ def cmd_setup(a) -> None:
                                           "lib": str(lib), "commit": commit, "existed": lib.exists(),
                                           "prev": os.readlink(cur) if cur.is_symlink() else ""}))
             _install_parts(PLUGIN_ROOT, lib)
+        else:   # already in place (ship_runtime unpacks there): its marketplaces still get written
+            _write_markets(lib)
         durable_write(lib / "runtime" / "ttp" / SOURCE_FILE, commit + "\n", sync=False)
         sync_all()    # a reboot now must not leave empty files that upgrades take in as upstream
         # The marker goes first: a daemon check between the two steps must not undo a deliberate downgrade.
@@ -10822,6 +10825,10 @@ def _install_parts(src_root: Path, lib: Path) -> None:
             _copy_tree(src, lib / part)
     for f in (lib / "bin").iterdir():
         f.chmod(0o755)
+    _write_markets(lib)
+
+
+def _write_markets(lib: Path) -> None:
     if (lib / ".claude-plugin").is_dir():
         from . import claudemarket
         claudemarket.write(lib)     # Claude Code's tt-project marketplace points here (claudemarket.py)
@@ -10961,6 +10968,9 @@ def cmd_upgrade(a) -> None:
     _cycle_hold(cyclenotice_paths(p), a, p, auto_rec=p if a.auto else None)
     from . import notifier
     for ln in notifier.refresh(send_test=not a.auto):   # this machine's notifier on the installed code too
+        print(ln)
+    from . import codexmarket
+    for ln in codexmarket.once():   # and Codex's copy of tt-project, once per release
         print(ln)
     held = locks.try_take([release.upgrade_lock(p)], f"ttp upgrade (pid {os.getpid()})", "ttp upgrade")
     if held is None:

@@ -10,8 +10,12 @@ for the marketplace. Each installed release (~/.tt-project/lib/<version>) is als
 marketplace (write()). When the cache holds another version than the release, reconcile() runs
 `codex plugin add` once. When the registered folder itself serves another version (an installer
 clone nothing updates), it first moves the registration to the release, unless that marketplace also
-serves another installed or enabled plugin or a newer tt-project (a developer's own checkout). Without `codex` on PATH or a registered tt-project
-marketplace it does nothing; a failed or hung call is a line to print, never fatal."""
+serves another installed or enabled plugin or a newer tt-project (a developer's own checkout). A git
+marketplace gets `codex plugin marketplace upgrade` first, and the add only when its snapshot then serves
+the release. `codex plugin add` drops the other version folders (codex-cli 0.160), so a newer folder
+an older registration left goes with the first add. Without `codex` on PATH or a registered tt-project
+marketplace it does nothing; a failed or hung call is a line to print, never fatal. once() runs it
+once per release from the daemon's start and `ttp upgrade`, for releases `ttp setup` did not refresh."""
 from __future__ import annotations
 
 import fcntl
@@ -21,12 +25,15 @@ import os
 import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 from .claudemarket import MARKETPLACE, PLUGIN
 
 ID = f"{PLUGIN}@{MARKETPLACE}"
 CALL_TIMEOUT_S = 180
+ONCE_TIMEOUT_S = 300    # once()'s calls together
+DONE = ".codexmarket.done"   # in HOME_DIR: the release once() last reconciled
 MANIFEST = Path(".agents") / "plugins" / "marketplace.json"
 
 
@@ -137,10 +144,17 @@ def _others(home: Path, cfg: dict) -> list[str]:
     return sorted({i for i in ids if i.endswith("@" + MARKETPLACE) and i != ID})
 
 
-def _call(codex: str, *args: str) -> str:
-    """Run `codex <args>`; "" when it exited 0, else why not."""
+def snapshot(home: Path) -> Path:
+    """Where Codex keeps its copy of a git marketplace (codex-cli 0.160)."""
+    return home / ".tmp" / "marketplaces" / MARKETPLACE
+
+
+def _call(codex: str, *args: str, by: float | None = None) -> str:
+    """Run `codex <args>`, cut off at CALL_TIMEOUT_S or the time.monotonic() `by`; "" when it exited 0,
+    else why not."""
+    t = CALL_TIMEOUT_S if by is None else max(1.0, min(CALL_TIMEOUT_S, by - time.monotonic()))
     try:
-        r = subprocess.run([codex, *args], capture_output=True, text=True, timeout=CALL_TIMEOUT_S,
+        r = subprocess.run([codex, *args], capture_output=True, text=True, timeout=t,
                            stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as e:
         return f"`codex {' '.join(args)}` failed ({e})"
@@ -150,9 +164,10 @@ def _call(codex: str, *args: str) -> str:
     return ""
 
 
-def reconcile(current: Path, version: str, home: Path | None = None) -> list[str]:
+def reconcile(current: Path, version: str, home: Path | None = None, timeout_s: float | None = None) -> list[str]:
     """Bring Codex's cached tt-project to `version`, the release installed at `current`. Lines to
-    print; none when the cache already holds it, or Codex or its tt-project marketplace is missing."""
+    print; none when the cache already holds it, or Codex or its tt-project marketplace is missing.
+    `timeout_s` bounds its codex calls together (a failed move's restore always gets a full call)."""
     from .project import HOME_DIR
     from .providers.codex import codex_home
     from .release import is_newer
@@ -166,6 +181,7 @@ def reconcile(current: Path, version: str, home: Path | None = None) -> list[str
     if not isinstance(reg, dict) or not codex or not installed or have == version:
         return []
     why = f"Codex: its tt-project cache holds {have or 'nothing'}, the release is {version}"
+    by = None if timeout_s is None else time.monotonic() + timeout_s
     try:
         HOME_DIR.mkdir(parents=True, exist_ok=True)
         lock = os.open(HOME_DIR / ".codexmarket.lock", os.O_CREAT | os.O_RDWR, 0o600)
@@ -178,32 +194,63 @@ def reconcile(current: Path, version: str, home: Path | None = None) -> list[str
             return [f"{why}; another `ttp setup` or `ttp doctor` is refreshing it"]
         out: list[str] = []
         src = reg.get("source")
-        if reg.get("source_type", "local") != "local" or not isinstance(src, str):
+        if reg.get("source_type") == "git" and isinstance(src, str):
+            # The user's pick of a published source: refreshed, never moved. Its snapshot may serve
+            # another version (a branch behind or ahead of this release): then nothing is added.
+            if err := _call(codex, "plugin", "marketplace", "upgrade", MARKETPLACE, by=by):
+                return [f"{why}; {err}; the next `ttp setup` or `ttp doctor` retries it"]
+            served = plugin_version(str(snapshot(home)))
+            if served != version:
+                return [f"{why}; its {MARKETPLACE} marketplace is the git source {src}, which serves "
+                        f"{served or 'no tt-project'}, so it was left as is: `codex plugin marketplace add` "
+                        f"a source serving {version} in its place to follow this release"]
+        elif reg.get("source_type", "local") != "local" or not isinstance(src, str):
             return [f"{why}; its {MARKETPLACE} marketplace is not a local folder, so it was left as is: run "
                     f"`codex plugin marketplace upgrade {MARKETPLACE} && codex plugin add {ID}`"]
-        served = plugin_version(src)
-        if served and is_newer(served, version):   # a newer checkout of the user's own: theirs to keep
+        elif (served := plugin_version(src)) and is_newer(served, version):   # a newer checkout of the user's own: theirs to keep
             return [f"{why}; its {MARKETPLACE} marketplace at {src} serves the newer {served}, so it was left as is"]
-        if served != version:
+        elif served != version:
             if plugin_version(str(current)) != version:
                 return [f"{why}; {current} is no Codex marketplace of it: rerun `ttp setup` from the plugin"]
             if others := _others(home, cfg):
                 return [f"{why}; its {MARKETPLACE} marketplace at {src} ({served or 'no tt-project'}) also serves "
                         f"{', '.join(others)}, so it was left as is: rerun the tt-project installer to update it"]
-            if err := _call(codex, "plugin", "marketplace", "remove", MARKETPLACE):
+            if err := _call(codex, "plugin", "marketplace", "remove", MARKETPLACE, by=by):
                 return [f"{why}; {err}; the next `ttp setup` or `ttp doctor` retries it"]
-            if err := _call(codex, "plugin", "marketplace", "add", str(current)):
+            if err := _call(codex, "plugin", "marketplace", "add", str(current), by=by):
                 back = _call(codex, "plugin", "marketplace", "add", src)
                 return [f"{why}; {err}; " + (f"{src} is registered again" if not back else
                         f"and putting {src} back: {back}; run `codex plugin marketplace add {src}`")]
             out.append(f"Codex: the {MARKETPLACE} marketplace served tt-project {served or 'nothing'} from {src}; "
                        f"now from {current}")
-        if err := _call(codex, "plugin", "add", ID):
+        if err := _call(codex, "plugin", "add", ID, by=by):
             return out + [f"{why}; {err}; the next `ttp setup` or `ttp doctor` retries it"]
         return out + [f"Codex: plugin cache refreshed to tt-project {version} (was {have or 'none'}); "
                       f"new sessions load it"]
     finally:
         os.close(lock)
+
+
+def once(timeout_s: float = ONCE_TIMEOUT_S) -> list[str]:
+    """reconcile() on the installed release, once per release (HOME_DIR/DONE): for a release a daemon
+    restarts onto or `ttp upgrade` finds that `ttp setup` did not refresh (a failed or busy call, a
+    reboot's recovery). Its lines; never raises."""
+    from .project import HOME_DIR, durable_write
+    from .providers.codex import codex_home
+    from .release import installed, runtime_version
+    try:
+        current = installed()
+        version = runtime_version(current / "runtime")
+        done = HOME_DIR / DONE
+        if version == "unknown" or (done.read_text().strip() if done.is_file() else "") == version \
+                or not shutil.which("codex") or not isinstance(_dict(config(codex_home()).get("marketplaces"))
+                                                             .get(MARKETPLACE), dict):
+            return []   # no Codex marketplace yet: checked again at the next start
+        lines = reconcile(current, version, timeout_s=timeout_s)
+        durable_write(done, version + "\n", sync=False)
+        return lines
+    except Exception as e:   # a plugin cache must never stop a daemon or an upgrade
+        return [f"Codex: plugin cache check failed ({type(e).__name__}: {e})"]
 
 
 def doctor_lines() -> list[str]:

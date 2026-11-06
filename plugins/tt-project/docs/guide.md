@@ -3351,9 +3351,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   release: each release folder is also a one-plugin Codex marketplace, and when Codex's cached
   tt-project differs from the release, they run `codex plugin add tt-project@tenstorrent-skills`
   once (with a timeout), first moving the marketplace to the release when its folder serves another
-  version, unless it also serves another installed plugin. Nothing runs without `codex` on PATH or a
-  registered tenstorrent-skills marketplace, none at the release, and a failure is a printed line,
-  never fatal. A `plugin_dirs` set for
+  version, unless it also serves another installed plugin. A git marketplace is refreshed with
+  `codex plugin marketplace upgrade` and never moved: the add runs only when it then serves the
+  release. A daemon's start and `ttp upgrade` run the same check once per release (bounded in time),
+  and a remote machine gets it from the `ttp setup` its runtime shipping runs. Nothing runs without
+  `codex` on PATH or a registered tenstorrent-skills marketplace, none at the release, and a failure is
+  a printed line, never fatal. A `plugin_dirs` set for
   Codex (or for a Cursor build without `--plugin-dir`) raises one low alert per value and a
   `ttp doctor` line saying workers run without them.
 - Coordinator updates reach a running worker on every provider: through the hook after a tool call

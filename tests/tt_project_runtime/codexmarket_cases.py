@@ -4,8 +4,9 @@ from __future__ import annotations
 
 # A `codex` stand-in that logs its calls to $CX_LOG, fails a call containing $CX_FAIL (exit 3) and
 # otherwise does what codex-cli 0.160 was measured to do: a marketplace is registered by its resolved
-# folder, `marketplace add` refuses a second source, `remove` keeps the plugin's entry, and
-# `plugin add` replaces the cached copy with the version the registered folder serves.
+# folder, `marketplace add` refuses a second source, `remove` keeps the plugin's entry, `marketplace
+# upgrade` copies a git source into $CODEX_HOME/.tmp/marketplaces/<name>, and `plugin add` replaces the
+# cached copy, other version folders included, with the version the registered folder or snapshot serves.
 CX_STUB = r'''
 import json, os, pathlib, re, sys, time
 a = sys.argv[1:]
@@ -25,8 +26,16 @@ elif a[:3] == ["plugin", "marketplace", "add"]:
     if sect.search(text):
         sys.exit(print("already added from a different source", file=sys.stderr) or 1)
     cfg.write_text(text + f'\n[marketplaces.tenstorrent-skills]\nsource_type = "local"\nsource = "{os.path.realpath(a[3])}"\n')
+elif a[:3] == ["plugin", "marketplace", "upgrade"]:
+    snap = home / ".tmp/marketplaces/tenstorrent-skills"
+    if 'source_type = "git"' in sect.search(text).group(0):
+        import shutil
+        shutil.rmtree(snap, ignore_errors=True)
+        shutil.copytree(re.search(r'source = "([^"]*)"', sect.search(text).group(0)).group(1), snap)
 elif a[:2] == ["plugin", "add"]:
     src = pathlib.Path(re.search(r'source = "([^"]*)"', sect.search(text).group(0)).group(1))
+    if 'source_type = "git"' in sect.search(text).group(0):
+        src = home / ".tmp/marketplaces/tenstorrent-skills"
     rel = [p for p in json.loads((src / ".agents/plugins/marketplace.json").read_text())["plugins"]
            if p["name"] == "tt-project"][0]["source"]["path"]
     man = json.loads((src / rel / ".codex-plugin/plugin.json").read_text())
@@ -135,8 +144,9 @@ def test_codex_marketplace_it_must_not_move_is_left_and_named(env, tmp_path, mon
     snap = (home / "config.toml").read_text()
     out = codexmarket.reconcile(cur, "0.3.0")
     assert len(out) == 1 and "also serves tt-skills@tenstorrent-skills, so it was left as is" in out[0]
-    # A git marketplace, or a release folder that is no Codex marketplace (an older `ttp setup`): named too.
-    (home / "config.toml").write_text(snap.replace("tt-skills", "x").replace('"local"', '"git"'))
+    # A source type this does not know (git has its own test), or a release folder that is no Codex
+    # marketplace (an older `ttp setup`): named too.
+    (home / "config.toml").write_text(snap.replace("tt-skills", "x").replace('"local"', '"other"'))
     assert "is not a local folder" in codexmarket.reconcile(cur, "0.3.0")[0]
     (home / "config.toml").write_text(snap.replace('[plugins."tt-skills@tenstorrent-skills"]', "[x]"))
     (cur / ".agents" / "plugins" / "marketplace.json").unlink()
@@ -217,3 +227,116 @@ def test_ttp_setup_and_doctor_refresh_a_lagging_codex_cache_once(env, tmp_path, 
     cli.main(["doctor", p.name])
     assert f"Codex: plugin cache refreshed to tt-project {version} (was 0.2.1)" in capsys.readouterr().out
     assert _cx_calls(log)[3:] == ["plugin add tt-project@tenstorrent-skills"]
+
+
+def test_codex_newer_cache_folder_an_older_registration_left_takes_one_add_not_one_per_run(env, tmp_path, monkeypatch):
+    """A newer folder a developer's earlier registration left in the cache: `codex plugin add` drops it
+    (measured on codex-cli 0.160 in a temp CODEX_HOME), so the second run makes no call."""
+    from ttp import codexmarket
+    home, cur, clone, log = _cx_box(tmp_path, monkeypatch, clone_version="0.3.0", cached_version="0.4.0")
+    (home / "plugins" / "cache" / "tenstorrent-skills" / "tt-project" / "0.2.1").mkdir()
+    assert codexmarket.reconcile(cur, "0.3.0") == [
+        "Codex: plugin cache refreshed to tt-project 0.3.0 (was 0.4.0); new sessions load it"]
+    assert codexmarket.cached(home) == ["0.3.0"]
+    for _ in range(2):
+        assert codexmarket.reconcile(cur, "0.3.0") == []
+    assert _cx_calls(log) == ["plugin add tt-project@tenstorrent-skills"]
+
+
+def test_codex_git_marketplace_is_upgraded_and_added_only_when_it_serves_the_release(env, tmp_path, monkeypatch):
+    from ttp import codexmarket
+    home, cur, clone, log = _cx_box(tmp_path, monkeypatch)
+    repo = _cx_market(tmp_path / "repo", "0.2.9")
+    (home / "config.toml").write_text((home / "config.toml").read_text().replace(
+        f'source_type = "local"\nsource = "{clone}"', f'source_type = "git"\nsource = "{repo}"'))
+    snap = (home / "config.toml").read_text()
+    # Its branch is behind the release: refreshed, never moved, nothing added.
+    out = codexmarket.reconcile(cur, "0.3.0")
+    assert len(out) == 1 and f"is the git source {repo}, which serves 0.2.9, so it was left as is" in out[0]
+    assert _cx_calls(log) == ["plugin marketplace upgrade tenstorrent-skills"] and codexmarket.cached(home) == ["0.2.1"]
+    # Ahead of it (a newer push): left as is too.
+    (repo / "plugins" / "tt-project" / ".codex-plugin" / "plugin.json").write_text(json.dumps({"version": "0.4.0"}))
+    assert "which serves 0.4.0, so it was left as is" in codexmarket.reconcile(cur, "0.3.0")[0]
+    # A failed upgrade (no network) is a line; the next run retries.
+    monkeypatch.setenv("CX_FAIL", "upgrade")
+    out = codexmarket.reconcile(cur, "0.3.0")
+    assert "`codex plugin marketplace upgrade tenstorrent-skills` exited 3 (no network); the next" in out[0]
+    monkeypatch.delenv("CX_FAIL")
+    # Once it serves the release: one add, then nothing.
+    (repo / "plugins" / "tt-project" / ".codex-plugin" / "plugin.json").write_text(json.dumps({"version": "0.3.0"}))
+    assert codexmarket.reconcile(cur, "0.3.0") == [
+        "Codex: plugin cache refreshed to tt-project 0.3.0 (was 0.2.1); new sessions load it"]
+    assert codexmarket.reconcile(cur, "0.3.0") == [] and _cx_calls(log)[-2:] == [
+        "plugin marketplace upgrade tenstorrent-skills", "plugin add tt-project@tenstorrent-skills"]
+    assert len(_cx_calls(log)) == 5 and (home / "config.toml").read_text() == snap and codexmarket.cached(home) == ["0.3.0"]
+
+
+def _cx_installed(monkeypatch, cur):
+    """`cur` as the installed release, as once() finds it."""
+    from ttp import release
+    (cur / "runtime" / "ttp").mkdir(parents=True)
+    (cur / "runtime" / "ttp" / "__init__.py").write_text('__version__ = "0.3.0"\n')
+    monkeypatch.setattr(release, "installed", lambda: cur)
+
+
+def test_codex_once_reconciles_each_release_once_bounded_and_never_raises(env, tmp_path, monkeypatch):
+    from ttp import codexmarket
+    home, cur, clone, log = _cx_box(tmp_path, monkeypatch, clone_version="0.3.0")
+    _cx_installed(monkeypatch, cur)
+    done = env["home"] / codexmarket.DONE
+    assert codexmarket.once() == ["Codex: plugin cache refreshed to tt-project 0.3.0 (was 0.2.1); new sessions load it"]
+    assert done.read_text() == "0.3.0\n"
+    cache = home / "plugins" / "cache" / "tenstorrent-skills" / "tt-project"
+    (cache / "0.3.0").rename(cache / "0.2.1")
+    assert codexmarket.once() == [] and len(_cx_calls(log)) == 1   # this release had its turn
+    # A new release (another stamp): its turn, bounded as a whole by once()'s timeout.
+    done.write_text("0.2.1\n")
+    monkeypatch.setenv("CX_HANG", "1")
+    t0 = time.time()
+    out = codexmarket.once(timeout_s=1)
+    assert time.time() - t0 < 10 and codexmarket.CALL_TIMEOUT_S == 180
+    assert "`codex plugin add tt-project@tenstorrent-skills` failed (" in out[0] and done.read_text() == "0.3.0\n"
+    # Never raises; no Codex marketplace registered yet: no stamp, so a later start checks again.
+    monkeypatch.delenv("CX_HANG")
+    done.unlink()
+    monkeypatch.setattr(codexmarket, "reconcile", lambda *a, **k: 1 / 0)
+    assert codexmarket.once() == ["Codex: plugin cache check failed (ZeroDivisionError: division by zero)"]
+    (home / "config.toml").write_text("")
+    assert codexmarket.once() == [] and not done.exists()
+
+
+def test_codex_once_runs_at_daemon_start_and_in_ttp_upgrade(env, monkeypatch):
+    import inspect
+    from ttp import cli, codexmarket, service
+    from ttp.daemon import Daemon
+    p = make(env)
+    calls = []
+    monkeypatch.setattr(codexmarket, "once", lambda: calls.append(1) or ["Codex: plugin cache refreshed (stub)"])
+    Daemon(p.base)._codex_cache_once()
+    assert "Codex: plugin cache refreshed (stub)" in (p.logs / "daemon.log").read_text()
+    assert "target=self._codex_cache_once" in inspect.getsource(Daemon.run)   # off the start path, in a thread
+    monkeypatch.setattr(service, "restart", lambda p: "restarted")
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        try:
+            cli.main(["upgrade", p.name])
+        except SystemExit:
+            pass
+    assert calls == [1, 1] and "Codex: plugin cache refreshed (stub)" in out.getvalue()
+
+
+def test_codex_ship_runtime_reaches_reconcile_on_the_remote_host(env, tmp_path, monkeypatch):
+    """ship_runtime's `ttp setup` there makes the shipped release a Codex marketplace and refreshes
+    that host's cache: run end to end through an `ssh` stand-in that runs the command in another HOME."""
+    from ttp import cli, codexmarket
+    home, _cur, clone, log = _cx_box(tmp_path, monkeypatch)
+    far = tmp_path / "far"
+    far.mkdir()
+    (tmp_path / "stubs" / "ssh").write_text(
+        f'#!/bin/sh\nfor a; do last=$a; done\nexec env -u TTP_HOME HOME={far} PYTHONDONTWRITEBYTECODE=1 sh -c "$last"\n')
+    (tmp_path / "stubs" / "ssh").chmod(0o755)
+    assert cli.ship_runtime("box") == f"~/.tt-project/lib/{cli.__version__}/bin/ttp"
+    lib = far / ".tt-project" / "lib" / cli.__version__
+    assert codexmarket.plugin_version(str(lib)) == cli.__version__ and (lib / ".claude-plugin" / "marketplace.json").is_file()
+    assert codexmarket.cached(home) == [cli.__version__]
+    assert codexmarket.config(home)["marketplaces"]["tenstorrent-skills"]["source"] == str(lib.resolve())
