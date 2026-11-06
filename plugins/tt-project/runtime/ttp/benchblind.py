@@ -221,9 +221,9 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float):
             argv, env = prov.build(role="review", model=model, effort=effort, cwd=tmp, budget_usd=budget_usd,
                                    read_only=True, schema=SCHEMA, restrictions={})
             out = Path(tmp) / "output.jsonl"
-            with open(out, "wb") as f:
-                subprocess.run(argv, input=text.encode(), stdout=f, stderr=subprocess.DEVNULL, cwd=tmp,
-                               env={**os.environ, **env}, timeout=1800)
+            r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                               cwd=tmp, env={**os.environ, **env}, timeout=1800)
+            durable_write(out, r.stdout, sync=False)
             u = prov.parse(out)
         if not u.structured:
             raise Refused(f"no scored answer ({u.error or 'empty'})")
