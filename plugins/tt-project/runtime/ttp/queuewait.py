@@ -214,7 +214,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
             continue
         opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores)
         msg = text(w, opts, now)
-        if _cause_owner(db, st, w, msg, now) is not None:
+        if _cause_owner(db, st, w, now) is not None:
             continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep}}
         fp = f"{KIND}:{ep}:{mark}"
@@ -243,16 +243,30 @@ def _open(db, tid) -> bool:
     return bool(row) and row["status"] not in TERMINAL_TASK_STATES
 
 
-def _cause_owner(db, st: dict, w: dict, msg: str, now: float) -> int | None:
+TASK_ID_RE = re.compile(r"(?:probe:)?#\d+|\btask \d+", re.I | re.A)   # task ids a reason names, not the queue
+
+
+def _cause_owner(db, st: dict, w: dict, now: float) -> int | None:
     """An open task, other than the waiting one, that already owns this wait's cause: the owner of an active
-    throughput-class observation mute whose match the item or the task's reason names (screen.mutes,
-    throughmute), or the fix task an earlier item on the same queue and resource was acted on with
-    (record_act's `owner`). None: raise the per-task item."""
+    throughput-class observation mute whose match names this queue (screen.mutes, throughmute), or the fix
+    task an earlier item on the same queue and resource was acted on with (record_act's `owner`). A mute
+    matches only the queue's own words and the task's reason without its task ids and 'next try' tail, never
+    other tasks' labels in the item text; a mute keyed to one task ('#<id>') only that task's wait. None:
+    raise the per-task item."""
     from . import screen, throughmute
+    from .sweepskip import NEXT_TRY
     row = db.one("SELECT blocked_reason FROM tasks WHERE id=?", (w["task"],)) or {}
-    hay = " ".join([msg, str(row.get("blocked_reason") or ""), *ALIASES.get(w["queue"], ())]).lower()
+    reason = TASK_ID_RE.sub(" ", NEXT_TRY.sub("", str(row.get("blocked_reason") or "")))
+    hay = " | ".join([NAMES.get(w["queue"], w["queue"]), *ALIASES.get(w["queue"], ()), str(w.get("res") or ""),
+                      reason]).lower()
     for m in screen.mutes(db, now):
-        if not throughmute.marked(m) or str(m.get("match") or "").lower() not in hay:
+        match = str(m.get("match") or "").strip().lower()
+        if not throughmute.marked(m) or not match:
+            continue
+        if (t := screen.task_of(match)) is not None:
+            if t != w["task"]:
+                continue
+        elif not re.search(r"(?<!\w)" + re.escape(match) + r"(?!\w)", hay):
             continue
         own = ((m.get("throughput") or {}).get("owner") or {}).get("task")
         ids = [own] + throughmute.named_tasks(m.get("why")) + [
@@ -268,21 +282,35 @@ def _cause_owner(db, st: dict, w: dict, msg: str, now: float) -> int | None:
 
 def fix_owner(db, it: dict, actions: list, applied) -> int | None:
     """The task a queue item was acted on with that owns its cause: a task_update naming the item's key on
-    another task, or the open task a task_add naming the key created (open titles are unique). A
-    task_update of the waiting task itself (priority, cancel) acts on that task only: None."""
+    another task not itself waiting on that queue (a priority bump of another waiter owns no cause), or the
+    open task a task_add naming the key created (open titles are unique). A task_update of the waiting task
+    itself (priority, cancel) acts on that task only: None."""
     from . import mustact
     k, own = str(it.get("key") or ""), set(it.get("tasks") or [])
+    queue = (str(it.get("episode") or "").split(":") + ["", ""])[1]
+    waiters = {r.get("task") for r in ((db.kv(KV) or {}).get("open") or {}).values() if r.get("queue") == queue}
     for i in sorted(applied or ()):
         a = actions[i] if 0 <= i < len(actions) else None
         if not isinstance(a, dict) or not any(k and mustact._names(v, k) for v in a.values() if isinstance(v, str)):
             continue
-        if a.get("type") == "task_update" and str(a.get("id")).isdigit() and int(a["id"]) not in own:
+        if a.get("type") == "task_update" and str(a.get("id")).isdigit() and int(a["id"]) not in own | waiters \
+                and not _waits_on(db, int(a["id"]), queue):
             return int(a["id"])
         if a.get("type") == "task_add" and (row := db.one(
                 "SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled') ORDER BY id DESC",
                 (str(a.get("title") or "").strip(),))):
             return int(row["id"])
     return None
+
+
+def _waits_on(db, tid: int, queue: str) -> bool:
+    """Task `tid` is itself waiting on `queue`, by its last waiting hand-off (collect's classify)."""
+    from .db import load_result
+    row = db.one("SELECT blocked_reason, result FROM tasks WHERE id=? AND status='queued'", (tid,))
+    prev = load_result(row["result"]) if row else {}
+    got = prev.get("status") == "waiting" and classify(prev.get("retry_when") or "", row["blocked_reason"] or "")
+    lockish = {"device", "lock"}   # without the device set a device lock classifies as a plain lock
+    return bool(got) and (got[0] == queue or {got[0], queue} <= lockish)
 
 
 def record_act(db, ep: str, now: float | None = None, owner: int | None = None) -> None:

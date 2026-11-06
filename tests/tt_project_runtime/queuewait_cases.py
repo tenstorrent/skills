@@ -199,6 +199,58 @@ def test_queue_wait_folds_into_an_active_mute_with_an_open_owner(env):
     assert len(queuewait.scan(p, QW_CFG, now + 36 * 60, host)) == 1
 
 
+def test_queue_wait_mute_matches_only_the_queue_and_the_task_itself(env):
+    """A mute folds a wait only by the queue's own words or the waiting task's reason without task ids: a
+    task-keyed mute of a holder ('#91' in the item's Holding list, or '#9' inside '#91') or of a task the
+    reason names raises the item; a task-keyed mute of the waiting task itself folds only its own wait."""
+    from ttp import queuewait, screen
+    p = make(env)
+    now = time.time()
+    assert _qw_task7(p) == 7
+    fix = p.db.add_task("fix", "s", kind="code")
+    p.db.update_task(7, blocked_reason=f"checks queued behind #91 and #{fix}; next try 08:10 PST")
+
+    def mute(match, source="progress"):
+        p.db.set_kv(screen.MUTES_KEY, [{"source": source, "match": match, "below": "high", "why": f"#{fix}",
+                                        "since": now, "until": now + 3600, "count": 0,
+                                        "throughput": {"owner": {"task": fix}, "max_h": 12}}])
+        p.db.x("DELETE FROM events WHERE kind='queue_wait'")
+        p.db.set_kv(queuewait.KV, {})
+
+    host = _qw_host(p, now, now - 40 * 60)
+    assert "#91" in queuewait.text({**queuewait.collect(p, QW_CFG, now, host)[0]}, [], now)
+    for m in ("#91", "#9", "probe:#91", f"#{fix}", "next try"):
+        mute(m)
+        assert len(queuewait.scan(p, QW_CFG, now, host, cores=64)) == 1, m
+    mute("#7")
+    assert queuewait.scan(p, QW_CFG, now, host, cores=64) == []
+    mute("host-wide checks slot", "wait_stale")
+    assert queuewait.scan(p, QW_CFG, now, host, cores=64) == []
+    mute("#7")   # another task's wait on the same queue still raises under #7's mute
+    b = p.db.add_task("b", "s", kind="code")
+    host2 = {**host, "queued": host["queued"] + [f"{p.name} task #{b} (run 1)"],
+             "queued_at": host["queued_at"] + [now - 41 * 60]}
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now, host2, cores=64)] == [str(b)]
+
+
+def test_queue_wait_fix_owner_is_never_another_waiter_on_the_queue(env):
+    """A task_update naming the key on another task waiting on the same queue (a priority bump of the queue
+    head) owns no cause; on a task not waiting there it does."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    a, b, c = (p.db.add_task(x, "s", kind="code") for x in "abc")
+    host = {"limit": 4, "running": [], "priority": [], "urgent": [], "parked": [],
+            "queued": [f"{p.name} task #{a} (run 1)", f"{p.name} task #{b} (run 1)"], "queued_at": [now - 40 * 60] * 2}
+    queuewait.scan(p, QW_CFG, now, host)
+    ev = json.loads(_qw_events(p)[0]["data"])["must_act"]
+    it = {"key": ev["key"], "tasks": ev["tasks"], "episode": ev["episode"]}
+    other = b if ev["tasks"] == [a] else a
+    assert queuewait.fix_owner(p.db, it, [{"type": "task_update", "id": other, "priority": 1,
+                                           "note": it["key"]}], [0]) is None
+    assert queuewait.fix_owner(p.db, it, [{"type": "task_update", "id": c, "note": it["key"]}], [0]) == c
+
+
 def test_queue_wait_one_act_per_queue_cause(env):
     """An item acted on with a task_add naming its key makes that task the cause's owner: other tasks'
     waits on the same queue raise nothing while it is open, and again once it is done. A priority bump of
