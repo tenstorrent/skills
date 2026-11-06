@@ -224,33 +224,41 @@ def live_room(every: list) -> int | None:
 def project_workers(cfg: dict | None = None, cores: int | None = None, project_name: str | None = None) -> int:
     """The most test workers one project runs at once over all its suites (0: no such ceiling):
     TTP_TEST_PROJECT_WORKERS, else the account's checks.test_project_workers, else the base (the smaller of
-    PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR) plus the cores
-    the load leaves under SPARE_LOAD x the cores, at most half the cores (spare_workers); a project's own
+    PROJECT_WORKERS_MAX and one per CORES_PER_PROJECT_WORKER cores, at least WORKERS_FLOOR, raised to the
+    host-wide checks cap times run_min (admitted_workers) within the test pool) plus the cores the CPU
+    demand leaves under SPARE_LOAD x the cores, at most half the cores (spare_workers); a project's own
     checks.test_project_workers only lowers it. So a project's suites take a small share of a busy host
-    however many of them run at once, and more of an idle one. The load `project_name`'s own held test
-    slots add is not counted (_own_held): its own suites never shrink its ceiling, others' load does, and
-    the host's pool and load guard still bound the total."""
+    however many of them run at once, and more of an idle one, and every run the host-wide cap admits
+    can start at run_min. The load `project_name`'s own held test slots add is not counted (_own_held):
+    its own suites never shrink its ceiling, others' load does, and the host's pool, live free cores
+    (live_room) and load guard still bound the total."""
     top = _setting(*TESTS.setting("project_workers"))
     if top is None:
         c = checkcap.cores() if cores is None else cores
-        top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER))
+        top = max(WORKERS_FLOOR, min(PROJECT_WORKERS_MAX, c // CORES_PER_PROJECT_WORKER), admitted_workers(cfg, c))
         top = max(top, min(c // 2, top + spare_workers(c, _own_held(project_name, c) if project_name else 0)))
     if (mine := _number(_section(cfg, "checks").get("test_project_workers"))) and mine > 0:
         top = min(top, mine) if top else mine
     return max(0, top)
 
 
+def admitted_workers(cfg: dict | None, c: int) -> int:
+    """The test workers the runs the host-wide checks cap admits need to start at run_min each:
+    checkcap.limit() x run_min(), at most the test pool (sizes); 0 with the cap off (0) or the pool off."""
+    s = sizes(cfg, cores=c)
+    n = checkcap.limit()
+    return min(s[0], n * run_min(cfg, s[1])) if s and n > 0 else 0
+
+
 def spare_workers(c: int, own: int = 0) -> int:
-    """The cores the host's load leaves under SPARE_LOAD x its `c` cores, by the larger of its 1- and
-    5-minute load averages (so the ceiling grows slowly and shrinks fast) less `own`, the load one worker
-    per slot the asking project holds puts there (never below 0); 0 with checks.load_extra 0 or an
-    unreadable load. A shrink bounds new grants only: holders above it still count (_own_free)."""
+    """The cores the host's runnable CPU demand (checkcap.cpu_demand, the load guard's reading: busy cores
+    and tasks waiting to run, not tasks waiting on I/O) leaves under SPARE_LOAD x its `c` cores, less `own`,
+    the load one worker per slot the asking project holds puts there (never below 0); 0 with
+    checks.load_extra 0 or an unreadable reading. A shrink bounds new grants only: holders above it still
+    count (_own_free)."""
     if not checkcap.extra_max():
         return 0
-    try:
-        ld = max(os.getloadavg()[:2])
-    except (OSError, ValueError):
-        return 0
+    ld = checkcap.cpu_demand()
     if ld != ld or ld == float("inf"):
         return 0
     return max(0, int(c * SPARE_LOAD - max(0.0, ld - own)))

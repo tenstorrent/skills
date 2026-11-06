@@ -6765,7 +6765,8 @@ def test_a_project_s_test_worker_ceiling_defaults_to_min_8_and_cores_over_8_at_l
     from ttp import checkcap, project, testslots
     monkeypatch.delenv("TTP_TEST_PROJECT_WORKERS", raising=False)
     monkeypatch.setattr(checkcap, "cores", lambda: cores)
-    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (cores, cores, cores))   # busy: no spare cores
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "0")   # no host-wide cap: no admitted-runs floor (admitted_workers)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: float(cores))   # busy: no spare cores
     assert testslots.project_workers() == want
     project.set_account_setting("checks.test_project_workers", 12)
     assert testslots.project_workers() == 12, "the account sets it"
@@ -6775,12 +6776,13 @@ def test_a_project_s_test_worker_ceiling_defaults_to_min_8_and_cores_over_8_at_l
     assert testslots.project_workers() == 0, "0: no ceiling"
 
 
-def _spare_load(monkeypatch, cores: int, load1: float, load5: float | None = None):
+def _spare_load(monkeypatch, cores: int, load1: float):
     from ttp import checkcap, testslots
     monkeypatch.delenv("TTP_TEST_PROJECT_WORKERS", raising=False)
     monkeypatch.delenv("TTP_CHECKS_LOAD_EXTRA", raising=False)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "0")   # no host-wide cap: no admitted-runs floor (admitted_workers)
     monkeypatch.setattr(checkcap, "cores", lambda: cores)
-    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (load1, load1 if load5 is None else load5, 0.0))
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: load1)
 
 
 @pytest.mark.parametrize("load,want", [(0, 32), (16, 32), (30, 26), (32, 24), (47, 9), (48, 8), (60, 8)])
@@ -6793,16 +6795,21 @@ def test_a_project_s_test_worker_ceiling_grows_into_spare_cores_up_to_half_the_h
     assert 8 <= testslots.project_workers() <= 32
 
 
-def test_a_project_s_test_worker_ceiling_grows_slowly_and_shrinks_fast(env, monkeypatch):
-    """The larger of the 1- and 5-minute load averages sizes it: a load that just dropped (high 5-minute)
-    keeps the base, one that just rose (high 1-minute) shrinks it at once."""
-    from ttp import testslots
-    _spare_load(monkeypatch, 64, 0.0, 48.0)
-    assert testslots.project_workers() == 8, "a 5-minute load at 0.75 x the cores: no growth yet"
-    _spare_load(monkeypatch, 64, 40.0, 0.0)
-    assert testslots.project_workers() == 16, "a 1-minute load of 40 shrinks it at once"
-    _spare_load(monkeypatch, 64, 0.0, 0.0)
-    assert testslots.project_workers() == 32
+def test_a_project_s_test_worker_ceiling_reads_runnable_cpu_demand_not_the_load_average(env, monkeypatch):
+    """The spare term reads the load guard's CPU demand (/proc/stat: busy cores and runnable tasks), so a
+    load average of 67 on 64 cores made mostly of tasks waiting on I/O (D state) leaves the idle cores to
+    the ceiling; real CPU demand still shrinks it."""
+    from ttp import checkcap, hostcpu, testslots
+    real = checkcap.cpu_demand
+    _spare_load(monkeypatch, 64, 0.0)
+    monkeypatch.setattr(checkcap, "cpu_demand", real)
+    monkeypatch.setattr(checkcap.os, "getloadavg", lambda: (67.0, 67.0, 67.0))
+    monkeypatch.setattr(hostcpu, "demand", lambda: 20.0)
+    assert testslots.spare_workers(64) == 28 and testslots.project_workers() == 32, "I/O waiters are not CPU load"
+    monkeypatch.setattr(hostcpu, "demand", lambda: 40.0)
+    assert testslots.project_workers() == 16, "CPU demand of 40 shrinks it"
+    monkeypatch.setattr(hostcpu, "demand", lambda: None)
+    assert testslots.project_workers() == 8, "no /proc/stat: the load average of 67 leaves no spare cores"
 
 
 def test_load_extra_0_or_a_set_test_worker_ceiling_keeps_it_fixed(env, monkeypatch):
@@ -6830,11 +6837,11 @@ def test_a_project_s_own_test_worker_setting_still_only_lowers_the_grown_ceiling
 
 
 def test_an_unreadable_load_gives_the_base_test_worker_ceiling(env, monkeypatch):
-    from ttp import testslots
+    from ttp import checkcap, testslots
     _spare_load(monkeypatch, 64, 0.0)
-    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (_ for _ in ()).throw(OSError()))
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: float("inf"))   # neither /proc/stat nor a load average
     assert testslots.project_workers() == 8
-    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (float("nan"), 0.0, 0.0))
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: float("nan"))
     assert testslots.project_workers() == 8, "a NaN load never grows it"
     for cores, want in ((1, 2), (4, 2), (16, 2)):
         _spare_load(monkeypatch, cores, float("inf"))
@@ -6845,11 +6852,11 @@ def test_a_project_s_own_held_suites_never_shrink_its_test_worker_ceiling(env, m
     """The load its own held test slots add (one worker each) is taken out before the spare term: with
     only its own suite loading the host its ceiling stays the idle one, so its next suite still gets the
     rest of it; another project, which holds none of those slots, sees the whole load."""
-    from ttp import testslots
+    from ttp import checkcap, testslots
     _slot_sizes(monkeypatch, 64, 28, TTP_TEST_PROJECT_SLOTS=64, TTP_CHECKS_LIVE_CORES=0)
     load = [0.0]
     _spare_load(monkeypatch, 64, 0.0)
-    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (load[0], load[0], 0.0))
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: load[0])
     assert testslots.project_workers(project_name="pa") == 32 and testslots.project_max(project_name="pa") == 32
     a = testslots.acquire("a", project_name="pa", wait_s=0)
     assert a and a.k == 28
@@ -6883,11 +6890,11 @@ def test_grants_follow_the_grown_ceiling_and_holders_past_a_shrunk_one_still_cou
     """project_max() and acquire() bound grants by the ceiling of the moment; once it shrinks, a run
     above it keeps its slots and they still count, so no new grant goes past the new ceiling even when
     the low budget slots themselves are free."""
-    from ttp import testslots
+    from ttp import checkcap, testslots
     _slot_sizes(monkeypatch, 64, 32, TTP_TEST_PROJECT_SLOTS=64, TTP_CHECKS_LIVE_CORES=0)
     load = [48.0]
     _spare_load(monkeypatch, 64, 0.0)
-    monkeypatch.setattr(testslots.os, "getloadavg", lambda: (load[0], load[0], 0.0))
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: load[0])
     assert testslots.project_max() == 8
     a = testslots.acquire("a", project_name="pa", wait_s=0)
     assert a and a.k == 8, "busy host: the base"
@@ -7080,6 +7087,47 @@ def test_a_second_full_run_of_a_project_starts_beside_the_first_within_its_worke
         locks.dequeue(parked)
         for g in ("first", "second"):
             (locals().get(g) or testslots.Grant()).close()
+
+
+@pytest.mark.parametrize("spare", [False, True])
+def test_every_run_the_host_wide_cap_admits_gets_run_min_on_a_64_core_host_at_load_67_of_io_waiters(
+        env, monkeypatch, spare):
+    """#6913: 64 cores, a 1-minute load of 67 made mostly of tasks waiting on I/O, checks.host_max 4 and
+    checks.test_run_min 4, no test-worker ceiling set. The project's ceiling was min(8, 64 // 8) plus the
+    spare cores under the load average (none): 8, so only 2 of the 4 admitted runs could test. Now it is
+    at least host_max x run_min (16) within the pool, its spare term reads the runnable CPU demand (20),
+    and all 4 runs queued at once start with run_min or more; with checks.load_extra 0 (no spare term)
+    too. A project's own lower value still lowers it, and the pool still bounds it."""
+    from ttp import checkcap, hostcpu, locks, testslots
+    _host_of_64(monkeypatch)
+    monkeypatch.delenv("TTP_TEST_PROJECT_WORKERS")
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_TEST_RUN_MIN", "4")
+    monkeypatch.setattr(checkcap, "_load", lambda: 67.0)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: hostcpu.demand() or checkcap._load())
+    monkeypatch.setattr(hostcpu, "demand", lambda: 20.0)
+    monkeypatch.setattr(checkcap, "extra_max", lambda: 2 if spare else 0)
+    want = 32 if spare else 16
+    assert testslots.project_workers({}, project_name="pa") == want
+    assert testslots.project_max({}, project_name="pa") == want
+    parked = [locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, f"r{i}", time.time(), group="pa") for i in (1, 2, 3)]
+    grants = []
+    try:
+        for i in range(4):
+            g = testslots.acquire(f"r{i}", project_name="pa", wait_s=0, full=True)
+            assert g and g.k >= 4, f"run {i + 1} of 4 starts with at least run_min"
+            grants.append(g)
+            if parked:
+                locks.dequeue(parked.pop(0))
+        assert sum(g.k for g in grants) == want
+    finally:
+        for t in parked:
+            locks.dequeue(t)
+        for g in grants:
+            g.close()
+    assert testslots.project_workers({"checks": {"test_project_workers": 6}}) == 6, "a project's own still lowers it"
+    monkeypatch.setenv("TTP_TEST_POOL", "12")
+    assert testslots.admitted_workers({}, 64) == 12 and testslots.project_max({}) == 12, "never above the pool"
 
 
 def test_over_the_load_guard_a_routine_run_waits_and_one_push_or_urgent_run_starts(env, monkeypatch):
