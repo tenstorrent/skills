@@ -4556,16 +4556,35 @@ def test_every_db_connection_waits_for_a_busy_database(env, tmp_path):
     assert any(k.arg == "timeout" for k in connects[0].keywords)
 
 
+def _release_once_busy(monkeypatch, release):
+    """The lock holder lets go once the writer met the lock past its busy timeout (its first busy
+    error), before the retry pause: no timer races the writer's retries under load."""
+    from ttp import db as dbm
+    met = []
+    real = dbm.is_busy
+
+    def is_busy(e):
+        busy = real(e)
+        if busy and not met:
+            met.append(e)
+            release()
+        return busy
+    monkeypatch.setattr(dbm, "is_busy", is_busy)
+    return met
+
+
 def test_db_write_retries_a_lock_held_past_the_busy_timeout(env, tmp_path, monkeypatch):
     import sqlite3
     from ttp import db as dbm
     _short_busy_waits(monkeypatch, timeout_s=0.05, pauses=(0.2, 0.4))
     d = dbm.DB(tmp_path / "x.db")
-    _hold_write_lock(tmp_path / "x.db", release_after=0.3)
+    met = _release_once_busy(monkeypatch, _hold_write_lock(tmp_path / "x.db"))
     d.set_kv("a", 1)                        # a write on its own
-    _hold_write_lock(tmp_path / "x.db", release_after=0.3)
+    assert met, "the write never met the held lock"
+    met = _release_once_busy(monkeypatch, _hold_write_lock(tmp_path / "x.db"))
     with d.tx():                            # a transaction's BEGIN IMMEDIATE
         d.set_kv("b", 2)
+    assert met, "the transaction never met the held lock"
     assert (d.kv("a"), d.kv("b")) == (1, 2)
     release = _hold_write_lock(tmp_path / "x.db")
     try:
