@@ -98,7 +98,9 @@ def _main(role: str, args: list[str] | None = None) -> int:
         if os.environ.get("TTP_FAKE_SHELL"):
             import subprocess
             subprocess.run(["sh", "-c", os.environ["TTP_FAKE_SHELL"]], stdin=subprocess.DEVNULL)
-        if not (os.environ.get("TTP_FAKE_SHELL") and (run_dir / "result.json").exists()):
+        if os.environ.get("TTP_FAKE_RESULT") == "none":
+            pass   # ends without writing a hand-off
+        elif not (os.environ.get("TTP_FAKE_SHELL") and (run_dir / "result.json").exists()):
             result = json.loads(os.environ.get("TTP_FAKE_RESULT") or "null") or {
                 "status": "done", "summary": f"fake {role} finished", "followups": []}
             (run_dir / "result.json").write_text(json.dumps(result))

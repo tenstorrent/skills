@@ -225,6 +225,9 @@ class Provider:
     # Workers get coordinator updates (steer.md) from a hook after each tool call (ttp.hook); without
     # one, `ttp note` and `ttp steer` print them (cli.print_update). Either marks them read (steerack).
     steer_hook = False
+    # Its runs refuse to end without a valid hand-off in-run (ttp.hook Stop). Without one, the daemon
+    # continues a run's session once to write it (Daemon._handoff_resume), where the session can resume.
+    stop_hook = False
 
     def reach_host(self, env: dict | None = None) -> str:
         """The host this provider's runs reach its API at: the base URL's host when its variable is

@@ -1143,6 +1143,20 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
                      f"$TTP_RUN_DIR/result.json, not under {lost['dir']}; a retry_when or on_pass_cmd that "
                      f"names files under {lost['dir']} still reads them there.\n")
         return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
+    if lost.get("cause") == "handoff":   # it ended without a hand-off the daemon takes (Daemon._handoff_resume)
+        text = (f"# Continue task #{task['id']}: {task['title']}\n"
+                f"Your run ended, but {lost.get('handoff')}\n"
+                f"This continues your session once, in the same attempt (budget "
+                f"${task['budget_usd'] or 0:.2f}, spent ${task['spent_usd'] or 0:.2f}). Do not redo finished work: "
+                f"fix what this names and write the hand-off to $TTP_RUN_DIR/result.json as the Handoff section "
+                f"says. Ending again without a valid one fails the run.\n")
+        if lost.get("dir"):
+            text += (f"This run has a new run directory, {RUN_DIR_MARK}: write the hand-off only there, not "
+                     f"under {lost['dir']}.\n")
+        if lost.get("spec_sha") and lost["spec_sha"] != spec_digest(task):
+            text += ("\nUpdate for your task from the project coordinator. Where it differs from the spec, it wins:\n"
+                     f"The spec changed:\n{task['spec'] or task['title']}\n")
+        return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
     why = {"reboot": "the host rebooted", "sleep": "the host slept",
            "network": "the network went away"}.get(lost.get("cause"), "its supervisor was lost")
     free = lost.get("cause") in ("reboot", "sleep", "network")

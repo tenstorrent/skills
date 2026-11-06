@@ -165,12 +165,15 @@ def test_ttp_task_restart_stops_a_running_task_and_records_the_why_in_its_spec(e
     assert "restart:" not in p.db.task(queued)["spec"], "a refused restart leaves the spec alone"
 
 
+@pytest.mark.parametrize("cause", ["dry_run", "handoff"])
 def test_a_restart_of_a_run_handed_back_by_an_on_pass_dry_run_starts_fresh_with_the_restart_block(
-        env, tmp_path, monkeypatch):
-    # The handed-back run continued the old session (onpassdry.KEY): a restart drops that session with its
-    # direction, so the next run neither resumes it nor counts as a wake of the dropped wait.
+        env, tmp_path, monkeypatch, cause):
+    # The handed-back run continued the old session (onpassdry.KEY, or HANDOFF_RESUME_KEY for a run that
+    # ended without a valid hand-off): a restart drops that session with its direction, so the next run
+    # neither resumes it nor counts as a wake of the dropped wait.
     from ttp import coordinator as coord, onpassdry
-    from ttp.daemon import Daemon, _stale_wakes
+    from ttp.daemon import Daemon, _stale_wakes, HANDOFF_RESUME_KEY
+    key = onpassdry.KEY if cause == "dry_run" else HANDOFF_RESUME_KEY
     from ttp.prompts import worker_task
     p = make(env)
     _rs_live(monkeypatch)
@@ -183,9 +186,9 @@ def test_a_restart_of_a_run_handed_back_by_an_on_pass_dry_run_starts_fresh_with_
     p.db.update_task(tid, result=json.dumps({
         "status": "waiting", "summary": "waits on the build", "retry_when": "test -e /nonexistent",
         "on_pass_cmd": "true", onpassdry.NOTE_KEY: "WARNING: on_pass_cmd cannot run as written",
-        onpassdry.KEY: {"run": rid, "session": "s1", "text": "the on_pass_cmd cannot run"}}))
+        key: {"run": rid, "session": "s1", "text": "the on_pass_cmd cannot run"}}))
     d = Daemon(p.base)
-    assert d._resumable(p.db.task(tid), "fake")["cause"] == "dry_run", "the setup resumes before the restart"
+    assert d._resumable(p.db.task(tid), "fake")["cause"] == cause, "the setup resumes before the restart"
     assert coord.apply(p, [{"type": "task_update", "id": tid,
                             "spec": "Build only the CPU target.\nrestart: it is rebuilding the device target"}]) == []
     (run_dir / "exit.json").write_text(json.dumps({"rc": 143, "stopped": "shutdown", "ended": time.time()}))
@@ -193,7 +196,7 @@ def test_a_restart_of_a_run_handed_back_by_an_on_pass_dry_run_starts_fresh_with_
     t = p.db.task(tid)
     prev = json.loads(t["result"])
     assert t["status"] == "queued" and prev["status"] == "restarted"
-    assert onpassdry.KEY not in prev and onpassdry.NOTE_KEY not in prev, prev
+    assert key not in prev and onpassdry.NOTE_KEY not in prev, prev
     assert d._resumable(t, "fake") is None, "the session the coordinator dropped is never resumed"
     assert _stale_wakes(prev, {"key": "k", "head": "h"}, False) == 0
     prompt = worker_task(p, t, str(worktree_dir), t["branch"])

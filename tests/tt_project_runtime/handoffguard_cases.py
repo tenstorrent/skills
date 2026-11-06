@@ -2,6 +2,8 @@
 # and a Stop hook that refuses to end a task run without a valid hand-off. Run from
 # test_tt_project_runtime.py.
 
+from ttp.db import load_result
+
 
 def _guard_run(monkeypatch, tmp_path, guard=True, task="7"):
     run_dir = tmp_path / "run"
@@ -227,3 +229,114 @@ def test_only_a_branchless_code_worker_run_gets_the_no_branch_flag(env, monkeypa
     assert "TTP_NO_BRANCH_ON_RECORD" not in run(tid, "reviewer")
     p.db.update_task(tid, branch="ttp/t1-build-it")
     assert "TTP_NO_BRANCH_ON_RECORD" not in run(tid)
+
+
+# Providers without a Stop hook (Codex; the fake agent here): a run that ends without a valid hand-off
+# continues its session once to write it (Daemon._handoff_resume), instead of a counted attempt and a cold rerun.
+
+def _no_handoff_run(env, p, d, monkeypatch, result="none"):
+    monkeypatch.setenv("TTP_FAKE_SESSION", "s1")
+    monkeypatch.setenv("TTP_FAKE_RESULT", result)
+    tid = p.db.add_task("build it", "build the thing", kind="work", tier="light", origin="user")
+    d.dispatch()
+    _finish_runs(p, d)
+    return p.db.task(tid)
+
+
+def _task_runs(p, tid):
+    return p.db.q("SELECT * FROM runs WHERE task=? ORDER BY id", (tid,))
+
+
+def test_a_run_without_a_stop_hook_that_ends_with_no_hand_off_resumes_its_session_once(env, monkeypatch):
+    from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
+    p = make(env)
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    t = _no_handoff_run(env, p, d, monkeypatch)
+    res = load_result(t["result"])
+    assert t["status"] == "queued" and t["attempts"] == 0 and (t["not_before"] or 0) <= time.time() + 1, dict(t)
+    assert res[HANDOFF_RESUME_KEY]["session"] == "s1" and "there is no result.json" in res["woke"]
+    first = _task_runs(p, t["id"])[-1]
+    back = d._resumable(t, "fake")
+    assert back["cause"] == "handoff" and back["session"] == "s1" and back["run"] == first["id"]
+    # The next run continues the same session, told what was wrong, and its valid hand-off is taken.
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "built", "followups": []}))
+    d.dispatch()
+    run = _task_runs(p, t["id"])[-1]
+    assert run["id"] != first["id"]
+    run_dir = pathlib.Path(run["dir"])
+    assert json.loads((run_dir / "run.json").read_text())["argv"][-2:] == ["--resume", "s1"]
+    prompt = (run_dir / "prompt.md").read_text()
+    assert "there is no result.json" in prompt and "Ending again without a valid one fails" in prompt
+    _finish_runs(p, d)
+    t = p.db.task(t["id"])
+    assert t["status"] == "done" and t["attempts"] == 1, dict(t)   # both runs: one attempt
+    assert HANDOFF_RESUME_KEY not in load_result(t["result"])
+
+
+def test_a_second_run_without_a_hand_off_fails_as_before_and_the_next_run_starts_fresh(env, monkeypatch):
+    from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
+    p = make(env)
+    _sessions(env, monkeypatch, "s1")
+    d = Daemon(p.base)
+    t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps({"status": "complete", "summary": "x"}))
+    assert "is not a hand-off state" in load_result(t["result"])["woke"]   # an invalid one, too
+    d.dispatch()
+    _finish_runs(p, d)
+    t = p.db.task(t["id"])
+    res = load_result(t["result"])
+    assert t["attempts"] == 1 and HANDOFF_RESUME_KEY not in res and "woke" not in res, dict(t)
+    assert d._resumable(t, "fake") is None
+    assert len(_task_runs(p, t["id"])) == 2
+
+
+def test_no_resume_for_a_provider_with_a_stop_hook_an_unsaved_session_or_a_spent_budget(env, monkeypatch):
+    from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
+    from ttp.providers.fake import Fake
+    from ttp.providers.claude import Claude
+    assert Claude.stop_hook and not Fake.stop_hook
+    p = make(env)
+    d = Daemon(p.base)
+    for case in ("stop_hook", "unsaved", "budget"):
+        with monkeypatch.context() as m:
+            if case != "unsaved":
+                _sessions(env, m, "s1")
+            if case == "stop_hook":
+                m.setattr(Fake, "stop_hook", True, raising=False)
+            if case == "budget":
+                m.setenv("TTP_FAKE_COST", "50")
+            t = _no_handoff_run(env, p, d, m)
+        res = load_result(t["result"])
+        assert HANDOFF_RESUME_KEY not in res and t["attempts"] == 1, (case, dict(t))
+        assert res.get("run_status") == "no_handoff" or "without a hand-off" in res["summary"], (case, res)
+
+
+def test_a_hand_off_check_send_back_continues_the_session_on_a_provider_without_a_stop_hook(env, monkeypatch):
+    from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
+    p = make(env)
+    _sessions(env, monkeypatch, "s1")
+    script = env["tmp"] / "hc_fail.py"
+    script.write_text("import sys\nprint('say what you verified')\nsys.exit(1)\n")
+    cfg = json.loads(p.config_path.read_text())
+    cfg["worker"] = {"handoff_checks": [{"name": "says it", "run": f"python3 {script} {{result}}"}]}
+    p.config_path.write_text(json.dumps(cfg))
+    d = Daemon(p.base)
+    t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps({"status": "done", "summary": "ok"}))
+    res = load_result(t["result"])
+    assert t["status"] == "queued" and res[HANDOFF_RESUME_KEY]["session"] == "s1", dict(t)
+    assert "say what you verified" in res["woke"] and res[HANDOFF_RESUME_KEY]["text"] == res["woke"]
+    assert d._resumable(t, "fake")["cause"] == "handoff"
+
+
+def test_the_hand_off_resume_prompt_names_the_problem_and_a_changed_spec(env):
+    from ttp.prompts import spec_digest, worker_resume
+    p = make(env)
+    tid = p.db.add_task("build it", "build the thing", kind="work", tier="light", origin="user")
+    t = p.db.task(tid)
+    lost = {"cause": "handoff", "handoff": "it ended without a valid hand-off: there is no result.json in the run dir",
+            "dir": "/old/run", "spec_sha": spec_digest(t)}
+    text = worker_resume(p, t, lost)
+    assert "there is no result.json" in text and "same attempt" in text and "/old/run" in text
+    assert "The spec changed" not in text
+    p.db.update_task(tid, spec="build only the CPU target")
+    assert "The spec changed:\nbuild only the CPU target" in worker_resume(p, p.db.task(tid), lost)

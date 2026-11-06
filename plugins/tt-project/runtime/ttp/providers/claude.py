@@ -120,6 +120,7 @@ class Claude(Provider):
     login_hint = "run `claude` there and use /login"
     efforts = ("low", "medium", "high", "xhigh", "max")
     steer_hook = True   # worker_settings() routes PostToolUse through ttp.hook
+    stop_hook = True    # and Stop (hook_settings)
 
     def credential_files(self) -> list[str]:
         return [str(claude_config_dir() / ".credentials.json")]

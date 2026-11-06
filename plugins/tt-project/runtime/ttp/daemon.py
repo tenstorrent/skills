@@ -555,6 +555,9 @@ CONFIG_UNREADABLE_KEY = "config_unreadable"   # kv: project.json and its last go
 ALERT_KEEP_S = 30 * 86400   # alerts_sent keeps an entry this long: the longest every_s any alert uses
 ROOT_CHECKOUT_KEY = "root_checkout"   # kv: task -> its open alert on what a run left in the project root's checkout
 ROOT_WAKE_KEY = "root_dirty_wake"   # in the task's result: its one wake to commit or revert paths it dirtied in the root
+# In the task's result: a run of a provider with no Stop hook (provider stop_hook) ended without a hand-off the
+# daemon takes, or one the project's hand-off checks sent back; its next run continues that session (_resumable).
+HANDOFF_RESUME_KEY = "handoff_resume"
 ROOT_HEAD_KEY = "root_head"   # kv: the open alert on a project root left detached or off its branch (guard_root_head)
 # Task kinds whose commits left on a detached HEAD get a rescue branch recorded as their branch (_rescue_detached).
 RESCUE_KINDS = ("code", "work")
@@ -5339,7 +5342,8 @@ class Daemon:
             why, prev = str(restart.get("why") or ""), load_result(task["result"])
             earlier = str(prev.get("summary") or "")[:600]
             prev = {k: v for k, v in prev.items() if k not in WAIT_KEYS + ("woke", "escalated_wake", "on_pass",
-                                                                              onpassdry.KEY, onpassdry.NOTE_KEY)}
+                                                                              onpassdry.KEY, onpassdry.NOTE_KEY,
+                                                                              HANDOFF_RESUME_KEY)}
             prev.update({"status": "restarted", "summary": f"run {r['id']} stopped by a coordinator restart"
                          + (f"; before it: {earlier}" if earlier else ""),
                          preempt.RESTART_KEY: {"why": why, "update": str(restart.get("update") or "")[:4000],
@@ -5522,10 +5526,19 @@ class Daemon:
                 self.cfg["budget"].get("max_reboot_losses", 3))
         no_handoff = status == "ok" and rstatus is None
         topped, guard = False, ""   # a top-up continues the run: not an attempt; the runaway guard ends it
+        resumed = None   # a run with no hand-off continues its session once (_handoff_resume)
         if waiting:
             new = "queued"   # a busy resource is not a failed attempt: the task comes back later
         elif refusal:
             new, status = "failed", "refused_wait"   # an attempt, but no deep retry (effort.RETRY_FAILED)
+        elif own and status == "ok" and rstatus not in HANDOFF_STATES and not refusal and \
+                not load_result(task["result"]).get(HANDOFF_RESUME_KEY) and \
+                (back := self._handoff_resume(r, task, usage, run_dir)):
+            # What a Stop hook does in-run (hook.stop): a provider without one gets the same session back
+            # once, told what is wrong, instead of a cold rerun. Not an attempt; a second miss fails as below.
+            new, resumed = "queued", back
+            summary = f"ended without a valid hand-off ({back['text']}); its session continues to write it"[:1500]
+            log(self.p, f"task {task['id']}: run {r.get('id')} {back['text']}; resuming session {back['session']}")
         elif no_handoff:
             # A clean exit without a hand-off is not evidence of done work: the worker may have
             # stopped mid-task ("I'll pick up later"). Count an attempt and retry with its last words.
@@ -5550,7 +5563,7 @@ class Daemon:
         else:
             new = "failed"
         attempts = int(task["attempts"] or 0) + (0 if status in FREE_ENDS or waiting or reboot_lost
-                                                  or rejects or topped else 1)
+                                                  or rejects or topped or resumed else 1)
         if new == "failed" and not guard and attempts < int(task["max_attempts"] or 3) \
                 and status in ("failed", "lost", "timeout", "stalled", "no_handoff", "refused_wait"):
             new = "queued"
@@ -5586,6 +5599,9 @@ class Daemon:
         extra: dict = {}
         reason = None
         not_before = None
+        if resumed:
+            extra.update({HANDOFF_RESUME_KEY: resumed, "woke": resumed["text"]})
+            reason, not_before = "ended without a valid hand-off; its session resumes once to write it", time.time()
         missed = self._missed_update(r, task, run_dir) if status == "ok" and own else None
         if rebooted:
             extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
@@ -5792,6 +5808,8 @@ class Daemon:
                 sent_back += 1
                 new, not_before, push_quiet = "queued", time.time(), True
                 extra["woke"] = handoffcheck.reason(bad, sent_back, cap)
+                if (back := self._handoff_resume(r, task, usage, run_dir, extra["woke"])):
+                    extra[HANDOFF_RESUME_KEY] = back   # the send-back continues its session (no Stop hook ran them)
                 reason = f"hand-off check '{bad['name']}' failed; sent back ({sent_back} of {cap})"
             else:
                 new, sent_back = "review", 0   # a requeue by the coordinator gets its send-backs again
@@ -9845,6 +9863,29 @@ class Daemon:
             return "slots"
         return ""
 
+    def _handoff_resume(self, r: dict, task: dict, usage, run_dir: Path, text: str = "") -> dict | None:
+        """The resume a run ended without a hand-off the daemon takes (or sent back by the hand-off checks,
+        `text`) gets in place of a cold rerun, when its provider has no Stop hook to refuse the end in-run
+        (provider stop_hook), its session can be continued in the same working directory and the task's
+        budget is not spent; None otherwise (a Claude run's Stop hook already did this)."""
+        if r.get("role") == "coordinator" or not r.get("id") or not r.get("provider") or task["status"] == "cancelled":
+            return None
+        prov = get_provider(r["provider"])
+        if getattr(prov, "stop_hook", False):
+            return None
+        budget, spent = float(task["budget_usd"] or 0), float(task["spent_usd"] or 0)
+        if budget and spent >= budget:
+            return None
+        session = usage.session_id or json.loads(r.get("note") or "{}").get("session_id")
+        spec = _read_result(run_dir / "run.json") or {}
+        cwd, run_env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
+        if not session or not cwd or not Path(cwd).is_dir() or not prov.resume_args(session) \
+                or not prov.session_saved(session, cwd, run_env):
+            return None
+        from .hook import handoff_problem
+        text = text or f"it ended without a valid hand-off: {handoff_problem(run_dir / RESULT_FILE) or 'none was read'}"
+        return {"run": r["id"], "session": session, "text": text[:1500]}
+
     def _resumable(self, task: dict, provider: str) -> dict | None:
         """The task's last run, when the host took it away (reboot, sleep, lost supervisor) after
         real progress and its agent session can be continued in the same working directory: a fresh
@@ -9863,6 +9904,19 @@ class Daemon:
                 return None   # a fresh run reads the dry run's output as why it woke
             return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(r["dir"]), "ended": r["ended"],
                     "cause": "dry_run", "dry_run": back.get("text") or "",
+                    "spec_sha": json.loads(r["note"] or "{}").get("spec_sha")}
+        back = load_result(task["result"]).get(HANDOFF_RESUME_KEY)
+        if isinstance(back, dict):   # its run ended without a valid hand-off (_handoff_resume): once, same session
+            r = self.p.db.one("SELECT * FROM runs WHERE id=?", (back.get("run"),))
+            session = back.get("session")
+            spec = _read_result(Path(r["dir"]) / "run.json") or {} if r and r["dir"] else {}
+            cwd, run_env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
+            prov = get_provider(provider)
+            if not r or r["provider"] != provider or not session or not cwd or not Path(cwd).is_dir() \
+                    or not prov.resume_args(session) or not prov.session_saved(session, cwd, run_env):
+                return None   # a fresh run reads why it woke
+            return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(r["dir"]), "ended": r["ended"],
+                    "cause": "handoff", "handoff": back.get("text") or "",
                     "spec_sha": json.loads(r["note"] or "{}").get("spec_sha")}
         want = self.cfg["budget"].get("resume_lost")
         if not isinstance(want, dict):
