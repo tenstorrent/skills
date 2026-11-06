@@ -1450,14 +1450,51 @@ def _task_step(c: dict, key: str, targets: list[str], page: dict, now: float,
                        "alias": c["alias"], "stage": 2, "id": f"{task['label']}#user", "severity": "normal",
                        "text": f"{late}{tail}."}
 
+def _local_projects() -> set[str] | None:
+    """The projects registered on this host (may_claim), or None when the registry cannot be read."""
+    try:
+        here = project.hostname()
+        reg = project.load_registry().get("projects")
+        return {n for n, e in reg.items() if isinstance(e, dict) and (not e.get("host") or e["host"] == here)}
+    except Exception:
+        return None
+
+
+def may_claim(pend: dict, makers: list[str], claimer: str, here: set[str] | None,
+              lists: Callable[[str], bool] | None = None) -> bool | None:
+    """Whether daemon `claimer` may take pending page `pend`. A project's page: only that project's daemon,
+    or any daemon when the project is not on this host (relayed with upstream.send). A user page: only the
+    first of `makers` (the entry's maker, the machine's recovery owner, its fallback) registered on this host;
+    with none of them here, a project whose charter lists the machine (`lists(alias)`); else None: nobody
+    here may deliver it. `here` (_local_projects) None: the registry cannot be read, so only the target or
+    the first maker may. An empty `claimer` (no project's daemon) takes every page."""
+    if not claimer:
+        return True
+    target = pend.get("target")
+    if here is None:
+        return claimer == (target if target != USER else next(iter(makers), None))
+    if target != USER:
+        return target == claimer or target not in here
+    local = [m for m in makers if m in here]
+    if local:
+        return claimer == local[0]
+    try:
+        if lists is not None and lists(str(pend.get("alias") or "")):
+            return True
+    except Exception:
+        pass   # cannot be checked: delivered by none
+    return None
+
+
 def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | None = None,
           claimer: str = "", healthy: Callable[[str, str, float, str], list[str]] | None = None,
           quiet: Callable[[dict, float, dict], tuple[str, bool]] | None = None,
           budgets: dict | None = None, task_status: Callable[[str, str], str | None] | None = None,
-          log: Callable[[str], None] | None = None) -> list[dict]:
+          log: Callable[[str], None] | None = None, lists: Callable[[str], bool] | None = None) -> list[dict]:
     """The pages to deliver now, model-free: [{target, kind, key, alias, stage, id, text}]. Each due
     page is recorded as pending; the pending pages nobody holds (or whose claim lapsed after CLAIM_S)
-    are claimed for `claimer` and returned. Mark each `delivered` once it went out, or `release` it.
+    that `claimer` may deliver (may_claim; `lists(alias)`: its charter lists the machine) are claimed
+    for it and returned. Mark each `delivered` once it went out, or `release` it.
     `quiet` (default quiet_reason) stops a condition's escalation, or every page of it. `budgets`
     (outagetask.budgets) times the outage task; `task_status` reads its state (outagetask.task_status).
     An overdue entry with nothing to undo is closed instead of paged (auto_close_rule), logged to `log`."""
@@ -1470,19 +1507,31 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
     if healthy is None:
         from .responsibilities import healthy_checks as healthy
     out: list[dict] = []
+    here = _local_projects()
 
-    def claim(page: dict) -> None:
+    def claim(page: dict, makers: list[str]) -> None:
         pend = page.get("pending")
-        if pend and now - float(pend.get("claimed") or 0) >= CLAIM_S:
+        if not pend or now - float(pend.get("claimed") or 0) < CLAIM_S:
+            return
+        ok = may_claim(pend, makers, claimer, here, lists)
+        if ok is None:   # a user page no project on this host may deliver: kept, logged once, in `ttp status`
+            if not pend.get("orphan"):
+                pend["orphan"] = now
+                log(f"page {pend.get('id')} for the user on {pend.get('alias')}: "
+                    f"{', '.join(makers) or 'no maker or recovery owner'} not registered on this host, so only a "
+                    "project whose charter lists the machine may deliver it; kept until one does, in `ttp status`")
+            return
+        if ok:
+            pend.pop("orphan", None)
             pend.update(claimed=now, claimed_by=claimer)
-            out.append({k: v for k, v in pend.items() if k not in ("claimed", "claimed_by")})
+            out.append({k: v for k, v in pend.items() if k not in ("claimed", "claimed_by", "orphan")})
 
-    def settle_task(c: dict) -> None:
+    def settle_task(c: dict, targets: list[str]) -> None:
         # A held or quiet condition escalates no further; a queued task still reaches its project.
         task = c.get("task") or {}
         if (task.get("pending") or {}).get("kind") == outagetask.OVERDUE_KIND:
             task.pop("pending")
-        claim(task)
+        claim(task, targets)
 
     with _locked():
         doc = _read(ROUTES, {"conditions": {}})
@@ -1515,8 +1564,8 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                                 f"{', '.join(c['seen_by'])}, but your own heal check {', '.join(checks)} sees it "
                                 f"healthy: {why}. No recovery page "
                                 f"was sent; nothing to do unless you see otherwise."}
-                claim(page)
-                settle_task(c)
+                claim(page, targets)
+                settle_task(c, targets)
                 continue
             page.pop("held", None)
             why, silent = quiet(c, now, doc)
@@ -1529,8 +1578,8 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 doc.setdefault("quiet", {})[c["alias"]] = {
                     "condition": c["condition"], "first": c["first"], "why": why, "at": now,
                     "seen_by": list(c.get("seen_by") or [])}
-                claim(page)
-                settle_task(c)
+                claim(page, targets)
+                settle_task(c, targets)
                 continue
             if page.pop("quiet", None) is not None and "stage" in page:
                 page.update(at=now)   # the steps resume from now, not from the page before the quiet spell
@@ -1543,12 +1592,12 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 # The text is fixed for this step (its duration too): a resend after a crash is the same note.
                 _pending(page, target, "machine_condition", f"machine:{key}", c["alias"], float(c["first"]),
                          condition_text(c, page, targets, target, now))
-            claim(page)
+            claim(page, targets)
             if why:
-                settle_task(c)   # quiet (paused, a known fault, no work needs it): its owner hears once, no task
+                settle_task(c, targets)   # quiet (paused, a known fault, no work needs it): its owner hears once, no task
                 continue
             _task_step(c, key, targets, page, now, able, b, acts, task_status)
-            claim(c.get("task") or {})
+            claim(c.get("task") or {}, targets)
         doc["quiet"] = {a: q for a, q in (doc.get("quiet") or {}).items()
                         if isinstance(q, dict) and now - float(q.get("at") or 0) < QUIET_KEPT_S}
         _store_outages(doc, outage_entries(now, doc))
@@ -1573,6 +1622,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                     changed = True
                 continue
             page = c.setdefault("page", {})
+            makers = chain(c["alias"], c.get("by"))
             if c["alias"] not in hushed:
                 hushed[c["alias"]] = change_quiet(c["alias"], now, doc)
             why = hushed[c["alias"]]
@@ -1582,12 +1632,12 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 page["quiet"] = why
                 if int((page.get("pending") or {}).get("stage") or 0) > 0:
                     page.pop("pending")
-                claim(page)
+                claim(page, makers)
                 continue
             if page.pop("quiet", None) is not None and "stage" in page:
                 page.update(at=now)   # the steps resume from now, not from the page before the pause
                 page.pop("unable_since", None)
-            target = _step(page, chain(c["alias"], c.get("by")), now, able)
+            target = _step(page, makers, now, able)
             gave_up = c.get("auto_undo_failed") or {}
             if target:
                 episode = float(c.get("page_from") or c["added"])
@@ -1604,11 +1654,27 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                 page["pending"].update(
                     severity=pagesev.change_severity(c, now, pagesev.serving_machine(machines.load().get(c["alias"]))),
                     fp=pagesev.change_fingerprint(f"machine-change:{c['id']}", episode))
-            claim(page)
+            claim(page, makers)
         if changed:
             _write(LEDGER, ledger)
     for line in shut:   # only once written
         log(line)
+    return out
+
+
+def orphan_lines(now: float | None = None, where=None) -> list[str]:
+    """`ttp status`: each pending user page no project on this host may deliver (route's orphans), one line each."""
+    now = time.time() if now is None else now
+    out = []
+    for name, empty in ((ROUTES, {"conditions": {}}), (LEDGER, {"next": 1, "changes": []})):
+        doc = _read(name, empty)
+        items = doc.get("conditions", {}).values() if name == ROUTES else doc.get("changes", [])
+        for c in items:
+            for slot in (c.get("page"), c.get("task")) if isinstance(c, dict) else ():
+                pend = slot.get("pending") if isinstance(slot, dict) else None
+                if pend and pend.get("orphan") and now - float(pend.get("claimed") or 0) >= CLAIM_S:
+                    out.append(f"undelivered machine page (no project here may deliver it, since "
+                               f"{ends.shown(float(pend['orphan']), where)}): {_clip(pend.get('text'), TEXT_CHARS)}")
     return out
 
 

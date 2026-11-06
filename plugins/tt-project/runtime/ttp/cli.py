@@ -1587,6 +1587,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
         if u["below_floor"]:
             lines.append(f"  {u['below_floor']} of the questions are below every chat's severity floor; lower "
                          f"notify.chat_min_severity or the chat's own floor to see them")
+    try:
+        from . import machine_ledger
+        lines += machine_ledger.orphan_lines(now, p)[:6]
+    except Exception as e:   # a status line must not keep the status from showing
+        lines.append(f"undelivered machine pages: not read ({type(e).__name__})")
     if h["runtime"]["line"]:
         lines.append(h["runtime"]["line"])
     from . import lease

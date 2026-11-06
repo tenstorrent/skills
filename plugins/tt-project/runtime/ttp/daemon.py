@@ -2338,8 +2338,14 @@ class Daemon:
             log(self.p, "ledger pause check failed\n" + traceback.format_exc())
         try:
             self._machine_probes.tick(now)
+            mine: list = []
+
+            def lists(alias: str) -> bool:   # a user page no maker or owner here takes: only if the charter lists it
+                if not mine:
+                    mine.append(set(machine_ledger.resource_machines(self.p)))
+                return alias in mine[0]
             pages = machine_ledger.route(now, claimer=self.p.name, budgets=outagetask.budgets(self.cfg),
-                                          log=lambda m: log(self.p, m))
+                                          log=lambda m: log(self.p, m), lists=lists)
         except Exception:
             log(self.p, "routing shared-machine pages failed\n" + traceback.format_exc())
             return

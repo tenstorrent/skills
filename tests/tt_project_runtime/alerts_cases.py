@@ -5444,3 +5444,89 @@ def test_ack_closes_an_alert_with_no_condition_key_by_the_id_status_shows(env, t
     ask = p.db.post("out", "Which board?", kind="ask", severity="high")
     with pytest.raises(ValueError, match=r"no alert with message id #\d+: `ttp alerts <project>` lists"):
         alerts.ack(p.db, ask, "x", now + 3)
+
+
+def test_a_user_stage_machine_change_page_reaches_only_its_makers_chat(env):
+    """A machine-change page is claimed only by its target project's daemon; once the chain is used up, the
+    user page goes to the chat of the project that made the entry, never a co-tenant's on the same host."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.daemon import Daemon
+    a, b = make(env, "proj-a"), _second_project(env, "proj-b")
+    mm.add("box-1", tags="device")
+    mm.set_recovery("box-1", owner="proj-a")
+    now = time.time()
+    ml.add_change("box-1", "drop-in", "rm it", "proj-a", expires="1h", now=now - 3 * 86400)
+    ok = lambda n: (True, "")   # noqa: E731
+    t1 = now - ml.REPAGE_S - 60
+    assert ml.route(t1, able=ok, claimer="proj-b") == [], "proj-a's own page"
+    first = ml.route(t1, able=ok, claimer="proj-a")
+    assert [x["target"] for x in first] == ["proj-a"]
+    ml.delivered(first[0])
+    assert ml.route(now - 30, able=ok, claimer="proj-b") == [], "a user page of proj-a's entry"
+    Daemon(b.base).route_machines(every_s=0)   # the co-tenant's own tick: nothing reaches its chat
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    pages = ml.route(now - 30 + ml.CLAIM_S, able=ok, claimer="proj-a")
+    assert [x["target"] for x in pages] == [ml.USER]
+    assert Daemon(a.base)._machine_page(pages[0], now)
+    ml.delivered(pages[0])
+    got = a.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change #1 %'")
+    assert got and "box-1" in got["text"], got
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+
+
+def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_status(env):
+    """A user page whose maker, recovery owner and fallback are none of this host's projects goes only to a
+    project whose charter lists the machine; with none, it is logged once and listed in `ttp status`."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    from ttp.cli import status_text
+    from ttp.daemon import Daemon
+    b, c = make(env, "proj-b"), _second_project(env, "proj-c")
+    mm.add("box-1", tags="device")
+    mm.set_recovery("box-1", owner="proj-y")
+    now = time.time()
+    ml.add_change("box-1", "drop-in", "rm it", "proj-x", expires="1h", now=now - 5 * 86400)
+    ok = lambda n: (True, "")   # noqa: E731
+    for i, who in enumerate(("proj-x", "proj-y")):   # pages to projects not on this host are relayed, as before
+        got = ml.route(now - (3 - i) * (ml.REPAGE_S + 60), able=ok, claimer="proj-b")
+        assert [x["target"] for x in got] == [who]
+        ml.delivered(got[0])
+    said: list[str] = []
+    assert ml.route(now - 60, able=ok, claimer="proj-b", lists=lambda a: False, log=said.append) == []
+    assert ml.route(now - 60 + ml.CLAIM_S, able=ok, claimer="proj-b", log=said.append) == []
+    assert len(said) == 1 and "proj-x, proj-y not registered on this host" in said[0], said
+    Daemon(b.base).route_machines(every_s=0)   # proj-b's charter does not list box-1
+    assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change%'")
+    assert "undelivered machine page (no project here may deliver it" in status_text(b)
+    c.charter_path.write_text("# proj-c\n\n## Goals\nGo.\n\n## Resources\n- box-1: a device machine.\n")
+    Daemon(c.base).route_machines(every_s=0)   # a project whose charter lists the machine may deliver it
+    got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'Outage: Machine change #1 %'")
+    assert got, "the listing project's chat gets it"
+    assert ml.orphan_lines() == []
+
+
+def test_a_user_stage_machine_condition_page_reaches_only_its_owners_chat(env):
+    """A machine condition's user page goes to the recovery owner's daemon, not to the reporting co-tenant."""
+    from ttp import machine_ledger as ml
+    from ttp import machines as mm
+    a, b = make(env, "proj-a"), _second_project(env, "proj-b")
+    mm.add("box-1", tags="device")
+    mm.set_recovery("box-1", owner="proj-a")
+    t0 = time.time() - 6 * 3600
+    ml.report("proj-b", "box-1", "held", "device held, no holder", now=t0)
+    able = {"proj-a": (False, "its daemon is stopped"), "proj-b": (True, "")}.get
+    first = t0 + ml.GRACE_S
+
+    def tick(at, who):
+        got = ml.route(at, able=able, claimer=who, healthy=lambda *x: [], quiet=lambda *x: ("", False))
+        for x in got:
+            ml.delivered(x)
+        return [x for x in got if x["kind"] == "machine_condition"]
+    assert tick(first, "proj-b") == [] and [x["target"] for x in tick(first, "proj-a")] == ["proj-a"]
+    ml.report("proj-b", "box-1", "held", now=first + 60)
+    tick(first + 60, "proj-a")
+    later = first + 60 + ml.UNAVAILABLE_S
+    ml.report("proj-b", "box-1", "held", now=later)
+    assert tick(later, "proj-b") == [], "the reporter does not get the owner's user page"
+    assert [x["target"] for x in tick(later + ml.CLAIM_S, "proj-a")] == [ml.USER]
