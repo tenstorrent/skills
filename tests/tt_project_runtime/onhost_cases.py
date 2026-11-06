@@ -502,3 +502,86 @@ def test_a_queued_task_whose_detached_driver_is_live_counts_as_under_way(env, mo
     assert not onhost.state(p, p.db.task(tid))["started"]
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=2)
     assert _oh_sent(p)[-1].startswith(f"{onhost.MARK} {text}")
+
+
+def _oh_noon(p):
+    """Today's 12:00 in the project's home zone, as an epoch: a send time with clock times on both sides."""
+    from datetime import datetime
+    from ttp import timefmt
+    return datetime.now(timefmt.tzinfo(p)).replace(hour=12, minute=0, second=0, microsecond=0).timestamp()
+
+
+def test_a_past_host_event_is_left_as_written(env):
+    from ttp import onhost
+    p = make(env)
+    tid = _oh_task(p)
+    tasks = [p.db.task(tid)]
+    noon = _oh_noon(p)
+    # Past tense only, or a stated time at or before the send time: a report of what was seen, not a plan.
+    for text in ("Restarted the service on box1; it came back cleanly.", f"#{tid}: box1 was power cycled.",
+                 "The service is running again on box1 since 11:42.", "box1 is running again since 11:42 am.",
+                 "box1 is running again since 11:42, restarted by the watchdog."):
+        assert onhost.guard(p, text, tasks, now=noon) == (text, []), text
+    # A stated time after the send time, or one with a later word, is no past report.
+    # A present claim next to a past one is still a claim of work under way.
+    for text in ("The service is running again on box1 since 12:30.", "Restarting box1 now, back by 11:50.",
+                 "Restarted box1 and it is running now.", "Restarting box1 now; it will be up again until 11:00."):
+        got, notes = onhost.guard(p, text, tasks, now=noon)
+        assert got.startswith(onhost.MARK) and notes, text
+
+
+def test_a_future_host_claim_with_no_started_worker_is_still_marked(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+    text = "Restarting the service on box1 now; it will be back within the hour."
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1", "owners": [tid]}], turn=1)
+    (got,) = _oh_sent(p)
+    assert got.startswith(f"{onhost.MARK} Restarting the service on box1 now")
+    assert f"{onhost.STATUS_HEAD}#{tid}: queued for a worker" in got, got
+
+
+def test_a_reply_claim_backed_by_a_passing_expect_probe_is_left_as_written(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+    tasks = [p.db.task(tid)]
+    text = "The service is running on box1 again."
+    ran = []
+
+    def prove(probe):
+        ran.append(probe)
+        return probe == "ok-probe"
+    assert onhost.guard(p, text, tasks, proofs=[(text, "ok-probe")], prove=prove) == (text, [])
+    # A failing probe, or a claim about another sentence, proves nothing.
+    assert onhost.guard(p, text, tasks, proofs=[(text, "bad-probe")], prove=prove)[0].startswith(onhost.MARK)
+    other = [("the docs build is green again today", "ok-probe")]
+    assert onhost.guard(p, text, tasks, proofs=other, prove=prove)[0].startswith(onhost.MARK)
+    assert ran == ["ok-probe", "bad-probe"]   # each probe runs once, only for a sentence it backs
+    # Through apply, with a real read-only probe: it passes, then it fails once its file is gone.
+    seen = env["tmp"] / "service-up"
+    seen.write_text("1")
+    claim = [{"text": "service running on box1 again", "expect": f"test -e {seen}"}]
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1", "owners": [tid], "claims": claim}], turn=1)
+    assert _oh_sent(p)[-1] == text
+    seen.unlink()
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1", "owners": [tid], "claims": claim}], turn=2)
+    assert _oh_sent(p)[-1].startswith(onhost.MARK)
+
+
+def test_the_appended_status_line_never_becomes_a_promise(env):
+    from ttp import coordinator as coord, obligations, onhost
+    p = make(env)
+    status = f"{onhost.STATUS_HEAD}#12: queued for a worker, ETA 15:30 to start, finish 16:10 (critical path #12)"
+    assert obligations.commitments(f"{onhost.MARK} Restarting box1 now.\n{status}") == []
+    assert obligations.commitments(f"Restarting box1 now.\n{onhost.STATUS_HEAD}new task 'restart': queued for a worker, ETA 15:30") == []
+    tid = _oh_task(p)
+    coord.apply(p, [{"type": "reply", "text": "Restarting the service on box1 now.", "chat": "c1",
+                     "owners": [tid]}], turn=1)
+    assert onhost.STATUS_HEAD in _oh_sent(p)[-1]
+    assert not [o for o in obligations.items(p.db) if o.get("promise")]
+    # The coordinator's own promise in the same message is still recorded.
+    coord.apply(p, [{"type": "reply", "text": "Restarting the service on box1 now. I'll report back by 16:00.",
+                     "chat": "c1", "owners": [tid]}], turn=2)
+    (pr,) = [o for o in obligations.items(p.db) if o.get("promise")]
+    assert "report back" in pr["text"] and onhost.STATUS_HEAD not in pr["text"]

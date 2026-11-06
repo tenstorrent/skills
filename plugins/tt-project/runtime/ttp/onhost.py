@@ -30,7 +30,13 @@ or host; any other sentence states a fact about other work and stays as written.
 job still live on its host (a queued task's driver too) is under way. Inside a block meant to be posted
 as written (segments(): a fenced code block, text between '---' lines, a '>' quote) nothing is inserted:
 the marker goes on its own line after the block, quoting the sentence. Nothing else in the message changes
-and it is posted at once: a rewrite in place keeps every word (goal 1) and the user never reads the claim as a fact."""
+and it is posted at once: a rewrite in place keeps every word (goal 1) and the user never reads the claim as a fact.
+
+A sentence that reports a past event (past tense only, or a stated time at or before the send time) and
+one backed by a reply claim whose `expect` probe passes now are left as written: they report what was
+observed, not a plan. A start verb ('started', 'began', 'launched', 'kicked off') is never a past report:
+it says work runs now. Only a stop not yet confirmed (live jobs) still marks a past 'stopped'. The
+appended status line is the harness's, never the coordinator's words: no promise is read from it."""
 from __future__ import annotations
 
 import json
@@ -42,13 +48,16 @@ FILE = "onhost.json"
 CLOSED = ("done", "failed", "cancelled", "exhausted")
 MARK = "Planned, not started on the host yet:"
 STATUS_HEAD = "Status now: "   # the honest status line guard() appends (claimcheck and promises skip it)
+CLAIM_PROBE_S = 20       # the reply claims' expect probes of one message, run at send time, all together
 
 _PROG_OBJ = re.compile(r"(?i)\b([a-z]{3,}ing)\s+(?:it|them|this|that|those|these|the|its|their|all|both)\b")
 _PROG = re.compile(r"(?i)\b([a-z]{3,}ing)\b")
 _NOW = re.compile(r"(?i)\b(?:now|right away|as we speak|at the moment|currently)\b")
 _RUNS = re.compile(r"(?i)\b(?:runs|running|under ?way|in progress|happening|going on)\b")
 _ONLY = re.compile(r"(?i)\bonly\b[^.!?\n]{0,80}?\b(?:runs|run|is running|are running|remains?|is left)\b")
-_DONE = re.compile(r"(?i)\b(?:started|stopped|killed|cancell?ed|halted|terminated|ended|aborted|power[- ]?cycled|"
+# A start verb says work began and runs now: never a past report, whatever its tense or stated time.
+_START = re.compile(r"(?i)\b(?:started|began|begun|launched|kicked off)\b")
+_DONE = re.compile(r"(?i)\b(?:stopped|killed|cancell?ed|halted|terminated|ended|aborted|power[- ]?cycled|"
                    r"rebooted|restarted|reset (?:it|them|the)|(?:is|are|was|were) (?:done|finished|complete)|"
                    r"\w+['’]s (?:done|finished|complete)|finished|completed)\b")
 # Words before a done-verb that make it a plan, a condition or a negation, not a claim.
@@ -330,18 +339,92 @@ def _progressive(s: str, pat) -> bool:
     return any(m.group(1).lower() not in _HONEST for m in pat.finditer(s))
 
 
-def claims(sentence: str) -> bool:
-    """Whether a sentence says an action is under way or done (high recall; scoped by guard())."""
+def _claim(sentence: str) -> str | None:
+    """'start' when a sentence says work began (so runs now), 'now' when it says an action is under way,
+    'past' when it only reports one done (a past tense verb), None when it claims neither."""
     s = sentence.strip()
     if not s or s.startswith(MARK):
-        return False
+        return None
+    if any(not _HEDGE.search(s[:m.start()]) for m in _START.finditer(s)):
+        return "start"
     if _NOW.search(s) and (_progressive(s, _PROG) or _RUNS.search(s)):
-        return True
+        return "now"
     if _progressive(s, _PROG_OBJ) or _ONLY.search(s):
-        return True
+        return "now"
     if re.search(r"(?i)\b(?:is|are)\s+(?:now\s+)?(?:running|under ?way|in progress|happening)\b", s):
+        return "now"
+    return "past" if any(not _HEDGE.search(s[:m.start()]) for m in _DONE.finditer(s)) else None
+
+
+def claims(sentence: str) -> bool:
+    """Whether a sentence says an action is under way or done (high recall; scoped by guard())."""
+    return _claim(sentence) is not None
+
+
+_LATER = re.compile(r"(?i)\b(?:will|shall|going to|tomorrow|tonight|next|later|until|till|ETA|expected|due|"
+                    r"by\s+(?:then|noon|tomorrow|tonight|end))\b|\bby\s+\d|'ll\b|’ll\b")
+
+
+def _said_before(sentence: str, now: float, tz) -> bool:
+    """Whether a sentence states a clock time (with minutes or am/pm, its date when named) at or before
+    `now`, and says nothing of later: it reports an event already seen."""
+    from datetime import datetime, timezone
+    from .obligations import CLOCK_RE, DAY_RE, MONTHS
+    if _LATER.search(sentence):
+        return False
+    day = DAY_RE.search(sentence)
+    for c in CLOCK_RE.finditer(sentence):
+        h, mi, ap = int(c.group("h")), int(c.group("m") or 0), (c.group("ap") or "").lower()
+        if not (c.group("m") or ap) or (ap and not 1 <= h <= 12):
+            continue
+        h = h % 12 + (12 if ap.startswith("p") else 0) if ap else h
+        base = datetime.fromtimestamp(now, timezone.utc if c.group("utc") else tz)
+        try:
+            when = base.replace(hour=h, minute=mi, second=0, microsecond=0)
+            if day:
+                when = when.replace(month=MONTHS.index(day.group("mon")[:3].lower()) + 1, day=int(day.group("d")))
+        except ValueError:
+            continue
+        if when.timestamp() <= now:
+            return True
+    return False
+
+
+def _words(s: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9#]+", s.replace(MARK, "").lower()))
+
+
+def _backs(sentence: str, claim: str) -> bool:
+    """Whether a reply claim's text is this sentence: one holds the other, or most of their words match."""
+    def flat(s: str) -> str:
+        return " ".join(re.findall(r"[a-z0-9#]+", s.replace(MARK, "").lower()))
+    a, b = flat(sentence), flat(claim)
+    if not a or not b:
+        return False
+    if f" {a} " in f" {b} " or f" {b} " in f" {a} ":
         return True
-    return any(not _HEDGE.search(s[:m.start()]) for m in _DONE.finditer(s))
+    one, other = _words(sentence), _words(claim)
+    return min(len(one), len(other)) >= 3 and len(one & other) >= 0.6 * min(len(one), len(other))
+
+
+def passes(p, probe: str, timeout: float = CLAIM_PROBE_S) -> bool:
+    """Whether a read-only probe exits 0 now, run as the daemon runs a claim's expect probe; never inside
+    a database transaction (False there) and never longer than `timeout` (killed, False)."""
+    import subprocess
+    from . import landed, machines, probespawn
+    from .project import command_env
+    if getattr(p.db, "conn", None) is not None and p.db.conn.in_transaction:
+        return False
+    run = probespawn.Pending(landed.probe_command(probe, p), cwd=str(p.root),
+                             env={**machines.mask_devices(command_env(p)), landed.DONE_ENV: "1"}, stdout=False)
+    try:
+        rc = run.wait(timeout)
+    except subprocess.TimeoutExpired:
+        run.stop()
+        rc = None
+    if f := run.take_file():
+        f.close()
+    return rc == 0
 
 
 def scope(p, text: str, chat: str | None, owners=(), batch_ids=(), pending: list | None = None) -> list[dict]:
@@ -419,14 +502,17 @@ def quoted(sentence: str) -> str:
     return '"' + re.sub(r"^[\s>]+", "", sentence).strip() + '"'
 
 
-def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[str, list[str]]:
+def guard(p, text: str, tasks: list[dict], now: float | None = None, proofs=(), prove=None) -> tuple[str, list[str]]:
     """(text to post, notes for the coordinator). Unchanged unless a covered task has not started on its
-    host (or was stopped with jobs still running) and a sentence claims an action is under way or done."""
+    host (or was stopped with jobs still running) and a sentence claims an action is under way or done.
+    A past report (past tense only, or a stated time at or before `now`) is marked only for a stop not yet
+    confirmed. `proofs`: the reply's (claim text, expect probe) pairs; a sentence one of them backs is left
+    as written when its probe passes (`prove`, default passes())."""
     now = time.time() if now is None else now
     if not text or not tasks:
         return text, []
     segs = [(re.split(r"((?<=[.!?;])[ \t]+|\n)", chunk), block) for chunk, block in segments(text)]
-    if not any(claims(parts[k]) for parts, _ in segs for k in range(0, len(parts), 2)):
+    if not any(_claim(parts[k]) for parts, _ in segs for k in range(0, len(parts), 2)):
         return text, []
     from . import eta
     try:
@@ -445,25 +531,47 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
             got = None
         if got and not got["started"]:
             who = f"#{t['id']}" if t.get("id") else f"new task '{str(t.get('title') or '')[:60]}'"
-            waiting.append((t, f"{who}: {got['line']}"))
+            waiting.append((t, f"{who}: {got['line']}", got.get("kind")))
     if not waiting:
         return text, []
+    from . import timefmt
+    tz = timefmt.tzinfo(p)
+    proved: dict[str, bool] = {}
+    end = time.monotonic() + CLAIM_PROBE_S   # all of one message's probes: a slow one never holds the post long
     about: set[int] = set()   # indexes in `waiting` of the tasks a marked sentence is about
     marked, out = 0, []
     for parts, block in segs:
         after = []
         for k in range(0, len(parts), 2):
-            if not claims(parts[k]):
+            kind = _claim(parts[k])
+            if not kind:
+                continue
+            # A report of a past event names no plan: only a stop its live jobs contradict still counts. A
+            # start claim is never one: only a started task or a passing expect probe clears it.
+            past = kind == "past" or (kind != "start" and _said_before(parts[k], now, tz))
+            pool = [j for j, w in enumerate(waiting) if w[2] == "stop"] if past else list(range(len(waiting)))
+            if not pool:
                 continue
             named = {int(x) for x in re.findall(r"#(\d{1,9})\b", parts[k])}
             # A sentence is about an unstarted task only when it names its #id, or (naming no #id) that
             # task's resource or host. Any other claim sentence is left as written: it states a fact about
             # other work, whatever its subject.
             if named:
-                hit = {j for j, (t, _) in enumerate(waiting) if t.get("id") in named}
+                hit = {j for j in pool if waiting[j][0].get("id") in named}
             else:
-                hit = {j for j, (t, _) in enumerate(waiting) if _names(parts[k], t)}
+                hit = {j for j in pool if _names(parts[k], waiting[j][0])}
             if not hit:
+                continue
+            # A reply claim whose expect probe passes now shows it done: posted as written.
+            backing = [probe for said, probe in proofs or () if probe and _backs(parts[k], said)]
+            for probe in backing:
+                if probe not in proved:
+                    left = end - time.monotonic()
+                    try:
+                        proved[probe] = left > 0 and bool((prove or (lambda q: passes(p, q, left)))(probe))
+                    except Exception:
+                        proved[probe] = False
+            if any(proved[q] for q in backing):
                 continue
             marked += 1
             about |= hit

@@ -2666,7 +2666,9 @@ def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list
         for t in tasks:
             if str((updates.get(t.get("id")) or {}).get("status") or "") == "cancelled":
                 t["status"] = "cancelled"   # cancelled later in this batch: its jobs still run until the sweep
-        text, why = onhost.guard(p, text, tasks)
+        proofs = [(str(c.get("text") or ""), str(c["expect"])) for c in a.get("claims") or []
+                  if isinstance(c, dict) and c.get("expect") not in (None, "")]
+        text, why = onhost.guard(p, text, tasks, proofs=proofs)
         notes += why
     except Exception as e:
         why = (f"onhost: the started-on-host check failed on a {a.get('type') or 'message'} "
