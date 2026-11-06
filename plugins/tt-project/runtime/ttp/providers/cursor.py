@@ -41,6 +41,12 @@ from .base import (_CLI_OUTPUT, AUTH_RE, CMD_MAX, LIMIT_RE, Provider, RunUsage, 
                    jsonl_from, price_row, request_rejected, status_check, stderr_tail)
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
+# A named model with no pricing.cursor row (a tier resolved from the CLI's own list, cursortiers.py,
+# can be the strongest reasoning model listed) is priced at TOP, the top published list rate of the
+# frontier models Cursor offers, so its estimate and budget cap never come in under the real cost.
+# `auto` (Cursor's router) keeps "default". A project's own rows, its "default" one included, win.
+TOP = (15.0, 1.5, 75.0)
+FALLBACK_MODEL = "auto"
 USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")
 # account(): `agent status` is asked again only this often, or at once when the login files change.
 ACCOUNT_TTL_S = 600.0
@@ -51,6 +57,17 @@ LOGIN_RE = re.compile(r"(?:logged in|signed in|authenticated)\s+as\s+[\"'`]?([^\
                       r"\b(?:user|email|account)\s*:\s*[\"'`]?([^\s\"'`]+)", re.I)
 EMAIL_RE = re.compile(r"[\w.+-]+@[\w-]+(?:\.[\w-]+)+")
 LOGGED_OUT_RE = re.compile(r"not (logged|authenticated|signed)|login required|unauthenticated", re.I)
+
+
+def rate(model: str, prices: dict | None = None) -> tuple[tuple[float, float, float], str]:
+    """($ per million input, cached input, output tokens) for `model`, and where that rate comes from."""
+    rows = {k for k, v in (prices or {}).items() if isinstance(v, (list, tuple)) and len(v) == 3}
+    if model in rows:
+        return price_row(PRICES, prices or {}, model), f"pricing.cursor.{model}"
+    if not model or model in (FALLBACK_MODEL, *PRICES) or "default" in rows:
+        return price_row(PRICES, prices or {}, "default"), \
+            ("pricing.cursor.default" if "default" in rows else "the shipped default rate")
+    return TOP, "the top rate: no pricing.cursor row for this model"
 
 
 def status_login(text: str) -> str:
@@ -234,8 +251,10 @@ class Cursor(Provider):
         return seen
 
     def _price(self, usage: dict) -> float:
-        pin, pcached, pout = price_row(PRICES, self.prices, self.model)
-        return (usage["inputTokens"] * pin + usage["cacheReadTokens"] * pcached + usage["outputTokens"] * pout) / 1e6
+        (pin, pcached, pout), _ = rate(self.model, self.prices)
+        # Cache writes are input billed apart; at 1.25x input (the highest write premium) never under.
+        return (usage["inputTokens"] * pin + usage["cacheReadTokens"] * pcached + usage["outputTokens"] * pout
+                + usage["cacheWriteTokens"] * pin * 1.25) / 1e6
 
     def activity(self, output_path, offset=0):
         """stream-json: a `tool_call` event with subtype started is a call, completed its result (an

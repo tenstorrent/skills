@@ -4406,7 +4406,13 @@ class Daemon:
             status = "limit"
         if usage.auth_failed and not slept_auth:
             status = "auth"
-        if status == "failed" and usage.request_error and not failed_resume:
+        dropped = status == "failed" and r["provider"] == "cursor" and \
+            cursortiers.drop_rejected(r["model"] or "", usage.error)
+        if dropped:
+            # The CLI refused a model its resolved tier map named: the next run lists the models again,
+            # so a retry is not the same request (cursortiers.py).
+            log(p, f"run {r['id']}: Cursor refused model {r['model']}; its tier map is resolved again")
+        if status == "failed" and usage.request_error and not failed_resume and not dropped:
             # The API rejected the request itself (a 400 or a bad schema): a retry, at any tier, fails
             # the same way. The task fails at once (_finish_worker); a resume still starts fresh.
             status = "request_error"

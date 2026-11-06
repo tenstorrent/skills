@@ -18,9 +18,16 @@ models this account may use and picks one per tier by this rule, never by a hard
   the model ranked midway between them. With fewer than three models, tiers share them.
 
 The resolved map is kept host-wide in `cursor-tiers.json` under the tt-project home with the CLI's
-version, and resolved again when the CLI binary (an upgrade) or its login changes. A listing that
-fails (logged out, an old CLI without `--list-models`, no answer) leaves the tiers on `auto` and says
-why; it is asked again after RETRY_S or at once on a login or CLI change.
+version, and resolved again when the CLI binary (an upgrade) or its login changes, once it is
+LISTED_MAX_S old (a model withdrawn on the server, a changed plan), and at once after a run failed
+because the CLI rejected a model the map named (`drop_rejected`; that model stays out of the map until
+the CLI or its login changes). A listing that fails (logged out,
+an old CLI without `--list-models`, no answer) leaves the tiers on `auto` and says why; it is asked
+again after RETRY_S or at once on a login or CLI change. An aged map whose refresh fails for any
+reason but a logout keeps its models and is asked again after RETRY_S.
+
+A resolved model with no pricing.cursor row is priced at the top rate (providers/cursor.py `rate`);
+`ttp doctor` names the rate each tier's spend and budget cap use (`rate_line`).
 
 A project's own providers.cursor.tiers.<tier>.model in project.json, `auto` included, always wins
 (`apply`), as does a task's own model pin (daemon.start_run).
@@ -33,12 +40,13 @@ import re
 import time
 from pathlib import Path
 
-from .providers.base import cli_output, find_binary, status_check
+from .providers.base import binary_stamp, cli_output, find_binary, status_check
 
 TIERS = ("light", "standard", "deep")
 FALLBACK = "auto"
 CACHE_NAME = "cursor-tiers.json"
 RETRY_S = 3600.0                 # a failed listing is asked again after this long (or on a login/CLI change)
+LISTED_MAX_S = 86400.0           # a listed map is asked again once this old
 LIST_TIMEOUT_S = 30.0
 ANSI_RE = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 # One listed model: '<id> - <display name> (current, default)' (the name and the marks are optional).
@@ -47,6 +55,10 @@ LINE_RE = re.compile(r"^(?P<id>[A-Za-z0-9][\w.:/\[\]=,-]*)(?:\s+-\s+(?P<name>.*?
 REASONING = {"thinking", "reasoning", "high", "xhigh", "max"}
 STRONG = {"pro": 2, "max": 2, "ultra": 2, "large": 1, "xhigh": 2, "high": 1, "thinking": 1, "reasoning": 1}
 CHEAP = {"mini": 2, "nano": 3, "lite": 2, "flash": 2, "fast": 1, "small": 2, "low": 1, "light": 1, "tiny": 3}
+# The CLI refusing the model a run named (withdrawn, not on the plan, unknown), on the run's error.
+REJECT_RE = re.compile(r"cannot use (?:this|the) model|(?:unknown|invalid|unsupported|unavailable) model|"
+                       r"model\b[^\n]{0,80}?\b(?:not (?:found|available|supported|allowed|enabled)|unavailable|"
+                       r"does not exist|is not valid|no longer)", re.I)
 LOGIN_RE = re.compile(r"authentication required|not (?:logged|authenticated|signed) in|agent login|"
                       r"credentials or api key are invalid", re.I)
 
@@ -105,12 +117,7 @@ def pick(models: list[dict]) -> dict[str, str]:
 def stamp(binary: str, credentials: str = "") -> str:
     """Path, mtime and size of the CLI binary as installed, and the login files' stamp: either moving
     (an upgrade, a login) resolves the map again."""
-    try:
-        real = os.path.realpath(binary)
-        st = os.stat(real)
-        return f"{real}:{st.st_mtime_ns}:{st.st_size}|{credentials}"
-    except OSError:
-        return f"{binary}:-|{credentials}"
+    return f"{binary_stamp(binary) or binary + ':-'}|{credentials}"
 
 
 def _read(path: Path) -> dict:
@@ -169,20 +176,46 @@ def resolve(binary: str | None = None, credentials: str | None = None, now: floa
         credentials = get_provider("cursor").credentials_stamp()
     key = stamp(binary, credentials)
     have = _read(path)
-    if not force and have.get("stamp") == key and isinstance(have.get("tiers"), dict) and \
-            (have.get("source") == "listed" or now - float(have.get("at") or 0) < RETRY_S):
+    same = not force and have.get("stamp") == key and isinstance(have.get("tiers"), dict) and not have.get("rejected")
+    if same and (now - float(have.get("at") or 0) < (LISTED_MAX_S if have.get("source") == "listed" else RETRY_S)
+                 or have.get("source") == "listed" and now - float(have.get("tried") or 0) < RETRY_S):
         return have
     got = status_check([binary, "--version"], timeout_s=15)
     version = (got[1].strip().splitlines() or [""])[0][:80] if got and got[0] == 0 else ""
     models, why = _list(binary)
-    tiers = pick(models)
+    # A model the CLI refused stays out of the map until the CLI or its login changes.
+    excluded = sorted(set(have.get("excluded") or []) | {have.get("rejected") or ""} - {""}) \
+        if have.get("stamp") == key else []
+    tiers = pick([m for m in models if m["id"] not in excluded])
     if not tiers:
         why = why or "the Cursor CLI lists no model but auto"
+        if same and have.get("source") == "listed" and "logged out" not in why:
+            # An aged map whose refresh failed keeps its models; asked again after RETRY_S.
+            kept = {**have, "tried": now, "refresh_why": why}
+            _write(path, kept)
+            return kept
     out = {"source": "listed" if tiers else "fallback", "tiers": tiers or dict.fromkeys(TIERS, FALLBACK),
            "why": "" if tiers else why, "cli": version, "at": now, "stamp": key,
-           "models": [m["id"] for m in models]}
+           "models": [m["id"] for m in models], **({"excluded": excluded} if excluded else {})}
     _write(path, out)
     return out
+
+
+def model_rejected(text: str, model: str) -> bool:
+    """Whether a failed run's error says the CLI refused its (named, not `auto`) model."""
+    return bool(model and model.lower() != FALLBACK and text and REJECT_RE.search(text))
+
+
+def drop_rejected(model: str, text: str, path: Path | None = None) -> bool:
+    """After a failed run: when the CLI refused `model` and the kept listed map names it, mark the map
+    so the next run lists the models again. True when it did."""
+    path = path or cache_path()
+    have = _read(path)
+    if have.get("source") != "listed" or model not in (have.get("tiers") or {}).values() or \
+            not model_rejected(text, model):
+        return False
+    _write(path, {**have, "rejected": model})
+    return True
 
 
 def own_tiers(raw: dict | None) -> set[str]:
@@ -219,3 +252,17 @@ def line(resolved: dict, raw: dict | None = None) -> str:
     if resolved.get("source") == "listed":
         return f"cursor tiers from the CLI's model list{cli}: " + ", ".join(parts)
     return f"cursor tiers: auto for every tier not set in project.json{cli}: {resolved.get('why') or 'no listing'}"
+
+
+def rate_line(cfg: dict) -> str:
+    """One `ttp doctor` line naming the rate each tier's spend estimate and budget cap use, after
+    `apply` wrote the resolved models into cfg."""
+    from .providers.cursor import rate
+    prices = (cfg.get("pricing") or {}).get("cursor") or {}
+    tiers = ((cfg.get("providers") or {}).get("cursor") or {}).get("tiers") or {}
+    parts = []
+    for t in TIERS:
+        model = str((tiers.get(t) or {}).get("model") or "")
+        (pin, pcached, pout), why = rate(model, prices)
+        parts.append(f"{t} {model or 'default'} ${pin:g}/${pcached:g}/${pout:g} ({why})")
+    return "cursor spend and budget cap rates per Mtok input/cached/output: " + "; ".join(parts)

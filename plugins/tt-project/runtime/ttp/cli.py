@@ -11745,7 +11745,11 @@ def cmd_doctor(a) -> None:
               + (f" · account {prov.account()}" if prov.available() and prov.account() else ""))
     from . import cursortiers
     if "cursor" in p.config()["providers"] and any(x.name == "cursor" and x.available() for x in all_providers()):
-        print(cursortiers.line(cursortiers.resolve(), p.raw_config()))
+        import copy
+        resolved, cfg = cursortiers.resolve(), copy.deepcopy(p.config())
+        cursortiers.apply(cfg, p.raw_config(), resolved)
+        print(cursortiers.line(resolved, p.raw_config()))
+        print(cursortiers.rate_line(cfg))
     rules = p.config().get("restrictions") or {}
     fence_off = {n for n, c in p.config()["providers"].items() if isinstance(c, dict) and c.get("write_fence") is False}
     gaps = [f"{prov.name} ({prov.write_fence(rules) or f'turned off: providers.{prov.name}.write_fence is false'})"

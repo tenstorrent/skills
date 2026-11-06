@@ -315,8 +315,8 @@ def test_cursor_tiers_resolve_again_when_the_cli_or_its_login_changes(env, monke
     first = cursortiers.resolve(exe, credentials="c1", now=1000.0, path=cache)
     asked = calls.read_text().count("--list-models")
     assert asked == 1
-    # Same CLI, same login, much later: the kept map answers, the CLI is not asked again.
-    assert cursortiers.resolve(exe, credentials="c1", now=1000.0 + 30 * 86400, path=cache) == first
+    # Same CLI, same login, later the same day: the kept map answers, the CLI is not asked again.
+    assert cursortiers.resolve(exe, credentials="c1", now=1000.0 + cursortiers.LISTED_MAX_S - 1, path=cache) == first
     assert calls.read_text().count("--list-models") == 1
     # An upgrade (the binary changes) with a new model list: resolved again, the new version recorded.
     _fake_cursor_lister(tmp_path, version="2026.02.02-bbbbbbbbbb",
@@ -411,3 +411,118 @@ def test_dispatched_cursor_run_takes_its_tier_from_the_resolved_map(env, monkeyp
                                   result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP,
                                   before=lambda p: p.set_config("providers.cursor.tiers.light.model", "own-model"))
     assert argv[argv.index("--model") + 1] == "own-model" and run["model"] == "own-model"
+
+
+def test_cursor_listed_tiers_refresh_daily_and_after_a_rejected_model(env, monkeypatch, tmp_path):
+    from ttp import cursortiers
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    exe = _fake_cursor_lister(tmp_path)
+    cache, calls = tmp_path / "tiers.json", tmp_path / "calls.log"
+    first = cursortiers.resolve(exe, credentials="c1", now=1000.0, path=cache)
+    assert first["tiers"]["deep"] == "beta-4-pro-thinking"
+    asked = lambda: calls.read_text().count("--list-models")
+    # A day old: listed again (a model withdrawn on the server, a changed plan).
+    day = 1000.0 + cursortiers.LISTED_MAX_S
+    assert cursortiers.resolve(exe, credentials="c1", now=day, path=cache)["at"] == day and asked() == 2
+    # An aged map whose refresh fails (no logout) keeps its models and is asked again after RETRY_S.
+    (tmp_path / "listing.txt").write_text("Error: network unreachable\n")
+    later = day + cursortiers.LISTED_MAX_S
+    kept = cursortiers.resolve(exe, credentials="c1", now=later, path=cache)
+    assert kept["source"] == "listed" and kept["tiers"] == first["tiers"] and "network" in kept["refresh_why"]
+    assert asked() == 3
+    cursortiers.resolve(exe, credentials="c1", now=later + cursortiers.RETRY_S - 1, path=cache)
+    assert asked() == 3
+    cursortiers.resolve(exe, credentials="c1", now=later + cursortiers.RETRY_S, path=cache)
+    assert asked() == 4
+    # A logged-out refresh drops to auto, as a first listing does.
+    (tmp_path / "listing.txt").write_text(CURSOR_LOGGED_OUT)
+    out = cursortiers.resolve(exe, credentials="c1", now=later + 3 * cursortiers.LISTED_MAX_S, path=cache)
+    assert out["source"] == "fallback" and "logged out" in out["why"]
+    # A run refused its model: the map is marked, listed again at once, and that model stays out.
+    (tmp_path / "listing.txt").write_text(CURSOR_MODEL_LIST)
+    now = 1e6
+    assert cursortiers.resolve(exe, credentials="c2", now=now, path=cache)["tiers"]["deep"] == "beta-4-pro-thinking"
+    err = "API Error: 400 invalid_request: Cannot use this model: beta-4-pro-thinking"
+    assert not cursortiers.drop_rejected("beta-4-pro-thinking", "tool crashed", path=cache), "an unrelated failure"
+    assert not cursortiers.drop_rejected("other-model", err, path=cache), "a model the map does not name"
+    assert not cursortiers.drop_rejected("auto", "unknown model auto", path=cache)
+    assert all(cursortiers.model_rejected(t, "m") for t in (
+        "Model 'm' not found", "Error: invalid model m", "The model m is not available on your plan",
+        "model m is no longer supported", "unsupported model: m"))
+    assert not cursortiers.model_rejected("model m answered: file not found", "")
+    n = asked()
+    assert cursortiers.drop_rejected("beta-4-pro-thinking", err, path=cache)
+    again = cursortiers.resolve(exe, credentials="c2", now=now + 1, path=cache)
+    assert asked() == n + 1 and again["tiers"]["deep"] == "beta-4-thinking" and again["excluded"] == ["beta-4-pro-thinking"]
+    # Still out after the daily refresh; back once the login (or the CLI) changes.
+    assert cursortiers.resolve(exe, credentials="c2", now=now + 2 * cursortiers.LISTED_MAX_S,
+                               path=cache)["tiers"]["deep"] == "beta-4-thinking"
+    assert cursortiers.resolve(exe, credentials="c3", now=now + 3 * cursortiers.LISTED_MAX_S,
+                               path=cache)["tiers"]["deep"] == "beta-4-pro-thinking"
+
+
+def test_cli_help_cache_follows_the_binary_stamp(tmp_path):
+    from ttp.providers import base
+    exe = tmp_path / "agent"
+    exe.write_text(f"#!{sys.executable}\nprint('  --old-flag')\n")
+    exe.chmod(0o755)
+    assert "--old-flag" in base.cli_output(str(exe), "--help")
+    assert base.cli_output(str(exe), "--help") == base._CLI_OUTPUT[(str(exe), "--help")]
+    # An upgrade in place, no daemon restart: the next ask sees the new flags.
+    exe.write_text(f"#!{sys.executable}\nprint('  --new-flag  added by the upgrade')\n")
+    os.utime(exe, ns=(time.time_ns(), time.time_ns() + 10**9))
+    assert "--new-flag" in base.cli_output(str(exe), "--help")
+    # Gone: "" , not the old answer.
+    exe.unlink()
+    assert base.cli_output(str(exe), "--help") == ""
+
+
+def test_cursor_resolved_models_are_never_priced_under_the_top_rate(env, tmp_path):
+    from ttp import cursortiers
+    from ttp.project import layered
+    from ttp.providers import cursor, get_provider
+    out = tmp_path / "c.json"
+    out.write_text(json.dumps({"result": "ok", "usage": {"inputTokens": 1_000_000, "outputTokens": 1_000_000,
+                                                          "cacheReadTokens": 1_000_000, "cacheWriteTokens": 0}}))
+    top = sum(cursor.TOP)
+    resolved = {"source": "listed", "tiers": {"light": "l-mini", "standard": "s-core", "deep": "d-pro-thinking"}}
+    cfg = layered({})
+    cursortiers.apply(cfg, {}, resolved)
+    for tier, model in resolved["tiers"].items():
+        assert cfg["providers"]["cursor"]["tiers"][tier]["model"] == model
+        assert get_provider("cursor").use(model, {}).parse(out).cost_usd >= top, tier
+        assert get_provider("cursor").use(model, {}).cost_so_far(out) >= top, tier
+    assert cursor.TOP[0] >= 5.0 and cursor.TOP[2] >= 25.0, "under an Opus-class list rate"
+    # auto (Cursor's router) keeps the default row; the project's own rows win, its default included.
+    assert get_provider("cursor").use("auto", {}).parse(out).cost_usd == pytest.approx(sum(cursor.PRICES["default"]))
+    assert get_provider("cursor").use("d-pro-thinking", {"d-pro-thinking": [1, 0.1, 2]}).parse(out).cost_usd \
+        == pytest.approx(3.1)
+    assert get_provider("cursor").use("d-pro-thinking", {"default": [2, 0.2, 4]}).parse(out).cost_usd \
+        == pytest.approx(6.2)
+    # Cache writes are billed input, not free.
+    out.write_text(json.dumps({"result": "ok", "usage": {"cacheWriteTokens": 1_000_000}}))
+    assert get_provider("cursor").use("auto", {}).parse(out).cost_usd == pytest.approx(cursor.PRICES["default"][0] * 1.25)
+    # ttp doctor names the rate each tier's cap uses.
+    cfg["pricing"] = {"cursor": {"s-core": [1, 0.1, 2]}}
+    cfg["providers"]["cursor"]["tiers"]["light"]["model"] = "auto"
+    line = cursortiers.rate_line(cfg)
+    assert "light auto $3/$0.3/$15 (the shipped default rate)" in line
+    assert "standard s-core $1/$0.1/$2 (pricing.cursor.s-core)" in line
+    assert "deep d-pro-thinking $15/$1.5/$75 (the top rate" in line
+
+
+def test_cursor_run_refusing_a_resolved_model_resolves_the_map_again(env, monkeypatch, tmp_path):
+    from ttp import cursortiers
+    resolved = {"source": "listed", "cli": "x", "why": "", "stamp": "s", "at": time.time(),
+                "tiers": {"light": "l-mini", "standard": "s-core", "deep": "d-pro-thinking"}}
+    cache = tmp_path / "tiers.json"
+    cache.write_text(json.dumps(resolved))
+    monkeypatch.setattr(cursortiers, "resolve", lambda *a, **k: resolved)
+    monkeypatch.setattr(cursortiers, "cache_path", lambda: cache)
+    refused = json.dumps({"type": "result", "subtype": "error", "is_error": True,
+                          "result": "API Error: 400 invalid_request: Cannot use this model: l-mini"}) + "\n"
+    _, run, task, argv, _ = _cli_run(env, monkeypatch, "cursor", refused, rc=1, help_text=CURSOR_REAL_HELP)
+    assert argv[argv.index("--model") + 1] == "l-mini"
+    # Not a request error that fails the task at once: the retry runs on a newly listed map.
+    assert run["status"] == "failed" and task["status"] == "queued", (run["status"], task["status"])
+    assert json.loads(cache.read_text())["rejected"] == "l-mini"

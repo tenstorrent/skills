@@ -533,6 +533,7 @@ class Provider:
 
 
 _CLI_OUTPUT: dict[tuple, str] = {}
+_CLI_STAMP: dict[tuple, str] = {}   # argv -> binary_stamp() of argv[0] when its output was cached
 
 
 def jsonl_from(path: Path, offset: int, needles: tuple[bytes, ...]) -> tuple[list[dict], int]:
@@ -574,15 +575,29 @@ def head80(value) -> str:
     return " ".join(text.split())[:80]
 
 
+def binary_stamp(binary: str) -> str:
+    """Path, mtime and size of `binary` as installed (symlinks followed); "" when it cannot be read.
+    An upgrade moves it."""
+    try:
+        real = os.path.realpath(shutil.which(binary) or binary)
+        st = os.stat(real)
+        return f"{real}:{st.st_mtime_ns}:{st.st_size}"
+    except (OSError, TypeError, ValueError):
+        return ""
+
+
 def cli_output(*argv: str) -> str:
-    """What a quick CLI query (`--help`, a feature list) prints, cached per process; "" when it
-    cannot run. Flags differ between CLI versions, so adapters check before using newer ones."""
-    if argv not in _CLI_OUTPUT:
+    """What a quick CLI query (`--help`, a feature list) prints, cached per process and binary stamp
+    (a CLI upgrade asks again without a restart); "" when it cannot run. Flags differ between CLI
+    versions, so adapters check before using newer ones."""
+    key = binary_stamp(argv[0]) if argv else ""
+    if argv not in _CLI_OUTPUT or _CLI_STAMP.get(argv, key) != key:
         try:
             out = subprocess.run(list(argv), capture_output=True, text=True, stdin=subprocess.DEVNULL, timeout=20)
             _CLI_OUTPUT[argv] = out.stdout + out.stderr
         except (OSError, subprocess.SubprocessError):
             _CLI_OUTPUT[argv] = ""
+        _CLI_STAMP[argv] = key
     return _CLI_OUTPUT[argv]
 
 
