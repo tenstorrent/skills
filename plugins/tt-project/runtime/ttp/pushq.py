@@ -362,10 +362,10 @@ def _contains(p: Project, heads: list[str], commit: str) -> bool:
 
 
 def _verdicts(db, review: dict, branches: set[str], now: float) -> tuple[dict[int, int], set[int], dict[int, str]]:
-    """Per code task, the latest finished review covering it (see _covers) within INHERIT_WINDOW_S,
-    leaving out `review` itself and the tasks it covers: ({failed task: its review}, {passed tasks},
-    {task: branch})."""
-    code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
+    """Per task with a branch (BRANCH_KINDS), the latest finished review covering it (see _covers)
+    within INHERIT_WINDOW_S, leaving out `review` itself and the tasks it covers: ({failed task: its
+    review}, {passed tasks}, {task: branch})."""
+    code = db.q("SELECT id, branch, labels FROM tasks WHERE %s AND branch IS NOT NULL AND branch!=''" % BRANCH_KINDS)
     index = BranchIndex(code)
     own = _covers(db, review, [{"branch": b} for b in branches], index)
     reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status IN ('done','pushing','failed') AND id!=? "
@@ -1758,16 +1758,23 @@ def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> 
 
 
 # reviewed code tasks ------------------------------------------------------------------------------
+# The tasks whose branch a review's push ships: a code task, or any other kind that committed on a branch
+# of its own (a question or work task, a `continue:` hop that kept its parent's kind). Not a review, and
+# not a harness task: the harness lands its branch itself (harnesstree).
+BRANCH_KINDS = "kind NOT IN ('review','harness')"
+
+
 def _covers(db, review: dict, rows: list[dict], code: list[dict] | BranchIndex | None = None,
             follow: bool = True) -> set[int]:
     """The tasks whose work a review's push ships: its parent and dependencies, the task its title or
-    label names, the code tasks whose branch it pushed or (naming no subject) its spec names, and,
+    label names, the tasks (BRANCH_KINDS) whose branch it pushed or (naming no subject) its spec names, and,
     with `follow`, the tasks each of those continues (a fix carries the change it fixes)."""
     ids = {d for d in dependency_ids(review) if isinstance(d, int)}
     ids |= {i for i in (review.get("parent"), review_subject(review)) if isinstance(i, int)}
     branches = {r["branch"] for r in rows if r["branch"]}
     if code is None:
-        code = db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!=''")
+        code = db.q("SELECT id, branch, labels FROM tasks WHERE %s AND branch IS NOT NULL AND branch!=''"
+                    % BRANCH_KINDS)
     index = code if isinstance(code, BranchIndex) else BranchIndex(code)
     ids |= {i for b in branches for i in index.by_branch.get(b, ())} | reviewed_ids(review, index)
     if not follow:
@@ -1777,25 +1784,27 @@ def _covers(db, review: dict, rows: list[dict], code: list[dict] | BranchIndex |
         i = ids.pop()
         if i not in out:
             out.add(i)
-            t = db.one("SELECT labels FROM tasks WHERE id=? AND kind='code'", (i,))
+            t = db.one("SELECT labels FROM tasks WHERE id=? AND %s" % BRANCH_KINDS, (i,))
             if t and (c := continues_id(t)) is not None:
                 ids.add(c)
     return out
 
 
 def settle_reviewed(db, now: float | None = None, only: set[int] | None = None) -> list[int]:
-    """Close the code tasks left in 'review' whose work shipped: the latest review covering one (see
-    _covers) is done, and the push queue pushed or landed its approval since the task entered review.
+    """Close the tasks left in 'review' whose work shipped: code tasks, and those of another kind
+    (BRANCH_KINDS) with a branch on record. The latest review covering one (see _covers) is done, and
+    the push queue pushed or landed its approval since the task entered review.
     A review that settles a push conflict on a branch of its own ships the task as well. `only`
     limits it to those task ids. Returns the ids closed. No git, no model."""
     now = time.time() if now is None else now
-    todo = [t for t in db.q("SELECT * FROM tasks WHERE kind='code' AND status='review' ORDER BY id")
+    todo = [t for t in db.q("SELECT * FROM tasks WHERE status='review' AND (kind='code' OR (%s AND branch IS NOT "
+                            "NULL AND branch!='')) ORDER BY id" % BRANCH_KINDS)
             if only is None or t["id"] in only]
     if not todo:
         return []
     since = db.review_since()
-    code = BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE kind='code' AND branch IS NOT NULL "
-                            "AND branch!=''"))
+    code = BranchIndex(db.q("SELECT id, branch, labels FROM tasks WHERE %s AND branch IS NOT NULL "
+                            "AND branch!=''" % BRANCH_KINDS))
     reviews = db.q("SELECT * FROM tasks WHERE kind='review' AND status!='cancelled' AND id>? ORDER BY id DESC",
                    (min(t["id"] for t in todo),))
     rows: dict[int, list[dict]] = {}

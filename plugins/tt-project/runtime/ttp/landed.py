@@ -436,16 +436,18 @@ def record_superseded(p, tid: int, sha: str, ref: str | None = None, repo: str |
     second repository; else only `sha` on `ref` is needed (_record_branchless). `repo`, a path, is searched
     first, before the task's own repositories and the project root.
 
-    A code task in 'review' is accepted on the same checks (its work landed), a harness task in 'review'
-    or done (with no `ref` or `repo`) when `sha` is merged into the harness checkout's HEAD and its
-    worktree branch has nothing unmerged (_record_harness); one left in 'review' is then closed as done."""
+    A code task in 'review', or one of another kind (not a review) with a branch on record, is accepted
+    on the same checks (its work landed), a harness task in 'review' or done (with no `ref` or `repo`)
+    when `sha` is merged into the harness checkout's HEAD and its worktree branch has nothing unmerged
+    (_record_harness); one left in 'review' is then closed as done."""
     task = p.db.task(tid)
     if not task:
         raise ValueError(f"no task #{tid}")
     status, kind = task.get("status"), task.get("kind")
-    if status != "done" and not (status == "review" and kind in ("code", "harness")):
+    if status != "done" and not (status == "review" and (kind in ("code", "harness") or (
+            kind != "review" and str(task.get("branch") or "").strip()))):
         raise ValueError(f"not recorded: task #{tid} is {status}, not done"
-                         + (" or a code or harness task in review" if status == "review" else ""))
+                         + (" or a code or harness task, or one with a branch, in review" if status == "review" else ""))
     if kind == "harness" and not ref and not repo:
         words = _record_harness(p, task, sha)
     else:

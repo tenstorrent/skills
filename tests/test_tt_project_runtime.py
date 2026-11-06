@@ -31619,7 +31619,7 @@ def test_superseded_accepts_a_task_in_review_only_when_its_work_is_merged(env, c
     plan = p.db.add_task("a plan in review", "s", kind="plan", origin="coordinator")
     p.db.update_task(plan, status="review")
     assert ttp_task("superseded", str(plan), merged) not in (0, None)
-    assert "not done or a code or harness task in review" in capsys.readouterr().err
+    assert "not done or a code or harness task, or one with a branch, in review" in capsys.readouterr().err
     queued = _harness_task(p, "queued edit")
     p.db.update_task(queued, status="queued")
     assert ttp_task("superseded", str(queued), merged) not in (0, None)

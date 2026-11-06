@@ -215,6 +215,33 @@ def test_superseded_refuses_a_commit_that_cannot_carry_the_branchs_work(env, mon
     assert set(p.db.kv(dm.KV_LOCAL_ONLY) or {}) == {str(tid)}, "the undelivered work stays flagged"
 
 
+
+def test_superseded_closes_a_question_task_in_review_whose_branch_work_landed(env, monkeypatch, capsys):
+    """`ttp task superseded` takes a question task in review that has a branch on the same checks as a
+    code task (the commit is on the push branch and changes the branch's files) and closes it as done;
+    one with no branch on record is refused and stays in review."""
+    from ttp import cli
+    p, repo, other, tid, path, branch, head = _landed_setup(env, monkeypatch)
+    relanded = _git_out(repo, "rev-parse", "origin/proj")
+    p.db.update_task(tid, kind="question", status="review")
+
+    def ttp_task(*args):
+        try:
+            cli.main(["task", p.name, *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    bare = p.db.add_task("a question in review with no branch", "s", kind="question", origin="coordinator")
+    p.db.update_task(bare, status="review")
+    assert ttp_task("superseded", str(bare), relanded) not in (0, None)
+    assert "or one with a branch, in review" in capsys.readouterr().err
+    assert p.db.task(bare)["status"] == "review"
+    assert ttp_task("superseded", str(tid), relanded[:12]) == 0
+    out = capsys.readouterr().out
+    assert f"recorded as superseded by {relanded[:10]}" in out and "it was in review and is now done" in out
+    t = p.db.task(tid)
+    assert t["status"] == "done" and json.loads(t["result"])["superseded_by"] == relanded
+
 def _run_in(p, tid, cwd):
     """A finished run of task `tid` whose run.json records `cwd` as its working directory."""
     rid = p.db.x("INSERT INTO runs(task, role, status, started, ended) VALUES(?,?,?,?,?)",
@@ -3764,6 +3791,45 @@ def test_the_daemon_closes_code_tasks_left_in_review_whose_latest_review_pushed_
     assert len(db.q("SELECT id FROM events WHERE kind='task_done'")) == 3
     assert pushq.settle_reviewed(db) == [] and len(db.q("SELECT id FROM events WHERE kind='task_done'")) == 3
 
+
+
+def test_settle_reviewed_closes_a_question_or_work_task_with_a_branch_whose_review_landed_it(env):
+    """A task of another kind that committed on its own branch (a `continue:` hop that kept its parent's
+    kind question, a work task) is closed like a code task once its covering review is done and the push
+    queue landed its approval. One with no branch on record, one whose covering review is not done, a
+    review and a harness task stay as they are."""
+    from ttp import pushq
+    p, _ = _pq_rows(env)
+    db, now = p.db, time.time()
+
+    def task(name, kind, branch=True):
+        tid = db.add_task(name, "s", kind=kind, tier="light", origin="user")
+        db.update_task(tid, status="review", branch=f"ttp/t{tid}-{name}" if branch else None)
+        db.x("UPDATE tasks SET updated=? WHERE id=?", (now - 500, tid))
+        return tid
+
+    def review(subject, status, branch):
+        rid = db.add_task(f"Review #{subject}: x", "r", kind="review", origin="coordinator")
+        db.update_task(rid, status=status)
+        db.x("INSERT INTO push_queue(task, branch, head, target, status, batch, created, updated, pushed_sha, "
+             "landed_sha, version) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+             (rid, branch, "ab" * 20, "origin/proj", "landed", "b1", now - 60, now, "cd" * 20, "ef" * 20, "0.3.2"))
+        return rid
+
+    question, work = task("question", "question"), task("work", "work")
+    branchless, pending = task("branchless", "question", branch=False), task("pending", "question")
+    harness = task("harness", "harness")
+    passed = review(question, "done", f"ttp/t{question}-question")
+    review(work, "done", f"ttp/t{work}-work")
+    review(branchless, "done", "ttp/other")
+    review(pending, "running", f"ttp/t{pending}-pending")
+    review(harness, "done", f"ttp/t{harness}-harness")
+    assert sorted(pushq.settle_reviewed(db)) == [question, work]
+    st = {i: db.task(i)["status"] for i in (question, work, branchless, pending, harness)}
+    assert st == {question: "done", work: "done", branchless: "review", pending: "review", harness: "review"}
+    res = json.loads(db.task(question)["result"])
+    assert res["shipped_by"] == passed and res["pushed"][0]["status"] == "landed"
+    assert pushq.settle_reviewed(db) == []
 
 def test_a_broken_target_tip_is_reported_once_and_held_until_the_tip_changes(env, monkeypatch):
     from ttp import pushq
