@@ -1140,6 +1140,7 @@ class Daemon:
         self._machines_routed = 0.0
         self._coverage_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
+        self._stale_user_held: set[str] = set()   # wait_stale fingerprints already logged as held by the user
         self._urgent_own_logged: dict[int, int] = {}   # task -> run whose own-wait hold check_urgent_start logged
         self._urgent_woke_from: dict[int, tuple] = {}   # task -> (its woke text, when that wake made it due); pruned by check_urgent_start
         self._route_waits: dict[int, float] = {}   # task id -> since when it waits for a routed slot (route.wait_s)
@@ -12550,9 +12551,9 @@ class Daemon:
                     and not userpause.is_probe(prev.get("retry_when"), self.cfg) \
                     and not (peer if peer is not None else
                              ackwait.peer_recovering(prev.get("retry_when"), self.cfg, self.p.harness)[0]):
-                self._stale_wait_event(task, prev, start, max_hold)
-                self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
-                                        (self._probe_out.get(tid) or ("",))[0], stale=True)
+                if self._stale_wait_event(task, prev, start, max_hold):
+                    self._flag_never_passes(task, str(prev.get("retry_when") or ""), rc,
+                                            (self._probe_out.get(tid) or ("",))[0], stale=True)
             retry = waitpoll.capped(self.cfg, task, prev, _retry_s(prev))
             nb = now + retry if held else min(now + retry, start + max_hold)
             what = self._wait_what(tid, prev)
@@ -12810,18 +12811,31 @@ class Daemon:
         line, read, by = self._probe_live.get(tid) or ("", None, "")
         return waitheal.live_note(said, prev.get("waiting_since"), line if by == probe else "", read, self.p)[:400]
 
-    def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> None:
-        """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping."""
+    def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> bool:
+        """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping. False
+        for a wait only the user's word ends (progress.user_hold, the test the progress check uses)."""
         db = self.p.db
         fp = f"wait_stale:{task['id']}:{since:.0f}"
+        try:
+            held = progress.user_hold(db, self.cfg, task, prev, str(prev.get("retry_when") or ""), self.p.root)
+        except Exception:   # the test only saves turns: a failure raises the event
+            log(self.p, "wait_stale user-hold test failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            held = False
+        if held:
+            if fp not in self._stale_user_held:
+                if len(self._stale_user_held) > 1000:
+                    self._stale_user_held.clear()
+                self._stale_user_held.add(fp)
+                log(self.p, f"task {task['id']} wait_stale not raised: user hold")
+            return False
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
-            return
+            return True
         wait, cur, fresh = self._stale_snap(task, prev, time.time())
         try:   # the same wait a turn decided nothing on, unchanged since: no turn (stalegate.py)
             if why := stalegate.skip_reason(db, wait, cur, fresh):
                 if n := stalegate.note_skip(db, wait, fp, why):
                     log(self.p, f"task {task['id']} wait_stale not raised ({n} for this wait): {why}")
-                return
+                return True
         except Exception:   # the gate only saves turns: a failure raises the event
             log(self.p, "wait_stale gate failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         what = self._wait_what(task["id"], prev)
@@ -12841,6 +12855,7 @@ class Daemon:
               f"at its timer, or cancel the task.", "queued", task["id"],
               json.dumps({"wait_stale": {"wait": wait, "snap": cur}})))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
+        return True
 
     def _stale_snap(self, task: dict, prev: dict, now: float) -> tuple[str, dict, bool]:
         """(wait key, stalegate.snap, fresh) for a waiting task: fresh when its probe answered since the

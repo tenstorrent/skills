@@ -894,41 +894,121 @@ def test_check_progress_passes_only_this_projects_machine_changes(env, monkeypat
 _HOLDS = ["test -e state/user-example || exit 1",                                  # (a) a user pause
           "test -e state/user-example || test -e state/other-ok || exit 1",        # (b) or another marker file
           "[ -f state/user-example ] && test -e state/user-other"]                 # user markers only
-_LIVE = ["test -e state/user-example && ssh somehost true || exit 1",              # (c) and a live check
-         "test -e state/user-example || ssh somehost test -e ready || exit 1",     # or a live check
-         "test -e state/user-example && test -e state/other-ok || exit 1",         # and a marker the project writes
+_GATED = ["test -e state/user-example && ssh somehost true || exit 1",             # (c) and a live check
+          "test -e state/user-example && test -e state/other-ok || exit 1"]        # and a marker the project writes
+_LIVE = ["test -e state/user-example || ssh somehost test -e ready || exit 1",     # or a live check
          "test -e state/out-ready || exit 1"]                                      # a plain live probe
 
 
-@pytest.mark.parametrize("probe", _HOLDS + _LIVE)
+@pytest.mark.parametrize("probe", _HOLDS + _GATED + _LIVE)
 def test_a_user_pause_probe_raises_no_probe_stall_and_the_sweep_and_wait_stale_agree(env, probe):
     """A start_when or retry_when that waits only on user markers (or an `||` of one with other marker
     files) is a user pause: the progress check raises no probe stall for it, however often it says not
     yet. The blocker sweep, wait_stale and the progress check classify every probe the same way, through
-    userpause.is_probe; anything else stays a live probe the stall check watches."""
+    userpause.is_probe; anything else stays a live probe the stall check watches. A probe that AND-s a
+    user marker with a live check (userpause.user_gate) is no user pause for the sweep, but while that
+    marker is missing it cannot pass: neither the progress check nor wait_stale raise it."""
     from ttp import coordinator as coord, progress, sweep, userpause
     from ttp.daemon import Daemon
     p = make(env)
-    d, hold = Daemon(p.base), probe in _HOLDS
+    d, hold, gated = Daemon(p.base), probe in _HOLDS, probe in _HOLDS + _GATED
     assert userpause.is_probe(probe, p.config()) == hold
+    assert userpause.user_gated(probe, p.config(), p.root) == gated
     now = time.time()
     tid = p.db.add_task("starts on a marker", "s", kind="work", tier="light", origin="user",
                         labels=coord.defer_labels(None, probe))
     for i in range(21):                              # 21 times not yet in an hour and more
         d._start_verdict(p.db.task(tid), 1, now - 4000 + i * 180)
-    got = progress.check(p.db, p.config(), p.state, now)
-    assert [(e["kind"], e["keys"]) for e in got] == ([] if hold else [("stall", [f"probe:#{tid}"])]), got
+    got = progress.check(p.db, p.config(), p.state, now, where=p)
+    assert [(e["kind"], e["keys"]) for e in got] == ([] if gated else [("stall", [f"probe:#{tid}"])]), got
     # The waiting check past its hold cap: a wait_stale event only for a live probe.
     wid = _due_waiting_task(p, probe, since_ago=7 * 24 * 3600)
     _settle_probe(d, wid)
     p.db.update_task(wid, not_before=time.time() - 1)
     d.probe_waiting()
     stale = p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (wid,))
-    assert bool(stale) != hold, stale
+    assert bool(stale) != gated, stale
     # The blocker sweep carries the deferred task as a user pause, or not; its user-pause reader agrees
     # on the waiting one.
     kinds = {i["task"]: i["kind"] for i in sweep.items(p.db, now + 30 * 3600, p.config()) if i.get("task")}
     assert (kinds.get(tid) == "user-pause", bool(userpause.probe_of(p.db.task(wid), p.config()))) == (hold, hold)
+
+
+@pytest.mark.parametrize("probe, needs", [
+    ("test -e state/user-words/user-x && bin/soak_clear.sh h", ["state/user-words/user-x"]),
+    ("test -e state/user-words/user-x && bin/soak_clear.sh h || exit 1", ["state/user-words/user-x"]),
+    ("[ -f 'state/user-x' ] && ssh h 'a || b' >/dev/null 2>&1 && test -e state/user-y", ["state/user-x", "state/user-y"]),
+    ("test -e state/user-x && (a || b); exit 1", []),                 # `;`: the last command decides
+    ("test -e state/user-x && a || b", []),                           # an `||` that can pass without it
+    ("test -e state/user-x || bin/check", []),                        # an optional term: as before
+    ("test -e state/user-x && a || exit 0", []),
+    ("test -e state/user-x && a & true", []),                         # background: the next command decides
+    ("true # && test -e state/user-x", []),                           # a comment hides the term
+    ("test -e state/user-x \n|| true", []),
+    ("test -e 'state/user-x && b", []),                               # an open quote
+    ("! test -e state/user-x && a", []),
+    ("a && test -e state/out-ready", []),                             # no user marker
+])
+def test_user_gate_names_only_markers_every_path_to_a_pass_needs(probe, needs):
+    """userpause.user_gate: the user markers a probe's top-level `&&` chain requires (optionally ending in
+    `|| exit 1`). Any other top-level operator, a comment, an open quote or a negated test may let the
+    probe pass without the marker: no gate."""
+    from ttp import userpause
+    assert userpause.user_gate(probe.replace("\\n", "\n")) == needs
+
+
+def test_a_user_gated_wait_is_live_again_once_its_marker_exists_and_unknown_paths_are_not_gated(env):
+    """While its user marker is missing, a `marker && gate` wait raises neither a probe stall nor
+    wait_stale (the daemon logs 'wait_stale not raised: user hold' once); once the user's word wrote the
+    marker, the gate is a live probe: both raise. A marker path that still holds a variable is unknown:
+    not gated."""
+    from ttp import progress, userpause
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    probe = "test -e state/user-words/user-go && test -e state/out-ready || exit 1"
+    assert not userpause.user_gated("test -e $NO_SUCH_VAR_T6615/user-go && a", None, p.root)
+    assert not userpause.user_gated(probe, None, None), "relative path, no root: unknown"
+    wid = _due_waiting_task(p, probe, since_ago=7 * 24 * 3600)
+    now = time.time()
+    for i in range(21):
+        progress.note_probe(p.db, wid, probe, 1, "not yet", now - 4000 + i * 180)
+
+    def stale_after_probe():
+        p.db.update_task(wid, not_before=time.time() - 1)
+        _settle_probe(d, wid)
+        p.db.update_task(wid, not_before=time.time() - 1)
+        d.probe_waiting()
+        return p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (wid,))
+
+    assert progress.check(p.db, p.config(), p.state, now, where=p) == []
+    assert not stale_after_probe() and not stale_after_probe()
+    log = (p.logs / "daemon.log").read_text()
+    assert log.count(f"task {wid} wait_stale not raised: user hold") == 1, log[-2000:]
+    (p.root / "state/user-words").mkdir(parents=True)
+    (p.root / "state/user-words/user-go").write_text("")
+    got = progress.check(p.db, p.config(), p.state, now + 60, where=p)
+    assert [e["keys"] for e in got] == [[f"probe:#{wid}"]], got
+    assert stale_after_probe()
+
+
+@pytest.mark.parametrize("case", ["wait_kind user", "user-paused resource"])
+def test_wait_stale_skips_a_user_wait_and_a_resource_the_user_paused(env, case):
+    """wait_stale applies the progress check's user-hold test (progress.user_hold): a hand-off whose
+    wait_kind is the user's, or a `ttp lock --probe` on a resource the user paused, raises no wait_stale."""
+    from ttp import coordinator
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    if case == "wait_kind user":
+        wid = _due_waiting_task(p, "test -e state/out-ready || exit 1", since_ago=7 * 24 * 3600, wait_kind="user")
+    else:
+        coordinator.pause_resource(p, "board-t6615", True, reason="hold", by="user")
+        wid = _due_waiting_task(p, "ttp lock --probe board-t6615", since_ago=7 * 24 * 3600)
+    _settle_probe(d, wid)
+    p.db.update_task(wid, not_before=time.time() - 1)
+    d.probe_waiting()
+    assert not p.db.q("SELECT id FROM events WHERE task=? AND kind='wait_stale'", (wid,))
 
 
 _LIVE_START = "test -e state/out-ready || exit 1"

@@ -578,10 +578,18 @@ def _user_paused(db: DB, cfg: dict | None, probe: str) -> bool:
         return False   # an unreadable pause is no pause, as for `ttp lock`
 
 
+def user_hold(db: DB, cfg: dict | None, t: dict, res: dict, probe: str, root=None) -> bool:
+    """Whether only the user's word ends task `t`'s wait on `probe`: a user wait (_user_wait), a user
+    pause or a probe gated on a missing user marker (userpause.user_gated, paths from `root`), or a
+    resource or machine the user paused (_user_paused). The progress check and wait_stale both skip it."""
+    return _user_wait(db, t, res) or userpause.user_gated(probe, cfg, root) or _user_paused(db, cfg, probe)
+
+
 def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[[dict], str | None],
-                 cfg: dict | None = None, gone: set | None = None, harness=None) -> list[dict]:
+                 cfg: dict | None = None, gone: set | None = None, harness=None, root=None) -> list[dict]:
     """Probe stalls; adds to `gone` the raised keys whose count was dropped as no longer valid. `harness`:
-    the project's harness dir, so its own ack-wait wrapper counts as a reply wait (ackwait.is_probe)."""
+    the project's harness dir, so its own ack-wait wrapper counts as a reply wait (ackwait.is_probe);
+    `root`: the project root, where probes run (a relative user marker is read from there)."""
     out = []
     paused, trouble = db.paused_resources(), db.kv("resource_trouble") or {}
     for k, rec in list(st["probes"].items()):
@@ -604,8 +612,8 @@ def probe_stalls(db: DB, s: dict, st: dict, now: float, current_probe: Callable[
             continue   # its own job or window: the wait checks cover a job that hangs
         if _user_wait(db, t, res):
             continue   # only the user's step ends it: no worker can speed it up (the probe keeps counting)
-        if userpause.is_probe(rec["probe"], cfg):
-            continue   # a user pause: only the user's word ends it, so saying not yet is no stall
+        if userpause.user_gated(rec["probe"], cfg, root):
+            continue   # a user pause or a missing user marker: only the user's word ends it, so not yet is no stall
         if _user_paused(db, cfg, rec["probe"]):
             rec["held"] = True   # a resource or machine the user paused: its Resume (or pause_end_due) ends it
             if gone is not None:
@@ -774,7 +782,7 @@ def check(db: DB, cfg: dict | None, state_dir: Path | str | None, now: float | N
     gone: set = set()
     harness = getattr(where, "harness", None)
     conds = (no_progress(db, cfg, s, st, now, streaks(recs))
-             + probe_stalls(db, s, st, now, current_probe, cfg, gone, harness)
+             + probe_stalls(db, s, st, now, current_probe, cfg, gone, harness, getattr(where, "root", None))
              + run_stalls(db, s, now) + schedule_stalls(db, s, st, now))
     kinds = CHECK_KINDS
     if changes is None:
