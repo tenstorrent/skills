@@ -190,6 +190,8 @@ def test_the_daemons_checks_start_skips_a_pre_stage_longer_than_its_inline_bound
     assert d._restart_checks(tid, again, {"worktree": str(path), "head": head, "cmd": ["true"], "fresh": True},
                               "r1") == ""
     assert _wait_precheck(again) == "0", (again / cli.CHECKS_OUT).read_text()
+    for run in (out, again):   # they write their exit code just before they end: none outlives the test
+        assert _wait_for(lambda: not cli._checks_alive(cli._read_checks_pid(run)), _load_scaled(30))
     assert not mark.exists(), "the daemon's start ran the pre-stage"
 
 
