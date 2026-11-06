@@ -107,11 +107,10 @@ def _mask_keys(text: str) -> tuple[str, int]:
     out, at = [], 0
     for m in _KEY_END_RE.finditer(text):   # END lines left alone: no BEGIN before them
         start, lines = m.start(), []
-        while start > at and (b := _KEY_LINE_RE.search(text[max(at, start - 400):start])):
-            line = b.group()
-            head = text[:start - len(line)]
+        while start > at and len(lines) < 400 and (b := _KEY_LINE_RE.search(text, max(at, start - 400), start)):
+            line, s0 = b.group(), b.start()
             if (lines and len(line.rstrip("\\nr\r\n")) < 16) or (
-                    start - len(line) > at and not head.endswith(("\n", "\\n"))):
+                    s0 > at and text[s0 - 1] != "\n" and text[s0 - 2:s0] != "\\n"):
                 break   # a short line above the last, or the end of a longer line (prose)
             lines.append(line)
             start -= len(line)
