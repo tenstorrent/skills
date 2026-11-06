@@ -4028,7 +4028,9 @@ def _change_entry(ml, cid):
     return next(c for c in ml.changes(open_only=False) if c["id"] == cid)
 
 
-def _overdue_pages(ml, at, claimer="alpha"):
+def _overdue_pages(ml, at, claimer=""):
+    # An empty claimer is a reader that is no project's daemon (may_claim takes every page for one); these
+    # tests are not the daemon's own claim of the entry's page.
     return [x for x in ml.route(at, able=lambda n: (True, ""), claimer=claimer) if x["kind"] == "machine_change_overdue"]
 
 
