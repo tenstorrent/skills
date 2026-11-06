@@ -9814,6 +9814,7 @@ def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again
     monkeypatch.setattr(checkcap, "acquire",
                         lambda *a, **k: arrivals.append((a[5] if len(a) > 5 else k.get("since"), k.get("preemptible")))
                         or holders.append(a[0]) or real(*a, **k))
+    monkeypatch.setenv(checkcap.CUT_ENV, "")
     monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
     mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
     script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
@@ -9841,6 +9842,7 @@ def test_check_commands_never_see_the_checks_runs_own_preempt_rerank_and_reexec_
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.CUT_ENV, "")
     monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
     monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, '{"since": 1.0, "asked": "x"}')
     monkeypatch.setenv(checkcap.RERANK_ENV, "1")

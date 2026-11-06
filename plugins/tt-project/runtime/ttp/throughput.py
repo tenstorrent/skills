@@ -628,7 +628,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         spans, own_s, host_s, cut_s = [], 0.0, 0.0, 0.0
         for q, g in slot_log.get(task, ()):
             rec = slot_rec.get((task, q, g), {})
-            if (cut := rec.get("cut_at")) is not None:   # before it: the preempted grant's own record
+            if (cut := rec.get("cut_at")) is not None and q <= cut < g:   # before it: the preempted grant's
                 a, b = max(q, w0, cut), min(g, w1)
                 if b > a and rec.get("cut_by") == cfg.get("name"):
                     own_s += b - a
