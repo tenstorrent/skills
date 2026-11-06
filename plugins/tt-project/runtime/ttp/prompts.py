@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
-from . import knownpaths, preempt, sidefx, specfold, streamguard
+from . import knownpaths, preempt, sidefx, spans, specfold, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -855,10 +855,12 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         short = (delta_review_task(p, task, cwd, branch, cmark, conflict["model_free"])
                  if isinstance(conflict.get("model_free"), dict) else conflict_fix_task(p, task, cwd, branch, cmark))
         return "\n\n".join(x for x in (worker_memory_block(p), worker_rules(p, task), short) if x.strip())
+    tag = spans.new_tag()   # one delimiter for every span in this prompt, the context block's too
     if prev:
-        history = f"\nPrevious attempt ended '{prev.get('status')}': {str(prev.get('summary') or '')[:1500]}\n"
+        said = ctxblock._span(prev.get("summary"), 1500, f"hand-off of #{task['id']}", tag)
+        history = f"\nPrevious attempt ended '{prev.get('status')}': {said}\n"
         if prev.get("woke"):
-            history += f"Woken because: {prev['woke']}.\n"
+            history += f"Woken because: {woke_text(prev['woke'], tag)}.\n"
         if conflict and cmark and cmark.get("trim"):
             history += (f"This run trims the change to fit its prompt size caps at {conflict.get('tier')} "
                         f"({conflict.get('why')}); it costs no review attempt. Rebase onto the tip, trim the "
@@ -911,7 +913,10 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     old = p.db.task(old_id) if old_id else None
     if old:
         on = f" on branch {old['branch']}" if own_worktree(old) and old["branch"] and continues_id(task) else ""
-        was = str(load_result(old["result"]).get("summary") or old["blocked_reason"] or "")[:1500]
+        was = load_result(old["result"]).get("summary")
+        was = (ctxblock._span(was, 1500, f"hand-off of #{old['id']}", tag) if was else
+               ctxblock._span(old["blocked_reason"], 1500, f"blocked reason of #{old['id']}", tag)
+               if old["blocked_reason"] else "")
         history += (f"\nThis task continues #{old['id']} {old['title']} ({old['status']}){on}"
                     + (", and starts from that branch's head" if on and (branch or gets_worktree(p, kind)) else "")
                     + (", and starts from the head of what it reviewed" if old["kind"] == "review" and branch else "")
@@ -990,7 +995,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         settled.prompt_block(p, dict(task)),
         taskfacts.prompt_block(p, dict(task)),
         overlap.prompt_block(p, dict(task))]
-    parts.append(ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p)))
+    parts.append(ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p), tag))
     parts.append(restrictions_pointer(p))
     return "\n\n".join(x for x in parts if x.strip())
 
@@ -1001,6 +1006,27 @@ def outside_line(p: Project, task: dict) -> str:
     runs = p.db.q("SELECT id, dir FROM runs WHERE task=? AND role!='coordinator' AND status!='running' "
                   "ORDER BY id DESC LIMIT 10", (task["id"],))
     return sidefx.last_block([Path(r["dir"]) if r["dir"] else p.runs / str(r["id"]) for r in runs])
+
+
+# Where a daemon wake note starts quoting a probe's, check's or job's output (daemon._probe_raw, the checks
+# and on_pass_cmd wakes, onpassdry.handback_text): what follows is enclosed as data.
+WOKE_OUTPUT = ("; last output: ", "the end of its output:\n", "the end of checks.out:\n", "What the check found:\n")
+
+
+def woke_text(woke, tag: str) -> str:
+    """A wake note's text with the output it quotes enclosed under `tag` (spans.wrap), clipped first; the
+    daemon's own sentences, and a spec change it appends at the end, stay outside."""
+    from .daemon import SPEC_WOKE
+    text = str(woke)
+    at = min((i for i in (text.find(m) for m in WOKE_OUTPUT) if i >= 0), default=-1)
+    if at < 0:
+        return text
+    cut = text.index("\n", at) + 1 if text[at] != ";" else at + len(WOKE_OUTPUT[0])
+    out, tail = text[cut:], ""
+    if out.endswith(f"; also {SPEC_WOKE}"):
+        out, tail = out[:-len(f"; also {SPEC_WOKE}")], f"; also {SPEC_WOKE}"
+    out = ctxblock.SPOOFED.sub(ctxblock.DATA_LABEL, out)
+    return text[:cut] + spans.wrap(out[:1500], "probe or job output", tag) + tail
 
 
 def _system_memory(p: Project) -> set[str]:

@@ -321,11 +321,12 @@ def sections(p, task: dict, have: str = "", shown=(), tag: str | None = None) ->
     ) if ls]
 
 
-def prompt_block(p, task: dict, have: str = "", shown=()) -> str:
+def prompt_block(p, task: dict, have: str = "", shown=(), tag: str | None = None) -> str:
     """The worker prompt's 'Context from the project's records' section ('' when no record links to it).
-    `have`: the prompt text around it (left out of the block); `shown`: memory entry names it already shows."""
+    `have`: the prompt text around it (left out of the block); `shown`: memory entry names it already shows;
+    `tag`: the prompt's span delimiter (a fresh one when None)."""
     try:
-        got = sections(p, dict(task), have, shown)
+        got = sections(p, dict(task), have, shown, tag)
     except Exception:
         return ""   # the records are a backstop: a reader fault never holds a run back
     if not got:
