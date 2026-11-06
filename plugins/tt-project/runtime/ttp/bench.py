@@ -301,6 +301,7 @@ def _passes(where: Path, tests: list[tuple[str, str]], rounds: int, cmd: str, ti
     out = where.parent / f"{where.name}.jsonl"
     env = addedtests.env(tests, out, {**os.environ, "PWD": str(where)}, rounds)
     env[addedtests.ENV] = json.dumps({**json.loads(env[addedtests.ENV]), "spread": False})
+    # own session: the test run is killed whole (its group) once past the timeout
     proc = subprocess.Popen(sandbox.wrap(shlex.split(cmd), env=env), cwd=where, env=env, start_new_session=True,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     try:
