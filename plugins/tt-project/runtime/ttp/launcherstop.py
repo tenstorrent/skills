@@ -169,3 +169,172 @@ def stop(pidfile: Path, pid: int, token: str, why: str) -> dict:
                 "text": f"{name}: stopped; pid {pid} ignored {stop_file} and SIGTERM and was killed (SIGKILL)"}
     return {"how": "left", "left": True,
             "text": f"{name}: pid {pid} still runs after {stop_file}, SIGTERM and SIGKILL"}
+
+
+# A launcher that keeps no NAME.pid ------------------------------------------------------------------
+# A project's own launcher may lay its jobs out its own way: a job folder, no pid file, and a stop command
+# of its own. The project registers that stop in project.json, `detach.launcher_stops`: {glob: command}.
+# The glob matches the job folder's path relative to the project root (an absolute glob: the whole path),
+# one folder level per `*`, any number of levels for a `**` level. The command (a string split as a shell
+# would, or a list; never run by a shell) gets the job folder as its last argument and runs from the
+# project root. `ttp detach --stop <job folder>` then runs it (registered_stop), logs the stop in the
+# project's job-signal stream and events (detached_job_stopped, as jobstop.end does) and reports which of
+# the job's processes (this user's, with the job folder as their cwd, in their command line or in their
+# environment) are still left. A folder outside the project root, inside another tt-project project's
+# folder, or with a process of another project is refused; nothing runs then.
+CONFIG_KEY = "detach.launcher_stops"
+CMD_TIMEOUT_S = 300.0
+GONE_WAIT_S = 15.0
+PROCS_MAX = 256
+
+
+def _glob_parts(pat: list[str], parts: list[str]) -> bool:
+    import fnmatch
+    if not pat:
+        return not parts
+    if pat[0] == "**":
+        return any(_glob_parts(pat[1:], parts[i:]) for i in range(len(parts) + 1))
+    return bool(parts) and fnmatch.fnmatchcase(parts[0], pat[0]) and _glob_parts(pat[1:], parts[1:])
+
+
+def registered(stops, folder: Path, root: Path) -> tuple[str, list[str]] | None:
+    """(glob, command argv) of the first `detach.launcher_stops` entry whose glob matches the job folder,
+    else None (also for a malformed entry, which is skipped)."""
+    import shlex
+    if not isinstance(stops, dict):
+        return None
+    try:
+        rel = folder.relative_to(root).parts
+    except ValueError:
+        rel = None
+    for glob, cmd in stops.items():
+        if not isinstance(glob, str) or not glob.strip():
+            continue
+        g = Path(glob).expanduser()
+        if g.is_absolute():
+            hit = _glob_parts(list(g.parts[1:]), list(folder.parts[1:]))
+        else:
+            hit = rel is not None and _glob_parts([x for x in g.parts if x != "."], list(rel))
+        if not hit:
+            continue
+        try:
+            argv = shlex.split(cmd) if isinstance(cmd, str) else [str(x) for x in cmd] if isinstance(cmd, list) else []
+        except ValueError:
+            argv = []
+        if argv:
+            return glob, argv
+    return None
+
+
+def foreign(folder: Path, root: Path, project: Path) -> str | None:
+    """Why this job folder is not this project's to stop, else None."""
+    if folder != root and root not in folder.parents:
+        return f"{folder} is outside the project root {root}"
+    if folder in (root, project, project / "state", project / "state" / "runs"):
+        return f"{folder} is the project's own folder, not a job's"
+    for a in (folder, *folder.parents):
+        if a == root:
+            break
+        if a != project and (a / "state" / "project.db").is_file():
+            return f"{folder} is inside another tt-project project ({a})"
+    return None
+
+
+def job_procs(folder: Path) -> dict[int, str]:
+    """{pid: start token} of this user's processes the job folder names: their cwd is in it, or a word of
+    their command line or a value of their environment is that folder or a path in it. Never this
+    command or one of its ancestors; at most PROCS_MAX."""
+    me, uid, out = _ancestors(), os.getuid(), {}
+    f = str(folder)
+    inside = lambda s: s == f or s.startswith(f + "/")
+    try:
+        pids = [int(d) for d in os.listdir("/proc") if d.isdigit()]
+    except OSError:
+        return {}
+    for pid in pids:
+        if pid in me or len(out) >= PROCS_MAX:
+            continue
+        st = _stat(pid)
+        if st is None or st[1] != uid:
+            continue
+        hit = False
+        try:
+            hit = inside(os.readlink(f"/proc/{pid}/cwd"))
+        except OSError:
+            pass
+        try:
+            if not hit:
+                hit = any(inside(w.decode(errors="replace")) for w in Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0"))
+            if not hit:
+                hit = any(inside(x.split(b"=", 1)[-1].decode(errors="replace"))
+                          for x in Path(f"/proc/{pid}/environ").read_bytes().split(b"\0"))
+        except OSError:
+            pass
+        if hit and (tok := proc_start(pid)) is not None:
+            out[pid] = tok
+    return out
+
+
+def _cmdline(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ").decode(errors="replace").strip()[:120]
+    except OSError:
+        return "?"
+
+
+def registered_stop(p, folder: Path, glob: str, argv: list[str], root: Path, why: str,
+                    task: int | None = None) -> dict:
+    """Run the registered stop command on the job folder, wait up to GONE_WAIT_S for the job's processes
+    to end, and log the stop (detach.signalled's stream and an events row). {"ok", "rc", "left", "text"}:
+    ok only when the command exited 0 and none of the job's processes is left. Refused (nothing run, ok
+    False, "refused" set) when a process of the job belongs to another tt-project project."""
+    import json
+    import subprocess
+    from .jobstop import EVENT
+    from .project import durable_append
+    from .detach import SIGNALS
+    before = job_procs(folder)
+    for pid in before:
+        there = _project_of(pid)
+        if there and Path(there).resolve() != Path(p.base).resolve():
+            return {"ok": False, "refused": True, "rc": None, "left": [],
+                    "text": f"pid {pid} of {folder} belongs to another tt-project project ({there}); nothing was run"}
+    cmd = [*argv, str(folder)]
+    try:
+        r = subprocess.run(cmd, cwd=root, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           errors="replace", timeout=CMD_TIMEOUT_S)
+        rc, tail = r.returncode, (r.stdout + r.stderr).strip()[-400:]
+    except subprocess.TimeoutExpired:
+        rc, tail = None, f"it ran over {CMD_TIMEOUT_S:g}s and was ended"
+    except OSError as e:
+        rc, tail = None, f"it could not start: {e}"
+    deadline = time.monotonic() + GONE_WAIT_S
+    while True:
+        left = {pid: tok for pid, tok in {**before, **job_procs(folder)}.items() if _same(pid, tok)}
+        if not left or time.monotonic() >= deadline:
+            break
+        time.sleep(0.2)
+    ok = rc == 0 and not left
+    name = folder.name
+    text = (f"{name}: " + ("stopped" if ok else "NOT stopped") + f" by its registered stop ({CONFIG_KEY} {glob!r}: "
+            f"{' '.join(cmd)[:200]}, exit {rc if rc is not None else '-'})"
+            + (f"; {len(before)} process(es) of the job ran before, none is left" if ok
+               else f"; still running: {', '.join(f'{pid} [{_cmdline(pid)}]' for pid in sorted(left)) or 'none'}")
+            + (f"; its output: {tail}" if tail and not ok else ""))
+    now = time.time()
+    row = {"ts": now, "job": name, "rc": str(folder), "pid": None, "group": False, "signal": "launcher_stop",
+           "reason": "ttp detach --stop", "why": why, "by": "ttp", "by_pid": os.getpid(),
+           "by_cmd": " ".join(cmd)[:200], "task": task, "exit": rc, "left": sorted(left), "ok": ok}
+    try:
+        durable_append(p.state / SIGNALS, json.dumps(row) + "\n")
+    except OSError:
+        pass
+    out = {"task": task, "job": name, "folder": str(folder), "glob": glob, "command": cmd, "exit": rc,
+           "before": sorted(before), "left": sorted(left), "why": why, "text": text}
+    try:
+        p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+               (now, "daemon", EVENT, f"launcher_stop:{folder}:{now}", "low" if ok else "normal", text,
+                json.dumps(out), "handled", task))
+    except Exception:   # the audit row is best effort, as detach.signalled's: never the stop's outcome
+        pass
+    return {"ok": ok, "rc": rc, "left": sorted(left), "text": text}

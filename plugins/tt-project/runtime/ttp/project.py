@@ -391,6 +391,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # jev_pick lets Jev choose medium or high from the spec (off by default).
     "effort_ab": {"enabled": True, "jev_pick": False},
     "web": {"bind": "127.0.0.1", "port": 0},
+    "detach": {},                       # launcher_stops: see EXTRA_KEYS
     "power": {},                        # keep_awake: replaced by runner.prevent_idle_sleep; "off" still turns it off
     # Disk guard: with free space under the project folder below the smaller of min_free_pct of the
     # disk and min_free_gb (either 0 = off), only question and plan tasks start; a machines-list entry's
@@ -627,6 +628,9 @@ EXTRA_KEYS = {
                  "channel_tags"},   # release-channel tags a forward move may update under never_force (channeltag)
     "jev": {"via", "url", "model"},
     "effort_ab": {"winner", "decided_at"},   # the end rule's result, written by effortab.conclude
+    # launcher_stops: {glob of a project launcher's job folders: stop command} `ttp detach --stop <job
+    # folder>` runs when the job has no detached.json entry and no pid file (launcherstop.registered_stop).
+    "detach": {"launcher_stops"},
     "power": {"keep_awake"},
     # device_timeout_max_s: a ceiling on device-job timeouts (off: unset); see device_timeout_max.
     # host_commands, host_command_timeout_s: what `ttp host-run` may run outside a worker's sandbox and

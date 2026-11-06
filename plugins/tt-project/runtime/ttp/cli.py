@@ -8127,16 +8127,32 @@ def _launcher_stop(what: str, rc: Path) -> int:
     """`ttp detach --stop` of a driver a project's own launcher started (launcherstop): RESULTS_DIR/NAME.pid
     found, its STOP file written and its process waited for, then signalled. 0 once stopped or already
     gone, 1 when it still runs, 2 when no pid file is found (the message says where it looked), 3 when
-    refused (its pid file names no pid, or a process that cannot be told to be the launcher's)."""
+    refused (its pid file names no pid, or a process that cannot be told to be the launcher's).
+    With no pid file, a job folder whose path matches a glob in detach.launcher_stops is stopped by that
+    registered command (_launcher_registered_stop); a folder outside the project root or inside another
+    tt-project project's folder is refused then (3)."""
     from . import launcherstop
     from .push import _boxed
     env = os.environ
     name, dirs = launcherstop.results_dirs(what, env.get("TTP_RUN_DIR"), env.get("TTP_PROJECT"), env.get("TTP_TASK"))
     f = launcherstop.find(name, dirs)
+    if f is None and env.get("TTP_PROJECT"):
+        p = Project(env["TTP_PROJECT"])
+        folders = ([Path(what).expanduser().absolute()] if "/" in what
+                   else [d / name for d in dirs] if launcherstop.NAME_RE.fullmatch(name) else [])
+        stops = (p.config().get("detach") or {}).get("launcher_stops")
+        for folder in (x.resolve() for x in folders if x.is_dir()):
+            if stops and (why := launcherstop.foreign(folder, p.root.resolve(), p.base.resolve())):
+                print(f"ttp detach --stop: {why}; nothing was run", file=sys.stderr)
+                return 3
+            if hit := launcherstop.registered(stops, folder, p.root.resolve()):
+                return _launcher_registered_stop(p, folder, *hit)
     if f is None:
         where = ", ".join(str(d) for d in dirs) or "nowhere (no $TTP_RUN_DIR; give the pid file's path)"
-        print(f"ttp detach --stop: no detached job is recorded at {rc}, and no launcher pid file {name}.pid in "
-              f"{where}; stop a driver another launcher started with that launcher's own stop", file=sys.stderr)
+        print(f"ttp detach --stop: no detached job is recorded at {rc}, no launcher pid file {name}.pid in "
+              f"{where}, and no stop command registered for its folder in {launcherstop.CONFIG_KEY} "
+              f"(project.json: {{glob of job folders: stop command}}); register the launcher's stop there, "
+              f"then rerun `ttp detach --stop <job folder>`", file=sys.stderr)
         return 2
     if _boxed():
         print(f"ttp detach --stop: {f} names a launcher's driver, but its process cannot be seen from inside a "
@@ -8162,6 +8178,27 @@ def _launcher_stop(what: str, rc: Path) -> int:
         return 3
     print(r["text"])
     return 1 if r["left"] else 0
+
+
+def _launcher_registered_stop(p: Project, folder: Path, glob: str, argv: list[str]) -> int:
+    """`ttp detach --stop <job folder>` of a launcher's job registered in detach.launcher_stops
+    (launcherstop.registered_stop): 0 once its command exited 0 and none of its processes is left, 1 when
+    the command failed or some are left (it names them), 3 when refused (nothing is run then)."""
+    from . import launcherstop
+    from .push import _boxed
+    if _boxed():
+        print(f"ttp detach --stop: {folder} is a launcher's job, but its processes cannot be seen from inside a "
+              "sandbox; run it outside `ttp sandbox`", file=sys.stderr)
+        return 3
+    caller = os.environ.get("TTP_TASK") or ""
+    r = launcherstop.registered_stop(p, folder, glob, argv, p.root, "stop requested by `ttp detach --stop`"
+                                     + (f" (task #{caller})" if caller else ""),
+                                     int(caller) if caller.isdigit() else None)
+    if r.get("refused"):
+        print(f"ttp detach --stop: {r['text']}", file=sys.stderr)
+        return 3
+    print(r["text"], file=sys.stdout if r["ok"] else sys.stderr)
+    return 0 if r["ok"] else 1
 
 
 def _detach_stop_pids(what: str) -> int:

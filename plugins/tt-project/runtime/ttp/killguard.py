@@ -75,7 +75,10 @@ ADVICE = ("kill only what this task started: record `$!` when you start a proces
           "`ttp checks`) end their jobs; never kill by name or pattern; a job an earlier run of this task "
           "detached: `ttp detach --list`, then `ttp detach --stop <name>`; an ended task's detached job, or one "
           "holding your priority-1 task's resource: `ttp detach --stop <rc>`; a driver this task started that "
-          "listed its pids in a file under the task's results dir: `ttp detach --stop-pids <file>`")
+          "listed its pids in a file under the task's results dir: `ttp detach --stop-pids <file>`; a job the "
+          "project's own launcher started in its own layout (no pid file): register the launcher's stop "
+          "command for its job folders in project.json `detach.launcher_stops`, then "
+          "`ttp detach --stop <job folder>` runs it, audited")
 PARSE = ("the kill guard could not parse this command, and a command with kill, pkill or killall that cannot be "
          "parsed is refused; split it into simpler commands")
 

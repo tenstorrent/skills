@@ -1525,7 +1525,17 @@ session and stateless coordinators on every provider.
   `ttp detach --stop <name>` with no job recorded stops a driver
   the project's own launcher started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id>
   folder, once its pid is verified (start time, user, project), gets a STOP file beside it, then SIGTERM and
-  SIGKILL if it does not exit (0 stopped or already gone, 2 none found: it names where it looked). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
+  SIGKILL if it does not exit (0 stopped or already gone, 2 none found: it names where it looked).
+  A launcher that lays its jobs out its own way (a job folder, no pid file) registers its stop in
+  project.json: `"detach": {"launcher_stops": {"<glob of job folders>": "<stop command>"}}`. The glob
+  matches the folder's path relative to the project root (`*` one level, `**` any number; an absolute
+  glob the whole path); the command, a string split as a shell would or a list, never run by a shell,
+  gets the job folder as its last argument and runs from the project root. `ttp detach --stop <job
+  folder>` then runs it, logs the stop in the job-signal stream and as a `detached_job_stopped` event,
+  waits for the job's processes (this user's, naming the folder as cwd, argument or environment value)
+  to end and names any left: 0 stopped, 1 the command failed or processes are left, 3 refused (a folder
+  outside the project root, the project's own folders, inside another tt-project project, or with a
+  process of another project: nothing runs). `ttp detach --remote <ssh alias> [--dir <dir>] <name> -- <command>`
   starts the driver on another host with setsid nohup (default folder `~/.ttp-detach/<run>`, with its
   .log, .rc, .pid, .boot and .start); its probe `ttp detach --check --host <alias> <dir>/<name>` exits
   0 once the .rc holds 0, 4 once it holds another exit code or the driver is gone (pid dead, or that

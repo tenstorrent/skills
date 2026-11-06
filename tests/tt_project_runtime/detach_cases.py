@@ -1880,9 +1880,140 @@ def test_detach_stop_of_an_unknown_name_says_where_it_looked(env, tmp_path):
     run_dir.mkdir(parents=True)
     r = _ttp_run(p, "detach", "--stop", "ghost", env={"TTP_RUN_DIR": str(run_dir), "TTP_TASK": "9"})
     assert r.returncode == 2 and "ghost.pid" in r.stderr and str(run_dir) in r.stderr, r.stderr
-    assert str(p.root / "t9") in r.stderr and "launcher's own stop" in r.stderr
+    assert str(p.root / "t9") in r.stderr and "detach.launcher_stops" in r.stderr
     r = _ttp_run(p, "detach", "--stop", str(tmp_path / "x" / "ghost.rc"))
-    assert r.returncode == 2 and str(tmp_path / "x") in r.stderr and "launcher's own stop" in r.stderr
+    assert r.returncode == 2 and str(tmp_path / "x") in r.stderr and "detach.launcher_stops" in r.stderr
+
+
+# `ttp detach --stop <job folder>` of a job a project's launcher laid out its own way (no detached.json
+# entry, no pid file): the stop command registered in detach.launcher_stops runs, audited.
+
+def _layout_job(folder, project=None):
+    """A launcher's job in its own layout: a process in its own session, with the job folder as its cwd,
+    that records its pid in <folder>/job.txt (not a pid file); returns its Popen."""
+    folder.mkdir(parents=True, exist_ok=True)
+    e = {k: v for k, v in os.environ.items() if k != "TTP_PROJECT"}
+    if project:
+        e["TTP_PROJECT"] = str(project)
+    proc = subprocess.Popen(["sh", "-c", "echo $$ >job.tmp; mv job.tmp job.txt; while :; do sleep 0.1; done"],
+                            cwd=folder, env=e, start_new_session=True)
+    assert _wait_for_path(folder / "job.txt")
+    return proc
+
+
+def _stop_script(tmp_path, body):
+    script = tmp_path / "bin" / "gate-stop"
+    script.parent.mkdir(parents=True, exist_ok=True)
+    script.write_text("#!/bin/sh\n" + body + "\n")
+    script.chmod(0o755)
+    return script
+
+
+def test_detach_stop_runs_a_registered_launcher_stop_and_audits_it(env, tmp_path):
+    from ttp import detach
+    p = make(env)
+    folder = p.root / "gates" / "run1"
+    proc = _layout_job(folder)
+    try:
+        script = _stop_script(tmp_path, 'for d; do :; done; echo "$1 $d" >>"$(dirname "$0")/called"; '
+                                          'kill "$(cat "$d/job.txt")"')
+        p.set_config("detach.launcher_stops", {"gates/*": f"{script} --now"})
+        r = _ttp_run(p, "detach", "--stop", str(folder), env={"TTP_TASK": "12"})
+        assert r.returncode == 0 and "run1: stopped by its registered stop" in r.stdout, r.stderr
+        assert "none is left" in r.stdout and proc.wait(timeout=10) is not None
+        assert (script.parent / "called").read_text().strip() == f"--now {folder.resolve()}"
+        rows = [json.loads(x) for x in (p.state / detach.SIGNALS).read_text().splitlines()]
+        assert any(x["signal"] == "launcher_stop" and x["rc"] == str(folder.resolve()) and x["task"] == 12
+                   and x["ok"] and x["exit"] == 0 for x in rows), rows
+        ev = p.db.one("SELECT text, data FROM events WHERE kind='detached_job_stopped' ORDER BY id DESC LIMIT 1")
+        assert ev and "registered stop" in ev["text"] and json.loads(ev["data"])["command"][-1] == str(folder.resolve())
+    finally:
+        _end_launcher(proc)
+
+
+def test_detach_stop_refuses_an_unregistered_launcher_layout_naming_the_key(env, tmp_path):
+    p = make(env)
+    folder = p.root / "gates" / "run1"
+    proc = _layout_job(folder)
+    try:
+        p.set_config("detach.launcher_stops", {"other/*": "true"})
+        r = _ttp_run(p, "detach", "--stop", str(folder))
+        assert r.returncode == 2 and "detach.launcher_stops" in r.stderr, r.stderr
+        time.sleep(0.2)
+        assert _launcher_alive(proc)
+    finally:
+        _end_launcher(proc)
+
+
+def test_detach_stop_reports_a_registered_stop_that_fails_or_leaves_processes(env, tmp_path, monkeypatch):
+    """A stop command exiting non-zero, or exiting 0 while a process of the job still runs, is reported with
+    what is left, never as stopped; both are still audited."""
+    from ttp import launcherstop
+    p = make(env)
+    folder = p.root / "gates" / "run2"
+    folder.mkdir(parents=True)
+    script = _stop_script(tmp_path, "echo cannot reach the gate >&2; exit 4")
+    p.set_config("detach.launcher_stops", {"gates/**": [str(script)]})
+    r = _ttp_run(p, "detach", "--stop", str(folder))
+    assert r.returncode == 1 and "NOT stopped" in r.stderr and "exit 4" in r.stderr, r.stderr
+    assert "cannot reach the gate" in r.stderr
+    monkeypatch.setattr(launcherstop, "GONE_WAIT_S", 0.3)
+    proc = _layout_job(folder)
+    try:
+        out = launcherstop.registered_stop(p, folder.resolve(), "gates/**", ["true"], p.root, "test")
+        assert not out["ok"] and out["rc"] == 0 and proc.pid in out["left"], out
+        assert f"still running: {proc.pid}" in out["text"] and _launcher_alive(proc)
+        assert p.db.one("SELECT COUNT(*) AS n FROM events WHERE kind='detached_job_stopped' AND severity='normal'")["n"] == 2
+    finally:
+        _end_launcher(proc)
+
+
+def test_detach_stop_never_runs_a_registered_stop_on_another_projects_job(env, tmp_path):
+    """A job folder outside the project root, inside another tt-project project's folder, or with a process
+    of another project is refused; the stop command never runs."""
+    p = make(env)
+    script = _stop_script(tmp_path, 'touch "$(dirname "$0")/called"')
+    outside = tmp_path / "elsewhere" / "run1"
+    outside.mkdir(parents=True)
+    other = p.root / "nested" / "tt-project"
+    (other / "state").mkdir(parents=True)
+    (other / "state" / "project.db").write_text("")
+    inner = other / "gates" / "run1"
+    inner.mkdir(parents=True)
+    p.set_config("detach.launcher_stops", {str(tmp_path / "**"): str(script), "**": str(script)})
+    (p.root / "gates").mkdir()
+    (p.root / "gates" / "link").symlink_to(outside)
+    for folder, why in ((outside, "outside the project root"), (inner, "another tt-project project"),
+                        (p.root / "gates" / "link", "outside the project root"),
+                        (p.root / "gates" / "..", "the project's own folder"),
+                        (p.runs, "the project's own folder")):
+        r = _ttp_run(p, "detach", "--stop", str(folder))
+        assert r.returncode == 3 and why in r.stderr, (folder, r.stderr)
+    run_dir = p.runs / "9"
+    run_dir.mkdir(parents=True)
+    r = _ttp_run(p, "detach", "--stop", "..", env={"TTP_RUN_DIR": str(run_dir)})
+    assert r.returncode == 2, r.stderr
+    mine = p.root / "gates" / "run3"
+    proc = _layout_job(mine, project=tmp_path / "third" / "tt-project")
+    try:
+        r = _ttp_run(p, "detach", "--stop", str(mine))
+        assert r.returncode == 3 and "belongs to another tt-project project" in r.stderr, r.stderr
+        assert _launcher_alive(proc)
+    finally:
+        _end_launcher(proc)
+    assert not (script.parent / "called").exists()
+
+
+def test_launcher_stop_globs_match_folder_levels():
+    from ttp import launcherstop
+    root = Path("/r")
+    stops = {"gates/*": "a", "deep/**/job": ["b", "x"], "bad": 3}
+    assert launcherstop.registered(stops, root / "gates" / "g1", root) == ("gates/*", ["a"])
+    assert launcherstop.registered(stops, root / "gates" / "g1" / "sub", root) is None
+    assert launcherstop.registered(stops, root / "deep" / "a" / "b" / "job", root) == ("deep/**/job", ["b", "x"])
+    assert launcherstop.registered(stops, root / "deep" / "job", root)[0] == "deep/**/job"
+    assert launcherstop.registered(stops, root / "bad", root) is None
+    assert launcherstop.registered("not a map", root / "gates" / "g1", root) is None
 
 
 def test_launcher_stop_never_targets_its_caller_nor_writes_through_a_stop_symlink(env, tmp_path, monkeypatch):
