@@ -11,9 +11,10 @@ the same prompt (the spec as queued under a fixed preamble), the same agent tool
 limits, enforced by the run supervisor the daemon uses (runner.py): wall clock, stall guard and
 dollar budget (where the provider caps one). Before the run the workspace is checked to hold one
 commit, one branch, no remote, reflog or alternates, neither the base nor the landed commit and no
-held-out test content (leaks); the bench folder and the results folder are denied to the agent's
-reads. After it, the transcript is audited for the bench's paths, the landed commit and history or
-forge commands (audit): a flagged cell fails. Then the held-out files are copied in and the held-out
+held-out test content (leaks); the bench and results folders, the source repository with its git dir
+and worktrees, the project's state folder and the providers' plugin caches and saved transcripts
+(hidden_paths) are denied to the agent's reads. After it, the transcript is audited for those paths,
+the landed commit and history or forge commands (audit): a flagged cell fails. Then the held-out files are copied in and the held-out
 tests run (the grade). Each cell appends one row to <out>/results.jsonl: cost, tokens, wall time,
 hand-off status, the grade and the sha256 of its transcript and diff; its files go to <out>/cells.
 A rerun with the same plan skips the cells already recorded. `dry_run` swaps every arm's provider
@@ -140,11 +141,51 @@ def _strings(raw: str) -> str:
     return "\n".join(found)
 
 
+def _system(line: str) -> bool:
+    # A provider's own system record (its init lists the installed plugins' paths): not the agent's.
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return False
+    return isinstance(rec, dict) and rec.get("type") == "system"
+
+
+def _forms(p: Path) -> list[str]:
+    # How a transcript may write a hidden path: as is, or under the home folder as ~/... or $HOME/...
+    try:
+        rel = p.relative_to(Path.home())
+    except ValueError:
+        return [str(p)]
+    return [str(p)] + ([f"~/{rel}", f"$HOME/{rel}", f"${{HOME}}/{rel}"] if str(rel) != "." else [])
+
+
+def hidden_paths(bench_dir: Path, out: Path, repos: list, state: Path | None) -> list[Path]:
+    """What a cell must not read: the bench and results folders, the source repository with its git
+    common dir and every worktree of it (their history holds the landed commit and later code), the
+    project's state folder, and the providers' installed plugin caches and saved transcripts (later
+    code and the original task's own run). Denied to the agent's reads and audited in its transcript."""
+    found = [bench_dir, out, *([state] if state else [])]
+    for repo in (r for r in repos if r and Path(r).exists()):
+        found.append(Path(repo))
+        common = gitmemo.run(["git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                             capture_output=True, text=True, timeout=None)
+        if common.returncode == 0 and common.stdout.strip():
+            found.append(Path(common.stdout.strip()))
+        trees = gitmemo.run(["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+                            capture_output=True, text=True, timeout=None)
+        found += [Path(x[len("worktree "):]) for x in trees.stdout.splitlines() if x.startswith("worktree ")]
+    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
+    codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+    found += [claude / "plugins", claude / "projects", codex / "plugins", codex / "sessions"]
+    return list(dict.fromkeys(Path(p).expanduser().resolve() for p in found))
+
+
 def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "") -> list[str]:
     """Why a cell counts as a cheat attempt: its transcript names a hidden path or the landed commit or
     runs history or forge commands, or it or the candidate's diff shows lines only the held-out tests
     have (bench.QUOTE_LINES of them, or all when fewer). [] when clean."""
-    out = [f"names {p}" for p in hidden if str(p) in transcript]
+    own = _strings("\n".join(x for x in transcript.splitlines() if not _system(x)))
+    out = [f"names {p}" for p in hidden if any(form in own for form in _forms(Path(p)))]
     if task["head"][:12] in transcript:
         out.append("names the landed commit")
     out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(transcript)})
@@ -173,9 +214,17 @@ def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float
 
 def _clean_env() -> dict:
     # The runner lays the cell's env over its own: nothing of this project's or run's own TTP_ state
-    # (the fake agent's scripted knobs, TTP_FAKE_*, pass for dry runs).
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_") or k.startswith("TTP_FAKE_")}
-    return {**env, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
+    # (the fake agent's scripted knobs, TTP_FAKE_*, pass for dry runs) and no PYTHONPATH, which would
+    # hand the agent this (later) runtime: the runner and the fake agent find it through _boot.
+    return {k: v for k, v in os.environ.items()
+            if k != "PYTHONPATH" and (not k.startswith("TTP_") or k.startswith("TTP_FAKE_"))}
+
+
+def _boot(module: str) -> list[str]:
+    # `python -m <module>` with this runtime on sys.path for that process only, not in its env.
+    runtime = str(Path(__file__).resolve().parent.parent)
+    return [sys.executable, "-c", f"import runpy, sys; sys.path.insert(0, {runtime!r}); "
+            f"runpy.run_module({module!r}, run_name='__main__', alter_sys=True)"]
 
 
 def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts: dict, cfg: dict) -> dict:
@@ -184,6 +233,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
     from .providers import get_provider
     row = {**cell, **arm, "dry_run": bool(opts.get("dry_run"))}
     keep = out / "cells" / f"{task['task']}-r{cell['rep']}-{cell['arm']}"
+    hidden = hidden_paths(bench_dir.resolve(), out.resolve(), [task.get("repo"), opts.get("repo")], opts.get("state"))
     tmp = Path(tempfile.mkdtemp(prefix="cell-"))
     try:
         ws, run = tmp / "work", tmp / "run"
@@ -198,7 +248,9 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
         argv, env = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
                                budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
-                               denied_reads=[str(bench_dir.resolve()), str(out.resolve())], web=False)
+                               denied_reads=[str(p) for p in hidden], web=False)
+        if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
+            argv = [*_boot("ttp.providers.fake"), *argv[3:]]
         spec = {"argv": argv, "env": {**env, "TTP_RUN_DIR": str(run)}, "cwd": str(ws), "provider": provider,
                 "model": arm["model"], "effort": arm["effort"], "timeout_s": opts["timeout_s"],
                 "stall_s": opts["stall_s"], "prices": prices, "default_budget_usd": opts["budget_usd"],
@@ -209,37 +261,58 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         began = time.time()
         try:
             with open(run / "runner.log", "wb") as log:
-                subprocess.run([sys.executable, "-m", "ttp.runner", str(run)], cwd=str(run), env=_clean_env(),
+                subprocess.run([*_boot("ttp.runner"), str(run)], cwd=str(run), env=_clean_env(),
                                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                timeout=opts["timeout_s"] + 300)
         except subprocess.TimeoutExpired:   # the supervisor itself hung: its watchdog ends the agent
             return {**row, "outcome": "runner_timeout", "passed": False, "wall_s": round(time.time() - began, 1)}
         row["wall_s"] = round(time.time() - began, 1)
-        u = prov.parse(run / "output.jsonl", run / "stderr.log")
-        row.update(cost_usd=u.cost_usd, cost_estimated=u.estimated, input_tokens=u.input_tokens,
-                   output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens)
-        transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
-        ended = json.loads((run / "exit.json").read_text()) if (run / "exit.json").exists() else {}
-        handoff = json.loads((run / "result.json").read_text()) if (run / "result.json").exists() else {}
-        row.update(exit={k: ended[k] for k in ("rc", "stopped", "refused") if ended.get(k) is not None},
-                   handoff=str(handoff.get("status") or "none"), transcript_sha256=_sha(transcript))
-        bench._git(ws, "add", "-A")
-        diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
-        row["diff_sha256"] = _sha(diff)
-        flags = audit(transcript.decode(errors="replace"), task, [bench_dir.resolve(), out.resolve()],
-                      secret_lines(bench_dir, task), diff.decode(errors="replace"))
-        passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"]) if not flags \
-            else (False, "not graded: flagged by the cheat audit")
-        row.update(passed=passed, flagged=flags, outcome="flagged" if flags else "pass" if passed else "fail")
-        keep.mkdir(parents=True, exist_ok=True)
-        for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log"):
-            if (run / name).exists():
-                shutil.copyfile(run / name, keep / name)
-        durable_write(keep / "diff.patch", diff.decode(errors="replace"))
-        durable_write(keep / "tests.log", log_tail)
-        return row
+        try:
+            return _finish(row, bench_dir, task, ws, run, keep, start, prov, opts, hidden)
+        except Exception as e:   # the agent ran and spent: record the cell, so a rerun skips it
+            return {**row, "outcome": "error", "passed": False, "why": [f"{type(e).__name__}: {e}"[:500]]}
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+
+
+def _read_json(path: Path):
+    # A file the candidate or its run wrote: None when missing, "invalid" when not a JSON object.
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text(errors="replace"))
+    except ValueError:
+        return "invalid"
+    return data if isinstance(data, dict) else "invalid"
+
+
+def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: Path, start: str, prov, opts: dict,
+            hidden: list[Path]) -> dict:
+    """Audit and grade a cell whose agent has run, filling `row` as it goes (its cost first)."""
+    u = prov.parse(run / "output.jsonl", run / "stderr.log")
+    row.update(cost_usd=u.cost_usd, cost_estimated=u.estimated, input_tokens=u.input_tokens,
+               output_tokens=u.output_tokens, cache_read_tokens=u.cache_read_tokens)
+    transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
+    ended, handoff = _read_json(run / "exit.json"), _read_json(run / "result.json")
+    ended = ended if isinstance(ended, dict) else {}
+    row.update(exit={k: ended[k] for k in ("rc", "stopped", "refused") if ended.get(k) is not None},
+               handoff=handoff if handoff == "invalid" else str((handoff or {}).get("status") or "none"),
+               transcript_sha256=_sha(transcript))
+    bench._git(ws, "add", "-A")
+    diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
+    row["diff_sha256"] = _sha(diff)
+    flags = audit(transcript.decode(errors="replace"), task, hidden,
+                  secret_lines(bench_dir, task), diff.decode(errors="replace"))
+    passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"]) if not flags \
+        else (False, "not graded: flagged by the cheat audit")
+    row.update(passed=passed, flagged=flags, outcome="flagged" if flags else "pass" if passed else "fail")
+    keep.mkdir(parents=True, exist_ok=True)
+    for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log"):
+        if (run / name).exists():
+            shutil.copyfile(run / name, keep / name)
+    durable_write(keep / "diff.patch", diff.decode(errors="replace"))
+    durable_write(keep / "tests.log", log_tail)
+    return row
 
 
 def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict, cfg: dict,
@@ -250,7 +323,8 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
     if bad := [a for a in arms if not re.fullmatch(r"[A-Za-z0-9_.-]+", a)]:
         raise BenchError(f"arm names take letters, digits, '.', '_' and '-' only: {bad}")
     man = verified(bench_dir)
-    tasks = {t["task"]: t for t in man["tasks"][:limit or None]}
+    # The source repository the bench was cut from (recorded by `ttp bench prep`) goes with each task.
+    tasks = {t["task"]: {**t, "repo": man.get("repo")} for t in man["tasks"][:limit or None]}
     plan = {"bench": str(bench_dir.resolve()), "manifest_sha256": (bench_dir / "manifest.sha256").read_text().split()[0],
             "arms": arms, "reps": reps, "seed": seed, "cells": schedule(list(tasks), list(arms), reps, seed),
             "limits": {k: opts[k] for k in ("timeout_s", "stall_s", "budget_usd", "test_cmd", "test_timeout_s")},

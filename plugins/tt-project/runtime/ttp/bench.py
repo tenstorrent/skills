@@ -193,7 +193,7 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0) -> dict:
                      "created": t["created"], "base": base, "head": head, "tree": tree,
                      "stratum": "small" if lines <= SMALL else "large", "changed_lines": lines,
                      "tests": [f"{p}::{n}" for p, n in tests], "heldout": held})
-    manifest = {"since": since, "made": time.time(), "tasks": kept,
+    manifest = {"since": since, "made": time.time(), "repo": str(repo.resolve()), "tasks": kept,
                 "excluded": excluded, "counts": {s: sum(k["stratum"] == s for k in kept) for s in ("small", "large")}}
     durable_write(out / "manifest.json", json.dumps(manifest, indent=1) + "\n")
     durable_write(out / "manifest.sha256", f"{_sha(out / 'manifest.json')}  manifest.json\n")

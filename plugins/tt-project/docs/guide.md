@@ -1047,16 +1047,27 @@ gets a fresh copy of the base workspace in a new temporary folder, the same prom
 fixed preamble) and the same limits, enforced by the daemon's own run supervisor: `bench.timeout_s`,
 `bench.stall_s` and `bench.budget_usd` (where the provider caps dollars). Before a run the workspace
 must hold one commit on one branch with no remote, reflog or alternates, neither the base nor the
-landed commit and no held-out test content; the bench and results folders are denied to the agent's
-reads. After it, a transcript that names those folders or the landed commit, or runs history or
+landed commit and no held-out test content. The agent's reads are denied, and its transcript is
+audited for, the bench and results folders, the source repository (recorded by `prep`, or `--repo`,
+default the project root) with its git dir and every worktree, the project's state folder, and the
+providers' plugin caches and saved transcripts (`~/.claude/plugins`, `~/.claude/projects`, and
+`plugins` and `sessions` under `$CODEX_HOME`): these hold the landed commit, later code or the
+original task's run. The audit matches each path as a prefix, also written with `~/` or `$HOME/`,
+and skips the provider's own system records. The agent's environment carries no `PYTHONPATH` to the
+harness runtime. A transcript that names a denied path or the landed commit, or runs history or
 forge commands (`git fetch`, `git log --all`, `gh api`), flags the cell as failed. Otherwise the
 held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`;
 wrap it in `ttp sandbox --` to run candidate code sandboxed). Each cell appends a row to
 `results.jsonl` (cost, tokens, wall time, hand-off status, pass or fail, flags, and the sha256 of its
 transcript and diff) and keeps its transcript, diff and test log under `cells/`; a rerun into the same
-folder skips recorded cells and refuses a different plan. `--dry-run` runs every arm on the fake agent:
-no model call and no spend. The cells run as the same user as the command, so the denial and the
-audit, not the operating system, keep a candidate from the bench folder.
+folder skips recorded cells and refuses a different plan. A cell whose hand-off is not a JSON
+object is still graded (hand-off `invalid`); any other fault after its agent ran records the cell
+as `error` with its cost and wall time, so the bench moves on and a rerun does not pay for it again. `--dry-run` runs every arm on the fake agent:
+no model call and no spend. The cells run as the same user as the command with the real home
+folder, so the denial and the audit, not the operating system, keep a candidate from those paths: a
+read the audit cannot see (a path built at run time, or one under another name) stays a gap. A
+scratch home folder holding only the provider's login would close more of it, but it is not used:
+the providers keep their login in the home folder, and the harness copies no credentials.
 
 ### OpenAI-compatible endpoints (the `chat` provider)
 

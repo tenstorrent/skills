@@ -7488,7 +7488,8 @@ def _bench_run(p, a) -> None:
         seed = a.seed if a.seed is not None else int.from_bytes(os.urandom(4), "big")
         opts = {"timeout_s": a.timeout or conf.get("timeout_s", 3600), "stall_s": conf.get("stall_s", 900),
                 "budget_usd": a.budget or conf.get("budget_usd", 8.0), "test_cmd": a.test_cmd or benchrun.TEST_CMD,
-                "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run}
+                "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run,
+                "repo": Path(a.repo or p.root).expanduser().resolve(), "state": p.state}
         rows = benchrun.run(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(), arms,
                             a.reps or conf.get("reps", 1), seed, opts, cfg, limit=a.limit)
     except (benchrun.BenchError, OSError, ValueError) as e:
@@ -13127,7 +13128,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")
     s.add_argument("--out", required=True, help="a new folder for the workspaces, held-out tests and manifest")
-    s.add_argument("--repo", help="the repository the tasks landed in (default: the project root)")
+    s.add_argument("--repo", help="the repository the tasks landed in (default: the project root); `run` also "
+                   "denies it, its git dir and worktrees to the cells")
     s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
     s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay")
     s.add_argument("--arm", action="append", help="run: name=provider:model:effort, repeatable (default: bench.arms)")

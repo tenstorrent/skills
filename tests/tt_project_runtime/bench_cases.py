@@ -279,3 +279,60 @@ def test_bench_run_cli_dry_run_takes_arms_from_the_command_line_and_refuses_one_
     with pytest.raises(SystemExit) as e:
         cli.main([*base, "--out", str(tmp_path / "o2")])
     assert e.value.code not in (0, None) and "at least two arms" in capsys.readouterr().err
+
+
+def test_bench_run_cell_that_reads_the_source_repo_or_provider_caches_is_flagged_and_gets_no_runtime_path(env, tmp_path, monkeypatch):
+    from ttp import benchrun
+    p, tid, task = _bench_built(env, tmp_path)
+    repo = tmp_path / "repo"
+    subprocess.run(["git", "-C", str(repo), "worktree", "add", "-q", str(tmp_path / "wt"), "v1"], check=True)
+    # The candidate copies the landed fix out of the source repository's history, as its transcript shows.
+    steal = (f"cmd='git -C {repo} show main:mod.py'; echo \"$cmd\"; $cmd > mod.py; printf 'PP=%s\\n' \"$PYTHONPATH\" "
+             "> pp.txt; git -c user.email=c@example.com -c user.name=c commit -qam fix; git add pp.txt; true")
+    monkeypatch.setenv("TTP_FAKE_SHELL", steal)
+    arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
+    out = tmp_path / "h2h"
+    rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path, repo=repo, state=p.state), p.config())
+    runtime = str(Path(benchrun.__file__).resolve().parent.parent)
+    for r in rows:
+        assert r["outcome"] == "flagged" and not r["passed"] and f"names {repo.resolve()}" in r["flagged"], r
+        cell = out / "cells" / f"{tid}-r1-{r['arm']}"
+        assert "+    return 2" in (cell / "diff.patch").read_text(), "the stolen fix is there: only the audit stops it"
+        assert "+PP=\n" in (cell / "diff.patch").read_text() and runtime not in (cell / "diff.patch").read_text()
+        assert all(runtime not in str(v) for v in json.loads((cell / "run.json").read_text())["env"].values())
+    # The source repo needs no --repo: `ttp bench prep` recorded it in the manifest.
+    rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h-2", arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in rows] == ["flagged", "flagged"]
+    # What is denied and audited: the repo, its git dir and worktrees, the state folder, the provider caches.
+    home = Path.home()
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    hidden = benchrun.hidden_paths(tmp_path / "bench", out, [repo], p.state)
+    for want in (repo, repo / ".git", tmp_path / "wt", p.state, home / ".claude" / "plugins",
+                 home / ".claude" / "projects", home / ".codex" / "sessions"):
+        assert want.resolve() in hidden, want
+    assert benchrun.audit("cat ~/.claude/plugins/cache/x/runtime/ttp/mod.py", task, hidden) == \
+        [f"names {(home / '.claude' / 'plugins').resolve()}"], "a ~ form of a hidden path is caught"
+    assert benchrun.audit(f"git -C {tmp_path / 'wt'} log -p -1 origin/main", task, hidden)
+    assert benchrun.audit(json.dumps({"type": "system", "plugins": [{"path": str(home / ".claude" / "plugins" / "x")}]}),
+                          task, hidden) == [], "the provider's own init record lists its plugins: not the agent's read"
+
+
+def test_bench_run_records_a_cell_whose_candidate_writes_a_malformed_result_and_a_rerun_skips_it(env, tmp_path, monkeypatch):
+    from ttp import benchrun
+    p, tid, task = _bench_built(env, tmp_path)
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"{_BENCH_FIX} && echo 'not json' > \"$TTP_RUN_DIR/result.json\"")
+    monkeypatch.setenv("TTP_FAKE_COST", "0.25")
+    arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
+    out = tmp_path / "h2h"
+    rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert [(r["outcome"], r["handoff"]) for r in rows] == [("pass", "invalid")] * 2
+    assert all(r["wall_s"] >= 0 and "cost_usd" in r for r in rows)
+    # Any other fault after the agent ran is recorded as an error, with the cell's cost, and not run again.
+    monkeypatch.setattr(benchrun, "grade", lambda *a: 1 / 0)
+    rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h-err", arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in rows] == ["error", "error"] and "ZeroDivisionError" in rows[0]["why"][0]
+    assert all("cost_usd" in r and "wall_s" in r for r in rows)
+    for o in (out, tmp_path / "h2h-err"):
+        assert benchrun.run(tmp_path / "bench", o, arms, 1, 1, _bench_opts(tmp_path), p.config()) == []
+        assert len((o / "results.jsonl").read_text().splitlines()) == 2
