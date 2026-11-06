@@ -309,15 +309,18 @@ def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
 
 def _dropped_told(db, b, m: dict) -> None:
     """One queued DROPPED_EVENT per commit a batch left out as landed only because the landing resolved a
-    conflict in its lines (the results' "dropped_as_resolved": batch._rewritten), keyed by batch and
-    commit (its fingerprint) so it is sent once, for the coordinator to check that no work was lost."""
+    conflict in its lines (the results' "dropped_as_resolved": batch._rewritten), for the coordinator to
+    check that no work was lost. Once per commit: a later batch that leaves out the same commit again
+    (its entry is still queued) tells nobody, so one check is never queued once per batch."""
     for r in m.get("results") or []:
         d = r.get("detail") if isinstance(r, dict) else None
         for x in (d.get("dropped_as_resolved") or []) if isinstance(d, dict) else []:
             if not isinstance(x, dict) or not x.get("commit"):
                 continue
             fp = f"{DROPPED_EVENT}:{b['id']}:{x['commit']}"
-            if db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+            end = f":{x['commit']}"   # the same commit told for any batch
+            if db.one("SELECT 1 FROM events WHERE kind=? AND substr(fingerprint, -?)=?",
+                      (DROPPED_EVENT, len(end), end)):
                 continue
             files = ", ".join(map(str, x.get("files") or [])) or "its files"
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",

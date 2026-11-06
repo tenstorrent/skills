@@ -2758,14 +2758,17 @@ def test_a_push_batch_records_a_commit_it_drops_on_a_landing_that_resolved_a_con
     assert batch.summary(p.state / "pushes" / "b1.json") == 0
     assert f"    left out {a[:10]} as landed by {landed_as[:10]}, which resolved a conflict in its lines of notes.txt" \
         in capsys.readouterr().out, "the batch summary shows the drop"
-    for _ in range(2):      # the coordinator hears of it once per batch and commit
-        pushq._dropped_told(p.db, {"id": "b1"}, m)
+    for bid in ("b1", "b1", "b2"):   # once per commit: a later batch leaving it out again tells nobody
+        pushq._dropped_told(p.db, {"id": bid}, m)
     [ev] = p.db.q("SELECT * FROM events WHERE kind=?", (pushq.DROPPED_EVENT,))
     assert ev["status"] == "queued" and ev["fingerprint"] == f"{pushq.DROPPED_EVENT}:b1:{a}", ev
     assert f"push batch b1 left out commit {pushq._short(a)}" in ev["text"] and "notes.txt" in ev["text"], ev["text"]
     pushq._dropped_told(p.db, {"id": "b1"}, {"results": [None, {"detail": None}, {"detail": {
         "dropped_as_resolved": ["x", {"files": []}]}}]})    # torn or foreign rows are skipped
     assert len(p.db.q("SELECT * FROM events WHERE kind=?", (pushq.DROPPED_EVENT,))) == 1
+    other = {"results": [{"id": 2, "detail": {"dropped_as_resolved": [{"commit": "1" + a, "files": ["f"]}]}}]}
+    pushq._dropped_told(p.db, {"id": "b2"}, other)   # another commit (its sha ends like the first) is told
+    assert len(p.db.q("SELECT * FROM events WHERE kind=?", (pushq.DROPPED_EVENT,))) == 2
 
 
 def test_a_push_batch_without_a_resolved_drop_tells_the_coordinator_nothing(env):
