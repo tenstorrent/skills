@@ -806,3 +806,166 @@ def test_coordinator_bash_guard_keeps_unrelated_and_ttps_own_writes(env, tmp_pat
     coordtools.pre_tool_use(payload)
     p.charter_path.write_text("user edit\n")
     assert coordtools.post_tool_use(payload) == (None, None) and p.charter_path.read_text() == "user edit\n"
+
+
+def test_coordinator_bash_guard_saves_what_it_puts_back(env, tmp_path, monkeypatch):
+    # (a) An out-of-band edit is put back and reported, and its content is saved where the notice says.
+    from ttp import coordtools
+    p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
+    cmd = 'f="$H/CHART""ER.md"; echo "- out of band" >> "$f"'
+    edited = files[p.charter_path] + b"- out of band\n"
+    notice = _bash_guarded_call(p, tmp_path, cmd, 0)
+    assert notice and "put back" in notice and p.charter_path.read_bytes() == files[p.charter_path]
+    saved = p.state / coordtools.PUT_BACK_DIR / hashlib.sha256(edited).hexdigest()
+    assert saved.read_bytes() == edited and str(saved) in notice
+    rec = json.loads((p.state / coordtools.PUT_BACK_LOG).read_text().splitlines()[-1])
+    assert rec["path"] == str(p.charter_path) and rec["saved"] == str(saved) and rec["command"] == cmd
+    event = p.db.one("SELECT data FROM events WHERE kind=?", (coordtools.GUARD_EVENT,))
+    assert json.loads(event["data"])["saved"] == [str(saved)]
+
+
+def test_coordinator_bash_guard_keeps_the_checked_ttp_path_and_ttps_git_writes(env, tmp_path, monkeypatch):
+    # (b) A write through the checked `ttp` path inside the call is kept.
+    from ttp import applyff, coordtools, upjournal
+    p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
+    cmd = f'PYTHONPATH={RUNTIME} {sys.executable} -m ttp config {p.name} runner.nice 7'
+    assert _bash_guarded_call(p, tmp_path, cmd, 0) is None
+    assert json.loads(p.config_path.read_text())["runner"]["nice"] == 7
+    # ttp's own git writes to the harness checkout during the call (a landing or upgrade merge, the upgrade
+    # journal's put-back) are kept: charter, memory entry and project.json alike.
+    git = lambda *a: subprocess.run(["git", "-C", str(p.harness), *a], check=True, capture_output=True,  # noqa: E731
+                                    text=True).stdout.strip()
+    p.commit_harness([p.memory_dir / "fact-a.md", p.config_path], "test: base")
+    base = git("rev-parse", "HEAD")
+    git("checkout", "-q", "-b", "side")
+    p.charter_path.write_text(p.charter_path.read_text() + "- merged in\n")
+    (p.memory_dir / "fact-a.md").write_text("---\nkind: fact\n---\nbeta\n")
+    p.config_path.write_text(json.dumps({**json.loads(p.config_path.read_text()), "note": "merged"}))
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-am", "side")
+    side = git("rev-parse", "HEAD")
+    merged = {f: f.read_bytes() for f in (p.charter_path, p.memory_dir / "fact-a.md", p.config_path)}
+    git("checkout", "-q", "main")
+    assert git("rev-parse", "HEAD") == base and p.charter_path.read_bytes() != merged[p.charter_path]
+    why = []
+    assert _bash_guarded_call(p, tmp_path, "true", 1,
+                              lambda: why.append(applyff.fast_forward(p.harness, side, "X"))) is None
+    assert why == [""] and git("rev-parse", "HEAD") == side
+    assert all(f.read_bytes() == data for f, data in merged.items())
+    assert not p.db.q("SELECT 1 FROM events WHERE kind=?", (coordtools.GUARD_EVENT,))
+    p.charter_path.write_text("- local damage\n")
+    assert _bash_guarded_call(p, tmp_path, "true", 2, lambda: upjournal._put_back(p.harness, ["CHARTER.md"])) is None
+    assert p.charter_path.read_bytes() == merged[p.charter_path]
+
+
+def test_coordinator_bash_guard_keeps_a_concurrent_daemon_write(env, tmp_path, monkeypatch):
+    # (c) Another process (the daemon) writing through ttp's write path while the call runs is kept.
+    from ttp import coordtools
+    p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
+    daemon = (f"import json, sys; sys.path.insert(0, {str(RUNTIME)!r}); from pathlib import Path\n"
+              f"from ttp.project import Project, write_json\nP = Project(Path({str(p.base)!r}))\n"
+              "write_json(P.config_path, {**json.loads(P.config_path.read_text()), 'note': 'daemon'})\n"
+              "P.add_memory('a daemon fact', kind='fact', title='from the daemon')\n")
+    def concurrently():
+        subprocess.run([sys.executable, "-c", daemon], check=True, timeout=60)
+    assert _bash_guarded_call(p, tmp_path, "sleep 0.1", 0, concurrently) is None
+    assert json.loads(p.config_path.read_text())["note"] == "daemon"
+    assert "from the daemon" in p.memory_index.read_text()
+    assert not (p.state / coordtools.PUT_BACK_LOG).exists()
+
+
+def test_coordinator_bash_guard_only_reports_a_file_no_ttp_writer_logs(env, tmp_path, monkeypatch):
+    # (d) A guarded file outside a project's harness folder has no write log: reported, never put back.
+    from ttp import coordtools
+    from ttp.project import protected_log
+    p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
+    loose = tmp_path / "loose" / "CHARTER.md"
+    loose.parent.mkdir()
+    loose.write_text("charter\n")
+    assert protected_log(loose) is None
+    monkeypatch.setenv(coordtools.PROTECTED_ENV, os.pathsep.join([*coordtools.protected_paths(p), str(loose)]))
+    notice = _bash_guarded_call(p, tmp_path, f'echo more >> "{loose.parent}/CHART""ER.md"; echo x >> "$H/MEMORY.m""d"', 0)
+    assert loose.read_text() == "charter\nmore\n" and p.memory_index.read_bytes() == files[p.memory_index]
+    assert notice and f"{loose} changed during this command; no ttp writer logs it" in notice
+    assert f"{p.memory_index} outside the coordinator's checks" in notice
+    data = json.loads(p.db.one("SELECT data FROM events WHERE kind=?", (coordtools.GUARD_EVENT,))["data"])
+    assert data["files"] == [str(p.memory_index)] and data["left"] == [str(loose)]
+
+
+_TREE_GIT = {"merge", "checkout", "reset", "restore", "stash", "revert", "cherry-pick", "pull", "rebase", "switch",
+             "am", "apply", "clean", "rm", "mv", "read-tree"}
+_HARNESS_EXPR = {"p.harness", "h", "harness", "self.harness", "self.p.harness", "project.harness"}
+# Not a git writer on a live harness checkout: a snapshot restore into a new folder no coordinator runs
+# on yet, and a landing's fast-forward of a branch in the project's own repo (its `h` is that checkout).
+_TREE_GIT_EXEMPT = {("replica.py", "restore"), ("landff.py", "_why_not")}
+
+
+def _harness_git_writers(source: str):
+    """(function, line, command) of each git command in `source` that can change tracked files in a
+    harness checkout and runs outside `with tree_writes(...)`."""
+    import ast
+    tree = ast.parse(source)
+    parent = {c: n for n in ast.walk(tree) for c in ast.iter_child_nodes(n)}
+    out = []
+    for call in [n for n in ast.walk(tree) if isinstance(n, ast.Call)]:
+        name = ast.unparse(call.func)
+        if name.endswith("_git") or name in ("git", "_plain"):
+            if not call.args:
+                continue
+            target, rest = call.args[0], call.args[1:]
+        elif name in ("subprocess.run", "subprocess.Popen", "subprocess.check_call", "subprocess.check_output",
+                      "gitmemo.run") and call.args and isinstance(call.args[0], ast.List):
+            elts = call.args[0].elts
+            if not (elts and isinstance(elts[0], ast.Constant) and elts[0].value == "git"):
+                continue
+            at = [i for i, e in enumerate(elts) if isinstance(e, ast.Constant) and e.value == "-C"]
+            if not at or at[0] + 1 >= len(elts):
+                continue
+            target, rest = elts[at[0] + 1], elts[at[0] + 2:]
+        else:
+            continue
+        t = ast.unparse(target)
+        t = t[4:-1] if t.startswith("str(") and t.endswith(")") else t
+        if t not in _HARNESS_EXPR:
+            continue
+        words = [e.value for e in rest if isinstance(e, ast.Constant) and isinstance(e.value, str)]
+        sub, skip = None, False
+        for w in words:
+            if skip:
+                skip = False
+            elif w == "-c":
+                skip = True
+            elif not w.startswith("-"):
+                sub = w
+                break
+        if sub not in _TREE_GIT or sub == "rm" and "--cached" in words \
+                or sub == "reset" and not {"--hard", "--merge", "--keep"} & set(words) \
+                or sub == "read-tree" and "-u" not in words or sub == "checkout" and "-b" in words:
+            continue
+        node, fn, wrapped = call, "", False
+        while node in parent:
+            node = parent[node]
+            if isinstance(node, (ast.With, ast.AsyncWith)) and any(
+                    isinstance(i.context_expr, ast.Call) and ast.unparse(i.context_expr.func).endswith("tree_writes")
+                    for i in node.items):
+                wrapped = True
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and not fn:
+                fn = node.name
+        if not wrapped:
+            out.append((fn, call.lineno, sub))
+    return out
+
+
+def test_every_git_writer_on_the_harness_checkout_logs_its_protected_writes():
+    """Each ttp git command that can change tracked files in a harness checkout runs inside
+    project.tree_writes, so a session coordinator's Bash guard keeps what it wrote."""
+    bad = [(f.name, fn, line, sub) for f in sorted((RUNTIME / "ttp").glob("*.py"))
+           for fn, line, sub in _harness_git_writers(f.read_text()) if (f.name, fn) not in _TREE_GIT_EXEMPT]
+    assert not bad, f"git writers on the harness checkout outside project.tree_writes: {bad}"
+    # The scan sees each form: a helper, a git argv list, -c options, and the exemptions it allows.
+    probe = ('def f(p, h):\n    _git(p.harness, "merge", "x")\n'
+             '    subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", m])\n'
+             '    _git(h, "-c", "a=b", "checkout", "HEAD", "--", f)\n'
+             '    _git(h, "rm", "-q", "--cached", f)\n    _git(h, "reset", "-q", "--", f)\n'
+             '    _git(p.harness, "checkout", "-q", "-b", "main")\n    _git(wt, "merge", "x")\n'
+             '    with tree_writes(h):\n        _git(h, "merge", "--abort")\n')
+    assert [(line, sub) for _, line, sub in _harness_git_writers(probe)] == [(2, "merge"), (3, "merge"), (4, "checkout")]

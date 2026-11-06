@@ -2583,7 +2583,7 @@ def protected_log(path: str | Path) -> Path | None:
     name = os.path.basename(s)
     if not (name in ("project.json", "MEMORY.md") or name.startswith("CHARTER") or f"{os.sep}memory{os.sep}" in s):
         return None
-    real = Path(os.path.realpath(s))
+    real = Path(os.path.realpath(os.path.dirname(os.path.abspath(s)))) / name   # a planted symlink is not followed
     for harness in list(real.parents)[:3]:
         if harness.name == "harness" and harness.parent.name == FOLDER:
             rel = real.relative_to(harness).parts
@@ -2614,6 +2614,42 @@ def note_protected(path: str | Path, data: bytes | None = None) -> None:
         durable_append(log, json.dumps({"ts": time.time(), "path": os.path.abspath(path), "sha": sha}) + "\n")
     except OSError:
         pass
+
+
+def protected_files(harness: str | Path) -> dict[str, bytes]:
+    """The protected files (protected_log) in a harness checkout, path -> bytes: the charter files, the
+    memory index, every memory entry (archived too) and project.json."""
+    h = Path(harness)
+    try:
+        files = [h / n for n in os.listdir(h) if n.startswith("CHARTER") or n in ("MEMORY.md", "project.json")]
+    except OSError:
+        return {}
+    files += [Path(d) / n for d, _, names in os.walk(h / "memory") for n in names
+              if not (n.startswith(".") and n.endswith(".tmp"))]   # durable_write's temporary files
+    out = {}
+    for f in files:
+        try:
+            out[os.path.abspath(f)] = f.read_bytes()
+        except OSError:
+            continue
+    return out
+
+
+@contextmanager
+def tree_writes(harness: str | Path) -> Iterator[None]:
+    """The one way ttp runs a git command (or a put-back) that can change tracked files in a harness
+    checkout (a harness task's landing merge and its abort, the upgrade's fast-forward or merge and the
+    upgrade journal's put-back): logs each protected file it changed, created or removed (note_protected),
+    so a session coordinator's Bash guard (coordtools.guard) keeps it. A static test fails on a git writer
+    on the harness checkout outside it."""
+    before = protected_files(harness)
+    try:
+        yield
+    finally:
+        after = protected_files(harness)
+        for f in sorted(set(before) | set(after)):
+            if before.get(f) != after.get(f):
+                note_protected(f, after.get(f))
 
 
 def replace_copy(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:

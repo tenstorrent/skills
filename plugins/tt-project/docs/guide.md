@@ -463,6 +463,15 @@ prolonged whole-box outage.
   As those checks read the command text, each Bash call is also compared before and after: a change
   to the charter, a memory file or `project.json` that `ttp` itself did not write (a variable, glob or
   script write) is put back and reported in the tool result and as a `coord_protected_write` event.
+  `ttp` logs each of its own writes to these files (its file writes, and every git command that changes
+  the harness checkout: a harness task's landing merge, `ttp upgrade`'s merge and its put-backs) in
+  `state/protected-writes.jsonl`, so a `ttp config` or `memory_add` inside the call, a landing or the
+  daemon writing meanwhile is kept. Before a put-back the changed content is saved under
+  `state/coord-put-back/` (indexed in `state/coord-put-back.jsonl` with its path, digest, time and
+  command) and the notice names it. A guarded file outside a project's harness folder has no write log:
+  its change is only reported, never put back. Known gap: your own editor edit to the charter, memory
+  or `project.json` while a coordinator Bash call runs is put back too (saved and reported), as the
+  guard cannot tell it from the coordinator's.
   The state database is not compared (the daemon writes it all the time); only the command-text
   check covers it. Any raw `git push` and any `ttp push` that lands or moves a tag is denied, by the hook and again
   at run time by `ttp push` and the harness's `git` wrapper: code goes through a work branch, a

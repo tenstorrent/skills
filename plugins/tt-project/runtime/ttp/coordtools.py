@@ -88,6 +88,8 @@ POST_EVENT, FAIL_EVENT = "CoordPostToolUse", "CoordPostToolUseFailure"
 AUDIT = "tool-audit.jsonl"   # in the run dir: one line per mutating tool call
 GUARD_DIR = "coord-guard"   # in the run dir: each Bash call's snapshot of the protected files (snapshot, guard)
 GUARD_EVENT = "coord_protected_write"   # the event of a protected file guard put back
+PUT_BACK_DIR = "coord-put-back"   # in a project's state folder: content guard put back, by its sha256
+PUT_BACK_LOG = "coord-put-back.jsonl"   # in a project's state folder: one line per put-back (guard)
 TOOL_TIMEOUT_S = 300   # a foreground command's limit by default
 MAX_TOOL_TIMEOUT_S = 600   # the CLI's own Bash ceiling
 MODES = ("full", "read_only")
@@ -413,20 +415,29 @@ def snapshot(payload: dict) -> None:
 
 def guard(payload: dict) -> str | None:
     """After a full-tools coordinator's Bash call: put back every protected file the call changed,
-    created or removed outside ttp's own writes (project.protected_log names those), from the snapshot,
-    record an event, and return the notice for the tool result (None: nothing changed out of band).
-    It reads files, not commands, so a variable, glob or script write is caught too. Accepted gaps: a
-    call whose post hook never runs (an interrupted call) and a write by a process the call left in the
-    background are not checked, and a script that also forges the write log passes."""
+    created or removed outside ttp's own writes, from the snapshot, record an event, and return the
+    notice for the tool result (None: nothing changed out of band). ttp's writers log each protected
+    write at one choke point (project.durable_write, durable_append, the memory archive renames and
+    project.tree_writes around every git command that changes the harness checkout); a change whose
+    path and new digest are logged since the snapshot is kept. Before a put-back the changed content is
+    saved (PUT_BACK_DIR under the project's state folder, indexed by PUT_BACK_LOG with path, digest,
+    time and command), and the notice names it, so nothing is lost. A changed file no ttp writer logs
+    for (project.protected_log is None: outside a project's harness folder) is reported, never put
+    back. It reads files, not commands, so a variable, glob or script write is caught too. Accepted
+    gaps: a user's own editor edit to the charter, memory or project.json during the call is put back
+    (saved and reported), not recognised as theirs; a call whose post hook never runs (an interrupted
+    call) and a write by a process the call left in the background are not checked; a script that also
+    forges the write log passes."""
     from pathlib import Path
-    from .project import durable_write, note_protected, protected_log
+    from .project import durable_append, durable_write, note_protected, protected_log
     run = os.environ.get("TTP_RUN_DIR")
     snap = Path(run) / GUARD_DIR / f"{_guard_key(payload)}.json" if run else None
     if snap is None or not snap.exists():
         return None
     before = json.loads(snap.read_text())
     files = sorted(set(before["files"]) | set(_guarded_files()))
-    now = {f: sha for f, (sha, _) in _digests(files).items()}
+    after = _digests(files)
+    now = {f: sha for f, (sha, _) in after.items()}
     logs = {protected_log(f) for f in files} - {None}
     logged = set()
     for log in logs:
@@ -442,26 +453,48 @@ def guard(payload: dict) -> str | None:
                         logged.add((e["path"], e["sha"]))
                 except (ValueError, KeyError, TypeError):
                     continue
-    bad = [f for f in files if before["files"].get(f) != now.get(f) and (f, now.get(f)) not in logged]
-    for f in bad:
+    changed = [f for f in files if before["files"].get(f) != now.get(f) and (f, now.get(f)) not in logged]
+    command = str((payload.get("tool_input") or {}).get("command") or "")
+    bad, saved = [], []
+    for f in changed:
+        if protected_log(f) is None:
+            continue   # no ttp writer logs it: reported only
+        if f in after:   # the changed content, kept before the put-back; unsaved, it stays as is
+            sha, data = after[f]
+            state = protected_log(f).parent
+            try:
+                durable_write(state / PUT_BACK_DIR / sha, data)
+                durable_append(state / PUT_BACK_LOG, json.dumps({
+                    "ts": time.time(), "path": f, "sha": sha, "saved": str(state / PUT_BACK_DIR / sha),
+                    "command": command[:2000]}) + "\n")
+            except OSError:
+                continue
+            saved.append(str(state / PUT_BACK_DIR / sha))
+        bad.append(f)
         if f in before["files"]:
             durable_write(Path(f), (snap.parent / "blobs" / before["files"][f]).read_bytes())
         else:
             os.unlink(f)
             note_protected(f)
     snap.unlink(missing_ok=True)
-    if not bad:
+    if not changed:
         return None
     how = sorted({_protected_why(next((p for p in os.environ.get(PROTECTED_ENV, "").split(os.pathsep)
-                                       if p and _protected_hit(f, [p])), f)) for f in bad})
-    text = (f"tt-project: this command changed {', '.join(bad)} outside the coordinator's checks; each is put "
-            f"back as it was before the call. " + "; ".join(how))
+                                       if p and _protected_hit(f, [p])), f)) for f in changed})
+    left = [f for f in changed if f not in bad]
+    text = "tt-project: " + " ".join(filter(None, [
+        bad and (f"this command changed {', '.join(bad)} outside the coordinator's checks; each is put back as it "
+                 f"was before the call" + (f" (the changed content is saved as {', '.join(saved)})" if saved else "")
+                 + "."),
+        left and f"{', '.join(left)} changed during this command; no ttp writer logs it (or its content could "
+                 f"not be saved), so it is left as is.",
+        "; ".join(how)]))
     try:
         from .project import Project
         Project(next(iter(logs)).parent.parent).db.x(
             "INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
             (time.time(), "coordinator", GUARD_EVENT, "normal", text[:1500],
-             json.dumps({"files": bad, "command": str((payload.get("tool_input") or {}).get("command") or "")[:500]}),
+             json.dumps({"files": bad, "left": left, "saved": saved, "command": command[:500]}),
              "handled"))
     except Exception:   # the files are back either way; only the record is lost
         pass

@@ -43,7 +43,7 @@ from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, r
                       durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
                       NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES, append_text,
-                      open_append_or_null)
+                      open_append_or_null, tree_writes)
 from . import gitmemo
 
 RUNTIME = Path(__file__).resolve().parent.parent              # .../runtime (plugin or project copy)
@@ -10379,7 +10379,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     _refuse_unfinished_merge(p, auto)
     emptied = _emptied(h, None, "HEAD")
     if emptied:      # a crash cut these short: they are damage, not local edits to commit and keep
-        _git(h, "checkout", "HEAD", "--", *emptied)
+        with tree_writes(h):
+            _git(h, "checkout", "HEAD", "--", *emptied)
         print("restored files a crash left empty: " + ", ".join(emptied))
     _restore_cut_runtime(h)
     left = _commit_local_changes(p, ident)
@@ -10469,16 +10470,18 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         die(f"upgrade not applied; the running harness is unchanged. {moved}", 1)
     genv = {**os.environ, release.GUARD_ENV: "1"}
     upjournal.step(p, "merging", base=base, merged=_git(h, "rev-parse", merged))
-    r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True, text=True,
-                       env=genv)
-    if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files
-        r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", merged], capture_output=True,
+    with tree_writes(h):
+        r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--ff-only", merged], capture_output=True,
                            text=True, env=genv)
-        if r.returncode != 0:
-            subprocess.run(["git", "-C", str(h), "merge", "--abort"], capture_output=True)
-            die(f"could not apply the checked upgrade to {h}: {(r.stdout + r.stderr)[-500:]}"
-                + (f"; files a running harness task changed were left for it to commit ({', '.join(left[:5])}): "
-                   f"rerun `ttp upgrade {p.name}` once it has committed them" if left else ""), 1)
+        if r.returncode != 0:   # the daemon committed charter or memory meanwhile: those touch other files
+            r = subprocess.run(["git", "-C", str(h), *ident, "merge", "--no-edit", merged], capture_output=True,
+                               text=True, env=genv)
+            if r.returncode != 0:
+                subprocess.run(["git", "-C", str(h), "merge", "--abort"], capture_output=True)
+    if r.returncode != 0:
+        die(f"could not apply the checked upgrade to {h}: {(r.stdout + r.stderr)[-500:]}"
+            + (f"; files a running harness task changed were left for it to commit ({', '.join(left[:5])}): "
+               f"rerun `ttp upgrade {p.name}` once it has committed them" if left else ""), 1)
     sync_all()       # a reboot right after must not leave the files git just wrote empty
     upjournal.step(p, "merged")
     if parked:      # merged without its worker: the paused project's finish task has nothing left to do
@@ -11247,7 +11250,8 @@ def _restore_cut_runtime(h: Path) -> None:
         return
     for f in cut:
         src = "upstream" if _why_cut(f, _blob(h, "HEAD", f), _blob(h, "upstream", f) or b"") else "HEAD"
-        r = subprocess.run(["git", "-C", str(h), "checkout", src, "--", f], capture_output=True, text=True)
+        with tree_writes(h):
+            r = subprocess.run(["git", "-C", str(h), "checkout", src, "--", f], capture_output=True, text=True)
         if r.returncode != 0:
             die(f"upgrade refused: {f} is {cut[f]} and could not be restored from {src}: "
                 f"{r.stderr.strip()[-300:]}. Nothing was committed; restore it, then rerun `ttp upgrade`.", 1)

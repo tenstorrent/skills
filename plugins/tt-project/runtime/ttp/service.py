@@ -28,7 +28,7 @@ import time
 from pathlib import Path
 
 from . import poll_s
-from .project import Project, durable_write, open_append_or_null
+from .project import Project, durable_write, open_append_or_null, tree_writes
 from . import gitmemo
 
 
@@ -836,8 +836,9 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
         _git(h, "add", "-A", "--", "runtime")
         _git(h, "commit", "-q", "-m", "runtime edits in place when the daemon failed to start")
         changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip()
-    if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
-        _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
+    with tree_writes(h):
+        if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
+            _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
     _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")
     phase = (f"Failed phase: the new daemon was not ready {judged:.0f}s after the old one "
              f"stopped (the old daemon took {stopped:.0f}s to stop; its service's stop timeout is {stop_s:.0f}s). ")

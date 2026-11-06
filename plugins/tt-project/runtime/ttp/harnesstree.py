@@ -29,7 +29,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .project import MEMORY_PATHS, Project, durable_write, git_fsync_args
+from .project import MEMORY_PATHS, Project, durable_write, git_fsync_args, tree_writes
 from . import gitmemo
 
 DIR = "harness-worktrees"
@@ -191,12 +191,14 @@ def land(p: Project, tid: int) -> str:
             from .upjournal import _differs, _put_back, _touched
             touched = _touched(p.harness, before, b)
             clean = [f for f in touched if f not in _differs(p.harness, touched)]
-            r = _git(p.harness, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
+            with tree_writes(p.harness):
+                r = _git(p.harness, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
             conflicted = False
             if r.returncode != 0:
                 conflicted = bool(_git(p.harness, "diff", "--name-only", "--diff-filter=U").stdout.strip())
                 if conflicted or landing_merge(p.harness):
-                    _git(p.harness, "merge", "--abort")
+                    with tree_writes(p.harness):
+                        _git(p.harness, "merge", "--abort")
                 if _git(p.harness, "rev-parse", "HEAD").stdout.strip() == before:
                     # git refused only after writing them (the template guard on main refuses a branch that
                     # holds a template merge): left there, they fail `ttp upgrade --apply`'s fast-forward
@@ -388,7 +390,8 @@ def sweep(p: Project, running: set[int]) -> dict[int, str]:
     if not root.is_dir():
         return {}
     if _is_repo(p) and landing_merge(p.harness):    # a merge of ours a killed daemon left: undo it first
-        _git(p.harness, "merge", "--abort")
+        with tree_writes(p.harness):
+            _git(p.harness, "merge", "--abort")
     out = {}
     for d in sorted(root.iterdir()):
         if not (d.is_dir() and d.name.startswith("t") and d.name[1:].isdigit()):
