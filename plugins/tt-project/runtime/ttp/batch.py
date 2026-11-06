@@ -65,9 +65,10 @@ SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds",
                  "imports": "names both sides import", "release": "release notes both sides wrote",
                  "cells": "different cells of a table row",
+                 "counters": "a test's size cap both sides raised",
                  "union": "lines both sides added to a shared doc (delivery.mechanical_merge_paths)"}
 RELEASE_KINDS = {"version", "release"}   # settlements in the shared release files only (release_kind)
-MERGED_KINDS = {"added", "hunks", "imports", "cells", "union"}   # settlements that keep both sides' changes: kept only when the checks pass
+MERGED_KINDS = {"added", "hunks", "imports", "cells", "counters", "union"}   # settlements that keep both sides' changes: kept only when the checks pass
 # delivery.mechanical_merge_paths default: shared docs and changesets, whose conflicts settle_union
 # settles by keeping the lines both sides added (fnmatch on the repo path, so `*` also crosses `/`).
 MECHANICAL_PATHS = ("docs/*.md", "*/docs/*.md", "*README.md", "*CHANGELOG.md", "*.changeset/*.md")
@@ -313,7 +314,8 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 
 def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
            hunks: bool = False, kinds: set | None = None, superseded: bool = False,
-           near: bool = False, imports: bool = False, cells: bool = False) -> str | None:
+           near: bool = False, imports: bool = False, cells: bool = False,
+           counters: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
     With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
@@ -323,7 +325,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     (_superseded). With `near`, both sides' added lines are not kept (by the added or hunks rule)
     when one nearly repeats the other (_near). With `imports`, a Python conflict made only of import
     statements keeps every name each side imports (_imports). With `cells`, a conflict of Markdown
-    table rows where the two sides changed different cells takes both (_cells). None when any other conflict
+    table rows where the two sides changed different cells takes both (_cells). With `counters`, a
+    conflict of lines where both sides only raised numbers and added comment parts adds both raises
+    (_counters). None when any other conflict
     remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
     settled ("added", "taken_in", "hunks", "cells"). The conflict markers carry a random tag, so file content
     never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
@@ -361,7 +365,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         while j < len(lines) and lines[j].rstrip("\r\n") != sep:
             old.append(lines[j])
             j += 1
-        if old and not (taken_in or hunks or superseded or imports or cells):
+        if old and not (taken_in or hunks or superseded or imports or cells or counters):
             return None                 # the base section is not empty: a real conflict
         j, theirs_lines = j + 1, []
         while j < len(lines) and lines[j].rstrip("\r\n") != end:
@@ -391,6 +395,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         elif old and cells and (both := _cells(mine, old, theirs_lines)) is not None:
             res += both
             how = "cells"
+        elif old and counters and (both := _counters(mine, old, theirs_lines)) is not None:
+            res += both
+            how = "counters"
         else:                           # a real conflict
             return None
         if kinds is not None:
@@ -465,6 +472,89 @@ def _cells(mine: list[str], old: list[str], theirs: list[str]) -> list[str] | No
             row.append(z if x == y else x)
         out.append("|".join(row) + o[len(rows[0]):])
     return out
+
+
+_NUM = re.compile(r"(?<![\w.])\d[\d_]*(?![\w.])")   # an integer literal (not part of a name or a float)
+
+
+def _counters(mine: list[str], old: list[str], theirs: list[str]) -> list[str] | None:
+    """Both sides' raises of the numbers on one conflict's lines, as when two changes each raise a
+    test's prompt size cap by what their own text needs: per line, each side kept the code around
+    the numbers and only raised numbers, so each number becomes old + both raises, and each side
+    only added `; `-separated parts to the line's trailing comment (the reasons), kept with ours
+    first. A line only one side changed is taken from it. None otherwise: a lowered number, any
+    other code edit, a reworded comment part, or no line where both raised a number."""
+    if not (len(mine) == len(old) == len(theirs)):
+        return None
+    out, raised = [], False
+    for o, b, t in zip(mine, old, theirs):
+        if o == t or t == b:
+            out.append(o)
+            continue
+        if o == b:
+            out.append(t)
+            continue
+        eol = o[len(o.rstrip("\r\n")):]
+        (co, mo), (cb, mb), (ct, mt) = (_code_comment(x.rstrip("\r\n")) for x in (o, b, t))
+        if _NUM.sub("0", co) != _NUM.sub("0", cb) or _NUM.sub("0", ct) != _NUM.sub("0", cb):
+            return None
+        nums = [[n.group() for n in _NUM.finditer(x)] for x in (co, cb, ct)]
+        code, at = [], 0
+        for n, (x, y, z) in zip(_NUM.finditer(cb), zip(*nums)):
+            vx, vy, vz = (int(v.replace("_", "")) for v in (x, y, z))
+            if vx < vy or vz < vy or any(v.startswith("0") and v != "0" for v in (x, y, z)):
+                return None
+            raised |= vx > vy and vz > vy
+            v = vx + vz - vy
+            code += [cb[at:n.start()], f"{v:_}" if "_" in x + y + z else str(v)]
+            at = n.end()
+        note = _comment_parts(mo, mb, mt)
+        if note is None:
+            return None
+        out.append("".join(code) + cb[at:] + note + eol)
+    return out if raised else None
+
+
+def _code_comment(line: str) -> tuple[str, str]:
+    """A line split before its trailing ` # ` comment: the first `#` outside a quoted string, after
+    a space. The whole line and no comment when there is none, or a string is still open."""
+    quote, i = "", 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and i and line[i - 1] == " ":
+            k = len(line[:i].rstrip(" "))
+            return line[:k], line[k:]
+        i += 1
+    return line, ""
+
+
+def _comment_parts(mine: str, old: str, theirs: str) -> str | None:
+    """Three trailing comments merged when each side only added `; `-separated parts to the old one
+    (conflictfix.additive, ours first); None for any other change."""
+    if mine == theirs or theirs == old:
+        return mine
+    if mine == old:
+        return theirs
+    head = re.compile(r"^\s*#\s*")
+    if not all(head.match(x) for x in (mine, old, theirs)):
+        return None
+    lead = head.match(old).group()
+    parts = [x[head.match(x).end():].split("; ") for x in (mine, old, theirs)]
+    both = conflictfix.additive(parts[0], parts[1], parts[2])
+    return None if both is None else lead + "; ".join(both)
+
+
+def _test_file(path: str) -> bool:
+    """Whether `path` is a test file, where a raised number is an allowance (a size cap) both raises add to."""
+    parts = path.replace("\\", "/").split("/")
+    return any(d in ("tests", "test") for d in parts[:-1]) or parts[-1].startswith("test_")
 
 
 def _edge_ok(k: int, new: list[str], e1: int, e2: int, edit: list[str], old: list[str]) -> bool:
@@ -799,8 +889,9 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
     test). `taken_in`, `hunks`, `superseded`, `near`, `imports` and `kinds` are merge3's; a version line taken adds "version" to
-    `kinds`. With `hunks`, a Markdown file also settles table rows by cell (merge3's `cells`). A
-    file both sides created is never settled."""
+    `kinds`. With `hunks`, a Markdown file also settles table rows by cell (merge3's `cells`), and
+    a test file numbers both sides raised (merge3's `counters`, _test_file). A file both sides
+    created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
         return False                    # deleted on one side, or created on both
@@ -819,7 +910,7 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
         b, t = vb, vt
     merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how,
                     superseded=superseded, near=near, imports=imports,
-                    cells=hunks and path.lower().endswith(".md"))
+                    cells=hunks and path.lower().endswith(".md"), counters=hunks and _test_file(path))
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):
