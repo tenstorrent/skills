@@ -8539,7 +8539,7 @@ def test_the_slot_a_preempted_run_frees_goes_to_the_urgent_run_that_asked_not_th
     routine = checkcap.acquire("routine", project_name="pa", priority=3, preemptible=True)
     told, got, other = [], [], []
     t_other = threading.Thread(target=lambda: other.append(checkcap.acquire(
-        "first in line", priority=3, since=time.time() - 600, max_wait_s=4)))
+        "first in line", priority=1, since=time.time() - 600, max_wait_s=4)))
     t_other.start()
     assert _wait_for(lambda: locks_queued(checkcap)), "the other waiter is first in line"
     t = threading.Thread(target=lambda: got.append(checkcap.acquire(
@@ -8579,6 +8579,8 @@ def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_th
         assert checkcap.claims() == 1 and checkcap.claims("tok1") == 0, "its own claim leaves its asker room"
         assert checkcap.preempted(victim.since) == "urgent urgent u"
         assert checkcap._room(1, checkcap.all_paths(1)) < checkcap._room(1, checkcap.all_paths(1), "tok1")
+        assert checkcap.preempt("urgent v", checkcap.all_paths(1), claim="tok2") == "", "asked already: not twice"
+        assert checkcap.claims("tok1") == 0, "and no second claim on its slot"
         path = checkcap._claim_path("tok1")
         rec = json.loads(path.read_text())
         old = time.time() - checkcap.CLAIM_S - 1

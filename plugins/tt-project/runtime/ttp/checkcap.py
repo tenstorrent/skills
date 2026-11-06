@@ -1167,8 +1167,8 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
         if not isinstance(h, dict) or not h.get("preemptible") or h.get("urgent") or is_urgent(h.get("priority")):
             continue
         pid = int(h.get("ns_pid") or h.get("pid") or 0)
-        if pid <= 0:
-            continue
+        if pid <= 0 or claim_live(str(_read(_preempt_path(pid)).get("claim") or "")):
+            continue   # none, or another asker's live claim waits for its slot already
         prio = h.get("priority")
         found.append(((bool(project_name) and h.get("checks_project") == project_name, prio is None,
                        prio if isinstance(prio, int) else 0, float(h.get("since") or 0)), pid, path, h))
