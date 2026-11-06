@@ -1094,16 +1094,29 @@ def test_coordsession_resumed_wakes_book_their_own_cost_and_cap_and_keep_the_gua
     assert coordguard.check(p.db, p.config(), time.time()) is None and not coordguard.tripped(p.db)
 
 
+_CS_RATE = 10.0 / 1e6   # dollars per weighted token of the seed-history rows
+
+
+def _cs_book_tokens(p, rid, seed_usd, cost_usd):
+    """Give run `rid` the tokens of a wake whose seed cost seed_usd (cache writes) and whose own work
+    made up the rest of cost_usd (output), at _CS_RATE."""
+    p.db.x("UPDATE runs SET cost_usd=?, cache_write_tokens=?, output_tokens=? WHERE id=?",
+           (cost_usd, round(seed_usd / (1.25 * _CS_RATE)), round((cost_usd - seed_usd) / (5 * _CS_RATE)), rid))
+
+
 def _cs_seed_wakes(env, monkeypatch, seeds=(), **cfg):
-    """A capped-fake session project whose earlier new-session wakes booked `seeds` (oldest first)."""
+    """A capped-fake session project whose earlier new-session wakes had `seeds` (oldest first): a seed
+    cost, or (seed cost, the wake's whole cost)."""
     p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
     _cs_capped_fake(monkeypatch)
     p.set_config("coordinator.session.mode", "on")
     for k, v in cfg.items():
         p.set_config(k, v)
     for i, usd in enumerate(seeds):
-        _cs_booked_run(p, f"OLD{i}", usd, "new")   # another model: the provider-wide fallback reads them
-        p.db.x("UPDATE runs SET provider='fake', model='other' WHERE session_id=?", (f"OLD{i}",))
+        seed, total = usd if isinstance(usd, tuple) else (usd, usd)
+        rid = _cs_booked_run(p, f"OLD{i}", total, "new")   # another model: the provider-wide fallback reads them
+        p.db.x("UPDATE runs SET provider='fake', model='other' WHERE id=?", (rid,))
+        _cs_book_tokens(p, rid, seed, total)
     return p, holder, turn
 
 
@@ -1123,6 +1136,27 @@ def test_coordsession_a_new_session_s_cap_covers_a_seed_over_the_per_wake_cap(en
     monkeypatch.setenv("TTP_FAKE_COST", "1.5")
     second, a1, _, s1 = turn("EVENTS", budget_usd=1.0)
     assert s1["mode"] == "resume" and _cs_cap(a1) == 2.2 and "seed_usd" not in s1, (s1, a1)
+
+
+def test_coordsession_a_new_session_s_cap_reads_past_seeds_not_past_wakes_whole_cost(env, monkeypatch):
+    """Review #6485: a past new-session wake's cost is its seed plus its own work under the raised cap.
+    Counting it all as the seed raised each next session's cap by up to the per-wake cap ($2.20,
+    $3.20, ...). Wakes that each spend their whole raised cap keep the next cap at per-wake + seed."""
+    from ttp import coordsession
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, seeds=((1.2, 2.2),))
+    caps = []
+    for _ in range(4):
+        p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))   # no session yet: the wake starts one
+        run, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
+        assert s0["mode"] == "new" and s0["seed_basis"] == "history", s0
+        caps.append(_cs_cap(a0))
+        _cs_book_tokens(p, run["id"], 1.2, _cs_cap(a0))   # the same seed, then work up to the whole cap
+    assert caps == [2.2, 2.2, 2.2, 2.2], caps
+    # A wake that reported no cache writes tells nothing of its seed: the prompt estimate applies.
+    p.db.x("UPDATE runs SET cache_write_tokens=0")
+    p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))
+    _, _, _, s0 = turn("EVENTS", budget_usd=1.0)
+    assert s0["seed_basis"] == "estimate", s0
 
 
 def test_coordsession_a_new_session_without_history_prices_its_seed_prompt(env, monkeypatch):
