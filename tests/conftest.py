@@ -108,7 +108,10 @@ def _git_global_config() -> None:
     config.write_text(("" if ident else "[user]\n\tname = t\n\temail = test@example.invalid\n")
                       + "".join(texts)
                       # Signing keys live in the account's home folder, which tests never see.
-                      + "[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n")
+                      + "[commit]\n\tgpgSign = false\n[tag]\n\tgpgSign = false\n"
+                      # Test repositories are thrown away: no fsync (git 2.36+), which on a disk
+                      # filesystem queues the suite's many small repositories on its metadata locks.
+                      + "[core]\n\tfsync = none\n")
     os.environ["GIT_CONFIG_GLOBAL"] = str(config)
 
 

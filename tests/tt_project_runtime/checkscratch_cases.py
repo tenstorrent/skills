@@ -97,6 +97,32 @@ def test_room_on_the_ram_disk_counts_the_other_runs_scratch_and_both_limits_at_t
     assert shorttmp.tmpfs_room(4 * _GIB) is None
 
 
+def test_leftover_ram_disk_dirs_count_as_runs_only_while_their_check_allocation_lives(env, tmp_path, monkeypatch):
+    """Dozens of leftover dirs (recreated by a process outliving its check) each counted 4 GiB and kept
+    every check on the disk: a dir counts only while its mark names a live allocation, or while fresh."""
+    from ttp import checkdirs, shorttmp
+    ram = _ram_disk(tmp_path, monkeypatch, free=21 * _GIB, size=40 * _GIB)   # room beside 1 run, not 2
+    monkeypatch.setattr(shorttmp, "FRESH_S", 0)
+    for name in ("cccccc01", "cccccc02", "cccccc03"):   # leftovers: unmarked, old
+        (ram / name).mkdir(parents=True)
+    (ram / "cccccc04").mkdir()
+    (ram / "cccccc04" / shorttmp.MARK).write_text(str(tmp_path / "gone-allocation"))
+    assert shorttmp.tmpfs_room(4 * _GIB) == ram
+    p = make(env)
+    live = [checkdirs.new(p.state, need=4 * _GIB) for _ in range(2)]
+    tmps = [pathlib.Path(json.loads((o / checkdirs.OWNER).read_text())["tmp"]) for o in live]
+    assert all(t.parent == ram and (t / shorttmp.MARK).read_text() == str(o) for t, o in zip(tmps, live))
+    assert shorttmp.tmpfs_room(4 * _GIB) is None   # 2 live runs' 8 GiB + this run's 4 leave under 10 of 21
+    checkdirs.finish(live[0])
+    assert not tmps[0].exists() and shorttmp.tmpfs_room(4 * _GIB) == ram
+    (ram / "cccccc05" / shorttmp.MARK).mkdir(parents=True)   # an unreadable mark counts: the safe side
+    assert shorttmp.tmpfs_room(4 * _GIB) is None
+    monkeypatch.setattr(shorttmp, "FRESH_S", 300)   # just made, not yet marked: counts
+    (ram / "cccccc05" / shorttmp.MARK).rmdir()
+    assert shorttmp.tmpfs_room(4 * _GIB) is None
+    checkdirs.finish(live[1])
+
+
 @pytest.mark.parametrize("end", ["crash", "reboot"])
 def test_a_killed_runs_ram_disk_scratch_and_checkout_go_at_recovery(env, tmp_path, monkeypatch, end):
     from ttp import checkdirs, cleantree, shorttmp
@@ -430,3 +456,11 @@ def test_check_scratch_holder_survives_a_proc_locks_read_that_misses_its_line(en
     err = capsys.readouterr().err
     assert "waiting for pid 4242 " in err and "pid 4242 still holds the lock" in err, err
     assert len(reads) > 1, "later reads missed the line"
+
+
+def test_test_git_repositories_skip_fsync_and_the_harness_config_does_not(tmp_path):
+    """The suite's throwaway repositories skip fsync through the session's own git config (tests/conftest.py),
+    which only the test process reads: the harness's own git settings never turn fsync off."""
+    r = subprocess.run(["git", "config", "--global", "--get", "core.fsync"], capture_output=True, text=True)
+    assert r.stdout.strip() == "none"
+    assert not [f for f in RUNTIME.rglob("*.py") if re.search(r"fsync[\"'], *[\"']none", f.read_text())]

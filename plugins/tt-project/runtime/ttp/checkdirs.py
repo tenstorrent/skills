@@ -89,6 +89,7 @@ def new(state: Path, owner: Path | None = None, need: int | None = None) -> Path
     except BaseException:
         shorttmp.remove(tmp)
         raise
+    shorttmp.mark(tmp, folder / name)
     return folder / name
 
 
@@ -201,6 +202,7 @@ def short(path: Path, need=None) -> tuple[str | None, str]:
             if not isinstance(e, OSError):
                 raise
             return None, 'long'   # the old record stays, unusable here: _short() skips it
+        shorttmp.mark(tmp, path)
         return (str(tmp), 'made') if tmp else (None, 'long')
 
 

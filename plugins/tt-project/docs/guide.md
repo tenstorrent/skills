@@ -1728,7 +1728,11 @@ session and stateless coordinators on every provider.
   and TMPDIR go on the RAM disk (`/dev/shm`) when it has room for this run's scratch (the checkout's real size,
   submodules included, times 1.5 plus 2 GiB of temp files, at most a quarter of the disk; 4 GiB counted per run
   already there) while keeping a quarter of it free and a fifth of the RAM available, else under `/tmp`, as are
-  checks that build (cmake, make, ninja): concurrent suites writing their temp git repositories to a disk filesystem wait on its locks. A lane goes to the most urgent
+  checks that build (cmake, make, ninja): concurrent suites writing their temp git repositories to a disk filesystem wait on its locks.
+  A run there counts only while its check is live (its dir holds a mark naming its check's allocation, or was made
+  in the last 5 minutes), so leftover dirs a stray process recreated never push later runs onto the disk. The run's
+  TMPDIR is pytest's temp root too; the checks runner removes the dir when the run ends, and recovery removes a
+  killed run's. The suite's own test git repositories skip fsync (git 2.36+, through the test session's git config). A lane goes to the most urgent
   waiting task priority first (read from the task's record; a check with no task, or a task with no priority,
   ranks as p3), then arrival; a running holder is never pre-empted, and a waiter gains one priority step per
   `checks.priority_age_s` waited (default 900, 15 min; project, then account), never past p1, so none starves.

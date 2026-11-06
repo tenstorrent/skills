@@ -19,6 +19,11 @@ the RAM available; else it goes under /tmp as before. A check that builds (cmake
 whose tree would take over MAX_SHARE of the RAM disk stays under /tmp. Suites write many short-lived git repositories: on a disk filesystem
 several concurrent suites queue on its locks (measured 2.7-3.2x slower than tmpfs with two suites at
 once beside four others), on tmpfs they do not.
+
+Only live check dirs count as other runs: one whose MARK names its check allocation still there, or
+one made in the last FRESH_S (before its mark). A leftover (a process outliving its check recreated
+the dir with mkdir -p after it was removed) holds no live allocation's mark and counts for nothing:
+dozens of them once counted 4 GiB each and kept every check on the disk.
 """
 from __future__ import annotations
 
@@ -27,6 +32,7 @@ import re
 import stat
 import subprocess
 import sys
+import time
 import uuid
 from pathlib import Path
 
@@ -38,6 +44,8 @@ MARGIN = 1.5            # on the clean checkout's measured size
 MAX_SHARE = 0.25        # of the RAM disk's size, the most one run may plan for
 KEEP_FREE = 0.25        # of the RAM disk's size, never planned for
 KEEP_RAM = 0.20         # of MemTotal, left available after the planned scratch
+MARK = '.ttp-check'   # in a check dir on the RAM disk: the path of the check allocation using it
+FRESH_S = 300         # a dir this young counts as a run though not yet marked
 MOUNTS, MEMINFO = '/proc/self/mounts', '/proc/meminfo'
 _NAME = re.compile(r'[0-9a-f]{8}')
 
@@ -138,7 +146,7 @@ def tmpfs_room(need: int | None) -> Path | None:
         return None
     try:
         free, size = _space(top.parent)
-        others = sum(1 for e in os.scandir(top) if _NAME.fullmatch(e.name)) if top.is_dir() else 0
+        others = sum(1 for e in os.scandir(top) if _NAME.fullmatch(e.name) and _live(e)) if top.is_dir() else 0
     except OSError:
         return None
     if need > MAX_SHARE * size:
@@ -148,6 +156,45 @@ def tmpfs_room(need: int | None) -> Path | None:
     if free - need < KEEP_FREE * size or not total or avail - need < KEEP_RAM * total:
         return None
     return top
+
+
+def _live(entry: os.DirEntry) -> bool:
+    """`entry`, a check dir on the RAM disk, holds a live run: its MARK names an allocation that still
+    exists, or it has no mark and was changed in the last FRESH_S."""
+    try:
+        with open(os.path.join(entry.path, MARK), encoding='utf-8') as f:
+            return os.path.isdir(f.read().strip() or '\0')
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError):
+        return True   # unreadable: count it, the safe side
+    try:
+        return time.time() - entry.stat(follow_symlinks=False).st_ctime < FRESH_S
+    except OSError:
+        return False
+
+
+def mark(value, allocation) -> None:
+    """Record in `value`, a dir make() put on the RAM disk, the check allocation using it (tmpfs_room
+    counts it while that allocation exists); anything else is left alone."""
+    if not on_tmpfs(value):
+        return
+    try:
+        fd = _open_root(create=False, top=Path(value).parent)
+    except OSError:
+        return
+    try:
+        d = os.open(Path(value).name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+        try:
+            out = os.open(MARK, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600, dir_fd=d)
+            with os.fdopen(out, 'w') as f:
+                f.write(os.path.abspath(allocation))
+        finally:
+            os.close(d)
+    except OSError:
+        pass   # unmarked, it counts only while fresh
+    finally:
+        os.close(fd)
 
 
 def on_tmpfs(value) -> Path | None:
