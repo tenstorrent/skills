@@ -1968,12 +1968,16 @@ running work is interrupted only by the preemption below:
   change's own diff outside those files is still the approved one. A conflict left only in shared
   docs (`delivery.mechanical_merge_paths`, a list of path globs where `*` also crosses `/`; default
   `docs/*.md`, `*/docs/*.md`, `*README.md`, `*CHANGELOG.md` and `*.changeset/*.md`; an empty list
-  turns this off) is settled by keeping both sides' lines in order, the branch's then the change's.
+  turns this off) is settled only where both sides just added lines (two changes appending to one
+  section): the queue keeps both sides' lines in landing order, the branch's then the change's.
   The approval carries only when the change's own diff outside those docs and the release files is
   still the approved one, no commit of it was left out as landed, the result holds no conflict
   marker and the push checks pass on it; the push log and the review's task events
-  (`approval_carried`) say so, and the Course check's self-race line does not count it. A change that really overlaps another goes back to its review to
-  resolve the conflict. An approval that carries an older copy of commits another open change has
+  (`approval_carried`, `doc_merged`) say so, the task's result records each merged doc
+  (`doc_merges`: file, hunks, the change's commit and the landed commit it met), and the Course
+  check's self-race line does not count it. A doc hunk where either side edits or removes lines
+  needs judgment: it goes back to its review like a conflict in code, tests or manifests. A change
+  that really overlaps another goes back to its review to resolve the conflict. An approval that carries an older copy of commits another open change has
   since rewritten goes after that change (in the same batch when both are approved, else it waits
   for that landing, at most two hours), so it is rebased and re-reviewed once instead of losing
   its approval at each of the other's landings; a failed check fails the

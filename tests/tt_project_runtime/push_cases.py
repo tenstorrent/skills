@@ -2143,15 +2143,21 @@ def test_a_pushed_approval_the_batch_carried_across_a_shared_doc_conflict_is_not
     now = time.time()
     s.p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', 'm', 'origin/proj', ?)", (now,))
     s.p.db.x("UPDATE push_queue SET status='batched', batch='b1' WHERE id=?", (rid,))
-    why = "its only conflicts were in shared docs (docs/guide.md), settled by keeping both sides' lines"
+    why = "its only conflicts were in shared docs (docs/guide.md), settled by keeping the lines both sides added"
+    doc = {"file": "docs/guide.md", "hunks": [{"line": 3, "ours": 2, "base": 0, "theirs": 2}],
+           "commit": "a" * 40, "landed": "b" * 40}
     m = {"outcome": "pushed", "ended": now, "pushed_sha": "c" * 40, "results": [
         {"id": rid, "status": "pushed", "detail": {"settled": ["docs/guide.md"], "settled_by": ["union"],
-                                                   "approval_carried": why}}]}
+                                                   "approval_carried": why, "doc_merges": [doc]}}]}
     pushq._apply(s.p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
     t = s.p.db.task(tid)
-    assert t["status"] == "done" and json.loads(t["result"])["approval_carried"] == [why], t["result"]
+    res = json.loads(t["result"])
+    assert t["status"] == "done" and res["approval_carried"] == [why] and res["doc_merges"] == [doc], t["result"]
     (e,) = s.p.db.q("SELECT text FROM events WHERE kind='approval_carried' AND task=?", (tid,))
     assert "batch b1 kept its approval: " + why in e["text"]
+    (e,) = s.p.db.q("SELECT text FROM events WHERE kind='doc_merged' AND task=?", (tid,))
+    assert f"batch b1 merged shared docs: docs/guide.md: 1 hunk at line 3, {'b' * 10}'s lines kept, " \
+           f"then {'a' * 10}'s" in e["text"], e["text"]
 
 
 def test_rows_a_batch_requeued_untested_skip_the_push_gap(env, monkeypatch):
@@ -17454,32 +17460,112 @@ def test_a_push_batch_still_sends_back_a_real_conflict_beside_a_release_file_con
     assert m["results"][0]["detail"]["files"] == ["plugins/p/f1.txt"], m["results"]
 
 
-def _doc_race(env, monkeypatch, entry_code="1\n", target_code=None, base_extra=""):
-    """An approval and a landing that both rewrite one line of docs/guide.md (no pure addition: settle
-    cannot take it); the approval also edits plugins/p/f1.txt. (p, origin, batch marker after the run)."""
+# Both sides add a paragraph after "shared line" that ends with the same line, so settle (merge3) refuses
+# to keep both (_clash) and only settle_union can; DOC_EDIT has both sides rewrite "shared line" instead.
+DOC_ADD = ("shared line\nmine para\nSee the table.\n", "shared line\ntheirs para\nSee the table.\n")
+DOC_EDIT = ("mine line\n", "theirs line\n")
+
+
+def _doc_race(env, monkeypatch, entry_code="1\n", target_code=None, base_extra="", sides=DOC_ADD):
+    """An approval and a landing that both change docs/guide.md after its "shared line" (`sides`: the
+    approval's and the landing's text in its place); the approval also edits plugins/p/f1.txt.
+    (p, origin, batch marker after the run)."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
     (other / "docs").mkdir()
     _land_as(other, {"docs/guide.md": f"# Guide\n{base_extra}shared line\nend\n", "plugins/p/f1.txt": "base\n"},
              "guide")
-    head = _entry(repo, "e1", {"docs/guide.md": f"# Guide\n{base_extra}mine line\nend\n",
+    head = _entry(repo, "e1", {"docs/guide.md": f"# Guide\n{base_extra}{sides[0]}end\n",
                                "plugins/p/f1.txt": entry_code})
-    _land_as(other, {"docs/guide.md": f"# Guide\n{base_extra}theirs line\nend\n",
+    _land_as(other, {"docs/guide.md": f"# Guide\n{base_extra}{sides[1]}end\n",
                      **({"plugins/p/f1.txt": target_code} if target_code else {})}, "target guide")
     return p, origin, _batch_marker(p, [head])
 
 
 def test_a_push_batch_carries_the_approval_across_a_conflict_only_in_a_shared_doc(env, monkeypatch, capsys):
-    """Both sides rewrote one line of a shared doc (delivery.mechanical_merge_paths): the batch keeps
-    both sides' lines, the checks run on the result, and the approval carries with its reason recorded."""
+    """Both sides added lines at one spot of a shared doc (delivery.mechanical_merge_paths): the batch
+    keeps both sides' lines, the checks run on the result, and the approval carries with its reason and
+    the doc's resolution (file, hunks, both source commits) recorded."""
     p, origin, marker = _doc_race(env, monkeypatch)
+    landed = _git_out(origin, "rev-parse", "proj")
+    entry = json.loads(marker.read_text())["entries"][0]["head"]
     rc, m = _run_batch(p, marker, monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"], m
     d = m["results"][0]["detail"]
     assert d["settled"] == ["docs/guide.md"] and "union" in d["settled_by"], d
     assert "only conflicts were in shared docs (docs/guide.md)" in d["approval_carried"], d
-    assert _git_out(origin, "show", "proj:docs/guide.md").splitlines() == ["# Guide", "theirs line", "mine line", "end"]
+    assert d["doc_merges"] == [{"file": "docs/guide.md", "hunks": [{"line": 3, "ours": 2, "base": 0, "theirs": 2}],
+                                "commit": entry, "landed": landed}], d
+    got = _git_out(origin, "show", "proj:docs/guide.md").splitlines()
+    assert got[:2] == ["# Guide", "shared line"] and got[-1] == "end", got
+    assert got.index("theirs para") < got.index("mine para"), "landing order: the branch's lines, then the change's"
     assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "1"
-    assert "approval carried" in capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "approval carried" in out and f"docs/guide.md: 1 hunk at line 3, {landed[:10]}'s lines kept, " \
+                                         f"then {entry[:10]}'s" in out, out
+
+
+def test_a_push_batch_sends_back_an_overlapping_edit_of_a_shared_doc(env, monkeypatch, capsys):
+    """Both sides rewrote one line of a shared doc: that needs judgment, so the approval goes back as a
+    conflict and nothing lands, as for code."""
+    p, origin, marker = _doc_race(env, monkeypatch, sides=DOC_EDIT)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    assert m["results"][0]["detail"]["files"] == ["docs/guide.md"], m["results"]
+    assert "approval_carried" not in m["results"][0]["detail"], m["results"]
+    assert "docs/guide.md: both sides change line 2 (not only add lines there); not settled" in capsys.readouterr().out
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "base"
+
+
+def test_two_approvals_appending_to_one_shared_doc_section_both_land_without_a_rebase(env, monkeypatch):
+    """Two approved heads each append a paragraph to the same section of docs/guide.md: the later one
+    replays onto the earlier's landing with both paragraphs in landing order, both push in one batch
+    (no conflict row, so no re-review and no self race), and the later one records the doc merge."""
+    from ttp import coursecheck, push
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    (other / "docs").mkdir()
+    _land_as(other, {"docs/guide.md": "# Guide\n## Pushing\nintro\n## Next\nmore\n"}, "guide")
+    heads = [_entry(repo, f"e{n}", {"docs/guide.md": f"# Guide\n## Pushing\nintro\nrule {n}.\nSee the table.\n"
+                                                     "## Next\nmore\n", f"plugins/p/f{n}.txt": f"{n}\n"})
+             for n in (1, 2)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "pushed"], m
+    assert _git_out(origin, "show", "proj:docs/guide.md").splitlines()[:4] == ["# Guide", "## Pushing", "intro", "rule 1."]
+    got = _git_out(origin, "show", "proj:docs/guide.md")
+    assert got.index("rule 1.") < got.index("rule 2.") < got.index("## Next"), got
+    first, second = (r["detail"] for r in m["results"])
+    assert "doc_merges" not in first, first
+    (rec,) = second["doc_merges"]
+    assert rec["file"] == "docs/guide.md" and rec["commit"] == heads[1] and rec["landed"] == m["results"][0]["sha"], rec
+    assert [h["base"] for h in rec["hunks"]] == [0] and "approval_carried" in second, second
+    folder = p.state / push.DETACHED
+    folder.mkdir(parents=True, exist_ok=True)
+    now = time.time()
+    _cc_batch(folder, "batch-other", "pushed", now - 600, now - 300, [99], target="origin/proj")
+    for r in m["results"]:   # the queue's rows as pushq records this batch: both pushed, inside the other's span
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated,detail) "
+               "VALUES(?,?,?,?,?,?,?,?,?)", (r["task"], f"e{r['id']}", heads[r["id"] - 1], "origin/proj",
+                                             r["status"], "b1", now - 900, now, json.dumps(r["detail"])))
+    # A control: an approval sent back as a conflict in the same span is counted.
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,batch,created,updated,detail) "
+           "VALUES(77,'e77',?,'origin/proj','conflict','b1',?,?,?)",
+           (heads[0], now - 900, now, json.dumps({"files": ["docs/guide.md"]})))
+    assert [r["task"] for r in coursecheck.self_race(p.db, folder, 1, now + 1)] == ["77"]
+
+
+def test_doc_hunks_reads_only_added_lines_as_an_append_and_any_edit_or_deletion_as_an_edit():
+    """settle_union's guard: a region with base lines is an edit (rewrite, deletion beside an addition,
+    an edit next to the other side's addition); both sides adding at one spot is not."""
+    from ttp import batch
+    base = b"a\nb\nc\n"
+    cases = [(b"a\nb\nX\nc\n", b"a\nb\nY\nc\n", [0]),       # both add after b
+             (b"a\nB1\nc\n", b"a\nB2\nc\n", [1]),              # both rewrite b
+             (b"a\nc\n", b"a\nb\nY\nc\n", [1]),                # one deletes b, the other adds after it
+             (b"a\nB1\nc\n", b"a\nb\nY\nc\n", [1]),            # one rewrites b, the other adds after it
+             (b"a\nb\nc\nX\n", b"a\nb\nc\nY\n", [0])]         # both append at the end
+    for ours, theirs, want in cases:
+        assert [h["base"] for h in batch._doc_hunks(ours, base, theirs)] == want, (ours, theirs)
+    assert batch._doc_hunks(b"a\nb\nX\nc\n", b"", b"a\nb\nY\nc\n")[0]["base"] == 0   # created on both sides
+    assert batch._doc_hunks(b"q\n" + b"<" * 40 + b"\n", base, b"q\nz\n") is not None
 
 
 def test_a_push_batch_still_sends_back_a_code_conflict_beside_a_shared_doc_conflict(env, monkeypatch):
@@ -17518,23 +17604,20 @@ def test_a_push_batch_sends_back_a_shared_doc_union_that_brings_back_a_deleted_l
     p, origin, marker = _doc_delete_race(env, monkeypatch, "# Guide\ntheirs line\nfalse claim\nend\n", claim)
     rc, m = _run_batch(p, marker, monkeypatch)
     assert _statuses(m) == ["conflict"], m
-    why = m["results"][0]["detail"]["files"][0]
-    assert f"brings back a line the change deletes from docs/guide.md: {claim!r}" in why, why
+    assert m["results"][0]["detail"]["files"] == ["docs/guide.md"], m["results"]   # an overlapping edit
     assert "approval_carried" not in m["results"][0]["detail"], m["results"]
     assert claim in _git_out(origin, "show", "proj:docs/guide.md")   # nothing of it landed
     assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "base"
 
 
-def test_a_push_batch_carries_a_shared_doc_union_that_keeps_the_deleted_lines_deleted(env, monkeypatch):
-    """union_clean_settles: the branch also drops the false claim while rewriting the line before; the
-    union keeps it deleted, so the approval carries."""
+def test_a_push_batch_sends_back_a_shared_doc_conflict_that_deletes_lines(env, monkeypatch):
+    """The branch also drops the false claim while rewriting the line before: a region that removes
+    lines is an edit, not an append, so the approval goes back rather than carried."""
     p, origin, marker = _doc_delete_race(env, monkeypatch, "# Guide\ntheirs line\nend\n")
     rc, m = _run_batch(p, marker, monkeypatch)
-    assert rc == 0 and _statuses(m) == ["pushed"], m
-    d = m["results"][0]["detail"]
-    assert "union" in d["settled_by"] and "only conflicts were in shared docs" in d["approval_carried"], d
-    assert "false claim" not in _git_out(origin, "show", "proj:docs/guide.md")
-    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "1"
+    assert _statuses(m) == ["conflict"], m
+    assert "approval_carried" not in m["results"][0]["detail"], m["results"]
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "base"
 
 
 def test_an_empty_mechanical_merge_paths_turns_the_shared_doc_carry_off(env, monkeypatch):

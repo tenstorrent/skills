@@ -1730,6 +1730,11 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
             result["approval_carried"] = carried
             _event(db, task, "approval_carried", f"#{tid} {task['title']}: batch {b['id']} kept its approval: "
                                                  f"{carried[0]}", queued=False)
+        # How the batch merged its shared docs with the landings before it (batch.Batch._doc_merge).
+        if docs := [d for x in current if x["status"] == "pushed" for d in _detail(x).get("doc_merges") or []]:
+            result["doc_merges"] = docs
+            _event(db, task, "doc_merged", f"#{tid} {task['title']}: batch {b['id']} merged shared docs: "
+                                           f"{batch.doc_merge_text(docs)}"[:1500], queued=False)
         db.update_task(tid, status="done", blocked_reason=None, result=dump_result(result))
         # Handled: the coordinator sees it in its next turn's task list; no turn is spent on it.
         _event(db, task, "task_done", f"#{tid} {task['title']} → done ({tail}, batch {b['id']}): {summary[:1200]}",
