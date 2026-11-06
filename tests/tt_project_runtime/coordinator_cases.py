@@ -19096,6 +19096,22 @@ def test_course_check_caps_costly_lines_open_first_and_counts_the_rest(env):
     assert again[:-1] == lines[:-1] and ident2 == ident and again[-1].startswith("- costly: 8 more not listed")
 
 
+def test_ttp_course_lists_every_costly_task_read_only(env, capsys):
+    from ttp import cli, course
+    p = make(env)
+    for i in range(20):
+        t = p.db.add_task(f"routine {i}", "s", origin="user", kind="code")
+        p.db.update_task(t, status="done", spent_usd=1.0)
+    cli.main(["course", p.name])
+    assert capsys.readouterr().out.strip() == "Course check: nothing trips"
+    for i in range(course.COSTLY_SHOWN + 2):
+        t = p.db.add_task(f"pricey {i}", "s", origin="user", kind="code")
+        p.db.update_task(t, spent_usd=5.0)
+    cli.main(["course", p.name])
+    out = capsys.readouterr().out
+    assert out.count("- costly: #") == course.COSTLY_SHOWN + 2 and "more not listed" not in out, out
+
+
 def test_course_check_flags_a_run_of_coordinator_turns_that_decided_nothing(env):
     from ttp import course
     p = make(env)
