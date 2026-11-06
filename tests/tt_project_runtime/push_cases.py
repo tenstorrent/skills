@@ -18970,3 +18970,84 @@ def test_script_torn_escalation_follows_its_delivery_setting(env, monkeypatch, a
     for bad in (-1, 1.5, "x"):
         with pytest.raises(ValueError):
             coordinator.push_queue_number("push_script_torn_escalate_after", bad)
+
+
+def test_a_head_that_conflicts_in_a_second_batch_leaves_batching_for_one_rebase_task_on_a_new_branch(
+        env, monkeypatch):
+    """With its review attempts left, an approved head that conflicts in a second batch is not tried
+    again: the review fails out of batching and the daemon queues one rebase task at once, which
+    delivers on a new branch. A third conflict while that task is open queues no second one."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch)
+    assert s.p.db.task(s.review)["max_attempts"] >= 3
+    onto = "ef" * 20
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["feature.txt"], "onto": onto})
+    _pq_hand_off(env, s)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert s.p.db.task(s.review)["status"] == "queued", "the first conflict: a conflict fix"
+    assert _pq_hand_off(env, s, note={"conflict_fix": {"tier": "light"}})["status"] == "pushing"
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    [rb] = s.p.db.q("SELECT * FROM tasks WHERE labels LIKE '%push_rebase:%'")
+    t = s.p.db.task(s.review)
+    assert t["status"] == "failed" and json.loads(t["result"])["auto_rebase"] == rb["id"], t
+    assert "rebase" in rb["title"].lower() and rb["status"] == "queued"
+    new = pushq.rebase_branch(s.branch, s.head)
+    assert new != s.branch and f'"branch": "{new}"' in rb["spec"] and f"git worktree add -b {new}" in rb["spec"]
+    [ev] = [e for e in _pq_events(s.p, mark, task=s.review) if e["kind"] == "task_failed"]
+    assert ev["status"] == "handled" and f"queued #{rb['id']}" in ev["text"], ev
+    # Left out of the next batch: nothing of it is approved, so nothing is due.
+    assert not s.p.db.q("SELECT id FROM push_queue WHERE task=? AND status IN ('approved','batched')", (s.review,))
+    assert not pushq.due(s.p, time.time() + 10 ** 6)[0]
+    # The review is approved again by hand and conflicts a third time: the open rebase task stays the only one.
+    assert _pq_hand_off(env, s)["status"] == "pushing"
+    mark = _pq_mark(s.p)
+    _pq_batch(s)
+    _pq_tend(s)
+    assert len(s.p.db.q("SELECT id FROM tasks WHERE labels LIKE '%push_rebase:%'")) == 1
+    t = s.p.db.task(s.review)
+    assert t["status"] == "failed" and json.loads(t["result"])["auto_rebase"] == rb["id"], t
+    [ev] = [e for e in _pq_events(s.p, mark, task=s.review) if e["kind"] == "task_failed"]
+    assert ev["status"] == "handled" and f"#{rb['id']} is still open" in ev["text"], ev
+    # The rebase task approves a head on its new branch.
+    _git_out(s.repo, "branch", new, s.head)
+    fix = _git_out(s.repo, "commit-tree", f"{s.head}^{{tree}}", "-p", s.head, "-m", "rebase onto the tip")
+    t = _pq_hand_off(env, s, push=[{"branch": new, "head": fix}], task=rb["id"])
+    assert t["status"] == "pushing" and s.p.db.one("SELECT branch FROM push_queue WHERE task=?",
+                                                   (rb["id"],))["branch"] == new
+
+
+def test_a_first_conflict_or_a_capped_rebase_keeps_the_conflict_fix(env, monkeypatch):
+    """The first conflict stays a conflict fix; at the second, when the review-task cap allows no
+    rebase task, the review runs its conflict fix as before while it has attempts left."""
+    s = _pq(env, monkeypatch)
+    s.p.set_config("coordinator.max_review_tasks_per_day", 0)
+    _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"}, detail={"files": ["feature.txt"], "onto": "ef" * 20})
+    for n in (1, 2):
+        _pq_hand_off(env, s, **({"note": {"conflict_fix": {"tier": "light"}}} if n > 1 else {}))
+        _pq_batch(s)
+        _pq_tend(s)
+        t = s.p.db.task(s.review)
+        assert t["status"] == "queued" and json.loads(t["result"])["conflict_fix"]["n"] == n, t
+    assert not s.p.db.q("SELECT id FROM tasks WHERE labels LIKE '%push_rebase:%'")
+
+
+def test_the_daily_audit_shows_approval_to_landed_median_and_p90(env):
+    from ttp import audit, pushq
+    p, rid = _pq_rows(env)
+    now = time.time()
+    for i, mins in enumerate((5, 10, 20, 60)):   # each approved `mins` before its batch ended an hour ago
+        _pq_batch_row(p, f"b{i}", now, age=3700, outcome="pushed", ended=now - 3600, finalized=now)
+        _pq_row(p, rid, now, status="pushed" if i else "landed", batch=f"b{i}", age=3600 + mins * 60)
+    _pq_batch_row(p, "old", now, age=3 * 86400, outcome="pushed", ended=now - 2 * 86400, finalized=now)
+    _pq_row(p, rid, now, status="pushed", batch="old", age=3 * 86400)          # landed before the window
+    _pq_batch_row(p, "bc", now, age=600, outcome="nothing", ended=now - 500, finalized=now)
+    _pq_row(p, rid, now, status="conflict", batch="bc", age=9 * 3600)          # never landed
+    assert pushq.landing_times(p.db, now - 86400) == {"n": 4, "median_s": 15 * 60.0, "p90_s": 60 * 60.0}
+    out = audit.lines(p.db, now)
+    assert "push queue approval to landed: 4 entries, median 15 min, p90 1.0 h" in out, out
+    assert audit.report(p.db, now)["approval_to_landed"]["n"] == 4
+    p.db.x("DELETE FROM push_queue")
+    assert not [x for x in audit.lines(p.db, now) if "approval to landed" in x]

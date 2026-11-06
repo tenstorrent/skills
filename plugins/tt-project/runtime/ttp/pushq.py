@@ -138,6 +138,7 @@ JUDGED_KEY = "inherited_judged"
 RESOLVES_MAX = 20               # upstream note fingerprints one approval may resolve (a hand-off's `resolves`)
 _HEX40 = re.compile(r"[0-9a-f]{40}")
 REBASE_LABEL = "push_rebase:"   # + the conflicting head: a review the daemon queued to rebase it (auto_rebase)
+REBASE_AFTER = 2                # the conflicting batch at which a review leaves batching for a rebase task
 _children: dict[str, subprocess.Popen] = {}   # batch processes this daemon started, reaped by finalize
 _default_branches: dict[tuple[str, str], tuple[float, str | None]] = {}   # (root, remote): (until, branch)
 _files_seen: dict[tuple[str, str], frozenset | None] = {}   # (tip, head): the files the head changes (_changed)
@@ -1837,15 +1838,21 @@ def _settle(p: Project, tid: int, b: dict, m: dict, now: float) -> None:
         # queue sent back, this one included.
         sent = db.one("SELECT COUNT(DISTINCT created) n FROM push_queue WHERE task=? AND status='conflict'",
                       (tid,))["n"]
-        if sent > int(task["max_attempts"] or 3):
-            text = f"{woke}. It keeps conflicting after {sent - 1} conflict fixes"
-            rebase = auto_rebase(p, task, r, target, woke)
+        # From its second conflicting batch on, it leaves batching for one rebase task on a branch of its
+        # own (auto_rebase), rather than another conflict fix tried again in a later batch.
+        held = open_rebase(db, task, str(r["head"] or "")) if sent >= REBASE_AFTER else None
+        rebase = auto_rebase(p, task, r, target, woke) if sent >= REBASE_AFTER and not held else None
+        if held or rebase or sent > int(task["max_attempts"] or 3):
+            text = f"{woke}. It keeps conflicting after {sent - 1} conflict fix{'es' if sent != 2 else ''}"
             if rebase:
                 text += f"; the daemon queued #{rebase} to rebase it once more and re-approve it"
+            elif held:
+                text += f"; rebase task #{held} is still open for it, so no second one was queued"
             db.update_task(tid, status="failed", blocked_reason=None, result=dump_result(
-                {**prev, "status": "failed", "summary": text[:1500], **({"auto_rebase": rebase} if rebase else {})}))
+                {**prev, "status": "failed", "summary": text[:1500], **({"auto_rebase": rebase or held}
+                                                                        if rebase or held else {})}))
             # With a rebase queued, nothing is the coordinator's to decide yet: its own failure is.
-            _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=not rebase)
+            _event(db, task, "task_failed", f"#{tid} {task['title']} → failed: {text}", queued=not (rebase or held))
             if not rebase:
                 _reply(db, task, "failed", text)
         else:
@@ -1904,10 +1911,25 @@ def rebase_head(task: dict) -> str:
     return ""
 
 
+def open_rebase(db, review: dict, head: str) -> int | None:
+    """The id of an unfinished rebase task (auto_rebase) that continues `review` or rebases `head`."""
+    pats = [f'%"continues:{review["id"]}"%'] + ([f'%"{REBASE_LABEL}{head}"%'] if _HEX40.fullmatch(head) else [])
+    r = db.one("SELECT id FROM tasks WHERE id!=? AND labels LIKE ? AND (%s) AND status NOT IN (%s) ORDER BY id"
+               % (" OR ".join("labels LIKE ?" for _ in pats), ",".join("?" * len(TERMINAL_TASK_STATES))),
+               (review["id"], f'%"{REBASE_LABEL}%', *pats, *TERMINAL_TASK_STATES))
+    return r["id"] if r else None
+
+
+def rebase_branch(branch: str, head: str) -> str:
+    """The new branch a rebase task (auto_rebase) delivers on: never the conflicting branch itself."""
+    return f"{branch.rstrip('/') or 'ttp'}-rebase-{head[:7]}"
+
+
 def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> int | None:
-    """When a review's approved head keeps conflicting after its attempts, one review task that
-    continues it to rebase that head onto the push branch's tip, resolve keeping both sides' intents
-    and approve the new head again: its id, inside _settle's transaction. None, so the review fails
+    """When a review's approved head conflicts in a second batch (REBASE_AFTER), or keeps conflicting
+    after its attempts, one review task that continues it to rebase that head, on a new branch of its
+    own (rebase_branch), onto the push branch's tip, resolve keeping both sides' intents and approve
+    the new head again: its id, inside _settle's transaction. None, so the review fails
     to the coordinator as before, when the review is itself such a rebase or continues one, the head
     already had one, a task already continues the review, or the rolling review-task cap
     (coordinator.max_review_tasks_per_day) allows no new review now."""
@@ -1935,15 +1957,18 @@ def auto_rebase(p: Project, review: dict, row: dict, target: str, woke: str) -> 
         if isinstance(labels, list) else []
     branch = row["branch"] or ""
     tier = "deep" if review["tier"] == "deep" else "standard"
+    new = rebase_branch(branch, head)
     spec = "\n".join([
-        f"Review #{review['id']} ({review['title'][:150]}) passed, but the push queue could not land its approved "
-        f"head after {review['attempts']} attempts: {woke}.",
+        f"Review #{review['id']} ({review['title'][:150]}) passed, but its approved head conflicted in more than "
+        f"one push batch: {woke}.",
         f"Branch: {branch or '(none)'} at {head}. Push branch: {target}.",
-        "Woken because `push conflict`: fetch, rebase that head onto the push branch's current tip in the change's "
-        "worktree and resolve every conflict keeping both sides' intents (the one edit you may make).",
+        f"Woken because `push conflict`: fetch, create the new branch {new} at that head in a worktree of your own "
+        f"(`git worktree add -b {new} <dir> {head}`), rebase it onto the push branch's current tip and resolve every "
+        f"conflict keeping both sides' intents (the one edit you may make). Leave {branch or 'the old branch'} as it "
+        "is, and carry no commit but the change's own over the tip.",
         "Then run the project's push checks (delivery.push_checks) on the rebased head with `ttp checks` and fix "
         "only what the resolution broke. Once they pass, commit and hand off `done` with "
-        f'"push": [{{"branch": "{branch}", "head": "<the rebased head>"}}] to approve it into the push queue again.',
+        f'"push": [{{"branch": "{new}", "head": "<the rebased head>"}}] to approve it into the push queue again.',
         "If the conflict needs a decision about either change's intent, hand off `failed` saying what it is.",
         "Return the rebased head and the check results."])
     rid = db.add_task(f"Rebase {branch or _short(head)} onto {target} after push conflicts (review #{review['id']})",
@@ -2673,6 +2698,21 @@ def pushed_heads(db, since: float = 0) -> set[str]:
     """Heads the queue pushed or landed (approved after `since`): work that is on the push branch."""
     return {r["head"] for r in db.q("SELECT head FROM push_queue WHERE status IN ('pushed','landed') AND created>=?",
                                     (since,))}
+
+
+def landing_times(db, since: float) -> dict:
+    """Approval to landed per queue entry that landed since `since`: from its row's approval (created)
+    to the end of the batch that pushed or landed it (its row's last update without one). {"n", "median_s",
+    "p90_s"}, the p90 by nearest rank; the times are None with no entry."""
+    rows = db.q("SELECT q.created, COALESCE(b.ended, q.updated) at_ FROM push_queue q LEFT JOIN push_batches b "
+                "ON b.id=q.batch WHERE q.status IN ('pushed','landed') AND COALESCE(b.ended, q.updated)>=?",
+                (since,))
+    secs = sorted(max(0.0, float(r["at_"]) - float(r["created"])) for r in rows)
+    n = len(secs)
+    if not n:
+        return {"n": 0, "median_s": None, "p90_s": None}
+    mid = secs[n // 2] if n % 2 else (secs[n // 2 - 1] + secs[n // 2]) / 2
+    return {"n": n, "median_s": mid, "p90_s": secs[max(0, -(-9 * n // 10) - 1)]}
 
 
 def conflict_stats(db, since: float) -> dict:

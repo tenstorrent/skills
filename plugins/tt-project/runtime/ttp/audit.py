@@ -21,6 +21,7 @@ the project could have saved. Model-free; the review grades it.
 - spend per finished task: the workers' own, and the coordinator's day spread over them; $ per
   done task by kind and tier;
 - tasks blocked or waiting longer than `blocked_h` hours now, longest first;
+- push queue: approval to landed per entry that landed in the window, median and p90 (pushq.landing_times);
 - review loops: per change whose review moved in the window, its review rounds and their spend
   plus the fixes they asked for (a review's `auto_review:<task>` and `continues:<review>` labels);
 - reviews finished (reviewstats): count, spend and failures by diff size (all and non-test lines), tier and first review
@@ -586,6 +587,10 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(f"blocked or waiting longer than {blocked_h:g} h now: {len(stuck)}: " + ", ".join(
             f"#{r['task']} {_short(r['title'], 50)} {r['kind']} {_dur(r['state_s'])}" for r in stuck[:TOP])
             + _more(stuck))
+    from . import pushq
+    if (landed := pushq.landing_times(db, since))["n"]:
+        out.append(f"push queue approval to landed: {landed['n']} entr{'ies' if landed['n'] != 1 else 'y'}, "
+                   f"median {_dur(landed['median_s'])}, p90 {_dur(landed['p90_s'])}")
     loops = review_loops(db, since)
     if loops:
         rev, fix = sum(x["review_usd"] for x in loops), sum(x["fix_usd"] for x in loops)
@@ -642,6 +647,7 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
 def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_h: float = BLOCKED_H,
            p: Project | None = None) -> dict:
     """Every collector's rows for the last `window_s`, for `ttp audit --json`."""
+    from . import pushq
     now = time.time() if now is None else now
     since = now - window_s
     done = finished(db, since)
@@ -658,4 +664,5 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "overrides": overrides(p, db, now, blocked_h), "promises": obligations.promise_outcomes(db, since, now),
             "repeated_instructions": correction.repeat_summary(db, since), "mount_races": mount_races(db, since),
             "context_gaps": context_gaps(db, since), "coordinator_fixes": coordfix.entries(db, since, now),
+            "approval_to_landed": pushq.landing_times(db, since),
             **({"rule_cites": rulecite.metric(p, now, window_s)} if p is not None else {})}

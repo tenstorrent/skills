@@ -20209,7 +20209,9 @@ def test_a_textual_push_conflict_queues_a_light_conflict_fix_and_a_merged_check_
     task, pick = d._size_review(t)
     assert task["tier"] == "light" and pick["conflict_fix"]["tier"] == "light", pick
     assert s.p.db.task(s.review)["tier"] == "standard", "the light tier is this run's, not the task's"
-    # The batch merged both sides and its checks failed: no plain textual conflict.
+    # The batch merged both sides and its checks failed: no plain textual conflict. (The review-task cap
+    # holds back the rebase task a second conflict would get, so it stays a conflict fix.)
+    s.p.set_config("coordinator.max_review_tasks_per_day", 0)
     _pq_hand_off(env, s, note={"conflict_fix": {"tier": "light"}})
     _pq_plan(s, outcome="nothing", rows={s.branch: "conflict"},
              detail={"files": ["feature.txt"], "onto": onto, "cmd": "pytest -q", "tail": "E  assert 1 == 2"})
