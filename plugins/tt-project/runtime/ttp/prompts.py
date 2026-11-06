@@ -924,11 +924,11 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
 
 
 def outside_line(p: Project, task: dict) -> str:
-    """The task's last ended run, when it ended without a hand-off: what it touched outside its folders
+    """The task's last failed run, when no run since handed off: what it touched outside its folders
     (sidefx.py, its run dir's outside.json), or ''."""
-    last = p.db.one("SELECT id, dir FROM runs WHERE task=? AND role!='coordinator' AND status!='running' "
-                    "ORDER BY id DESC LIMIT 1", (task["id"],))
-    return sidefx.prompt_block(Path(last["dir"]) if last["dir"] else p.runs / str(last["id"])) if last else ""
+    runs = p.db.q("SELECT id, dir FROM runs WHERE task=? AND role!='coordinator' AND status!='running' "
+                  "ORDER BY id DESC LIMIT 10", (task["id"],))
+    return sidefx.last_block([Path(r["dir"]) if r["dir"] else p.runs / str(r["id"]) for r in runs])
 
 
 def _system_memory(p: Project) -> set[str]:

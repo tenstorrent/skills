@@ -15,11 +15,11 @@ def scratch_home(tmp_path, monkeypatch):
     return home
 
 
-def _sidefx_run(d, lines, cwd, *, result=None, rc=1, provider="claude"):
-    """A worker run of a new task in `cwd` whose transcript is `lines`, finished by the daemon; with
-    `result`, it wrote that hand-off first."""
+def _sidefx_run(d, lines, cwd, *, result=None, rc=1, provider="claude", tid=None):
+    """A worker run of a new task (or task `tid`) in `cwd` whose transcript is `lines`, finished by the
+    daemon; with `result`, it wrote that hand-off first."""
     db = d.p.db
-    tid = db.add_task("premise check", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    tid = tid or db.add_task("premise check", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
     db.update_task(tid, status="running")
     rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
                "VALUES(?,'worker',?,'opus',?,'running',?,?)", (tid, provider, time.time() - 60, d.boot, "{}"))
@@ -169,3 +169,55 @@ def test_outside_writes_parser_shell_edges(tmp_path, scratch_home):
     assert found(f"rm -rf {wt}2/x") == {f"{wt}2/x"}   # a prefix of the worktree's name is not inside it
     rec = sidefx.record(rd, 7, str(wt))
     assert rec["high"] is False and json.loads((rd / sidefx.FILE).read_text())["run"] == 7
+
+
+def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_output(tmp_path, scratch_home):
+    from ttp import sidefx
+    wt, rd = tmp_path / "wt", tmp_path / "run"
+    wt.mkdir(), rd.mkdir()
+    h = str(scratch_home)
+
+    def found(*cmds):
+        (rd / "output.jsonl").write_text(json.dumps(_claude_calls(*(("Bash", {"command": c}) for c in cmds))[0]) + "\n")
+        return {f["path"] for f in sidefx.scan(rd, str(wt))}
+
+    # regex and awk text is no path, in each tool and in a `bash -lc` script (Codex's form)
+    assert found("grep -n '/^def' f.py; rm -f x", "awk '/_launch/ {print $1}' f > out.txt",
+                 "sed -n '/^def/,/^$/p' f.py | head; touch y", "grep -rn -e /_launch -e '/x$' . > hits.txt",
+                 "bash -lc 'rg /_launch src > hits.txt'", "perl -ne 'print if /^\\d+/' f > o.txt") == set()
+    # a comparison is no redirect: `>=` after a cd elsewhere named '<dir>/=NNN:' before
+    assert found(f"cd {tmp_path}/state && python3 -c 'print(1 if 5>=3 else 0)' && grep -c 'run>=123:' log") == set()
+    # an ssh remote command's paths are the remote host's; its local redirect and key are local
+    assert found("ssh box 'rm -rf /tmp/r && echo x > ~/.config/r'", "ssh -o BatchMode=yes box \"cat /srv/a > /srv/b\"",
+                 "ssh box rm /tmp/r2") == set()
+    assert found(f"ssh -i ~/.ssh/k box 'cat /var/log/x' > /tmp/local.log\nrm /tmp/after") \
+        == {f"{h}/.ssh/k", "/tmp/local.log", "/tmp/after"}
+    # Claude Code's saved large tool output is read, not a credential folder
+    saved = f"{h}/.claude/projects/-wt/tool-results/b1.txt"
+    assert found(f"sed -n 1,40p {saved}", f"grep -n x {saved} | head") == set()
+    assert not sidefx.sensitive(saved, h) and sidefx.sensitive(f"{h}/.claude/settings.json", h)
+    assert sidefx.sensitive(f"{h}/.claude/projects/-wt/memory.md", h)
+    # real writes still count: an awk program's own output file, a grep's redirect, a quoted target
+    assert found("awk '/x/ {print > \"/tmp/a\"}' f", "grep -n '/^def' f.py > /tmp/defs",
+                 "sed -i 's/a/b/' \"$HOME/.config/c\"") == {"/tmp/a", "/tmp/defs", f"{h}/.config/c"}
+    assert found("rm /tmp/my\\ dir/f") == {"/tmp/my\\"}   # an escaped space is no regex escape
+    assert found("echo hi 2>&1 > /tmp/s") == {"/tmp/s"} and found("echo 'unclosed > /tmp/u") == {"/tmp/u"}
+
+
+def test_a_later_failed_run_that_touched_nothing_keeps_the_earlier_runs_writes_named(env, tmp_path, scratch_home):
+    from ttp.daemon import Daemon
+    from ttp import prompts
+    p = make(env)
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    d = Daemon(p.base)
+    rid1, _, task = _sidefx_run(d, _claude_calls(("Bash", {"command": f"rm -rf {tmp_path}/shared/cache"})), wt)
+    rid2, run_dir2, _ = _sidefx_run(d, _claude_calls(("Bash", {"command": "ls"})), wt, tid=task["id"])
+    assert not (run_dir2 / "outside.json").exists()
+    text = prompts.worker_task(p, p.db.task(task["id"]), str(wt), None)
+    assert f"Run {rid1}, an earlier run of this task, ended without a hand-off" in text and f"{tmp_path}/shared/cache" in text
+    _sidefx_run(d, _claude_calls(("Bash", {"command": "ls"})), wt, tid=task["id"],
+                result={"status": "failed", "summary": "tried"}, rc=0)   # a hand-off reported it
+    assert f"Run {rid1}" not in prompts.worker_task(p, p.db.task(task["id"]), str(wt), None)
+    rid4, _, _ = _sidefx_run(d, _claude_calls(("Bash", {"command": "ls"})), wt, tid=task["id"])
+    assert "earlier run of this task" not in prompts.worker_task(p, p.db.task(task["id"]), str(wt), None)
