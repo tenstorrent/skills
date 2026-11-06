@@ -1096,3 +1096,94 @@ def test_session_on_with_a_provider_is_off_for_one_that_runs_no_session():
     assert all(coordtools.session_on({}, n) for n in (None, "claude", "codex", "cursor", "fake"))
     assert not coordtools.session_on({}, "chat") and not coordtools.session_on({}, "no-such-provider")
     assert not coordtools.session_on({"coordinator": {"session": {"mode": "off"}}}, "claude")
+
+
+# A stand-in agent CLI for a coordinator turn without ttp's tool hooks: before it answers as FAKE_CLI
+# does, it appends to the charter and tries a raw `git push` and `ttp push --land`, as an agent with its
+# own shell could, and records each push's exit code, stderr and the program PATH found.
+ACT_CLI = """#!{python}
+import json, os, shutil, subprocess, sys
+from pathlib import Path
+if not ("--help" in sys.argv[1:] or sys.argv[1:3] == ["features", "list"] or sys.argv[1:2] == ["app-server"]):
+    with open(os.environ["FAKE_ACT_CHARTER"], "a") as f:
+        f.write("\\n- the coordinator's own new rule\\n")
+    got = {{}}
+    for cmd in (["git", "push", "origin", "HEAD:refs/heads/main"], ["ttp", "push", "--land"]):
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+        got[cmd[0]] = [r.returncode, r.stderr, shutil.which(cmd[0])]
+    Path(os.environ["FAKE_ACT_LOG"]).write_text(json.dumps(got))
+os.execv(sys.executable, [sys.executable, os.environ["FAKE_CLI_FILE"], *sys.argv[1:]])
+"""
+
+
+def _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text, session_mode):
+    """One stateless coordinator turn of `provider` (no ttp tool hooks) against ACT_CLI, reaped by the
+    daemon: (project, run row, original charter, the pushes' record, the turn's session note)."""
+    from ttp import coordinator as coord, coordsession
+    from ttp.daemon import Daemon
+    bin_dir = env["tmp"] / "actbin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "fake_cli.py").write_text(FAKE_CLI.format(python=sys.executable))
+    for name in ("codex", "agent"):
+        (bin_dir / name).write_text(ACT_CLI.format(python=sys.executable))
+        (bin_dir / name).chmod(0o755)
+    acts = env["tmp"] / "act.json"
+    p = make(env)
+    p.set_config("coordinator.session.mode", session_mode)
+    if session_mode == "on":   # session mode's fallback: decide() sends this wake stateless
+        monkeypatch.setattr(coordsession, "decide", lambda *a, **k: ("stateless", "test: fallback"))
+    charter = p.charter_path.read_text()
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    for k, v in (("LOG", str(env["tmp"] / "fakecli")), ("STDOUT", stdout), ("STDERR", ""), ("RC", "0"),
+                 ("RESULT", ""), ("HELP", help_text), ("PACE", "0"), ("SESSION", "{}"),
+                 ("FILE", str(bin_dir / "fake_cli.py"))):
+        monkeypatch.setenv(f"FAKE_CLI_{k}", v)
+    monkeypatch.setenv("FAKE_ACT_CHARTER", str(p.charter_path))
+    monkeypatch.setenv("FAKE_ACT_LOG", str(acts))
+    head, context = coord.prompt_parts(p)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    rid = d.start_run("coordinator", "EVENTS", provider, "light", str(p.base), read_only=True,
+                      schema=coord.ACTIONS_SCHEMA, system=head, context=context, timeout_s=100, budget_usd=3.0)
+    exit_file = p.runs / str(rid) / "exit.json"
+    deadline = time.time() + 90
+    while not exit_file.exists() and time.time() < deadline:
+        time.sleep(0.05)
+    assert exit_file.exists(), (p.runs / str(rid) / "runner.log").read_text()
+    assert p.charter_path.read_text() != charter, "the stand-in agent's charter edit never ran"
+    d.reap_runs()
+    r = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    return p, r, charter, json.loads(acts.read_text()), json.loads(r["note"])["turn"].get("session")
+
+
+@pytest.mark.parametrize("session_mode", ["off", "on"])
+@pytest.mark.parametrize("provider", ["codex", "cursor"])
+def test_a_stateless_coordinator_turn_without_tool_hooks_gets_its_charter_put_back_and_pushes_nothing(
+        env, monkeypatch, provider, session_mode):
+    # Provider parity: a stateless coordinator turn (session mode off, or its fallback) on an agent
+    # without ttp's tool hooks runs a shell of its own. The daemon's whole-wake guard puts back and
+    # reports a charter edit, and the run's bin/git and `ttp push` refuse a push, as on Claude.
+    from ttp import coordtools
+    from ttp.providers import get_provider
+    assert not get_provider(provider).tool_hooks
+    if provider == "codex":
+        stdout, help_text = _codex_events(*_codex_turn(json.dumps({"actions": []}))), CODEX_EXEC_HELP
+    else:
+        stdout, help_text = _codex_events(*CURSOR_STREAM_OK[:-1], {**CURSOR_STREAM_OK[-1],
+                                                                    "result": json.dumps({"actions": []})}), CURSOR_HELP
+    p, r, charter, acts, session = _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text, session_mode)
+    assert (session or {}).get("mode", "stateless") == "stateless", session
+    # (a) the charter is back, its changed content saved, the put-back reported in daemon.log and events
+    assert p.charter_path.read_text() == charter
+    log = (p.logs / "daemon.log").read_text()
+    assert f"run {r['id']}: tt-project: this command changed {p.charter_path}" in log, log[-2000:]
+    ev = p.db.one("SELECT * FROM events WHERE kind=?", (coordtools.GUARD_EVENT,))
+    assert ev and str(p.charter_path) in json.loads(ev["data"])["files"]
+    saved = [json.loads(x) for x in (p.state / coordtools.PUT_BACK_LOG).read_text().splitlines()]
+    assert [s["path"] for s in saved] == [str(p.charter_path)]
+    assert "own new rule" in Path(saved[0]["saved"]).read_text()
+    # (b) both push forms refused by the run's own guards, not by a missing program
+    rc, err, where = acts["git"]
+    assert rc == 1 and coordtools.PUSH_REFUSAL in err and where.startswith(str(p.harness)), acts["git"]
+    rc, err, where = acts["ttp"]
+    assert rc not in (0, None) and coordtools.PUSH_REFUSAL in err, acts["ttp"]
