@@ -1720,6 +1720,42 @@ def test_a_queued_resume_wait_names_the_hold_true_now_not_a_spend_gate_that_clea
     assert gone[0]["status"] == "handled" and json.loads(gone[0]["data"])["retired"] == "resumed or left the queue"
 
 
+def test_a_resume_wait_retired_for_a_passing_net_hold_is_raised_again_while_the_spend_gate_holds(env, monkeypatch):
+    """A one-check network blip retires the unread observation (the network hold reports itself). Once it
+    clears and the global cap still holds the task, the next check queues the observation again."""
+    from ttp import globalcap as gcap
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    core = p.config().get("core_provider", "claude")
+    monkeypatch.setattr(gcap, "total", lambda *a, **k: {"usd": 2017.0, "stale": [], "includes": []})
+    p.set_config("budget.global_daily_usd", 2000)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    assert not d.gates[core].allow_new_work, d.gates[core]
+    tid = p.db.add_task("woken wait", "s", kind="work", tier="light", origin="user", priority=3)
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "woke": True}), not_before=time.time() - 20 * 60)
+
+    def check():
+        d._resume_wait_checked = 0.0
+        d.check_resume_wait()
+        return p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'resume_wait:%'")
+
+    first = check()
+    assert [(e["task"], e["status"]) for e in first] == [(tid, "queued")]
+    real = Daemon._start_hold
+    monkeypatch.setattr(Daemon, "_start_hold", lambda self, *a: "net")
+    blip = check()
+    assert [e["status"] for e in blip] == ["handled"]
+    monkeypatch.setattr(Daemon, "_start_hold", real)
+    back = check()
+    assert [(e["id"], e["status"]) for e in back] == [(first[0]["id"], "queued")]
+    assert "held by the spend gate (no new work at red: global daily cap" in back[0]["text"], back[0]["text"]
+    assert check() == back   # stays one queued row, unchanged
+
+
 def _merge_task(p, **kw):
     """The harness task `ttp upgrade` queues to finish a template merge, as it queues it (cli.upgrade)."""
     from ttp import release

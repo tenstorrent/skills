@@ -8551,7 +8551,8 @@ class Daemon:
         (resumefirst.ready_at), so a daemon restart keeps it. Observation only: dispatch never reads it.
         One still queued (no turn has read it yet) is read again each check against the gate update_gates
         read this tick: rewritten when what holds it changed (a spend gate that cleared is not named),
-        retired once the task resumed, left the queue or such a self-reporting hold took it."""
+        retired once the task resumed, left the queue or such a self-reporting hold took it; one retired for
+        such a hold is queued again (same row) once that hold clears and the task still waits."""
         now = time.time()
         if now - getattr(self, "_resume_wait_checked", 0.0) < every_s:
             return
@@ -8578,10 +8579,19 @@ class Daemon:
         for t, at, ran in late:
             tid = t["id"]
             fp = f"{resumefirst.FP}:{tid}:{ran}"
-            row = queued.get(fp)
-            if row is None and db.one("SELECT id FROM events WHERE fingerprint IN (?,?,?)",
-                                      (fp, f"slot_wait:{tid}:{ran}", f"{unstarted.READY_KIND}:{tid}:{ran}")):
-                continue
+            row, parked = queued.get(fp), None
+            if row is None:
+                if db.one("SELECT id FROM events WHERE fingerprint IN (?,?)",
+                          (f"slot_wait:{tid}:{ran}", f"{unstarted.READY_KIND}:{tid}:{ran}")):
+                    continue
+                if (old := db.one("SELECT id, data FROM events WHERE fingerprint=?", (fp,))) is not None:
+                    try:   # retired unread for a self-reporting hold: raised again once that hold clears
+                        parked = str(json.loads(old["data"] or "{}").get("retired", "")).startswith("held:")
+                    except (ValueError, AttributeError):
+                        parked = False
+                    if not parked:
+                        continue
+                    parked = old["id"]
             why = self._start_hold(t, t["provider"] or core, ctx)
             if why in ("paused", "logged_out", "net") or (why is None and self._own_checks_wait(t)):
                 if row is not None:
@@ -8599,6 +8609,11 @@ class Daemon:
                 if row["data"] != data:
                     db.x("UPDATE events SET text=?, data=? WHERE id=? AND status='queued'", (text[:4000], data, row["id"]))
                     log(self.p, f"resume wait: task {tid} now held by {held[:200]}")
+                continue
+            if parked:
+                db.x("UPDATE events SET ts=?, text=?, data=?, status='queued' WHERE id=? AND status='handled'",
+                     (now, text[:4000], data, parked))
+                log(self.p, f"resume wait: task {tid} held again by {held[:200]}")
                 continue
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", fp, "normal", text[:4000], "queued", tid, data))
