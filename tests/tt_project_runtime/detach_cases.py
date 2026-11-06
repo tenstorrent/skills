@@ -2660,7 +2660,7 @@ def test_a_checks_queued_job_ends_at_its_bound_or_once_its_owner_marker_is_gone(
 def test_a_cpu_only_checks_queued_job_sees_no_device_nodes(env, tmp_path, monkeypatch):
     """A check that holds no device (TTP_NO_DEVICE=1) queues a job: the daemon starts it in the sandbox that
     hides the device nodes, as the check's own commands were."""
-    from ttp import detach, sandbox
+    from ttp import detach, locks, sandbox
     if sandbox.status()[0] is None:
         pytest.skip("no process sandbox works on this host")
     dev = tmp_path / "dev-tt"
@@ -2673,7 +2673,10 @@ def test_a_cpu_only_checks_queued_job_sees_no_device_nodes(env, tmp_path, monkey
     detach.enqueue(p.state, rc, report / "hidden.log", ["sh", "-c", f"ls -A {shlex.quote(str(dev))} >{shlex.quote(str(out))}"],
                    str(tmp_path), {**os.environ, "TTP_NO_DEVICE": "1"}, bound=detach.check_bound(None))
     detach.tend(p)
-    assert _wait_for_path(rc) and rc.read_text().strip() == "0", (report / "hidden.log").read_text()
+    # A sandboxed start on a loaded host can take longer than a fixed 20 s: wait while the job holds its
+    # lock (the wrapper writes the rc before it lets go), bounded only against a hang.
+    assert _wait_for(lambda: rc.exists() or locks.any_free([locks.job_lock(rc)]), timeout=300)
+    assert rc.exists() and rc.read_text().strip() == "0", (report / "hidden.log").read_text()
     assert out.read_text() == ""
     assert (dev / "0").exists()
 
