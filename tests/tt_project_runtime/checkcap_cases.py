@@ -8806,9 +8806,9 @@ def test_a_preempted_checks_run_starts_ahead_of_runs_that_queued_after_it_at_its
     monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
     try:
         q = locks.fair_order(checkcap.slot_dir(), checkcap.RESOURCE, **checkcap.order())
-        assert [locks.is_requeued(t) for t in q].count(True) == 1
         names = [t.read_text() for t in q]
         assert names[0] == "R1 mine", names
+        assert [locks.is_requeued(t) for t in q].count(True) == 1
         blocker.close()
         for t in threads:
             t.join(30)
