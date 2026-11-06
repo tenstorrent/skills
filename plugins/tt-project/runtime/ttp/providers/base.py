@@ -474,7 +474,8 @@ class Provider:
     def activity(self, output_path: Path, offset: int = 0) -> tuple[list[dict], int]:
         """Tool events a running run wrote to its output after byte `offset`, and the offset to read
         from next: {"kind": "call" | "result", "id", "tool", "input_head" (80 chars), "is_error"
-        (None on a call), "ts" (None when the stream has no time)}. Only whole lines count, so a line
+        (None on a call), "ts" (None when the stream has no time)}; a call may add "hash" (of its whole
+        input) and "command" (a shell command, CMD_MAX chars), which drift.py reads. Only whole lines count, so a line
         still being written is read next time. None here: runwatch falls back to progress.md and git."""
         return [], offset
 
@@ -532,6 +533,15 @@ def jsonl_from(path: Path, offset: int, needles: tuple[bytes, ...]) -> tuple[lis
     except OSError:
         pass
     return out, offset
+
+
+CMD_MAX = 400   # characters of a shell command an activity event keeps
+
+
+def input_hash(tool: str, value) -> str:
+    """A short hash of a tool call's whole input, to find the same call repeated."""
+    text = value if isinstance(value, str) else json.dumps(value, sort_keys=True, default=str)
+    return hashlib.sha1(f"{tool}\0{text}".encode(errors="replace")).hexdigest()[:12]
 
 
 def head80(value) -> str:

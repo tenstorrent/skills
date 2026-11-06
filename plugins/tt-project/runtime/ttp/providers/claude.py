@@ -49,7 +49,7 @@ from ..budget import Window
 from .. import fencefree
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
                    cli_output, find_binary, last_json_object, request_rejected, status_check, strict_schema,
-                   drop_nulls, head80, jsonl_from)
+                   drop_nulls, head80, input_hash, jsonl_from, CMD_MAX)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -420,8 +420,10 @@ class Claude(Provider):
                     inp = b.get("input") if isinstance(b.get("input"), dict) else {}
                     key = next((k for k in ("command", "file_path", "pattern", "path", "url", "query",
                                             "description", "skill") if isinstance(inp.get(k), str)), None)
+                    cmd = inp.get("command") if isinstance(inp.get("command"), str) else ""
                     events.append({"kind": "call", "id": str(b.get("id") or ""), "tool": str(b.get("name") or ""),
-                                   "input_head": head80(inp[key] if key else inp), "is_error": None, "ts": None})
+                                   "input_head": head80(inp[key] if key else inp), "is_error": None, "ts": None,
+                                   "hash": input_hash(str(b.get("name") or ""), inp), "command": cmd[:CMD_MAX]})
                 elif b.get("type") == "tool_result":
                     events.append({"kind": "result", "id": str(b.get("tool_use_id") or ""), "tool": "",
                                    "input_head": "", "is_error": bool(b.get("is_error")), "ts": None})

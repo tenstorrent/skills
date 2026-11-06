@@ -52,7 +52,7 @@ from pathlib import Path
 
 from . import register
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_output, price_row, request_rejected,
-                   status_check, stderr_tail, strict_schema, drop_nulls, head80, jsonl_from)
+                   status_check, stderr_tail, strict_schema, drop_nulls, head80, input_hash, jsonl_from, CMD_MAX)
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -425,7 +425,8 @@ class Codex(Provider):
             else:
                 head = item.get("query") or ""
             call = {"kind": "call", "id": str(item.get("id") or ""), "tool": kind, "input_head": head80(head),
-                    "is_error": None, "ts": None}
+                    "is_error": None, "ts": None, "hash": input_hash(kind, head),
+                    "command": str(head)[:CMD_MAX] if kind == "command_execution" else ""}
             if ev.get("type") == "item.started":
                 events.append(call)
             else:

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -24,9 +25,10 @@ from .project import Project, write_json
 from .providers import get_provider
 
 FILE = "runwatch.json"
-RECENT = 20          # tool calls kept per run, for the failed count
+RECENT = 30          # tool calls kept per run, for the failed count (of the last 20) and drift.py's loop check
 GIT_TTL_S = 300      # a cached file list is redone after this, even with HEAD and the index unchanged
 MAX_FILES = 50
+MAX_FAILS = 50       # failed commands counted per run (the most-failed kept)
 TAIL_BYTES = 16384   # the end of progress.md and steer.md read for their last lines
 
 
@@ -63,6 +65,10 @@ def tick(p: Project, now: float | None = None, write: bool = True) -> dict:
     return data
 
 
+def write(p: Project, data: dict) -> None:
+    write_json(path(p), data)
+
+
 def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
     run_dir = Path(r["dir"]) if r["dir"] else p.runs / str(r["id"])
     started = float(r["started"] or now)
@@ -77,6 +83,12 @@ def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
     spec = spec if isinstance(spec, dict) else {}
     e["note"], e["checks"] = _progress(run_dir / "progress.md")
     e.update(_tools(r["provider"], run_dir / "output.jsonl", old, now))
+    # its last sign of life (a tool call or result, a note), for drift.py's quiet check
+    e["active_at"] = max(started, float(e.pop("tool_at", None) or old.get("active_at") or 0),
+                         min(_mtime(run_dir / "progress.md") / 1e9, now))
+    for k in ("drift", "flags", "outside_n"):   # drift.py's ladder state and flags, until it runs again
+        if k in old:
+            e[k] = old[k]
     e.update(_files(p, str(spec.get("cwd") or ""), old, now, base))
     cost, budget = float(r["cost_usd"] or 0), r["budget_usd"]
     task_usd = float(r["spent_usd"] or 0) + cost
@@ -108,33 +120,56 @@ def _progress(f: Path) -> tuple[str, str]:
 
 def _tools(provider: str, out: Path, old: dict, now: float) -> dict:
     offset, recent, last = int(old.get("offset") or 0), list(old.get("recent") or []), old.get("last_tool")
+    fails, tool_at = dict(old.get("fails") or {}), None
     try:
         size = out.stat().st_size
     except OSError:
         size = 0
     if size < offset:   # the stream was replaced (a restarted run): read it afresh
-        offset, recent, last = 0, [], None
+        offset, recent, last, fails = 0, [], None, {}
     try:
         events, offset = get_provider(provider).activity(out, offset)
     except Exception:
         events = []
     for ev in events:
-        ts = ev.get("ts") or now
+        ts = tool_at = ev.get("ts") or now
         known = next((c for c in reversed(recent) if ev["id"] and c["id"] == ev["id"]), None)
         if ev["kind"] == "call" or known is None:
-            known = {"id": ev["id"], "tool": ev["tool"], "error": None}
+            known = {"id": ev["id"], "tool": ev["tool"], "error": None, "h": ev.get("hash") or "",
+                     "cmd": norm_command(ev.get("command") or "")}
             recent.append(known)
             if ev["kind"] == "call" or ev["tool"]:   # a bare result of a call never seen names no tool
                 last = {"id": ev["id"], "tool": ev["tool"], "input_head": ev["input_head"], "since": ts,
                         "done": False}
         if ev["kind"] == "result":
             known["error"] = bool(ev["is_error"])
+            if known["error"] and known.get("cmd"):
+                fails[known["cmd"]] = fails.get(known["cmd"], 0) + 1
             if last and last["id"] == ev["id"]:
                 last.update(done=True, is_error=bool(ev["is_error"]), ended=ts)
     recent = recent[-RECENT:]
-    return {"offset": offset, "recent": recent, "last_tool": last,
+    if len(fails) > MAX_FAILS:   # keep the commands that failed most
+        fails = dict(sorted(fails.items(), key=lambda kv: -kv[1])[:MAX_FAILS])
+    return {"offset": offset, "recent": recent, "last_tool": last, "fails": fails, "tool_at": tool_at,
             "pending_s": round(now - last["since"]) if last and not last["done"] else None,
-            "failed_last_20": sum(1 for c in recent if c.get("error"))}
+            "failed_last_20": sum(1 for c in recent[-20:] if c.get("error"))}
+
+
+_CD_RE = re.compile(r"^\s*cd\s+\S+\s*(?:&&|;)\s*")
+_WRAP_RE = re.compile(r"^(?:ttp\s+clip\s+--\s+|ttp\s+sandbox\s+--\s+|timeout\s+(?:-{1,2}[\w=-]+(?:\s+\d+[smhd]?)?\s+)*\d+(?:\.\d+)?[smhd]?\s+)")
+_TAIL_RE = re.compile(r"(?:\s*2>&1)?(?:\s*\|\s*(?:tail|head)(?:\s+-n)?(?:\s+-?\d+)?)+\s*$|\s*2>&1\s*$")
+
+
+def norm_command(cmd: str) -> str:
+    """A shell command without what varies between tries of the same one: a leading `cd <dir> &&`,
+    `ttp clip --`, `timeout N` and a trailing `2>&1 | tail -N`; whitespace collapsed."""
+    cmd = " ".join(str(cmd).split())
+    while True:
+        new = _WRAP_RE.sub("", _CD_RE.sub("", cmd))
+        if new == cmd:
+            break
+        cmd = new
+    return _TAIL_RE.sub("", cmd)[:160]
 
 
 def _git(cwd: str, *args: str) -> str | None:
@@ -247,6 +282,8 @@ def text(data: dict, task: int | None = None) -> str:
                 lines.append(f"  {label}: {val}")
         if e.get("files_n"):
             lines.append(f"  files ({e['files_n']}): {', '.join(e['files'][:8])}{' ...' if e['files_n'] > 8 else ''}")
+        if e.get("flags"):
+            lines.append("  drift: " + "; ".join(f"{k}: {v}" for k, v in e["flags"].items()))
         if st and st.get("last"):
             state = {True: "read", False: "UNREAD", None: "read state unknown"}[st.get("read")]
             lines.append(f"  steer: {st['last']} ({state})")

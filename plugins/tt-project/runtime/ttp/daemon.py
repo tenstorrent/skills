@@ -46,6 +46,7 @@ from . import coordwrites
 from . import checksgone
 from . import userorder
 from . import runwatch
+from . import drift
 from . import resumefirst
 from . import rejcool
 from . import stalegate
@@ -4103,7 +4104,11 @@ class Daemon:
         if now - self._runwatch_at < every_s:
             return
         self._runwatch_at = now
-        runwatch.tick(self.p, now)
+        data = runwatch.tick(self.p, now, write=False)
+        try:
+            drift.check(self.p, self.cfg, data, now)   # flags each run and takes one ladder step
+        finally:
+            runwatch.write(self.p, data)
 
     def _record_running_windows(self, r: dict, out: Path) -> None:
         """A provider whose running runs report the account's plan windows (Codex: with each model
