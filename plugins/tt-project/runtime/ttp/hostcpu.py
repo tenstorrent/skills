@@ -7,6 +7,12 @@ in /proc/stat's aggregate counters since this process's previous reading, when t
 FRESH_S old (a waiter polling every few seconds reads once per poll); else over a fresh SAMPLE_S
 window. A reading under SAMPLE_S after the last one returns the last value. None where /proc/stat
 cannot be read (macOS): the caller falls back to the load average.
+
+demand() is the runnable CPU demand over the same window, in cores: the busy cores, or more while tasks
+wait to run (`procs_running` in /proc/stat, the mean of the window's two readings less the reader
+itself). Unlike the load average it leaves out tasks in uninterruptible sleep (D state, mostly waiting
+on I/O), so a host whose disk is contended but whose cores sit idle is not called CPU-overloaded; disk
+contention has its own limit (diskgate).
 """
 from __future__ import annotations
 
@@ -42,18 +48,31 @@ def jiffies(text: str) -> tuple[int, int] | None:
     return None
 
 
-def _read(read=None) -> tuple[int, int] | None:
+def running(text: str) -> int | None:
+    """`procs_running` from /proc/stat: the tasks running or waiting to run now (not those in D state)."""
+    for line in text.splitlines():
+        if line.startswith("procs_running "):
+            try:
+                return int(line.split()[1])
+            except (IndexError, ValueError):
+                return None
+    return None
+
+
+def _read(read=None) -> tuple[int, int, int | None] | None:
     try:
-        return jiffies(STAT.read_text() if read is None else read())
+        text = STAT.read_text() if read is None else read()
+        j = jiffies(text)
     except (OSError, ValueError):
         return None
+    return None if j is None else (*j, running(text))
 
 
-def busy_cores(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | None = None) -> float | None:
-    """Cores busy now (above); `read` returns /proc/stat's text, `sleep` and `clock` are for tests."""
+def _sample(read, sleep, clock, cpus) -> tuple[float, float | None] | None:
+    """(busy cores, runnable tasks scaled to `cpus`, or None) over the window busy_cores describes."""
     now = clock()
     if (b := _LAST.get("busy")) and 0 <= now - b[0] < SAMPLE_S:
-        return b[1]
+        return b[1], b[2]
     cur = _read(read)
     if cur is None:
         return None
@@ -68,6 +87,28 @@ def busy_cores(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | No
     dt = cur[1] - prev[2]
     if dt <= 0:
         return None
-    busy = max(0.0, min(1.0, (cur[0] - prev[1]) / dt)) * (cpus or cores())
-    _LAST["busy"] = (now, busy)
-    return busy
+    n = cpus or cores()
+    busy = max(0.0, min(1.0, (cur[0] - prev[1]) / dt)) * n
+    runnable = None
+    if cur[2] is not None and prev[3] is not None:
+        # procs_running is host-wide: scale it to the share of the cores this process may use; the
+        # reader itself runs too.
+        c = cores()
+        runnable = max(0.0, (prev[3] + cur[2]) / 2 - 1) * min(1.0, c / (os.cpu_count() or c))
+    _LAST["busy"] = (now, busy, runnable)
+    return busy, runnable
+
+
+def busy_cores(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | None = None) -> float | None:
+    """Cores busy now (above); `read` returns /proc/stat's text, `sleep` and `clock` are for tests."""
+    got = _sample(read, sleep, clock, cpus)
+    return None if got is None else got[0]
+
+
+def demand(read=None, sleep=time.sleep, clock=time.monotonic, cpus: int | None = None) -> float | None:
+    """The runnable CPU demand now in cores (above): the busy cores, or the runnable tasks where more;
+    None where /proc/stat cannot be read."""
+    got = _sample(read, sleep, clock, cpus)
+    if got is None:
+        return None
+    return got[0] if got[1] is None else max(got[0], got[1])

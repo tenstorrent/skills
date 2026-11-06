@@ -7,8 +7,9 @@ holding a host-wide checks slot here (checkcap: every project of the account on 
 the cap (checks.host_max, else its load-following default) and the checks running on spill hosts
 (checkspill claims). The host is overloaded by its test runs when all three hold:
 
-- its 5-minute load is above the load guard's threshold: checks.load_guard times its cores
-  (testslots.load_guard_factor; with the guard off, its cores);
+- its runnable CPU demand (checkcap.cpu_demand: busy cores and tasks waiting to run, not tasks waiting
+  on I/O in D state, which the load average counts) is above the load guard's threshold:
+  checks.load_guard times its cores (testslots.load_guard_factor; with the guard off, its cores);
 - the local runs are at or near the cap: at least NEAR of it (one run with a cap of 1 or 2);
 - no spill host takes any run: no live spill claim from this host.
 
@@ -21,7 +22,8 @@ once the condition no longer holds. A cap of 0 (checks.host_max 0: no cap) takes
 cannot be counted and it never fires. Read-only: it never stops, moves or slows a run.
 
 lines() is the same reading for `ttp checks --slot-status` and the daily review: the check runs per
-host (this one and each spill host) and this host's load."""
+host (this one and each spill host), this host's load and CPU demand, and which limit holds: the CPU
+limit (checks.load_guard) here, the I/O pressure limit (checks.io_full_max) in diskgate's line."""
 from __future__ import annotations
 
 import math
@@ -32,7 +34,7 @@ from . import checkcap, checkspill, locks, testslots
 
 KEY = "checks_host_overloaded"
 SOURCE = "daemon:checks-host-overloaded"
-CLEARED = "the host's load or its local check runs dropped below the threshold, or a spill host took runs"
+CLEARED = "the host's CPU demand or its local check runs dropped below the threshold, or a spill host took runs"
 CHECK_S = 60.0
 HOLD_S = 900.0   # how long the condition holds before anyone hears
 NEAR = 0.75      # local runs at or above this share of the cap are "near" it
@@ -52,9 +54,10 @@ def near(running: int, cap: int) -> bool:
 
 
 def snapshot(cfg: dict | None = None) -> dict:
-    """This host's reading: {"load": (1, 5, 15) or None, "cores", "factor" (checks.load_guard, 1 when
-    off), "threshold", "cap", "running" (local check runs), "spilled" ({spill host: runs from here}),
-    "spill_hosts" (the project's delivery.checks_spill_hosts)}."""
+    """This host's reading: {"load": (1, 5, 15) or None, "demand" (checkcap.cpu_demand, None when
+    unreadable), "cores", "factor" (checks.load_guard, 1 when off), "threshold", "cap", "running" (local
+    check runs), "spilled" ({spill host: runs from here}), "spill_hosts" (the project's
+    delivery.checks_spill_hosts)}."""
     cap, c = checkcap.limit(), checkcap.cores()
     factor = testslots.load_guard_factor() or 1.0
     try:
@@ -64,13 +67,25 @@ def snapshot(cfg: dict | None = None) -> dict:
     spilled: dict[str, int] = {}
     for r in checkspill.holders():
         spilled[r["host"]] = spilled.get(r["host"], 0) + 1
-    return {"load": loads(), "cores": c, "factor": factor, "threshold": factor * c, "cap": cap,
+    return {"load": loads(), "demand": demand(), "cores": c, "factor": factor, "threshold": factor * c, "cap": cap,
             "running": running, "spilled": spilled, "spill_hosts": checkspill.hosts(cfg)}
 
 
+def demand() -> float | None:
+    """checkcap.cpu_demand(), or None where neither /proc/stat nor the load average can be read."""
+    d = checkcap.cpu_demand()
+    return None if d != d or d == float("inf") else d
+
+
 def overloaded(s: dict) -> bool:
-    return bool(s["load"]) and s["load"][1] > s["threshold"] and near(s["running"], s["cap"]) \
-        and not s["spilled"]
+    """The CPU is over the threshold by its runnable demand while local runs sit near the cap and none
+    spill. A reading without "demand" (an older caller) judges by the 5-minute load."""
+    d = s["demand"] if "demand" in s else (s["load"][1] if s["load"] else None)
+    return d is not None and d > s["threshold"] and near(s["running"], s["cap"]) and not s["spilled"]
+
+
+def _demand_text(s: dict) -> str:
+    return "unreadable" if s.get("demand") is None else f"{s['demand']:.1f} cores"
 
 
 def _load_text(s: dict) -> str:
@@ -87,7 +102,8 @@ def text(s: dict, held_s: float) -> str:
     else:
         move = ("no spill host is set: list idle machines this project may use in delivery.checks_spill_hosts "
                 "(`ttp config delivery.checks_spill_hosts '[\"<alias>\", ...]'`)")
-    return (f"checks host overloaded: this host's 5-minute load {s['load'][1]:.1f} (1/5/15 min {_load_text(s)}) "
+    return (f"checks host overloaded: this host's runnable CPU demand {_demand_text(s)} (busy and waiting "
+            f"to run; load 1/5/15 min {_load_text(s)}, which also counts tasks waiting on I/O) "
             f"has stayed above {over} for {held_s / 60:.0f} min, with {s['running']} check runs here at or "
             f"near the cap of {s['cap']} (checks.host_max) and none on a spill host. To move runs off this "
             f"host: {move}. Runs only spill after waiting delivery.checks_spill_after_s for a slot here, so "
@@ -99,9 +115,12 @@ def lines(cfg: dict | None = None, s: dict | None = None) -> list[str]:
     """The check runs per host and this host's load, for `ttp checks --slot-status` and the daily review."""
     s = s or snapshot(cfg)
     cap = f"cap {s['cap']}" if s["cap"] else "no cap"
-    flag = ", overloaded" if overloaded(s) else ""
-    out = [f"this host: {s['running']} check runs ({cap}), load 1/5/15 min {_load_text(s)} on "
-           f"{s['cores']} cores (threshold {s['threshold']:g}){flag}"]
+    over = s.get("demand") is not None and s["demand"] > s["threshold"] and testslots.load_guard_factor()
+    flag = (", overloaded: CPU over its limit" if overloaded(s)
+            else ", CPU over its limit: new suites wait" if over else "")
+    out = [f"this host: {s['running']} check runs ({cap}), CPU demand {_demand_text(s)} (busy and waiting to "
+           f"run) on {s['cores']} cores, CPU limit {s['threshold']:g} (checks.load_guard), load 1/5/15 min "
+           f"{_load_text(s)} (counts tasks waiting on I/O too: their limit is checks.io_full_max){flag}"]
     for h in list(dict.fromkeys([*s["spill_hosts"], *s["spilled"]])):
         out.append(f"{h}: {s['spilled'].get(h, 0)} spilled check runs from this host")
     return out

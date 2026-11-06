@@ -3175,6 +3175,7 @@ def test_a_p1_check_takes_the_urgent_extra_lane_at_a_busy_load_while_checks_host
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
     monkeypatch.setenv(checkcap.LIVE_ENV, "0")
     monkeypatch.setattr(checkcap, "_load", lambda: 90.0)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: 90.0)
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     monkeypatch.setattr(checklane, "_mem_gib", lambda: 64.0)
     kw = dict(repo=_LANE_REPO, slots=2, wait_s=0.3, headroom=checklane.headroom)
@@ -6257,6 +6258,7 @@ def test_no_suite_starts_while_the_host_is_overloaded_and_its_lane_says_why(env,
     load = [10.0]
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     monkeypatch.setattr(checkcap, "_load", lambda: load[0])
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: load[0])
     running = testslots.acquire("running", project_name="pa", wait_s=0)
     assert running and running.k == 4
     load[0] = 82.0
@@ -6320,6 +6322,7 @@ def _host_of_64(monkeypatch, load: float = 0.0):
     monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     monkeypatch.setattr(checkcap, "_load", lambda: load)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: load)
     monkeypatch.setattr(checkcap, "live_cores_on", lambda: False)
     monkeypatch.setattr(checkcap, "extra_max", lambda: 0)
 
@@ -6706,6 +6709,7 @@ def test_a_spill_bounded_checks_wait_under_the_load_guard_takes_no_host_slot(env
     monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD", raising=False)
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     monkeypatch.setattr(checkcap, "_load", lambda: 900.0)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: 900.0)
     monkeypatch.setenv("TTP_TEST_POOL", "4")
     floor = _hold_load_floor()   # another run holds the one routine pass
     try:
@@ -7384,6 +7388,62 @@ def _fake_disk(monkeypatch, tmp_path, dirty_kb=0, full60=None, dirty_max=None, i
             monkeypatch.delenv(key, raising=False)
         else:
             monkeypatch.setenv(key, str(v))
+
+
+def _fake_cpu(monkeypatch, tmp_path, busy, running, blocked, load=67.0, cores=64):
+    """Fake /proc/stat for hostcpu after a window of SAMPLE_S+ (no sleep): `busy` of `cores` cores busy,
+    `running` tasks running or waiting to run and `blocked` in D state at both readings; a fixed load average."""
+    from ttp import checkcap, hostcpu
+    stat = tmp_path / "stat"
+    idle = (cores - busy) * 100
+    stat.write_text(f"cpu  {busy * 50} 0 {busy * 50} {idle} 0 0 0 0 0 0\ncpu0 1 0 1 1 0 0 0 0 0 0\n"
+                    f"intr 1\nprocs_running {running}\nprocs_blocked {blocked}\n")
+    monkeypatch.setattr(hostcpu, "STAT", stat)
+    monkeypatch.setattr(hostcpu, "_LAST", {"at": (time.monotonic() - 2 * hostcpu.SAMPLE_S, 0, 0, running)})
+    monkeypatch.setattr(hostcpu, "cores", lambda: cores)
+    monkeypatch.setattr(checkcap, "cores", lambda: cores)
+    monkeypatch.setattr(os, "cpu_count", lambda: cores)
+    monkeypatch.setattr(os, "getloadavg", lambda: (load, load, load))
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+
+
+def test_the_load_guard_judges_cpu_by_runnable_demand_and_io_pressure_by_its_own_limit(env, tmp_path, monkeypatch):
+    """#6836: a load average over the cores made of tasks in D state (waiting on a contended disk) while
+    half the cores sit idle holds nothing; runnable demand over the cores holds new suites, named as the
+    CPU limit (checks.load_guard); io PSI over checks.io_full_max holds new runs, named as I/O pressure."""
+    from ttp import checkcap, diskgate, hostcpu, hostload, testslots
+    # (a) load 67 on 64 cores from 35 D-state waiters, 34 cores busy, io PSI under its limit: not held.
+    _fake_cpu(monkeypatch, tmp_path, busy=34, running=35, blocked=35)
+    _fake_disk(monkeypatch, tmp_path, full60="2.00")
+    assert hostcpu.demand() == 34.0 and checkcap.cpu_demand() == 34.0, "the reader itself is not demand"
+    assert testslots.load_guard() == "" and diskgate.saturated() == ""
+    s = hostload.snapshot()
+    assert s["load"][1] == 67.0 and s["demand"] == 34.0 and not hostload.overloaded({**s, "running": 4, "cap": 4})
+    assert "CPU demand 34.0 cores" in hostload.lines(s=s)[0] and "over its limit" not in hostload.lines(s=s)[0]
+    # (b) runnable demand over the cores (all busy, 90 tasks wanting a core): held as the CPU limit.
+    _fake_cpu(monkeypatch, tmp_path, busy=64, running=91, blocked=0, load=60.0)
+    why = testslots.load_guard()
+    assert why.startswith("the host's CPU is overloaded: its runnable demand of 90.0 cores is above its 64 "
+                          "cores (CPU limit checks.load_guard)"), why
+    assert diskgate.saturated() == ""
+    s = hostload.snapshot()
+    assert hostload.overloaded({**s, "running": 4, "cap": 4}), "the watch judges the demand, not the load of 60"
+    assert hostload.lines(s={**s, "running": 4, "cap": 4})[0].endswith(", overloaded: CPU over its limit")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "2")
+    assert testslots.load_guard() == "", "90 is under 2 x 64"
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "0")
+    assert testslots.load_guard() == "", "0 turns the CPU limit off"
+    # (c) io PSI over its limit with idle cores: held as I/O pressure, by its own key; the CPU limit holds nothing.
+    _fake_cpu(monkeypatch, tmp_path, busy=10, running=11, blocked=40)
+    _fake_disk(monkeypatch, tmp_path, full60="35.00")
+    assert testslots.load_guard() == ""
+    assert diskgate.saturated() == "io pressure full avg60 35.0% over 10% (checks.io_full_max)"
+    assert "disk saturated: new local check runs held" in diskgate.line()
+    # No /proc/stat (macOS): the 1-minute load average stands in.
+    monkeypatch.setattr(hostcpu, "STAT", tmp_path / "missing")
+    monkeypatch.setattr(hostcpu, "_LAST", {})
+    monkeypatch.setenv("TTP_CHECKS_LOAD_GUARD", "1")
+    assert hostcpu.demand() is None and checkcap.cpu_demand() == 67.0 and testslots.load_guard()
 
 
 def test_disk_gate_reads_dirty_and_io_pressure_against_their_limits(env, tmp_path, monkeypatch):

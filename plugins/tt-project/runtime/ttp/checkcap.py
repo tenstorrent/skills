@@ -542,6 +542,14 @@ def _load() -> float:
         return float("inf")
 
 
+def cpu_demand() -> float:
+    """This host's runnable CPU demand in cores for the load guard (testslots.load_guard): busy cores and
+    tasks waiting to run, read from /proc/stat over a short window (hostcpu.demand), which leaves out
+    tasks waiting on I/O in D state; the 1-minute load average where /proc/stat cannot be read."""
+    d = hostcpu.demand()
+    return _load() if d is None else d
+
+
 POOL_DIRS_ENV = "TTP_CHECKS_POOL_DIRS"   # where pool runs' folders are looked for (os.pathsep-separated)
 POOL_MAX_AGE_S = 720 * 60.0   # an older ttp-check.* folder is a leftover, not a running check (checkspill's bound)
 

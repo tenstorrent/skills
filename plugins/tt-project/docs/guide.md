@@ -1670,8 +1670,8 @@ session and stateless coordinators on every provider.
   measured cores; with no check running one always starts. Its test grant is then at most those free
   cores (at least 2); `checks.live_cores 0` turns both off. Nor does a new check start here while the
   host's disk is saturated by writes, even with none running: while `Dirty:` in /proc/meminfo is over
-  `checks.dirty_max_mb` (default 2048) or `full avg60` in /proc/pressure/io is over `checks.io_full_max`
-  percent (default 10; a kernel without PSI skips only this signal). Both are account settings
+  `checks.dirty_max_mb` (default 2048) or `full avg60` in /proc/pressure/io is over the I/O pressure limit
+  `checks.io_full_max` percent (default 10; a kernel without PSI skips only this signal). Both are account settings
   (`ttp config --account checks.dirty_max_mb N`, or `TTP_CHECKS_DIRTY_MAX_MB` / `TTP_CHECKS_IO_FULL_MAX`;
   0 turns that signal off). A run that may spill then tries the spill hosts first, else it keeps its
   place and waits; running checks and the push branch's checks (its priority slot) go on. `ttp checks --slot-status` shows the values
@@ -1690,8 +1690,13 @@ session and stateless coordinators on every provider.
   Both stay within `checks.test_project_workers` (chat-settable, per project or account; default the smaller of 8 and
   one per 8 cores, at least 2, plus the cores the larger of the 1- and 5-minute load, less one per test slot the project itself holds, leaves under
   0.75 x the cores, at most half the cores, so its own suites never shrink it; `checks.load_extra` 0 keeps the base; a shrink bounds new grants only), the most test workers one project's suites run at once, which also bounds one run's
-  grant. No new suite starts while the host's 1-minute load is above its cores (`checks.load_guard`, a factor of the
-  cores, default 1; 0 turns it off): it waits and its lane's wait note says why; running suites go on. Four
+  grant. No new suite starts while the host's runnable CPU demand is above its cores (the CPU limit,
+  `checks.load_guard`, a factor of the cores, default 1; 0 turns it off): it waits and its lane's wait note says
+  why; running suites go on. The demand is the busy cores, or the tasks running or waiting to run where more
+  (/proc/stat over a few seconds; the 1-minute load average where that cannot be read). Unlike the load average
+  it leaves out tasks waiting on I/O (D state), so a contended disk with idle cores holds nothing here: disk
+  contention has its own I/O pressure limit (`checks.io_full_max`, above). `ttp checks status` shows both
+  readings, both limits and which one holds. Four
   passes still let one suite each start past it: one for an urgent run (priority 1 or better), one for an urgent
   or push run, one for a run owed to the user (priority 0), and a floor pass for any run, so two urgent runs never
   queue behind each other and load from work outside the queue never stops it while slots are free. A fixed

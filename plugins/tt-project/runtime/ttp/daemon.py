@@ -7716,7 +7716,7 @@ class Daemon:
                  (now, got["text"], json.dumps(history), r["id"]))
 
     def check_host_load(self) -> None:
-        """Model-free host-load watch (hostload): this host's 5-minute load above the load guard's threshold
+        """Model-free host-load watch (hostload): this host's runnable CPU demand above the load guard's threshold
         while local check runs sit at or near the checks cap and no spill host takes any, for
         hostload.HOLD_S, raises one normal observation keyed hostload.KEY per episode; its issue closes once
         that no longer holds. Read-only."""

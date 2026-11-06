@@ -16,7 +16,7 @@ The grant reaches the command as PYTEST_XDIST_AUTO_NUM_WORKERS (what xdist's `-n
 a check keeps its parent's grant (HELD_ENV) instead of taking more. Checks also run at a lower CPU
 and IO priority (low_priority(): nice 19, idle IO), so a host's live services win. One project's suites run
 at most project_workers() test workers at once between them, and no new suite takes slots while the host's
-1-minute load is above its cores (load_guard()); running ones are never stopped.
+runnable CPU demand is above its cores (load_guard()); running ones are never stopped.
 
 Defaults (sizes()): the pool is half the host's usable cores, at least 2, so tests leave the other
 half to live work and builds; one run takes at most min(RUN_MAX, half the pool), at least 1, so two
@@ -119,7 +119,7 @@ NICE = 19            # checks run at the lowest CPU priority by default: every o
 PROJECT_WORKERS_MAX = 8       # checks.test_project_workers base: at most this many test workers per project ...
 CORES_PER_PROJECT_WORKER = 8  # ... and one per this many cores, at least WORKERS_FLOOR (project_workers)
 SPARE_LOAD = 0.75    # unset, a project's test-worker ceiling grows by the cores its load leaves under this x the cores
-LOAD_GUARD = 1.0     # default checks.load_guard: no suite starts while the 1-minute load is above this x the cores
+LOAD_GUARD = 1.0     # default checks.load_guard: no suite starts while the CPU demand is above this x the cores
 PUSH_LOAD_WAIT_S, PUSH_LOAD_WAIT_KEY, PUSH_LOAD_WAIT_ENV = 300.0, "push_load_wait_s", "TTP_CHECKS_PUSH_LOAD_WAIT_S"
 # (push_load_wait_s) the longest push checks wait under load_guard before their branch's reserved lane
 IONICE = ["-c3"]    # idle class: a live service's IO always goes first
@@ -274,18 +274,19 @@ def load_guard_factor() -> float:
 
 
 def load_guard() -> str:
-    """Why no new suite may start now, or "": the host's 1-minute load is above checks.load_guard
-    (load_guard_factor()) times its cores. 0 turns the guard off; an unreadable load average never
-    holds a suite."""
+    """Why no new suite may start now, or "": the host's runnable CPU demand (checkcap.cpu_demand: busy
+    cores and tasks waiting to run, not tasks waiting on I/O) is above checks.load_guard
+    (load_guard_factor()) times its cores. 0 turns the guard off; an unreadable reading never holds a
+    suite. Disk contention is diskgate's limit (checks.io_full_max), not this one."""
     factor = load_guard_factor()
     if not factor:
         return ""
-    ld, c = checkcap._load(), checkcap.cores()
+    ld, c = checkcap.cpu_demand(), checkcap.cores()
     if ld != ld or ld == float("inf") or ld <= factor * c:
         return ""
-    return (f"the host is overloaded: its 1-minute load {ld:.1f} is above "
+    return (f"the host's CPU is overloaded: its runnable demand of {ld:.1f} cores is above "
             + (f"its {c} cores" if factor == 1.0 else f"{factor:g} x its {c} cores")
-            + " (checks.load_guard); no new suite starts until it drops, running ones go on")
+            + " (CPU limit checks.load_guard); no new suite starts until it drops, running ones go on")
 
 
 LOAD_PASS = "test-slots-load-pass"   # check-slots/test-slots-load-pass.lock: the one push or urgent run past the load guard
