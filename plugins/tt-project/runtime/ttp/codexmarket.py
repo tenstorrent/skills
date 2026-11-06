@@ -10,7 +10,7 @@ for the marketplace. Each installed release (~/.tt-project/lib/<version>) is als
 marketplace (write()). When the cache holds another version than the release, reconcile() runs
 `codex plugin add` once. When the registered folder itself serves another version (an installer
 clone nothing updates), it first moves the registration to the release, unless that marketplace also
-serves another installed or enabled plugin. Without `codex` on PATH or a registered tt-project
+serves another installed or enabled plugin or a newer tt-project (a developer's own checkout). Without `codex` on PATH or a registered tt-project
 marketplace it does nothing; a failed or hung call is a line to print, never fatal."""
 from __future__ import annotations
 
@@ -155,6 +155,7 @@ def reconcile(current: Path, version: str, home: Path | None = None) -> list[str
     print; none when the cache already holds it, or Codex or its tt-project marketplace is missing."""
     from .project import HOME_DIR
     from .providers.codex import codex_home
+    from .release import is_newer
     home = home or codex_home()
     cfg = config(home)
     reg = _dict(cfg.get("marketplaces")).get(MARKETPLACE)
@@ -181,6 +182,8 @@ def reconcile(current: Path, version: str, home: Path | None = None) -> list[str
             return [f"{why}; its {MARKETPLACE} marketplace is not a local folder, so it was left as is: run "
                     f"`codex plugin marketplace upgrade {MARKETPLACE} && codex plugin add {ID}`"]
         served = plugin_version(src)
+        if served and is_newer(served, version):   # a newer checkout of the user's own: theirs to keep
+            return [f"{why}; its {MARKETPLACE} marketplace at {src} serves the newer {served}, so it was left as is"]
         if served != version:
             if plugin_version(str(current)) != version:
                 return [f"{why}; {current} is no Codex marketplace of it: rerun `ttp setup` from the plugin"]

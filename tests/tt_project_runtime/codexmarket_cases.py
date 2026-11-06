@@ -141,6 +141,10 @@ def test_codex_marketplace_it_must_not_move_is_left_and_named(env, tmp_path, mon
     (home / "config.toml").write_text(snap.replace('[plugins."tt-skills@tenstorrent-skills"]', "[x]"))
     (cur / ".agents" / "plugins" / "marketplace.json").unlink()
     assert "is no Codex marketplace of it: rerun `ttp setup`" in codexmarket.reconcile(cur, "0.3.0")[0]
+    # A newer checkout the user registered (a developer's own tree) is theirs: never moved back.
+    newer = _cx_market(tmp_path / "dev", "0.4.0")
+    (home / "config.toml").write_text(snap.replace(str(clone), str(newer)).replace('[plugins."tt-skills@tenstorrent-skills"]', "[x]"))
+    assert "serves the newer 0.4.0, so it was left as is" in codexmarket.reconcile(cur, "0.3.0")[0]
     assert _cx_calls(log) == [] and codexmarket.cached(home) == ["0.2.1"]
 
 
