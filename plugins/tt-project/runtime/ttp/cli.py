@@ -5345,7 +5345,9 @@ def _checks_name_senders(rc_file: Path) -> bool:
     def take() -> None:
         while _CHECK_NAMER["gen"] == gen:   # until _checks_names_off
             info = signal.sigtimedwait(_CHECK_STOP_SIGNALS, 1.0)
-            if info is None:
+            # None: timed out. A signal outside the set: Python 3.10 hands back a siginfo it never filled
+            # when its timeout passes while it retries after EINTR (a busy host), so nothing was taken.
+            if info is None or info.si_signo not in _CHECK_STOP_SIGNALS:
                 continue
             try:
                 _checks_sender_seen(info.si_signo, info.si_pid, info.si_uid, rc_file)

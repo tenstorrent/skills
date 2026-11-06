@@ -4787,6 +4787,33 @@ def test_checks_child_in_process_leaves_the_stop_signals_unblocked(env, tmp_path
     assert cli._checks_child(types.SimpleNamespace(rc=str(tmp_path / cli.CHECKS_RC))) == 1
     assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before and not cli._CHECK_NAMER["on"]
 
+def test_the_stop_signal_thread_drops_a_siginfo_naming_no_stop_signal(env, tmp_path, monkeypatch):
+    # Python 3.10's sigtimedwait returns an unfilled siginfo when its timeout passes during an EINTR
+    # retry (seen on a loaded host: signal -15989136): queued, it crashed the checks' main-thread handler.
+    import signal
+    import threading
+    from ttp import cli
+    rc = tmp_path / cli.CHECKS_RC
+    bad = [-15989136, 0, int(signal.SIGUSR1), 1 << 30]
+    fed, done = list(bad), threading.Event()
+
+    def fake(sigset, timeout):
+        if fed:
+            return types.SimpleNamespace(si_signo=fed.pop(0), si_pid=1434177248, si_uid=30154)
+        done.set()
+        return None
+    monkeypatch.setattr(signal, "sigtimedwait", fake)
+    before = signal.pthread_sigmask(signal.SIG_BLOCK, [])
+    assert cli._checks_name_senders(rc)
+    try:
+        assert done.wait(_load_scaled(30)), "the thread never took the fed results"
+        assert cli._CHECK_NAMER["queue"] == [], "a non-stop signal went on to the main thread"
+    finally:
+        cli._checks_names_off()
+    assert signal.pthread_sigmask(signal.SIG_BLOCK, []) == before
+    assert not (tmp_path / "checks.log").exists(), "a non-stop signal was logged as received"
+
+
 def _queue_events(n, waited_s=1000.0, holders=None, start=13):
     now = time.time()
     holders = [{"task": "12", "pid": 4242, "run_since": now - 600, "command": "pytest -q"}] if holders is None \
