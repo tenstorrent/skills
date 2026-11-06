@@ -83,3 +83,17 @@ def test_credwatch_a_run_that_overwrites_gh_hosts_raises_one_high_observation_an
     assert f"run {run['id']} of task #{tid}" in rows[0]["text"] and str(gh) in rows[0]["text"], rows[0]["text"]
     assert gh.read_text() == "token: x\n", "nothing restored"
     assert not list(gh.parent.glob("*.ttp*")), "no copy left beside the file"
+
+
+def test_credwatch_premise_checks_and_guard_tests_run_read_only_under_a_scratch_home():
+    """A premise check once fed a guard a patch for ~/.config/gh/ on the live HOME and overwrote gh's login:
+    the premise question, question tasks and the code self-check all say read-only and a fresh scratch HOME."""
+    from ttp import premise
+    spec = premise.question_spec({"id": 1, "title": "t", "spec": "s"}, "the guard misses X")
+    prompts = RUNTIME.parent / "template" / "prompts"
+    for text in (spec, (prompts / "kind-question.md").read_text(), (prompts / "kind-code.md").read_text(),
+                 (RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "self-check.md").read_text()):
+        flat = " ".join(text.split())
+        assert "HOME, XDG_CONFIG_HOME and GH_CONFIG_DIR" in flat and "fresh `mktemp -d`" in flat, flat[:300]
+    for text in (spec, (prompts / "kind-question.md").read_text()):
+        assert "write nothing outside your run folder" in " ".join(text.split())

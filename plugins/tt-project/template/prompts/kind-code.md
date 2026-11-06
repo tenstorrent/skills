@@ -29,7 +29,8 @@
   mark a part `split` or `wip`: an unfinished head skips its review and the last part reviews them all.
 <!-- /ttp:if split_lines -->
 - Before the hand-off, try to break it (tt-project-harness self-check.md): tick each spec step;
-  a guard or parser: test 3+ bypasses; exit codes: an unexpected one, an interrupted run; no
+  a guard or parser: test 3+ bypasses (feed hooks and guards under HOME, XDG_CONFIG_HOME and
+  GH_CONFIG_DIR at a fresh `mktemp -d`); exit codes: an unexpected one, an interrupted run; no
   unbounded wait or I/O in a db transaction; 100+ non-test lines: why not split. Hand off
   a `self_check` line (also in `on_pass`): what you ticked and tried.
 - A change your spec keeps off the push branch (a `no_push:` line, or a plain ban on this change,

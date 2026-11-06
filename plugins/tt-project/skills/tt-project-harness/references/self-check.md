@@ -8,6 +8,7 @@ A step left partly done is a blocking review finding.
 
 Guards, parsers and denylists (text that decides what is allowed): list at least three bypass forms and test each, for example another spelling or flag order (`-s KILL`, `--signal=KILL`), quoting or escaping, a second command after `;`, `&&` or a newline, a path or alias form, an absolute path, and odd whitespace or case.
 Fixing one reported bypass: test the whole class it belongs to, not only that string.
+Feed tool payloads to hooks and guards, and make any file at a credential-like path, only with HOME, XDG_CONFIG_HOME and GH_CONFIG_DIR set to a fresh `mktemp -d`: runs are unsandboxed, and a payload a guard lets through writes the account's real files (one such check overwrote a host's gh login).
 
 Exit codes and statuses: test one exit code the code does not expect and one interrupted run (killed, timed out, no output or marker written).
 Neither may read as a pass; a probe that cannot run is broken, not passed.
