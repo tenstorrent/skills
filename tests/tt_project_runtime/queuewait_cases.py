@@ -296,3 +296,39 @@ def test_queue_wait_raises_at_most_three_a_scan_longest_first(env):
     assert [fp.split(":")[1] for fp in first] == [str(i) for i in ids[:1:-1]]
     assert sorted(fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host)) == sorted(map(str, ids[:2]))
     assert queuewait.scan(p, QW_CFG, now + 120, host) == []
+
+
+def test_queue_wait_offers_a_spill_host_only_when_it_can_take_checks_now(env):
+    """#6883: a checks wait's item lists a spill host as an option only when it can take checks now (allowed,
+    not paused, its lock not refused); with every spill host paused it lists none and names the pause."""
+    from ttp import db as dbm
+    from ttp import machines, queuewait
+    p = make(env)
+    now = time.time()
+    hosts = ["check-host-a", "check-host-b"]
+    p.charter_path.write_text("# Charter\n## Resources\n" + "".join(f"- {h}: a check host\n" for h in hosts))
+    for h in hosts:
+        machines.add(h)
+    cfg = {**QW_CFG, "delivery": {"checks_spill_hosts": hosts}}
+    host = _qw_host(p, now, now - 40 * 60)
+
+    def item():
+        p.db.x("DELETE FROM events WHERE kind='queue_wait'")
+        p.db.set_kv(queuewait.KV, {})
+        assert len(queuewait.scan(p, cfg, now, host, cores=64)) == 1
+        return _qw_events(p)[0]["text"]
+
+    t = item()
+    assert "spill to an allowed check host (check-host-a, check-host-b)" in t and "No spill host" not in t, t
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "user hold", "by": "user", "since": now}})
+    t = item()
+    assert "spill to an allowed check host (check-host-b)" in t, "a paused host is never offered"
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {h: {"reason": "user hold", "by": "user", "since": now} for h in hosts})
+    t = item()
+    assert "spill to" not in t, "no spill host can take checks: none is offered"
+    assert "No spill host can take checks now (check-host-a: paused: user hold; check-host-b: paused: user hold)" in t, t
+    assert "Options: (1)" in t, "the other options stay"
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {})
+    w = {"task": 7, "queue": "checks", "since": now - 2400}
+    assert not any("spill to" in o for o in queuewait.options(p.db, w, cfg, {})), "never offered unchecked"
+    assert any("spill to" in o for o in queuewait.options(p.db, w, cfg, {}, spill=queuewait.spill_ready(p, cfg)))

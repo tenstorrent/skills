@@ -8771,3 +8771,86 @@ def test_a_requeued_run_is_labelled_so_while_it_waits_and_not_once_it_holds_a_sl
         slot.close()
     monkeypatch.delenv(checkcap.PREEMPTED_ENV)
     assert checkcap.label("pa") == "pa task #31 (run 7)"
+
+
+def test_a_preempted_checks_run_starts_ahead_of_runs_that_queued_after_it_at_its_priority(env, monkeypatch):
+    """#6883: R1 queued at t0 and was preempted at t1 by an urgent run of its own project; R2..R4 (its project
+    and two others) queued between t0 and t1 at its priority. When the slot frees, R1 starts first, though its
+    project's turn went to the urgent run; a waiter that arrived before R1 or is more urgent still goes first."""
+    import threading
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.05)
+    t0 = time.time() - 600
+    blocker = checkcap.acquire("urgent run", project_name="mine", priority=1)   # took R1's slot at t1
+    order, threads = [], []
+
+    def wait(name, project, since, prio=3):
+        def run():
+            s = checkcap.acquire(name, project_name=project, priority=prio, since=since, max_wait_s=30)
+            order.append(name)
+            if s is not None:
+                s.close()
+        threads.append(threading.Thread(target=run))
+        threads[-1].start()
+        assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)) == len(threads))
+
+    wait("R2 mine", "mine", t0 + 10)
+    wait("R3 other", "other", t0 + 20)
+    wait("R4 third", "third", t0 + 30)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "urgent #9")
+    wait("R1 mine", "mine", t0)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    try:
+        q = locks.fair_order(checkcap.slot_dir(), checkcap.RESOURCE, **checkcap.order())
+        assert [locks.is_requeued(t) for t in q].count(True) == 1
+        names = [t.read_text() for t in q]
+        assert names[0] == "R1 mine", names
+        blocker.close()
+        for t in threads:
+            t.join(30)
+        assert order == ["R1 mine", *names[1:]], order
+    finally:
+        blocker.close()
+    # It never passes a waiter that arrived before it or a more urgent one.
+    d = checkcap.slot_dir()
+    tk = {n: locks.enqueue(d, "place", n, since, group="g", priority=pr, requeued=n == "R")
+          for n, since, pr in (("early p4", t0 - 10, 4), ("urgent", t0 + 5, 1), ("later p3", t0 + 6, 3),
+                               ("later p5", t0 + 7, 5), ("R", t0, 3))}
+    try:
+        got = locks.requeued_place([tk[n] for n in ("early p4", "urgent", "later p3", "later p5", "R")])
+        assert [t.read_text() for t in got] == ["early p4", "urgent", "R", "later p3", "later p5"]
+        assert locks.requeued_place([tk["R"], tk["later p3"]]) == [tk["R"], tk["later p3"]]
+    finally:
+        for t in tk.values():
+            locks.dequeue(t)
+
+
+def test_preemption_asks_a_run_never_preempted_before_over_one_already_preempted(env, monkeypatch):
+    """#6883: with two eligible routine runs on the cap, the one already preempted once (the latest granted, of
+    the asker's project) is not asked again: the other one is. Alone, it can still be asked."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    fresh = checkcap.acquire("fresh run", project_name="other", priority=2, preemptible=True)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "urgent #9")
+    again = checkcap.acquire(checkcap.label("mine"), project_name="mine", priority=3, preemptible=True)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    try:
+        every = checkcap.all_paths(2)
+        assert checkcap.preempt("urgent", every, "mine") == "fresh run"
+        checkcap.clear_preempt()
+        for f in checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"):
+            f.unlink()
+        fresh.close()
+        assert checkcap.preempt("urgent", every, "mine") == "mine [preempted by urgent #9]", "the only one left"
+    finally:
+        for f in checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"):
+            f.unlink()
+        fresh.close()
+        again.close()

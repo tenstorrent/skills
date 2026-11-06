@@ -134,9 +134,36 @@ def _holders(db, p, queue: str, res: str, cfg: dict) -> dict:
     return {"cap": None, "running": [], "queued": []}
 
 
-def options(db, w: dict, cfg: dict, paused: dict, device: set | None = None, cores: int = 0) -> list[str]:
+def spill_ready(p, cfg: dict) -> tuple[list[str], list[str]]:
+    """(the spill hosts that can take checks now, why each other one cannot): allowed for this project's checks
+    and not paused here or by another project (checkspill.allowed), and their machine lock not refused
+    (checkspill.lock_busy, as `ttp lock --probe --shared` answers). Local reads only."""
+    from . import checkspill
+    ok, why = [], []
+    for h in checkspill.hosts(cfg):
+        try:
+            no = checkspill.allowed(p, cfg, h) or checkspill.lock_busy(p, cfg, h)
+        except Exception as e:   # unreadable: never offered as a route
+            no = f"could not be read ({e})"
+        if no:
+            why.append(f"{h}: {no}")
+        else:
+            ok.append(h)
+    return ok, why
+
+
+def spill_note(spill: tuple[list[str], list[str]] | None) -> str:
+    """The item's line when spill hosts are set but none can take checks now (spill_ready), else ""."""
+    if not spill or spill[0] or not spill[1]:
+        return ""
+    return f"No spill host can take checks now ({'; '.join(spill[1][:3])}), so none is offered."
+
+
+def options(db, w: dict, cfg: dict, paused: dict, device: set | None = None, cores: int = 0,
+            spill: tuple[list[str], list[str]] | None = None) -> list[str]:
     """Concrete unblock options for wait `w`, from config and host state; none that a user pause, a cap the
-    user set or missing config forbids. Empty: only the user can clear it."""
+    user set or missing config forbids. Empty: only the user can clear it. A spill host is offered only from
+    `spill` (spill_ready): one that can take checks now; none without it."""
     from . import configwho
     t = db.one("SELECT priority, origin FROM tasks WHERE id=?", (w["task"],)) or {}
     res = [r for r in str(w.get("res") or "").split(",") if r]
@@ -145,8 +172,7 @@ def options(db, w: dict, cfg: dict, paused: dict, device: set | None = None, cor
     user_set = lambda key: configwho.role(configwho.get(db, key)) == "user"   # noqa: E731
     out, q = [], w["queue"]
     if q in ("checks", "cpu", "pool"):
-        from . import checkspill
-        hosts = checkspill.hosts(cfg)
+        hosts = list((spill or ([], []))[0])
         if hosts and not user_set("delivery.checks_spill_after_s"):
             out.append(f"spill to an allowed check host ({', '.join(hosts[:3])}): config_set "
                        f"delivery.checks_spill_after_s lower so it spills sooner")
@@ -178,13 +204,14 @@ def key(w: dict) -> str:
     return f"qwait-{w['task']}-{w['queue']}"
 
 
-def text(w: dict, opts: list[str], now: float) -> str:
+def text(w: dict, opts: list[str], now: float, note: str = "") -> str:
     cap = w.get("cap")
     run, que = list(w.get("running") or []), list(w.get("queued") or [])
     some = lambda xs: "; ".join(xs[:4]) + ("; ..." if len(xs) > 4 else "") or "none seen"   # noqa: E731
     head = (f"{key(w)}: #{w['task']} has waited {(now - w['since']) / 60:.0f} min on the "
             f"{NAMES.get(w['queue'], w['queue'])}{' ' + w['res'] if w.get('res') else ''}: {len(run)} running"
-            f" (cap {cap if cap else 'unknown'}), {len(que)} queued. Holding: {some(run)}. Waiting: {some(que)}.")
+            f" (cap {cap if cap else 'unknown'}), {len(que)} queued. Holding: {some(run)}. Waiting: {some(que)}."
+            + (f" {note}" if note else ""))
     if not opts:
         return head + " No option is open to the project (a user pause or a cap the user set holds it): the user is told."
     return head + " Options: " + " | ".join(f"({i}) {o}" for i, o in enumerate(opts, 1))
@@ -199,7 +226,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         return []
     waits = sorted((w for w in collect(p, cfg, now, host, device) if now - w["since"] >= thr), key=lambda w: w["since"])
     paused = db.paused_resources()
-    raised, live = [], set()
+    raised, live, spill = [], set(), None
     st = db.kv(KV) or {}
     opened, told = st.setdefault("open", {}), st.setdefault("told", [])
     for w in waits:
@@ -212,8 +239,11 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         k, mark = key(w), int((now - w["since"]) // thr)
         if db.one("SELECT id FROM events WHERE kind=? AND status='queued' AND data LIKE ?", (KIND, f'%"key": "{k}"%')):
             continue
-        opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores)
-        msg = text(w, opts, now)
+        if spill is None and w["queue"] in ("checks", "cpu", "pool"):
+            spill = spill_ready(p, cfg)   # once a scan, only when a wait could spill
+        sp = spill if w["queue"] in ("checks", "cpu", "pool") else None
+        opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores, sp)
+        msg = text(w, opts, now, spill_note(sp))
         if _cause_owner(db, st, w, now) is not None:
             continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep}}
