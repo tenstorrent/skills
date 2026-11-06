@@ -2611,8 +2611,7 @@ def note_protected(path: str | Path, data: bytes | None = None) -> None:
         sha = hashlib.sha256(data).hexdigest() if data is not None else None
         if log.exists() and log.stat().st_size > PROTECTED_LOG_MAX:
             os.replace(log, log.with_name(log.name + ".1"))
-        with open(log, "a") as f:
-            f.write(json.dumps({"ts": time.time(), "path": os.path.abspath(path), "sha": sha}) + "\n")
+        durable_append(log, json.dumps({"ts": time.time(), "path": os.path.abspath(path), "sha": sha}) + "\n")
     except OSError:
         pass
 
