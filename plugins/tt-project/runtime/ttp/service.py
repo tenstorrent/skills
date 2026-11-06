@@ -166,7 +166,7 @@ Type=oneshot
 WorkingDirectory={p.base}
 ExecStart={' '.join(shlex.quote(a) for a in watchdog_argv(p))}
 {env}
-TimeoutStartSec=300
+TimeoutStartSec={WATCHDOG_RUN_S}
 """, _watchdog_unit(p, "timer"): f"""[Unit]
 Description=Run the tt-project watchdog for {p.name} every 5 minutes
 
@@ -456,6 +456,12 @@ LAUNCHD_EXIT_TIMEOUT_S = 20   # launchd's default ExitTimeOut: SIGKILL this long
 # A restart deferred because the old daemon outlived its stop timeout (restart() could not judge the new
 # one) is recorded here; check_deferred judges the new daemon later, from the watchdog or its own start.
 RESTART_DEFERRED = "restart.deferred"
+# The watchdog runs as a oneshot unit killed WATCHDOG_RUN_S after it starts. A rollback it makes judges the
+# restarted daemon only until JUDGE_MARGIN_S before that kill, so its alert is always posted; it starts one
+# only with ROLLBACK_MIN_S left (the restart's own 60 s bound and the rollback's commits), else a later run does.
+WATCHDOG_RUN_S = 300
+JUDGE_MARGIN_S = 30
+ROLLBACK_MIN_S = 90
 # A helper that dies without a result (its runtime fails to import, a kill, a reboot) is reaped by the
 # daemon: its own handle says it ended, or its claim outlived HELPER_BOUND_S, longer than a restart's own
 # waits (the old daemon's stop, a new daemon's first tick, twice with a rollback, plus the service
@@ -667,12 +673,12 @@ def main() -> int:
 
 
 def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float | None = None,
-                   waits_from: float | None = None) -> str:
+                   waits_from: float | None = None, until: float | None = None) -> str:
     """How a daemon started after `since` came up: "running" once it completed a tick; "busy" if it
     is alive and still in its first tick after tick_wait_s (a first tick may fetch and add worktrees),
     or if no new daemon started because the old one is still alive and holds the lock; otherwise
     "broken": it did not start within wait_s, it exited, or its first tick failed twice. Both waits
-    count from `waits_from` (default `since`)."""
+    count from `waits_from` (default `since`). "unconfirmed" when `until` passes before any of these."""
     from .daemon import HEARTBEAT_STALE_S, _alive, _is_daemon, _read_pid, heartbeat, start_marker
     tick_wait_s = HEARTBEAT_STALE_S if tick_wait_s is None else tick_wait_s
     waits_from = since if waits_from is None else waits_from
@@ -691,6 +697,8 @@ def wait_for_start(p: Project, since: float, wait_s: float, tick_wait_s: float |
         elif now >= waits_from + wait_s:
             old = _read_pid(p.state / "daemon.pid")
             return "busy" if old and _is_daemon(old) or old_daemon_beats(p, since, after=since) else "broken"
+        if until is not None and now >= until:
+            return "unconfirmed"
         time.sleep(poll_s(1))
 
 
@@ -769,16 +777,20 @@ def _await_exit(pids: set[int], until: float) -> set[int]:
 
 
 def _judge_start(p: Project, t0: float, old: set[int], stop_s: float, wait_s: float,
-                 tick_wait_s: float | None) -> tuple[str | None, float, set[int]]:
+                 tick_wait_s: float | None, until: float | None = None) -> tuple[str | None, float, set[int]]:
     """After a restart made at t0, judge the new daemon only once the old daemons (old) have exited: wait
     for their pids at most the service's stop timeout plus STOP_MARGIN_S from t0, then give the new
     daemon wait_s from that moment (wait_for_start). Returns (its state, or None while an old daemon
-    still runs; seconds the old daemons took to stop; the pids still running)."""
-    left = _await_exit(old, t0 + stop_s + STOP_MARGIN_S) if old else set()
+    still runs; seconds the old daemons took to stop; the pids still running). Neither wait outlasts
+    `until` when given (wait_for_start then says "unconfirmed")."""
+    end = t0 + stop_s + STOP_MARGIN_S
+    left = _await_exit(old, end if until is None else min(end, until)) if old else set()
     stopped = time.time() - t0
     if left:
         return None, stopped, left
-    return wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time()), stopped, left
+    if until is None:
+        return wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time()), stopped, left
+    return wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time(), until=until), stopped, left
 
 
 def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None,
@@ -838,9 +850,10 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
 
 
 def _roll_back(p: Project, msg: str, judged: float, stopped: float, stop_s: float, wait_s: float,
-               tick_wait_s: float | None, restart_fn, note: str = "") -> Restarted:
+               tick_wait_s: float | None, restart_fn, note: str = "", until: float | None = None) -> Restarted:
     """The new daemon is broken: roll runtime/ back to the last commit a daemon ran well on, restart and alert
-    (restart(), or check_deferred for a restart judged later). `note` opens the alert's failed phase."""
+    (restart(), or check_deferred for a restart judged later). `note` opens the alert's failed phase. The
+    restarted daemon is judged at most until `until` (the caller's own time limit), so the alert is posted."""
     h = p.harness
     good = (p.db.kv("harness_good") or {}).get("commit")
     changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip() if good else ""
@@ -862,13 +875,16 @@ def _roll_back(p: Project, msg: str, judged: float, stopped: float, stop_s: floa
     failed = _running_daemons(p, main)
     t1 = time.time()
     restart_fn(p)
-    again, _, _ = _judge_start(p, t1, failed, stop_s, wait_s, tick_wait_s)
-    back = again not in (None, "broken")
+    again, _, _ = _judge_start(p, t1, failed, stop_s, wait_s, tick_wait_s, until)
+    back = again not in (None, "broken", "unconfirmed")
+    cut = until is not None and again in (None, "unconfirmed") and time.time() >= until
     commits = "; ".join(changed.splitlines()[:10])
     text = (f"The daemon did not start after a runtime change, so the harness runtime was rolled back to "
             f"{good[:10]}, the last version that ran (a new commit; nothing was deleted). Rolled back: {commits}. "
             + phase + ("" if msg == "restarted" else f"The service manager said: {msg}. ")
-            + ("The daemon is running again." if back else f"It still does not start: check `ttp logs {p.name}`."))
+            + ("The daemon is running again." if back else
+               f"Its restart was not confirmed before this check's time ran out: check `ttp status {p.name}`."
+               if cut else f"It still does not start: check `ttp logs {p.name}`."))
     from .deploy import redeploy_key
     p.db.post("out", text, chat=None, kind="alert", severity="high", ref=redeploy_key(p.name))
     return _said(text, "rolled_back")
@@ -877,25 +893,32 @@ def _roll_back(p: Project, msg: str, judged: float, stopped: float, stop_s: floa
 def _defer(p: Project, t0: float, msg: str, old: set[int], stop_s: float, wait_s: float,
            tick_wait_s: float | None) -> None:
     """Record a restart made at t0 that restart() could not judge (the old daemons, old, still ran), with
-    the harness commit it was to start, for check_deferred."""
-    try:
-        r = _git(p.harness, "rev-parse", "HEAD")
-        head = r.stdout.strip() if r.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError):
-        head = None                            # unknown: check_deferred then does not compare it
+    the harness runtime tree it was to start, for check_deferred."""
     durable_write(p.state / RESTART_DEFERRED, json.dumps({
         "at": t0, "msg": msg, "old": sorted(old), "stop_s": stop_s, "wait_s": wait_s,
-        "tick_wait_s": tick_wait_s, "head": head}))
+        "tick_wait_s": tick_wait_s, "runtime": _runtime_tree(p)}))   # unknown (None): never compared
 
 
-def check_deferred(p: Project, who: str = "watchdog", restart_fn=None) -> str | None:
+def _runtime_tree(p: Project) -> str | None:
+    """The git tree id of the harness's committed runtime/ (a memory or charter commit keeps it), or None."""
+    try:
+        r = _git(p.harness, "rev-parse", "HEAD:runtime")
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def check_deferred(p: Project, who: str = "watchdog", restart_fn=None, budget_s: float | None = None) -> str | None:
     """Judge a deferred restart's new daemon (RESTART_DEFERRED) without waiting, as restart() would have:
     "pending" while an old daemon still runs or the new one is inside its start window (counted from the
     first look that found the old daemons gone); "running" or "busy" (a slow first tick, left alone) end
     it; a broken new daemon is rolled back as restart() does (_roll_back) and returns "rolled_back". The
-    record ends with no verdict ("superseded") once the harness moved past the commit it was to start (a
-    later deploy, or a rollback the updater made), and a later restart() removes it: never two rollbacks.
-    Only the caller that claims the record rolls back. None when there is nothing to judge."""
+    record ends with no verdict ("superseded") once the harness runtime differs from the one it was to start
+    (a later deploy, or a rollback the updater made; commits outside runtime/ keep it), and a later
+    restart() removes it: never two rollbacks. Only the caller that claims the record rolls back.
+    `budget_s`: the seconds the caller may still run (the watchdog's unit kills it): the rollback's judge
+    stops JUDGE_MARGIN_S short of it, and with under ROLLBACK_MIN_S left it stays "pending" for a later
+    run. None when there is nothing to judge."""
     from .daemon import HEARTBEAT_STALE_S, _alive, _is_daemon, heartbeat, start_marker
     path = p.state / RESTART_DEFERRED
     try:
@@ -910,13 +933,10 @@ def check_deferred(p: Project, who: str = "watchdog", restart_fn=None) -> str | 
     if hb and float(hb.get("started") or 0) >= t0:
         path.unlink(missing_ok=True)
         return "running"
-    try:
-        r = _git(p.harness, "rev-parse", "HEAD")
-    except (OSError, subprocess.SubprocessError):
-        return "pending"
-    if r.returncode != 0:
+    tree = _runtime_tree(p)
+    if tree is None:
         return "pending"                       # unknown: never a reason to drop or roll back
-    if rec.get("head") and r.stdout.strip() != rec["head"]:
+    if rec.get("runtime") and tree != rec["runtime"]:
         path.unlink(missing_ok=True)
         return "superseded"
     if any(_is_daemon(int(pid)) for pid in rec.get("old") or []) or old_daemon_beats(p, t0, after=t0):
@@ -938,6 +958,9 @@ def check_deferred(p: Project, who: str = "watchdog", restart_fn=None) -> str | 
             return "busy"
     elif now < gone + wait_s:
         return "pending"
+    until = None if budget_s is None else now + budget_s - JUDGE_MARGIN_S
+    if until is not None and until - now < ROLLBACK_MIN_S:
+        return "pending"                       # too little time left to roll back and alert: a later run
     claim = path.with_name(f"{RESTART_DEFERRED}.{os.getpid()}")
     try:
         os.replace(path, claim)                # one judge rolls back: the daemon's start or the watchdog
@@ -951,7 +974,7 @@ def check_deferred(p: Project, who: str = "watchdog", restart_fn=None) -> str | 
         note = (f"The restart was deferred (the old daemon outlived its service's stop timeout), so the {who} "
                 f"checked the new daemon later. ")
         res = _roll_back(p, msg, now - gone, gone - t0, float(rec.get("stop_s") or 0), wait_s,
-                         rec.get("tick_wait_s"), restart_fn or restart_service, note)
+                         rec.get("tick_wait_s"), restart_fn or restart_service, note, until)
         if res.outcome == "failed":            # nothing to roll back to: no caller reports it, so alert
             p.db.post("out", f"{note}{res}", chat=None, kind="alert", severity="high")
         return res.outcome

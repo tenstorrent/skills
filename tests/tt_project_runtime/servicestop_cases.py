@@ -73,9 +73,9 @@ def _slow_stop_service(env, monkeypatch, exits_at=120.2, ready_at=5.0, show="Tim
     froms = []
     judge = service.wait_for_start
 
-    def wait_for_start(p, since, wait_s, tick_wait_s=None, waits_from=None):
+    def wait_for_start(p, since, wait_s, tick_wait_s=None, waits_from=None, **kw):
         froms.append((waits_from or since) - restarts[0])
-        return judge(p, since, wait_s, tick_wait_s, waits_from)
+        return judge(p, since, wait_s, tick_wait_s, waits_from, **kw)
 
     monkeypatch.setattr(service, "wait_for_start", wait_for_start)
     return p, head, clock, froms
@@ -188,11 +188,79 @@ def test_a_deferred_restart_is_never_rolled_back_again_once_the_harness_moved_on
     from ttp import service
     # The updater already rolled back (or deployed again): the harness moved past the deferred commit.
     p, head, clock = _ss_deferred(env, monkeypatch, ready_at=None)
-    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m",
-             "roll back runtime to abc: handled by the updater")
+    _runtime_change(p.harness)
     assert service.check_deferred(p) == "superseded"
     assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND severity='high'")
     # A later restart judges the daemon itself: it drops the deferred record.
     service._defer(p, clock.now, "restarted", set(), 90, 60, None)
     service.restart(p, restart_fn=lambda p: "restarted")
     assert not (p.state / service.RESTART_DEFERRED).exists()
+
+
+def test_a_deferred_restart_survives_a_commit_outside_the_runtime(env, monkeypatch):
+    from ttp import service
+    # A memory or charter commit after the deploy leaves the runtime it was to start: still judged.
+    p, head, clock = _ss_deferred(env, monkeypatch, ready_at=None)
+    (p.harness / "MEMORY.md").write_text("a memory entry\n")
+    _git_out(p.harness, "add", "MEMORY.md")
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "memory: an entry")
+    assert service.check_deferred(p) == "rolled_back"
+    assert p.db.one("SELECT id FROM messages WHERE kind='alert' AND severity='high'")
+
+
+def _ss_slow_rollback(env, monkeypatch, budget_s):
+    """A deferred restart whose new daemon died, judged by a watchdog run killed budget_s from now: the
+    rollback's restart starts no new daemon, so its judge would wait out a 600 s start window."""
+    from ttp import service
+    p, head, clock = _ss_deferred(env, monkeypatch, ready_at=None)
+    path = p.state / service.RESTART_DEFERRED
+    path.write_text(json.dumps({**json.loads(path.read_text()), "wait_s": 600}))
+    clock.sleep(5)                             # the dead new daemon started before this run
+    killed_at, sleep = clock.now + budget_s, clock.sleep
+
+    def sleep_until_killed(s):
+        if clock.now + s > killed_at:
+            raise SystemExit("the watchdog's unit timed out")
+        sleep(s)
+    clock.sleep = sleep_until_killed
+    res = service.check_deferred(p, restart_fn=lambda p: "restarted", budget_s=budget_s)
+    return p, head, clock, res, killed_at
+
+
+def test_a_watchdog_rollback_posts_its_alert_before_the_unit_timeout_kills_it(env, monkeypatch):
+    from ttp import service
+    p, head, clock, res, killed_at = _ss_slow_rollback(env, monkeypatch, budget_s=service.WATCHDOG_RUN_S - 40)
+    assert res == "rolled_back" and _git_out(p.harness, "rev-parse", "HEAD") != head
+    alert = p.db.one("SELECT text FROM messages WHERE kind='alert' AND severity='high'")
+    assert alert and "not confirmed" in alert["text"] and "Rolled back:" in alert["text"], alert
+    assert clock.now <= killed_at - service.JUDGE_MARGIN_S + 2
+
+
+def test_a_watchdog_run_with_too_little_time_left_leaves_the_rollback_to_a_later_run(env, monkeypatch):
+    from ttp import service
+    budget = service.JUDGE_MARGIN_S + service.ROLLBACK_MIN_S - 1
+    p, head, clock, res, killed_at = _ss_slow_rollback(env, monkeypatch, budget_s=budget)
+    assert res == "pending" and (p.state / service.RESTART_DEFERRED).exists()
+    _no_rollback(p, head)
+
+
+def test_the_watchdog_run_judges_a_deferred_restart(env, monkeypatch):
+    from ttp import service, watchdog
+    p, head, clock = _ss_deferred(env, monkeypatch, ready_at=None)
+    monkeypatch.setattr(watchdog, "check", lambda p: "ok")
+    monkeypatch.setattr(watchdog.sys, "argv", ["ttp.watchdog", str(p.base)])
+    assert watchdog.main() == 0
+    assert not (p.state / service.RESTART_DEFERRED).exists()
+    assert _git_out(p.harness, "rev-parse", "HEAD") != head
+    alert = p.db.one("SELECT text FROM messages WHERE kind='alert' AND severity='high'")
+    assert alert and "the watchdog checked" in alert["text"] and "running again" in alert["text"], alert
+
+
+def test_a_new_daemons_first_tick_ends_a_deferred_restart(env):
+    p = make(env)
+    from ttp import service
+    from ttp.daemon import Daemon
+    service._defer(p, time.time() - 5, "restarted", set(), 90, 60, None)
+    assert json.loads((p.state / service.RESTART_DEFERRED).read_text())["runtime"]
+    Daemon(p.base)._beat()
+    assert not (p.state / service.RESTART_DEFERRED).exists(), "the new daemon's tick left the restart unjudged"

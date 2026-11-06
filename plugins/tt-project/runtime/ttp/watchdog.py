@@ -265,6 +265,7 @@ def _end(pid: int, grace_s: float) -> bool:
 
 
 def main() -> int:
+    began = time.time()
     p = Project(sys.argv[1] if len(sys.argv) > 1 else os.getcwd())
     if p.state.is_dir():
         found = check(p)
@@ -272,7 +273,7 @@ def main() -> int:
             print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} watchdog: {found}")
         try:   # a restart deferred past the old daemon's stop timeout: judge its new daemon now
             from . import service
-            judged = service.check_deferred(p)
+            judged = service.check_deferred(p, budget_s=service.WATCHDOG_RUN_S - (time.time() - began))
         except Exception as e:  # never in the way of the hang check
             judged = f"error: {type(e).__name__}: {e}"
         if judged not in (None, "pending"):
