@@ -143,9 +143,12 @@ def prep(cells: list[dict], out: Path, seed: int | None = None) -> dict:
 
 @contextmanager
 def _locked(d: Path):
-    with open(d / ".lock", "a") as f:
-        fcntl.flock(f, fcntl.LOCK_EX)
+    fd = os.open(d / ".lock", os.O_RDWR | os.O_CREAT, 0o600)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
         yield json.loads((d / "batch.json").read_text())
+    finally:
+        os.close(fd)
 
 
 def _check(got: dict) -> dict:
