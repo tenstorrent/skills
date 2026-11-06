@@ -84,7 +84,7 @@ def test_a_run_cannot_edit_or_name_a_listed_guard_outside_a_harness_task(env, mo
     assert "harness task" in _worker("Edit", p.harness, file_path="guards/./no_wipe.py", old_string="a", new_string="b")
     for cmd in (f"sed -i 's/wipe/x/' {target}", "rm guards/no_wipe.py", f"mv {target} /tmp/off.py"):
         assert "harness task" in _worker("Bash", p.harness, command=cmd), cmd
-    t = p.db.add_task("harness", "tune the local guard")
+    t = p.db.add_task("tune the local guard", kind="harness")
     monkeypatch.setenv("TTP_TASK", str(t))
     assert _worker("Write", tmp_path, file_path=str(target), content=NO_WIPE) is None
 
