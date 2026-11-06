@@ -317,5 +317,42 @@ def test_curl_and_wget_posts_to_github_slack_jira_and_confluence_need_the_ai_tag
         "echo curl -d x https://slack.com/api/chat.postMessage")
     for cmd in passed:
         assert bash(cmd) is None, cmd
+    # Structured bodies (Confluence storage, Jira ADF, Slack blocks) are one post that ends with its last
+    # text, not with a structural value (representation, marks) or one block on its own.
+    import json
+    tagged = "[authored by AI]"
+
+    def adf(end):
+        return {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [
+            {"type": "text", "text": "hi "}, {"type": "text", "text": end, "marks": [{"type": "em"}]}]}]}
+    shapes = (   # (url, body with its end text)
+        ("https://x.atlassian.net/wiki/rest/api/content", lambda end: {
+            "type": "page", "title": "t", "space": {"key": "S"},
+            "body": {"storage": {"value": f"<p>hi</p><p>{end}</p>", "representation": "storage"}}}),
+        ("https://x.atlassian.net/wiki/rest/api/content/12/child/comment", lambda end: {
+            "type": "comment", "container": {"id": "12", "type": "page"},
+            "body": {"storage": {"value": f"<p>{end}</p>", "representation": "storage"}}}),
+        ("https://x.atlassian.net/wiki/api/v2/pages", lambda end: {
+            "spaceId": "1", "status": "current", "title": "t",
+            "body": {"representation": "storage", "value": f"<p>hi</p><p>{end}</p>"}}),
+        ("https://x.atlassian.net/wiki/api/v2/footer-comments", lambda end: {
+            "pageId": "1", "body": {"representation": "storage", "value": f"<p>{end}</p>"}}),
+        ("https://x.atlassian.net/rest/api/3/issue/X-1/comment", lambda end: {"body": adf(end)}),
+        ("https://x.atlassian.net/rest/api/3/issue", lambda end: {
+            "fields": {"project": {"key": "X"}, "summary": "s", "issuetype": {"name": "Task"}, "description": adf(end)}}),
+        ("https://x.atlassian.net/rest/api/2/issue/X-1/comment", lambda end: {"body": f"hi\n{end}"}),
+        ("https://x.atlassian.net/rest/api/2/issue", lambda end: {
+            "fields": {"project": {"key": "X"}, "summary": "s", "description": f"d\n{end}"}}),
+        ("https://slack.com/api/chat.postMessage", lambda end: {
+            "channel": "C1", "text": f"hi {tagged}", "blocks": [
+                {"type": "section", "text": {"type": "mrkdwn", "text": "hi"}},
+                {"type": "context", "elements": [{"type": "mrkdwn", "text": end}]}]}))
+    for url, body in shapes:
+        for end, ok in ((tagged, True), ("bye", False)):
+            cmd = f"curl -X POST -H 'Content-Type: application/json' -d {shlex.quote(json.dumps(body(end)))} {url}"
+            why = bash(cmd)
+            assert (why is None) == ok, (cmd, why)
+    for host in ("http://localhost:8080", "http://127.0.0.1", "http://[::1]:9000"):   # a local endpoint
+        assert bash(f"curl -d '{{\"body\": \"d\"}}' {host}/rest/api/2/issue/X-1/comment") is None, host
     p.set_config("delivery.ai_tag", "")
     assert bash(refused[0]) is None

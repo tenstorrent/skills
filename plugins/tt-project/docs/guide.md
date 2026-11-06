@@ -2196,7 +2196,8 @@ running work is interrupted only by the preemption below:
   post, draft or create a message, comment, issue, page or email (Slack, Jira, Confluence, mail), or
   an event or invite that names guests; and the Bash hook (Claude Code and Codex runs) on `curl` or
   `wget` sending a body to a literal GitHub, Slack (messages, webhooks), Jira (issues, comments) or
-  Confluence (pages, comments) URL that posts. PR bodies, edits of an issue's or PR's own body and
+  Confluence (pages, comments) URL that posts (not on a local host); a structured body (Confluence
+  storage, Jira ADF, Slack `blocks`) is one post judged by its last text. PR bodies, edits of an issue's or PR's own body and
   commit messages are left as they are, and messages to the user (the chat relay, `ttp notify`, the
   web app) are never tagged. Known gaps, left to the prompt rule: a script or another CLI posting
   (python, httpie, a gh extension), a URL or body built at run time (`$URL`, a text ending in `$MSG`),

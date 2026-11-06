@@ -207,14 +207,28 @@ def _leaves(v) -> list[str]:
     return []
 
 
+def _text_leaves(v) -> list[str]:
+    """The text of a structured field (rich text, a document tree, Slack blocks): the strings under a
+    text key or `value` and the plain strings of a list, not structure (type, representation, marks)."""
+    if isinstance(v, str):
+        return [v]
+    if isinstance(v, dict):
+        return [s for k, x in v.items() for s in
+                (([x] if _text_key(str(k)) or str(k).lower() == "value" else []) if isinstance(x, str)
+                 else _text_leaves(x))]
+    if isinstance(v, list):
+        return [s for x in v for s in _text_leaves(x)]
+    return []
+
+
 def _texts(tool_input, depth: int = 0) -> list[str]:
     """The text fields of a tool's input: a string field under a text key, or a structured one (rich
-    text, a document tree) as its last text leaf."""
+    text, a document tree, a Slack `blocks` list) as one post that ends with its last text leaf."""
     out = []
     if isinstance(tool_input, dict) and depth < 4:
         for k, v in tool_input.items():
-            if _text_key(str(k)):
-                leaves = [s for s in _leaves(v) if s.strip()]
+            if _text_key(str(k)) or str(k).lower() == "blocks" and isinstance(v, list):
+                leaves = [s for s in _text_leaves(v) if s.strip()] or [s for s in _leaves(v) if s.strip()]
                 if isinstance(v, str):
                     out += [v] if v.strip() else []
                 elif leaves:
@@ -266,7 +280,8 @@ def tool_problem(tool_name: str, tool_input, cfg: dict | None) -> str | None:
 # A literal URL of an API call that posts text others read: GitHub (the REST endpoints above), Slack
 # messages and webhooks, Jira issues and comments, Confluence pages and comments.
 HTTP_POST_URL_RE = re.compile(
-    r"^https?://(?:api\.github\.com/(?P<gh>[^?#]+)|(?:[\w-]+\.)?slack\.com/api/chat\.(?:postMessage|postEphemeral"
+    r"^https?://(?!(?:localhost|127(?:\.\d+){3}|\[::1\]|0\.0\.0\.0)(?::\d+)?(?:[/?#]|$))"   # not a local endpoint
+    r"(?:api\.github\.com/(?P<gh>[^?#]+)|(?:[\w-]+\.)?slack\.com/api/chat\.(?:postMessage|postEphemeral"
     r"|scheduleMessage|update)\b|hooks\.slack\.com/(?:services|workflows|triggers)/"
     r"|[^/?#]+(?:/[^?#]*)?/rest/api/(?:2|3|latest)/issue(?:/[^/?#]+/comment(?:/\d+)?)?/?(?:[?#]|$)"
     r"|[^/?#]+(?:/[^?#]*)?/(?:rest/api/content(?:/\d+(?:/child/comment)?)?|api/v2/(?:pages|blogposts|footer-comments"
