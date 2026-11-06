@@ -119,3 +119,35 @@ def test_benchblind_scores_are_refused_after_the_labels_are_revealed(tmp_path):
     assert benchblind.main(["score", str(d), ids[0], json.dumps(good)]) == 2
     stored = json.loads((d / "batch.json").read_text())
     assert stored["seed"] == 3 and len(stored["scores"]) == 4 and stored["labels"] == out["labels"]
+
+
+def test_benchblind_prep_refuses_cells_that_share_a_task_id(tmp_path):
+    # Two cells of one task (repeats) would both show the last cell's diffs and never reveal.
+    from ttp import benchblind
+    one, two = _blind_cells()[:2]
+    for task in (one["task"], int(one["task"])):   # 501 and "501" are one id once stringified
+        dup = [one, {**two, "task": task}]
+        with pytest.raises(benchblind.Refused, match="own task id"):
+            benchblind.prep(dup, tmp_path / "d", seed=5)
+        assert not (tmp_path / "d").exists()   # refused before anything is written
+    p = tmp_path / "cells.json"
+    p.write_text(json.dumps({"cells": [one, {**two, "task": one["task"]}]}))
+    assert benchblind.main(["prep", str(p), "--out", str(tmp_path / "e")]) == 2 and not (tmp_path / "e").exists()
+    b = benchblind.prep([one, {**two, "task": f"{one['task']}-r2"}], tmp_path / "f", seed=5)
+    assert len(b["items"]) == 4 and {i["task"] for i in b["items"]} == {one["task"], f"{one['task']}-r2"}
+
+
+def test_benchblind_reviewer_call_runs_unsandboxed_like_other_decision_only_runs(monkeypatch):
+    from ttp import benchblind
+    seen, real = [], benchblind.subprocess.run
+
+    def run(argv, **kw):
+        if "input" not in kw:   # the adapter's own probes (`codex exec --help`)
+            return real(argv, **kw)
+        seen.append(list(argv))
+        raise RuntimeError("stop")
+    monkeypatch.setattr(benchblind.subprocess, "run", run)
+    with pytest.raises(RuntimeError):
+        benchblind.provider_ask("codex", "", "", 1.0)("score this")
+    argv = seen[0]
+    assert "danger-full-access" in argv and not any(a == "-s" and b == "read-only" for a, b in zip(argv, argv[1:]))

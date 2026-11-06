@@ -884,6 +884,7 @@ criteria and every arm's diff with its metadata (model, provider, effort, run id
 timings), and writes anonymised items: commit headers, trailers and blob ids are dropped, and model
 and provider names, effort settings, run and session ids, timestamps, elapsed times, transcript
 paths and every metadata value in the batch are masked. Prep refuses a batch where one still shows.
+Each cell needs its own task id: prep refuses cells that share one, so give each repeat its own id.
 The arms of each task take letters in an order shuffled from the seed, and the items are shuffled
 too. The seed and labels go to `<dir>/seal.json` (mode 0600), pinned by its sha256 in
 `<dir>/batch.json`. `review <dir> [--provider P --model M --effort E]` runs one decision-only,

@@ -119,6 +119,10 @@ def _sha(b: bytes) -> str:
 def prep(cells: list[dict], out: Path, seed: int | None = None) -> dict:
     if out.exists():
         raise Refused(f"{out} exists; name a new folder")
+    seen: set = set()
+    dup = sorted({t for t in (str(c["task"]) for c in cells) if t in seen or seen.add(t)})
+    if dup:   # cells are keyed by task: repeats would show one cell's diffs twice and never reveal
+        raise Refused(f"task id(s) {', '.join(dup[:10])} name more than one cell; give each repeat its own task id")
     seed = secrets.randbits(63) if seed is None else int(seed)
     tokens = arm_tokens(cells)
     by_task = {str(c["task"]): c for c in cells}
@@ -220,6 +224,7 @@ def provider_ask(provider: str, model: str, effort: str, budget_usd: float):
         with tempfile.TemporaryDirectory() as tmp:
             argv, env = prov.build(role="review", model=model, effort=effort, cwd=tmp, budget_usd=budget_usd,
                                    read_only=True, schema=SCHEMA, restrictions={})
+            argv = prov.read_only_args(argv)   # decision-only: unsandboxed, as the daemon's
             out = Path(tmp) / "output.jsonl"
             r = subprocess.run(argv, input=text.encode(), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
                                cwd=tmp, env={**os.environ, **env}, timeout=1800)
