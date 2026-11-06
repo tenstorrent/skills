@@ -2266,7 +2266,8 @@ def test_a_push_batch_replays_heads_in_order_and_keeps_an_approval_only_when_the
     `cells`: the tip and the change each edited a different cell of one docs table row (a send-back
     that cost a review run): settled by cells, the checks run on the result and both land with no
     model. `same_cell` (both rewrote one cell) and `own_logic` (both changed one line of a function)
-    still go back to the review as a conflict."""
+    still go back to the review as a conflict (`same_cell` with delivery.mechanical_merge_paths empty: by
+    default a shared doc keeps both sides' rows, see the shared-doc carry tests)."""
     files = {"cells": "docs/providers.md", "same_cell": "docs/providers.md", "own_logic": "pkg/m.py"}
     path = files[case]
     base = ("| Item | Claude | Codex |\n| --- | --- | --- |\n| Mode | `--a` | `-s ro` |\n" if case != "own_logic"
@@ -2276,6 +2277,8 @@ def test_a_push_batch_replays_heads_in_order_and_keeps_an_approval_only_when_the
     change = {"cells": base.replace("`-s ro`", "`-s full`"), "same_cell": base.replace("`-s ro`", "`-s full`"),
               "own_logic": base.replace("x + 1", "x * 3")}[case]
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    if case == "same_cell":
+        p.set_config("delivery.mechanical_merge_paths", [])
     (other / path).parent.mkdir(parents=True)
     _commit(other, path, base)
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
