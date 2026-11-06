@@ -701,23 +701,31 @@ def task_pass(p, task: str, head: str, cwd: str | None) -> dict | None:
     top = _git_out(cwd, "rev-parse", "--show-toplevel")
     if not top or _git_out(cwd, "status", "--porcelain", "--untracked-files=no"):
         return None
-    if not (p.state / "project.db").is_file():
+    rec = task_record(p, task, head)
+    if rec and rec.get("passed") is True and isinstance(rec.get("worktree"), str) \
+            and os.path.realpath(rec["worktree"]) == os.path.realpath(top):
+        return rec
+    return None
+
+
+def task_record(p, task, head: str) -> dict | None:
+    """The latest candidate `ttp checks` record (CHECKS_FILE) of any run of task `task` on exactly `head`,
+    with its run's folder as "run_dir", or None. A harness qualification is never candidate evidence. The
+    latest candidate record on this head decides: a later failure there is not covered by an earlier pass."""
+    if not (str(task).isdigit() and head) or not (p.state / "project.db").is_file():
         return None
     try:
         runs = p.db.q("SELECT id FROM runs WHERE task=? ORDER BY id DESC", (int(task),))
     except Exception:
         return None
     for r in runs:
+        run_dir = p.runs / str(r["id"])
         try:
-            rec = json.loads((p.runs / str(r["id"]) / CHECKS_FILE).read_text())
+            rec = json.loads((run_dir / CHECKS_FILE).read_text())
         except (OSError, ValueError):
             continue
         if isinstance(rec, dict) and rec.get("head") == head and candidate_record(rec):
-            # A harness qualification is never candidate evidence. The latest candidate record on this head decides: a later failure there is not covered by an earlier pass.
-            if rec.get("passed") is True and isinstance(rec.get("worktree"), str) \
-                    and os.path.realpath(rec["worktree"]) == os.path.realpath(top):
-                return rec
-            return None
+            return {**rec, "run_dir": str(run_dir)}
     return None
 
 

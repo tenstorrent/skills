@@ -15518,7 +15518,7 @@ class Daemon:
                                                           ", and the landed commit." if lands else "."))
         # A review that publishes with `ttp push --own` carries the branch it publishes onto, as its subject does.
         labels = [f"auto_review:{task['id']}"] + ([f"continues:{prior['id']}"] if prior else []) \
-            + ([PRECHECK_LABEL + checks.name] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never or ext else []) + ([push.LAND_LABEL] if lands else []) \
+            + ([f"{PRECHECK_LABEL}t{task['id']}-{full[:12]}"] if checks else []) + ([push.REVIEW_ONLY_LABEL] if elsewhere or off or never or ext else []) + ([push.LAND_LABEL] if lands else []) \
             + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
             + ([extchange.HEAD_LABEL + ext["head"]] if ext else []) \
             + ([chaincap.SPLIT_REVIEW_LABEL + own_split] if stall else [])
@@ -15638,7 +15638,25 @@ class Daemon:
         return True
 
     def _precheck_line(self, task: dict, head: str, checks: Path) -> str:
-        """The review spec's line on the checks _precheck started on the code task's head."""
+        """The review spec's line on the checks _precheck started on the code task's head, or on the
+        code task's own pass there that it reused (_own_pass)."""
+        if checks.parent != self.p.state / PRECHECKS_DIR:
+            from . import prguard
+            try:
+                rec = json.loads((checks / prguard.CHECKS_FILE).read_text())
+            except (OSError, ValueError):
+                rec = {}
+            excused = ", ".join(i for x in rec.get("excused") or [] if isinstance(x, dict)
+                                for k in ("quarantined", "pre_existing", "flaky") for i in x.get(k) or [])
+            return (f"The project's checks (`ttp checks`) already passed on head {head} in #{task['id']}'s own run "
+                    f"{checks.name}, so the daemon started no checks run for this review: "
+                    f"{checks / prguard.CHECKS_FILE} records the pass and {checks / 'checks.log'} its output. "
+                    + (f"That pass excused failures not new on this head ({excused or 'see its excused list'}), so it "
+                       f"counts for this change's landing only and is not recorded for reuse: `ttp checks` there "
+                       f"would run them all again. " if rec.get("excused") else
+                       "Its pass is recorded, so `ttp checks` there reuses it. ")
+                    + "The push queue runs the full checks again on the commit it pushes: run only focused tests "
+                      "of what changed.")
         return (f"The daemon started the project's checks (`ttp checks`) on head {head} in "
                 f"{self.p.worktrees / ('t' + str(task['id']))} as #{task['id']} finished, and starts this review "
                 f"once they end: `ttp checks --result {checks}` prints their exit code and output tail "
@@ -15699,7 +15717,7 @@ class Daemon:
         self.p.db.update_task(review["id"],
                               spec=f"{review.get('spec') or ''}\n{self._precheck_line(task, full[:12], checks)}",
                               labels=[x for x in labels if not x.startswith(PRECHECK_LABEL)]
-                              + [PRECHECK_LABEL + checks.name])
+                              + [f"{PRECHECK_LABEL}t{task['id']}-{full[:12]}"])
 
     def _precheck(self, task: dict, full: str) -> Path | None:
         """With the push queue on, the project's checks (`ttp checks --detach`) started on the code
@@ -15717,6 +15735,10 @@ class Daemon:
                 return None
         except Exception:
             return None
+        if own := self._own_pass(task, full, path, push.all_checks(d)):
+            log(self.p, f"task {task['id']}: no checks started on {full[:12]} for its review: its own run "
+                        f"{Path(own['run_dir']).name} passed them there ({own['run_dir']})")
+            return Path(own["run_dir"])
         base = self.p.state / PRECHECKS_DIR
         self._prune_prechecks(base)
         out = base / f"t{task['id']}-{full[:12]}"
@@ -15724,6 +15746,23 @@ class Daemon:
             return None
         log(self.p, f"task {task['id']}: started the checks on {full[:12]} for its review ({out})")
         return out
+
+    def _own_pass(self, task: dict, full: str, path: Path, checks: list) -> dict | None:
+        """The code task's own latest `ttp checks` record on exactly `full` (prguard.task_record), when it
+        passed in `path` and its commands start with the project's checks `checks` (as the pre-checks
+        would run them): the review reuses it and no checks run again. A pass that excused failures not
+        new on the head (gatejudge, landing only) counts too: it is this change's own landing, and the
+        push queue runs its full checks on the commit it pushes anyway. None for any other record, and
+        the pre-checks start; `ttp checks` then applies its own pass-reuse rules."""
+        from . import prguard
+        rec = prguard.task_record(self.p, task["id"], full)
+        want = [str(c) for c in checks]
+        cmds = rec.get("commands") if rec else None
+        if not rec or rec.get("passed") is not True or not want or not isinstance(cmds, list) \
+                or [str(c) for c in cmds[:len(want)]] != want or not isinstance(rec.get("worktree"), str) \
+                or os.path.realpath(rec["worktree"]) != os.path.realpath(path):
+            return None
+        return rec
 
     @staticmethod
     def _prune_prechecks(base: Path) -> None:

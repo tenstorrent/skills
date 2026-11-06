@@ -13218,6 +13218,87 @@ def test_a_review_whose_precheck_did_not_fail_on_its_tests_still_gets_its_review
     assert not s.p.db.q("SELECT id FROM tasks WHERE labels LIKE ?", (f'%"review_fix:{s.review}"%',))
 
 
+def _own_checks_record(p, tid, **rec):
+    """A run of code task `tid` whose `ttp checks` wrote `rec` (prguard.CHECKS_FILE) in its run folder."""
+    rid = p.db.x("INSERT INTO runs(task,role,status) VALUES(?,?,?)", (tid, "worker", "ok"))
+    (p.runs / str(rid)).mkdir(parents=True, exist_ok=True)
+    (p.runs / str(rid) / "checks.json").write_text(json.dumps({"purpose": "candidate", "ts": time.time(), **rec}))
+    return str(rid)
+
+
+def _review_of_own_checks(env, monkeypatch, record):
+    """A code task finishes with the push queue on and the project's checks `false` (a run of them would
+    fail); `record(tid, head, worktree)` writes its own checks records first. (review, started checks, head)."""
+    from ttp import worktree
+    from ttp.daemon import Daemon
+    p = make(env)
+    _with_origin(env, clone=False)
+    p.set_config("delivery.push_branch", "work")
+    p.set_config("delivery.push_queue", True)
+    p.set_config("delivery.push_checks", ["false"])
+    started = []
+    monkeypatch.setattr(Daemon, "_start_checks", lambda self, path, out, run_id, tid, extra: started.append(out) or True)
+
+    def before(tid, head):
+        record(p, tid, head, str(worktree.ensure(p, p.db.task(tid))[0]))
+    tid, branch, _, (rev,) = _finish_code(env, p, "reuse own", {"app.py": 3}, before=before)
+    return p, tid, rev, started, _git_out(p.root, "rev-parse", branch).strip()
+
+
+@pytest.mark.parametrize("excused", [False, True])
+def test_a_review_of_a_head_its_code_task_passed_starts_no_checks_and_cites_that_run(env, monkeypatch, excused):
+    """Review pre-checks ran the 40-minute suite again on the head the code task had just passed, one
+    whose flaky test the gate excused (landing only, so its pass was not recorded for reuse) waiting
+    for a host slot: the code task's own pass on that head, same worktree and check set, answers for them."""
+    from ttp.daemon import PRECHECK_LABEL, PRECHECKS_DIR
+    runs = {}
+    gate = {"excused": [{"check": "false", "quarantined": ["tests/test_x.py::test_flaky"]}], "landing_only": True}
+
+    def record(p, tid, head, path):
+        runs["own"] = _own_checks_record(p, tid, head=head, worktree=path, passed=True,
+                                         commands=["false", "pytest -q tests/test_app.py"], **(gate if excused else {}))
+    p, tid, rev, started, head = _review_of_own_checks(env, monkeypatch, record)
+    assert not started, "the review's pre-checks ran again on a head its code task passed"
+    assert not (p.state / PRECHECKS_DIR / f"t{tid}-{head[:12]}").exists()
+    assert json.loads(rev["labels"]).count(f"{PRECHECK_LABEL}t{tid}-{head[:12]}") == 1
+    assert f"#{tid}'s own run {runs['own']}" in rev["spec"] and "started no checks run" in rev["spec"]
+    assert str(p.runs / runs["own"] / "checks.json") in rev["spec"]
+    assert ("landing only" in rev["spec"] and "tests/test_x.py::test_flaky" in rev["spec"]) == excused
+    assert ("`ttp checks` there reuses it" in rev["spec"]) != excused
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    assert not d._precheck_holds(p.db.task(rev["id"]), time.time()), "the review waits for no checks"
+    assert not d._precheck_failed(p.db.task(rev["id"])), "nothing failed: the reviewer runs"
+    assert "no checks started on" in (p.logs / "daemon.log").read_text()
+
+
+@pytest.mark.parametrize("case", ["other head", "other checks", "failed later", "other worktree", "harness",
+                                  "fast path", "none"])
+def test_a_review_whose_code_task_has_no_matching_pass_on_its_head_still_starts_its_checks(env, monkeypatch, case):
+    from ttp.daemon import PRECHECK_LABEL
+
+    def record(p, tid, head, path):
+        ok = dict(head=head, worktree=path, passed=True, commands=["false"])
+        if case == "other head":
+            ok["head"] = "0" * 40
+        elif case == "other checks":
+            ok["commands"] = ["true", "false"]
+        elif case == "other worktree":
+            ok["worktree"] = str(env["tmp"])
+        elif case == "harness":
+            ok["purpose"] = "harness"
+        elif case == "fast path":
+            ok["fast_path"] = True
+        if case != "none":
+            _own_checks_record(p, tid, **ok)
+        if case == "failed later":   # the latest record on the head decides
+            _own_checks_record(p, tid, **{**ok, "passed": False})
+    p, tid, rev, started, head = _review_of_own_checks(env, monkeypatch, record)
+    assert [o.name for o in started] == [f"t{tid}-{head[:12]}"], case
+    assert f"{PRECHECK_LABEL}t{tid}-{head[:12]}" in json.loads(rev["labels"])
+    assert "ttp checks --result" in rev["spec"] and "started no checks run" not in rev["spec"]
+
+
 def test_own_push_remote_names_where_own_branches_go_by_remote_name_or_url(env, monkeypatch, capsys):
     """delivery.own_push_remote: `ttp push --own` publishes the task branch to the remote it names, or
     to the URL it names (here per repo, keyed by the main checkout's folder name), never to origin.
