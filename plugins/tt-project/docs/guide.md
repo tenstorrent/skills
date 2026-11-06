@@ -1676,7 +1676,9 @@ session and stateless coordinators on every provider.
   queue behind each other and load from work outside the queue never stops it while slots are free. A fixed
   count of passes, not urgent runs sharing one, keeps the guard's bound on an overloaded host. An urgent run the
   guard holds 10+ minutes raises an `urgent_check_wait` event naming the load and its passes' holders. The floor goes to the most urgent, oldest run the load alone holds; a run parked for another reason
-  keeps no place in that line. Push
+  keeps no place in that line. A run takes its pass the moment its gate lets it start and keeps it until its
+  test slots are granted, so only one parked run leaves the park per pass and none holds a host-wide checks
+  slot only to wait under the guard. Push
   checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on
   their branch's reserved lane alone, one per lane at a time. Heavy suites
   belong on another host where a project has one allowed (`delivery.checks_host`).

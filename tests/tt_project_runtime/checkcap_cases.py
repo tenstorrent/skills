@@ -6716,6 +6716,91 @@ def test_a_spill_bounded_checks_wait_under_the_load_guard_takes_no_host_slot(env
     assert picks == 3 and grants == 0, (picks, grants)
 
 
+def test_a_spill_bounded_checks_wait_with_the_floor_pass_free_starts_on_it_with_its_test_slots(
+        env, tmp_path, monkeypatch):
+    """#5460 with the floor pass free (review #6596): the run takes the floor at its gate and its one
+    host-wide checks slot comes with its test slots, never a slot handed back at a spill bound."""
+    import io
+    from ttp import checkcap, checkspill, cli, testslots
+    monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD", raising=False)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    monkeypatch.setattr(checkcap, "_load", lambda: 900.0)
+    monkeypatch.setenv("TTP_TEST_POOL", "4")
+    assert testslots.load_guard() and testslots.pool_room({}, "px", full=True), "the floor is free"
+    p = make(env)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    p.set_config("delivery.checks_spill_after_s", 0.3)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setattr(checkspill, "pick", lambda *_a, **_k: None)
+    before = len(checkcap.grant_records())
+    slot = cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, True, cmds=["true"], top=str(p.base), spill=True)
+    try:
+        assert slot is not None and slot.f is not None and slot.tests is not None and slot.tests.k
+        assert any(Path(f.name).stem == testslots.LOAD_FLOOR for f in slot.tests.files), "it holds the floor"
+        assert len(checkcap.grant_records()) - before == 1 and testslots.reserved_pass() is None
+        assert testslots.pool_gate({}, "py", full=True, priority=3).startswith(testslots.LOAD_GATE)
+    finally:
+        slot and slot.close()
+
+
+def test_parked_routine_runs_leave_the_park_one_per_freed_floor_pass(env, monkeypatch):
+    """Review #6596: several routine runs parked under the load guard while another holds the floor. Once
+    it frees, the first whose gate passes takes the floor at once (testslots.full_startable), so the
+    others stay parked even with a gap before its test-slot wait (cli's lane_waits, ps_cycle, turn wait):
+    no run holds a host-wide checks slot without test slots."""
+    import threading
+    from ttp import checkcap, locks, testslots
+    _host_of_64(monkeypatch, load=84.5)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.05)
+    d, now = checkcap.slot_dir(), time.time()
+    floor = _hold_load_floor()
+    res, threads, done = {}, [], threading.Event()
+
+    class Lanes:
+        def __init__(self, f):
+            self.files = [f]
+
+    def run(i):
+        proj, arrived = f"p{i}", now - 100 + i
+        lane = Lanes(locks.try_take([d / f"{testslots.SUITE}.{proj}.repo.0.lock"], f"run {i}", "ttp checks"))
+        slot = g = None
+        try:
+            slot = checkcap.acquire(f"run {i}", "x", max_wait_s=3, since=arrived, project_name=proj, priority=2,
+                                    startable=lambda: testslots.full_startable(lane, {}, proj, f"run {i}",
+                                                                               priority=2, since=arrived))
+            time.sleep(0.3)   # the gap between the checks slot and the test-slot wait
+            if slot is not None:
+                g = testslots.acquire(f"run {i}", wait_s=1.0, project_name=proj, priority=2, full=True,
+                                      since=arrived)
+            res[i] = (slot is not None, g is not None)
+            done.wait(6)
+        finally:
+            testslots.release_load_pass()
+            g and g.close()
+            slot and slot.close()
+            lane.files[0].close()
+
+    for i in range(3):
+        threads.append(threading.Thread(target=run, args=(i,)))
+        threads[-1].start()
+    time.sleep(0.8)
+    floor.close()   # the floor frees
+    for _ in range(200):
+        if len(res) == 3:
+            break
+        time.sleep(0.05)
+    done.set()
+    for t in threads:
+        t.join(15)
+    assert len(res) == 3, res
+    assert not [i for i, (s, g) in res.items() if s and not g], f"a host slot held without test slots: {res}"
+    assert sum(g for _s, g in res.values()) == 1, f"one run leaves the park on the floor pass: {res}"
+
+
 def test_a_spill_bounded_full_run_waiting_for_run_min_takes_no_host_slot(env, tmp_path, monkeypatch):
     """#5460: a full run starts only with checks.test_run_min slots free; with fewer free (pool_room's one
     free slot is not enough) a run bounded by checkspill.after_s waits outside the host queue, so its spill

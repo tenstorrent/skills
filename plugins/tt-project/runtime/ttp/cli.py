@@ -4964,11 +4964,11 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         # bounded by checkspill.after_s never takes and hands back a slot at each bound.
         # The gate that holds it goes on its lane while it does, so status names it (checklane._parked):
         # the startable bool comes from the patchable pool_room, the gate name only once it holds it.
+        # Under the load guard the run takes its load pass as its gate passes and holds it until its test
+        # slots are granted (testslots.full_startable), so only one parked run leaves the park per pass.
         startable = None if os.environ.get(testslots.HELD_ENV) else (
-            lambda: testslots.gate_lanes(suite, "" if testslots.pool_room(cfg, p.name if p else None, full=True,
-                                                                        priority=prio, since=arrived)
-                                       else testslots.pool_gate(cfg, p.name if p else None, full=True,
-                                                              priority=prio, since=arrived)))
+            lambda: testslots.full_startable(suite, cfg, p.name if p else None,
+                                             checkcap.label(p.name if p else None), priority=prio, since=arrived))
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
@@ -5056,6 +5056,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         out.write(f"ttp checks: {e}\n")
         out.flush()
         die(f"ttp checks: {e}")
+    finally:
+        testslots.release_load_pass()   # a pass its gate took that no test-slot grant took over
 
 
 def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out, lanes=None,

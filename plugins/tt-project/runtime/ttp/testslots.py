@@ -350,9 +350,61 @@ def load_passes(priority: int | None = None, push: bool = False, since: float | 
 
 
 def load_held(priority: int | None = None, push: bool = False, since: float | None = None) -> str:
-    """load_guard()'s reason while it holds this run (load_passes: no pass of its free), else ""."""
+    """load_guard()'s reason while it holds this run (load_passes: no pass of its free, and this thread's
+    run holds none: reserve_load_pass), else ""."""
     why = load_guard()
-    return "" if not why or load_passes(priority, push, since) else why
+    return "" if not why or reserved_pass() is not None or load_passes(priority, push, since) else why
+
+
+_RESERVED = threading.local()   # .grant: the load pass this thread's run took at its gate (reserve_load_pass)
+
+
+def reserved_pass():
+    return getattr(_RESERVED, "grant", None)
+
+
+def reserve_load_pass(holder: str, priority: int | None = None, push: bool = False,
+                      since: float | None = None) -> str:
+    """Take this run's load pass (load_pass_paths) the moment its gate passes under the load guard, and
+    hold it across its wait for a host-wide checks slot until acquire takes it with its grant: a parked
+    run that passed the gate stops counting for floor_ahead (its lane's gate is "", its PARKED ticket
+    gone), so without it every other parked run would see the floor free too and take a host-wide slot
+    only to wait under the guard. "" once this run holds a pass or the guard is off, else the guard's
+    reason (pool_gate's LOAD_GATE one)."""
+    if reserved_pass() is not None or not (load := load_guard()):
+        return ""
+    try:
+        f = locks.try_take(load_pass_paths(priority, push, since), holder, "load-guard pass",
+                           extra={"priority": priority} if priority is not None else None)
+    except OSError:
+        f = None
+    if f is None:
+        return f"{LOAD_GATE}{load}"
+    _RESERVED.grant = f
+    return ""
+
+
+def release_load_pass() -> None:
+    """Let go of the pass reserve_load_pass took (the run parked again, or its wait ended without
+    acquire taking it)."""
+    f, _RESERVED.grant = reserved_pass(), None
+    if f is not None:
+        f.close()
+
+
+def full_startable(grant, cfg: dict | None, project_name: str | None, holder: str,
+                   priority: int | None = None, since: float | None = None) -> bool:
+    """A full run's startable gate for checkcap.acquire (cli._checks_slot_take): pool_room(full=True),
+    its reason (pool_gate) recorded on the lanes `grant` holds (gate_lanes). Once it passes under the load
+    guard the run takes its load pass at once (reserve_load_pass), so one parked run leaves the park per
+    pass; held off again, it lets the pass go."""
+    gate = "" if pool_room(cfg, project_name, full=True, priority=priority, since=since) \
+        else pool_gate(cfg, project_name, full=True, priority=priority, since=since)
+    if gate:
+        release_load_pass()
+    else:
+        gate = reserve_load_pass(holder, priority, since=since)
+    return gate_lanes(grant, gate)
 
 
 def push_load_wait_s(cfg: dict | None = None) -> float | None:
@@ -538,6 +590,13 @@ def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
 
 
 @project.ps_snapshot()
+def _pass_told(what: str, passed, load: str) -> str:
+    return (f"{what}: past the load guard on its "
+            + {LOAD_OWED: "pass for runs owed to the user", LOAD_URGENT: "pass for urgent runs",
+               LOAD_PASS: "pass for an urgent or push-queue run"}
+            .get(Path(passed.name).stem, "floor pass, the one run it admits so the queue moves") + f"; {load}")
+
+
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
@@ -572,7 +631,9 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     name = _project_name() if project_name is None else project_name
     start, told, ticket, mine, guard = time.time(), 0.0, None, None, None
     arrival = start if since is None else since
-    guarded, passed = "", None
+    guarded, passed = "", (_RESERVED.__dict__.pop("grant", None) if kind is TESTS else None)
+    if passed is not None and (load := load_guard()):   # taken at its gate (reserve_load_pass)
+        tell(_pass_told(what, passed, load))
     try:
         while True:
             project.ps_cycle()
@@ -582,10 +643,7 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                 if (passed := locks.try_take(load_pass_paths(priority, bool(push_key), arrival), holder,
                                              "load-guard pass",
                                              extra={"priority": priority} if priority is not None else None)):
-                    tell(f"{what}: past the load guard on its "
-                         + {LOAD_OWED: "pass for runs owed to the user", LOAD_URGENT: "pass for urgent runs",
-                            LOAD_PASS: "pass for an urgent or push-queue run"}
-                         .get(Path(passed.name).stem, "floor pass, the one run it admits so the queue moves") + f"; {load}")
+                    tell(_pass_told(what, passed, load))
             if kind is TESTS and passed is None and (load := load_guard()):
                 if push_key and (bound := push_load_wait_s(cfg)) is not None and time.time() - start >= bound \
                         and (f := locks.try_take([reserved_path(push_key)], holder, "push test slots",
