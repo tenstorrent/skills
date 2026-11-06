@@ -228,8 +228,9 @@ def credential_marks(before: dict | None = None):
 # The account's ssh folder and gh's config folder, whole: each regular file's size, mtime, ctime and inode
 # (stat only: no file there is ever opened or read), so a session fails when a test wrote any file there (another process's change: a warning). ssh and ssh-keygen find
 # ~/.ssh from the account's passwd entry, not HOME: a test passes them -f/-F/-o UserKnownHostsFile under its
-# temp folder. known_hosts files and sockets are left out: the account's own ssh sessions change them
-# while a suite runs.
+# temp folder. A child running ssh-keygen without such a -f, or ssh-copy-id, counts as handed the ssh
+# folder (_WriteRecorder.spawned). known_hosts files and sockets are left out: the account's own ssh
+# sessions change them while a suite runs.
 def secret_folders(env=None) -> list[str]:
     env = _REAL_ENV if env is None else env
     home = env.get("HOME") or REAL_HOME
@@ -390,7 +391,9 @@ def _outside_snapshot(config) -> dict:
 # command line, working folder or an explicit environment that differs from the session's, or that
 # lacks HOME: the child then finds the account's home from its passwd entry). A change to a recorded
 # path fails the session; any other is a warning line. A child that finds the account's home by itself
-# while the session's temp HOME is set (ssh, a script calling getpwuid) is not seen: its change is a warning.
+# while the session's temp HOME is set is handed its ssh folder where it runs ssh-keygen (without -f
+# outside the home) or ssh-copy-id, by its argv or a shell command's words (ssh_keys_handed); any other
+# (plain ssh, a script calling getpwuid) is not seen: its change is a warning.
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _PATH_CHARS = r"[^\s'\"`;:,=()&|<>]"
 
@@ -461,6 +464,13 @@ class _WriteRecorder:
             if text is not None:
                 for m in self.found.finditer(os.fsdecode(os.fspath(text))):
                     self.wrote(m.group(0))
+        if event == "subprocess.Popen":
+            words = [argv] if isinstance(argv, (str, bytes, os.PathLike)) else [exe] * (exe is not None) + list(argv or ())
+        else:
+            words = list(args[-2] or ()) if event != "os.system" else [args[0]]
+        if ssh_keys_handed([w for w in words if w is not None],
+                           (cwd if event == "subprocess.Popen" else None) or os.getcwd(), self.homes):
+            self.record(os.path.join(self.home, ".ssh"))
 
     def give_home(self, env) -> bool:
         """Puts the session's HOME (a temp folder) into a child's HOME-less env dict, so it does not fall
@@ -486,6 +496,55 @@ class _WriteRecorder:
             os.write(fd, (path + "\n").encode())
         finally:
             os.close(fd)
+
+
+_SSH_KEY_TOOLS = {"ssh-keygen", "ssh-copy-id"}
+_SHELL_BREAKS = {";", "&", "&&", "|", "||", "(", ")", ";;"}
+_KEYGEN_ARGS = set("CDEFGIJMNOPRVYZabfgjmnrstwz")   # ssh-keygen's options that take a value
+
+
+def ssh_keys_handed(words, cwd, homes) -> bool:
+    """True when a child's `words` (its argv; a word with spaces or shell punctuation, as an `sh -c`
+    command or os.system's string, is split as a shell would) run ssh-keygen or ssh-copy-id on the
+    account's ssh folder: they find it from passwd, not HOME. ssh-keygen given -f under a folder outside
+    `homes` (relative to `cwd`) does not; a -f naming ~, a variable or a command does."""
+    import shlex
+    flat: list[str] = []
+    for word in words:
+        word = os.fsdecode(os.fspath(word))
+        if re.search(r"[\s;&|()`$<>]", word):
+            try:
+                lex = shlex.shlex(word, posix=True, punctuation_chars=True)
+                lex.whitespace_split = True
+                flat += list(lex) + [";"]
+            except ValueError:
+                flat += word.split() + [";"]
+        else:
+            flat.append(word)
+    for i, word in enumerate(flat):
+        name = os.path.basename(word)
+        if name == "ssh-copy-id":
+            return True
+        if name != "ssh-keygen":
+            continue
+        key, j = None, i + 1
+        while j < len(flat) and flat[j] not in _SHELL_BREAKS:
+            opt, j = flat[j], j + 1
+            if not opt.startswith("-") or opt.startswith("--"):
+                continue
+            for k, letter in enumerate(opt[1:], 1):   # getopt: -lf <key>, -qf<key>, -t ed25519
+                if letter in _KEYGEN_ARGS:
+                    value = opt[k + 1:] or (flat[j] if j < len(flat) else "")
+                    j += not opt[k + 1:]
+                    if letter == "f":
+                        key = value
+                    break
+        if key is None or key.startswith("~") or re.search(r"[$`]", key):
+            return True
+        path = os.path.normpath(os.path.join(os.fsdecode(os.fspath(cwd)), key))
+        if any(p == h or p.startswith(h + os.sep) for p in (path, os.path.realpath(path)) for h in homes):
+            return True
+    return False
 
 
 def _homes(home: str) -> list[str]:

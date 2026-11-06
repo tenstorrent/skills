@@ -1619,6 +1619,48 @@ def test_credential_guards_fail_only_on_the_sessions_own_changes(tmp_path):
     assert c.guarded_changes(changes, None, str(real)) == ([f"  {p}: {how}" for p, how in changes], [])
 
 
+def test_ssh_keygen_child_is_handed_the_accounts_ssh_folder(tmp_path):
+    """ssh-keygen and ssh-copy-id find the ssh folder from passwd, not HOME, so a child running one (by
+    argv, an `sh -c` command or os.system's string) counts as handed <home>/.ssh unless ssh-keygen gets
+    -f under a folder outside the home; plain ssh does not. A change to a key there is then the session's."""
+    c = _test_conftest()
+    home, scratch = tmp_path / "u", tmp_path / "scratch"
+    home.mkdir()
+    scratch.mkdir()
+    ssh = f"{home}/.ssh"
+
+    def handed(event, args):
+        log = tmp_path / "writes.log"
+        log.unlink(missing_ok=True)
+        c._WriteRecorder(str(home), c.HOME_WATCHED + c.GUARDED, str(log), {"HOME": str(scratch)})(event, args)
+        return c.recorded_writes(str(log))
+
+    def popen(argv, cwd=None):
+        return handed("subprocess.Popen", (None, argv, cwd, None))
+    assert popen(["ssh-keygen", "-q", "-t", "ed25519", "-N", ""]) == {ssh}
+    assert popen(["/usr/bin/ssh-keygen", "-lf", "~/.ssh/id_rsa.pub"]) == {ssh}
+    assert popen(["sh", "-c", "cd /x && ssh-keygen -q -t ed25519 -N ''"]) == {ssh}
+    assert popen(["bash", "-lc", f"ssh-keygen -f {scratch}/k -N '' ; ssh-keygen -y"]) == {ssh}   # the second one
+    assert popen("ssh-keygen -t ed25519 -f \"$HOME/k\"") == {ssh}   # shell=True; a variable may name the home
+    assert popen(["ssh-copy-id", "-i", f"{scratch}/k.pub", "host"]) == {ssh}
+    assert popen(["env", "A=1", "ssh-keygen", "-t", "ed25519", "-N", ""]) == {ssh}
+    assert popen(["ssh-keygen", "-t", "ed25519", "-f", "k", "-N", ""], f"{home}/work") == {ssh}   # relative, cwd in home
+    assert handed("os.system", ("ssh-keygen -q -t ed25519 -N ''",)) == {ssh}
+    assert handed("os.exec", ("/usr/bin/ssh-keygen", ["ssh-keygen", "-t", "rsa"], None)) == {ssh}
+    assert handed("os.posix_spawn", ("/usr/bin/ssh-keygen", ["ssh-keygen", "-t", "rsa"], {"HOME": str(scratch)})) == {ssh}
+    for argv, cwd in ((["ssh-keygen", "-q", "-t", "ed25519", "-N", "", "-f", f"{scratch}/k"], None),
+                      (["ssh-keygen", f"-qf{scratch}/k", "-t", "ed25519"], None),
+                      (["sh", "-c", f"ssh-keygen -t ed25519 -N '' -f {scratch}/k && cat {scratch}/k.pub"], None),
+                      (["ssh-keygen", "-l", "-f", "k.pub"], str(scratch)),
+                      (["ssh", "-o", "BatchMode=yes", "host", "true"], None),
+                      (["echo", "ssh-keygen-like"], None)):
+        assert popen(argv, cwd) == set(), argv
+    changes = [(f"{ssh}/id_ed25519", "changed")]
+    assert c.guarded_changes(changes, popen(["ssh-keygen", "-q", "-t", "ed25519", "-N", ""]), str(home))[0] == \
+        [f"  {ssh}/id_ed25519: changed"]
+    assert c.guarded_changes(changes, set(), str(home))[0] == []   # no such child: a warning
+
+
 def test_ssh_and_gh_folder_marks_stat_only_and_open_no_file(tmp_path, monkeypatch):
     """The session's check of the account's ssh and gh config folders never opens or reads a file there
     (private keys, gh's token): it marks each regular file by lstat alone, and still sees a same-size
