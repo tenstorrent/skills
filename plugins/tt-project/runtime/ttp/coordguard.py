@@ -38,7 +38,8 @@ session off for hours. While tripped the coordinator runs stateless turns (the s
 reads tripped() or the key: tripped and now < until). After `until` it un-trips. The HOLD_TRIPS-th trip
 within HOLD_DAYS days holds it: `until` is renewed on every check and it stays tripped until the
 project's coordinator (or the user) sets coordinator.session.mode again (a configwho record newer than
-the trip). Mode off: inert; both keys are dropped, so the next switch-on records a fresh baseline.
+the trip). A trip whose window re-reads at or under its allowance (its turns were booked lower since)
+is withdrawn: it un-trips at once and leaves the trip count (rebooked()). Mode off: inert; both keys are dropped, so the next switch-on records a fresh baseline.
 """
 from __future__ import annotations
 
@@ -201,6 +202,8 @@ def check(db, cfg: dict, now: float | None = None) -> dict | None:
             f"${base['usd_turn']:.2f}/turn ({base['turns']} turns over {base['days']:g} days)" if base["turns"]
             else "coordinator session spend guard: no coordinator turn in the 7 days before; nothing to compare, inert")}
     g, _ = db.kv_dict(KEY)
+    if g.get("tripped") and (got := rebooked(db, g, base, now)):
+        return got
     if g.get("tripped"):
         if g.get("hold"):
             rec = _mode_set(db)
@@ -231,14 +234,37 @@ def check(db, cfg: dict, now: float | None = None) -> dict | None:
               if deferred >= 0.005 else "")
     why = (f"coordinator session spent ${raw:.2f} in {turns} turns over the last {hours:.1f} h{seeded}, over its "
            f"allowance ${limit:.2f} (stateless baseline ${base['usd_day']:.2f}/day, ${base['usd_turn']:.2f}/turn)")
-    db.set_kv(KEY, {"tripped": True, "until": now + pause * 3600, "why": why, "at": now, "pause_h": round(pause, 3),
-                    "trips": trips, "hold": hold, "usd": round(usd, 4), "raw_usd": round(raw, 4),
+    db.set_kv(KEY, {"tripped": True, "until": now + pause * 3600, "why": why, "at": now, "from": start,
+                    "pause_h": round(pause, 3), "trips": trips, "hold": hold, "usd": round(usd, 4), "raw_usd": round(raw, 4),
                     "allowance": round(limit, 4)})
     then = (f"trip {len(trips)} in {HOLD_DAYS} days: it stays on stateless turns until the coordinator sets "
             f"coordinator.session.mode again" if hold
             else f"stateless turns for {round(pause, 1):g} h ({'a repeat trip: ' if prior else 'sized to the overrun, '}"
                  f"coordinator.session.pause_h {pause_h(cfg):g} h at most), then the session resumes")
     return {"event": "trip", "hold": hold, "at": now, "text": f"{why}. The guard reverted it to {then}."}
+
+
+def rebooked(db, g: dict, base: dict, now: float) -> dict | None:
+    """A trip whose own window (from its start to the trip) now sums at or under the allowance it was
+    judged against: its turns were booked lower since (a resumed session wake booked at the session's
+    running total, then netted to its own cost). It was never over: un-trip now and drop it from the
+    trip count. None while the trip stands or its record lacks the figures."""
+    try:
+        at, allowed, was = float(g["at"]), float(g["allowance"]), float(g["usd"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    start = _num(g.get("from")) or max(at - WINDOW_H * 3600, _num(base.get("at")))
+    r = db.one("SELECT COALESCE(SUM(cost_usd),0) AS usd FROM runs WHERE role='coordinator' AND started>=? "
+               "AND started<=?", (start, at))
+    usd = float(r["usd"] or 0)
+    if usd > allowed:
+        return None
+    trips = [t for t in (g.get("trips") or []) if t != g["at"]]
+    db.set_kv(KEY, {"tripped": False, "trips": trips, "resumed": now,
+                    "rebooked": {"at": at, "usd": round(usd, 4), "was": was, "allowance": allowed}})
+    return {"event": "rebooked", "text": (
+        f"coordinator session spend guard: its trip counted ${was:.2f}, but those turns are now booked at "
+        f"${usd:.2f}, under the allowance ${allowed:.2f}; the trip is withdrawn and session turns resume")}
 
 
 def status_line(db, cfg: dict, now: float, fmt=None) -> str | None:

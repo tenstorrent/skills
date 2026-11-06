@@ -273,13 +273,14 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
     return st
 
 
-def fail(cfg: dict, state, now: float) -> tuple[dict, bool]:
-    """kv KEY after a resumed wake failed: the next wake reruns its batch stateless. True when this
-    failure reached max_failures_per_h within the hour and paused the mode for pause_h hours."""
+def fail(cfg: dict, state, now: float, error: str = "") -> tuple[dict, bool]:
+    """kv KEY after a resumed wake failed (`error`, kept for the rerun's note): the next wake reruns its
+    batch stateless. True when this failure reached max_failures_per_h within the hour and paused the
+    mode for pause_h hours."""
     s = settings(cfg)
     st = dict(state) if isinstance(state, dict) else {}
     fails = [t for t in (st.get("failures") or []) if isinstance(t, (int, float)) and now - t < 3600] + [now]
-    st.update({"failures": fails, "last_ok": False, "rerun": True, "last_why": "resume failed"})
+    st.update({"failures": fails, "last_ok": False, "rerun": True, "last_why": "resume failed", "fail_error": error})
     st.pop(DIGEST, None)
     st.pop("pending", None)
     if len(fails) >= _num(s.get("max_failures_per_h"), DEFAULTS["max_failures_per_h"]):

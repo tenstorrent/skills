@@ -305,3 +305,35 @@ def test_the_session_guard_pauses_a_small_first_overrun_briefly_and_a_repeat_or_
     g = p.db.kv(coordguard.KEY)
     assert got["event"] == "trip" and g["pause_h"] == coordguard.PAUSE_H and "a repeat trip" in got["text"], g
     assert g["until"] == t2 + coordguard.PAUSE_H * 3600
+
+
+def test_a_session_guard_trip_on_turns_booked_lower_since_is_withdrawn_and_leaves_the_count(env):
+    from ttp import coordguard
+    now = time.time()
+    p = _guard_project(env, now)
+    _session_on(p)
+    coordguard.check(p.db, p.config(), now)
+    # Resumed wakes booked at the session's running total trip the guard...
+    _coord_runs(p, now + 60, 10, 3.0, step_s=60)
+    t = now + 3600
+    assert coordguard.check(p.db, p.config(), t)["event"] == "trip"
+    g = p.db.kv(coordguard.KEY)
+    assert now - 1 <= g["from"] <= now + 60, g
+    # ...then stays tripped while the booked spend still stands, quiet before `until`.
+    assert coordguard.check(p.db, p.config(), t + 300) is None and coordguard.tripped(p.db, t + 300)
+    # A run started after the trip never counts toward it: the stateless turns run while tripped.
+    _coord_runs(p, t + 60, 5, 0.1, step_s=60)
+    p.db.x("UPDATE runs SET cost_usd=0.3 WHERE started>? AND started<=?", (now, t))   # netted to their own cost
+    got = coordguard.check(p.db, p.config(), t + 600)
+    g2 = p.db.kv(coordguard.KEY)
+    assert got["event"] == "rebooked" and "$30.00" in got["text"] and "$3.00" in got["text"], got
+    assert g2["tripped"] is False and g2["trips"] == [] and g2["resumed"] == t + 600, g2
+    assert not coordguard.tripped(p.db, t + 600)
+    # A held guard whose last trip re-reads under its allowance is released too; an old record
+    # without the window start uses the trip time less the window, after the switch-on.
+    p.db.set_kv(coordguard.KEY, {**g, "hold": True, "trips": [t - 2, t - 1, g["at"]], "from": None})
+    assert coordguard.check(p.db, p.config(), t + 900)["event"] == "rebooked"
+    assert p.db.kv(coordguard.KEY)["trips"] == [t - 2, t - 1]
+    # A record lacking its figures is left to its pause.
+    p.db.set_kv(coordguard.KEY, {"tripped": True, "until": t + 9999, "at": t})
+    assert coordguard.check(p.db, p.config(), t + 1200) is None and coordguard.tripped(p.db, t + 1200)

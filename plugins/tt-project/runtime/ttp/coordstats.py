@@ -10,7 +10,15 @@ session), rollovers, tool calls per wake (tool_use blocks in its transcript; any
 share of its prompt tokens. The baseline is every coordinator run of the 7 days before the first
 "resume" or "new" wake: turns/day, $/turn and $/day. A day breaks even at <= 2 tool calls and
 <= 20k context growth per wake; it is over the baseline when all its coordinator runs cost more
-than the baseline's $/day (today: so far)."""
+than the baseline's $/day (today: so far).
+
+Why each session wake did or did not resume (reason(), from the mode and why the daemon recorded at
+its decision, coordsession.decide): resumed, handover, a rollover at its context size, a new session
+for another cause, or a stateless fallback (spend guard, a failed resume with its error, paused after
+failed resumes). The fallback rate is stateless wakes over session wakes, so only time with the mode
+on counts. Coordinator wakes with the mode off are counted apart: the daemon records turn.session_off;
+an older wake without either record ran with the mode off or an agent that cannot resume (the daemon
+recorded turn.session for every other one)."""
 from __future__ import annotations
 
 import json
@@ -73,6 +81,60 @@ def tool_calls(r, runs_dir: Path) -> int | None:
     return len(ids) + bare
 
 
+NEW_WHY = {"no session": "new: no session", "prefix changed": "new: prompt, charter or schema changed",
+           "model or effort changed": "new: model or effort changed", "last run not ok": "new: last wake failed",
+           "session not saved": "new: transcript gone"}
+
+
+def _provider_gaps() -> set:
+    """coordsession.gap() of each provider that keeps no coordinator session (its stateless why)."""
+    from . import coordsession
+    from .providers import all_providers
+    return {g for g in map(coordsession.gap, all_providers()) if g}
+
+
+def reason(s: dict, status: str = "ok") -> str:
+    """The reason label of one session wake (its turn.session) for the per-day counts."""
+    mode, why = s.get("mode"), str(s.get("why") or "")
+    if mode == "resume":
+        return "resume failed" if status not in ("ok", "running") else "handover" if why == "handover" else "resumed"
+    if mode == "new":
+        return "rollover" if why.startswith("context reached") else NEW_WHY.get(why, "new: other")
+    if why == "spend guard tripped":
+        return "spend guard"
+    if why.startswith("rerun"):
+        return "failed resume (rerun)"
+    if why.startswith("paused"):
+        return "paused after failed resumes"
+    if why in _provider_gaps():
+        return "provider keeps no session"
+    return "decide failed" if why.startswith("decide failed") else "stateless: other"
+
+
+def _rollover_tokens(s: dict) -> int | None:
+    words = str(s.get("why") or "").split()
+    return int(words[2]) if s.get("mode") == "new" and words[:2] == ["context", "reached"] and words[2:3] \
+        and words[2].isdigit() else None
+
+
+def run_error(r, runs_dir: Path) -> str:
+    """A failed wake's error from its transcript's result event (e.g. error_max_budget_usd), else ""."""
+    out = (Path(r["dir"]) if r["dir"] else Path(runs_dir) / str(r["id"])) / "output.jsonl"
+    try:
+        lines = out.read_text(errors="replace").splitlines()
+    except OSError:
+        return ""
+    for line in reversed(lines):
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(ev, dict) and ev.get("type") == "result":
+            errs = ev.get("errors") if isinstance(ev.get("errors"), list) else []
+            return "; ".join(str(x) for x in [ev.get("subtype") if ev.get("is_error") else None, *errs] if x)[:200]
+    return ""
+
+
 def _first_context(r) -> int | None:
     v = _part(r, "cache_telemetry").get("first_context")
     return v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else None
@@ -84,7 +146,7 @@ def _mean(xs: list) -> float | None:
 
 def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> dict:
     now = time.time() if now is None else now
-    cols = "id, started, cost_usd, input_tokens, cache_read_tokens, cache_write_tokens, note, session_id, dir, provider"
+    cols = "id, started, status, cost_usd, input_tokens, cache_read_tokens, cache_write_tokens, note, session_id, dir, provider"
     noted = [r for r in db.q(f"SELECT {cols} FROM runs WHERE role='coordinator' AND note LIKE '%session%' "
                              "ORDER BY started, id") if session_of(r)]
     first = next((r["started"] for r in noted if session_of(r).get("mode") in ("resume", "new")), None)
@@ -99,7 +161,12 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
                 "usd_per_turn": round(usd / len(base), 3) if base else None,
                 "usd_per_day": round(usd / span, 2) if span > 0 else None}
     since = now - days * 86400
-    prev, by_day = {}, {}
+    prev, by_day, off = {}, {}, {}
+    for r in db.q("SELECT started, note FROM runs WHERE role='coordinator' AND started>=?", (since,)):
+        if not session_of(r):   # mode off (or an agent that cannot resume), recorded or not
+            why = str(_part(r, "turn").get("session_off") or "off, not recorded")
+            day = off.setdefault(timefmt.today(r["started"], tz), {})
+            day[why] = day.get(why, 0) + 1
     for r in noted:   # the previous wake of each session, also from before the window
         s, sid = session_of(r), r["session_id"] or ""
         last, fc = prev.get(sid), _first_context(r)
@@ -122,9 +189,21 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
         day_usd = db.one("SELECT COALESCE(SUM(cost_usd), 0) u FROM runs WHERE role='coordinator' AND started>=? "
                          "AND started<?", _day_bounds(day, tz))["u"]
         growth, tc = _mean(d["growth"]), _mean(calls)
+        reasons, errors = {}, []
+        for r, s in d["runs"]:
+            why = reason(s, r["status"])
+            reasons[why] = reasons.get(why, 0) + 1
+            if r["status"] not in ("ok", "running"):   # the rerun's note also names a failed resume's error
+                errors.append(f"run {r['id']} ({s.get('mode')}, {r['status']}): "
+                              f"{run_error(r, runs_dir) or 'no error recorded'}"[:240])
+        sizes = [t for t in (_rollover_tokens(s) for _, s in d["runs"]) if t is not None]
         out.append({"day": day, "partial": day == today, "wakes": len(rs), "resumed": modes.count("resume"),
                     "rollovers": modes.count("new"), "stateless": modes.count("stateless"),
                     "usd": round(cost, 2), "usd_per_wake": round(cost / len(rs), 3),
+                    "reasons": dict(sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))),
+                    "fallback_rate": round(modes.count("stateless") / len(rs), 3),
+                    "rollover_tokens": round(sum(sizes) / len(sizes)) if sizes else None,
+                    "failed_wakes": errors[:5], "mode_off": off.get(day, {}),
                     "growth_per_wake": growth, "growth_wakes": len(d["growth"]),
                     "tool_calls_per_wake": tc, "tool_call_wakes": len(calls),
                     "cache_read_ratio": round(read / prompt, 3) if prompt else None,
@@ -163,4 +242,13 @@ def text(s: dict, name: str = "") -> str:
             f"{'n/a' if d['cache_read_ratio'] is None else format(d['cache_read_ratio'], '.0%')}; "
             f"break-even (<= {BREAK_EVEN_TOOL_CALLS} tool calls, <= {BREAK_EVEN_GROWTH // 1000}k growth/wake): "
             f"{even}; coordinator ${d['coordinator_usd']:.2f} vs ${f(b['usd_per_day'], '.2f')}/day: {over}")
+        size = d["rollover_tokens"]
+        why = ", ".join(f"{k} {v}" + (f" (mean {size / 1000:.0f}k tokens)" if k == "rollover" and size else "")
+                        for k, v in d["reasons"].items())
+        offs = sum(d["mode_off"].values())
+        lines.append(f"    why: {why}; fallback to stateless {d['fallback_rate']:.0%} of {d['wakes']} wakes with the "
+                     f"mode on" + (f"; {offs} more with it off ("
+                                   + ", ".join(f"{k} {v}" for k, v in sorted(d["mode_off"].items())) + ")"
+                                   if offs else ""))
+        lines.extend(f"    failed wake: {e}" for e in d["failed_wakes"])
     return "\n".join(lines)

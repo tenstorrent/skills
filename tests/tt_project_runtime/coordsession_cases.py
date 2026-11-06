@@ -246,6 +246,7 @@ def test_coordsession_mode_off_launches_today_s_turn_byte_for_byte(env, monkeypa
     runs.append(turn("EVENTS golden"))
     for r, argv, prompt, session in runs:
         assert r["status"] == "ok" and session is None
+        assert json.loads(r["note"])["turn"]["session_off"] == "mode off", "stats tell it from a fallback"
         assert argv == [sys.executable, "-m", "ttp.providers.fake", "coordinator"], argv
         assert prompt == coord.join_prompt(head, context) + "\n\nEVENTS golden"
     assert runs[0][1:] == runs[1][1:]
@@ -324,6 +325,7 @@ def test_coordsession_a_failed_resume_reruns_its_batch_stateless_and_handles_eac
     assert p.db.kv(coordsession.KEY)["rerun"] is True
     rerun = _cs_wake(p, d)
     assert rerun == failed + 1 and note(rerun) == {**note(rerun), "mode": "stateless", "why": "rerun of a failed resume"}
+    assert note(rerun)["error"].startswith(f"run {failed}: "), "the rerun names the failed resume"
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rerun,))["status"] == "ok"
     assert not p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0")
     texts = [m["text"] for m in p.db.unread_for_chat("c1", 0)]
@@ -485,7 +487,9 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
     assert d1 == {"day": "2026-11-04", "partial": False, "wakes": 4, "resumed": 2, "rollovers": 1, "stateless": 1,
                   "usd": 0.7, "usd_per_wake": 0.175, "growth_per_wake": 12500.0, "growth_wakes": 2,
                   "tool_calls_per_wake": 1.0, "tool_call_wakes": 3, "cache_read_ratio": round(168000 / 195000, 3),
-                  "coordinator_usd": 1.1, "over_baseline": True, "break_even": True}
+                  "coordinator_usd": 1.1, "over_baseline": True, "break_even": True,
+                  "reasons": {"resumed": 2, "new: other": 1, "stateless: other": 1}, "fallback_rate": 0.25,
+                  "rollover_tokens": None, "failed_wakes": [], "mode_off": {"off, not recorded": 1}}
     assert d2["day"] == "2026-11-05" and d2["partial"] and (d2["wakes"], d2["resumed"], d2["rollovers"]) == (2, 1, 1)
     assert d2["growth_per_wake"] == 35000.0 and d2["tool_calls_per_wake"] == 4.0 and d2["tool_call_wakes"] == 1
     assert d2["break_even"] is False and d2["over_baseline"] is False and d2["coordinator_usd"] == 0.5
@@ -500,6 +504,59 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
     assert "OVER baseline" in out and "2026-11-05 (so far):" in out and ": missed; coordinator $0.50" in out
     # The day bounds follow the home zone: 01:00 UTC on 11-04 is still 11-03 in Los Angeles.
     assert coordstats.report(p.db, p.runs, "America/Los_Angeles", 7, now=now)["by_day"][0]["day"] == "2026-11-03"
+
+
+def test_coord_session_stats_name_why_each_wake_did_not_resume_and_rate_only_mode_on_time(env):
+    from ttp import coordstats
+    p = make(env)
+    t0 = 1793750400.0   # 2026-11-04 00:00 UTC
+    whys = [("resume", "continued"), ("resume", "continued"), ("resume", "handover"),
+            ("new", "context reached 300000 tokens"), ("new", "context reached 200000 tokens"),
+            ("new", "prefix changed"), ("new", "last run not ok"), ("new", "no session"), ("new", "odd"),
+            ("stateless", "spend guard tripped"), ("stateless", "spend guard tripped"),
+            ("stateless", "paused after repeated failed resumes"), ("stateless", "rerun of a failed resume"),
+            ("stateless", "decide failed: KeyError: x"), ("stateless", "off")]
+    rids = []
+    for i, (mode, why) in enumerate(whys):
+        rids.append(_cstat_run(p, t0 + 3600 + i * 60, 0.1, mode, "s1"))
+        note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rids[-1],))["note"])
+        note["turn"]["session"]["why"] = why
+        p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), rids[-1]))
+    # A resumed wake and a new one that failed: each listed with its transcript's error, or none.
+    bad = _cstat_run(p, t0 + 7200, 0.1, "resume", "s1")
+    p.db.x("UPDATE runs SET status='failed' WHERE id=?", (bad,))
+    (p.runs / str(bad)).mkdir(parents=True, exist_ok=True)
+    (p.runs / str(bad) / "output.jsonl").write_text(json.dumps(
+        {"type": "result", "is_error": True, "subtype": "error_max_budget_usd", "errors": ["Reached maximum budget ($1)"]})
+        + "\nnot json\n")
+    bare = _cstat_run(p, t0 + 7260, 0.1, "new", "s2")
+    p.db.x("UPDATE runs SET status='timeout' WHERE id=?", (bare,))
+    # Wakes with the mode off: recorded by the daemon, or older ones with no record; never in the rate.
+    for i, off in enumerate(["mode off", "mode off", "provider codex cannot resume", None]):
+        note = {"turn": {"session_off": off}} if off else {}
+        p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,note) VALUES('coordinator','claude',?,?,"
+               "'ok',0.5,?)", (t0 + 60 * i, t0 + 60 * i + 30, json.dumps(note)))
+    [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000)["by_day"]
+    assert d["wakes"] == 17 and d["stateless"] == 6
+    assert d["reasons"] == {"spend guard": 2, "resumed": 2, "rollover": 2, "decide failed": 1,
+                            "failed resume (rerun)": 1, "handover": 1, "new: last wake failed": 1,
+                            "new: no session": 1, "new: other": 2, "new: prompt, charter or schema changed": 1,
+                            "paused after failed resumes": 1, "resume failed": 1, "stateless: other": 1}, d["reasons"]
+    assert d["fallback_rate"] == round(6 / 17, 3) and d["rollover_tokens"] == 250000
+    assert d["mode_off"] == {"mode off": 2, "provider codex cannot resume": 1, "off, not recorded": 1}
+    assert d["failed_wakes"] == [f"run {bad} (resume, failed): error_max_budget_usd; Reached maximum budget ($1)",
+                                 f"run {bare} (new, timeout): no error recorded"]
+    out = coordstats.text(coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000))
+    assert "    why: new: other 2, resumed 2, rollover 2 (mean 250k tokens), spend guard 2, decide failed 1," in out, out
+    assert ("fallback to stateless 35% of 17 wakes with the mode on; 4 more with it off (mode off 2, off, not "
+            "recorded 1, provider codex cannot resume 1)") in out, out
+    assert f"    failed wake: run {bad} (resume, failed): error_max_budget_usd" in out
+    assert coordstats.reason({"mode": "new", "why": "context reached many tokens"}) == "rollover"
+    assert coordstats._rollover_tokens({"mode": "new", "why": "context reached many tokens"}) is None
+    from ttp import coordsession
+    from ttp.providers import get_provider
+    gap = coordsession.gap(get_provider("chat"))
+    assert gap and coordstats.reason({"mode": "stateless", "why": gap}) == "provider keeps no session"
 
 
 def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsys):

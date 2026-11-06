@@ -2964,6 +2964,9 @@ class Daemon:
             # With the turn's usage, so a before/after comparison can tell the lifetimes apart.
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}),
                                              "cache_ttl": cache_ttl, "cache_ttl_why": ttl_why}}
+            if not session_on and not resume:   # why it is no session wake (`ttp stats --coord-session`)
+                on = str(coordsession.settings(self.cfg).get("mode")).lower() == "on"
+                note["turn"]["session_off"] = f"provider {provider} cannot resume" if on else "mode off"
         # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
         thread = ""
@@ -3020,6 +3023,8 @@ class Daemon:
                 "provider": provider, **({"digest": ack} if ack else {}),
                 **({"cap_usd": session_cap} if session_cap is not None else {}),
                 **({"seed_usd": seed_usd, "seed_basis": seed_basis} if seed_usd is not None else {}),
+                **({"error": str((state or {}).get("fail_error") or "")}   # the failed resume this reruns
+                   if session_mode == "stateless" and (state or {}).get("rerun") else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
         elif role == "coordinator" and not resume and prov.cache_key_per_session:
             try:   # the agent's cache follows its session: continue the last turn's while warm
@@ -4857,7 +4862,8 @@ class Daemon:
                 session = {k: v for k, v in session.items() if k != "digest"}
             state = db.kv(coordsession.KEY)
             if session.get("mode") == "resume" and not ok:
-                state, paused = coordsession.fail(self.cfg, state, now)
+                state, paused = coordsession.fail(self.cfg, state, now,
+                                                  f"run {r['id']}: {str(getattr(usage, 'error', '') or '')[:200]}")
                 db.set_kv(coordsession.KEY, state)
                 log(self.p, f"coordinator run {r['id']}: the resumed session failed; its batch reruns stateless")
                 if paused:
