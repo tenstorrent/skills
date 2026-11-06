@@ -37,10 +37,10 @@ def _line(text: str, **kw) -> str:
 # (what it checks, what the watcher prints, the last status, {issue title: status}, new wakes)
 STEPS = (
     ("a report and an error at exit 1", _line(REPORT) + _line(ERROR, error=True),
-     "ok (2 observations)", {REPORT: "open", ERROR: "open"}, 2),
+     "ok (1 observations, 1 errors)", {REPORT: "open", ERROR: "open"}, 2),
     ("a successful run repairs the error", _line(REPORT), "ok (1 observations)",
      {REPORT: "open", ERROR: "fixed"}, 0),
-    ("a recurrence of the error wakes", _line(REPORT) + _line(ERROR, error=True), "ok (2 observations)",
+    ("a recurrence of the error wakes", _line(REPORT) + _line(ERROR, error=True), "ok (1 observations, 1 errors)",
      {REPORT: "open", ERROR: "open"}, 1),
     ("a run that prints nothing closes all", "", "ok (0 observations)", {REPORT: "fixed", ERROR: "fixed"}, 0),
 )

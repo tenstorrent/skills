@@ -1111,3 +1111,39 @@ def test_a_new_or_re_enabled_command_schedule_that_never_ran_runs_at_the_next_pa
     p.db.x("UPDATE schedules SET enabled=0, last_run=?, next_run=? WHERE name='cmd'", (now - 3600, now + 86400))
     sched.set_enabled(p.db, "cmd", True)   # it ran before: its slot stays
     assert p.db.one("SELECT next_run FROM schedules WHERE name='cmd'")["next_run"] == now + 86400
+
+
+def test_a_command_schedule_status_counts_error_lines_apart_and_a_run_of_only_errors_is_a_failed_check(env, capsys):
+    """A line with "error": true means the check could not run: a run of only such lines reads 'error'
+    and shows as failing (list, ttp status, web app); a mixed run counts them; plain runs are unchanged.
+    Exit 0 and 1 stay normal runs."""
+    from ttp import cli, coordinator as coord, daemon as dm, schedule as sched
+    p = make(env)
+    out = p.root / "out.txt"
+    assert coord.apply(p, [{"type": "schedule_set", "name": "acct", "kind": "command", "every": "1h",
+                            "command": f"cat {shlex.quote(str(out))}; exit 1"}]) == []
+    d = dm.Daemon(p.base)
+    line = lambda text, **kw: json.dumps({"text": text, "severity": "normal", **kw}) + "\n"
+
+    def run(printed):
+        out.write_text(printed)
+        p.db.x("UPDATE schedules SET next_run=? WHERE name='acct'", (time.time() - 1,))
+        d.run_schedules()
+        return p.db.one("SELECT last_status FROM schedules WHERE name='acct'")["last_status"]
+
+    assert run(line("pr state: gh is not logged in", error=True)) == "error (1 lines: check could not run)"
+    assert [r["name"] for r in sched.broken(p.db)] == ["acct"]
+    assert "acct (error (1 lines" in sched.broken_line(p.db)
+    cli.main(["schedules", p.name])
+    assert "error (1 lines: check could not run)" in capsys.readouterr().out
+    assert run(line("a", error=True) + line("b", error=True)) == "error (2 lines: check could not run)"
+    assert run(line("ledger: entry missing") + line("ledger: cannot read", error=True)) \
+        == "ok (1 observations, 1 errors)"
+    assert sched.broken(p.db) == []
+    # A string "true" is no error flag: a report, as before.
+    assert run(line("ledger: entry missing") + line("x", error="true")) == "ok (2 observations)"
+    assert run("") == "ok (0 observations)"
+    # Without the command failing, an error-only run at exit 0 reads the same.
+    p.db.x("UPDATE schedules SET payload=? WHERE name='acct'",
+           (json.dumps({"command": f"cat {shlex.quote(str(out))}"}),))
+    assert run(line("cannot reach the api", error=True)) == "error (1 lines: check could not run)"

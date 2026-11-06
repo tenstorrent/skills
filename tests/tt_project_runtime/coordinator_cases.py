@@ -7080,7 +7080,7 @@ def test_a_daily_receipt_watcher_keeps_its_pending_item_quiet_until_it_changes(e
     assert not p.db.q("SELECT id FROM issues WHERE source='watcher:receipts' AND status!='open'")
     assert run(line)[1] == 0
     age(25)
-    assert run("", rc_cmd="exit 3")[0].startswith("ok")
+    assert run("", rc_cmd="exit 3")[0] == "error (1 lines: check could not run)", "a failed run"
     age(25)
     scr.close_quiet_watcher_issues(p.db, {"watcher:receipts": 86400})
     assert p.db.one("SELECT COUNT(*) n FROM issues WHERE source='watcher:receipts' AND status='open' "

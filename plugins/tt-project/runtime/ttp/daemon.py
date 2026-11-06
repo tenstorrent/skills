@@ -7102,7 +7102,7 @@ class Daemon:
             if self.p.db.kv(PAGED_KEY + s["name"]):   # a line paged again later is a new episode
                 self.p.db.set_kv(PAGED_KEY + s["name"], {})
             return "ok (0 observations)"
-        n, subjects = 0, set()
+        n, errs, subjects = 0, 0, set()
         paged = dict(self.p.db.kv(PAGED_KEY + s["name"]) or {})
         reported: set[str] = set()
         filed = 0
@@ -7132,6 +7132,7 @@ class Daemon:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
             n += 1
+            errs += error
         if ok:   # a line no longer reported is over: its recurrence pages again
             paged = {k: v for k, v in paged.items() if k in reported}
         if paged != (self.p.db.kv(PAGED_KEY + s["name"]) or {}):
@@ -7139,7 +7140,11 @@ class Daemon:
         if ok:
             scr.settle_receipts(self.p.db, source, started, subjects)
             scr.settle_mutes(self.p.db, source, started)   # muted conditions it no longer reported cleared
-        return f"ok ({n} observations)"
+        # Error lines are not observations: a run of only errors is a check that could not run, a failing
+        # status (schedule.failing) in the list, ttp status and the web app.
+        if n and errs == n:
+            return f"error ({n} lines: check could not run)"
+        return f"ok ({n - errs} observations, {errs} errors)" if errs else f"ok ({n} observations)"
 
     def _page_target(self, name: str, obs: dict) -> str | None:
         """The other local project a line's `to` names (pageto.resolve), else None: the line is then a

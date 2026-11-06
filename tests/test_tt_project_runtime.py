@@ -8580,11 +8580,13 @@ def test_command_watcher_exit_1_is_a_normal_run_and_only_error_true_lines_are_er
     assert tick(command=f"cat {out}; exit 1")[0] == "ok (3 observations)" and fix_tasks() == 0
     # The same failure with "error": true is the watcher's own error, also at exit 1.
     assert tick(_line("ledger: cannot read the books", error=True), command=f"cat {out}; exit 1") \
-        == ("ok (1 observations)", 1)
+        == ("error (1 lines: check could not run)", 1)
     assert [(x["title"], x["status"], x["lifecycle"]) for x in issues(err)] \
         == [("ledger: cannot read the books", "open", scr.ERROR)]
     assert len(issues(src)) == 3, "an error line opens no report"
     assert tick(command=f"cat {out}; exit 1")[1] == 0, "a known error does not wake again"
+    # Only error lines twice in a row: the check could not run, a failing schedule with its fix task.
+    assert fix_tasks() == 1
     # The next successful run that no longer prints it repairs it; its reports stay as they were.
     assert tick(_line("ledger: entry missing"), command=f"cat {out}; exit 1")[1] == 0
     assert [(x["status"], x["cleared_why"]) for x in issues(err)] == [("fixed", scr.REPAIRED_WHY)]
@@ -8592,7 +8594,7 @@ def test_command_watcher_exit_1_is_a_normal_run_and_only_error_true_lines_are_er
     assert tick(command=f"cat {out}; echo broke >&2; exit 2")[1] == 1
     assert any(x["title"].startswith("watcher command exited rc=2") and x["status"] == "open"
                for x in issues(err))
-    assert fix_tasks() == 0
+    assert fix_tasks() == 1, "its printed lines are reports: no new failure stint"
     # The skill and the coordinator's schedule_set entry say so.
     skill = " ".join((RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "watchers.md").read_text().split())
     prompt = " ".join((RUNTIME.parent / "template" / "prompts" / "coordinator.md").read_text().split())
