@@ -1158,6 +1158,13 @@ def test_lock_probe_judges_a_pid_from_another_pid_namespace_through_that_namespa
         held.close()
 
 
+# The deadline of a command that sets up or runs in a fresh user and PID namespace. On a loaded host the
+# kernel's namespace setup has stalled for minutes at a time, every namespace command at once (a 100-run
+# stress loop beside load ~120 of 64 cores, 2026-11-06: `unshare ... true` past 30 s, `ttp lock --probe`
+# inside one past 60 s). The wait ends as soon as the command does; the bound only stops a real hang.
+NS_DEADLINE = 600
+
+
 def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
     """End to end in a real PID namespace: a taker inside one hands its slot to a keeper there; `ttp lock
     --probe` outside names the keeper's pid as another namespace's, alive with its pid here, then gone once
@@ -1165,7 +1172,7 @@ def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
     from ttp import locks, shared
     unshare = shutil.which("unshare")
     probe_ns = [unshare, "--user", "--map-current-user", "--pid", "--fork", "--mount-proc", "true"] if unshare else []
-    if not unshare or _run_to_end(probe_ns, timeout=30).returncode:
+    if not unshare or _run_to_end(probe_ns, timeout=NS_DEADLINE).returncode:
         pytest.skip("no unprivileged PID namespaces here")
     p = make(env)
     cfg = p.config()
@@ -1186,13 +1193,13 @@ def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
 
     try:
         # Bounded, and over as soon as the taker answers or dies: a niced test on a busy host waits for CPU.
-        assert _wait_for(lambda: took() or proc.poll() is not None, 120) and took(), "taker never took it"
+        assert _wait_for(lambda: took() or proc.poll() is not None, NS_DEADLINE) and took(), "taker never took it"
         out = _ttp_run(p, "lock", "--probe", "build-a").stdout
         assert "from another PID namespace; pid " in out and ") alive" in out, out
         rec = json.loads(_ttp_run(p, "lock", "--probe", "--json", "build-a").stdout)["holders"][0]
         assert rec["alive"] is True and rec["pidns"] != locks._pid_ns() and rec["via"] == "keeper", rec
         stop.touch()
-        assert _wait_for(lambda: ready.read_text() == "gone" or proc.poll() is not None, 120)
+        assert _wait_for(lambda: ready.read_text() == "gone" or proc.poll() is not None, NS_DEADLINE)
         assert ready.read_text() == "gone", proc.poll()
         out = _ttp_run(p, "lock", "--probe", "build-a").stdout
         assert "(from another PID namespace, which no longer has it) gone" in out, out
@@ -1376,7 +1383,7 @@ def test_lock_probe_inside_a_real_sandbox_sees_a_live_keeper_outside_it_through_
     from ttp import hold, locks
     unshare = shutil.which("unshare")
     ns = [unshare, "--user", "--map-current-user", "--pid", "--fork", "--mount-proc"] if unshare else []
-    if not unshare or _run_to_end(ns + ["true"], timeout=30).returncode:
+    if not unshare or _run_to_end(ns + ["true"], timeout=NS_DEADLINE).returncode:
         pytest.skip("no unprivileged PID namespaces here")
     p = make(env)
     t = p.db.add_task("holder", "s", kind="work", origin="user")
@@ -1391,7 +1398,7 @@ def test_lock_probe_inside_a_real_sandbox_sees_a_live_keeper_outside_it_through_
 
         def inside():
             r = _run_to_end(ns + [sys.executable, str(TTP), "lock", "--probe", "--json", "build-a"],
-                            text=True, timeout=60, env=dict(os.environ, TTP_PROJECT=str(p.base)))
+                            text=True, timeout=NS_DEADLINE, env=dict(os.environ, TTP_PROJECT=str(p.base)))
             assert r.returncode == 75, (r.returncode, r.stdout, r.stderr)
             return json.loads(r.stdout)["holders"][0]
 
