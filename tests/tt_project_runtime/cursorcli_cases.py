@@ -449,7 +449,10 @@ def test_cursor_listed_tiers_refresh_daily_and_after_a_rejected_model(env, monke
     assert all(cursortiers.model_rejected(t, "m") for t in (
         "Model 'm' not found", "Error: invalid model m", "The model m is not available on your plan",
         "model m is no longer supported", "unsupported model: m"))
-    assert not cursortiers.model_rejected("model m answered: file not found", "")
+    assert not any(cursortiers.model_rejected(t, "m") for t in (
+        "model m answered: file not found", "model m: tool read_file not found", "invalid model m-2",
+        "Model 'm.1' not found", "tool crashed: unknown model"))
+    assert not cursortiers.model_rejected("Model 'm' not found", "")
     n = asked()
     assert cursortiers.drop_rejected("beta-4-pro-thinking", err, path=cache)
     again = cursortiers.resolve(exe, credentials="c2", now=now + 1, path=cache)
@@ -526,3 +529,21 @@ def test_cursor_run_refusing_a_resolved_model_resolves_the_map_again(env, monkey
     # Not a request error that fails the task at once: the retry runs on a newly listed map.
     assert run["status"] == "failed" and task["status"] == "queued", (run["status"], task["status"])
     assert json.loads(cache.read_text())["rejected"] == "l-mini"
+
+
+def test_doctor_names_the_rate_each_cursor_tier_uses(env, monkeypatch, capsys):
+    from ttp import cli, cursortiers
+    from ttp.providers import cursor
+    bin_dir = env["tmp"] / "docbin"
+    bin_dir.mkdir(exist_ok=True)
+    (bin_dir / "agent").write_text("#!/bin/sh\nexit 0\n")
+    (bin_dir / "agent").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    monkeypatch.setattr(cursor.Cursor, "account", lambda self: "")
+    monkeypatch.setattr(cursortiers, "resolve", lambda *a, **k: {
+        "source": "listed", "cli": "x", "why": "", "tiers": {"light": "l-mini", "standard": "s-core", "deep": "d-pro"}})
+    p = make(env)
+    cli.main(["doctor", p.name])
+    out = capsys.readouterr().out
+    assert "cursor tiers from the CLI's model list" in out
+    assert "deep d-pro $15/$1.5/$75 (the top rate" in out, out

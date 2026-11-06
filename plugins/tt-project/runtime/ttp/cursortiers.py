@@ -55,10 +55,6 @@ LINE_RE = re.compile(r"^(?P<id>[A-Za-z0-9][\w.:/\[\]=,-]*)(?:\s+-\s+(?P<name>.*?
 REASONING = {"thinking", "reasoning", "high", "xhigh", "max"}
 STRONG = {"pro": 2, "max": 2, "ultra": 2, "large": 1, "xhigh": 2, "high": 1, "thinking": 1, "reasoning": 1}
 CHEAP = {"mini": 2, "nano": 3, "lite": 2, "flash": 2, "fast": 1, "small": 2, "low": 1, "light": 1, "tiny": 3}
-# The CLI refusing the model a run named (withdrawn, not on the plan, unknown), on the run's error.
-REJECT_RE = re.compile(r"cannot use (?:this|the) model|(?:unknown|invalid|unsupported|unavailable) model|"
-                       r"model\b[^\n]{0,80}?\b(?:not (?:found|available|supported|allowed|enabled)|unavailable|"
-                       r"does not exist|is not valid|no longer)", re.I)
 LOGIN_RE = re.compile(r"authentication required|not (?:logged|authenticated|signed) in|agent login|"
                       r"credentials or api key are invalid", re.I)
 
@@ -202,8 +198,14 @@ def resolve(binary: str | None = None, credentials: str | None = None, now: floa
 
 
 def model_rejected(text: str, model: str) -> bool:
-    """Whether a failed run's error says the CLI refused its (named, not `auto`) model."""
-    return bool(model and model.lower() != FALLBACK and text and REJECT_RE.search(text))
+    """Whether a failed run's error says the CLI refused its (named, not `auto`) model: the refusal
+    words right next to the model's own name, never a tool error that mentions a model."""
+    if not (model and model.lower() != FALLBACK and text):
+        return False
+    name = rf"{re.escape(model)}(?![\w.-])"
+    return bool(re.search(rf"(?:cannot use (?:this|the) model|(?:unknown|invalid|unsupported|unavailable) model)"
+                          rf"\W{{0,4}}{name}|model\W{{0,4}}{name}\W{{0,4}}(?:is\s+)?(?:not (?:found|available|"
+                          rf"supported|allowed|enabled)|unavailable|does not exist|no longer)", text, re.I))
 
 
 def drop_rejected(model: str, text: str, path: Path | None = None) -> bool:
