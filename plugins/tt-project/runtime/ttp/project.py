@@ -721,19 +721,34 @@ def section_value_problem(dotted: str, value: Any) -> str | None:
 PROVIDER_KEY_TYPES: dict[str, type] = {"write_dirs": list}
 
 # List- or object-typed keys whose readers also take a plain form ({dotted key: forms}), each form as its
-# reader reads it: "number" a non-negative number for every tier, "false" off. Nothing else is taken.
+# reader reads it: "number" a non-negative number for every tier, "false" off, "names" a comma-separated
+# string, "string" one string, "floor" a string tierfloor.floor_of reads. Nothing else is taken.
 KEY_EXTRA_FORMS: dict[str, tuple[str, ...]] = {
     "budget.compact_window_tokens": ("number",),   # daemon worker start: one window, 0 off
     "budget.split_reread_tokens": ("number",),     # daemon split check: one split line, 0 off
     "budget.resume_lost": ("false",),              # daemon lost-run resume: not an object, starts fresh
     "waiting.wake_gate": ("false",),               # waitgate.settings: false, every wake starts a turn
+    "coordinator.conclusion_floor": ("floor",),    # tierfloor.floor: 'standard/high', 'off'
+    "providers_allowed": ("names",),               # provallow.names: 'claude,codex'
+    "coordinator.provider_failover_to": ("string",),   # failover.targets: one provider name
+    "ack_wait.probe_commands": ("string",),        # ackwait.probe_commands: one command
 }
-FORM_NAMES = {"number": "a non-negative number", "false": "false (off)"}
+FORM_NAMES = {"number": "a non-negative number", "false": "false (off)",
+              "names": "a comma-separated string", "string": "a string",
+              "floor": "a tier and effort such as 'standard/high', or 'off'"}
 
 
 def _extra_form(form: str, value: Any) -> bool:
     if form == "false":
         return value is False
+    if form in ("names", "string"):
+        return isinstance(value, str)
+    if form == "floor":
+        from .tierfloor import floor_of
+        try:
+            return isinstance(value, str) and bool(floor_of(value))
+        except ValueError:
+            return False
     return (isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
             and value >= 0)
 

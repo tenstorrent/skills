@@ -151,3 +151,46 @@ def test_config_set_and_the_web_settings_path_run_the_same_type_check(env, monke
     assert "wake_gate" not in (p.raw_config().get("waiting") or {})
     assert coord.apply(p, [{"type": "config_set", "key": "waiting.wake_gate", "value": False}]) == []
     assert p.raw_config()["waiting"]["wake_gate"] is False
+
+
+@pytest.mark.parametrize("key,value", [
+    ("coordinator.conclusion_floor", "off"),
+    ("coordinator.conclusion_floor", "deep/xhigh"),
+    ("providers_allowed", "claude"),
+    ("coordinator.provider_failover_to", "claude"),
+    ("ack_wait.probe_commands", "my-probe --x"),
+])
+def test_set_config_takes_the_string_form_the_reader_reads(env, key, value):
+    """A list- or object-typed key whose reader also reads a string (KEY_EXTRA_FORMS) stores it as given,
+    and the reader reads it."""
+    from ttp import ackwait, failover, provallow, tierfloor
+    p = make(env)
+    p.set_config(key, value)
+    cfg = p.config()
+    read = {"coordinator.conclusion_floor": lambda: tierfloor.floor(cfg),
+            "providers_allowed": lambda: provallow.names(cfg),
+            "coordinator.provider_failover_to": lambda: failover.targets(cfg),
+            "ack_wait.probe_commands": lambda: ackwait.probe_commands(cfg)}[key]()
+    want = {"off": {"tier": "light", "effort": ""}, "deep/xhigh": {"tier": "deep", "effort": "xhigh"},
+            "my-probe --x": [["my-probe", "--x"]]}.get(value)
+    assert read == want if want is not None else "claude" in read, read
+
+
+@pytest.mark.parametrize("key,value,forms", [
+    ("coordinator.conclusion_floor", "nonsense", "or a tier and effort such as 'standard/high', or 'off'"),
+    ("coordinator.conclusion_floor", "standard/loud", "or a tier and effort"),
+    ("coordinator.conclusion_floor", 3, "a JSON object ({...}) or a tier and effort"),
+    ("coordinator.conclusion_floor", False, "or a tier and effort"),
+    ("providers_allowed", 1, "a JSON list ([...]) or a comma-separated string"),
+    ("providers_allowed", {"claude": 1}, "or a comma-separated string"),
+    ("coordinator.provider_failover_to", True, "a JSON list ([...]) or a string"),
+    ("ack_wait.probe_commands", {"cmd": "x"}, "a JSON list ([...]) or a string"),
+    ("shared_resources", "board", "needs a JSON list ([...]), not"),   # shared.names ignores a string
+])
+def test_set_config_still_refuses_what_no_reader_reads(env, key, value, forms):
+    p = make(env)
+    before = p.config_path.read_text()
+    with pytest.raises(ValueError) as e:
+        p.set_config(key, value)
+    assert f"{key} needs " in str(e.value) and forms in str(e.value), str(e.value)
+    assert p.config_path.read_text() == before

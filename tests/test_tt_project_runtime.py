@@ -26594,7 +26594,8 @@ def _second_project(env, name="other"):
 def test_shared_resources_ignores_a_value_that_is_not_a_list(env):
     from ttp import shared
     p = make(env)
-    p.set_config("shared_resources", "board")
+    raw = p.raw_config()   # a hand edit: `ttp config` refuses a string here (key_type_problem)
+    p.config_path.write_text(json.dumps({**raw, "shared_resources": "board"}))
     assert shared.names(p.config()) == set()
     p.set_config("shared_resources", ["board"])
     assert shared.names(p.config()) == {"board"}

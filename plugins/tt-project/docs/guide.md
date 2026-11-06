@@ -193,7 +193,9 @@ prolonged whole-box outage.
   from `project.json`, so its default applies again, and a key whose default is a list or an object
   refuses a value of another type without writing it, except the plain forms its reader takes
   (`budget.compact_window_tokens` and `budget.split_reread_tokens`: one non-negative number for every tier;
-  `budget.resume_lost` and `waiting.wake_gate`: `false`, off). The chat's config_set and the web app check alike. `ttp spend-today [--json]` prints this machine's tt-project spend for the
+  `budget.resume_lost` and `waiting.wake_gate`: `false`, off; `coordinator.conclusion_floor`: a string such
+  as `standard/high` or `off`; `providers_allowed`: a comma-separated string; `coordinator.provider_failover_to`
+  and `ack_wait.probe_commands`: one string). The chat's config_set and the web app check alike. `ttp spend-today [--json]` prints this machine's tt-project spend for the
   budget day by provider and account hash, and its other Claude Code sessions as estimated; it is
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
