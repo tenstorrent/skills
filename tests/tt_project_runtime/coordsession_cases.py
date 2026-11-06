@@ -966,6 +966,22 @@ def test_coordsession_a_new_session_for_a_changed_prefix_names_each_changed_part
     assert "parts" not in st and st["at"] == 5.0, "a key without digests leaves none to compare"
 
 
+@pytest.mark.parametrize("resume_between", [True, False])
+def test_coordsession_an_order_opening_moves_no_prefix_part(env, monkeypatch, resume_between):
+    # The session role always renders with the order ledger's rules: an order opening changes neither
+    # the prompt nor its "standing" digest, so a later new session names only what really changed.
+    from ttp import obligations
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    first, _, _ = wake("one")
+    obligations.add(p, "Ship the soak report.")
+    if resume_between:
+        second, _, _ = wake("two")
+        assert second["mode"] == "resume" and second["parts"] == first["parts"], second
+    p.charter_path.write_text(_CS_CHARTER.replace("Ship v1.", "Ship v2."))
+    third, _, _ = wake("three")
+    assert (third["mode"], third["why"], third["changed"]) == ("new", "prefix changed", ["charter"]), third
+
+
 def test_coordsession_decide_names_a_transcript_gone_since_a_daemon_restart():
     from ttp import coordsession as cs
     gone, now = (lambda s: False), 5000.0

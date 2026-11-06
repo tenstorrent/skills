@@ -711,12 +711,13 @@ def session_prompt(p, provider: str | None = None) -> dict:
     """{"system", "context", "parts"}: session_prompt_parts() and the digests of its prefix parts."""
     from .coordinator import _prompt_head
     from .knownpaths import block
-    from .prompts import coordinator_features, coordinator_session_role, session_tools
+    from .prompts import coordinator_session_features, coordinator_session_role, session_tools
     rules, _, charter = _prompt_head(p)
-    role, paths, context = coordinator_session_role(p, session_tools(p, provider)).rstrip(), block(p), f"# CHARTER\n{charter}\n"
+    features = coordinator_session_features(p, session_tools(p, provider))   # one set for the render and its digest
+    role, paths, context = coordinator_session_role(p, features=features).rstrip(), block(p), f"# CHARTER\n{charter}\n"
     return {"system": f"{rules}{role}\n\n{paths}", "context": context,
             "parts": {"template": _sha(role), "charter": _sha(rules + "\0" + context),
-                      "standing": _sha(json.dumps([sorted(coordinator_features(p)), paths]))}}
+                      "standing": _sha(json.dumps([sorted(features[0]), paths]))}}
 
 
 def prefix_parts(parts, schema: dict | None, provider: str) -> dict:

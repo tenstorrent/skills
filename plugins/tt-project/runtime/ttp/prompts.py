@@ -139,17 +139,24 @@ def coordinator_role(p: Project) -> str:
     return feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), coordinator_features(p) - {"session"})
 
 
-def coordinator_session_role(p: Project, tools: tuple[str, str] = ("full", "")) -> str:
-    """The persistent session's role (coordinator.md, then prompts/coordinator-session.md: how wakes
-    continue one session and compact it in place), under the coordinator role's size budget. It
-    always carries the order ledger's rules: the first open order or the last closed one would
-    otherwise change the prompt and start a new session. Its Tools section names
-    only the wake's real tools (session_tools): `tools` is (full, read or none, why)."""
+def coordinator_session_features(p: Project, tools: tuple[str, str] = ("full", "")) -> tuple[set[str], str]:
+    """(features, tools why) the persistent session's role renders with, `tools` being (full, read or
+    none, why) as session_tools gives it. The role always carries the order ledger's rules: the first
+    open order or the last closed one would otherwise change the prompt and start a new session. Its
+    Tools section names only the wake's real tools."""
     from .coordtools import tools_mode
     state, why = tools
     if state == "full" and tools_mode(p.config()) != "full":
         state, why = "read", "`coordinator.session.tools` is read_only"
-    on = coordinator_features(p) | {"obligations", f"tools_{state}"}
+    return coordinator_features(p) | {"obligations", f"tools_{state}"}, why
+
+
+def coordinator_session_role(p: Project, tools: tuple[str, str] = ("full", ""),
+                             features: tuple[set[str], str] | None = None) -> str:
+    """The persistent session's role (coordinator.md, then prompts/coordinator-session.md: how wakes
+    continue one session and compact it in place), under the coordinator role's size budget, with
+    `features` (default coordinator_session_features(p, tools))."""
+    on, why = features or coordinator_session_features(p, tools)
     role = feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), on)
     return f"{role}\n\n{_read(p, 'coordinator-session.md', on)}".rstrip().replace("{tools_why}", why) + "\n"
 
