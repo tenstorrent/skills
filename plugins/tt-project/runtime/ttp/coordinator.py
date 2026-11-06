@@ -638,6 +638,12 @@ LEDGER_SEEN_KEY = "machine_ledger_lines"   # in digest_seen: {"lines": {key: has
 # messages, and every row is whole on the first turn after a prompt-snapshot refresh (so each last
 # note is read at least once per refresh cycle).
 TASK_ROWS_SEEN_KEY = "task_rows"   # in digest_seen: {"snap": snapshot time, "rows": {task id: hash}}
+# Running workers (workers_lines): one line per running run from state/runwatch.json. A session wake
+# folds the runs whose ident (step, files, check, steer state, flags; no clocks or dollars) is as the
+# previous turn left it into one line, so a delta resends the section only when a row changed.
+WORKER_ROWS_SEEN_KEY = "worker_rows"   # in digest_seen: {run id: hash of its ident}
+WORKERS_HEAD = "## Running workers (task | step | files | last check | spend, wall | steer | flags)"
+WORKER_LINE_CHARS = 160
 ROW_TITLE_CHARS = 60
 _TICKS_RE = coordsession.TICKS   # ages and read times, normalised away
 LEDGER_WHOLE_CHANGES = 10   # change lines in a whole view (overdue, then the project's own); the rest counted
@@ -1102,6 +1108,92 @@ def collapse_rows(p: Project, db, lines: list[str], rows: list[dict], seen: dict
     return out, store
 
 
+def _flag_names(e: dict) -> list[str]:
+    """The drift flags runwatch carries for a run (a list of names or of {name|flag|kind: ...}, or a
+    {name: evidence} map)."""
+    got = e.get("flags") or []
+    got = list(got) if isinstance(got, dict) else got if isinstance(got, list) else []
+    return [str(x.get("name") or x.get("flag") or x.get("kind") or "") if isinstance(x, dict) else str(x)
+            for x in got if x]
+
+
+def _worker_line(p: Project, e: dict, now: float) -> tuple[str, str]:
+    """(a running run's line, at most WORKER_LINE_CHARS, and its ident without clocks or dollars)."""
+    if e.get("gone"):
+        return f"- #{e.get('task')} | run {e.get('run')}: run dir gone", "gone"
+    t = e.get("last_tool") or {}
+    step = e.get("note") or (f"{t.get('tool')}: {t.get('input_head')}" if t.get("tool") else "starting")
+    out = e.get("files_outside_spec")
+    files = f"files {e.get('files_n') or 0}" + (f" ({out} outside spec)" if out else "")
+    check = re.sub(r"^\W*checks:\s*", "", str(e.get("checks") or "")) or "no check yet"
+    sp, wall, st = e.get("spend") or {}, e.get("wall") or {}, e.get("steer") or {}
+    money = f"${float(sp.get('task_usd') or 0):.2f}" + (f" of ${float(sp['budget_usd']):.2f}" if sp.get("budget_usd") else "")
+    money += f", {float(wall['share']):.0%} of wall" if wall.get("share") is not None else ""
+    steer, ago = "", ""
+    if st.get("last") and st.get("read") is not None:
+        try:
+            ago = f" {max(0, int((now - (p.runs / str(e.get('run')) / 'steer.md').stat().st_mtime) // 60))} min"
+        except OSError:
+            pass
+        steer = f"steer: {'read' if st['read'] else 'unread'}"
+    flags = ", ".join(_flag_names(e))
+    ident = " | ".join([step, files, _TICKS_RE.sub("", check), steer, flags])
+    tail = [clip(check, 40), money] + ([steer + ago] if steer else []) + ([flags] if flags else [])
+    tail_text = " | ".join([files] + tail)
+    room = WORKER_LINE_CHARS - len(f"- #{e.get('task')} |  | ") - len(tail_text)
+    return f"- #{e.get('task')} | {clip(step, max(room, 20))} | {tail_text}"[:WORKER_LINE_CHARS], ident
+
+
+def workers_lines(p: Project, db, seen: dict | None, fold: bool, now: float) -> tuple[list[str], list[str], dict]:
+    """(the Running workers section, its unfolded form, {run id: ident hash} to store): one line per
+    run runwatch.json lists that the runs table still has running, capped at coordinator.live_view_chars
+    (0: off; past it flagged runs first, then '+N more'). `fold`: a session wake, whose runs unchanged
+    since `seen` go on one line. Writes no state."""
+    cap = int(p.config()["coordinator"].get("live_view_chars", 1200) or 0)
+    try:
+        runs = json.loads((p.state / "runwatch.json").read_text()).get("runs") or {}
+    except (OSError, ValueError, AttributeError):
+        runs = {}
+    runs = runs if isinstance(runs, dict) else {}
+    live = {r["id"] for r in db.q("SELECT id FROM runs WHERE status='running' AND role!='coordinator'")}
+    got = [e for e in runs.values() if isinstance(e, dict) and e.get("run") in live]
+    if cap <= 0 or not got:
+        return [], [], {}
+    got.sort(key=lambda e: (not _flag_names(e), str(e.get("task")).zfill(12), e["run"]))
+    made = []
+    for e in got:
+        try:
+            made.append((e, *_worker_line(p, e, now)))
+        except (TypeError, ValueError, KeyError, AttributeError):   # a malformed entry never breaks the digest
+            made.append((e, f"- #{e.get('task')} | run {e.get('run')}: runwatch entry unreadable", "unreadable"))
+
+    def capped(rows: list, extra: str = "") -> tuple[list[str], list]:
+        """(the section within the cap, the rows it shows): '+N more' for the rest, `extra` last."""
+        out, used = [WORKERS_HEAD], len(WORKERS_HEAD) + (len(extra) + 1 if extra else 0)
+        for i, (e, ln, _) in enumerate(rows):
+            left = len(rows) - i
+            if len(out) > 1 and used + len(ln) + 1 + (len(f"- +{left} more") + 1 if left > 1 else 0) > cap:
+                return out + [f"- +{left} more"] + ([extra] if extra else []), rows[:i]
+            out.append(ln)
+            used += len(ln) + 1
+        return out + ([extra] if extra else []), rows
+
+    whole, shown = capped(made)
+    before = (seen or {}).get(WORKER_ROWS_SEEN_KEY) if fold else None
+    before = before if isinstance(before, dict) else {}
+    same = [r for r in made if before.get(str(r[0]["run"])) == _sha(r[2])]
+    if same:
+        ids = ", ".join(f"#{e.get('task')}" for e, _, _ in same)
+        shown_rows = [r for r in made if r not in same]
+        view, shown = capped(shown_rows, clip(f"- {len(same)} as last turn (step, files, check, steer and flags "
+                                              f"unchanged; spend and wall not repeated): {ids}", max(cap // 2, 80)))
+        shown = shown + same
+    else:
+        view = whole
+    # Only the runs this turn showed (a line, or the line of those as last turn) count as seen next turn.
+    return view, whole, {str(e["run"]): _sha(ident) for e, _, ident in shown}
+
+
 def digest(p: Project, gates: dict, event_ids: list[int], msg_ids: list[int], seen: dict | None = None) -> str:
     return "\n".join(text for _, text in digest_parts(p, gates, event_ids, msg_ids, seen)[0])
 
@@ -1341,6 +1433,10 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     rows_whole = lines
     lines, shas[TASK_ROWS_SEEN_KEY] = collapse_rows(p, db, lines, rows, seen, event_ids, msg_ids, now)
     section("tasks", lines, full=rows_whole)
+    wk_lines, wk_whole, wk_seen = workers_lines(p, db, seen, whole is not None, now)
+    if wk_seen:
+        shas[WORKER_ROWS_SEEN_KEY] = wk_seen
+    section("workers", wk_lines, full=wk_whole)
     section("user_orders", userorder.digest_lines(p))
     events = (db.q(f"SELECT * FROM events WHERE id IN ({','.join('?' * len(event_ids))}) ORDER BY id", event_ids)
               if event_ids else [])

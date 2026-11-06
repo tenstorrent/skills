@@ -52,3 +52,4 @@
 +90: obligation order `supersedes`: older spec steps it replaces; running tasks told (userorder.fan_out)
 +90: a `restart: <why>` line in a running task's spec reruns it from a safe point, work kept, max 3 per 6 h (#6301)
 +239: posts to people other than the user end with the AI-authorship tag, replies to the user never (aitag.py)
++180: the Running workers digest section: what it shows, steer or restart a flagged run (#6311)

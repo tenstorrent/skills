@@ -231,6 +231,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # No worker run started for this long while dispatch would start a queued task:
                     # one high observation per stall lists those tasks (Daemon.check_stall; 0: off).
                     "stall_wake_h": 3,
+                    # The digest's Running workers section (coordinator.workers_lines, from state/runwatch.json)
+                    # is cut at this many chars, flagged runs first, then '+N more' (0: off).
+                    "live_view_chars": 1200,
                     # A ready obligation owner or priority-1 task held this long only because every
                     # worker slot is taken: one observation per task names it and the running tasks
                     # holding the slots (Daemon.check_slot_wait; 0: off).

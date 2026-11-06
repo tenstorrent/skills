@@ -22619,3 +22619,113 @@ def test_gate_holds_wake_only_for_a_decision_and_a_rejection_survives_a_restart(
     d._finish_coordinator({"dir": "x"}, SimpleNamespace(structured={"actions": [], "summary": ""}, error="",
                                                         final_text=""), "ok", {})
     assert not db.kv(coord.REJECTED_BACKED_KEY)
+
+
+def _rw_runs(p, n, over=None):
+    """`n` running worker runs in the runs table and state/runwatch.json; `over`: {index: entry fields}."""
+    runs = {}
+    for i in range(n):
+        tid = p.db.add_task(f"w{i}", "s", origin="user")
+        rid = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)", (tid, time.time()))
+        e = {"run": rid, "task": tid, "role": "worker", "note": f"editing part {i}", "files_n": 3,
+             "checks": "checks: pass (412 passed in 95s)", "spend": {"task_usd": 0.42 + i, "budget_usd": 8.0},
+             "wall": {"share": 0.31}, "steer": None}
+        e.update((over or {}).get(i, {}))
+        runs[str(rid)] = e
+    (p.state / "runwatch.json").write_text(json.dumps({"updated": time.time(), "runs": runs}))
+    return runs
+
+
+def test_coordinator_running_workers_section_none_one_and_off(env):
+    """No running run, or only runs the runs table no longer has running: no Running workers section.
+    One run: one line under 160 chars with step, files (outside spec), check, spend of budget and wall
+    share, steer read state and flags, the last two only when runwatch carries them."""
+    from ttp import coordinator as coord
+    p = make(env)
+    assert "workers" not in dict(coord.digest_parts(p, {}, [], [])[0])
+    gone = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(1,'worker','done',?)", (time.time(),))
+    (p.state / "runwatch.json").write_text(json.dumps({"runs": {str(gone): {"run": gone, "task": 1}}}))
+    assert "workers" not in dict(coord.digest_parts(p, {}, [], [])[0]), "a finished run is not listed"
+    runs = _rw_runs(p, 1, {0: {"files_outside_spec": 2, "flags": [{"name": "outside_spec"}],
+                                 "steer": {"last": "Update for your task", "read": False}}})
+    e = next(iter(runs.values()))
+    text = dict(coord.digest_parts(p, {}, [], [])[0])["workers"]
+    head, line = text.split("\n")
+    assert head == coord.WORKERS_HEAD and len(line) <= coord.WORKER_LINE_CHARS, text
+    assert line.startswith(f"- #{e['task']} | editing part 0 | files 3 (2 outside spec) | pass (412 passed"), line
+    assert "$0.42 of $8.00, 31% of wall" in line and "steer: unread" in line and line.endswith("outside_spec"), line
+    runs[str(e["run"])].update(steer={"last": "", "read": None}, flags=[], files_outside_spec=0,
+                               note="x" * 400)
+    (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
+    line = dict(coord.digest_parts(p, {}, [], [])[0])["workers"].split("\n")[1]
+    assert "steer" not in line and "outside" not in line and len(line) <= coord.WORKER_LINE_CHARS, line
+    runs[str(e["run"])].update(spend={"task_usd": "n/a", "budget_usd": 8}, flags="loop")
+    (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
+    assert "runwatch entry unreadable" in dict(coord.digest_parts(p, {}, [], [])[0])["workers"]
+    for bad in ("[1, 2]", '{"runs": [1]}', "{", '{"runs": {"x": 5}}'):
+        (p.state / "runwatch.json").write_text(bad)
+        assert "workers" not in dict(coord.digest_parts(p, {}, [], [])[0]), bad
+    (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
+    p.set_config("coordinator.live_view_chars", 0)
+    assert "workers" not in dict(coord.digest_parts(p, {}, [], [])[0]), "0 turns the section off"
+
+
+def test_coordinator_running_workers_section_caps_with_flagged_first(env):
+    """Ten runs past coordinator.live_view_chars: the section stays within it, flagged runs come first
+    and '+N more' counts the rest."""
+    from ttp import coordinator as coord
+    p = make(env)
+    long = {i: {"note": f"part {i}: " + "editing the digest builder and its tests " * 3} for i in range(10)}
+    long[7]["flags"], long[9]["flags"] = ["loop"], {"pace": "90% spent"}
+    runs = list(_rw_runs(p, 10, long).values())
+    text = dict(coord.digest_parts(p, {}, [], [])[0])["workers"]
+    lines = text.split("\n")
+    assert len(text) <= 1200 and lines[-1].startswith("- +"), text
+    shown = len(lines) - 2
+    assert lines[-1] == f"- +{10 - shown} more" and 2 < shown < 10, text
+    assert lines[1].startswith(f"- #{runs[7]['task']} | part 7") and lines[1].endswith("| loop"), lines[1]
+    assert lines[2].startswith(f"- #{runs[9]['task']} | part 9") and lines[2].endswith("| pace"), lines[2]
+    assert all(len(ln) <= coord.WORKER_LINE_CHARS for ln in lines), lines
+    p.set_config("coordinator.live_view_chars", 5000)
+    assert len(dict(coord.digest_parts(p, {}, [], [])[0])["workers"].split("\n")) == 11, "all fit: no '+N more'"
+
+
+def test_coordinator_running_workers_fold_unchanged_rows_on_session_wakes(env):
+    """A session wake (digest_parts with `whole`) folds the runs whose ident (step, files, check, steer,
+    flags) is as the previous turn saw it into one line: a change of spend or wall alone keeps the
+    section text the same, so the session delta resends nothing; a changed step resends that row whole.
+    A stateless turn never folds, and `whole` always has every line."""
+    from ttp import coordinator as coord, coordsession as cs
+    p = make(env)
+    runs = _rw_runs(p, 8)
+
+    def build(seen, session=True):
+        whole = [] if session else None
+        parts, shas = coord.digest_parts(p, {}, [], [], seen, {}, whole)
+        return parts, shas, dict(whole or [])
+
+    first, seen, whole = build({})
+    full = dict(first)["workers"]
+    assert full == whole["workers"] and len(full.split("\n")) == 9, full
+    for e in runs.values():
+        e["spend"]["task_usd"] += 0.37
+        e["wall"]["share"] = 0.55
+    (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
+    second, seen2, whole2 = build(seen)
+    folded = dict(second)["workers"].split("\n")
+    assert len(folded) == 2 and folded[1].startswith("- 8 as last turn"), folded
+    assert "$1.79" in whole2["workers"] and "55% of wall" in whole2["workers"], "whole keeps the live numbers"
+    third, seen3, _ = build(seen2)
+    assert dict(third)["workers"] == dict(second)["workers"]
+    acked = {cs.DIGEST: {"sections": cs.sections(second), "rows": cs.rows(second), "seen": "s", "gen": "g"}}
+    sent, _ = cs.delta(third, acked, "s", "g")
+    assert "workers" not in dict(sent), "nothing changed: the delta leaves the section out"
+    first_run = next(iter(runs.values()))
+    first_run["note"] = "running the checks"
+    (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
+    fourth = dict(build(seen3)[0])["workers"].split("\n")
+    assert fourth[1].startswith(f"- #{first_run['task']} | running the checks") and fourth[2].startswith("- 7 as last"), fourth
+    assert len(dict(build(seen3, session=False)[0])["workers"].split("\n")) == 9, "a stateless turn shows every run"
+    # Measured on this fixture (8 runs): the full section and a delta where no row changed.
+    tokens = len(full) / 4
+    assert tokens <= 300, (tokens, full)

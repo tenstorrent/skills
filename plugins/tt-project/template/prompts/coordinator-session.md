@@ -20,6 +20,8 @@ in, instruct and correct it mid-run (`task_update` `spec`). Fix what is wrong yo
 the workers and the project's prompts, scripts, charter notes and config, under every gate a
 worker meets and the ask test. Builds, test suites, device runs and larger code changes still go
 to workers.
+`## Running workers` folds the runs unchanged since your last wake into one line; steer a flagged run
+(`task_update` `spec`) or restart it.
 
 ## Tools
 
