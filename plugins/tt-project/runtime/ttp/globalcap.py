@@ -31,7 +31,9 @@ The global total for a provider counts, for this day:
   that machine's answer, so never twice. An answer from an older tt-project has no such field: it
   counts 0 for them and the total says those machines' sessions are not in it;
 - other spend sources registered with `add_other_source` (a hook for spend outside tt-project, e.g.
-  the user's own sessions; localspend adds this machine's other Claude Code sessions).
+  the user's own sessions; localspend adds this machine's other Claude Code and Codex sessions, and
+  names Cursor's unknown). Other machines' Codex sessions are not in their answers yet: a Codex
+  total names those machines in `sessions_missing`.
 
 Only spend on the same provider and the same account counts: a Codex project, or a project logged
 in to another account, is not billed with this one. Rows with no account recorded count (fail safe).
@@ -730,6 +732,8 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
                         apart[how][1].append(name)
             elif provider == "claude":       # an older tt-project there, or its logs not read yet
                 missing.append(name)
+            if provider == "codex":          # answers carry only the Claude Code estimate
+                missing.append(name)
             if fresh:
                 usd += add
                 remote_sessions += more
@@ -768,8 +772,9 @@ def total(db, provider: str, start: float, end: float, now: float | None = None,
     if not others and not n_sessions:
         includes += "; not your own sessions outside tt-project"
     else:
-        gap = (f"other Claude Code sessions on {', '.join(missing)} (an older tt-project there, or its logs "
-               f"not read yet), " if missing else "")
+        gap = ("" if not missing else f"other Codex sessions on {', '.join(missing)} (not sent between machines), "
+               if provider == "codex" else f"other Claude Code sessions on {', '.join(missing)} (an older tt-project "
+               f"there, or its logs not read yet), ")
         includes += f"; not {gap}sessions on machines without tt-project, nor web, desktop or cloud sessions"
     apart_out = []
     if apart["plan"][0]:

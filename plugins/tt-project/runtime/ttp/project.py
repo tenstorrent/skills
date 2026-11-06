@@ -2909,7 +2909,7 @@ def unregister(name: str) -> None:
 
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
-ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude"},
+ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
                 "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
                 "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",

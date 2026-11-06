@@ -5022,3 +5022,142 @@ def test_same_probe_compares_probes_after_normalising_their_formatting(a, b, sam
     from ttp.daemon import _same_probe
     assert _same_probe({"retry_when": a}, {"retry_when": b}) is same
     assert _same_probe({"retry_when": a}, {"retry_when": "other", "retry_when_orig": b}) is same
+
+
+def _codex_home(tmp_path, monkeypatch, mode="apikey"):
+    """A CODEX_HOME with a login of `mode` (apikey: billed per use; chatgpt: a plan) and its sessions folder."""
+    home = tmp_path / "codex-home"
+    (home / "sessions").mkdir(parents=True)
+    (home / "auth.json").write_text(json.dumps({"auth_mode": mode, **({"OPENAI_API_KEY": "test-key"} if mode == "apikey" else {})}))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    return home / "sessions"
+
+
+def _rollout(sessions, sid, records, ts):
+    """Append Codex rollout records to the session's file under its day folder."""
+    day = time.strftime("%Y/%m/%d", time.gmtime(ts))
+    path = sessions / day / f"rollout-{time.strftime('%Y-%m-%dT%H-%M-%S', time.gmtime(ts))}-{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    return path
+
+
+def _rec(kind, ts, payload):
+    return {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts)), "type": kind, "payload": payload}
+
+
+def _tokens(ts, inp, cached, out):
+    total = {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": out}
+    return _rec("event_msg", ts, {"type": "token_count", "info": {"total_token_usage": total, "last_token_usage": total}})
+
+
+def _session(sid, ts, model="gpt-test"):
+    return [_rec("session_meta", ts, {"id": sid, "cwd": "/work"}), _rec("turn_context", ts, {"model": model})]
+
+
+def test_other_codex_sessions_are_priced_from_their_rollouts_and_tt_projects_runs_left_out(env, tmp_path, monkeypatch):
+    # Codex writes no Claude Code logs: a usage-billed Codex account's sessions outside tt-project
+    # are read from CODEX_HOME's rollouts, priced at the Codex table (account pricing.codex wins),
+    # and tt-project's own runs, ended or still going, never count as other spend.
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    from ttp import project as proj
+    sessions = _codex_home(tmp_path, monkeypatch)
+    proj.write_json(proj.account_settings_path(), {"pricing": {"codex": {"gpt-priced": [1.0, 0.5, 10.0]}}})
+    p = make(env)
+    other = _other_project(tmp_path, "other")
+    now = time.time()
+    M = 1_000_000
+    user = "11111111-2222-3333-4444-555555555555"
+    ended = "aaaaaaaa-2222-3333-4444-555555555555"
+    going = "bbbbbbbb-2222-3333-4444-555555555555"
+    path = _rollout(sessions, user, [*_session(user, now - 300), _tokens(now - 290, M, M // 2, 0),
+                                     _rec("event_msg", now - 289, {"type": "token_count", "info": None, "rate_limits": {}}),
+                                     _tokens(now - 280, 2 * M, M, M), _tokens(now - 279, 2 * M, M, M)], now - 300)
+    _rollout(sessions, ended, [*_session(ended, now - 200), _tokens(now - 190, M, 0, M)], now - 200)
+    _rollout(sessions, going, [*_session(going, now - 100), _tokens(now - 90, M, 0, M)], now - 100)
+    other.x("INSERT INTO runs(role,provider,started,ended,status,session_id) VALUES('worker','codex',?,?,'ok',?)",
+            (now - 210, now - 150, ended))
+    rid = other.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','codex',?,'running')", (now - 110,))
+    out = Path(other.path).parent / "runs" / str(rid) / "output.jsonl"
+    out.parent.mkdir(parents=True)
+    out.write_text(json.dumps({"type": "thread.started", "thread_id": going}) + "\n")
+    b = _far_day(now)
+    ls.scan(b, now, kind="codex")
+    start, end = gcap.day_bounds(b, now)
+    e = ls.estimate(b, start, end, now, kind="codex")
+    # default row (4, 0.4, 20): 0.5M fresh + 0.5M cached, then 0.5M + 0.5M + 1M out; the repeat counts nothing
+    assert e["usd"] == 24.4 and e["sessions"] == 1 and e["billing"] == "usage" and e["unknown"] == ["gpt-test"], e
+    # More growth is read from where the scan stopped, under the model the session switched to.
+    with open(path, "a") as f:
+        f.write(json.dumps(_rec("turn_context", now - 60, {"model": "gpt-priced"})) + "\n")
+        f.write(json.dumps(_tokens(now - 50, 3 * M, M, 2 * M)) + "\n")
+    ls.scan(b, now + 1, kind="codex")
+    ls._MEMO.clear()
+    assert ls.estimate(b, start, end, now + 1, kind="codex")["usd"] == 24.4 + 11.0
+    # The file rewritten (a new inode, read from the start) counts nothing twice.
+    text = path.read_text()
+    path.unlink()
+    path.write_text(text)
+    ls.scan(b, now + 2, kind="codex")
+    ls._MEMO.clear()
+    assert ls.estimate(b, start, end, now + 2, kind="codex")["usd"] == 35.4
+    # The global Codex total counts them and the caps line names them; the Claude total does not.
+    monkeypatch.setattr(ls, "account_budget", lambda: b)
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    ls._MEMO.clear()
+    t = gcap.total(p.db, "codex", start, end, now + 2, account="")
+    assert t["usd"] == 35.4 and "other Codex sessions on this machine ($35.40, estimated from local rollouts" in t["includes"], t
+    assert "Codex" not in gcap.total(p.db, "claude", start, end, now + 2, account="")["includes"]
+
+
+def test_a_chatgpt_codex_logins_sessions_are_shown_not_counted_and_cursor_is_unknown_not_zero(env, tmp_path, monkeypatch):
+    # User correction: the global cap counts usage-billed spend only. A ChatGPT login's sessions are
+    # metered by its plan windows; Cursor keeps no local log, so its other sessions are named unknown.
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    sessions = _codex_home(tmp_path, monkeypatch, mode="chatgpt")
+    p = make(env)
+    now = time.time()
+    sid = "cccccccc-2222-3333-4444-555555555555"
+    _rollout(sessions, sid, [*_session(sid, now - 100), _tokens(now - 90, 1_000_000, 0, 0)], now - 100)
+    b = _far_day(now)
+    ls.scan(b, now, kind="codex")
+    start, end = gcap.day_bounds(b, now)
+    monkeypatch.setattr(ls, "account_budget", lambda: b)
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    t = gcap.total(p.db, "codex", start, end, now, account="")
+    assert t["usd"] == 0 and t["plan_usd"] == 4.0 and "$4.00 subscription-plan sessions on this machine" in t["includes"], t
+    t = gcap.total(p.db, "cursor", start, end, now, account="")
+    assert t["usd"] == 0 and "other Cursor sessions on this machine (unknown" in t["includes"], t
+    # The daemon's background scan reads the rollouts too, when they are due.
+    monkeypatch.setattr(ls, "_THREAD", {})
+    ls.scan_async({"global_daily_usd": 1}, now + ls.SCAN_S)
+    ls._THREAD["t"].join(10)
+    assert ls.load("codex")["scanned"] == now + ls.SCAN_S and ls.load("codex")["ok"], ls.load("codex")
+    # No rollout folder yet is no sessions ($0, read), not an unreadable log.
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty"))
+    assert ls.scan(b, now + 1, kind="codex")["ok"] is True
+
+
+def test_other_machines_are_named_missing_from_a_codex_total(env, monkeypatch):
+    # Answers between machines carry only their Claude Code estimate: a Codex total names those
+    # machines as not counted rather than counting their Codex sessions as $0.
+    from ttp import globalcap as gcap
+    p = make(env)
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [lambda *a: (0.0, "this machine's own sessions", "usage")])
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    key = gcap.account_key("codex", "")
+    rec = {"v": 1, "host": "far", "sent": now, "windows": [{"start": start, "end": end, "projects": ["x"],
+                                                           "rows": [{"provider": "codex", "key": key, "usd": 2.0}]}]}
+    assert gcap.receive((json.dumps(rec) + "\n").encode(), "far", now)[1] == 0
+    t = gcap.total(p.db, "codex", start, end, now + 1, account="")
+    assert t["usd"] == 2.0 and t["sessions_missing"] == ["far"], t
+    assert "other Codex sessions on far (not sent between machines)" in t["includes"], t["includes"]
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="")
+    assert "Codex" not in t["includes"] and t["sessions_missing"] == ["far"], t
