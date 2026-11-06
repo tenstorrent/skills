@@ -9,11 +9,16 @@ the per-wake cap plus the expected seed cost:
 
 - expected(): the dearest seed of the last HISTORY new-session wakes of this project (same provider,
   same model where there are any), failed ones included. A past wake's seed is the context it wrote
-  to the prompt cache plus its uncached input, priced by budget.estimate_cost, never more than the
-  wake booked; never its whole cost, which also holds the wake's own work under the cap raised here,
-  so each raise would feed the next. A wake that reported no cache writes is skipped. Without such
-  a wake, the seed prompt's size at the model's prices (budget.estimate_cost: this project's own rate
-  on the provider, else the configured fallback).
+  to the prompt cache plus its uncached input, at that wake's own booked rate: its cost times their
+  share of its weighted tokens (budget.TOKEN_WEIGHTS; a cache write at a 1h lifetime weighs
+  CACHE_WRITE_1H). Never the project-wide rate of budget.estimate_cost, which averages mostly workers
+  booked far below a coordinator wake. Never its whole cost either, which also holds the wake's own
+  work under the cap raised here, so each raise would feed the next. Part of its cache writes are
+  its own work too, so the seed counts at most SEED_FACTOR times that wake's own prompt size
+  (turn.prompt_bytes, else this wake's): the cap then stays bounded however much each wake spends.
+  A wake that reported no cache writes is skipped. Without such a wake, the seed prompt's size at
+  the model's prices (budget.estimate_cost: this project's own rate on the provider, else the
+  configured fallback).
 - cap(): the raise never goes past what the dollar caps and the hourly coordinator limit leave
   (turnsize.headroom), and never lowers the per-wake cap. A resumed wake is not raised here.
 
@@ -25,23 +30,50 @@ import json
 
 HISTORY = 3
 CHARS_PER_TOKEN = 4
+CACHE_WRITE_1H = 2.0   # a 1h cache write costs 2x input (cachettl.py); the 5m weight is TOKEN_WEIGHTS'
+# A past seed counts at most this many times its wake's prompt size in tokens: the agent's own system
+# prompt and tool definitions, which the prompt size leaves out, and a denser text than CHARS_PER_TOKEN
+# (a live new-session wake wrote 2.6 times its prompt bytes / 4), but not a wake's whole work.
+SEED_FACTOR = 3.0
 
 
-def _seeds(db, cfg: dict, provider: str, model: str | None) -> list[float]:
-    from .budget import estimate_cost
+def _seed(r, turn: dict, cfg: dict, chars: int) -> float:
+    """Run row r's seed: its cache writes and uncached input at its own booked rate, at most
+    SEED_FACTOR times its prompt size (turn.prompt_bytes, else `chars`), never more than it booked."""
+    from .budget import TOKEN_WEIGHTS
+    w = {**TOKEN_WEIGHTS, **((cfg.get("budget") or {}).get("estimate_weights") or {})}
+    if turn.get("cache_ttl") == "1h":
+        w["cache_write"] = CACHE_WRITE_1H * w["input"]
+    n = {k: float(r[f"{k}_tokens"] or 0) for k in ("input", "output", "cache_read", "cache_write")}
+    units = sum(n[k] * w[k] for k in n)
+    if units <= 0:
+        return 0.0
+    try:
+        size = int(turn.get("prompt_bytes") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    size = size if size > 0 else int(chars)
+    seed = n["cache_write"] * w["cache_write"] + n["input"] * w["input"]
+    if size > 0:
+        seed = min(seed, SEED_FACTOR * size / CHARS_PER_TOKEN * w["cache_write"])
+    cost = float(r["cost_usd"])
+    return min(cost * seed / units, cost)
+
+
+def _seeds(db, cfg: dict, provider: str, model: str | None, chars: int = 0) -> list[float]:
     got = []
-    for r in db.q("SELECT model, cost_usd, input_tokens, cache_write_tokens, note FROM runs WHERE role='coordinator' "
+    for r in db.q("SELECT cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, note "
+                  "FROM runs WHERE role='coordinator' "
                   "AND task IS NULL AND provider=? AND (? IS NULL OR model=?) AND status!='running' AND cost_usd>0 "
                   "AND cache_write_tokens>0 AND note LIKE '%\"new\"%' ORDER BY id DESC LIMIT 50",
                   (provider, model, model)):
         try:
-            session = (json.loads(r["note"] or "{}").get("turn") or {}).get("session") or {}
+            turn = json.loads(r["note"] or "{}").get("turn") or {}
+            session = turn.get("session") or {}
         except (ValueError, AttributeError):
             continue
         if isinstance(session, dict) and session.get("mode") == "new":
-            seed = estimate_cost(db, cfg, provider, r["model"] or "",
-                                 {"cache_write": r["cache_write_tokens"] or 0, "input": r["input_tokens"] or 0})
-            got.append(min(seed, float(r["cost_usd"])))
+            got.append(_seed(r, turn, cfg, chars))
             if len(got) >= HISTORY:
                 break
     return got
@@ -49,7 +81,7 @@ def _seeds(db, cfg: dict, provider: str, model: str | None) -> list[float]:
 
 def expected(db, cfg: dict, provider: str, model: str, chars: int) -> tuple[float, str]:
     """(dollars, basis) a new session's seed is expected to cost: "history" or "estimate"."""
-    seeds = _seeds(db, cfg, provider, model or None) or _seeds(db, cfg, provider, None)
+    seeds = _seeds(db, cfg, provider, model or None, chars) or _seeds(db, cfg, provider, None, chars)
     if seeds:
         return round(max(seeds), 2), "history"
     from .budget import estimate_cost

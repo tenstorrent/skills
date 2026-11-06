@@ -1172,11 +1172,17 @@ def test_coordsession_resumed_wakes_book_their_own_cost_and_cap_and_keep_the_gua
 _CS_RATE = 10.0 / 1e6   # dollars per weighted token of the seed-history rows
 
 
-def _cs_book_tokens(p, rid, seed_usd, cost_usd):
-    """Give run `rid` the tokens of a wake whose seed cost seed_usd (cache writes) and whose own work
-    made up the rest of cost_usd (output), at _CS_RATE."""
-    p.db.x("UPDATE runs SET cost_usd=?, cache_write_tokens=?, output_tokens=? WHERE id=?",
-           (cost_usd, round(seed_usd / (1.25 * _CS_RATE)), round((cost_usd - seed_usd) / (5 * _CS_RATE)), rid))
+def _cs_book_tokens(p, rid, seed_usd, cost_usd, *, prompt_bytes=None, work="output"):
+    """Give run `rid` the tokens of a wake whose seed cost seed_usd (cache writes at a 1h lifetime) and
+    whose own work made up the rest of cost_usd (output, or more cache writes), at _CS_RATE. Its prompt
+    is prompt_bytes long (default: the seed's tokens, so the SEED_FACTOR bound does not bind)."""
+    from ttp import seedcap
+    w = seedcap.CACHE_WRITE_1H * _CS_RATE
+    seed_tok, rest = round(seed_usd / w), cost_usd - seed_usd
+    out, cw = (round(rest / (5 * _CS_RATE)), seed_tok) if work == "output" else (0, seed_tok + round(rest / w))
+    p.db.x("UPDATE runs SET cost_usd=?, cache_write_tokens=?, output_tokens=?, note=json_set(note, "
+           "'$.turn.cache_ttl', '1h', '$.turn.prompt_bytes', ?) WHERE id=?",
+           (cost_usd, cw, out, prompt_bytes or seed_tok * seedcap.CHARS_PER_TOKEN, rid))
 
 
 def _cs_seed_wakes(env, monkeypatch, seeds=(), **cfg):
@@ -1232,6 +1238,59 @@ def test_coordsession_a_new_session_s_cap_reads_past_seeds_not_past_wakes_whole_
     p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))
     _, _, _, s0 = turn("EVENTS", budget_usd=1.0)
     assert s0["seed_basis"] == "estimate", s0
+
+
+def test_coordsession_a_past_seed_is_priced_at_its_own_wake_s_booked_rate(env, monkeypatch):
+    """Review #6487: the project-wide estimate_cost rate averages mostly workers booked far below a
+    coordinator wake and weighs a cache write at the 5m price, so a live $1.20 wake whose cache writes
+    were about $0.86 at list price gave a $0.34 seed and a $1.34 cap. Its seed is its share of its own cost."""
+    from ttp import seedcap
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch)
+    rid = _cs_booked_run(p, "OLD", 1.2005, "new")
+    p.db.x("UPDATE runs SET provider='fake', model='other', input_tokens=4, output_tokens=12925, "
+           "cache_read_tokens=96325, cache_write_tokens=85741, note=json_set(note, '$.turn.cache_ttl', '1h', "
+           "'$.turn.prompt_bytes', 132755) WHERE id=?", (rid,))
+    for i in range(40):   # cheap worker runs: the project-wide rate is a tenth of the wake's
+        p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,input_tokens,output_tokens,"
+               "cache_write_tokens) VALUES(?,'worker','fake','other',?,?,'ok',0.1,1000,20000,50000)",
+               (i + 1, time.time() - 900, time.time() - 800))
+    want = round(1.2005 * (2.0 * 85741 + 4) / (4 + 5 * 12925 + 0.1 * 96325 + 2.0 * 85741), 2)
+    assert want == 0.84
+    assert seedcap.expected(p.db, p.config(), "fake", "other", 0) == (want, "history")
+    _, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
+    assert s0["seed_usd"] == 0.84 and _cs_cap(a0) == 1.84, (s0, a0)
+    # The same wake at a 5m lifetime weighs its cache writes at TOKEN_WEIGHTS' 1.25.
+    p.db.x("UPDATE runs SET note=json_set(note, '$.turn.cache_ttl', '5m') WHERE id=?", (rid,))
+    assert seedcap.expected(p.db, p.config(), "fake", "other", 0)[0] == round(
+        1.2005 * (1.25 * 85741 + 4) / (4 + 5 * 12925 + 0.1 * 96325 + 1.25 * 85741), 2) == 0.71
+    # A seed never counts past what its wake booked, nor a row with no token classes weighed.
+    assert seedcap._seed({"cost_usd": 0.5, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0,
+                          "cache_write_tokens": 0}, {}, {}, 1000) == 0.0
+    assert seedcap._seed({"cost_usd": 0.5, "input_tokens": 9, "output_tokens": 0, "cache_read_tokens": 0,
+                          "cache_write_tokens": 10**6}, {"prompt_bytes": "junk"}, {}, 0) == 0.5
+
+
+def test_coordsession_capped_wakes_spending_on_cache_writes_converge(env, monkeypatch):
+    """Part of a wake's cache writes are its own work under the raised cap. Wakes that each spend their
+    whole cap on cache writes would raise every next cap by that cap ($2.20, $3.20, $4.20, ...); counted
+    at most SEED_FACTOR times the wake's own prompt size, the caps settle at once and stay put."""
+    from ttp import coordsession, seedcap
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, seeds=((1.2, 2.2),))
+    bound = round(seedcap.SEED_FACTOR * 100_000 / seedcap.CHARS_PER_TOKEN * seedcap.CACHE_WRITE_1H * _CS_RATE, 2)
+    assert bound == 1.5
+    caps = []
+    for _ in range(5):
+        p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))   # no session yet: the wake starts one
+        run, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
+        assert s0["mode"] == "new" and s0["seed_basis"] == "history", s0
+        caps.append(_cs_cap(a0))
+        _cs_book_tokens(p, run["id"], 1.2, _cs_cap(a0), prompt_bytes=100_000, work="cache_write")
+    assert caps == [2.2, 2.5, 2.5, 2.5, 2.5], caps
+    # A row without a recorded prompt size is bounded by this wake's prompt: the cap still holds.
+    p.db.x("UPDATE runs SET note=json_remove(note, '$.turn.prompt_bytes')")
+    p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))
+    _, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
+    assert s0["seed_basis"] == "history" and 1.0 < _cs_cap(a0) < 2.5, (s0, a0)
 
 
 def test_coordsession_a_new_session_without_history_prices_its_seed_prompt(env, monkeypatch):
