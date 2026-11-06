@@ -46,17 +46,17 @@ saved hashes may not match what it saw: none saved, a stateless turn or a failed
 since, another turn's digest since (the collapse baseline moved), a daemon restart, or the session
 asked for it with the action {"type": "noop", "key": FULL_ASK}.
 
-Per-row updates (coordinator.session.row_delta, on by default): a changed list section whose rows all
-have a stable key (KEYED: Open tasks '- #<id> |', promises '- o<n>', memory and correction entries
-'[name]', attached chats) is compared row by row, each row without its ages and read times (TICKS),
+Per-row updates (coordinator.session.row_delta, on by default): only a changed Open tasks section
+(ROWS, rows keyed '- #<id> |') is compared row by row, each row without its ages and read times (TICKS),
 against the row hashes the acknowledged wake saved. It sends its header, a line naming the rows added,
 changed and removed by key and counting the rest, then the added and changed rows, each whole with its
 current age. Never a partial row or a text diff. The section goes whole, as without per-row updates,
-when: a row has no key (an Open tasks group line is keyed by its hash), a key repeats, the list is cut
-short by its row limit (Open tasks' cut_line(), or Chats attached at CHATS_SHOWN), its header changed in
-more than its counts, more than half its rows changed, the rows it kept changed order, there are no row
-hashes acknowledged, or the whole section is shorter. A task the section no longer shows is called no
-longer open unless a group line still names it."""
+when: a key repeats (a group line is keyed by its hash), the list is cut short by its row limit
+(cut_line()), its header changed in more than its counts, more than half its rows changed, the rows it
+kept changed order, there are no row hashes acknowledged, or the whole section is shorter. A task the
+section no longer shows is called no longer open unless a group line still names it. Every other
+section (memory, user corrections, promises, chats) is hashed raw and sent whole on any change, so one
+whose only change is an age goes whole too."""
 from __future__ import annotations
 
 import hashlib
@@ -94,13 +94,7 @@ OPEN_ROWS = 60   # the Open tasks section's row limit
 CUT_NAMED = 40   # the most open tasks past it named one by one
 _CUT = "- (open tasks past this list's limit of"
 CHATS_SHOWN = 10   # the Chats attached section's row limit (it has no line for the chats past it)
-_ENTRY = re.compile(r"(\[[^\]\n]+\])")
-# The list sections sent row by row: {section: (row key pattern, what a removed row is, row limit or 0)}.
-KEYED = {ROWS: (re.compile(r"- (#\d+) \| "), "no longer open", 0),
-         "promises": (re.compile(r"- (o\d+) "), "no longer open", 0),
-         "chats": (re.compile(r"- (\S+) \("), "no longer listed", CHATS_SHOWN),
-         **{k: (_ENTRY, "no longer listed", 0) for k in ("user_corrections", "user_corrections_added",
-                                                         "memory_added", "memory_recent", "memory_recent_added")}}
+_ROW_KEY = re.compile(r"- (#\d+) \| ")   # an Open tasks row's key, its task id
 
 
 def cut_line(ids: list[int]) -> str:
@@ -298,23 +292,19 @@ def sections(parts: list[tuple[str, str]]) -> dict:
     return {k: [_sha(_body(k, t)), _label(_body(k, t) or t)] for k, t in _keyed(parts)}
 
 
-def _key_rows(key: str, text: str) -> list[tuple[str, str]] | None:
-    """A KEYED section's (row key, line) after its header, or None when its rows have no stable key: a
-    line no key matches (an Open tasks group line is keyed '~' and its hash), a repeated key, or a list
-    cut short by its row limit."""
-    pat, _, cap = KEYED[key]
+def _key_rows(text: str) -> list[tuple[str, str]] | None:
+    """The Open tasks section's (row key, line) after its header (a group line is keyed '~' and its
+    hash), or None when a key repeats or the list is cut short by its row limit."""
     out = []
     for ln in text.split("\n")[1:]:
         if not ln.strip():
             continue
-        if key == ROWS and ln.startswith(_CUT):
+        if ln.startswith(_CUT):
             return None
-        m = pat.match(ln)
-        if not m and key != ROWS:
-            return None
+        m = _ROW_KEY.match(ln)
         out.append((m[1] if m else f"~{_sha(_unticked(ln))}", ln))
     keys = [k for k, _ in out]
-    return None if len(set(keys)) < len(keys) or (cap and len(out) >= cap) else out
+    return None if len(set(keys)) < len(keys) else out
 
 
 def _head(text: str) -> str:
@@ -323,21 +313,21 @@ def _head(text: str) -> str:
 
 
 def rows(parts: list[tuple[str, str]]) -> dict:
-    """{section: {"head": _head(), "rows": {row key: hash without ages}}} of the KEYED sections whose rows
-    all have a stable key, in row order."""
+    """{section: {"head": _head(), "rows": {row key: hash without ages}}} of the Open tasks section when
+    its rows have stable keys, in row order."""
     out = {}
     for key, text in _keyed(parts):
-        got = _key_rows(key.split("#")[0], text) if key.split("#")[0] in KEYED else None
+        got = _key_rows(text) if key.split("#")[0] == ROWS else None
         if got is not None:
             out[key] = {"head": _head(text), "rows": {k: _sha(_unticked(ln)) for k, ln in got}}
     return out
 
 
 def _row_delta(key: str, text: str, before) -> str | None:
-    """A changed KEYED section as its header, a line naming the rows added, changed and removed by key,
+    """A changed Open tasks section as its header, a line naming the rows added, changed and removed by key,
     then the added and changed rows, each whole; None when it goes whole (_key_rows, a header changed in
     more than its counts, more than half its rows changed, or the rows it kept in another order)."""
-    now = _key_rows(key.split("#")[0], text)
+    now = _key_rows(text)
     old = before.get("rows") if isinstance(before, dict) and before.get("head") == _head(text) else None
     if now is None or not isinstance(old, dict):
         return None
@@ -358,7 +348,7 @@ def _row_delta(key: str, text: str, before) -> str | None:
     # A task folded into a group line is not gone: that line names it.
     gone = [k for k in removed if not (k.startswith("#") and re.search(rf"{re.escape(k)}\b", grouped))]
     said = [named([k for k, _ in added], "added"), named([k for k, _ in changed], "changed"),
-            named(gone, f"removed ({KEYED[key.split('#')[0]][1]}):"),
+            named(gone, "removed (no longer open):"),
             f"{len(now) - len(added) - len(changed)} as last shown, not repeated, their ages grown since"]
     note = "(rows since your last wake, by key: " + "; ".join(s for s in said if s) + ")"
     return "\n".join([text.split("\n", 1)[0], note] + [ln for k, ln in now if (k, ln) in added + changed])
@@ -373,7 +363,7 @@ def row_delta_of(value) -> bool:
 
 
 def row_delta_on(cfg: dict) -> bool:
-    """coordinator.session.row_delta: per-row updates of the KEYED sections (on unless set off)."""
+    """coordinator.session.row_delta: per-row updates of the Open tasks section (on unless set off)."""
     return str(settings(cfg).get("row_delta")).strip().lower() not in ("false", "off", "no", "0")
 
 
@@ -395,7 +385,7 @@ def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str,
     for key, text in _keyed(parts):
         old = before.get(key)
         changed = key in ALWAYS or not isinstance(old, list) or old[:1] != now[key][:1]
-        rowed = (_row_delta(key, text, keyed.get(key)) if changed and key.split("#")[0] in KEYED
+        rowed = (_row_delta(key, text, keyed.get(key)) if changed and key.split("#")[0] == ROWS
                  and isinstance(old, list) else None)
         if rowed is not None and len(rowed) < len(text):   # else the whole section is the shorter
             sent.append((key, rowed))

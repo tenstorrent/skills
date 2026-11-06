@@ -434,14 +434,15 @@ prolonged whole-box outage.
   20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
   backstop. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
-  line naming the sections left out. List sections whose rows have a stable key (Open tasks, promises,
-  memory and correction entries, attached chats) go row by row (`row_delta`, default on; `false` sends
-  every changed section whole): the added and changed rows, each whole, and a line naming every added,
-  changed and removed row by its key and counting the rest; an age or read time alone is no change. Such
-  a section still goes whole when a row has no key or a key repeats, its list is cut short by its row
-  limit, its heading changed in more than its counts, more than half its rows changed or its rows only
-  changed order. Sections without row keys (course check, resources, ETA lines and the like) always go
-  whole when they change, so one changed line there resends the section.
+  line naming the sections left out. Only the Open tasks section goes row by row, keyed by task id
+  (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,
+  each whole, and a line naming every added, changed and removed task and counting the rest; an age or
+  read time alone is no change. It still goes whole when a task id repeats, its list is cut short by
+  its row limit, its heading changed in more than its counts, more than half its rows changed or its
+  rows only changed order. Every other section (memory, user corrections, promises, chats, course
+  check, resources and the like) is compared as raw text and sent whole on any change, so one changed
+  line there resends the section. Accepted gap: a chats or promises section whose only change is an
+  age is resent whole too.
   A new session, a daemon restart, a stateless, failed or
   compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
   digest on the next wake. A session wake's answer is checked before its turn ends: an action the

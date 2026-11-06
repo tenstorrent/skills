@@ -793,34 +793,28 @@ def test_coordsession_delta_sends_a_keyed_section_whole_when_rows_cannot_stand_a
     assert not any(cs.row_delta_on({"coordinator": {"session": {"row_delta": v}}}) for v in (False, "off", 0))
 
 
-def test_coordsession_promises_memory_and_chats_go_by_row_and_the_first_wake_after_a_resume_whole():
-    """Promises, memory and correction entries and attached chats use the same per-row update; a new
-    session, a daemon restart (the session resumed under a new daemon) and a failed or compacted wake
-    since send the whole digest."""
+def test_coordsession_promises_memory_corrections_and_chats_go_whole_and_the_first_wake_after_a_resume_whole():
+    """Only Open tasks go by row. Promises, memory and correction entries and attached chats are hashed
+    raw and sent whole on any change, so an entry edited only in a number and unit ('30 min' to '2h')
+    reaches the session; a new session, a daemon restart (the session resumed under a new daemon) and a
+    failed or compacted wake since send the whole digest."""
     from ttp import coordsession as cs
     ph = "## Promises made in chat: 6 open (send each deliverable or an honest update in its chat)"
     pr = [f"- o{n} report on item {n} [chat c1, message #{n}; due Thu 18:00 PST]" for n in range(1, 7)]
-    st = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts(ph, *pr, key="promises"), "f", "f", "g")[1]}
-    now = _cs_rowparts(ph.replace("6 open", "6 open, 1 OVERDUE"), *pr[1:], pr[0] + " OVERDUE 0.5 h")
-    assert dict(cs.wake_digest("resume", st, [(k.replace("tasks", "promises"), t) for k, t in now], [], "f", "f",
-                               "g")[0])["promises"] == now[1][1]   # the heading gained more than a count
-    later = pr[:2] + [pr[2].replace("report", "send the report")] + pr[4:] + ["- o9 a new one [chat c2; due Fri]"]
-    got = dict(cs.wake_digest("resume", st, _cs_rowparts(ph, *later, key="promises"), [], "f", "f", "g")[0])
-    assert got["promises"].split("\n")[1:] == ["(rows since your last wake, by key: added o9; changed o3; removed "
-                                               "(no longer open): o4; 4 as last shown, not repeated, their ages "
-                                               "grown since)", later[2], later[-1]], got["promises"]
-    mh = "## Decisions and facts recorded or changed since the cached prompt"
-    mem = [f"[fact-{n}] fact number {n} holds for every project" for n in range(6)]
-    st = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts(mh, *mem, key="memory_recent_added"), "f", "f",
-                                    "g")[1]}
-    got = dict(cs.wake_digest("resume", st, _cs_rowparts(mh, *mem[:5], "[fact-5] retired, ignore",
-                                                         key="memory_recent_added"), [], "f", "f", "g")[0])
-    assert got["memory_recent_added"].split("\n")[1:] == ["(rows since your last wake, by key: changed [fact-5]; 5 as "
-                                                          "last shown, not repeated, their ages grown since)",
-                                                          "[fact-5] retired, ignore"]
-    ch = [f"- c{n} (chat), active {n} min ago" for n in range(cs.CHATS_SHOWN)]
-    assert "chats" in cs.rows([("chats", "\n".join(["## Chats attached"] + ch[:-1]))])
-    assert "chats" not in cs.rows([("chats", "\n".join(["## Chats attached"] + ch))])   # at its row limit
+    mem = [f"[fact-{n}] fact number {n} holds for every project" for n in range(5)] + ["[fact-5] wait 30 min"]
+    ch = [f"- c{n} (chat), active {n} min ago" for n in range(4)]
+    for key, head, was, edit in (
+            ("promises", ph, pr, lambda r: r[:2] + [r[2].replace("report", "send the report")] + r[3:]),
+            ("memory_recent_added", "## Decisions and facts recorded or changed since the cached prompt", mem,
+             lambda r: r[:5] + ["[fact-5] wait 2h"]),
+            ("user_corrections_added", "# USER CORRECTIONS (OUTRANK PROJECT NOTES)", mem,
+             lambda r: r[:5] + ["[fact-5] wait 2h"]),
+            ("chats", "## Chats attached", ch, lambda r: r[:3] + ["- c3 (chat), active 2 h ago"])):
+        st = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts(head, *was, key=key), "f", "f", "g")[1]}
+        now = _cs_rowparts(head, *edit(was), key=key)
+        got, _, why = cs.wake_digest("resume", st, now, [], "f", "f", "g")
+        assert why.startswith("delta: ") and dict(got)[key] == dict(now)[key], (key, dict(got).get(key))
+        assert key not in cs.rows(now) and "by row" not in dict(got)[cs.DELTA]
     # The first wake of a session, after a daemon restart, and after a failed or compacted wake: whole.
     head = "## Open tasks (id | status)"
     rows = [f"- #{n} | running" for n in range(1, 9)]
