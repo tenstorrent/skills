@@ -28,6 +28,11 @@ short one (shorttmp), so a socket bound beneath it stays within the AF_UNIX path
 record under the state names it in its `path` file. Without a usable short root the record is the
 temp dir.
 
+It also gets a work dir of its own, `$TTP_JOB_DIR` (WORK in its record, under the project's state for a
+job of a run or a check): a check's own scratch and temp dir go with the check, maybe before the daemon
+starts the job it queued, so the job keeps its files here. A queued job whose cwd went meanwhile starts
+there. Both go when it ends, as its temp dir does.
+
 A job started with `ttp detach --resumable` also gets <name>.resume.json: its argv, cwd and
 environment (secrets left out, as for a queued job) and how often the daemon relaunched it. When a
 host reboot cut it short, the daemon starts the same command again on the next boot (relaunch),
@@ -63,6 +68,7 @@ from .project import FOLDER, Project, durable_append, durable_write, nice_level,
 
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
 SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
+WORK = "work"            # in a job's record: its durable work dir, $TTP_JOB_DIR
 QUEUED_S = 900           # a queued job the daemon has not started by then is recorded as lost
 BOUND = "detach-bound"   # under the project's state: <run>-<name>.json per running job a check queued (bound)
 CHECK_JOB_S = 6 * 3600   # a job a check queued ends this long after it was queued, if its owner lasts that long
@@ -193,11 +199,14 @@ def resume_file(rc: Path) -> Path:
 
 
 def scratch(rc: Path) -> Path:
-    """The record of the job's own temp dir, under the project's state for a job of a run (keyed by
-    run and job name, so tend can tell whose it is), else next to its .rc."""
+    """The record of the job's own temp dir and work dir, under the project's state for a job of a run
+    or of a check (keyed by run or check report folder and job name, so tend can tell whose it is),
+    else next to its .rc."""
     rc = Path(rc)
     if rc.parent.parent.name == "runs":
         return rc.parent.parent.parent / SCRATCH / f"{rc.parent.name}-{rc.stem}"
+    if rc.parent.parent.name == "check-reports":
+        return rc.parent.parent.parent / SCRATCH / f"check-{rc.parent.name}-{rc.stem}"
     return rc.with_suffix(".tmp")
 
 
@@ -231,7 +240,13 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
         except OSError:   # unrecorded, nothing would remove it: use the record itself
             shorttmp.remove(tmp)
             tmp = record
-    env = {**env, **{var: str(tmp) for var in _TMP_VARS}, "TTP_DETACHED": "1"}
+    work = record / WORK
+    work.mkdir(mode=0o700)
+    env = {**env, **{var: str(tmp) for var in _TMP_VARS}, "TTP_JOB_DIR": str(work), "TTP_DETACHED": "1"}
+    if not os.path.isdir(cwd):   # a check's clean checkout, gone with its push before the daemon started the job
+        cmd = ["sh", "-c", 'echo "ttp detach: its directory $0 is gone: started in its work dir $PWD" >&2; exec "$@"',
+               cwd, *cmd]
+        cwd = str(work)
     proc = subprocess.Popen(["/bin/sh", "-c", WRAPPER, "sh", str(log), str(rc), str(started(rc)), str(tmp),
                              str(record), *cmd],
                             cwd=cwd, env=env, stdin=subprocess.DEVNULL,
@@ -1039,10 +1054,10 @@ def sweep(state: Path) -> None:
     ends, but not when it is killed or the host restarts. A job that still runs holds its lock."""
     folder = Path(state) / SCRATCH
     for d in sorted(folder.iterdir()) if folder.is_dir() else []:
-        m = re.fullmatch(r"([0-9]+)-([A-Za-z0-9._-]{1,64})", d.name)
+        m = re.fullmatch(r"(?:([0-9]+)|check-([0-9a-f]{32}))-([A-Za-z0-9._-]{1,64})", d.name)
         if not m or d.is_symlink() or not d.is_dir():
             continue
-        rc = Path(state) / "runs" / m[1] / f"{m[2]}.rc"
+        rc = Path(state) / ("runs" if m[1] else "check-reports") / (m[1] or m[2]) / f"{m[3]}.rc"
         if rc.exists() or lost(rc).exists() or locks.any_free([locks.job_lock(rc)]):
             _drop(d)
 

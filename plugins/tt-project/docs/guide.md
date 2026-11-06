@@ -1538,6 +1538,15 @@ session and stateless coordinators on every provider.
   owner is the push or checks run named in the check allocation's `owner.json`. The daemon ends it
   6 hours after it was queued or once that owner's marker file is gone, whichever comes first, with
   the reason in its .lost; put a tighter bound in the command itself (`timeout`).
+  Every `ttp detach` job gets, before it starts, a work dir of its own under the project's state
+  (`$TTP_JOB_DIR`, in `state/detach-tmp/`) and its own short temp dir (`TMPDIR`, `TMP` and `TEMP`),
+  neither inside the starting run's or check's scratch. Both stay until the job ends, then go (the
+  daemon removes those of a job killed without that cleanup); a push that exits busy (75) or a checks
+  run that removes its scratch never touches them. A job a check detaches keeps its files there, never
+  in the push's check scratch or the check's temp folder: those go with the check, maybe before the
+  daemon starts the job. Stage what it needs from the commit inside the job (`git archive <sha>` from
+  the repository, not the check's clean checkout). A queued job whose directory is gone when the
+  daemon starts it starts in `$TTP_JOB_DIR`, with a line in its log saying so.
   A `ttp detach` run in a PID namespace that /proc does not show (as `unshare --pid` makes) is
   queued the same way, so the pid in a job's record (detached.json) is the host's, stored with that
   pid's start time: every pid check (stops, bounds, remote verdicts) takes a pid whose start time

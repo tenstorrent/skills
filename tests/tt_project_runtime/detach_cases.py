@@ -2969,3 +2969,95 @@ def test_a_jobs_recycled_pid_counts_as_gone(env, tmp_path, monkeypatch):
         assert other.poll() is None
     finally:
         _reap(other)
+
+
+def test_a_checks_detached_job_keeps_its_files_after_the_push_exits_busy_and_its_scratch_goes(env, tmp_path,
+                                                                                               monkeypatch):
+    """A push check (cwd and TMPDIR in the push's check scratch) runs `ttp detach gate -- ...` and the push
+    exits 75; its check scratch goes before the daemon starts the job. The job still starts, in its own
+    work dir under the project's state ($TTP_JOB_DIR, its cwd once the check's is gone), with a TMPDIR of its
+    own outside the check's: it writes files there and finds them later. Both go once it ends."""
+    from ttp import detach, sandbox
+    monkeypatch.setenv("TTP_DEVICE_NODES", "")
+    p = make(env)
+    marker = p.state / "pushes" / "m1.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"status": "running"}))
+    report = _check_report(p, marker)
+    check_tmp = tmp_path / "check-scratch"
+    head = check_tmp / "head"
+    head.mkdir(parents=True)
+    seen = tmp_path / "seen"
+    job = ('set -e; d=$(mktemp -d "$TMPDIR/x.XXXXXX"); echo staged >"$d/f"; mkdir -p "$TTP_JOB_DIR/w"; '
+           'cp "$d/f" "$TTP_JOB_DIR/w/f"; sleep 0.2; cat "$TTP_JOB_DIR/w/f" "$d/f" >' + shlex.quote(str(seen))
+           + '; printf "%s\\n%s\\n%s\\n" "$PWD" "$TTP_JOB_DIR" "$TMPDIR" >>' + shlex.quote(str(seen)))
+    check = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} detach gate -- sh -c {shlex.quote(job)}; exit 75"
+    e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report), "TTP_SANDBOX_CHECKS": "1",
+         "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": "", "TTP_CHECK_SANDBOX": "tok",
+         **dict.fromkeys(("TMPDIR", "TMP", "TEMP"), str(check_tmp))}
+    for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED"):
+        e.pop(k, None)
+    r = subprocess.run(sandbox.wrap(["sh", "-c", check], True, e), env=e, cwd=str(head),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 75, r
+    shutil.rmtree(check_tmp)   # the push that exited busy removes its check scratch
+    rc = report / "gate.rc"
+    detach.tend(p)
+    assert _wait_for_path(rc), detach.lost(rc).read_text() if detach.lost(rc).exists() else r
+    log = (report / "gate.log").read_text()
+    assert rc.read_text().strip() == "0", log
+    staged, staged2, cwd, work, tmp = seen.read_text().splitlines()
+    assert staged == staged2 == "staged"
+    assert Path(work) == detach.scratch(rc) / detach.WORK and Path(cwd).resolve() == Path(work).resolve()
+    assert Path(work).is_relative_to(p.state) and not Path(tmp).is_relative_to(check_tmp)
+    assert "started in its work dir" in log
+    assert not Path(work).exists() and not Path(tmp).exists(), "removed once the job ended"
+
+
+def test_a_job_detached_from_a_ttp_checks_command_keeps_a_temp_dir_after_the_checks_run_cleans_up(
+        env, tmp_path, monkeypatch):
+    """A `ttp checks` command starts `ttp detach gate -- ...` and ends; the checks run exits and removes its
+    scratch, TMPDIR included. The job, still running, can make temp dirs under its own TMPDIR and use its
+    work dir ($TTP_JOB_DIR), neither of them inside the checks run's TMPDIR."""
+    from ttp import cli, detach
+    p, repo, run, git, tmp = _clean_repo(env, tmp_path, monkeypatch)
+    go, seen, outer = tmp_path / "go", tmp_path / "seen", tmp_path / "outer"
+    job = (f'while [ ! -e {shlex.quote(str(go))} ]; do sleep 0.05; done; d=$(mktemp -d "$TMPDIR/x.XXXXXX") && '
+           f'touch "$d/f" "$TTP_JOB_DIR/f" && printf "%s\\n%s\\n%s\\n" "$d" "$TMPDIR" "$TTP_JOB_DIR" >{shlex.quote(str(seen))}')
+    cmd = (f'echo "$TMPDIR" >{shlex.quote(str(outer))}; TTP_PROJECT={shlex.quote(str(p.base))} '
+           f'{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} detach gate -- sh -c {shlex.quote(job)}')
+    cli.main(["checks", "--detach", "--fresh", "--", cmd])
+    assert _wait_precheck(run) == "0", (run / cli.CHECKS_OUT).read_text()
+    check_tmp = Path(outer.read_text().strip())
+    found = [f for f in tmp_path.rglob("gate.*") if f.suffix in (".log", ".queued")]
+    assert found, "the job was neither started nor queued"
+    rc = found[0].with_suffix(".rc")
+    _wait_for(lambda: not check_tmp.exists(), 30)
+    assert not check_tmp.exists(), "the checks run removed its TMPDIR"
+    detach.tend(p)   # starts it, were it queued
+    go.touch()
+    assert _wait_for_path(rc), (rc.with_suffix(".log").read_text() if rc.with_suffix(".log").exists() else "")
+    assert rc.read_text().strip() == "0", rc.with_suffix(".log").read_text()
+    made, job_tmp, work = seen.read_text().splitlines()
+    assert Path(made).parent == Path(job_tmp) and not Path(job_tmp).is_relative_to(check_tmp)
+    assert Path(work).is_relative_to(p.state) and not Path(work).exists() and not Path(job_tmp).exists()
+
+
+def test_the_sweep_removes_the_work_dir_of_a_checks_job_gone_without_its_wrapper_cleaning_up(env, tmp_path):
+    """A check's job killed with its wrapper (or a host restart) leaves its record under detach-tmp: tend's sweep
+    removes it, and its temp dir, once the job is gone; a running job's (its lock held) stays."""
+    from ttp import detach, locks
+    p = make(env)
+    report = _check_report(p)
+    gone, live = report / "gone.rc", report / "live.rc"
+    for rc in (gone, live):
+        (detach.scratch(rc) / detach.WORK).mkdir(parents=True)
+    detach.lost(gone).write_text("killed\n")
+    held = locks.try_take([locks.job_lock(live)], "test", "test")
+    try:
+        detach.sweep(p.state)
+        assert not detach.scratch(gone).exists() and detach.scratch(live).is_dir()
+    finally:
+        held.close()
+    detach.sweep(p.state)
+    assert not detach.scratch(live).exists()
