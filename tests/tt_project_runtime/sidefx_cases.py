@@ -233,6 +233,43 @@ def test_outside_writes_reads_a_tool_name_only_in_command_position(tmp_path, scr
                  "a; ssh host rm /tmp/r", "time awk '/x/ {print}' f > out.txt") == {f"{h}/.ssh"}
 
 
+def test_outside_writes_finds_the_tool_past_timeout_git_process_substitution_and_long_options(tmp_path,
+                                                                                               scratch_home):
+    from ttp import sidefx
+    wt, rd = tmp_path / "wt", tmp_path / "run"
+    wt.mkdir(), rd.mkdir()
+    h = str(scratch_home)
+
+    def found(*cmds):
+        (rd / "output.jsonl").write_text(json.dumps(_claude_calls(*(("Bash", {"command": c}) for c in cmds))[0]) + "\n")
+        return {f["path"] for f in sidefx.scan(rd, str(wt))}
+
+    lt = sidefx._local_text
+    # timeout, its options and its duration come before the command
+    assert lt("timeout 30 grep pat ~/x") == "timeout 30 grep  ~/x"
+    assert lt("timeout 5 rg /x f") == "timeout 5 rg  f"
+    assert lt("timeout -s KILL -k 3 --foreground --preserve-status -v 9 grep /x f") \
+        == "timeout -s KILL -k 3 --foreground --preserve-status -v 9 grep  f"
+    # git grep is a grep, past git's own options
+    assert lt("git grep -n foo -- path") == "git grep -n  -- path"
+    assert lt("git -C dir grep /x f") == "git -C dir grep  f"
+    assert lt("git --no-pager grep /x f") == "git --no-pager grep  f"
+    assert lt("git -c core.pager=cat grep /x") == "git -c core.pager=cat grep "
+    # process substitution starts a command; it is no redirect
+    assert lt("diff <(grep /x f) y") == "diff <(grep  f) y"
+    assert lt("tee >(rg /x) < in") == "tee >(rg ) < in"
+    # sudo, env and xargs long options that take a value
+    assert lt("sudo --user root rg /x f") == "sudo --user root rg  f"
+    assert lt("env --unset X grep /x f") == "env --unset X grep  f"
+    assert found("timeout 5 rg /x f", "git grep 'rm /tmp/x'", "diff <(grep /x f) y", "sudo --user root rg /x f",
+                 "git -C . grep -n /etc/y") == set()
+    # a real target stays named, and git's other commands keep their text
+    assert found("timeout 5 cp a ~/.ssh/authorized_keys") == {f"{h}/.ssh/authorized_keys"}
+    assert f"{h}/.ssh/authorized_keys" in found("cp ./tools/rg ~/.ssh/authorized_keys")
+    assert found("timeout 5 grep x f > /tmp/hits") == {"/tmp/hits"}
+    assert lt("git commit -m /x") == "git commit -m /x" and lt("git -C d rg /x") == "git -C d rg /x"
+
+
 def test_a_later_failed_run_that_touched_nothing_keeps_the_earlier_runs_writes_named(env, tmp_path, scratch_home):
     from ttp.daemon import Daemon
     from ttp import prompts
