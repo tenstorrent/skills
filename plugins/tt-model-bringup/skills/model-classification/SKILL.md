@@ -13,9 +13,11 @@ directory name or from an existing TTNN implementation.
 - Upstream repository and immutable revision.
 - Weight source and immutable revision.
 - Intended task and acceptance metric.
+- Explicit configuration-scope choice from the user.
 - Target checkout and fresh output directory.
 - Allowed reference roots and forbidden read roots.
 - Requested profile, topology and serving mode.
+- Licenses for every source, weight, checkpoint, and dataset.
 
 ## Procedure
 
@@ -26,11 +28,17 @@ directory name or from an existing TTNN implementation.
    - `vision`: image, detection, segmentation, BEV or planning.
    - `multimodal`: coupled vision and language generation.
    - `other`: no supported workflow fits.
-4. Select the task family from the contract reference.
-5. Record preprocessing and postprocessing boundaries.
-6. Record custom operators and dynamic-shape risks.
-7. Write `MODEL_DIR/doc/model_contract.json`.
-8. Validate it with `scripts/check_model_contract.py`.
+4. Ask whether the port is pinned or generic.
+5. For `pinned`, record exactly one named configuration.
+6. For `generic`, record every initially supported configuration.
+7. Never infer configuration scope from available checkpoints.
+8. Select the task family from the contract reference.
+9. Record preprocessing and postprocessing boundaries.
+10. Record custom operators and dynamic-shape risks.
+11. Record every external asset and its license policy.
+12. Mark unknown commercial or redistribution terms explicitly.
+13. Write `MODEL_DIR/doc/model_contract.json` using schema two.
+14. Validate it with `scripts/check_model_contract.py`.
 
 Read [the model contract](../model-bringup/references/model-contract.md) before writing the file.
 
@@ -57,6 +65,9 @@ fresh write root. Record every upstream file used in `doc/reference/source_manif
 - Weight artifacts are read and matched to SHA-256.
 - Preprocessing, postprocessing and risks are explicit.
 - Every output and metric has a numeric acceptance rule.
+- Configuration scope records an explicit user choice.
+- Generic scope names at least two supported configurations.
+- Every external asset has licensing and redistribution status.
 - Raw outputs and metrics are explicit.
 - State reset and sequence semantics are explicit.
 - The selected workflow matches the category.

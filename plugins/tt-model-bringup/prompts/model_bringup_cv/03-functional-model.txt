@@ -10,11 +10,15 @@ Completion requirements:
 - Assemble the complete inference graph declared by the contract.
 - Preserve advertised input shapes and raw output semantics.
 - Compare every declared raw output against PyTorch.
+- Run full-model parity for every declared configuration.
+- Reject checkpoint-specific hardcoded dimensions or layer counts.
 - Test representative real weights and inputs.
 - Prove repeated inference is deterministic when expected.
 - Prove the measured path has no Torch fallback.
 - Leave functional parity and fallback-audit artifacts.
 - Generate MODEL_DIR/README.md from the assembled package.
 - Follow the functional-vision generated README guide.
+- Disclose every contract asset and restricted license term.
+- Link every generated Torch model structure artifact.
 - Run $stage-review; fix findings; obtain `clean-pass`.
 - Commit stage-owned changes locally; never push.
