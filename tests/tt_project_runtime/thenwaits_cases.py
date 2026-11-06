@@ -123,6 +123,8 @@ def test_passed_checks_move_to_the_next_stage_and_failed_ones_wake_at_the_task_t
     res = json.loads(p.db.task(tid)["result"])
     assert p.db.task(tid)["status"] == "queued" and res["then_stage"] == 1 and res["retry_when"] == then[0]["retry_when"]
     assert not _ready(p, tid), res
+    if tid in d._probes:   # the stage's probe the settle started next (PROBE_EVERY_S 0) ends before the gate
+        d._probes[tid][0].wait(_load_scaled(60))   # is there: its "not yet" is not the settle's answer below
     gate.write_text("")
     _settle_probe(d, tid)
     task = p.db.task(tid)
