@@ -58,6 +58,43 @@ def test_a_signalled_caller_of_boundedchild_leaves_no_child_or_grandchild(tmp_pa
     assert _bc_all_gone(pids), "the child or grandchild outlived its caller"
 
 
+
+@pytest.mark.parametrize("start", ["started", "could-not-start"])
+@pytest.mark.parametrize("how", ["SIGTERM", "python-handler"])
+def test_a_signal_while_boundedchild_starts_its_child_still_kills_the_group_and_goes_on(tmp_path, how, start):
+    """The signal comes while Popen has not yet returned (a loaded host: the child runs, its grandchild
+    too, before its parent gets the Popen back). The call's handler had no child then and let the group
+    live on (a flaky fail of the test above): it now kills the group once Popen returns, then the signal
+    goes on as before; a child that never started has no group, and the signal still goes on."""
+    cmd, kid, grand = _bc_family(tmp_path)
+    handler = ("def h(s, f):\n    raise SystemExit(7)\n"
+               "signal.signal(signal.SIGTERM, h)\n") if how == "python-handler" else ""
+    if start == "started":   # the real Popen, then the signal once the child and grandchild run
+        late = (f"    _init(self, *a, **k)\n    end = time.monotonic() + 30\n"
+                f"    while not (os.path.exists({str(kid)!r}) and os.path.getsize({str(kid)!r})) "
+                f"and time.monotonic() < end:\n        time.sleep(0.01)\n"
+                "    os.kill(os.getpid(), signal.SIGTERM)\n")
+    else:
+        late = "    os.kill(os.getpid(), signal.SIGTERM)\n    raise OSError('no such program')\n"
+    script = (f"import os, signal, subprocess, sys, time\nsys.path.insert(0, {str(RUNTIME)!r})\n{handler}"
+              "_init = subprocess.Popen.__init__\n"
+              f"def _late(self, *a, **k):\n{late}"
+              "subprocess.Popen.__init__ = _late\n"
+              "from ttp import boundedchild\n"
+              f"boundedchild.run(['sh', '-c', {cmd!r}], 60)\n"
+              "sys.exit(0)\n")
+    caller = subprocess.Popen([sys.executable, "-c", script])
+    try:
+        rc = caller.wait(timeout=60)
+    finally:
+        if caller.poll() is None:
+            caller.kill()
+    assert rc == {"SIGTERM": -signal.SIGTERM, "python-handler": 7}[how]
+    if start == "started":
+        assert _bc_all_gone(_bc_pids(kid, grand, timeout=1)), "the child or grandchild outlived its caller"
+    else:
+        assert not kid.exists()
+
 def test_boundedchild_timeout_kills_grandchildren_and_says_timed_out(tmp_path):
     from ttp import boundedchild
     cmd, kid, grand = _bc_family(tmp_path)

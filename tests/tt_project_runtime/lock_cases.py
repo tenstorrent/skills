@@ -45,6 +45,24 @@ def _stderr_until(proc, text, timeout=60):
     return "".join(got)
 
 
+def _napping(proc, timeout=60) -> bool:
+    """proc is in its lock wait's nap: it blocks SIGTERM (SigBlk, before the call) or sleeps in
+    sigtimedwait (wchan; the kernel unblocks the waited signals inside it), so a SIGTERM now is taken
+    and named. Before the nap (its progress append, its stale-lock sweep), the signal would end it
+    by the default or exit handler, unnamed: a fixed sleep raced that under load."""
+    end = time.monotonic() + timeout
+    while time.monotonic() < end and proc.poll() is None:
+        try:
+            wchan = Path(f"/proc/{proc.pid}/wchan").read_text()
+            blocked = int(Path(f"/proc/{proc.pid}/status").read_text().split("SigBlk:")[1].split()[0], 16)
+        except (OSError, IndexError, ValueError):
+            wchan, blocked = "", 0
+        if "sigtimedwait" in wchan or blocked >> (signal.SIGTERM - 1) & 1:
+            return True
+        time.sleep(0.01)
+    return False
+
+
 def _ended(procs, timeout=60):
     out = []
     for x in procs:
@@ -1619,7 +1637,7 @@ def test_a_waiting_ttp_lock_logs_who_sent_it_sigterm_and_still_exits_143(env, tm
         _wait_for_file(held, h)
         w = _lock(dict(run_env, TTP_TEST_POLL_S="30", TTP_RUN_DIR=str(run_dir)), "rig-a")
         assert "waiting for" in _stderr_until(w, "waiting for")
-        time.sleep(0.3)   # into its nap
+        assert _napping(w), "the waiter never reached its nap"
         w.send_signal(signal.SIGTERM)
         assert w.wait(timeout=30) == 143
         err = w.stderr.read()
@@ -1945,7 +1963,7 @@ def test_a_signalled_lock_waiter_never_follows_a_symlinked_progress_log(env, tmp
         _wait_for_file(held, h)
         w = _lock(dict(run_env, TTP_TEST_POLL_S="30", TTP_RUN_DIR=str(run_dir)), "rig-a")
         _stderr_until(w, "waiting for")
-        time.sleep(0.3)
+        assert _napping(w), "the waiter never reached its nap"
         w.send_signal(signal.SIGTERM)
         assert w.wait(timeout=30) == 143, "the waiter still ends with the signal"
         err = w.stderr.read()

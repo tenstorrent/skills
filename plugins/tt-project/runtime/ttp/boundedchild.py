@@ -63,9 +63,12 @@ def run(argv: list[str] | str, timeout: float, *, shell: bool = False, cwd: str 
                                     stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
                                     stderr=errs, start_new_session=True)
         except (OSError, subprocess.SubprocessError, ValueError) as e:
+            box.append(None)
+            _go_on(saved)
             return Result(None, empty, empty, error=f"could not start: {e}")
         box.append(proc)
         try:
+            _go_on(saved)
             if on_start is not None and not on_start(proc.pid):
                 stop(proc, grace)
                 out, err = _drain(proc, grace, empty)
@@ -148,9 +151,13 @@ def _hook(box: list, grace: float) -> dict:
     if threading.current_thread() is not threading.main_thread():
         return {}
     saved: dict = {}
+    pending: list = []
 
     def handler(signum, frame):
-        if box:
+        if not box:   # the child is starting (Popen has not returned): run() passes it on once it knows
+            pending.append(signum)
+            return
+        if box[0] is not None:
             stop(box[0], grace)
         _unhook(saved)
         prev = saved.get(signum)
@@ -170,14 +177,22 @@ def _hook(box: list, grace: float) -> dict:
         except (ValueError, OSError):   # not the main interpreter
             continue
     saved["handler"] = handler
+    saved["pending"] = pending
     return saved
+
+
+def _go_on(saved: dict) -> None:
+    """A signal that came while the child was starting goes on now: the group is killed (box holds the
+    child, or None when it never started) and the signal goes on to the caller's earlier handler."""
+    if saved.get("pending"):
+        saved["handler"](saved["pending"][0], None)
 
 
 def _unhook(saved: dict) -> None:
     """Put back the earlier handlers, where this call's handler is still the one installed."""
     mine = saved.get("handler")
     for sig, prev in list(saved.items()):
-        if sig == "handler":
+        if sig in ("handler", "pending"):
             continue
         try:
             if signal.getsignal(sig) is mine:
