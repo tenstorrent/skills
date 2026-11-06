@@ -202,10 +202,13 @@ def test_replies_and_notifies_to_the_user_go_out_untagged_while_posts_to_others_
     from ttp import aitag
     assert aitag.gh_problem("pr", ["comment", "7", "-b", "Review is ready."], p.config())
     assert aitag.tool_problem("mcp__claude_ai_Slack__slack_send_message", {"message": "Review is ready."}, p.config())
-    prompts = pathlib.Path(aitag.__file__).parents[2] / "template" / "prompts"
-    for name in ("coordinator.md", "coordinator-session.md"):
-        text = (prompts / name).read_text()
+    # Both coordinator modes carry the rule once: the session role is coordinator.md then
+    # coordinator-session.md, so the rule lives only in coordinator.md.
+    from ttp.prompts import coordinator_role, coordinator_session_role
+    for name, text in (("stateless", coordinator_role(p)), ("session", coordinator_session_role(p))):
+        assert text.count("AI-authorship tag") == 1, name
         at = text.index("AI-authorship tag")
         assert "replies" in text[at - 150:at + 200].lower() and "never" in text[at - 150:at + 200], name
+    prompts = pathlib.Path(aitag.__file__).parents[2] / "template" / "prompts"
     worker = (prompts / "worker.md").read_text()
-    assert "Never tag hand-offs, notes or notifies to the user" in worker
+    assert "Posts others (not the user) read end with `[authored by AI]`" in worker
