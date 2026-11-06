@@ -716,3 +716,95 @@ def test_a_retired_ban_naming_a_hyphenated_alias_finds_the_lines_naming_that_ali
     assert restriction_audit.tool_hit("hold jobs on tt-box-3", set(), {"jobs", "tt-box-3"}) == ["jobs", "tt-box-3"]
     for line in ("hold jobs on tt-box-30", "hold jobs on tt-box-3-b", "hold jobs on my-tt-box-3", "hold jobs on box-b"):
         assert restriction_audit.tool_hit(line, set(), {"jobs", "tt-box-3", "box-a"}) == [], line
+
+
+_POWER = ("Exception to the power limit item: within this Restrictions scope the thermal soak may draw up to "
+          "900 W on rack-q (user msg #4321).")
+
+
+def _scope_project(env, extra=()):
+    """A charter whose remaining items use the harness's own words, and a dozen tools sharing only those
+    words (and 'power', which another item still states) with _POWER, plus `extra` (name, text) tools."""
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Each Restrictions item names its scope and limit; an "
+                              "exception needs the user's word. (user msg #1)\n- Never cut power to a shared rack. "
+                              "(user msg #2)\n")
+    (p.root / "bin").mkdir(exist_ok=True)
+    for i in range(12):
+        (p.root / "bin" / f"guard{i}.sh").write_text(
+            "#!/bin/sh\n# every Restrictions item in scope stays under its limit\n"
+            "echo 'exception: power limit item out of scope'\n")
+    for name, text in extra:
+        (p.root / "bin" / name).write_text(text)
+    return p, lambda: p.db.q("SELECT * FROM tasks WHERE labels LIKE '%restriction_tools:%'")
+
+
+def test_a_removal_sharing_only_generic_words_selects_no_tools(env):
+    """A removed item shares only the harness's own words ('item', 'restrictions', 'scope', 'limit',
+    'exception') and a word the charter still states ('power') with a dozen tools: no tool, task or event."""
+    from ttp import restriction_audit
+    p, tasks = _scope_project(env)
+    assert restriction_audit.restriction_tools(p, [(_POWER, "", "")], []) == []
+    assert tasks() == [] and not p.db.q("SELECT 1 FROM events WHERE kind='restriction_tools'")
+    _, words, _ = restriction_audit.tool_terms(_POWER, "", p.charter_path.read_text())
+    assert not {"item", "restrictions", "scope", "limit", "exception", "power"} & words, words
+    assert {"rack-q", "900w", "900 w", "thermal"} <= words, words
+
+
+def test_a_removal_naming_a_message_id_or_a_value_selects_only_the_tools_citing_it(env):
+    """The removed item's cite (#4321), its value with a unit ('900 W' or '900W') beside another of its
+    words, or its machine name selects the tool naming it; the dozen generic-word tools stay out."""
+    from ttp import restriction_audit
+    p, tasks = _scope_project(env, [("soak.sh", "#!/bin/sh\n# allowed by user msg #4321\nexit 0\n"),
+                                    ("draw.sh", "#!/bin/sh\necho 'thermal soak capped at 900W'\n"),
+                                    ("other.sh", "#!/bin/sh\n# see user msg #43210\n")])
+    out = restriction_audit.restriction_tools(p, [(_POWER, "", "")], [])
+    assert len(out) == 1, out
+    assert "bin/soak.sh:2 (#4321)" in out[0] and "bin/draw.sh:2 (" in out[0], out
+    assert "guard" not in out[0] and "other.sh" not in out[0], out
+    assert restriction_audit.tool_hit("soak at 900 w", set(), {"900 w", "900w", "soak"}) == ["900 w", "soak"]
+
+
+def test_an_over_note_naming_a_landed_fix_dispatches_nothing(env):
+    """`over` naming a done harness task, or a commit already on the project repo's HEAD, that updated the
+    tools: no task and no event. A task still open, a done task that changed no code, a user-message cite of
+    the same number or an unknown commit dispatch as before."""
+    import subprocess
+    from ttp import restriction_audit
+    tool = [("soak.sh", "#!/bin/sh\n# allowed by user msg #4321\nexit 0\n")]
+    fix = None
+
+    def run(over, setup=None):
+        nonlocal fix
+        p, tasks = _scope_project(env, tool)
+        p.db.x("DELETE FROM tasks")
+        fix = p.db.add_task("update the soak tools", "edit bin/soak.sh", kind="harness")
+        if setup:
+            over = setup(p, over)
+        restriction_audit.restriction_tools(p, [(_POWER, "", over)], [])
+        return tasks()
+
+    def done(p, over, kind="harness"):
+        p.db.update_task(fix, status="done", kind=kind)
+        return over
+
+    assert run(f"the soak ended; task #{{}} updated the tools", lambda p, o: done(p, o.format(fix))) == []
+    assert run("the soak ended; #{} updated the tools", lambda p, o: done(p, o.format(fix))) == []
+    assert len(run("the soak ended; task #{} will update the tools", lambda p, o: o.format(fix))) == 1
+    assert len(run("the soak ended; task #{} measured it", lambda p, o: done(p, o.format(fix), "work"))) == 1
+    assert len(run("the soak ended (user msg #{})", lambda p, o: done(p, o.format(fix)))) == 1
+    assert len(run("the soak ended (msg #{})", lambda p, o: done(p, o.format(fix)))) == 1
+    assert len(run("the soak ended; task #{}9 updated the tools", lambda p, o: done(p, o.format(fix)))) == 1
+
+    def commit(p, over):
+        g = lambda *a: subprocess.run(["git", "-C", str(p.root), *a], check=True, capture_output=True, text=True)
+        if subprocess.run(["git", "-C", str(p.root), "rev-parse", "--git-dir"], capture_output=True).returncode:
+            g("init", "-q")
+        (p.root / "bin" / "soak.sh").write_text("#!/bin/sh\nexit 0\n")
+        g("add", "bin/soak.sh")
+        g("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-qm", "soak tools updated", "--allow-empty")
+        (p.root / "bin" / "soak.sh").write_text(tool[0][1])   # the scan still sees a citing line
+        return over.format(g("rev-parse", "--short=10", "HEAD").stdout.strip())
+
+    assert run("the soak ended; commit {} updated the tools", commit) == []
+    assert len(run("the soak ended; commit 0badc0ffee1 updated the tools", commit)) == 1

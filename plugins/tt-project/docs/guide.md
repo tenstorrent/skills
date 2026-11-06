@@ -3140,7 +3140,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   priority-1 harness task per change naming the project's tools (bin/, hooks/, schedule commands,
   prechecks and heal checks, open tasks' `start_when` probes) that still carry the old item's terms,
   and a `restriction_tools` event says so; the digest shows a "Guards behind the charter" line while
-  that task is open. It never edits a tool. The charter guard's refusal says a user's loosening
+  that task is open. It never edits a tool. A tool is picked only by the item's distinctive terms:
+  identifiers, quoted phrases, user-message cites (#N), values with a unit (900 W), machine and
+  resource names, or two of its words with one rare in the tool tree. The harness's own words
+  (item, Restrictions, scope, limit, exception) never count, and for a removed item neither does a
+  word another charter item still states. An `over` naming the done or landed code or harness task,
+  or a commit on the project repo's HEAD, that already updated the tools queues nothing.
+  The charter guard's refusal says a user's loosening
   goes in as written, and offers the temporary-exception route only when the user's own words make
   it temporary.
 - A scoped exception for work you (or, in agent mode, your agent) ordered goes in without new
