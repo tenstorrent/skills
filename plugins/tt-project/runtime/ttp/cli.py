@@ -7985,9 +7985,15 @@ def cmd_bench(a) -> None:
     out = Path(a.out).expanduser().resolve()
     if out.exists():
         die(f"bench: {out} exists; name a new folder")
-    m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit)
+    from . import addedtests
+    cmd = a.test_cmd or bench.TEST_CMD
+    if not a.no_validate and not addedtests.eligible(cmd):
+        die(f"bench: --test-cmd {cmd!r} is not one plain pytest run")
+    m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit,
+                   test_cmd=cmd, validated=not a.no_validate)
     print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
-          f"{len(m['excluded'])} excluded; manifest {out / 'manifest.json'}")
+          f"{len(m['excluded'])} excluded{'' if m['validated'] else ', tests not validated'}; "
+          f"manifest {out / 'manifest.json'}")
 
 
 def _bench_run(p, a) -> None:
@@ -13905,8 +13911,9 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_quarantine)
 
     s = sub.add_parser("bench", help="replay bench, model-free part: `prep` picks landed tasks newer than --since "
-                                      "that add tests, builds a clean one-commit workspace at each base and holds "
-                                      "out the landed tests, with a hash-pinned manifest")
+                                      "that add tests, keeps the tests that fail on the base and pass on the head, "
+                                      "builds a clean one-commit workspace at each base and holds out the landed "
+                                      "test files, with a hash-pinned manifest")
     s.add_argument("action", choices=["prep", "run", "blind"],
                    help="prep: build the bench in --out; run: the head-to-head of two or more arms on --bench, "
                         "results and the blind review's cells.json in --out; blind: the blind review "
@@ -13925,8 +13932,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--seed", type=int, help="run: the arm-order seed (default: a random one, recorded)")
     s.add_argument("--timeout", type=float, default=0, help="run: wall-clock limit per cell in s (default: bench.timeout_s)")
     s.add_argument("--budget", type=float, default=0, help="run: dollar budget per cell (default: bench.budget_usd)")
-    s.add_argument("--test-cmd", help="run: the command the held-out test ids are appended to "
-                                            "(default: python3 -m pytest -q -p no:cacheprovider)")
+    s.add_argument("--test-cmd", help="prep: the pytest command that validates the held-out tests, run in a copy of "
+                   "the base and of the head; run: the command the held-out test ids are appended to "
+                   "(default: python3 -m pytest -q -p no:cacheprovider)")
+    s.add_argument("--no-validate", action="store_true", help="prep: skip validation: keep every added test unrun "
+                                                               "(a count, or a host that cannot run the tests)")
     s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
     s.set_defaults(fn=cmd_bench)
 
