@@ -878,12 +878,18 @@ def harness_gh_edit(payload: dict) -> str | None:
     return None if _harness_task() else HARNESS_GH_WHY
 
 
-def harness_gh_patch(payload: dict) -> str | None:
-    """harness_gh_edit for each file a Codex apply_patch call names (tool_input.command, the patch text)."""
+def patch_files(payload: dict) -> list[str]:
+    """Each file a Codex apply_patch call names (add, update, delete and move targets) in its patch text
+    (tool_input itself, or its command, input or patch)."""
     inp = payload.get("tool_input")
     text = inp if isinstance(inp, str) else next((v for k in ("command", "input", "patch")
                                                   if isinstance(v := (inp or {}).get(k), str)), "")
-    for name in PATCH_FILE_RE.findall(text):
+    return PATCH_FILE_RE.findall(text)
+
+
+def harness_gh_patch(payload: dict) -> str | None:
+    """harness_gh_edit for each file a Codex apply_patch call names."""
+    for name in patch_files(payload):
         if why := harness_gh_edit({**payload, "tool_input": {"file_path": name}}):
             return why
     return None
@@ -1200,8 +1206,11 @@ def local_guard(payload: dict) -> str | None:
     except Exception as e:   # unreadable settings: the listed guards cannot be found, so none is skipped silently
         return f"the project's settings could not be read for its local guards ({type(e).__name__})" \
             if tool == "Bash" else None
-    if (tool == "Bash" or tool in EDIT_TOOLS) and (f := localguard.names_guard(
-            cfg, localguard.harness_dir(), tool, args, str(payload.get("cwd") or os.getcwd()))) and not _harness_task():
+    cwd, harness = str(payload.get("cwd") or os.getcwd()), localguard.harness_dir()
+    edits = [("Edit", {"file_path": n}) for n in patch_files(payload)] if tool in PATCH_TOOLS else \
+        [(tool, args)] if tool == "Bash" or tool in EDIT_TOOLS else []
+    if (f := next((g for t, a in edits if (g := localguard.names_guard(cfg, harness, t, a, cwd))), None)) \
+            and not _harness_task():
         return (f"the project's local guard {f.name} ({localguard.KEY}) changes only in a harness task: other runs "
                 f"never edit, move or disable it, and a command naming its path is refused (read it with the Read tool)")
     hit = localguard.refusal(cfg, tool, args)

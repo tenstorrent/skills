@@ -89,6 +89,36 @@ def test_a_run_cannot_edit_or_name_a_listed_guard_outside_a_harness_task(env, mo
     assert _worker("Write", tmp_path, file_path=str(target), content=NO_WIPE) is None
 
 
+def test_a_codex_apply_patch_cannot_touch_a_listed_guard_outside_a_harness_task(env, monkeypatch, tmp_path):
+    """The same rule for a Codex apply_patch: each add, update, delete and move target it names is checked,
+    whatever shape its payload takes (the patch text itself, or its command, input or patch)."""
+    p, _ = _guarded(env, monkeypatch, tmp_path, {"guards/no_wipe.py": NO_WIPE}, ["guards/no_wipe.py"])
+    target = p.harness / "guards" / "no_wipe.py"
+
+    def patch(cwd, body, key="input"):
+        from ttp import hook
+        text = f"*** Begin Patch\n{body}\n*** End Patch"
+        out, _ = hook.pre_tool_use({"tool_name": "apply_patch", "tool_input": text if key is None else {key: text},
+                                    "cwd": str(cwd)})
+        o = (out or {}).get("hookSpecificOutput", {})
+        return o.get("permissionDecisionReason", "") if o.get("permissionDecision") == "deny" else None
+
+    touching = [(tmp_path, f"*** Update File: {target}\n@@\n-a\n+b"),
+                (p.harness, "*** Delete File: guards/./no_wipe.py"),
+                (p.harness, "*** Add File: notes.txt\n+x\n*** update file:guards/no_wipe.py\n@@\n-a\n+b"),
+                (tmp_path, f"*** Update File: {tmp_path / 'scratch.py'}\n*** Move to: {target}\n@@\n-a\n+b")]
+    for (cwd, body), key in zip(touching, ("input", "command", None, "patch")):
+        why = patch(cwd, body, key)
+        assert why and "harness task" in why and "no_wipe.py" in why, (body, why)
+    unlisted = (f"*** Add File: {p.harness / 'guards' / 'other.py'}\n+x\n"
+                f"*** Update File: {tmp_path / 'a.py'}\n*** Move to: {tmp_path / 'b.py'}\n@@\n-a\n+b")
+    assert patch(tmp_path, unlisted) is None
+    t = p.db.add_task("tune the local guard", kind="harness")
+    monkeypatch.setenv("TTP_TASK", str(t))
+    for cwd, body in touching:
+        assert patch(cwd, body) is None, body
+
+
 def test_an_upgrade_leaves_local_guards_and_their_setting_alone(env, monkeypatch, tmp_path):
     p = make(env)
     from ttp import cli, service
