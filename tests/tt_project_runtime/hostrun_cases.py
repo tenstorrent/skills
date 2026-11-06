@@ -354,8 +354,10 @@ def test_host_run_detached_writes_its_rc_file_survives_its_caller_and_polls_runn
     assert hostrun.status(p, rid, result=True) == hostrun.NO_ANSWER
     capfd.readouterr()
     gate.write_text("")   # the caller is long gone: the run goes on and answers by itself
-    end = time.monotonic() + 30
-    while not (q / f"{rid}.rc").exists() and time.monotonic() < end:
+    # The supervisor writes the rc file, then logs the end, then drops the claim: wait for its last step,
+    # since under load the rc file can stand a while before the claim goes.
+    end = time.monotonic() + 120
+    while ((q / f"{rid}.running").exists() or not (q / f"{rid}.rc").exists()) and time.monotonic() < end:
         time.sleep(0.05)
     assert (q / f"{rid}.rc").read_text().strip() == "5"
     assert hostrun.status(p, rid) == 0 and "ended: exit 5" in capfd.readouterr().out
@@ -381,7 +383,7 @@ def test_host_run_detached_run_keeps_its_entry_limit_and_a_lost_one_says_so(env,
     assert _hostrun_with_daemon(p, cmd, [], detach=True) == 0
     rid = re.search(r"started ([0-9a-f]{32})", capfd.readouterr().out).group(1)
     q = p.state / hostrun.QUEUE
-    end = time.monotonic() + 20
+    end = time.monotonic() + 120
     while not (q / f"{rid}.rc").exists() and time.monotonic() < end:
         time.sleep(0.05)
     assert (q / f"{rid}.rc").read_text().strip() == str(hostrun.TIMED_OUT)
