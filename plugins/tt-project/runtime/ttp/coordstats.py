@@ -20,7 +20,9 @@ all its coordinator runs cost more than the baseline's $/day (today: so far).
 Why each session wake did or did not resume (reason(), from the mode and why the daemon recorded at
 its decision, coordsession.decide): resumed, compacted in place (older releases: handover, a rollover
 at its context size), a new session for another cause, or (history and session-less providers only) a
-stateless wake. Coordinator wakes with no session record (turn.session_off, or none at all) are older
+stateless wake. A new session for a changed prefix also counts the prefix parts that changed
+(coordsession.PREFIX_PARTS: template, charter, standing, rest), and one whose transcript is gone
+since a daemon restart is told apart from other gone transcripts. Coordinator wakes with no session record (turn.session_off, or none at all) are older
 stateless turns, counted apart."""
 from __future__ import annotations
 
@@ -86,7 +88,9 @@ def tool_calls(r, runs_dir: Path) -> int | None:
 
 NEW_WHY = {"no session": "new: no session", "prefix changed": "new: prompt, charter or schema changed",
            "model or effort changed": "new: model or effort changed", "last run not ok": "new: last wake failed",
-           "session not saved": "new: transcript gone", "resume failed": "new: resume rejected",
+           "session not saved": "new: transcript gone",
+           "session not saved since daemon restart": "new: transcript gone after daemon restart",
+           "resume failed": "new: resume rejected",
            "provider changed": "new: provider changed",
            "prompt changed, provider cannot resume with it": "new: prompt changed, provider cannot resume with it"}
 
@@ -96,6 +100,13 @@ def _provider_gaps() -> set:
     from . import coordsession
     from .providers import all_providers
     return {g for g in map(coordsession.gap, all_providers()) if g}
+
+
+def changed_parts(s: dict) -> list[str]:
+    """The prefix parts a new session for a changed prefix names (coordsession.changed_parts), each
+    once; ["not recorded"] for a session that started before they were recorded."""
+    got = s.get("changed")
+    return [str(x) for x in dict.fromkeys(got)] if isinstance(got, list) else ["not recorded"]
 
 
 def reason(s: dict, status: str = "ok") -> str:
@@ -207,10 +218,13 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
         day_usd = db.one("SELECT COALESCE(SUM(cost_usd), 0) u FROM runs WHERE role='coordinator' AND started>=? "
                          "AND started<?", _day_bounds(day, tz))["u"]
         growth, tc = _mean(d["growth"]), _mean(calls)
-        reasons, errors = {}, []
+        reasons, errors, parts = {}, [], {}
         for r, s in d["runs"]:
             why = reason(s, r["status"])
             reasons[why] = reasons.get(why, 0) + 1
+            if s.get("mode") == "new" and s.get("why") == "prefix changed":
+                for k in changed_parts(s) or ["none (same digests)"]:
+                    parts[k] = parts.get(k, 0) + 1
             if r["status"] not in ("ok", "running"):   # the rerun's note also names a failed resume's error
                 errors.append(f"run {r['id']} ({s.get('mode')}, {r['status']}): "
                               f"{run_error(r, runs_dir) or 'no error recorded'}"[:240])
@@ -220,6 +234,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
                     "handoffs": sum(s.get("mode") == "new" and s.get("why") != "no session" for _, s in d["runs"]),
                     "usd": round(cost, 2), "usd_per_wake": round(cost / len(rs), 3),
                     "reasons": dict(sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))),
+                    "prefix_parts": dict(sorted(parts.items(), key=lambda kv: (-kv[1], kv[0]))),
                     "fallback_rate": round(modes.count("stateless") / len(rs), 3),
                     "rollover_tokens": round(sum(sizes) / len(sizes)) if sizes else None,
                     "failed_wakes": errors[:5], "mode_off": off.get(day, {}),
@@ -291,6 +306,9 @@ def text(s: dict, name: str = "") -> str:
                      + (f"; {offs} more stateless turns with no session record ("
                                    + ", ".join(f"{k} {v}" for k, v in sorted(d["mode_off"].items())) + ")"
                                    if offs else ""))
+        if d["prefix_parts"]:
+            lines.append("    prefix parts changed (new sessions for a changed prefix): "
+                         + ", ".join(f"{k} {v}" for k, v in d["prefix_parts"].items()))
         lines.extend(f"    failed wake: {e}" for e in d["failed_wakes"])
         lines.extend(f"    compacted in place: session {str(c['session'] or '-')[:8]} at {timefmt.short(c['at'], s['zone'])}, "
                      f"{int(c['before'] or 0) / 1000:.0f}k -> {int(c['after'] or 0) / 1000:.0f}k tokens ({c['how']}"

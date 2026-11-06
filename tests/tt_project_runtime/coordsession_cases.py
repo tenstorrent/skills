@@ -554,7 +554,8 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
                   "tool_calls_per_wake": 1.0, "tool_call_wakes": 3, "cache_read_ratio": round(168000 / 195000, 3),
                   "coordinator_usd": 1.1, "over_baseline": True, "break_even": True,
                   "reasons": {"resumed": 2, "new: other": 1, "stateless: other": 1}, "fallback_rate": 0.25,
-                  "rollover_tokens": None, "failed_wakes": [], "mode_off": {"off, not recorded": 1}, "compactions": []}
+                  "rollover_tokens": None, "failed_wakes": [], "mode_off": {"off, not recorded": 1}, "compactions": [],
+                  "prefix_parts": {}}
     assert d2["day"] == "2026-11-05" and d2["partial"] and (d2["wakes"], d2["resumed"], d2["rollovers"]) == (2, 1, 1)
     assert d2["growth_per_wake"] == 35000.0 and d2["tool_calls_per_wake"] == 4.0 and d2["tool_call_wakes"] == 1
     assert d2["break_even"] is False and d2["over_baseline"] is False and d2["coordinator_usd"] == 0.5
@@ -638,6 +639,31 @@ def test_coord_session_stats_name_why_each_wake_did_not_resume_and_keep_old_rows
     from ttp.providers import get_provider
     gap = coordsession.gap(get_provider("chat"))
     assert gap and coordstats.reason({"mode": "stateless", "why": gap}) == "provider keeps no session"
+
+
+def test_coord_session_stats_count_the_changed_prefix_parts_and_a_restart_apart(env):
+    from ttp import coordstats
+    p = make(env)
+    t0 = 1793750400.0   # 2026-11-04 00:00 UTC
+    sessions = [{"why": "prefix changed", "changed": ["charter"]}, {"why": "prefix changed", "changed": ["charter"]},
+                {"why": "prefix changed", "changed": ["template", "standing", "template"]},
+                {"why": "prefix changed", "changed": []}, {"why": "prefix changed"},
+                {"why": "prefix changed", "changed": "junk"},
+                {"why": "session not saved since daemon restart", "changed": ["charter"]},
+                {"why": "session not saved"}]
+    for i, extra in enumerate(sessions):
+        rid = _cstat_run(p, t0 + 3600 + i * 60, 0.1, "new", f"s{i}")
+        note = json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])
+        note["turn"]["session"].update(extra)
+        p.db.x("UPDATE runs SET note=? WHERE id=?", (json.dumps(note), rid))
+    [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000)["by_day"]
+    assert d["reasons"] == {"new: prompt, charter or schema changed": 6, "new: transcript gone": 1,
+                            "new: transcript gone after daemon restart": 1}, d["reasons"]
+    assert d["prefix_parts"] == {"charter": 2, "not recorded": 2, "none (same digests)": 1, "standing": 1,
+                                 "template": 1}, d["prefix_parts"]
+    out = coordstats.text(coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000))
+    assert ("    prefix parts changed (new sessions for a changed prefix): charter 2, not recorded 2, "
+            "none (same digests) 1, standing 1, template 1") in out, out
 
 
 def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsys):
@@ -909,6 +935,49 @@ def test_a_failing_prompt_record_write_still_launches_the_session_wake(env, monk
     monkeypatch.setattr(dmod, "durable_write", real)
     _, _, prompt3 = wake("three")
     assert coordsession.CHANGED_HEAD in prompt3 and "Ship v2." in prompt3
+
+
+def test_coordsession_a_new_session_for_a_changed_prefix_names_each_changed_part(env, monkeypatch):
+    from ttp import coordsession
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    first, _, _ = wake("one")
+    assert set(first["parts"]) == set(coordsession.PREFIX_PARTS) and "changed" not in first
+    second, _, _ = wake("two")
+    assert second["mode"] == "resume" and second["parts"] == first["parts"]
+    p.charter_path.write_text(_CS_CHARTER.replace("Ship v1.", "Ship v2."))
+    third, _, _ = wake("three")
+    assert (third["mode"], third["why"], third["changed"]) == ("new", "prefix changed", ["charter"]), third
+    # A setting that picks the role's rule blocks: the standing settings and the rendered role both moved.
+    p.set_config("delivery.draft_prs", False)
+    fourth, _, _ = wake("four")
+    assert (fourth["why"], fourth["changed"]) == ("prefix changed", ["template", "standing"]), fourth
+    # The role prompt file alone.
+    role = p.harness / "prompts" / "coordinator-session.md"
+    role.write_text(role.read_text() + "\nOne more rule.\n")
+    fifth, _, _ = wake("five")
+    assert (fifth["why"], fifth["changed"]) == ("prefix changed", ["template"]), fifth
+    # The schema or the agent (the rest), and a session saved before the digests were recorded.
+    parts = fifth["parts"]
+    assert coordsession.changed_parts({"parts": parts}, coordsession.prefix_parts(parts, {"x": 1}, "codex")) == ["rest"]
+    assert coordsession.changed_parts({"parts": parts}, parts) == []
+    for old in (None, {}, {"parts": {}}, {"parts": "junk"}):
+        assert coordsession.changed_parts(old, parts) is None, old
+    st = coordsession.record({"parts": parts}, None, "s9", {"mode": "new", "key": "k"}, True, 5.0)
+    assert "parts" not in st and st["at"] == 5.0, "a key without digests leaves none to compare"
+
+
+def test_coordsession_decide_names_a_transcript_gone_since_a_daemon_restart():
+    from ttp import coordsession as cs
+    gone, now = (lambda s: False), 5000.0
+    why = lambda state, started: cs.decide(_cs_cfg(), state, "k1", "m", "high", gone, now, daemon_started=started)
+    assert why(_cs_state(at=1000), 2000) == ("new", "session not saved since daemon restart")
+    assert why(_cs_state(started=1000), 2000)[1] == "session not saved since daemon restart", "older state: its start"
+    assert why(_cs_state(at=3000), 2000) == ("new", "session not saved"), "written since this daemon started"
+    assert why(_cs_state(at=1000), None) == ("new", "session not saved"), "no start known"
+    assert why(_cs_state(at=0, started=0), 2000) == ("new", "session not saved"), "no time recorded"
+    assert why(_cs_state(at="junk", started=None), 2000) == ("new", "session not saved")
+    assert cs.decide(_cs_cfg(), _cs_state(at=1000), "k1", "m", "high", lambda s: True, now,
+                     daemon_started=2000) == ("resume", "continued"), "a saved transcript resumes across a restart"
 
 
 def test_both_coordinator_modes_and_the_planner_pass_the_worker_the_context_it_cannot_see(env):

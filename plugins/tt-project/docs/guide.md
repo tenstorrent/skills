@@ -562,7 +562,9 @@ coordinator with that evidence.
   than the baseline's $/day. Each day counts wakes resumed, new, new with a hand-off (new for any
   reason but the first session) and stateless (expected 0; older history rows keep their own labels,
   such as handover, rollover, spend guard or pause), names why wakes did not resume (a new session and
-  its cause, a rejected resume, a provider that keeps no session, decide failed), counts compactions
+  its cause, a rejected resume, a provider that keeps no session, decide failed; a transcript gone
+  since a daemon restart is its own cause, and a new session for a changed prompt prefix names the
+  parts that changed: role template, charter, standing settings or the rest, schema and agent), counts compactions
   in place, and lists failed session wakes with their transcript's error. In session mode the system prompt is the
   Restrictions, the coordinator role with `prompts/coordinator-session.md` and the charter verbatim:
   the same bytes every wake while the charter is unchanged, so the prompt cache holds. Every

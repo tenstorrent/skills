@@ -3551,7 +3551,7 @@ class Daemon:
                   handoff_guard: bool = True, session_prompt: dict | None = None,
                   session_digest: dict | None = None) -> int:
         """`session_prompt` (every coordinator turn, the session being always on): {"system", "context",
-        "cached"}, the session's own byte-stable prompt (coordsession.session_prompt_parts) that a
+        "parts", "cached"}, the session's own byte-stable prompt (coordsession.session_prompt) that a
         resumed or new session wake runs on instead of `system` and `context`, and the cached digest
         sections a new session's first message carries. `handoff_guard` (a task's worker or reviewer run): the provider's Stop hook refuses to end
         the run without a valid result.json (ttp.hook.stop). `context` (with `system`): stable text that follows the system prompt, sent as a block of
@@ -3676,12 +3676,13 @@ class Daemon:
         if session_on:   # first: a session wake's cache lifetime follows the session's own writes
             sp = session_prompt or {}
             key = coordsession.prefix_key(sp.get("system", system), sp.get("context", context), schema, provider)
+            parts = coordsession.prefix_parts(sp["parts"], schema, provider) if sp.get("parts") else {}
             try:
                 session_mode, why = coordsession.decide(
                     self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
                     lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
                     no_session=coordsession.gap(prov), provider=provider,
-                    prompt_resumes=bool(prov.resume_new_prompt))
+                    prompt_resumes=bool(prov.resume_new_prompt), daemon_started=self._started)
             except Exception as e:   # the next session, seeded with the hand-off: never a stateless turn
                 session_mode, why = "new", f"decide failed: {type(e).__name__}: {e}"[:200]
                 log(self.p, f"coordinator session {why}")
@@ -3801,7 +3802,8 @@ class Daemon:
                     log(self.p, f"coordinator session seed cap failed: {type(e).__name__}: {e}"[:300])
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "session": {
                 "mode": session_mode, "why": why, "key": key, "model": model, "effort": effort,
-                "provider": provider, **({"digest": ack} if ack else {}),
+                "provider": provider, **({"digest": ack} if ack else {}), **({"parts": parts} if parts else {}),
+                **({"changed": coordsession.changed_parts(state, parts)} if why == "prefix changed" else {}),
                 **({"cap_usd": session_cap} if session_cap is not None else {}),
                 **({"seed_usd": seed_usd, "seed_basis": seed_basis} if seed_usd is not None else {}),
                 **({"error": str((state or {}).get("fail_error") or "")}   # the failed resume this reruns
@@ -11845,8 +11847,7 @@ class Daemon:
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                               "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
-            s_head, s_context = coordsession.session_prompt_parts(self.p, provider)   # byte-stable prompt and its schema
-            session_prompt = {"system": s_head, "context": s_context, "cached": cached}
+            session_prompt = {**coordsession.session_prompt(self.p, provider), "cached": cached}   # byte-stable prompt and its schema
             context = coord.with_cached(context, cached)
             burst = bursthold.carried(db, evs)
             if provider in self._net_holds:   # this turn is the held provider's one try (as in start_run)

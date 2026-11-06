@@ -17,7 +17,8 @@ A new session starts only when: there is none; the provider changed; the prompt 
 prompt, stable context or action schema) on a provider that cannot resume with a changed prompt
 (Provider.resume_new_prompt ""); the model or effort changed; the last new session's first wake did
 not end ok and did no work in it (one that did, then hit its dollar cap or timeout, is kept like a
-failed resume: the next wake resumes it); its transcript is no longer saved (a host move or the provider's session expiry); or the
+failed resume: the next wake resumes it); its transcript is no longer saved (a host move or the provider's
+session expiry; why names a daemon restart when the session's last write predates it); or the
 provider rejected the resume (resume failed, below). Never because the context grew: the session
 compacts its own context in place and keeps its id (user order: every agent compacts its own
 context as needed). The context is the last model call's prompt and answer; limit() is the size
@@ -213,9 +214,11 @@ def prefix_key(system: str | None, context: str | None, schema: dict | None, pro
 
 
 def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, now: float,
-           no_session: str = "", provider: str = "", prompt_resumes: bool = True) -> tuple[str, str]:
+           no_session: str = "", provider: str = "", prompt_resumes: bool = True,
+           daemon_started: float | None = None) -> tuple[str, str]:
     """(mode, why) of one wake: "resume" or "new" (the next session, seeded with the hand-off). A daemon
-    restart or a reboot changes nothing here: the saved session is resumed by its id. `state`
+    restart or a reboot changes nothing here: the saved session is resumed by its id (a transcript gone
+    since a restart only says so in why; `daemon_started` is when this daemon started). `state`
     is kv KEY (None: none yet), `saved(session_id)` says the agent can still resume that session,
     `no_session` is gap() of the wake's provider: only a provider that keeps no session at all gets
     "stateless". No setting in `cfg` changes the mode; it only sizes compaction (limit()). A changed
@@ -239,7 +242,9 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
     if not st.get("last_ok") and not st.get("rerun"):   # a new session's first wake never ended ok
         return "new", "last run not ok"
     if not saved(st["id"]):
-        return "new", "session not saved"
+        at = _num(st.get("at") or st.get("started"), 0)
+        restarted = daemon_started is not None and 0 < at < _num(daemon_started, 0)
+        return "new", "session not saved since daemon restart" if restarted else "session not saved"
     if st.get("rerun"):   # a failed resume the provider did not reject (a crash, a lost process): same session
         return "resume", "rerun"
     if _num(st.get("context_tokens"), 0) >= limit(cfg, st, model):
@@ -412,7 +417,11 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     sid = str(getattr(usage, "session_id", "") or session_id or "")
     st.update({"id": sid or st.get("id") or "", "provider": turn.get("provider", ""),
                "model": turn.get("model", ""), "effort": turn.get("effort", ""), "key": turn.get("key", ""),
-               "last_ok": bool(ok and sid)})
+               "last_ok": bool(ok and sid), "at": now})
+    if isinstance(turn.get("parts"), dict):   # the key's per-part digests: the next "prefix changed" names the parts
+        st["parts"] = turn["parts"]
+    else:
+        st.pop("parts", None)
     if ok:
         st["wakes"] = int(_num(st.get("wakes"), 0)) + 1
         st["context_tokens"] = context_tokens(usage)
@@ -687,12 +696,41 @@ def session_prompt_parts(p, provider: str | None = None) -> tuple[str, str]:
     (prompts.session_tools), then the charter verbatim (its Restrictions section is the block).
     Rendered live from the charter, the prompt files and the tool state only, so two wakes with an
     unchanged charter and tool state get the same bytes."""
+    sp = session_prompt(p, provider)
+    return sp["system"], sp["context"]
+
+
+# The prefix key's parts, each digested apart so a new session for a changed prefix names what changed:
+# the role prompt as rendered ("template"), the charter and its Restrictions block, the settings that
+# pick the role's rule blocks and the known-paths block ("standing"), and the action schema with the
+# agent ("rest", prefix_parts). Memory is not one: a session gets it in its messages, never in its prefix.
+PREFIX_PARTS = ("template", "charter", "standing", "rest")
+
+
+def session_prompt(p, provider: str | None = None) -> dict:
+    """{"system", "context", "parts"}: session_prompt_parts() and the digests of its prefix parts."""
     from .coordinator import _prompt_head
     from .knownpaths import block
-    from .prompts import coordinator_session_role, session_tools
+    from .prompts import coordinator_features, coordinator_session_role, session_tools
     rules, _, charter = _prompt_head(p)
-    role = coordinator_session_role(p, session_tools(p, provider)).rstrip()
-    return f"{rules}{role}\n\n{block(p)}", f"# CHARTER\n{charter}\n"
+    role, paths, context = coordinator_session_role(p, session_tools(p, provider)).rstrip(), block(p), f"# CHARTER\n{charter}\n"
+    return {"system": f"{rules}{role}\n\n{paths}", "context": context,
+            "parts": {"template": _sha(role), "charter": _sha(rules + "\0" + context),
+                      "standing": _sha(json.dumps([sorted(coordinator_features(p)), paths]))}}
+
+
+def prefix_parts(parts, schema: dict | None, provider: str) -> dict:
+    """The per-part digests of prefix_key()'s inputs: session_prompt()'s parts and the rest."""
+    return {**(parts if isinstance(parts, dict) else {}), "rest": _sha(json.dumps([schema, provider], sort_keys=True))}
+
+
+def changed_parts(state, parts: dict) -> list[str] | None:
+    """The PREFIX_PARTS whose digest differs from the session's (kv KEY's `parts`); None when either
+    side has no digests (a session started before they were recorded)."""
+    old = state.get("parts") if isinstance(state, dict) else None
+    if not isinstance(old, dict) or not old or not parts:
+        return None
+    return [k for k in PREFIX_PARTS if old.get(k) != parts.get(k)]
 
 
 def _note_path(p, session_id: str):
