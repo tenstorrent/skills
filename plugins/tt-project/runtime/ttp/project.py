@@ -444,6 +444,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # dead_dep_h blocked on a failed or cancelled dependency (0: off). Urgent, user-ordered, review and
     # obligation-owner tasks never expire.
     "queue": {"expire_h": 48, "dead_dep_h": 24},
+    # A code task's `premise_cmd:` (premise.py) runs model-free before each dispatch, killed after
+    # cmd_timeout_s; an exit 0 lets the task dispatch for recheck_min minutes, then it runs again.
+    "premise": {"cmd_timeout_s": 60, "recheck_min": 30},
     # Builtin watchers (prs, logfile): one run stops at deadline_s (capped at 1800), keeps what it read
     # and reports one error saying it was cut short; each gh call times out after gh_timeout_s, cut to
     # the time left. The prs watcher reads pr_workers PRs at once, each within pr_timeout_s, each PR once

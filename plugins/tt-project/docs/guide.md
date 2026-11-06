@@ -775,6 +775,19 @@ only in the feed and never under "needs you".
   coordinator turn, which a re-hold no longer postpones). `dependency_cycle`: tasks that depend on
   each other, named; `task_add` and `task_update` refuse to create one. All are listed in the
   `stale_holds` event and flagged as loops in each blocker sweep.
+- Premise commands (model-free): a code task's spec line `premise: <words>` is checked once by a
+  light question before its first run (an urgent task checks it itself). When a read-only shell
+  command can answer it, add `premise_cmd: <command>`: the daemon runs it itself from the project
+  root, devices masked, before each dispatch, and again before a later dispatch once its pass is
+  older than `premise.recheck_min` (30, retries included). Exit 0: the premise holds and the task
+  starts. Exit 1: the premise is false; the task closes as not needed with the command, exit code
+  and output tail in its result, no worker runs, the coordinator gets one `task_done` event, and
+  `task_add` refuses the same command for 14 days. Any other exit, a run past
+  `premise.cmd_timeout_s` (60) or a command the read-only guard refuses (writes, git that changes
+  refs, ssh, schedulers, device tools) falls back to the light question, never a silent skip. Map
+  other scripts onto 0 and 1 with a wrapper, e.g. a fix already merged:
+  `premise_cmd: git merge-base --is-ancestor <sha> origin/<branch> && exit 1 || exit 0`. The daily
+  review counts premise-closed tasks and the cost they saved at the tier's median code run.
 - Dead landing waits (model-free): a queued task whose start_when is exactly `landed:#<id>`, with
   that producer done, not landed and nothing open that can land it (no review, fix, rebase, task on
   its branch or push queue row) for `waiting.landed_wait_dead_s` (900), raises one

@@ -1202,6 +1202,8 @@ class Daemon:
         self._git_memo: dict[int, dict] = {}   # task -> git facts its hand-off is judged by, read before the tx (_prefetch_git)
         self._git_attempts: dict[int, gitmemo.Attempt] = {}   # task -> its finish's gitreplay attempt, from the warm-up
         self._start_rc: dict[int, tuple[int | str, float, str]] = {}   # a start_when's last not-yet or broken verdict
+        self._premise_runs: dict[int, tuple] = {}   # task -> its running premise command: (Pending, started, cmd)
+        self._premise_ok: dict[int, tuple[float, str]] = {}   # task -> when its premise command last exited 0, cmd
         self._checks_gone_at: dict[int, tuple[str, float]] = {}   # task -> probe on gone checks, first seen (checksgone)
         self._host_up: dict[str, tuple[bool, float]] = {}   # host a probe's 255 named -> ssh reached it, when
         self._down_n: dict[int, int] = {}   # task -> its probe's confirmed-down answers in a row (downwait.gap)
@@ -4225,12 +4227,68 @@ class Daemon:
         self._raise_unhandled_failed_reviews(now)
 
     def _tend_premises(self) -> None:
-        """premise.tend: split, settle and clean up code tasks' premise checks; never stops the caller."""
+        """_premise_cmds, then premise.tend: split, settle and clean up code tasks' premise checks (a
+        command that gave no verdict falls back to one in the same pass); never stops the caller."""
+        try:
+            self._premise_cmds(time.time())
+        except Exception:
+            log(self.p, "premise commands not tended: " + traceback.format_exc().replace("\n", " | ")[:1500])
         try:
             for tid, what in premise.tend(self.p.db):
                 log(self.p, f"task {tid}: {what}")
         except Exception:
             log(self.p, "premise checks not tended: " + traceback.format_exc().replace("\n", " | ")[:1500])
+
+    def _premise_fresh(self, task: dict, now: float) -> bool:
+        """Whether ready code task `task` may dispatch as far as its premise command goes: it has none
+        (premise.runs_cmd), or that command exited 0 within premise.recheck_min."""
+        cmd = premise.runs_cmd(task)
+        if not cmd:
+            return True
+        ok = self._premise_ok.get(task["id"])
+        return bool(ok) and ok[1] == cmd and now - ok[0] < premise.cmd_config(self.cfg)[1]
+
+    def _premise_cmds(self, now: float) -> None:
+        """Run ready code tasks' premise commands, model-free, and act on those that ended (premise.py):
+        0 holds (the task may dispatch for premise.recheck_min), 1 closes it as not needed, anything
+        else (another exit, a timeout, no start, a guard refusal) falls back to the light question."""
+        db = self.p.db
+        timeout, _ = premise.cmd_config(self.cfg)
+        for tid, (proc, started, cmd) in list(self._premise_runs.items()):
+            rc = proc.poll()
+            if rc is None and now - started < timeout:
+                continue
+            if rc is None:
+                probespawn.kill(proc)
+                rc = "timeout"
+            del self._premise_runs[tid]
+            tail = ends._err_tail({id(proc): proc}, proc)
+            t = db.task(tid)
+            if not t or t["status"] != "queued" or premise.runs_cmd(t) != cmd:
+                continue   # started, cancelled or edited meanwhile: a fresh run decides
+            if rc == 0:
+                self._premise_ok[tid] = (now, cmd)
+                log(self.p, f"task {tid}: premise command exited 0, the premise holds")
+            elif rc == 1:
+                if premise.cmd_false(db, t, cmd, rc, tail, now):
+                    log(self.p, f"task {tid}: premise command exited 1, closed as not needed")
+            else:
+                why = f"exit {rc}" if isinstance(rc, int) else str(rc)
+                if premise.cmd_unknown(db, t, cmd, why + (f": {tail[-200:]}" if tail else ""), now):
+                    log(self.p, f"task {tid}: premise command gave no verdict ({why}), falls back")
+        for tid in [k for k in self._premise_ok if k not in self._premise_runs]:
+            t = db.task(tid)
+            if not t or t["status"] != "queued":
+                del self._premise_ok[tid]   # dispatched or ended: its next dispatch checks again
+        for t in db.ready_tasks():
+            cmd = premise.runs_cmd(t)
+            if not cmd or t["id"] in self._premise_runs or self._premise_fresh(t, now):
+                continue
+            if why := premise.guard(cmd):
+                premise.cmd_unknown(db, t, cmd, why, now)
+                continue
+            self._premise_runs[t["id"]] = (probespawn.Pending(cmd, cwd=str(self.p.root), env=self._probe_env()),
+                                           now, cmd)
 
     def _raise_review_stalls(self, now: float) -> None:
         """Only 'done' satisfies a dependency, so a task left in 'review' holds its dependents back
@@ -8978,7 +9036,7 @@ class Daemon:
                     + (f"; {w}" if w else "") + ")"
             if not g.allow_new_work and (why_g := g.cause or next(iter(g.reasons), "")):
                 return f"the spend gate (no new work at {g.level}: {why_g[:160]})"
-        return {"held": "a disk guard or its review's pre-checks", "paused": "a paused resource",
+        return {"held": "a disk guard, its review's pre-checks or its premise command", "paused": "a paused resource",
                 "logged_out": f"the {task['provider'] or 'core'} provider's login (auth gate)",
                 "net": "its provider's API host not resolving", "gate": "the spend gate (no new work)",
                 "optional": "the spend gate (optional work held)", "device": "every device task slot taken",
@@ -10373,6 +10431,9 @@ class Daemon:
             return "held"
         if why := self._required_model_down(task, provider, now):
             ctx["held_by"][task["id"]] = why
+            return "held"
+        if not self._premise_fresh(task, now):
+            ctx["held_by"][task["id"]] = "its premise command (`premise_cmd:`), run by the daemon before it starts"
             return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
             ctx["holds"][task["id"]] = {"kind": "pause", "resource": sorted(coord.task_resources(task)
