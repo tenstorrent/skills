@@ -4,6 +4,8 @@
 from __future__ import annotations
 
 
+import pytest   # module level: the runner file imports pytest, but the include is lazy, so name it here
+
 def _lock_env(env, p, **kw):
     return dict(os.environ, TTP_HOME=str(env["home"]), TTP_HOST="testhost", TTP_PROJECT=str(p.base), **kw)
 
