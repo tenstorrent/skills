@@ -43,7 +43,8 @@ session:
 2. Promises made in chat, in the words you used, with their due times.
 3. Pending checks: what you mean to verify, how and when.
 4. Decisions with their reasons, so the next session does not decide them again.
-5. User corrections and standing orders not yet in memory, quoted verbatim.
+5. User corrections and standing orders not yet in memory, quoted verbatim with their msg #N:
+   a line claiming a user order whose quote is not in that logged message is dropped.
 
 Give ids (task, message, run) with each fact, never a summary of the digest the next session sees
 anyway. What must outlive every session goes in memory (`memory_add`) as well. Return no

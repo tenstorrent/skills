@@ -3050,11 +3050,15 @@ class Daemon:
                 system, context = session_prompt["system"], session_prompt["context"]
                 try:   # the rollover handover (coordsession.py): no order, promise or decision is lost
                     if session_mode == "new":
-                        prompt = coordsession.seed(self.p, state, why, session_prompt.get("cached") or "") + "\n\n" + prompt
+                        from .relay import agent_orders
+                        prompt = (coordsession.seed(self.p, state, why, session_prompt.get("cached") or "",
+                                                    agent=agent_orders(self.cfg)) + "\n\n" + prompt)
                         pending = {k: v[0] for k, v in coordsession.memory_view(self.p).items()}
                     else:   # memory recorded since the last wake, though a re-render emptied the digest's deltas
                         changed, pending = coordsession.resume_memory(self.p, state, prompt)
                         prompt = f"{changed}\n\n{prompt}" if changed else prompt
+                        if (state or {}).get("compacted"):   # the summary carries no user order
+                            prompt = coordsession.compacted_block(self.p) + "\n\n" + prompt
                     self.p.db.set_kv(coordsession.KEY, {**(state or {}), "pending": pending})   # record() keeps it once ok
                     if why == "handover":
                         prompt = prompt + "\n\n" + coordsession.handover_ask(state)
@@ -4947,12 +4951,14 @@ class Daemon:
         `session_note` (its rollover handover) as state/coord-session/<session id>.md. True for a resumed
         wake that failed: nothing of it is applied and the next wake reruns its batch stateless at
         once, with no backoff; repeated failures pause the mode and raise an issue. A wake that asked
-        for the whole digest, or whose session compacted its history, leaves no digest acknowledged."""
+        for the whole digest, or whose session compacted its history, leaves no digest acknowledged; a
+        compacted one also marks kv KEY `compacted`, so the next wake leads with compacted_block."""
         db, now = self.p.db, time.time()
         try:
             ctx = self._session_context(r, usage) if session.get("mode") in ("new", "resume") else None
-            if session.get("digest") and (coordsession.asked_full(actions) or self._compacted(r)
-                                          or (ctx or {}).get("compacted")):
+            compacted = ok and session.get("mode") in ("new", "resume") and (self._compacted(r)
+                                                                             or bool((ctx or {}).get("compacted")))
+            if session.get("digest") and (coordsession.asked_full(actions) or compacted):
                 session = {k: v for k, v in session.items() if k != "digest"}
             state = db.kv(coordsession.KEY)
             if session.get("mode") == "resume" and not ok:
@@ -4970,9 +4976,11 @@ class Daemon:
                 return True
             if ok and session.get("mode") in ("new", "resume") and isinstance(out, dict) and out.get("session_note"):
                 sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
-                if path := coordsession.save_note(self.p, sid, out.get("session_note")):
+                from .relay import agent_orders
+                if path := coordsession.save_note(self.p, sid, out.get("session_note"), agent_orders(self.cfg)):
                     log(self.p, f"coordinator run {r['id']}: session handover saved to {path}")
-            db.set_kv(coordsession.KEY, coordsession.record(state, usage, r.get("session_id") or "", session, ok, now))
+            state = coordsession.record(state, usage, r.get("session_id") or "", session, ok, now)
+            db.set_kv(coordsession.KEY, {**state, "compacted": True} if compacted else state)
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         return False

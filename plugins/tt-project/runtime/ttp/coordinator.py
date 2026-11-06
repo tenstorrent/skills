@@ -3240,6 +3240,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "
                              f"({', '.join(rec['files']) or 'no file named: it reaches no task prompt'})")
             elif t == "memory_add":
+                if forged := coordsession.checked(db, a["text"], relay.agent_orders(cfg), strict=False)[1]:
+                    coordsession.log_dropped(db, "memory_add", forged)
+                    raise ValueError(f"memory_add rejected: a line quoting the user fails the verbatim check: "
+                                     f"{forged[0][1]}. Quote the logged message's own words exactly with its msg #N, "
+                                     f"or record it as your own decision or a fact, without the user's-words label")
                 text = _unapplied_config_note(a["text"], cfg_refused)
                 if text != a["text"]:
                     notes.append("memory_add: noted in the entry that a config_set it names was rejected")
