@@ -17,6 +17,7 @@ manifest.sha256 pins it. The bench names no model: what it compares is the runne
 from __future__ import annotations
 
 import ast
+import concurrent.futures
 import functools
 import hashlib
 import json
@@ -39,6 +40,7 @@ QUOTE_LEN = 30     # an added line counts as quotable from this many characters
 ROUNDS = 3         # runs on the head each kept test must pass
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 TEST_TIMEOUT = 900  # seconds one validation run may take
+BUILDERS = 4        # workspaces built at once, beside the scan
 _EPOCH = {"GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000"}
 
 
@@ -370,7 +372,7 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                   "AND landed_sha IS NOT NULL AND landed_sha != '' ORDER BY id")
     reach = _reach(rows, pushed)
     kept, excluded = [], []
-    with gitmemo.scope({}):
+    with gitmemo.scope({}), concurrent.futures.ThreadPoolExecutor(BUILDERS) as pool:
         for t in tasks:
             if limit and len(kept) >= limit:
                 break
@@ -397,7 +399,7 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                 excluded.append({"task": t["id"], "why": why})
                 continue
             here = out / str(t["id"])
-            tree = workspace(repo, base, here / "workspace")
+            tree = pool.submit(workspace, repo, base, here / "workspace")
             sums = {}
             for path in held:
                 dest = here / "heldout" / path
@@ -407,6 +409,8 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                          "created": t["created"], "base": base, "head": head, "tree": tree,
                          "stratum": "small" if lines <= SMALL else "large", "changed_lines": lines,
                          "tests": [f"{p}::{n}" for p, n in tests], "heldout": sums})
+        for k in kept:
+            k["tree"] = k["tree"].result()
     manifest = {"since": since, "made": time.time(), "validated": validated,
                 **({"test_cmd": test_cmd, "rounds": ROUNDS} if validated else {}), "tasks": kept,
                 "excluded": excluded, "counts": {s: sum(k["stratum"] == s for k in kept) for s in ("small", "large")}}
