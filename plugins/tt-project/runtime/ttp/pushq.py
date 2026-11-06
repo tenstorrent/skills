@@ -889,6 +889,16 @@ def _approved(db, name: str) -> list[dict]:
                 "WHERE c.task=q.task AND c.status='conflict'), q.id", (name,))
 
 
+def _sent_back(db, rows: list[dict]) -> set[int]:
+    """The ids of `rows` whose task an earlier batch sent back as a conflict (they lead: _approved)."""
+    tasks = {r["task"] for r in rows}
+    if not tasks:
+        return set()
+    back = {r["task"] for r in db.q(f"SELECT DISTINCT task FROM push_queue WHERE status='conflict' "
+                                    f"AND task IN ({','.join('?' * len(tasks))})", tuple(tasks))}
+    return {r["id"] for r in rows if r["task"] in back}
+
+
 def dep_waits(p: Project, rows: list[dict], now: float) -> dict[int, dict]:
     """{row id: the sent-back row (of another review) its head is built on} for `rows` that wait
     for that review's landing (DEP_SENT_BACK, DEP_WAIT_S). A git answer it cannot get holds nothing."""
@@ -1182,8 +1192,10 @@ def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) ->
     """The ids of `rows` (approved, same target) that go in a batch of their own at once: urgent
     (urgent.covers_urgent), of priority FAST_PRIORITY or better, or changing no file that an earlier
     row still in the queue (approved, batched or held) changes. Files overlap.ignore lists
-    (changesets, changelogs, manifests) do not count. A row git cannot read is not independent, nor
-    is any with no fetched tip; rows in `skip` (already tried on a failing tip) are never fast."""
+    (changesets, changelogs, manifests) do not count. A row sent back as a conflict counts as earlier
+    than every routine row of its priority or worse (it leads them: _approved), so an older peer sharing
+    its files never goes ahead of it. A row git cannot read is not independent, nor is any with no
+    fetched tip; rows in `skip` (already tried on a failing tip) are never fast."""
     if not rows:
         return set()
     db = p.db
@@ -1198,11 +1210,15 @@ def fast_ids(p: Project, rows: list[dict], tip: str, skip: set = frozenset()) ->
     for e in earlier:
         got = _changed(p, tip, e["head"]) if e["head"] else None
         files[e["id"]] = None if got is None else frozenset(f for f in got if not overlap._ignored(f, globs))
+    back = _sent_back(db, rows)
+    prio = {r["id"]: int(r["priority"] if r["priority"] is not None else 9) for r in rows}
     for r in rows:
         mine = files.get(r["id"])
         if r["id"] in skip or r["id"] in out or not mine:
             continue
-        if all(files[e["id"]] is not None and not (mine & files[e["id"]]) for e in earlier if e["id"] < r["id"]):
+        ahead = {b for b in back if b != r["id"] and prio[b] <= prio[r["id"]]}
+        if all(files.get(e["id"]) is not None and not (mine & files[e["id"]])
+               for e in earlier if e["id"] < r["id"] or e["id"] in ahead):
             out.add(r["id"])
     return out
 
@@ -1217,7 +1233,7 @@ def _one_solo(p: Project, rows: list[dict], cap: int, paths: list[str], tip: str
               fast: set = frozenset()) -> tuple[list[dict], list[dict]]:
     """Up to `cap` of `rows` in order, at most one routine one (not in `fast`) a change touching `paths`
     since it left `tip`: (taken, the touching ones left for a later batch). The oldest touching one
-    leads the routine part, so each waits at most one batch per older one, never behind newer ones of
+    (one sent back as a conflict before any other: _approved) leads the routine part, so each waits at most one batch per older one, never behind newer ones of
     a better priority. Fast rows are never held. A row git cannot tell about counts as touching (one
     per batch is the safe side)."""
     if not paths or len(rows) < 2:
@@ -1225,7 +1241,8 @@ def _one_solo(p: Project, rows: list[dict], cap: int, paths: list[str], tip: str
     touching = [r for r in rows if r["id"] not in fast and _touches_paths(p, tip, f"{REF_PREFIX}{r['id']}", paths)]
     if not touching:
         return rows[:cap], []
-    lead = min(touching, key=lambda r: r["id"])
+    back = _sent_back(p.db, touching)
+    lead = min(touching, key=lambda r: (r["id"] not in back, r["id"]))
     held = [r for r in touching if r is not lead]
     first = [r for r in rows if r["id"] in fast]
     order = first + [lead] + [r for r in rows if r["id"] not in fast and r is not lead and r not in held]

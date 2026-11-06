@@ -3310,6 +3310,39 @@ def test_an_approval_sent_back_by_a_conflict_leads_its_priority_in_the_next_batc
     assert [r["id"] for r in got] == [hot, back, *older, carried], why
 
 
+def test_an_approval_sent_back_by_a_conflict_keeps_its_lead_over_an_older_peer_sharing_its_files(env, monkeypatch):
+    """Review #6565: fast_ids counts a routine row independent only against older ones, so an older peer
+    changing the re-approved head's file went first (due's fast reorder, the wait path, _one_solo) and
+    could send it back again. A sent-back row counts as earlier than every routine row of its priority."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=10)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time() + 1
+    _pq_last_batch(s, "pushed", now - 60)
+    peer = _pq_alone(s, "feature.txt", text="peer\n")
+    back = _pq_alone(s, "feature.txt", text="back\n")
+    other = _pq_alone(s, "other.txt")
+    back_task = s.p.db.one("SELECT task FROM push_queue WHERE id=?", (back,))["task"]
+    s.p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+             (back_task, s.branch, s.head, "origin/proj", "conflict", now - 600, now - 300))
+    assert [r["id"] for r in pushq._approved(s.p.db, "origin/proj")] == [back, peer, other]
+    tip = pushq._tracking_tip(s.p, "origin", "proj")
+    rows = pushq._approved(s.p.db, "origin/proj")
+    assert pushq.fast_ids(s.p, rows, tip) == {other}, "the peer sharing the sent-back head's file is not fast"
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [other, back, peer], why
+    s.p.set_config("delivery.push_solo_paths", ["feature.txt"])
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [other, back], "_one_solo: the sent-back head leads, the peer waits"
+    s.p.set_config("delivery.push_solo_paths", [])
+    s.p.db.update_task(s.review, status="running")   # the wait path sends only fast rows: never the peer
+    s.p.db.x("DELETE FROM push_batches")
+    _pq_last_batch(s, "tip_failed", now - 1)
+    s.p.set_config("delivery.push_batch_s", 900)
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [other], why
+
+
 def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, monkeypatch):
     """No idle gap between batches while approvals wait: one approved before the last clean batch
     (and its after_push) ended starts the next at once, even with a review still running; one approved
