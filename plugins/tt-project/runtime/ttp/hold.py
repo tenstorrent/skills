@@ -161,23 +161,23 @@ def keep(run_dir: Path, spec: dict, held: list, wanted: list[dict], inherited: l
     lock = locks.try_take([Path(run_dir) / LIVE], f"keeper of run {run}")
     if lock is None:
         return None
-    resources = []
-    for w, f in zip(wanted, held):   # the same open file: relabelled, never let go
-        holder = w.get("holder") or who(task)   # a shared resource's names the project too
-        resources.append({"resource": w.get("resource"), "path": f.name, "holder": holder,
-                          "label": label(holder, run, LABEL)})
+    resources = [{"resource": w.get("resource"), "path": f.name, "holder": (h := w.get("holder") or who(task)),
+                  "label": label(h, run, LABEL)} for w, f in zip(wanted, held)]   # a shared one's names the project
+    rec = {"task": task, "run": run, "since": time.time(), "state": "holding", "resources": resources,
+           "jobs": jobs}
+    # The record and its registry entry first: a job's `ttp lock` that reads the keeper's label must find
+    # them (covers), else it queues behind the very hold kept for it and waits for good.
+    _write(run_dir, rec)
+    Path(registry).mkdir(parents=True, exist_ok=True)
+    durable_write(Path(registry) / f"{run}.json", json.dumps({"run_dir": str(Path(run_dir).resolve())}))
+    for r, f in zip(resources, held):   # the same open file: relabelled, never let go
         f.seek(0)
         try:   # the taker's pid stays named until label_pid names the keeper: never a label without one
             was = json.loads(f.read() or "{}")
         except ValueError:
             was = {}
         owner = {k: was[k] for k in ("pid", "node", "pidns") if isinstance(was, dict) and k in was}
-        locks.write_label(f, {"holder": label(holder, run, LABEL), "since": time.time(), "command": LABEL, **owner})
-    rec = {"task": task, "run": run, "since": time.time(), "state": "holding", "resources": resources,
-           "jobs": jobs}
-    _write(run_dir, rec)
-    Path(registry).mkdir(parents=True, exist_ok=True)
-    durable_write(Path(registry) / f"{run}.json", json.dumps({"run_dir": str(Path(run_dir).resolve())}))
+        locks.write_label(f, {"holder": r["label"], "since": time.time(), "command": LABEL, **owner})
     try:
         rec["keeper"] = _spawn(run_dir, [lock.fileno(), *(f.fileno() for f in held)])
         for f in held:

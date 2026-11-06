@@ -2465,3 +2465,32 @@ def test_a_push_batch_checks_ttp_lock_goes_ahead_of_an_earlier_suite_waiter_only
     starts = [ln.split()[1] for ln in marks.read_text().splitlines() if ln.startswith("start ")]
     assert starts == (["holder", "late", "suite"] if mode == "target" else ["holder", "suite", "late"]), starts
     assert list(landmark.marks_dir().iterdir()) == []
+
+
+def test_a_kept_hold_covers_its_job_from_the_moment_the_keeper_label_is_written(tmp_path, monkeypatch):
+    # hold.keep relabels the run's slot to its keeper's: a detached job's `ttp lock` reading the slot
+    # right then must find the hold record and registry entry already written (hold.covers), else it
+    # waits as a stranger for the very hold kept for it and never runs (seen under host load).
+    from ttp import hold, locks
+    run_dir, registry = tmp_path / "runs" / "61", tmp_path / "holds"
+    run_dir.mkdir(parents=True)
+    job = str((run_dir / "job.rc").resolve())
+    slot = tmp_path / "board.0.lock"
+    f = locks.try_take([slot], hold.label(hold.who(7), 61, hold.WHOLE_RUN))
+    spec = {"env": {"TTP_TASK": "7", "TTP_RUN_ID": "61"}, "holds": str(registry)}
+    job_env = {"TTP_RUN_ID": "99", "TTP_DETACHED": "1", "TTP_DETACH_RC": job}
+    seen = []
+    write = locks.write_label
+
+    def watched(fh, lbl):
+        write(fh, lbl)
+        if hold.LABEL in str(lbl.get("holder")):
+            seen.append(hold.covers([slot], hold.who(7), spec, job_env))
+    monkeypatch.setattr(locks, "write_label", watched)
+    monkeypatch.setattr(hold, "live", lambda rcs: [r for r in rcs if r == job])
+    monkeypatch.setattr(hold, "_spawn", lambda rd, fds: os.getpid())
+    try:
+        assert hold.keep(run_dir, spec, [f], [{"resource": "board"}], [job]) == os.getpid()
+        assert seen and set(seen) == {hold.label(hold.who(7), 61, hold.LABEL)}, seen
+    finally:
+        f.close()
