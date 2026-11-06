@@ -7452,6 +7452,23 @@ def cmd_land(a) -> None:
     sys.exit(land.run(p, a))
 
 
+def cmd_bench(a) -> None:
+    """`ttp bench prep --since <date> --out <dir>`: pick the landed tasks a model comparison can
+    replay, with clean base workspaces and held-out tests, model-free (bench.py)."""
+    from . import bench
+    p = here() or die("bench: no project here (run it in a project or with TTP_PROJECT set)")
+    try:
+        when = _dt.datetime.fromisoformat(a.since)
+    except ValueError:
+        die(f"bench: --since {a.since!r} is not a date (YYYY-MM-DD, or with a time)")
+    out = Path(a.out).expanduser().resolve()
+    if out.exists():
+        die(f"bench: {out} exists; name a new folder")
+    m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit)
+    print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
+          f"{len(m['excluded'])} excluded; manifest {out / 'manifest.json'}")
+
+
 def cmd_landed(a) -> None:
     """Probe for start_when/retry_when: exit 0 once a commit, or a task's landing (`--task <id>`),
     is on the push branch, also as rebased commits; 1 while not yet; 2 when it cannot tell. The
@@ -12319,7 +12336,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "course", "uninstall")),
+               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "course", "uninstall", "bench")),
 )
 
 
@@ -13070,6 +13087,17 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("test_id", nargs="?", help="lift: the pytest id, as `ttp quarantine list` shows it")
     s.add_argument("--why", help="lift: why it may go (a fix landed, the test was removed, ...)")
     s.set_defaults(fn=cmd_quarantine)
+
+    s = sub.add_parser("bench", help="replay bench, model-free part: `prep` picks landed tasks newer than --since "
+                                      "that add tests, builds a clean one-commit workspace at each base and holds "
+                                      "out the landed tests, with a hash-pinned manifest")
+    s.add_argument("action", choices=["prep"], help="prep: build the bench in --out")
+    s.add_argument("--since", required=True, help="keep tasks created on or after this date (YYYY-MM-DD): the "
+                                                  "later of the compared models' release dates")
+    s.add_argument("--out", required=True, help="a new folder for the workspaces, held-out tests and manifest")
+    s.add_argument("--repo", help="the repository the tasks landed in (default: the project root)")
+    s.add_argument("--limit", type=int, default=0, help="keep at most this many tasks (default: all)")
+    s.set_defaults(fn=cmd_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
                                         "(a retry_when: 0 once replied, 1 while not, 2 if it cannot tell) or settle "

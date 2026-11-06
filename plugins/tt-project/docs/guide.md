@@ -1023,6 +1023,21 @@ the user reads. `--severity high` still reaches the coordinator, and the daemon'
 notices are unaffected. The route is a refusal rather than a relay through a standard run: the
 hand-off already reaches the coordinator, so a relay would add a paid run for no new path.
 
+### Replay bench for model comparisons
+
+`ttp bench prep --since <date> --out <dir>` builds, without a model call, the task set a later run
+uses to compare two models or efforts on this project's own work. `--since` is the later of the
+compared models' release dates, so neither saw the changes. It keeps done code and work tasks created
+since then whose change landed through one push queue row and adds or changes tests; their landed
+tests are held out as graders. It excludes, with the reason, a task whose spec quotes 3 or more lines
+of the fix, whose held-out tests use a repository symbol the base lacks and the spec does not name, or
+whose landing range on the push branch is unclear (a fast-forward, a squash, several pushes). Each
+kept task gets `<id>/workspace`, the base commit's tracked files in a fresh repository with one commit
+and no remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the
+manifest records its spec, base, landed commit, stratum (small up to 150 changed non-test lines, else
+large) and each held-out file's sha256, and `manifest.sha256` pins the manifest. The bench names no
+model.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat
