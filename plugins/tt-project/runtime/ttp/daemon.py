@@ -12876,11 +12876,11 @@ class Daemon:
     def _missed_update(self, r: dict, task: dict, run_dir: Path) -> dict | None:
         """{"started": spec digest the run started on, "text": its unread updates} when the task's spec
         changed after the run started and the steer.md update carrying the change was not read before
-        the run ended; else None. A worker with the update hook (provider steer_hook) has read up to its
-        steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
+        the run ended; else None. A worker with the update hook (provider steer_hook, or the run's
+        HOOKED_FILE: Codex may run it) has read up to its steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
         that offset too) or reads steer.md itself, so only an update newer than its
         result.json is surely unread. A model-free on_pass is checked in _probe_passed instead."""
-        from .hook import STEER_FILE, unread_update
+        from .hook import STEER_FILE, hooked as run_hooked, unread_update
         from .prompts import spec_digest
         started = load_result(r.get("note")).get("spec_sha")
         if not isinstance(started, str) or started == spec_digest(task):
@@ -12889,7 +12889,7 @@ class Daemon:
         if not text:
             return None
         try:
-            hooked = bool(getattr(get_provider(r["provider"]), "steer_hook", False))
+            hooked = run_hooked(run_dir) or bool(getattr(get_provider(r["provider"]), "steer_hook", False))
         except Exception:
             hooked = True
         if not hooked:

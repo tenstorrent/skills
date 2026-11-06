@@ -227,9 +227,11 @@ def _files(p: Project, cwd: str, old: dict, now: float, base: list[str]) -> dict
 
 
 def _steer(run_dir: Path, provider: str) -> dict | None:
-    """The last update written to steer.md and whether the run read it: up to steer.offset with the
-    update hook; a provider without one reads steer.md itself, so its read state is unknown (None)."""
-    from .hook import OFFSET_FILE, STEER_FILE
+    """The last update written to steer.md and whether the run read it: up to steer.offset when the
+    update hook runs (the provider's steer_hook, or this run's HOOKED_FILE: Codex may run it). A run
+    without it read the update once `ttp note` or `ttp steer` moved steer.offset to the end; short of
+    that it may read steer.md itself, so its read state is unknown (None)."""
+    from .hook import OFFSET_FILE, STEER_FILE, hooked as run_hooked
     f = run_dir / STEER_FILE
     try:
         size = f.stat().st_size
@@ -242,12 +244,12 @@ def _steer(run_dir: Path, provider: str) -> dict | None:
     lines = _tail_lines(f)
     at = max((i for i, ln in enumerate(lines) if ln.startswith("## Update")), default=None)
     try:
-        hooked = bool(getattr(get_provider(provider), "steer_hook", False))
+        hooked = run_hooked(run_dir) or bool(getattr(get_provider(provider), "steer_hook", False))
     except Exception:
         hooked = False
     return {"last": lines[at][3:] if at is not None else "",
             "text": " ".join(lines[at + 1:at + 3])[:160] if at is not None else "",
-            "size": size, "offset": seen, "read": (seen >= size) if hooked else None}
+            "size": size, "offset": seen, "read": (seen >= size) if hooked else (seen >= size or None)}
 
 
 def doing(e: dict) -> str:

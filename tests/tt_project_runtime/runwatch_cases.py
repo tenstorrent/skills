@@ -145,6 +145,67 @@ def test_runwatch_records_a_codex_run_and_leaves_its_steer_read_state_unknown(en
     assert e["last_tool"]["id"] == "i2" and not e["last_tool"]["done"] and e["failed_last_20"] == 1
 
 
+def test_runwatch_steer_read_state_is_per_run_not_per_provider_class(env, tmp_path):
+    """A Codex run whose hook ran (HOOKED_FILE) shows read/unread from steer.offset like Claude; a
+    Cursor run, never hooked, shows read once `ttp note` or `ttp steer` moved the offset to the end
+    (hook.mark_seen), else unknown, since it may read steer.md itself."""
+    from ttp import hook, runwatch
+    p = make(env)
+    cx_dir, cu_dir = p.runs / "rw-cx", p.runs / "rw-cu"
+    _, cx = _rw_run(p, "codex", cx_dir)
+    _, cu = _rw_run(p, "cursor", cu_dir)
+    for d in (cx_dir, cu_dir):
+        (d / "steer.md").write_text("\n## Update Thu 10:06 PST\nnew order\n")
+    hook.mark_hooked(cx_dir)
+    runs = runwatch.tick(p)["runs"]
+    assert runs[str(cx)]["steer"]["read"] is False, "a hooked Codex run's unread update showed as unknown"
+    assert runs[str(cu)]["steer"]["read"] is None
+    for d in (cx_dir, cu_dir):
+        hook.mark_seen(d, (d / "steer.md").stat().st_size)
+    runs = runwatch.tick(p)["runs"]
+    assert runs[str(cx)]["steer"]["read"] is True
+    assert runs[str(cu)]["steer"]["read"] is True, "an update `ttp note` handed over showed as unknown"
+    # A newer update past the offset: hooked shows unread, unhooked unknown again.
+    for d in (cx_dir, cu_dir):
+        with open(d / "steer.md", "a") as f:
+            f.write("\n## Update Thu 10:20 PST\nanother order\n")
+    runs = runwatch.tick(p)["runs"]
+    assert runs[str(cx)]["steer"]["read"] is False and runs[str(cu)]["steer"]["read"] is None
+
+
+def test_missed_update_counts_a_codex_run_whose_hook_ran_as_hooked(env, tmp_path):
+    """_missed_update: a hooked run's unread update is missed even if result.json came later; an
+    unhooked run's is missed only when steer.md changed after its result.json."""
+    import os
+    from ttp import hook
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("steered", "first spec", kind="code")
+    task = p.db.task(tid)
+
+    def run(name, provider, hooked):
+        rd = tmp_path / name
+        rd.mkdir()
+        (rd / "steer.md").write_text("\n## Update Thu 10:06 PST\nnew order\n")
+        (rd / "result.json").write_text("{}")
+        t = time.time()
+        os.utime(rd / "steer.md", (t - 60, t - 60))   # the update came before the hand-off
+        if hooked:
+            hook.mark_hooked(rd)
+        return rd, {"provider": provider, "note": json.dumps({"spec_sha": "older"})}
+
+    cx_dir, cx = run("cx", "codex", True)
+    cu_dir, cu = run("cu", "cursor", False)
+    cl_dir, cl = run("cl", "claude", False)
+    assert d._missed_update(cx, task, cx_dir)["text"].endswith("new order"), \
+        "a hooked Codex run was treated as unhooked"
+    assert d._missed_update(cu, task, cu_dir) is None, "an unhooked run may have read steer.md itself"
+    assert d._missed_update(cl, task, cl_dir)["text"].endswith("new order"), "Claude changed"
+    hook.mark_seen(cx_dir, (cx_dir / "steer.md").stat().st_size)
+    assert d._missed_update(cx, task, cx_dir) is None
+
+
 def test_runwatch_keeps_the_last_call_when_a_result_arrives_for_a_call_it_never_saw(env, tmp_path):
     from ttp import runwatch
     p = make(env)
