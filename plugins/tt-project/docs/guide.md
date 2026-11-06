@@ -1202,6 +1202,15 @@ running work is interrupted only by the preemption below:
   `<name>.lost` unless the job wrote its own, so a reader of the .rc alone sees an ended job, not a dead
   one; `ttp detach --check` prints `stopped on purpose rc=137 (<why>)` and the closed record is `ended`
   with `stopped` and the why.
+  anyone else is refused (exit 3). A stopped job is never relaunched at boot.
+  A push check or `ttp checks` command that runs `ttp detach` inside the check's process sandbox (a
+  PID namespace that ends with the check) has its job queued: the daemon starts it outside within
+  seconds, with the check's device masking (`TTP_NO_DEVICE`, `TT_VISIBLE_DEVICES`, hidden device
+  nodes) and without the check's own fds and reaper token, and its .rc and .log stay in the check's
+  report folder. No task owns such a job, so the task sweep and leftover stops never end it; its
+  owner is the push or checks run named in the check allocation's `owner.json`. The daemon ends it
+  6 hours after it was queued or once that owner's marker file is gone, whichever comes first, with
+  the reason in its .lost; put a tighter bound in the command itself (`timeout`).
   `ttp detach --stop <name>` with no job recorded stops a driver
   the project's own launcher started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id>
   folder, once its pid is verified (start time, user, project), gets a STOP file beside it, then SIGTERM and

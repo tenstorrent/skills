@@ -2472,3 +2472,110 @@ def test_stop_pids_also_stops_the_requeued_groups_of_the_listed_processes_job(en
         assert reused.poll() is None
     finally:
         _reap(driver, child, reused)
+
+
+def _check_report(p, marker=None):
+    """A check's report folder (checkdirs.reports, its TTP_RUN_DIR) whose allocation's owner.json names
+    `marker`, as a push or `ttp checks` run leaves them."""
+    from ttp import checkdirs
+    name = secrets.token_hex(16)
+    alloc = p.state / checkdirs.FOLDER / name
+    alloc.mkdir(parents=True)
+    (alloc / checkdirs.OWNER).write_text(json.dumps({"marker": str(marker) if marker else None}))
+    report = p.state / "check-reports" / name
+    report.mkdir(parents=True)
+    return report
+
+
+def test_a_sandboxed_checks_detached_job_is_started_by_the_daemon_and_outlives_the_check(env, tmp_path, monkeypatch):
+    """A push check run in the process sandbox (TTP_SANDBOX_CHECKS=1) starts `ttp detach gate -- ...` and
+    exits 75. The job is queued (the sandbox would end it with the check), the daemon starts it outside,
+    and it runs to its end and writes its .rc. It keeps the check's device masking, never the check's
+    own fd and reaper variables."""
+    from ttp import detach, sandbox
+    monkeypatch.setenv("TTP_DEVICE_NODES", "")
+    p = make(env)
+    marker = p.state / "pushes" / "m1.json"
+    marker.parent.mkdir(parents=True)
+    marker.write_text(json.dumps({"status": "running"}))
+    report = _check_report(p, marker)
+    hb, go, seen = tmp_path / "hb", tmp_path / "go", tmp_path / "env"
+    job = f"env >{shlex.quote(str(seen))}; while [ ! -e {shlex.quote(str(go))} ]; do echo beat >>{shlex.quote(str(hb))}; sleep 0.05; done"
+    check = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} detach gate -- sh -c {shlex.quote(job)}; exit 75"
+    e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report), "TTP_SANDBOX_CHECKS": "1",
+         "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": "", "TTP_CHECKS_TMP_FD": "9", "TTP_CHECK_SANDBOX": "tok"}
+    for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED"):
+        e.pop(k, None)
+    r = subprocess.run(sandbox.wrap(["sh", "-c", check], True, e), env=e, cwd=str(tmp_path),
+                       capture_output=True, text=True, timeout=60)
+    assert r.returncode == 75, r
+    rc = report / "gate.rc"
+    detach.tend(p)   # the daemon's tick
+    assert _wait_for_path(hb), "the job never ran outside the check"
+    go.touch()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0", (r.stdout, r.stderr)
+    got = dict(line.split("=", 1) for line in seen.read_text().splitlines() if "=" in line)
+    assert got.get("TTP_NO_DEVICE") == "1" and got.get("TT_VISIBLE_DEVICES") == ""
+    assert "TTP_CHECKS_TMP_FD" not in got and "TTP_CHECK_SANDBOX" not in got
+    assert _ttp_run(p, "detach", "--check", str(rc)).returncode == 0
+    detach.tend(p)   # the next tick
+    assert not list((p.state / detach.BOUND).glob("*.json")), "an ended job's bound record goes"
+
+
+def test_a_checks_queued_job_ends_at_its_bound_or_once_its_owner_marker_is_gone(env, tmp_path, monkeypatch):
+    """No task waits on a job a check queued: the daemon ends it at its bound (CHECK_JOB_S from its queueing)
+    or once the push marker or checks run that owns it is gone, whichever comes first, with the reason in its
+    .lost. Before either it keeps running through every tick."""
+    from ttp import detach, locks
+    monkeypatch.setenv("TTP_DEVICE_NODES", "")
+    p = make(env)
+    loop = ["sh", "-c", "while :; do sleep 0.05; done"]
+    jobs = {}
+    for name in ("gone", "late"):
+        marker = tmp_path / f"{name}.json"
+        marker.write_text("{}")
+        report = _check_report(p, marker)
+        rc = report / f"{name}.rc"
+        detach.enqueue(p.state, rc, report / f"{name}.log", loop, str(tmp_path), dict(os.environ),
+                       bound=detach.check_bound(str(marker)))
+        jobs[name] = (rc, marker)
+    detach.tend(p)
+    for rc, _ in jobs.values():
+        assert _wait_for_path(detach.started(rc))
+    detach.tend(p)
+    assert all(detach.state(rc)[0] == "running" for rc, _ in jobs.values())
+    jobs["gone"][1].unlink()
+    detach.tend(p)
+    rc = jobs["gone"][0]
+    assert detach.state(rc)[0] == "lost" and "is gone" in detach.lost(rc).read_text()
+    rc = jobs["late"][0]
+    assert detach.state(rc)[0] == "running"
+    detach.bound(p, now=time.time() + detach.CHECK_JOB_S + 1)
+    assert detach.state(rc)[0] == "lost" and "bound" in detach.lost(rc).read_text()
+    for rc, _ in jobs.values():
+        deadline = time.time() + 20
+        while time.time() < deadline and not locks.any_free([locks.job_lock(rc)]):
+            time.sleep(0.05)
+        assert locks.any_free([locks.job_lock(rc)]), "the stopped job's processes are gone"
+    assert not list((p.state / detach.BOUND).glob("*.json"))
+
+
+def test_a_cpu_only_checks_queued_job_sees_no_device_nodes(env, tmp_path, monkeypatch):
+    """A check that holds no device (TTP_NO_DEVICE=1) queues a job: the daemon starts it in the sandbox that
+    hides the device nodes, as the check's own commands were."""
+    from ttp import detach, sandbox
+    if sandbox.status()[0] is None:
+        pytest.skip("no process sandbox works on this host")
+    dev = tmp_path / "dev-tt"
+    dev.mkdir()
+    (dev / "0").write_text("")
+    monkeypatch.setenv("TTP_DEVICE_NODES", str(dev))
+    p = make(env)
+    report = _check_report(p)
+    out, rc = tmp_path / "seen", report / "hidden.rc"
+    detach.enqueue(p.state, rc, report / "hidden.log", ["sh", "-c", f"ls -A {shlex.quote(str(dev))} >{shlex.quote(str(out))}"],
+                   str(tmp_path), {**os.environ, "TTP_NO_DEVICE": "1"}, bound=detach.check_bound(None))
+    detach.tend(p)
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0", (report / "hidden.log").read_text()
+    assert out.read_text() == ""
+    assert (dev / "0").exists()

@@ -7323,8 +7323,14 @@ def cmd_detach(a) -> None:
         job_env.setdefault("TTP_PROJECT", str(state.parent))   # whose job it is (procowner)
     if getattr(a, "resumable", False):   # before it starts: a reboot right after still finds it
         detach.save_resume(rc, logf, cmd, os.getcwd(), job_env, boot_id())
+    # A push check's (its run dir is a check's report folder): its sandbox, a PID namespace, would end
+    # the job with the check, so the daemon starts it, bounded by its owner's life (detach.bound).
+    check = detach.check_owner(rd, os.environ.get("TTP_PROJECT")) if state is None else None
+    from . import sandbox
     if _boxed() and state is not None:   # this command's sandbox would end the job: the daemon starts it
         detach.enqueue(state, rc, logf, cmd, os.getcwd(), job_env)
+    elif check is not None and (_boxed() or sandbox.inside()):
+        detach.enqueue(check[0], rc, logf, cmd, os.getcwd(), job_env, bound=detach.check_bound(check[1]))
     else:
         # The job inherits this lock and holds it while any of its processes lives, so a job gone
         # without an .rc is told apart from one still running (detach.state).
@@ -7358,7 +7364,9 @@ def cmd_detach(a) -> None:
                                                getattr(a, "devices", None), getattr(a, "mem_gb", None),
                                                _job_base_env(state))})
     how = (f"(pid {pid})" if pid else
-           "(queued: this command's sandbox would end it, so the daemon starts it within seconds)")
+           "(queued: this command's sandbox would end it, so the daemon starts it within seconds"
+           + (f"; it ends after {detach.CHECK_JOB_S // 3600} h or once the push or checks run that ran this "
+              "check is gone, whichever comes first)" if check is not None else ")"))
     print(f"detached {a.name} {how}\nlog: {logf}\nrc:  {rc}\n"
           + (f"locks: {','.join(job_locks)} (taken all or nothing before the command starts, held until it "
              f"ends; a paused one ends the job with exit 75)\n" if job_locks else "")

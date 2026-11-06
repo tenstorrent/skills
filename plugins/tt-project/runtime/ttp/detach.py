@@ -10,8 +10,10 @@ A sandbox that runs each command in a PID namespace or a cgroup of its own can e
 command started once it returns, a new session or not: the job would die before its first line. As
 for `ttp push --detach`, a launcher that finds itself boxed (push._boxed) queues the job under
 state/detach-queue, with <name>.queued next to its .rc, and the daemon starts it outside the sandbox
-(tend). A job gone without an exit code gets <name>.lost holding why, so its probe and the next run
-read the reason, never a bare "gone".
+(tend). So does a push check or `ttp checks` command in the check's process sandbox (check_owner):
+no task owns its job, so bound() ends it at CHECK_JOB_S or once the push or checks run that owns the
+check is gone. A job gone without an exit code gets <name>.lost holding why, so its probe and the next
+run read the reason, never a bare "gone".
 
 Each request carries an id, which <name>.queued names too. The queue folder's .lock serializes
 publishing a request (enqueue), settling one (_settle) and telling whether one is pending (pending):
@@ -62,6 +64,8 @@ from .project import FOLDER, Project, durable_append, durable_write, nice_level,
 QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
 SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
 QUEUED_S = 900           # a queued job the daemon has not started by then is recorded as lost
+BOUND = "detach-bound"   # under the project's state: <run>-<name>.json per running job a check queued (bound)
+CHECK_JOB_S = 6 * 3600   # a job a check queued ends this long after it was queued, if its owner lasts that long
 RELAUNCH_CAP = 3         # default relaunches of a resumable job after reboots (budget.max_job_relaunches)
 FAILED_RC = 4            # `ttp detach --check`: every job ended, but one with an exit code other than 0 or none
 CHECK_RE = re.compile(r"\bdetach\s+--check\b")
@@ -157,7 +161,9 @@ def failed_logs(probe: str, cwd=None, limit: int = LOG_EXCERPT_CHARS) -> str:
 
 # Environment a queued job does not take from the run that queued it: the run's sandbox markers, and
 # secrets, which stay off disk (the daemon's own environment supplies them).
-_SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP")
+# Also a check's fds (its scratch guard, a push's run lock) and its reaper token (checkreap.MARKER):
+# meaningless where the daemon starts the job, and the token would have the check's reaper end it.
+_SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP", "TTP_CHECKS_TMP_FD", "TTP_PUSH_RUN_LOCK_FD", "TTP_CHECK_SANDBOX")
 _SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", re.I)
 # With TTP_ACTIVITY_LOG and TTP_ACTIVITY_ID set (unset before the job runs), the job's end is appended
 # to that project's activity log (activity.py).
@@ -253,13 +259,15 @@ def reap_children() -> int:
 
 
 def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *, checks: dict | None = None,
-            start_within: float | None = None) -> Path:
+            start_within: float | None = None, bound: dict | None = None) -> Path:
     """Queue the job for the daemon to start, replacing a request of the same job not started yet;
     returns the queue file. The request and its marker are published together, under the lock, the
     marker first: a signal between the two writes (a caller with other threads is not masked) leaves at
     most a marker without its request, which withdraw_unstarted and pending clear, never a request
     no marker names. `start_within` (seconds) gives the request its own start deadline in place of
-    QUEUED_S: one its caller stopped waiting for, even if killed without withdrawing it, never starts late."""
+    QUEUED_S: one its caller stopped waiting for, even if killed without withdrawing it, never starts late.
+    `bound` (check_bound) marks a job a check queued: the daemon starts it hiding the device nodes from a
+    CPU-only one and ends it at that bound (bound())."""
     rc = Path(rc)
     q = Path(state) / QUEUE / f"{rc.parent.name}-{rc.stem}.json"
     keep = _kept_env(env)
@@ -272,8 +280,63 @@ def enqueue(state: Path, rc: Path, log: Path, cmd: list, cwd: str, env: dict, *,
         durable_write(queued(rc), f"{q}\n{rid}\n")
         write_json(q, {"rc": str(rc), "log": str(log), "command": cmd, "cwd": cwd, "env": keep, "id": rid,
                        "queued": now, **({"checks": checks} if checks is not None else {}),
-                       **({"start_by": now + start_within} if start_within is not None else {})}, mode=0o600)
+                       **({"start_by": now + start_within} if start_within is not None else {}),
+                       **({"bound": bound} if bound is not None else {})}, mode=0o600)
     return q
+
+
+def check_owner(rd: Path, base: str | None) -> tuple[Path, str | None] | None:
+    """(the project's state, the marker of the push or `ttp checks` run that owns the check) when `rd` is
+    a check's report folder (checkdirs.reports) of project `base` (TTP_PROJECT), else None. The owner is
+    what the check allocation's owner.json names; None when it names none or cannot be read."""
+    from . import checkdirs
+    if not base or rd.parent.name != "check-reports":
+        return None
+    state = Project(base).state
+    if state.resolve() != rd.parent.parent:
+        return None
+    try:
+        marker = json.loads((state / checkdirs.FOLDER / rd.name / checkdirs.OWNER).read_text()).get("marker")
+    except (OSError, ValueError, AttributeError):
+        marker = None
+    return state, marker if isinstance(marker, str) and marker else None
+
+
+def check_bound(marker: str | None, now: float | None = None) -> dict:
+    """The bound of a job a check queues: CHECK_JOB_S from now, and the life of its owner's `marker`."""
+    return {"marker": marker, "until": (time.time() if now is None else now) + CHECK_JOB_S}
+
+
+def bound(p: Project, now: float | None = None) -> None:
+    """The daemon's pass over the running jobs checks queued (BOUND): no task waits on one, so jobstop
+    never ends it; this does, once its bound passed or the marker of its owner (the push or checks run
+    that ran the check) is gone, whichever comes first, with the reason in its .lost. A record of a job
+    that ended or is gone goes."""
+    now = time.time() if now is None else now
+    folder = p.state / BOUND
+    for f in sorted(folder.glob("*.json")) if folder.is_dir() else []:
+        try:
+            b = json.loads(f.read_text())
+            rc, marker, until = Path(b["rc"]), b.get("marker"), _num(b.get("until"))
+        except (OSError, ValueError, KeyError, TypeError, AttributeError):
+            f.unlink(missing_ok=True)
+            continue
+        if pending(rc):
+            continue   # not started yet
+        if not rc.exists() and not lost(rc).exists() and not locks.any_free([locks.job_lock(rc)]):
+            why = (f"its bound passed: a job a check queued runs at most {CHECK_JOB_S // 3600} h" if now > until
+                   else f"its owner {marker} (the push or checks run whose check queued it) is gone"
+                   if marker and not os.path.lexists(marker) else "")
+            if not why:
+                continue
+            try:
+                pid = int(started(rc).read_text().split()[0])
+            except (OSError, ValueError, IndexError):
+                continue   # not running its wrapper yet: the next tick
+            stop(rc, pid, why, reason="detach.bound", state=p.state)
+        elif not rc.exists():
+            state(rc)   # gone without an exit code: records why
+        f.unlink(missing_ok=True)
 
 
 def _kept_env(env: dict) -> dict:
@@ -880,13 +943,19 @@ def tend(p: Project) -> None:
             if lock is not None:   # else it already runs
                 try:
                     if _still_queued(q, rid):   # else withdrawn meanwhile (withdraw_unstarted): never start it
-                        pid = start(rc, log, list(m["command"]), m["cwd"], _job_env(m.get("env")), lock)
+                        cmd, env = list(m["command"]), _job_env(m.get("env"))
+                        if isinstance(m.get("bound"), dict):   # a check's: recorded first, so a crash leaves no unbounded job
+                            write_json(p.state / BOUND / q.name, {**m["bound"], "rc": str(rc)})
+                            from . import sandbox   # a CPU-only check's job sees no device node, as the check did
+                            cmd = sandbox.wrap(cmd, True, {k: v for k, v in env.items() if k != sandbox.ENV})
+                        pid = start(rc, log, cmd, m["cwd"], env, lock)
                         renice(pid, nice_level(p.config().get("runner"))[0])
                 except (OSError, ValueError, TypeError) as e:   # its folder went, say: never retried each tick
                     why = f"the daemon could not start it: {e}"
                 finally:
                     lock.close()
         _settle(q, rc, rid, why)
+    bound(p)
 
 
 def _num(v) -> float:
