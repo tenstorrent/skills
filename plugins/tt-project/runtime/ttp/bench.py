@@ -117,12 +117,40 @@ def _words(repo: Path, blob: str) -> frozenset[str]:
     return frozenset(re.findall(r"\w+", _blob(repo, blob).decode(errors="replace")))
 
 
-@functools.lru_cache(maxsize=4)   # a task's file versions: base and head of one or two files
-def _tree(repo: Path, blob: str) -> ast.Module | None:
+# A line that may start a top-level statement: not indented, not a comment, not a clause of the one
+# before it. A piece that splits a statement or a string does not parse and joins the next one.
+_TOP = re.compile(rb"^(?!(?:else|elif|except|finally|case)\b)[A-Za-z_@]", re.M)
+_PIECE_MAX = 1 << 15   # bytes a piece that does not parse may grow to before the whole file is parsed
+
+
+@functools.lru_cache(maxsize=1 << 16)
+def _piece(src: bytes) -> list | None:
     try:
-        return ast.parse(_blob(repo, blob))
+        return ast.parse(src).body
     except (SyntaxError, ValueError):
         return None
+
+
+@functools.lru_cache(maxsize=4)   # a task's file versions: base and head of one or two files
+def _tree(repo: Path, blob: str) -> ast.Module | None:
+    """`blob` parsed piece by piece, each top-level piece cached by its text: a new version of a
+    large test file parses only the pieces it changed (one parse of a 2 MB file takes about 1 s)."""
+    src = _blob(repo, blob)
+    cuts = [m.start() for m in _TOP.finditer(src)][1:] + [len(src)]
+    body, start = [], 0
+    for cut in cuts:
+        nodes = _piece(src[start:cut])
+        if nodes is not None:
+            body += nodes
+            start = cut
+        elif cut - start > _PIECE_MAX:   # each retry parses it all again: stop before that costs more
+            break
+    if start < len(src):   # no cut ends a statement: the file as a whole decides
+        try:
+            return ast.parse(src)
+        except (SyntaxError, ValueError):
+            return None
+    return ast.Module(body=body, type_ignores=[])
 
 
 @functools.lru_cache(maxsize=1024)

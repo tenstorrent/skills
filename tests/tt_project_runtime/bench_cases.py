@@ -187,3 +187,28 @@ def test_bench_prep_validates_fail_to_pass_tests_and_finds_landings_through_carr
     assert [t["task"] for t in unchecked["tasks"]] == [mixed, passes, broken, via]
     assert unchecked["validated"] is False and "test_cmd" not in unchecked
     assert unchecked["tasks"][0]["tests"] == ["tests/test_mod.py::test_same", "tests/test_mod.py::test_new"]
+
+
+def test_bench_parses_a_test_file_piece_by_piece_like_a_whole_parse(tmp_path, monkeypatch):
+    # Pieces split at unindented lines; one that splits a string, a bracket, a decorated def or an
+    # if/else does not parse and joins the next. The result equals one parse of the whole file, a
+    # file that does not parse gives None, and an unchanged piece of a new version is not parsed again.
+    from ttp import bench
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    src = ('"""Doc."""\nimport os\nX = """\nnot code\ndef nope(:\n"""\nY = [\n1,\n]\n@deco\n'
+           'def test_a():\n    pass\nif os:\n    Z = 1\nelse:\n    Z = 2\ntry:\n    pass\nexcept Exception:\n'
+           '    pass\nfinally:\n    pass\nclass TestB:\n    def test_b(self):\n        os.sep\n')
+    blob = lambda r, path: subprocess.run([*git, "rev-parse", f"{r}:{path}"], capture_output=True,
+                                          text=True).stdout.strip()
+    commit({"tests/test_p.py": src, "tests/test_bad.py": src + "def broken(:\n    pass\n",
+            "tests/test_big.py": "S = '''\n" + "word\n" * (bench._PIECE_MAX // 4) + "'''\ndef test_c():\n    pass\n"}, "p")
+    for path in ("tests/test_p.py", "tests/test_big.py"):
+        tree = bench._tree(repo, blob("HEAD", path))
+        assert ast.dump(tree) == ast.dump(ast.parse((repo / path).read_bytes()))
+    assert bench._tree(repo, blob("HEAD", "tests/test_bad.py")) is None
+    assert bench._tests_at(repo, blob("HEAD", "tests/test_p.py")) == {"test_a": [], "TestB.test_b": []}
+    parsed, parse = [], ast.parse
+    monkeypatch.setattr(bench.ast, "parse", lambda s, *a, **k: parsed.append(s) or parse(s, *a, **k))
+    commit({"tests/test_p.py": src + "def test_new():\n    pass\n"}, "p2")
+    assert "test_new" in bench._tests_at(repo, blob("HEAD", "tests/test_p.py"))
+    assert parsed == [b"def test_new():\n    pass\n"]
