@@ -17,8 +17,8 @@ files on that pool and prints one line per file done (DONE_RE, or --done-re). It
   shard still runs, on the one marked longest ago, rather than not at all.
 - Waiting: the time before the shard's first file (its job queue, environment setup, a tree sync) is
   recorded as a test-pool wait of its push check (checkwait, pool=True), as `ttp pool-wait` records one:
-  the check's time limit (delivery.push_checks_timeout_s) does not count it, its pool-wait bound
-  (delivery.push_pool_wait_s) and the stall window do.
+  the push log shows it, and it counts against the check's time limit (delivery.push_checks_timeout_s,
+  wall time), its pool-wait bound (delivery.push_pool_wait_s) and the stall window.
 
 The window: `checks.pool_shard_stall_s` (account settings, or TTP_POOL_SHARD_STALL_S) when set, else
 STALL_FACTOR times the median seconds per file this machine measured (the time between two files of one

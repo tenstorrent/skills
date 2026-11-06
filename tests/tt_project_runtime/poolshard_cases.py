@@ -99,32 +99,39 @@ def test_pool_shard_stall_mark_skips_the_pool_on_later_gates_until_it_shows_prog
     assert not ps._mark_path("pool-stuck").exists() and "\tclear\tpool-stuck\t" in (ps._dir() / ps.LOG).read_text()
 
 
-def test_pool_shard_time_before_its_first_file_is_not_counted_against_the_push_check_limit(tmp_path, monkeypatch):
-    """A shard whose job queues 4 s before its first file (the limit is 2 s) passes under `ttp pool-shard`: the
-    push counts that time as a test-pool wait. The same command run bare is ended at its limit."""
+def test_pool_shard_time_before_its_first_file_is_a_test_pool_wait_counted_against_the_push_check_limit(
+        tmp_path, monkeypatch):
+    """Time before a shard's first file is a test-pool wait of its push check: the push log shows it live and
+    once the check ends, and it counts against the check's time limit (delivery.push_checks_timeout_s counts
+    wall time, test-pool waits included). Under the limit the shard passes; a shard whose job queues past the
+    limit is ended at it, the log saying it was waiting for a test-pool slot."""
     from ttp import checkwait, push
     _pool_home(monkeypatch, tmp_path)
-    monkeypatch.setattr(push, "check_limit_s", 2.0)
     monkeypatch.setattr(push, "check_queue_s", 60.0)
     monkeypatch.setattr(push, "pool_wait_s", 4 * 3600.0)
     monkeypatch.setattr(push, "CHECK_POLL_S", 0.05)
-    shard = ["sh", "-c", "sleep 4; for f in a b; do echo \"PASS 0.1 s  tests/test_$f.py\"; done"]
+    monkeypatch.setattr(push, "POOL_SAY_S", 0.5)
 
-    def check(name, argv):
+    def check(name, queue_s, limit_s):
+        monkeypatch.setattr(push, "check_limit_s", limit_s)
+        shard = ["sh", "-c", f"sleep {queue_s}; for f in a b; do echo \"PASS 0.1 s  tests/test_$f.py\"; done"]
         waits = tmp_path / name
         waits.mkdir()
-        proc = subprocess.Popen(argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+        proc = subprocess.Popen([sys.executable, "-m", "ttp", "pool-shard", "--pool", "pool-a", "--window", "30",
+                                 "--", *shard], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                 env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_HOME": str(tmp_path / "home"),
                                      checkwait.ENV: str(waits)})
         said = []
         return push._timed_wait(proc, waits, name, said.append), "\n".join(said)
 
-    rc, said = check("sharded", [sys.executable, "-m", "ttp", "pool-shard", "--pool", "pool-a", "--window", "30",
-                                 "--", *shard])
+    rc, said = check("under", 2, 30.0)
     assert rc == 0, said
-    assert re.search(r"check waited [34] s for a test-pool slot, not counted against its time limit", said), said
-    rc, said = check("bare", shard)
-    assert rc == 124 and "check ran past its limit of 2 s" in said, said
+    assert re.search(r"check waiting for a test-pool slot: \d+ s so far, counted against its time limit", said), said
+    assert re.search(r"check waited [12] s for a test-pool slot, counted against its time limit", said), said
+    rc, said = check("past", 4, 2.0)
+    assert rc == 124, said
+    assert "check ran past its limit of 2 s and was ended" in said and "waiting for a test-pool slot:" in said, said
+    assert re.search(r"\(\d+ s counted, [12] s of it waiting for a test-pool slot", said), said
 
 
 def test_pool_shard_stall_window_comes_from_the_measured_seconds_per_file_with_a_floor(tmp_path, monkeypatch):

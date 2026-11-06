@@ -6046,7 +6046,7 @@ def cmd_pool_shard(a) -> None:
     """Run one shard of a project's own test pool on the first pool without a fresh stall mark; a shard
     that makes no file progress for its stall window is ended, its job cancelled, the pool marked, and its
     files run on the next pool (poolshard). The time before its first file is a test-pool wait of its push
-    check, not run time. Exits with the finished run's code, poolshard.STALLED when every pool stalled."""
+    check, counted against its time limit. Exits with the finished run's code, poolshard.STALLED when every pool stalled."""
     from . import poolshard
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd or not a.pool:
