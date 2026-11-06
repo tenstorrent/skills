@@ -1440,6 +1440,8 @@ class Batch:
         self.landed_at: dict[int, str] = {}    # entry index -> its own commit on the branch (pushed or landed)
         self._heads: dict[str, str] | None = None   # push.landed_heads, read once per batch
         self.check_run_dir = m.get("check_run_dir")
+        self.isolate = {str(c) for c in m.get("setup_isolate") or []}   # alerted setup_fault checks (pushq)
+        self.at = ""                            # the head _check runs on
         self.checks = {"runs": 0, "seconds": 0.0, "flaky": False}
         self.tip = self.pushed_sha = self.version = None
         self.reach: dict | None = None          # push.reach of what it pushed or found landed
@@ -1586,6 +1588,7 @@ class Batch:
             except setupfault.Infra as e:
                 # A check that failed before any test ran, again on its reruns (or no free pool slot): the
                 # host or its pool, never the entries; every one goes back, retried after setupfault.RETRY_S.
+                # A check the queue alerted on reaches here only from the tip alone or a pool (_run_check).
                 self.checks["setup_fault"] = {"check": e.check, **e.fault}
                 return self._all("requeued", "setup_fault", f"{e}; the batch is held, not failed, and retried later",
                                  keep=("landed", "refused"))
@@ -2200,6 +2203,7 @@ class Batch:
         if self.checks_at is None:
             self.checks_at = time.time()
         self._checkout(head)
+        self.at = head
         stale = push.stale_versions(self.wt, self.tip) if push.version_guard(self.d) else []
         if stale:
             msg = (f"{', '.join(stale)}: this change edits the plugin but keeps the version already on "
@@ -2310,7 +2314,10 @@ class Batch:
         workerloss.Infra: the host, never a failure of the batch's entries. A failure on a transient syntax
         error in a script outside the change runs once more too (syntaxfault); so again, it raises
         syntaxfault.Infra. One that failed before any test ran runs again up to setupfault.RERUNS times (a pool
-        with no free slot not at all); still so, it raises setupfault.Infra."""
+        with no free slot not at all); still so, it raises setupfault.Infra, unless the check is one whose
+        setup_fault holds the queue already alerted on (self.isolate) and it ran on a head with entries: then
+        its setup fault is that head's failed check, so the entry search isolates the entry it follows (the
+        tip alone failing so too, or a pool fault, still raises it: no entry's own)."""
         collect = workerloss.Collector()
 
         def once():
@@ -2332,6 +2339,9 @@ class Batch:
                 continue
             if rc != push.BUSY and (fault := setupfault.found(collect.setup, self.wt)):
                 if fault["kind"] == "pool" or setup >= setupfault.RERUNS:
+                    if fault["kind"] == "setup" and str(cmd) in self.isolate and self.at != self.tip:
+                        say(setupfault.isolate_line(fault, str(cmd)))
+                        return rc, f"{setupfault.isolate_line(fault, str(cmd))}\n{tail}"
                     raise setupfault.Infra(fault, str(cmd))
                 setup += 1
                 say(setupfault.rerun_line(fault, str(cmd), setup))

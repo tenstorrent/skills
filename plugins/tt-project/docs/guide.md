@@ -1666,7 +1666,11 @@ session and stateless coordinators on every provider.
   queue holds the batch (`setup_fault`) and tries it again after 10 min; held this way 3 times in a
   row on one check (`delivery.push_setup_fault_escalate_after`, 0 = off), one high
   `push_setup_fault` alert names the check, the fault lines and the batches, and clears once that
-  check passes or a batch pushes. It never counts as passed.
+  check passes or a batch pushes. Until it clears, that check's next setup fault on a batch head
+  is a failed check of that head instead of a hold: the batch's entry search sends back the entry
+  that brings it and pushes the rest, so one entry whose check names a missing dir or setup outside
+  the repository cannot hold every other approval. One on the tip alone (every head fails so) or no
+  free pool slot still holds the batch and blames no entry. It never counts as passed.
   Any test verdict in the output keeps a failure a failure. A gate of your own that knows it ran
   nothing can say so directly: exit 75. A job a check detaches makes its work dir inside the job,
   after it is detached, so it outlives the check (see `ttp detach` above).
@@ -2461,7 +2465,8 @@ session and stateless coordinators on every provider.
   transient syntax error in a script outside the change, one high `push_script_torn` alert names the
   check, the scripts and the batches; each check counts on its own, and the alert clears once that
   check passes or a batch pushes; 0 = off), `push_setup_fault_escalate_after` (default 3: the same
-  for batches held because one check failed before any test ran, after its reruns), `after_push`
+  for batches held because one check failed before any test ran, after its reruns; once alerted, that
+  check's next such fault isolates the entry that brings it instead), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
   (default 1800). A batch that ends without writing an outcome is retried with a growing pause,
   and three such batches in a row raise a high alert, unless the host rebooted while it ran: then

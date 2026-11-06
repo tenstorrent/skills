@@ -304,7 +304,9 @@ def _setup_text(cmd: str, rec: dict, b: dict, logs) -> str:
             f"{'; '.join(rec['seen']) or 'no fault line kept'}. Batches {', '.join(map(str, rec['runs']))} "
             f"(logs: {logs}/<batch>.log). The approvals stay queued and are retried every "
             f"{setupfault.RETRY_S // 60} min, but this fault keeps coming back: fix the host or test pool the "
-            f"check copies to (or the dir it names). This clears once that check passes or a batch pushes.")
+            f"check copies to (or the dir it names). Until then its next setup fault on a batch head isolates the "
+            f"entry that brings it, and the rest push; one on the tip alone still holds the batch. This clears "
+            f"once that check passes or a batch pushes.")
 
 
 # outcome: (pushq state key, its delivery setting, default, alert key, the hold's detail key, alert text)
@@ -342,6 +344,14 @@ def _held_told(p: Project, st: dict, b: dict, m: dict, now: float, outcome: str)
     else:
         st.pop(key, None)
     return later
+
+
+def _setup_isolate(db) -> list[str]:
+    """The checks whose setup_fault holds raised their push_setup_fault alert (_held_told) and not cleared since:
+    the batch (batch.Batch._run_check) treats their next setup fault on a head with entries as that head's
+    failed check, so the entry search isolates the entry it follows; on the tip alone, or a pool with no free
+    slot, it still holds the batch."""
+    return sorted(c for c, rec in (_state(db).get("setup") or {}).items() if isinstance(rec, dict) and rec.get("alerted"))
 
 
 def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
@@ -1408,6 +1418,8 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
             # due leaves these out of its urgent-first pick while the tip is this one: the batch never
             # stops its search for them (batch.Batch._yield_now), or the next batch would stop again
             m["yield_skip"] = {"tip": st_bad["tip"], "ids": list(st_bad["tried"])}
+        if iso := _setup_isolate(db):
+            m["setup_isolate"] = iso    # alerted setup_fault checks: their next setup fault isolates an entry
         if any(_detail(r).get("yielded") for r in rows):
             m["after_yield"] = True     # requeued by a batch that stopped for an urgent one: never again
         m["check_run_dir"] = str(checkdirs.new(p.state, marker, push.scratch_need(p, p.root)))
