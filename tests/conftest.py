@@ -425,8 +425,8 @@ class _WriteRecorder:
         else:
             texts, env = [args[-3]] + list(args[-2] or ()), args[-1]
         if env is not None:
-            env = {os.fsdecode(k): os.fsdecode(v) for k, v in dict(env).items()}
-            if "HOME" not in env:
+            raw, env = env, {os.fsdecode(k): os.fsdecode(v) for k, v in dict(env).items()}
+            if "HOME" not in env and not (event == "subprocess.Popen" and self.give_home(raw)):
                 self.record(self.home)
             for key, value in env.items():
                 own = set(self.env.get(key, "").split(os.pathsep))
@@ -435,6 +435,18 @@ class _WriteRecorder:
             if text is not None:
                 for m in self.found.finditer(os.fsdecode(os.fspath(text))):
                     self.wrote(m.group(0))
+
+    def give_home(self, env) -> bool:
+        """Puts the session's HOME (a temp folder) into a child's HOME-less env dict, so it does not fall
+        back to passwd's: Popen builds the child's env after this audit event (os.exec and os.posix_spawn
+        before theirs). False where it cannot: not a dict, or the session's HOME is the account's own."""
+        home = os.environ.get("HOME")
+        real = os.path.realpath(home) if home else None
+        if type(env) is not dict or not real or any(real == h or real.startswith(h + os.sep) for h in self.homes):
+            return False
+        as_bytes = any(isinstance(k, bytes) for k in env)
+        env[b"HOME" if as_bytes else "HOME"] = os.fsencode(home) if as_bytes else home
+        return True
 
     def record(self, path: str) -> None:
         if path in self.seen or not any(path == w or w.startswith(path + os.sep) or path.startswith(w + os.sep)

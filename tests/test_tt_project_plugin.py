@@ -1358,6 +1358,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        subprocess.run(['sh', '-c', f'printf x >> {REAL}/.zshrc'], check=True)\n"
         "def test_outside():\n"   # another process on the host changes the account's files meanwhile
         "    out = pathlib.Path(os.environ['OUT'])\n"
+        "    shown = subprocess.run(['sh', '-c', 'echo $HOME'], env={'PATH': os.environ['PATH']}, capture_output=True, text=True)\n"
+        "    assert shown.stdout.strip() == os.environ['HOME'] != REAL, shown.stdout\n"   # a HOME-less child: the temp HOME
         "    (out / 'ready').write_text('')\n"
         "    for _ in range(600):\n"
         "        if (out / 'done').exists():\n"
@@ -1517,6 +1519,17 @@ def test_the_session_records_only_its_own_writes_to_the_account_home(tmp_path, m
     assert record(("subprocess.Popen", (None, ["tool"], str(home), None))) == {str(home)}
     assert record(("subprocess.Popen", (None, ["tool"], None, {**base, "HOME": str(home)}))) == {str(home)}
     assert record(("os.posix_spawn", ("/bin/tool", ["tool"], {"PATH": "/usr/bin"}))) == {str(home)}
+    # A Popen child's HOME-less env dict gets the session's temp HOME instead: no fallback, nothing recorded.
+    # Not a dict, or the session's HOME is the account's own: the child may use the home folder.
+    bare, raw = {"PATH": "/usr/bin"}, {b"PATH": b"/usr/bin"}
+    assert record(("subprocess.Popen", (None, ["tool"], None, bare)), ("subprocess.Popen", (None, ["tool"], None, raw))) == set()
+    assert bare == {"PATH": "/usr/bin", "HOME": os.environ["HOME"]} and raw[b"HOME"] == os.fsencode(os.environ["HOME"])
+    assert record(("subprocess.Popen", (None, ["tool"], None, types.MappingProxyType({"PATH": "/usr/bin"})))) == {str(home)}
+    for session_home in (str(home), str(real), f"{home}/sub"):
+        monkeypatch.setenv("HOME", session_home)
+        assert record(("subprocess.Popen", (None, ["tool"], None, {"PATH": "/usr/bin"}))) == {str(home)}, session_home
+    monkeypatch.delenv("HOME")
+    assert record(("subprocess.Popen", (None, ["tool"], None, {"PATH": "/usr/bin"}))) == {str(home)}
     assert record(("os.exec", ("/bin/tool", ["tool", f"--config={home}/.codex"], base))) == {f"{home}/.codex"}
     # The verdict: a change below, at or above a recorded path is the session's; any other is a warning.
     before = {"home": c.home_marks(home), "home_path": str(home), "repo": None, "repo_path": str(tmp_path)}
