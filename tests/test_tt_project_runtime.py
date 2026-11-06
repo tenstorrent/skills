@@ -22389,7 +22389,7 @@ def _checks_killed_by_reboot(p, tmp_path, tid, boot="an-earlier-boot"):
     run_dir.mkdir(parents=True, exist_ok=True)
     (run_dir / cli.CHECKS_RC).unlink(missing_ok=True)
     (run_dir / cli.CHECKS_PID).write_text(json.dumps(
-        {"pid": 999999, "started": "gone", "ts": time.time() - 900, "boot": boot, "worktree": str(wt),
+        {"pid": _dead_pid(), "started": "gone", "ts": time.time() - 900, "boot": boot, "worktree": str(wt),
          "head": head, "cmd": ["--", "test -f app.py"], "fresh": True}))
     if not p.db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(run_dir))):
         p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,boot_id) VALUES(?,?,?,?,?,?,?,?)",
@@ -22476,7 +22476,7 @@ def test_checks_a_reboot_killed_are_not_restarted_on_a_moved_or_dirty_worktree(e
     # An old checks.pid that names no worktree, head or boot: woken as before.
     old = p.db.add_task("old", "s", kind="code", tier="light", origin="user")
     _, run_dir4 = _checks_killed_by_reboot(p, tmp_path, old)
-    (run_dir4 / cli.CHECKS_PID).write_text(json.dumps({"pid": 999999, "started": "gone", "ts": 1}))
+    (run_dir4 / cli.CHECKS_PID).write_text(json.dumps({"pid": _dead_pid(), "started": "gone", "ts": 1}))
     assert boot(old)
     assert not any(_relaunches(p, x) for x in (moved, dirty, gone, old))
 
@@ -28062,6 +28062,14 @@ def _detached_checks(run, capsys, *check):
     return json.loads((run / "checks.pid").read_text())["pid"]
 
 
+def _dead_pid():
+    """A pid proven dead: a child that exited and was reaped. A literal pid such as 999999 may name a
+    live process on a host with a large pid_max."""
+    proc = subprocess.Popen(["true"])
+    proc.wait()
+    return proc.pid
+
+
 def _gone_pid(pid):
     from ttp.daemon import _alive
     try:   # the detached checks are this test's child: reap them, or their zombie answers kill(pid, 0)
@@ -28905,7 +28913,7 @@ def test_an_orphan_queued_marker_is_cleared_by_the_probe_and_after_a_restart_or_
     tid, wt = _checks_wait_task(p, tmp_path, DONE_ON_PASS, rc=None)
     run = pathlib.Path(p.db.one("SELECT dir FROM runs WHERE task=?", (tid,))["dir"])
     head = subprocess.run(["git", "-C", str(wt), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
-    (run / cli.CHECKS_PID).write_text(json.dumps({"pid": 999999, "started": "1", "boot": "an-earlier-boot", "req": "x",
+    (run / cli.CHECKS_PID).write_text(json.dumps({"pid": _dead_pid(), "started": "1", "boot": "an-earlier-boot", "req": "x",
                                                   "worktree": str(wt), "head": head, "cmd": ["--", "true"]}))
     detach.queued(run / cli.CHECKS_RC).write_text(f"{p.state / detach.QUEUE / 'consumed.json'}\nx\n")
     d = Daemon(p.base)

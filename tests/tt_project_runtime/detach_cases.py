@@ -25,12 +25,6 @@ def _remote_job(tmp_path, **remote):
     return rc
 
 
-def _dead_pid():
-    proc = subprocess.Popen(["true"])
-    proc.wait()
-    return proc.pid
-
-
 def test_a_remote_hosts_changed_boot_id_is_a_reset_verdict(env, tmp_path, monkeypatch):
     from ttp import detach
     from ttp.runner import boot_id

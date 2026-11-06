@@ -1054,8 +1054,9 @@ def test_a_held_label_naming_a_kernel_thread_is_holder_unverifiable_and_its_run_
     monkeypatch.setattr(locks, "kthread", lambda pid, proc="/proc": int(pid) == kt)
     here = {"node": os.uname().nodename, "pidns": locks._pid_ns()}
     tid = p.db.add_task("Holder", "s", kind="work", tier="light", origin="coordinator")
-    rid = p.db.x("INSERT INTO runs(task, role, started, status, pid, boot_id) VALUES(?, 'worker', ?, 'ok', 999999, ?)",
-                 (tid, time.time(), boot_id()))
+    gone = _dead_pid()
+    rid = p.db.x("INSERT INTO runs(task, role, started, status, pid, boot_id) VALUES(?, 'worker', ?, 'ok', ?, ?)",
+                 (tid, time.time(), gone, boot_id()))
     lbl = f"task #{tid} (run {rid})"
     bad = {"holder": lbl, **here, "pid": kt}
     assert locks.pid_alive(bad) is None
@@ -1063,7 +1064,7 @@ def test_a_held_label_naming_a_kernel_thread_is_holder_unverifiable_and_its_run_
     good = {"holder": lbl, **here, "pid": os.getpid()}    # a valid label: unchanged
     assert locks.pid_alive(good) is True and locks._pid_note(good) == f", pid {os.getpid()} alive"
     note = locks._holder_note(bad, where=p)
-    assert f"holder unverifiable; pid 999999 gone (run {rid}'s worker)" in note, note
+    assert f"holder unverifiable; pid {gone} gone (run {rid}'s worker)" in note, note
     assert "stale" not in note      # its task is not done
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
     assert locks._holder_note(bad, where=p).endswith(f"; stale: task #{tid} is done")
@@ -2161,7 +2162,7 @@ def test_a_reused_pid_never_keeps_a_queue_entry_and_a_live_or_unjudgeable_waiter
         other_ns = ticket(3.0, {**me, "pid": 999999, "pidns": "pid:[1]"})   # another PID namespace: cannot tell
         other_host = ticket(4.0, {**me, "pid_start": "1", "node": me["node"] + "-elsewhere"})
         no_record = ticket(5.0, None)                              # an older runtime's ticket
-        gone = ticket(6.0, {**me, "pid": 999999})                  # no such process
+        gone = ticket(6.0, {**me, "pid": _dead_pid()})             # no such process
         mine = locks.enqueue(d, res, "mine", since=7.0)
         q = locks.queued(d, res)
         assert q == [live, other_ns, other_host, no_record, mine], q

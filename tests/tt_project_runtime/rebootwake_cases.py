@@ -130,7 +130,7 @@ def test_a_compound_probe_with_a_reboot_volatile_part_wakes_instead_of_relaunchi
     p = make(env)
     tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
     rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
-    _wait_on(p, tid, f"ttp detach --check {rc} && kill -0 999999")
+    _wait_on(p, tid, f"ttp detach --check {rc} && kill -0 {_dead_pid()}")
     _boot_daemon(p)
     assert _woken(p, tid), dict(p.db.task(tid))
     assert counter.read_text().split() == ["run"] and not _job_relaunches(p, tid)
