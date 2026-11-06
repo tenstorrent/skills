@@ -14,6 +14,9 @@ import types
 import pytest
 import yaml
 
+# pytester runs the scratch pytest sessions some tests need in this process, with the suite's own pytest.
+pytest_plugins = ["pytester"]
+
 PLUGIN = pathlib.Path(__file__).resolve().parents[1] / "plugins" / "tt-project"
 SKILLS = PLUGIN / "skills"
 RUNTIME = PLUGIN / "runtime" / "ttp"
@@ -2169,6 +2172,25 @@ def test_runs_without_a_device_never_open_one_through_tests():
     assert (SKILLS / "tt-project-harness" / "ttp_no_device.py").is_file()
 
 
+def _no_device_run(pytester, monkeypatch, env, *args):
+    """Run pytest on the scratch repo in this process with the suite's own pytest, not a child
+    `python -m pytest`: a child imports whatever pytest the host has on disk at that moment (a shared
+    user site another tool's pip had just replaced made it load an older system pytest and crash on an
+    autoloaded third-party plugin), and plugin autoload is off so no installed plugin joins the run."""
+    for k in [k for k in os.environ if k.startswith(("TTP_", "PYTEST_"))]:
+        monkeypatch.delenv(k)
+    monkeypatch.setenv("PYTEST_DISABLE_PLUGIN_AUTOLOAD", "1")
+    for k, v in env.items():
+        monkeypatch.setenv(k, v)
+    r = pytester.runpytest_inprocess("-p", "no:cacheprovider", *args)
+    return r, {ln.split("::")[1] for ln in r.outlines if "::" in ln}
+
+
+def _no_device_repo(pytester):
+    pytester.syspathinsert()
+    (pytester.path / "ttp_no_device.py").write_bytes((SKILLS / "tt-project-harness" / "ttp_no_device.py").read_bytes())
+
+
 @pytest.mark.parametrize("no_device, fixtures, expect", [
     (None, None, {"test_cpu", "test_dev", "test_indirect", "test_marked"}),
     ("0", None, {"test_cpu", "test_dev", "test_indirect", "test_marked"}),
@@ -2176,52 +2198,60 @@ def test_runs_without_a_device_never_open_one_through_tests():
     ("1", "board_*", {"test_cpu", "test_dev", "test_indirect", "test_marked"}),
 ])
 def test_the_no_device_pytest_plugin_deselects_device_tests_only_under_ttp_no_device(
-        tmp_path, no_device, fixtures, expect):
-    import subprocess
-    import shutil
-    shutil.copy(SKILLS / "tt-project-harness" / "ttp_no_device.py", tmp_path / "ttp_no_device.py")
-    (tmp_path / "conftest.py").write_text(
+        pytester, monkeypatch, no_device, fixtures, expect):
+    _no_device_repo(pytester)
+    pytester.makeconftest(
         'import pytest\npytest_plugins = ["ttp_no_device"]\n\n'
         '@pytest.fixture\ndef mesh_device():\n    raise RuntimeError("opened a device")\n\n'
         '@pytest.fixture\ndef model(mesh_device):\n    return mesh_device\n')
-    (tmp_path / "test_x.py").write_text(
+    pytester.makepyfile(test_x=
         "import pytest\n\ndef test_cpu():\n    pass\n\ndef test_dev(mesh_device):\n    pass\n\n"
         "def test_indirect(model):\n    pass\n\n@pytest.mark.hw\ndef test_marked():\n    pass\n")
-    (tmp_path / "pytest.ini").write_text("[pytest]\nmarkers =\n    hw: needs hardware\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_", "PYTEST_"))}
+    pytester.makeini("[pytest]\nmarkers =\n    hw: needs hardware\n")
+    env = {}
     if no_device is not None:
         env["TTP_NO_DEVICE"] = no_device
     if fixtures is not None:
         env["TTP_DEVICE_FIXTURES"] = fixtures
-    r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"],
-                       cwd=tmp_path, env=env, capture_output=True, text=True)
-    got = {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln}
-    assert got == expect, r.stdout + r.stderr
+    r, got = _no_device_run(pytester, monkeypatch, env, "--collect-only", "-q")
+    assert got == expect, r.stdout.str() + r.stderr.str()
     if no_device == "1" and fixtures is None:
-        assert "2 deselected" in r.stdout, r.stdout
+        assert "2 deselected" in r.stdout.str(), r.stdout.str()
         # Markers are configurable too, and an exact id that needs a device is not run.
-        r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "-q", "test_x.py::test_dev"],
-                           cwd=tmp_path, env={**env, "TTP_DEVICE_MARKERS": "hw"}, capture_output=True, text=True)
-        assert r.returncode == 5 and "opened a device" not in r.stdout, r.stdout
-        assert "ttp_no_device: deselected 1 device test" in r.stdout, r.stdout
-        r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"],
-                           cwd=tmp_path, env={**env, "TTP_DEVICE_MARKERS": "hw"}, capture_output=True, text=True)
-        assert {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln} == {"test_cpu"}, r.stdout
+        env["TTP_DEVICE_MARKERS"] = "hw"
+        r, _ = _no_device_run(pytester, monkeypatch, env, "-q", "test_x.py::test_dev")
+        assert r.ret == 5 and "opened a device" not in r.stdout.str(), r.stdout.str()
+        assert "ttp_no_device: deselected 1 device test" in r.stdout.str(), r.stdout.str()
+        r, got = _no_device_run(pytester, monkeypatch, env, "--collect-only", "-q")
+        assert got == {"test_cpu"}, r.stdout.str()
 
 
-def test_the_no_device_pytest_plugin_deselects_hardware_markers_by_default(tmp_path):
-    import subprocess
-    import shutil
-    shutil.copy(SKILLS / "tt-project-harness" / "ttp_no_device.py", tmp_path / "ttp_no_device.py")
-    (tmp_path / "conftest.py").write_text('pytest_plugins = ["ttp_no_device"]\n')
-    (tmp_path / "test_x.py").write_text(
+def test_the_no_device_pytest_plugin_deselects_hardware_markers_by_default(pytester, monkeypatch):
+    _no_device_repo(pytester)
+    pytester.makeconftest('pytest_plugins = ["ttp_no_device"]\n')
+    pytester.makepyfile(test_x=
         "import pytest\n\ndef test_cpu():\n    pass\n\n@pytest.mark.requires_hardware\ndef test_hw():\n    pass\n\n"
         "@pytest.mark.device\ndef test_dev():\n    pass\n\n@pytest.mark.silicon\ndef test_si():\n    pass\n")
-    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_", "PYTEST_"))}
     for no_device, expect in (("1", {"test_cpu"}), ("0", {"test_cpu", "test_hw", "test_dev", "test_si"})):
-        r = subprocess.run([sys.executable, "-m", "pytest", "-p", "no:cacheprovider", "--collect-only", "-q"],
-                           cwd=tmp_path, env={**env, "TTP_NO_DEVICE": no_device}, capture_output=True, text=True)
-        assert {ln.split("::")[1] for ln in r.stdout.splitlines() if "::" in ln} == expect, r.stdout + r.stderr
+        r, got = _no_device_run(pytester, monkeypatch, {"TTP_NO_DEVICE": no_device}, "--collect-only", "-q")
+        assert got == expect, r.stdout.str() + r.stderr.str()
+
+
+def test_the_no_device_plugin_tests_use_the_suites_own_pytest_not_the_one_on_disk(pytester, monkeypatch, tmp_path):
+    """A pytest on the import path that a child process would load (here one that cannot import, as when
+    another tool's pip swapped the host's pytest mid-run) does not reach these tests' runs."""
+    broken = tmp_path / "other-pytest"
+    for pkg in ("pytest", "_pytest"):
+        (broken / pkg).mkdir(parents=True)
+        (broken / pkg / "__init__.py").write_text('raise ImportError("a different pytest on disk")\n')
+        (broken / pkg / "__main__.py").write_text('raise ImportError("a different pytest on disk")\n')
+    monkeypatch.setenv("PYTHONPATH", str(broken))
+    _no_device_repo(pytester)
+    pytester.makeconftest('pytest_plugins = ["ttp_no_device"]\n')
+    pytester.makepyfile(test_x="import pytest\n\ndef test_cpu():\n    pass\n\n@pytest.mark.device\ndef test_dev():\n    pass\n")
+    r, got = _no_device_run(pytester, monkeypatch, {"TTP_NO_DEVICE": "1", "PYTHONPATH": str(broken)},
+                            "--collect-only", "-q")
+    assert got == {"test_cpu"}, r.stdout.str() + r.stderr.str()
 
 
 def test_worker_prompt_detached_driver_retries_transient_faults():
