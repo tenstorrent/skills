@@ -176,6 +176,23 @@ def test_runwatch_falls_back_to_progress_and_git_for_a_provider_without_activity
     assert e["spend"]["share"] is None and e["steer"] is None
 
 
+def test_runwatch_git_read_takes_no_index_lock_in_a_workers_worktree(env, tmp_path):
+    """A plain `git status` refreshes a stat-dirty index and rewrites it under index.lock, which can
+    fail the worker's own `git add`/`commit` running at the same moment; the observer reads only."""
+    from ttp import runwatch
+    p = make(env)
+    p.set_config("delivery.base_ref", "main")
+    wt = _rw_repo(tmp_path)
+    f, index = wt / "committed.py", wt / ".git" / "index"
+    later = index.stat().st_mtime_ns + 5_000_000_000
+    os.utime(f, ns=(later, later))      # tracked file newer than its index entry: status would refresh
+    before = index.stat().st_mtime_ns
+    _, rid = _rw_run(p, "fake", p.runs / "rw-lock", cwd=wt, budget=None)
+    e = runwatch.tick(p)["runs"][str(rid)]
+    assert e["files"] == ["committed.py", "heredoc.py"]
+    assert index.stat().st_mtime_ns == before, "runwatch's git read rewrote the worker's index"
+
+
 def test_runwatch_marks_a_vanished_run_dir_and_skips_the_coordinator(env, tmp_path):
     from ttp import runwatch
     p = make(env)

@@ -14,6 +14,7 @@ wall limit used; its attempt; and whether it read the last update written to its
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import time
 from pathlib import Path
@@ -137,8 +138,11 @@ def _tools(provider: str, out: Path, old: dict, now: float) -> dict:
 
 
 def _git(cwd: str, *args: str) -> str | None:
+    # GIT_OPTIONAL_LOCKS=0: a plain status refreshes and rewrites a worker's index under index.lock,
+    # which fails the worker's own add/commit running at the same moment; the observer only reads.
     try:
-        r = gitmemo.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=20)
+        r = gitmemo.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=20, read=True,
+                        stdin=subprocess.DEVNULL, env={**os.environ, "GIT_OPTIONAL_LOCKS": "0"})
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None
