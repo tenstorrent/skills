@@ -226,6 +226,52 @@ def test_a_blocked_user_namespace_names_the_setting_that_allows_it(tmp_path, mon
     assert sandbox.status() == (None, why)
 
 
+def _fake_unshare(tmp_path, monkeypatch, body: str):
+    from ttp import sandbox
+    monkeypatch.setattr(sandbox, "_STATE", {})
+    fake = tmp_path / "bin" / "unshare"
+    fake.parent.mkdir(exist_ok=True)
+    fake.write_text("#!/bin/sh\n" + body)
+    fake.chmod(0o755)
+    monkeypatch.setattr(sandbox.shutil, "which", lambda name, *a, **k: str(fake) if name == "unshare" else None)
+    return sandbox, fake
+
+
+def test_a_probe_that_ended_during_a_stall_past_its_deadline_finds_the_sandbox(tmp_path, monkeypatch):
+    """A stall (a loaded host) freezes the caller past the probe's deadline while the probe ends: the first
+    wait times out with the answer already there. That is no verdict: the sandbox works."""
+    sandbox, fake = _fake_unshare(tmp_path, monkeypatch, "exit 0\n")
+    stalls = []
+
+    class Stalled(subprocess.Popen):
+        def communicate(self, input=None, timeout=None):
+            if timeout is not None and not stalls:
+                stalls.append(self.wait())   # the command ended while this process stood still
+                raise subprocess.TimeoutExpired(self.args, timeout)
+            return super().communicate(input, timeout)
+
+    monkeypatch.setattr(sandbox.subprocess, "Popen", Stalled)
+    pre, why = sandbox.status()
+    assert stalls == [0] and pre and pre[0] == str(fake), why
+
+
+def test_a_timed_out_probe_is_not_kept_and_the_next_call_probes_again(tmp_path, monkeypatch):
+    """A probe still running at its deadline (twice) reads as no sandbox for that call only: nothing kept,
+    the next call probes again and finds it, so one slow moment never runs every later command unsandboxed.
+    A probe that answers is kept."""
+    flag = tmp_path / "slow"
+    flag.write_text("")
+    sandbox, fake = _fake_unshare(tmp_path, monkeypatch, f'[ -e {shlex.quote(str(flag))} ] && exec sleep 30\nexit 0\n')
+    monkeypatch.setattr(sandbox, "PROBE_S", 0.3)
+    pre, why = sandbox.status()
+    assert pre is None and sandbox._STATE == {}, "a timed-out probe is kept"
+    assert "still running" in why, why
+    flag.unlink()
+    assert sandbox.status()[0][0] == str(fake)
+    fake.write_text("#!/bin/sh\nexit 1\n")
+    assert sandbox.status()[0][0] == str(fake), "an answer is kept for the process"
+
+
 def test_ttp_checks_reports_a_push_check_that_opts_out_of_the_sandbox(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, sandbox
     monkeypatch.setenv(sandbox.ENV, "1")

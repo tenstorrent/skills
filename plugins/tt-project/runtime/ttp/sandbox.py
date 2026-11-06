@@ -31,6 +31,7 @@ from pathlib import Path
 
 INIT = Path(__file__).with_name("sandbox_init.py")
 PROBE_S = 20
+TIMED_OUT = f"still running {2 * PROBE_S} s after its start"
 # The sysctls that turn unprivileged user namespaces off: (name, value that does, what turns them on).
 SETTINGS = (("kernel.apparmor_restrict_unprivileged_userns", "1",
              "set it to 0, or give unshare or bwrap an AppArmor profile that allows user namespaces"),
@@ -83,26 +84,51 @@ def _probe() -> tuple[list[str] | None, str]:
     errors = []
     for name, pre in tools:
         try:
-            r = subprocess.run([*pre, *_init(), *test], stdin=subprocess.DEVNULL, capture_output=True,
-                               text=True, timeout=PROBE_S)
+            rc, err = _run_probe([*pre, *_init(), *test])
         except (OSError, subprocess.SubprocessError) as e:
             errors.append(f"{name}: {e}")
             continue
-        if r.returncode == 0:
+        if rc == 0:
             return pre, ""
-        last = (r.stderr.strip().splitlines() or [f"exit {r.returncode}"])[-1]
+        last = TIMED_OUT if rc is None else (err.strip().splitlines() or [f"exit {rc}"])[-1]
         errors.append(f"{name}: {last}")
     why = "; ".join(errors)
     return None, (f"{setting} ({why})" if (setting := _setting()) else why)
 
 
+def _run_probe(argv: list[str]) -> tuple[int | None, str]:
+    """(exit code, stderr) of a probe command; None for one still running at its second deadline.
+    A stall that freezes this process past a deadline makes communicate() time out even on a command
+    that ended meanwhile; the next deadline reads that one's answer at once."""
+    proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True)
+    try:
+        for _ in range(2):
+            try:
+                _, err = proc.communicate(timeout=PROBE_S)
+                return proc.returncode, err
+            except subprocess.TimeoutExpired:
+                pass
+        return None, ""
+    finally:   # hung or interrupted: never left running; a child holding the pipes never blocks this
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        for f in (proc.stdout, proc.stderr):
+            f.close()
+
+
 def status() -> tuple[list[str] | None, str]:
     """(the argv prefix that sandboxes a command, "") where a sandbox works, else (None, why).
-    Probed once per process and PATH."""
+    Probed once per process and PATH; a probe that timed out (a loaded host, say) is no verdict: the
+    next call probes again, so a slow moment never runs every later command of the process unsandboxed."""
     key = os.environ.get("PATH", "")
-    if key not in _STATE:
-        _STATE[key] = _probe()
-    return _STATE[key]
+    if key in _STATE:
+        return _STATE[key]
+    got = _probe()
+    if TIMED_OUT not in got[1]:
+        _STATE[key] = got
+    return got
 
 
 def inside() -> bool:
