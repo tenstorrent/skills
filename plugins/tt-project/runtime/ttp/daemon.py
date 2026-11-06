@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import sidefx
 from . import pausegone
 from . import urgentfup
 from . import topup
@@ -4303,6 +4304,25 @@ class Daemon:
                                     "usd_after": round(sum(c[2] for c in changed), 6)})
         return changed
 
+    def _outside_writes(self, r: dict, run_dir: Path) -> None:
+        """A run that ended without a valid hand-off: what it touched outside its working directory and
+        run dir goes to its outside.json (its task's next run reads it) and, once, to the coordinator
+        (sidefx.py)."""
+        db = self.p.db
+        try:
+            cwd = str((json.loads((run_dir / "run.json").read_text()) or {}).get("cwd") or "")
+            rec = sidefx.record(run_dir, r["id"], cwd)
+            fp = f"{sidefx.KIND}:{r['id']}"
+            if not rec or db.one("SELECT 1 FROM events WHERE fingerprint=?", (fp,)):
+                return
+            task = db.task(r["task"]) or {"id": r["task"], "title": ""}
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?,?)",
+                 (time.time(), "daemon", sidefx.KIND, fp, "high" if rec["high"] else "normal",
+                  sidefx.event_text(task, rec), json.dumps({"run": r["id"], "paths": [f["path"] for f in rec["found"]]}),
+                  "queued", r["task"]))
+        except Exception:   # the scan only discloses: a failure never costs the run its end
+            log(self.p, f"run {r['id']}: outside-writes scan failed\n" + traceback.format_exc())
+
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
         held = ""
@@ -4400,6 +4420,8 @@ class Daemon:
         # A run without its system prompt never stands on its hand-off: it is held and the task blocked.
         handed_off = r["role"] != "coordinator" and refused != "instructions_missing" and \
             (_read_result(run_dir / RESULT_FILE) or {}).get("status") in HANDOFF_STATES
+        if r["role"] != "coordinator" and r["task"] and not handed_off:
+            self._outside_writes(r, run_dir)
         if status == "timeout" and handed_off:
             cut_off, status = status, "ok"   # it handed off before the clock ran out: the work is done, not wasted
         if usage.limited:

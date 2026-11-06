@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
-from . import preempt, streamguard
+from . import preempt, sidefx, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -832,6 +832,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
         if not str(prev.get("retry_when") or "").strip():
             history += ("The last hand-off gave no `retry_when`, so only a model run could check this wait. "
                         "If you hand off `waiting` again, give one.\n")
+    history += outside_line(p, task)
     # A review with a push step run while a setting hold stands: review only, then blocked.
     history += settinghold.prompt_line(p.db, cfg, task, p.root)
     if branch:
@@ -920,6 +921,14 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
     parts.append(ctxblock.prompt_block(p, dict(task), "\n".join(parts), _system_memory(p)))
     parts.append(restrictions_pointer(p))
     return "\n\n".join(x for x in parts if x.strip())
+
+
+def outside_line(p: Project, task: dict) -> str:
+    """The task's last ended run, when it ended without a hand-off: what it touched outside its folders
+    (sidefx.py, its run dir's outside.json), or ''."""
+    last = p.db.one("SELECT id, dir FROM runs WHERE task=? AND role!='coordinator' AND status!='running' "
+                    "ORDER BY id DESC LIMIT 1", (task["id"],))
+    return sidefx.prompt_block(Path(last["dir"]) if last["dir"] else p.runs / str(last["id"])) if last else ""
 
 
 def _system_memory(p: Project) -> set[str]:
