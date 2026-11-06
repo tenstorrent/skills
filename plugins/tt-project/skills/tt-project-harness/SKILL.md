@@ -83,6 +83,7 @@ read the one for the lever you change.
 | Superseded reviews | A failed or `changes_needed` review closes as superseded (verdict kept) once a later re-review in its chain passes, model-free; by hand, `ttp task <name> superseded <id> --by-review <passed re-review id>` or `ttp task <name> superseded <id> <covering commit> [--ref <ref>]`. No evidence, an unreachable commit or a failed or unrelated re-review is refused. Superseded reviews leave the open lists and the unhandled-failed-review check. |
 | Evidence manifests | A hash-pinned manifest names only immutable artifacts and receipts, never a mutable queue, outbox or growing log; queued, recorded and delivered stay distinct. See [references/evidence-manifests.md](references/evidence-manifests.md) |
 | A project's own checks on gh calls | Executables in `bin/gh.d/`, never edits to `bin/gh` (the template's, replaced on upgrade); they can only refuse. See [references/gh-pre-hooks.md](references/gh-pre-hooks.md) |
+| A project's own tool guards | Python files listed in project.json `guards.local`, outside runtime/ and prompts/; never edits to `runtime/ttp/hook.py` (an upgrade conflicts on them). See [references/local-guards.md](references/local-guards.md) |
 | Web app | `runtime/ttp/web/` |
 | Runtime behavior | `runtime/ttp/*.py` (last resort) |
 

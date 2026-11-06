@@ -243,6 +243,17 @@ only in the feed and never under "needs you".
   independently reviewable tasks, each with its own tests: in measured runs such diffs failed
   review about twice as often as those under 100. The daily review's `reviews finished` line counts reviews and
   failures by all diff lines and by non-test lines (tests, docs and changesets left out).
+- Local tool guards (`guards.local`, empty by default): the project's own rules on tool calls, the one
+  supported place for them. Never edit `runtime/` files for a guard: an edited `runtime/ttp/hook.py` makes
+  `ttp upgrade` conflict and leaves the project on an old release. List Python files by path from the
+  harness folder, kept outside `runtime/` and `prompts/` (for example `guards/no_prod_restart.py`), so an
+  upgrade never touches them. Each defines `refusal(cmd)`, asked about every shell command, returning the
+  reason it refuses or None, and may define `tool_refusal(tool, tool_input)` for other tool calls (file edits,
+  connector calls). The worker hook asks them after the built-in guards, as does a session coordinator's tool
+  check; a refusal blocks the call and is logged with kind `local:<file>`. A listed guard is never skipped: a
+  file that is missing, does not import, has no `refusal` or raises refuses the calls it checks, naming itself
+  and the error. Only a harness task edits a listed guard file. `ttp doctor` shows each guard and whether it
+  loads. See the harness skill's references/local-guards.md.
 - Hand-off checks (`worker.handoff_checks`, unset by default): the project's own model-free commands
   the daemon runs on each worker's hand-off before it accepts it, posts its `reply_chat` reply or
   queues its review or push. Each entry is `{"name", "run", "timeout_s" (60), "kinds"}` (`kinds`: the
