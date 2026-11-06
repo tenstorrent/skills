@@ -46,7 +46,7 @@ def test_codex_isolated_worker_keeps_the_installed_tt_project_skills(env, monkey
     assert _codex_plugin_table(iso) == {"tt-project@tenstorrent-skills": {"enabled": True}}
     # The config's own plugins held the hook back; the isolated run gets it back, the plugin enabled.
     assert "--dangerously-bypass-hook-trust" in iso and set(_codex_hook_commands(iso + ["-"])) == {"PreToolUse",
-                                                                                                    "PostToolUse"}
+                                                                                                    "PostToolUse", "Stop"}
     # A run that reads config.toml loads the plugin from there: a whole table would replace the user's.
     assert _codex_plugin_table(argv) is None
     coord = get_provider("codex").build(role="coordinator", model="", effort="", cwd=str(tmp_path), budget_usd=None,
