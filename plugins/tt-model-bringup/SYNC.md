@@ -86,6 +86,13 @@ Every CV stage scopes Git commands and file inventories to the current generated
 directory or an authorized upstream reference. Repository-wide discovery commands are
 forbidden because they can reveal pre-existing implementations under forbidden roots.
 
+## CV contract and README disclosures (0.2.3)
+
+New CV contracts use schema two. They record the user's pinned-versus-generic configuration
+choice and structured licensing policy for every external asset. Existing schema-one contracts
+remain readable for resuming earlier runs. Generated READMEs disclose restricted or unknown terms
+and link Torch-inspected structures for every supported configuration.
+
 ## Trace allocation guidance (0.1.19)
 
 Adapt the six-skill policy change from [tt-metal #54769](https://github.com/tenstorrent/tt-metal/pull/54769),

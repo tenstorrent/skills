@@ -12,6 +12,8 @@ Completion requirements:
 - Record supported shapes, batches, state and topology.
 - Record host preprocessing and postprocessing boundaries.
 - Record unsupported operators, modes and serving limits.
+- Preserve configuration scope and supported configuration names.
+- Preserve license, commercial-use and redistribution disclosures.
 - Write a customer-readable readiness report under MODEL_DIR/doc/release/.
 - Run $stage-review; fix findings; obtain `clean-pass`.
 - Commit stage-owned changes locally; never push.

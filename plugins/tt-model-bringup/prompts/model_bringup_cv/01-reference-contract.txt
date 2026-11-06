@@ -9,12 +9,19 @@ Scope every Git command and file inventory to MODEL_DIR or an authorized upstrea
 Completion requirements:
 - Validate MODEL_CONTRACT with the packaged checker.
 - Confirm upstream source and weight revisions are immutable.
+- Confirm configuration scope came from an explicit user choice.
+- Reject inferred scope from checkpoint or directory names.
 - Confirm reference checkout HEAD matches the pinned source commit.
 - Confirm weight SHA-256 or the complete digest manifest.
 - Confirm category, task, state and raw outputs.
 - Record boundaries, risks and numeric acceptance thresholds.
+- Record source, weight, checkpoint and dataset license policies.
+- Mark unknown commercial or redistribution terms explicitly.
 - Write MODEL_DIR/doc/reference/source_manifest.json.
 - Write MODEL_DIR/doc/reference/golden_plan.md.
+- Instantiate every contract-supported upstream PyTorch configuration.
+- Write one generated torch_model_structure_<config>.txt per configuration.
+- Record exact structure-generation commands and upstream revision.
 - Do not start TTNN implementation or device work.
 - Run $stage-review; fix findings; obtain `clean-pass`.
 - Commit stage-owned changes locally; never push.

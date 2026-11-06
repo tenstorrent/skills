@@ -31,7 +31,9 @@ SERVING_MODES = {"none", "task-api", "vllm"}
 STATE_MODES = {"stateless", "temporal", "iterative", "kv-cache"}
 IMMUTABLE_REVISION = re.compile(r"^[0-9a-f]{40}$")
 WEIGHTS_DIGEST = re.compile(r"^(?:sha256:[0-9a-f]{64}|manifest:[A-Za-z0-9_./-]+)$")
-TOP_LEVEL_KEYS = {"schema_version", "model", "execution", "paths", "validation"}
+SCHEMA_VERSIONS = {1, 2}
+TOP_LEVEL_KEYS_V1 = {"schema_version", "model", "execution", "paths", "validation"}
+TOP_LEVEL_KEYS_V2 = {*TOP_LEVEL_KEYS_V1, "assets"}
 MODEL_KEYS = {
     "name",
     "category",
@@ -43,6 +45,23 @@ MODEL_KEYS = {
     "weights_digest",
     "weights_file",
 }
+MODEL_KEYS_V2 = {*MODEL_KEYS, "config_scope"}
+CONFIG_SCOPE_KEYS = {"mode", "configs", "selection_source"}
+CONFIG_SCOPE_MODES = {"pinned", "generic"}
+CONFIG_SELECTION_SOURCES = {"explicit-user-choice"}
+ASSET_KEYS = {
+    "kind",
+    "name",
+    "source",
+    "license",
+    "license_url",
+    "commercial_use",
+    "redistribution",
+    "included_in_package",
+    "notes",
+}
+ASSET_KINDS = {"source", "weights", "checkpoint", "dataset", "other"}
+ASSET_POLICIES = {"allowed", "restricted", "unknown"}
 EXECUTION_KEYS = {"profile", "topology", "serving", "state", "multichip_reason"}
 PATH_KEYS = {"reference_root", "weights_root", "target_dir", "write_root", "forbidden_read_roots"}
 VALIDATION_KEYS = {
@@ -111,6 +130,60 @@ def _strings(parent: dict[str, Any], key: str, prefix: str, *, required: bool) -
     return [item.strip() for item in value]
 
 
+def _config_scope(model: dict[str, Any]) -> None:
+    scope = _mapping(model, "config_scope")
+    _reject_unknown(scope, CONFIG_SCOPE_KEYS, "model.config_scope")
+    mode = _choice(scope, "mode", "model.config_scope", CONFIG_SCOPE_MODES)
+    configs = _strings(scope, "configs", "model.config_scope", required=True)
+    _choice(scope, "selection_source", "model.config_scope", CONFIG_SELECTION_SOURCES)
+    if len(configs) != len(set(configs)):
+        raise ContractError("model.config_scope.configs must not contain duplicates")
+    if mode == "pinned" and len(configs) != 1:
+        raise ContractError("pinned config scope requires exactly one config")
+    if mode == "generic" and len(configs) < 2:
+        raise ContractError("generic config scope requires at least two configs")
+
+
+def _assets(data: dict[str, Any]) -> None:
+    assets = data.get("assets")
+    if not isinstance(assets, list) or not assets:
+        raise ContractError("assets must be a non-empty list")
+
+    kinds: set[str] = set()
+    identities: set[tuple[str, str]] = set()
+    for index, asset in enumerate(assets):
+        prefix = f"assets[{index}]"
+        if not isinstance(asset, dict):
+            raise ContractError(f"{prefix} must be an object")
+        _reject_unknown(asset, ASSET_KEYS, prefix)
+        kind = _choice(asset, "kind", prefix, ASSET_KINDS)
+        name = _string(asset, "name", prefix)
+        _string(asset, "source", prefix)
+        _string(asset, "license", prefix)
+        license_url = asset.get("license_url")
+        if license_url is not None and (
+            not isinstance(license_url, str) or not license_url.strip()
+        ):
+            raise ContractError(f"{prefix}.license_url must be null or a non-empty string")
+        _choice(asset, "commercial_use", prefix, ASSET_POLICIES)
+        _choice(asset, "redistribution", prefix, ASSET_POLICIES)
+        if not isinstance(asset.get("included_in_package"), bool):
+            raise ContractError(f"{prefix}.included_in_package must be boolean")
+        _strings(asset, "notes", prefix, required=False)
+        identity = (kind, name)
+        if identity in identities:
+            raise ContractError(f"duplicate asset identity: {kind}/{name}")
+        identities.add(identity)
+        kinds.add(kind)
+
+    required = {"source", "dataset"}
+    missing = sorted(required - kinds)
+    if missing:
+        raise ContractError(f"assets is missing required kinds: {', '.join(missing)}")
+    if not kinds.intersection({"weights", "checkpoint"}):
+        raise ContractError("assets requires a weights or checkpoint entry")
+
+
 def _relative_path(value: str, field: str) -> pathlib.PurePosixPath:
     path = pathlib.PurePosixPath(value)
     if path.is_absolute() or value in {"", "."} or ".." in path.parts:
@@ -155,15 +228,18 @@ def _acceptance(parent: dict[str, Any], expected: set[str]) -> None:
 
 
 def validate_contract(data: dict[str, Any]) -> dict[str, Any]:
-    _reject_unknown(data, TOP_LEVEL_KEYS, "contract")
-    if data.get("schema_version") != 1:
-        raise ContractError("schema_version must equal 1")
+    schema_version = data.get("schema_version")
+    if schema_version not in SCHEMA_VERSIONS:
+        raise ContractError("schema_version must equal 1 or 2")
+    top_level_keys = TOP_LEVEL_KEYS_V2 if schema_version == 2 else TOP_LEVEL_KEYS_V1
+    _reject_unknown(data, top_level_keys, "contract")
 
     model = _mapping(data, "model")
     execution = _mapping(data, "execution")
     paths = _mapping(data, "paths")
     validation = _mapping(data, "validation")
-    _reject_unknown(model, MODEL_KEYS, "model")
+    model_keys = MODEL_KEYS_V2 if schema_version == 2 else MODEL_KEYS
+    _reject_unknown(model, model_keys, "model")
     _reject_unknown(execution, EXECUTION_KEYS, "execution")
     _reject_unknown(paths, PATH_KEYS, "paths")
     _reject_unknown(validation, VALIDATION_KEYS, "validation")
@@ -186,6 +262,9 @@ def validate_contract(data: dict[str, Any]) -> dict[str, Any]:
             raise ContractError("model.weights_file is only valid with a direct sha256 digest")
     else:
         _relative_path(_string(model, "weights_file", "model"), "model.weights_file")
+    if schema_version == 2:
+        _config_scope(model)
+        _assets(data)
 
     profile = _choice(execution, "profile", "execution", PROFILES)
     topology = _choice(execution, "topology", "execution", TOPOLOGIES)

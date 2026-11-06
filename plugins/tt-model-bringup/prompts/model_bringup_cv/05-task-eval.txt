@@ -10,9 +10,13 @@ Completion requirements:
 - Validate raw outputs before postprocessing.
 - Validate task postprocessing separately.
 - Run every metric declared by the contract.
+- Run task metrics for every declared configuration.
 - Compare TTNN and upstream results using identical samples.
 - Record sample counts, seeds, preprocessing and thresholds.
 - Update MODEL_DIR/README.md with final structure and evidence.
+- Verify README configuration scope matches the contract.
+- Verify README asset disclosures match the contract.
+- Verify every Torch structure artifact link resolves.
 - Validate every local README link before review.
 - Write MODEL_DIR/doc/functional_vision/task_eval.json.
 - Complete the functional-vision evidence set.

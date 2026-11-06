@@ -37,7 +37,7 @@ def valid_contract(**execution_overrides):
         **execution_overrides,
     }
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "model": {
             "name": "example-vision-model",
             "category": "vision",
@@ -48,6 +48,11 @@ def valid_contract(**execution_overrides):
             "weights_revision": "IMAGENET1K_V2",
             "weights_digest": "sha256:" + "b" * 64,
             "weights_file": "resnet50.pth",
+            "config_scope": {
+                "mode": "pinned",
+                "configs": ["default"],
+                "selection_source": "explicit-user-choice",
+            },
         },
         "execution": execution,
         "paths": {
@@ -75,7 +80,125 @@ def valid_contract(**execution_overrides):
                 },
             },
         },
+        "assets": [
+            {
+                "kind": "source",
+                "name": "example source",
+                "source": "https://github.com/example/model",
+                "license": "Apache-2.0",
+                "license_url": "https://github.com/example/model/blob/main/LICENSE",
+                "commercial_use": "allowed",
+                "redistribution": "allowed",
+                "included_in_package": False,
+                "notes": [],
+            },
+            {
+                "kind": "weights",
+                "name": "example weights",
+                "source": "example/model",
+                "license": "unknown",
+                "license_url": None,
+                "commercial_use": "unknown",
+                "redistribution": "unknown",
+                "included_in_package": False,
+                "notes": ["Resolve before redistribution"],
+            },
+            {
+                "kind": "dataset",
+                "name": "ImageNet-1K",
+                "source": "https://www.image-net.org/",
+                "license": "ImageNet terms",
+                "license_url": "https://www.image-net.org/download.php",
+                "commercial_use": "restricted",
+                "redistribution": "restricted",
+                "included_in_package": False,
+                "notes": ["Dataset is not redistributed"],
+            },
+        ],
     }
+
+
+def legacy_contract():
+    contract = valid_contract()
+    contract["schema_version"] = 1
+    del contract["model"]["config_scope"]
+    del contract["assets"]
+    return contract
+
+
+def test_schema_one_remains_valid_for_existing_runs():
+    assert contract_module.validate_contract(legacy_contract())["schema_version"] == 1
+
+
+def test_schema_two_requires_explicit_config_scope():
+    contract = valid_contract()
+    del contract["model"]["config_scope"]
+    with pytest.raises(contract_module.ContractError, match="config_scope"):
+        contract_module.validate_contract(contract)
+
+
+def test_pinned_config_scope_requires_exactly_one_config():
+    contract = valid_contract()
+    contract["model"]["config_scope"]["configs"] = ["small", "base"]
+    with pytest.raises(contract_module.ContractError, match="exactly one"):
+        contract_module.validate_contract(contract)
+
+
+def test_generic_config_scope_requires_multiple_configs():
+    contract = valid_contract()
+    contract["model"]["config_scope"].update(mode="generic", configs=["tiny"])
+    with pytest.raises(contract_module.ContractError, match="at least two"):
+        contract_module.validate_contract(contract)
+
+
+def test_generic_config_scope_accepts_multiple_configs():
+    contract = valid_contract()
+    contract["model"]["config_scope"].update(mode="generic", configs=["small", "base"])
+    scope = contract_module.validate_contract(contract)["model"]["config_scope"]
+    assert scope["mode"] == "generic"
+
+
+def test_config_scope_requires_explicit_user_choice():
+    contract = valid_contract()
+    contract["model"]["config_scope"]["selection_source"] = "checkpoint-name"
+    with pytest.raises(contract_module.ContractError, match="explicit-user-choice"):
+        contract_module.validate_contract(contract)
+
+
+def test_schema_two_requires_asset_disclosures():
+    contract = valid_contract()
+    del contract["assets"]
+    with pytest.raises(contract_module.ContractError, match="assets"):
+        contract_module.validate_contract(contract)
+
+
+def test_assets_require_source_weights_and_dataset():
+    contract = valid_contract()
+    contract["assets"] = contract["assets"][:1]
+    with pytest.raises(contract_module.ContractError, match="dataset"):
+        contract_module.validate_contract(contract)
+
+
+def test_assets_allow_explicit_unknown_license_policy():
+    contract = valid_contract()
+    weights = contract["assets"][1]
+    weights.update(license="unknown", commercial_use="unknown", redistribution="unknown")
+    assert contract_module.validate_contract(contract)["assets"][1] == weights
+
+
+def test_assets_require_package_inclusion_disclosure():
+    contract = valid_contract()
+    del contract["assets"][0]["included_in_package"]
+    with pytest.raises(contract_module.ContractError, match="included_in_package"):
+        contract_module.validate_contract(contract)
+
+
+def test_generated_readme_contract_requires_disclosures_and_structures():
+    guide = (PLUGIN / "skills" / "functional-vision" / "references" / "generated-readme.md").read_text()
+    assert "`Licensed Assets`" in guide
+    assert "`PyTorch Model Structure`" in guide
+    assert "torch_model_structure_<config>.txt" in guide
+    assert "commercial-use" in guide
 
 
 def test_functional_stateless_plan_stops_after_task_evaluation():

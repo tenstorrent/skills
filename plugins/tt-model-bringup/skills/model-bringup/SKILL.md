@@ -39,7 +39,10 @@ or replace acceptance criteria with a review plugin's criteria.
    child. `PYTHONPATH` exposes the packaged `readiness_check` module; it does not copy files into
    tt-metal. Shell commands using package resources must quote the expanded absolute paths.
 4. Confirm the upstream model/revision, target checkout, acceptance contract and already-authorized
-   hardware. Use `$model-classification` when the category is not already proven. Text models retain
+   hardware. Before implementation, ask whether configuration support is pinned to one named
+   configuration or generic across multiple named configurations. Record the explicit choice in a
+   schema-two model contract; never infer it from the chosen checkpoint. Use `$model-classification`
+   when the category is not already proven. Text models retain
    `models/autoports/<lowercase HF ID with non-alphanumeric characters replaced by underscores>`.
    Vision models use the fresh target and access boundaries from
    [the model contract](references/model-contract.md). Do not acquire hardware just because a plugin
@@ -48,7 +51,8 @@ or replace acceptance criteria with a review plugin's criteria.
    changes belong in the target checkout; workflow fixes belong in this plugin. Changes to the
    TT vLLM plugin or vLLM follow [plugin changes](../vllm-integration/references/plugin-changes.md).
    Record exact commands, commits, hardware identity and evidence. Keep weights, credentials and
-   private logs out of published commits.
+   private logs out of published commits. Record licensing and commercial-use terms for every
+   source, weight, checkpoint, and dataset used during bring-up.
 
 ## Dependency selection
 

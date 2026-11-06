@@ -10,7 +10,8 @@ Completion requirements:
 - Capture deterministic PyTorch intermediate goldens.
 - Inventory required TTNN operations and unsupported operators.
 - Implement the contract's major modules under MODEL_DIR.
-- Add parity tests for real model shapes and weights.
+- Add parity tests for every declared configuration's shapes.
+- Derive module dimensions from configuration, never checkpoints.
 - Cover odd, padded and dynamic shapes from the contract.
 - Keep preprocessing and postprocessing outside measured TTNN modules.
 - Prove the measured path has no hidden Torch fallback.
