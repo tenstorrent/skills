@@ -3,6 +3,9 @@
 This plugin is the canonical source for the model bring-up workflow. Its skills,
 prompts, runner and verification tools are maintained together inside this directory.
 
+The model-classification and functional-vision skills, CV prompts, model-contract checker and CV
+planner are authored in this plugin. They have no tt-metal source entry in `sync-source.json`.
+
 ## Source tracking
 
 `sync-source.json` records the source path, Git blob, source SHA-256 and packaged
@@ -30,6 +33,8 @@ target tt-metal checkout.
 - Persistent runner logs support stage resume. Stage gates cover implementation
   identity, context contracts and real-weight coverage for each decoder-layer kind.
   Preserve stage goals, checker exit meanings and resume behavior when importing.
+- Vision bring-up uses `doc/model_contract.json` and `scripts/cv_multigoal.py`. Functional vision
+  stops after task evaluation and never enters text-only vLLM stages.
 - Use operator-selected paths and limit Docker cleanup to the recorded run container.
 - The benchmark runtime is in `runtime/benchmark_stage`; Stage 11 uses fixed lm-eval
   subsets through native-chat vLLM and 4K-input performance at concurrency 1 and 32.
@@ -74,6 +79,12 @@ These tests use synthetic generators and tokenizers. Model accuracy and performa
 require separate hardware measurements with recorded implementation identity,
 protocol and sample coverage. Benchmark completion checks measurement integrity and
 report completeness; accuracy acceptance belongs to the bringup owner.
+
+## CV path isolation (0.2.1)
+
+Every CV stage scopes Git commands and file inventories to the current generated model
+directory or an authorized upstream reference. Repository-wide discovery commands are
+forbidden because they can reveal pre-existing implementations under forbidden roots.
 
 ## Trace allocation guidance (0.1.19)
 

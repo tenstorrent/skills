@@ -1,11 +1,11 @@
 ---
 name: model-bringup
-description: Implement Hugging Face text models in TTNN through staged decoder, multi-chip, full-model, datatype, vLLM and benchmark work. Use for model bring-up or resuming its staged goals; requires separately installed tt-autodebug.
+description: Implement text, computer-vision, and multimodal models in TTNN through category-specific staged workflows. Text models retain decoder, multi-chip, vLLM, and benchmark stages; vision models use functional-first single-chip bring-up with optional later stages. Requires separately installed tt-autodebug.
 ---
 
 # Model bring-up
 
-Own the implementation, stage gates and evidence for one target HF model in a tt-metal checkout.
+Own the implementation, stage gates and evidence for one target model in a tt-metal checkout.
 Read the relevant stage skill and its exact goal before doing that stage. Do not skip unmet gates
 or replace acceptance criteria with a review plugin's criteria.
 
@@ -43,10 +43,12 @@ or replace acceptance criteria with a review plugin's criteria.
    Run this setup in shells used for model work. The runner also supplies these exports to its
    child. `PYTHONPATH` exposes the packaged `readiness_check` module; it does not copy files into
    tt-metal. Shell commands using package resources must quote the expanded absolute paths.
-4. Confirm the HF model/revision, target checkout, acceptance contract and already-authorized
-   hardware. Resolve model directory as `models/autoports/<lowercase HF ID with non-alphanumeric
-   characters replaced by underscores>`. Do not acquire hardware just because a plugin was installed.
-   Record any serving-plugin interface change that the operator authorizes for this run.
+4. Confirm the upstream model/revision, target checkout, acceptance contract and already-authorized
+   hardware. Use `$model-classification` when the category is not already proven. Text models retain
+   `models/autoports/<lowercase HF ID with non-alphanumeric characters replaced by underscores>`.
+   Vision models use the fresh target and access boundaries from
+   [the model contract](references/model-contract.md). Do not acquire hardware just because a plugin
+   was installed. Record any serving-plugin interface change that the operator authorizes for this run.
 5. Keep the checkout, `CODEX_HOME`, runner logs and artifacts on persistent storage. Runtime model
    changes belong in the target checkout; workflow fixes belong in this plugin. Changes to the
    TT vLLM plugin or vLLM follow [plugin changes](../vllm-integration/references/plugin-changes.md).
@@ -64,9 +66,10 @@ versions and recommendation source, then retain them across resumes. Re-resolve 
 explicit restart or migration, preserving prior evidence and revalidating affected checks.
 For serving, follow [vLLM stack setup](../vllm-integration/references/serving-stack.md).
 
-## Execution
+## Text execution
 
-The eleven [goal templates](../../prompts/model_bringup_multigoal) run in order:
+For `model.category=text`, the existing eleven
+[goal templates](../../prompts/model_bringup_multigoal) run in order:
 
 1. Functional decoder — `functional-decoder`
 2. Fused decoder — `graph-fusing`
@@ -86,6 +89,37 @@ For an optional standalone TTI release handoff once serving is ready, use
 When the authorized hardware is one chip, stages 4 and 5 are recorded as skipped by the
 operator in the run record and the full-model goal starts from `tt/optimized_decoder.py`;
 single-chip is then the target topology, not a fallback, and the later stages say so.
+
+## Vision execution
+
+For `model.category=vision`, validate the model contract and let the CV planner select stages:
+
+```bash
+python "$TT_MODEL_BRINGUP_ROOT/scripts/check_model_contract.py" \
+  MODEL_DIR/doc/model_contract.json --print-plan
+python "$TT_MODEL_BRINGUP_ROOT/scripts/cv_multigoal.py" \
+  --contract MODEL_DIR/doc/model_contract.json --repo "$PWD" -- --dry-run
+```
+
+The functional profile runs reference-contract, functional-modules, functional-model, conditional
+stateful-sequence and task-eval goals. It excludes fusion, optimization, datatype selection and
+serving. Multichip runs only when topology explicitly requests it. `optimized` and `release` add
+only stages explicitly selected by the contract.
+Pure vision never uses vLLM. A requested multichip topology must record a capacity or throughput
+reason; single-chip is the default.
+
+For `model.category=multimodal`, `$functional-vision` owns the vision encoder and projector handoff.
+The text workflow owns the decoder, generation, KV-cache and optional vLLM stages. Do not launch
+the pure-CV runner for a multimodal contract. For `model.category=other`, stop and report the missing
+workflow instead of forcing the model through text or vision stages.
+
+Resume an interrupted CV stage with the same contract, Codex home and persistent log directory:
+
+```bash
+python "$TT_MODEL_BRINGUP_ROOT/scripts/cv_multigoal.py" \
+  --contract MODEL_DIR/doc/model_contract.json --repo "$PWD" -- \
+  --log-dir bringup/artifacts/multigoal-runs/<run-id> --resume-stage <stage-number>
+```
 
 `tt-device-usage`, `tt-enable-tracing`, `qualitative-check` and `stage-review` provide shared
 requirements. AutoDebug/AutoTriage/AutoFix come from the explicit dependency. Implementation

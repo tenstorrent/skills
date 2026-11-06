@@ -1,0 +1,20 @@
+/goal Use $functional-vision and $tt-device-usage to evaluate MODEL_NAME for TASK_FAMILY.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Use MODEL_CONTRACT. Run the declared task metric with the pinned dataset protocol. Keep metric evaluation host-side and do not start optimization.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Validate raw outputs before postprocessing.
+- Validate task postprocessing separately.
+- Run every metric declared by the contract.
+- Compare TTNN and upstream results using identical samples.
+- Record sample counts, seeds, preprocessing and thresholds.
+- Update MODEL_DIR/README.md with final structure and evidence.
+- Validate every local README link before review.
+- Write MODEL_DIR/doc/functional_vision/task_eval.json.
+- Complete the functional-vision evidence set.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.

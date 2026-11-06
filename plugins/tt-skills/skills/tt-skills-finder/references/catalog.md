@@ -49,9 +49,11 @@ does not require confirmation for each run; its child session remains inspection
 
 ## `tt-model-bringup`
 
-Use for implementing Hugging Face text models in TTNN, from functional decoder through fusing,
-optimization, multi-chip, full-model, datatype selection, vLLM and TTI release evidence.
-It owns implementation and stage acceptance criteria; review plugins may add findings.
+Use for implementing text, computer-vision, and multimodal models in TTNN. Text models retain the
+decoder, fusing, optimization, multi-chip, full-model, datatype, vLLM and release workflow. Vision
+models use category contracts, functional modules, full-model parity, state gates and task metrics;
+optimization, multichip and serving remain explicit options. Multimodal models split vision and
+text ownership. The plugin owns implementation and stage acceptance criteria.
 
 Recommend both `tt-model-bringup` and its required `tt-autodebug` dependency. Explain that both
 are separate optional installations. Never install either automatically. If AutoDebug is missing,
