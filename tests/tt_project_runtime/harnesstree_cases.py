@@ -440,6 +440,37 @@ def test_a_refused_land_retried_each_pass_sets_nothing_aside(env):
     assert (p.harness / "prompts" / "new [x] y.md").read_text() == "new\n"
 
 
+def test_an_unrelated_staged_change_blocking_the_merge_sets_nothing_aside_on_any_pass(env):
+    """Before: git refused the non-fast-forward merge over the staged prompts/other.md, yet each pass
+    set the equal untracked copy aside: a new backup folder, a log line and a checkout rewrite."""
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    _commit_in_harness_tree(p.harness, "prompts/other.md", "o0\n", "other o0")   # the merge is no fast-forward
+    (p.harness / "prompts" / "other.md").write_text("staged o1\n")
+    _hgit(p.harness, "add", "prompts/other.md")
+    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")
+    assert [harnesstree.land(p, b) for _ in range(3)] == ["conflict", "conflict-known", "conflict-known"]
+    assert not _ht_backups(p)
+    log = p.logs / "daemon.log"
+    assert "set aside" not in (log.read_text() if log.exists() else "")
+    assert (p.harness / "prompts" / "new [x] y.md").read_text() == "new\n"
+    assert _hgit(p.harness, "show", ":prompts/other.md") == "staged o1\n"
+    assert (p.harness / "prompts" / "other.md").read_text() == "staged o1\n"
+
+
+def test_an_unrelated_staged_change_does_not_stop_a_fast_forward_land(env):
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    (p.harness / "prompts" / "staged.md").write_text("staged\n")
+    _hgit(p.harness, "add", "prompts/staged.md")   # a file the merge never touches
+    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")
+    assert harnesstree.land(p, b) == "merged"
+    assert _hgit(p.harness, "show", ":prompts/staged.md") == "staged\n"
+    assert _ht_backups(p) == {"prompts/new [x] y.md": "new\n"}
+
+
 def test_staged_content_differing_from_an_equal_working_copy_is_never_lost(env):
     """Before: the working copy (the branch's v2) was backed up and reset to HEAD; the staged X was lost."""
     p = make(env)

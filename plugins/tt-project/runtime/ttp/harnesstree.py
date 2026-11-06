@@ -19,7 +19,7 @@ conflicts, or that git refuses over uncommitted changes there, is undone and kep
 pass (sweep), and reported to the coordinator once per branch head (a refusal only while no harness
 run works in the checkout). Before it merges, an uncommitted copy in the checkout of a file the branch
 changed is set aside when it equals one of the branch's versions of that file since the merge base,
-and only when every such copy does (_settle): backed up under state/harness-land-backups/, put back to HEAD, then the merge writes the
+and only when every such copy does and no other staged change makes git refuse (_settle): backed up under state/harness-land-backups/, put back to HEAD, then the merge writes the
 branch's version; every other uncommitted file is left alone. A conflict is merged again only once its branch head or the harness HEAD
 moved: each try briefly leaves MERGE_HEAD in the live checkout, in the way of `ttp upgrade`. A merge
 that changed runtime/ asks the daemon to restart, as `ttp restart` would."""
@@ -248,7 +248,8 @@ def _settle(p: Project, tid: int, b: str) -> tuple[list[str], Path | None]:
     since its merge base whose content equals one of the branch's versions there (its head's or an
     earlier one): git would refuse the merge over them though they hold nothing the branch lacks. Only
     when every such copy qualifies (none a deletion, a symlink, other content or a staged entry that
-    differs from both HEAD and the working copy), else none: git refuses as before. Each is copied to a
+    differs from both HEAD and the working copy) and no other staged change blocks a merge that is not a
+    fast-forward, else none: git refuses as before. Each is copied to a
     dated backup folder under the state, then put back to HEAD (an untracked one removed). Every other uncommitted file is left alone, and nothing while another harness run works
     in the checkout (its edits are its own). Returns the files and the backup folder."""
     if checkout_busy(p, tid):
@@ -286,6 +287,10 @@ def _settle(p: Project, tid: int, b: str) -> tuple[list[str], Path | None]:
         settled.append(f)
     if not settled:
         return [], None
+    staged = set(_git(p.harness, "diff", "--cached", "--name-only", "-z", "--no-renames", "HEAD").stdout.split("\0"))
+    if (staged - set(settled) - {""}
+            and _git(p.harness, "merge-base", "--is-ancestor", "HEAD", b).returncode != 0):
+        return [], None   # git refuses a non-fast-forward merge over any staged change, wherever it is
     backup = p.state / BACKUP_DIR / f"{time.strftime('%Y-%m-%d-%H%M%S')}-t{int(tid)}"
     for f in settled:
         src = p.harness / f
