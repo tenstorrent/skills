@@ -429,6 +429,9 @@ def supervise(run_dir: Path) -> int:
                 launch_auth = bool(getattr(e, "auth", False))   # no usable key: the auth gate's (daemon)
                 raise OSError(f"chat bridge: {e}") from None
             env.update(bridge.env())
+        # The stream guard reads the hook's marker before the agent starts: it could write one itself.
+        from .hook import hooked
+        pre_hooked = hooked(run_dir)
         child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
                                  start_new_session=True, preexec_fn=preexec)
     except OSError as e:
@@ -481,11 +484,11 @@ def supervise(run_dir: Path) -> int:
         progress = ProgressWatch(out_path, run_dir)
         waits_idle = bool(spec.get("waits_idle"))
         from . import streamguard
-        guard = {"on": streamguard.active(prov, argv, env, run_dir), "offset": 0}
+        guard = {"on": streamguard.active(prov, argv, env, pre_hooked), "offset": 0}
 
         def check_calls() -> None:
             # A run the harness hook does not reach: each tool call it starts is checked as the hook would.
-            # Decided once, at the start: the agent could write the hook's marker itself later.
+            # Decided once, from the marker as it was before launch: the agent could write one itself.
             calls, guard["offset"] = prov.activity(out_path, guard["offset"])
             for c in (c for c in calls if c.get("kind") == "call"):
                 for payload in c.get("payloads") or []:

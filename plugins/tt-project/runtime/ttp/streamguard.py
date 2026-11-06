@@ -13,7 +13,7 @@ blocks it for the coordinator.
 This is weaker than a hook's deny: the call is stopped once it has started, so a quick command may have
 run. Rewrites and hints the hook would add are not applied. Runs whose provider passes the harness hook
 (Provider.harness_hook) or whose hook already ran when it started (hook.HOOKED_FILE) are left alone; the
-marker is read only then, since the agent could write it later."""
+marker is read before the agent starts, since the agent could write it itself."""
 from __future__ import annotations
 
 import json
@@ -28,10 +28,10 @@ KEY = "guard_stop"       # in the task's result: the refusal its next run's prom
 CHECK_TIMEOUT_S = 20     # as the hook's own timeout: a check that hangs lets the call through
 
 
-def active(prov, argv: list[str], env: dict, run_dir: Path) -> bool:
-    """Whether the runner guards this run: a task run without the harness hook."""
-    from . import hook
-    return bool(env.get("TTP_TASK")) and not prov.harness_hook(argv) and not hook.hooked(run_dir)
+def active(prov, argv: list[str], env: dict, hooked: bool) -> bool:
+    """Whether the runner guards this run: a task run without the harness hook. `hooked`: the hook's
+    marker as read before the agent started."""
+    return bool(env.get("TTP_TASK")) and not prov.harness_hook(argv) and not hooked
 
 
 def refusal(payload: dict, env: dict, cwd: str) -> str | None:
