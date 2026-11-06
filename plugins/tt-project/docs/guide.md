@@ -1620,9 +1620,11 @@ running work is interrupted only by the preemption below:
   A check command that waits on an outside CPU pool (a test gate waiting for a pool slot) gives the run's host-wide
   checks slot up while it waits: it runs `ttp checks-yield` before the wait and `ttp checks-yield --resume` before
   its CPU work, which returns once the run holds a slot again, queued in the normal priority order (urgent first);
-  checks queued behind it start meanwhile. Only the host-wide slot goes (its lane and test slots stay). A waiter
-  that dies while yielded leaves the run to take a slot again for its further work, the next command never starts
-  without one, and a killed run holds none. Outside a run that can yield (no slot, cap off, urgent or
+  checks queued behind it start meanwhile. Only the host-wide slot goes (its lane and test slots stay). Several
+  processes of one command may ask at once: each is answered, the slot stays given up while any waiter that
+  yielded lives and none asked to resume since, and one slot comes back for all resumes. Once every such waiter
+  died, the run takes a slot again for its further work; the next command never starts without one, and a killed
+  run holds none. Outside a run that can yield (no slot, cap off, urgent or
   spilled) both return at once; every waiter on the same pool should yield, so none holds a slot the pool waits on.
   `checks.fallback_lane` (project setting,
   default "", off) is where those commands run while the wrapper's lock is paused (`held by pause on`): a

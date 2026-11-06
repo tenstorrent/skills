@@ -7808,6 +7808,11 @@ def _yield_setup(monkeypatch, cap: str = "1"):
     monkeypatch.setattr(checkcap, "POLL_S", 0.05)
 
 
+def _yield_reqs(run) -> list:
+    stem = Path(run.yield_stem)
+    return sorted(stem.parent.glob(stem.name + ".*.req"))
+
+
 def test_a_check_waiting_on_an_outside_pool_frees_its_slot_and_takes_one_back_in_priority_order(env, monkeypatch):
     """[note d3dbe43fdffc5aab] (1) a run whose command waits on an outside pool gives its host-wide slot up
     (checks-yield) and a queued check starts on it; (2) asked to resume, it queues again in the normal
@@ -7823,7 +7828,7 @@ def test_a_check_waiting_on_an_outside_pool_frees_its_slot_and_takes_one_back_in
     queued.start()
     ask = threading.Thread(target=lambda: asked.update(y=checkcap.ask_yield("yield", os.getpid(), wait_s=30)))
     ask.start()
-    assert _wait_for(lambda: Path(run.yield_stem + ".req").exists())
+    assert _wait_for(lambda: _yield_reqs(run))
     told = []
     checkcap.serve_yield(run, told.append)
     ask.join(30)
@@ -7838,7 +7843,7 @@ def test_a_check_waiting_on_an_outside_pool_frees_its_slot_and_takes_one_back_in
     assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE) or []) >= 1)
     ask = threading.Thread(target=lambda: asked.update(r=checkcap.ask_yield("resume", os.getpid())))
     ask.start()
-    assert _wait_for(lambda: '"resume"' in Path(run.yield_stem + ".req").read_text())
+    assert _wait_for(lambda: any('"resume"' in f.read_text() for f in _yield_reqs(run)))
     serve = threading.Thread(target=checkcap.serve_yield, args=(run,))
     serve.start()
     assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE) or []) >= 2)
@@ -7856,6 +7861,60 @@ def test_a_check_waiting_on_an_outside_pool_frees_its_slot_and_takes_one_back_in
     assert checkcap.line() == ""
 
 
+def test_concurrent_checks_yield_askers_of_one_run_are_all_answered(env, monkeypatch):
+    """Review #6362: two processes of one check command that run `ttp checks-yield` (then `--resume`) at
+    once are each answered (one request file each, never a lost update): the run gives one slot up, keeps
+    it given up while either waiter lives, takes exactly one back for both resumes, and once both waiters
+    died after a yield takes one back by itself."""
+    from ttp import checkcap, locks
+    _yield_setup(monkeypatch)
+
+    def held() -> int:
+        return len(locks.held_labels(checkcap.all_paths()))
+
+    run = checkcap.acquire("run", project_name="A")
+    assert run.allow_yield()
+    monkeypatch.setenv(checkcap.YIELD_ENV, run.yield_stem)
+    waiters = [subprocess.Popen(["sleep", "60"]) for _ in range(2)]
+
+    def ask(want: str, pid: int):
+        code = (f"import sys; sys.path.insert(0, {str(RUNTIME)!r}); from ttp import checkcap; "
+                f"print(repr(checkcap.ask_yield({want!r}, {pid}, wait_s=30)), flush=True)")
+        return subprocess.Popen([sys.executable, "-c", code], stdout=subprocess.PIPE, text=True,
+                                env=dict(os.environ))
+
+    try:
+        for want, slot_held in (("yield", 0), ("resume", 1)):
+            askers = [ask(want, w.pid) for w in waiters]
+            assert _wait_for(lambda: len(_yield_reqs(run)) == 2), f"both {want} requests stay apart"
+            checkcap.serve_yield(run)
+            outs = [p.communicate(timeout=30)[0].strip() for p in askers]
+            assert outs == ["''", "''"], (want, outs)
+            assert held() == slot_held and (run.f is not None) == bool(slot_held), (want, held())
+            checkcap.serve_yield(run)
+            assert held() == slot_held, f"answered {want}s are not served again"
+        askers = [ask("yield", w.pid) for w in waiters]
+        assert _wait_for(lambda: len(_yield_reqs(run)) == 2)
+        checkcap.serve_yield(run)
+        assert [p.communicate(timeout=30)[0].strip() for p in askers] == ["''", "''"]
+        assert run.yielded and run.waiters == {w.pid for w in waiters} and held() == 0
+        waiters[0].kill()
+        waiters[0].wait()
+        checkcap.serve_yield(run)
+        assert run.yielded and held() == 0, "one waiter still waits: the slot stays given up"
+        waiters[1].kill()
+        waiters[1].wait()
+        checkcap.serve_yield(run)
+        assert run.f is not None and not run.yielded and held() == 1, "both died: one slot taken back"
+        checkcap.serve_yield(run)
+        assert held() == 1
+    finally:
+        for w in waiters:
+            w.kill()
+    run.close()
+    assert held() == 0 and not list(checkcap.slot_dir().glob(f"{checkcap.YIELD}.*"))
+
+
 def test_a_killed_pool_waiter_leaks_no_host_wide_checks_slot(env, monkeypatch):
     """[note d3dbe43fdffc5aab] (3) a waiter killed while its run's slot is given up holds nothing and leaves
     the run with exactly one slot again for its further work; a slot freed once is never freed twice; a run
@@ -7869,7 +7928,7 @@ def test_a_killed_pool_waiter_leaks_no_host_wide_checks_slot(env, monkeypatch):
     run = checkcap.acquire("waiter", project_name="A")
     assert run.allow_yield()
     waiter = subprocess.Popen(["sleep", "60"])
-    Path(run.yield_stem + ".req").write_text(json.dumps({"id": "1", "want": "yield", "pid": waiter.pid}))
+    Path(run.yield_stem + ".1.req").write_text(json.dumps({"id": "1", "want": "yield", "pid": waiter.pid}))
     checkcap.serve_yield(run)
     assert run.f is None and held() == 0
     checkcap.serve_yield(run)
@@ -7893,7 +7952,7 @@ def test_a_killed_pool_waiter_leaks_no_host_wide_checks_slot(env, monkeypatch):
     run = checkcap.acquire("ends")
     run.allow_yield()
     run.f.close()
-    run.f, run.yielded, run.waiter = None, True, os.getpid()
+    run.f, run.yielded, run.waiters = None, True, {os.getpid()}
     full[1] = checkcap.acquire("y")
     assert not run.hold_again(stop=lambda: "its command ended") and run.f is None and held() == 2, \
         "ended while queued: it holds none"

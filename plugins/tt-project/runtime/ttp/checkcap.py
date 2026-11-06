@@ -797,8 +797,7 @@ class Slot:
         self.again = again   # acquire's arguments that took it, to take one again after a yield (hold_again)
         self.yield_stem = ""   # its commands may ask it to give the slot up (allow_yield, YIELD_ENV)
         self.yielded = False   # given up while its commands wait on an outside pool (serve_yield)
-        self.waiter = 0   # the process that asked it to: its death ends the yield
-        self.answered = ""   # the last yield request answered
+        self.waiters: set[int] = set()   # the processes that asked it to: once all died, the yield ends
         self.tests = None   # the run's test slots (testslots.Grant), held and freed with this slot
         self.spill = None   # a claim on a spill host the checks run on instead (checkspill.Claim)
         self.urgent = False   # a reserved urgent slot beyond the cap (acquire's `urgent`, urgent_key)
@@ -817,8 +816,8 @@ class Slot:
     def close(self) -> None:
         self.let_go()
         if self.yield_stem:
-            for end in (".req", ".ack"):
-                Path(self.yield_stem + end).unlink(missing_ok=True)
+            for f in Path(self.yield_stem).parent.glob(Path(self.yield_stem).name + ".*"):
+                f.unlink(missing_ok=True)   # its commands' requests and answers (ask_yield)
             self.yield_stem = ""
         if self.tests is not None:
             self.tests.close()
@@ -851,7 +850,7 @@ class Slot:
             got = acquire(**(self.again or {}), tell=tell, stop=stop)
         except Cancelled:
             return False
-        self.f, self.since, self.yielded, self.waiter = got.f if got else None, time.time(), False, 0
+        self.f, self.since, self.yielded, self.waiters = got.f if got else None, time.time(), False, set()
         if got is not None:
             got.f = None
         return True
@@ -1157,7 +1156,7 @@ def clear_preempt() -> None:
         pass
 
 
-YIELD = "yield"   # check-slots/yield.<pid>.<token>.req|.ack: a run's commands ask it to give its slot up and back
+YIELD = "yield"   # check-slots/yield.<pid>.<token>.<request id>.req|.ack: a run's commands ask it to give its slot up and back
 YIELD_ENV = "TTP_CHECKS_YIELD"   # that stem, for the commands of a run that may yield (Slot.allow_yield)
 YIELD_WAIT_S = 60.0   # ask_yield waits this long for the run to answer a yield (it looks every checkwall.POLL_S)
 
@@ -1177,27 +1176,35 @@ def _write(path: Path, rec: dict) -> None:
 
 
 def serve_yield(slot, tell: Callable[[str], None] | None = None, stop: Callable[[], str] | None = None) -> None:
-    """Answer the latest yield request of `slot`'s commands (ask_yield), called while they run: "yield" frees
-    the host-wide slot (Slot.let_go), "resume" queues for one in the normal order and holds it (hold_again,
-    which `stop()` ends: its command ended). A waiter that died while yielded never left the run without a
-    slot for its further work: the run takes one again at once. One answer per request, so a slot is freed once."""
-    if not getattr(slot, "yield_stem", ""):
+    """Answer every pending yield request of `slot`'s commands (ask_yield: one file each, oldest first), called
+    while they run: "yield" frees the host-wide slot (Slot.let_go) and adds its waiter, "resume" queues for one
+    in the normal order and holds it (hold_again, which `stop()` ends: its command ended); resumes pending
+    together take one slot. The slot stays given up while a waiter that asked lives and none asked to resume
+    since; once all died, the run takes one again at once for its further work. Each request is answered once,
+    in its own answer file, and a slot is freed once."""
+    stem = getattr(slot, "yield_stem", "")
+    if not stem:
         return
-    req = _read(Path(slot.yield_stem + ".req"))
-    rid, want = str(req.get("id") or ""), req.get("want")
-    if rid and rid != slot.answered:
-        if want == "yield" and slot.f is not None:
-            slot.let_go()
-            slot.yielded, slot.waiter = True, int(req.get("pid") or 0)
-            tell and tell("gave up its host-wide checks slot while its command waits on an outside pool (ttp checks-yield)")
+    base = Path(stem)
+    reqs = [(float(req.get("at") or 0), f.name, f, req) for f in base.parent.glob(base.name + ".*.req")
+            for req in [_read(f)]]
+    for _, _, f, req in sorted(reqs, key=lambda r: r[:2]):
+        want, pid = req.get("want"), int(req.get("pid") or 0)
+        if want == "yield" and (slot.f is not None or slot.yielded):
+            if slot.f is not None:
+                slot.let_go()
+                tell and tell("gave up its host-wide checks slot while its command waits on an outside pool (ttp checks-yield)")
+            slot.yielded = True
+            slot.waiters.add(pid)
         elif want == "resume" and not slot.hold_again(tell, stop):
-            return
-        slot.answered = rid
+            return   # unanswered: its command ended
+        f.unlink(missing_ok=True)
         try:
-            _write(Path(slot.yield_stem + ".ack"), {"id": rid, "held": slot.f is not None})
+            _write(f.with_suffix(".ack"), {"id": str(req.get("id") or ""), "held": slot.f is not None})
         except OSError:
             pass   # unanswered: the asker ends at its bound or with the run
-    elif slot.yielded and not locks._alive(slot.waiter):
+    slot.waiters = {w for w in slot.waiters if locks._alive(w)}
+    if slot.yielded and not slot.waiters:
         slot.hold_again(tell, stop)
 
 
@@ -1205,25 +1212,31 @@ def ask_yield(want: str, pid: int | None = None, wait_s: float | None = None) ->
     """From a check command: ask the `ttp checks` run it is in (YIELD_ENV) to give its host-wide slot up
     while `pid` (default: this process's parent, the script that waits) waits on an outside pool ("yield",
     answered within YIELD_WAIT_S), or to take one again before CPU work ("resume": waits until it holds one,
-    queued in the normal priority order). "" once answered or when there is no slot to give up (outside a
-    run, cap off, nested, urgent or spilled), else why not."""
+    queued in the normal priority order). Each request has its own file, so concurrent askers are all answered.
+    "" once answered or when there is no slot to give up (outside a run, cap off, nested, urgent or spilled),
+    else why not."""
     stem = os.environ.get(YIELD_ENV) or ""
     if not stem:
         return ""
     owner = int((Path(stem).name.split(".") + ["", ""])[1] or 0)
     rid = secrets.token_hex(6)
+    req, ack = Path(f"{stem}.{rid}.req"), Path(f"{stem}.{rid}.ack")
     try:
-        _write(Path(stem + ".req"), {"id": rid, "want": want, "pid": pid or os.getppid(), "at": time.time()})
+        _write(req, {"id": rid, "want": want, "pid": pid or os.getppid(), "at": time.time()})
     except OSError as e:
         return f"could not ask: {e}"
     span = YIELD_WAIT_S if wait_s is None else wait_s
     end = None if want == "resume" else time.time() + span
-    while _read(Path(stem + ".ack")).get("id") != rid:
-        if not locks._alive(owner):
-            return "the checks run that held the slot has ended"
-        if end is not None and time.time() >= end:
-            return f"no answer from the checks run (pid {owner}) within {span:.0f} s"
-        time.sleep(poll_s(0.5))
+    try:
+        while _read(ack).get("id") != rid:
+            if not locks._alive(owner):
+                return "the checks run that held the slot has ended"
+            if end is not None and time.time() >= end:
+                return f"no answer from the checks run (pid {owner}) within {span:.0f} s"
+            time.sleep(poll_s(0.5))
+    finally:
+        req.unlink(missing_ok=True)   # an unanswered request is withdrawn: the run never acts on it late
+        ack.unlink(missing_ok=True)
     return ""
 
 
