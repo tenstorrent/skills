@@ -33,7 +33,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bench
+from . import bench, gitmemo
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -88,7 +88,7 @@ def schedule(tasks: list[int], arms: list[str], reps: int, seed: int) -> list[di
 def leaks(ws: Path, task: dict) -> list[str]:
     """What in a cell's workspace could show the candidate the landed change; [] when nothing."""
     def git(*a):
-        return subprocess.run(["git", "-C", str(ws), *a], capture_output=True, text=True)
+        return bench._git(ws, *a)
     out = []
     if git("remote").stdout.strip():
         out.append("a remote")
@@ -190,7 +190,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         shutil.copytree(bench_dir / str(task["task"]) / "workspace", ws, symlinks=True)
         if problems := leaks(ws, task):
             return {**row, "outcome": "isolation_failed", "passed": False, "why": problems}
-        start = subprocess.run(["git", "-C", str(ws), "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        start = bench._git(ws, "rev-parse", "HEAD").stdout.strip()
         run.mkdir()
         durable_write(run / "prompt.md", PROMPT.format(spec=task["spec"]))
         provider = "fake" if opts.get("dry_run") else arm["provider"]
@@ -223,8 +223,8 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         handoff = json.loads((run / "result.json").read_text()) if (run / "result.json").exists() else {}
         row.update(exit={k: ended[k] for k in ("rc", "stopped", "refused") if ended.get(k) is not None},
                    handoff=str(handoff.get("status") or "none"), transcript_sha256=_sha(transcript))
-        subprocess.run(["git", "-C", str(ws), "add", "-A"], capture_output=True)
-        diff = subprocess.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True).stdout
+        bench._git(ws, "add", "-A")
+        diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
         row["diff_sha256"] = _sha(diff)
         flags = audit(transcript.decode(errors="replace"), task, [bench_dir.resolve(), out.resolve()],
                       secret_lines(bench_dir, task), diff.decode(errors="replace"))

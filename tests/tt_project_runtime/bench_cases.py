@@ -268,6 +268,7 @@ def test_bench_run_arms_parse_and_need_two(tmp_path):
 def test_bench_run_cli_dry_run_takes_arms_from_the_command_line_and_refuses_one_arm(env, tmp_path, monkeypatch, capsys):
     from ttp import cli
     p, tid, task = _bench_built(env, tmp_path)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))   # the test's project, never the one around the checkout
     monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
     base = ["bench", "run", "--bench", str(tmp_path / "bench"), "--dry-run", "--seed", "3",
             "--test-cmd", f"{sys.executable} -m pytest -q -p no:cacheprovider"]
