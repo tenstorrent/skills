@@ -30,7 +30,7 @@ For this example, it installs `tt-autodebug`, uses AutoDebug to investigate, and
 You can also ask:
 
 ```text
-Use tt-model-bringup on <HF model ID>.
+Use tt-model-bringup on <model ID or upstream repository>.
 ```
 
 Or describe the job, such as “Review this TTNN pull request,” and let the finder recommend a
@@ -44,7 +44,7 @@ automatically for matching tasks; you can also ask your agent to make them expli
 | `tt-skills` | The finder: recommends relevant plugins and helps you install them with your approval |
 | `tt-review-skills` | PR and diff review for TTNN, Metalium, LLK, models, serving, multi-chip, trace, precision, testing, and L1 changes |
 | `tt-autodebug` | AutoDebug and AutoTriage investigate code issues and hangs; AutoFix tests hypotheses and repairs the cause |
-| `tt-model-bringup` | Eleven stages from HF decoder through TTNN/vLLM benchmarking, with chunked-prefill guidance, prefill/TTFT optimization, trace warmup/reuse and allocation validation, targeted path/serving checks, and fixed standard accuracy subsets plus 4K-input vLLM benchmarks at concurrency 1 and 32. Includes a standalone TTI release skill. Requires `tt-autodebug`. |
+| `tt-model-bringup` | Category-aware TTNN bring-up for text, computer-vision, and multimodal models. Text retains eleven decoder-to-vLLM benchmark stages. Vision adds source-isolated functional modules, full-model parity, state gates and task metrics, with optimization, multichip and serving selected explicitly. Requires `tt-autodebug`. |
 | `tt-debug-tools` | Drive the Tenstorrent debug tools and read their output: tt-triage, dprint, watcher, asserts, etc. See [`plugins/tt-debug-tools/README.md`](plugins/tt-debug-tools/README.md) |
 | `tt-buddy` | A coding agent with Tenstorrent operating principles: takes notes all the time, learns when needed, keeps the diff minimal. Device runs need [`tt-device-mcp`](https://github.com/tenstorrent/tt-device-mcp). See [`plugins/tt-buddy/README.md`](plugins/tt-buddy/README.md) |
 | `tt-serve-model` | Take a model from host discovery to a verified server on Tenstorrent hardware: discover the host (boards vs ASICs, `--tt-device` string, driver/firmware, hugepages, docker, device holders, reset verdict), retrieve the model (HF gating, tt-inference-server spec entry, image spec drift, GHCR tag/ancestry, tt-model-manager bundles, exact pull command), diagnose a launch (stage/hang/failure classification, mandatory docker flags, override safety, timing, displaced services) and verify the running server (health, correctness, mesh utilization, throughput/batching, reasoning-model checks). |
@@ -69,9 +69,13 @@ legacy vLLM and bundled-plugin source layouts. See
 
 ## Model bring-up
 
-Ask your agent to use `tt-model-bringup` with the HF model ID in your target checkout. The finder
-recommends both `tt-model-bringup` and its `tt-autodebug` dependency if needed, and asks for approval
-to install them.
+Ask your agent to use `tt-model-bringup` with the model ID or upstream repository in your target
+checkout. The finder recommends both `tt-model-bringup` and its `tt-autodebug` dependency if needed,
+and asks for approval to install them.
+
+The entrypoint first routes text, vision, multimodal and unsupported categories. Text retains its
+existing stage workflow. Vision uses a pinned model contract and supports functional-only
+single-chip bring-up without mandatory optimization, multichip or serving work.
 
 The stage skills support Codex and Claude Code; automated multi-goal execution uses Codex.
 See the [Agentic Research guide](docs/agentic-research/getting-started.md#model-bring-up) for how to

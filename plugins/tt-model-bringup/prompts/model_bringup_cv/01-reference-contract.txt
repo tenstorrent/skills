@@ -1,0 +1,20 @@
+/goal Use $model-classification for MODEL_NAME from UPSTREAM_REPO at UPSTREAM_REVISION.
+
+As the user, I explicitly authorize subagents when a selected skill requires them.
+
+Work only from MODEL_CONTRACT and its authorized upstream reference. Never inspect forbidden read roots. The fresh generated tree at MODEL_DIR may contain only current-run files.
+
+Scope every Git command and file inventory to MODEL_DIR or an authorized upstream path. Never run repository-wide `git status`, `git diff`, `rg`, `find` or equivalent discovery.
+
+Completion requirements:
+- Validate MODEL_CONTRACT with the packaged checker.
+- Confirm upstream source and weight revisions are immutable.
+- Confirm reference checkout HEAD matches the pinned source commit.
+- Confirm weight SHA-256 or the complete digest manifest.
+- Confirm category, task, state and raw outputs.
+- Record boundaries, risks and numeric acceptance thresholds.
+- Write MODEL_DIR/doc/reference/source_manifest.json.
+- Write MODEL_DIR/doc/reference/golden_plan.md.
+- Do not start TTNN implementation or device work.
+- Run $stage-review; fix findings; obtain `clean-pass`.
+- Commit stage-owned changes locally; never push.
