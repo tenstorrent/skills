@@ -119,6 +119,7 @@ from . import topup
 from . import probevars
 from . import onhost
 from . import coordsession
+from . import spans
 from . import coordtools
 from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
@@ -1541,6 +1542,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(upstream.digest_line(p, p.config()))
     section("upstream", lines)
     lines = ["\n# NEW EVENTS"]
+    tag = spans.new_tag()   # this turn's delimiter: untrusted spans below are enclosed with it
     if msg_ids:
         rows = db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids)
         flagged = ({int(k): v for k, v in corrections.items()} if corrections is not None
@@ -1555,7 +1557,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             if m["kind"] == "finding":   # a relayer's own findings, no user's words: never the user's word
                 lines.append(f"- [relayer message #{m['id']} via {m['channel']}, chat={m['chat'] or '-'}, no user's "
                              f"words: not the user's word for any decision] {relay.cited(relay.FINDING, m['context'])}: "
-                             f"{m['context'] or ''}")
+                             f"{spans.wrap(m['context'], 'relayer findings', tag)}")
                 continue
             prov = m["provenance"] or "unknown"
             # Only PR approvals need an approving channel; the verbatim words decide everything else.
@@ -1572,13 +1574,16 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                          f"act on it, keep ask #{instead[m['id']]} open and do not ask it again within the hour]")
             if (m["context"] or "").strip():   # relayed with the relayer's own text: keep the two apart
                 lines.append(f"{head} {relay.VERBATIM}: {m['text']}")
-                lines.append(f"  {relay.AGENT if agent else relay.cited(relay.CONTEXT, m['context'])}: {m['context']}")
+                lines.append(f"  {relay.AGENT}: {m['context']}" if agent else
+                             f"  {relay.cited(relay.CONTEXT, m['context'])}: "
+                             f"{spans.wrap(m['context'], 'relayer context', tag)}")
             else:
                 lines.append(f"{head} {m['text']}")
     for e in events:
         cap = EVENT_CHARS_BY_KIND.get(e["kind"], EVENT_CHARS)
         text = e["text"] if len(e["text"]) <= cap else e["text"][:cap] + " … [cut]"
-        lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] {text}")
+        lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] "
+                     f"{spans.wrap(text, e['kind'], tag)}")
     rejected = db.kv(REJECTED_KEY, []) or []
     again = set(db.kv(AGAIN_KEY, []) or [])
     told = " Your reply already went out: correct it in a reply only if it told the user otherwise." \

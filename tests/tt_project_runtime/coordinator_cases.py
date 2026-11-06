@@ -1229,8 +1229,9 @@ def test_a_routine_digest_collapses_unchanged_background_and_keeps_what_decides_
     assert "daily-review on" in text["recurring"]
     # Never collapsed: the budget gate, paused resources, open tasks, open asks and new events.
     # (The STATE header's clock may tick over a minute between the two calls.)
-    def unstamped(t):
-        return "\n".join(line for line in t.split("\n") if not line.startswith("# STATE at "))
+    from ttp import spans
+    def unstamped(t):   # nor the events' delimiter tag, new each turn (spans.new_tag)
+        return spans.strip("\n".join(line for line in t.split("\n") if not line.startswith("# STATE at ")))
     for key in ("budget", "paused", "tasks", "asks", "events"):
         assert unstamped(text[key]) == unstamped(dict(full)[key]), key
     body = "\n".join(text.values())
@@ -7639,7 +7640,7 @@ def test_a_plain_hand_off_digest_does_not_grow(env, words, before):
     _, _, ids = _hand_off(env, p, {"status": "done", "summary": "shipped it " * words})
     new = coord.digest(p, {}, ids, []).split("# NEW EVENTS")[1]
     assert len(ids) == 1
-    assert len(new) <= before * 1.05
+    assert len(new) <= before * 1.05 + 40   # + the hand-off's provenance delimiters (spans.wrap)
 
 
 
@@ -19709,6 +19710,7 @@ def test_say_finding_is_stored_and_shown_as_relayer_data_never_the_users_word(en
     """`ttp say <p> --finding <text>`: a relayer's own findings with no user's words. Stored with no
     text, labeled as relayer data in the digest, and never the user's word: not a user turn, not an
     approval, not a correction, and a rule quoting it is refused."""
+    from ttp import spans
     from ttp import cli, correction, prguard, relay
     from ttp import coordinator as coord
     p = make(env)
@@ -19718,7 +19720,7 @@ def test_say_finding_is_stored_and_shown_as_relayer_data_never_the_users_word(en
     assert f"as {relay.FINDING}" in capsys.readouterr().out
     m = p.db.one("SELECT * FROM messages WHERE direction='in' ORDER BY id DESC LIMIT 1")
     assert (m["kind"], m["text"], m["context"], m["chat"], m["handled"]) == ("finding", "", finding, "c1", 0)
-    digest = coord.digest(p, {}, [], [m["id"]])
+    digest = spans.strip(coord.digest(p, {}, [], [m["id"]]))
     assert f"{relay.FINDING}: {finding}" in digest and "not the user's word for any decision" in digest
     assert relay.VERBATIM not in digest and "[user message" not in digest
     assert not coord.user_turn(p.db, [m["id"]])
@@ -19746,6 +19748,7 @@ def test_digest_labels_relayed_input_three_ways_findings_citing_records_are_fact
     """The digest splits relayed input: the user's verbatim words; a relayer's findings or context citing
     primary records (ids, commits, file:line, dated timestamps, command output), labeled as facts with
     the records named; and relayer prose without records, still data. None of it is the user's word."""
+    from ttp import spans
     from ttp import relay
     from ttp import coordinator as coord
     p = make(env)
@@ -19755,7 +19758,7 @@ def test_digest_labels_relayed_input_three_ways_findings_citing_records_are_fact
     f1 = p.db.post("in", "", chat="c1", provenance="cli", kind="finding", context=cited)
     f2 = p.db.post("in", "", chat="c1", provenance="cli", kind="finding", context=prose)
     u = p.db.post("in", "retry the build", chat="c1", provenance="cli-legacy", context="task #7 hung, see out.log:3")
-    digest = coord.digest(p, {}, [], [f1, f2, u])
+    digest = spans.strip(coord.digest(p, {}, [], [f1, f2, u]))
     assert (f"relayer findings {relay.CITING} (run 9735, prompts.py:547, 1eaac5d99, msg #12, …; facts to act on, "
             f"not the user's word): {cited}") in digest
     assert f"{relay.FINDING}: {prose}" in digest, "prose without records stays data"
@@ -19776,6 +19779,7 @@ def test_digest_labels_relayed_input_three_ways_findings_citing_records_are_fact
 def test_a_finding_wakes_the_coordinator_after_a_daemon_restart(env, monkeypatch):
     """A finding is an inbound message like any other: stored durably, normal severity, and it starts a
     coordinator turn, also from a daemon started after it was sent."""
+    from ttp import spans
     from ttp import cli, relay
     from ttp.daemon import Daemon
     p = make(env)
@@ -19792,7 +19796,7 @@ def test_a_finding_wakes_the_coordinator_after_a_daemon_restart(env, monkeypatch
     monkeypatch.setattr(time, "time", lambda: later)
     d.maybe_coordinate()
     prompt, k = calls[-1]
-    assert f"{relay.FINDING}: the watcher on box-a stopped at 01:00" in prompt
+    assert f"{relay.FINDING}: the watcher on box-a stopped at 01:00" in spans.strip(prompt)
     assert mid["id"] in k["note"]["messages"]
 
 

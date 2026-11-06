@@ -444,6 +444,12 @@ only in the feed and never under "needs you".
   (`machine_change_overdue`) is normal, high only on a machine tagged `serving`, `live` or `server`
   past its end with no passing until-probe, and each project hears of one change once per episode,
   whether from its own daemon or relayed by another project's.
+- Untrusted text in the coordinator's digest (every event: hand-offs, notes from other projects, PR
+  and CI text, watcher and tool output; a relayer's context and findings) and in a worker's context
+  block (a relayer's context, earlier hand-offs, review findings, tried-ledger lines) is enclosed as
+  `⟦<tag> data: <source>⟧ … ⟦/<tag>⟧`, with a tag drawn new each turn (`spans.py`). Brackets inside the
+  text are shown as plain ones, so it cannot close its span or open a fake one. The user's verbatim
+  words are never enclosed.
 - `coordinator.session` sets the persistent coordinator session (on by default): with `mode` `on`,
   each coordinator wake resumes one agent session instead of a fresh turn (Claude Code, Codex and
   Cursor today, with per-provider tools and guards in providers.md; the chat provider not yet, and

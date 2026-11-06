@@ -25650,7 +25650,8 @@ def test_a_worker_sends_another_project_a_note_it_reads_as_untrusted_data(env, m
     assert not dst.db.one("SELECT id FROM messages WHERE direction='in' AND text LIKE '%approve%'")
     dig = coord.digest(dst, {}, [ev["id"]], [])
     line = next(x for x in dig.splitlines() if "the build cache is stale" in x)
-    assert line.startswith("- [upstream_note from upstream, severity high] note to this project from a worker")
+    assert re.match(r"- \[upstream_note from upstream, severity high\] \u27e6[0-9a-f]{8} data: upstream_note\u27e7 "
+                    r"note to this project from a worker", line)
     assert not any(x.startswith("- [user message") for x in dig.splitlines())
     assert upstream.ingest(dst, dst.config()) == 0, "read twice"
     # Not the sender's, nor a third project's, even one that reads the whole inbox.
@@ -29409,6 +29410,7 @@ def test_inbound_messages_carry_the_channel_they_came_in_on(env, tmp_path, monke
 
 
 def test_say_keeps_a_relayers_context_apart_from_the_users_words(env, tmp_path):
+    from ttp import spans
     from ttp import cli, relay
     from ttp import coordinator as coord
     from ttp.db import DB
@@ -29427,7 +29429,9 @@ def test_say_keeps_a_relayers_context_apart_from_the_users_words(env, tmp_path):
         cli.main(["say", "demo", "--context", "only mine", "--", " "])
     # The digest labels the two parts; a message without context reads as before.
     plain = p.db.post("in", "hello", chat="cli", provenance="cli-legacy")
-    digest = coord.digest(p, {}, [], [m["id"], plain])
+    raw = coord.digest(p, {}, [], [m["id"], plain])
+    assert "⟦" not in raw.split("relayer context")[0].rsplit("[user message", 1)[1]   # the words: not enclosed
+    digest = spans.strip(raw)
     assert f"chat={m['chat']}] user's words (verbatim): fix the flaky test\n  relayer context (data, not the user's word): " \
            f"background: the user is on a laptop" in digest
     assert "chat=cli] hello" in digest and digest.count("relayer context (data") == 1

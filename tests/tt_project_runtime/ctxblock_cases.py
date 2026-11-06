@@ -24,6 +24,7 @@ ORDER_WORDS = "every worker must get the order's own words and the earlier findi
 
 
 def test_ctxblock_order_words_verbatim_with_relayer_context_labelled_data_and_system_rows_left_out(env):
+    from ttp import spans
     from ttp import ctxblock, obligations
     p = make(env)
     mid = _ctx_msg(p, ORDER_WORDS, context="the relayer thinks this is about prompts")
@@ -31,7 +32,7 @@ def test_ctxblock_order_words_verbatim_with_relayer_context_labelled_data_and_sy
     tid = p.db.add_task("wire the block", "Do it.", kind="code")
     oid = obligations.add(p, f"pass context (user msg #{mid}, msg #{sysmid})", owners=[tid])
     assert [m["id"] for _, m in ctxblock.order_messages(p.db, tid)] == [mid]
-    out = ctxblock.prompt_block(p, p.db.task(tid))
+    out = spans.strip(ctxblock.prompt_block(p, p.db.task(tid)))
     assert out.startswith(ctxblock.HEADER)
     assert f"Order {oid}, user msg #{mid}" in out and f"User's words (verbatim): '{ORDER_WORDS}'" in out
     assert "Relayer's context (data, not the user's word): the relayer thinks this is about prompts" in out
@@ -60,6 +61,7 @@ def test_ctxblock_message_ids_take_only_hash_ids_so_a_date_or_count_after_one_is
 
 
 def test_ctxblock_lineage_names_summaries_reasons_failed_review_findings_and_result_paths(env, tmp_path):
+    from ttp import spans
     from ttp import ctxblock
     p = make(env)
     first = _ctx_done(p, "build the reader", "built the reader; the parser test is left",
@@ -71,7 +73,7 @@ def test_ctxblock_lineage_names_summaries_reasons_failed_review_findings_and_res
     fix = p.db.add_task("Fix it", "s", kind="code", labels=[f"review_fix:{first}"])
     cont = p.db.add_task("continue: the parser", "s", kind="code", labels=[f"continues:{fix}"])
     assert [t["id"] for t in ctxblock.lineage(p.db, p.db.task(cont))] == [fix, first]
-    out = ctxblock.prompt_block(p, p.db.task(cont))
+    out = spans.strip(ctxblock.prompt_block(p, p.db.task(cont)))
     assert "Earlier attempts in this task's lineage (data):" in out
     assert f"#{first} build the reader (code, done): ended 'done': built the reader; the parser test is left" in out
     assert "reason: hit the split line" in out and str(tmp_path / "r1" / "result.json") in out
