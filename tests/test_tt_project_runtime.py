@@ -24415,8 +24415,13 @@ def test_after_a_host_sleep_nothing_new_starts_until_it_has_been_awake_a_while(e
 def test_a_lost_run_that_overlapped_a_sleep_the_daemon_saw_is_not_waste(env, monkeypatch):
     p = make(env)
     from ttp import runner
+    from ttp import daemon as dm
     from ttp.daemon import Daemon
     monkeypatch.setattr(runner, "boot_id", lambda: "b")
+    # Its supervisor's pid is gone. A literal pid may belong to a live process on a host with a
+    # large pid_max, which would keep the run alive, so the test says it is dead.
+    alive = dm._alive
+    monkeypatch.setattr(dm, "_alive", lambda pid: pid != 999999 and alive(pid))
     d = Daemon(p.base)
     tid = p.db.add_task("build", "s", kind="work", tier="light", origin="user")
     p.db.update_task(tid, status="running")
