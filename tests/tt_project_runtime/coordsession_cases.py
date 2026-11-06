@@ -1456,7 +1456,7 @@ def test_coordsession_capped_wakes_spending_on_cache_writes_converge(env, monkey
     assert s0["seed_basis"] == "history" and 1.0 < _cs_cap(a0) < 2.5, (s0, a0)
 
 
-def test_coordsession_a_past_seed_is_bounded_by_its_seeded_prompt_size(env, monkeypatch):
+def test_coordsession_a_past_seed_is_bounded_by_the_size_of_its_seeded_prompt(env, monkeypatch):
     """Review #6545: turn.prompt_bytes is measured before the session seed (memory, order ledger,
     handover note, chat) is added, so a seed that grew past SEED_FACTOR times it was clipped and the next
     first wake's cap fell short. A new-session wake records its seeded size (turn.session.seed_chars),
