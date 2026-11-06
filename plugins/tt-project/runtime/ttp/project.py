@@ -715,7 +715,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
         return {"claude", "codex", "cursor", "fake", "chat"} if len(path) == 1 else PROVIDER_KEYS if len(path) == 2 else None
     if path == ["checks"]:
         # wrap_cmd: the project's own lock or queue command the commands after `ttp checks --` run
-        # behind (push.wrap_of; default "", none); delivery.push_checks never go through it.
+        # behind (push.wrap_of; default "", none); delivery.push_checks never go through it. A map
+        # {"cmd": ..., "repos": [repo keys]} scopes it to those repositories; others run unwrapped.
         # wrap_lane: where those runs take its lane, before the wrapper starts or after (push.wrap_lane_of).
         # no_device_cmds: commands that need no device, run without wrap_cmd (checklane.no_device).
         # fallback_lane: where those run while wrap_cmd's lock is paused, a wrapper or "unwrapped" (push.fallback_lane_of;

@@ -2149,7 +2149,11 @@ session and stateless coordinators on every provider.
   `ttp checks --freeze-lock <file>` writes one that pins the user site's packages too (tt-project-harness
   push-checks reference, "The pinned Python env"). `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
-  fails the checks, and `delivery.push_checks` never go through it. A wrapper running its own test pool starts
+  fails the checks, and `delivery.push_checks` never go through it. A plain string applies to every repository;
+  `{"cmd": "<command>", "repos": ["<repo key>", ...]}` scopes it to the repositories it serves (keys as in
+  `delivery.push_checks_by_repo`), and checks elsewhere run unwrapped. A wrapped command the wall-time cap stops
+  before any test started is a wrapper or queue timeout (exit 75, `infra_fault: "wrapper-queue-timeout"`), never a
+  test failure. A wrapper running its own test pool starts
   each shard, local or over ssh, as `ttp checks-shard -- <cmd>`, so the shard counts toward that host's checks slots.
   A check command that waits on an outside CPU pool (a test gate waiting for a pool slot) gives the run's host-wide
   checks slot up while it waits: it runs `ttp checks-yield` before the wait and `ttp checks-yield --resume` before

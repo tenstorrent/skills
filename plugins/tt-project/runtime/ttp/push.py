@@ -230,20 +230,38 @@ def with_host(checks: list, default: Any) -> list:
 WRAP_KEY = "checks.wrap_cmd"
 
 
-def wrap_of(cfg: dict | None) -> tuple[str, ...]:
+def wrap_of(cfg: dict | None, repo: Path | str | None = None, p: Project | None = None) -> tuple[str, ...]:
     """`checks.wrap_cmd` as argv words: a project's own lock or queue command that each command given
     after `--` to `ttp checks` (and the ones `ttp push --own` reruns from that record) runs behind, the
     command passed to it as separate arguments. () when unset or empty. ValueError when it is not a
-    string or its quoting does not parse; callers fail the checks then, never run the command unwrapped."""
+    string or its quoting does not parse; callers fail the checks then, never run the command unwrapped.
+    A map `{"cmd": "<command>", "repos": ["<repo key>", ...]}` scopes it to the repositories it serves,
+    keyed as delivery.push_checks_by_repo is (repo_named): with `repo` (the checked repository; `p` its
+    project) one it does not name gets (), so its checks run unwrapped. No `repo`: the wrapper itself,
+    whatever its scope (its lock's identity)."""
     v = ((cfg or {}).get("checks") or {}).get("wrap_cmd") if isinstance((cfg or {}).get("checks"), dict) else None
+    repos: list[str] | None = None
+    if isinstance(v, dict):
+        if bad := set(map(str, v)) - {"cmd", "repos"}:
+            raise ValueError(f"{WRAP_KEY} takes only cmd and repos, not {', '.join(sorted(bad))}")
+        repos = [v["repos"]] if isinstance(v.get("repos"), str) else v.get("repos")
+        if not isinstance(repos, list) or not repos or not all(isinstance(k, str) and k.strip() for k in repos):
+            raise ValueError(f"{WRAP_KEY}.repos must be a repo key or a non-empty list of them (as "
+                             f"delivery.{BY_REPO} keys: {HARNESS_KEY!r}, a path or a checkout's folder name)")
+        v = v.get("cmd")
+        if not isinstance(v, str) or not v.strip():
+            raise ValueError(f"{WRAP_KEY}.cmd must be a command string")
     if v is None or v == "":
         return ()
     if not isinstance(v, str):
-        raise ValueError(f"{WRAP_KEY} must be a command string, not {type(v).__name__}")
+        raise ValueError(f"{WRAP_KEY} must be a command string or a map of cmd and repos, not {type(v).__name__}")
     try:
-        return tuple(shlex.split(v))
+        words = tuple(shlex.split(v))
     except ValueError as e:
         raise ValueError(f"{WRAP_KEY} {v!r} does not parse: {e}") from e
+    if repos is not None and repo is not None and not repo_named(repos, Path(repo), p):
+        return ()
+    return words
 
 
 def wrap_problem(wrap: tuple[str, ...], cwd: str | Path, env: dict | None = None) -> str:
@@ -2077,6 +2095,23 @@ def harness_repo(p: Project | None, repo: Path) -> bool:
     return bool(mine and theirs) and Path(mine).resolve() == Path(theirs).resolve()
 
 
+def _names(k: str, paths: list[Path], name: str, p: Project | None) -> bool:
+    """Whether repo key `k` (not `harness`) names the repository known by `paths` and `name` (_repo_keys):
+    its main checkout's folder name, or a path (absolute, ~, or relative to the project root)."""
+    path, root = Path(k).expanduser(), p.root if p is not None else None
+    return k == name or ("/" in k or k.startswith("~")) \
+        and (path if path.is_absolute() or root is None else root / path).resolve() in paths
+
+
+def repo_named(keys: list[str], repo: Path, p: Project | None = None) -> bool:
+    """Whether any of `keys` names `repo` as a delivery.push_checks_by_repo key would: `harness` for the
+    project's own harness repo, a path, or its main checkout's folder name."""
+    if HARNESS_KEY in keys and harness_repo(p, repo):
+        return True
+    paths, name = _repo_keys(repo)
+    return any(k != HARNESS_KEY and _names(k, paths, name, p) for k in keys)
+
+
 def repo_checks(d: dict, repo: Path, p: Project | None = None) -> tuple[Any, str]:
     """The check list for `repo` (delivery settings `d`) and where it came from. The
     delivery.push_checks_by_repo entry that names it: `harness` for the project's own harness repo,
@@ -2090,13 +2125,8 @@ def repo_checks(d: dict, repo: Path, p: Project | None = None) -> tuple[Any, str
         if harness and HARNESS_KEY in by:
             return by[HARNESS_KEY], f"delivery.{BY_REPO}.{HARNESS_KEY}"
         paths, name = _repo_keys(repo)
-        root = p.root if p is not None else None
         for k, v in by.items():
-            if k == HARNESS_KEY:
-                continue
-            path = Path(k).expanduser()
-            if k == name or ("/" in k or k.startswith("~")) \
-                    and (path if path.is_absolute() or root is None else root / path).resolve() in paths:
+            if k != HARNESS_KEY and _names(k, paths, name, p):
                 return v, f"delivery.{BY_REPO}[{k!r}]"
     if harness:
         return [c.config() for c in check_list(d.get("push_checks")) if c.purpose == "harness"], HARNESS_UNSET
@@ -3618,7 +3648,8 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             base: str | None = None, ff_only: bool = False, recorded: dict | None = None,
             check_run_dir: str | None = None, reuse: Callable[[str, list, list], str] | None = None,
             host: str = "", lease: bool = False, start: str = "",
-            start_ref: str = "", never_force: bool = False, cfg: dict | None = None) -> int:
+            start_ref: str = "", never_force: bool = False, cfg: dict | None = None,
+            p: Project | None = None) -> int:
     """`ttp push --own`: run `checks` on HEAD as it is and push it to remote/branch, the task's own
     branch. No rebase and no version bump, so the pushed commit is the one reviewed; without force,
     so the remote takes only a fast-forward of what it has. Without checks, as for `ttp push`, only
@@ -3695,7 +3726,7 @@ def publish(repo: Path, remote: str, branch: str, checks: list[str],
             todo = extras = with_host(recorded_extras(recorded, head, checks), host)
             if todo:
                 try:
-                    wrap = wrap_of(cfg)
+                    wrap = wrap_of(cfg, repo, p)
                 except ValueError as e:
                     say(f"{e}; not pushing")
                     return CHECKS_FAILED
@@ -4445,7 +4476,7 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
                      ff_only=own_ff_only(branch) and not lease, lease=lease, start=start, start_ref=start_ref,
                      recorded=recorded or recorded_checks(os.environ.get("TTP_RUN_DIR")), check_run_dir=output,
                      reuse=lambda tree, cmds, envs, parts: _own_pass(p, tree, cmds, envs, parts), host=d.get("checks_host") or "",
-                     never_force=never_force_on(p.config()), cfg=p.config())
+                     never_force=never_force_on(p.config()), cfg=p.config(), p=p)
     else:
         rc = push(repo, remote, branch, checks, rounds, hold=lambda: take(p, remote, branch, wait_s),
                   version_bump=version_bump, timed=lambda s: record_check_s(p, s),

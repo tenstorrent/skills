@@ -8260,6 +8260,120 @@ def test_missing_program_resolves_the_program_a_launcher_runs_in_the_checks_env(
     assert envfault.missing_program("true && mylint", tmp_path, off) == "mylint"   # past a builtin
 
 
+def test_checks_wrap_cmd_scoped_to_its_repos_wraps_only_their_checks(env, tmp_path, monkeypatch, capsys):
+    """A wrapper scoped to the repositories it serves ({"cmd", "repos"}) wraps only their checks: a check in
+    another repository runs unwrapped and says so; a plain string still wraps every repository."""
+    from ttp import cli, project, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    log = tmp_path / "wrap.log"
+    wrapper = str(_arg_logging_wrapper(tmp_path / "lock.sh", log))
+    calls = lambda: log.read_text().splitlines().count("CALL") if log.exists() else 0
+    tree = subprocess.run([*git, "worktree", "add", "-q", "-b", "side", str(tmp_path / "side")], capture_output=True)
+    assert tree.returncode == 0, tree.stderr
+    # Scoped by folder name, by absolute path, by a path relative to the project root, or a list mixing them.
+    for repos in ("work", [str(repo)], [os.path.relpath(repo, p.root)], ["other", "work"]):
+        p.set_config("checks.wrap_cmd", {"cmd": wrapper, "repos": repos})
+        before = calls()
+        cli.main(["checks", "--fresh", "--", "true"])
+        assert calls() == before + 1, repos
+        assert "run behind checks.wrap_cmd" in capsys.readouterr().out
+    # A worktree of a named repository is that repository.
+    monkeypatch.chdir(tmp_path / "side")
+    before = calls()
+    cli.main(["checks", "--fresh", "--", "true"])
+    assert calls() == before + 1
+    monkeypatch.chdir(repo)
+    # Another repository's checks run unwrapped, even when the wrapper is missing.
+    for cmd in (wrapper, str(tmp_path / "nope.sh")):
+        p.set_config("checks.wrap_cmd", {"cmd": cmd, "repos": ["other-repo", str(tmp_path / "elsewhere")]})
+        capsys.readouterr()
+        before = calls()
+        cli.main(["checks", "--fresh", "--", "true"])
+        assert calls() == before and "scoped to other repositories" in capsys.readouterr().out
+        assert json.loads((run / "checks.json").read_text())["passed"] is True
+    # A plain string applies everywhere, as before.
+    p.set_config("checks.wrap_cmd", wrapper)
+    before = calls()
+    cli.main(["checks", "--fresh", "--", "true"])
+    assert calls() == before + 1
+    # Without a repository: the wrapper itself (its lock's identity), whatever its scope.
+    scoped = {"checks": {"wrap_cmd": {"cmd": "w --x", "repos": "work"}}}
+    assert push.wrap_of(scoped) == ("w", "--x") and push.wrap_of(scoped, repo, p) == ("w", "--x")
+    assert push.wrap_of(scoped, tmp_path, p) == ()
+    assert push.wrap_of({"checks": {"wrap_cmd": "w"}}, tmp_path, p) == ("w",)
+    # Malformed maps are refused by the config check, naming the key.
+    for bad in ({"cmd": "w"}, {"cmd": "w", "repos": []}, {"cmd": "w", "repos": [""]}, {"cmd": "", "repos": ["a"]},
+                {"cmd": "'unclosed", "repos": ["a"]}, {"cmd": "w", "repos": ["a"], "lane": "x"}, {"repos": ["a"]}):
+        assert any("checks.wrap_cmd" in x for x in project.config_problems({"checks": {"wrap_cmd": bad}})), bad
+    assert not [x for x in project.config_problems({"checks": {"wrap_cmd": {"cmd": "w", "repos": ["a"]}}})
+                if "wrap" in x]
+
+
+def test_push_own_runs_extras_unwrapped_in_a_repository_the_scoped_wrapper_does_not_serve(
+        env, monkeypatch, capsys, tmp_path):
+    p, repo, origin, other = _push_setup(env, monkeypatch, [COND])
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.setenv("TTP_TASK", "60")
+    _git_out(repo, "checkout", "-q", "-b", "ttp/t60-exp")
+    _commit(repo, "mine.dat", "mine\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    (run / "checks.json").write_text(json.dumps({"head": head, "passed": True, "commands": ["true"],
+                                                 "skipped": [], "ts": 0}))
+    # A missing wrapper scoped to another repository is not this one's: the extras run, unwrapped.
+    p.set_config("checks.wrap_cmd", {"cmd": str(tmp_path / "nope.sh"), "repos": ["not-this-repo"]})
+    assert _ttp("push", "--own") == 0
+    assert _git_out(origin, "rev-parse", "ttp/t60-exp") == head
+    # Scoped to this repository: it applies (a missing one fails, never runs unwrapped).
+    _commit(repo, "more.dat", "more\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    (run / "checks.json").write_text(json.dumps({"head": head, "passed": True, "commands": ["true"],
+                                                 "skipped": [], "ts": 0}))
+    p.set_config("checks.wrap_cmd", {"cmd": str(tmp_path / "nope.sh"), "repos": [str(repo)]})
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 4 and "checks.wrap_cmd" in capsys.readouterr().err
+
+
+def test_a_wrapped_check_the_wall_cap_stops_before_any_test_started_is_a_queue_timeout_not_a_failure(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_TASK", "7")
+    p.set_config("checks.wall_cap_s", 2)
+    queue = tmp_path / "queue.sh"   # a wrapper that only says where it waits in its queue
+    queue.write_text('#!/bin/sh\nwhile :; do echo "waiting in the queue, position 8"; sleep 0.2; done\n')
+    queue.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(queue))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 75, err
+    assert "before any test started: a wrapper or queue timeout, not a test failure" in err, err
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is False and rec["infra_fault"] == checkwall.QUEUED_INFRA and rec["timed_out"]["queued"]
+    assert checkwall.last_timeout(p.state, "7")["queued"]
+    # A wrapped check whose tests had started is a plain timeout of the run (exit 1), never a queue timeout.
+    started = tmp_path / "started.sh"
+    started.write_text('#!/bin/sh\necho "============ test session starts ============"\nexec sleep 300\n')
+    started.chmod(0o755)
+    p.set_config("checks.wrap_cmd", str(started))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "true"])
+    err = capsys.readouterr().err
+    assert e.value.code == 1 and "a wrapper or queue timeout" not in err, err
+    assert "queued" not in json.loads((run / "checks.json").read_text())["timed_out"]
+    # An unwrapped check stopped at the cap with no output is a plain timeout too.
+    p.set_config("checks.wrap_cmd", "")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh", "--", "sleep 300"])
+    assert e.value.code == 1 and "a wrapper or queue timeout" not in capsys.readouterr().err
+    # What counts as a test start: a runner header, collection or a verdict; a queue's own words do not.
+    assert checkwall.test_started("collected 3 items\n") and checkwall.test_started("1 passed in 0.1s\n")
+    assert checkwall.test_started("1..4\nok 1\n")
+    assert not checkwall.test_started("waiting in the queue, position 8\nno verdict yet\n")
+
+
 def test_push_own_reruns_recorded_extras_behind_checks_wrap_cmd(env, monkeypatch, capsys, tmp_path):
     log = tmp_path / "wrap.log"
     p, repo, origin, other = _push_setup(env, monkeypatch, [COND])

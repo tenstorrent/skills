@@ -3628,13 +3628,16 @@ def cmd_checks(a) -> None:
     fallback, fb_lane, fell_back = ("", (), ""), (), {}
     if mine:   # checks.wrap_cmd: the project's own lock or queue wrapper (never the project checks)
         try:
-            wrap, after = push.wrap_of(cfg), push.wrap_lane_of(cfg) == "after"
+            wrap, after = push.wrap_of(cfg, top, p), push.wrap_lane_of(cfg) == "after"
         except ValueError as e:
             die(f"ttp checks: {e}; the commands after `--` were not run", 1)
         from . import checklane
         # checks.wrap_lane "after": the wrapper lock's lane is taken inside the wrapper, once it holds its lock.
         # A command that needs no device (--no-device, checks.no_device_cmds) runs without the wrapper.
         nodev = lambda c: checklane.no_device(c, cfg, bool(getattr(a, "no_device", False)))
+        if not wrap and push.wrap_of(cfg):
+            print(f"ttp checks: {push.WRAP_KEY} is scoped to other repositories (its repos): the commands after "
+                  "`--` run here without it")
         mine = push.with_wrap(mine, wrap, _wrap_lane_step(p, Path(run_dir), wrap) if wrap and after and p else (),
                               nodev)
         wrapped = {str(c) for c in mine if getattr(c, "wrap", None)}   # their run takes the lock's lane
@@ -4010,7 +4013,9 @@ def cmd_checks(a) -> None:
                     said_last = (f"this task's last checks run (run {last.get('run') or '?'} on "
                                  f"{str(last.get('head') or '')[:12]}) was stopped "
                                  + (f"after no output for {checkwall.span(float(last['silent_s']))}"
-                                    if last.get("silent_s") else "at the wall-time cap") + ": a timeout, not a pass")
+                                    if last.get("silent_s") else "behind checks.wrap_cmd at the wall-time cap before "
+                                    "any test started" if last.get("queued") else "at the wall-time cap")
+                                 + ": a timeout, not a pass")
                     print(f"ttp checks: {said_last}", flush=True)
                     out.write(f"ttp checks: {said_last}\n")
             # Once they all passed, each check's pass is recorded before the rerun of the added tests (a
@@ -4140,12 +4145,15 @@ def cmd_checks(a) -> None:
                     break
                 except subprocess.TimeoutExpired:
                     # Past the wall-time cap: _run_check ended its group and what it left; never a pass.
+                    # Behind checks.wrap_cmd with no test started yet: it only queued (a wrapper or queue timeout).
                     passed, failed, rc = False, c, checkwall.RC
                     ext_s = wall_ext.granted if wall_ext else 0.0
                     how = wall_how + (f", extended by {checkwall.span(ext_s)}" if ext_s else "")
                     timed_out = {"check": str(c), "cap_s": wall + ext_s, "how": how, "head": head,
-                                 "run": os.environ.get("TTP_RUN_ID") or "?"}
-                    out.write(f"ttp checks: {checkwall.said(str(c), wall + ext_s, how, head)}\n")
+                                 "run": os.environ.get("TTP_RUN_ID") or "?",
+                                 **({"queued": True} if str(c) in wrapped and not push.remote_host(c)
+                                    and not checkwall.test_started(_log_since(out, log, check_start)) else {})}
+                    out.write(f"ttp checks: {checkwall.said_for(timed_out)}\n")
                     out.write(_check_took(c, rc, began))
                     break
                 if rc != 0:
@@ -4351,6 +4359,15 @@ def cmd_checks(a) -> None:
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": setupfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
+        # Behind checks.wrap_cmd, stopped at the wall-time cap before any test started: no verdict (checkwall).
+        if timed_out and timed_out.get("queued") and not passed and not _CHECK_STOP.get("stopped"):
+            said = checkwall.said_for(timed_out)
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "timed_out": timed_out,
+                                                             "infra_fault": checkwall.QUEUED_INFRA})
+            print(f"ttp checks: {said} (full output: {log})", file=sys.stderr)
             sys.exit(75)
         # The gate's rerun found no slot (an admission timeout): no verdict, never a failure of the head.
         if gate_busy is not None and not passed and not _CHECK_STOP.get("stopped"):
