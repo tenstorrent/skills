@@ -570,7 +570,22 @@ def _own_free(project_name: str | None, own: list, kind: Kind = TESTS) -> int:
     """How many of a project's budget slots `own` it may still take: their number less every slot of its
     budget held, those past a budget that shrank (project_workers) included."""
     span = own_paths(project_name, max(len(own), checkcap.cores()), kind)
-    return max(0, len(own) - len(locks._slot_labels(span)))
+    return max(0, len(own) - _held(span))
+
+
+def _held(paths: list) -> int:
+    """How many of `paths` are held now; while a preempt weighs a run (checkcap.FREEING), less those that
+    run holds, as if it had stopped (checkcap.preempt's `startable`)."""
+    if not (owner := checkcap.FREEING.get()):
+        return len(locks._slot_labels(paths))
+    n = 0
+    for path in paths:
+        if locks._slot_labels([path]):
+            try:
+                n += not checkcap.same_owner(locks.read_label(path), owner)
+            except (OSError, ValueError):
+                n += 1
+    return n
 
 
 def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
@@ -1153,7 +1168,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     s = sizes(cfg)
     if s is None:
         return ""
-    used = len(locks._slot_labels(paths(max(s[0], checkcap.cores()))))
+    used = _held(paths(max(s[0], checkcap.cores())))
     pool = pool_now(cfg, s[0], used)
     if used >= pool:
         return f"the host's test pool is full: {used} of {pool} held"

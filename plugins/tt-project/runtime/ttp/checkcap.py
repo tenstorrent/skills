@@ -66,8 +66,12 @@ With those held too, an urgent waiter that has waited preempt_after_s() since it
 (PREEMPT_ASKED_ENV, kept over a re-execution), one routine run on a cap slot to step back (preempt): its own
 project's first, then the least urgent, then the latest granted (it loses the least work). It ends its command,
 lets its slots go and queues again at its old arrival, so it keeps its place and what it recorded (in a pinned
-run, only passes on the pinned commit), and the waiter takes the freed slot; its log and its queue entry say
-`preempted by urgent #<task>` (PREEMPTED_ENV, label()). Never another urgent run or a push check (their priority
+run, only passes on the pinned commit), and the waiter takes the freed slot: a claim (claims, CLAIM_S) keeps
+it from every other waiter while the asker lives and renews it, and a request whose claim lapsed asks nothing.
+A waiter parked for its test slots asks only a run whose stop lets it start (preempt's `startable`, FREEING:
+its project's budget and the host's test pool counted without that run's slots); else nobody. Its log says
+`preempted by urgent #<task>`; its queue entry says `requeued after preemption by ...` until it holds a slot
+again (PREEMPTED_ENV, label(), requeued()). Never another urgent run or a push check (their priority
 slots are no cap slots), nor a run behind a lock (a wrapper lock, `ttp lock`, `ttp devq`: preemptible()); a
 holder whose label does not say it can be asked (an older ttp) is skipped. A routine run whose task turns urgent
 while it waits sees it within RERANK_S (reranked) and re-executes as an urgent run (cli._checks_reexec).
@@ -107,6 +111,7 @@ when it arrived (grant_line).
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import fcntl
 import hashlib
 import json
@@ -164,6 +169,11 @@ PREEMPT_AFTER_S = 120.0   # default checks.preempt_after_s: an urgent waiter's g
 PREEMPT_AFTER_ENV = "TTP_CHECKS_PREEMPT_AFTER_S"
 PREEMPT_ASKED_ENV = "TTP_CHECKS_PREEMPT_ASKED"   # this urgent request asked already (kept over a re-execution)
 PREEMPTED_ENV = "TTP_CHECKS_PREEMPTED"   # this routine run was preempted: "urgent #<task>" (label())
+CLAIM = "claim"   # check-slots/claim.<token>.json: the slot a preempted run frees is its asker's (preempt)
+CLAIM_S = 30.0   # a claim lapses this long after its asker last renewed it (it renews while the asked run holds)
+CLAIM_MAX_S = 600.0   # and this long after it was made, however often renewed
+# The run a preempt would stop: testslots counts the test slots it holds as free (preempt's `startable`).
+FREEING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("checkcap_freeing", default=None)
 RERANK_ENV = "TTP_CHECKS_RERANKED"   # these waiting checks re-executed once as urgent (reranked)
 RERANK_S = 30.0   # a waiting routine run reads its task's priority again at most this often (reranked)
 # What only this `ttp checks` run reads (its own re-queue, re-execution and label): never passed to the check
@@ -687,9 +697,14 @@ def label(project_name: str | None, what: str = "") -> str:
     """Who holds or waits for a slot, as status lines show it: the project and the task's run."""
     task, run = os.environ.get("TTP_TASK"), os.environ.get("TTP_RUN_ID")
     who = f"{project_name or 'no project'}" + (f" task #{task} (run {run or '?'})" if task else "")
-    if by := os.environ.get(PREEMPTED_ENV):
-        who += f" [preempted by {by}]"
-    return who + (f" {what}" if what else "")
+    return who + requeued() + (f" {what}" if what else "")
+
+
+def requeued() -> str:
+    """What label() adds while a preempted run queues again (PREEMPTED_ENV), "" otherwise. The slot it takes
+    back is labelled without it (acquire), and its run drops PREEMPTED_ENV once it holds one (cli)."""
+    by = os.environ.get(PREEMPTED_ENV)
+    return f" [requeued after preemption by {by}]" if by else ""
 
 
 def task_priority(p) -> int | None:
@@ -973,6 +988,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     if not n or os.environ.get(HELD_ENV):
         return Slot()
     since = time.time() if since is None else since
+    held_as = holder.replace(requeued(), "") if requeued() else holder   # a slot it holds is no requeue
+    asked, claim = _asked(since), _asked(since, "claim")   # one request asks once, over a re-execution too
     waiting = checkwait.chain(waiting, "host-wide checks slot")   # inside a push check: not its run time
     ps, every = paths(n), all_paths(n)
     queued_as = holder + (OBLIGATION_MARK if priority is not None and priority < 1 else "")
@@ -982,13 +999,15 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
         if twin:
             _drop_pass()
         f = (None if parked or twin or locks.queued(slot_dir(), RESOURCE)
-             else _take(n, ps, every, holder, what, same, label=label))
+             else _take(n, ps, every, held_as, what, same, label=label, mine=claim))
         if f:
+            drop_claim(claim)
             locks.mark_served(slot_dir(), RESOURCE, project_name)
             locks.mark_turn(slot_dir(), RESOURCE, None)
             _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
             return Slot(f, again=again)
-        if f := _urgent_take(urgent, priority, every, holder, what, same):
+        if f := _urgent_take(urgent, priority, every, held_as, what, same):
+            drop_claim(claim)
             return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
                                                    priority=priority)
@@ -1000,7 +1019,6 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     except OSError as e:
         raise _unavailable(e) from e
     started, told, checked, parked_told = time.time(), 0.0, time.time(), parked
-    asked = _asked(since)   # one request asks once, over a re-execution too
     try:
         while True:
             if done and ((ticket is None and not parked) or time.time() - checked >= DONE_S):
@@ -1041,19 +1059,26 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 n = limit() or n   # a default cap follows the load (default_limit())
                 ps = paths(n)
                 try:
-                    f = _take_in_turn(n, ticket, ps, every, holder, what, same, label)
+                    f = _take_in_turn(n, ticket, ps, every, held_as, what, same, label, mine=claim)
                 except OSError:
                     f = None
-            if not f and not twin and (f := _urgent_take(urgent, priority, every, holder, what, same)):
+            if not f and not twin and (f := _urgent_take(urgent, priority, every, held_as, what, same)):
                 return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
             if not f and asked and not twin and not parked:   # the slot a preempted run gave up is this run's
-                f = _take(n, paths(n), every, holder, what, same, label=label)
+                f = _take(n, paths(n), every, held_as, what, same, label=label, mine=claim)
+            if claim and not f:
+                renew_claim(claim, parked)
             if (not f and not asked and not twin and urgent and is_urgent(priority)
                     and time.time() - since >= preempt_after_s()):
-                if asked := preempt(holder, every, project_name):
-                    os.environ[PREEMPT_ASKED_ENV] = json.dumps({"since": since, "asked": asked})
+                # Only a run whose stop lets this one start: parked, its test slots must fit once that run's free.
+                claim = secrets.token_hex(6)
+                if asked := preempt(holder, every, project_name, startable=startable if parked else None,
+                                    claim=claim):
+                    os.environ[PREEMPT_ASKED_ENV] = json.dumps({"since": since, "asked": asked, "claim": claim})
                     if tell:
                         tell(PREEMPT_LINE.format(asked))
+                else:
+                    claim = ""
             if f:
                 locks.mark_served(slot_dir(), RESOURCE, project_name)
                 locks.mark_turn(slot_dir(), RESOURCE, ticket)
@@ -1078,6 +1103,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             project.ps_cycle()   # pids are read once per poll cycle, never one `ps` each (ps_snapshot)
     finally:
         locks.dequeue(ticket)
+        drop_claim(claim)   # taken, or given up: the asked run need not stop for it any more (preempted)
         _park(False, park, "", 0.0, None, None)
         if told and waiting:
             waiting(False)
@@ -1120,13 +1146,17 @@ def _preempt_path(pid: int) -> Path:
     return slot_dir() / f"{PREEMPT}.{pid}.json"
 
 
-def preempt(by: str, every: list[Path], project_name: str | None = None) -> str:
+def preempt(by: str, every: list[Path], project_name: str | None = None,
+            startable: Callable[[], bool] | None = None, claim: str = "") -> str:
     """Ask one routine run holding a slot of the cap (`every`) to give it up: a run of the asker's project
     (`project_name`) first, then the lowest priority (none first, then the highest number), the latest granted
     among equals (it loses the least work). Only a holder whose label says it can be asked (acquire's
     `preemptible`), never an urgent run (is_urgent) or a reserved slot's; push checks hold priority slots,
-    never these. Returns the holder asked, or ""."""
-    best, rank = None, None
+    never these. With `startable` (the asker waits for its test slots) only a run whose stop lets it start:
+    `startable()` true with that run's test slots counted free (FREEING), else nobody is asked. With `claim`
+    the slot it frees is the asker's (claims): no other waiter takes it while the claim lives, and the request
+    lapses with it (preempted). Returns the holder asked, or ""."""
+    found = []
     for path in every:
         if not locks.held_labels([path]):
             continue
@@ -1140,37 +1170,114 @@ def preempt(by: str, every: list[Path], project_name: str | None = None) -> str:
         if pid <= 0:
             continue
         prio = h.get("priority")
-        r = (bool(project_name) and h.get("checks_project") == project_name, prio is None,
-             prio if isinstance(prio, int) else 0, float(h.get("since") or 0))
-        if rank is None or r > rank:
-            best, rank = (pid, str(h.get("holder") or pid)), r
-    if best is None:
-        return ""
+        found.append(((bool(project_name) and h.get("checks_project") == project_name, prio is None,
+                       prio if isinstance(prio, int) else 0, float(h.get("since") or 0)), pid, path, h))
+    for _, pid, path, h in sorted(found, key=lambda x: x[0], reverse=True):
+        if startable is not None:
+            tok = FREEING.set(h)
+            try:
+                if not startable():
+                    continue
+            finally:
+                FREEING.reset(tok)
+        try:
+            if claim:
+                _write(_claim_path(claim), {"by": by, "made": time.time(), "at": time.time(), "slot": path.name,
+                                            "victim": {k: h.get(k) for k in OWNER_KEYS}, **locks.taker()})
+            _preempt_path(pid).write_text(json.dumps({"by": by, "task": os.environ.get("TTP_TASK") or "",
+                                                      "at": time.time(), **({"claim": claim} if claim else {})}))
+        except OSError:
+            drop_claim(claim)
+            return ""
+        return str(h.get("holder") or pid)
+    return ""
+
+
+OWNER_KEYS = ("pid", "pid_start", "ns_pid")   # a slot label's fields that name the process holding it (same_owner)
+
+
+def same_owner(label: dict, owner: dict) -> bool:
+    """Whether slot `label` is held by the process `owner` (a slot label too) names: its pid fields match."""
+    return bool(owner.get("pid")) and all(label.get(k) == owner.get(k) for k in OWNER_KEYS)
+
+
+def _claim_path(token: str) -> Path:
+    return slot_dir() / f"{CLAIM}.{token}.json"
+
+
+def _claim_live(rec: dict, now: float) -> bool:
+    """A claim lives while its asker does and renewed it within CLAIM_S, for at most CLAIM_MAX_S."""
     try:
-        _preempt_path(best[0]).write_text(json.dumps({"by": by, "task": os.environ.get("TTP_TASK") or "",
-                                                      "at": time.time()}))
+        at, made = float(rec.get("at") or 0), float(rec.get("made") or 0)
+    except (TypeError, ValueError):
+        return False
+    return now - at < CLAIM_S and now - made < CLAIM_MAX_S and locks.pid_alive(rec) is not False
+
+
+def claims(mine: str = "") -> int:
+    """Live claims on a slot a preempted run frees, other than `mine`: each keeps one slot of the cap from
+    every waiter but its asker (_room). A lapsed one is removed."""
+    n, now = 0, time.time()
+    for path in slot_dir().glob(f"{CLAIM}.*.json"):
+        if mine and path.name == _claim_path(mine).name:
+            continue
+        if _claim_live(_read(path), now):
+            n += 1
+        elif now - _mtime(path) >= CLAIM_S:
+            path.unlink(missing_ok=True)
+    return n
+
+
+def _mtime(path: Path) -> float:
+    try:
+        return path.stat().st_mtime
     except OSError:
-        return ""
-    return best[1]
+        return 0.0
 
 
-def _asked(since: float) -> str:
-    """The holder the request arriving at `since` asked already (PREEMPT_ASKED_ENV), or ""."""
+def claim_live(token: str) -> bool:
+    return bool(token) and _claim_live(_read(_claim_path(token)), time.time())
+
+
+def renew_claim(token: str, parked: bool) -> None:
+    """Keep the claim `token` alive while the run it asked still holds its slot and the asker could take
+    it (not `parked`); once that run let it go, or while the asker parks, it lapses within CLAIM_S."""
+    path = _claim_path(token)
+    rec = _read(path)
+    if parked or not _claim_live(rec, time.time()):
+        return
+    slot = slot_dir() / str(rec.get("slot") or "")
+    if rec.get("slot") and locks._slot_labels([slot]) and same_owner(_read(slot), rec.get("victim") or {}):
+        with contextlib.suppress(OSError):
+            _write(path, {**rec, "at": time.time()})
+
+
+def drop_claim(token: str) -> None:
+    if token:
+        _claim_path(token).unlink(missing_ok=True)
+
+
+def _asked(since: float, key: str = "asked") -> str:
+    """The holder the request arriving at `since` asked already (PREEMPT_ASKED_ENV), or ""; its claim's
+    token with `key` "claim"."""
     try:
         got = json.loads(os.environ.get(PREEMPT_ASKED_ENV) or "{}")
     except ValueError:
         return ""
-    return str(got.get("asked") or "") if isinstance(got, dict) and got.get("since") == since else ""
+    return str(got.get(key) or "") if isinstance(got, dict) and got.get("since") == since else ""
 
 
 def preempted(since: float) -> str:
     """Who asked this process's checks to give up their slot (preempt), granted at `since`, or "":
-    "urgent #<task>" when the asker ran for a task, else "urgent <its holder>"."""
+    "urgent #<task>" when the asker ran for a task, else "urgent <its holder>". A request whose claim
+    lapsed or was dropped (its asker died, parked, or took another slot) asks nothing any more."""
     try:
         req = json.loads(_preempt_path(os.getpid()).read_text() or "{}")
     except (OSError, ValueError):
         return ""
     if not isinstance(req, dict) or float(req.get("at") or 0) < since:
+        return ""
+    if req.get("claim") and not claim_live(str(req["claim"])):
         return ""
     task = str(req.get("task") or "")
     return f"urgent #{task}" if task.isdigit() else f"urgent {req.get('by') or 'run'}"
@@ -1337,15 +1444,16 @@ def _running(every: list[Path], same: str) -> str:
     return ""
 
 
-def _room(n: int, every: list[Path]) -> int:
-    return n + extra(n) - len(locks.held_labels(every)) - len(pool_runs())
+def _room(n: int, every: list[Path], mine: str = "") -> int:
+    """Slots a waiter may take: the cap and extra(), less those held, pool runs and others' live claims."""
+    return n + extra(n) - len(locks.held_labels(every)) - len(pool_runs()) - claims(mine)
 
 
 def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, same: str, room: int | None = None,
-          label: dict | None = None):
+          label: dict | None = None, mine: str = ""):
     """A slot of the cap, else one load opened beyond it, while fewer than cap plus extra() are held.
     The cap's own slots are tried first, so two takers racing never pass the cap with no extra open."""
-    room = _room(n, every) if room is None else room
+    room = _room(n, every, mine) if room is None else room
     if room <= 0 or cores_short(every) or diskgate.saturated():
         return None
     f = locks.try_take(ps, holder, what, key=same, extra=label)
@@ -1355,9 +1463,9 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
 
 
 def _take_in_turn(n: int, ticket: Path, ps: list[Path], every: list[Path], holder: str, what: str, same: str,
-                  label: dict | None = None):
+                  label: dict | None = None, mine: str = ""):
     """locks.take_in_turn over the cap and the slots load opened beyond it."""
-    room = _room(n, every)
+    room = _room(n, every, mine)
     if room <= 0 or not locks.my_turn(slot_dir(), RESOURCE, ticket, room, fair=True, **order()):
         return None
     return _take(n, ps, every, holder, what, same, room, label)

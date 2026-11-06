@@ -8038,10 +8038,10 @@ def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setattr(checkwall, "POLL_S", 0.1)
-    real, arrivals = checkcap.acquire, []
+    real, arrivals, holders = checkcap.acquire, [], []
     monkeypatch.setattr(checkcap, "acquire",
                         lambda *a, **k: arrivals.append((a[5] if len(a) > 5 else k.get("since"), k.get("preemptible")))
-                        or real(*a, **k))
+                        or holders.append(a[0]) or real(*a, **k))
     monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
     mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
     script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
@@ -8052,7 +8052,9 @@ def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again
     assert time.time() - t0 < 45, "its command ended once asked"
     assert "preempted by urgent #77: an urgent run needed this host-wide checks slot" in out, out
     assert "preempted by urgent #77" in (run / "progress.md").read_text(), "its task is told"
-    assert os.environ[checkcap.PREEMPTED_ENV] == "urgent #77", "its queue entry and status say so (label)"
+    assert "[requeued after preemption by urgent #77]" in holders[1], "its queue entry says so (label)"
+    assert "preempted" not in holders[0] and "[preempted by" not in holders[1], holders
+    assert checkcap.PREEMPTED_ENV not in os.environ, "it holds a slot again: the label clears"
     assert "passed" in out.rsplit("preempted by", 1)[1], "its own retry ran to its result"
     assert len(arrivals) == 2 and arrivals[0] == arrivals[1] and arrivals[0][1], "it queued again at its old place"
     assert not req.exists() and checkcap.line() == ""
@@ -8079,7 +8081,7 @@ def test_check_commands_never_see_the_checks_runs_own_preempt_rerank_and_reexec_
     cli.main(["checks", "--", "sh", "-c", script])
     out = capsys.readouterr().out
     assert "preempted by urgent #77" in out and "passed" in out.rsplit("preempted by", 1)[1], out
-    assert os.environ[checkcap.PREEMPTED_ENV] == "urgent #77", "the run itself keeps its label"
+    assert checkcap.PREEMPTED_ENV not in os.environ, "the run dropped its label once it held a slot again"
     seen = {line.split("=", 1)[0] for line in dump.read_text().splitlines() if "=" in line}
     assert "TTP_RUN_DIR" in seen, "the dump is the check's environment"
     assert not seen & set(checkcap.RUN_ONLY_ENV), sorted(seen & set(checkcap.RUN_ONLY_ENV))
@@ -8114,7 +8116,7 @@ def test_an_urgent_checks_run_past_its_grace_preempts_one_routine_run_of_its_own
         assert time.time() - since >= 0.5, "not before its grace"
         assert checkcap.preempted(mine.since) == "urgent #6198"
         monkeypatch.setenv(checkcap.PREEMPTED_ENV, checkcap.preempted(mine.since))
-        assert checkcap.label("mine") == "mine task #6198 (run ?) [preempted by urgent #6198]"
+        assert checkcap.label("mine") == "mine task #6198 (run ?) [requeued after preemption by urgent #6198]"
         mine.close()
         t.join(30)
         assert got and got[0] is not None and got[0].f is not None and not got[0].urgent
@@ -8520,3 +8522,184 @@ def test_testslots_acquire_keeps_its_ps_snapshot():
     from ttp import testslots
     assert hasattr(testslots.acquire, "__wrapped__")
     assert not hasattr(testslots._pass_told, "__wrapped__")
+
+
+def test_the_slot_a_preempted_run_frees_goes_to_the_urgent_run_that_asked_not_the_next_waiter(env, monkeypatch):
+    """#6842 (1): an urgent run's preemption freed a cap slot that the next waiter in turn took, so the
+    preempted run's work was lost and the urgent run still waited. Its claim keeps the freed slot from
+    every other waiter; it is dropped once the asker holds a slot."""
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    routine = checkcap.acquire("routine", project_name="pa", priority=3, preemptible=True)
+    told, got, other = [], [], []
+    t_other = threading.Thread(target=lambda: other.append(checkcap.acquire(
+        "first in line", priority=3, since=time.time() - 600, max_wait_s=4)))
+    t_other.start()
+    assert _wait_for(lambda: locks_queued(checkcap)), "the other waiter is first in line"
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "urgent", project_name="pa", priority=1, urgent=True, tell=told.append, max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine") in told), told
+        assert checkcap.claims() == 1 and len(list(checkcap.slot_dir().glob(f"{checkcap.CLAIM}.*.json"))) == 1
+        routine.close()
+        t.join(30)
+        t_other.join(30)
+        assert got and got[0] is not None and got[0].f is not None, "the asker took the freed slot"
+        assert other == [None], "the waiter ahead in line did not take it"
+        assert checkcap.claims() == 0 and not list(checkcap.slot_dir().glob(f"{checkcap.CLAIM}.*.json"))
+    finally:
+        checkcap.clear_preempt()
+        for h in [routine, *got, *other]:
+            if h is not None:
+                h.close()
+
+
+def locks_queued(checkcap):
+    from ttp import locks
+    return bool(locks.queued(checkcap.slot_dir(), checkcap.RESOURCE))
+
+
+def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_then_asks_nothing(env, monkeypatch):
+    """#6842 (1): a claim lives only while its asker lives and renews it (while the asked run holds its
+    slot and the asker is not parked), for at most CLAIM_MAX_S; a request whose claim lapsed or was dropped
+    preempts nobody, and the slot goes back to the normal turn."""
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    victim = checkcap.acquire("victim", priority=3, preemptible=True)
+    try:
+        assert checkcap.preempt("urgent u", checkcap.all_paths(1), claim="tok1") == "victim"
+        assert checkcap.claims() == 1 and checkcap.claims("tok1") == 0, "its own claim leaves its asker room"
+        assert checkcap.preempted(victim.since) == "urgent urgent u"
+        assert checkcap._room(1, checkcap.all_paths(1)) < checkcap._room(1, checkcap.all_paths(1), "tok1")
+        path = checkcap._claim_path("tok1")
+        rec = json.loads(path.read_text())
+        old = time.time() - checkcap.CLAIM_S - 1
+        checkcap._write(path, {**rec, "at": old})
+        checkcap.renew_claim("tok1", parked=False)
+        assert checkcap.claims() == 0, "a lapsed claim is not renewed"
+        assert checkcap.preempted(victim.since) == "", "its request asks nothing any more"
+        checkcap._write(path, {**rec, "at": time.time()})
+        checkcap.renew_claim("tok1", parked=True)
+        assert json.loads(path.read_text())["at"] == pytest.approx(time.time(), abs=5)
+        checkcap._write(path, {**rec, "at": old + 1})
+        checkcap.renew_claim("tok1", parked=True)
+        assert json.loads(path.read_text())["at"] == old + 1, "a parked asker does not renew it"
+        checkcap._write(path, {**rec, "at": time.time() - 1})
+        checkcap.renew_claim("tok1", parked=False)
+        assert json.loads(path.read_text())["at"] > time.time() - 1, "renewed while the asked run holds"
+        checkcap._write(path, {**rec, "at": time.time(), "made": time.time() - checkcap.CLAIM_MAX_S - 1})
+        assert checkcap.claims() == 0, "at most CLAIM_MAX_S"
+        dead = subprocess.Popen(["true"])
+        dead.wait()
+        checkcap._write(path, {**rec, "at": time.time(), **locks._owner(dead.pid)})
+        assert checkcap.claims() == 0 and checkcap.preempted(victim.since) == "", "its asker died"
+        checkcap._write(path, {**rec, "at": time.time()})
+        assert checkcap.claims() == 1
+        checkcap.drop_claim("tok1")
+        assert checkcap.claims() == 0 and checkcap.preempted(victim.since) == "", "dropped: the asker took another"
+        checkcap.clear_preempt()
+        assert checkcap.preempt("urgent u", checkcap.all_paths(1)) == "victim"
+        assert checkcap.preempted(victim.since) == "urgent urgent u", "a request with no claim asks as before"
+    finally:
+        checkcap.clear_preempt()
+        victim.close()
+
+
+def test_a_parked_urgent_run_preempts_only_a_run_whose_stop_lets_it_start(env, monkeypatch):
+    """#6842 (2): an urgent run parked for its test slots preempted a run whose stop still left it parked,
+    so the work was lost for nothing. It asks only a run with which its startable() holds once that run's
+    test slots count free (FREEING), skipping a better-ranked one that would not; none such: nobody."""
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    big = checkcap.acquire("big", priority=3, preemptible=True)
+    small = checkcap.acquire("small", priority=5, preemptible=True)   # ranked first: the least urgent
+    fits = {"big"}
+    startable = lambda: (checkcap.FREEING.get() or {}).get("holder") in fits   # noqa: E731
+    told = []
+    try:
+        assert checkcap.acquire("urgent", priority=1, urgent=True, tell=told.append, startable=lambda: False,
+                                max_wait_s=1.0) is None
+        assert not any(m.startswith("urgent checks with every") for m in told), "no stop lets it start: nobody"
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"))
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.CLAIM}.*.json")), "no claim left behind"
+        got = []
+        t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+            "urgent", priority=1, urgent=True, tell=told.append, startable=startable, max_wait_s=1.0)))
+        t.start()
+        t.join(30)
+        assert checkcap.PREEMPT_LINE.format("big") in told, told
+        assert checkcap.PREEMPT_LINE.format("small") not in told
+        assert checkcap.FREEING.get() is None, "the weighing ends with the call"
+    finally:
+        checkcap.clear_preempt()
+        big.close()
+        small.close()
+
+
+def test_the_test_pool_and_a_projects_budget_count_a_run_being_weighed_for_preemption_as_stopped(env, monkeypatch):
+    """#6842 (2): while preempt weighs a run (checkcap.FREEING), the host's test pool and its project's
+    budget count that run's test slots free (testslots._held), and only that run's."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (2, 1))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    taken = [locks.try_take(testslots.paths(2), "a run", "test slots") for _ in range(2)]
+    own = testslots.own_paths("pa", 2)
+    mine = [locks.try_take(own, "a run", "test slots") for _ in range(2)]
+    try:
+        assert all(taken) and all(mine) and not testslots.pool_room({}, "pa")
+        victim = {"pid": 4242, "pid_start": "s1"}
+        locks.relabel(taken[0], victim)
+        locks.relabel(mine[0], victim)
+        assert testslots._own_free("pa", own) == 0
+        tok = checkcap.FREEING.set({**victim, "holder": "victim"})
+        try:
+            assert testslots.pool_room({}, "pa"), "its stop leaves room"
+            assert testslots._own_free("pa", own) == 1, "its project's budget slot counts free"
+        finally:
+            checkcap.FREEING.reset(tok)
+        tok = checkcap.FREEING.set({"pid": 4242, "pid_start": "other start"})
+        try:
+            assert not testslots.pool_room({}, "pa"), "a reused pid is another process"
+        finally:
+            checkcap.FREEING.reset(tok)
+        assert not testslots.pool_room({}, "pa")
+    finally:
+        for f in taken + mine:
+            if f:
+                f.close()
+
+
+def test_a_requeued_run_is_labelled_so_while_it_waits_and_not_once_it_holds_a_slot(env, monkeypatch):
+    """#6842 (3): a preempted run that got its slot back still read '[preempted by urgent #N]' as if stuck.
+    While it queues again its label says 'requeued after preemption'; the slot it takes is labelled without it."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv("TTP_TASK", "31")
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "urgent #12")
+    who = checkcap.label("pa", "ttp checks")
+    assert who == "pa task #31 (run 7) [requeued after preemption by urgent #12] ttp checks"
+    slot = checkcap.acquire(who, project_name="pa", priority=3)
+    try:
+        assert checkcap.state()["running"] == ["pa task #31 (run 7) ttp checks"], checkcap.state()
+        assert "preempt" not in checkcap.line()
+    finally:
+        slot.close()
+    monkeypatch.delenv(checkcap.PREEMPTED_ENV)
+    assert checkcap.label("pa") == "pa task #31 (run 7)"

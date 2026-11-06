@@ -1923,9 +1923,13 @@ session and stateless coordinators on every provider.
   its own project first, then the least urgent, then the latest started. That run ends its current
   command, frees its slots and queues again at its old arrival, ahead of every later arrival of its
   project, keeping every pass and log it recorded (a pinned run keeps only passes on its pinned commit
-  and reruns the rest there), and the urgent run takes the freed slot. Its log, its task's notes and
-  its queue entry in `ttp status` say `preempted by urgent #<task>`, and its own rerun goes on to its
-  result. Another urgent run, a push check and a run behind a lock (the `checks.wrap_cmd` wrapper, or
+  and reruns the rest there), and the urgent run takes the freed slot: a short-lived claim keeps it
+  from every other waiter while the urgent run lives and still waits for it, and lapses within 30 s
+  otherwise (a lapsed claim's request asks nothing). An urgent run waiting for its test slots asks
+  only a run whose stop leaves its project's test budget and the host's test pool room for it; else
+  nobody. Its log and its task's notes say `preempted by urgent #<task>`, its queue entry in
+  `ttp status` says `requeued after preemption by urgent #<task>` until it holds a slot again, and its
+  own rerun goes on to its result. Another urgent run, a push check and a run behind a lock (the `checks.wrap_cmd` wrapper, or
   commands that run `ttp lock`, `ttp devq` or `flock`) are never asked. A routine run whose task
   turns urgent while it waits notices within 30 s and re-executes once as an urgent run, at the same
   arrival. `ttp status` shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push

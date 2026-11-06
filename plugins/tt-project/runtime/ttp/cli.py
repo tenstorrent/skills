@@ -4985,6 +4985,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             if slot is None or slot.served:
                 suite.close()
                 return slot
+            os.environ.pop(checkcap.PREEMPTED_ENV, None)   # it holds a slot again: no longer requeued (label)
             # Then the run's share of the host's test-worker slots (testslots), held with the checks slot;
             # in the foreground none free by the end of the same wait hands over to detached checks too.
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
