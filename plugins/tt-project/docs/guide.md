@@ -2933,6 +2933,23 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   checks and guard tests run read-only, under a fresh `mktemp -d` HOME. The tripwire is
   `credwatch.snapshot()` and `credwatch.changes()` in `runtime/ttp/credwatch.py`, its path list
   `credwatch.files()`, for other guards to reuse.
+- Runs are unsandboxed, so credential stores are kept out of tool calls model-free (credguard.py).
+  Claude Code runs get a Read deny rule for gh's hosts file, `~/.git-credentials`, `~/.netrc`, the
+  agents' login files (Claude's `.credentials.json`, Codex's `auth.json`) and every file in `~/.ssh`
+  but public keys, `config`, `known_hosts` and control sockets. The worker hook refuses a Bash call
+  that names one of them, `gh auth token`, `gh auth status --show-token` and `git credential fill`.
+  ssh, git and gh still read them themselves: `ssh -i <key>`, `-o IdentityFile=`, `ssh-add`,
+  `ssh-keygen`, and chmod or test of a key pass. Known gap: a path a script builds at run time.
+- Pushes go only through `ttp push` and the push queue. Inside a run, the harness's gh refuses `gh api`
+  calls that create, move or delete refs or tags, write file contents, merge branches or write
+  releases (REST, and GraphQL `createRef`, `updateRef(s)`, `deleteRef`, `createCommitOnBranch`,
+  `mergeBranch`), `gh release create`, `gh release delete --cleanup-tag` and `gh repo sync` of a
+  named repo; the hook refuses the same requests sent by curl and the like. PR merges follow the
+  charter's merge policy.
+- Guards in the harness are a second line. Give the account the harness uses a fine-grained token
+  that can write only the repositories, and where the host allows it only the branches, its
+  projects push to, and protect each repository's default branch (required reviews, no force pushes
+  or deletions), so a run that gets around a guard still cannot change it.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
   `GET <base url>/models` and saves it with its URL as `endpoint/<alias>`; `ttp secret show` lists it

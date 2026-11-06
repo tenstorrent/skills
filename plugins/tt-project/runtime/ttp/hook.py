@@ -388,6 +388,17 @@ def _api_draft_change(text: str, full: str = "") -> bool:
     return bool(api and change and HTTP_CLIENT_RE.search(text))
 
 
+def api_ref_write(text: str) -> bool:
+    """An HTTP client sending a write to a GitHub API route that moves refs, tags, releases or file
+    contents (credguard), or a GraphQL ref mutation."""
+    from .credguard import REF_MUTATION_RE, REF_URL_RE
+    api = GITHUB_API_RE.search(text) or (TOKEN_API_RE.search(text) and API_PATH_RE.search(text))
+    write = WRITE_RE.search(text) or re.search(r"(?:-X\s*|--request[\s=]+|--method[\s=]+|method\s*[=:]\s*)[\"']?"
+                                               r"DELETE\b|\.delete\s*\(", text, re.I)
+    change = (write and REF_URL_RE.search(text)) or REF_MUTATION_RE.search(text)
+    return bool(api and change and HTTP_CLIENT_RE.search(text))
+
+
 def _quoting(line: str) -> list[tuple[bool, int]]:
     """Per character of `line`: whether it is quoted (or escaped, or in a comment), and the depth
     of parentheses around it."""
@@ -635,6 +646,9 @@ def draft_bypass(text: str, path_changed: bool = False, trusted: bool = True) ->
     if _api_draft_change(text, full):
         return ("create or update PRs with gh, not a direct GitHub API call: a PR leaves draft only with "
                 "the user's recorded approval")
+    if api_ref_write(text):
+        from .credguard import REF_WHY
+        return REF_WHY.removeprefix("refused: ")
     return None
 
 
@@ -1113,6 +1127,9 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = HARNESS_GH_WHY
     if not why:
         why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
+    if not why:
+        from . import credguard
+        why = credguard.bash_refusal(cmd, _all_segments(commands))
     if not why:
         why = git_push_bypass(segments)
     if not why:

@@ -2966,7 +2966,8 @@ class Daemon:
         denied = coord.tool_list(self.cfg["providers"].get(provider, {}).get("disallowed_tools") or [])
         from .project import secrets_path
         from .web import token_path
-        no_reads = [str(token_path(self.p).resolve()), str(secrets_path().resolve())]
+        from .credguard import credential_files
+        no_reads = [str(token_path(self.p).resolve()), str(secrets_path().resolve()), *credential_files()]
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,

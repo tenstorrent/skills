@@ -56,11 +56,13 @@ def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
     assert all(a.startswith("Bash(ttp ") or a.startswith("Read(") or a == "StructuredOutput" for a in allowed)
     assert not [a for a in allowed if "Edit" in a or "Write" in a or a == "Bash(*)"]
     deny = argv[len(argv) - 1 - argv[::-1].index("--disallowedTools") + 1]
-    assert deny.count("Read(//") == 2, "the web token and the credential store"
+    from ttp.credguard import credential_files
+    stores = len(credential_files())
+    assert deny.count("Read(//") == 2 + stores, "the web token, the secrets store and the credential stores"
     settings = json.loads(argv[argv.index("--settings") + 1])
     cmd = settings["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
     assert settings["hooks"]["PreToolUse"][0]["matcher"] == "*" and cmd.endswith("-m ttp.hook CoordPreToolUse")
-    assert len(settings["permissions"]["deny"]) == 2
+    assert len(settings["permissions"]["deny"]) == 2 + stores
 
 
 def test_providers_doc_names_structuredoutput_in_the_read_only_coordinator_row():
