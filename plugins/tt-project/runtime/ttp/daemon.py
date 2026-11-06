@@ -40,6 +40,7 @@ from . import ackwait
 from . import pausegone
 from . import urgentfup
 from . import topup
+from . import seedcap
 from . import turnrules
 from . import checksettle
 from . import coordwrites
@@ -2963,10 +2964,24 @@ class Daemon:
                         prompt = prompt + "\n\n" + coordsession.handover_ask(state)
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            seed_usd = None
+            if session_mode == "new" and budget_usd is not None and prov.caps_budget:
+                try:   # the seed rides on this wake: its cap covers it, within the dollar caps (seedcap.py)
+                    seed_usd, seed_basis = seedcap.expected(
+                        self.p.db, self.cfg, provider, model,
+                        sum(len(t or "") for t in (system, context, append_system, prompt)))
+                    g = self.gates.get(provider)
+                    room = turnsize.headroom(self.cfg, dict(g.numbers) if g else {})
+                    session_cap = seedcap.cap(float(budget_usd), seed_usd, room)
+                    argv = _with_flag(argv, "--max-budget-usd", f"{session_cap:.2f}")
+                except Exception as e:   # the bare per-wake cap still bounds the wake
+                    seed_usd, session_cap = None, None
+                    log(self.p, f"coordinator session seed cap failed: {type(e).__name__}: {e}"[:300])
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "session": {
                 "mode": session_mode, "why": why, "key": key, "model": model, "effort": effort,
                 "provider": provider, **({"digest": ack} if ack else {}),
                 **({"cap_usd": session_cap} if session_cap is not None else {}),
+                **({"seed_usd": seed_usd, "seed_basis": seed_basis} if seed_usd is not None else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
         elif role == "coordinator" and not resume and prov.cache_key_per_session:
             try:   # the agent's cache follows its session: continue the last turn's while warm

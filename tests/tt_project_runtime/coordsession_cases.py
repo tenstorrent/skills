@@ -1081,14 +1081,74 @@ def test_coordsession_resumed_wakes_book_their_own_cost_and_cap_and_keep_the_gua
     assert [round(r["cost_usd"], 6) for r, *_ in got] == [1.0, 0.6, 0.5], "a wake booked the session total"
     assert json.loads(third["note"])["session_cost_usd"] == 2.1 and "session_cost_usd" not in json.loads(first["note"])
     caps = [a[a.index("--max-budget-usd") + 1] for a in (a0, a1, a2)]
-    assert caps == ["3.00", "4.00", "4.60"], caps
-    assert "cap_usd" not in s0 and s1["cap_usd"] == 4.0 and s2["cap_usd"] == 4.6
+    # The new wake's cap also covers its seed (seedcap.py); the resumed wakes' caps do not carry it.
+    assert s0["seed_basis"] == "estimate" and 0 < s0["seed_usd"] <= 1.0, s0
+    assert caps == [f"{3.0 + s0['seed_usd']:.2f}", "4.00", "4.60"], caps
+    assert s0["cap_usd"] == round(3.0 + s0["seed_usd"], 2) and s1["cap_usd"] == 4.0 and s2["cap_usd"] == 4.6
+    assert "seed_usd" not in s1 and "seed_usd" not in s2
     # Allowance $2.40 at the first hour: the netted $2.10 is under it, the summed totals ($4.70) are not.
     p.db.set_kv(coordguard.BASELINE_KEY, {"at": t0, "turns": 10, "usd": 8.0, "days": 1.0,
                                           "usd_turn": 0.8, "usd_day": 0.0})
     p.db.set_kv(coordguard.KEY, {"tripped": False, "trips": []})
     assert abs(coordguard.spend(p.db, t0)[0] - 2.1) < 1e-6
     assert coordguard.check(p.db, p.config(), time.time()) is None and not coordguard.tripped(p.db)
+
+
+def _cs_seed_wakes(env, monkeypatch, seeds=(), **cfg):
+    """A capped-fake session project whose earlier new-session wakes booked `seeds` (oldest first)."""
+    p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
+    _cs_capped_fake(monkeypatch)
+    p.set_config("coordinator.session.mode", "on")
+    for k, v in cfg.items():
+        p.set_config(k, v)
+    for i, usd in enumerate(seeds):
+        _cs_booked_run(p, f"OLD{i}", usd, "new")   # another model: the provider-wide fallback reads them
+        p.db.x("UPDATE runs SET provider='fake', model='other' WHERE session_id=?", (f"OLD{i}",))
+    return p, holder, turn
+
+
+def _cs_cap(argv) -> float:
+    return float(argv[argv.index("--max-budget-usd") + 1])
+
+
+def test_coordsession_a_new_session_s_cap_covers_a_seed_over_the_per_wake_cap(env, monkeypatch):
+    """Re-measure #6327: a $1.20 seed failed on a $1.00 per-wake cap and the next wake seeded again. With
+    the seed history the new wake's cap is the per-wake cap plus the dearest recent seed, so it completes;
+    the resumed wake after it keeps its own cap (what the session booked plus the per-wake cap)."""
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, seeds=(5.0, 0.8, 1.2, 0.9))   # $5.00: past HISTORY
+    monkeypatch.setenv("TTP_FAKE_COST", "1.2")
+    first, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
+    assert s0["mode"] == "new" and s0["seed_basis"] == "history" and s0["seed_usd"] == 1.2, s0
+    assert _cs_cap(a0) == 2.2 == s0["cap_usd"] and first["cost_usd"] <= _cs_cap(a0), "the seed fits its cap"
+    monkeypatch.setenv("TTP_FAKE_COST", "1.5")
+    second, a1, _, s1 = turn("EVENTS", budget_usd=1.0)
+    assert s1["mode"] == "resume" and _cs_cap(a1) == 2.2 and "seed_usd" not in s1, (s1, a1)
+
+
+def test_coordsession_a_new_session_without_history_prices_its_seed_prompt(env, monkeypatch):
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, **{"budget.estimate_usd_per_mtok": 400.0})
+    _, a0, prompt, s0 = turn("EVENTS", budget_usd=1.0)
+    want = round(len(prompt) // 4 * 1.25 * 400.0 / 1e6, 2)
+    assert s0["seed_basis"] == "estimate" and abs(s0["seed_usd"] - want) <= 0.02, (s0, want)
+    assert _cs_cap(a0) == round(1.0 + min(s0["seed_usd"], 3.0), 2) > 1.0, a0
+
+
+def test_coordsession_a_new_session_s_seed_raise_stays_inside_the_dollar_caps(env, monkeypatch):
+    """The project and account caps stay hard: the raise stops at what they leave and never lowers the
+    per-wake cap; the hourly coordinator limit bounds it too."""
+    from types import SimpleNamespace
+    from ttp import coordsession, seedcap
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, seeds=(1.2,))
+    for numbers, want in (({"daily_cap": 10.0, "spent_today": 8.5}, 1.5),       # project day: $1.50 left
+                          ({"global_cap": 50.0, "global_today": 49.4}, 1.0),   # account: under the per-wake cap
+                          ({"weekly_cap": 20.0, "spent_7d": 18.2}, 1.8),
+                          ({"coordinator_1h": 2.6}, 1.4),                      # hourly coordinator limit $4
+                          ({}, 2.2)):
+        p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))   # no session yet: the wake starts one
+        holder["d"].gates = {"fake": SimpleNamespace(numbers=numbers)}
+        _, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
+        assert s0["mode"] == "new" and _cs_cap(a0) == want == s0["cap_usd"], (numbers, a0, s0)
+    assert seedcap.cap(1.0, 5.0, None) == 6.0 and seedcap.cap(1.0, 5.0, 0.2) == 1.0 and seedcap.cap(1.0, -1, 9) == 1.0
 
 
 def _cs_booked_run(p, session, cost, mode, *, out=0, task=None, role="coordinator", basis="reported"):
