@@ -447,10 +447,17 @@ def _git(h: Path, *args: str) -> subprocess.CompletedProcess:
 # runs `python -m ttp.service` (with the harness runtime on disk) detached, and that restart, made from
 # the host with the service manager in reach, writes RESTART_RESULT.
 RESTART_REQUEST, RESTART_RESULT = "restart.request", "restart.result"
+# A restart judges the new daemon only once the old one has exited: it waits for the old daemon's pid
+# at most the service's own stop timeout (stop_timeout_s, capped at STOP_WAIT_CAP_S) plus
+# STOP_MARGIN_S for the kill to land, and only then starts the new daemon's start window.
+STOP_WAIT_CAP_S = 300
+STOP_MARGIN_S = 15
+LAUNCHD_EXIT_TIMEOUT_S = 20   # launchd's default ExitTimeOut: SIGKILL this long after SIGTERM
 # A helper that dies without a result (its runtime fails to import, a kill, a reboot) is reaped by the
 # daemon: its own handle says it ended, or its claim outlived HELPER_BOUND_S, longer than a restart's own
-# waits (a new daemon's first tick, twice with a rollback, plus the service manager's time).
-HELPER_BOUND_S = 2 * (60 + 300) + 300
+# waits (the old daemon's stop, a new daemon's first tick, twice with a rollback, plus the service
+# manager's time).
+HELPER_BOUND_S = 2 * (STOP_WAIT_CAP_S + STOP_MARGIN_S + 60 + 300) + 300
 HELPER_STARTED = "restart helper running"     # main() logs it first: the helper got past its imports
 _helpers: dict[str, subprocess.Popen] = {}    # the daemon's handle on the helper it started, per project
 # The service manager could not be reached from here, as opposed to it trying and the daemon failing.
@@ -694,6 +701,80 @@ def _off_files(p: Project) -> str | None:
     return ran if ran and m and ran != m.group(1) else None
 
 
+_SYSTEMD_SPAN_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(us|ms|s|min|m|h|d|w)?(?![a-z])")
+_SYSTEMD_UNIT_S = {"us": 1e-6, "ms": 1e-3, "s": 1, None: 1, "min": 60, "m": 60, "h": 3600, "d": 86400,
+                   "w": 604800}
+
+
+def _systemd_span_s(text: str) -> float | None:
+    """A systemd time span as `systemctl show` prints it ("2min", "1min 30s", "infinity") in seconds;
+    None when it cannot be read, inf for infinity."""
+    text = text.strip().lower()
+    if text in ("infinity", "inf"):
+        return float("inf")
+    parts = _SYSTEMD_SPAN_RE.findall(text)
+    if not parts or _SYSTEMD_SPAN_RE.sub("", text).strip():
+        return None
+    return sum(float(n) * _SYSTEMD_UNIT_S[u or None] for n, u in parts)
+
+
+def _manager_view(p: Project) -> tuple[float, int | None]:
+    """How long the service manager lets the daemon stop before it kills it (s, at most STOP_WAIT_CAP_S),
+    and the daemon's pid as the manager knows it (systemd's MainPID), read before a restart."""
+    if sys.platform == "darwin" and _agent(p).exists():
+        try:
+            job = plistlib.loads(_agent(p).read_bytes())
+            stop = float(job.get("ExitTimeOut") or LAUNCHD_EXIT_TIMEOUT_S)
+        except (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException):
+            stop = LAUNCHD_EXIT_TIMEOUT_S
+        return min(stop, STOP_WAIT_CAP_S), None
+    if _unit(p).exists():
+        stop, main = None, None
+        try:
+            r = _run("systemctl", "--user", "show", "-p", "TimeoutStopUSec", "-p", "MainPID", _unit(p).name)
+            for line in (r.stdout or "").splitlines() if r.returncode == 0 else ():
+                key, _, val = line.partition("=")
+                if key == "TimeoutStopUSec":
+                    stop = _systemd_span_s(val)
+                elif key == "MainPID" and val.strip().isdigit():
+                    main = int(val.strip()) or None
+        except (OSError, subprocess.SubprocessError):
+            pass
+        return min(STOP_TIMEOUT_S if stop is None else stop, STOP_WAIT_CAP_S), main
+    from .daemon import HEARTBEAT_STALE_S   # restart_service's own wait before it starts a new daemon
+    return float(HEARTBEAT_STALE_S), None
+
+
+def _running_daemons(p: Project, main: int | None) -> set[int]:
+    """The daemon processes a restart is to replace: the pid file's and the manager's main pid, if live."""
+    from .daemon import _is_daemon, _read_pid
+    pids = {_read_pid(p.state / "daemon.pid"), main}
+    return {pid for pid in pids if pid and pid != os.getpid() and _is_daemon(pid)}
+
+
+def _await_exit(pids: set[int], until: float) -> set[int]:
+    """Wait until each of pids has exited or `until` passes; returns those still running."""
+    from .daemon import _is_daemon
+    while True:
+        left = {pid for pid in pids if _is_daemon(pid)}
+        if not left or time.time() >= until:
+            return left
+        time.sleep(poll_s(1))
+
+
+def _judge_start(p: Project, t0: float, old: set[int], stop_s: float, wait_s: float,
+                 tick_wait_s: float | None) -> tuple[str | None, float, set[int]]:
+    """After a restart made at t0, judge the new daemon only once the old daemons (old) have exited: wait
+    for their pids at most the service's stop timeout plus STOP_MARGIN_S from t0, then give the new
+    daemon wait_s from that moment (wait_for_start). Returns (its state, or None while an old daemon
+    still runs; seconds the old daemons took to stop; the pids still running)."""
+    left = _await_exit(old, t0 + stop_s + STOP_MARGIN_S) if old else set()
+    stopped = time.time() - t0
+    if left:
+        return None, stopped, left
+    return wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time()), stopped, left
+
+
 def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float | None = None,
             requested: bool = False) -> Restarted:
     """Restart the daemon and confirm it ticks. If it is broken (never started, exited, or its first
@@ -704,9 +785,13 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     If it could not be reached from here (a sandbox), the running daemon is asked to restart itself
     (unless this is that restart, `requested`). A restart the service manager did not confirm in time
     (TIMED_OUT) is pending: it counts once a new daemon runs the runtime on disk within the window.
+    The new daemon is judged only after the old one has exited (_judge_start), so an old daemon slow to
+    stop (up to its service's stop timeout) never makes a new runtime look broken.
     The result's `outcome` says how it went."""
     from .daemon import start_marker
     restart_fn = restart_fn or restart_service
+    stop_s, main = _manager_view(p)
+    old = _running_daemons(p, main)
     t0 = time.time()
     msg = restart_fn(p)
     timed_out = msg.startswith(TIMED_OUT)
@@ -719,7 +804,13 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
         return _said(f"Restart unavailable from here: {msg}. No daemon heartbeat is fresh either, so it may be "
                      f"down; its service restarts it from the host. Nothing was rolled back: the new runtime "
                      f"was never started, so nothing shows it is at fault", "failed")
-    state = wait_for_start(p, t0, wait_s, tick_wait_s, waits_from=time.time())
+    state, stopped, left = _judge_start(p, t0, old, stop_s, wait_s, tick_wait_s)
+    judged = time.time() - t0 - stopped        # how long the new daemon had once the old one was gone
+    if state is None:
+        return _said(f"{msg}; but the old daemon has not exited after {stopped:.0f}s (pid "
+                     f"{', '.join(map(str, sorted(left)))}), past its service's stop timeout ({stop_s:.0f}s), so the new one has not "
+                     f"started yet. Nothing was rolled back: the new runtime never ran. Check `ttp status {p.name}` "
+                     f"shortly", "deferred")
     if state == "running":
         off = _off_files(p) if timed_out else None
         if off:
@@ -748,13 +839,18 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
         _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
     _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")
+    phase = (f"Failed phase: the new daemon was not ready {judged:.0f}s after the old one "
+             f"stopped (the old daemon took {stopped:.0f}s to stop; its service's stop timeout is {stop_s:.0f}s). ")
+    stop_s, main = _manager_view(p)
+    failed = _running_daemons(p, main)
     t1 = time.time()
     restart_fn(p)
-    back = wait_for_start(p, t1, wait_s, tick_wait_s, waits_from=time.time()) != "broken"
+    again, _, _ = _judge_start(p, t1, failed, stop_s, wait_s, tick_wait_s)
+    back = again not in (None, "broken")
     commits = "; ".join(changed.splitlines()[:10])
     text = (f"The daemon did not start after a runtime change, so the harness runtime was rolled back to "
             f"{good[:10]}, the last version that ran (a new commit; nothing was deleted). Rolled back: {commits}. "
-            + ("" if msg == "restarted" else f"The service manager said: {msg}. ")
+            + phase + ("" if msg == "restarted" else f"The service manager said: {msg}. ")
             + ("The daemon is running again." if back else f"It still does not start: check `ttp logs {p.name}`."))
     p.db.post("out", text, chat=None, kind="alert", severity="high")
     return _said(text, "rolled_back")
