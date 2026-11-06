@@ -1168,7 +1168,7 @@ FUTURE_RE = re.compile(_FUTURE + r"|\byou(?:'ll|’ll|\s+will)\s+(?:have|get|see
 ETA_RE = re.compile(r"\bETA\b", re.I)
 OFFER_RE = re.compile(r"\b(?:if you (?:want|like|wish|prefer|agree|approve|say so)|if you'd like|should I|want\s+me\s+to|"
                       r"shall\s+I|would you like)\b", re.I)
-CLOCK_RE = re.compile(r"\b(?P<h>[01]?\d|2[0-3])(?::(?P<m>[0-5]\d))?\s*(?P<ap>[ap]\.?m\b\.?)?(?:\s*(?P<utc>UTC|GMT)\b)?", re.I)
+CLOCK_RE = re.compile(r"\b(?P<h>2[0-3]|[01]?\d)(?::(?P<m>[0-5]\d))?\s*(?P<ap>[ap]\.?m\b\.?)?(?:\s*(?P<utc>UTC|GMT)\b)?", re.I)
 IN_RE = re.compile(r"\b(?:in|within)\s+(?:about\s+|around\s+|roughly\s+|~)?(?P<n>\d+(?:\.\d+)?)\s*"
                    r"(?P<u>minutes?|mins?|m|hours?|hrs?|h)\b", re.I)
 DAY_RE = re.compile(r"\b(?P<mon>jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|aug(?:ust)?|"
@@ -1293,21 +1293,25 @@ def _named_owner(db, chat: str, text: str) -> int | None:
 
 
 def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int, str | None],
-                    obligations: list[str] = (), now: float | None = None, explicit=()) -> list[str]:
+                    obligations: list[str] = (), now: float | None = None, explicit=(),
+                    plans: dict[str, str] | None = None) -> list[str]:
     """Record the commitments in this batch's sent messages (message id, chat, text). `tasks`: the batch's
     tasks by id with their reply_chat; one replying to a promise's chat owns it. `obligations`: the ids the
     batch recorded or attached owners to; one owned by a task that owns the promise is linked to it, and
     the promise closes with it. `explicit`: the message ids of replies that named `owners` or `delivers`;
     any other promise no batch task owns is attached to the one open task its text names in that chat
-    (_named_owner). Every promise is recorded. Returns a note per promise."""
+    (_named_owner). Every promise is recorded. `plans`: {obligation id: plan change} of this batch
+    (replan.batch_plans); a new time for a promise past its due with none is flagged (replan.flag_reply).
+    Returns a note per promise."""
     now = time.time() if now is None else now
     found = [(mid, _chat(chat), said) for mid, chat, text in sent if (said := commitments(text))]
     if not found:
         return []
     full = {mid: text for mid, _, text in sent}
-    from . import timefmt
+    from . import replan, timefmt
     tz = timefmt.tzinfo(p)
     hours = default_h(p.config())
+    plans = plans or {}
     notes = []
     with p.db.tx():
         st = _load(p.db)
@@ -1334,10 +1338,17 @@ def record_promises(p, sent: list[tuple[int, str | None, str]], tasks: dict[int,
                 if pr["message"] == mid:
                     continue   # the same turn applied again
                 pr["message"] = mid
+                notes += replan.flag_reply(p, st, chat, mid, due, owners, full.get(mid, ""), plans, now,
+                                           skip=same["id"])
                 if due is not None and due != pr["due"]:
+                    if replan.missed(pr, now):
+                        replan.note_miss(pr, now)
+                        replan.note_move(pr, due, now, plans.get(same["id"]), None, f"reply #{mid}")
+                        notes += [] if plans.get(same["id"]) else replan.flag(p, same, mid, now)
                     pr.update(due=due, timed=True, raised=None, set_at=now)   # set_at: when this due was promised
                 notes.append(f"promise {same['id']} in chat {chat} updated from message #{mid}")
                 continue
+            notes += replan.flag_reply(p, st, chat, mid, due, owners, full.get(mid, ""), plans, now)
             oid = f"o{st['next']}"
             st["next"] += 1
             st["items"][oid] = {"id": oid, "text": text, "by": "coordinator", "created": now, "owners": {},
@@ -1401,8 +1412,9 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
         return _check_order(p, o, now, raised)
     if now < pr["due"] or pr.get("raised") is not None:
         return False
-    from . import timefmt
+    from . import replan, timefmt
     pr["raised"] = now
+    twice = replan.note_miss(pr, now) >= 2
     owners = ", ".join(f"#{t}" for t in pr["tasks"]) or "no task"
     text = (f"Promise {o['id']} to the user is overdue (due {timefmt.long(pr['due'], p)}"
             + ("" if pr["timed"] else ", the default for a promise naming no time")
@@ -1410,8 +1422,9 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
               f"Owner: {owners}. Send the deliverable or an honest update in that chat now, without being asked "
               f"(new ETA and why). Then close it: `obligation` with key {o['id']} and `evidence` (what was sent) "
               f"or `why` (no longer owed). A new promise in the update is tracked anew.")
+    text += replan.REPLAN_TEXT.format(key=o["id"]) if twice else ""
     fp += f":{int(pr['due'])}"   # a promise given a new due time can fall due once more
-    if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None, _must(o)):
+    if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None, _must(o, twice)):
         raised.append(fp)
     return True
 
@@ -1584,8 +1597,10 @@ UNFIT_OWNER_KINDS = ("question", "plan", "review")
 ORDER_AUDIT_DAYS = 7
 
 
-def _must(o: dict) -> dict:
-    return {"must_act": {"key": o["id"], "chat": o["promise"]["chat"], "tasks": _owner_ids(o)}}
+def _must(o: dict, replan: bool = False) -> dict:
+    """An overdue item's must-act data; `replan`: its second miss or later (replan.py)."""
+    return {"must_act": {"key": o["id"], "chat": o["promise"]["chat"], "tasks": _owner_ids(o),
+                         **({"replan": True} if replan else {})}}
 
 
 def _when(value, what: str) -> float:
@@ -1739,7 +1754,7 @@ def _order_line(o: dict) -> str:
 
 def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     """An open order's start and due checks (after _kept found it not done). Returns whether `o` changed."""
-    from . import timefmt
+    from . import replan, timefmt
     pr, db, changed = o["promise"], p.db, False
     ids = _owner_ids(o)
     if pr.get("started") is None and ids:
@@ -1757,13 +1772,15 @@ def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
             raised.append(fp)
     if now >= pr["due"] and pr.get("raised") is None:
         pr["raised"], changed = now, True
+        twice = replan.note_miss(pr, now) >= 2
         fp = f"obligation:{o['id']}:order:{int(pr['due'])}"
         text = (_order_line(o) + f"\nIt is overdue (due {timefmt.long(pr['due'], p)}"
                 + ("" if pr["timed"] else ", the default for an order naming no time")
                 + f"). Send the result or an honest update in that chat now, without being asked (new time and "
                   f"why), re-order it or escalate. Then close it: `obligation` with key {o['id']} and `evidence` "
                   f"(what was delivered) or `why` (no longer owed); `due` with key {o['id']} sets a new time.")
-        if _raise(db, now, fp, ORDER_KIND, text, ids[0] if ids else None, _must(o)):
+        text += replan.REPLAN_TEXT.format(key=o["id"]) if twice else ""
+        if _raise(db, now, fp, ORDER_KIND, text, ids[0] if ids else None, _must(o, twice)):
             raised.append(fp)
     return changed
 
@@ -1835,7 +1852,7 @@ def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[i
 
 def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
     """Close a claim that holds, or raise its one claim_failed event. Returns whether `o` changed."""
-    from . import timefmt
+    from . import replan, timefmt
     pr = o["promise"]
     c, db, fp = pr["claim"], p.db, f"obligation:{o['id']}:claim"   # + its due: a new due can fail once more
     if c.get("task"):
@@ -1865,12 +1882,14 @@ def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
     if pr.get("raised") is not None:
         return False
     pr["raised"] = now
+    twice = now >= pr["due"] and replan.note_miss(pr, now) >= 2
     text = (f"Claim {o['id']} you told the user (chat {pr['chat']}, message #{pr['message']}, due "
             f"{timefmt.long(pr['due'], p)}) does not hold: {miss}. You said: {o['text']}\n"
             f"Correct it in that chat now (what is true, what is being done, by when), and fix or re-order the "
             f"work. Then close it: `obligation` with key {o['id']} and `evidence` or `why`.")
+    text += replan.REPLAN_TEXT.format(key=o["id"]) if twice else ""
     fp += f":{int(pr['due'])}"
-    if _raise(db, now, fp, CLAIM_KIND, text, int(c["task"]) if c.get("task") else None, _must(o)):
+    if _raise(db, now, fp, CLAIM_KIND, text, int(c["task"]) if c.get("task") else None, _must(o, twice)):
         raised.append(fp)
     return True
 
@@ -1902,9 +1921,11 @@ def claim_result(p, oid: str, rc, now: float | None = None) -> list[str]:
     return raised
 
 
-def set_due(p, oid: str, due, now: float | None = None) -> str:
-    """Give an open order, promise or claim a new due time: it can fall due once more."""
-    from . import timefmt
+def set_due(p, oid: str, due, now: float | None = None, plan: str | None = None, user: int | None = None) -> str:
+    """Give an open order, promise or claim a new due time: it can fall due once more. Past its due, the
+    move needs `plan` (the batch's plan change, replan.plan_change) or `user` (the user's message asking
+    for it); else it is refused (replan.py)."""
+    from . import replan, timefmt
     now = time.time() if now is None else now
     at = _when(due, f"{oid} due")
     with p.db.tx():
@@ -1915,6 +1936,16 @@ def set_due(p, oid: str, due, now: float | None = None) -> str:
                              f"(receipt) or why (drop)")
         if not o.get("promise") or not _open(o):
             raise ValueError(f"{oid} is not an open order, promise or claim")
-        o["promise"].update(due=at, timed=True, raised=None, set_at=now)
+        pr = o["promise"]
+        late = replan.missed(pr, now)
+        refused = late and not plan and user is None
+        if late:
+            replan.note_miss(pr, now)   # kept on a refusal too
+        if not refused:
+            replan.note_move(pr, at, now, plan, user, "due")
+            pr.update(due=at, timed=True, raised=None, set_at=now)
         p.db.set_kv(KV, st)
-    return f"{oid} now due {timefmt.long(at, p)}"
+    if refused:
+        raise ValueError(replan.refusal(o, timefmt.long(pr["due"], p)))
+    why = f"plan change: {plan}" if plan else f"the user asked in message #{user}" if user is not None else ""
+    return f"{oid} now due {timefmt.long(at, p)}" + (f" ({why})" if late and why else "")

@@ -62,6 +62,7 @@ def block(db, ids) -> str:
             continue
         first = (ev["text"] or "").split("\n", 1)[0][:300]
         again = " (second wake: you did not act on it last turn)" if ev["kind"] == REWAKE_KIND else ""
+        again += " (re-plan: missed twice)" if it.get("replan") else ""
         owners = f"; owners #{', #'.join(map(str, it.get('tasks') or []))}" if it.get("tasks") else "; no owner task"
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
     if not out:

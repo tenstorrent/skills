@@ -114,6 +114,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     yesask,
 )
 from . import urgent
+from . import replan
 from . import topup
 from . import probevars
 from . import onhost
@@ -248,7 +249,7 @@ ACTIONS_SCHEMA: dict[str, Any] = {
                 "key": {"type": "string", "pattern": r"^[a-zA-Z0-9_-]{1,64}$"},
                 "due": {"type": ["number", "string"]}, "evidence_required": {"type": "string"}},
                 "required": ["key", "due", "evidence_required"]}},
-            "order": {"type": "integer"}, "action_class": {"type": "string", "enum": list(obligations.ORDER_CLASSES)},
+            "order": {"type": "integer"}, "message": {"type": "integer"}, "action_class": {"type": "string", "enum": list(obligations.ORDER_CLASSES)},
             "due": {"type": ["number", "string"]}, "start_by": {"type": ["number", "string"]},
             "claims": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"}, "task": {"type": "integer"}, "action": {"type": "integer"},
@@ -2406,6 +2407,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         except (TypeError, ValueError):
             pass   # the action itself is refused with its reason when it is applied
     failed: set[int] = set()   # indexes of refused actions (causefix: a refused fix is no fix)
+    due_moves: list[tuple[int, dict, str]] = []   # (index, action, key) of `obligation` due moves
+    started = time.time()   # an obligation owner attached from now on is this batch's (replan)
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
@@ -3659,8 +3662,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                             batch_obls.append(oid)
                     fan_orders.append((oid, int(a["order"]), a.get("supersedes") or []))
                 elif a.get("due") not in (None, "") and oid and not owners \
-                        and not any(str(a.get(f) or "").strip() for f in ("evidence", "why", "justify")):
-                    notes.append(obligations.set_due(p, oid, a["due"]))
+                        and not any(str(a.get(f) or "").strip() for f in ("evidence", "why")):
+                    due_moves.append((i, a, oid))   # after the batch: a missed one needs its plan change (replan)
                 elif not oid:
                     oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
                                           milestones=a.get("milestones") or [])
@@ -3756,6 +3759,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 _charter_retry_now(p, a, str(e), key, announced, filled=(filled[0], why) if filled else None)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
+    plans = _apply_due_moves(p, actions, due_moves, failed, problems, notes, started)
     for k, before, upd in new_ask_holds:
         ask = next((mid for at, mid in turn_asks if at > k), None)
         now_labels = json.loads((db.task(before["id"]) or before)["labels"] or "[]")
@@ -3785,7 +3789,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     except Exception as e:
         notes.append(f"delivery not recorded: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: recording its promise never undoes or rejects it
-        notes += obligations.record_promises(p, sent, batch_tasks, batch_obls, explicit=explicit)
+        notes += obligations.record_promises(p, sent, batch_tasks, batch_obls, explicit=explicit, plans=plans)
     except Exception as e:
         notes.append(f"promise not recorded: {type(e).__name__}: {str(e)[:200]}")
     try:   # a reply already went out: tracking its claims never undoes or rejects it
@@ -7110,6 +7114,31 @@ def _users_withdrawal(p: Project, name: str, user_turn: bool, why: str | None,
     stem = Path(name.strip().strip("[]")).stem
     entry = next((e for e in p._memory_entries() if e["name"] == stem), None) if stem else None
     return entry if entry and _withdrawn(p.db, entry["body"], user_turn, why, messages=messages) else None
+
+
+def _apply_due_moves(p: Project, actions: list, moves: list, failed: set, problems: list, notes: list,
+                     since: float) -> dict:
+    """Apply the batch's `obligation` due moves once the rest of it went through: one past its due needs a
+    plan change of this batch or the user's message (`message`), else it is refused (replan.py). Returns
+    the batch's plan changes by obligation id, for the reply check (record_promises). `since`: when the
+    batch started applying (an owner attached since is a new one)."""
+    plans = replan.batch_plans(p.db, actions, failed, since=since)
+    for i, a, oid in moves:
+        try:
+            user = None
+            if a.get("message") not in (None, ""):
+                mid = int(a["message"])
+                if not _users_own(p.db, [mid]):
+                    raise ValueError(f"`message` #{mid} is not a message the user wrote: cite the user's own "
+                                     f"message that asks for the new time")
+                user = mid
+            notes.append(obligations.set_due(p, oid, a["due"], plan=plans.get(oid), user=user))
+            if str(a.get("justify") or "").strip():
+                notes.append(eta.justify(p, oid, str(a["justify"])))
+        except Exception as e:
+            failed.add(i)
+            problems.append(f"obligation: {e}")
+    return plans
 
 
 def _users_own(db, messages: list[int]) -> list[int]:

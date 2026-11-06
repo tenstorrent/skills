@@ -48,7 +48,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, obligations, plainreply, quietgate, relay, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, obligations, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -503,6 +503,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(fixes)
     if promised := obligations.audit_line(db, since, now):
         out.append(promised)
+    if missed := replan.audit_line(db, since, now):
+        out.append(missed)
     if orders := obligations.order_audit_line(db, now):
         out.append(orders)
     if hands_on := coordfix.audit_line(db, since, now):
