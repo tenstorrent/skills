@@ -47,13 +47,12 @@ def test_pool_admit_refuses_a_cut_run_its_granted_slots_cannot_finish_inside_the
     locks.record_wait(waits, "lock", time.time() - 500, time.time())
     _pool_check(monkeypatch, tmp_path, limit_s=1000, ran_s=500, waits=waits)
     assert _ttp("pool-admit", "--what", "cpu", "--planned", "6", "--granted", "4", "--files", "122") == 0
-    # its waits for a pool slot count, as in the push: 500 s of them leave 500 s, so 4 slots no longer fit
+    # nor do its waits for a pool slot, as in the push: 500 s of them leave the whole limit
     pooled = tmp_path / "waits-pool"
     (pooled / checkwait.POOL).mkdir(parents=True)
     locks.record_wait(pooled / checkwait.POOL, "shard", time.time() - 500, time.time())
     _pool_check(monkeypatch, tmp_path, limit_s=1000, ran_s=500, waits=pooled)
-    assert _ttp("pool-admit", "--what", "cpu", "--planned", "6", "--granted", "4", "--files", "122") == pooladmit.SHORT
-    assert capsys.readouterr().out.strip() == "8"
+    assert _ttp("pool-admit", "--what", "cpu", "--planned", "6", "--granted", "4", "--files", "122") == 0
     # a run's own pool waits are not its run time: 1000 s with 400 s waiting records 600 s
     other = tmp_path / "waits2"
     (other / checkwait.POOL).mkdir(parents=True)

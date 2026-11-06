@@ -1474,10 +1474,12 @@ session and stateless coordinators on every provider.
   the wait is twice the last measured check run plus 60 s, at least 900 s and at most 2 h.
   Each check runs at most `delivery.push_checks_timeout_s` (unset: four times the last measured
   check run, at least 4 h; 0 for no limit): one past it is ended and the push fails, saying so.
-  The limit counts wall time since the check started, less only time it spends waiting for a
-  grant (a `ttp lock`, a checks lane or a host-wide checks slot): waits for a test-pool slot
-  count. Past it the check is ended within a few seconds, running or waiting for a slot, and the
-  push log says it timed out, after how long and how much of that was pool wait. A check still
+  The limit counts run time: wall time since the check started, less time it spends waiting for
+  a grant (a `ttp lock`, a checks lane or a host-wide checks slot) or for a test-pool slot. Run
+  past it, the check is ended within a few seconds and fails, and the push log says it timed out,
+  after how long and how much was pool wait. A check still waiting for a test-pool slot once its
+  wall time less grant waits reaches the limit is ended as `busy, not failed` and the push exits
+  75 (a full pool is not the change). A check still
   waiting for a grant once the limit plus the push wait has passed is ended as `queued, not run`
   and the push exits 75 (busy, try again), never a failed check. A gate of your own that is not
   behind `ttp lock` counts as run time.
@@ -1514,13 +1516,13 @@ session and stateless coordinators on every provider.
   exit 0 starts them; exit 3 means the run on K slots is estimated to go past the time the check
   has left, so it is not started there, and stdout gives the fewest slots that would fit. The
   script then gives the slots back and waits for that many inside `ttp pool-wait` (that wait
-  counts against the limit, so it asks again once granted), or runs the set on this host's checks
+  is not run time, but a check still waiting at its limit is ended busy, so it asks again once granted), or runs the set on this host's checks
   slots (`ttp checks-shard`). The estimate is the median slot-seconds per file (with `--files`),
   else per planned shard, of earlier passing runs the script recorded with `ttp pool-admit --ran
   <s> --granted K [--planned N] [--files F]`; with none, each planned shard is taken as half of
   the whole limit. Granted every planned slot, or with no limit known, nothing changes. A push
-  check gets its limit in `TTP_CHECK_LIMIT` (the time left takes off only its grant waits, as the
-  push does), a `ttp checks` run its wall cap in `TTP_CHECKS_WALL`.
+  check gets its limit in `TTP_CHECK_LIMIT` (the time left takes off its grant and pool waits, as
+  the push does), a `ttp checks` run its wall cap in `TTP_CHECKS_WALL`.
   Why this design: refusing the cut run is the simplest rule that never starts a run certain to
   time out, and it leaves the project's own pool in charge of where its shards go. The limit is
   never scaled for a cut run: that would let one run hold a push longer than the project set.
@@ -1529,7 +1531,7 @@ session and stateless coordinators on every provider.
   command are filled in; TTP_POOL and TTP_POOL_SHARD are set). The shard prints one line per file
   done (`PASS`/`FAIL` at the start, or pytest's `[ NN%]` progress; `--done-re` changes it). Its time
   before the first file (a queued batch job, setup) is a test-pool wait: the push log shows it and
-  `delivery.push_pool_wait_s` bounds it, and like any pool wait it counts against the check's limit. A shard with
+  `delivery.push_pool_wait_s` bounds it, and like any pool wait it is not run time against the check's limit. A shard with
   no file done for its stall window is ended with its process group, `--cancel` cancels its batch
   job, the stall goes to `~/.tt-project/check-slots/pool-stalls.log` with the shard id and pool alias, and
   its files run again on the next `--pool` given; when every pool stalls it exits 124. The window is

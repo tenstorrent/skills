@@ -99,12 +99,12 @@ def test_pool_shard_stall_mark_skips_the_pool_on_later_gates_until_it_shows_prog
     assert not ps._mark_path("pool-stuck").exists() and "\tclear\tpool-stuck\t" in (ps._dir() / ps.LOG).read_text()
 
 
-def test_pool_shard_time_before_its_first_file_is_a_test_pool_wait_counted_against_the_push_check_limit(
+def test_pool_shard_time_before_its_first_file_is_a_test_pool_wait_not_run_time_of_the_push_check(
         tmp_path, monkeypatch):
     """Time before a shard's first file is a test-pool wait of its push check: the push log shows it live and
-    once the check ends, and it counts against the check's time limit (delivery.push_checks_timeout_s counts
-    wall time, test-pool waits included). Under the limit the shard passes; a shard whose job queues past the
-    limit is ended at it, the log saying it was waiting for a test-pool slot."""
+    once the check ends, and it is not run time against the check's time limit (delivery.push_checks_timeout_s).
+    Under the limit the shard passes; a shard whose job still queues at the limit is ended then, busy, not
+    failed, the log saying it was waiting for a test-pool slot."""
     from ttp import checkwait, push
     _pool_home(monkeypatch, tmp_path)
     monkeypatch.setattr(push, "check_queue_s", 60.0)
@@ -126,12 +126,12 @@ def test_pool_shard_time_before_its_first_file_is_a_test_pool_wait_counted_again
 
     rc, said = check("under", 2, 30.0)
     assert rc == 0, said
-    assert re.search(r"check waiting for a test-pool slot: \d+ s so far, counted against its time limit", said), said
-    assert re.search(r"check waited [12] s for a test-pool slot, counted against its time limit", said), said
+    assert re.search(r"check waiting for a test-pool slot: \d+ s so far, not counted as run time", said), said
+    assert re.search(r"check waited [12] s for a test-pool slot, not counted as run time", said), said
     rc, said = check("past", 4, 2.0)
-    assert rc == 124, said
-    assert "check ran past its limit of 2 s and was ended" in said and "waiting for a test-pool slot:" in said, said
-    assert re.search(r"\(\d+ s counted, [12] s of it waiting for a test-pool slot", said), said
+    assert rc == push.POOL_BUSY, said
+    assert "check still waiting for a test-pool slot at its limit of 2 s and was ended, busy, not failed" in said
+    assert "ran past its limit" not in said, said
 
 
 def test_pool_shard_stall_window_comes_from_the_measured_seconds_per_file_with_a_floor(tmp_path, monkeypatch):

@@ -24,9 +24,9 @@ the planned slots is refused until a run on enough slots was measured. `ttp pool
 the run's --granted, --planned and --files records a passing run's time (its pool waits left out)
 into that history (HISTORY, the newest KEEP per pool).
 
-The time left: a push check's limit counts wall time less only its waits for a grant, its test-pool waits
-included (push._timed_wait), so the push gives each check LIMIT_ENV (its start and limit) and the left time
-takes off the same grant waits (checkwait.grants); a `ttp checks` run gives WALL_ENV, its start and wall
+The time left: a push check's limit counts wall time less its waits for a grant and for a test-pool slot
+(push._timed_wait), so the push gives each check LIMIT_ENV (its start and limit) and the left time takes off
+the same waits (checkwait.grants, checkwait.pool); a `ttp checks` run gives WALL_ENV, its start and wall
 cap, waits included. With both, the tighter one counts.
 
 The limit itself is never scaled: refusing is enough to start no run that is certain to time out, and a
@@ -70,7 +70,8 @@ def time_left(now: float | None = None, env: dict | None = None) -> tuple[float,
             continue
         waited = 0.0
         if name == LIMIT_ENV and env.get(checkwait.ENV):
-            waited = checkwait.grants(env[checkwait.ENV], start, now)[0]
+            d = env[checkwait.ENV]
+            waited = checkwait.grants(d, start, now)[0] + checkwait.pool(d, start, now)[0]
         out.append((limit - (now - start - waited), limit))
     return min(out) if out else None
 

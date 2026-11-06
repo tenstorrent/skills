@@ -14919,6 +14919,39 @@ def test_a_push_check_past_its_time_limit_is_ended_and_fails_the_push_loudly(env
     assert _ttp("push") == push.REFUSED and "push_checks_timeout_s" in capsys.readouterr().err
 
 
+def test_a_push_check_still_waiting_for_a_full_test_pool_at_its_limit_is_busy_not_failed(
+        env, monkeypatch, capsys, request):
+    """A check whose test pool stays full (a live pool wait open from before it starts) past its 1 s limit never
+    ran its tests: it is ended there and the push exits 75 (busy) with a retry_when, nothing pushed, never a
+    failed check (4). One that really ran past the limit still fails (test_a_push_check_past_its_time_limit_...)."""
+    from ttp import checkwait, locks, push
+    monkeypatch.setattr(push, "CHECK_POLL_S", 0.1)
+    real = push.tempfile.mkdtemp
+
+    def mkdtemp(*a, **k):   # the check's pool wait, held live by this process, is open from its start
+        d = real(*a, **k)
+        if k.get("prefix") == "check-waits-":
+            (Path(d) / checkwait.POOL).mkdir()
+            locks.record_wait(Path(d) / checkwait.POOL, "shard", time.time(), None)
+            fd = locks._WAITS_HELD.pop((str(Path(d) / checkwait.POOL), "shard"), None)
+            if fd is not None:
+                request.addfinalizer(lambda: os.close(fd))
+        return d
+    monkeypatch.setattr(push.tempfile, "mkdtemp", mkdtemp)
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["sleep 61.3; true"])
+    before = _git_out(origin, "rev-parse", "proj")
+    _commit(repo, "mine.txt", "mine\n")
+    p.set_config("delivery.push_checks_timeout_s", 1)
+    t0 = time.time()
+    assert _ttp("push") == push.BUSY
+    err = capsys.readouterr().err
+    assert time.time() - t0 < 30, err
+    assert "check still waiting for a test-pool slot at its limit of 1 s and was ended, busy, not failed" in err
+    assert "busy, not failed: sleep 61.3; true" in err and "retry_when" in err, err
+    assert "ran past its limit" not in err, err
+    assert _git_out(origin, "rev-parse", "proj") == before
+
+
 def _waiting_check(env, name, wait_s, run_s):
     """A push check that waits `wait_s` for a grant, then runs `run_s` and writes <name>.ran beside its
     script. Its wait is the one _waits_open_from_start opens before it starts, so its own start-up (nice,
@@ -15037,22 +15070,27 @@ def _clock_timed_wait(monkeypatch, tmp_path, limit_s, pool_bound_s, pool_until, 
     return rc, "\n".join(said), clock[0] - 1000.0
 
 
-def test_a_push_check_time_limit_counts_its_wait_for_a_test_pool_slot_as_wall_time(monkeypatch, tmp_path):
-    """The limit is wall time since the check started, its test-pool waits included: a check that waits 600 s
-    for a slot and then runs is ended within a poll of 900 s, while running; one still waiting for a slot at
-    900 s is ended then, while waiting; each says it timed out and after how long. One done inside the limit
-    passes, and the push log gives its pool-wait seconds as counted."""
+def test_a_push_check_time_limit_counts_run_time_not_its_wait_for_a_test_pool_slot(monkeypatch, tmp_path):
+    """The limit is run time, its test-pool waits left out: a check that waits 600 s for a slot and then runs
+    past the limit is ended within a poll of 900 s run (1500 s wall) and fails (124), saying it timed out and
+    after how long; one that waits 600 s and then runs 500 s passes (a full pool is not the change). One still
+    waiting for a slot at 900 s is ended then, busy, not failed (POOL_BUSY). The push log gives the pool-wait
+    seconds as not counted."""
+    from ttp import push
     rc, said, t = _clock_timed_wait(monkeypatch, tmp_path / "a", 900.0, 4 * 3600.0, 600, 2000)
-    assert rc == 124 and 900 <= t < 900 + 5, (t, said)   # within one poll (CHECK_POLL_S) of the limit
-    assert "check ran past its limit of 900 s and was ended: timed out after 900 s, running" in said, said
-    assert "(900 s counted, 600 s of it waiting for a test-pool slot; 0 s waiting for a grant not counted" in said
+    assert rc == 124 and 1500 <= t < 1500 + 5, (t, said)   # within one poll (CHECK_POLL_S) of the limit
+    assert "check ran past its limit of 900 s and was ended: timed out after 1500 s" in said, said
+    assert "(900 s counted; 600 s waiting for a test-pool slot and 0 s waiting for a grant not counted" in said
+    rc, said, t = _clock_timed_wait(monkeypatch, tmp_path / "f", 900.0, 4 * 3600.0, 600, 1100)
+    assert rc == 0 and t == 1100 and "ran past its limit" not in said, (t, said)
     rc, said, t = _clock_timed_wait(monkeypatch, tmp_path / "b", 900.0, 4 * 3600.0, 1261, 1510)
-    assert rc == 124 and 900 <= t < 905, (t, said)
-    assert "timed out after 900 s, waiting for a test-pool slot" in said, said
-    assert "check waited 900 s for a test-pool slot, counted against its time limit: run-shards" in said, said
+    assert rc == push.POOL_BUSY and 900 <= t < 905, (t, said)
+    assert "check still waiting for a test-pool slot at its limit of 900 s and was ended, busy, not failed" in said
+    assert "ran past its limit" not in said, said
+    assert "check waited 900 s for a test-pool slot, not counted as run time: run-shards" in said, said
     rc, said, _ = _clock_timed_wait(monkeypatch, tmp_path / "c", 900.0, 4 * 3600.0, 600, 850)
     assert rc == 0 and "ran past its limit" not in said, said
-    assert "check waited 600 s for a test-pool slot, counted against its time limit: run-shards" in said, said
+    assert "check waited 600 s for a test-pool slot, not counted as run time: run-shards" in said, said
     # With no limit there is no bound to enforce, but the pool wait is still reported.
     rc, said, _ = _clock_timed_wait(monkeypatch, tmp_path / "d", None, 4 * 3600.0, 300, 500)
     assert rc == 0 and "waited 300 s for a test-pool slot" in said, said
@@ -15107,16 +15145,17 @@ def _shards_timed_wait(monkeypatch, tmp_path, name, ends_at, limit_s=900.0):
     return rc, "\n".join(said), clock[0] - 1000.0
 
 
-def test_a_push_check_time_limit_counts_its_running_shards_waits_for_test_pool_slots(monkeypatch, tmp_path):
+def test_a_push_check_time_limit_leaves_out_its_running_shards_waits_for_test_pool_slots(monkeypatch, tmp_path):
     """Shards of a running check wait for test-pool slots while others run: those waits (live, wrapped in
-    `ttp pool-wait`, or reported once granted with `--waited`) are wall time of the check, so it is ended at its
-    limit, not its limit plus the waits; the log gives them once each, overlapping ones counted once."""
+    `ttp pool-wait`, or reported once granted with `--waited`) are not run time of the check, so one that runs
+    on past them is ended at its limit plus the waits; the log gives them once each, overlapping ones counted
+    once."""
     rc, said, _ = _shards_timed_wait(monkeypatch, tmp_path, "a", 880)
     assert rc == 0, said
-    assert "waited 500 s for a test-pool slot, counted against its time limit" in said, said
+    assert "waited 500 s for a test-pool slot, not counted as run time" in said, said
     rc, said, t = _shards_timed_wait(monkeypatch, tmp_path, "b", 3000)
-    assert rc == 124 and "check ran past its limit of 900 s" in said and 900 <= t < 905, (t, said)
-    assert "500 s of it waiting for a test-pool slot" in said, said
+    assert rc == 124 and "check ran past its limit of 900 s" in said and 1400 <= t < 1405, (t, said)
+    assert "500 s waiting for a test-pool slot" in said, said
 
 
 def test_a_push_check_keeps_the_pool_wait_of_a_waiter_that_died_before_closing_it(monkeypatch, tmp_path):
@@ -15146,18 +15185,19 @@ def test_a_push_check_keeps_the_pool_wait_of_a_waiter_that_died_before_closing_i
         return rc, "\n".join(said), clock[0] - 1000.0
 
     rc, said, _ = run("a", 800)
-    m = re.search(r"check waited (\d+) s for a test-pool slot, counted", said)
+    m = re.search(r"check waited (\d+) s for a test-pool slot, not counted", said)
     assert rc == 0 and m and 495 <= int(m[1]) <= 500, said   # seen to the last poll before it died
     rc, said, t = run("b", 5000)
-    assert rc == 124 and 900 <= t < 905, (rc, t, said)
-    m = re.search(r"\((\d+) s counted, (\d+) s of it waiting for a test-pool slot", said)
-    assert m and int(m[1]) == 900 and 495 <= int(m[2]) <= 500, said
+    assert rc == 124 and 1395 <= t < 1410, (rc, t, said)   # 900 s run past the wait it saw
+    m = re.search(r"\((\d+) s counted; (\d+) s waiting for a test-pool slot", said)
+    assert m and 900 <= int(m[1]) < 906 and 495 <= int(m[2]) <= 500, said
 
 
 def test_a_push_check_time_limit_counts_a_test_gates_head_and_base_rerun_pool_waits(monkeypatch, tmp_path):
     """A check whose tests gate reruns failing tests on the head and the base waits for a pool slot for each
     rerun (gatejudge.rerun records it, checkwait): 180 s of shard pool waits plus 480 s and 300 s of gate rerun
-    waits are 960 s of pool wait in the log; the check is ended at its wall-time limit, those waits counted."""
+    waits are 960 s of pool wait in the log, not counted as run time; a check still waiting for the base rerun's
+    slot at its limit is ended busy, not failed."""
     from ttp import checkwait, push
 
     def run(name, ends_at, steps, limit_s):
@@ -15184,10 +15224,10 @@ def test_a_push_check_time_limit_counts_a_test_gates_head_and_base_rerun_pool_wa
              **gate("base", 900.0, 300.0)}
     rc, said, _ = run("a", 1290, steps, 1800.0)
     assert rc == 0 and "ran past its limit" not in said, said
-    assert "waited 960 s for a test-pool slot, counted" in said, said
+    assert "waited 960 s for a test-pool slot, not counted" in said, said
     rc, said, t = run("b", 5000, steps, 900.0)
-    assert rc == 124 and "check ran past its limit of 900 s" in said and 900 <= t < 905, (t, said)
-    assert "timed out after 900 s, waiting for a test-pool slot" in said, said   # the base rerun's wait
+    assert rc == push.POOL_BUSY and "ran past its limit" not in said and 900 <= t < 905, (t, said)
+    assert "still waiting for a test-pool slot at its limit of 900 s" in said, said   # the base rerun's wait
 
 
 def test_a_push_check_shows_its_test_pool_wait_live_in_the_log_and_the_result_probe(monkeypatch, tmp_path):
@@ -15210,9 +15250,9 @@ def test_a_push_check_shows_its_test_pool_wait_live_in_the_log_and_the_result_pr
     assert seen[120] == "; check waiting for a test-pool slot, 120 s so far", seen
     assert seen[400] == "; check waited 300 s for a test-pool slot", seen   # granted at 300 s
     lines = [x for x in said.splitlines() if "so far" in x]
-    assert [x.split(": ")[1] for x in lines] == [f"{s} s so far, counted against its time limit" for s in (5, 65, 125, 185, 245)], lines
+    assert [x.split(": ")[1] for x in lines] == [f"{s} s so far, not counted as run time" for s in (5, 65, 125, 185, 245)], lines
     assert push.pool_status_words(tmp_path / "push-1.json") == "; check waited 300 s for a test-pool slot"
-    assert "check waited 300 s for a test-pool slot, counted against its time limit" in said, said
+    assert "check waited 300 s for a test-pool slot, not counted as run time" in said, said
     assert push.pool_status_words(tmp_path / "none.json") == ""
 
 

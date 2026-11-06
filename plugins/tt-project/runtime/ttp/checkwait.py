@@ -12,8 +12,8 @@ check started and whether it waits now.
 
 A wait for a slot of a test pool (a check script's or its shards' own pick of a free test host, wrapped in
 `ttp pool-wait`, marked live with `ttp pool-wait --start` / `--stop`, or reported once over with `--waited`)
-records itself the same way in the folder's POOL subfolder: it is wall time of the check, which its time limit
-counts, and no grant the push may queue on; pool() reads it on its own, for the push's pool-wait bound and the
+records itself the same way in the folder's POOL subfolder: it is not run time of the check, which its time limit
+counts (a check still waiting for a pool slot at its limit is ended busy), and no grant the push may queue on; pool() reads it on its own, for the push's pool-wait bound and the
 live and final pool-wait figures of its log. The push keeps what it read in a Seen: a wait it once counted stays
 counted, even when its waiter dies before closing its record (which then counts nothing here)."""
 from __future__ import annotations
