@@ -3947,6 +3947,97 @@ def test_lane_waits_name_the_project_cap_when_the_repository_s_other_lanes_only_
             g and g.close()
 
 
+
+def test_the_cap_label_shows_only_at_the_cap_and_below_it_the_wait_names_the_host_gate_and_its_run(
+        env, monkeypatch):
+    """A waiter with a free lane waits on the project cap only while the project's running checks fill it
+    (testslots.project_held); below it, the wait names the host gate a lane holder of the project records
+    (lane_waits, gate_lanes), else nothing. A wait with no task names its run (its ticket's label)."""
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=2)
+    p = make(env)
+    p.set_config("checks.slots", 3)
+    p.set_config("checks.wait_event_s", 1)
+    cfg = p.config()
+    three = lambda _held: 3   # noqa: E731
+    hold = lambda: testslots.suite_hold(p.name, repo=_LANE_REPO, slots=three, cap=2, wait_s=0,   # noqa: E731
+                                        pending=True, running=True, who="run 1")
+    gs = [hold(), hold()]
+    ticket = None
+    try:
+        assert all(g and g.files for g in gs) and testslots.claim_running(gs[0], p.name, three, 2)
+        ticket = locks.enqueue(checkcap.slot_dir(), testslots._suite_resource(p.name, _LANE_REPO),
+                               f"{p.name}: full checks (run 99, pid 4242)", time.time() - 60, priority=2)
+        w = checklane.waits(p.name, cfg)
+        assert len(w) == 1 and len(testslots.project_held(p.name)) == 1, w
+        assert w[0]["waits_on"] == "nothing (about to start)" and w[0]["limit"] == "", "1 of 2 held: no cap"
+        assert w[0]["who"] == "run 99 (no task)" and w[0]["run"] == "99", w
+        # the other lane's run waits under the host's load guard: the wait names that gate, never the cap
+        testslots.lane_waits(gs[1], testslots.LOAD_WAITS + "1-minute load 70.0 above its 64 cores")
+        w = checklane.waits(p.name, cfg)
+        assert w[0]["limit"] == "host" and w[0]["waits_on"] == (
+            checklane.HOST_GATE + testslots.LOAD_WAITS + "1-minute load 70.0 above its 64 cores"), w
+        testslots.gate_lanes(gs[1], "the host test-slot pool is full")   # pool_gate's reason wins
+        ev = checklane.wait_events(p.name, cfg)
+        assert len(ev) == 1 and ev[0]["task"] is None, ev
+        assert "run 99 (no task) has waited" in ev[0]["text"], ev
+        assert "on the host's gate: the host test-slot pool is full" in ev[0]["text"], ev
+        assert "project cap" not in ev[0]["text"].split("Lanes:")[0] and "held by the host's gate" in ev[0]["text"]
+        assert "run 99 (no task) has waited" in checklane.long_wait_lines(p.name, cfg, over_s=1)[0]
+        # the project's running checks fill its cap of 2: now, and only now, the cap
+        assert testslots.claim_running(gs[1], p.name, three, 2)
+        w = checklane.waits(p.name, cfg)
+        assert w[0]["waits_on"] == checklane.CAP_LABEL and w[0]["limit"] == "project_cap", w
+        assert "held by the project cap (checks.test_project_max)." in checklane.wait_events(p.name, cfg)[0]["text"]
+        # a waiter whose label names no run still says whose wait it is
+        assert checklane._waiter_name("", f"{p.name}: full checks (pid 7)") == "a run with no task (full checks (pid 7))"
+        assert checklane._waiter_name("41", "task #41 x (run 3)") == "#41"
+    finally:
+        ticket and locks.dequeue(ticket)
+        for g in gs:
+            g and g.close()
+
+
+def test_a_long_holder_is_a_likely_hang_only_when_its_log_and_cpu_stalled_else_slow_under_load(monkeypatch):
+    """checks.wait_hang_factor x the median alone says a holder is long, not hung: a likely hang needs
+    checkstall's stalled view (its log not grown for its threshold) and, where the daemon's CPU reading
+    of its tree is known, that CPU idle. A long holder still progressing is named slow under load, with
+    the host's load and cores, and wakes nobody."""
+    from ttp import checkcap, checklane, checkstall
+    monkeypatch.setattr(checkcap, "_load", lambda: 63.0)
+    monkeypatch.setattr(checkcap, "cores", lambda: 64)
+    t0 = 1_000_000.0
+    now = t0 + 3600   # 6x the 10 min median: long
+    h = {"task": "12", "pid": 4242, "run_since": t0, "log": "/scratch/run/checks.log", "command": "pytest -q"}
+    cfg = {"checks": {"wait_hang_factor": 3}}
+    evs = _queue_events(1, holders=[h])
+    grew = {"at": now - 5}
+    stat = lambda path: (grew["at"], 1000)   # noqa: E731 - the log's mtime and size
+    moving = {checkstall.key(h): {"cpu": 2000.0, "at": now - 30}}   # its tree used CPU in the last reading
+    idle = {checkstall.key(h): {"cpu": 2000.0, "at": t0 + 100}}
+
+    why, inc = checklane.wait_wake(evs, None, cfg, now, 600.0, marks=moving, stat=stat)
+    assert why == ["new"] and inc["slow"] and not inc["hang"], (why, inc)
+    text = checklane.wake_text(why, evs, inc, cfg, now, 600.0)
+    assert "slow under load (1-minute load 63.0 on 64 cores), not hung" in text and "likely hang" not in text, text
+    assert checklane.wait_wake(evs, inc, cfg, now + 60, 600.0, marks=moving, stat=stat)[0] == [], "slow: no wake"
+    # bypasses: its log stalled but its tree busy (left to the wall-time cap); stall watch off; no log named
+    grew["at"] = t0 + 100
+    assert checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 600.0, marks=moving, stat=stat)[0] == []
+    off = {"checks": {"wait_hang_factor": 3, "stall_s": 0}}
+    assert checklane.wait_wake(evs, {"start": 1.0}, off, now, 600.0, marks=idle, stat=stat)[0] == []
+    nolog = _queue_events(1, holders=[{k: v for k, v in h.items() if k != "log"}])
+    assert checklane.wait_wake(nolog, {"start": 1.0}, cfg, now, 600.0, marks=idle, stat=stat)[0] == []
+    # stalled: log still for 58 min and the tree idle as long, or the log alone where no reading is known
+    for marks in (idle, {}, None):
+        why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 600.0, marks=marks, stat=stat)
+        assert why == ["hang"] and not inc["slow"], (marks, why, inc)
+    assert "its log stopped growing, its CPU idle: a likely hang" in checklane.wake_text(why, evs, inc, cfg, now, 600.0)
+    # short of the factor: neither hung nor slow, however still its log
+    assert checklane.wait_wake(evs, {"start": 1.0}, cfg, t0 + 1700, 600.0, marks=idle, stat=stat)[0] == []
+
+
 _RUNNING_HOLDER = """
 import os, signal, sys, time
 from pathlib import Path
