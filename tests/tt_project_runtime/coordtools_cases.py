@@ -527,7 +527,7 @@ def test_full_tools_hook_allows_writes_and_denies_protected_files_and_pushes(tmp
               "sqlite3 state/project.db 'delete from tasks'", "echo x >> harness/MEMORY.md",
               f"rm {harness}/memory/fact.md", "cp /tmp/x CHARTER.md",
               # a raw git push, every way: plain, by path, wrapped, nested in a shell or ssh, to a tag
-              "git push origin HEAD:smartonTT/x", "/usr/bin/git -C repo push --tags", "env A=1 git push",
+              "git push origin HEAD:someone/x", "/usr/bin/git -C repo push --tags", "env A=1 git push",
               "timeout 60 git push origin main", "sh -c 'cd r && git push origin main'",
               "ssh box1 'cd r; git push origin v1'", "bash -c \"bash -c 'git push'\"", "true; git push -f",
               # the worker's own checks still run
@@ -599,7 +599,7 @@ def test_session_tools_key_loosens_only_on_the_users_word():
 def test_full_tools_coordinator_lands_nothing_and_moves_no_tag(tmp_path, monkeypatch):
     # The hook: every landing `ttp push`, also wrapped or nested; only the forms that move nothing pass.
     _full_env(tmp_path, monkeypatch)
-    for cmd in ("cd wt && ttp push --detach", "ttp push --move-tag smartonTT/x-dogfood abc123", "ttp push",
+    for cmd in ("cd wt && ttp push --detach", "ttp push --move-tag someone/x-dogfood abc123", "ttp push",
                 "ttp push --land --detach", "ttp push --own", "ttp clip -- ttp push", "env A=1 ttp push --batch m",
                 "sh -c 'cd wt && ttp push'", "ssh box1 'ttp push --detach'", "ttp push --free --move-tag t c",
                 "ttp push --queue --detach", "/x/bin/ttp push --marker m"):
