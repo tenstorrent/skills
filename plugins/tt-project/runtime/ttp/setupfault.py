@@ -39,11 +39,13 @@ NO_VERDICT = re.compile(r"\bno verdict\b", re.I)    # a runner's own word that n
 
 class Scan:
     """What found() reads from a check's output as it streams: whether a test verdict showed, and the
-    first KEPT fault lines with their kind and the missing dir they name (None for none)."""
+    first KEPT fault lines with their kind and the missing dir they name (None for none), and the kind and
+    dir of the last fault line seen (past KEPT too)."""
 
     def __init__(self) -> None:
         self.verdict = False
         self.faults: list[tuple[str, str, str | None]] = []
+        self.last: tuple[str, str | None] | None = None
 
     def feed(self, line: str) -> None:
         if self.verdict:
@@ -53,8 +55,10 @@ class Scan:
             self.verdict = True
             return
         for kind, sign in _SIGNS:
-            if (m := sign.search(line)) and len(self.faults) < KEPT:
-                self.faults.append((kind, line.strip()[:300], m.groupdict().get("path")))
+            if m := sign.search(line):
+                self.last = (kind, m.groupdict().get("path"))
+                if len(self.faults) < KEPT:
+                    self.faults.append((kind, line.strip()[:300], self.last[1]))
                 return
 
 
@@ -75,15 +79,17 @@ def _inside(path: str, repo: Path | str | None) -> bool:
 
 
 def found(s: Scan, repo: Path | str | None) -> dict | None:
-    """The setup fault a failed check's output (Scan) shows, or None: `kind` "pool" when a pool had no
-    free slot (the check waits, never reruns at once), else "setup", and its `lines`. A dir missing
-    inside the repository is the change's own doing, never one; any test verdict makes none."""
+    """The setup fault a failed check's output (Scan) shows, or None: `kind` "pool" when the last fault
+    seen is a pool with no free slot (the check waits, never reruns at once; a wait that later got a slot
+    and then failed setup is "setup"), else "setup", and its `lines`. A dir missing inside the repository
+    is the change's own doing, never one; any test verdict makes none."""
     if s.verdict:
         return None
     faults = [(k, ln) for k, ln, path in s.faults if not (path and _inside(path, repo))]
     if not faults:
         return None
-    return {"kind": "pool" if any(k == "pool" for k, _ in faults) else "setup", "lines": [ln for _, ln in faults]}
+    last = s.last if s.last and not (s.last[1] and _inside(s.last[1], repo)) else faults[-1]
+    return {"kind": last[0], "lines": [ln for _, ln in faults]}
 
 
 def starved() -> dict:

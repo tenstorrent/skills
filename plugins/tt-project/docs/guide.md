@@ -1407,10 +1407,14 @@ running work is interrupted only by the preemption below:
   `no verdict` (`FAIL <shard> (infra); no verdict`) or no free pool slot (`no free slot`, `no <name>
   pool free`), and no test verdict (a pytest count or result line, TAP `ok`/`not ok`, an upper-case
   `PASS` or `FAIL` on a line not saying `no verdict`, a traceback). `ttp push`, `ttp land`,
-  `ttp checks` and the push queue run it again up to 2 times (no free pool slot: not at once);
+  `ttp checks` and the push queue run it again up to 2 times (no free pool slot as the last fault
+  seen: not at once; a pool wait that later lost its head dir reruns);
   still so, the push log says `infrastructure fault: ... no test ran`, `ttp push` exits 75 with a
   `retry_when`, `ttp checks` exits 75 with `infra_fault: no-test-ran` in checks.json, and the push
-  queue holds the batch (`setup_fault`) and tries it again after 10 min. It never counts as passed.
+  queue holds the batch (`setup_fault`) and tries it again after 10 min; held this way 3 times in a
+  row on one check (`delivery.push_setup_fault_escalate_after`, 0 = off), one high
+  `push_setup_fault` alert names the check, the fault lines and the batches, and clears once that
+  check passes or a batch pushes. It never counts as passed.
   Any test verdict in the output keeps a failure a failure. A gate of your own that knows it ran
   nothing can say so directly: exit 75. A job a check detaches makes its work dir inside the job,
   after it is detached, so it outlives the check (see `ttp detach` above).
@@ -2076,7 +2080,8 @@ running work is interrupted only by the preemption below:
   (default 3: when batches are held this many times in a row because one check failed twice on a
   transient syntax error in a script outside the change, one high `push_script_torn` alert names the
   check, the scripts and the batches; each check counts on its own, and the alert clears once that
-  check passes or a batch pushes; 0 = off), `after_push`
+  check passes or a batch pushes; 0 = off), `push_setup_fault_escalate_after` (default 3: the same
+  for batches held because one check failed before any test ran, after its reruns), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
   (default 1800). A batch that ends without writing an outcome is retried with a growing pause,
   and three such batches in a row raise a high alert, unless the host rebooted while it ran: then

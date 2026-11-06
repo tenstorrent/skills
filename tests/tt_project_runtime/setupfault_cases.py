@@ -58,7 +58,12 @@ def test_setupfault_names_only_faults_before_any_test_ran(tmp_path):
     # a gate's own shard lines saying no test ran (its local fallback after a starved pool) are no verdict
     gate = ("no CPU pool free after 120 s; running shards locally\n" + _head_gone(tmp_path)
             + "FAIL shard 3 (infra); no verdict\nhead run did not complete (infra); no verdict\n")
-    assert found(gate)["kind"] == "pool" and found(_head_gone(tmp_path) + "FAIL shard 3 (infra); no verdict\n")
+    assert found(gate)["kind"] == "setup", "a pool wait that ran on and then lost its head dir reruns"
+    assert found(_head_gone(tmp_path) + "FAIL shard 3 (infra); no verdict\n")
+    # the kind is the last fault seen, past the KEPT lines too
+    assert found(_STARVED + _head_gone(tmp_path))["kind"] == "setup"
+    assert found(_head_gone(tmp_path) * 3 + _STARVED)["kind"] == "pool"
+    assert found(_STARVED + f"x: cd: {repo}/b: No such file or directory\n")["kind"] == "pool"
     assert found("FAIL shard 1 (infra); no verdict\n")["kind"] == "setup"
     assert found(gate + "FAIL tests/test_a.sh\n") is None, "a real FAIL from another shard stays a failure"
     assert found("FAIL shard 1 (infra); no verdict\n1 failed in 0.2s\n") is None
@@ -149,3 +154,67 @@ def test_push_batch_holds_a_check_that_failed_before_any_test_ran_and_requeues_i
     assert m["checks"]["setup_fault"]["kind"] == "setup", m
     out = capsys.readouterr().out
     assert "the batch is held, not failed" in out and "check failed on" not in out, out
+
+
+def test_repeated_setup_fault_holds_of_one_check_raise_one_alert_until_that_check_passes(env, monkeypatch):
+    """A batch held setup_fault (a check that failed before any test ran, after its reruns) goes back to the
+    queue. Two holds of one check raise nothing; the third in a row raises one high alert naming the check, the
+    fault lines and the batches. Another check's hold neither counts nor clears it. A batch that passes the
+    check clears its count and the alert; a pushed batch clears every count. delivery.push_setup_fault_escalate_after
+    0 turns it off."""
+    from ttp import alerts, coordinator, pushq
+    s = _pq(env, monkeypatch)
+    db = s.p.db
+    _pq_hand_off(env, s)
+    a, b = "make test", "make lint"
+
+    def held(cmd, line="cd: /srv/gate/head: No such file or directory"):
+        _pq_plan(s, outcome="setup_fault", row="requeued",
+                 checks={"runs": 1, "seconds": 2.0, "setup_fault": {"check": cmd, "kind": "setup", "lines": [line]}})
+        bid = _pq_batch(s)
+        _pq_tend(s)
+        return bid
+
+    def ran(outcome, row, passed):
+        _pq_plan(s, outcome=outcome, row=row, checks={"runs": 1, "seconds": 2.0, "passed": passed})
+        _pq_batch(s)
+        _pq_tend(s)
+
+    alerted = lambda cmd: db.q("SELECT text, severity FROM messages WHERE kind='alert' AND ref=?", (pushq.setup_key(cmd),))
+    count = lambda cmd: ((db.kv(pushq.KV) or {}).get("setup") or {}).get(cmd, {}).get("n", 0)
+    holds = lambda cmd: alerts.holds(db, pushq.setup_key(cmd), 0, time.time())
+    runs = [held(a), held(a)]
+    assert (count(a), alerted(a), holds(a)) == (2, [], False), "two holds raise nothing"
+    held(b)   # another check: counted apart, never resets or raises the first
+    assert (count(a), count(b), alerted(b)) == (2, 1, [])
+    runs.append(held(a, "tar: This does not look like a tar archive"))
+    [msg] = alerted(a)
+    assert a in msg["text"] and "/srv/gate/head" in msg["text"] and "tar archive" in msg["text"], msg
+    assert all(str(r) in msg["text"] for r in runs) and holds(a) and not holds(b)
+    held(a)
+    assert count(a) == 4 and len(alerted(a)) == 1, "one alert, not one per hold"
+    assert "torn" not in db.kv(pushq.KV), "a setup_fault hold is no script_torn one"
+    ran("moved", "requeued", [b])   # passing the other check clears only that one
+    assert (count(a), count(b), holds(a)) == (4, 0, True)
+    ran("moved", "requeued", [a])
+    assert (count(a), holds(a)) == (0, False), "a pass of the check clears it"
+    held(a), held(a)
+    assert count(a) == 2 and len(alerted(a)) == 1, "counting starts again after a pass"
+    held(b)
+    ran("pushed", "pushed", [])
+    assert "setup" not in db.kv(pushq.KV), "a pushed batch clears every count"
+    for bad in (-1, 1.5, "x"):
+        with pytest.raises(ValueError):
+            coordinator.push_queue_number("push_setup_fault_escalate_after", bad)
+
+
+def test_setup_fault_escalation_off_raises_nothing(env, monkeypatch):
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_setup_fault_escalate_after=0)
+    _pq_hand_off(env, s)
+    for _ in range(4):
+        _pq_plan(s, outcome="setup_fault", row="requeued",
+                 checks={"runs": 1, "seconds": 2.0, "setup_fault": {"check": "make test", "kind": "pool", "lines": ["x"]}})
+        _pq_batch(s)
+        _pq_tend(s)
+    assert not s.p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref=?", (pushq.setup_key("make test"),))

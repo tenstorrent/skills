@@ -588,7 +588,8 @@ EXTRA_KEYS = {
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
-                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "push_script_torn_escalate_after", "after_push",
+                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "push_script_torn_escalate_after",
+                 "push_setup_fault_escalate_after", "after_push",
                  "push_solo_paths", "push_cap_tests", "push_rerun_s", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
@@ -858,14 +859,17 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
 # push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 # push_script_torn_escalate_after: batches held script_torn on one check this many times in a row raise a
-# high alert (pushq._torn_told; 0 = off).
+# high alert (pushq._held_told; 0 = off); push_setup_fault_escalate_after: the same for batches held
+# setup_fault (a check that failed before any test ran, after its reruns).
 PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 300, "push_batch_max": 8, "push_min_gap_s": 1800,
                        "push_landing_alert_h": 4, "push_script_torn_escalate_after": 3,
+                       "push_setup_fault_escalate_after": 3,
                        "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
                       "push_min_gap_s": (0, True, False), "push_landing_alert_h": (0, True, False),
                       "push_script_torn_escalate_after": (0, True, True),
+                      "push_setup_fault_escalate_after": (0, True, True),
                       "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False)}
 
 

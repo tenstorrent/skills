@@ -89,6 +89,8 @@ BAD_TIP_ALERT = "push_tip_failing"   # the keyed alert while the push branch tip
 TORN_ALERT = "push_script_torn"   # keyed per check (torn_key) while its batches keep being held script_torn (alerts.holds)
 DEFAULT_TORN_AFTER = 3          # delivery.push_script_torn_escalate_after: script_torn holds of one check in a row before it (0 = off)
 TORN_RUNS = 10                  # batch ids kept per check
+SETUP_ALERT = "push_setup_fault"   # keyed per check (setup_key) while its batches keep being held setup_fault (alerts.holds)
+DEFAULT_SETUP_AFTER = 3         # delivery.push_setup_fault_escalate_after: setup_fault holds of one check in a row before it (0 = off)
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
@@ -240,40 +242,66 @@ def torn_key(check: str) -> str:
     return f"{TORN_ALERT}:{hashlib.sha1(check.encode()).hexdigest()[:12]}"
 
 
-def _torn_told(p: Project, st: dict, b: dict, m: dict, now: float) -> list[tuple]:
-    """Count the batch's script_torn hold (batch: a check failing twice on a transient syntax error outside the
-    change) per check in st["torn"]; the delivery.push_script_torn_escalate_after-th in a row of one check
-    returns its TORN_ALERT, once until it clears. A check the batch passed (checks.passed), or a pushed batch,
-    clears its count and so the alert (alerts.holds). Another check's hold neither counts nor clears it."""
+def setup_key(check: str) -> str:
+    """The SETUP_ALERT key of one check command."""
+    return f"{SETUP_ALERT}:{hashlib.sha1(check.encode()).hexdigest()[:12]}"
+
+
+def _torn_text(cmd: str, rec: dict, b: dict, logs) -> str:
+    scripts = rec["seen"]
+    return (f"Push batches to {b['target']} were held {rec['n']} times in a row because the "
+            f"check `{cmd}` failed twice on a transient syntax error in "
+            f"{', '.join(scripts) or 'a script'} outside the change: something rewrites "
+            f"{'that script' if len(scripts) == 1 else 'those scripts'} in place while the check "
+            f"runs. Batches {', '.join(map(str, rec['runs']))} (logs: {logs}/<batch>.log). The "
+            f"approvals stay queued and are retried every {syntaxfault.RETRY_S // 60} min; find "
+            f"what writes the script and make it rename a temp file into place. This clears "
+            f"once that check passes.")
+
+
+def _setup_text(cmd: str, rec: dict, b: dict, logs) -> str:
+    return (f"Push batches to {b['target']} were held {rec['n']} times in a row because the check `{cmd}` "
+            f"failed before any test ran, after {setupfault.RERUNS} reruns each: "
+            f"{'; '.join(rec['seen']) or 'no fault line kept'}. Batches {', '.join(map(str, rec['runs']))} "
+            f"(logs: {logs}/<batch>.log). The approvals stay queued and are retried every "
+            f"{setupfault.RETRY_S // 60} min, but this fault keeps coming back: fix the host or test pool the "
+            f"check copies to (or the dir it names). This clears once that check passes or a batch pushes.")
+
+
+# outcome: (pushq state key, its delivery setting, default, alert key, the hold's detail key, alert text)
+_HELD = {"script_torn": ("torn", "push_script_torn_escalate_after", DEFAULT_TORN_AFTER, torn_key, "scripts", _torn_text),
+         "setup_fault": ("setup", "push_setup_fault_escalate_after", DEFAULT_SETUP_AFTER, setup_key, "lines",
+                         _setup_text)}
+
+
+def _held_told(p: Project, st: dict, b: dict, m: dict, now: float, outcome: str) -> list[tuple]:
+    """Count the batch's `outcome` hold (script_torn: a check failing twice on a transient syntax error outside
+    the change; setup_fault: a check that failed before any test ran, after its reruns) per check in its pushq
+    state key; the delivery setting's n-th in a row of one check returns its alert, once until it clears. A
+    check the batch passed (checks.passed), or a pushed batch, clears its count and so the alert (alerts.holds).
+    Another check's hold neither counts nor clears it."""
+    key, setting, default, keyer, detail, text = _HELD[outcome]
     checks = m.get("checks") if isinstance(m.get("checks"), dict) else {}
     passed = {str(c) for c in checks.get("passed") or []}
-    outcome = str(m.get("outcome"))
-    torn = {k: v for k, v in (st.get("torn") or {}).items()
-            if isinstance(v, dict) and outcome != "pushed" and k not in passed}
+    ended = str(m.get("outcome"))
+    counts = {k: v for k, v in (st.get(key) or {}).items()
+              if isinstance(v, dict) and ended != "pushed" and k not in passed}
     later = []
-    held = checks.get("script_torn") if outcome == "script_torn" else None
+    held = checks.get(outcome) if ended == outcome else None
     if isinstance(held, dict) and held.get("check"):
-        cmd, prev = str(held["check"]), torn.get(str(held["check"])) or {}
-        scripts = list(dict.fromkeys([*map(str, held.get("scripts") or []), *(prev.get("scripts") or [])]))[:10]
-        rec = {"key": torn_key(cmd), "n": int(prev.get("n") or 0) + 1, "runs": [*(prev.get("runs") or []), b["id"]][-TORN_RUNS:],
-               "scripts": scripts, "since": prev.get("since") or now, "alerted": bool(prev.get("alerted"))}
-        torn[cmd] = rec
-        after = int(_num(_delivery(p).get("push_script_torn_escalate_after"), DEFAULT_TORN_AFTER, int, 0))
+        cmd, prev = str(held["check"]), counts.get(str(held["check"])) or {}
+        seen = list(dict.fromkeys([*map(str, held.get(detail) or []), *(prev.get(detail) or [])]))[:10]
+        rec = {"key": keyer(cmd), "n": int(prev.get("n") or 0) + 1, "runs": [*(prev.get("runs") or []), b["id"]][-TORN_RUNS:],
+               detail: seen, "since": prev.get("since") or now, "alerted": bool(prev.get("alerted"))}
+        counts[cmd] = rec
+        after = int(_num(_delivery(p).get(setting), default, int, 0))
         if after and rec["n"] >= after and not rec["alerted"]:
             rec["alerted"] = True
-            logs = p.state / "pushes"
-            later.append((rec["key"], f"Push batches to {b['target']} were held {rec['n']} times in a row because the "
-                                      f"check `{cmd}` failed twice on a transient syntax error in "
-                                      f"{', '.join(scripts) or 'a script'} outside the change: something rewrites "
-                                      f"{'that script' if len(scripts) == 1 else 'those scripts'} in place while the check "
-                                      f"runs. Batches {', '.join(map(str, rec['runs']))} (logs: {logs}/<batch>.log). The "
-                                      f"approvals stay queued and are retried every {syntaxfault.RETRY_S // 60} min; find "
-                                      f"what writes the script and make it rename a temp file into place. This clears "
-                                      f"once that check passes.", "high"))
-    if torn:
-        st["torn"] = torn
+            later.append((rec["key"], text(cmd, {**rec, "seen": seen}, b, p.state / "pushes"), "high"))
+    if counts:
+        st[key] = counts
     else:
-        st.pop("torn", None)
+        st.pop(key, None)
     return later
 
 
@@ -1996,7 +2024,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: "
                                            f"{str(m.get('message') or _tail_of(m, None, 5))[:1500]}. "
                                            f"The approvals stay queued and are retried in {BACKOFF_MAX_S // 60} min.", "high"))
-        later += _torn_told(p, st, b, m, now)
+        later += _held_told(p, st, b, m, now, "script_torn") + _held_told(p, st, b, m, now, "setup_fault")
         db.set_kv(KV, st)
         later += _hold_scoped(p, b, m, now)
         for tid in dict.fromkeys(r["task"] for r in rows):
