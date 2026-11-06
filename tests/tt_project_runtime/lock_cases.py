@@ -655,6 +655,12 @@ def test_a_hanging_pre_grant_check_blocks_a_daemon_tick_for_about_one_timeout(en
     assert len(log.read_text().splitlines()) == 2
 
 
+def _ps_args(pid) -> str:
+    """The command line of process pid, "" once it is gone."""
+    r = subprocess.run(["ps", "-ww", "-o", "args=", "-p", str(pid)], capture_output=True, text=True, timeout=30)
+    return r.stdout.strip()
+
+
 def _probing_driver(marks, release, tries=15):
     """A detached driver that, like a resumable try loop, probes the lock before each try and gives up
     after `tries` busy probes; its try runs under `ttp lock board`, then it runs until `release` exists."""
@@ -667,7 +673,8 @@ def _probing_driver(marks, release, tries=15):
             f"while [ ! -e {q(str(release))} ]; do {_nap()}; done"]
 
 
-def test_a_driver_probing_its_own_runs_kept_hold_starts_its_try_and_the_hold_then_ends(env, tmp_path):
+def test_a_driver_probing_its_own_runs_kept_hold_starts_its_try_and_the_hold_then_ends(env, tmp_path,
+                                                                                    reap_tmp_processes):
     # (a), (d), (b): an exclusive run ends while its detached driver waits for the board through
     # `ttp lock --probe`. The keeper of the run's hold kept the board for that driver, so the driver's
     # probe must read it as free for it, its try run under the hold, and the hold end with the driver.
@@ -679,22 +686,33 @@ def test_a_driver_probing_its_own_runs_kept_hold_starts_its_try_and_the_hold_the
     _exclusive_run_detaching(p, mine["id"], 61, run_dir, _probing_driver(marks, release))
     paths = Daemon(p.base)._slot_paths("board")
     try:
-        assert _until_true(lambda: marks.exists() and marks.read_text().strip(), 60), "the driver never got past its probe"
-        assert marks.read_text().splitlines() == ["try1"], marks.read_text()
-        assert "free for this run (held by task #%d (run 61)" % mine["id"] in (tmp_path / "marks.probe").read_text()
-        # The try ran under the kept hold: the board never was free for anyone else meanwhile.
-        assert locks.held_labels(paths) == [f"task #{mine['id']} (run 61), detached jobs"]
-        assert hold.read(run_dir)["state"] == "holding"
-        for who in ({}, {"TTP_TASK": str(other["id"])}):
-            r = _lock_probe(dict(os.environ, TTP_PROJECT=str(p.base), **who), "board")
-            assert r.returncode == 75 and "busy" in r.stdout, r.stdout
+        try:
+            assert _until_true(lambda: marks.exists() and marks.read_text().strip(), 60), "the driver never got past its probe"
+            assert marks.read_text().splitlines() == ["try1"], marks.read_text()
+            assert "free for this run (held by task #%d (run 61)" % mine["id"] in (tmp_path / "marks.probe").read_text()
+            # The try ran under the kept hold: the board never was free for anyone else meanwhile.
+            assert locks.held_labels(paths) == [f"task #{mine['id']} (run 61), detached jobs"]
+            assert hold.read(run_dir)["state"] == "holding"
+            for who in ({}, {"TTP_TASK": str(other["id"])}):
+                r = _lock_probe(dict(os.environ, TTP_PROJECT=str(p.base), **who), "board")
+                assert r.returncode == 75 and "busy" in r.stdout, r.stdout
+        finally:
+            release.touch()
+        # (b) No live job of the run uses the hold any more: it ends within a keeper poll or two.
+        assert _until_true(lambda: (run_dir / "job.rc").exists()) and (run_dir / "job.rc").read_text().strip() == "0"
+        assert _until_true(lambda: locks.any_free(paths), 10), "the hold outlived its last detached job"
+        assert hold.read(run_dir)["state"] == "released"
+        assert _lock_probe(dict(os.environ, TTP_PROJECT=str(p.base), TTP_TASK=str(other["id"])), "board").returncode == 0
     finally:
-        release.touch()
-    # (b) No live job of the run uses the hold any more: it ends within a keeper poll or two.
-    assert _until_true(lambda: (run_dir / "job.rc").exists()) and (run_dir / "job.rc").read_text().strip() == "0"
-    assert _until_true(lambda: locks.any_free(paths), 10), "the hold outlived its last detached job"
-    assert hold.read(run_dir)["state"] == "released"
-    assert _lock_probe(dict(os.environ, TTP_PROJECT=str(p.base), TTP_TASK=str(other["id"])), "board").returncode == 0
+        # A failure above leaves the driver (its `ttp lock board` maybe still waiting, so `release` never
+        # ends it) and the hold keeper it pins: stop the run's wrapper, the driver's group and the keeper,
+        # every one of them named by its command line in tmp_path (the run folder is under it).
+        keeper = (hold.read(run_dir) or {}).get("keeper")
+        left = reap_tmp_processes(tmp_path)
+        if keeper and _ps_args(keeper).find(f"ttp.hold {run_dir} ") >= 0:   # its recorded pid, still that keeper
+            os.kill(keeper, signal.SIGKILL)
+            left.append((keeper, None, "hold keeper"))
+        assert left == [], f"processes of the fake run outlived the test: {left}"
 
 
 def test_a_kept_hold_reads_free_only_for_its_own_runs_lineage(env, tmp_path):

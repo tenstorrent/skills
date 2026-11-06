@@ -9434,6 +9434,55 @@ def test_leak_guard_finds_and_reaps_processes_naming_the_temp_root(tmp_path, lea
             proc.wait()
 
 
+def test_each_tt_project_test_has_the_processes_left_in_its_tmp_path_stopped_and_reported(tmp_path):
+    """tests/conftest.py's per-test teardown: a process a tt-project test left running whose working folder
+    is in its tmp_path, or whose command line names it, is stopped with its group and reported as an
+    error of that test's teardown; a test that leaves nothing, or one naming a sibling path, is not."""
+    import textwrap
+    inner, pids = tmp_path / "inner", tmp_path / "pids"
+    inner.mkdir()
+    shutil.copy(Path(__file__).resolve().parent / "conftest.py", inner / "conftest.py")
+    (inner / "test_tt_project_leaks.py").write_text(textwrap.dedent(f"""
+        import os, subprocess, sys
+
+        def _keep(proc, name):
+            with open({str(pids)!r}, "a") as f:
+                f.write(f"{{name}} {{proc.pid}}\\n")
+
+        def test_by_cwd(tmp_path):
+            _keep(subprocess.Popen(["sleep", "120"], cwd=tmp_path, start_new_session=True), "cwd")
+
+        def test_by_args_in_pytests_group(tmp_path):
+            _keep(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", str(tmp_path / "x")]),
+                  "args")
+
+        def test_sibling(tmp_path):
+            _keep(subprocess.Popen([sys.executable, "-c", "import time; time.sleep(120)", str(tmp_path) + "1/y"],
+                                   start_new_session=True), "sibling")
+
+        def test_clean(tmp_path):
+            subprocess.run(["true"], cwd=tmp_path)
+    """))
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(inner),
+                        f"--basetemp={tmp_path / 'bt'}", str(inner)], cwd=inner, capture_output=True, text=True,
+                       timeout=300, env=dict(os.environ, TTP_TEST_JOBS="1"))
+    got = dict(line.split() for line in pids.read_text().splitlines())
+    try:
+        out = r.stdout + r.stderr
+        assert "4 passed, 2 errors" in out, out[-3000:]
+        assert out.count("process(es) running in its tmp_path") == 2, out[-3000:]
+        assert f"pid {got['cwd']} " in out and f"pid {got['args']} " in out
+        # The sibling is no test's leftover: only the session guard names it (it is under the basetemp).
+        assert out.count(f"pid {got['sibling']} ") == 1 and "tests left 1 process(es) running" in out, out[-3000:]
+        assert _wait_for(lambda: not _ps_args(got["cwd"]) and not _ps_args(got["args"]), 10), "a leftover still runs"
+    finally:
+        for pid in got.values():
+            try:
+                os.kill(int(pid), signal.SIGKILL)
+            except OSError:
+                pass
+
+
 def test_sandboxed_detached_checks_without_daemon_refused_before_launch(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

@@ -20,7 +20,10 @@ A session that runs tt-project tests also fails if, at its end, a process whose 
 the session's own temp root (basetemp) is still alive: those are processes a test detached and never
 reaped. The guard lists them and stops them first, so a failure leaves nothing behind. Only this
 session's basetemp counts, so concurrent sessions on the host never trip it. `reap_tmp_processes`
-gives a test the same reaping for its own tmp_path.
+gives a test the same reaping for its own tmp_path. Each tt-project test that used tmp_path also has,
+after its teardown, any process still running there (its working folder in tmp_path, or its command
+line naming it; read from /proc, so Linux only) stopped with its group and reported as an error of
+that test (_reap_test_processes): a test that fails before its own cleanup leaves nothing running.
 
 Every run ends its summary with one line of wall time and CPU time (user + system, of the main
 process and every child it waited for: workers and the processes the tests started), e.g.
@@ -869,10 +872,12 @@ def leaked_processes(root: str | Path, since: float | None = None) -> list[tuple
             if pid not in mine and start >= since + 1 and names.search(cmd)]
 
 
-def reap(found: list[tuple[int, int, str]], root: str | Path, grace: float = 3.0) -> list[tuple[int, int, str]]:
+def reap(found: list[tuple[int, int, str]], root: str | Path, grace: float = 3.0,
+         finder=None) -> list[tuple[int, int, str]]:
     """Stop the processes in `found` and their process groups: TERM, up to `grace` s, then KILL. A group
     this process or an ancestor belongs to is never signalled, only the process. Returns those of
-    `found` still alive afterwards."""
+    `found` still alive afterwards, as `finder(root)` (default leaked_processes) sees them."""
+    finder = finder or leaked_processes
     rows = _ps()
     mine = _ancestors(rows)
     ours = {row[2] for row in rows if row[0] in mine} | {os.getpgrp()}
@@ -888,7 +893,7 @@ def reap(found: list[tuple[int, int, str]], root: str | Path, grace: float = 3.0
                 pass
         deadline = time.time() + grace
         while True:
-            left = [proc for proc in leaked_processes(root) if proc[0] in {f[0] for f in found}]
+            left = [proc for proc in finder(root) or [] if proc[0] in {f[0] for f in found}]
             if not left or time.time() >= deadline:
                 break
             time.sleep(0.1)
@@ -903,6 +908,70 @@ def reap_tmp_processes():
     returns those still alive after TERM and KILL, normally []. For a test that detaches processes:
     call it from a finalizer that also runs when the test fails."""
     return lambda root: reap(leaked_processes(root), root)
+
+
+def _proc_ancestors() -> set[int]:
+    """This process and its ancestors, from /proc."""
+    mine, pid = set(), os.getpid()
+    while pid > 0 and pid not in mine:
+        mine.add(pid)
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                pid = int(f.read().rsplit(b")", 1)[1].split()[1])
+        except (OSError, ValueError, IndexError):
+            break
+    return mine
+
+
+def processes_in(root: str | Path) -> list[tuple[int, int, str]] | None:
+    """(pid, pgid, command line) of this account's live processes whose working folder is `root` or
+    below it, or whose command line names it, other than this process and its ancestors. Read from
+    /proc (one pass, about 20 ms on a busy host, cheap enough for every test); None where there is no
+    /proc (macOS): the session guard (leaked_processes) still covers those hosts."""
+    if not os.path.isdir("/proc/self"):
+        return None
+    root = str(root).rstrip(os.sep)
+    names = re.compile(re.escape(root.encode()) + rb"(?=[/\s'\"\x00]|$)")
+    mine, found = _proc_ancestors(), []
+    for name in os.listdir("/proc"):
+        if not name.isdigit() or int(name) in mine:
+            continue
+        try:   # another account's process: unreadable here, and never ours to stop
+            cwd = os.readlink(f"/proc/{name}/cwd")
+            with open(f"/proc/{name}/cmdline", "rb") as f:
+                cmd = f.read()
+            pgid = os.getpgid(int(name))
+        except OSError:
+            continue
+        if cwd == root or cwd.startswith(root + os.sep) or names.search(cmd):
+            found.append((int(name), pgid, cmd.rstrip(b"\x00").replace(b"\x00", b" ").decode(errors="replace")))
+    return found
+
+
+LEFT_GRACE_S = 1.0   # how long a test's leftover processes get to end on their own before they are stopped
+
+
+@pytest.fixture(autouse=True)
+def _reap_test_processes(request):
+    """After each tt-project test that used tmp_path: a process still running in it (its working folder
+    there, or its command line naming it) is stopped with its group (reap) and reported as an error of
+    the test's teardown, so a test that failed before its own cleanup leaves nothing running and is
+    named, rather than leaving detached drivers and hold keepers to the session's end or past it."""
+    if not request.path.name.startswith(_SHARDED) or "tmp_path" not in request.fixturenames:
+        yield
+        return
+    root = request.getfixturevalue("tmp_path")   # taken now: tmp_path then ends after this fixture
+    yield
+    deadline = time.time() + LEFT_GRACE_S
+    while (found := processes_in(root)) and time.time() < deadline:
+        time.sleep(0.1)
+    if not found:
+        return
+    left = reap(found, root, finder=processes_in)
+    lines = [f"the test left {len(found)} process(es) running in its tmp_path {root} "
+             f"(stopped now{'' if not left else f'; {len(left)} still alive'}):"]
+    lines += [f"  pid {pid} (group {pgid}): {cmd[:300]}" for pid, pgid, cmd in found]
+    pytest.fail("\n".join(lines), pytrace=False)
 
 
 @pytest.fixture
