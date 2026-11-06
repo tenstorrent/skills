@@ -1607,10 +1607,11 @@ def test_throughput_books_a_passed_start_when_wait_to_its_gate_not_worker_slots(
     assert w["count"] == 2 and w["p90_s"] <= 61 and not w["slow"]
 
 
-def _tp_lanes_full(p, d, monkeypatch, tmp_path, now, **rec):
+def _tp_lanes_full(p, d, monkeypatch, tmp_path, now, cut_by=None, **rec):
     """Under the project cap 3, two p1 waits of 700 s each with both of checks.slots 2 held by the
     project's own runs; each waits-log record written by checkcap.record_wait with `rec`, where a value
-    callable on the wait's start w0 is called on it."""
+    callable on the wait's start w0 is called on it; with `cut_by`, a preempted run's rerun whose old grant
+    (checkcap.CUT_ENV, as `ttp checks` sets it on Preempted) was 10 s in, by that project."""
     from ttp import checkcap
     monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
     p.set_config("checks.test_project_max", 3)
@@ -1619,6 +1620,8 @@ def _tp_lanes_full(p, d, monkeypatch, tmp_path, now, **rec):
         t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"lane wait {i}", w0, 700)
         _tp_checks_run(p, monkeypatch, w0 - 60, 750)
         _tp_checks_run(p, monkeypatch, w0 - 30, 900)
+        if cut_by:
+            monkeypatch.setenv(checkcap.CUT_ENV, json.dumps({"at": w0 + 10, "by": cut_by}))
         _tp_slot_wait(p, monkeypatch, t, w0, w0 + 690, cap=3,
                       **{k: v(w0) if callable(v) else v for k, v in rec.items()})
 
@@ -1659,8 +1662,7 @@ def test_throughput_a_checks_wait_cut_by_a_preemption_books_the_preempting_proje
     from ttp.daemon import Daemon
     p = make(env)
     d, now = Daemon(p.base), time.time()
-    monkeypatch.setenv(checkcap.CUT_ENV, json.dumps({"at": 0, "by": by or p.name}))
-    _tp_lanes_full(p, d, monkeypatch, tmp_path, now, lane_at=lambda w0: w0 + 680)
+    _tp_lanes_full(p, d, monkeypatch, tmp_path, now, cut_by=by or p.name, lane_at=lambda w0: w0 + 680)
     ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
     if by:
         assert ck["held_by"]["own"] == 0 and ck["held_by"][throughput.OTHER_PROJECTS] == 2, ck
