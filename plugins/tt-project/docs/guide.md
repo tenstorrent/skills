@@ -526,6 +526,9 @@ only in the feed and never under "needs you".
   or drops it in the same turn. An action resent unchanged goes through and is refused after the
   turn as before; at most 2 answers a wake are sent back.
   `tools` (`full`, the default, or `read_only`) sets what a session wake may use (coordtools.py).
+  The session prompt's Tools section names only what the wake really gets on its provider
+  (`Provider.coord_tool_set`): a worker's tools, read-only tools or none, with the reason, and hands
+  what it cannot do to workers.
   With `full` it gets a worker's tools (Bash, Read, Edit, Write, Skill, ToolSearch and the web
   tools unless `no_internet`) under a worker's PreToolUse checks, so it can edit, build, ssh to the
   machines its charter allows and run the `ttp` CLI. Direct writes to the charter, the memory

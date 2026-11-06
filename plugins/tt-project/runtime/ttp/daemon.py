@@ -9322,7 +9322,7 @@ class Daemon:
             head, context = coord.prompt_parts(self.p)
             session_prompt = None
             if coordsession.on(self.cfg, provider):   # the session's byte-stable prompt and its schema
-                s_head, s_context = coordsession.session_prompt_parts(self.p)
+                s_head, s_context = coordsession.session_prompt_parts(self.p, provider)
                 session_prompt = {"system": s_head, "context": s_context, "cached": cached}
             context = coord.with_cached(context, cached)
             burst = bursthold.carried(db, evs)

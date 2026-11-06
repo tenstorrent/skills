@@ -146,6 +146,11 @@ class Claude(Provider):
     tool_hooks = True
     fence_optional = True   # the Bash sandbox (fence_args)
 
+    def coord_tool_set(self, cwd):
+        # The session tools come only with ttp's tool hooks (coordtools.session_tool_args); a subclass
+        # without them (chat) runs its coordinator turns tool-less.
+        return ("full", "") if self.tool_hooks else ("none", "ttp's tool hooks are not wired for this provider yet")
+
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]

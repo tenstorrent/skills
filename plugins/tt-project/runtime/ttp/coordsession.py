@@ -497,14 +497,16 @@ def schema() -> dict:
     return {**ACTIONS_SCHEMA, "properties": {**ACTIONS_SCHEMA["properties"], "session_note": {"type": "string"}}}
 
 
-def session_prompt_parts(p) -> tuple[str, str]:
-    """(system prompt, stable context) of a session wake: the Restrictions block and the session role,
-    then the charter verbatim (its Restrictions section is the block). Rendered live from the charter
-    and the prompt files only, so two wakes with an unchanged charter get the same bytes."""
+def session_prompt_parts(p, provider: str | None = None) -> tuple[str, str]:
+    """(system prompt, stable context) of a session wake on coordinator `provider` (unset: claude): the
+    Restrictions block and the session role, its Tools section naming that provider's real tools
+    (prompts.session_tools), then the charter verbatim (its Restrictions section is the block).
+    Rendered live from the charter, the prompt files and the tool state only, so two wakes with an
+    unchanged charter and tool state get the same bytes."""
     from .coordinator import _prompt_head
-    from .prompts import coordinator_session_role
+    from .prompts import coordinator_session_role, session_tools
     rules, _, charter = _prompt_head(p)
-    return f"{rules}{coordinator_session_role(p)}", f"# CHARTER\n{charter}\n"
+    return f"{rules}{coordinator_session_role(p, session_tools(p, provider))}", f"# CHARTER\n{charter}\n"
 
 
 def _note_path(p, session_id: str):

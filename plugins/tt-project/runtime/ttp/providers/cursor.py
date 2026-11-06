@@ -192,6 +192,10 @@ class Cursor(Provider):
     def write_fence(self, restrictions=None) -> str:
         return self._sandbox_gap(restrictions)
 
+    def coord_tool_set(self, cwd):
+        # A coordinator turn is read-only (build: `--mode ask` and no `--force`); no per-call hooks.
+        return "read", "Cursor runs coordinator wakes in its ask mode: it reads files but runs no commands and edits nothing"
+
     def resume_args(self, session_id: str) -> list[str]:
         # `--resume [chatId]` continues a chat; the id is the session_id every stream event carries.
         ok = session_id and re.fullmatch(r"[A-Za-z0-9-]+", session_id)
