@@ -261,7 +261,9 @@ def folder_changes(before: dict, after: dict) -> list[str]:
 
 @pytest.fixture(autouse=True)
 def _temp_home(tmp_path_factory, monkeypatch):
-    """Points HOME (and the XDG and agent config folders) at a fresh temp folder for this test."""
+    """Points HOME (and the XDG and agent config folders) at a fresh temp folder for this test, and
+    fails it when it handed the account's whole home to a child (a HOME-less env the recorder could not
+    fill, HOME=<account home>): the session would then count every outside change there as its own."""
     root = tmp_path_factory.getbasetemp() / "homes"
     root.mkdir(mode=0o700, exist_ok=True)
     import tempfile
@@ -271,7 +273,17 @@ def _temp_home(tmp_path_factory, monkeypatch):
         own = Path(home, ".gitconfig")   # a copy, not an include: see _git_global_config
         own.write_bytes(_session_git_config(os.environ["GIT_CONFIG_GLOBAL"]))
         monkeypatch.setenv("GIT_CONFIG_GLOBAL", str(own))
-    return Path(home)
+    recorder = getattr(sys.modules.get("_ttp_suite_writes"), "recorder", None)
+    bare, fallback = (recorder.bare, recorder.fallback) if recorder else (0, None)
+    if recorder:
+        recorder.fallback = home
+    yield Path(home)
+    if recorder:
+        recorder.fallback = fallback
+    if recorder and recorder.bare > bare:
+        pytest.fail(f"a child of this test was handed the account's home {recorder.home} (HOME unset or "
+                    "set to it): give it a temp HOME (and patch ttp.project._account where the code falls "
+                    "back to passwd's home)", pytrace=False)
 
 
 _GIT_CONFIG_TEXT: dict[str, bytes] = {}
@@ -388,6 +400,8 @@ class _WriteRecorder:
         self.home = os.path.normpath(home)
         self.watched = [os.path.join(self.home, rel) for rel in watched]
         self.log, self.env, self.seen, self.quiet = log, dict(env), set(), 0   # quiet: the conftest's own child
+        self.bare = 0   # times the whole home was recorded: the per-test guard in _temp_home reads it
+        self.fallback = None   # the running test's temp HOME: given where the test unset HOME
         self.found = re.compile("|".join(re.escape(h) for h in self.homes) + rf"(?:/{_PATH_CHARS}*)?(?![^\s'\"`;:,=()&|<>/])")
 
     def __call__(self, event: str, args: tuple) -> None:
@@ -439,8 +453,9 @@ class _WriteRecorder:
     def give_home(self, env) -> bool:
         """Puts the session's HOME (a temp folder) into a child's HOME-less env dict, so it does not fall
         back to passwd's: Popen builds the child's env after this audit event (os.exec and os.posix_spawn
-        before theirs). False where it cannot: not a dict, or the session's HOME is the account's own."""
-        home = os.environ.get("HOME")
+        before theirs), or the running test's temp HOME where the test unset HOME. False where it cannot:
+        not a dict, or the session's HOME is the account's own."""
+        home = os.environ.get("HOME") or self.fallback
         real = os.path.realpath(home) if home else None
         if type(env) is not dict or not real or any(real == h or real.startswith(h + os.sep) for h in self.homes):
             return False
@@ -449,6 +464,7 @@ class _WriteRecorder:
         return True
 
     def record(self, path: str) -> None:
+        self.bare += path == self.home
         if path in self.seen or not any(path == w or w.startswith(path + os.sep) or path.startswith(w + os.sep)
                                         for w in self.watched):
             return

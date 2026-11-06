@@ -1366,6 +1366,12 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "            break\n"
         "        time.sleep(0.1)\n"
         "    assert (out / 'done').exists()\n"
+        "def test_bare(monkeypatch):\n"   # a child handed the account's whole home fails the test
+        "    if os.environ.get('BARE'):\n"
+        "        subprocess.run(['true'], env={'PATH': os.environ['PATH'], 'HOME': REAL})\n"
+        "    monkeypatch.delenv('HOME')\n"   # a test that unsets HOME: a HOME-less child still gets its temp HOME
+        "    shown = subprocess.run(['sh', '-c', 'echo $HOME'], env={'PATH': os.environ['PATH']}, capture_output=True, text=True)\n"
+        "    assert shown.stdout.strip() not in ('', REAL), shown.stdout\n"
         "def test_rewrite():\n"   # the account's own tooling (a deploy's `ttp setup`) rewriting a file
         "    for rel, text in (('.local/bin/ttp', '#!/bin/sh\\n'), ('.claude/settings.json', '{}\\n')):\n"
         "        path, tmp = pathlib.Path(REAL, rel), pathlib.Path(REAL, rel + '.tmp')\n"
@@ -1381,13 +1387,18 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
                               cwd=str(repo), env={**env, **extra}, capture_output=True, text=True, timeout=120)
 
     r = run("-k", "not test_outside")
-    assert r.returncode == 0 and "62 passed" in r.stdout, r.stdout + r.stderr
+    assert r.returncode == 0 and "63 passed" in r.stdout, r.stdout + r.stderr
     homes = {(out / f"home-{i}").read_text() for i in range(60)}
     assert len(homes) == 60, "tests shared a HOME"
     assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".claude", ".codex", ".config", ".gitconfig", ".local", ".ssh"] and (real / ".bashrc").read_text() == "mine\n"
     assert (real / ".gitconfig").read_text() == "[t]\n\tmine = 1\n"
     assert not list((real / ".config" / "systemd" / "user").iterdir())
     assert "wrote outside" not in r.stdout
+    # A test whose child was handed the account's home (HOME=<it>, or a HOME-less env the recorder could not
+    # fill) fails: the session would count every outside change there as its own.
+    r = run("-k", "test_bare", BARE="1")
+    assert r.returncode == 1 and "1 passed" in r.stdout and "1 error" in r.stdout, r.stdout + r.stderr
+    assert f"a child of this test was handed the account's home {real}" in r.stdout, r.stdout
     # A test that still writes there, by an absolute path or relative to its working folder.
     r = run("-k", "test_leak", LEAK="1")
     assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr

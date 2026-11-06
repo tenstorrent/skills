@@ -21613,17 +21613,24 @@ def test_a_failed_detached_job_lets_the_on_pass_cmd_decide_model_free(env, monke
     assert res["escalated_wake"] is True and res["wake_tier"] == "standard", res
 
 
-_OWNER_HOME_CHECK = ("python3 -c \"import os, pwd, sys; "
-                     "sys.exit(os.path.expanduser('~') != pwd.getpwuid(os.getuid()).pw_dir)\" && "
-                     """printf '{"status":"done","summary":"home checked"}'""" + _TO_RESULT)
+def _owner_home_check(owner: pathlib.Path) -> str:
+    return (f"python3 -c \"import os, sys; sys.exit(os.path.expanduser('~') != '{owner}')\" && "
+            """printf '{"status":"done","summary":"home checked"}'""" + _TO_RESULT)
 
 
 @pytest.mark.parametrize("daemon_home", ["unset", "worker dir", "missing", "another user's"])
 def test_an_on_pass_cmd_runs_with_the_owners_home_whatever_the_daemon_inherited(env, monkeypatch, tmp_path,
                                                                                  daemon_home):
     """A daemon started without HOME, from a worker's folder, a sandbox or another user's shell must not
-    make `~` in a hook mean somewhere else: the hook sees the owner's home and runs from the project root."""
+    make `~` in a hook mean somewhere else: the hook sees the owner's home and runs from the project root.
+    The owner's home from passwd is a temp folder here: a hook handed the real one would make the suite
+    count every outside change there as its own (_account itself is checked against pwd)."""
     import pwd
+    from ttp import project as pmod
+    assert pmod._account() == (pwd.getpwuid(os.getuid()).pw_name, pwd.getpwuid(os.getuid()).pw_dir)
+    owner = tmp_path / "owner"
+    owner.mkdir()
+    monkeypatch.setattr(pmod, "_account", lambda: (pwd.getpwuid(os.getuid()).pw_name, str(owner)))
     p = make(env)
     from ttp import daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
@@ -21638,7 +21645,7 @@ def test_an_on_pass_cmd_runs_with_the_owners_home_whatever_the_daemon_inherited(
     else:
         monkeypatch.setenv("HOME", home)
     seen = tmp_path / "seen"
-    tid, _ = _on_pass_cmd_task(p, tmp_path, f'echo "$PWD $USER" > {seen}; ' + _OWNER_HOME_CHECK)
+    tid, _ = _on_pass_cmd_task(p, tmp_path, f'echo "$PWD $USER" > {seen}; ' + _owner_home_check(owner))
     _settle_on_pass(d, tid)
     task = p.db.task(tid)
     assert task["status"] == "done", (task["status"], json.loads(task["result"]).get("woke"))
