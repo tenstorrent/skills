@@ -178,21 +178,17 @@ def test_a_branchless_hand_off_s_top_level_branch_and_head_queue_exactly_one_rev
     assert d._external_change(p.db.task(other)) is None
 
 
-def test_a_question_hop_with_a_branch_commit_gets_one_review_at_hand_off_and_one_without_a_diff_none(env):
-    """#6127: a `continue:` hop kept its parent's kind 'question', committed on its branch and sat in
-    review with no review queued. A done task of any kind but review or harness whose branch changes
-    anything gets exactly one review at its hand-off, with no coordinator turn; one that changes nothing
-    gets none, and the review sweep raises nothing for it."""
+
+def test_a_work_task_with_a_branch_commit_gets_one_review_at_hand_off_and_one_without_a_diff_none(env):
+    """A done work task whose branch changes anything gets exactly one review at its hand-off, as a code
+    task does; one that changes nothing gets none, and the review sweep adds or raises nothing."""
     from ttp.daemon import Daemon
     p = make(env)
     _with_origin(env, clone=False)   # a repo with no remote never pushes: review only
-    parent = p.db.add_task("look into caps", "spec", kind="question", origin="coordinator")
-    tid, branch, done, reviews = _finish_code(env, p, "continue: caps line", {"caps.py": 5}, kind="question",
-                                              labels=[f"continues:{parent}"])
+    tid, branch, done, reviews = _finish_code(env, p, "measure caps", {"caps.py": 5}, kind="work")
     (rev,) = reviews
-    assert rev["title"] == f"Review #{tid}: continue: caps line" and rev["origin"] == "daemon"
-    assert f"branch {branch}, head " in rev["spec"] and "spec of continue: caps line" in rev["spec"]
-    assert done["status"] == "handled", "a routine hand-off still starts a coordinator turn"
+    assert rev["title"] == f"Review #{tid}: measure caps" and rev["origin"] == "daemon"
+    assert f"branch {branch}, head " in rev["spec"] and "spec of measure caps" in rev["spec"]
     assert f"Review #{rev['id']} queued by the daemon" in done["text"]
     # One head gets one review: asking again (a sweep, a repeated hand-off) names the same one.
     d = Daemon(p.base)
@@ -200,36 +196,55 @@ def test_a_question_hop_with_a_branch_commit_gets_one_review_at_hand_off_and_one
     p.db.update_task(tid, status="review")
     _sweep(d)
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1
-    # A question (or work) task whose branch changes nothing gets no review.
-    for kind in ("question", "work"):
-        q, _, qdone, none = _finish_code(env, p, f"{kind} only", {}, kind=kind)
-        assert not none and "queued by the daemon" not in qdone["text"]
+    _, _, wdone, none = _finish_code(env, p, "work only", {}, kind="work")
+    assert not none and "queued by the daemon" not in wdone["text"]
     assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1 and not _unqueued(p)
 
 
-def test_the_sweep_reviews_a_non_code_task_in_review_with_a_diff_once_and_skips_one_without(env):
+def test_a_question_or_plan_task_with_a_branch_commit_gets_no_review_the_documented_gap(env):
+    """Only code and work tasks are reviewed by the daemon: a question or plan task that committed (also a
+    `continue:` hop that kept such a kind) gets none at hand-off or from the sweep; its branch reaches the
+    coordinator as a local_only event (guide.md)."""
     from ttp.daemon import Daemon
     p = make(env)
-    tid, branch, head = _unreviewed(env, p, "work hop", kind="work", status="review", age=1900, result={
-        "status": "needs_review", "summary": "work hop committed"})
-    bare = p.db.add_task("plain question", "spec", kind="question", origin="coordinator")
-    p.db.update_task(bare, status="review", result=json.dumps({"status": "needs_review", "summary": "answer"}))
-    _ran(p, bare, time.time() - 1900)
-    d = Daemon(p.base)
-    _sweep(d)
-    (rev,) = _daemon_reviews(p, tid)
-    assert f"branch {branch}, head {head[:12]}" in rev["spec"]
-    assert not _daemon_reviews(p, bare) and not _unqueued(p)
+    _with_origin(env, clone=False)
+    for kind in ("question", "plan"):
+        parent = p.db.add_task(f"look into {kind}", "spec", kind=kind, origin="coordinator")
+        tid, _, done, none = _finish_code(env, p, f"continue: {kind} line", {f"{kind}.py": 5}, kind=kind,
+                                          labels=[f"continues:{parent}"])
+        assert not none and "queued by the daemon" not in done["text"]
+        assert Daemon(p.base)._code_change(p.db.task(tid)) is False
+        p.db.update_task(tid, status="review")
+        _ran(p, tid, time.time() - 1900)
     _sweep(Daemon(p.base))
-    assert len(p.db.q("SELECT id FROM tasks WHERE kind='review'")) == 1 and not _unqueued(p)
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'")
 
 
-def test_a_review_or_harness_task_s_own_commits_are_never_a_change_to_review(env):
+def test_a_work_hop_that_hands_off_another_continue_hop_is_a_split_with_no_review(env):
+    """#6378: the split gate keyed on kind 'code' while the review gate took work tasks, so a work hop that
+    left its change unfinished got a review of a half-done head. _code_change gates both: the head is a
+    split, no review is queued, and the next hop takes the branch over."""
+    from ttp import chaincap
+    p = make(env)
+    _with_origin(env, clone=False)
+    parent = p.db.add_task("caps work", "spec", kind="work", origin="coordinator")
+    tid, branch, done, reviews = _finish_code(
+        env, p, "continue: caps line", {"caps.py": 5}, kind="work", labels=[f"continues:{parent}"],
+        result={"status": "done", "summary": "half done", "followups": [
+            {"title": "continue: caps line part 2", "spec": "Finish the caps line on this branch, then hand off."}]})
+    head = _git_out(p.root, "rev-parse", branch).strip()
+    assert chaincap.split_head(p.db.task(tid)) == head and not reviews
+    assert not p.db.q("SELECT id FROM tasks WHERE kind='review'") and f"Split at head {head[:12]}" in done["text"]
+
+
+def test_code_change_is_any_code_task_and_a_work_task_with_a_diff_only(env):
     from ttp.daemon import Daemon
     p = make(env)
     d = Daemon(p.base)
-    for kind, want in (("review", False), ("harness", False), ("code", True)):
+    for kind, want in (("review", False), ("harness", False), ("question", False), ("plan", False),
+                       ("code", True), ("work", True)):
         tid, _, _ = _unreviewed(env, p, f"{kind} commits", kind=kind)
         assert d._code_change(p.db.task(tid)) is want, kind
-    tid = p.db.add_task("no branch", "spec", kind="question", origin="coordinator")
-    assert d._code_change(p.db.task(tid)) is False
+    for kind, want in (("code", True), ("work", False)):   # no branch: a code task is still one, as before
+        tid = p.db.add_task(f"{kind} no branch", "spec", kind=kind, origin="coordinator")
+        assert d._code_change(p.db.task(tid)) is want, kind

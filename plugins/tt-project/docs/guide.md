@@ -275,8 +275,12 @@ prolonged whole-box outage.
   group with it, unless a member is protected or another task's, project's or user's: then only the
   leader goes and the command says why (exit 2).
 - When delivery has a review step (`delivery.review_before_pr` or a `delivery.push_branch`), the
-  daemon queues the review of each finished code task in the same step that records its hand-off
-  (`review.auto`, on by default). A review whose head carries commits of another task whose latest
+  daemon queues the review of each finished code task, and of each finished work task whose branch
+  changes anything, in the same step that records its hand-off (`review.auto`, on by default). One
+  rule decides the split, the review, the no-new-commits check and the continue hop for both kinds.
+  A gap: a question or plan task (also a `continue:` hop that kept such a kind) never gets an
+  automatic review, even when it committed; its unpushed branch reaches the coordinator as a
+  local-only notice, and the coordinator queues its review or a code task for it. A review whose head carries commits of another task whose latest
   review failed, while that task's fix or re-review is still open, is queued but held: its status
   names the open fix, and it starts once that fix lands, once the fix chain ends failed or
   cancelled (its spec then says so), or after `review.carried_hold_max_h` hours (default 24, 0 no
