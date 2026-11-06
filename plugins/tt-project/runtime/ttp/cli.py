@@ -3475,7 +3475,7 @@ def cmd_checks(a) -> None:
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
     excused = []   # checks whose failing tests the gate judged not new on this head (gatejudge): landing only
-    proven_new = []   # the gate's blocking verdicts (gatejudge.blocks): new on the head, the base passing on that host
+    proven_new = []   # the gate's verdicts with ids proven new (gatejudge.proven): the base passing them on that host
     base = _checks_base(p, Path(top), cmds)
     (Path(run_dir) / "check_failure.json").unlink(missing_ok=True)
     (Path(run_dir) / slowtests.FILE).unlink(missing_ok=True)   # this run's slowest tests only
@@ -3984,7 +3984,7 @@ def cmd_checks(a) -> None:
         # environment is ruled out, so a rerun here would only fail again holding a slot (gatejudge.known_new).
         if spilled and proven_new and not passed and not timed_out:
             said = (f"the checks failed on spill host {spilled.host} with tests the base passes on that host: "
-                    + ", ".join(i for v in proven_new for i in v["new"])
+                    + ", ".join(i for v in proven_new for i in gatejudge.proven(v))
                     + "; not run again here: fix them and commit")
             out.write(f"ttp checks: {said}\n")
             out.flush()
@@ -5318,8 +5318,9 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
     failing again on the merge base with `base`. The verdict when none of them is new on the head (each
     pre-existing, flaky or quarantined), else None: the failure stands. A remote check (a spill host's
     included) reruns on its own host, each rerun a copy of the commit there with the select plugin
-    shipped along (remotecheck), and its base results are that host's. A blocking verdict is appended to
-    `proven` and saved for the head's tree (gatejudge.save_new). Never for a release check
+    shipped along (remotecheck), and its base results are that host's. A blocking verdict with ids proven
+    new (gatejudge.proven) is appended to `proven` and saved for the head's tree (gatejudge.save_new); one
+    the reruns could not tell leaves the failure as it was. Never for a release check
     (`--release`), a harness run, a Slurm batch check or a command that is not one plain pytest run."""
     from . import cleantree, gatejudge, push, pushpass, pushq, worktree
     if not p or getattr(a, "release", False) or getattr(a, "purpose", None) not in (None, "candidate") \
@@ -5380,6 +5381,8 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         if new:   # one fix note per newly quarantined test
             pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c)), queued=True)
     if gatejudge.blocks(v):
+        if not gatejudge.proven(v):
+            return None
         tree = subprocess.run(["git", "-C", top, "rev-parse", f"{head}^{{tree}}"], capture_output=True, text=True)
         if tree.returncode == 0:
             gatejudge.save_new(p.state, tree.stdout.strip(), str(c), v, now)

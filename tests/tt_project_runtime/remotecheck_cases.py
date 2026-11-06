@@ -2048,3 +2048,27 @@ def test_a_spilled_failure_new_on_the_head_fails_the_change_and_a_rerun_of_its_t
         and "Fix them" in again, again
     assert "rerun at once" not in again and "check-host-a" in again, "it ran nothing: the saved verdict decided"
     assert not json.loads((run / "checks.json").read_text())["passed"]
+
+
+@pytest.mark.parametrize("got", [(None, ""), (2, "ERROR: usage\n")], ids=["timeout", "exit-2"])
+def test_a_spilled_failure_whose_head_rerun_cannot_tell_still_runs_again_here_and_saves_nothing(
+        env, tmp_path, monkeypatch, got):
+    """Review #6582: the spill host's head rerun times out or exits 2, so nothing is proven new there (the host's
+    environment is not ruled out): the checks run again here as before and gate_new.json keeps nothing."""
+    import threading
+    from ttp import cli, gatejudge
+    base = "def test_ok():\n    pass\n\n\ndef test_x():\n    pass\n"
+    p, repo, run = _spill_gate(env, tmp_path, monkeypatch, base,
+                               base.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
+    monkeypatch.setattr(gatejudge, "rerun", lambda *a, **k: got)
+    lane = _spill_lane(p, repo)
+    threading.Timer(2.0, lane.close).start()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh"])
+    assert e.value.code == 1
+    text = (run / "checks.log").read_text()
+    assert "rerun at once on check-host-a" in text and "not proven new" in text, text
+    assert "did not pass on spill host check-host-a" in text, text
+    assert "tests the base passes on that host" not in text, text
+    assert not json.loads((run / "checks.json").read_text())["passed"]
+    assert not (p.state / gatejudge.NEW_FILE).exists() or not json.loads((p.state / gatejudge.NEW_FILE).read_text())

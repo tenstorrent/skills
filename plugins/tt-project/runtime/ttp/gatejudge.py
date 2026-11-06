@@ -22,8 +22,9 @@ host fault there (exit 75 too) is busy alike. A base result saved earlier (BASE_
 same base commit. A failing id in the active quarantine is excused without a rerun unless the change
 touches its file.
 
-A blocking verdict is saved per head tree and check (NEW_FILE, save_new). It ends the run there: a spill
-host's run whose new failures it proved on that host's base is not run again here (the host's environment
+Only ids proven new (`proven`: the head rerun failed them and a real base result on that same host passed
+them or did not have them) are saved per head tree and check (NEW_FILE, save_new). They end the run there:
+a spill host's run with ids proven new on that host's base is not run again here (the host's environment
 is ruled out), and a later `ttp checks` of the same tree and check fails at once, before it queues for a
 checks slot, telling the task to fix them (known_new; --fresh runs it again).
 
@@ -192,16 +193,17 @@ def save_base(state: Path, where: str, base: str, verdicts: dict[str, bool], now
 
 
 def save_new(state: Path, tree: str, check: str, v: dict, now: float) -> None:
-    """Record blocking verdict `v` (blocks: ids that failed on the head twice and passed on the base on the same
-    host) of `check` on the head tree `tree`, so a rerun of the same tree and check fails at once (known_new)
-    instead of taking a checks slot to fail again. Kept BASE_KEEP_S."""
-    if not tree or not v.get("new"):
+    """Record the ids of verdict `v` proven new (proven: failed on the head twice and passed on the base on the
+    same host) of `check` on the head tree `tree`, so a rerun of the same tree and check fails at once (known_new)
+    instead of taking a checks slot to fail again. An unproven failure saves nothing. Kept BASE_KEEP_S."""
+    ids = proven(v)
+    if not tree or not ids:
         return
     path = Path(state) / NEW_FILE
     with _locked(path):
         d = {k: e for k, e in _load(path).items() if isinstance(e, dict) and now - float(e.get("ts") or 0) < BASE_KEEP_S}
         d[f"{tree}|{check}"] = {"head": v.get("head") or "", "base": v.get("base") or "", "host": v.get("host") or "",
-                                "new": list(v["new"]), "ts": now}
+                                "new": ids, "ts": now}
         _save(path, d)
 
 
@@ -253,10 +255,13 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
           touched=lambda _id: True, tries: int = BUSY_TRIES, wait_s: float = BUSY_WAIT_S,
           sleep=time.sleep) -> dict:
     """Judge a check's failing `ids`. `run(at, ids)` reruns ids at "head" or "base" on this host and
-    returns (exit code or None, output); one that exits BUSY is retried (rerun). The verdict: {new,
+    returns (exit code or None, output); one that exits BUSY is retried (rerun). The verdict: {new, proven,
     pre_existing, flaky, quarantined, busy, base, host}; the check blocks while `new` is not empty, and
-    is undecided (neither passed nor failed) while `busy` is not."""
-    v = {"new": [], "pre_existing": [], "flaky": [], "quarantined": [], "busy": [], "base": base, "host": where}
+    is undecided (neither passed nor failed) while `busy` is not. `proven` is the part of `new` a conclusive
+    head rerun failed and a real base result on this host passed or did not have; the rest of `new` is a
+    failure the reruns could not tell apart (a timeout, an odd exit, an incomplete list, no base)."""
+    v = {"new": [], "proven": [], "pre_existing": [], "flaky": [], "quarantined": [], "busy": [], "base": base,
+         "host": where}
     q = active(state, now)
     todo = []
     for i in ids:
@@ -288,11 +293,17 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
             known.update(fresh)
     v["pre_existing"] = [i for i in still if known.get(i) is True]
     v["new"] = [i for i in still if known.get(i) is not True and i not in v["busy"]]
+    v["proven"] = [i for i in v["new"] if known.get(i) is False]
     return v
 
 
 def blocks(v: dict) -> bool:
     return bool(v.get("new"))
+
+
+def proven(v: dict) -> list[str]:
+    """The ids of verdict `v` proven new on its host (judge): only these are saved (save_new) or end a spill run."""
+    return [i for i in v.get("proven") or [] if i in (v.get("new") or [])]
 
 
 def undecided(v: dict) -> bool:
@@ -312,8 +323,10 @@ def lines(v: dict) -> list[str]:
     if v.get("quarantined"):
         out.append("quarantined as flaky earlier and not touched by this change, not blocking: "
                    + ", ".join(v["quarantined"]))
-    if v.get("new"):
-        out.append("new on this head (failed again on its rerun, not on the base), blocking: " + ", ".join(v["new"]))
+    if (sure := proven(v)):
+        out.append("new on this head (failed again on its rerun, not on the base), blocking: " + ", ".join(sure))
+    if (unsure := [i for i in v.get("new") or [] if i not in sure]):
+        out.append("not proven new (a head or base rerun could not tell, or no base), so the failure stands: " + ", ".join(unsure))
     if v.get("busy"):
         out.append(f"not judged: their rerun found no free slot on this host (exit {BUSY}) after its retries, "
                    "so they are neither excused nor counted as new: " + ", ".join(v["busy"]))

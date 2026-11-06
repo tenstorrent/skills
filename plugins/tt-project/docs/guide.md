@@ -1894,8 +1894,9 @@ running work is interrupted only by the preemption below:
   name); passing on the head rerun is flaky: it goes into the project's quarantine
   (`state/test_quarantine.json`: first seen, evidence, expiry after `checks.quarantine_days`, default 7),
   which `ttp status` shows, one fix note goes to the coordinator, and it does not block. Failing on the
-  head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell. Such a
-  blocking verdict is saved per head tree and check (`state/gate_new.json`, kept 7 days): a later `ttp checks`
+  head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell. Only the
+  tests proven new (a conclusive head rerun failed them and a real base result on the same host passed or
+  lacked them) are saved per head tree and check (`state/gate_new.json`, kept 7 days): a later `ttp checks`
   of the same tree fails at once, before it queues for a checks slot, naming the tests to fix (`--fresh` runs
   it again). A saved
   base result counts only when it ran on the same host for the same base commit. A quarantined test the

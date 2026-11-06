@@ -45,7 +45,41 @@ def test_gate_judge_sorts_pre_existing_flaky_and_new_failures(tmp_path):
     # A test the base does not have (pytest exit 5, nothing selected) passes there: the failure is new.
     v = gatejudge.judge([a], lambda at, ids: (1, f"FAILED {a} - x\n1 failed in 0.1s\n") if at == "head"
                         else (5, "no tests ran\n"), tmp_path / "t", "b4", "host-a", 1000.0)
-    assert v["new"] == [a]
+    assert v["new"] == [a] and gatejudge.proven(v) == [a]
+
+
+def test_gate_judge_proves_new_only_from_a_conclusive_head_rerun_and_a_real_base_result(tmp_path):
+    """Review #6582: an id the reruns could not tell apart stays `new` (the failure stands) but is never
+    `proven`, so it is never saved (save_new) and never ends a spill run; the gate's words say so."""
+    from ttp import gatejudge
+    a = "tests/test_a.py::test_new"
+    head_fail = (1, f"FAILED {a} - x\n1 failed in 0.1s\n")
+    cases = {   # the head rerun: out of time, an odd exit, a crash, an incomplete list
+        "timeout": lambda at, ids: (None, ""), "exit 2": lambda at, ids: (2, "ERROR: usage\n"),
+        "exit 255": lambda at, ids: (255, "ssh: connect\n"), "incomplete": lambda at, ids: (1, "boom\n"),
+        # the base rerun cannot tell (out of time, exit 2): no real base result
+        "base timeout": lambda at, ids: head_fail if at == "head" else (None, ""),
+        "base exit 2": lambda at, ids: head_fail if at == "head" else (2, "ERROR\n"),
+    }
+    for n, (name, run) in enumerate(cases.items()):
+        v = gatejudge.judge([a], run, tmp_path / str(n), "b1", "host-a", 1000.0)
+        assert v["new"] == [a] and gatejudge.blocks(v), name
+        assert gatejudge.proven(v) == [], name
+        gatejudge.save_new(tmp_path, f"tree{n}", "pytest", {**v, "head": "h"}, 1000.0)
+        assert gatejudge.known_new(tmp_path, f"tree{n}", "pytest", 1001.0) is None, name
+        said = " ".join(gatejudge.lines(v))
+        assert "not proven new" in said and "not on the base" not in said, (name, said)
+    # No merge base: nothing to compare with, never proven.
+    v = gatejudge.judge([a], lambda at, ids: head_fail, tmp_path / "nb", "", "host-a", 1000.0)
+    assert v["new"] == [a] and gatejudge.proven(v) == []
+    # A saved base result from this host for this base proves it, as a fresh one does.
+    gatejudge.save_base(tmp_path / "sb", "host-a", "b1", {a: False}, 1000.0)
+    v = gatejudge.judge([a], lambda at, ids: head_fail if at == "head" else (None, ""), tmp_path / "sb", "b1",
+                        "host-a", 1000.0)
+    assert gatejudge.proven(v) == [a] and "not on the base" in " ".join(gatejudge.lines(v))
+    # Only the proven part of a mixed verdict is saved.
+    gatejudge.save_new(tmp_path, "mix", "pytest", {"new": [a, "t::u"], "proven": [a], "head": "h"}, 1000.0)
+    assert gatejudge.known_new(tmp_path, "mix", "pytest", 1001.0)["new"] == [a]
 
 
 def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of_it(tmp_path):
@@ -229,6 +263,25 @@ def test_ttp_checks_blocks_a_failure_new_on_the_head(env, tmp_path, monkeypatch,
     assert e.value.code == 1
     assert "new on this head" in capsys.readouterr().out
     assert not json.loads((run / "checks.json").read_text())["passed"]
+
+
+def test_ttp_checks_a_local_failure_whose_base_rerun_cannot_tell_fails_and_saves_nothing(env, tmp_path, monkeypatch,
+                                                                                         capsys):
+    """Review #6582: the head rerun fails the test again but the base rerun cannot tell (here out of time): the
+    failure stands, unproven, and gate_new.json keeps nothing, so the tree's next run is not failed by it."""
+    from ttp import cli, gatejudge
+    base = "def test_ok():\n    pass\n\n\ndef test_x():\n    pass\n"
+    p, run = _gate_repo(env, tmp_path, monkeypatch, base, base.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
+    real = gatejudge.rerun
+    monkeypatch.setattr(gatejudge, "rerun", lambda run, at, ids, *a, **k: real(run, at, ids, *a, **k) if at == "head"
+                        else (None, ""))
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _FAIL])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert "not proven new" in out and "new on this head" not in out, out
+    assert not json.loads((run / "checks.json").read_text())["passed"]
+    assert not (p.state / gatejudge.NEW_FILE).exists() or not json.loads((p.state / gatejudge.NEW_FILE).read_text())
 
 
 def test_ttp_checks_quarantines_a_flaky_failure_and_notes_the_coordinator_once(env, tmp_path, monkeypatch, capsys):
@@ -433,8 +486,8 @@ def test_a_blocking_verdict_is_saved_per_tree_and_check_and_expires(tmp_path):
     """#6509: save_new keeps a blocking verdict per head tree and check (only one with new ids); known_new
     finds it for that tree and check alone until BASE_KEEP_S passes, and its text says to fix the tests."""
     from ttp import gatejudge
-    v = {"new": ["t.py::test_x"], "head": "a" * 40, "base": "b" * 40, "host": "box"}
-    gatejudge.save_new(tmp_path, "tree1", "pytest", {**v, "new": []}, 100.0)
+    v = {"new": ["t.py::test_x"], "proven": ["t.py::test_x"], "head": "a" * 40, "base": "b" * 40, "host": "box"}
+    gatejudge.save_new(tmp_path, "tree1", "pytest", {**v, "new": [], "proven": []}, 100.0)
     assert gatejudge.known_new(tmp_path, "tree1", "pytest", 101.0) is None, "a verdict that blocks nothing"
     gatejudge.save_new(tmp_path, "tree1", "pytest", v, 100.0)
     e = gatejudge.known_new(tmp_path, "tree1", "pytest", 101.0)
