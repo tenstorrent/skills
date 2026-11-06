@@ -18,9 +18,15 @@ command, run again where it was found, no longer hits it, or once that checkout 
 A check with a host (push.remote_host, remotecheck) needs no local runner: its fault is the host,
 env:check-host:<host>, when it is paused (remotecheck.paused: probed with no ssh), ssh cannot reach
 it or it lacks git or tar (probed before the checks, or the check exits remotecheck.FAULT_RC mid-run).
-It clears once the pause lifts and ssh reaches the host again."""
+It clears once the pause lifts and ssh reaches the host again.
+
+A missing or old runner's observation also names its likely cause (cause), read-only and model-free:
+the pip runs of the CAUSE_WINDOW_S before it (pip's selfcheck cache: one file per interpreter prefix,
+stamped at each run), and the tt-project detached jobs of the account's projects that ran then and
+whose logs name one of those prefixes."""
 from __future__ import annotations
 
+import json
 import os
 import re
 import shlex
@@ -36,6 +42,9 @@ OLD = "env:old-runner:"
 PROBE_S = 60            # the push queue's recheck of open faults: at most once per this
 PROBE_TIMEOUT_S = 30
 HOLD_ALERT_S = 6 * 3600   # a queue hold this old raises one more observation
+CAUSE_WINDOW_S = 600      # pip runs and detached jobs this long before a runner fault are its likely cause
+CAUSE_MAX = 5             # pip runs and jobs named, each
+_LOG_SCAN = 1 << 20       # bytes read from each end of a job's log
 _PY = re.compile(r"python[0-9.]*$")
 _ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=")
 _OPS = {"&&", "||", ";", "|", "&", "(", ")", ";;", "|&", "\n"}
@@ -292,6 +301,137 @@ def line(f: dict) -> str:
             "not the change: nothing is counted against it")
 
 
+def _selfcheck_dir(env: dict | None = None) -> Path:
+    env = os.environ if env is None else env
+    if env.get("PIP_CACHE_DIR"):
+        return Path(env["PIP_CACHE_DIR"]) / "selfcheck"
+    cache = env.get("XDG_CACHE_HOME") or str(Path(env.get("HOME") or Path.home()) / ".cache")
+    return Path(cache) / "pip" / "selfcheck"
+
+
+def _stamp(v) -> float | None:
+    try:
+        from datetime import datetime
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00")).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
+def pip_runs(now: float, env: dict | None = None) -> tuple[list[tuple[float, str]], str]:
+    """The (time, interpreter prefix) of each pip run in the CAUSE_WINDOW_S before `now`, newest first,
+    from pip's selfcheck cache, and why the cache could not be read ("" when it could, or is absent)."""
+    d = _selfcheck_dir(env)
+    try:
+        names = list(os.scandir(d))
+    except FileNotFoundError:
+        return [], ""
+    except OSError as e:
+        return [], f"pip's selfcheck cache {d} is unreadable ({e.strerror or e})"
+    out = []
+    for e in names:
+        try:
+            if not e.is_file() or e.stat().st_mtime < now - CAUSE_WINDOW_S - 60:
+                continue
+            j = json.loads(Path(e.path).read_text()[:65536])
+        except (OSError, ValueError):
+            continue
+        ts = _stamp(j.get("last_check")) if isinstance(j, dict) else None
+        if ts is not None and j.get("key") and now - CAUSE_WINDOW_S <= ts <= now + 60:
+            out.append((ts, str(j["key"])))
+    return sorted(out, reverse=True), ""
+
+
+def _names(log: Path, needles: list[str]) -> list[str]:
+    """Which of `needles` the log names, reading at most _LOG_SCAN bytes from each end."""
+    try:
+        with open(log, "rb") as fh:
+            size = os.fstat(fh.fileno()).st_size
+            text = fh.read(_LOG_SCAN)
+            if size > _LOG_SCAN:
+                fh.seek(max(_LOG_SCAN, size - _LOG_SCAN))
+                text += fh.read(_LOG_SCAN)
+    except OSError:
+        return []
+    return [n for n in needles if n.encode() in text]
+
+
+def _job_folders(p) -> list[Path]:
+    """The run folders (state/runs) of this project and of every project in the account's registry."""
+    from .project import FOLDER, load_registry
+    out = [Path(p.runs)] if getattr(p, "runs", None) else []
+    try:
+        reg = load_registry().get("projects") or {}
+    except Exception:
+        reg = {}
+    for e in reg.values() if isinstance(reg, dict) else []:
+        if isinstance(e, dict) and e.get("dir"):
+            r = Path(e["dir"]) / FOLDER / "state" / "runs"
+            if r not in out:
+                out.append(r)
+    return out
+
+
+def jobs_naming(p, prefixes: list[str], now: float) -> list[tuple[dict, str, list[str]]]:
+    """(record, project folder, prefixes its log names) of each detached job that ran in the
+    CAUSE_WINDOW_S before `now` and whose log names one of `prefixes`."""
+    out = []
+    for runs in _job_folders(p) if prefixes else []:
+        try:
+            regs = [r for r in runs.glob("*/detached.json") if r.stat().st_mtime >= now - 86400]
+        except OSError:
+            continue
+        for r in regs:
+            try:
+                jobs = json.loads(r.read_text())
+            except (OSError, ValueError):
+                continue
+            for j in jobs if isinstance(jobs, list) else []:
+                if not isinstance(j, dict) or not j.get("log"):
+                    continue
+                start, end = j.get("started") or 0, j.get("ended")
+                if start > now + 60 or (isinstance(end, (int, float)) and end < now - CAUSE_WINDOW_S):
+                    continue
+                if hit := _names(Path(j["log"]), prefixes):
+                    out.append((j, str(runs.parent.parent.parent), hit))
+                    if len(out) >= CAUSE_MAX:
+                        return out
+    return out
+
+
+def cause(p, now: float | None = None, env: dict | None = None) -> str:
+    """One sentence naming a runner fault's likely cause, or saying none was found. Never raises."""
+    now = time.time() if now is None else now
+    try:
+        def at(ts):
+            try:
+                from . import timefmt
+                return timefmt.short(ts, p, now)
+            except Exception:
+                return time.strftime("%H:%M UTC", time.gmtime(ts))
+        runs, why = pip_runs(now, env)
+        mins = CAUSE_WINDOW_S // 60
+        if why:
+            return f" Likely cause: not read: {why}."
+        if not runs:
+            return f" Likely cause: no pip run in the {mins} minutes before (pip's selfcheck cache)."
+        shown = runs[:CAUSE_MAX]
+        s = (f" Likely cause: pip ran in the {mins} minutes before, from "
+             + ", ".join(f"{k} at {at(ts)}" for ts, k in shown)
+             + (f" and {len(runs) - len(shown)} more" if len(runs) > len(shown) else "")
+             + " (pip's selfcheck cache).")
+        jobs = jobs_naming(p, list(dict.fromkeys(k for _, k in shown)), now)
+        for j, proj, hit in jobs:
+            who = ", ".join(x for x in (f"task #{j['task']}" if j.get("task") else "",
+                                        f"run {j['run']}" if j.get("run") else "") if x)
+            s += (f" Detached job {j.get('name')} of {Path(proj).name}" + (f" ({who})" if who else "")
+                  + f", log {j['log']}, names {', '.join(hit)}.")
+        if not jobs:
+            s += " No tt-project detached job's log names those interpreters."
+        return s
+    except Exception as e:   # the diagnosis never stops the record
+        return f" Likely cause: not read ({type(e).__name__})."
+
+
 def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
     """Keep the fault open in the project's state, and raise one coordinator observation the first
     time its signature is seen in this episode. True when this call raised it. Never raises.
@@ -302,6 +442,9 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
     try:
         db = p.db
         now = time.time()
+        sig0 = str(f["sig"])
+        why = (cause(p, now) if sig0.startswith((PREFIX, OLD)) and f.get("kind") != "host"
+               and sig0 not in open_faults(p) else "")   # read before the transaction, not in it
         with db.tx():
             faults = db.kv(KV, {}) or {}
             sig = str(f["sig"])
@@ -336,7 +479,7 @@ def record(p, f: dict, task: str | None = None, queue: bool = False) -> bool:
                  (now, "checks", "observation", fp, "high",
                   f"Environment fault {sig}: {what} (first seen in {f.get('cmd')!r}). Check runs wait instead "
                   "of failing and nothing is counted against any change; the push queue holds its batch. "
-                  f"{fix}. Waiting tasks and the queue resume once `ttp checks --env-ok` passes.", "queued"))
+                  f"{fix}.{why} Waiting tasks and the queue resume once `ttp checks --env-ok` passes.", "queued"))
         return True
     except Exception:   # a note about the host never stops the caller from waiting
         return False
