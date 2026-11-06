@@ -27174,6 +27174,7 @@ def test_durable_write_syncs_renames_and_keeps_the_mode(env, monkeypatch):
 # Every place the runtime writes a file directly, and why it need not survive a power cut. Anything
 # else goes through project.durable_write / durable_append / write_json.
 DURABLE_EXEMPT = {
+    ("shorttmp.py", "with os.fdopen(out, 'w') as f:"): "marks a check's scratch dir on the RAM disk with its allocation, which a reboot clears anyway; a lost mark only counts the dir as live for a few minutes",
     ("ttp_pytest_durations.py", 'open(tmp, "w")'): "runs inside the checked repo's pytest, not the runtime: a timing note written whole to a temp file, then renamed; a lost one costs only the note",
     ("ttp_pytest_durations.py", "os.replace(tmp, self.path)"): "renames that timing note into place: a rename lost to a crash leaves the old note or none",
     ("ttp_pytest_durations.py", 'open(self.live, "a")'): "runs inside the checked repo's pytest, not the runtime: appends one timing line per test start and end; a cut last line is ignored on read, a lost one costs only the note",
