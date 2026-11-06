@@ -54,7 +54,6 @@ import json
 import os
 import re
 import shlex
-import sys
 import time
 
 from .coordlimits import positive
@@ -153,7 +152,8 @@ def hook_settings(denied_reads=(), *, full: bool = False, protected=(), timeout_
     CLI's Bash timeout."""
     from pathlib import Path
     runtime = str(Path(__file__).resolve().parents[1])
-    cmd = f"{shlex.quote(sys.executable)} -m ttp.hook"
+    from .providers.base import isolated_module_argv
+    cmd = shlex.join(isolated_module_argv("ttp.hook", runtime))   # never imports from the project folder
     deny = [str(p) for p in denied_reads if os.path.isabs(p)]
     hook = lambda event: [{"matcher": "*", "hooks": [{"type": "command", "command": f"{cmd} {event}", "timeout": 20}]}]  # noqa: E731
     out = {"hooks": {"PreToolUse": hook(HOOK_EVENT)}, "permissions": {"deny": [f"Read(/{p})" for p in deny]},

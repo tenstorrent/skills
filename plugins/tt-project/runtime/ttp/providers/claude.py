@@ -49,7 +49,7 @@ from ..budget import Window
 from .. import fencefree
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, MAX_CACHE_BREAKPOINTS, Provider, RunUsage, cap_cache_breakpoints,
                    cli_output, find_binary, last_json_object, request_rejected, status_check, strict_schema,
-                   drop_nulls, head80, input_hash, jsonl_from, CMD_MAX)
+                   drop_nulls, head80, input_hash, isolated_module_argv, jsonl_from, CMD_MAX)
 
 EXCLUDE_DYNAMIC = "--exclude-dynamic-system-prompt-sections"
 APPEND_SYSTEM = "--append-system-prompt"
@@ -597,7 +597,7 @@ def hook_settings() -> dict:
     project never changes another's behavior.
     """
     runtime = str(Path(__file__).resolve().parents[2])
-    cmd = f"{shlex.quote(sys.executable)} -m ttp.hook"
+    cmd = shlex.join(isolated_module_argv("ttp.hook", runtime))   # never imports from the worktree
     return {"hooks": {"PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": f"{cmd} PostToolUse",
                                                                   "timeout": 20}]}],
                       # A failed call gets no PostToolUse: the same updates, plus the sandbox mount race hint.

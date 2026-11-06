@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlparse
@@ -119,6 +120,19 @@ def _nullable(sub):
     if "enum" in sub and None not in sub["enum"]:
         sub["enum"] = [*sub["enum"], None]
     return sub
+
+
+# Starts a ttp module with only the runtime and the installed Python's own paths on sys.path (`python -I`): a
+# hook or guard child starts in the agent's worktree, where `-m` would import a ttp/ or json.py the agent
+# wrote there first. PYTHONPATH is ignored too, so the runtime comes as an argument (-P needs Python 3.11):
+# `python -I -c <boot> <runtime> -m <module> <args>`, the same tail as a plain `python -m` line.
+ISOLATED_BOOT = ("import sys,runpy;r,m=sys.argv[1],sys.argv[3];del sys.argv[1:4];sys.path.insert(0,r);"
+                 "runpy.run_module(m,run_name='__main__',alter_sys=True)")
+
+
+def isolated_module_argv(module: str, runtime: str, *args: str) -> list[str]:
+    """`python -m <module> <args>` from `runtime`, never importing from the current directory."""
+    return [sys.executable, "-I", "-c", ISOLATED_BOOT, runtime, "-m", module, *args]
 
 
 # Linux refuses one argument longer than 128 KiB (MAX_ARG_STRLEN; the exec fails with E2BIG), so a

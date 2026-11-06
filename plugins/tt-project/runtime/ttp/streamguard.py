@@ -37,10 +37,11 @@ def active(prov, argv: list[str], env: dict, hooked: bool) -> bool:
 def refusal(payload: dict, env: dict, cwd: str) -> str | None:
     """hook.pre_tool_use's deny reason for `payload`, asked in a child with the run's environment;
     None when it allows it (or the check fails: the hook also lets a call through on an error)."""
+    from .providers.base import isolated_module_argv
     runtime = str(Path(__file__).resolve().parents[1])
     child_env = {**env, "PYTHONPATH": runtime}
-    try:
-        out = subprocess.run([sys.executable, "-m", "ttp.streamguard"], input=json.dumps({**payload, "cwd": cwd}),
+    try:   # isolated: never imports a ttp/ or json.py the agent wrote in its worktree (cwd)
+        out = subprocess.run(isolated_module_argv("ttp.streamguard", runtime), input=json.dumps({**payload, "cwd": cwd}),
                              capture_output=True, text=True, env=child_env, cwd=cwd if os.path.isdir(cwd) else None,
                              timeout=CHECK_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):

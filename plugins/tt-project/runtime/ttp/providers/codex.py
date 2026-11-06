@@ -48,14 +48,14 @@ import os
 import re
 import shlex
 import subprocess
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
 
 from . import register
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_output, price_row, request_rejected,
-                   status_check, stderr_tail, strict_schema, drop_nulls, head80, input_hash, jsonl_from, CMD_MAX)
+                   status_check, stderr_tail, strict_schema, drop_nulls, head80, input_hash, isolated_module_argv, jsonl_from,
+                   CMD_MAX)
 
 # $ per million tokens: (input, cached input, output). Estimates only; the project may override
 # them in project.json under pricing.codex.<model>. Unknown models use the "default" row.
@@ -833,7 +833,7 @@ def hook_config_args() -> list[str]:
     """`-c` keys that route Bash calls and every tool result through `ttp.hook` (see the module
     docstring). PYTHONPATH is set in the command itself, so the worker's own commands keep theirs."""
     runtime = str(Path(__file__).resolve().parents[2])
-    cmd = f"env PYTHONPATH={shlex.quote(runtime)} {shlex.quote(sys.executable)} -m ttp.hook"
+    cmd = f"env PYTHONPATH={shlex.quote(runtime)} {shlex.join(isolated_module_argv('ttp.hook', runtime))}"
     out = []
     for event, matcher in (("PreToolUse", "Bash"), ("PostToolUse", "*")):
         entry = f"[{{matcher={toml_string(matcher)},hooks=[{{type=\"command\",command={toml_string(f'{cmd} {event}')},timeout=20}}]}}]"

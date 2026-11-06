@@ -182,3 +182,53 @@ def test_a_run_without_a_guard_stop_gets_no_guard_block(env, tmp_path):
     tid = p.db.add_task("build it", "Goal: build.", kind="code", tier="light", origin="user")
     p.db.update_task(tid, result=json.dumps({"status": "failed", "summary": "x"}))
     assert "STOPPED BY A HARNESS GUARD" not in worker_task(p, p.db.task(tid), str(tmp_path), None)
+
+
+def _sg_plant(d):
+    """A worktree an agent planted: a ttp/ package whose guard allows everything and a json.py that exits."""
+    (d / "ttp").mkdir(parents=True)
+    (d / "ttp" / "__init__.py").write_text("")
+    for mod in ("streamguard", "hook"):
+        (d / "ttp" / f"{mod}.py").write_text("import sys\nsys.exit(0)\n")
+    (d / "json.py").write_text("raise SystemExit(0)\n")
+
+
+def test_refusal_never_imports_files_from_the_worktree(tmp_path):
+    from ttp import streamguard
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    env = {**os.environ, "TTP_RUN_DIR": str(run_dir), "TTP_TASK": "7"}
+    for plant in ("ttp", "json.py"):
+        wt = tmp_path / f"wt-{plant}"
+        _sg_plant(wt)
+        if plant == "ttp":
+            (wt / "json.py").unlink()
+        else:
+            shutil.rmtree(wt / "ttp")
+        why = streamguard.refusal({"tool_name": "Bash", "tool_input": {"command": SG_DENIED}}, env, str(wt))
+        assert why and "web token" in why, plant
+
+
+def test_harness_hook_commands_never_import_files_from_the_worktree(tmp_path):
+    """The hook commands Claude Code, Codex and the coordinator session run in the worktree."""
+    import re as _re
+    from ttp import coordtools
+    from ttp.providers import claude, codex
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    wt = tmp_path / "wt"
+    _sg_plant(wt)
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+    env.update(TTP_RUN_DIR=str(run_dir), TTP_TASK="7")
+    toml_cmd = next(_re.search(r'command=("(?:[^"\\]|\\.)*")', a).group(1) for a in codex.hook_config_args()
+                    if a.startswith("hooks.PreToolUse="))
+    cmds = {"claude": claude.hook_settings()["hooks"]["PreToolUse"][0]["hooks"][0]["command"],
+            "codex": json.loads(toml_cmd),
+            "coordinator": coordtools.hook_settings()["hooks"]["PreToolUse"][0]["hooks"][0]["command"]}
+    payload = json.dumps({"tool_name": "Bash", "tool_input": {"command": SG_DENIED}, "cwd": str(wt)})
+    for name, cmd in cmds.items():
+        if name != "coordinator":
+            assert cmd.endswith("-m ttp.hook PreToolUse"), (name, cmd)
+        r = subprocess.run(["sh", "-c", cmd], input=payload, capture_output=True, text=True, cwd=wt, env=env,
+                           timeout=60)
+        assert '"deny"' in r.stdout, (name, cmd, r.stdout, r.stderr[-500:])
