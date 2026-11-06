@@ -386,22 +386,27 @@ def test_a_detached_release_check_keeps_release_across_a_daemon_restart(env, mon
     # checks.pid records --release and the daemon's restart (reboot, shared failure, rebase) passes it
     # on: a restarted release run that lost it would excuse failures and exit 0.
     import argparse
-    from ttp import cli, worktree
+    from ttp import checkdirs, cli, worktree
     from ttp import daemon as dmod
     p = make(env)
     run_dir = env["tmp"] / "rel"
     run_dir.mkdir()
-    argvs = []
+    argvs, children = [], []
     real = subprocess.Popen
 
     def popen(argv, **kw):   # the launcher's child: recorded, then a stand-in that waits for its go
         argvs.append(list(argv))
-        return real([sys.executable, "-c", "import sys; sys.stdin.read()"], **kw)
+        children.append(real([sys.executable, "-c", "import sys; sys.stdin.read()"], **kw))
+        return children[-1]
     monkeypatch.setattr(cli.subprocess, "Popen", popen)
+    # The launcher returns only once its child ended (as on a loaded host), so its dropped Popen reaps
+    # the child: the test waits through its own handle, never os.waitpid(pid), which then has none.
+    cleanup = checkdirs.cleanup
+    monkeypatch.setattr(checkdirs, "cleanup", lambda *x, **k: (children[0].wait(timeout=60), cleanup(*x, **k)))
     a = argparse.Namespace(fresh=False, full=False, light=False, no_device=False, release=True, purpose=None,
                            cmd=["true"])
     pid = cli._checks_start(a, run_dir, "", "a" * 40, {**os.environ, "TTP_PROJECT": str(p.base)})
-    os.waitpid(pid, 0)
+    assert children[0].pid == pid and children[0].wait(timeout=60) == 0
     info = cli._read_checks_pid(run_dir)
     assert "--release" in argvs[0] and info["release"] is True
     monkeypatch.setattr(worktree, "is_git", lambda _p: True)
