@@ -774,6 +774,9 @@ def test_quarantine_lifts_an_entry_whose_fix_landed_and_keeps_one_whose_fix_did_
     fix = _land_fix(p, repo, other, "make test_fixed and test_again deterministic")
     # A work task naming the test, and a code task naming it whose commit never landed, lift nothing.
     p.db.add_task("look at test_open", "s", kind="work")
+    # A landed code task whose spec only mentions the test is not its fix: only its title counts.
+    mention = _land_fix(p, repo, other, "speed up the overview")
+    p.db.update_task(mention, spec="see tests/test_q.py::test_open for the slow overview")
     tid, path, _ = _code_task(p, "unlanded")
     p.db.update_task(tid, title="fix test_open")
     _commit(path, "open.txt", "x\n")
@@ -792,30 +795,38 @@ def test_quarantine_lifts_an_entry_whose_fix_landed_and_keeps_one_whose_fix_did_
                for ln in audit.lines(p.db, now=now, p=p))
 
 
-def test_quarantine_lifts_an_id_that_no_longer_names_a_test_and_logs_it(env, monkeypatch):
-    from ttp import gatejudge
-    files = {"tests/test_q.py": ("import pytest\n\n\n@pytest.mark.parametrize('x', [\n    1, 2])\n"
+def test_quarantine_never_lifts_an_id_not_found_at_the_tip_and_lists_it_for_a_hand_lift(env, monkeypatch, capsys):
+    # A test only on the change branch and an id relative to a rootdir in a subfolder read as "missing"
+    # at the push tip exactly like a removed test: none is lifted, all are marked for a hand lift.
+    from ttp import audit, cli, gatejudge
+    files = {"tests/test_q.py": ("import pytest\n\n\n@pytest.mark.parametrize('x', [1, 2])\n"
                                  "def test_now_param(x):\n    pass\n\n\ndef test_plain():\n    pass\n\n\n"
-                                 "def test_fixture_param(x):\n    pass\n\n\nclass TestK:\n"
-                                 "    @pytest.mark.parametrize('y', [1])\n    def test_m(self, y):\n        pass\n"),
+                                 "class TestK:\n    def test_m(self):\n        pass\n"),
              "tests/cases/area_cases.py": "def test_in_case():\n    pass\n"}
     p, repo, other = _quarantine_repo(env, monkeypatch, files)
+    _commit(repo, "test_branch_only.py", "def test_branch_only():\n    pass\n")   # on the change branch only
     now = time.time()
-    keep = ["tests/test_q.py::test_plain", "tests/test_q.py::test_now_param[1]",
-            "tests/test_q.py::test_fixture_param[a]", "tests/test_q.py::test_in_case"]
-    drop = ["tests/test_q.py::test_now_param", "tests/test_q.py::test_removed", "tests/test_old.py::test_x",
-            "tests/test_q.py::TestK::test_m"]
-    gatejudge.quarantine(p.state, keep + drop, {"head": "", "check": "pytest", "host": "h", "task": ""}, now - 60)
-    got = gatejudge.lift_due(p, now)
-    tip = _git_out(repo, "rev-parse", "origin/proj")
-    assert sorted(x["id"] for x in got) == sorted(drop)
-    assert all(x["commit"] == tip and "no longer names a test" in x["why"] for x in got)
-    assert sorted(gatejudge.active(p.state, now)) == sorted(keep)
-    assert sorted(e["id"] for e in gatejudge.lifts(p.state, now - 1)) == sorted(drop)
-    assert all(e["by"] == "daemon" for e in gatejudge.lifts(p.state, now - 1))
-    # No readable push branch: nothing is judged gone.
-    p.set_config("delivery.push_branch", "origin/nowhere")
+    found = ["tests/test_q.py::test_plain", "tests/test_q.py::test_now_param", "tests/test_q.py::test_now_param[1]",
+             "tests/test_q.py::TestK::test_m", "tests/test_q.py::test_in_case"]
+    missing = ["test_branch_only.py::test_branch_only", "cases/area_cases.py::test_in_case",
+               "tests/test_q.py::test_removed", "tests/test_old.py::test_x"]
+    gatejudge.quarantine(p.state, found + missing, {"head": _git_out(repo, "rev-parse", "HEAD"), "check": "pytest",
+                                                    "host": "h", "task": ""}, now - 60)
     assert gatejudge.lift_due(p, now) == []
+    assert sorted(gatejudge.active(p.state, now)) == sorted(found + missing)
+    assert gatejudge.lifts(p.state, 0) == []
+    assert gatejudge.not_found(p, found + missing) == set(missing)
+    cli.main(["quarantine", "list"])
+    out = capsys.readouterr().out.splitlines()
+    for i in found + missing:
+        (ln,) = [x for x in out if x.startswith(f"quarantined test {i}:")]
+        assert ("not found at the push-branch tip; lift by hand" in ln) == (i in missing), ln
+    (ln,) = [x for x in audit.lines(p.db, now=now, p=p) if "not found at the push-branch tip" in x]
+    assert ln.startswith(f"quarantined tests not found at the push-branch tip; lift by hand if the test was removed: "
+                         f"{len(missing)}: ") and all(i in ln for i in missing)
+    # No readable push branch: nothing is marked.
+    p.set_config("delivery.push_branch", "origin/nowhere")
+    assert gatejudge.not_found(p, missing) == set()
 
 
 def test_quarantine_lift_interrupted_mid_write_leaves_the_old_file_whole(tmp_path, monkeypatch):

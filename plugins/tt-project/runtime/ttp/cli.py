@@ -1646,7 +1646,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     if paused := slurmcheck.paused_line(now):   # the Slurm overflow's start-failure breaker: always shown
         lines.append(paused)
     from . import gatejudge   # tests the gate quarantined as flaky (no release check counts them passed)
-    lines.extend(gatejudge.status_lines(p.state, now, lambda ts: at(ts, now, tz)))
+    lines.extend(gatejudge.status_lines(p.state, now, lambda ts: at(ts, now, tz),
+                                        gatejudge.not_found(p, gatejudge.active(p.state, now))))
     if verbose:
         lines.extend(checkspill.status_lines(p.name, now))
         lines.extend(slurmcheck.status_lines(p.name, now))
@@ -7360,7 +7361,7 @@ def cmd_quarantine(a) -> None:
         return
     if a.test_id:
         die("ttp quarantine list takes no test id")
-    lines = gatejudge.status_lines(p.state, now)
+    lines = gatejudge.status_lines(p.state, now, missing=gatejudge.not_found(p, gatejudge.active(p.state, now)))
     print("\n".join(lines) if lines else "no test is quarantined, and none was lifted in the last day")
 
 

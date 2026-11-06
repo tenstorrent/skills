@@ -28,13 +28,15 @@ a spill host's run with ids proven new on that host's base is not run again here
 is ruled out), and a later `ttp checks` of the same tree and check fails at once, before it queues for a
 checks slot, telling the task to fix them (known_new; --fresh runs it again).
 
-An entry leaves the quarantine on its expiry, or earlier when the daemon's sweep (lift_due, every
-LIFT_EVERY_S) finds it fixed or gone: a done code task naming the test, updated since it was first seen
-flaky, has landed on the push branch (landed.check, as `ttp landed --task`) and was not already in the
-head it last flaked at; or its id no longer names a test at the push branch tip (its file or function
-is gone, or a bare id whose function is now parametrized). `ttp quarantine lift <id> --why` lifts one by
-hand. Each lift is logged (LIFTS_FILE), shown by `ttp status` for a day and by the daily review's audit.
-A test that is still flaky fails again, passes its rerun and is quarantined anew.
+An entry leaves the quarantine on its expiry, or earlier in two ways only. The daemon's sweep (lift_due,
+every LIFT_EVERY_S) lifts it once its fix landed: a done code task whose title names the test, updated
+since it was first seen flaky, has landed on the push branch (landed.check, as `ttp landed --task`) and
+was not already in the head it last flaked at. Or `ttp quarantine lift <id> --why` lifts it by hand.
+Each lift is logged (LIFTS_FILE), shown by `ttp status` for a day and by the daily review's audit. No
+existence check lifts anything: an id whose file or function is not found at the push branch tip is only
+marked so (not_found) in `ttp quarantine list`, `ttp status` and the audit, since a test only on the
+change branch or an id relative to another rootdir reads the same. A deleted test stays listed until
+lifted by hand. A test that is still flaky fails again, passes its rerun and is quarantined anew.
 
 Nothing in the repository is edited, skipped or loosened: the quarantine is a harness record only the
 gate reads. An excused check counts for this change's landing only: its pass is never recorded, so
@@ -223,72 +225,59 @@ def _name(test_id: str) -> str:
     return test_id.rpartition("::")[2].partition("[")[0]
 
 
-def _defs(repo: Path, tip: str, test_id: str) -> list[bool] | None:
-    """Per definition of the test's function at `tip` (any .py file under the test file's top folder):
-    whether it is parametrized. [] when its file or function is gone, None when git cannot tell."""
+def _found(repo: Path, tip: str, test_id: str) -> bool | None:
+    """Whether the test's file and a definition of its function (any .py file under the file's top
+    folder) are at `tip`; None when git cannot tell."""
     from .landed import _git
     path, name = test_id.partition("::")[0], _name(test_id)
     if not path or not re.fullmatch(r"\w+", name):
         return None
     if _git(repo, "cat-file", "-e", f"{tip}:{path}").returncode != 0:
-        return []
-    got = _git(repo, "grep", "-n", "-E", rf"^\s*(async\s+)?def {name}\(", tip, "--", path.partition("/")[0] or ".")
-    if got.returncode not in (0, 1):
-        return None
-    out, files = [], {}
-    for hit in got.stdout.splitlines():
-        f, _, rest = hit[len(tip) + 1:].partition(":")
-        n = int(rest.partition(":")[0] or 0)
-        if f not in files:
-            files[f] = _git(repo, "show", f"{tip}:{f}").stdout.splitlines()
-        lines = files[f]
-        indent = len(lines[n - 1]) - len(lines[n - 1].lstrip())
-        k, block = n - 2, []
-        while k >= 0 and lines[k].strip():   # its decorators, up to a blank line or other code
-            ind, s = len(lines[k]) - len(lines[k].lstrip()), lines[k].strip()
-            if not (ind > indent or ind == indent and s[:1] in "@)]"):
-                break
-            block.append(s)
-            k -= 1
-        out.append(any("parametrize" in s for s in block))
-    return out
-
-
-def gone(repo: Path, tip: str, test_id: str) -> bool:
-    """Whether `test_id` no longer names a test at `tip`: its file or function is gone, or it is a bare id
-    and every definition is now parametrized. An id with parameters whose function is not decorated may
-    take them from a fixture: not gone."""
-    defs = _defs(repo, tip, test_id)
-    if defs is None:
         return False
-    return not defs or ("[" not in test_id.rpartition("::")[2] and all(defs))
+    got = _git(repo, "grep", "-q", "-E", rf"^\s*(async\s+)?def {name}\(", tip, "--", path.partition("/")[0] or ".")
+    return {0: True, 1: False}.get(got.returncode)
+
+
+def _push_tip(p) -> tuple[Path, str]:
+    """(repo, push branch tip) from local refs, never a fetch; tip "" when unreadable."""
+    from . import landed
+    repo = Path(p.root)
+    try:
+        return repo, landed._tip(repo, landed._push_ref(p, repo), False)[0]
+    except ValueError:
+        return repo, ""
+
+
+def not_found(p, ids) -> set[str]:
+    """The ids whose file or function git finds missing at the push branch tip. Information for a human or
+    coordinator only, never a lift: a test only on the change branch or an id relative to another rootdir
+    reads the same as a removed one."""
+    repo, tip = _push_tip(p)
+    return {i for i in ids if tip and _found(repo, tip, i) is False}
 
 
 def fix_tasks(db, test_id: str, entry: dict) -> list[int]:
-    """Done code tasks naming the test (its function, as a word), updated since it was first seen flaky."""
+    """Done code tasks whose title names the test (its function, as a word), updated since it was first
+    seen flaky. A spec that only mentions the test does not make the task its fix."""
     name = _name(test_id)
     if not name:
         return []
     word = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)")
-    rows = db.q("SELECT id, title, spec FROM tasks WHERE kind='code' AND status='done' AND updated>=? "
-                "AND (instr(title, ?) OR instr(spec, ?)) ORDER BY id DESC LIMIT 50",
-                (float(entry.get("first_seen") or 0), name, name))
-    return [r["id"] for r in rows if word.search(f"{r['title']}\n{r['spec']}")][:FIX_TRIES]
+    rows = db.q("SELECT id, title FROM tasks WHERE kind='code' AND status='done' AND updated>=? "
+                "AND instr(title, ?) ORDER BY id DESC LIMIT 50",
+                (float(entry.get("first_seen") or 0), name))
+    return [r["id"] for r in rows if word.search(r["title"] or "")][:FIX_TRIES]
 
 
 def lift_due(p, now: float | None = None) -> list[dict]:
-    """The daemon's sweep: lift each active entry whose fix landed or whose id is gone (see the module
-    docstring). Local refs only, never a fetch. The lifts made: [{id, why, commit}]."""
+    """The daemon's sweep: lift each active entry whose fix landed (see the module docstring). Local refs
+    only, never a fetch. The lifts made: [{id, why, commit}]."""
     from . import landed
     now = time.time() if now is None else now
     q = active(p.state, now)
     if not q:
         return []
-    repo = Path(p.root)
-    try:
-        tip, _ = landed._tip(repo, landed._push_ref(p, repo), False)
-    except ValueError:
-        tip = ""
+    repo, tip = _push_tip(p)
     out = []
     for i, e in sorted(q.items()):
         heads = [str(x.get("head") or "") for x in e.get("evidence") or [] if isinstance(x, dict)]
@@ -300,8 +289,6 @@ def lift_due(p, now: float | None = None) -> list[dict]:
                                                                           fetch=False)[0] == 0):
                 why, commit = f"its fix #{tid} landed ({words})", tip
                 break
-        if not why and tip and gone(repo, tip, i):
-            why, commit = "its test id no longer names a test on the push branch", tip
         if why and lift(p.state, [i], why, commit, now=now):
             out.append({"id": i, "why": why, "commit": commit})
     return out
@@ -485,11 +472,16 @@ def note_text(ids: list[str], head: str, cmd: str) -> str:
             "condition or a test clock, not wall time).")
 
 
-def status_lines(state: Path, now: float, at=lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))) -> list[str]:
-    """One line per quarantined test and per lift of the last day, for `ttp status`."""
+NOT_FOUND = "not found at the push-branch tip; lift by hand if the test was removed"
+
+
+def status_lines(state: Path, now: float, at=lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts)),
+                 missing=frozenset()) -> list[str]:
+    """One line per quarantined test and per lift of the last day, for `ttp status`; an id in `missing`
+    (not_found) is marked so."""
     return [f"quarantined test {i}: first seen {at(float(e.get('first_seen') or 0))}, expires "
             f"{at(float(e['expires']))}, seen flaky {len(e.get('evidence') or [])} time(s); "
-            "it never counts as passed for a release or whole-suite check"
+            "it never counts as passed for a release or whole-suite check" + (f"; {NOT_FOUND}" if i in missing else "")
             for i, e in sorted(active(state, now).items())] + [
         lift_line(e, at) for e in lifts(state, now - LIFT_SHOW_S)]
 

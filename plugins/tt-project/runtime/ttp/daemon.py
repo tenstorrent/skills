@@ -2418,7 +2418,7 @@ class Daemon:
             log(self.p, "health coverage inventory failed\n" + traceback.format_exc())
 
     def lift_quarantine(self) -> None:
-        """Lift quarantined flaky tests whose fix landed or whose id is gone (gatejudge.lift_due), model-free:
+        """Lift quarantined flaky tests whose fix landed (gatejudge.lift_due), model-free:
         a few git reads every gatejudge.LIFT_EVERY_S while any is quarantined."""
         now = time.time()
         if now - self._quarantine_at < gatejudge.LIFT_EVERY_S:
