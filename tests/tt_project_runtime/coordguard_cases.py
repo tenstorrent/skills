@@ -195,27 +195,29 @@ def test_the_daemon_session_guard_raises_an_issue_and_a_low_notify_and_closes_it
 
 
 def test_the_session_guard_stays_inert_for_a_coordinator_provider_that_runs_no_session(env, monkeypatch):
-    # The mode defaults on, but only coordsession.PROVIDERS run a session: a codex or cursor coordinator's own
-    # stateless turns are never compared with a baseline, so no false "session overspent" trip, issue or notify.
+    # The mode defaults on, but only a provider that keeps a session (coordsession.keeps_session) runs one: a chat
+    # coordinator's (or an unknown provider's) own stateless turns are never compared with a baseline, so no false "session overspent" trip, issue or notify.
     from ttp import coordguard, coordsession, daemon
     from ttp.cli import status_text
     now = time.time()
     p = _guard_project(env, now)
     _coord_runs(p, now + 60, 50, 5.0, step_s=60)   # a busy day of the provider's own stateless turns
-    for prov in ("codex", "cursor"):
+    for prov in ("codex", "cursor"):   # these keep a session, so the guard applies
+        assert coordguard.mode_on({**p.config(), "core_provider": prov}), prov
+    for prov in ("chat", "no-such-provider"):
         cfg = {**p.config(), "core_provider": prov}
-        assert not coordguard.mode_on(cfg) and not coordsession.on(cfg, prov), prov
+        assert not coordguard.mode_on(cfg) and not coordsession.keeps_session(prov), prov
         assert coordguard.check(p.db, cfg, now) is None and coordguard.check(p.db, cfg, now + 3600) is None, prov
         assert p.db.kv(coordguard.KEY) is None and p.db.kv(coordguard.BASELINE_KEY) is None, prov
         assert coordguard.status_line(p.db, cfg, now + 3600) is None, prov
         assert coordsession.status_line(cfg, None) == "", prov
-    # A baseline left from a claude coordinator is cleared once the provider moves to codex.
+    # A baseline left from a claude coordinator is cleared once the provider moves to chat.
     assert coordguard.check(p.db, {**p.config(), "core_provider": "claude"}, now)["event"] == "baseline"
-    assert coordguard.check(p.db, {**p.config(), "core_provider": "codex"}, now + 1)["event"] == "off"
+    assert coordguard.check(p.db, {**p.config(), "core_provider": "chat"}, now + 1)["event"] == "off"
     assert p.db.kv(coordguard.BASELINE_KEY) is None
-    # The daemon reads the project's own core_provider: no baseline, trip, issue or notify for codex.
+    # The daemon reads the project's own core_provider: no baseline, trip, issue or notify for chat.
     monkeypatch.setattr(daemon.Daemon, "_coord_guard_checked", 0.0, raising=False)
-    p.set_config("core_provider", "codex")
+    p.set_config("core_provider", "chat")
     d = daemon.Daemon(p.base)
     d.check_coord_guard()
     d._coord_guard_checked = 0.0

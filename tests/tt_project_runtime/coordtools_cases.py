@@ -1091,8 +1091,8 @@ def test_session_coordinator_settings_turn_the_bash_sandbox_off_like_a_workers(t
 
 
 def test_session_on_with_a_provider_is_off_for_one_that_runs_no_session():
-    # Daemon wake_budget passes the coordinator's provider: a codex or cursor turn keeps its plain budget.
+    # Daemon wake_budget passes the coordinator's provider: a chat turn (no session yet) keeps its plain budget.
     from ttp import coordtools
-    assert coordtools.session_on({}) and coordtools.session_on({}, "claude") and coordtools.session_on({}, "fake")
-    assert not coordtools.session_on({}, "codex") and not coordtools.session_on({}, "cursor")
+    assert all(coordtools.session_on({}, n) for n in (None, "claude", "codex", "cursor", "fake"))
+    assert not coordtools.session_on({}, "chat") and not coordtools.session_on({}, "no-such-provider")
     assert not coordtools.session_on({"coordinator": {"session": {"mode": "off"}}}, "claude")

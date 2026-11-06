@@ -72,9 +72,9 @@ def session_cfg(cfg: dict) -> dict:
 def mode_on(cfg: dict) -> bool:
     """coordinator.session.mode reads on (True, "on" and the like; unset: the default, coordsession.DEFAULTS)
     and the coordinator's provider (core_provider, as the daemon resolves it) runs a session
-    (coordsession.PROVIDERS); off, shadow, bad or another provider: False."""
-    from .coordsession import DEFAULTS, PROVIDERS
-    if ((cfg or {}).get("core_provider") or "claude") not in PROVIDERS:
+    (coordsession.keeps_session); off, shadow, bad or a provider that keeps none: False."""
+    from .coordsession import DEFAULTS, keeps_session
+    if not keeps_session((cfg or {}).get("core_provider")):
         return False
     m = session_cfg(cfg).get("mode")
     if m is None:
