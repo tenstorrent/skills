@@ -1656,13 +1656,20 @@ def test_codex_session_coordinator_gets_its_tools_through_its_own_hooks(env, mon
     ro_env = {**os.environ, **renv, "TTP_RUN_DIR": str(run), "TTP_PROJECT": str(p.base)}
     assert call("PreToolUse", "ttp status", env_=ro_env, cmds_=cmds) is None
     assert call("PreToolUse", "touch x", env_=ro_env, cmds_=cmds)["permissionDecision"] == "deny"
-    # No hook can run (another hook source): read-only keeps the shell off; full tools get it with no bypass.
+    # No hook can run (another hook source, or a build without hooks): no shell or web, read-only or full,
+    # since nothing would refuse a push to the push branch; the reason is named for daemon.log.
     (repo / ".codex").mkdir()
     (repo / ".codex" / "hooks.json").write_text('{"hooks": {}}')
-    argv, _ = coord(False)
-    assert "features.shell_tool=false" in argv and not _codex_hook_commands(argv)
-    argv, _ = coord(True)
-    assert "--dangerously-bypass-hook-trust" not in argv and "features.shell_tool=false" not in argv
+    for full in (True, False):
+        argv, fenv = coord(full)
+        assert "--dangerously-bypass-hook-trust" not in argv and not _codex_hook_commands(argv) and fenv == {}
+        assert all(f"features.{f}=false" in argv for f in ("shell_tool", "unified_exec", "web_search_request")), full
+        assert "hooks cannot run here" in prov.coord_tools_note and ".codex" in prov.coord_tools_note
+    (repo / ".codex" / "hooks.json").unlink()
+    assert coord(True)[1] and prov.coord_tools_note == ""
+    monkeypatch.setattr(type(prov), "hooks_supported", lambda self: False)
+    argv, fenv = coord(True)
+    assert "features.shell_tool=false" in argv and fenv == {} and "runs no hooks" in prov.coord_tools_note
 
 
 def test_codex_like_coordinator_session_wake_launches_with_the_agent_s_tools_and_env(env, monkeypatch):

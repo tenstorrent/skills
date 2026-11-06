@@ -307,12 +307,17 @@ class Codex(Provider):
     def coord_tools(self, argv, cwd, settings, full, web=True):
         # A session coordinator's tools (coordtools.session_tool_args for Claude): every call goes
         # through ttp.hook's CoordPreToolUse (and with full tools the CoordPostToolUse guard and audit),
-        # under the same trust-bypass rule as a worker's hook (_hook_for). The read-only turn's shell
-        # comes back only with that hook to hold it to the read-only list; full tools get it (and the
-        # web, unless no_internet) either way, as a Codex worker does, the whole-wake guard then
-        # covering the protected files (coordtools.wake_guard).
-        hooked = self.hooks_supported() and not hook_sources(cwd, user_config=IGNORE_USER_CONFIG not in argv)
-        if not (hooked or full):
+        # under the same trust-bypass rule as a worker's hook (_hook_for). The shell and the web come
+        # back only with that hook: without it nothing refuses a push to the push branch or a call past
+        # the tool timeout (coordtools.full_refusal), so the turn keeps its read-only tool set and
+        # coord_tools_note names why.
+        self.coord_tools_note = ""
+        if not self.hooks_supported():
+            self.coord_tools_note = "codex: this build runs no hooks: the coordinator has no shell"
+            return argv, {}
+        others = hook_sources(cwd, user_config=IGNORE_USER_CONFIG not in argv)
+        if others:
+            self.coord_tools_note = f"codex: hooks cannot run here ({', '.join(others)}): the coordinator has no shell"
             return argv, {}
         back = {f"features.{f}=false" for f in READ_ONLY_OFF if f != "web_search_request" or (full and web)}
         out = []
@@ -321,11 +326,10 @@ class Codex(Provider):
                 out.pop()
             else:
                 out.append(a)
-        if hooked:
-            from ..coordtools import HOOK_EVENT, POST_EVENT
-            hooks = [("PreToolUse", "*", HOOK_EVENT, 20)] + ([("PostToolUse", "*", POST_EVENT, 20)] if full else [])
-            i = len(out) - 1 if out and out[-1] == "-" else len(out)
-            out[i:i] = [HOOK_TRUST_BYPASS, *hook_config_args(hooks)]
+        from ..coordtools import HOOK_EVENT, POST_EVENT
+        hooks = [("PreToolUse", "*", HOOK_EVENT, 20)] + ([("PostToolUse", "*", POST_EVENT, 20)] if full else [])
+        i = len(out) - 1 if out and out[-1] == "-" else len(out)
+        out[i:i] = [HOOK_TRUST_BYPASS, *hook_config_args(hooks)]
         return out, dict(settings.get("env") or {})
 
     def write_fence(self, restrictions=None) -> str:

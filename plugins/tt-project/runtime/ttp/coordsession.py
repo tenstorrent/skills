@@ -84,8 +84,8 @@ CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the 
 NOTE_DIR = "coord-session"
 # Session mode runs on every provider, with no per-provider opt-out. Each provider says how it keeps
 # the session (providers/base.Provider.coord_session): "agent" resumes the agent CLI's own saved session
-# (claude, chat, which is Claude Code on a served model, codex; the fake in tests); a provider that
-# cannot yet runs each wake stateless, its reason (Provider.session_gap) named in the wake's `why`.
+# (claude, codex, cursor; the fake in tests); a provider that cannot yet (chat) runs each wake
+# stateless, its reason (Provider.session_gap) named in the wake's `why`.
 DIGEST = "digest"   # in KEY: {"sections": {key: [hash, label]}, "keyed": {key: {"head": hash, "rows": {row key:
 #                     hash}}}, "seen": collapse baseline, "gen": daemon start}
 FULL_ASK = "full_digest"

@@ -3228,6 +3228,8 @@ class Daemon:
                     argv, cwd, coordtools.hook_settings(no_reads, full=full, protected=coordtools.protected_paths(self.p),
                                                         timeout_s=coordtools.tool_timeout_s(self.cfg)),
                     full, web=not restrictions.get("no_internet"))
+                if prov.coord_tools_note:
+                    log(self.p, f"run {run_id}: {prov.coord_tools_note}")
             if append_system is not None:
                 (run_dir / "system.md").write_text(append_system)
                 sys_args = prov.append_system_args(run_dir / "system.md")
