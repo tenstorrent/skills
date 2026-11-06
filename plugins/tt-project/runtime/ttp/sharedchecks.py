@@ -116,21 +116,34 @@ def failure_sigs(output: str, ids: list[str]) -> dict[str, str]:
     section), else of its summary line's message, with numbers, addresses and temp names left out, so a
     flaky timing assertion matches itself while a guard naming another change's file and line does not.
     '' when the output shows neither (cut)."""
+    blocks, msgs = failure_blocks(output, ids), summary_msgs(output)
+    sigs = {}
+    for i in ids:
+        text = "\n".join(ln[1:] for ln in blocks[i].splitlines() if ln.startswith("E "))
+        text = _norm(text or msgs.get(i, ""))
+        sigs[i] = hashlib.sha256(text.encode()).hexdigest()[:16] if text else ""
+    return sigs
+
+
+def failure_blocks(output: str, ids: list[str]) -> dict[str, str]:
+    """Each failing id's traceback in pytest's FAILURES (or ERRORS) section, '' when the output has none."""
     out, blocks = output or "", {}
     for m in _HEADER.finditer(out):
         end = _BLOCK_END.search(out, m.end())
         blocks.setdefault(m.group(1), []).append(out[m.end():end.start() if end else len(out)])
-    msgs = {m.group(1): m.group(2) for m in _SUMMARY_MSG.finditer(out)}
-    sigs = {}
+    got = {}
     for i in ids:
         path, _, name = i.partition("::")
         found = blocks.get(name.replace("::", "."), [])
         if len(found) > 1:
             found = [b for b in found if path in b] or found
-        text = "\n".join(ln[1:] for ln in found[0].splitlines() if ln.startswith("E ")) if found else ""
-        text = _norm(text or msgs.get(i, ""))
-        sigs[i] = hashlib.sha256(text.encode()).hexdigest()[:16] if text else ""
-    return sigs
+        got[i] = found[0] if found else ""
+    return got
+
+
+def summary_msgs(output: str) -> dict[str, str]:
+    """{id: message} of pytest's short summary lines (`FAILED <id> - <message>`)."""
+    return {m.group(1): m.group(2) for m in _SUMMARY_MSG.finditer(output or "")}
 
 
 def ensure(db: DB) -> None:

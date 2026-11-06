@@ -8,8 +8,12 @@ fail again once on the base (the change's merge base with the push target). Per 
 - passes on the head rerun: flaky. It goes into the project's quarantine (QUARANTINE_FILE: first
   seen, evidence, expiry after checks.quarantine_days, default 7), which status shows, and one fix
   note goes to the coordinator. It does not block.
-- fails on the head rerun and on the base: pre-existing. Reported by name; it does not block.
+- fails on the head rerun and on the base the same way (same_failure: the same first error line, else the
+  same summary message, else the same failing location, and the same failing statement): pre-existing. Reported by name; it does not block.
 - fails on the head rerun and passes on the base (or is not there): new. It blocks.
+- fails on the head rerun and on the base another way: not proven either way, so the failure stands
+  (new, never `proven`). A test that broke differently on the head is a change's own failure until shown
+  otherwise.
 
 A rerun that cannot tell (out of time, an exit other than 0, 1, 5 or 75, an incomplete list, a head
 rerun that selected none or not all of the ids) keeps the failure. A rerun that exits 75 (BUSY: its
@@ -73,6 +77,8 @@ LIFT_EVERY_S = 600.0   # the daemon's sweep for fixed or gone entries
 LIFT_SHOW_S = 86400.0  # status shows the lifts of the last day
 FIX_TRIES = 5          # candidate fix tasks checked per entry and sweep, newest first
 _COUNT = re.compile(r"\b(\d+) (passed|failed|errors?)\b")   # the counts in pytest's summary line
+_AT = re.compile(r"^(\S+):(\d+): (\w[\w.]*)\s*$", re.M)   # a traceback's `path:line: Error` location line
+MARK_MAX = 300      # the characters of a failure mark's line or message kept
 
 
 def _ran(output: str) -> tuple[int, int] | None:
@@ -140,6 +146,46 @@ def failed_of(rc: int | None, output: str, ids: list[str], at: str = "base") -> 
         return None
     got, complete = sharedchecks.failing_ids(output)
     return set(ids) & set(got) if complete else None
+
+
+def _mark_norm(text: str) -> str:
+    """`text` with what differs between two runs of one failure left out: addresses, temp names and the
+    numbers in paths (pytest's numbered temp folders). Other numbers stay: `assert 5 == 0` (a run that
+    selected nothing) is not `assert 1 == 0`."""
+    text = re.sub(r"0x[0-9a-fA-F]+", "N", re.sub(r"\btmp[\w-]+", "tmp", text or ""))
+    text = re.sub(r"\S*/\S*", lambda m: re.sub(r"\d+", "N", m.group(0)), text)
+    return re.sub(r"\s+", " ", text).strip()[:MARK_MAX]
+
+
+def marks(output: str, ids: list[str]) -> dict[str, dict]:
+    """How each of `ids` failed in a rerun's output: {"line": its traceback's first `E` line, "msg": its
+    summary message, "src": the statement that failed (the traceback's last `>` line), "at": its last
+    `file:line: Error` location (file name only, the checkouts differ)}, each '' when the output does not
+    show it."""
+    blocks, msgs = sharedchecks.failure_blocks(output, ids), sharedchecks.summary_msgs(output)
+    got = {}
+    for i in ids:
+        b = blocks[i]
+        line = next((ln[1:] for ln in b.splitlines() if ln.startswith("E ")), "")
+        at = _AT.findall(b)
+        src = [ln[1:] for ln in b.splitlines() if ln.startswith(">")]
+        got[i] = {"line": _mark_norm(line), "msg": _mark_norm(msgs.get(i, "")), "src": _mark_norm(src[-1] if src else ""),
+                  "at": f"{Path(at[-1][0]).name}:{at[-1][1]}: {at[-1][2]}" if at else ""}
+    return got
+
+
+def same_failure(head: dict | None, base: dict | None) -> bool:
+    """Head and base failed one test the same way: the first of the first error line, the summary message
+    and (with neither) the location that both marks show is equal, and so is the failing statement when
+    both show it (two asserts can print the same `assert 1 == 0`; a line number moves with any edit above
+    it). Marks with nothing in common prove nothing."""
+    head, base = head or {}, base or {}
+    if head.get("src") and base.get("src") and head["src"] != base["src"]:
+        return False
+    for k in ("line", "msg", "at"):
+        if head.get(k) and base.get(k):
+            return head[k] == base[k]
+    return False
 
 
 @contextmanager
@@ -294,24 +340,31 @@ def lift_due(p, now: float | None = None) -> list[dict]:
     return out
 
 
-def saved_base(state: Path, where: str, base: str, ids: list[str], now: float) -> dict[str, bool]:
-    """{id: failed} of base results saved on host `where` for commit `base`; any other host's never count."""
+def _saved(state: Path, where: str, base: str, ids: list[str], now: float) -> dict[str, dict]:
     d = _load(Path(state) / BASE_FILE)
     out = {}
     for i in ids:
         e = d.get(f"{where}|{base}|{i}")
         if isinstance(e, dict) and e.get("host") == where and now - float(e.get("ts") or 0) < BASE_KEEP_S:
-            out[i] = bool(e.get("failed"))
+            out[i] = e
     return out
 
 
-def save_base(state: Path, where: str, base: str, verdicts: dict[str, bool], now: float) -> None:
+def saved_base(state: Path, where: str, base: str, ids: list[str], now: float) -> dict[str, bool]:
+    """{id: failed} of base results saved on host `where` for commit `base`; any other host's never count."""
+    return {i: bool(e.get("failed")) for i, e in _saved(state, where, base, ids, now).items()}
+
+
+def save_base(state: Path, where: str, base: str, verdicts: dict[str, bool], now: float,
+              how: dict[str, dict] | None = None) -> None:
+    """Save base results, with each failure's mark (`how`, marks) to compare a later head failure with."""
     path = Path(state) / BASE_FILE
     with _locked(path):
         d = {k: v for k, v in _load(path).items()
              if isinstance(v, dict) and now - float(v.get("ts") or 0) < BASE_KEEP_S}
         for i, bad in verdicts.items():
-            d[f"{where}|{base}|{i}"] = {"host": where, "failed": bad, "ts": now}
+            d[f"{where}|{base}|{i}"] = {"host": where, "failed": bad, "ts": now,
+                                        **({"mark": (how or {})[i]} if bad and (how or {}).get(i) else {})}
         _save(path, d)
 
 
@@ -379,12 +432,14 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
           sleep=time.sleep) -> dict:
     """Judge a check's failing `ids`. `run(at, ids)` reruns ids at "head" or "base" on this host and
     returns (exit code or None, output); one that exits BUSY is retried (rerun). The verdict: {new, proven,
-    pre_existing, flaky, quarantined, busy, base, host}; the check blocks while `new` is not empty, and
+    pre_existing, other_failure, flaky, quarantined, busy, base, host}; the check blocks while `new` is not empty, and
     is undecided (neither passed nor failed) while `busy` is not. `proven` is the part of `new` a conclusive
     head rerun failed and a real base result on this host passed or did not have; the rest of `new` is a
-    failure the reruns could not tell apart (a timeout, an odd exit, an incomplete list, no base)."""
-    v = {"new": [], "proven": [], "pre_existing": [], "flaky": [], "quarantined": [], "busy": [], "base": base,
-         "host": where}
+    failure the reruns could not tell apart (a timeout, an odd exit, an incomplete list, no base, or a base
+    that failed it another way: `other_failure`, same_failure). Only a base failure the same as the head's
+    is `pre_existing`."""
+    v = {"new": [], "proven": [], "pre_existing": [], "other_failure": [], "flaky": [], "quarantined": [], "busy": [],
+         "base": base, "host": where}
     q = active(state, now)
     todo = []
     for i in ids:
@@ -403,7 +458,11 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
     still = [i for i in todo if i in again]
     if not still:
         return v
-    known = saved_base(state, where, base, still, now) if base else {}
+    head_how = marks(got[1], still)
+    saved = _saved(state, where, base, still, now) if base else {}
+    # A saved base failure without its mark (saved before marks were) cannot be compared: run the base again.
+    known = {i: bool(e.get("failed")) for i, e in saved.items() if not e.get("failed") or e.get("mark")}
+    how = {i: saved[i]["mark"] for i in known if known[i]}
     need = [i for i in still if i not in known]
     if need and base:
         got = rerun(run, "base", need, tries, wait_s, sleep)
@@ -411,11 +470,14 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
             v["busy"] = need
         bad = None if got[0] == BUSY else failed_of(*got, need)
         if bad is not None:
-            fresh = {i: i in bad for i in need}
-            save_base(state, where, base, fresh, now)
+            fresh, fresh_how = {i: i in bad for i in need}, marks(got[1], sorted(bad))
+            save_base(state, where, base, fresh, now, fresh_how)
             known.update(fresh)
-    v["pre_existing"] = [i for i in still if known.get(i) is True]
-    v["new"] = [i for i in still if known.get(i) is not True and i not in v["busy"]]
+            how.update(fresh_how)
+    same = {i for i in still if known.get(i) is True and same_failure(head_how.get(i), how.get(i))}
+    v["pre_existing"] = [i for i in still if i in same]
+    v["other_failure"] = [i for i in still if known.get(i) is True and i not in same]
+    v["new"] = [i for i in still if i not in same and i not in v["busy"]]
     v["proven"] = [i for i in v["new"] if known.get(i) is False]
     return v
 
@@ -450,7 +512,10 @@ def lines(v: dict) -> list[str]:
                    + ", ".join(v["quarantined"]))
     if (sure := proven(v)):
         out.append("new on this head (failed again on its rerun, not on the base), blocking: " + ", ".join(sure))
-    if (unsure := [i for i in v.get("new") or [] if i not in sure]):
+    if (other := [i for i in v.get("other_failure") or [] if i in (v.get("new") or [])]):
+        out.append(f"failed on the base {str(v.get('base'))[:12]} too but another way (another first error "
+                   "line, message or location), so not pre-existing: blocking: " + ", ".join(other))
+    if (unsure := [i for i in v.get("new") or [] if i not in sure and i not in other]):
         out.append("not proven new (a head or base rerun could not tell, or no base), so the failure stands: " + ", ".join(unsure))
     if v.get("busy"):
         out.append(f"not judged: their rerun found no free slot on this host (exit {BUSY}) after its retries, "

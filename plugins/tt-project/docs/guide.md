@@ -2160,8 +2160,10 @@ session and stateless coordinators on every provider.
   review or harness task, or with no task); a candidate that is
   not an ancestor of the head (a fork point rebased away) is skipped, and a later candidate that
   descends from the first (the head merged or was rebased onto a newer tip) wins. The check output and
-  its excused record name the base and why. Failing on both is pre-existing and does not block (reported by
-  name); passing on the head rerun is flaky: it goes into the project's quarantine
+  its excused record name the base and why. Failing on both the same way (the same first error line or
+  summary message, and the same failing statement) is pre-existing and does not block (reported by name);
+  failing on the base another way blocks. A rerun's selection stays in its own pytest process: a pytest a
+  test starts never inherits it. Passing on the head rerun is flaky: it goes into the project's quarantine
   (`state/test_quarantine.json`: first seen, evidence, expiry after `checks.quarantine_days`, default 7),
   which `ttp status` shows, one fix note goes to the coordinator, and it does not block. Failing on the
   head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell. Only the
