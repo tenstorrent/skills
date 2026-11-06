@@ -1119,6 +1119,7 @@ class Daemon:
         self._pre_grant_seen: dict[tuple[str, int], tuple[float, pregrant.Answer]] = {}
         self._pre_grant_broken: dict[str, tuple[float, pregrant.Answer]] = {}   # resource -> its last broken answer
         self._pre_grant_spent = (0.0, 0.0)   # (tick it was spent in, seconds of pre-grant checks in it)
+        self._order_faults: set[str] = set()   # user-order read errors raised since the last good read
         self._lock_fd: int | None = None
         self._started = time.time()
         self._loaded_at = runtimeload.LOADED_AT   # runtime files written later are not what this daemon runs
@@ -15314,12 +15315,18 @@ class Daemon:
         slots are taken: each holder's label, pid and alive, from locks.holder_records), or with config
         locks.pre_grant_check set, {"kind": "pre_grant", "resource", "rc", "line"} (the project's own
         check holds it, or is broken: pregrant.py), or {"kind": "order", "resource", "line"} (a newer user
-        order on it holds a task created or last re-specified before it: userorder.py)."""
+        order on it holds a task created or last re-specified before it: userorder.py), or
+        {"kind": "order_unread", "resource", "line"} (those orders could not be read: _order_unread)."""
+        names = sorted(coord.task_resources(task))
         try:
-            ordered = userorder.holding(self.p.db, self.cfg, task, sorted(coord.task_resources(task)))
-        except Exception as e:   # a broken order record never stops dispatch
+            ordered = userorder.holding(self.p.db, self.cfg, task, names)
+        except Exception as e:   # fail closed: unread user holds keep the task off its resource this pass
             log(self.p, f"task {task['id']}: user orders not read: {e}")
+            if names:
+                return self._order_unread(names[0], e)
             ordered = None
+        else:
+            self._order_faults.clear()   # read again: the next failure is raised anew
         if ordered:
             return {"kind": "order", "resource": ordered[0],
                     "line": userorder.line(self.p, task["id"], *ordered)}
@@ -15380,6 +15387,20 @@ class Daemon:
             if not got.granted:
                 return {"kind": "pre_grant", "resource": res, "rc": got.rc, "line": got.line}
         return None
+
+    def _order_unread(self, res: str, e: Exception) -> dict:
+        """The hold of a task whose user orders, re-specs or record could not be read (_resource_hold):
+        it waits this pass, attempts untouched, and is asked again on the next. One observation per
+        error until a read succeeds; it is no standing hold."""
+        err = f"{type(e).__name__}: {e}"
+        line = f"{res}: user holds not read ({err}); held until they read again"
+        key = f"user-orders-unread:{type(e).__name__}"
+        if key not in self._order_faults:
+            self._order_faults.add(key)
+            self.observe("daemon:user-orders", f"Dispatch holds tasks on their resources: the user orders "
+                         f"could not be read ({err}). They start once the read succeeds.", "normal", key=key,
+                         whole=True)
+        return {"kind": "order_unread", "resource": res, "line": line}
 
     def _pre_grant(self, check: str, res: str, tid: int) -> pregrant.Answer:
         """The pre-grant check's answer for a task and resource, reused for PRE_GRANT_REUSE_S: dispatch
@@ -19339,6 +19360,8 @@ def hold_reason(hold: dict | None) -> str:
         return hold.get("line") or f"{res} held by the project's pre-grant check"
     if kind == "order":
         return hold.get("line") or f"{res} held by a newer user order"
+    if kind == "order_unread":
+        return hold.get("line") or f"{res} held: user holds not read"
     hs = [h for h in hold.get("holders") or [] if isinstance(h, dict)]
 
     def _who(h: dict, state: str) -> str:

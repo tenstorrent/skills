@@ -89,6 +89,39 @@ def test_a_user_order_holds_older_queued_tasks_at_dispatch_and_steers_older_runn
     assert not (other_dir / "steer.md").exists()   # a running task on another resource is not told
 
 
+@pytest.mark.parametrize("read", ["orders", "respecs", "task"])
+def test_an_unreadable_user_hold_state_holds_the_task_at_dispatch_until_it_reads_again(env, tmp_path, monkeypatch,
+                                                                                        read):
+    """An OSError reading the user orders, the re-specs or a task record holds every task with a resource
+    off it for that pass (fail closed), raised once however often it repeats; a good read frees them."""
+    from ttp import daemon as dmod
+    from ttp import userorder
+    p, ids, msg, _, _ = _ordered(env, tmp_path)
+    d = dmod.Daemon(p.base)
+    newer = p.db.task(ids["newer"])
+    assert d._resource_hold(newer) is None   # healthy: no order holds a task made after it
+    bare = p.db.add_task("no resource", "s", kind="work", tier="light")
+
+    def boom(*a, **k):
+        raise OSError(5, "Input/output error")
+    with monkeypatch.context() as m:
+        if read == "task":
+            m.setattr(d.p.db, "task", boom)
+        else:
+            m.setattr(userorder, {"orders": "_orders", "respecs": "_respecs"}[read], boom)
+        for _ in range(3):   # every pass holds it; one observation names the error
+            hold = d._resource_hold(newer)
+            assert hold and hold["kind"] == "order_unread" and hold["resource"] == "rig", hold
+            assert "OSError" in dmod.hold_reason(hold) and "Input/output error" in dmod.hold_reason(hold)
+        assert d._resource_hold(p.db.task(bare)) is None   # nothing to hold a task without resources off
+    obs = p.db.q("SELECT text FROM events WHERE source='daemon:user-orders'")
+    assert len(obs) == 1 and "OSError" in obs[0]["text"] and "Input/output error" in obs[0]["text"], obs
+    # Readable again: the hold is gone, no standing hold remains, and the gate is as before.
+    assert d._resource_hold(newer) is None
+    assert (d._resource_hold(p.db.task(ids["old"])) or {}).get("kind") == "order"
+    assert not p.db.paused_resources()
+
+
 def test_an_order_held_task_never_reserves_the_ordered_resource_ahead_of_the_orders_task(env):
     """An older exclusive task that outranks the order's task (better priority) and that the order holds
     off the resource is no slot contender there: it reserves nothing, so the order's task is free."""
