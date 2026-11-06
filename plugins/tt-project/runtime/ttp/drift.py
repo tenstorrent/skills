@@ -95,8 +95,9 @@ def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float) -> dic
     recent = (e.get("recent") or [])[-LOOP_WINDOW:]
     if s["loop"] > 0:
         top = Counter(c.get("h") for c in recent if c.get("h")).most_common(1)
-        if top and top[0][1] >= s["loop"]:
-            c = next(c for c in recent if c.get("h") == top[0][0])
+        c = next((c for c in recent if top and c.get("h") == top[0][0]), {})
+        failing = s["repeat_fail"] > 0 and (e.get("fails") or {}).get(c.get("cmd") or "", 0) >= s["repeat_fail"]
+        if top and top[0][1] >= s["loop"] and not failing:   # a failing repeat is repeat_fail's, told once
             flags["loop"] = f"the same {c.get('tool')} call {top[0][1]} times in the last {len(recent)}" + (
                 f": `{c['cmd'][:80]}`" if c.get("cmd") else "")
     if s["outside_spec"] > 0 and named:
