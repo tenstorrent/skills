@@ -4,12 +4,14 @@
 
 Model-free, each minute (Daemon.check_queue_waits): collect() finds every task of the project waiting on a
 queue, cap or admission: a host-wide checks slot (checkcap.state, queued or parked) or its own detached checks
-it polls (`ttp checks --result`, 'next try ...'), the push queue (`ttp push`), worker capacity (the next ready
+it polls while queued (`ttp checks --result`, or a reason saying so), the push queue (`ttp push`), worker capacity (the next ready
 task, never started while every worker slot is taken), a device or other `ttp lock` resource, an outside batch pool
-(`ttp pool-wait`, Slurm) or CPU admission (a 'waiting for' reason naming CPU or load). Each task and queue
+(`ttp pool-wait`, Slurm) or CPU admission (a reason naming admission and CPU or load). Each task and queue
 waiting past the threshold raises one must-act event (KIND, mustact.py): the queue, its cap and occupancy,
 who holds and waits for each place, the wait so far, and options() computed from config and host state,
 leaving out every route a user pause, a cap the user set or missing config forbids. Restrictions still bind.
+A wait whose cause an open task already owns (an active throughput-class mute's owner, or the fix task an earlier
+item on the same queue was acted on with) folds into it: one act per queue cause, not per waiting task.
 The coordinator acts in that turn (mustact.acted: a config_set, a task_add or task_update naming the item's
 key or updating the task, or a reply or notify naming the key and the safety rule that holds it). Not acted
 on, the next threshold mark raises it again (fingerprint per mark). With no option left the user is told
@@ -30,6 +32,8 @@ HIST_MAX = 300
 MAX_RAISE = 3   # new items per scan, so a long queue never floods the coordinator with wakes
 NAMES = {"checks": "checks queue", "push": "push queue", "workers": "worker slots", "device": "device queue",
          "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission"}
+# Words other observations use for a queue, so a mute of one (screen.mutes) matches its waits.
+ALIASES = {"checks": ("host-wide checks slot", "checks slot", "checks queue")}
 
 
 def threshold_s(cfg: dict) -> float:
@@ -39,11 +43,16 @@ def threshold_s(cfg: dict) -> float:
         return DEFAULT_MIN * 60
 
 
+# A worker's own checks waiting for a slot, as its `ttp checks --result` probe's line says it (cli.checks_result).
+CHECKS_WAIT_RE = re.compile(r"\bttp checks: (?:queued|waiting)\b|queued for a host-wide checks slot")
+
+
 def classify(probe: str, reason: str, device: set | frozenset = frozenset()) -> tuple[str, str] | None:
-    """(queue, resource) a waiting task's probe or blocked reason waits on; None for any other wait."""
-    pr, r = str(probe or ""), str(reason or "").strip().lower()
-    if re.search(r"\bttp checks\b[^;|&]*--result\b", pr) or "next try" in r:
-        return "checks", ""
+    """(queue, resource) a waiting task's probe or blocked reason waits on; None for any other wait. The probe
+    decides first; the reason only by its own words, never by the daemon's '; next try <time>' tail, which
+    every waiting task's reason ends with."""
+    from .sweepskip import NEXT_TRY
+    pr, r = str(probe or ""), NEXT_TRY.sub("", str(reason or "").strip()).lower()
     if re.search(r"\bttp push\b", pr):
         return "push", ""
     if m := re.search(r"\bttp lock --probe\s+['\"]?([\w.,:/-]+)", pr):
@@ -52,10 +61,12 @@ def classify(probe: str, reason: str, device: set | frozenset = frozenset()) -> 
         return "device", ""
     if re.search(r"\bpool-wait\b|\bsqueue\b|\bsacct\b", pr):
         return "pool", ""
-    if r.startswith("waiting for") and re.search(r"\bcpu\b|admission|\bload\b", r):
+    if re.search(r"\bttp checks\b[^;|&]*--result\b", pr):
+        return None if "ttp checks: running" in r else ("checks", "")   # running: holds its slot, no queue wait
+    if CHECKS_WAIT_RE.search(r):
+        return "checks", ""
+    if re.search(r"\badmission\b", r) and re.search(r"\bcpu\b|\bcores?\b|\bload\b", r):
         return "cpu", ""
-    if m := re.match(r"waiting for (?:resource )?([\w.:/-]+)", r):
-        return ("device" if m[1] in device else "lock"), m[1]
     return None
 
 
@@ -66,7 +77,7 @@ def _task_of(label: str, project: str) -> int | None:
 
 def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | None = None) -> list[dict]:
     """The project's queue waits now: {task, queue, res, since, cap, running, queued}, one per task and queue."""
-    from .db import load_result
+    from .db import TERMINAL_TASK_STATES, load_result
     db, name, out = p.db, p.name, {}
     host = host or {}
     device = set(device or ())
@@ -79,6 +90,9 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
         k = (tid, queue)
         if since is None or (k in out and out[k]["since"] <= since):
             return
+        row = db.one("SELECT status FROM tasks WHERE id=?", (tid,))
+        if row is None or row["status"] in TERMINAL_TASK_STATES:
+            return   # a finished task's label left in the host queue: no wait of this project's to unblock
         out[k] = {"task": tid, "queue": queue, "res": res, "since": float(since), **info}
 
     for h, at in [*zip(host.get("queued") or [], host.get("queued_at") or []), *(host.get("parked") or [])]:
@@ -191,7 +205,8 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
     for w in waits:
         ep = f"{w['task']}:{w['queue']}:{w['since']:.0f}"
         live.add(ep)
-        rec = opened.setdefault(ep, {"task": w["task"], "queue": w["queue"], "since": w["since"], "acted": None})
+        rec = opened.setdefault(ep, {"task": w["task"], "queue": w["queue"], "res": w["res"], "since": w["since"],
+                                     "acted": None})
         if rec.get("acted"):
             continue
         k, mark = key(w), int((now - w["since"]) // thr)
@@ -199,6 +214,8 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
             continue
         opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores)
         msg = text(w, opts, now)
+        if _cause_owner(db, st, w, msg, now) is not None:
+            continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep}}
         fp = f"{KIND}:{ep}:{mark}"
         if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data):
@@ -220,13 +237,64 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
     return raised
 
 
-def record_act(db, ep: str, now: float | None = None) -> None:
-    """The coordinator acted on the item of episode `ep`: no more raises for this wait; the metric's mark."""
+def _open(db, tid) -> bool:
+    from .db import TERMINAL_TASK_STATES
+    row = db.one("SELECT status FROM tasks WHERE id=?", (tid,)) if isinstance(tid, int) else None
+    return bool(row) and row["status"] not in TERMINAL_TASK_STATES
+
+
+def _cause_owner(db, st: dict, w: dict, msg: str, now: float) -> int | None:
+    """An open task, other than the waiting one, that already owns this wait's cause: the owner of an active
+    throughput-class observation mute whose match the item or the task's reason names (screen.mutes,
+    throughmute), or the fix task an earlier item on the same queue and resource was acted on with
+    (record_act's `owner`). None: raise the per-task item."""
+    from . import screen, throughmute
+    row = db.one("SELECT blocked_reason FROM tasks WHERE id=?", (w["task"],)) or {}
+    hay = " ".join([msg, str(row.get("blocked_reason") or ""), *ALIASES.get(w["queue"], ())]).lower()
+    for m in screen.mutes(db, now):
+        if not throughmute.marked(m) or str(m.get("match") or "").lower() not in hay:
+            continue
+        own = ((m.get("throughput") or {}).get("owner") or {}).get("task")
+        ids = [own] + throughmute.named_tasks(m.get("why")) + [
+            int(x) for x in throughmute.PROBE_TASK_RE.findall(str(m.get("end_when") or ""))]
+        if tid := next((t for t in ids if t != w["task"] and _open(db, t)), None):
+            return tid
+    for rec in [*(st.get("open") or {}).values(), *(st.get("hist") or [])]:
+        if (rec.get("queue"), rec.get("res", "")) == (w["queue"], w["res"]) and rec.get("owner") != w["task"] \
+                and _open(db, rec.get("owner")):
+            return rec["owner"]
+    return None
+
+
+def fix_owner(db, it: dict, actions: list, applied) -> int | None:
+    """The task a queue item was acted on with that owns its cause: a task_update naming the item's key on
+    another task, or the open task a task_add naming the key created (open titles are unique). A
+    task_update of the waiting task itself (priority, cancel) acts on that task only: None."""
+    from . import mustact
+    k, own = str(it.get("key") or ""), set(it.get("tasks") or [])
+    for i in sorted(applied or ()):
+        a = actions[i] if 0 <= i < len(actions) else None
+        if not isinstance(a, dict) or not any(k and mustact._names(v, k) for v in a.values() if isinstance(v, str)):
+            continue
+        if a.get("type") == "task_update" and str(a.get("id")).isdigit() and int(a["id"]) not in own:
+            return int(a["id"])
+        if a.get("type") == "task_add" and (row := db.one(
+                "SELECT id FROM tasks WHERE title=? AND status NOT IN ('done','failed','cancelled') ORDER BY id DESC",
+                (str(a.get("title") or "").strip(),))):
+            return int(row["id"])
+    return None
+
+
+def record_act(db, ep: str, now: float | None = None, owner: int | None = None) -> None:
+    """The coordinator acted on the item of episode `ep`: no more raises for this wait; the metric's mark.
+    `owner` (fix_owner): the task that owns the cause, so other waits on that queue fold into it."""
     with db.tx():
         st = db.kv(KV) or {}
         rec = (st.get("open") or {}).get(ep)
         if rec is not None and not rec.get("acted"):
             rec["acted"] = time.time() if now is None else now
+            if owner is not None:
+                rec["owner"] = owner
             db.set_kv(KV, st)
 
 

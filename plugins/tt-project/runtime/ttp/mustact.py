@@ -157,7 +157,8 @@ def settle(p, ids, actions, applied, now: float | None = None) -> list[tuple[str
         if it.get("kind") == QUEUE_KIND:   # acted: no more raises for this wait; else the next mark raises it
             if acted(it, actions, applied):
                 from . import queuewait
-                queuewait.record_act(db, str(it.get("episode") or ""), now)
+                queuewait.record_act(db, str(it.get("episode") or ""), now,
+                                     queuewait.fix_owner(db, it, actions, applied))
             continue
         if acted(it, actions, applied):
             continue

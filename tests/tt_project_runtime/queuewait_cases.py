@@ -7,11 +7,20 @@ QW_CFG = {"coordinator": {"queue_wait_escalate_min": 30}, "budget": {"max_parall
 
 
 def _qw_host(p, now, mine_at, cap=4, queued=20, limit_set=False):
-    """A fake host checks state: `cap` running (cap `cap`), `queued` queued, one of them task 7 of `p`."""
+    """A fake host checks state: `cap` running (cap `cap`), `queued` queued, one of them task 7 of `p` (made
+    here: a label of a task that is gone raises nothing)."""
+    if not p.db.one("SELECT id FROM tasks WHERE id=7"):
+        _qw_task7(p)
     q = [f"other task #{i} (run 1) ttp checks" for i in range(queued - 1)] + [f"{p.name} task #7 (run 3) ttp checks"]
     return {"limit": cap, "running": [f"other task #{90 + i} (run 1)" for i in range(cap)], "queued": q,
             "queued_at": [now - 600] * (queued - 1) + [mine_at], "priority": [], "urgent": [], "parked": [],
             "limit_set": limit_set}
+
+
+def _qw_task7(p):
+    while (tid := p.db.add_task(f"t{len(p.db.q('SELECT id FROM tasks'))}", "s", kind="code")) < 7:
+        pass
+    return tid
 
 
 def _qw_events(p, status=None):
@@ -119,21 +128,100 @@ def test_queue_wait_covers_worker_slots_and_polled_checks(env):
     assert len(queuewait.scan(p, cfg, now, {})) == 2
 
 
+NT = "; next try 07:10 PST"   # the tail the daemon puts on every waiting task's reason (daemon.py, sweepskip.NEXT_TRY)
+
+
 @pytest.mark.parametrize("probe,reason,want", [
-    ("ttp checks --result /r/1", "", ("checks", "")),
-    ("", "next try 04:50 PST", ("checks", "")),
-    ("ttp push --result /r/m", "", ("push", "")),
-    ("ttp lock --probe dev0", "", ("device", "dev0")),
-    ("ttp lock --probe 'build-dir'", "", ("lock", "build-dir")),
-    ("ttp pool-wait --check x", "", ("pool", "")),
-    ("", "waiting for CPU admission on the host", ("cpu", "")),
-    ("ttp detach --check /r/job", "", None),
-    ("echo ttp checks", "", None),
-    ("landed:#12", "", None),
+    ("ttp checks --result /r/1", "waiting for checks (ttp checks: queued for a host-wide checks slot (pid 9))" + NT,
+     ("checks", "")),
+    ("ttp checks --result /r/1", "waiting for checks; its probe says not yet" + NT, ("checks", "")),
+    ("", "waiting for ttp checks: queued for a host-wide checks slot" + NT, ("checks", "")),
+    ("ttp checks --result /r/1", "waiting for checks (ttp checks: running (pid 9))" + NT, None),
+    ("ttp push --result /r/m", "waiting for the push; next try Fri 07:10 PST", ("push", "")),
+    ("ttp lock --probe dev0", "waiting for dev0 held by #5" + NT, ("device", "dev0")),
+    ("ttp lock --probe 'build-dir'", "waiting for build-dir" + NT, ("lock", "build-dir")),
+    ("ttp devq status 3", "waiting for the device run" + NT, ("device", "")),
+    ("ttp pool-wait --check x", "waiting for a Slurm node" + NT, ("pool", "")),
+    ("", "waiting for CPU admission on the host" + NT, ("cpu", "")),
+    ("ttp detach --check /r/job", "waiting for the build" + NT, None),
+    ("echo ttp checks", "waiting for checks" + NT, None),
+    ("landed:#12", "waiting for landed:#12" + NT, None),
+    ("ttp ci --repo o/r --branch b", "waiting for ttp ci on o/r" + NT, None),
+    ("ttp ack-wait probe --from quad --hash ab12", "waiting for quad's reply" + NT, None),
+    ("ttp notify --check true", "waiting for the user's sign-in" + NT, None),
+    ("", "waiting for the user" + NT, None),
 ])
 def test_queue_wait_classifies_each_queue(probe, reason, want):
+    """The daemon's real reasons: its '; next try' tail never makes a wait a checks wait; the probe decides
+    first; a worker's running checks are no queue wait."""
     from ttp import queuewait
     assert queuewait.classify(probe, reason, {"dev0"}) == want
+
+
+def test_queue_wait_skips_running_checks_and_finished_tasks(env):
+    """A worker whose own checks run (cap 0: the host view lists none) waits on no queue; a done or
+    cancelled task whose label is still in the host queue raises nothing, so no option names it."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    run = p.db.add_task("run", "s", kind="code")
+    p.db.update_task(run, not_before=now + 300, blocked_reason="waiting for checks (ttp checks: running (pid 9))" + NT,
+                     result=json.dumps({"status": "waiting", "retry_when": "ttp checks --result /tmp/x",
+                                        "waiting_since": now - 40 * 60}))
+    assert queuewait.collect(p, QW_CFG, now, {"limit": 0, "running": [], "queued": []}) == []
+    gone = p.db.add_task("gone", "s", kind="code")
+    p.db.update_task(gone, status="done")
+    host = {"limit": 4, "running": [], "queued": [f"{p.name} task #{gone} (run 1)"], "queued_at": [now - 3600]}
+    assert queuewait.collect(p, QW_CFG, now, host) == [] and queuewait.scan(p, QW_CFG, now, host) == []
+
+
+def test_queue_wait_folds_into_an_active_mute_with_an_open_owner(env):
+    """A throughput-class mute of the host-wide checks slot whose owner task is open raises no item for
+    any checks wait; once the owner is done, or the mute ends, the item is raised."""
+    from ttp import queuewait, screen
+    p = make(env)
+    now = time.time()
+    assert _qw_task7(p) == 7
+    fix = p.db.add_task("fix the checks slot", "s", kind="code")
+    p.db.set_kv(screen.MUTES_KEY, [{"source": "wait_stale", "match": "host-wide checks slot", "below": "high",
+                                    "why": f"fix queued as #{fix}", "since": now, "until": now + 3600, "count": 0,
+                                    "throughput": {"owner": {"task": fix}, "max_h": 12}}])
+    host = _qw_host(p, now, now - 40 * 60)
+    assert queuewait.scan(p, QW_CFG, now, host, cores=64) == []
+    p.db.update_task(fix, status="done")
+    assert len(queuewait.scan(p, QW_CFG, now + 60, host, cores=64)) == 1
+    p.db.x("UPDATE events SET status='handled' WHERE kind='queue_wait'")   # the turn handled it
+    f2 = p.db.add_task("fix again", "s", kind="code")   # the next mark, with the mute ending instead of its owner
+    p.db.set_kv(screen.MUTES_KEY, [{"source": "wait_stale", "match": "host-wide checks slot", "below": "high",
+                                    "why": f"#{f2}", "since": now, "until": now + 35 * 60, "count": 0,
+                                    "throughput": {"owner": {"task": f2}, "max_h": 12}}])
+    assert queuewait.scan(p, QW_CFG, now + 31 * 60, host) == []
+    assert len(queuewait.scan(p, QW_CFG, now + 36 * 60, host)) == 1
+
+
+def test_queue_wait_one_act_per_queue_cause(env):
+    """An item acted on with a task_add naming its key makes that task the cause's owner: other tasks'
+    waits on the same queue raise nothing while it is open, and again once it is done. A priority bump of
+    the waiting task itself owns no cause."""
+    from ttp import mustact, queuewait
+    p = make(env)
+    now = time.time()
+    a, b = p.db.add_task("a", "s", kind="code"), p.db.add_task("b", "s", kind="code")
+    host = {"limit": 4, "running": [], "priority": [], "urgent": [], "parked": [],
+            "queued": [f"{p.name} task #{a} (run 1)"], "queued_at": [now - 40 * 60]}
+    queuewait.scan(p, QW_CFG, now, host)
+    ev = _qw_events(p)[0]
+    k = f"qwait-{a}-checks"
+    acts = [{"type": "task_add", "title": "spill checks", "spec": f"for {k}: spill them", "kind": "code"}]
+    fix = p.db.add_task("spill checks", f"for {k}: spill them", kind="code")
+    p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev["id"],))
+    mustact.settle(p, [ev["id"]], acts, [0], now)
+    host2 = {**host, "queued": host["queued"] + [f"{p.name} task #{b} (run 1)"], "queued_at": [now - 40 * 60] * 2}
+    assert queuewait.scan(p, QW_CFG, now + 60, host2) == []
+    p.db.update_task(fix, status="done")
+    assert [fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 120, host2)] == [str(b)]
+    it = {"key": k, "tasks": [a]}
+    assert queuewait.fix_owner(p.db, it, [{"type": "task_update", "id": a, "priority": 1, "note": k}], [0]) is None
 
 
 def test_queue_wait_rule_is_in_the_role_prompt_every_provider_reads():
@@ -148,10 +236,11 @@ def test_queue_wait_raises_at_most_three_a_scan_longest_first(env):
     from ttp import queuewait
     p = make(env)
     now = time.time()
+    ids = [p.db.add_task(f"t{i}", "s", kind="code") for i in range(1, 6)]
     host = {"limit": 4, "running": [], "priority": [], "urgent": [], "parked": [],
-            "queued": [f"{p.name} task #{i} (run 1)" for i in range(1, 6)],
+            "queued": [f"{p.name} task #{i} (run 1)" for i in ids],
             "queued_at": [now - (40 + 10 * i) * 60 for i in range(1, 6)]}
     first = queuewait.scan(p, QW_CFG, now, host)
-    assert [fp.split(":")[1] for fp in first] == ["5", "4", "3"]
-    assert sorted(fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host)) == ["1", "2"]
+    assert [fp.split(":")[1] for fp in first] == [str(i) for i in ids[:1:-1]]
+    assert sorted(fp.split(":")[1] for fp in queuewait.scan(p, QW_CFG, now + 60, host)) == sorted(map(str, ids[:2]))
     assert queuewait.scan(p, QW_CFG, now + 120, host) == []
