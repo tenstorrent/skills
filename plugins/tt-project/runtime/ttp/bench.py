@@ -25,6 +25,7 @@ import time
 from pathlib import Path
 
 from . import addedtests, gitmemo
+from .project import durable_write
 
 SMALL = 150        # changed non-test lines at most for the small stratum
 QUOTE_LINES = 3    # added lines of the fix quoted verbatim in the spec that exclude it
@@ -186,8 +187,7 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0) -> dict:
         held = {}
         for path in sorted({p for p, _ in tests}):
             dest = here / "heldout" / path
-            dest.parent.mkdir(parents=True, exist_ok=True)
-            dest.write_text(addedtests._show(repo, head, path))
+            durable_write(dest, addedtests._show(repo, head, path), sync=False)
             held[path] = _sha(dest)
         kept.append({"task": t["id"], "kind": t["kind"], "title": t["title"], "spec": t["spec"],
                      "created": t["created"], "base": base, "head": head, "tree": tree,
@@ -195,6 +195,6 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0) -> dict:
                      "tests": [f"{p}::{n}" for p, n in tests], "heldout": held})
     manifest = {"since": since, "made": time.time(), "tasks": kept,
                 "excluded": excluded, "counts": {s: sum(k["stratum"] == s for k in kept) for s in ("small", "large")}}
-    (out / "manifest.json").write_text(json.dumps(manifest, indent=1) + "\n")
-    (out / "manifest.sha256").write_text(f"{_sha(out / 'manifest.json')}  manifest.json\n")
+    durable_write(out / "manifest.json", json.dumps(manifest, indent=1) + "\n")
+    durable_write(out / "manifest.sha256", f"{_sha(out / 'manifest.json')}  manifest.json\n")
     return manifest
