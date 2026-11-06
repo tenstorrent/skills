@@ -551,7 +551,8 @@ def test_speed_complaint_detector_skips_product_speed_wording_unless_it_names_th
     complaint about the project's pace; a complaint naming the project or its tasks still is."""
     from ttp import slowcomplaint as sc
     for text in ("add a low-latency flag; throughput faster than realtime by generating several videos at a time",
-                 "the model should decode faster than real-time", "implement a feature to stream frames faster"):
+                 "the model should decode faster than real-time", "Can you add a low-latency flag so throughput is realtime?",
+                 "implement a feature to stream frames faster"):
         assert not sc.detect(text), text
     for text in ("why is this so slow", "Fix your throughput asap, especially on the most time sensitive tasks!",
                  "the low-latency flag task is still waiting for hours", "your work on the video feature is so slow"):

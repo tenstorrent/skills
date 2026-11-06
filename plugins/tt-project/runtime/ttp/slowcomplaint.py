@@ -6,7 +6,7 @@ review the same tick, model-free (throughput.py), instead of a prose answer.
 `detect` matches a short generic word list (WORDS, whole words) or 'again' with a delay word
 (AGAIN_DELAY). Product wording (PRODUCT: a flag, latency, real time, generating videos) says the speed is
 the built product's, not the project's: such a message counts only when it also names the project or
-its work (WORK: you, your, tasks, reviews, the queue). At a coordinator turn's start the daemon calls `on_messages` with the turn's new
+its work (WORK: your, tasks, reviews, the queue). At a coordinator turn's start the daemon calls `on_messages` with the turn's new
 messages: on an inbound user message that matches it runs `throughput.review(apply=True)`, queues one
 priority 1 task listing the slow lanes it could not change itself (at most one open at a time: later
 lanes are added to it; a lane a closed one listed waits for new evidence or a cooldown, _followups;
@@ -32,7 +32,7 @@ PRODUCT = re.compile(r"\b(implement\w*|flag|feature|latency|low-latency|real[- ]
                      r"fps|per second|tokens?/s|frames?|videos?|images?|generat\w+|inference|kernels?|models?|"
                      r"decode|prefill)\b")
 # The project or its work: a complaint names it even beside product wording.
-WORK = re.compile(r"\b(you|your|you're|yours|tasks?|workers?|reviews?|checks|queue|queued|push(?:es)?|landing|"
+WORK = re.compile(r"\b(your|yours|tasks?|workers?|reviews?|checks|queue|queued|push(?:es)?|landing|"
                   r"coordinator|project|harness|the work|progress)\b")
 TITLE = throughput.TASK_TITLE   # follow-up tasks are titled `throughput: <lane> ...`
 SECTION = "throughput"
