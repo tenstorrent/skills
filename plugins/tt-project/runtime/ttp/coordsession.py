@@ -82,8 +82,10 @@ NOTE_CHARS = 16000        # a session_note's cap, about 4,000 tokens
 CHAT_EXCHANGES = 20       # the chat exchanges a new session's first message carries verbatim
 CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the newest always stays
 NOTE_DIR = "coord-session"
-# The agents whose coordinator turns may resume one session (the fake stands in for Claude in tests).
-PROVIDERS = ("claude", "fake")
+# Session mode runs on every provider, with no per-provider opt-out. Each provider says how it keeps
+# the session (providers/base.Provider.coord_session): "agent" resumes the agent CLI's own saved session
+# (claude, chat, which is Claude Code on a served model, codex; the fake in tests); a provider that
+# cannot yet runs each wake stateless, its reason (Provider.session_gap) named in the wake's `why`.
 DIGEST = "digest"   # in KEY: {"sections": {key: [hash, label]}, "keyed": {key: {"head": hash, "rows": {row key:
 #                     hash}}}, "seen": collapse baseline, "gen": daemon start}
 FULL_ASK = "full_digest"
@@ -141,8 +143,14 @@ def _num(value, default: float) -> float:
         return default
 
 
-def on(cfg: dict, provider: str) -> bool:
-    return str(settings(cfg).get("mode")).lower() == "on" and provider in PROVIDERS
+def on(cfg: dict, provider: str = "") -> bool:
+    """Session mode is on, whatever the provider (decide() names a provider that cannot keep one)."""
+    return str(settings(cfg).get("mode")).lower() == "on"
+
+
+def gap(prov) -> str:
+    """Why `prov` (a providers.Provider) runs coordinator wakes stateless in session mode; "" when it keeps one."""
+    return "" if getattr(prov, "coord_session", "") else f"{prov.name}: {prov.session_gap}"
 
 
 def prefix_key(system: str | None, context: str | None, schema: dict | None, provider: str) -> str:
@@ -156,12 +164,15 @@ def guard_tripped(guard, now: float) -> bool:
 
 
 def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, now: float,
-           guard=None) -> tuple[str, str]:
+           guard=None, no_session: str = "") -> tuple[str, str]:
     """(mode, why) of one wake: "resume", "new" or "stateless". `state` is kv KEY (None: none yet),
-    `saved(session_id)` says the agent can still resume that session, `guard` is kv GUARD_KEY."""
+    `saved(session_id)` says the agent can still resume that session, `guard` is kv GUARD_KEY,
+    `no_session` is gap() of the wake's provider."""
     s = settings(cfg)
     if str(s.get("mode")).lower() != "on":
         return "stateless", "off"
+    if no_session:
+        return "stateless", no_session
     if guard_tripped(guard, now):
         return "stateless", "spend guard tripped"
     st = state if isinstance(state, dict) else {}

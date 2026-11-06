@@ -6,7 +6,7 @@ in the project's home zone, against the stateless coordinator it replaced.
 A session wake is a coordinator run whose note has turn.session (coordinator.session.mode on): mode
 "resume", "new" (a rollover) or "stateless" (paused, spend guard, rerun). Per day: wakes, $/wake,
 context growth per resumed wake (its first call's prompt less the previous wake's of the same
-session), rollovers, tool calls per wake (tool_use blocks in its transcript), and the cache-read
+session), rollovers, tool calls per wake (tool_use blocks in its transcript; any provider), and the cache-read
 share of its prompt tokens. The baseline is every coordinator run of the 7 days before the first
 "resume" or "new" wake: turns/day, $/turn and $/day. A day breaks even at <= 2 tool calls and
 <= 20k context growth per wake; it is over the baseline when all its coordinator runs cost more
@@ -44,12 +44,20 @@ def session_of(r) -> dict | None:
 
 def tool_calls(r, runs_dir: Path) -> int | None:
     """tool_use blocks in the run's transcript, each once (a stream repeats a message per block);
-    None without a transcript."""
+    another agent's stream (Codex): its own tool calls (Provider.activity). None without a transcript."""
     out = (Path(r["dir"]) if r["dir"] else Path(runs_dir) / str(r["id"])) / "output.jsonl"
     try:
         lines = out.read_text(errors="replace").splitlines()
     except OSError:
         return None
+    prov = r["provider"] if "provider" in r.keys() else "claude"
+    if prov not in ("claude", "chat"):   # chat is Claude Code on a served model: the same stream
+        from .providers import get_provider
+        try:
+            calls = get_provider(prov).activity(out)[0]
+        except Exception:
+            return None
+        return len({c.get("id") or i for i, c in enumerate(calls) if c.get("kind") == "call"})
     ids, bare = set(), 0
     for line in lines:
         try:
@@ -76,7 +84,7 @@ def _mean(xs: list) -> float | None:
 
 def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> dict:
     now = time.time() if now is None else now
-    cols = "id, started, cost_usd, input_tokens, cache_read_tokens, cache_write_tokens, note, session_id, dir"
+    cols = "id, started, cost_usd, input_tokens, cache_read_tokens, cache_write_tokens, note, session_id, dir, provider"
     noted = [r for r in db.q(f"SELECT {cols} FROM runs WHERE role='coordinator' AND note LIKE '%session%' "
                              "ORDER BY started, id") if session_of(r)]
     first = next((r["started"] for r in noted if session_of(r).get("mode") in ("resume", "new")), None)

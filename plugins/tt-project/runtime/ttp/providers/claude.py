@@ -142,6 +142,8 @@ class Claude(Provider):
             return rc == 0
 
     caps_budget = True   # --max-budget-usd
+    coord_session = "agent"   # --resume <session id>
+    tool_hooks = True
     fence_optional = True   # the Bash sandbox (fence_args)
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,

@@ -372,12 +372,12 @@ def _guard_key(payload: dict) -> str:
     return key
 
 
-def _guarded_files() -> list[str]:
+def _guarded_files(protected=None) -> list[str]:
     """The files a coordinator Bash call's guard compares: the charter (and sibling CHARTER* files), the
     memory index, every memory entry and project.json; never the state database, which the daemon writes
     all the time (only the command-text refusal covers it)."""
     out = set()
-    for f in [d for d in os.environ.get(PROTECTED_ENV, "").split(os.pathsep) if d]:
+    for f in _protected_list(protected):
         if os.path.basename(f) == "project.db":
             continue
         if os.path.isdir(f):
@@ -389,6 +389,12 @@ def _guarded_files() -> list[str]:
             if name.startswith("CHARTER") and os.path.isdir(parent):
                 out.update(os.path.join(parent, n) for n in os.listdir(parent) if n.startswith("CHARTER"))
     return sorted({os.path.abspath(x) for x in out})   # not realpath: a symlink planted there is put back, never followed
+
+
+def _protected_list(protected=None) -> list[str]:
+    """`protected` (the daemon's wake guard), else the hook's PROTECTED_ENV."""
+    got = protected if protected is not None else os.environ.get(PROTECTED_ENV, "").split(os.pathsep)
+    return [str(d) for d in got if d]
 
 
 def _digests(files: list[str]) -> dict[str, tuple[str, bytes]]:
@@ -403,17 +409,18 @@ def _digests(files: list[str]) -> dict[str, tuple[str, bytes]]:
     return out
 
 
-def snapshot(payload: dict) -> None:
+def snapshot(payload: dict, run=None, protected=None) -> None:
     """Before a full-tools coordinator's Bash call: record the protected files' hashes (and their bytes,
-    once per content) in the run dir, for guard to compare after the call."""
+    once per content) in the run dir, for guard to compare after the call. `run` and `protected` (else
+    TTP_RUN_DIR and PROTECTED_ENV): the daemon's whole-wake guard (wake_snapshot)."""
     from pathlib import Path
     from .project import durable_write
-    run = os.environ.get("TTP_RUN_DIR")
+    run = run or os.environ.get("TTP_RUN_DIR")
     if not run:
         return
     d = Path(run) / GUARD_DIR
     ts = time.time()   # before the reads: a logged write while they run counts
-    files = _digests(_guarded_files())
+    files = _digests(_guarded_files(protected))
     for sha, data in files.values():
         if not (d / "blobs" / sha).exists():
             durable_write(d / "blobs" / sha, data, sync=False)
@@ -421,7 +428,7 @@ def snapshot(payload: dict) -> None:
                   json.dumps({"ts": ts, "files": {f: sha for f, (sha, _) in files.items()}}), sync=False)
 
 
-def guard(payload: dict) -> str | None:
+def guard(payload: dict, run=None, protected=None) -> str | None:
     """After a full-tools coordinator's Bash call: put back every protected file the call changed,
     created or removed outside ttp's own writes, from the snapshot, record an event, and return the
     notice for the tool result (None: nothing changed out of band). ttp's writers log each protected
@@ -443,12 +450,12 @@ def guard(payload: dict) -> str | None:
     also undoes the ttp write (the combined content is saved)."""
     from pathlib import Path
     from .project import durable_append, durable_write, note_protected, protected_log
-    run = os.environ.get("TTP_RUN_DIR")
+    run = run or os.environ.get("TTP_RUN_DIR")
     snap = Path(run) / GUARD_DIR / f"{_guard_key(payload)}.json" if run else None
     if snap is None or not snap.exists():
         return None
     before = json.loads(snap.read_text())
-    files = sorted(set(before["files"]) | set(_guarded_files()))
+    files = sorted(set(before["files"]) | set(_guarded_files(protected)))
     after = _digests(files)
     now = {f: sha for f, (sha, _) in after.items()}
     logs = {protected_log(f) for f in files} - {None}
@@ -492,8 +499,8 @@ def guard(payload: dict) -> str | None:
     snap.unlink(missing_ok=True)
     if not changed:
         return None
-    how = sorted({_protected_why(next((p for p in os.environ.get(PROTECTED_ENV, "").split(os.pathsep)
-                                       if p and _protected_hit(f, [p])), f)) for f in changed})
+    how = sorted({_protected_why(next((p for p in _protected_list(protected) if _protected_hit(f, [p])), f))
+                  for f in changed})
     left = [f for f in changed if f not in bad]
     text = "tt-project: " + " ".join(filter(None, [
         bad and (f"this command changed {', '.join(bad)} outside the coordinator's checks; each is put back as it "
@@ -512,6 +519,23 @@ def guard(payload: dict) -> str | None:
     except Exception:   # the files are back either way; only the record is lost
         pass
     return text
+
+
+WAKE = {"tool_use_id": "wake"}   # the whole-wake guard's snapshot key (tool call ids never take it)
+
+
+def wake_snapshot(run_dir, protected) -> None:
+    """Before a coordinator wake on an agent without ttp's tool hooks (Provider.tool_hooks False): the
+    per-call guard's snapshot, taken once around the whole wake."""
+    snapshot(WAKE, str(run_dir), list(protected))
+
+
+def wake_guard(run_dir, protected) -> str | None:
+    """After that wake, before its output is applied: guard() over the whole wake, so a protected file
+    it changed outside ttp's own writes is saved, put back and reported as on a hooked agent. Its
+    accepted gaps are guard()'s, over the wake's whole span: a user's own edit while it runs is put back
+    (saved and reported)."""
+    return guard(WAKE, str(run_dir), list(protected))
 
 
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:

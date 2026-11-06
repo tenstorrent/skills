@@ -22,6 +22,7 @@ from .base import Provider, RunUsage
 @register
 class Fake(Provider):
     name = "fake"
+    coord_session = "agent"
     efforts = ("minimal", "low", "medium", "high", "xhigh", "max")
 
     def credential_files(self) -> list[str]:

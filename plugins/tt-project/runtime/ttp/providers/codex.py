@@ -105,6 +105,7 @@ class Codex(Provider):
     # Codex sends the thread id as the request's prompt_cache_key: one `codex exec` per coordinator
     # turn read 0 cached tokens on most turns with a byte-identical prefix (measured on 0.160).
     cache_key_per_session = True
+    coord_session = "agent"   # `codex exec ... resume <id> -`; size and compaction from the rollout (session_context)
     mcp_by_args = True   # `-c mcp_servers=...` (codexmcp.py): Codex has no per-run MCP config file
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.
@@ -422,6 +423,36 @@ class Codex(Provider):
         if last is None:
             return None, limits
         return (tuple(max(a - b, 0) for a, b in zip(last, base)) if base else last), limits
+
+    def session_context(self, session_id, since, env=None):
+        # `codex exec --json` gives one usage per turn, summed over its calls; the rollout's token_count
+        # events carry each call's own (last_token_usage, input counting the cached part), and a
+        # "compacted" record marks a history Codex compacted.
+        paths = self.session_paths(session_id, "", env)
+        if not paths:
+            return None
+        first = last = 0
+        compacted = False
+        try:
+            with open(max(paths, key=lambda f: f.stat().st_mtime), "rb") as f:
+                for raw in f:
+                    if b'"token_count"' not in raw and b'"compacted"' not in raw:
+                        continue
+                    try:
+                        rec = json.loads(raw)
+                        if since is not None and _stamp(rec.get("timestamp")) < since:
+                            continue
+                        if rec.get("type") == "compacted":
+                            compacted = True
+                            continue
+                        call = rec["payload"]["info"]["last_token_usage"]
+                        n = int(call.get("input_tokens") or 0) + int(call.get("output_tokens") or 0)
+                    except (ValueError, TypeError, KeyError, AttributeError):
+                        continue
+                    first, last = first or n, n
+        except OSError:
+            return None
+        return {"first_context": first, "last_context": last, "compacted": compacted} if last or compacted else None
 
     def activity(self, output_path, offset=0):
         """`codex exec --json`: item.started is a call, item.completed its result (a command that

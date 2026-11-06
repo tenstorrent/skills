@@ -242,6 +242,15 @@ class Provider:
     # Its runs refuse to end without a valid hand-off in-run (ttp.hook Stop). Without one, the daemon
     # continues a run's session once to write it (Daemon._handoff_resume), where the session can resume.
     stop_hook = False
+    # How a persistent coordinator session (coordsession.py) keeps its history between wakes: "agent"
+    # when the CLI saves and resumes it (resume_args, session_saved, RunUsage.session_id); "" when it
+    # cannot yet, and session_gap says why: its wakes then run stateless with that reason.
+    coord_session = ""
+    session_gap = "its CLI keeps no session the harness can resume"
+    # The CLI runs ttp's PreToolUse/PostToolUse hooks (coordtools.hook_settings): the coordinator's tool
+    # policy and per-call protected-file guard. Without them the daemon guards the protected files
+    # around the whole coordinator wake (coordtools.wake_snapshot, wake_guard).
+    tool_hooks = False
 
     def reach_host(self, env: dict | None = None) -> str:
         """The host this provider's runs reach its API at: the base URL's host when its variable is
@@ -324,6 +333,12 @@ class Provider:
         """Whether the transcript of `session_id`, run in `cwd` with the environment `env` (the run's
         own, which may point the agent at another config directory), is still on disk to resume."""
         return False
+
+    def session_context(self, session_id: str, since: float, env: dict | None = None) -> dict | None:
+        """For an agent whose stream gives no per-call usage: what its saved session says of the run that
+        started at `since`, {"first_context", "last_context": a model call's prompt plus answer,
+        "compacted": the agent compacted the history}; None when it says nothing."""
+        return None
 
     def session_paths(self, session_id: str, cwd: str, env: dict | None = None) -> list[Path]:
         """The transcript files the agent keeps for `session_id` (subagents' too), for masking stored

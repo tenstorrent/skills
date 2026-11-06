@@ -18,6 +18,11 @@ class Chat(Claude):
     api_host, api_base_env = "", ""
     login_hint = "save the endpoint's key with `ttp secret endpoint <alias> --url <base url>`"
     own_cache_breakpoints = 0
+    # Its coordinator turns run stateless for now (coordsession.py names this reason), with the
+    # whole-wake protected-file guard: ttp's tool hooks and system-prompt flags are wired for claude.
+    coord_session = ""
+    session_gap = "the coordinator session is not enabled on this provider yet"
+    tool_hooks = False
 
     # Claude Code prices a model name it does not know at its fallback rate. With pricing.chat rows
     # ({"<model id>" or "default": [input, cached input, output] in $ per million tokens}) a run is

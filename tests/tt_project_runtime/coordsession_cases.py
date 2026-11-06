@@ -1501,3 +1501,98 @@ def test_coordinator_and_worker_prompts_follow_intent_ask_rarely_and_frame_the_s
     worker = flat(worker_system(p, {"kind": "code", "title": "t"}))
     assert "decide yourself, by the intent of your spec and the user's orders, not a literal reading" in worker
     assert "including the task, as written (in doubt, the stricter reading)" in worker
+
+
+def test_coordsession_runs_on_every_provider_or_names_why_it_cannot():
+    from ttp import coordsession
+    from ttp.providers import get_provider
+    cfg = _cs_cfg()
+    gaps = {n: coordsession.gap(get_provider(n)) for n in ("claude", "chat", "codex", "cursor", "fake")}
+    assert all(coordsession.on(cfg, n) for n in gaps), "no per-provider opt-out"
+    assert {n for n, g in gaps.items() if g} == {"chat", "cursor"}, gaps
+    assert gaps["cursor"].startswith("cursor: ") and gaps["chat"].startswith("chat: ")
+    assert [get_provider(n).tool_hooks for n in ("claude", "chat", "codex", "cursor")] == [True, False, False, False]
+    got = coordsession.decide(cfg, _cs_state(), "k1", "m", "high", lambda s: True, 10.0, no_session=gaps["cursor"])
+    assert got == ("stateless", gaps["cursor"])
+    assert coordsession.decide({}, _cs_state(), "k1", "m", "high", lambda s: True, 10.0,
+                               no_session=gaps["cursor"])[0] == "stateless"
+
+
+def test_codex_session_context_reads_each_call_and_compaction_from_its_rollout(tmp_path, monkeypatch):
+    from datetime import datetime, timezone
+    from ttp.providers.codex import Codex
+    thread = "0199a213-81c0-7800-8aa1-bbab2a035a53"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "none"))
+    day = tmp_path / "own" / "sessions" / "2026" / "11" / "06"
+    day.mkdir(parents=True)
+    tc = lambda ts, i, o: {"timestamp": ts, "type": "event_msg", "payload": {"type": "token_count", "info": {  # noqa: E731
+        "last_token_usage": {"input_tokens": i, "cached_input_tokens": i // 2, "output_tokens": o}}}}
+    lines = [tc("2026-11-06T09:00:00Z", 50000, 100), tc("2026-11-06T10:00:01Z", 60000, 200),
+             {"timestamp": "2026-11-06T10:00:02Z", "type": "compacted", "payload": {"message": "s"}},
+             tc("2026-11-06T10:00:03Z", 9000, 300)]
+    (day / f"rollout-2026-11-06T09-00-00-{thread}.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    env = {"CODEX_HOME": str(tmp_path / "own")}
+    since = datetime(2026, 11, 6, 10, 0, 0, tzinfo=timezone.utc).timestamp()
+    assert Codex().session_context(thread, since, env) == {"first_context": 60200, "last_context": 9300, "compacted": True}
+    assert Codex().session_context(thread, None, env)["first_context"] == 50100
+    assert Codex().session_context("0199a213-0000", since, env) is None
+
+
+def test_coordsession_an_agent_without_call_usage_or_hooks_keeps_its_session_size_cap_and_guard(env, monkeypatch):
+    """A Codex-like agent (no per-call usage in its stream, no ttp tool hooks): the session resumes
+    across a restart, its size comes from the agent's saved session, a compacted history leaves no
+    digest acknowledged, the runner holds the wake's budget, and a protected file it wrote is put back."""
+    from ttp import coordsession
+    from ttp.daemon import Daemon
+    from ttp.providers.base import RunUsage
+    from ttp.providers.fake import Fake
+    p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
+    p.set_config("coordinator.session.mode", "on")
+    ctx = {"first_context": 40000, "last_context": 42000, "compacted": False}
+    monkeypatch.setattr(Fake, "session_context", lambda self, sid, since, env=None: dict(ctx))
+    first, _, _, s0 = turn("EVENTS 1", budget_usd=3.0)
+    sid = first["session_id"]
+    assert s0["mode"] == "new" and p.db.kv(coordsession.KEY)["context_tokens"] == 42000
+    holder["d"] = Daemon(p.base)   # a restart resumes it
+    r, argv, _, s1 = turn("EVENTS 2", budget_usd=3.0)
+    assert argv[-2:] == ["--resume", sid] and s1["mode"] == "resume" and r["session_id"] == sid
+    assert json.loads((p.runs / str(r["id"]) / "run.json").read_text())["budget_usd"] == 3.0
+    d, row = holder["d"], dict(r)
+    for compacted, acked in ((False, True), (True, False)):
+        ctx["compacted"] = compacted
+        d._coord_session_end(row, RunUsage(session_id=sid), {**s1, "digest": {"seen": {}}}, True, {"actions": []}, [])
+        assert (coordsession.DIGEST in p.db.kv(coordsession.KEY)) is acked
+    # The whole-wake guard: a charter change no ttp writer logged is put back and reported.
+    run_dir = p.runs / str(r["id"])
+    before = p.charter_path.read_text()
+    d._coord_snapshot(run_dir, wake_guard=True)
+    p.charter_path.write_text(before + "\n- loosened\n")
+    d._coord_writes(row, run_dir)
+    assert p.charter_path.read_text() == before
+    assert p.db.q("SELECT id FROM events WHERE kind='coord_protected_write'")
+
+
+def test_coordsession_a_provider_without_a_session_runs_each_wake_stateless_with_its_reason(env, monkeypatch):
+    from ttp import coordsession
+    from ttp.providers.fake import Fake
+    p, _, _, turn, _, _ = _cs_daemon(env, monkeypatch)
+    p.set_config("coordinator.session.mode", "on")
+    monkeypatch.setattr(Fake, "coord_session", "")
+    for i in (1, 2):
+        r, argv, _, s = turn(f"EVENTS {i}")
+        assert r["status"] == "ok" and "--resume" not in argv
+        assert s["mode"] == "stateless" and s["why"] == f"fake: {Fake.session_gap}", s
+    assert not (p.db.kv(coordsession.KEY) or {}).get("id")
+
+
+def test_coord_session_stats_count_a_codex_wake_s_own_tool_calls(env):
+    from ttp import coordstats
+    p = make(env)
+    rid = _cstat_run(p, time.time() - 60, 0.1, session="resume", sid="s1", tools=0)
+    p.db.x("UPDATE runs SET provider='codex' WHERE id=?", (rid,))
+    with open(p.runs / str(rid) / "output.jsonl", "w") as f:
+        for i in range(3):
+            f.write(json.dumps({"type": "item.started", "item": {"id": f"i{i}", "type": "command_execution",
+                                                                  "command": "ttp status"}}) + "\n")
+    row = p.db.one("SELECT id, dir, provider FROM runs WHERE id=?", (rid,))
+    assert coordstats.tool_calls(row, p.runs) == 3

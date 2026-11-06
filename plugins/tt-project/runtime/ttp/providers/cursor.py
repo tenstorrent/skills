@@ -120,6 +120,9 @@ def account_label(who: str) -> str:
 @register
 class Cursor(Provider):
     name = "cursor"
+    # resume_args has --resume, but session_saved cannot tell a saved chat from a lost one (a resume of
+    # a lost chat may start an empty one), so a session would lose its history unnoticed.
+    session_gap = "its CLI keeps no chat the harness can check is still saved before a resume"
     binaries = ("agent", "cursor-agent")
     api_host = "api2.cursor.sh"
     login_hint = "run `agent login` there"

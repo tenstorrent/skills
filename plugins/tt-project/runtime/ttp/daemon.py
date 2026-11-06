@@ -2918,7 +2918,7 @@ class Daemon:
                 session_mode, why = coordsession.decide(
                     self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
                     lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
-                    guard=self.p.db.kv(coordsession.GUARD_KEY))
+                    guard=self.p.db.kv(coordsession.GUARD_KEY), no_session=coordsession.gap(prov))
             except Exception as e:   # the stateless turn is always safe
                 session_mode, why = "stateless", f"decide failed: {type(e).__name__}: {e}"[:200]
                 log(self.p, f"coordinator session {why}")
@@ -3199,7 +3199,7 @@ class Daemon:
                     system = coord.join_prompt(system, context)
             if system is not None:
                 (run_dir / "system.md").write_text(system)
-                if provider == "claude":
+                if prov.tool_hooks:   # claude
                     tools = (coordtools.session_tool_args(self.cfg, project=self.p.name, root=str(self.p.root),
                                                           denied_reads=no_reads, session_mode=session_mode,
                                                           protected=coordtools.protected_paths(self.p),
@@ -3317,7 +3317,7 @@ class Daemon:
                     "nice": nice_level(self.cfg.get("runner"))[0] if role != "coordinator" else 0}
             durable_write(run_dir / "run.json", json.dumps(spec, indent=1))   # read again after a reboot
             if role == "coordinator":
-                self._coord_snapshot(run_dir)
+                self._coord_snapshot(run_dir, wake_guard=not prov.tool_hooks)
             with open(run_dir / "runner.log", "wb") as out:
                 proc = subprocess.Popen([sys.executable, "-m", "ttp.runner", str(run_dir)], cwd=runtime_dir,
                                         env={**os.environ, "PYTHONPATH": runtime_dir}, stdout=out, stderr=out,
@@ -4684,16 +4684,30 @@ class Daemon:
     def _coord_folders(self) -> list[Path]:
         return [self.p.harness, self.p.root]
 
-    def _coord_snapshot(self, run_dir: Path) -> None:
-        """The harness folder and repo checkout before a coordinator turn (coordwrites): a report only."""
+    def _coord_snapshot(self, run_dir: Path, wake_guard: bool = False) -> None:
+        """The harness folder and repo checkout before a coordinator turn (coordwrites): a report only.
+        `wake_guard` (an agent without ttp's tool hooks): also the protected files, which _coord_writes
+        puts back after the turn as the hooks would after each call (coordtools.wake_guard)."""
         try:
             coordwrites.save(run_dir, self._coord_folders())
         except Exception:
             log(self.p, f"run {run_dir.name}: coordinator write snapshot failed\n" + traceback.format_exc())
+        if wake_guard:
+            try:
+                coordtools.wake_snapshot(run_dir, coordtools.protected_paths(self.p))
+            except Exception:
+                log(self.p, f"run {run_dir.name}: coordinator protected-file snapshot failed\n" + traceback.format_exc())
 
     def _coord_writes(self, r: dict, run_dir: Path) -> None:
         """Logs a warning when a coordinator turn changed files in the harness folder or the repo
-        checkout (coordwrites): no model call, no alert; the turn's end stands."""
+        checkout (coordwrites): no model call, no alert; the turn's end stands. First, on an agent without
+        ttp's tool hooks, the whole-wake protected-file guard (coordtools.wake_guard) puts back and reports
+        a charter, memory or project.json change no ttp writer logged."""
+        try:
+            if notice := coordtools.wake_guard(run_dir, coordtools.protected_paths(self.p)):
+                log(self.p, f"run {r['id']}: {notice}")
+        except Exception:
+            log(self.p, f"run {r['id']}: coordinator protected-file guard failed\n" + traceback.format_exc())
         try:
             if changed := coordwrites.changed(run_dir):
                 log(self.p, f"run {r['id']}: warning: coordinator turn changed files in {', '.join(changed)} "
@@ -4804,7 +4818,9 @@ class Daemon:
         for the whole digest, or whose session compacted its history, leaves no digest acknowledged."""
         db, now = self.p.db, time.time()
         try:
-            if session.get("digest") and (coordsession.asked_full(actions) or self._compacted(r)):
+            ctx = self._session_context(r, usage) if session.get("mode") in ("new", "resume") else None
+            if session.get("digest") and (coordsession.asked_full(actions) or self._compacted(r)
+                                          or (ctx or {}).get("compacted")):
                 session = {k: v for k, v in session.items() if k != "digest"}
             state = db.kv(coordsession.KEY)
             if session.get("mode") == "resume" and not ok:
@@ -4827,6 +4843,28 @@ class Daemon:
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         return False
+
+    def _session_context(self, r: dict, usage) -> dict | None:
+        """The session's size after a wake from the agent's own saved session (Provider.session_context),
+        for an agent whose stream gives no per-call usage: merged into the usage's cache_telemetry, which
+        coordsession.context_tokens and record read, where the stream left it out."""
+        tel = getattr(usage, "extra", None)
+        if not isinstance(tel, dict) or (tel.get("cache_telemetry") or {}).get("last_context"):
+            return None
+        sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
+        try:
+            spec = json.loads((self._run_dir(r) / "run.json").read_text())
+        except (OSError, ValueError):
+            spec = {}
+        try:
+            ctx = get_provider(r["provider"]).session_context(sid, float(r["started"] or 0) or None, spec.get("env"))
+        except Exception:   # the turn's summed usage stands: it rolls over early, never late
+            log(self.p, f"run {r['id']}: session context not read: " + traceback.format_exc().replace("\n", " | ")[:500])
+            return None
+        if ctx and sid:
+            got = tel.setdefault("cache_telemetry", {})
+            got.update({k: int(ctx[k]) for k in ("first_context", "last_context") if ctx.get(k)})
+        return ctx
 
     def _compacted(self, r: dict) -> bool:
         """The agent compacted the run's session history (Claude's stream-json `compact_boundary`)."""
