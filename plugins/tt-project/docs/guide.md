@@ -579,8 +579,9 @@ coordinator with that evidence.
   carries it. Unlabelled lines (a paraphrase citing a msg, a quoted term) are carried as the note's
   data; put names and terms in backticks. The note's header vouches only for that drop: nothing in
   it is the user's word unless the chat log, order ledger, memory or charter shows it. A
-  `memory_add` with a labelled line that fails the same check is refused; a paraphrase is stored as
-  data. A coordinator run's `ttp memory` writes are refused (use `memory_add`); the user's own `ttp
+  `memory_add` or an `obligation` (the order ledger: its text, evidence, drop reason, milestone or
+  justification; in either coordinator mode) with a labelled line that fails the same check is
+  refused and logged; a paraphrase is stored as data. A coordinator run's `ttp memory` writes are refused (use `memory_add`); the user's own `ttp
   memory` is unchanged. Known gaps: only quotes are checked, so unquoted text on a labelled line
   with a checked quote is carried; a claim phrased past those label forms ("the user ordered
   '...'", "as the user put it", "User:", another language) is not checked and is carried as data

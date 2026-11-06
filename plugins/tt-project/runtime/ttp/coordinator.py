@@ -4142,6 +4142,16 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                           + ", ".join(f"#{m}" for m in said),
                           json.dumps({"key": key, "value": value, "before": before, "messages": said}), "handled"))
             elif t == "obligation":
+                # Its free text claims a user order only on the verbatim check memory_add passes.
+                said = [a.get(f) for f in ("text", "evidence", "why", "justify")] + [
+                    m.get("evidence_required") for m in a.get("milestones") or [] if isinstance(m, dict)]
+                if forged := [d for x in said if isinstance(x, str)
+                              for d in coordsession.checked(db, x, relay.agent_orders(cfg), strict=False)[1]]:
+                    coordsession.log_dropped(db, "obligation", forged)
+                    raise ValueError(f"obligation rejected: a line labelled as the user's words fails the verbatim "
+                                     f"check: {forged[0][1]}. Quoted text on such a line must be that message's own "
+                                     f"words, with its msg #N; put names and terms in backticks, or record it "
+                                     f"without the user's-words label")
                 oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
                 if a.get("order") is not None and not oid:   # the order a user message carries
                     had = obligations.open_order(db, int(a["order"]))

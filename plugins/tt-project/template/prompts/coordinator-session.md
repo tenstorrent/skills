@@ -62,7 +62,8 @@ digest and also return `session_note` (at most 4,000 tokens):
 3. Pending checks: what, how and when.
 4. Decisions with their reasons.
 5. User corrections and orders not yet in memory, verbatim with their msg #N: a quote on a
-   user's-words line must be in that message, else the line is dropped; put terms in backticks.
+   user's-words line must be in that message, else the line is dropped (a `memory_add` or
+   `obligation` with one is refused); put terms in backticks.
 
 Give ids (task, message, run) with each fact. After a compaction the next wake leads with "CONTEXT
 COMPACTED", restored from disk; where your summary differs, the restored record wins. What must
