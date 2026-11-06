@@ -12132,7 +12132,7 @@ def test_agent_orders_as_user_counts_the_owners_agent_only_where_turned_on(env, 
     off, they are refused as before. In both modes PR approval, the user-only settings, a step relay.HELD
     names and anyone else's text are unchanged; the key itself is set only on the owner's own words."""
     import json
-    from ttp import cli, relay
+    from ttp import cli, relay, spans
     from ttp import coordinator as coord
     p = make(env)
     p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
@@ -12185,7 +12185,7 @@ def test_agent_orders_as_user_counts_the_owners_agent_only_where_turned_on(env, 
     problems = coord.apply(p, [{**restr, "source": json.dumps({"msg": mid, "quote": "never run nightly builds on box Q"})}],
                            user_turn=True, messages=[mid])
     assert problems and ("quote check failed" in problems[0] or "relayer context" in problems[0]), problems
-    assert f"{relay.CONTEXT}: {ctx}" in coord.digest(p, {}, [], [mid]) and relay.AGENT not in coord.digest(p, {}, [], [mid, fid])
+    assert f"{relay.CONTEXT}: {ctx}" in spans.strip(coord.digest(p, {}, [], [mid])) and relay.AGENT not in coord.digest(p, {}, [], [mid, fid])
     assert "widget farm" not in p.charter_path.read_text() and "box Q" not in p.charter_path.read_text()
     unchanged(mid, fid)
 
