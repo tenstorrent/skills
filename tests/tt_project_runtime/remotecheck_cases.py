@@ -588,6 +588,107 @@ def test_a_run_that_does_not_pass_on_a_spill_host_runs_again_here(env, tmp_path,
         assert not any(k.startswith("env:check-host:") for k in envfault.open_faults(p))
 
 
+def test_a_run_with_the_host_wide_cap_full_spills_to_a_free_host_past_a_paused_one(env, tmp_path, monkeypatch):
+    """#6379: the project's lanes are free but the host-wide checks cap is full: past checks_spill_after_s
+    the run skips a paused spill host and runs on the next free one, never waiting for the cap here."""
+    from ttp import checkcap, cli, db as dbm
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-c", "check-host-a"],
+                                        charter=("check-host-a", "check-host-c"))
+    p.set_config("checks.slots", 4)
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-c": {"reason": "user hold", "by": "user", "since": 1}})
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkcap, "extra_max", lambda: 0)
+    p.set_config("delivery.push_checks", ["true"])
+    held = checkcap.acquire("other project", priority=3)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        held.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    text = (run / "checks.log").read_text()
+    assert "check-host-c (paused: user hold)" in text and "spilling to check-host-a" in text, text
+
+
+def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tmp_path, monkeypatch):
+    """#6379: checks that fail on one spill host run again on the next free one (a pass there counts),
+    never back on the one they failed on; with every listed host kept off, paused or full they wait
+    here and run here. Before, any rerun after a spill host waited for a slot here."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    hosts = tmp_path / "ssh.log"
+    monkeypatch.setenv("FAKE_SSH_LOG", str(hosts))
+    mark, log = tmp_path / "failed-once", tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}; test -e {mark} || {{ touch {mark}; exit 1; }}"])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
+    text = (run / "checks.log").read_text()
+    assert "did not pass on spill host check-host-a (exit 1)" in text and "spilling to check-host-b" in text, text
+    assert "check-host-a (these checks did not pass there in this run)" in text, text
+    assert all("/ttp-check." in w for w in log.read_text().splitlines()), "both runs were on spill hosts"
+    # Failing everywhere: a, then b (a kept off), then here once the lane frees, whose result counts.
+    mark.unlink()
+    log.write_text("")
+    p.set_config("delivery.push_checks", [f'pwd >> {log}; case "$PWD" in */ttp-check.*) exit 1;; esac'])
+    lane = _spill_lane(p, repo)
+    threading.Timer(4.0, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    where = log.read_text().splitlines()
+    assert len(where) == 3 and "/ttp-check." not in where[-1], where
+    assert checkspill.holders(p.name) == []
+
+
+def test_spill_off_keeps_a_failed_host_off_and_a_faulted_one_after_its_second_fault():
+    """#6379: OFF_ENV's value names the hosts a rerun keeps off: a host the checks failed on at once, one
+    whose own fault (exit 75) ended them only after HOST_FAULT_TRIES faults; "1" keeps every host off."""
+    from ttp import checkspill
+    assert checkspill.all_off("1") and not checkspill.all_off("") and checkspill.kept_off("") == set()
+    off = checkspill.spill_off_add("", "host-a", fault=True)
+    assert checkspill.kept_off(off) == set(), "a host fault (paused mid-run) leaves it one more try"
+    off = checkspill.spill_off_add(off, "host-b", fault=False)
+    assert checkspill.kept_off(off) == {"host-b"} and not checkspill.all_off(off)
+    off = checkspill.spill_off_add(off, "host-a", fault=True)
+    assert checkspill.kept_off(off) == {"host-a", "host-b"}
+    assert checkspill.kept_off(checkspill.spill_off_add("1", "user@host-c:22", fault=False)) == {"user@host-c:22"}
+
+
+def test_an_urgent_rerun_after_a_spill_host_still_takes_a_free_pool_host_at_once(env, tmp_path, monkeypatch):
+    """#6379: an urgent rerun of checks that failed on a spill host still goes first: it asks the pool at
+    once (no checkspill.after_s wait), keeping off the host it failed on, and takes no Slurm overflow."""
+    import io
+    from ttp import checkcap, checkspill, cli, slurmcheck
+    p = make(env)
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a", "check-host-b"])
+    p.set_config("delivery.checks_spill_after_s", 60)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setattr(checkcap, "task_rank", lambda _p: (0, []))
+    asked = []
+    monkeypatch.setattr(checkspill, "pick", lambda _p, _c, _t, _w="", off="": asked.append(off) or (
+        {"host": "check-host-b"} if "check-host-b" not in checkspill.kept_off(off) else None))
+    monkeypatch.setattr(slurmcheck, "pick", lambda *_a, **_k: pytest.fail("no Slurm overflow for a rerun"))
+    held = checkcap.acquire("routine", priority=3)
+    try:
+        t0 = time.time()
+        off = checkspill.spill_off_add("", "check-host-a", fault=False)
+        slot = cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, True, cmds=["true"], top=str(p.base),
+                                spill=True, spill_off=off)
+        assert slot is not None and slot.spill == {"host": "check-host-b"} and asked == [off]
+        assert time.time() - t0 < 20, "no wait for the 60 s spill bound"
+    finally:
+        held.close()
+
+
 def test_a_spilled_run_copies_the_commit_it_checks_even_when_the_worktree_moved_while_it_waited(
         env, tmp_path, monkeypatch):
     """A run that spills after its wait here copies the commit it started on (the one its pass names),

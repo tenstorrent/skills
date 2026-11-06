@@ -52,8 +52,11 @@ wrapper (the check's `spill_wrap_cmd`, else checks.spill_wrap_cmd: push.spill_wr
 says its wrappers need no device (`checks.wrap_needs_device: false`; unset or true: the need is unknown
 or real, so it stays here), and never a light run (it never waits). On a spill host a check never runs
 behind this machine's checks.wrap_cmd: it runs behind its remote wrapper when it has one (push.spill_to),
-a wrapper missing there being a host fault (remotecheck), else unwrapped. A run that does not pass on a spill host runs again here (OFF_ENV):
-a spill host's own environment never fails a change, only a pass there counts.
+a wrapper missing there being a host fault (remotecheck), else unwrapped. A run that does not pass on a spill host runs again
+(OFF_ENV): a spill host's own environment never fails a change, only a pass there counts. The rerun waits for a slot here
+as any run does and may spill to another listed host, never back to one its checks failed on (spill_off_add): a host fault
+there (exit 75: the host paused, its lock or a tool gone mid-run) leaves that host one more try, once pick finds it free.
+With none left it runs here, whose result counts.
 """
 from __future__ import annotations
 
@@ -75,7 +78,8 @@ BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a devic
 NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
 AFTER_KEY = "checks_spill_after_s"
 SPILL_AFTER_S = 60.0
-OFF_ENV = "TTP_CHECKS_NO_SPILL"   # set for the local rerun of a run that did not pass on a spill host
+OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the hosts a rerun keeps off (spill_off_add)
+HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
 PROBE_TIMEOUT_S = 30
 DEVICE_SUFFIX = "-device"
 DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
@@ -645,13 +649,35 @@ def _ours(alias: str) -> int:
     return sum(1 for r in holders() if r.get("host") == alias)
 
 
-def pick(p, cfg: dict, tell, what: str = "") -> Claim | None:
+def all_off(off: str) -> bool:
+    """Whether OFF_ENV's value `off` keeps the checks off every spill host ("1"; "" or a host list: no)."""
+    return off == "1"
+
+
+def spill_off_add(off: str, host: str, fault: bool) -> str:
+    """OFF_ENV's value after the checks did not pass on spill host `host`: `fault` when the host's own fault
+    ended them (exit 75), else they failed or timed out there."""
+    return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{'fault' if fault else 'fail'}"])
+
+
+def kept_off(off: str) -> set[str]:
+    """The spill hosts OFF_ENV's value `off` keeps a rerun off: each its checks failed on, and each whose own
+    fault ended them HOST_FAULT_TRIES times."""
+    seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
+    return {h for h, _, why in seen if why != "fault"
+            or sum(1 for h2, _, w2 in seen if h2 == h and w2 == "fault") >= HOST_FAULT_TRIES}
+
+
+def pick(p, cfg: dict, tell, what: str = "", off: str = "") -> Claim | None:
     """The first spill host that is allowed, reachable and has a free slot, claimed; None when none is.
-    Each host skipped is told with why."""
+    Each host skipped is told with why. `off`: OFF_ENV's value, whose hosts (kept_off) are skipped."""
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
-    skipped = []
+    skipped, keep = [], kept_off(off)
     for alias in hosts(cfg):
+        if alias in keep:
+            skipped.append(f"{alias} (these checks did not pass there in this run)")
+            continue
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
         why, dev = allowed(p, cfg, alias) or lock_busy(p, cfg, alias), ""
         if not why and beside:

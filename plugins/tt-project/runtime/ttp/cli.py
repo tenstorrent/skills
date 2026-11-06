@@ -3553,9 +3553,10 @@ def cmd_checks(a) -> None:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
         from . import checkjoin, checklane, checkspill
-        # A rerun here of checks that did not pass on a spill host never spills again (checkspill).
-        no_spill = bool(os.environ.pop(checkspill.OFF_ENV, ""))
-        spill_ok = not no_spill and checkspill.spillable(todo, cfg)
+        # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
+        # "1" keeps them off every spill host.
+        no_spill = os.environ.pop(checkspill.OFF_ENV, "")
+        spill_ok = not checkspill.all_off(no_spill) and checkspill.spillable(todo, cfg)
         fresh_ok = not a.fresh
         slot = None
         light = bool(todo) and checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ())
@@ -3572,7 +3573,8 @@ def cmd_checks(a) -> None:
                                     (lambda: bool(_recorded_pass(p, tree, todo, purpose))) if fresh_ok else None,
                                     todo, light, str(top),
                                     checklane.wrap_key(wrap) if any(str(c) in wrapped for c in todo) else "",
-                                    spill_ok, (lambda: _checks_yield(p, join_rec)) if join_rec else None)
+                                    spill_ok, (lambda: _checks_yield(p, join_rec)) if join_rec else None,
+                                    no_spill)
             except checkjoin.Yield as y:
                 slot = None
                 joined = _checks_follow(p, Path(run_dir), out, head, join_rec, y, bool(getattr(a, "own_group", False)))
@@ -3874,7 +3876,7 @@ def cmd_checks(a) -> None:
                 slot.close()
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
             if no_spill:
-                os.environ[checkspill.OFF_ENV] = "1"
+                os.environ[checkspill.OFF_ENV] = no_spill
             if join_rec:
                 checkjoin.forget(p.state)
             return cmd_checks(a)
@@ -3895,17 +3897,20 @@ def cmd_checks(a) -> None:
         if slot and not passed:
             slot.close()
         # A spill host's own environment never fails a change (a fault there, a missing tool): what did
-        # not pass there (a timeout included) runs again here, in its place in the queue, and only that
-        # verdict counts.
+        # not pass there (a timeout included) runs again, in its place in the queue: here, whose verdict
+        # counts, or on another spill host that is free (checkspill.kept_off), where only a pass counts.
         if spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped"):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
+            no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out)
             said = (f"the checks did not pass on spill host {spilled.host} ({how}); running them again on "
-                    "this machine, whose result counts")
+                    "this machine, whose result counts, or on a free spill host "
+                    + ("they did not fail on" if spilled.host in checkspill.kept_off(no_spill)
+                       else "(that one again once free: the fault was the host's)"))
             out.write(f"ttp checks: {said}\n")
             out.flush()
             print(f"ttp checks: {said}", flush=True)
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
-            os.environ[checkspill.OFF_ENV] = "1"
+            os.environ[checkspill.OFF_ENV] = no_spill
             if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                 checkjoin.forget(p.state)
             return cmd_checks(a)
@@ -4589,7 +4594,8 @@ def _checks_lane_status(as_json: bool) -> int:
 
 def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: bool = False,
                  arrived: float | None = None, same: str = "", done=None, cmds: list | None = None,
-                 light: bool = False, top: str = "", lock: str = "", spill: bool = False, yielder=None):
+                 light: bool = False, top: str = "", lock: str = "", spill: bool = False, yielder=None,
+                 spill_off: str = ""):
     """Wait for a host-wide checks slot (checkcap). The wait is told in the log, the run's notes
     (progress.md) and CHECKS_SLOT_WAIT, which the `--result` probe and `ttp status` read. In the
     foreground it is recorded like a `ttp lock` wait, so it does not count toward the run's wall
@@ -4602,8 +4608,10 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     checks.slots, checks.max_wait_s), or with `lock` (checklane.wrap_key: commands behind checks.wrap_cmd)
     for that wrapper lock's one lane, at most checklane.project_cap of the project's at once, told with
     the holder and the queue position each minute. With `spill` and delivery.checks_spill_hosts set, a
-    wait past delivery.checks_spill_after_s tries those hosts (checkspill.pick) and keeps its place here
-    when none can take the run (nor the account's Slurm overflow, slurmcheck.pick): a slot whose `spill`
+    wait past delivery.checks_spill_after_s (the lane's or the host-wide cap's) tries those hosts
+    (checkspill.pick; none `spill_off` keeps off: OFF_ENV of a rerun) and keeps its place here
+    when none can take the run (nor the account's Slurm overflow, slurmcheck.pick, which a rerun after a
+    spill host never takes): a slot whose `spill`
     claim names the host the checks then run on (with `slurm` set, the cluster's submit host); while
     this host's disk is saturated (diskgate) it tries them before it waits here at all. Both
     settings are read again at each bound: hosts set while a run waits take it at its next bound.
@@ -4672,7 +4680,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         if spill_to and first and checkspill.hosts(spill_cfg) and (disk := diskgate.saturated()):
             tell(f"{disk}: trying the spill hosts first")
             if (claim := checkspill.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
-                                         what)) is not None:
+                                         what, spill_off)) is not None:
                 slot = checkcap.Slot()
                 slot.spill = claim
                 return slot
@@ -4688,14 +4696,14 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
                 checkjoin.forget(p.state)
             _checks_reexec(str(e), arrived, prio, spill, tell, out, getattr(e, "lanes", None),
-                           getattr(e, "slot", None), rerank=isinstance(e, checkcap.Reranked))
+                           getattr(e, "slot", None), rerank=isinstance(e, checkcap.Reranked), spill_off=spill_off)
             continue   # it could not re-execute: wait again with the code it runs
         if slot is not None or not spill_to:
             return slot
         spill_cfg = p.config()   # as set now, not when the wait began
         # The same hosts skipped for the same reasons are told once, not after every bound.
         if checkspill.hosts(spill_cfg) and (claim := checkspill.pick(
-                p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)), what)) is not None:
+                p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)), what, spill_off)) is not None:
             slot = checkcap.Slot()
             slot.spill = claim
             return slot
@@ -4704,7 +4712,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             continue
         # No pool host could take it: the account's Slurm overflow (slurmcheck), urgent runs first. Its batch
         # job runs no spill wrapper and a wrapped check never runs unwrapped, so a wrapped run waits here.
-        if not _spill_wrapped(cmds, spill_cfg) and (claim := slurmcheck.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
+        if not spill_off and not _spill_wrapped(cmds, spill_cfg) and (claim := slurmcheck.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
                                      what, prio, start if arrived is None else arrived)) is not None:
             slot = checkcap.Slot()
             slot.spill = claim
@@ -4938,7 +4946,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
 
 
 def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out, lanes=None,
-                   slot=None, rerank: bool = False) -> None:
+                   slot=None, rerank: bool = False, spill_off: str = "") -> None:
     """Run these waiting detached checks again with the runtime installed now (version `new`,
     checkcap.Upgraded), as the same process: exec keeps its pid and start time, so checks.pid, the
     launcher's `go` and a cancel request still name it, and its checks.rc is written once at its end.
@@ -4953,6 +4961,8 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
         os.environ[checkcap.ARRIVED_ENV] = repr(arrived)
     if not spill:   # what cmd_checks took out of the environment: no spill host for these checks
         os.environ[checkspill.OFF_ENV] = "1"
+    elif spill_off:   # or the spill hosts a rerun keeps off
+        os.environ[checkspill.OFF_ENV] = spill_off
     if rerank:
         os.environ[checkcap.RERANK_ENV] = new
     else:
@@ -5502,7 +5512,7 @@ def _checks_owner(run_dir: Path, top: str, purpose) -> str:
 
 
 def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str = "",
-                   arrived: float | None = None, no_spill: bool = False, need: int | None = None) -> None:
+                   arrived: float | None = None, no_spill: str = "", need: int | None = None) -> None:
     """Start `ttp checks` in a session of its own. It writes checks.rc however it ends (a stop by
     TERM, HUP or INT included); the printed `--result` probe also wakes the task when it was killed
     outright. This run's earlier detached checks for the same worktree and purpose are stopped
@@ -5525,9 +5535,9 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     if arrived is not None:
         env[checkcap.ARRIVED_ENV] = repr(arrived)
-    if no_spill:   # the rerun here of checks that did not pass on a spill host keeps off the spill hosts
+    if no_spill:   # the rerun of checks that did not pass on a spill host keeps off those hosts (checkspill)
         from . import checkspill
-        env[checkspill.OFF_ENV] = "1"
+        env[checkspill.OFF_ENV] = no_spill
     detach.lost(rc).unlink(missing_ok=True)
     # A request the daemon has not finished starting is replaced through the queue too, so the daemon
     # never starts an older request after this one.

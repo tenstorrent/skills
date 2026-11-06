@@ -1557,8 +1557,13 @@ running work is interrupted only by the preemption below:
   entries too), `"spill": true` lets it spill even with `"host": "local"`, `"spill": false` keeps it here (left out:
   a check with host `local` stays here, others follow the pool rules), and `"spill_wrap_cmd"` overrides the
   project's remote wrapper. A remote wrapper missing or not executable on the host is a host fault: the check never
-  runs unwrapped. A run that does not pass on a spill host runs again here, and that result
-  counts. `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
+  runs unwrapped. The order when the slots here are full (the project's lanes or the host-wide checks cap): an
+  urgent run asks the spill hosts at once, others after `delivery.checks_spill_after_s`; the first listed host
+  that is allowed, free and reachable takes the run; only when every one is full, paused or unreachable does it
+  wait here (and try them again after the same bound). A run that does not pass on a spill host runs again in
+  the same order, keeping off the hosts its checks failed on (one whose own fault ended them, such as a pause
+  taken mid-run, gets one more try once free); a pass on another spill host counts, else the result here does.
+  `checks.json` (`spilled_to`), `ttp status` and `ttp checks status` name the host.
   `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
   (each paused, busy with a device job, full or unreachable, or no pool at all) to a Slurm cluster instead of
   waiting here: `ttp config --account checks.slurm_overflow '{"host": "<cluster-login>", "partition":
