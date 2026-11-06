@@ -31,3 +31,6 @@ every +265: a waiting hand-off lists the later waits of a known sequence in `the
 code +135: the `context_gaps` hand-off field names what the spec and its context block lacked
 code +44: a confirm or watch wait settles from its probe output by `probe_match`, model-free
 every +83: a confirm or watch wait settles from its probe output by `probe_match`, model-free
+code +45: the kill guard and Stop hook lines say on which providers the harness hook runs (no false claim without it)
+question +41: the kill guard and Stop hook lines say on which providers the harness hook runs (no false claim without it)
+every +45: the kill guard and Stop hook lines say on which providers the harness hook runs (no false claim without it)

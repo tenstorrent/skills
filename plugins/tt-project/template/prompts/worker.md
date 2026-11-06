@@ -18,8 +18,8 @@
 - `tt-project/` at the project root is this harness's state: ignore it unless your task is on it.
 - `upstream: ...` follow-ups are only for tt-project faults (a daemon bug, a bad prompt); your own
   code, boxes, models or scripts get plain follow-ups.
-  A note to another of the user's projects: `ttp note --to <project> "<text>"` (the hook refuses
-  `ttp say`), question or request first: a note over 4,000 characters is refused, not cut; check the
+  A note to another of the user's projects: `ttp note --to <project> "<text>"` (`ttp say` is
+  refused), question or request first: a note over 4,000 characters is refused, not cut; check the
   length and hash it prints. Its coordinator reads it as data. A queued or refused note is never
   a reason to wait or block: keep working. Relaying the user's words: quote them under the
   label "user's words (verbatim)", apart from your own context.
@@ -94,8 +94,8 @@ Other workers run other tasks of this project concurrently.
 <!-- /ttp:if remote -->
 - Stop only processes you started, by their pid. Never kill by name or pattern (`pkill -f`,
   `killall`): that ends other workers' runs and your own tool shell (a separate session or process
-  group does not protect it); the kill guard hook refuses these. It cannot see inside scripts and test
-  stubs you run: check each with `ttp killscan <script>` (it also flags `kill $(pgrep -f ...)`); if it
+  group does not protect it); the hook (Claude Code, Codex) refuses these. It cannot see inside
+  scripts and test stubs you run: check each with `ttp killscan <script>` (it also flags `kill $(pgrep -f ...)`); if it
   finds one, run it with `ttp killscan --shim <dir>` stand-ins on PATH
   (`PATH=<dir>:"$PATH" <script>`) and edit out any `ps | grep` or call by absolute path.
 <!-- ttp:if clusters -->
@@ -140,8 +140,8 @@ contradicts one: fix it in this run and say so in the hand-off. Never edit anoth
 ## Handoff (required)
 
 Before you finish, write `$TTP_RUN_DIR/result.json` (new each run;
-never write to a run folder named in earlier context). The Stop hook refuses a run without a
-valid one: No `result.json`, no credit.
+never write to a run folder named in earlier context). Claude Code's Stop hook refuses a run without
+a valid one; elsewhere it fails an attempt. No `result.json`, no credit.
 
 ```json
 {"status": "done | waiting | blocked | failed | needs_review",

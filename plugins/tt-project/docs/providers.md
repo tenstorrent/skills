@@ -3,6 +3,45 @@
 What the runtime needs from each agent CLI, and what each one offers. Each cell says what the
 adapter in `runtime/ttp/providers/` does and links the official doc it relies on.
 
+## Feature parity
+
+Every tt-project feature is meant to behave the same on every provider; where a CLI lacks a
+mechanism, the harness is to supply one. This table says where that holds in this release. Claude Code is the
+reference; each other cell starts with **same**, **differs** or **missing**, names the mechanism,
+and names the open task that closes the gap where one exists. `chat` is Claude Code on an
+OpenAI-compatible endpoint (`providers/chat.py`), so it inherits Claude Code's rows unless noted.
+One row per line: a change to a feature updates its row alone. Measured checks and adapter details
+follow below.
+
+| Feature | Claude Code | Codex CLI | Cursor agent | chat |
+| :- | :- | :- | :- | :- |
+| Worker tool guards (`hook.py` PreToolUse: draft PR bypass, raw push, ssh fence, kill guard, AI tag, idle waits, full suite, device rule, wide reads) | reference: harness hook per run via `--settings` | **differs**: the same hook via `-c hooks.PreToolUse`, Bash calls only, and only where hooks are on and no other hook source exists; else none (#6512, #6513) | **missing**: no hook (#6534, #6513) | **same** |
+| Edit and MCP guards (edits to the harness `bin/`; AI tag on MCP connector posts) | reference: hook matchers for Edit, Write, MultiEdit, NotebookEdit and `mcp__.*` | **missing**: hook matcher is Bash only; `apply_patch` and MCP calls are not checked (#6512) | **missing**: no hook (#6534, #6513) | **same** |
+| Credential reads | reference: `Read` deny rules in the run's settings plus the Bash hook | **differs**: Bash hook only, where it runs; no file-read deny (#6512, #6513) | **missing**: deny rules live only in a config file the harness does not write (#6534, #6513) | **same** |
+| Stop hand-off guard (no end without a valid `result.json`; hand-off checks in session) | reference: Stop hook (`hook.py`, `handoffcheck.at_stop`) | **missing**: no Stop hook; the daemon counts a failed attempt and reruns cold, and runs the hand-off checks after the run (#6512, #6514) | **missing**: as Codex (#6514) | **same** |
+| gh and git wrappers, `ttp say` | reference: harness `bin/gh` and `bin/git` first on every run's PATH (`prguard.py`, `gitguard.py`); `ttp say` refused by the CLI in any run | **same** | **same** | **same** |
+| Mid-run updates (`steer.md`) | reference: the hook hands an update over after a tool call | **differs**: by hook where it runs, else the worker's next `ttp note` or `ttp steer` prints it | **differs**: only `ttp note` or `ttp steer` print it (#6534) | **same** |
+| Update read state (read shown, missed-update check) | reference: per run, from the provider's `steer_hook` (`runwatch.py`) | **differs**: the class flag says no hook, so read state is unknown even when the hook ran (#6535) | **missing**: read state unknown (#6535) | **same** |
+| Live run view | reference: tool calls from the stream (`Claude.activity`) | **same**: `Codex.activity` from its events | **missing**: no activity parser (base default) | **same** |
+| Resume, restart and preemption | reference: `--resume <id>`, transcript checked first | **same**: `exec resume <id>`, rollout checked first | **missing**: no way to check a chat exists, so a cut-off or preempted run starts fresh with its last notes (#6555) | **same** |
+| Coordinator session mode and tools | reference: `coordinator.session.mode` (`coordsession.py`), full tools and guards (`coordtools.py`) | **missing**: session mode is Claude-only on the tip; wakes run stateless (#6507, #6532: approved, not landed) | **missing**: as Codex (#6507, #6532) | deferred (user's call) |
+| Stateless coordinator turn | reference: read-only (`--restricted`, Edit and Write denied), system prompt replaced | **differs**: `danger-full-access` by default, a turn that changed files is only logged; shell and web tools off where listed (#6554) | **differs**: `--mode ask` where listed, scratch directory, system text leads the prompt; no tool guard (#6554) | deferred (user's call); today Claude Code's read-only flags, system prompt added rather than replaced (#6554) |
+| Coordinator prompt cache | reference: cached system input and cache TTL (`Claude.cached_input`) | **differs**: session thread reuse (`cachettl.py`) | **missing**: no cache control | **differs**: no cache breakpoints of its own; the bridge reports the endpoint's cached tokens |
+| Context block and spec delivery (`ctxblock.py`) | reference: in the prompt; system text by `--append-system-prompt-file` | **same**: in the prompt; system text by `developer_instructions`, checked in the rollout | **same**: in the prompt; system text leads it | **same** |
+| Sandbox default | reference: unsandboxed by default (`providers.<name>.write_fence` turns a fence on) | **same**: `danger-full-access` | **same**: `--force`, no sandbox | **same** |
+| Budget cap | reference: `--max-budget-usd` | **differs**: the runner stops the run on its token-priced estimate, mid-turn | **differs**: the runner's estimate, with a floor before usage arrives | **differs**: the runner on the `pricing.chat` reprice, else Claude Code's cap at its fallback rate; `billing: plan` has no dollar cap |
+| Cost | reference: reported by the CLI, calibrated (`localspend.calibrate`) | **differs**: estimated from tokens and `pricing.codex` | **differs**: usage when the build reports it, else the elapsed share of the budget | **differs**: repriced from tokens by `pricing.chat`, else Claude Code's figure booked as estimated |
+| Other sessions' spend in the global cap | reference: `localspend.py` counts the machine's other Claude Code sessions | **missing** (#6536) | **missing** | **missing**: other use of the endpoint is not seen |
+| Plan windows | reference: five-hour and seven-day windows from the CLI's events | **same**: from its rollout (`windows_so_far`) and the meter | **differs**: the CLI reports none; `providers.cursor.billing` decides | **differs**: none; `providers.chat.billing` decides |
+| Auth breaker and login check | reference: an auth failure requeues free, the breaker stops new runs, a model-free login check reopens them | **same** | **same**: `agent status` text read too | **same**: the saved endpoint key's stamp |
+| Tiers and effort | reference: `sonnet`/`opus` with low, high, max effort | **same**: the default model with low, high, xhigh effort | **missing**: every tier `auto`, no effort flag (#6552) | **same**: `providers.chat` tiers and the endpoint's effort fields |
+| Routing (model pick, escalation, tier floor) | reference: `route.py`, `tierfloor.py`, no provider branch | **same** | **same** | **same** |
+| Skills (plugin) | reference: `--plugin-dir` per run | **differs**: only plugins installed in Codex's home; coordinator turns and isolated workers skip the user config, so they get none (#6515: approved, not landed) | **same**: `--plugin-dir` where `--help` lists it | **same** |
+| MCP isolation and tool denylist | reference: `worker_isolation`, `--strict-mcp-config`, listed servers, `--tools` and `--disallowedTools` | **differs**: `--ignore-user-config` and `-c mcp_servers`; no tool denylist | **missing**: neither | **same**: takes Claude Code's settings while its own are unset |
+| Install and doctor | reference: `ttp doctor`; `--live` and `--loop` measured | **same**: measured live and by loop | **differs**: installed, never run live (no login on the test machine) (#6555) | **differs**: `ttp doctor` lists it only when the project configures it; not measured live |
+
+## Measured checks
+
 Claude Code and the Codex CLI have been run live; Cursor is installed but has not run live (no login). `ttp doctor --live <provider>
 [--json]` measures one provider's row: in a scratch project it starts a small worker run the way
 the daemon does, resumes its session, and runs one read-only coordinator turn with the
