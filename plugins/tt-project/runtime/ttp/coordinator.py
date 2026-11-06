@@ -3160,6 +3160,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if why:
                         raise ValueError(f"ask_user rejected: {why}")
                 text, rec = db.for_user(text), db.for_user((a.get("recommendation") or "").strip())   # notes follow them
+                least = db.for_user(least)   # the least-disruptive part is appended mid-message: its tag would stay
                 if a["blocking"] == "restriction":
                     text += f"{_LEAST_NOTE}{least}"
                 elif a["blocking"] == "irreversible" and least:

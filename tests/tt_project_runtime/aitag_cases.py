@@ -379,9 +379,10 @@ def test_ai_tag_for_user_drops_only_a_trailing_tag_and_posts_to_others_keep_thei
 
 
 def test_composed_messages_to_the_user_drop_the_tag_of_each_model_written_part(env, monkeypatch):
-    """Review #6541: the harness adds its own text after a model's (an ask's recommendation and timer
-    notes, a blocked reply's 'Needs from you', a user step's command and deadline, a step updated in
-    place without db.post), so the tag of each model-written part is dropped before composing."""
+    """Review #6541: the harness adds its own text after a model's (an ask's question, its
+    least-disruptive or reversible-alternative part, its recommendation and timer notes, a blocked
+    reply's 'Needs from you', a user step's command and deadline, a step updated in place without
+    db.post), so the tag of each model-written part is dropped before composing."""
     from ttp import coordinator as coord, userstep
     p = make(env)
     p.db.ai_tag = "(bot)"
@@ -390,6 +391,15 @@ def test_composed_messages_to_the_user_drop_the_tag_of_each_model_written_part(e
                             "blocking": "review", "recommendation": "yes, CI is green. (bot)"}]) == []
     ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")["text"]
     assert "My recommendation: yes, CI is green." in ask and "AI]" not in ask and "(bot)" not in ask, ask
+    # A restriction ask: its model-written least_disruptive part is appended mid-message, so its
+    # trailing tag is dropped when the note is composed, not only when the message is posted.
+    least = "wait for the lull; it still breaks the never-cycle restriction\n[authored by AI]"
+    problems, ask = _ask(p, "May I restart the shared service?", blocking="restriction",
+                         classify="restriction_change", least_disruptive=least,
+                         recommendation="yes, at night")
+    assert problems == [], problems
+    assert "Least-disruptive way considered: wait for the lull; it still breaks the never-cycle restriction" \
+        in ask["text"] and "AI]" not in ask["text"], ask["text"]
     # A blocked reply: its summary and blocked_reason each drop theirs.
     task, replies = _reply_hand_off(env, p, {"status": "blocked", "summary": "Needs a token. [authored by AI]",
                                              "question": "Which token?",
