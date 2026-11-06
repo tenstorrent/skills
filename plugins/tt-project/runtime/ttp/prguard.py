@@ -1223,6 +1223,8 @@ def main(argv: list[str], own_dir: str) -> int:
         why = check(args, real, db, stdin_text, allowed=allowed, seen=seen)
     except Exception as e:   # fails closed only for the calls it guards
         guarded = (args[:2] in (["pr", "ready"], ["pr", "create"]) or args[:1] == ["api"]
+                   or os.environ.get("TTP_RUN_DIR") and (args[:1] == ["release"] or args[:2] in (
+                       ["pr", "update-branch"], ["repo", "sync"]))   # credguard.gh_refusal
                    or args[:2] in (["pr", "edit"], ["issue", "edit"])
                    and any(a.startswith(("-b", "--body", "-F")) for a in args[2:]))
         why = f"refused: the PR draft guard failed ({e})" if guarded else None

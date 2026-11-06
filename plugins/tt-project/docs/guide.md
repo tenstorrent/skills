@@ -2963,11 +2963,16 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   a path do not hide it, and a `find` looking for a private key or credential file by name is
   refused. Known gap: a path a script builds at run time.
 - Pushes go only through `ttp push` and the push queue. Inside a run, the harness's gh refuses `gh api`
-  calls that create, move or delete refs or tags, write file contents, merge branches or write
-  releases (REST, and GraphQL `createRef`, `updateRef(s)`, `deleteRef`, `createCommitOnBranch`,
-  `mergeBranch`), `gh release create`, `gh release delete --cleanup-tag` and `gh repo sync` of a
-  named repo; the hook refuses the same requests sent by curl and the like. PR merges follow the
-  charter's merge policy.
+  calls that create, move or delete refs or tags, write file contents, merge branches, update a PR's
+  branch, write releases or the rules that protect a branch or tag (branch and tag protection,
+  rulesets; REST, and GraphQL `createRef`, `updateRef(s)`, `deleteRef`, `createCommitOnBranch`,
+  `mergeBranch`, `updatePullRequestBranch` and the branch protection rule and repository ruleset
+  mutations), `gh release` create, edit, delete, upload and delete-asset, `gh pr update-branch` and
+  `gh repo sync` of a named repo; reads of the same endpoints pass, and the hook refuses the same
+  requests sent by curl and the like. PR merges follow the charter's merge policy.
+- A session coordinator's Read, Grep and Glob calls are refused on the credential files listed at
+  its launch and on any other non-public file in `~/.ssh`, also a key made later or reached by a
+  symlink.
 - Guards in the harness are a second line. Give the account the harness uses a fine-grained token
   that can write only the repositories, and where the host allows it only the branches, its
   projects push to, and protect each repository's default branch (required reviews, no force pushes

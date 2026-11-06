@@ -17,10 +17,16 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
 Secrets stay reachable only through `ttp secret env` (hook.secret_read).
 
 Pushes go only through `ttp push` and the push queue. The run's bin/gh (prguard.check) refuses, inside
-a run, `gh api` calls that create, move or delete refs or tags, write file contents, merge branches or
-write releases (ref_write), `gh release create`, `gh release delete --cleanup-tag` and `gh repo sync`
-of a named repo; the hook refuses the same requests sent by curl and the like (hook.api_ref_write).
-PR merges stay under the charter's merge policy and are not refused here.
+a run, `gh api` calls that create, move or delete refs or tags, write file contents, merge branches,
+update a PR's branch, write releases or the rules that protect a branch or tag (branch protection,
+tag protection, rulesets; ref_write), the gh commands that send the same requests (`gh release`
+create, edit, delete, upload and delete-asset, `gh pr update-branch`, `gh repo sync` of a named repo),
+and the GraphQL mutations doing the same; the hook refuses them sent by curl and the like
+(hook.api_ref_write). Reads pass. PR merges stay under the charter's merge policy and are not refused
+here (`gh pr merge` is not either).
+A session coordinator's Read, Grep and Glob calls are refused on the files credential_files() named at
+launch and on any other non-public file in ~/.ssh, also one made later or reached by a symlink
+(ssh_secret, coordtools.pre_tool_use).
 """
 from __future__ import annotations
 
@@ -59,16 +65,23 @@ WHY = ("a run never reads credential stores (ssh private keys, gh's hosts file o
        "and gh read them themselves: give ssh a key with `-i <key>`, give a stored secret to a command with "
        "`ttp secret env`, and call a store by what it is in text, never by its path")
 
-# GitHub REST routes that move refs or write a repo's files: refs, tags, contents, merges, releases, renames
+# GitHub REST routes that move refs or write a repo's files: refs, tags, contents, merges, releases, renames,
+# a PR branch update, and the rules that protect a branch or tag (a branch name may hold slashes)
 REF_ROUTE_RE = re.compile(r"^/?(?:repos/[^/]+/[^/]+|repositories/\d+)/(?:git/refs|git/tags|contents|merges"
-                          r"|merge-upstream|releases|branches/[^/]+/rename)(?:/|$)", re.I)
+                          r"|merge-upstream|releases|branches/.+?/(?:rename|protection)|tags/protection|rulesets"
+                          r"|pulls/\d+/update-branch)(?:/|$)", re.I)
 # The same routes in a URL a client sends to
 REF_URL_RE = re.compile(r"/(?:repos/[^/\s]+/[^/\s]+|repositories/\d+)/(?:git/refs|git/tags|contents/|merges\b"
-                        r"|merge-upstream\b|releases\b|branches/[^/\s]+/rename)", re.I)
-REF_MUTATION_RE = re.compile(r"\b(?:createRef|updateRefs?|deleteRef|createCommitOnBranch|mergeBranch)\b")
-REF_WHY = ("refused: a run never writes git refs, tags, releases or file contents through the GitHub API "
-           "(gh api, gh release create, gh repo sync, curl and the like). Commit, and land the change "
-           "through `ttp push` and the push queue, which run the checks and review first")
+                        r"|merge-upstream\b|releases\b|branches/\S+?/(?:rename|protection)\b|tags/protection\b"
+                        r"|rulesets\b|pulls/\d+/update-branch\b)", re.I)
+REF_MUTATION_RE = re.compile(r"\b(?:createRef|updateRefs?|deleteRef|createCommitOnBranch|mergeBranch"
+                             r"|updatePullRequestBranch|(?:create|update|delete)BranchProtectionRule"
+                             r"|(?:create|update|delete)RepositoryRuleset)\b")
+# gh release subcommands that write a release (create and publish also make its tag)
+RELEASE_WRITES = {"create", "edit", "delete", "upload", "delete-asset"}
+REF_WHY = ("refused: a run never writes git refs, tags, releases, file contents or branch rules through the GitHub "
+           "API (gh api, gh release, gh pr update-branch, gh repo sync, curl and the like). Commit, and land the "
+           "change through `ttp push` and the push queue, which run the checks and review first")
 
 
 def ssh_public(name: str) -> bool:
@@ -212,6 +225,19 @@ def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = 
     return None
 
 
+def ssh_secret(path: str, search: bool = False, home: str | Path | None = None) -> bool:
+    """`path` is a non-public file in ~/.ssh (ssh_public), also one made after credential_files() listed
+    them or reached by a symlink; with `search` (Grep, Glob), also the ~/.ssh dir itself."""
+    try:
+        ssh = os.path.realpath(Path(home or os.path.expanduser("~")) / ".ssh")
+        real = os.path.realpath(os.path.expanduser(path))
+    except (OSError, ValueError):
+        return True
+    if real == ssh:
+        return search
+    return real.startswith(ssh + os.sep) and not ssh_public(os.path.relpath(real, ssh))
+
+
 def ref_write(endpoint: str, method: str, text: str) -> bool:
     """A `gh api` call to `endpoint` with `method` (its fields and body in `text`) writes refs, tags,
     releases or file contents."""
@@ -221,9 +247,13 @@ def ref_write(endpoint: str, method: str, text: str) -> bool:
 
 
 def gh_refusal(args: list[str]) -> str | None:
-    """Why gh `args` (no `api`) moves a ref, inside a run: release create, release delete
-    --cleanup-tag, repo sync of a named repo."""
-    if args[:2] == ["release", "create"] or (args[:2] == ["release", "delete"] and "--cleanup-tag" in args):
+    """Why gh `args` (no `api`) writes a ref or a release, inside a run: a release write
+    (RELEASE_WRITES), pr update-branch, repo sync of a named repo."""
+    if args[:1] == ["release"]:
+        sub = next((a for i, a in enumerate(args[1:], 1)
+                    if not a.startswith("-") and args[i - 1] not in ("-R", "--repo")), "")
+        return REF_WHY if sub in RELEASE_WRITES else None
+    if args[:2] == ["pr", "update-branch"]:
         return REF_WHY
     if args[:2] == ["repo", "sync"]:
         values = {"-s", "--source", "-b", "--branch"}

@@ -144,11 +144,88 @@ def test_the_gh_wrapper_refuses_ref_tag_and_contents_writes_in_a_run(env, tmp_pa
         assert prguard.check(args, "/nonexistent/gh", cfg={}) == _cred_ref_why(), args
     for args in (["api", "repos/o/r/git/refs"], ["api", "repos/o/r/contents/README.md"],
                  ["api", "-X", "GET", "repos/o/r/git/refs/heads/main"], ["api", "graphql", "-f", "query={viewer{login}}"],
-                 ["release", "view", "v1"], ["release", "delete", "v1"], ["repo", "sync"],
+                 ["release", "view", "v1"], ["repo", "sync"],
                  ["repo", "sync", "--branch", "main"], ["api", "repos/o/r/issues", "-f", "title=t"]):
         assert prguard.check(args, "/nonexistent/gh", cfg={}) is None, args
     monkeypatch.delenv("TTP_RUN_DIR")
     assert prguard.check(["release", "create", "v1"], "/nonexistent/gh", cfg={}) is None
+
+
+def test_the_gh_wrapper_refuses_branch_rule_pr_branch_and_release_writes_in_a_run(env, tmp_path, monkeypatch):
+    # Each write next to a read of the same endpoint or command, which still passes.
+    from ttp import prguard
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    (tmp_path / "rule.graphql").write_text("mutation { createBranchProtectionRule(input: {}) { clientMutationId } }")
+    pairs = [
+        (["api", "-X", "PUT", "repos/o/r/branches/main/protection", "--input", "p.json"],
+         ["api", "repos/o/r/branches/main/protection"]),
+        (["api", "-X", "DELETE", "repos/o/r/branches/feature/x/protection/required_status_checks"],
+         ["api", "-X", "GET", "repos/o/r/branches/feature/x/protection/required_status_checks"]),
+        (["api", "repos/o/r/tags/protection", "-f", "pattern=v*"], ["api", "repos/o/r/tags/protection"]),
+        (["api", "repos/o/r/rulesets", "-f", "name=r", "-f", "enforcement=disabled"], ["api", "repos/o/r/rulesets"]),
+        (["api", "-X", "DELETE", "repositories/123/rulesets/7"], ["api", "repositories/123/rulesets/7"]),
+        (["api", "-X", "PUT", "repos/o/r/pulls/5/update-branch"], ["api", "repos/o/r/pulls/5/commits"]),
+        (["api", "graphql", "-f", "query=mutation{updateBranchProtectionRule(input:{}){clientMutationId}}"],
+         ["api", "graphql", "-f", "query={repository(owner:\"o\",name:\"r\"){branchProtectionRules(first:5){nodes{id}}}}"]),
+        (["api", "graphql", "-F", f"query=@{tmp_path / 'rule.graphql'}"],
+         ["api", "graphql", "-f", "query={viewer{login}}"]),
+        (["api", "graphql", "-f", "query=mutation{deleteRepositoryRuleset(input:{}){clientMutationId}}"],
+         ["api", "graphql", "-f", "query={repository(owner:\"o\",name:\"r\"){rulesets(first:5){nodes{id}}}}"]),
+        (["api", "graphql", "-f", "query=mutation{updatePullRequestBranch(input:{}){clientMutationId}}"],
+         ["api", "graphql", "-f", "query={repository(owner:\"o\",name:\"r\"){pullRequest(number:5){headRefName}}}"]),
+        (["pr", "update-branch", "5"], ["pr", "view", "5"]),
+        (["release", "edit", "v1", "--draft=false"], ["release", "view", "v1"]),
+        (["release", "-R", "o/r", "delete", "v1", "--yes"], ["release", "list", "-R", "o/r"]),
+        (["release", "delete", "v1"], ["release", "view", "v1", "--json", "assets"]),
+        (["release", "upload", "v1", "a.tgz"], ["release", "download", "v1"]),
+        (["release", "delete-asset", "v1", "a.tgz", "-y"], ["release", "list"]),
+    ]
+    for refused, allowed in pairs:
+        assert prguard.check(refused, "/nonexistent/gh", cfg={}) == _cred_ref_why(), refused
+        assert prguard.check(allowed, "/nonexistent/gh", cfg={}) is None, allowed
+    # PR merges stay under the charter's merge policy (credguard's doc), as `gh pr merge` does
+    assert prguard.check(["api", "-X", "PUT", "repos/o/r/pulls/5/merge"], "/nonexistent/gh", cfg={}) is None
+
+
+def test_the_hook_refuses_branch_rule_and_pr_branch_writes_sent_by_a_client(env, tmp_path, monkeypatch):
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    api = "https://api.github.com/repos/o/r"
+    for cmd in (f"curl -X PUT {api}/branches/main/protection -d @p.json",
+                f"curl -X DELETE -H \"Authorization: token $GH_TOKEN\" {api}/tags/protection/3",
+                f"curl -X POST {api}/rulesets -d '{{\"name\":\"r\"}}'",
+                f"curl -X PUT {api}/pulls/5/update-branch",
+                "curl -X POST https://api.github.com/graphql -d "
+                "'{\"query\":\"mutation{deleteBranchProtectionRule(input:{}){clientMutationId}}\"}'"):
+        assert "GitHub API" in _bash_why(tmp_path, cmd), cmd   # pulls/ routes: also the PR draft guard
+    for cmd in (f"curl {api}/branches/main/protection", f"curl -s {api}/rulesets", f"curl -X GET {api}/tags/protection",
+                "curl -X POST https://api.github.com/graphql -d '{\"query\":\"{viewer{login}}\"}'"):
+        assert "GitHub API" not in _bash_why(tmp_path, cmd), cmd
+
+
+def test_the_coordinator_file_tools_refuse_ssh_keys_not_listed_at_launch(env, tmp_path, monkeypatch):
+    from ttp import coordtools
+    home = _cred_home(tmp_path, monkeypatch)
+    monkeypatch.setenv(coordtools.DENIED_ENV, "")   # nothing listed: a key made after launch
+    (home / ".ssh" / "deploy_key").write_text("x\n")
+    (tmp_path / "link").symlink_to(home / ".ssh" / "deploy_key")
+
+    def decide(tool, **args):
+        out, _ = coordtools.pre_tool_use({"tool_name": tool, "tool_input": args})
+        return (out or {}).get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+    for full in ("", "1"):   # read-only and full tools take the same file check
+        monkeypatch.setenv(coordtools.FULL_ENV, full)
+        for tool, args in (("Read", {"file_path": str(home / ".ssh" / "deploy_key")}),
+                           ("Read", {"file_path": str(tmp_path / "link")}),
+                           ("Read", {"file_path": "~/.ssh/id_ed25519"}),
+                           ("Read", {"file_path": str(home / ".ssh" / "config.d" / ".." / "work-key")}),
+                           ("Grep", {"pattern": "PRIVATE", "path": str(home / ".ssh")}),
+                           ("Glob", {"pattern": "*", "path": str(home / ".ssh")})):
+            assert decide(tool, **args) == "deny", (full, tool, args)
+        for tool, args in (("Read", {"file_path": str(home / ".ssh" / "id_ed25519.pub")}),
+                           ("Read", {"file_path": str(home / ".ssh" / "config")}),
+                           ("Read", {"file_path": str(home / ".ssh" / "known_hosts")}),
+                           ("Read", {"file_path": str(tmp_path / "a.md")})):
+            assert decide(tool, **args) == "allow", (full, tool, args)
 
 
 def test_the_setup_box_plan_checks_pass_the_credential_guard(env, tmp_path, monkeypatch):
