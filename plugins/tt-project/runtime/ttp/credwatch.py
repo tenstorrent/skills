@@ -5,10 +5,12 @@
 Runs are unsandboxed, so a tool call can write any file in HOME, a login file too (a check that fed a
 patch for ~/.config/gh/ to a hook on the live HOME overwrote gh's hosts file and logged gh out on the
 host). The runner (runner.supervise) takes snapshot() as an agent starts and again once it ended, and
-writes changes() of the two to the run's exit.json; the daemon (observe) then queues one high
-observation per changed path for the coordinator, naming the run, and fails the run's hand-off. Only
-stat is read (size, mtime, ctime, inode), never a file's contents: no key or token is opened or hashed,
-and ctime still tells a same-size rewrite whose mtime was put back.
+writes changes() of the two to the run's exit.json; the daemon (observe) then queues one observation
+per changed path for the coordinator, naming the run: normal when this machine's change ledger records
+the change as made while the run ran, else high with the run's transcript line that shows it, or the
+file's time when none does. A change the ledger does not record fails the run's hand-off. Only stat is
+read (size, mtime, ctime, inode), never a file's contents: no key or token is opened or hashed, and
+ctime still tells a same-size rewrite whose mtime was put back.
 
 Two kinds of file (files()):
 - stores: gh's hosts file, git's and netrc's credential files, the ssh private keys, and every file
@@ -29,6 +31,7 @@ store_paths() is the one list of credential stores here, for a credential write 
 from __future__ import annotations
 
 import os
+import re
 import stat
 from pathlib import Path
 
@@ -160,21 +163,137 @@ def changes(before: dict, after: dict) -> list[list[str]]:
     return out
 
 
-def observe(db, run: dict, changed: list, now: float) -> int:
-    """One high observation per changed path of `run` (a runs row): the run, the path and what to do.
-    A change several overlapping runs saw is told once (the fingerprint holds the path and when it was
-    seen to change, to the minute). Returns how many it queued."""
+LEDGER_SLACK_S = 120   # a ledger entry this long before the run started still counts as made while it ran
+QUOTE = 200            # characters of a transcript line quoted in the observation
+# ssh-keygen writing to a scratch file (-f under /tmp or a mktemp/TMP variable), or only reading a key or
+# editing known_hosts (-l, -y, -F, -R, -B): it does not write the account's key
+SSH_SCRATCH = re.compile(r"""-f\s*\\?['"]?(?:/tmp/|/var/tmp/|\$\{?(?:TMP|tmp|TEMP|H\b|scratch)|\$\(mktemp)""")
+SSH_READ = re.compile(r"\s-[A-Za-z]*[lyFRB]\b")
+COMMAND_END = re.compile(r"\\n|;|&&|\|")
+
+
+def _forms(path: str, home: str) -> list[str]:
+    """The ways a command or a ledger entry writes `path`: as is, and from ~ or $HOME."""
+    out, home = [path], home.rstrip("/")
+    if home and path.startswith(home + "/"):
+        rel = path[len(home) + 1:]
+        out += [f"~/{rel}", f"$HOME/{rel}", f"${{HOME}}/{rel}"]
+    return out
+
+
+def _names(text: str, path: str, home: str) -> re.Match | None:
+    """Where `text` names `path` itself (not a longer name it begins, such as its .pub)."""
+    alt = "|".join(re.escape(f) for f in _forms(path, home))
+    return re.search(rf"(?:{alt})(?![\w-]|\.\w)", text)
+
+
+def _writer(line: str, path: str) -> re.Match | None:
+    """A command in `line` that writes a store like `path` without naming it: ssh-keygen with no scratch
+    -f for an ssh key, gh auth for gh's hosts file, git credential for git's or netrc's."""
+    if "/.ssh/" in path:
+        for m in re.finditer(r"\bssh-keygen\b", line):
+            cmd = COMMAND_END.split(line[m.end():m.end() + 300], 1)[0]
+            if not SSH_SCRATCH.search(cmd) and not SSH_READ.search(cmd):
+                return m
+        return None
+    if path.endswith("hosts.yml"):
+        return re.search(r"\bgh\s+auth\s+(?:login|logout|refresh|switch|setup-git)\b", line)
+    if path.endswith((".git-credentials", ".netrc")):
+        return re.search(r"\bgit\s+credential\b|credential\.helper", line)
+    return None
+
+
+def ledger_entry(path: str, start: float | None, now: float, home: str = "") -> dict | None:
+    """The newest entry, open or closed and of any project, of this machine's change ledger (the one
+    `ttp machines change list --all` reads) made while the run ran (from `start`, less LEDGER_SLACK_S,
+    to `now`) whose text names `path`; None without one, or when the machines list has no entry for
+    this machine."""
+    from . import machine_ledger, machines
+    me = machines.here()
+    if not me:
+        return None
+    lo = (start or now) - LEDGER_SLACK_S
+    hits = [c for c in machine_ledger.changes([me[0]], open_only=False)
+            if any(lo <= float(c.get(k) or 0) <= now for k in ("added", "since"))
+            and _names(str(c.get("what") or ""), path, home)]
+    return max(hits, key=lambda c: float(c.get("added") or 0), default=None)
+
+
+def unrecorded(changed: list, start: float | None, now: float, home: str = "") -> list:
+    """The changes of `changed` (changes() rows) the machine's change ledger does not record as made while
+    the run ran (ledger_entry): those fail its hand-off. An unreadable ledger records nothing."""
+    home = home or os.environ.get("HOME") or os.path.expanduser("~")
+    out = []
+    for c in changed:
+        try:
+            if ledger_entry(c[0], start, now, home):
+                continue
+        except Exception:
+            pass
+        out.append(c)
+    return out
+
+
+def transcript_hit(run_dir: str | Path | None, path: str, home: str = "") -> tuple[int, str] | None:
+    """(line number, quote) of the first line of the run's transcript (output.jsonl) that names `path`
+    or runs a command that writes such a store (_writer); None when none does."""
+    if not run_dir:
+        return None
+    try:
+        fh = open(Path(run_dir) / "output.jsonl", errors="replace")
+    except OSError:
+        return None
+    with fh:
+        for n, line in enumerate(fh, 1):
+            if m := _names(line, path, home) or _writer(line, path):
+                a = max(0, m.start() - QUOTE // 2)
+                return n, " ".join(line[a:a + QUOTE].split())
+    return None
+
+
+def observe(db, run: dict, changed: list, now: float, run_dir: str | Path | None = None, where=None) -> int:
+    """One observation per changed path of `run` (a runs row): the run, the path and where to start.
+    A change the machine's change ledger records as made while the run ran (ledger_entry) is a known,
+    deliberate one: told at normal severity naming the entry, its project and task, and no urgent work.
+    Any other is high, quoting the run's transcript line that names the path or runs a command that
+    writes it (transcript_hit) or, with none, saying so and giving the file's time (in `where`'s zone),
+    so the search starts at the right time. A change several overlapping runs saw is told once (the
+    fingerprint holds the path and when it was seen to change, to the minute). Returns how many it
+    queued."""
     run, told = dict(run), 0
+    home = os.environ.get("HOME") or os.path.expanduser("~")
     for path, how in changed:
         fp = f"credwatch:{path}:{int(now // 60)}"
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
             continue
         who = f"run {run.get('id')}" + (f" of task #{run['task']}" if run.get("task") else f" ({run.get('role')})")
+        try:
+            entry = ledger_entry(path, run.get("started"), now, home)
+        except Exception:   # an unreadable ledger never hides the alarm
+            entry = None
+        if entry:
+            by = f"project {entry.get('by') or '?'}" + (f" task #{entry['task']}" if entry.get("task") else "")
+            sev, text = "normal", (
+                f"Credential file {how} during {who}: {path}. The machine's change ledger records it as a "
+                f"deliberate change: #{entry.get('id')} by {by}: {str(entry.get('what') or '')[:300]}. Not this "
+                f"run's doing: no urgent work. If a login stops working, take it up with that project. Nothing "
+                f"was restored.")
+        else:
+            if hit := transcript_hit(run_dir, path, home):
+                seen = f"This run's transcript has it (output.jsonl line {hit[0]}: {hit[1]}): start there"
+            else:
+                seen = "Not seen in this run's commands; another process on the host may have done it"
+                try:
+                    from . import timefmt
+                    seen += f" (the file's time: {timefmt.long(os.stat(path).st_mtime, where)}): start there"
+                except OSError:
+                    pass
+            sev, text = "high", (
+                f"Credential file {how} during {who}: {path}. A run, or something else on the host while it "
+                f"ran, wrote the account's credential file (only its size, time and inode were compared). "
+                f"{seen}, and stop it recurring; if the login no longer works, ask the user to log in again "
+                f"(for gh: `gh auth login`). Nothing was restored.")
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
-             (now, "daemon", "observation", fp, "high",
-              f"Credential file {how} during {who}: {path}. A run, or something else on the host while it ran, "
-              f"wrote the account's credential file (only its size, time and inode were compared). Find which "
-              f"command did it in the run's transcript and stop it recurring; if the login no longer works, "
-              f"ask the user to log in again (for gh: `gh auth login`). Nothing was restored.", "queued"))
+             (now, "daemon", "observation", fp, sev, text, "queued"))
         told += 1
     return told

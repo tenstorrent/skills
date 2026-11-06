@@ -2828,9 +2828,16 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   and each provider's login file, plus every file under the write guard's protected paths (its defaults
   and `guards.protected_paths`, in HOME and the account's own home; known_hosts, gh's state file and
   cache folders left out). Only size, mtime, ctime and inode are compared, never contents: no key or
-  token is opened or hashed, and ctime still shows a same-size rewrite. A change queues one high
+  token is opened or hashed, and ctime still shows a same-size rewrite. A change queues one
   observation for the coordinator naming the run and the path (one per path and minute when several
-  overlapping runs saw it), and the run's hand-off is stored failed. Provider login files count only when removed or
+  overlapping runs saw it). When this machine's change ledger (`ttp machines change list --all`) has
+  an entry made while the run ran that names the path, the change was a recorded, deliberate one: the
+  observation is normal severity, names the entry, its project and task, asks for no urgent work, and
+  the run's hand-off stands. Otherwise it is high and quotes the first line of the run's transcript
+  that names the path or runs a command that writes such a file (ssh-keygen without a scratch `-f`,
+  `gh auth`, `git credential`), or, with none, says the run's commands did not show it and gives the
+  file's time, so the search starts there; and the run's hand-off is stored failed. Provider login
+  files count only when removed or
   rewritten to under half their size, since their CLIs rewrite them on every token refresh. Nothing is
   restored automatically: without reading contents the harness cannot tell damage from a real change (a new
   `gh auth login`, a refreshed token, a rotated key, by you or another run at the same time), a restore

@@ -189,3 +189,77 @@ def test_credwatch_a_run_that_changes_a_protected_path_fails_its_hand_off_and_a_
     assert task["status"] != "done" and res.get("status") == "failed", (task["status"], res)
     assert res.get("handoff_status") == "done" and res.get("cred_changed") == [[str(access / "token"), "changed"]], res
     assert "credential files changed" in res["summary"]
+    # The same write, recorded in this machine's change ledger while the run ran: normal, and its hand-off stands.
+    import time
+    from ttp import machine_ledger, machines
+    machines.add("testhost")   # this machine (TTP_HOST)
+    machine_ledger.add_change("testhost", "new token ~/.config/example-access/token", "none: test", "proj-x",
+                              task=9, expires="1d", now=time.time())
+    p.db.x("DELETE FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    tid = p.db.add_task("write the access token, recorded", "s", kind="work", tier="light", origin="user")
+    d.dispatch()
+    _finish_runs(p, d)
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert len(rows) == 1 and rows[0]["severity"] == "normal" and "by project proj-x task #9" in rows[0]["text"], rows
+    assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
+
+
+def test_credwatch_a_ledgered_change_is_normal_and_a_transcript_line_or_the_files_time_keeps_it_high(env, monkeypatch):
+    """A change the machine's change ledger records as made while the run ran (another project's new key)
+    is told at normal severity naming the entry; one the run's transcript shows stays high and quotes the
+    line; with neither it stays high, says the run's commands did not show it and gives the file's time."""
+    import json
+    import time
+    from ttp import credwatch, machines, timefmt
+    from ttp import machine_ledger as ml
+    home = env["tmp"] / "acct"
+    monkeypatch.setenv("HOME", str(home))
+    key, rsa = home / ".ssh" / "id_ed25519", home / ".ssh" / "id_rsa"
+    key.parent.mkdir(parents=True)
+    key.write_text("k\n")
+    rsa.write_text("k\n")
+    os.utime(key, (1_700_000_000, 1_700_000_000))
+    machines.add("testhost")   # this machine (TTP_HOST)
+    machines.add("box-b")
+    now = time.time()
+    run = {"id": 7, "task": 42, "role": "worker", "started": now - 600}
+    run_dir = env["tmp"] / "run7"
+    run_dir.mkdir()
+
+    def observe(path, at):
+        assert credwatch.observe(p_db, run, [[str(path), "created"]], at, run_dir, "UTC") == 1
+        return p_db.one("SELECT severity, text FROM events WHERE fingerprint=?", (f"credwatch:{path}:{int(at // 60)}",))
+
+    p_db = make(env).db
+    # Entries that do not count: another machine's, one naming only the .pub, one made before the run.
+    ml.add_change("box-b", "new key ~/.ssh/id_ed25519", "rm it", "proj-x", task=9, expires="1d", now=now - 60)
+    ml.add_change("testhost", "copied ~/.ssh/id_ed25519.pub out", "rm it", "proj-x", expires="1d", now=now - 60)
+    ml.add_change("testhost", "new key ~/.ssh/id_ed25519", "rm it", "proj-x", expires="1d", now=now - 3600)
+    row = observe(key, now)
+    assert row["severity"] == "high", row
+    assert "Not seen in this run's commands; another process on the host may have done it" in row["text"], row["text"]
+    assert timefmt.long(1_700_000_000, "UTC") in row["text"], row["text"]
+    # A ledger entry on this machine, made while the run ran, naming the path: normal, naming it.
+    c = ml.add_change("testhost", "new deploy key ~/.ssh/id_ed25519 for a hop", "mv it aside", "proj-x", task=9,
+                      expires="1d", now=now - 120)
+    row = observe(key, now + 60)
+    assert row["severity"] == "normal", row
+    assert f"#{c['id']} by project proj-x task #9" in row["text"] and "no urgent work" in row["text"], row["text"]
+    # Only the change no entry records fails the run's hand-off.
+    assert credwatch.unrecorded([[str(key), "created"], [str(rsa), "changed"]], run["started"], now + 60) == \
+        [[str(rsa), "changed"]]
+    # Another path the entry does not name, written by a command in the transcript: high, quoting its line.
+    lines = [{"type": "system"},
+             {"type": "assistant", "cmd": "ssh-keygen -t ed25519 -N '' -f /tmp/x/k"},    # a scratch key
+             {"type": "assistant", "cmd": "ssh-keygen -l -f ~/.ssh/id_rsa.pub"},         # reads the .pub
+             {"type": "assistant", "cmd": "ssh-keygen -t rsa -N '' -C me"}]
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    row = observe(rsa, now + 120)
+    assert row["severity"] == "high", row
+    assert "output.jsonl line 4" in row["text"] and "ssh-keygen -t rsa" in row["text"], row["text"]
+    # A line naming the path itself counts too; gh's hosts file goes by gh auth.
+    assert credwatch.transcript_hit(run_dir, str(rsa) + ".pub", str(home))[0] == 3
+    gh = str(home / ".config" / "gh" / "hosts.yml")
+    (run_dir / "output.jsonl").write_text(json.dumps({"cmd": "gh auth status"}) + "\n" +
+                                          json.dumps({"cmd": "gh auth login --with-token"}) + "\n")
+    assert credwatch.transcript_hit(run_dir, gh, str(home))[0] == 2

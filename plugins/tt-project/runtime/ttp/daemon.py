@@ -4364,7 +4364,7 @@ class Daemon:
             log(p, f"run {r['id']}: masking stored secrets failed\n" + traceback.format_exc())
         if exit_info.get("cred_changed"):
             try:
-                credwatch.observe(db, r, exit_info["cred_changed"], time.time())
+                credwatch.observe(db, r, exit_info["cred_changed"], time.time(), run_dir, p)
             except Exception:
                 log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
@@ -5540,8 +5540,10 @@ class Daemon:
         rejects = rstatus == "done" and task["kind"] == "review" and review_rejects(result)
         if rejects:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
-        if own and rstatus in HANDOFF_STATES and rstatus != "failed" and (cred := _cred_changed(run_dir)):
-            # The run changed a credential file (credwatch, observed above): its hand-off never stands.
+        if own and rstatus in HANDOFF_STATES and rstatus != "failed" and (
+                cred := credwatch.unrecorded(_cred_changed(run_dir), r.get("started"), time.time())):
+            # The run changed a credential file (credwatch, observed above) that no change ledger entry
+            # records as made while it ran: its hand-off never stands.
             rstatus, result = "failed", dict(result, status="failed", handoff_status=rstatus, cred_changed=cred,
                                              summary=f"Failed: credential files changed during the run "
                                                      f"({'; '.join(f'{p} {h}' for p, h in cred)[:400]}). Its "
