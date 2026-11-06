@@ -1299,9 +1299,11 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     config in temp folders that the processes it starts inherit, and a session fails, naming the paths,
     when a test still wrote one of the account's own files by an absolute path, or left an untracked
     file in the repository the suite runs from. Code run at import or collection sees a session temp HOME
-    too, and a session fails when a credential file (gh's hosts file here) changed, by stat alone."""
+    too, and a session fails when a credential file (gh's hosts file here) changed, by stat alone. A home
+    folder change no process of the session wrote (another process on a shared host) is only a warning."""
     import shutil
     import subprocess
+    import time
     real, repo, out = tmp_path / "realhome", tmp_path / "repo", tmp_path / "out"
     (real / ".config" / "systemd" / "user").mkdir(parents=True)
     (real / ".bashrc").write_text("mine\n")
@@ -1310,6 +1312,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (real / ".local" / "bin" / "ttp").write_text("#!/bin/sh\n")
     (real / ".claude").mkdir()
     (real / ".claude" / "settings.json").write_text("{}\n")
+    (real / ".codex").mkdir()
+    (real / ".codex" / "config.toml").write_text("model = 'a'\n")
     (real / ".config" / "gh").mkdir()
     (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: mine\n")
     (real / ".ssh").mkdir()
@@ -1321,7 +1325,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (repo / "plugins" / "tt-project").mkdir(parents=True)   # the plugin's credential list (credwatch)
     (repo / "plugins" / "tt-project" / "runtime").symlink_to(RUNTIME.parent)
     (repo / "test_tt_project_home.py").write_text(
-        "import os, pathlib, subprocess, pytest\n"
+        "import os, pathlib, subprocess, time, pytest\n"
         "REAL = os.environ['REAL']\n"
         "assert not os.environ['HOME'].startswith(REAL) and not os.environ['GH_CONFIG_DIR'].startswith(REAL)\n"
         "@pytest.mark.parametrize('i', range(60))\n"
@@ -1350,6 +1354,16 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        pathlib.Path(REAL, '.ssh/id_ed25519').write_text('x\\n')\n"
         "        pathlib.Path(REAL, '.ssh/id_new').write_text('x\\n')\n"
         "        pathlib.Path(REAL, '.ssh/known_hosts').write_text('h k\\n')\n"   # ssh's own appends: not a test's
+        "    if os.environ.get('CHILD'):\n"   # a child handed the path, by its command line
+        "        subprocess.run(['sh', '-c', f'printf x >> {REAL}/.zshrc'], check=True)\n"
+        "def test_outside():\n"   # another process on the host changes the account's files meanwhile
+        "    out = pathlib.Path(os.environ['OUT'])\n"
+        "    (out / 'ready').write_text('')\n"
+        "    for _ in range(600):\n"
+        "        if (out / 'done').exists():\n"
+        "            break\n"
+        "        time.sleep(0.1)\n"
+        "    assert (out / 'done').exists()\n"
         "def test_rewrite():\n"   # the account's own tooling (a deploy's `ttp setup`) rewriting a file
         "    for rel, text in (('.local/bin/ttp', '#!/bin/sh\\n'), ('.claude/settings.json', '{}\\n')):\n"
         "        path, tmp = pathlib.Path(REAL, rel), pathlib.Path(REAL, rel + '.tmp')\n"
@@ -1364,11 +1378,11 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         return subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", *args, str(repo)],
                               cwd=str(repo), env={**env, **extra}, capture_output=True, text=True, timeout=120)
 
-    r = run()
+    r = run("-k", "not test_outside")
     assert r.returncode == 0 and "62 passed" in r.stdout, r.stdout + r.stderr
     homes = {(out / f"home-{i}").read_text() for i in range(60)}
     assert len(homes) == 60, "tests shared a HOME"
-    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".claude", ".config", ".gitconfig", ".local", ".ssh"] and (real / ".bashrc").read_text() == "mine\n"
+    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".claude", ".codex", ".config", ".gitconfig", ".local", ".ssh"] and (real / ".bashrc").read_text() == "mine\n"
     assert (real / ".gitconfig").read_text() == "[t]\n\tmine = 1\n"
     assert not list((real / ".config" / "systemd" / "user").iterdir())
     assert "wrote outside" not in r.stdout
@@ -1397,6 +1411,30 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
     for line in (f"{real}/.local/bin/ttp: changed", f"{real}/.claude/settings.json: changed"):
         assert f"  {line}\n" in r.stdout, r.stdout
+    # A child the test handed the path to (a shell writing by its command line) is the session's too.
+    r = run("-k", "test_leak", CHILD="1")
+    assert r.returncode == 1 and "1 passed" in r.stdout and f"  {real}/.zshrc: created\n" in r.stdout, r.stdout
+    assert "by no write of this session" not in r.stdout, r.stdout
+    (real / ".zshrc").unlink()
+    # Another process on the host changes watched files while the session runs (an agent CLI rewrites its
+    # config file as it starts, another project removes a systemd user unit): a warning, not a failure.
+    p = subprocess.Popen([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-k", "test_outside",
+                          str(repo)], cwd=str(repo), env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+    try:
+        for _ in range(600):
+            if (out / "ready").exists() or p.poll() is not None:
+                break
+            time.sleep(0.1)
+        (real / ".codex" / "config.toml").write_text("model = 'b'\n")
+        (real / ".config" / "systemd" / "user" / "x.service").unlink()
+        (out / "done").write_text("")
+        text = p.communicate(timeout=120)[0]
+    finally:
+        p.kill()
+    assert p.returncode == 0 and "1 passed" in text and "wrote outside" not in text, text
+    assert "by no write of this session (another process on the host; not a failure)" in text, text
+    for line in (f"{real}/.codex/config.toml: changed", f"{real}/.config/systemd/user/x.service: removed"):
+        assert f"  {line}\n" in text, text
 
 
 def test_spawned_git_and_gh_see_the_temp_home(_temp_home):
@@ -1429,6 +1467,69 @@ def _test_conftest():
     mod = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(mod)
     return mod
+
+
+def test_the_session_records_only_its_own_writes_to_the_account_home(tmp_path, monkeypatch):
+    """The suite's write recorder (an audit hook in each of the session's processes) records a watched
+    home path the session wrote or handed to a child, by any route, and nothing else: another process's
+    change to the same path is then a warning, a recorded one a failure."""
+    c = _test_conftest()
+    home, other = tmp_path / "u", tmp_path / "u2"
+    (home / ".codex").mkdir(parents=True)
+    (home / ".config" / "systemd" / "user").mkdir(parents=True)
+    other.mkdir()
+    real = tmp_path / "real"
+    real.symlink_to(home)
+    log = tmp_path / "writes.log"
+    base = {"HOME": "/tmp/session-home", "PATH": f"/usr/bin:{home}/.local/bin", "PYTHONUSERBASE": f"{home}/.local"}
+
+    def record(*events):
+        log.unlink(missing_ok=True)
+        rec = c._WriteRecorder(str(home), c.HOME_WATCHED, str(log), base)
+        for event, args in events:
+            rec(event, args)
+        return c.recorded_writes(str(log))
+
+    W, R = os.O_WRONLY | os.O_CREAT | os.O_TRUNC, os.O_RDONLY
+    monkeypatch.chdir(home)
+    # Reads, unwatched paths, a neighbour folder sharing the name's prefix and the session's own env: nothing.
+    assert record(("open", (f"{home}/.bashrc", "r", R)), ("open", (f"{home}/notes.txt", "w", W)),
+                  ("open", (f"{other}/.bashrc", "w", W)), ("open", (3, "w", W)),
+                  ("subprocess.Popen", (None, ["git", "-C", f"{home}/repo", "status"], f"{home}/repo",
+                                        {**base, "HOME": "/tmp/t1", "PATH": f"/tmp/bin:{base['PATH']}"})),
+                  ("subprocess.Popen", (None, f"ls {other}/.bashrc", None, None))) == set()
+    # Writes by every route, relative ones and through a symlink to the home folder too.
+    got = record(("open", (".bashrc", "a", os.O_WRONLY | os.O_APPEND)),
+                 ("os.rename", (f"{home}/.codex/c.tmp", f"{home}/.codex/config.toml", None, None)),
+                 ("os.remove", (f"{home}/.config/systemd/user/x.service", None)),
+                 ("os.mkdir", (f"{home}/.claude/skills/new", 0o777, None)), ("os.symlink", ("/x", f"{home}/.mcp.json", None)),
+                 ("shutil.rmtree", (f"{home}/.idea", None)), ("os.truncate", (f"{home}/.profile", 0)),
+                 ("open", (f"{home}/.gitconfig".encode(), "wb", W)))
+    assert got == {f"{home}/{rel}" for rel in (".bashrc", ".codex/config.toml", ".config/systemd/user/x.service",
+                                               ".claude/skills/new", ".mcp.json", ".idea", ".profile", ".gitconfig")}, got
+    log.unlink()
+    c._WriteRecorder(str(real), c.HOME_WATCHED, str(log), base)("open", (f"{home}/.zshrc", None, W))   # HOME a symlink
+    assert c.recorded_writes(str(log)) == {f"{real}/.zshrc"}
+    # A child handed a watched path or the home folder: by its command line, shell text, working folder,
+    # an env value the session does not have, or an explicit env with no HOME (it then uses passwd's).
+    assert record(("subprocess.Popen", (None, ["sh", "-c", f"printf x > '{home}/.bashrc'"], None, None))) == {f"{home}/.bashrc"}
+    assert record(("os.system", (f"echo x>{home}/.codex/config.toml",)),) == {f"{home}/.codex/config.toml"}
+    assert record(("subprocess.Popen", (None, ["tool"], str(home), None))) == {str(home)}
+    assert record(("subprocess.Popen", (None, ["tool"], None, {**base, "HOME": str(home)}))) == {str(home)}
+    assert record(("os.posix_spawn", ("/bin/tool", ["tool"], {"PATH": "/usr/bin"}))) == {str(home)}
+    assert record(("os.exec", ("/bin/tool", ["tool", f"--config={home}/.codex"], base))) == {f"{home}/.codex"}
+    # The verdict: a change below, at or above a recorded path is the session's; any other is a warning.
+    before = {"home": c.home_marks(home), "home_path": str(home), "repo": None, "repo_path": str(tmp_path)}
+    (home / ".codex" / "config.toml").write_text("model = 'b'\n")
+    (home / ".config" / "systemd" / "user" / "x.service").write_text("")
+    (home / ".bashrc").write_text("x\n")
+    after = {**before, "home": c.home_marks(home)}
+    own, warn = c.written_outside(before, after, {f"{home}/.bashrc", f"{home}/.config/systemd"})
+    assert own == [f"  {home}/.bashrc: created", f"  {home}/.config/systemd/user/x.service: created"], own
+    assert warn == [f"  {home}/.codex/config.toml: created"], warn
+    assert c.written_outside(before, after) == ([own[0], warn[0], own[1]], []), "no record: every change is the session's"
+    # A hook that raises would fail the call it audits: a bad payload is ignored.
+    assert record(("open", (object(), "w", W)), ("subprocess.Popen", (None, None, None, 5))) == set()
 
 
 def test_ssh_and_gh_folder_marks_stat_only_and_open_no_file(tmp_path, monkeypatch):

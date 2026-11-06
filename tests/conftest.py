@@ -123,7 +123,8 @@ _git_global_config()
 # one of its own (_session_home), and every process they start inherits them. Python's user packages stay importable from the account's own user base. A session
 # also fails when, at its end, one of the account's own files below (HOME_WATCHED, under REAL_HOME) or
 # an untracked file in the repository the suite runs from is new or changed: what a test wrote there by
-# an absolute path, or relative to its working folder.
+# an absolute path, or relative to its working folder. A home folder change that no process of the session
+# recorded writing (_WriteRecorder) is another process's on a shared host: a warning, not a failure.
 REAL_HOME = os.path.expanduser("~")
 _XDG = {"XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
         "XDG_CACHE_HOME": ".cache"}
@@ -206,12 +207,18 @@ def credential_marks(before: dict | None = None):
     ([[path, how], ...]); None when the plugin's runtime is not beside this file or the child fails."""
     if _RUNTIME is None:
         return None
+    recorder = getattr(sys.modules.get("_ttp_suite_writes"), "recorder", None)
+    if recorder:   # its own child reads under the account's environment: no write of a test
+        recorder.quiet += 1
     try:
         r = subprocess.run([sys.executable, "-I", "-c", _CRED_SCRIPT, str(_RUNTIME)], input=json.dumps(before),
                            capture_output=True, text=True, timeout=60, env=_REAL_ENV, cwd=os.sep)
         return json.loads(r.stdout) if r.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+    finally:
+        if recorder:
+            recorder.quiet -= 1
 
 
 # The account's ssh folder and gh's config folder, whole: each regular file's size, mtime, ctime and inode
@@ -326,28 +333,154 @@ def untracked_files(root: str | Path) -> set[str] | None:
     return {e[3:] for e in r.stdout.split("\0") if e.startswith("?? ")}
 
 
-def written_outside(before: dict, after: dict) -> list[str]:
-    """What a session wrote outside its temp folders, from two snapshots of {"home": home_marks,
-    "home_path": ..., "repo": untracked_files, "repo_path": ...}: one line per path."""
-    lines = []
+def written_outside(before: dict, after: dict, recorded=None) -> tuple[list[str], list[str]]:
+    """What changed outside a session's temp folders, from two snapshots of {"home": home_marks,
+    "home_path": ..., "repo": untracked_files, "repo_path": ...}: one line per path, as (the session's
+    own changes, home folder changes no recorded write of the session explains). `recorded`: the
+    session's recorded writes (recorded_writes); None counts every change as the session's."""
+    home: list[tuple[str, str]] = []
     for rel, was in before["home"].items():
         now = after["home"].get(rel)
         path = os.path.join(before["home_path"], rel)
         if was == now:
             continue
         if isinstance(was, frozenset) and isinstance(now, frozenset):
-            lines += [f"  {os.path.join(path, n)}: created" for n in sorted(now - was)]
-            lines += [f"  {os.path.join(path, n)}: removed" for n in sorted(was - now)]
+            home += [(os.path.join(path, n), "created") for n in sorted(now - was)]
+            home += [(os.path.join(path, n), "removed") for n in sorted(was - now)]
         else:
-            lines.append(f"  {path}: {'created' if was is None else 'removed' if now is None else 'changed'}")
-    if before["repo"] is not None and after["repo"] is not None:
-        lines += [f"  {os.path.join(before['repo_path'], f)}: created" for f in sorted(after["repo"] - before["repo"])]
-    return lines
+            home.append((path, "created" if was is None else "removed" if now is None else "changed"))
+    own = [f"  {p}: {how}" for p, how in home if recorded is None or own_change(p, recorded)]
+    other = [f"  {p}: {how}" for p, how in home if recorded is not None and not own_change(p, recorded)]
+    if before["repo"] is not None and after["repo"] is not None:   # the run's own checkout: always its own
+        own += [f"  {os.path.join(before['repo_path'], f)}: created" for f in sorted(after["repo"] - before["repo"])]
+    return own, other
 
 
 def _outside_snapshot(config) -> dict:
     root = str(config.rootpath)
     return {"home": home_marks(REAL_HOME), "home_path": REAL_HOME, "repo": untracked_files(root), "repo_path": root}
+
+
+# Other processes on a shared host change the account's own files while a suite runs (an agent CLI
+# rewrites its config file when it starts, another project's setup adds or removes a systemd user unit),
+# so a change alone does not say a test made it. Each process of the session (the main one, its forked
+# workers, xdist's workers) records in one log the watched paths it wrote (a write open, rename, remove,
+# mkdir, link, truncate or rmtree there or above) and the ones it handed to a child it started (by its
+# command line, working folder or an explicit environment that differs from the session's, or that
+# lacks HOME: the child then finds the account's home from its passwd entry). A change to a recorded
+# path fails the session; any other is a warning line. A child that finds the account's home by itself
+# while the session's temp HOME is set (ssh, a script calling getpwuid) is not seen: its change is a warning.
+_WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
+_PATH_CHARS = r"[^\s'\"`;:,=()&|<>]"
+
+
+class _WriteRecorder:
+    """The audit hook: appends each watched path under `home` that this process wrote or handed to a
+    child, once per process, to the file `log`. `env` is the session's own environment (a child's
+    explicit environment counts only where it differs from it)."""
+
+    SPAWNS = {"subprocess.Popen", "os.system", "os.exec", "os.posix_spawn", "os.spawn"}
+    WRITES = {"os.rename": (0, 1), "os.remove": (0,), "os.rmdir": (0,), "os.mkdir": (0,), "os.symlink": (1,),
+              "os.link": (1,), "os.truncate": (0,), "shutil.rmtree": (0,)}
+
+    def __init__(self, home: str, watched, log: str, env: dict):
+        self.homes = sorted({os.path.normpath(home), os.path.realpath(home)}, key=len, reverse=True)
+        self.home = os.path.normpath(home)
+        self.watched = [os.path.join(self.home, rel) for rel in watched]
+        self.log, self.env, self.seen, self.quiet = log, dict(env), set(), 0   # quiet: the conftest's own child
+        self.found = re.compile("|".join(re.escape(h) for h in self.homes) + rf"(?:/{_PATH_CHARS}*)?(?![^\s'\"`;:,=()&|<>/])")
+
+    def __call__(self, event: str, args: tuple) -> None:
+        if self.quiet:
+            return
+        try:
+            if event == "open":
+                if isinstance(args[2], int) and args[2] & _WRITE_FLAGS or isinstance(args[1], str) and set(args[1]) & set("wax+"):
+                    self.wrote(args[0])
+            elif event in self.WRITES:
+                for i in self.WRITES[event]:
+                    self.wrote(args[i])
+            elif event in self.SPAWNS:
+                self.spawned(event, args)
+        except Exception:   # an audit hook that raises would fail the call it audits
+            pass
+
+    def wrote(self, path) -> None:
+        if isinstance(path, int) or path is None:
+            return
+        path = os.fsdecode(os.fspath(path))
+        if not os.path.isabs(path):
+            path = os.path.abspath(path)
+        for h in self.homes:
+            if path == h or path.startswith(h + os.sep):
+                self.record(self.home + os.path.normpath(path)[len(h):])
+                return
+
+    def spawned(self, event: str, args: tuple) -> None:
+        if event == "subprocess.Popen":
+            exe, argv, cwd, env = args
+            texts = [exe, cwd] + ([argv] if isinstance(argv, (str, bytes, os.PathLike)) else list(argv or ()))
+        elif event == "os.system":
+            texts, env = [args[0]], None
+        else:
+            texts, env = [args[-3]] + list(args[-2] or ()), args[-1]
+        if env is not None:
+            env = {os.fsdecode(k): os.fsdecode(v) for k, v in dict(env).items()}
+            if "HOME" not in env:
+                self.record(self.home)
+            for key, value in env.items():
+                own = set(self.env.get(key, "").split(os.pathsep))
+                texts += [part for part in value.split(os.pathsep) if part not in own]
+        for text in texts:
+            if text is not None:
+                for m in self.found.finditer(os.fsdecode(os.fspath(text))):
+                    self.wrote(m.group(0))
+
+    def record(self, path: str) -> None:
+        if path in self.seen or not any(path == w or w.startswith(path + os.sep) or path.startswith(w + os.sep)
+                                        for w in self.watched):
+            return
+        self.seen.add(path)
+        fd = os.open(self.log, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+        try:
+            os.write(fd, (path + "\n").encode())
+        finally:
+            os.close(fd)
+
+
+def recorded_writes(log: str | None) -> set[str]:
+    try:
+        return set(Path(log).read_text().split("\n")) - {""} if log else set()
+    except OSError:
+        return set()
+
+
+def own_change(path: str, recorded) -> bool:
+    """True when the session recorded `path`, a folder above it or a path below it."""
+    return any(path == r or path.startswith(r + os.sep) or r.startswith(path + os.sep) for r in recorded)
+
+
+def _write_log() -> str:
+    """The session's write log, one per process however often this file is imported (a test loads it
+    afresh), and one hook: sys.addaudithook cannot remove one. xdist's workers append to the log of the
+    session that started them."""
+    shared = sys.modules.get("_ttp_suite_writes")
+    if shared is None:
+        shared = sys.modules["_ttp_suite_writes"] = type(sys)("_ttp_suite_writes")
+        log = os.environ.get("TTP_TEST_WRITE_LOG") if os.environ.get("PYTEST_XDIST_WORKER") else None
+        if not log:
+            import atexit
+            import tempfile
+            fd, log = tempfile.mkstemp(prefix="ttp-test-writes-")
+            os.close(fd)
+            atexit.register(lambda: os.path.exists(log) and os.unlink(log))
+            os.environ["TTP_TEST_WRITE_LOG"] = log
+        shared.log, shared.recorder = log, _WriteRecorder(REAL_HOME, HOME_WATCHED, log, os.environ)
+        sys.addaudithook(shared.recorder)
+    return shared.log
+
+
+_WRITE_LOG = _write_log()
 
 
 def _jobs(config, items) -> int:
@@ -585,11 +718,15 @@ def pytest_sessionstart(session):
 
 def pytest_sessionfinish(session, exitstatus):
     before = getattr(session.config, "_ttp_outside", None)
-    written = written_outside(before, _outside_snapshot(session.config)) if before else []
+    written, other = (written_outside(before, _outside_snapshot(session.config), recorded_writes(_WRITE_LOG))
+                      if before else ([], []))
     if written:
         _report(session, ["tests wrote outside their temp folders (the account's home folder or the "
                           "repository the suite runs from):"] + written)
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    if other:
+        _report(session, ["ttp-suite: warning: the account's home folder changed while the tests ran, by no "
+                          "write of this session (another process on the host; not a failure):"] + other, red=False)
     creds = getattr(session.config, "_ttp_creds", None)
     changed = credential_marks(creds) if creds else None
     if changed:
@@ -618,11 +755,11 @@ def pytest_sessionfinish(session, exitstatus):
     session.exitstatus = pytest.ExitCode.TESTS_FAILED
 
 
-def _report(session, lines: list[str]) -> None:
+def _report(session, lines: list[str], red: bool = True) -> None:
     tr = session.config.pluginmanager.get_plugin("terminalreporter")
     for line in lines:
         if tr:
-            tr.write_line(line, red=True)
+            tr.write_line(line, red=red, yellow=not red)
         else:
             print(line, file=sys.stderr)
 
