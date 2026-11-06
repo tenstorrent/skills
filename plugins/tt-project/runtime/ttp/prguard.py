@@ -824,8 +824,13 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
     return None
 
 
+_ALIAS_LISTS: dict[str, str] = {}   # real gh -> its `gh alias list`, read once per gh call (main clears it)
+
+
 def _alias(real: str, name: str) -> str | None:
-    for line in _gh(real, "alias", "list").splitlines():
+    if real not in _ALIAS_LISTS:
+        _ALIAS_LISTS[real] = _gh(real, "alias", "list")
+    for line in _ALIAS_LISTS[real].splitlines():
         k, _, v = line.partition(":")
         if k.strip() == name and v.strip():
             return v.strip().strip("'\"")
@@ -1149,6 +1154,7 @@ def main(argv: list[str], own_dir: str) -> int:
         print("gh: not found on PATH", file=sys.stderr)
         return 127
     args = argv[1:]
+    _ALIAS_LISTS.clear()
     if not needs_stdin(args):
         _stdin_devnull()   # a parent's open pipe never reaches the hooks or the real gh
     why = run_gh_hooks(args, own_dir, real)   # the project's own checks first: they can only refuse
@@ -1170,9 +1176,9 @@ def main(argv: list[str], own_dir: str) -> int:
         stdin_text = stdin_raw.decode("utf-8", "replace")
     from . import outscan
     try:
-        if stdin_text is None and outscan.in_run() and outscan.gh_reads_stdin(args):
+        if stdin_text is None and not os.isatty(0) and outscan.gh_wants_stdin(args, real):
             stdin_text = sys.stdin.read()   # scanned here, then passed on to gh
-        why = outscan.gh_problem(args, stdin_text)
+        why = outscan.gh_problem(args, stdin_text, real)
     except Exception as e:   # fails closed: a run's gh call may carry what the scan is for
         why = f"refused: the leak scan failed ({type(e).__name__}); nothing was sent"
     if why:

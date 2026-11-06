@@ -10,8 +10,10 @@ the run read. It looks for:
 - the project's own forbidden-data patterns (forbidden.py), when it declares any.
 
 It covers a run's outward writes (TTP_TASK set):
-- every `gh` call through the run's bin/gh (prguard.main): its arguments, and the files and stdin it
-  sends (--body-file, --notes-file, --input, -F, gist files);
+- every `gh` call through the run's bin/gh (prguard.main), its gh alias expanded: its arguments, and
+  the files and stdin it sends (--body-file, --notes-file, --input, -F file and -F key=@file, gist
+  files, and stdin wherever gh keeps it: gist create, variable and secret set, workflow run, an alias
+  or extension; not auth login or codespace ssh, see STDIN_UNSCANNED);
 - `ttp note --to` / `--reply` and `ttp notify`.
 A daemon's chat post (slack.Slack._body) cannot be refused without losing the message: stored values
 are masked there already (redact.scrub) and credential shapes are masked by mask_shapes().
@@ -119,12 +121,11 @@ def _gh_files(args: list[str]) -> list[str]:
     """The files (or `-`) whose contents `gh <args>` sends."""
     from .prguard import _opts, _positionals
     files = _opts(args, ("--body-file", "--notes-file", "--input"))
-    api = args[:1] == ["api"]
     for v in _opts(args, ("-F", "--field")):
         v = v[1:] if v.startswith("=") else v   # -F=x is -F x to gh
-        if not api:
-            files.append(v)                      # pr, issue, release: the body or notes file
-        elif v.partition("=")[2].startswith("@"):
+        if args[:1] in (["pr"], ["issue"], ["release"]):
+            files.append(v)                      # the body or notes file
+        if v.partition("=")[2].startswith("@"):  # api fields, workflow run inputs: key=@file reads the file
             files.append(v.partition("=")[2][1:])
     if args[:2] == ["gist", "create"] or args[:2] == ["gist", "edit"]:
         files += _positionals(args[2:], ("-d", "--desc", "-f", "--filename", "-a", "--add"))
@@ -132,10 +133,38 @@ def _gh_files(args: list[str]) -> list[str]:
     return files
 
 
-def gh_reads_stdin(args: list[str]) -> bool:
-    """Whether the payload of `gh <args>` comes (in part) from stdin, which the scan must then read."""
-    from .prguard import STDIN_PATHS
-    return bool(STDIN_PATHS.intersection(_gh_files(args)))
+def gh_resolve(args: list[str], real: str | None) -> tuple[list[str], str]:
+    """`gh <args>` with its gh alias expanded the way prguard.check does (up to depth 3), and the
+    expansion text of a shell alias (`!...`, whose command cannot be parsed: its text is scanned)."""
+    from .prguard import GH_COMMANDS, _alias, _expand
+    for _ in range(3):
+        if not real or not args or args[0] in GH_COMMANDS or args[0].startswith("-"):
+            break
+        expansion = _alias(real, args[0])
+        if expansion is None:
+            break
+        if expansion.startswith("!"):
+            return args, expansion
+        args = _expand(expansion, args[1:])
+    return args, ""
+
+
+# Commands whose stdin is not scanned or read ahead: `auth login --with-token` reads gh's own token
+# (which matches the token shape by design, and goes only to the host it signs in to), and
+# `codespace ssh` streams stdin to the run's own codespace as a session, which reading it to its end
+# first would break.
+STDIN_UNSCANNED = frozenset((("auth", "login"), ("codespace", "ssh")))
+
+
+def gh_wants_stdin(args: list[str], real: str | None) -> bool:
+    """Whether a run's `gh <args>` may send its stdin off the host, so the scan reads it first (and gh
+    then gets it as read): every call prguard.needs_stdin keeps stdin for, after alias expansion, but
+    STDIN_UNSCANNED. A shell alias or an extension may read it too."""
+    from .prguard import needs_stdin
+    if not in_run() or not needs_stdin(args):
+        return False
+    resolved, shell = gh_resolve(args, real)
+    return bool(shell) or tuple(resolved[:2]) not in STDIN_UNSCANNED and needs_stdin(resolved)
 
 
 def _read(path: str) -> str:
@@ -146,14 +175,21 @@ def _read(path: str) -> str:
         return ""   # gh fails on it too, sending nothing
 
 
-def gh_problem(args: list[str], stdin_text: str | None) -> str | None:
-    """Why `gh <args>` must not run: it would send a leak. None when clean or outside a run."""
+def gh_problem(args: list[str], stdin_text: str | None, real: str | None = None) -> str | None:
+    """Why `gh <args>` must not run: it would send a leak. None when clean or outside a run. `real` is
+    the real gh, to expand an alias (prguard caches its alias list for the call)."""
     if not in_run() or not args:
         return None
     from .prguard import STDIN_PATHS
-    texts = [" ".join(args)]
-    for f in _gh_files(args):
-        texts.append(stdin_text or "" if f in STDIN_PATHS else _read(f))
-    why = problem(f"gh {' '.join(args[:2])}".rstrip(), *texts)
+    resolved, shell = gh_resolve(args, real)
+    texts = [" ".join(args), " ".join(resolved), shell, stdin_text or ""]
+    texts += [_read(f) for f in ([] if shell else _gh_files(resolved)) if f not in STDIN_PATHS]
+    hit = matcher()
+    words = []   # the command words only: an alias's or extension's second word may be the payload
+    for w in args[:2]:
+        if not re.fullmatch(r"[a-z][a-z-]{0,30}", w) or hit(w):
+            break
+        words.append(w)
+    why = problem(" ".join(["gh", *words]), *texts)
     return why and f"refused: {why}"
 

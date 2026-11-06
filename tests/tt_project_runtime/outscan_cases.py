@@ -105,3 +105,64 @@ def test_a_chat_post_masks_credential_shapes_and_stored_values(env, monkeypatch)
     body = Slack._body("demo", f"token {_OUT_SHAPE} and {_OUT_SECRET}", None)
     assert _OUT_SHAPE not in body and _OUT_SECRET not in body
     assert "[redacted:GitHub token]" in body and "[secret:acme]" in body
+
+
+_OUT_FAKE_GH = '''#!{python}
+import os, sys
+a = sys.argv[1:]
+if a[:2] == ["alias", "list"]:
+    with open(os.environ["FAKE_GH_LOG"] + ".aliases", "a") as f:
+        f.write("listed\\n")
+    print("post: api repos/acme/widgets/issues/7/comments -F body=@$1")
+    print("put: gist create")
+    print("sh: !cat $1 | gh gist create")
+    sys.exit(0)
+with open(os.environ["FAKE_GH_LOG"], "a") as f:
+    f.write(" ".join(a) + " <" + ("" if os.isatty(0) else sys.stdin.read()) + ">\\n")
+'''
+
+
+def test_runs_gh_scans_kept_stdin_aliases_and_field_files(env, tmp_path, monkeypatch):
+    """Review #6111: stdin gh keeps without a `-` (gist create, variable set, workflow run, an alias or
+    extension), a gh alias's expansion (its files, a shell alias's text) and `-F key=@file` on any command
+    are scanned; clean ones run with their stdin passed on; auth login's stdin is left to gh."""
+    p = _outscan_project(env, monkeypatch)
+    fake = tmp_path / "fakebin"
+    fake.mkdir()
+    (fake / "gh").write_text(_OUT_FAKE_GH.format(python=sys.executable))
+    (fake / "gh").chmod(0o755)
+    log, f = tmp_path / "gh.log", tmp_path / "payload.txt"
+    routes = [lambda t: (["gist", "create", "--public"], t.encode()),
+              lambda t: (["variable", "set", "X"], t.encode()),
+              lambda t: (["workflow", "run", "w", "--json"], t.encode()),
+              lambda t: (["myext", "send"], t.encode()),
+              lambda t: (["put"], t.encode()),
+              lambda t: (f.write_text(t) and ["post", str(f)], b""),
+              lambda t: (["sh", t], b""),
+              lambda t: (["sh", "x"], t.encode()),
+              lambda t: (f.write_text(t) and ["workflow", "run", "w", "-F", f"note=@{f}"], b""),
+              lambda t: (f.write_text(t) and ["workflow", "run", "w", "--field=note=@" + str(f)], b"")]
+    for leak in (_OUT_SECRET, _OUT_SHAPE, "serial " + _OUT_FORBIDDEN):
+        for route in routes:
+            args, data = route(f"status: {leak}")
+            log.write_text("")
+            r = _gh_main(p, tmp_path, args, data, fake=fake)
+            err = r.stderr.decode()
+            assert r.returncode == 1 and "refused" in err and "nothing was sent" in err, (args, err)
+            assert leak not in err and log.read_text() == "", args
+    for route in routes:
+        args, data = route("status: all green")
+        log.write_text("")
+        r = _gh_main(p, tmp_path, args, data, fake=fake)
+        assert r.returncode == 0 and "refused" not in r.stderr.decode(), (args, r.stderr)
+        assert log.read_text().count("\n") == 1, args
+        if data:
+            assert "<status: all green>" in log.read_text(), args   # read once, passed on to gh
+    # One `gh alias list` per call, though both the scan and the draft guard expand the alias.
+    (tmp_path / "gh.log.aliases").write_text("")
+    _gh_main(p, tmp_path, ["put"], b"fine", fake=fake)
+    assert (tmp_path / "gh.log.aliases").read_text() == "listed\n"
+    # auth login --with-token reads gh's own token: not scanned, and gh still gets it.
+    log.write_text("")
+    r = _gh_main(p, tmp_path, ["auth", "login", "--with-token"], _OUT_SHAPE.encode(), fake=fake)
+    assert r.returncode == 0 and _OUT_SHAPE in log.read_text()

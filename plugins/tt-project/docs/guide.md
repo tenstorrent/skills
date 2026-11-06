@@ -2967,8 +2967,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   harness knows of.
 - A run's outward writes are scanned before they leave, model-free (`ttp/outscan.py`), so a stored
   secret or a token stays home even when text the run read asks to send it: every `gh` call through
-  the harness's `bin/gh` (its arguments, and the body, notes, `--input`, `-F` and gist files or stdin
-  it sends), `ttp note --to` / `--reply` and `ttp notify`. Each is checked for every stored secret
+  the harness's `bin/gh`, with a gh alias expanded first (its arguments, a shell alias's text, the
+  body, notes, `--input`, `-F` and `-F key=@file` and gist files, and stdin wherever gh keeps it:
+  gist create, variable and secret set, workflow run, an alias or extension, read once and passed on;
+  not `auth login`, whose stdin is gh's own token, or `codespace ssh`, which streams it as a session),
+  `ttp note --to` / `--reply` and `ttp notify`. Each is checked for every stored secret
   value (as is and JSON-escaped), common credential shapes (forge, chat and cloud tokens, private-key
   headers) and the project's forbidden-data patterns. A hit is refused with one line naming its class
   (the secret's slot, the shape or the pattern's label), never the text, and nothing is sent. A chat
