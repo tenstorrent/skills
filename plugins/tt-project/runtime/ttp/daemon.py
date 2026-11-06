@@ -220,6 +220,7 @@ from . import reviewhold
 from . import carryback
 from . import reviewreuse
 from . import reviewstats
+from . import splitgate
 from . import reviewsup
 from . import runner
 from . import schedule as sched
@@ -8387,6 +8388,11 @@ class Daemon:
         if split:
             text += (f"\nSplit at head {split[:12]}: no review of it; its continue hop builds on this branch, and "
                      f"the chain's last hop gets the one review.")
+        # A change over chains.split_lines goes back to its worker once with a split order, before any review.
+        resplit = self._split_back(task, result, int(task["attempts"] or 0)) \
+            if new in ("done", "review") and not split and not requeued and self._code_change(task) else ""
+        if resplit:
+            text += f"\n{resplit}"
         # An urgent or owed one's (an open obligation's owner) review is queued at once on a needs_review hand-off
         # too (no sweep_after_s wait).
         # Accepted gap: _auto_review (and _fix_without_commits below) still run a few local ref-metadata git
@@ -8396,12 +8402,12 @@ class Daemon:
         # `changes` line: a code task, or a work task whose branch changes anything.
         review = self._auto_review(dict(task, **upd), summary) \
             if (new == "done" or new == "review" and (urgent.is_urgent(task) or obligations.owned_open(db, task["id"]))) \
-            and not split and not requeued and self._code_change(task) else None
+            and not split and not requeued and not resplit and self._code_change(task) else None
         # A fix of a failed review that adds no commit to the head that review saw leaves its re-review
         # nothing new to check: the re-review is blocked, never run on the same head, and the coordinator
         # decides.
         stale = self._fix_without_commits(dict(task, **upd)) \
-            if new in ("done", "review") and self._code_change(task) and not requeued else []
+            if new in ("done", "review") and self._code_change(task) and not requeued and not resplit else []
         for r in stale:
             why = (f"fix #{task['id']} ended with no new commits on {task['branch']} after the head "
                    f"{r['base']} its review saw: nothing new to re-review")
@@ -8483,7 +8489,7 @@ class Daemon:
         landed_now = changes and bool(db.one("SELECT 1 FROM task_superseded WHERE task=?", (task["id"],)))
         refused: list[str] = []
         hop = self._auto_continue(db.task(task["id"]) or dict(task, **upd), fups, ready, refused) \
-            if ready and not requeued and not fix and (review or split or not changes or landed_now) else None
+            if ready and not requeued and not resplit and not fix and (review or split or not changes or landed_now) else None
         # A follow-up on an open task's branch, files or lineage goes into that task, not a new one (fupfold).
         hopped = {id(fups[0])} if hop or requeued else set()
         folds = fupfold.fold(self.p, self.cfg, db.task(task["id"]) or dict(task, **upd), fups, hopped,
@@ -8531,7 +8537,8 @@ class Daemon:
         # Every proposal queued as an urgent next step and nothing else to read: no turn either.
         settled = bool(quick or folds) and len(fups) <= MAX_FOLLOWUPS and all(id(f) in folded for f in fups) \
             and not notes and sev == "normal" and not hcheck_text
-        routine = ((review is not None and plain) or fix is not None or hop is not None or requeued or settled) \
+        routine = ((review is not None and plain) or fix is not None or hop is not None or requeued or resplit
+                   or settled) \
             and not stale
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
@@ -19183,6 +19190,8 @@ class Daemon:
         tag = spans.new_tag()   # this spec's delimiter: the worker's own text is enclosed with it as data
         lines += [f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
                   f"Its hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(task), tag)}"]
+        if not ext and not published and (size := splitgate.review_line(cfg, task, changes)):
+            lines.append(size)
         fups = load_result(task.get("result")).get("followups")
         fups = [coord.clip(f["title"], 120) for f in fups if isinstance(f, dict) and f.get("title")] \
             if isinstance(fups, list) else []
@@ -20088,6 +20097,38 @@ class Daemon:
             return ""
         log(self.p, f"task {task['id']}: split at {head[:12]}: no review until its last continue hop finishes")
         return head
+
+    def _split_back(self, task: dict, result, attempts: int) -> str:
+        """splitgate at the hand-off of task `task` (its row before this hand-off; `result` the new one):
+        the line for its event when its change went back once for a split, else '' (its review is queued
+        as before). A change already approved, landed or superseded is not returned; a miss never stops
+        the hand-off."""
+        branch = task.get("branch")
+        if not branch or not splitgate.split_lines(self.cfg) or task.get("kind") != "code":
+            return ""
+        try:
+            changes = gitmemo.cached(("worktree.diff_lines", branch), lambda: worktree.diff_lines(self.p, [branch]))
+            hit = splitgate.check(self.cfg, task, changes, result, load_result(task.get("result")))
+            if hit is None:
+                return ""
+            why, n, limit = hit
+            if why != "return":
+                log(self.p, f"task {task['id']}: {n} non-test lines over chains.split_lines ({limit}), reviewed "
+                            f"unsplit: {why}")
+                return ""
+            if chaincap.approved_or_landed(self.p.db, task["id"]) or self._landed_elsewhere(task):
+                return ""
+            head, _ = self._branch_tip(branch)
+            if not splitgate.send_back(self.p.db, self.cfg, self.p.db.task(task["id"]) or task, n, limit, head,
+                                       attempts):
+                return ""
+        except Exception:
+            log(self.p, f"split check of #{task['id']}: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            return ""
+        log(self.p, f"task {task['id']}: {n} non-test lines over chains.split_lines ({limit}): back to its worker "
+                    f"once for a split")
+        return (f"Returned once to its worker for a split ({n} non-test lines, over chains.split_lines {limit}): "
+                f"the same task, branch and worktree; no review yet. Its next hand-off is reviewed whatever its size.")
 
     def _branch_tip(self, branch: str) -> tuple[str, str]:
         """(head, its subject) of `branch`, ('', '') when it is missing; read once within a gitmemo scope."""

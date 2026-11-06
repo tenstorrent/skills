@@ -31,6 +31,7 @@ def test_review_stats_bucket_reviews_by_non_test_lines_too(env):
     row = p.db.one("SELECT * FROM review_stats WHERE task=?", (rev["id"],))
     assert (row["lines"], row["code_lines"]) == (310, 40), row
     p.db.x("UPDATE review_stats SET code_lines=NULL WHERE task=?", (rev["id"],))   # a row from before the field
+    p.set_config("chains.split_lines", 0)   # reviewed unsplit, not sent back for a split (splitgate)
     _, _, _, (rev2,) = _finish_code(env, p, "big", {"big.py": 230})
     _fail_review(env, p, rev2["id"], status="done", summary="fine")
     s = reviewstats.summary(p.db, 0)

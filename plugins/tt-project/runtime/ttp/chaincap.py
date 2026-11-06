@@ -816,19 +816,10 @@ def approved_or_landed(db: DB, task_id: int) -> bool:
     return bool(landed.recorded(db, task_id, carry)[0])
 
 
-def requeue(p, cfg: dict, task: dict, fup: dict, why: str, attempts: int, now: float | None = None) -> bool:
-    """Re-queue done code task `task` for `fup`, its lone `continue:` hop that hop_ready passed (`why`), when
-    its change is neither approved nor landed (approved_or_landed): the same task, so its id, worktree,
-    branch and review chain stay. The follow-up's spec is appended as an `## Update`, its per-task budget
-    tops up to a fresh one (its BUDGET_BASE_LABEL, the budget it had before its first re-queue), its
-    attempts go back to `attempts` (the count before this run) and its result (the last hand-off) stays.
-    An AUTO_EVENT records it. Whether it was re-queued; False leaves the task as it was."""
+def budget_base(cfg: dict, task: dict) -> tuple[list, float]:
+    """(task `task`'s labels, the per-task budget a re-queue tops it up to): its BUDGET_BASE_LABEL, else
+    its budget now (or the tier default), then added to the labels returned."""
     from . import budget as bud
-    db = p.db
-    if not caps(cfg)["requeue"] or task.get("kind") != "code" or not task.get("branch") \
-            or approved_or_landed(db, task["id"]):
-        return False
-    now = time.time() if now is None else now
     try:
         labels = json.loads(task.get("labels") or "[]")
     except ValueError:
@@ -840,6 +831,22 @@ def requeue(p, cfg: dict, task: dict, fup: dict, why: str, attempts: int, now: f
     if base is None:
         base = float(task.get("budget_usd") or bud.task_default_usd(cfg, task.get("tier")))
         labels.append(f"{BUDGET_BASE_LABEL}{base:g}")
+    return labels, base
+
+
+def requeue(p, cfg: dict, task: dict, fup: dict, why: str, attempts: int, now: float | None = None) -> bool:
+    """Re-queue done code task `task` for `fup`, its lone `continue:` hop that hop_ready passed (`why`), when
+    its change is neither approved nor landed (approved_or_landed): the same task, so its id, worktree,
+    branch and review chain stay. The follow-up's spec is appended as an `## Update`, its per-task budget
+    tops up to a fresh one (its BUDGET_BASE_LABEL, the budget it had before its first re-queue), its
+    attempts go back to `attempts` (the count before this run) and its result (the last hand-off) stays.
+    An AUTO_EVENT records it. Whether it was re-queued; False leaves the task as it was."""
+    db = p.db
+    if not caps(cfg)["requeue"] or task.get("kind") != "code" or not task.get("branch") \
+            or approved_or_landed(db, task["id"]):
+        return False
+    now = time.time() if now is None else now
+    labels, base = budget_base(cfg, task)
     title = str(fup.get("title") or "").strip()[:200]
     spec = str(fup.get("spec") or "").strip()
     update = f"## Update\nContinue ({title}), re-queued by the daemon after your last hand-off:\n{spec}"

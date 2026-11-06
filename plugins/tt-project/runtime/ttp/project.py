@@ -453,7 +453,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # With requeue, a code task whose change is neither approved nor landed is re-queued for that hop
     # itself (chaincap.requeue: same id, worktree and branch) instead of a new task.
     # split_lines (0 off): kind-code.md asks a worker whose change would pass about this many non-test
-    # lines to hand it off in parts, each reviewed and landed on its own (prompts.split_lines).
+    # lines to hand it off in parts, each reviewed and landed on its own (prompts.split_lines); the daemon
+    # sends a larger change back once for a split before its review (splitgate).
     # A task that ran max_task_runs times since its last explicit requeue, or whose last max_idle_runs
     # runs spent money with no hand-off and no commit, is not started again (0 turns one off): it is
     # blocked and the coordinator gets one run_cap event summing up its runs (runcap).

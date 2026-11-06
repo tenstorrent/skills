@@ -32162,6 +32162,7 @@ def test_the_unreviewed_invariant_queues_at_most_its_cap_per_pass(env):
 def test_the_daemons_re_review_continues_the_failed_review(env):
     p = make(env)
     from ttp.db import continues_id, dump_result
+    p.set_config("chains.split_lines", 0)   # reviewed unsplit, not sent back for a split (splitgate)
     first, _, _, (rev,) = _finish_code(env, p, "stack", {"app.py": 300})
     p.db.update_task(rev["id"], status="failed", result=dump_result({"summary": "missing test", "status": "failed"}))
     fix, _, done, (re_rev,) = _finish_code(env, p, "fix it", {"fix.py": 5}, labels=[f"continues:{rev['id']}"])

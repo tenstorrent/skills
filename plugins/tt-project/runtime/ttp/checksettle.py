@@ -21,7 +21,7 @@ import subprocess
 from pathlib import Path
 
 # The fields a final hand-off carries over from the waiting one (daemon.DEFAULT_ON_PASS_KEYS).
-KEYS = ("artifacts", "metrics", "self_check", "resolves", "no_push", "published", "outcome", "tried")
+KEYS = ("artifacts", "metrics", "self_check", "resolves", "no_push", "no_split", "published", "outcome", "tried")
 HEAD_RE = re.compile(r"[0-9a-f]{7,40}")
 
 
