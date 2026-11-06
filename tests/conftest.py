@@ -124,7 +124,8 @@ _git_global_config()
 # also fails when, at its end, one of the account's own files below (HOME_WATCHED, under REAL_HOME) or
 # an untracked file in the repository the suite runs from is new or changed: what a test wrote there by
 # an absolute path, or relative to its working folder. A home folder change that no process of the session
-# recorded writing (_WriteRecorder) is another process's on a shared host: a warning, not a failure.
+# recorded writing (_WriteRecorder) is another process's on a shared host: a warning, not a failure. The
+# credential guards below (credential_marks, folder_marks) judge their changes by the same rule (guarded_changes).
 REAL_HOME = os.path.expanduser("~")
 _XDG = {"XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share", "XDG_STATE_HOME": ".local/state",
         "XDG_CACHE_HOME": ".cache"}
@@ -159,6 +160,9 @@ HOME_WATCHED = (".bash_profile", ".bash_login", ".bashrc", ".profile", ".zprofil
                 ".claude/settings.local.json", ".claude/CLAUDE.md", ".claude/skills", ".claude/agents",
                 ".claude/commands", ".claude/hooks", ".codex/config.toml", ".config/systemd/user",
                 "Library/LaunchAgents", ".local/bin/ttp")
+# The credential stores and the ssh and gh folders the session's credential guards watch: the write
+# recorder records the session's writes there too (and the providers' login files, _WriteRecorder.watch).
+GUARDED = (".ssh", ".config/gh", ".git-credentials", ".netrc")
 
 
 def _point_home(home: str, setenv, delenv) -> None:
@@ -193,7 +197,7 @@ _session_home()
 # every file under the write guard's protected paths (pathguard.paths()), the providers' login files) as the
 # plugin's own list names them (credwatch.files), read by a child under the account's real environment and
 # compared by stat only (size, mtime, ctime, inode; never contents, as credwatch.changes does): a session
-# fails when one changed.
+# fails when the session changed one (guarded_changes).
 _HERE = Path(__file__).resolve().parent
 _RUNTIME = next((d / "plugins" / "tt-project" / "runtime" for d in (_HERE.parent, _HERE)
                  if (d / "plugins" / "tt-project" / "runtime" / "ttp" / "credwatch.py").is_file()), None)
@@ -222,7 +226,7 @@ def credential_marks(before: dict | None = None):
 
 
 # The account's ssh folder and gh's config folder, whole: each regular file's size, mtime, ctime and inode
-# (stat only: no file there is ever opened or read), so a session fails when a test wrote any file there. ssh and ssh-keygen find
+# (stat only: no file there is ever opened or read), so a session fails when a test wrote any file there (another process's change: a warning). ssh and ssh-keygen find
 # ~/.ssh from the account's passwd entry, not HOME: a test passes them -f/-F/-o UserKnownHostsFile under its
 # temp folder. known_hosts files and sockets are left out: the account's own ssh sessions change them
 # while a suite runs.
@@ -253,10 +257,15 @@ def folder_marks(folders) -> dict[str, tuple]:
     return marks
 
 
+def folder_diff(before: dict, after: dict) -> list[tuple[str, str]]:
+    """(path, how) of each created, removed or changed file between two folder_marks."""
+    return [(p, "created" if p not in before else "removed" if p not in after else "changed")
+            for p in sorted(set(before) | set(after)) if before.get(p) != after.get(p)]
+
+
 def folder_changes(before: dict, after: dict) -> list[str]:
     """One line per created, removed or changed file between two folder_marks."""
-    return [f"  {p}: {'created' if p not in before else 'removed' if p not in after else 'changed'}"
-            for p in sorted(set(before) | set(after)) if before.get(p) != after.get(p)]
+    return [f"  {p}: {how}" for p, how in folder_diff(before, after)]
 
 
 @pytest.fixture(autouse=True)
@@ -396,7 +405,7 @@ class _WriteRecorder:
               "os.link": (1,), "os.truncate": (0,), "shutil.rmtree": (0,)}
 
     def __init__(self, home: str, watched, log: str, env: dict):
-        self.homes = sorted({os.path.normpath(home), os.path.realpath(home)}, key=len, reverse=True)
+        self.homes = _homes(home)
         self.home = os.path.normpath(home)
         self.watched = [os.path.join(self.home, rel) for rel in watched]
         self.log, self.env, self.seen, self.quiet = log, dict(env), set(), 0   # quiet: the conftest's own child
@@ -422,13 +431,16 @@ class _WriteRecorder:
     def wrote(self, path) -> None:
         if isinstance(path, int) or path is None:
             return
-        path = os.fsdecode(os.fspath(path))
-        if not os.path.isabs(path):
-            path = os.path.abspath(path)
-        for h in self.homes:
-            if path == h or path.startswith(h + os.sep):
-                self.record(self.home + os.path.normpath(path)[len(h):])
-                return
+        path = home_path(os.fsdecode(os.fspath(path)), self.home, self.homes)
+        if path:
+            self.record(path)
+
+    def watch(self, paths) -> None:
+        """Records writes to these paths too (absolute; ones outside the home folder are not seen)."""
+        for path in paths:
+            path = home_path(path, self.home, self.homes)
+            if path and path not in self.watched:
+                self.watched.append(path)
 
     def spawned(self, event: str, args: tuple) -> None:
         if event == "subprocess.Popen":
@@ -476,6 +488,22 @@ class _WriteRecorder:
             os.close(fd)
 
 
+def _homes(home: str) -> list[str]:
+    """`home` as written and resolved, longest first."""
+    return sorted({os.path.normpath(home), os.path.realpath(home)}, key=len, reverse=True)
+
+
+def home_path(path: str, home: str, homes=None) -> str | None:
+    """`path` (relative ones from the working folder) as the recorder writes it: under `home` as written,
+    also when it names it through its resolved form (`homes`: _homes(home)); None when it is not under it."""
+    if not os.path.isabs(path):
+        path = os.path.abspath(path)
+    for h in homes or _homes(home):
+        if path == h or path.startswith(h + os.sep):
+            return os.path.normpath(home) + os.path.normpath(path)[len(h):]
+    return None
+
+
 def recorded_writes(log: str | None) -> set[str]:
     try:
         return set(Path(log).read_text().split("\n")) - {""} if log else set()
@@ -486,6 +514,33 @@ def recorded_writes(log: str | None) -> set[str]:
 def own_change(path: str, recorded) -> bool:
     """True when the session recorded `path`, a folder above it or a path below it."""
     return any(path == r or path.startswith(r + os.sep) or r.startswith(path + os.sep) for r in recorded)
+
+
+def _changed_at(path: str) -> str:
+    """When `path` last changed (its ctime; once removed, its folder's), by stat alone, in local time."""
+    for p in (path, os.path.dirname(path)):
+        try:
+            return time.strftime("%Y-%m-%d %H:%M:%S %Z", time.localtime(os.lstat(p).st_ctime))
+        except OSError:
+            continue
+    return "an unknown time"
+
+
+def guarded_changes(changes, recorded, home: str = REAL_HOME) -> tuple[list[str], list[str]]:
+    """The (path, how) changes of the account's credential files or ssh and gh folders, as (lines of the
+    session's own, warning lines with the change time of the rest), by the tripwire's rule (own_change):
+    a path the session recorded writing, or below or above one (the whole home handed to a child), is its
+    own. `recorded` None (no readable write log) or a path outside `home` (the recorder cannot see it)
+    counts as the session's."""
+    own: list[str] = []
+    other: list[str] = []
+    for path, how in changes:
+        seen = home_path(path, home)
+        if recorded is None or seen is None or own_change(seen, recorded):
+            own.append(f"  {path}: {how}")
+        else:
+            other.append(f"  {path}: {how} at {_changed_at(path)}")
+    return own, other
 
 
 def _write_log() -> str:
@@ -501,9 +556,13 @@ def _write_log() -> str:
             import tempfile
             fd, log = tempfile.mkstemp(prefix="ttp-test-writes-")
             os.close(fd)
-            atexit.register(lambda: os.path.exists(log) and os.unlink(log))
+            atexit.register(lambda: [os.unlink(f) for f in (log, log + ".watch") if os.path.exists(f)])
             os.environ["TTP_TEST_WRITE_LOG"] = log
-        shared.log, shared.recorder = log, _WriteRecorder(REAL_HOME, HOME_WATCHED, log, os.environ)
+        shared.log, shared.recorder = log, _WriteRecorder(REAL_HOME, HOME_WATCHED + GUARDED, log, os.environ)
+        try:   # an xdist worker: the credential files the session watches (pytest_sessionstart)
+            shared.recorder.watch(Path(log + ".watch").read_text().split("\n")[:-1])
+        except OSError:
+            pass
         sys.addaudithook(shared.recorder)
     return shared.log
 
@@ -740,14 +799,18 @@ def pytest_sessionstart(session):
     _STARTED = time.time()
     if not os.environ.get("PYTEST_XDIST_WORKER"):
         session.config._ttp_outside = _outside_snapshot(session.config)
-        session.config._ttp_creds = credential_marks()
+        creds = session.config._ttp_creds = credential_marks()
         session.config._ttp_secret = folder_marks(secret_folders())
+        recorder = getattr(sys.modules.get("_ttp_suite_writes"), "recorder", None)
+        if recorder:   # the providers' login files and gh's folder, wherever the account's env puts them
+            recorder.watch(list((creds or {}).get("kinds") or ()) + secret_folders())
+            Path(_WRITE_LOG + ".watch").write_text("".join(p + "\n" for p in recorder.watched))
 
 
 def pytest_sessionfinish(session, exitstatus):
     before = getattr(session.config, "_ttp_outside", None)
-    written, other = (written_outside(before, _outside_snapshot(session.config), recorded_writes(_WRITE_LOG))
-                      if before else ([], []))
+    recorded = recorded_writes(_WRITE_LOG) if _WRITE_LOG and os.path.exists(_WRITE_LOG) else None
+    written, other = written_outside(before, _outside_snapshot(session.config), recorded) if before else ([], [])
     if written:
         _report(session, ["tests wrote outside their temp folders (the account's home folder or the "
                           "repository the suite runs from):"] + written)
@@ -756,17 +819,25 @@ def pytest_sessionfinish(session, exitstatus):
         _report(session, ["ttp-suite: warning: the account's home folder changed while the tests ran, by no "
                           "write of this session (another process on the host; not a failure):"] + other, red=False)
     creds = getattr(session.config, "_ttp_creds", None)
-    changed = credential_marks(creds) if creds else None
+    changed, other = guarded_changes(credential_marks(creds) or [] if creds else [], recorded)
     if changed:
         _report(session, ["the account's credential files changed while the tests ran (stat only: size, mtime, "
-                          "inode; a test must use its temp HOME):"] + [f"  {path}: {how}" for path, how in changed])
+                          "inode; a test must use its temp HOME):"] + changed)
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    if other:
+        _report(session, ["ttp-suite: warning: the account's credential files changed while the tests ran, by no "
+                          "write of this session (another process on the host; not a failure):"] + other, red=False)
     secret = getattr(session.config, "_ttp_secret", None)
-    moved = folder_changes(secret, folder_marks(secret_folders())) if secret is not None else []
+    moved, other = guarded_changes(folder_diff(secret, folder_marks(secret_folders())) if secret is not None else [],
+                                   recorded)
     if moved:
         _report(session, ["the account's ssh or gh config folder changed while the tests ran (a test must use "
                           "its temp HOME, and pass ssh and ssh-keygen paths under it):"] + moved)
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    if other:
+        _report(session, ["ttp-suite: warning: the account's ssh or gh config folder changed while the tests ran, "
+                          "by no write of this session (another process on the host; not a failure):"] + other,
+                red=False)
     if not any(i.path.name.startswith(_SHARDED) for i in session.items):
         return
     root = getattr(getattr(session.config, "_tmp_path_factory", None), "_basetemp", None)

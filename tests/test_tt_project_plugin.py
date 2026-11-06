@@ -1319,6 +1319,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: mine\n")
     (real / ".ssh").mkdir()
     (real / ".ssh" / "id_ed25519").write_text("mine\n")
+    (real / ".ssh" / "config").write_text("Host *\n")
     out.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".gitignore").write_text("__pycache__/\n")
@@ -1357,6 +1358,9 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        pathlib.Path(REAL, '.ssh/known_hosts').write_text('h k\\n')\n"   # ssh's own appends: not a test's
         "    if os.environ.get('CHILD'):\n"   # a child handed the path, by its command line
         "        subprocess.run(['sh', '-c', f'printf x >> {REAL}/.zshrc'], check=True)\n"
+        "    if os.environ.get('CHILDCRED'):\n"   # a child handed gh's hosts file, one handed the whole home
+        "        subprocess.run(['sh', '-c', f'printf x >> {REAL}/.config/gh/hosts.yml'], check=True)\n"
+        "        subprocess.run(['sh', '-c', 'printf x > \"$HOME/.ssh/id_child\"'], env={'PATH': os.environ['PATH'], 'HOME': REAL}, check=True)\n"
         "def test_outside():\n"   # another process on the host changes the account's files meanwhile
         "    out = pathlib.Path(os.environ['OUT'])\n"
         "    shown = subprocess.run(['sh', '-c', 'echo $HOME'], env={'PATH': os.environ['PATH']}, capture_output=True, text=True)\n"
@@ -1430,6 +1434,15 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     assert r.returncode == 1 and "1 passed" in r.stdout and f"  {real}/.zshrc: created\n" in r.stdout, r.stdout
     assert "by no write of this session" not in r.stdout, r.stdout
     (real / ".zshrc").unlink()
+    # A child handed a credential file by its command line, or the whole home (ssh's key folder in it):
+    # the credential guards count both as the session's, as the tripwire does.
+    r = run("-k", "test_leak", CHILDCRED="1")
+    assert r.returncode == 1 and f"a child of this test was handed the account's home {real}" in r.stdout, r.stdout
+    assert "credential files changed" in r.stdout and f"  {real}/.config/gh/hosts.yml: changed\n" in r.stdout, r.stdout
+    assert "ssh or gh config folder changed" in r.stdout and f"  {real}/.ssh/id_child: created\n" in r.stdout, r.stdout
+    assert "by no write of this session" not in r.stdout, r.stdout
+    (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: mine\n")
+    (real / ".ssh" / "id_child").unlink()
     # Another process on the host changes watched files while the session runs (an agent CLI rewrites its
     # config file as it starts, another project removes a systemd user unit): a warning, not a failure.
     p = subprocess.Popen([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "-k", "test_outside",
@@ -1441,14 +1454,26 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
             time.sleep(0.1)
         (real / ".codex" / "config.toml").write_text("model = 'b'\n")
         (real / ".config" / "systemd" / "user" / "x.service").unlink()
+        # ...or a credential file, the ssh config and a new key in the ssh folder (the outside changes that
+        # once failed whole check sessions): warnings naming each path and when it changed.
+        (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: other\n")
+        (real / ".ssh" / "config").write_text("Host *\n  User x\n")
+        (real / ".ssh" / "id_outside").write_text("x\n")
         (out / "done").write_text("")
         text = p.communicate(timeout=120)[0]
     finally:
         p.kill()
     assert p.returncode == 0 and "1 passed" in text and "wrote outside" not in text, text
     assert "by no write of this session (another process on the host; not a failure)" in text, text
-    for line in (f"{real}/.codex/config.toml: changed", f"{real}/.config/systemd/user/x.service: removed"):
+    for line in (f"{real}/.codex/config.toml: changed", f"{real}/.config/systemd/user/x.service: removed",
+                 f"{real}/.ssh/config: changed"):
         assert f"  {line}\n" in text, text
+    assert "credential files changed while the tests ran, by no write of this session" in text, text
+    assert "ssh or gh config folder changed while the tests ran, by no write of this session" in text, text
+    for line in (f"{real}/.config/gh/hosts.yml: changed at ", f"{real}/.ssh/id_outside: created at ",
+                 f"{real}/.ssh/config: changed at "):
+        assert f"  {line}" in text, text
+    assert "a test must use its temp HOME" not in text, text
 
 
 def test_spawned_git_and_gh_see_the_temp_home(_temp_home):
@@ -1555,6 +1580,43 @@ def test_the_session_records_only_its_own_writes_to_the_account_home(tmp_path, m
     assert c.written_outside(before, after) == ([own[0], warn[0], own[1]], []), "no record: every change is the session's"
     # A hook that raises would fail the call it audits: a bad payload is ignored.
     assert record(("open", (object(), "w", W)), ("subprocess.Popen", (None, None, None, 5))) == set()
+
+
+def test_credential_guards_fail_only_on_the_sessions_own_changes(tmp_path):
+    """The credential file and ssh and gh folder guards use the tripwire's rule: a change to a path the
+    session recorded writing, or below one it recorded (the whole home handed to a child), fails; a path
+    the recorder cannot see (no write log, outside the home folder) counts as the session's; any other
+    change is a warning naming the path and when it changed. The recorder watches the guarded folders
+    and the login files the session adds (watch), through the home folder's symlink too."""
+    c = _test_conftest()
+    home = tmp_path / "u"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_new").write_text("x\n")
+    real = tmp_path / "real"
+    real.symlink_to(home)
+    log = tmp_path / "writes.log"
+    rec = c._WriteRecorder(str(real), c.HOME_WATCHED + c.GUARDED, str(log), {"HOME": "/tmp/session-home"})
+    rec.watch([f"{home}/.claude/.credentials.json", "/elsewhere/auth.json"])
+    W = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+    for path in (f"{real}/.config/gh/hosts.yml", f"{home}/.claude/.credentials.json", f"{real}/.netrc",
+                 f"{real}/.claude/other.json", "/elsewhere/auth.json"):
+        rec("open", (path, "w", W))
+    assert c.recorded_writes(str(log)) == {f"{real}/.config/gh/hosts.yml", f"{real}/.claude/.credentials.json",
+                                           f"{real}/.netrc"}
+    # Other routes: a child handed gh's folder by an env value, a key renamed into the ssh folder.
+    rec("subprocess.Popen", (None, ["gh"], None, {"HOME": "/tmp/session-home", "GH_CONFIG_DIR": f"{home}/.config/gh"}))
+    rec("os.rename", (str(tmp_path / "k"), f"{home}/.ssh/id_x", None, None))
+    assert {f"{real}/.config/gh", f"{real}/.ssh/id_x"} <= c.recorded_writes(str(log))
+    changes = [(f"{real}/.config/gh/hosts.yml", "changed"), (f"{home}/.claude/.credentials.json", "shrunk"),
+               (f"{real}/.ssh/id_new", "created"), (f"{real}/.ssh/id_gone", "removed"), ("/elsewhere/auth.json", "changed")]
+    own, warn = c.guarded_changes(changes, c.recorded_writes(str(log)), str(real))
+    assert own == [f"  {real}/.config/gh/hosts.yml: changed", f"  {home}/.claude/.credentials.json: shrunk",
+                   "  /elsewhere/auth.json: changed"], own
+    assert [w.split(" at ")[0] for w in warn] == [f"  {real}/.ssh/id_new: created", f"  {real}/.ssh/id_gone: removed"], warn
+    assert all(re.search(r" at \d{4}-\d\d-\d\d \d\d:\d\d:\d\d", w) for w in warn), warn   # the folder's time once removed
+    # The whole home handed to a child, or no readable write log: every change is the session's.
+    assert c.guarded_changes(changes, {str(real)}, str(real))[1] == []
+    assert c.guarded_changes(changes, None, str(real)) == ([f"  {p}: {how}" for p, how in changes], [])
 
 
 def test_ssh_and_gh_folder_marks_stat_only_and_open_no_file(tmp_path, monkeypatch):
