@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The persistent coordinator session (coordinator.session.mode "on"): each coordinator wake resumes
+"""The persistent coordinator session (coordinator.session.mode "on", the default): each coordinator wake resumes
 one agent session instead of starting a stateless turn, while that session is still sound.
 
 decide() picks each wake's mode from the saved session (kv KEY), model-free and without I/O:
@@ -67,7 +67,7 @@ import time
 KEY = "coord_session"
 GUARD_KEY = "coord_session_guard"
 MODES = ("off", "on", "shadow")
-DEFAULTS = {"mode": "off", "rollover_tokens": 0, "rollover_growth_tokens": 100000, "context_window_tokens": 0,
+DEFAULTS = {"mode": "on", "rollover_tokens": 0, "rollover_growth_tokens": 100000, "context_window_tokens": 0,
             "rollover_margin_tokens": 40000, "max_failures_per_h": 3, "pause_h": 6, "row_delta": True}
 LONG_WINDOW = 1_000_000   # a model id ending "[1m]" (Claude's long-context variant)
 HANDOVER_HEAD = "## Session handover"

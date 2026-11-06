@@ -133,10 +133,12 @@ def test_the_session_guard_is_inert_with_the_mode_off_or_no_baseline(env):
     now = time.time()
     p = _guard_project(env, now)
     _coord_runs(p, now + 60, 50, 5.0, step_s=60)
-    for mode in (None, "off", "shadow", False, "", 1.5):
+    # Unset is the default (on), the same reading as the session code's.
+    assert coordguard.mode_on(p.config()) and coordguard.mode_on({}) and coordguard.mode_on(
+        {"coordinator": {"session": {"mode": None}}})
+    for mode in ("off", "shadow", False, "", 1.5):
         cfg = p.config()
-        if mode is not None:
-            cfg = {**cfg, "coordinator": {**cfg["coordinator"], "session": {"mode": mode}}}
+        cfg = {**cfg, "coordinator": {**cfg["coordinator"], "session": {"mode": mode}}}
         assert not coordguard.mode_on(cfg), mode
         assert coordguard.check(p.db, cfg, now + 3600) is None, mode
         assert p.db.kv(coordguard.KEY) is None and p.db.kv(coordguard.BASELINE_KEY) is None, mode

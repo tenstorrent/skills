@@ -27,14 +27,18 @@ def _coord_argv(env, monkeypatch, session=None, budget=1.0):
 
 
 def test_mode_off_coordinator_argv_is_unchanged(env, monkeypatch):
-    base, timeout, note, _ = _coord_argv(env, monkeypatch)
+    base, timeout, note, _ = _coord_argv(env, monkeypatch, {"mode": "off"})
     i = base.index("--tools")
     assert base[i - 2:i + 2] == ["--safe-mode", "--strict-mcp-config", "--tools", ""]
-    for off in ({}, {"mode": "off"}, {"mode": "OFF ", "wake_budget_usd": 9, "wake_budget_s": 5}, "on"):
+    for off in ({"mode": "OFF ", "wake_budget_usd": 9, "wake_budget_s": 5}, {"mode": "shadow"}, {"mode": ""}):
         argv, t, n, _ = _coord_argv(env, monkeypatch, off)
         assert argv == base and t == timeout, off
         assert "wake_budget" not in n["turn"]
     assert "--allowedTools" not in base and "--settings" not in base
+    # No mode of its own (unset, an empty section or one saved as a plain value): the default, on.
+    for unset in (None, {}, "on"):
+        argv = _coord_argv(env, monkeypatch, unset)[0]
+        assert argv[argv.index("--tools") + 1] != "" and "--safe-mode" not in argv, unset
 
 
 def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
@@ -477,7 +481,7 @@ def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypat
     argv, _, _, _ = _coord_argv(env, monkeypatch, {"mode": "on"})
     assert argv[argv.index("--tools") + 1] == "Read,Bash"
     # The stateless turn (mode off) still has no tools at all.
-    argv, _, _, _ = _coord_argv(env, monkeypatch, None)
+    argv, _, _, _ = _coord_argv(env, monkeypatch, {"mode": "off"})
     assert argv[argv.index("--tools") + 1] == "" and "--settings" not in argv
 
 

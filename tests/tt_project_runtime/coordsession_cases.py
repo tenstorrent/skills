@@ -16,7 +16,8 @@ def _cs_state(**over):
 def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
     from ttp import coordsession as cs
     now, yes = 1000.0, (lambda s: True)
-    assert cs.decide({}, _cs_state(), "k1", "m", "high", yes, now) == ("stateless", "off"), "off by default"
+    assert cs.decide({}, _cs_state(), "k1", "m", "high", yes, now) == ("resume", "continued"), "on by default"
+    assert cs.decide(_cs_cfg(mode="off"), _cs_state(), "k1", "m", "high", yes, now) == ("stateless", "off")
     assert cs.decide(_cs_cfg(mode="shadow"), _cs_state(), "k1", "m", "high", yes, now)[0] == "stateless"
     assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "continued")
     reasons = {
@@ -94,7 +95,8 @@ def test_coordsession_record_counts_wakes_and_context_of_its_session():
     assert not cs.record(None, use, "", turn, True, 30.0)["last_ok"]
     line = cs.status_line(_cs_cfg(), st)
     assert line == "coordinator session (on): s1 · 2 wakes · 935 context tokens · last: continued", line
-    assert cs.status_line({}, None) == ""
+    assert cs.status_line(_cs_cfg(mode="off"), None) == ""
+    assert cs.status_line({}, None).startswith("coordinator session (on): none · 0 wakes"), "on by default"
 
 
 def _cs_stream(path, calls):
@@ -193,15 +195,15 @@ def test_coordsession_mode_is_chat_settable(env, capsys):
         cli.cmd_chat_settable("coordinator.session.mode", "always")
     assert e.value.code == 1 and "refused" in capsys.readouterr().out
     p = make(env)
-    assert p.config()["coordinator"]["session"] == {"mode": "off", "rollover_tokens": 0,
+    assert p.config()["coordinator"]["session"] == {"mode": "on", "rollover_tokens": 0,
                                                    "rollover_growth_tokens": 100000, "context_window_tokens": 0,
                                                    "rollover_margin_tokens": 40000,
                                                    "max_failures_per_h": 3, "pause_h": 6, "row_delta": True}
     assert settable("coordinator.session.row_delta")(" Off ") is False and settable("coordinator.session.row_delta")(True)
     with pytest.raises(ValueError):
         settable("coordinator.session.row_delta")("sometimes")
-    p.set_config("coordinator.session.mode", settable("coordinator.session.mode")("on"))
-    assert p.config()["coordinator"]["session"]["mode"] == "on"
+    p.set_config("coordinator.session.mode", settable("coordinator.session.mode")("off"))
+    assert p.config()["coordinator"]["session"]["mode"] == "off"
     assert p.config()["coordinator"]["session"]["rollover_growth_tokens"] == 100000, "the other defaults stay"
 
 
@@ -232,6 +234,7 @@ def test_coordsession_mode_off_launches_today_s_turn_byte_for_byte(env, monkeypa
     from ttp import coordinator as coord
     from ttp import coordsession
     p, holder, _, turn, head, context = _cs_daemon(env, monkeypatch)
+    p.set_config("coordinator.session.mode", "off")   # the project's own user turned it off
     runs = [turn("EVENTS golden")]
     monkeypatch.setattr(coordsession, "on", lambda *a: False)   # the code path before the session mode
     runs.append(turn("EVENTS golden"))
@@ -294,8 +297,7 @@ def test_coordsession_a_failed_resume_reruns_its_batch_stateless_and_handles_eac
     from ttp.providers import fake
     p = make(env)
     sessions = _sessions(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
-    p.set_config("coordinator.debounce_s", 0)
+    p.set_config("coordinator.debounce_s", 0)   # session mode by default: no explicit value
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
     d = Daemon(p.base)
@@ -327,6 +329,36 @@ def test_coordsession_a_failed_resume_reruns_its_batch_stateless_and_handles_eac
     p.db.post("in", "third", chat="c1")
     nxt = _cs_wake(p, d)
     assert note(nxt)["mode"] == "new" and note(nxt)["why"] == "last run not ok"
+
+
+def test_coordsession_is_on_by_default_for_new_and_upgraded_projects_and_an_explicit_off_stays_off(env, monkeypatch):
+    from ttp import cli
+    from ttp import configwho
+    from ttp.daemon import Daemon
+    p = make(env)
+    _sessions(env, monkeypatch)
+    p.set_config("coordinator.debounce_s", 0)
+    note = lambda i: json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (i,))["note"])["turn"]["session"]
+    # A new project: `ttp new` writes no mode, so the shipped default (on) decides.
+    assert "mode" not in ((p.raw_config().get("coordinator") or {}).get("session") or {})
+    assert p.config()["coordinator"]["session"]["mode"] == "on"
+    d = Daemon(p.base)
+    p.db.post("in", "first")
+    assert note(_cs_wake(p, d))["mode"] == "new"
+    # An older project.json (written before the mode existed, no coordinator.session at all): on too.
+    raw = p.raw_config()
+    raw.get("coordinator", {}).pop("session", None)
+    p.config_path.write_text(json.dumps(raw))
+    assert "session" not in p.raw_config().get("coordinator", {}) and p.config()["coordinator"]["session"]["mode"] == "on"
+    p.db.post("in", "second")
+    assert note(_cs_wake(p, d))["mode"] == "resume"
+    # The project's own user turns it off: kept, and every wake is the stateless turn.
+    cli.main(["config", p.name, "coordinator.session.mode", "off"])
+    assert p.raw_config()["coordinator"]["session"]["mode"] == "off" and p.config()["coordinator"]["session"]["mode"] == "off"
+    assert configwho.get(p.db, "coordinator.session.mode")
+    p.db.post("in", "third")
+    rid = _cs_wake(p, d)
+    assert rid and json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["turn"].get("session") is None
 
 
 def test_coordsession_the_failure_cap_pauses_the_mode_and_raises_an_issue(env, monkeypatch):
@@ -1280,6 +1312,7 @@ def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_stateless_
     monkeypatch.setattr(fake.Fake, "cache_env",
                         lambda self, ttl: {"FAKE_CACHE_TTL": ttl} if ttl in ("5m", "1h") else {}, raising=False)
     p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
+    p.set_config("coordinator.session.mode", "off")
     ttls = lambda r: (json.loads(r["note"])["turn"]["cache_ttl"], json.loads(r["note"])["turn"]["cache_ttl_why"])
     # Stateless (mode off): today's choice on the stateless prefix, recorded in its own kv.
     ttl, why = ttls(turn("EVENTS 0")[0])

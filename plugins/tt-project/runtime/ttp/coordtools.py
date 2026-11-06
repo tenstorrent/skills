@@ -105,8 +105,10 @@ def session(cfg: dict) -> dict:
 
 
 def session_on(cfg: dict) -> bool:
-    """coordinator.session.mode == "on"; missing, malformed or anything else is off."""
-    return str(session(cfg).get("mode") or "").strip().lower() == "on"
+    """coordinator.session.mode == "on" (unset: the default, coordsession.DEFAULTS); anything else is off."""
+    from .coordsession import DEFAULTS
+    mode = session(cfg).get("mode")
+    return str(DEFAULTS["mode"] if mode is None else mode).strip().lower() == "on"
 
 
 def tools_mode(cfg: dict) -> str:

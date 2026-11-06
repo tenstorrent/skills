@@ -36,11 +36,12 @@ sent. A failure to read replies is reported on stderr and never stops the messag
 
 - **Daemon** (one per project): schedules, watchers, budget gates, message routing, web app.
   Deterministic and cheap. It starts a model only through a run.
-- **Coordinator**: a short, tool-less decision over a digest of the project, batched and rate
-  capped. Anything needing files, commands or deep thought becomes a task. With
-  `coordinator.session` on it is the project's hands-on manager instead: one persistent session
-  that corrects workers mid-run and fixes the project's own prompts, scripts and config, while
-  heavy work still goes to workers. Either way it reads orders by their intent (a Restriction binds
+- **Coordinator**: by default (`coordinator.session.mode` on, Claude) the project's hands-on
+  manager: one persistent session, woken by chat, task ends and timers, that corrects workers
+  mid-run and fixes the project's own prompts, scripts and config, while heavy work still goes to
+  workers. With the mode off, on an agent without sessions, or while a session cannot run, it is a
+  short, tool-less stateless decision over a digest of the project, batched and rate capped, and
+  anything needing files, commands or deep thought becomes a task. Either way it reads orders by their intent (a Restriction binds
   as written), decides on its own unless a step could hurt people or speak or pass as a human,
   and asks rarely, never waiting on the answer.
 - **Workers**: one task each, in a git worktree on their own branch for code, with a dollar
@@ -412,9 +413,12 @@ prolonged whole-box outage.
   (`machine_change_overdue`) is normal, high only on a machine tagged `serving`, `live` or `server`
   past its end with no passing until-probe, and each project hears of one change once per episode,
   whether from its own daemon or relayed by another project's.
-- `coordinator.session` sets the persistent coordinator session (off by default): with `mode` `on`
-  (Claude), each coordinator wake resumes one agent session instead of a fresh turn; `shadow` is
-  reserved. A project's coordinator may set the mode itself (`config_set`). A new session starts
+- `coordinator.session` sets the persistent coordinator session (on by default): with `mode` `on`
+  (Claude), each coordinator wake resumes one agent session instead of a fresh turn; `off` runs
+  every wake as the stateless turn; `shadow` is reserved. A project with no value of its own
+  follows the default, so new and upgraded projects run the session; a user turns it off for their
+  own project with `ttp config <name> coordinator.session.mode off` (kept across upgrades). A
+  project's coordinator may set the mode itself (`config_set`). A new session starts
   when there is none, the system prompt, stable context or action schema changed, the model or
   effort changed, the context reached its limit, the last session turn did not end ok, or its
   transcript is gone (a host move). The context is the last model call's prompt and answer; the

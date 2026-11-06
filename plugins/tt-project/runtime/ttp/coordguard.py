@@ -56,8 +56,12 @@ def session_cfg(cfg: dict) -> dict:
 
 
 def mode_on(cfg: dict) -> bool:
-    """coordinator.session.mode reads on (True, "on" and the like); off, shadow, unset or bad: False."""
+    """coordinator.session.mode reads on (True, "on" and the like; unset: the default, coordsession.DEFAULTS);
+    off, shadow or bad: False."""
     m = session_cfg(cfg).get("mode")
+    if m is None:
+        from .coordsession import DEFAULTS
+        m = DEFAULTS["mode"]
     return m is True or (isinstance(m, str) and m.strip().lower() in ON)
 
 

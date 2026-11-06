@@ -278,14 +278,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # turn's session for up to thread_max_turns turns (under 2: off) while it ended
                     # under thread_warm_min minutes ago (cachettl.pick_thread).
                     "thread_warm_min": 10, "thread_max_turns": 8,
-                    # The persistent coordinator session (coordsession.py): mode "on" resumes one
-                    # Claude session each wake ("shadow" is reserved and acts as "off"); a new session
+                    # The persistent coordinator session (coordsession.py): mode "on" (the default)
+                    # resumes one Claude session each wake; "off" runs each wake as a stateless turn
+                    # ("shadow" is reserved and acts as "off"); a failed or paused session falls back
+                    # to the stateless turn; a new session
                     # starts once its last call's context reaches its first prompt plus
                     # rollover_growth_tokens, at most context_window_tokens (0: by model) less
                     # rollover_margin_tokens (rollover_tokens above 0: a fixed limit instead);
                     # max_failures_per_h failed resumes within an hour run every turn stateless for pause_h hours;
                     # row_delta false sends each changed digest section whole (else keyed lists go by row).
-                    "session": {"mode": "off", "rollover_tokens": 0, "rollover_growth_tokens": 100000,
+                    "session": {"mode": "on", "rollover_tokens": 0, "rollover_growth_tokens": 100000,
                                 "context_window_tokens": 0, "rollover_margin_tokens": 40000,
                                 "max_failures_per_h": 3, "pause_h": 6, "row_delta": True},
                     "turn_budget_usd": 1.0,
@@ -541,7 +543,7 @@ EXTRA_KEYS = {
     # owner_identities: names, handles or emails the owner writes external records under (tickets, chat
     # comments), read with the project root's git user.name and user.email to verify a cited record's
     # author (restriction_source.owner_identities; default none, set only on the owner's own message).
-    # session: the persistent coordinator ({"mode": "on" | "off", default off}). With it on (coordtools.py,
+    # session: the persistent coordinator ({"mode": "on" | "off", default on}). With it on (coordtools.py,
     # hostcheck.py): "wake_budget_usd" and "wake_budget_s" cap one wake (default: the stateless turn's sized
     # budget and timeout), "host_access" ({alias: helper argv in the project folder | ssh config file
     # there}, default none) and "log_paths" ({name: absolute path} `ttp hostcheck log-tail` may read).
