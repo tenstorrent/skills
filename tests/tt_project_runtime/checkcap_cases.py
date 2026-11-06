@@ -5284,7 +5284,7 @@ def test_a_landing_check_never_waits_behind_task_checks_on_the_project_cap(env, 
     # The project's cap of 2 is full of task runs and the repository's lane is held. A task-less landing
     # check (a push batch's or another landing one) starts at once on the landing lane, without headroom
     # or priority; a second landing check waits while it is held; a priority-1 run keeps its own over-cap
-    # lane beside it; an ordinary run still waits. Only a task-less run or one under a landing mark lands.
+    # lane beside it; an ordinary run still waits. Only a run under a landing mark or the coordinator's task-less run lands.
     from ttp import cli, locks, testslots
     _lane_env(monkeypatch)
     hold = [testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, priority=2, worktree="/w/a", wait_s=0),
@@ -5309,10 +5309,22 @@ def test_a_landing_check_never_waits_behind_task_checks_on_the_project_cap(env, 
             g and g.close()
     import types
     proj = types.SimpleNamespace(name="pa")
+    from ttp import coordtools, landmark
     monkeypatch.delenv("TTP_TASK", raising=False)
-    assert cli._landing_check(proj) and not cli._landing_check(None)
+    monkeypatch.delenv(landmark.ENV, raising=False)
+    monkeypatch.delenv(coordtools.ROLE_ENV, raising=False)
+    assert not cli._landing_check(proj), "a plain task-less run (a user's, a test's) shares the project's lanes"
+    monkeypatch.setenv(coordtools.ROLE_ENV, "worker")
+    assert not cli._landing_check(proj), "a worker run without a task is no landing check"
+    monkeypatch.setenv(coordtools.ROLE_ENV, "coordinator")
+    assert cli._landing_check(proj) and not cli._landing_check(None), "the coordinator's own run lands"
     monkeypatch.setenv("TTP_TASK", "12")
     assert not cli._landing_check(proj), "a task's own checks queue under the cap as before"
+    monkeypatch.delenv(coordtools.ROLE_ENV)
+    monkeypatch.setenv(landmark.ENV, "/nonexistent/forged-mark")
+    assert not cli._landing_check(proj), "a forged landing mark path is no landing check"
+    monkeypatch.setattr(landmark, "label", lambda env=None: {"pid": 1})
+    assert cli._landing_check(proj), "a run under a verified landing mark lands, even inside a task"
 
 
 def test_cap_turn_counts_one_lane_for_the_old_unkeyed_base(env, monkeypatch):

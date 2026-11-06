@@ -1175,9 +1175,10 @@ running work is interrupted only by the preemption below:
   Later urgent approvals lead the next batch, which starts as soon as the running one ends; after a
   stop, the next batch takes the urgent approvals it stopped for, never the stopped batch's own
   entries again.
-- Landing checks: a `ttp checks` run for no task (a push batch's, the coordinator's or a user's) or
-  under a landing mark never waits behind the project's task checks for `checks.test_project_max`:
-  one at a time takes the project's landing lane past its lanes and cap. The host-wide cap and its
+- Landing checks: a `ttp checks` run under a landing mark (a push batch's or `ttp push`'s checks) or
+  the coordinator's own run for no task never waits behind the project's task checks for
+  `checks.test_project_max`: one at a time takes the project's landing lane past its lanes and cap.
+  Other task-less runs (a user's or a script's) share the project's lanes as before. The host-wide cap and its
   push slot still apply, and priority-1 runs keep their own lane past the cap.
 - Rejected pushes: a push rejected for authentication keeps its approvals queued and retries as soon
   as a model-free dry-run push shows push access works (checked every 2 minutes, at the latest after
