@@ -9409,14 +9409,17 @@ class Daemon:
             if self.p.db.kv(PAGED_KEY + s["name"]):   # a line paged again later is a new episode
                 self.p.db.set_kv(PAGED_KEY + s["name"], {})
             return "ok (0 observations)"
-        n, errs, subjects = 0, 0, set()
+        n, errs, sides, subjects = 0, 0, 0, set()
         paged = dict(self.p.db.kv(PAGED_KEY + s["name"]) or {})
         reported: set[str] = set()
         filed = 0
         for obs in _observations(text):
             body = obs.get("text", "")
-            # Its own failure lines ("error": true) are errors, not reports.
-            error = failed or obs.get("error") is True
+            # Its own failure lines ("error": true) are errors, not reports. "error": "side" is a side
+            # check's error: reported the same way, but the run's main check ran, so it never fails the run
+            # (at an exit outside (0, 1) the main check did not finish: then it counts as an error).
+            side = ok and obs.get("error") == "side"
+            error = failed or obs.get("error") in (True, "side")
             kind = scr.ERROR if error else receipt
             # A JSON line with "whole": true is one observation: never split at '; '.
             whole = obs.get("whole") is True
@@ -9439,7 +9442,8 @@ class Daemon:
                 subjects.update(scr.normalize(subj) for subj, _, cleared in scr.watcher_conditions(source, body, whole) or ()
                                 if not cleared)
             n += 1
-            errs += error
+            errs += error and not side
+            sides += side
         if ok:   # a line no longer reported is over: its recurrence pages again
             paged = {k: v for k, v in paged.items() if k in reported}
         if paged != (self.p.db.kv(PAGED_KEY + s["name"]) or {}):
@@ -9448,12 +9452,13 @@ class Daemon:
             scr.settle_receipts(self.p.db, source, started, subjects)
             scr.settle_mutes(self.p.db, source, started)   # muted conditions it no longer reported cleared
         # Error lines are not observations: a run of only errors is a check that could not run, a failing
-        # status (schedule.failing) in the list, ttp status and the web app.
+        # status (schedule.failing) in the list, ttp status and the web app. Side errors alone never are.
         if failed:   # its stderr tail in `ttp schedules`
             return f"error: watcher command failed rc={out.returncode}: {output_tail(out.stderr, 240) or '(no stderr)'}"
-        if n and errs == n:
+        if errs and errs + sides == n:
             return f"error ({n} lines: check could not run)"
-        return f"ok ({n - errs} observations, {errs} errors)" if errs else f"ok ({n} observations)"
+        extra = (f", {errs} errors" if errs else "") + (f", {sides} side errors" if sides else "")
+        return f"ok ({n - errs - sides} observations{extra})"
 
     def _page_target(self, name: str, obs: dict) -> str | None:
         """The other local project a line's `to` names (pageto.resolve), else None: the line is then a

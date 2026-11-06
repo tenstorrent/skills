@@ -1206,3 +1206,38 @@ def test_a_daily_review_starting_late_re_reads_its_coordinator_stats_at_start(en
     assert "[stats re-read at " in stored and "[stats read at " not in stored
     assert stored.endswith("Coordinator note: also check the push queue."), stored[-200:]
     assert sched.refresh_feed("no stats here", "x", time.time(), time.time(), None) is None
+
+
+def test_a_command_watcher_side_error_alone_is_not_a_failed_run(env):
+    """A line with "error": "side" (only a side check failed; the main check ran) is reported under the
+    watcher's error source but never makes the run fail, so two such runs queue no fix task.
+    "error": true alone, with or without side errors, and an exit outside (0, 1) still fail it."""
+    from ttp import coordinator as coord, daemon as dm, schedule as sched
+    p = make(env)
+    out = p.root / "out.txt"
+    assert coord.apply(p, [{"type": "schedule_set", "name": "acct", "kind": "command", "every": "1h",
+                            "command": f"cat {shlex.quote(str(out))}"}]) == []
+    d = dm.Daemon(p.base)
+    line = lambda text, **kw: json.dumps({"text": text, "severity": "low", **kw}) + "\n"
+
+    def run(printed, rc=0):
+        out.write_text(printed)
+        p.db.x("UPDATE schedules SET payload=?, next_run=? WHERE name='acct'",
+               (json.dumps({"command": f"cat {shlex.quote(str(out))}; exit {rc}"}), time.time() - 1))
+        d.run_schedules()
+        return p.db.one("SELECT last_status FROM schedules WHERE name='acct'")["last_status"]
+
+    side = line("acct: side lookup skipped: ssh timed out after 20s", error="side")
+    assert run(side) == "ok (0 observations, 1 side errors)"
+    assert run(side) == "ok (0 observations, 1 side errors)"
+    assert sched.broken(p.db) == []
+    assert p.db.q("SELECT id FROM tasks WHERE title LIKE '%acct%'") == []
+    err = p.db.q("SELECT title FROM issues WHERE source='watcher-error:acct'")
+    assert err and all("side lookup skipped" in e["title"] for e in err), err   # reported, as an error line
+    assert run(line("ledger: entry missing") + side) == "ok (1 observations, 1 side errors)"
+    # A real error still fails the run, also beside a side error, and so does a failed exit code.
+    assert run(line("cannot reach the api", error=True)) == "error (1 lines: check could not run)"
+    assert run(line("cannot reach the api", error=True) + side) == "error (2 lines: check could not run)"
+    assert run(line("ledger: entry missing") + line("x", error=True) + side) \
+        == "ok (1 observations, 1 errors, 1 side errors)"
+    assert sched.failing(run(side, rc=3))
