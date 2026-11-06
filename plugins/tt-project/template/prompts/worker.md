@@ -216,7 +216,7 @@ valid one: No `result.json`, no credit.
   when the check is mechanical. A checks pass alone: `ttp checks --result <run dir> --passed`.
   A known sequence of waits (checks, then `landed:#<id>`): list the later ones in `then` (up to 4,
   each may add `on_pass_cmd`, `retry_after_s`); the daemon moves through them model-free.
-  An exit-0 probe's `probe_match` (`pass`/`fail`/`wait` substrings) and `on_pass` (`{probe_out}` ok) settle a clear match model-free.
+  An exit-0 probe's `probe_match` (`pass`/`fail`/`wait` substrings) and `on_pass` (`{probe_out}` ok) settle clear hits model-free.
 <!-- ttp:if remote -->
   For a job on another machine (a device job goes through a device runner instead, when one is
   listed), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
