@@ -408,8 +408,8 @@ def test_a_dedupe_on_the_users_turn_is_no_withdrawal_unless_it_cites_or_quotes_t
     dup = "Hold deploys during the `quiet-window` each Friday."
     said = _echo_said(p, "What is still queued for this week?")   # the user's turn, about something else
 
-    def forget(why, messages=(said,), text=dup):
-        a, b = p.add_memory(text, kind="decision"), p.add_memory(dup + " ", kind="decision")
+    def forget(why, messages=(said,), text=dup, kind="decision"):
+        a, b = p.add_memory(text, kind=kind), p.add_memory(dup + " ", kind=kind)
         p.db.set_kv(echoes.RETIRED_KEY, [])
         assert coord.apply(p, [{"type": "memory_forget", "name": a.stem, "why": why}], user_turn=True, turn=1,
                            messages=list(messages)) == []
@@ -421,11 +421,13 @@ def test_a_dedupe_on_the_users_turn_is_no_withdrawal_unless_it_cites_or_quotes_t
     assert forget("duplicate of the entry kept") == ([], [])
     assert forget("duplicate", messages=[_echo_said(p, "drop the `quiet-window` rule", kind="finding")]) == ([], [])
     assert forget("merged: \"each Friday\" said twice") == ([], [])   # a quote that is not the user's words
-    # The user's word: a `why` citing them, a quote of their message, or their message naming the rule.
+    # The user's word: a `why` citing them, a quote of their message, or (a user rule only) their message
+    # naming the rule. Their message merely holding a name of the coordinator's own decision withdraws nothing.
     assert forget("user msg #7 ended it") == ([echoes.WITHDRAWN], ["directive"])
     assert forget("the user said \"what is still queued\"") == ([echoes.WITHDRAWN], ["directive"])
-    assert forget("done", messages=[_echo_said(p, "Forget the quiet-window each Friday, deploy any day.")]) \
-        == ([echoes.WITHDRAWN], ["directive"])
+    assert forget("done", messages=[_echo_said(p, "Forget the quiet-window each Friday, deploy any day.")]) == ([], [])
+    assert forget("done", messages=[_echo_said(p, "Forget the quiet-window each Friday, deploy any day.")],
+                  kind="preference") == ([echoes.WITHDRAWN], ["directive"])
     # Off the user's turn only a `why` citing them counts, as before.
     assert coord._withdrawn(p.db, dup, False, "the user's words in msg 3") is True
     assert coord._withdrawn(p.db, dup, False, "duplicate", messages=[said]) is False
@@ -954,3 +956,102 @@ def test_an_acknowledged_false_positive_is_hidden_counted_and_listed_again_once_
     assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
     p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Wait for the alpha_gate_flag before every release.", task))
     assert classes()[(rec["id"], f"task #{task} spec")] == "directive"
+
+
+def _unit_watch(p, n=4):
+    """A project whose scripts and a watch config name a service unit, as live code does."""
+    files = {p.harness / "bin" / f"probe{i}.sh": f"#!/bin/sh\nsystemctl is-active svc-broker.service\n" for i in range(n)}
+    files[p.harness / "box-watch.json"] = '{"dropin": "svc-broker.service.d/auto.conf", "unit": "svc-broker.service"}\n'
+    for path, text in files.items():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+
+
+def test_a_coordinators_own_decision_retired_as_withdrawn_or_superseded_orders_no_fix_but_a_user_rule_does(env):
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    _unit_watch(p)
+    p.db.add_task("soak", "Soak the canary box for `two_hour_soak` before the next cut.")
+    old = "Soak the canary box for `two_hour_soak` before the next cut."
+    # A legacy record (no `explicit` flag) of the coordinator's own decision, stored as withdrawn: advisory.
+    rec = echoes.record(p.db, "memory [decision-soak] withdrawn", old)
+    got = [h for h in echoes.scan(p) if h["retirement"] == rec["id"]]
+    assert got and {h["class"] for h in got} == {"advisory"} and "coordinator's own decision" in got[0]["why"], got
+    assert echoes.digest_lines(p) == []
+    # Superseded or withdrawn alike; a decision citing the user, or one retired on the user's explicit word, is not one.
+    for source, text, explicit, want in (
+            ("memory [decision-soak] superseded by [decision-new]", old, None, "advisory"),
+            ("memory [decision-soak] withdrawn", old + " (user msg #4)", None, "directive"),
+            ("memory [decision-soak] withdrawn", old, True, "directive"),
+            ("memory [preference-soak] withdrawn", old, None, "directive"),
+            ("charter 'Notes' quote replaced", old, None, "directive")):
+        p.db.set_kv(echoes.RETIRED_KEY, [])
+        echoes.record(p.db, source, text, kind=echoes.WITHDRAWN, explicit=explicit)
+        assert {h["class"] for h in echoes.scan(p)} == {want}, (source, explicit)
+    # Through the coordinator: the user naming the decision's phrase on their turn records it superseded, not
+    # withdrawn; a `why` citing the user withdraws it (explicit).
+    p.db.set_kv(echoes.RETIRED_KEY, [])
+    a = p.add_memory(old, kind="decision")
+    said = _echo_said(p, "How is the two_hour_soak going?")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [a.stem],
+                            "text": "Soak the canary box overnight."}], user_turn=True, turn=1, messages=[said]) == []
+    (r,) = echoes.records(p)
+    assert r["kind"] == echoes.SUPERSEDED and r["explicit"] is False
+    assert {h["class"] for h in echoes.scan(p)} == {"advisory"}
+    b = p.add_memory("Gate the cut on `night_gate` checks.", kind="decision")
+    p.db.add_task("gate", "Wait for night_gate.")
+    said = _echo_said(p, "drop the night gate")
+    assert coord.apply(p, [{"type": "memory_forget", "name": b.stem, "why": f"user msg #{said} dropped it"}],
+                       user_turn=True, turn=2, messages=[said]) == []
+    r = next(r for r in echoes.records(p) if "night_gate" in r["old"])
+    assert r["kind"] == echoes.WITHDRAWN and r["explicit"] is True
+    assert {h["class"] for h in echoes.scan(p) if h["retirement"] == r["id"]} == {"directive"}
+
+
+def test_a_systemd_unit_name_is_weak_like_a_file_name_and_never_a_fix_order_alone(env):
+    from ttp import echoes
+    for tok in ("svc-broker.service", "broker.service", "nightly.timer", "app.socket", "data.mount", "x.service:3"):
+        assert echoes._weak_token(tok) and echoes._weak(tok), tok
+    assert not echoes._weak("broker_service") and not echoes._weak("service.mode")   # a config key stays strong
+    p = make(env)
+    _unit_watch(p)
+    # A user rule's withdrawal sharing only the unit name with live scripts and watches: advisory everywhere.
+    rec = echoes.record(p.db, "memory [preference-soak] withdrawn",
+                        "Restart broker.service and netconsole.service after every soak.")
+    assert "broker.service" in rec["phrases"]
+    hits = echoes.scan(p)
+    assert len(hits) == 5 and {h["class"] for h in hits} == {"advisory"}, hits
+    assert all("file name" in h["why"] for h in hits)
+    # Its governing wording still orders a fix.
+    t = p.db.add_task("t", "Restart broker.service and netconsole.service after every soak.")
+    assert [h["label"] for h in echoes.scan(p) if h["class"] == "directive"] == [f"task #{t} spec"]
+
+
+def test_one_phrase_ack_covers_every_place_of_one_retirement_and_no_other_phrase_or_retirement(env, capsys):
+    import pytest
+    from ttp import cli, echoes
+    p = make(env)
+    for i in range(4):
+        p.db.add_task(f"t{i}", f"Check queue_gate_flag {i}")
+    both = p.db.add_task("both", "Check queue_gate_flag and hold every merge for the night owl review.")
+    rec = echoes.record(p.db, "charter 'Notes' quote replaced",
+                        "Hold every merge for the night owl review. Set `queue_gate_flag` too.")
+    other = echoes.record(p.db, "charter 'Ops' quote replaced", "Watch the queue_gate_flag value.")
+    assert len([h for h in echoes.scan(p) if h["retirement"] == rec["id"]]) == 5
+    with pytest.raises(SystemExit):
+        cli.main(["echoes", "demo", "--ack-phrase", rec["id"], "no such phrase"])
+    with pytest.raises(SystemExit):
+        cli.main(["echoes", "demo", "--ack-phrase", "0000000000", "queue_gate_flag"])
+    cli.main(["echoes", "demo", "--ack-phrase", rec["id"], "queue_gate_flag"])
+    assert "(4 now)" in capsys.readouterr().out
+    acked: list = []
+    found = echoes.scan(p, acked=acked)
+    mine = [h for h in found if h["retirement"] == rec["id"]]
+    # The place holding the retirement's other phrase still lists that one; the other retirement is untouched.
+    assert [(h["label"], h["phrase"]) for h in mine] == [(f"task #{both} spec", "hold every merge for the night owl review")]
+    assert len([h for h in acked if h["retirement"] == rec["id"]]) == 4
+    assert len([h for h in found if h["retirement"] == other["id"] and h["class"] == "directive"]) == 5
+    # A new place matching later is covered too; counted as acknowledged.
+    p.db.add_task("late", "queue_gate_flag again")
+    assert echoes.export(p)["counts"]["acknowledged"] == 5
+

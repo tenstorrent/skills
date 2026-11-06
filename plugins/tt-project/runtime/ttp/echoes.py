@@ -47,7 +47,15 @@ suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' cou
 A false positive (code using a name the retired text also holds) can be acknowledged: `ttp echoes --ack
 <retirement> <place>` (acknowledge, ACK_KEY) keeps that one match out of the digest's fix orders while the
 matched line's text is unchanged; it is still counted and listed as acknowledged, and a changed line lists
-it again. The strong/weak rules are untouched by it.
+it again. `ttp echoes --ack-phrase <retirement> <phrase>` (acknowledge_phrase) covers one phrase of one
+retirement at every place it matches, while the retirement lives. The strong/weak rules are untouched by it.
+
+A coordinator's own decision (a memory decision entry citing no user words) retired without the user's
+explicit word (a cite or a quote of theirs, not only a phrase their message happens to hold) is advisory
+whatever its kind (_own_decision): no user rule was withdrawn. A systemd unit name (*.service, *.timer, ...)
+is weak like a file name. Accepted gap: how many places use a name is no sign it is right (a retired command
+copied into many scripts is an echo), so a name current code uses widely still matches; acknowledge it by
+phrase.
 """
 from __future__ import annotations
 
@@ -67,6 +75,7 @@ SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits
 WITHDRAWN, COMPACTED, SUPERSEDED = "withdrawn", "compacted", "superseded"   # retirement kinds (see the top)
 ACK_KEY = "retired_echo_acks"       # kv: {hit key: sha256 of the matched line when acknowledged}
 ACK_KEEP = 200
+ACK_PHRASE = "phrase"                # ACK_KEY value of "<retirement>:phrase:<phrase>": that phrase, at every place
 UNVERIFIED = "unverified"
 KINDS = (WITHDRAWN, COMPACTED, SUPERSEDED, UNVERIFIED)
 HISTORICAL_INDEX = "echo_historical.json"   # harness/: {"historical": [{"path", "sha256", "retirement"}]}
@@ -102,7 +111,8 @@ _TTP_CMD = re.compile(r"\bttp [a-z][a-z-]*[a-z]\b")
 _SENTENCE = re.compile(r"(?<=[.!?])\s+")
 # A phrase that alone names no rule: a file name, a path, a version, a hash or an evidence reference.
 _FILEISH = re.compile(r"[\w.-]*\.(?:md|markdown|txt|json|jsonl|ya?ml|toml|py|sh|bash|js|ts|log|csv|tsv|html?|ini"
-                      r"|cfg|conf|lock|db|sqlite|patch|diff|out|err|rc|pdf|png|tar|gz|zip)(?::\d+)*")
+                      r"|cfg|conf|lock|db|sqlite|patch|diff|out|err|rc|pdf|png|tar|gz|zip"
+                      r"|service|timer|socket|mount|automount|slice|scope)(?::\d+)*")   # systemd unit names too
 _VERSION = re.compile(r"v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
 # A name joined to a version by '-' or '@' only (tool-1.2.3, pkg@1.2.3); a config key=value or key_1.5 never is.
 _VERSIONED = re.compile(r"[\w.]*[-@]v?\d+(?:\.\d+)+(?:[-+][\w.]+)?")
@@ -205,6 +215,16 @@ def _kind(rec: dict) -> str:
     return UNVERIFIED
 
 
+def _own_decision(rec: dict) -> bool:
+    """Whether retirement `rec` retired one of the coordinator's own decisions, no user rule: a memory
+    decision entry whose text cites no user words (USER_CITE), retired without the user's explicit word
+    (`explicit`: the change cited or quoted the user, coordinator._withdrawn; a record stored before the
+    flag has none, so it counts as the coordinator's own)."""
+    from .project import USER_CITE
+    return (bool(re.match(r"memory \[decision-[^\]]*\] (?:superseded by \[|withdrawn$)", rec.get("source") or ""))
+            and not USER_CITE.search(rec.get("old") or "") and not rec.get("explicit"))
+
+
 def _store(db, rec: dict, now: float) -> None:
     recs = [r for r in db.kv(RETIRED_KEY, []) or [] if now - r.get("at", 0) < RETIRED_DAYS * 86400
             and r.get("id") != rec["id"]]
@@ -213,13 +233,13 @@ def _store(db, rec: dict, now: float) -> None:
 
 def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: float | None = None,
            negated: bool = False, found: list[str] | None = None, kind: str = WITHDRAWN,
-           unsourced: bool = False) -> dict | None:
+           unsourced: bool = False, explicit: bool | None = None) -> dict | None:
     """Keep retired text `old` (replaced by `new`) to search for. `skip`: place keys (see places) never
     searched for it, such as the replacing entry. `found`: the phrases, when the caller has them.
     `negated`: a match right after a negation ('never <phrase>') agrees with the change, so is no hit.
     `kind`: one of KINDS (an unknown one counts as UNVERIFIED). `unsourced`: `old` is an advisory charter
     Restrictions item the coordinator dropped (scan checks whether a binding section still states it).
-    None (nothing kept) when the text has no distinctive phrase."""
+    `explicit`: a memory entry retired on the user's explicit word (see _own_decision). None (nothing kept) when the text has no distinctive phrase."""
     now = time.time() if now is None else now
     ps = phrases(old, new) if found is None else [p for p in map(_flat, found) if len(p) >= 6][:MAX_PHRASES]
     if not ps:
@@ -229,6 +249,8 @@ def record(db, source: str, old: str, new: str = "", skip: list[str] = (), now: 
            "new": _flat(new)[:4000], "phrases": ps, "skip": list(skip), "negated": negated,
            "kind": kind if kind in KINDS else UNVERIFIED}
     rec["unsourced"] = bool(unsourced)   # stored either way: a record without it predates the flag (_unsourced)
+    if explicit is not None:
+        rec["explicit"] = bool(explicit)
     _store(db, rec, now)
     return rec
 
@@ -643,16 +665,19 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
         cur = {ph for ph in own if _states(units, ph)} if _MEMORY_RETIRED.match(rec.get("source") or "") else set()
         own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
+        mine = _own_decision(rec)
+        okd = {ph for ph in own if acks.get(f"{rec['id']}:{ACK_PHRASE}:{ph}") == ACK_PHRASE}   # acked phrases
         for key, label, text, flat in where:
             if key in skip or (rec["id"], key) in seen or _BRIEF.match(key):   # the user's own words, never one
                 continue
-            ph = _hit(rec, flat, own)
+            ph = _hit(rec, flat, [x for x in own if x not in okd]) or _hit(rec, flat, [x for x in own if x in okd])
             if ph:
                 seen.add((rec["id"], key))
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
                 why = (f"still stated in {stated}: no action" if stated else
                        "a current Restrictions item with its source states it: no action" if ph in cur else
+                       "a coordinator's own decision retired, no user rule withdrawn: no action" if mine else
                        "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
                        else f"retired as {rec['kind']}, not withdrawn by the user" if rec["kind"] != WITHDRAWN
@@ -660,7 +685,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
                        "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
                        "class": "advisory" if why else "directive", "why": why, "sha": _line_sha(text, own)}
-                if acks.get(hit["key"]) == hit["sha"]:
+                if acks.get(hit["key"]) == hit["sha"] or ph in okd:
                     if acked is not None:
                         acked.append(dict(hit, **{"class": "acknowledged"}))
                     continue
@@ -723,7 +748,7 @@ def digest_lines(p, now: float | None = None) -> list[str]:
                      f" listed again once its line changes)")
     if advisory:   # counted, never a fix order
         lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
-                     f"superseded coordinator decision, a retirement of unknown origin, a name a current cited "
+                     f"coordinator's own decision, a retirement of unknown origin, a name a current cited "
                      f"Restrictions item states or only a file name, version "
                      f"or evidence reference, never a rule the user withdrew; change nothing for them (all: "
                      f"`ttp echoes`)")
@@ -752,6 +777,29 @@ def acknowledge(p, retirement: str, where: str, now: float | None = None) -> dic
             p.db.set_kv(ACK_KEY, dict(list(acks.items())[-ACK_KEEP:]))
             return h
     raise ValueError(f"no current match of retirement {retirement} at {where} (see `ttp echoes`)")
+
+
+def acknowledge_phrase(p, retirement: str, phrase: str, now: float | None = None) -> list[dict]:
+    """Acknowledge phrase `phrase` of retirement `retirement` as no echo at every place it matches, now and
+    later (a name the project still uses rightly): its hits are listed as acknowledged while that retirement
+    lives; a place another phrase of it also matches still lists that one. Returns the matches it covers now.
+    Raises ValueError when the retirement is not live or holds no such phrase."""
+    ph = _flat(phrase).strip("`'\"")
+    rec = next((r for r in records(p, now) if r.get("id") == retirement), None)
+    if rec is None:
+        raise ValueError(f"no live retirement {retirement} (see `ttp echoes`)")
+    if ph not in (rec.get("phrases") or []):
+        raise ValueError(f"retirement {retirement} has no phrase \"{ph}\"; its phrases: "
+                         + "; ".join(f"\"{x}\"" for x in rec.get("phrases") or []))
+    live = {r.get("id") for r in records(p, now)}
+    acks = p.db.kv(ACK_KEY, {}) or {}
+    acks = {k: v for k, v in (acks if isinstance(acks, dict) else {}).items() if k.split(":", 1)[0] in live}
+    acks.pop(f"{retirement}:{ACK_PHRASE}:{ph}", None)
+    acks[f"{retirement}:{ACK_PHRASE}:{ph}"] = ACK_PHRASE
+    p.db.set_kv(ACK_KEY, dict(list(acks.items())[-ACK_KEEP:]))
+    acked: list[dict] = []
+    scan(p, now, [], acked)
+    return [h for h in acked if h["retirement"] == retirement and h["phrase"] == ph]
 
 
 def export(p, now: float | None = None) -> dict:

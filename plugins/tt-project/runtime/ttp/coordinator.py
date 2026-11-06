@@ -3369,11 +3369,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     for name in old:
                         stem = Path(str(name).strip().strip("[]")).stem
                         if stem in live and stem != added.stem:
+                            gone = _withdrawn(db, live[stem]["body"], user_turn, a.get("why"), a["text"], messages,
+                                              since=_stamp_ts(live[stem]["created"]),
+                                              inferred=not _own_decision(live[stem]))
                             echoes.record(db, f"memory [{stem}] superseded by [{added.stem}]", live[stem]["body"],
                                           a["text"], skip=[f"memory:{added.stem}"],
-                                          kind=_echo_kind(live[stem], _withdrawn(
-                                              db, live[stem]["body"], user_turn, a.get("why"), a["text"],
-                                              messages, since=_stamp_ts(live[stem]["created"]))))
+                                          kind=_echo_kind(live[stem], gone), explicit=gone)
                 for name in old:
                     try:
                         # A standing entry superseded by a standing one is shortened, not retired.
@@ -3388,7 +3389,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 gone = _users_withdrawal(p, str(a.get("name") or ""), user_turn, a.get("why"), messages)
                 p.forget_memory(str(a.get("name") or ""), why=a.get("why"))
                 if gone:   # the user withdrew it: its text, searched for in what still binds (echoes)
-                    echoes.record(db, f"memory [{gone['name']}] withdrawn", gone["body"])
+                    echoes.record(db, f"memory [{gone['name']}] withdrawn", gone["body"], explicit=True)
                 memory_budget_check(p)
             elif t == "charter_update" and a.get("both_hold") and not (a.get("text") or a.get("quote")
                                                                     or a.get("replaces")):
@@ -7185,8 +7186,14 @@ def _user_msg_ids(text: str) -> set[str]:
     return {i for m in _USER_MSG_ID.finditer(text) for i in re.findall(r"\d+", m.group())}
 
 
+def _own_decision(entry: dict) -> bool:
+    """Whether memory `entry` is one of the coordinator's own decisions: a decision citing no user words."""
+    from .project import USER_CITE
+    return entry.get("kind") == "decision" and not USER_CITE.search(entry.get("body") or "")
+
+
 def _withdrawn(db, old: str, user_turn: bool, why: str | None, new: str = "",
-               messages: list[int] | None = None, since: float | None = None) -> bool:
+               messages: list[int] | None = None, since: float | None = None, inferred: bool = True) -> bool:
     """Whether a memory change retiring entry text `old` is the user's withdrawal: its `why` cites the
     user's words (USER_CITE), on any turn. On the user's turn also: the new text cites a user message
     `old` does not, a quote in `why` or the new text holds the user's own words of this turn, or those
@@ -7194,7 +7201,9 @@ def _withdrawn(db, old: str, user_turn: bool, why: str | None, new: str = "",
     of these: a turn being the user's alone never makes it theirs. `since` (a supersede: when `old` was
     written): a cite naming only user messages posted before it is where a rule came from (such as a
     current Restrictions item's source), not the user retiring `old`: one coordinator entry replacing
-    another. A cite naming no message, or one not in the chat log, still counts."""
+    another. A cite naming no message, or one not in the chat log, still counts. `inferred` False (the
+    coordinator's own decision, _own_decision): only a cite or a quote of the user's words counts, never their
+    message merely holding a phrase of `old` (a unit or script name they mentioned retires no decision)."""
     from .project import USER_CITE
     why, new = why or "", new or ""
 
@@ -7219,7 +7228,7 @@ def _withdrawn(db, old: str, user_turn: bool, why: str | None, new: str = "",
     if not said:
         return False
     quoted = [echoes._flat(next(g for g in m.groups() if g)) for m in echoes._QUOTED.finditer(f"{why}\n{new}")]
-    return any(q and q in said for q in quoted) or any(
+    return any(q and q in said for q in quoted) or inferred and any(
         ph in said for ph in echoes.phrases(old) if not echoes._weak(ph))
 
 
@@ -7229,7 +7238,8 @@ def _users_withdrawal(p: Project, name: str, user_turn: bool, why: str | None,
     then searches for; None otherwise or when no entry is named."""
     stem = Path(name.strip().strip("[]")).stem
     entry = next((e for e in p._memory_entries() if e["name"] == stem), None) if stem else None
-    return entry if entry and _withdrawn(p.db, entry["body"], user_turn, why, messages=messages) else None
+    return entry if entry and _withdrawn(p.db, entry["body"], user_turn, why, messages=messages,
+                                         inferred=not _own_decision(entry)) else None
 
 
 def _apply_due_moves(p: Project, actions: list, moves: list, failed: set, problems: list, notes: list,

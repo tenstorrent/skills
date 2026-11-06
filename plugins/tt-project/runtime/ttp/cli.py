@@ -2069,6 +2069,14 @@ def cmd_echoes(a) -> None:
             die(str(e))
         print(f"acknowledged: {h['label']} (retirement {h['retirement']}): hidden while that line is unchanged")
         return
+    if a.ack_phrase:
+        try:
+            hs = echoes.acknowledge_phrase(p, *a.ack_phrase)
+        except ValueError as e:
+            die(str(e))
+        print(f"acknowledged phrase \"{a.ack_phrase[1]}\" of retirement {a.ack_phrase[0]} at every place it matches "
+              f"({len(hs)} now): listed as acknowledged while that retirement lives")
+        return
     data = echoes.export(p)
     print(json.dumps(data, indent=1, default=str) if a.json else echoes.export_text(data, timefmt.home(p)))
 
@@ -12925,6 +12933,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="acknowledge one match as no echo: the retirement id and the place as listed (a file's "
                         "<path>:<line>); stored in the project's state, listed as acknowledged, never a fix order, until that "
                         "line changes or a new copy appears there")
+    s.add_argument("--ack-phrase", nargs=2, metavar=("RETIREMENT", "PHRASE"),
+                   help="acknowledge one phrase of one retirement as no echo at every place it matches (a name the "
+                        "project still uses rightly), while that retirement lives")
     s.set_defaults(fn=cmd_echoes)
 
     s = sub.add_parser("replicate", help="backup copies of the project's state on a standby machine "
