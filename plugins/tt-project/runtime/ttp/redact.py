@@ -14,6 +14,12 @@ becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for eve
   and the daemon again before it reads the hand-off);
 - text sent to a helper model or service (Jev, Slack) and endpoint client errors.
 
+Every private-key block (PEM `-----BEGIN <type> PRIVATE KEY-----` to its END line, PGP PRIVATE KEY
+BLOCK) becomes KEY_MASK the same way, stored or not, raw or JSON-escaped; one cut off before its END
+line (a lone BEGIN line too) is masked to the end of its string (the first character a key body never
+holds, such as the quote closing a JSON string), so JSONL stays valid; a lone END line is masked with
+the base64 lines right above it (a block whose start output trimming cut off).
+
 Nothing here prints or logs a value: callers get the masked text, or a count.
 """
 from __future__ import annotations
@@ -29,6 +35,17 @@ SECRET_FIELD_RE = re.compile(r"key|token|secret|passw", re.I)
 MAX_FILE_BYTES = 256 << 20       # a run file bigger than this is left alone (never seen in practice)
 BUILTIN = ("jev", "slack")       # slots whose other fields (via, user_id, url) are not secret
 _cache: dict[str, Any] = {"sig": None, "pairs": []}
+KEY_MASK = "[private key redacted]"
+_KEY_TYPE = r"(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?"
+# A key body: base64, PEM and PGP armor headers (Proc-Type, DEK-Info, Version, Comment) and line ends,
+# raw or JSON-escaped (once or more: JSON in a JSON string); never a quote or a lone backslash.
+_KEY_BODY = r"(?:[A-Za-z0-9+/=:,.()\- \t\r\n]|\\+[nrt/]|\\+u[0-9a-fA-F]{4})"
+_KEY_RE = (rf"-{{4,5}} ?BEGIN {_KEY_TYPE} ?-{{4,5}}{_KEY_BODY}*?"
+           rf"(?:-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}|(?!{_KEY_BODY}))")
+KEY_RE = re.compile(_KEY_RE)
+_KEY_END_RE = re.compile(rf"-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}")
+# One base64 line, raw or JSON-escaped, from a line start (or the text's) to its line end last.
+_KEY_LINE_RE = re.compile(r"(?:^|(?<=\n)|(?<=\\n))[A-Za-z0-9+/=]+(?:\r?\n|(?:\\+r)?\\+n)\Z")
 
 
 def custom(slot: str) -> bool:
@@ -83,10 +100,39 @@ def mask(slot: str) -> str:
     return f"[secret:{slot}]"
 
 
+def _mask_keys(text: str) -> tuple[str, int]:
+    if "PRIVATE KEY" not in text:
+        return text, 0
+    text, n = KEY_RE.subn(KEY_MASK, text)
+    out, at = [], 0
+    for m in _KEY_END_RE.finditer(text):   # END lines left alone: no BEGIN before them
+        start, lines = m.start(), []
+        while start > at and (b := _KEY_LINE_RE.search(text[max(at, start - 400):start])):
+            line = b.group()
+            head = text[:start - len(line)]
+            if (lines and len(line.rstrip("\\nr\r\n")) < 16) or (
+                    start - len(line) > at and not head.endswith(("\n", "\\n"))):
+                break   # a short line above the last, or the end of a longer line (prose)
+            lines.append(line)
+            start -= len(line)
+        if not any(len(x.rstrip("\\nr\r\n")) >= 40 for x in lines):
+            start = m.start()   # no full base64 line above it: only the END line
+        out += [text[at:start], KEY_MASK]
+        at, n = m.end(), n + 1
+    return "".join(out) + text[at:], n
+
+
+def scrub_keys(text: str) -> str:
+    """`text` with every private-key block, and any lone BEGIN or END line of one, masked (KEY_MASK)."""
+    return _mask_keys(text)[0]
+
+
 def scrub(text: Any) -> Any:
-    """`text` with every stored secret value masked; anything but a str comes back as it was."""
+    """`text` with every private-key block and stored secret value masked; anything but a str comes back
+    as it was."""
     if not isinstance(text, str) or not text:
         return text
+    text = scrub_keys(text)
     for value, slot in pairs():
         if value in text:
             text = text.replace(value, mask(slot))
@@ -111,11 +157,9 @@ def _variants(value: str) -> list[str]:
 
 
 def scrub_file(path: Path) -> int:
-    """Masks every stored secret value in the file, rewritten whole (same mode) only when one is in it.
-    Returns how many values it masked; 0 for a missing, unreadable or oversized file."""
+    """Masks every private-key block and stored secret value in the file, rewritten whole (same mode)
+    only when one is in it. Returns how many it masked; 0 for a missing, unreadable or oversized file."""
     found = pairs()
-    if not found:
-        return 0
     try:
         if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_FILE_BYTES:
             return 0
@@ -123,6 +167,9 @@ def scrub_file(path: Path) -> int:
     except OSError:
         return 0
     n = 0
+    if b"PRIVATE KEY" in data:   # bytes that are not UTF-8 come back as they were (surrogateescape)
+        text, n = _mask_keys(data.decode("utf-8", "surrogateescape"))
+        data = text.encode("utf-8", "surrogateescape")
     for value, slot in found:
         for v in _variants(value):
             b = v.encode()
@@ -155,10 +202,9 @@ def session_id(output: Path) -> str:
 
 
 def scrub_run(run_dir: Path) -> int:
-    """Masks stored secrets in every file of a finished run's folder (output, logs, hand-off) and in the
-    agent's own session transcript for that run. Returns how many values it masked; safe to run twice."""
-    if not pairs():
-        return 0
+    """Masks private keys and stored secrets in every file of a finished run's folder (output, logs,
+    hand-off) and in the agent's own session transcript for that run. Returns how many it masked; safe
+    to run twice."""
     run_dir = Path(run_dir)
     n = 0
     try:

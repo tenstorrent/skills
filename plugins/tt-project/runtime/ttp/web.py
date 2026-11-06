@@ -18,7 +18,7 @@ from . import alerts, awake, chatgone
 from . import budget as bud
 from . import globalcap as gcap
 from . import coordinator as coord
-from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, release, responsibilities, route, sweep, timefmt, urgent, waits
+from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, redact, release, responsibilities, route, sweep, timefmt, urgent, waits
 from . import schedule as sched
 from . import pauseends, selfreview, startgate, sweepskip, timefmt, topup, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
@@ -837,7 +837,8 @@ class Handler(BaseHTTPRequestHandler):
         super().end_headers()
 
     def _send(self, code: int, body, ctype: str = "application/json") -> None:
-        data = body if isinstance(body, bytes) else json.dumps(body, default=str).encode()
+        # Every API answer (state, messages, run views) is masked: a running worker's files are not yet.
+        data = body if isinstance(body, bytes) else redact.scrub(json.dumps(body, default=str)).encode()
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
@@ -885,7 +886,7 @@ class Handler(BaseHTTPRequestHandler):
                 if not r:
                     return self._send(404, {"error": "no run"})
                 d = Path(r["dir"])
-                tail = lambda n: (d / n).read_text(errors="replace")[-8000:] if (d / n).exists() else ""  # noqa: E731
+                tail = lambda n: redact.scrub((d / n).read_text(errors="replace"))[-8000:] if (d / n).exists() else ""  # noqa: E731
                 return self._send(200, {"progress": tail("progress.md"), "result": tail("result.json"),
                                         "stderr": tail("stderr.log"), "archived": archived_files(self._proj(), r["task"])})
             return self._send(404, {"error": "unknown endpoint"})

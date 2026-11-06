@@ -1221,3 +1221,162 @@ def test_doctor_reports_an_unreadable_secret_store_in_one_line_and_runs_its_late
     assert _EP_KEY not in out, out
     assert "host-run: runner.host_commands entry 1" in out, "doctor runs on to the host-run checks"
     assert "process sandbox for checks:" in out, "and on to the checks after them"
+
+
+# Private-key blocks never reach a run's files, records, outbox or views (redact.KEY_RE). Every key here is
+# assembled at test time from random bytes: the repository holds no key-looking text.
+def _key_block(kind="OPENSSH", headers=""):
+    """(block, body lines) of a random PEM-style private key of `kind` ("" for a plain one)."""
+    import base64
+    body = base64.b64encode(os.urandom(400)).decode()
+    lines = [body[i:i + 64] for i in range(0, len(body), 64)]
+    label = (kind + " " if kind else "") + "PRIVATE" + " KEY"
+    dash = "-" * 5
+    block = f"{dash}BEGIN {label}{dash}\n{headers}" + "\n".join(lines) + f"\n{dash}END {label}{dash}\n"
+    return block, lines
+
+
+def _no_key(text, lines):
+    return not any(ln in text for ln in lines) and not any(ln[:24] in text for ln in lines)
+
+
+@pytest.mark.parametrize("kind,headers", [("OPENSSH", ""), ("RSA", ""), ("EC", ""), ("DSA", ""), ("", ""),
+                                          ("ENCRYPTED", ""), ("RSA", "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0A1B\n\n"),
+                                          ("PGP", "Version: Test 1\n\n")])
+def test_private_key_blocks_are_masked_raw_and_json_escaped(kind, headers):
+    from ttp import redact
+    block, lines = _key_block(kind, headers)
+    if kind == "PGP":
+        block = block.replace("PRIVATE KEY-", "PRIVATE KEY BLOCK-")
+    out = redact.scrub("cat k:\n" + block + "done")
+    assert out == f"cat k:\n{redact.KEY_MASK}\ndone"
+    line = json.dumps({"type": "tool_result", "content": "before " + block + " after"})
+    out = redact.scrub(line)
+    assert _no_key(out, lines) and json.loads(out)["content"] == f"before {redact.KEY_MASK}\n after"
+    twice = json.dumps(json.dumps({"t": block}))   # JSON in a JSON string
+    out = redact.scrub(twice)
+    assert _no_key(out, lines) and redact.KEY_MASK in json.loads(json.loads(out))["t"]
+
+
+def test_a_cut_off_key_block_is_masked_to_the_end_of_its_string_and_two_in_a_line_each():
+    from ttp import redact
+    block, lines = _key_block("RSA")
+    cut = json.dumps({"t": "x " + block[:200]}) + "\n" + json.dumps({"n": 1}) + "\n"
+    out = redact.scrub(cut)
+    assert _no_key(out, lines) and [json.loads(x) for x in out.splitlines()] == [{"t": "x " + redact.KEY_MASK}, {"n": 1}]
+    assert redact.scrub("x " + block[:200]) == "x " + redact.KEY_MASK
+    other, lines2 = _key_block("EC")
+    one = json.dumps({"t": block.rstrip() + " and " + other.rstrip()})
+    out = redact.scrub(one)
+    assert _no_key(out, lines + lines2) and json.loads(out)["t"] == f"{redact.KEY_MASK} and {redact.KEY_MASK}"
+
+
+def test_lone_marker_lines_and_a_block_trimmed_at_its_start_are_masked(env, monkeypatch):
+    """Regression (user msg #1904): a transcript that held only the BEGIN and END lines of a key, with no
+    body between them, and a block whose start output trimming cut off."""
+    from ttp import project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    block, lines = _key_block()
+    begin, end = block.splitlines()[0], block.splitlines()[-1]
+    for text in (begin + "\n" + end + "\n", begin, end, "cat k\n" + end + "\nok"):
+        out = redact.scrub(text)
+        assert "PRIVATE" not in out and redact.KEY_MASK in out, text
+    assert redact.scrub("cat k\n" + end + "\nok") == f"cat k\n{redact.KEY_MASK}\nok"
+    trimmed = "kept prose\n" + "\n".join(lines[2:]) + "\n" + end + "\n"
+    assert redact.scrub(trimmed) == f"kept prose\n{redact.KEY_MASK}\n"
+    line = json.dumps({"type": "tool_result", "content": "...\n" + "\n".join(lines[3:]) + "\n" + end})
+    out = redact.scrub(line)
+    assert _no_key(out, lines) and json.loads(out)["content"] == "...\n" + redact.KEY_MASK
+    run = env["tmp"] / "runs" / "12"
+    run.mkdir(parents=True)
+    (run / "output.jsonl").write_text(json.dumps({"tool_result": begin + "\n" + end + "\n"}) + "\n"
+                                      + json.dumps({"tool_result": end}) + "\n")
+    assert redact.scrub_run(run) == 2
+    out = (run / "output.jsonl").read_text()
+    assert "PRIVATE" not in out and [json.loads(x) for x in out.splitlines()] == [
+        {"tool_result": redact.KEY_MASK + "\n"}, {"tool_result": redact.KEY_MASK}]
+
+
+def test_public_keys_and_prose_about_private_keys_stay_as_they_are():
+    from ttp import redact
+    dash = "-" * 5
+    for text in (f"{dash}BEGIN PUBLIC KEY{dash}\nMIIBIjANBgkq\n{dash}END PUBLIC KEY{dash}\n",
+                 "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAI user@example",
+                 "Never print a private key; the PRIVATE KEY header names its type.",
+                 f"a {dash}BEGIN CERTIFICATE{dash} block"):
+        assert redact.scrub(text) == text
+
+
+def test_scrub_run_masks_private_keys_with_no_stored_secret_and_keeps_jsonl_valid(env, monkeypatch):
+    from ttp import project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")   # no secrets store at all
+    block, lines = _key_block()
+    run = env["tmp"] / "runs" / "11"
+    run.mkdir(parents=True)
+    sid = "0123abcd-4567-89ef-0123-456789abcdef"
+    (run / "output.jsonl").write_text(json.dumps({"type": "system", "session_id": sid}) + "\n"
+                                      + json.dumps({"tool_result": block}) + "\n"
+                                      + json.dumps({"tool_result": block[:150]}) + "\n")
+    (run / "stderr.log").write_text("warn\n" + block + "tail\n")
+    cfg = env["tmp"] / "claude-own"
+    (run / "run.json").write_text(json.dumps({"provider": "claude", "cwd": "/w", "env": {"CLAUDE_CONFIG_DIR": str(cfg)}}))
+    session = cfg / "projects" / "-w" / f"{sid}.jsonl"
+    session.parent.mkdir(parents=True)
+    session.write_text(json.dumps({"content": block}) + "\n")
+    assert redact.scrub_run(run) == 4
+    for f in (run / "output.jsonl", run / "stderr.log", session):
+        assert _no_key(f.read_text(), lines) and redact.KEY_MASK in f.read_text(), f
+    assert len([json.loads(x) for x in (run / "output.jsonl").read_text().splitlines()]) == 3
+    assert redact.scrub_run(run) == 0
+
+
+def test_a_run_that_prints_a_private_key_keeps_it_out_of_every_copy(env, monkeypatch):
+    """Regression (user msg #1901): a worker that prints a key file into its transcript leaves the key in no
+    stored or shown copy: run files, hand-off, database rows, outbox, the web app's run and state views."""
+    p = make(env)
+    from ttp import outbox, project
+    from ttp.daemon import Daemon
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "key-home")
+    block, lines = _key_block()
+    keyfile, tool = env["tmp"] / "k", env["tmp"] / "tool.jsonl"
+    keyfile.write_text(block)
+    tool.write_text(json.dumps({"type": "user", "tool_result": {"content": block}}) + "\n")
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"cat '{tool}'; cat '{keyfile}'; cat '{keyfile}' > \"$TTP_RUN_DIR/job.log\"; "
+                                         f"cat '{keyfile}' >&2")
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "the key file holds " + block}))
+    tid = p.db.add_task("read the key file", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    assert _run_until(d, p, lambda: p.db.task(tid)["status"] == "done")
+    run = p.db.one("SELECT id, dir FROM runs WHERE task=?", (tid,))
+    run_dir = pathlib.Path(run["dir"]) if run["dir"] else p.runs / str(run["id"])
+    files = [f for f in run_dir.rglob("*") if f.is_file()]
+    assert {"output.jsonl", "result.json", "job.log", "stderr.log"} <= {f.name for f in files}
+    for f in files:
+        assert _no_key(f.read_text(errors="replace"), lines), f.name
+    out = (run_dir / "output.jsonl").read_text()
+    assert _masked(out) and _masked((run_dir / "result.json").read_text())
+    json.loads(out.splitlines()[0])   # the tool line stays valid JSON
+    dump = json.dumps([p.db.q(f"SELECT * FROM {t}") for t in ("tasks", "events", "runs", "messages")])
+    assert _no_key(dump, lines) and _masked(dump)
+    outbox.add("peer", ["say", "the key: " + block], outbox.new_id(), None)
+    assert _no_key(outbox.path("peer").read_text(), lines) and _masked(outbox.path("peer").read_text())
+    (run_dir / "progress.md").write_text("15:00 note: " + block + "x" * 7990 + "\n")   # a live run: not masked yet
+    if _sockets_refused():
+        return
+    from ttp import web
+    port = _start_web(p)
+    for path in (f"/api/run/{run['id']}", "/api/state"):
+        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"X-TTP-Token": web.token(p)})
+        for _ in range(50):
+            try:
+                body = urllib.request.urlopen(req, timeout=5).read().decode()
+                break
+            except urllib.error.URLError:
+                time.sleep(0.1)
+        assert _no_key(body, lines), path
+        json.loads(body)
+
+
+def _masked(text):
+    from ttp import redact
+    return redact.KEY_MASK in text

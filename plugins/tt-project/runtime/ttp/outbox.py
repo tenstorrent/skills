@@ -20,7 +20,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
-from . import project
+from . import project, redact
 
 
 def folder() -> Path:
@@ -79,6 +79,7 @@ def _append(p: Path, entry: dict) -> None:
 
 
 def _append_text(p: Path, text: str) -> None:
+    text = redact.scrub(text)
     p.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     fd = os.open(str(p), os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o600)
     try:
@@ -104,7 +105,7 @@ def _rewrite(name: str, keep: list[dict]) -> None:
     if not keep:
         _unlink(p)
         return
-    project.durable_write(p, "".join(json.dumps(e, sort_keys=True) + "\n" for e in keep), mode=0o600)
+    project.durable_write(p, redact.scrub("".join(json.dumps(e, sort_keys=True) + "\n" for e in keep)), mode=0o600)
 
 
 def _unlink(p: Path) -> None:

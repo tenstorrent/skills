@@ -34,7 +34,7 @@ _STARTED_BY = (os.getpid(), os.getppid())
 
 from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
-from . import outbox
+from . import outbox, redact
 from .devq import unmask_devices
 from . import chatgone, checkwait, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
@@ -1877,9 +1877,9 @@ def cmd_status(a) -> None:
             die("no tt-project project here; name one: `ttp status <name>`")
     if a.json:
         from .web import state_payload
-        print(json.dumps(state_payload(p, p.db), default=str, indent=1))
+        print(redact.scrub(json.dumps(state_payload(p, p.db), default=str, indent=1)))
     else:
-        print(status_text(p, verbose=a.verbose))
+        print(redact.scrub(status_text(p, verbose=a.verbose)))   # a live run's notes are read as they are
         from .project import secrets_state
         if not (sec := secrets_state())["readable"]:
             print(f"secrets store: unreadable, skipped ({sec['error']})")
@@ -2262,6 +2262,7 @@ def cmd_note(a) -> None:
         die("ttp note: the note's text is required", 2)
     if not run_dir:
         die("ttp note only works inside a tt-project run")
+    a.text = redact.scrub(a.text)   # progress.md and a note's recipients keep no key or secret
     if getattr(a, "reply", None) and a.to:
         die("ttp note: --reply answers the note's sender by its own route; leave out --to", 2)
     if getattr(a, "confirms", None):
@@ -10144,7 +10145,7 @@ def log_tail(logs: Path, n: int) -> str | None:
             continue
     if not seen:
         return None
-    return out.lstrip(bytes(range(0x80, 0xC0))).decode(errors="replace")   # no half character at the cut
+    return redact.scrub(out.lstrip(bytes(range(0x80, 0xC0))).decode(errors="replace"))   # no half character at the cut
 
 
 def cmd_logs(a) -> None:

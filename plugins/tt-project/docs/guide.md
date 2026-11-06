@@ -2933,6 +2933,14 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   database (events, notes, notify text, hand-offs), the daemon log, each run's folder and its agent's
   session transcript once the run ends, and text for Jev and Slack. The secrets store is mode 0600
   and run folders 0700.
+- Private keys get the same treatment on every provider, saved or not: any PEM-style
+  `BEGIN ... PRIVATE KEY` block (OPENSSH, RSA, EC, DSA, ENCRYPTED, plain) or PGP private key block,
+  raw or JSON-escaped, becomes `[private key redacted]`, as does a block cut short or a lone BEGIN or
+  END line. Beyond the places above it is masked in `ttp note` text, the `ttp say` outbox, `ttp
+  status` and `ttp logs` output and every web app answer. A running worker's own files hold what it
+  printed until the run ends; the web app and `ttp status` mask it when they show it. The Claude Code
+  and Codex session transcripts are masked at run end; Cursor and the `chat` provider keep none the
+  harness knows of.
 
 ## Limits
 

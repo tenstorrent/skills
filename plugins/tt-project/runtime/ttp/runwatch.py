@@ -66,7 +66,8 @@ def tick(p: Project, now: float | None = None, write: bool = True) -> dict:
 
 
 def write(p: Project, data: dict) -> None:
-    write_json(path(p), data)
+    from . import redact
+    write_json(path(p), redact.scrub_obj(data))   # a tool call's text can carry a key or secret
 
 
 def _entry(p: Project, r: dict, old: dict, now: float, base: list[str]) -> dict:
@@ -296,4 +297,5 @@ def text(data: dict, task: int | None = None) -> str:
             state = {True: "read", False: "UNREAD", None: "read state unknown"}[st.get("read")]
             lines.append(f"  steer: {st['last']} ({state})")
         out.append("\n".join(lines))
-    return "\n".join(out) if out else "no running worker or reviewer runs"
+    from . import redact
+    return redact.scrub("\n".join(out)) if out else "no running worker or reviewer runs"
