@@ -79,16 +79,53 @@ def _claude_launch(env, p, cwd, d=None):
     from ttp.daemon import Daemon
     d = d or Daemon(p.base)
     tid = p.db.add_task("t", "s", kind="work", tier="light", origin="user")
-    rid = d.start_run("worker", "go", "claude", "light", str(cwd), task=p.db.task(tid))
+    held = []
+
+    class Held(subprocess.Popen):
+        # start_run drops its runner's Popen: a runner that exited first (a loaded host) was then reaped by
+        # Popen.__del__ or subprocess's cleanup, and os.waitpid here found no child. Held, only this test reaps it.
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            held.append(self)
+    real = subprocess.Popen
+    subprocess.Popen = Held
+    try:
+        rid = d.start_run("worker", "go", "claude", "light", str(cwd), task=p.db.task(tid))
+    finally:
+        subprocess.Popen = real
     (p.runs / str(rid) / "STOP").touch()
     spec = json.loads((p.runs / str(rid) / "run.json").read_text())
     pid = int((p.runs / str(rid) / "runner.pid").read_text().split()[0])
+    proc = next(x for x in held if x.pid == pid)
     try:   # the launch is what is checked: stop the runner this test started (its own session)
         os.killpg(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
-    os.waitpid(pid, 0)
+    proc.wait()
     return spec
+
+
+def test_claude_launch_reaps_a_runner_that_exited_before_start_run_returned(env, monkeypatch):
+    from ttp import runner
+    from ttp.providers import claude
+    monkeypatch.setattr(claude.Claude, "binary", lambda self: "/usr/bin/true")
+    monkeypatch.setattr(claude, "find_binary", lambda b: None)   # unfenced: the runner ends on its own
+    gone = []
+    real = runner.proc_start
+
+    def after_exit(pid, *a, **k):   # a loaded host's timing: the runner is gone before start_run returns
+        for _ in range(1200 if pid != os.getpid() else 0):   # the daemon reads its own start too
+            try:
+                if Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                    gone.append(pid)
+                    break
+            except OSError:
+                break
+            time.sleep(0.1)
+        return real(pid, *a, **k)
+    monkeypatch.setattr(runner, "proc_start", after_exit)
+    spec = _claude_launch(env, make(env), env["repo"])
+    assert gone and spec["argv"], "the helper reaps a runner the daemon's dropped Popen could have reaped"
 
 
 def test_daemon_fences_claude_workers_and_observes_a_missing_dependency_once(env, monkeypatch):
