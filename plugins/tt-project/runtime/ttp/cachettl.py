@@ -189,14 +189,26 @@ def record(state, fp: dict, now: float | None = None) -> dict:
 
 # A persistent coordinator session (coordsession.py) caches its whole history, not only the stateless
 # prefix, so its wakes are judged on the session's own writes, kept in its kv state under SESSION:
-# {"h1": start of its last 1h wake, "ttl": its last wake's lifetime}. A resumed wake goes at 5m only
-# right after the session's own 1h wake, while that is warm: what it adds is then the only part a gap
-# over 5 min loses. Any other session wake (a new session, a resume after a 5m wake) goes at 1h when a
-# next wake is likely (likely_next), so the history it writes outlives the many 5-60 min gaps. The
-# handover wake goes at 5m: the next wake starts a new session, which reads none of this one's history.
-# A replay of recorded session wakes found 5m after each fresh 5m wake (while the tail lives) or
-# whenever the 1h write is warm costing more: their 5m tails grow, and a miss rewrites all of them.
+# {"h1": start of its last 1h wake, "ttl": its last wake's lifetime, "ts": that wake's start, "end": its
+# end (coordsession.record)}. A 1h request never reads a 5m write: a wake that asked for 1h right after a
+# warm 5m wake re-wrote that wake's whole tail. So once the session wrote at 5m, its resumed wakes stay
+# at 5m while that write is warm (TAIL_WARM_S since its wake ended) or the session's 1h write is warm
+# (cache_warm_min), which every 5m wake reads. Any other session wake (a new session, a resume with
+# both cold) goes at 1h when a next wake is likely (likely_next), so the history it writes outlives the
+# many 5-60 min gaps. The handover wake goes at 5m: the next wake starts a new session, which reads none
+# of this one's history. A replay of recorded session wakes with that hit rule put this at 16% under
+# alternating 1h and 5m wakes and 8% under always 1h.
 SESSION = "cache"
+TAIL_WARM_S = 300        # a 5m write unread this long is gone
+
+
+def _tail_age(c: dict, now: float) -> float | None:
+    """Seconds since the session's last 5m wake ended (else started), while its write is warm."""
+    stamps = [v for v in (c.get("ts"), c.get("end")) if isinstance(v, (int, float)) and not isinstance(v, bool)]
+    if c.get("ttl") != "5m" or not stamps:
+        return None
+    age = now - max(stamps)
+    return age if 0 <= age < TAIL_WARM_S else None
 
 
 def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, signals=None,
@@ -210,12 +222,14 @@ def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, sig
     h1 = c.get("h1")
     if mode != "resume":
         reason = "cold: a new session"
+    elif (tail := _tail_age(c, now)) is not None:
+        return "5m", f"warm: the session's 5m wake ended {tail / 60:.0f} min ago; a 1h request would not read it"
     elif not isinstance(h1, (int, float)):
         reason = "cold: no 1h write of this session"
     elif not 0 <= now - h1 < _num(warm_min, WARM_MIN) * 60:
         reason = f"cold: the session last wrote at 1h {max(now - h1, 0) / 60:.0f} min ago"
     elif c.get("ttl") != "1h":
-        reason = "the session's last wake went at 5m"
+        return "5m", f"warm: the session wrote at 1h {(now - h1) / 60:.0f} min ago and its wakes since went at 5m"
     else:
         return "5m", f"warm: the session's last wake went at 1h {(now - h1) / 60:.0f} min ago"
     return _cold(reason, now, signals)
@@ -225,7 +239,15 @@ def session_record(state, mode: str, ttl: str, now: float) -> dict:
     """The session's kv state once a wake of `mode` started at `ttl`: a new session starts its own."""
     st = dict(state) if isinstance(state, dict) else {}
     prev = st.get(SESSION) if mode == "resume" and isinstance(st.get(SESSION), dict) else {}
-    st[SESSION] = {"h1": now if ttl == "1h" else prev.get("h1"), "ttl": ttl}
+    st[SESSION] = {"h1": now if ttl == "1h" else prev.get("h1"), "ttl": ttl, "ts": now}
+    return st
+
+
+def session_ended(state, now: float) -> dict:
+    """The session's kv state once its running wake ended at `now` (its writes are that fresh)."""
+    st = dict(state) if isinstance(state, dict) else {}
+    if isinstance(st.get(SESSION), dict):
+        st[SESSION] = {**st[SESSION], "end": now}
     return st
 
 

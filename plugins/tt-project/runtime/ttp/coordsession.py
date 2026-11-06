@@ -64,6 +64,8 @@ import json
 import re
 import time
 
+from . import cachettl
+
 KEY = "coord_session"
 GUARD_KEY = "coord_session_guard"
 MODES = ("off", "on", "shadow")
@@ -214,6 +216,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
     if mode == "stateless":
         st.pop("rerun", None)
         return st
+    st = cachettl.session_ended(st, now)   # the next wake judges this one's 5m write on it
     if ack:
         st[DIGEST] = ack
     if mode == "new":   # failed-resume times stay: fail() bounds them to the hour across rollovers
