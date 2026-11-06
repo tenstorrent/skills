@@ -12560,7 +12560,7 @@ def cmd_doctor(a) -> None:
     if gaps:
         print("unfenced providers (their workers can write anywhere, project.db included): " + ", ".join(gaps))
     from . import localguard
-    for line in localguard.report(p.config(), p.harness):
+    for line in localguard.report(p.config(), p.harness, p.config_status):
         print(line)
     from .coordinator import dir_list
     for prov in all_providers():

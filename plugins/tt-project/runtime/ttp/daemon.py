@@ -1513,7 +1513,8 @@ class Daemon:
         if bad:
             self.alert("config", f"{self.p.config_path} is missing or not valid JSON, and there is no last good "
                                  f"copy to fall back on. No coordinator turns or worker runs start until it reads "
-                                 f"again (running work goes on); its earlier versions are in the harness git history.",
+                                 f"again (running work goes on, and the project's local guards, guards.local, are "
+                                 f"not asked on its tool calls); its earlier versions are in the harness git history.",
                        every_s=ALERT_KEEP_S)
 
     def _check_config(self) -> None:

@@ -52,9 +52,27 @@ def refusal(cmd):
 - `ttp doctor <project>` shows each guard and whether it loads, and flags one inside `runtime/` or
   `prompts/`.
 - The upgrade's conflict message for `runtime/ttp/hook.py` points here.
+- A guard that calls `sys.exit` (at import or in a check) counts as one that raises: it refuses, named.
+- A shell command names a listed guard only by whole path components: `guards/a.py` matches
+  `rm ./guards/a.py`, never `rm guards/data.py`.
+- A full-tools session coordinator edits a listed guard file only through a harness task: its own Edit,
+  Write and shell calls on it are refused, as a worker's are; it queues a harness task for the change.
+- A project.json that does not read and has no last good copy lists no guards, so none is asked. This
+  one case does not refuse every call, since that would also stop the runs that could fix it: the daemon
+  starts no new run, its config alert says the local guards are not asked, and `ttp doctor` reports it
+  as a problem. A broken project.json with a last good copy keeps that copy's guards.
 
 ## Providers
 
-The guards run wherever the harness hook runs: Claude Code and Codex workers, and session coordinators.
-A provider whose workers run without the hook is covered once the runner-side guard asks
-`hook.pre_tool_use` for it; until then a guard does not bind that provider's runs.
+Every provider path asks the same guards through `hook.local_guard`:
+
+- Claude Code workers: the PreToolUse hook, on every tool.
+- Codex workers: the PreToolUse hook on shell calls, `apply_patch` edits (`tool_refusal` gets
+  `("apply_patch", {"command": <patch text>})`) and `mcp__` connector calls; Codex's other tools are not
+  hooked.
+- Cursor workers: the per-run `.cursor/hooks.json`, with each call in Claude's shape (Shell is `Bash`,
+  every file edit is `Write`, `MCP:<tool>` is `mcp__cursor__<tool>`).
+- Runs without the hook (Cursor or Codex with hooks off): the runner-side tool guard asks the same check
+  about each call it reads from the run's output and stops the run on a refusal. The call has started by
+  then, so a quick command may have run.
+- Session coordinators, read-only and full tools, Read, Grep and Glob included.

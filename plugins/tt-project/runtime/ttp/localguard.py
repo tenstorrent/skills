@@ -11,18 +11,31 @@ ships nothing elsewhere, so an upgrade never touches or conflicts on them. Each 
 and may define `tool_refusal(tool: str, tool_input: dict) -> str | None` for every other tool call (file
 edits, connector calls). Keep them fast and side-effect free: they run on each tool call.
 
-The worker hook (hook.pre_tool_use, hook.local_guard) asks them after the built-in guards, on every
-provider that runs it (Claude, Codex, and runs the runner-side guard checks), and so does a session
-coordinator's tool check (coordtools.pre_tool_use, read-only and full tools). A refusal blocks the call
-and is logged to the run's refusal log with kind `local:<file name>`. A listed guard is a safety
-rule and is never skipped: a file that is missing, fails to import, has no `refusal`, or raises refuses
-every call it would check (a module that does not load: every shell command), naming itself and the
-error. `ttp doctor` reports each listed guard and whether it loads (problems)."""
+hook.local_guard asks them after the built-in guards, from every tool check the harness runs:
+- the worker hook (hook.pre_tool_use): Claude Code on every tool; Codex on what its hook matches
+  (shell, apply_patch edits with the patch text as tool_input, mcp__ connector calls: its other tools,
+  such as web search, are not asked); Cursor through its per-run hooks.json (cursorhook.translate, the
+  call in Claude's shape: Shell is Bash, every file edit is Write, MCP:<tool> is mcp__cursor__<tool>);
+- the runner-side tool guard (streamguard) of runs the hook does not reach: it asks hook.pre_tool_use
+  about each call read from the run's output and stops the run on a refusal, once the call has started;
+- a session coordinator's tool check (coordtools.pre_tool_use), read-only and full tools, its Read,
+  Grep and Glob calls included.
+A refusal blocks the call and is logged to the run's refusal log with kind `local:<file name>`. A listed
+guard is a safety rule and is never skipped: a file that is missing, fails to import, has no `refusal`,
+or raises (or calls sys.exit) refuses every call it would check (a module that does not load: every
+shell command), naming itself and the error. A listed guard file is edited, moved or named in a shell
+command only by a harness task's run (a full-tools coordinator included: it gives the change to one).
+
+One case cannot refuse: a project.json that does not read and has no last good copy (project.py
+read_config "unavailable") lists no guards, so none is asked. Refusing every call instead would also stop
+the runs that could fix it; the daemon starts no new run then and says so in its config alert, naming
+the local guards, and `ttp doctor` reports it as a problem. Otherwise `ttp doctor` reports each listed guard and whether it loads."""
 from __future__ import annotations
 
 import hashlib
 import importlib.util
 import os
+import re
 from pathlib import Path
 
 KEY = "guards.local"
@@ -64,12 +77,18 @@ def names_guard(cfg: dict, harness: Path | None, tool: str, tool_input: dict, cw
     if tool == "Bash":
         cmd = str(tool_input.get("command") or "")
         raw = [x.strip() for x in ((cfg.get("guards") or {}).get("local") or [])]
-        return next((f for f, x in zip(files, raw) if x in cmd or str(f) in cmd), None)
+        return next((f for f, x in zip(files, raw) if _names(cmd, x) or _names(cmd, str(f))), None)
     name = str(tool_input.get("file_path") or tool_input.get("notebook_path") or "")
     if not name:
         return None
     path = os.path.realpath(os.path.join(cwd, os.path.expanduser(name)))
     return next((f for f in files if os.path.realpath(f) == path), None)
+
+
+def _names(cmd: str, path: str) -> bool:
+    """`cmd` names `path` as whole path components: `a.py` matches `rm a.py` and `rm ./a.py`, never
+    `data.py` or `a.py.bak`."""
+    return bool(path) and re.search(r"(?<![\w.~-])" + re.escape(path) + r"(?![\w.-])", cmd) is not None
 
 
 def load(path: Path):
@@ -104,7 +123,7 @@ def refusal(cfg: dict, tool: str, tool_input: dict, harness: Path | None = None)
         kind = f"local:{f.name}"
         try:
             mod = load(f)
-        except Exception as e:   # not loaded: its tool_refusal is unknown, its refusal(cmd) is not
+        except (Exception, SystemExit) as e:   # not loaded: its tool_refusal is unknown, its refusal(cmd) is not
             if tool == "Bash":
                 return kind, _broken(f, e)
             continue
@@ -116,15 +135,22 @@ def refusal(cfg: dict, tool: str, tool_input: dict, harness: Path | None = None)
                 why = check(tool, dict(tool_input or {}))
             else:
                 continue
-        except Exception as e:
+        except (Exception, SystemExit) as e:   # a guard's sys.exit is its failure, not the hook's exit
             return kind, _broken(f, e)
         if why:
             return kind, f"{str(why).rstrip('.')} (the project's local guard {f.name})"
     return None
 
 
-def report(cfg: dict, harness: Path | None) -> list[str]:
-    """`ttp doctor` lines: each listed guard and whether it loads; a problem line starts with 'problem'."""
+UNREAD = ("project.json does not read and there is no last good copy, so its local guards ({key}), if it "
+          "lists any, are not asked on tool calls until it reads again").format(key=KEY)
+
+
+def report(cfg: dict, harness: Path | None, status: str = "ok") -> list[str]:
+    """`ttp doctor` lines: each listed guard and whether it loads; a problem line starts with 'problem'.
+    `status`: how project.json read (project.read_config)."""
+    if status == "unavailable":
+        return [f"problem: {UNREAD}"]
     files, bad = paths(cfg, harness)
     if bad:
         return [f"problem: {bad}; every shell command of the project's runs is refused"]
@@ -136,7 +162,7 @@ def report(cfg: dict, harness: Path | None) -> list[str]:
             load(f)
             out.append(f"local guard {f}: loads" + ("; problem: it sits in a folder `ttp upgrade` merges, "
                                                      "move it out of runtime/ and prompts/" if under else ""))
-        except Exception as e:
+        except (Exception, SystemExit) as e:
             out.append(f"problem: local guard {f} does not load ({type(e).__name__}: {str(e)[:200]}); "
                        f"its calls are refused")
     return out

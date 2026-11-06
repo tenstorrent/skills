@@ -596,7 +596,9 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
             from .credguard import tool_refusal
             if path and (_denied_read(path, denied, search) or tool_refusal(tool, args)):
                 return _deny("that file holds a credential; a coordinator never reads it"), None
-            return None, None
+            from .hook import local_guard   # the project's own guards, as on a worker's Read (localguard.py)
+            why = local_guard(payload)
+            return (_deny(why) if why else None), None
         if tool == ANSWER_TOOL:   # the turn's structured answer (module doc)
             return _answer_check(payload), None
         if tool == "Bash":

@@ -263,8 +263,8 @@ only in the feed and never under "needs you".
   harness folder, kept outside `runtime/` and `prompts/` (for example `guards/no_prod_restart.py`), so an
   upgrade never touches them. Each defines `refusal(cmd)`, asked about every shell command, returning the
   reason it refuses or None, and may define `tool_refusal(tool, tool_input)` for other tool calls (file edits,
-  connector calls). The worker hook asks them after the built-in guards, as does a session coordinator's tool
-  check; a refusal blocks the call and is logged with kind `local:<file>`. A listed guard is never skipped: a
+  connector calls). Every provider path asks them after the built-in guards (the Claude, Codex and Cursor worker
+  hooks, the runner-side guard of runs without one, and a session coordinator's tool check); a refusal blocks the call and is logged with kind `local:<file>`. A listed guard is never skipped: a
   file that is missing, does not import, has no `refusal` or raises refuses the calls it checks, naming itself
   and the error. Only a harness task edits a listed guard file. `ttp doctor` shows each guard and whether it
   loads. See the harness skill's references/local-guards.md.
