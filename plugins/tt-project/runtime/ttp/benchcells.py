@@ -128,7 +128,7 @@ def find_bug(src: Path, test_cmd: list[str], targets: dict[str, set[int] | None]
         with tempfile.TemporaryDirectory(prefix="ttp-seed-") as tmp:
             ws = Path(tmp) / "ws"
             _copy(src, ws)
-            (ws / m["file"]).write_text(text)
+            durable_write(ws / m["file"], text, sync=False)
             if _run(test_cmd, ws, timeout) not in (0, None):
                 return m, ""
     return None, f"none of {min(tries, len(cands))} mutation(s) made the hidden tests fail"
@@ -140,7 +140,7 @@ def seeded_cell(src: Path, hidden: list[str], mutation: dict, test_cmd: list[str
     ws = dest / "workspace"
     _copy(src, ws)
     path = ws / mutation["file"]
-    path.write_text(apply(path.read_text(), mutation))
+    durable_write(path, apply(path.read_text(), mutation), sync=False)
     held = {}
     for p in hidden:
         data = (src / p).read_bytes()
@@ -166,8 +166,7 @@ def score_seeded(cell_dir: Path, after: Path, timeout: float = 600) -> dict:
             data = (cell_dir / "heldout" / p).read_bytes()
             if _sha(data) != sha:
                 raise ValueError(f"held-out file {p} changed since the cell was built: the cell cannot be scored")
-            (ws / p).parent.mkdir(parents=True, exist_ok=True)
-            (ws / p).write_bytes(data)
+            durable_write(ws / p, data, sync=False)
         rc = _run(cell["test_cmd"], ws, timeout)
     return {"pass": rc == 0, "rc": rc, "why": "" if rc == 0 else "timed out" if rc is None else f"hidden tests exit {rc}"}
 
