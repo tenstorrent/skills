@@ -233,14 +233,21 @@ SLOTS_KEY = "checks.slots"
 
 
 def slot_limit(text: str) -> str:
-    """The limit a checks_slot_wait event's text names, in checklane's own wording ("the
-    per-repository lane limit (checks.slots)" / "the project cap (checks.test_project_max)");
-    the default is the project cap, the limit every pre-#4316 event and every reason text was
-    held under."""
-    if "per-repository lane limit" in text:
+    """The limit a checks_slot_wait event's text names, in checklane's own wording (its closing "This
+    wait was held by ..."): "the per-repository lane limit (checks.slots)" is SLOTS_KEY, "the project
+    cap (checks.test_project_max)" CAP_KEY, the host's gate (checklane.HOST_GATE: a wait below the
+    project cap) HOST_CORES and "nothing (about to start)" "" (no cap); the default is the project
+    cap, the limit every pre-#4316 event and every reason text was held under."""
+    from .checklane import HOST_GATE
+    held = text.rpartition("This wait was held by ")[2]
+    if "per-repository lane limit" in held:
         return SLOTS_KEY
-    if "project cap" in text:
+    if "project cap" in held:
         return CAP_KEY
+    if held.startswith(HOST_GATE):
+        return HOST_CORES
+    if held.startswith("nothing (about to start)"):
+        return ""
     return CAP_KEY
 
 
@@ -261,10 +268,11 @@ HELD_NOTE = {
 def host_held(text: str) -> bool:
     """Whether a checks_slot_wait event's text (checklane.wait_events) shows every lane holder it names
     not running yet, itself waiting for a host-wide gate (a host-wide checks slot, host test slots:
-    testslots.lane_waits): the host held the wait, not the project's own lanes."""
+    testslots.lane_waits), or that names the host's gate as its limit (slot_limit): the host held the
+    wait, not the project's own lanes."""
     m = re.search(r"\bbehind (.*?)\. Lanes:", text)
     held = m.group(1).split("; ") if m else []
-    return bool(held) and all("not running yet (waiting for " in h for h in held)
+    return slot_limit(text) == HOST_CORES or bool(held) and all("not running yet (waiting for " in h for h in held)
 
 
 def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, gates: dict | None = None) -> dict:
@@ -399,11 +407,13 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                   "ORDER BY ts LIMIT ?", (t0 - DAY, ROWS)):
         ev_waits.setdefault(e["task"], []).append(e)
     slot_ev: dict[int, list[tuple[float, str]]] = {}
-    slot_host: dict[int, list[tuple[float, bool]]] = {}   # each event: did the host hold its lane holders
+    slot_host: dict[int, list[tuple[float, bool | None]]] = {}   # each event: did the host hold its lane holders
     for e in db.q("SELECT ts, task, text FROM events WHERE kind='checks_slot_wait' AND task IS NOT NULL AND ts>?",
                   (t0 - DAY,)):
-        slot_ev.setdefault(e["task"], []).append((float(e["ts"]), slot_limit(e["text"] or "")))
-        slot_host.setdefault(e["task"], []).append((float(e["ts"]), host_held(e["text"] or "")))
+        key = slot_limit(e["text"] or "")
+        slot_ev.setdefault(e["task"], []).append((float(e["ts"]), key))
+        # an event about to start ("": no cap) names no holder: ck_holder skips it
+        slot_host.setdefault(e["task"], []).append((float(e["ts"]), host_held(e["text"] or "") if key else None))
     slot_log: dict[int, list[tuple[float, float]]] = {}
     slot_cap: dict[tuple[int, float, float], int] = {}   # the cap in force a record stored at its grant
     slot_lane: dict[tuple[int, float, float], float] = {}   # when the record's run got its repository's lane
@@ -506,7 +516,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
                 spans.append((h, b))
         if own_s and own_s >= sum(b - a for a, b in spans):
             return "own"
-        evs = [h for ts, h in slot_host.get(task, ()) if w0 <= ts <= w1]
+        evs = [h for ts, h in slot_host.get(task, ()) if w0 <= ts <= w1 and h is not None]
         if evs and not all(evs):
             return "own"
         if not spans and not evs:
@@ -514,9 +524,10 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         return OTHER_PROJECTS if any(a <= g <= b for a, b in spans or [(w0, w1)] for g in others) else HOST_CORES
 
     def slot_held(task: int, w0: float, w1: float, extra: list | tuple = ()) -> str | None:
-        """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes) or
-        "checks.test_project_max" (the project's cap) — or None when the checks did not hold it:
-        a checks_slot_wait event in the wait (its text names the limit; older events named none:
+        """Which checks limit held `task` in [w0, w1] — "checks.slots" (its repository's lanes),
+        "checks.test_project_max" (the project's cap), HOST_CORES (the host's gate, below the cap) or ""
+        (no cap: about to start) — or None when the checks did not hold it:
+        a checks_slot_wait event in the wait (its text names the limit: slot_limit; older events named none:
         the project cap, the limit those waits were held under), or its logged slot waits and
         `extra` spans covering at least half of it (no limit recorded: the per-repository limit,
         the default holder of a queue wait)."""
@@ -583,17 +594,22 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
         for w0, w1, reason, queued, selfw in spans_w:
             if w1 <= t0 or w1 < w0:
                 continue
-            if "other full checks" in reason or "ttp checks: waiting" in reason or slot_held(t["id"], w0, w1):
+            key = slot_held(t["id"], w0, w1)
+            if "other full checks" in reason or "ttp checks: waiting" in reason or key is not None:
                 # Which of the two checks limits held it: a checks_slot_wait event or checkcap record
-                # names the limit; a reason text alone means the legacy default, the project cap.
-                slot_tally[slot_held(t["id"], w0, w1) or CAP_KEY] += w1 - w0
+                # names the limit; a reason text alone means the legacy default, the project cap. A wait
+                # the host's gate held (ck_holder counts it) or one about to start charges neither.
+                key = CAP_KEY if key is None else key
+                if key in slot_tally:
+                    slot_tally[key] += w1 - w0
                 ln = lane("checks_slots", CAP_KEY, cap_n)
                 add(ln, w1 - w0, prio, w0, w1, None, queued)
                 if w1 - w0 > (p1_s if prio <= 1 else other_s):
                     state = cap_wait(t["id"], w0, w1) if cap_n else "idle"
                     ln[state] += bool(cap_n)
                     held = ln.setdefault("held_by", {"own": 0, HOST_CORES: 0, OTHER_PROJECTS: 0})
-                    held[ck_holder(t["id"], w0, w1, state)] += 1
+                    if key:
+                        held[ck_holder(t["id"], w0, w1, state)] += 1
             elif selfw or "detach" in reason or "ttp checks" in reason or "own job" in reason:
                 lane("own_job", None, None)["note"] = "the task's own detached job or checks ran: no limit"
                 add(lanes["own_job"], w1 - w0, prio, w0, w1, None, queued)
