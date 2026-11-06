@@ -39,7 +39,7 @@ reads tripped() or the key: tripped and now < until). After `until` it un-trips.
 within HOLD_DAYS days holds it: `until` is renewed on every check and it stays tripped until the
 project's coordinator (or the user) sets coordinator.session.mode again (a configwho record newer than
 the trip). A trip whose window re-reads at or under its allowance (its turns were booked lower since)
-is withdrawn: it un-trips at once and leaves the trip count (rebooked()). Mode off: inert; both keys are dropped, so the next switch-on records a fresh baseline.
+is withdrawn: it un-trips at once and leaves the trip count (rebooked(), on the same counted() figure, seeds spread). Mode off: inert; both keys are dropped, so the next switch-on records a fresh baseline.
 """
 from __future__ import annotations
 
@@ -135,20 +135,21 @@ def tripped(db, now: float | None = None) -> bool:
         return bool(g.get("tripped"))
 
 
-def spend(db, start: float) -> tuple[float, int]:
+def spend(db, start: float, end: float | None = None) -> tuple[float, int]:
+    """(dollars, turns) of the coordinator runs started in [start, end] (end None: up to now)."""
     r = db.one("SELECT COUNT(*) AS n, COALESCE(SUM(cost_usd),0) AS usd FROM runs "
-               "WHERE role='coordinator' AND started>=?", (start,))
+               "WHERE role='coordinator' AND started>=? AND started<=?", (start, float("inf") if end is None else end))
     return float(r["usd"] or 0), int(r["n"] or 0)
 
 
-def seeds(db, cfg: dict, start: float) -> list[float]:
-    """The seed (seedcap.seed_of) of each new-session coordinator wake started at or after `start`, oldest first."""
+def seeds(db, cfg: dict, start: float, end: float | None = None) -> list[float]:
+    """The seed (seedcap.seed_of) of each new-session coordinator wake started in [start, end], oldest first."""
     from . import seedcap
     got = []
     for r in db.q("SELECT provider, cost_usd, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, note "
                   "FROM runs "
-                  "WHERE role='coordinator' AND task IS NULL AND started>=? AND cost_usd>0 "
-                  "AND note LIKE '%\"new\"%' ORDER BY started, id", (start,)):
+                  "WHERE role='coordinator' AND task IS NULL AND started>=? AND started<=? AND cost_usd>0 "
+                  "AND note LIKE '%\"new\"%' ORDER BY started, id", (start, float("inf") if end is None else end)):
         try:
             session = (json.loads(r["note"] or "{}").get("turn") or {}).get("session") or {}
         except (ValueError, AttributeError):
@@ -158,12 +159,12 @@ def seeds(db, cfg: dict, start: float) -> list[float]:
     return got
 
 
-def counted(db, cfg: dict, start: float, hours: float) -> tuple[float, float, int, float]:
-    """(dollars judged, dollars spent, turns, dollars deferred) of the window from `start`: the first
-    SEED_AMORT seeds count only h/24 of their cost (h in [MIN_H, 24]), the rest of the spend counts whole."""
-    usd, turns = spend(db, start)
+def counted(db, cfg: dict, start: float, hours: float, end: float | None = None) -> tuple[float, float, int, float]:
+    """(dollars judged, dollars spent, turns, dollars deferred) of the window [start, end] (end None: up to
+    now): the first SEED_AMORT seeds count only h/24 of their cost (h in [MIN_H, 24]), the rest counts whole."""
+    usd, turns = spend(db, start, end)
     frac = min(WINDOW_H, max(MIN_H, hours)) / WINDOW_H
-    deferred = min(usd, sum(seeds(db, cfg, start)[:SEED_AMORT]) * (1 - frac))
+    deferred = min(usd, sum(seeds(db, cfg, start, end)[:SEED_AMORT]) * (1 - frac))
     return usd - deferred, usd, turns, deferred
 
 
@@ -202,7 +203,7 @@ def check(db, cfg: dict, now: float | None = None) -> dict | None:
             f"${base['usd_turn']:.2f}/turn ({base['turns']} turns over {base['days']:g} days)" if base["turns"]
             else "coordinator session spend guard: no coordinator turn in the 7 days before; nothing to compare, inert")}
     g, _ = db.kv_dict(KEY)
-    if g.get("tripped") and (got := rebooked(db, g, base, now)):
+    if g.get("tripped") and (got := rebooked(db, cfg, g, base, now)):
         return got
     if g.get("tripped"):
         if g.get("hold"):
@@ -244,19 +245,18 @@ def check(db, cfg: dict, now: float | None = None) -> dict | None:
     return {"event": "trip", "hold": hold, "at": now, "text": f"{why}. The guard reverted it to {then}."}
 
 
-def rebooked(db, g: dict, base: dict, now: float) -> dict | None:
-    """A trip whose own window (from its start to the trip) now sums at or under the allowance it was
-    judged against: its turns were booked lower since (a resumed session wake booked at the session's
-    running total, then netted to its own cost). It was never over: un-trip now and drop it from the
-    trip count. None while the trip stands or its record lacks the figures."""
+def rebooked(db, cfg: dict, g: dict, base: dict, now: float) -> dict | None:
+    """A trip whose own window (from its start to the trip) now counts at or under the allowance it was
+    judged against, by the same counted() figure check() tripped on (seeds spread alike): its turns were
+    booked lower since (a resumed session wake booked at the session's running total, then netted to its
+    own cost). It was never over: un-trip now and drop it from the trip count. None while the trip
+    stands or its record lacks the figures."""
     try:
         at, allowed, was = float(g["at"]), float(g["allowance"]), float(g["usd"])
     except (KeyError, TypeError, ValueError):
         return None
     start = _num(g.get("from")) or max(at - WINDOW_H * 3600, _num(base.get("at")))
-    r = db.one("SELECT COALESCE(SUM(cost_usd),0) AS usd FROM runs WHERE role='coordinator' AND started>=? "
-               "AND started<=?", (start, at))
-    usd = float(r["usd"] or 0)
+    usd = counted(db, cfg, start, max(0.0, (at - start) / 3600), at)[0]
     if usd > allowed:
         return None
     trips = [t for t in (g.get("trips") or []) if t != g["at"]]

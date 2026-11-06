@@ -307,6 +307,32 @@ def test_the_session_guard_pauses_a_small_first_overrun_briefly_and_a_repeat_or_
     assert g["until"] == t2 + coordguard.PAUSE_H * 3600
 
 
+def test_a_seed_heavy_session_guard_trip_is_withdrawn_once_its_window_counts_under_with_seeds_spread(env):
+    from ttp import coordguard
+    now = time.time()
+    p = _guard_project(env, now)   # $10/day, $1/turn: the first hour's allowance is about $3.82
+    _session_on(p)
+    coordguard.check(p.db, p.config(), now)
+    # A $2.50 seed (2M cache-write tokens at weight 1.25), then 3 resumed wakes booked at the session's running total.
+    _session_wake(p, now + 60, "new", 2.5, cache_write=2_000_000)
+    for i in range(3):
+        _session_wake(p, now + 600 + i * 300, "resume", 3.0, output=100_000)
+    t = now + 3600
+    assert coordguard.check(p.db, p.config(), t)["event"] == "trip"
+    allowed = p.db.kv(coordguard.KEY)["allowance"]
+    # A new session started after the trip is no seed of its window: counted it would spread $1.92 more.
+    _session_wake(p, t + 60, "new", 2.0, cache_write=1_600_000)
+    p.db.x("UPDATE runs SET cost_usd=1.5 WHERE started>? AND started<? AND cost_usd=3.0", (now, t))
+    assert coordguard.check(p.db, p.config(), t + 300) is None and coordguard.tripped(p.db, t + 300)
+    # Netted lower: $5.50 raw is still over the allowance, but $3.10 counted (the seed spread) is under it.
+    p.db.x("UPDATE runs SET cost_usd=1.0 WHERE started>? AND started<? AND cost_usd=1.5", (now, t))
+    raw = coordguard.spend(p.db, now, t)[0]
+    assert abs(raw - 5.5) < 1e-6 and raw > allowed, (raw, allowed)
+    got = coordguard.check(p.db, p.config(), t + 600)
+    assert got and got["event"] == "rebooked" and "$3.10" in got["text"], got
+    assert not coordguard.tripped(p.db, t + 600) and abs(p.db.kv(coordguard.KEY)["rebooked"]["usd"] - 3.1) < 0.01
+
+
 def test_a_session_guard_trip_on_turns_booked_lower_since_is_withdrawn_and_leaves_the_count(env):
     from ttp import coordguard
     now = time.time()

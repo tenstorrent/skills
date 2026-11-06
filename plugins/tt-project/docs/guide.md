@@ -471,7 +471,8 @@ only in the feed and never under "needs you".
   new-session seeds in its window count spread over a day, later ones whole. Over it, turns are
   stateless for 1 h on a first small overrun, rising to `pause_h` at twice the allowance or on a
   repeat trip within 7 days; a third trip holds them until the mode is set again. A trip whose
-  window re-reads at or under its allowance after its turns were re-netted is withdrawn at once and
+  window re-reads at or under its allowance (counted the same way, seeds spread) after its turns
+  were re-netted is withdrawn at once and
   leaves the trip count. A coordinator on a
   provider that runs no session (the chat provider, for now) keeps stateless turns, with no spend guard
   and no session line in `ttp status`. `ttp status --verbose` shows the session's
