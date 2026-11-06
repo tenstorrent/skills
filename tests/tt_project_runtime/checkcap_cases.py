@@ -3445,9 +3445,12 @@ def _wrap_lane_held(project_name: str, key: str) -> list:
     return locks.holder_records(testslots.lane_paths(project_name, 1, "w" + key))
 
 
-def _run_behind_held_resource(env, tmp_path, monkeypatch, lane: str | None, crash: bool = False) -> dict:
+def _run_behind_held_resource(env, tmp_path, monkeypatch, lane: str | None, crash: bool = False,
+                              slow_start: float = 0) -> dict:
     """`ttp checks` behind checks.wrap_cmd `flock <resource>` while this test holds the resource: what the
-    wrapper lock's lane looked like while the run queued on the resource, once the command ran, and after."""
+    wrapper lock's lane looked like while the run queued on the resource, once the command ran, and after.
+    The wrapper marks its start before it queues on the resource; the lane is read once it has.
+    `slow_start`: seconds the run spends before its wrapper starts, as on a loaded host."""
     import fcntl
     import signal
     from ttp import checkcap, checklane, cli, push
@@ -3456,7 +3459,11 @@ def _run_behind_held_resource(env, tmp_path, monkeypatch, lane: str | None, cras
     monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 5)
     monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
     resource, started, go = tmp_path / "resource.lock", tmp_path / "started", tmp_path / "go"
-    p.set_config("checks.wrap_cmd", f"flock {resource}")
+    queued = tmp_path / "queued"
+    p.set_config("checks.wrap_cmd", f"sh -c 'touch {queued}; exec flock {resource} \"$@\"' sh")
+    if slow_start:
+        problem = push.wrap_problem
+        monkeypatch.setattr(push, "wrap_problem", lambda *a, **k: time.sleep(slow_start) or problem(*a, **k))
     if lane:
         p.set_config("checks.wrap_lane", lane)
     key = checklane.wrap_key(push.wrap_of(p.config()))
@@ -3466,7 +3473,8 @@ def _run_behind_held_resource(env, tmp_path, monkeypatch, lane: str | None, cras
 
     def side():
         try:
-            time.sleep(1.0)   # the run is queued on the resource, inside its wrapper
+            # The run is in its wrapper, which can only queue on the resource: nothing behind it runs yet.
+            seen["wrapper_started"] = _wait_for(queued.exists, 60)
             seen["queued"] = _wrap_lane_held(p.name, key)
             seen["ran_early"] = started.exists()
             fcntl.flock(res, fcntl.LOCK_UN)
@@ -3497,14 +3505,23 @@ def test_checks_wrap_lane_before_holds_the_wrapper_lane_while_the_run_queues_on_
     # The default (and the premise of the change): the lane is taken before the wrapper starts, so runs
     # behind a wrapper that fails instead of waiting never go side by side; it is held during the queue.
     seen = _run_behind_held_resource(env, tmp_path, monkeypatch, None)
-    assert seen["queued"] and seen["queued"][0]["pid"] == seen["pid"], seen
+    assert seen["wrapper_started"] and seen["queued"] and seen["queued"][0]["pid"] == seen["pid"], seen
+    assert seen["started"] and not seen["ran_early"] and not seen["after"], seen
+
+
+def test_checks_wrap_lane_before_reads_the_queued_lane_once_a_slow_run_reaches_its_wrapper(
+        env, tmp_path, monkeypatch):
+    # A run slow to reach its wrapper (a loaded host) is read once it queues there, not after a fixed time.
+    seen = _run_behind_held_resource(env, tmp_path, monkeypatch, None, slow_start=1.5)
+    assert seen["wrapper_started"] and seen["queued"] and seen["queued"][0]["pid"] == seen["pid"], seen
     assert seen["started"] and not seen["ran_early"] and not seen["after"], seen
 
 
 def test_checks_wrap_lane_after_takes_the_lane_only_once_the_wrappers_lock_is_held_and_frees_it_at_the_end(
         env, tmp_path, monkeypatch):
     seen = _run_behind_held_resource(env, tmp_path, monkeypatch, "after")
-    assert seen["queued"] == [] and not seen["ran_early"], f"a lane held while queued on the wrapper's lock: {seen}"
+    assert seen["wrapper_started"] and seen["queued"] == [] and not seen["ran_early"], \
+        f"a lane held while queued on the wrapper's lock: {seen}"
     assert seen["started"] and len(seen["running"]) == 1, seen
     holder = seen["running"][0]
     assert holder["pid"] != seen["pid"] and holder["alive"], "the step inside the wrapper holds it"
@@ -3514,7 +3531,7 @@ def test_checks_wrap_lane_after_takes_the_lane_only_once_the_wrappers_lock_is_he
 
 def test_checks_wrap_lane_after_frees_the_lane_when_the_step_holding_it_crashes(env, tmp_path, monkeypatch):
     seen = _run_behind_held_resource(env, tmp_path, monkeypatch, "after", crash=True)
-    assert seen["queued"] == [] and seen["started"] and len(seen["running"]) == 1, seen
+    assert seen["wrapper_started"] and seen["queued"] == [] and seen["started"] and len(seen["running"]) == 1, seen
     assert seen["after_crash"], "a killed step leaves no lane held"
     assert seen["after"] == [] and seen.get("exit") not in (None, 0), "the crash fails the check, never a pass"
 

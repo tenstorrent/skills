@@ -297,9 +297,9 @@ def test_a_stale_urgent_line_shows_its_age_not_that_the_user_is_present_now(env)
     assert urgent.new_line("plain", "plain\nurgent: now") and not urgent.new_line("urgent: a", "urgent: a\nmore")
 
 
-def _step_ask(p, text, ref="blocking:access", ago=600):
+def _step_ask(p, text, ref="blocking:access", ago=600, now=None):
     return p.db.x("INSERT INTO messages(ts,direction,kind,text,ref) VALUES(?,?,?,?,?)",
-                  (time.time() - ago, "out", "ask", text, ref))
+                  ((time.time() if now is None else now) - ago, "out", "ask", text, ref))
 
 
 def _step_open_asks(p):
@@ -354,18 +354,22 @@ def test_a_non_access_ask_still_closes_when_the_task_it_names_lands(env):
     assert unblock.close_landed(p.db, [x]) == [a] and a not in _step_open_asks(p)
 
 
-def test_the_daily_audit_shows_an_ask_closed_by_a_done_user_step_as_resolved_with_a_fixed_open_time(env):
+def test_the_daily_audit_shows_an_ask_closed_by_a_done_user_step_as_resolved_with_a_fixed_open_time(
+        env, monkeypatch):
     """An access ask that close_step_done closed shows 'resolved: #<task>'s user step was done', its open
     time ending at the close, a day later too. A landed ask and an answered one keep their lines."""
     from ttp import audit, unblock
     p = make(env)
     now = time.time()
+    # A loaded host: the clock moves on (a second here) before the asks are written. Each is stamped from
+    # `now`, the time every expected open time below counts from, never from a later clock read.
+    monkeypatch.setattr(time, "time", lambda real=time.time: real() + 1.0)
     y = _add_deferred(p)
     x = p.db.add_task("ship it", "s", kind="code", origin="coordinator")
-    step = _step_ask(p, f"Please sign in to the example tool so #{y} can run?", ago=3 * 3600)
-    landed = _step_ask(p, f"May #{x} ship to the branch?", ref="blocking:review", ago=3 * 3600)
-    answered = _step_ask(p, "Which example model should the run use?", ref="blocking:choice", ago=3 * 3600)
-    plain = _step_ask(p, "Grant the token the workflow scope?", ref="blocking:review", ago=3 * 3600)
+    step = _step_ask(p, f"Please sign in to the example tool so #{y} can run?", ago=3 * 3600, now=now)
+    landed = _step_ask(p, f"May #{x} ship to the branch?", ref="blocking:review", ago=3 * 3600, now=now)
+    answered = _step_ask(p, "Which example model should the run use?", ref="blocking:choice", ago=3 * 3600, now=now)
+    plain = _step_ask(p, "Grant the token the workflow scope?", ref="blocking:review", ago=3 * 3600, now=now)
     p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,?,?,?)",
            (now - 3600, "in", "user", f"ask {answered}: the small one"))
     p.db.update_task(y, status="done")
