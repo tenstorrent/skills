@@ -1215,6 +1215,13 @@ def test_throughput_a_checks_wait_counts_against_the_limit_its_event_names_cap_h
     want = {"lanes": throughput.SLOTS_KEY, "cap": throughput.CAP_KEY, "host": throughput.HOST_CORES, "about": ""}
     assert {k: throughput.slot_limit(v) for k, v in texts.items()} == want, texts
     assert throughput.host_held(texts["host"]) and not throughput.host_held(texts["cap"])
+    # only the closing "held by" names the limit: a gate reason or a header naming another limit does not
+    gate = texts["host"].rpartition(checklane.HOST_GATE)[2]
+    assert throughput.slot_limit(texts["host"].replace(gate, "the project cap (checks.test_project_max).")) \
+        == throughput.HOST_CORES
+    assert throughput.slot_limit(texts["host"].replace(gate, "the per-repository lane limit.")) == throughput.HOST_CORES
+    assert throughput.slot_limit("This wait was held by the project cap. " + texts["about"]) == ""
+    assert throughput.slot_limit("Checks lane wait: #3 has waited 20 min") == throughput.CAP_KEY   # an older event
     for task, hours, ev in ((lane_t, 1, texts["lanes"]), (t, 3, texts[kind])):
         p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
                (task, "worker", now - (hours + 1) * 3600, now - hours * 3600, "ok", "{}"))

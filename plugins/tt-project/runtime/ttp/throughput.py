@@ -240,14 +240,12 @@ def slot_limit(text: str) -> str:
     cap, the limit every pre-#4316 event and every reason text was held under."""
     from .checklane import HOST_GATE
     held = text.rpartition("This wait was held by ")[2]
-    if "per-repository lane limit" in held:
-        return SLOTS_KEY
-    if "project cap" in held:
-        return CAP_KEY
-    if held.startswith(HOST_GATE):
+    if held.startswith(HOST_GATE):   # first: the gate's own reason may name any limit
         return HOST_CORES
     if held.startswith("nothing (about to start)"):
         return ""
+    if "per-repository lane limit" in held:
+        return SLOTS_KEY
     return CAP_KEY
 
 
