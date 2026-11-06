@@ -1596,3 +1596,93 @@ def test_coord_session_stats_count_a_codex_wake_s_own_tool_calls(env):
                                                                   "command": "ttp status"}}) + "\n")
     row = p.db.one("SELECT id, dir, provider FROM runs WHERE id=?", (rid,))
     assert coordstats.tool_calls(row, p.runs) == 3
+
+
+def test_codex_session_coordinator_gets_its_tools_through_its_own_hooks(env, monkeypatch, tmp_path):
+    """A Codex session coordinator's tools: its shell comes back with ttp's CoordPreToolUse hook (and with
+    full tools the CoordPostToolUse guard), run as Codex runs it: a push, a direct charter write and
+    an off-list read-only command are denied, a charter changed by a shell call is put back."""
+    from ttp import coordtools
+    features = CODEX_HOOK_FEATURES + "".join(f"{f}  stable  true\n" for f in ("shell_tool", "unified_exec",
+                                                                                  "web_search_request"))
+    worker, home, repo = _codex_hooks(monkeypatch, tmp_path, features=features)
+    prov = worker()[0]
+    p = make(env)
+    protected = coordtools.protected_paths(p)
+
+    def coord(full, web=True, settings_full=None):
+        argv, _ = prov.build(role="coordinator", model="", effort="", cwd=str(repo), budget_usd=None, read_only=True,
+                             schema=None, restrictions={})
+        assert "features.shell_tool=false" in argv
+        settings = coordtools.hook_settings([], full=full if settings_full is None else settings_full,
+                                            protected=protected)
+        return prov.coord_tools(argv, str(repo), settings, full, web=web)
+
+    argv, cenv = coord(True)
+    cmds = _codex_hook_commands(argv)
+    assert set(cmds) == {"PreToolUse", "PostToolUse"} and argv[-1] == "-" and "--dangerously-bypass-hook-trust" in argv
+    assert cmds["PreToolUse"].endswith("-m ttp.hook CoordPreToolUse") and "CoordPostToolUse" in cmds["PostToolUse"]
+    assert not any(a.startswith("features.") and a.endswith("=false") for a in argv), "full tools: shell and web on"
+    assert cenv[coordtools.FULL_ENV] == "1" and cenv[coordtools.PROTECTED_ENV]
+    assert "features.web_search_request=false" in coord(True, web=False)[0], "no_internet keeps the web off"
+    run = tmp_path / "run"
+    run.mkdir()
+    hook_env = {**os.environ, **cenv, "TTP_RUN_DIR": str(run), "TTP_PROJECT": str(p.base), coordtools.ROLE_ENV: "coordinator"}
+
+    def call(event, command, n=1, env_=hook_env, cmds_=cmds):
+        payload = {"session_id": THREAD, "turn_id": "t-1", "cwd": str(repo), "hook_event_name": event,
+                   "tool_name": "Bash", "tool_input": {"command": command}, "tool_use_id": f"exec-{n}"}
+        if event == "PostToolUse":
+            payload["tool_response"] = "ok\n"
+        out = subprocess.run(cmds_[event], shell=True, input=json.dumps(payload), capture_output=True, text=True,
+                             env=env_, cwd=str(repo), timeout=60)
+        assert out.returncode == 0, out.stderr
+        return json.loads(out.stdout)["hookSpecificOutput"] if out.stdout.strip() else None
+
+    for bad in ("git push origin HEAD", f"echo x > {p.charter_path}", "ttp push --land"):
+        got = call("PreToolUse", bad)
+        assert got and got["permissionDecision"] == "deny", bad
+    assert call("PreToolUse", "ls") is None
+    before = p.charter_path.read_text()
+    assert call("PreToolUse", "python3 edit.py", n=7) is None
+    p.charter_path.write_text(before + "\n- loosened\n")
+    got = call("PostToolUse", "python3 edit.py", n=7)
+    assert got and got["additionalContext"] and p.charter_path.read_text() == before, "the per-call guard put it back"
+    # Read-only tools: the shell back only under the hook, held to the read-only list.
+    argv, renv = coord(False)
+    cmds = _codex_hook_commands(argv)
+    assert set(cmds) == {"PreToolUse"} and "features.shell_tool=false" not in argv
+    assert "features.web_search_request=false" in argv and coordtools.FULL_ENV not in renv
+    ro_env = {**os.environ, **renv, "TTP_RUN_DIR": str(run), "TTP_PROJECT": str(p.base)}
+    assert call("PreToolUse", "ttp status", env_=ro_env, cmds_=cmds) is None
+    assert call("PreToolUse", "touch x", env_=ro_env, cmds_=cmds)["permissionDecision"] == "deny"
+    # No hook can run (another hook source): read-only keeps the shell off; full tools get it with no bypass.
+    (repo / ".codex").mkdir()
+    (repo / ".codex" / "hooks.json").write_text('{"hooks": {}}')
+    argv, _ = coord(False)
+    assert "features.shell_tool=false" in argv and not _codex_hook_commands(argv)
+    argv, _ = coord(True)
+    assert "--dangerously-bypass-hook-trust" not in argv and "features.shell_tool=false" not in argv
+
+
+def test_codex_like_coordinator_session_wake_launches_with_the_agent_s_tools_and_env(env, monkeypatch):
+    """The daemon gives an agent without ttp's Claude hooks its coordinator tools (Provider.coord_tools)
+    on session wakes and on the read-only turns of session mode, never with session mode off."""
+    from ttp.providers.fake import Fake
+    p, _, _, turn, _, _ = _cs_daemon(env, monkeypatch)
+    seen = []
+
+    def tools(self, argv, cwd, settings, full, web=True):
+        seen.append((full, settings["env"].get("TTP_COORD_FULL_TOOLS")))
+        return argv[:-1] + ["--coord-tools", argv[-1]] if argv and argv[-1] == "-" else argv + ["--coord-tools"], \
+            {"TTP_COORD_MARK": "1"}
+    monkeypatch.setattr(Fake, "coord_tools", tools)
+    r, argv, _, _ = turn("EVENTS 0")
+    assert not seen and "--coord-tools" not in argv, "session mode off: the stateless turn has no tools"
+    p.set_config("coordinator.session.mode", "on")
+    r, argv, _, s = turn("EVENTS 1")
+    assert s["mode"] == "new" and seen[-1] == (True, "1") and "--coord-tools" in argv
+    assert json.loads((p.runs / str(r["id"]) / "run.json").read_text())["env"]["TTP_COORD_MARK"] == "1"
+    p.set_config("coordinator.session.tools", "read_only")
+    r, argv, _, s = turn("EVENTS 2")
+    assert s["mode"] == "resume" and seen[-1] == (False, None) and "--coord-tools" in argv

@@ -304,6 +304,30 @@ class Codex(Provider):
             return []
         return [HOOK_TRUST_BYPASS, *hook_config_args()]
 
+    def coord_tools(self, argv, cwd, settings, full, web=True):
+        # A session coordinator's tools (coordtools.session_tool_args for Claude): every call goes
+        # through ttp.hook's CoordPreToolUse (and with full tools the CoordPostToolUse guard and audit),
+        # under the same trust-bypass rule as a worker's hook (_hook_for). The read-only turn's shell
+        # comes back only with that hook to hold it to the read-only list; full tools get it (and the
+        # web, unless no_internet) either way, as a Codex worker does, the whole-wake guard then
+        # covering the protected files (coordtools.wake_guard).
+        hooked = self.hooks_supported() and not hook_sources(cwd, user_config=IGNORE_USER_CONFIG not in argv)
+        if not (hooked or full):
+            return argv, {}
+        back = {f"features.{f}=false" for f in READ_ONLY_OFF if f != "web_search_request" or (full and web)}
+        out = []
+        for a in argv:
+            if a in back and out and out[-1] == "-c":
+                out.pop()
+            else:
+                out.append(a)
+        if hooked:
+            from ..coordtools import HOOK_EVENT, POST_EVENT
+            hooks = [("PreToolUse", "*", HOOK_EVENT, 20)] + ([("PostToolUse", "*", POST_EVENT, 20)] if full else [])
+            i = len(out) - 1 if out and out[-1] == "-" else len(out)
+            out[i:i] = [HOOK_TRUST_BYPASS, *hook_config_args(hooks)]
+        return out, dict(settings.get("env") or {})
+
     def write_fence(self, restrictions=None) -> str:
         return ""   # workspace-write: Seatbelt on macOS, bubblewrap or the bundled helper on Linux
 
@@ -874,16 +898,21 @@ def _payloads(item: dict) -> list[dict]:
 PRE_TOOL_MATCHER = "Bash|apply_patch|mcp__.*"
 
 
-def hook_config_args() -> list[str]:
+# A worker's hooks, as (Codex event, matcher or None, ttp.hook event, timeout) rows.
+WORKER_HOOKS = (("PreToolUse", PRE_TOOL_MATCHER, "PreToolUse", 20), ("PostToolUse", "*", "PostToolUse", 20),
+                ("Stop", None, "Stop", STOP_HOOK_TIMEOUT_S))
+
+
+def hook_config_args(hooks=WORKER_HOOKS) -> list[str]:
     """`-c` keys that route shell, edit and MCP calls, every tool result and the end of a turn (Stop: the
-    hand-off guard) through `ttp.hook` (see the module docstring). PYTHONPATH is set in the command
+    hand-off guard) through `ttp.hook` (see the module docstring); `hooks`: (Codex event, matcher or
+    None, ttp.hook event, timeout) rows, a worker's by default. PYTHONPATH is set in the command
     itself, so the worker's own commands keep theirs."""
     runtime = str(Path(__file__).resolve().parents[2])
     cmd = f"env PYTHONPATH={shlex.quote(runtime)} {shlex.join(isolated_module_argv('ttp.hook', runtime))}"
     out = []
-    for event, matcher, timeout in (("PreToolUse", PRE_TOOL_MATCHER, 20), ("PostToolUse", "*", 20),
-                                    ("Stop", None, STOP_HOOK_TIMEOUT_S)):
-        hook = f"{{type=\"command\",command={toml_string(f'{cmd} {event}')},timeout={timeout}}}"
+    for event, matcher, handler, timeout in hooks:
+        hook = f"{{type=\"command\",command={toml_string(f'{cmd} {handler}')},timeout={timeout}}}"
         entry = f"[{{{'' if matcher is None else f'matcher={toml_string(matcher)},'}hooks=[{hook}]}}]"
         out += ["-c", f"hooks.{event}={entry}"]
     return out

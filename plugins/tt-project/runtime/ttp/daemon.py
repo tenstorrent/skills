@@ -3220,6 +3220,14 @@ class Daemon:
                         argv = _before_stdin(argv, sys_args)
                     else:
                         prompt = system + "\n\n" + prompt
+            coord_env = {}
+            if role == "coordinator" and not prov.tool_hooks and coordtools.session_on(self.cfg):
+                # The same tools and per-call checks through the agent's own hooks where it has them (Codex).
+                full = coordtools.full_tools(self.cfg, session_mode)
+                argv, coord_env = prov.coord_tools(
+                    argv, cwd, coordtools.hook_settings(no_reads, full=full, protected=coordtools.protected_paths(self.p),
+                                                        timeout_s=coordtools.tool_timeout_s(self.cfg)),
+                    full, web=not restrictions.get("no_internet"))
             if append_system is not None:
                 (run_dir / "system.md").write_text(append_system)
                 sys_args = prov.append_system_args(run_dir / "system.md")
@@ -3257,6 +3265,7 @@ class Daemon:
                 env["TTP_NO_DEVICE"] = "1"
             elif task:
                 env["TTP_NO_DEVICE"] = "0" if holds_device(task, self.cfg) else "1"
+            env.update(coord_env)
             env[coordtools.ROLE_ENV] = role   # always set: never an inherited value (coordtools.coordinator_run)
             # A light-tier or chat-routed run hands its text off instead of posting it (workernotify.no_post).
             # Always set, blank when unmarked: the runner lays this env over its own, so a popped key would

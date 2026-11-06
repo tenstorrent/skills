@@ -334,6 +334,13 @@ class Provider:
         own, which may point the agent at another config directory), is still on disk to resume."""
         return False
 
+    def coord_tools(self, argv: list[str], cwd: str, settings: dict, full: bool,
+                    web: bool = True) -> tuple[list[str], dict]:
+        """A session coordinator's tools on an agent without tool_hooks: `argv` changed to give them
+        and the run env they need (coordtools.hook_settings' "env"), from `settings` (hook_settings)
+        and `full` (coordtools.full_tools). Default: unchanged, no tools beyond the turn's own."""
+        return argv, {}
+
     def session_context(self, session_id: str, since: float, env: dict | None = None) -> dict | None:
         """For an agent whose stream gives no per-call usage: what its saved session says of the run that
         started at `since`, {"first_context", "last_context": a model call's prompt plus answer,
