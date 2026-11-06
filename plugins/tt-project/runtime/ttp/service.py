@@ -189,9 +189,12 @@ def _write_watchdog_units(p: Project) -> bool:
     return changed
 
 
-# How long systemd waits after SIGTERM before it force-kills the daemon. A stop ends the running tick
-# step and skips the rest (Daemon._run_step), so this only needs to outlast one slow step. KillMode
-# stays `process`: workers must outlive a daemon restart.
+# How long systemd waits after SIGTERM before it force-kills the daemon. A stop skips the tick's
+# remaining steps and ends the running one at a safe point (Daemon._run_step: a finish round rolled
+# back, a looping step's next item), so the daemon exits within seconds. KillMode stays `process`:
+# workers, checks and detached jobs must outlive a daemon restart, and neither the stop's SIGTERM nor
+# its final SIGKILL reaches them. They stay in the unit's cgroup ("remains running after unit
+# stopped" is only a notice; the next start ignores them), so no separate scope is needed for them.
 STOP_TIMEOUT_S = 120
 
 

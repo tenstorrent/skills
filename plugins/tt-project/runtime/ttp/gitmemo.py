@@ -27,7 +27,8 @@ stays within its slice; past it the read raises GitMiss before spawning, the tra
 the read runs outside the lock and the round runs again. The db audit hook calls on_audit(): a raw
 git spawn inside a round counts against the slice; a non-git spawn or a socket connect is the round's
 point of no return, after which it never aborts: later misses run live within the slice, else raise
-subprocess.TimeoutExpired without spawning."""
+subprocess.TimeoutExpired without spawning. A stop (Attempt.stop: the daemon got SIGTERM) ends an
+abortable round before its next live git, spawn or connect, so a stop never waits out the rounds."""
 
 from __future__ import annotations
 
@@ -161,6 +162,10 @@ class Attempt:
         self.round = 0
         self.strict: _Round | None = None
         self.last: _Round | None = None
+        self.stop: Callable[[], bool] | None = None   # the daemon is stopping: an abortable round ends
+
+    def stopping(self) -> bool:
+        return bool(self.stop and self.stop())
 
 
 class _Round:
@@ -252,15 +257,19 @@ def _spawn(argv, t: float | None, kw: dict) -> subprocess.CompletedProcess:
 def on_audit(event: str, args: tuple) -> None:
     """From the db audit hook: a raw git spawn inside a strict round counts against its slice (past
     it: GitMiss, or TimeoutExpired after the point of no return); a non-git spawn or a socket
-    connect is the point of no return."""
+    connect is the point of no return. Once the daemon is stopping (Attempt.stop), an abortable round
+    ends before its next spawn or connect."""
     a = _att.get()
     rd = a.strict if a else None
     if rd is None or _own.get():
         return
+    if event not in ("subprocess.Popen", "socket.connect"):
+        return
+    if rd.abort() and a.stopping():   # before the spawn or connect: nothing outside the round changed yet
+        raise GitMiss(args[1] if event == "subprocess.Popen" and len(args) > 1 else [event], {}, None, None,
+                      "the daemon is stopping", learn=False)
     if event == "socket.connect":
         rd.pnr = True
-        return
-    if event != "subprocess.Popen":
         return
     rd.raw_close()
     argv = args[1] if len(args) > 1 else None
@@ -300,6 +309,8 @@ keeps its own cap and makes the round's point of no return)."""
     check = bool(kw.pop("check", False))
     write = not is_read(args) and not _pure(args)
     slice_binds = False
+    if rd and rd.abort() and a.stopping():   # a stop ends the round before its next live git
+        raise GitMiss(argv, {**kw, "check": check}, timeout, read, "the daemon is stopping", learn=False)
     if rd and write:
         rd.pnr = True   # a write keeps its own cap: the slice never refuses, binds or kills it
     elif rd:

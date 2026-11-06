@@ -969,6 +969,12 @@ def disk_guard_bytes(disk: dict, path: Path) -> float:
 FINISH_STRICT = True   # finish transactions run as strict rounds (Daemon._finish_rounds)
 
 
+class StopRequested(BaseException):
+    """The daemon is stopping: a finish ends at a safe point (a round rolled back, nothing applied) and
+    is left to the next daemon. A BaseException, so a step's `except Exception` cannot swallow it;
+    _run_step ends the step on it, _reap unmarks the run for a full reap after the restart."""
+
+
 class _FinishRound:
     """One round of Daemon._finish_rounds: attempt, memo scope, log buffer, db.tx, the TX_GIT_S
     budget and gitmemo.strict, entered in that order. A GitMiss is kept in .miss and suppressed
@@ -1201,8 +1207,8 @@ class Daemon:
         select.select([self._wake[0]], [], [], seconds)
 
     def _on_stop_signal(self, signum, _frame=None) -> None:
-        """SIGTERM/SIGINT: stop at the end of the running tick step (_run_step skips the rest), and
-        end the between-tick wait now, well inside the unit's TimeoutStopSec."""
+        """SIGTERM/SIGINT: end the running tick step at its next safe point (_run_step skips the rest),
+        and end the between-tick wait now, well inside the unit's TimeoutStopSec."""
         first = not self.stopping
         # Log before the flag: a real handler runs on the main thread, but a stop may also be
         # asked for from another thread (the tests do this); once `stopping` is set, run() can
@@ -1617,7 +1623,8 @@ class Daemon:
         success clears the count and the alert. The watchdogs still hear of progress either way.
         Returns the step's result, or `default` when it raised; `name` labels a step that is not a
         method of this daemon (a lambda). Once a stop is requested the steps not yet started are
-        skipped (returning `default`): a running step always finishes what it began."""
+        skipped (returning `default`); a running step ends at its next safe point (_step_over, a
+        finish round rolled back: StopRequested) or finishes what it began."""
         name = name or step.__name__
         if self.stopping:   # a stop skips the tick's remaining steps; each is its own transaction
             self._stop_skipped.append(name)
@@ -1629,6 +1636,8 @@ class Daemon:
         try:
             with gitmemo.bounded(gitmemo.TICK_GIT_S):   # one slow git read never holds the step long
                 result = step()
+        except StopRequested as e:   # a stop ended it at a safe point: the next daemon picks it up
+            log(self.p, f"stop: tick step {name} ended at a safe point ({e})")
         except Exception as e:  # one bad step must not stop the rest of the tick
             self._log_step_error(f"tick step {name}", e)
             n, since = self._step_fails.get(name, (0, time.time()))
@@ -1659,7 +1668,7 @@ class Daemon:
         t = time.monotonic()
         self._step_charge(t)
         self._step_holder, self._step_task, self._step_mark = holder, task, t
-        return self._step_began is not None and t - self._step_began >= STEP_BUDGET_S
+        return self._stopping or (self._step_began is not None and t - self._step_began >= STEP_BUDGET_S)
 
     def _step_charge(self, t: float) -> None:
         if self._step_holder and t - self._step_mark > self._step_worst[0]:
@@ -3437,6 +3446,8 @@ class Daemon:
         except Exception:   # a pending restart never holds up reaping
             log(self.p, "pending restarts failed\n" + traceback.format_exc())
         for r in running:
+            if self.stopping:   # the runs not reaped yet are the next daemon's: a stop never waits on them
+                return
             try:
                 # Liveness first: a runner writes exit.json before it exits, so a run found dead here
                 # has its exit.json by the look below. The other order calls a run that ends between
@@ -3476,6 +3487,9 @@ class Daemon:
         self._lean_reap = mode == "lean"
         try:
             self.finish_run(r, exit_info)
+        except StopRequested:   # rolled back at a safe point, not cut off: the next daemon reaps it in full
+            self._reap_unmark(r["id"])
+            raise
         finally:
             self._lean_reap = False
         self._reap_unmark(r["id"])
@@ -5192,10 +5206,14 @@ class Daemon:
         and the next round replays it. A round past its point of no return (a non-git spawn, a socket),
         the one after MAX_ROUNDS or FINISH_WALL_S, or one after a miss that cannot be learned (raw git)
         never aborts: a read past its slice fails fast and degrades as a git failure does. Each round
-        also keeps _finish_tx's TX_GIT_S budget. Off (FINISH_STRICT False), or inside a transaction
+        also keeps _finish_tx's TX_GIT_S budget. Once the daemon is stopping, an abortable round ends
+        before its next live git or spawn and, rolled back, raises StopRequested instead of retrying:
+        rounds once ran on for minutes (FINISH_WALL_S) past SIGTERM, until the unit's stop timeout
+        killed the daemon. Off (FINISH_STRICT False), or inside a transaction
         already open (no rollback to retry from): one _finish_tx round, as before."""
         memo = self._git_memo.pop(task_id, None)
         att = self._git_attempts.pop(task_id, None) or gitmemo.Attempt()
+        att.stop = lambda: self._stopping   # a stop ends the open round before its next live git or spawn
         t0, final = time.monotonic(), False
         try:
             if not FINISH_STRICT or self.p.db.conn.in_transaction:
@@ -5210,6 +5228,8 @@ class Daemon:
                 miss = rnd.miss
                 if miss is None:
                     return
+                if self._stopping:   # the round rolled back: nothing applied, the next daemon finishes it
+                    raise StopRequested(f"finish of task {task_id} rolled back after {att.round} round(s)")
                 if not miss.learn:   # raw git: no answer to keep, so another strict round cannot do better
                     final = True
                     continue

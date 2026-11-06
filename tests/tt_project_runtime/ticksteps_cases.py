@@ -1589,6 +1589,122 @@ def test_g_a_read_that_never_settles_degrades_as_a_git_failure_in_the_final_roun
     assert dmod.Daemon(s.p.base).sweep_unreviewed(force=True) == [s.code]
 
 
+def test_a_stop_ends_an_abortable_round_before_its_next_spawn_but_never_one_past_its_point_of_no_return(
+        env, monkeypatch, tmp_path):
+    """Once the daemon is stopping (Attempt.stop), an abortable strict round raises GitMiss (not learnt)
+    before a live git read through gitmemo.run, a raw git spawn and a non-git spawn: nothing runs. A
+    round past its point of no return, or a final one, runs on as before; no stop: as before."""
+    from ttp import gitmemo, gitreplay, project
+    project.Project(make(env).base)   # the db audit hook gitmemo.on_audit hangs off
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    marker = tmp_path / "spawned"
+    read = ["git", "-C", str(repo), "rev-parse", "--git-dir"]
+    spawns = _record_spawns(monkeypatch)
+    stop = [True]
+    cases = {"read": lambda: gitmemo.run(read, capture_output=True),
+             "raw git": lambda: subprocess.run(["git", "-C", str(repo), "status"], capture_output=True),
+             "other": lambda: subprocess.run(["sh", "-c", f": > {marker}"])}
+    for name, call in cases.items():
+        gitreplay.clear()
+        with gitmemo.attempt() as a, gitmemo.strict(60.0) as rd:
+            a.stop = lambda: stop[0]
+            with pytest.raises(gitmemo.GitMiss) as miss:
+                call()
+            assert miss.value.why == "the daemon is stopping" and not miss.value.learn, name
+            assert not rd.pnr, name
+    assert spawns == [] and not marker.exists(), "a stopped round spawned"
+    for final in (False, True):   # past its point of no return, or a final round: it runs
+        gitreplay.clear()
+        with gitmemo.attempt() as a, gitmemo.strict(60.0, abortable=not final) as rd:
+            a.stop = lambda: stop[0]
+            rd.pnr = not final
+            assert gitmemo.run(read, capture_output=True).returncode == 0
+    stop[0] = False
+    gitreplay.clear()
+    with gitmemo.attempt() as a, gitmemo.strict(60.0) as rd:   # not stopping: as before
+        a.stop = lambda: stop[0]
+        assert gitmemo.run(read, capture_output=True).returncode == 0 and not rd.pnr
+        subprocess.run(["sh", "-c", f": > {marker}"])
+        assert marker.exists() and rd.pnr
+
+
+def test_sigterm_during_a_long_finish_exits_in_seconds_and_the_next_daemon_picks_it_up(
+        env, monkeypatch):
+    """The 0.2.931 daemon ran its finish rounds on for minutes after SIGTERM (reap_runs: a coordinator
+    turn's finish kept rolling back and retrying, up to FINISH_WALL_S) until the unit's stop timeout
+    killed it. Now a stop ends the open round before its next spawn, rolls it back and skips the runs
+    not reaped yet: the daemon exits within seconds of SIGTERM. A run still going (its own process
+    group, as the runner starts it) lives on, and the next daemon reaps the stopped finish in full
+    (not lean: it was not cut off) and still sees the live run."""
+    import signal as sig
+    from ttp import daemon as dmod, gitmemo, gitreplay, runner, service, web
+    real_get = gitreplay.get   # a read the memo never keeps: every round rolls back on it, MAX_ROUNDS
+    monkeypatch.setattr(gitreplay, "get", lambda k, *a: None if "rev-parse" in k.args else real_get(k, *a))
+    s, runs = _big_finish(env, monkeypatch, 20)
+    p = s.p
+    _slow_git(env["tmp"], monkeypatch, delay=0.3)   # 50 rounds: 15 s and more past the stop, unfixed
+    monkeypatch.setattr(gitmemo, "HOLD_SLICE_S", 0.0)   # every read the memo lacks rolls a round back
+    monkeypatch.setattr(gitmemo, "TICK_GIT_S", 30.0)
+    ended, live = runs
+    (p.runs / str(ended) / "exit.json").write_text(json.dumps({"rc": 0, "started": time.time() - 60,
+                                                               "ended": time.time(), "stopped": None}))
+    child = subprocess.Popen(["sleep", "120"], start_new_session=True)   # the live run's supervisor
+    d = dmod.Daemon(p.base)
+    (p.runs / str(live) / "runner.pid").write_text(f"{child.pid}\n{runner.proc_start(child.pid)}")
+    (p.runs / str(live) / "lease").touch()
+    p.db.x("UPDATE runs SET pid=?, boot_id=? WHERE id=?", (child.pid, d.boot, live))
+    monkeypatch.setattr(d, "_prefetch_git", lambda task, result: None)
+    monkeypatch.setattr(d, "tick", lambda: d._run_step(d.reap_runs))
+    monkeypatch.setattr(web, "serve", lambda daemon: None)
+    monkeypatch.setattr(service, "take_restart_request", lambda p, started: False)
+    rounds, stopped = [], []
+    real_enter = dmod._FinishRound.__enter__
+
+    def enter(rnd):
+        rounds.append(time.monotonic())
+        if len(rounds) == 3:   # well into the rounds: SIGTERM through the handler run() installs
+            stopped.append(time.monotonic())
+            os.kill(os.getpid(), sig.SIGTERM)
+        return real_enter(rnd)
+    monkeypatch.setattr(dmod._FinishRound, "__enter__", enter)
+    old = {x: sig.getsignal(x) for x in (sig.SIGTERM, sig.SIGINT)}
+    try:
+        assert d.run() == 0
+        done = time.monotonic()
+    finally:
+        for x, h in old.items():
+            sig.signal(x, h)
+        _close_daemon_lock(d)
+    try:
+        assert stopped, f"the finish never reached its third round ({len(rounds)})"
+        assert done - stopped[0] < _load_scaled(5), f"the daemon ran {done - stopped[0]:.1f} s past SIGTERM"
+        assert len(rounds) <= 4, f"{len(rounds)} rounds: the rounds ran on after the stop"
+        text = (p.logs / "daemon.log").read_text()
+        assert "stop: tick step reap_runs ended at a safe point" in text, text[-2000:]
+        assert (p.db.kv(dmod.CLEAN_STOP_KEY) or {}).get("clean_stop") is True
+        row = p.db.one("SELECT status FROM runs WHERE id=?", (ended,))
+        assert row["status"] == "running", "the rolled-back finish applied something"
+        assert p.db.task(s.code)["status"] == "running"
+        assert str(ended) not in (p.db.kv(dmod.REAP_KEY) or {}), "the stopped reap stays marked: a lean retry"
+        assert child.poll() is None, "the stop ended a running run"
+        # The next daemon: the stopped finish is reaped in full, the live run is still its own.
+        monkeypatch.setattr(dmod._FinishRound, "__enter__", real_enter)
+        monkeypatch.setattr(gitreplay, "get", real_get)
+        monkeypatch.setattr(gitmemo, "HOLD_SLICE_S", 1.5)
+        d2 = dmod.Daemon(p.base)
+        with gitmemo.bounded(gitmemo.TICK_GIT_S):
+            d2.reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (ended,))["status"] != "running"
+        assert p.db.task(s.code)["status"] != "running"
+        assert "optional checks skipped" not in (p.logs / "daemon.log").read_text()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (live,))["status"] == "running"
+        assert d2._run_alive(p.db.one("SELECT * FROM runs WHERE id=?", (live,))) and child.poll() is None
+    finally:
+        child.kill()
+        child.wait()
+
+
 def _masked_rows(db) -> dict:
     """Every table's rows with what a retried round may change masked: times (epoch seconds, ISO stamps)."""
     stamp = re.compile(r"\b1[6-9]\d{8}(\.\d+)?\b|\d{4}-\d\d-\d\dT\d\d:\d\d(:\d\d(\.\d+)?)?\S*")
