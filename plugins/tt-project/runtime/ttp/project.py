@@ -514,6 +514,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # workstations (a Mac is one); other platforms never.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
     "runner": {"nice": 10, "prevent_idle_sleep": "auto", "pin_verify": "lenient"},
+    # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
+    # limits every cell gets alike.
+    "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900},
     # Once a day the daemon archives (to memory/archive/, one harness commit, one low feed line) the
     # decision and fact entries, never standing ones, that every prompt has left out for at least
     # archive_hidden_days days (0 = off). `ttp memory <name> --search <words>` still finds them.

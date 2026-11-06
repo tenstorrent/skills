@@ -129,3 +129,119 @@ def test_bench_unknown_symbols_counts_names_the_spec_gives_and_ignores_outside_m
     files = ["tests/test_tool.py"]
     assert bench.unknown_symbols(repo, base, head, files, "") == ["tool", "tool.extra", "tool.run"]
     assert bench.unknown_symbols(repo, base, head, files, "Add pkg/tool.py with run() and extra().") == []
+
+
+def _bench_built(env, tmp_path):
+    # A one-task bench (task "keep": add new() returning 2, held-out tests/test_mod.py::test_new).
+    from ttp import bench
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    tid = _bench_land(git, commit, rev, "keep", {"mod.py": "def old():\n    return 1\n\n\ndef new():\n    return 2\n",
+                                                  "tests/test_mod.py": "import mod\n\n\ndef test_old():\n    assert mod.old() == 1"
+                                                  "\n\n\ndef test_new():\n    assert mod.new() == 2\n"},
+                      p, "Add new() returning 2.", 2_000_000.0)
+    m = bench.prep(p.db, repo, tmp_path / "bench", 1_000_000.0)
+    assert [t["task"] for t in m["tasks"]] == [tid]
+    return p, tid, m["tasks"][0]
+
+
+_BENCH_FIX = ("printf 'def old():\\n    return 1\\n\\n\\ndef new():\\n    return 2\\n' > mod.py && "
+              "git -c user.email=c@example.com -c user.name=c commit -qam fix")
+
+
+def _bench_opts(tmp_path, **kw):
+    return {"timeout_s": 120, "stall_s": 120, "budget_usd": 1.0, "test_timeout_s": 120,
+            "test_cmd": f"{sys.executable} -m pytest -q -p no:cacheprovider", "dry_run": True, **kw}
+
+
+def test_bench_run_dry_run_runs_every_cell_alike_in_a_seeded_order_and_grades_on_the_held_out_tests(env, tmp_path, monkeypatch):
+    from ttp import benchrun
+    p, tid, task = _bench_built(env, tmp_path)
+    arms = {"opus": {"provider": "claude", "model": "m-one", "effort": "medium"},
+            "glm": {"provider": "chat", "model": "m-two", "effort": "max"}}
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
+    out = tmp_path / "h2h"
+    rows = benchrun.run(tmp_path / "bench", out, arms, 2, 7, _bench_opts(tmp_path), p.config())
+    plan = json.loads((out / "plan.json").read_text())
+    assert plan["seed"] == 7 and plan["cells"] == benchrun.schedule([tid], ["opus", "glm"], 2, 7)
+    assert [(r["rep"], r["arm"]) for r in rows] == [(c["rep"], c["arm"]) for c in plan["cells"]]
+    assert {r["arm"] for r in rows if r["rep"] == 1} == {"opus", "glm"} and len(rows) == 4
+    for r in rows:
+        assert r["outcome"] == "pass" and r["passed"] and r["flagged"] == [] and r["handoff"] == "done", r
+        assert r["dry_run"] and r["cost_usd"] == 0 and r["wall_s"] >= 0 and len(r["transcript_sha256"]) == 64
+        assert r["seed"] == 7 and r["exit"]["rc"] == 0
+        cell = out / "cells" / f"{tid}-r{r['rep']}-{r['arm']}"
+        assert "+    return 2" in (cell / "diff.patch").read_text()
+        spec = json.loads((cell / "run.json").read_text())
+        assert spec["provider"] == "fake" and spec["timeout_s"] == 120 and spec["model"] == arms[r["arm"]]["model"]
+    prompts = {json.loads((out / "cells" / f"{tid}-r1-{a}" / "run.json").read_text())["argv"][-1] for a in arms}
+    assert len(prompts) == 1, "both arms run the same agent command"
+    assert benchrun.run(tmp_path / "bench", out, arms, 2, 7, _bench_opts(tmp_path), p.config()) == [], \
+        "a rerun of the same plan skips the recorded cells"
+    with pytest.raises(benchrun.BenchError, match="another plan"):
+        benchrun.run(tmp_path / "bench", out, arms, 2, 8, _bench_opts(tmp_path), p.config())
+    assert len((out / "results.jsonl").read_text().splitlines()) == 4
+    # A candidate that leaves the fix undone fails the held-out tests.
+    monkeypatch.setenv("TTP_FAKE_SHELL", "true")
+    rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h-nofix", arms, 1, 7, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in rows] == ["fail", "fail"]
+    assert "test_new" in (tmp_path / "h2h-nofix" / "cells" / f"{tid}-r1-glm" / "tests.log").read_text()
+    # A tampered bench is refused before any cell runs.
+    held = tmp_path / "bench" / str(tid) / "heldout" / "tests" / "test_mod.py"
+    held.write_text(held.read_text() + "\n")
+    with pytest.raises(benchrun.BenchError, match="does not match"):
+        benchrun.run(tmp_path / "bench", tmp_path / "h2h-3", arms, 1, 7, _bench_opts(tmp_path), p.config())
+
+
+def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held_out_tests(env, tmp_path, monkeypatch):
+    from ttp import benchrun
+    p, tid, task = _bench_built(env, tmp_path)
+    # A candidate that hunts for the answer inside its cell: every ref, object and file it can reach.
+    # (It cannot name the landed commit: nothing in the cell does, which leaks() checks below.)
+    hunt = ("{ git log --all --format=%H; git reflog; git remote -v; git for-each-ref; git stash list; "
+            "git fsck --lost-found --no-progress; cat .git/packed-refs; grep -rl 'test_[n]ew' . ; "
+            "env | grep -i -e 'held[o]ut' -e '/[b]ench'; ls -a \"$TTP_RUN_DIR\" ..; } > found.txt 2>&1; true")
+    monkeypatch.setenv("TTP_FAKE_SHELL", hunt)
+    arms = {"a": {"provider": "claude", "model": "", "effort": ""}, "b": {"provider": "claude", "model": "", "effort": ""}}
+    out = tmp_path / "h2h"
+    rows = benchrun.run(tmp_path / "bench", out, arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in rows] == ["fail", "fail"], "isolation passed and the candidate did not solve it"
+    for r in rows:
+        found = (out / "cells" / f"{tid}-r1-{r['arm']}" / "diff.patch").read_text()
+        assert "found.txt" in found and task["head"] not in found and task["base"] not in found
+        assert "test_new" not in found and str(tmp_path / "bench") not in found and str(out) not in found
+        assert json.loads((out / "cells" / f"{tid}-r1-{r['arm']}" / "run.json").read_text())["argv"]
+    # Each way a workspace could leak is caught before a cell runs.
+    ws = tmp_path / "ws"
+    shutil.copytree(tmp_path / "bench" / str(tid) / "workspace", ws, symlinks=True)
+    assert benchrun.leaks(ws, task) == []
+    g = ["git", "-C", str(ws), "-c", "user.email=c@example.com", "-c", "user.name=c"]
+    subprocess.run([*g, "remote", "add", "origin", str(tmp_path / "repo")], check=True)
+    subprocess.run([*g, "tag", "t"], check=True)
+    shutil.copyfile(tmp_path / "bench" / str(tid) / "heldout" / "tests" / "test_mod.py", ws / "copy.py")
+    (ws / "out").symlink_to(tmp_path / "bench")
+    found = benchrun.leaks(ws, task)
+    assert "a remote" in found and any(f.startswith("refs ") for f in found)
+    assert "copy.py holds a held-out test file" in found and "out links outside the workspace" in found
+    subprocess.run([*g, "fetch", "-q", "origin", "main"], check=True)
+    found = benchrun.leaks(ws, task)
+    assert "more than one commit" in found and f"commit {task['head'][:12]}" in found
+    # The transcript audit flags a candidate that names a hidden path, the landed commit or runs history commands.
+    flags = benchrun.audit(f"cat {tmp_path / 'bench'}/x; git show {task['head']}; git fetch origin; gh api x",
+                           task, [tmp_path / "bench"])
+    assert flags == [f"names {tmp_path / 'bench'}", "names the landed commit", "runs 'gh api'", "runs 'git fetch'"]
+    assert benchrun.audit("git log --oneline; pytest -q", task, [tmp_path / "bench"]) == []
+
+
+def test_bench_run_arms_parse_and_need_two(tmp_path):
+    from ttp import benchrun
+    assert benchrun.parse_arm("x=chat:org/model-1:max") == ("x", {"provider": "chat", "model": "org/model-1", "effort": "max"})
+    assert benchrun.parse_arm("y=claude::") == ("y", {"provider": "claude", "model": "", "effort": ""})
+    for bad in ("x", "x=claude", "=claude::", "x=:m:e", "x=a:b:c:d"):
+        with pytest.raises(benchrun.BenchError):
+            benchrun.parse_arm(bad)
+    with pytest.raises(benchrun.BenchError, match="two arms"):
+        benchrun.run(tmp_path, tmp_path / "o", {"a": {}}, 1, 1, {}, {})
+    s = benchrun.schedule([1, 2], ["a", "b"], 3, 5)
+    assert s == benchrun.schedule([1, 2], ["b", "a"], 3, 5), "the order depends on the seed alone"
+    assert len({tuple(c["arm"] for c in s[i:i + 2]) for i in range(0, len(s), 2)}) == 2, "both orders occur"

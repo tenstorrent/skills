@@ -7457,6 +7457,10 @@ def cmd_bench(a) -> None:
     replay, with clean base workspaces and held-out tests, model-free (bench.py)."""
     from . import bench
     p = here() or die("bench: no project here (run it in a project or with TTP_PROJECT set)")
+    if a.action == "run":
+        return _bench_run(p, a)
+    if not a.since:
+        die("bench prep: --since is required")
     try:
         when = _dt.datetime.fromisoformat(a.since)
     except ValueError:
@@ -7467,6 +7471,33 @@ def cmd_bench(a) -> None:
     m = bench.prep(p.db, Path(a.repo or p.root).resolve(), out, when.timestamp(), limit=a.limit)
     print(f"ttp bench: {len(m['tasks'])} task(s) kept ({m['counts']['small']} small, {m['counts']['large']} large), "
           f"{len(m['excluded'])} excluded; manifest {out / 'manifest.json'}")
+
+
+def _bench_run(p, a) -> None:
+    """`ttp bench run --bench <dir> --out <dir>`: the head-to-head of bench.arms (or --arm) (benchrun.py)."""
+    from . import benchrun
+    cfg = p.config()
+    conf = cfg.get("bench") or {}
+    arms = {k: {"provider": v.get("provider", ""), "model": v.get("model", ""), "effort": v.get("effort", "")}
+            for k, v in (conf.get("arms") or {}).items()}
+    try:
+        if a.arm:
+            arms = dict(benchrun.parse_arm(x) for x in a.arm)
+        if not a.bench:
+            raise benchrun.BenchError("--bench <dir> (a `ttp bench prep` folder) is required")
+        seed = a.seed if a.seed is not None else int.from_bytes(os.urandom(4), "big")
+        opts = {"timeout_s": a.timeout or conf.get("timeout_s", 3600), "stall_s": conf.get("stall_s", 900),
+                "budget_usd": a.budget or conf.get("budget_usd", 8.0), "test_cmd": a.test_cmd or benchrun.TEST_CMD,
+                "test_timeout_s": conf.get("test_timeout_s", 900), "dry_run": a.dry_run}
+        rows = benchrun.run(Path(a.bench).expanduser().resolve(), Path(a.out).expanduser().resolve(), arms,
+                            a.reps or conf.get("reps", 1), seed, opts, cfg, limit=a.limit)
+    except (benchrun.BenchError, OSError, ValueError) as e:
+        die(f"bench run: {e}")
+    for r in rows:
+        print(f"task {r['task']} rep {r['rep']} {r['arm']}: {r['outcome']}, ${r.get('cost_usd', 0):.2f}, "
+              f"{r.get('wall_s', 0):.0f} s" + (f" ({'; '.join(r.get('flagged') or r.get('why') or [])})"
+                                              if r['outcome'] in ("flagged", "isolation_failed") else ""))
+    print(f"ttp bench run: {len(rows)} cell(s) run, seed {seed}; results {Path(a.out).expanduser().resolve() / 'results.jsonl'}")
 
 
 def cmd_landed(a) -> None:
@@ -13091,12 +13122,22 @@ def main(argv: list[str] | None = None) -> None:
     s = sub.add_parser("bench", help="replay bench, model-free part: `prep` picks landed tasks newer than --since "
                                       "that add tests, builds a clean one-commit workspace at each base and holds "
                                       "out the landed tests, with a hash-pinned manifest")
-    s.add_argument("action", choices=["prep"], help="prep: build the bench in --out")
-    s.add_argument("--since", required=True, help="keep tasks created on or after this date (YYYY-MM-DD): the "
+    s.add_argument("action", choices=["prep", "run"], help="prep: build the bench in --out; run: the head-to-head "
+                                                            "of two or more arms on --bench, results in --out")
+    s.add_argument("--since", help="keep tasks created on or after this date (YYYY-MM-DD): the "
                                                   "later of the compared models' release dates")
     s.add_argument("--out", required=True, help="a new folder for the workspaces, held-out tests and manifest")
     s.add_argument("--repo", help="the repository the tasks landed in (default: the project root)")
-    s.add_argument("--limit", type=int, default=0, help="keep at most this many tasks (default: all)")
+    s.add_argument("--limit", type=int, default=0, help="keep (prep) or run (run) at most this many tasks (default: all)")
+    s.add_argument("--bench", help="run: the `ttp bench prep` folder to replay")
+    s.add_argument("--arm", action="append", help="run: name=provider:model:effort, repeatable (default: bench.arms)")
+    s.add_argument("--reps", type=int, default=0, help="run: repeats per task and arm (default: bench.reps, 1)")
+    s.add_argument("--seed", type=int, help="run: the arm-order seed (default: a random one, recorded)")
+    s.add_argument("--timeout", type=float, default=0, help="run: wall-clock limit per cell in s (default: bench.timeout_s)")
+    s.add_argument("--budget", type=float, default=0, help="run: dollar budget per cell (default: bench.budget_usd)")
+    s.add_argument("--test-cmd", help="run: the command the held-out test ids are appended to "
+                                            "(default: python3 -m pytest -q -p no:cacheprovider)")
+    s.add_argument("--dry-run", action="store_true", help="run: every arm on the fake agent, no model call")
     s.set_defaults(fn=cmd_bench)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "

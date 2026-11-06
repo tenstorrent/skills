@@ -138,8 +138,9 @@ def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float
 
 
 def _clean_env() -> dict:
-    # The runner lays the cell's env over its own: nothing of this project's or run's own TTP_ state.
-    env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
+    # The runner lays the cell's env over its own: nothing of this project's or run's own TTP_ state
+    # (the fake agent's scripted knobs, TTP_FAKE_*, pass for dry runs).
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_") or k.startswith("TTP_FAKE_")}
     return {**env, "PYTHONPATH": str(Path(__file__).resolve().parent.parent)}
 
 
@@ -183,7 +184,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         transcript = (run / "output.jsonl").read_bytes() if (run / "output.jsonl").exists() else b""
         ended = json.loads((run / "exit.json").read_text()) if (run / "exit.json").exists() else {}
         handoff = json.loads((run / "result.json").read_text()) if (run / "result.json").exists() else {}
-        row.update(exit=ended.get("reason") or ended.get("refused") or ended.get("rc"),
+        row.update(exit={k: ended[k] for k in ("rc", "stopped", "refused") if ended.get(k) is not None},
                    handoff=str(handoff.get("status") or "none"), transcript_sha256=_sha(transcript))
         subprocess.run(["git", "-C", str(ws), "add", "-A"], capture_output=True)
         diff = subprocess.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True).stdout
