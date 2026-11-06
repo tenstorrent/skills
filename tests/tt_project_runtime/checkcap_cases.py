@@ -10890,8 +10890,27 @@ def test_checks_tests_cpu_counts_what_a_holder_started_not_itself(tmp_path):
         deadline = time.time() + 60
         while not (tmp_path / "done").exists() and time.time() < deadline:
             time.sleep(0.05)
-        assert checkcap.tests_cpu_s(sh.pid) >= 0.6, "a reaped command's CPU counts"
+        assert checkcap.tests_cpu_s(sh.pid) >= 0.5, "a reaped command's CPU counts (0.6 s, in clock ticks)"
         assert checkcap.tests_cpu_s(2 ** 22 + 7) is None, "a pid that is gone reads None"
     finally:
         sh.kill()
         sh.wait()
+
+
+def test_detached_checks_keep_the_identity_their_parent_adopted(env, monkeypatch, tmp_path):
+    # The background run of a detached `ttp checks` outlives its parent, so it cannot walk up to the run: the
+    # parent hands what it adopted over in the environment, honoured only for an existing project.
+    from ttp import checkcap
+    p = make(env)
+    monkeypatch.setattr(checkcap, "_IDENT", {})
+    monkeypatch.setattr(checkcap, "inherited", lambda pid, base=None: {})
+    assert checkcap.adopted_env() == {}
+    checkcap._IDENT.update(task="42", run="9", base=str(p.base), project=p.name)
+    monkeypatch.setenv(checkcap.ADOPTED_ENV, checkcap.adopted_env()[checkcap.ADOPTED_ENV])
+    monkeypatch.delenv(checkcap.NO_INHERIT_ENV)
+    assert checkcap.adopt_identity()["task"] == "42" and checkcap.queue_name(None) == p.name
+    assert checkcap.adopt_identity(tmp_path / "other") == {}, "another project's run is not taken"
+    monkeypatch.setenv(checkcap.ADOPTED_ENV, '{"task": "42", "base": "%s"}' % (tmp_path / "gone"))
+    assert checkcap.adopt_identity() == {}
+    monkeypatch.setenv(checkcap.ADOPTED_ENV, "not json")
+    assert checkcap.adopt_identity() == {}

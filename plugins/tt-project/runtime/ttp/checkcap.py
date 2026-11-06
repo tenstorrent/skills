@@ -203,6 +203,7 @@ BARE_SLOTS = 1   # default checks.bare_slots: host-wide slots held at once by ru
 BARE_SLOTS_ENV = "TTP_CHECKS_BARE_SLOTS"
 INHERIT_DEPTH = 64   # ancestors read at most for the project run a `ttp checks` was started under (inherited)
 NO_INHERIT_ENV = "TTP_TEST_NO_INHERIT"   # tests: never take the identity of the process running them
+ADOPTED_ENV = "TTP_CHECKS_ADOPTED"   # the identity a detached run's parent adopted (adopted_env)
 IDLE_HOLD_S = 600.0   # default checks.idle_hold_s: a slot held this long with no test running is flagged (line)
 IDLE_HOLD_ENV = "TTP_CHECKS_IDLE_HOLD_S"
 ACTIVE_SAMPLE_S = 0.5   # holder_activity reads each holder's tests' CPU twice, this far apart
@@ -879,8 +880,27 @@ def adopt_identity(base: Path | None = None) -> dict:
     project, behind every project's waiter (fair_order's bare_last, bare_slots)."""
     _IDENT.clear()
     if not os.environ.get("TTP_TASK") and not os.environ.get(NO_INHERIT_ENV):
-        _IDENT.update(inherited(os.getppid(), base))
+        _IDENT.update(_handed(base) or inherited(os.getppid(), base))
     return dict(_IDENT)
+
+
+def adopted_env() -> dict:
+    """The environment that hands the adopted identity to the background run a detached `ttp checks` starts
+    (its parent, and with it the ancestor chain, ends)."""
+    return {ADOPTED_ENV: json.dumps(_IDENT)} if _IDENT else {}
+
+
+def _handed(base: Path | None) -> dict:
+    """The identity adopted_env handed over, when its project still exists (and is `base`, with one)."""
+    from . import procowner
+    try:
+        got = json.loads(os.environ.get(ADOPTED_ENV) or "{}")
+    except ValueError:
+        return {}
+    there = procowner.base_of(got.get("base")) if isinstance(got, dict) and got.get("task") else None
+    if not there or (base is not None and there != procowner.base_of(base)) or not project.Project(there).exists():
+        return {}
+    return {k: str(got.get(k) or "") for k in ("task", "run", "base", "project")}
 
 
 def _task_run() -> tuple[str | None, str | None]:

@@ -6089,6 +6089,7 @@ def _checks_detach(a, run_dir: Path, p: Project | None, top: str = "", head: str
     env = dict(os.environ, PYTHONPATH=str(Path(__file__).resolve().parents[1]))
     if arrived is not None:
         env[checkcap.ARRIVED_ENV] = repr(arrived)
+    env.update(checkcap.adopted_env())   # its parent ends: the identity it adopted goes along
     if no_spill:   # the rerun of checks that did not pass on a spill host keeps off those hosts (checkspill)
         from . import checkspill
         env[checkspill.OFF_ENV] = no_spill
