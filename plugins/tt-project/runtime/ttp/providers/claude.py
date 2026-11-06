@@ -125,6 +125,9 @@ class Claude(Provider):
     def credential_files(self) -> list[str]:
         return [str(claude_config_dir() / ".credentials.json")]
 
+    def harness_hook(self, argv):
+        return True   # every run's settings route PreToolUse through ttp.hook (hook_settings)
+
     def login_check(self) -> bool | None:
         b = self.binary()
         if not b or "status" not in cli_output(b, "auth", "--help"):

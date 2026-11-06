@@ -45,6 +45,7 @@ from . import turnrules
 from . import checksettle
 from . import coordwrites
 from . import checksgone
+from . import streamguard
 from . import userorder
 from . import runwatch
 from . import drift
@@ -5351,6 +5352,27 @@ class Daemon:
             db.update_task(task["id"], status="queued", blocked_reason=f"restarted by the coordinator: {why}"[:500],
                            result=dump_result(prev))
             log(self.p, f"task {task['id']}: run {r['id']} stopped for a restart; queued again: {why}")
+            return
+        if (stop := streamguard.take(run_dir)) is not None:
+            # The runner stopped a run the harness hook does not reach at a call the hook refuses
+            # (streamguard): queued once more with the refusal on top, no attempt spent; twice in a row, blocked.
+            why, prev = str(stop["why"])[:500], load_result(task["result"])
+            again = isinstance(prev.get(streamguard.KEY), dict)
+            text = (f"#{task['id']} {task['title']}: run {r['id']} stopped by the stream guard at a "
+                    f"{stop.get('tool') or 'tool'} call: {why}"
+                    + ("; the second stop in a row, so blocked" if again else "; queued again, no attempt spent"))
+            with db.tx():
+                if again:
+                    db.update_task(task["id"], status="blocked", blocked_reason=f"stream guard, twice: {why}"[:500],
+                                   result=dump_result({"status": "blocked", "summary": text[:1500]}))
+                else:
+                    db.update_task(task["id"], status="queued", blocked_reason=f"stream guard: {why}"[:500],
+                                   result=dump_result({"status": "guard_stopped", "summary": text[:1500],
+                                                       streamguard.KEY: {**stop, "why": why, "run": r["id"]}}))
+                db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                     (time.time(), f"task:{task['id']}", "task_blocked" if again else "guard_stop",
+                      "normal" if again else "low", text, "queued" if again else "handled", task["id"]))
+            log(self.p, text)
             return
         if status not in ("ok", "killed", "resource_busy") and (
                 (handoff or {}).get("status") in HANDOFF_STATES

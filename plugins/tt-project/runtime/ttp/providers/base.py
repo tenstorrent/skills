@@ -478,9 +478,16 @@ class Provider:
         """Tool events a running run wrote to its output after byte `offset`, and the offset to read
         from next: {"kind": "call" | "result", "id", "tool", "input_head" (80 chars), "is_error"
         (None on a call), "ts" (None when the stream has no time)}; a call may add "hash" (of its whole
-        input) and "command" (a shell command, CMD_MAX chars), which drift.py reads. Only whole lines count, so a line
-        still being written is read next time. None here: runwatch falls back to progress.md and git."""
+        input) and "command" (a shell command, CMD_MAX chars), which drift.py reads, and "payloads" (the
+        hook-shaped {"tool_name", "tool_input"} of each thing it does, whole), which streamguard checks. Only
+        whole lines count, so a line still being written is read next time. None here: runwatch falls back
+        to progress.md and git."""
         return [], offset
+
+    def harness_hook(self, argv: list[str]) -> bool:
+        """Whether a run started with `argv` passes its tool calls through the harness hook (ttp.hook);
+        False: the runner checks them from the stream instead (streamguard)."""
+        return False
 
     def resolved_session(self, argv: list[str], cwd: str, env: dict | None = None) -> dict | None:
         """The model and reasoning effort a run started with `argv` in `cwd` would actually use, asked

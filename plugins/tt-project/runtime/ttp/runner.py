@@ -18,6 +18,8 @@
   (a long sleep or a polling loop, is_wait) filling WAIT_SHARE of the last stall_s also end it, so a run
   that only sleep-polls between quick checks stalls too;
 - enforces the run's dollar budget mid-flight when the provider streams usage;
+- in a task run the harness hook does not reach (streamguard), checks each tool call the agent starts
+  as the hook would and stops the run at the first one it refuses;
 - ends the child when <run_dir>/STOP appears (a cancel, or `ttp stop --kill` writing "shutdown") or
   the run dir is deleted, and never starts it when the STOP came first;
 - ends the child's whole process group, its tools too, TERM then KILL, when the runner itself dies
@@ -478,6 +480,23 @@ def supervise(run_dir: Path) -> int:
         st = {"lease": 0.0, "budget": 0.0, "active": 0.0}
         progress = ProgressWatch(out_path, run_dir)
         waits_idle = bool(spec.get("waits_idle"))
+        from . import streamguard
+        guard = {"on": streamguard.active(prov, argv, env, run_dir), "offset": 0}
+
+        def check_calls() -> None:
+            # A run the harness hook does not reach: each tool call it starts is checked as the hook would.
+            # Decided once, at the start: the agent could write the hook's marker itself later.
+            calls, guard["offset"] = prov.activity(out_path, guard["offset"])
+            for c in (c for c in calls if c.get("kind") == "call"):
+                for payload in c.get("payloads") or []:
+                    why = streamguard.refusal(payload, env, cwd)
+                    if why:
+                        guard["on"] = False
+                        streamguard.record(run_dir, why, str(payload.get("tool_name") or ""))
+                        print(f"runner: stream guard stopped the run at a {payload.get('tool_name')} call: {why}",
+                              flush=True)
+                        threading.Thread(target=stop, args=("guard",), daemon=True).start()
+                        return
 
         def look() -> None:
             now, up = time.time(), awake.tick()
@@ -513,6 +532,8 @@ def supervise(run_dir: Path) -> int:
                     if got.get("state") == "missing" and env_extra.get("TTP_TASK"):
                         # Running without the charter's restrictions: ended now, its task blocked (daemon).
                         threading.Thread(target=stop, args=("instructions_missing",), daemon=True).start()
+            if guard["on"]:
+                check_calls()
             why = stop_reason(run_dir)
             if why:
                 threading.Thread(target=stop, args=(why,), daemon=True).start()

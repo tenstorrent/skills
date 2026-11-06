@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
-from . import preempt
+from . import preempt, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -883,6 +883,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
                  "yours; need other packages? make a venv of your own in the working directory)\n") if venv else ""
     parts = [
         restart_block(p, prev),
+        streamguard.prompt_block(prev),
         _sections(_raw(p, f"kind-{kind}.md"), cfg),
         worker_rules(p, task),
         f"# YOUR TASK #{task['id']}: {task['title']}\n"

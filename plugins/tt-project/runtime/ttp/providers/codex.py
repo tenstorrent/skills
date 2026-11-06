@@ -279,6 +279,9 @@ class Codex(Provider):
             return []
         return [IGNORE_USER_CONFIG]
 
+    def harness_hook(self, argv):
+        return any(str(a).startswith("hooks.PreToolUse=") for a in argv)   # hook_config_args, when _hook_for adds it
+
     def hooks_supported(self) -> bool:
         """This build runs hooks (the `hooks` feature is on) and takes the trust bypass flag."""
         features = cli_output(self.binary() or "codex", "features", "list")
@@ -438,7 +441,7 @@ class Codex(Provider):
                     "is_error": None, "ts": None, "hash": input_hash(kind, head),
                     "command": str(head)[:CMD_MAX] if kind == "command_execution" else ""}
             if ev.get("type") == "item.started":
-                events.append(call)
+                events.append({**call, "payloads": _payloads(item)})
             else:
                 code = item.get("exit_code")
                 failed = item.get("status") == "failed" or (isinstance(code, int) and code != 0)
@@ -798,6 +801,32 @@ def config_has_hooks(config_toml: str) -> bool:
             if isinstance(plugins, dict) else plugins
         return "hooks" in data or bool(enabled)
     return bool(HOOK_CONFIG_RE.search(config_toml))
+
+
+def shell_script(command: str) -> str:
+    """The script of a `bash -lc '<script>'` command line as `codex exec --json` reports it (what the
+    Bash hook gets as its command); the line itself when it is no such wrapper."""
+    try:
+        words = shlex.split(command)
+    except ValueError:
+        return command
+    if len(words) == 3 and os.path.basename(words[0]) in ("bash", "sh", "zsh") and words[1] in ("-c", "-lc"):
+        return words[2]
+    return command
+
+
+def _payloads(item: dict) -> list[dict]:
+    """The hook-shaped calls of one started item (Provider.activity "payloads")."""
+    kind = item.get("type") or item.get("item_type") or ""
+    if kind == "command_execution":
+        return [{"tool_name": "Bash", "tool_input": {"command": shell_script(str(item.get("command") or ""))}}]
+    if kind == "file_change":
+        return [{"tool_name": "Edit", "tool_input": {"file_path": str(c.get("path") or "")}}
+                for c in item.get("changes") or [] if isinstance(c, dict)]
+    if kind == "mcp_tool_call":
+        return [{"tool_name": f"mcp__{item.get('server') or ''}__{item.get('tool') or ''}",
+                 "tool_input": item.get("arguments")}]
+    return []
 
 
 def hook_config_args() -> list[str]:

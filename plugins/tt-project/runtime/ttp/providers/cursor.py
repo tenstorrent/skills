@@ -37,8 +37,8 @@ import time
 from pathlib import Path
 
 from . import register
-from .base import (_CLI_OUTPUT, AUTH_RE, LIMIT_RE, Provider, RunUsage, cli_output, price_row, request_rejected,
-                   status_check, stderr_tail)
+from .base import (_CLI_OUTPUT, AUTH_RE, CMD_MAX, LIMIT_RE, Provider, RunUsage, cli_output, head80, input_hash,
+                   jsonl_from, price_row, request_rejected, status_check, stderr_tail)
 
 PRICES = {"default": (3.0, 0.3, 15.0)}
 USAGE_KEYS = ("inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens")
@@ -237,6 +237,35 @@ class Cursor(Provider):
         pin, pcached, pout = price_row(PRICES, self.prices, self.model)
         return (usage["inputTokens"] * pin + usage["cacheReadTokens"] * pcached + usage["outputTokens"] * pout) / 1e6
 
+    def activity(self, output_path, offset=0):
+        """stream-json: a `tool_call` event with subtype started is a call, completed its result (an
+        error or a non-zero exit code is an error). The call is keyed by its kind (shellToolCall,
+        editToolCall, ...), holding its args."""
+        lines, offset = jsonl_from(Path(output_path), offset, (b'"tool_call"',))
+        events = []
+        for ev in lines:
+            body = ev.get("tool_call")
+            if ev.get("type") != "tool_call" or not isinstance(body, dict) or not body:
+                continue
+            name, call = next(iter(body.items()))
+            call = call if isinstance(call, dict) else {}
+            args = call.get("args") if isinstance(call.get("args"), dict) else {}
+            payloads = _payloads(name, args)
+            tool = name.removesuffix("ToolCall") or name
+            head = args.get("command") if tool == "shell" else args.get("path") or args
+            ts = ev.get("timestamp_ms")
+            out = {"kind": "call", "id": str(ev.get("call_id") or ""), "tool": tool, "input_head": head80(head or ""),
+                   "is_error": None, "ts": ts / 1000 if isinstance(ts, (int, float)) else None,
+                   "hash": input_hash(tool, head or ""), "command": str(head or "")[:CMD_MAX] if tool == "shell" else ""}
+            if ev.get("subtype") == "started":
+                events.append({**out, "payloads": payloads})
+            elif ev.get("subtype") == "completed":
+                res = call.get("result") if isinstance(call.get("result"), dict) else {}
+                code = (res.get("success") or {}).get("exitCode") if isinstance(res.get("success"), dict) else None
+                failed = any(k in res for k in ("error", "failure", "rejected")) or (isinstance(code, int) and code != 0)
+                events.append({**out, "kind": "result", "is_error": failed})
+        return events, offset
+
     def cost_so_far(self, output_path, since=None, env=None):
         seen = self._scan(output_path)
         if seen["reported"]:
@@ -304,3 +333,19 @@ class Cursor(Provider):
         _ACCOUNT.clear()
         _ACCOUNT[key] = (now, label)
         return label
+
+
+EDIT_CALLS = {"editToolCall": "Edit", "writeToolCall": "Write", "deleteToolCall": "Edit"}
+
+
+def _payloads(name: str, args: dict) -> list[dict]:
+    """The hook-shaped calls of one started stream-json tool call (Provider.activity "payloads")."""
+    if name == "shellToolCall":
+        return [{"tool_name": "Bash", "tool_input": {"command": str(args.get("command") or "")}}]
+    if name in EDIT_CALLS:
+        return [{"tool_name": EDIT_CALLS[name], "tool_input": {"file_path": str(args.get("path") or "")}}]
+    if name == "mcpToolCall":
+        server = args.get("providerIdentifier") or args.get("server") or ""
+        tool = args.get("toolName") or args.get("name") or ""
+        return [{"tool_name": f"mcp__{server}__{tool}", "tool_input": args.get("args") or args.get("arguments")}]
+    return []
