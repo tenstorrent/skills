@@ -33309,17 +33309,51 @@ def test_overview_lists_every_project_and_never_modifies_them(env, tmp_path, cap
     b.close()
 
 
+_OVERVIEW_EVENTS: list = []   # (thread, events) of the call being measured; empty: not measuring
+
+
+def _overview_audit(event, args):
+    if _OVERVIEW_EVENTS and event in ("open", "sqlite3.connect", "subprocess.Popen", "os.system", "os.exec",
+                                      "os.posix_spawn", "os.fork", "socket.connect", "socket.getaddrinfo") \
+            and threading.get_ident() == _OVERVIEW_EVENTS[0][0]:   # not other tests' leftover threads
+        a = args[0] if args else ""
+        _OVERVIEW_EVENTS[0][1].append((event, os.fsdecode(a) if isinstance(a, (bytes, str, os.PathLike)) else str(a)))
+
+
 def test_overview_reads_ten_projects_in_under_two_seconds(env, tmp_path):
+    """The overview's cost per project stays small and flat: one read-only database connection and a
+    few small file reads each, no subprocess, network call or log scan. Counted with an audit hook,
+    not timed, so a busy host cannot fail it (the old 2 s wall-clock bound did under parallel suites)."""
     from ttp import overview
     for i in range(10):
         _, db = _overview_project(tmp_path, f"proj{i}", "0.9.0")
         db.spend("claude", 1.0, "task:1")
         db.post("out", "Ship it?", kind="ask")
         db.close()
-    t0 = time.monotonic()
-    ov = overview.overview()
-    assert time.monotonic() - t0 < 2.0
+    if not getattr(sys, "_ttp_overview_audit", False):
+        sys.addaudithook(_overview_audit)   # hooks cannot be removed: one per process, idle unless measuring
+        sys._ttp_overview_audit = True
+    overview.overview()   # warm: lazy imports open module files once, not per project
+    _OVERVIEW_EVENTS.append((threading.get_ident(), []))
+    try:
+        ov = overview.overview()
+    finally:
+        events = _OVERVIEW_EVENTS.pop()[1]
     assert len(ov["projects"]) == 10 and all(r["ok"] and r["asks"] == 1 for r in ov["projects"])
+    assert not [e for e in events if e[0] not in ("open", "sqlite3.connect")], events
+    per: dict[str, list] = {f"proj{i}": [] for i in range(10)}
+    shared = []
+    for e in events:
+        rel = os.path.relpath(e[1].removeprefix("file:").removeprefix("//").split("?")[0], tmp_path)
+        (per[rel.split(os.sep)[0]] if rel.split(os.sep)[0] in per else shared).append((e[0], rel, e[1]))
+    # Outside the projects: the registry and installed version, read once for all of them.
+    assert len(shared) <= 4, shared
+    for name, ev in per.items():
+        conns = [x for x in ev if x[0] == "sqlite3.connect"]
+        opens = [x for x in ev if x[0] == "open"]
+        assert len(conns) == 1 and ("immutable=1" in conns[0][2] or "mode=ro" in conns[0][2]), (name, conns)
+        assert len(opens) <= 8, (name, opens)
+        assert not [x for x in opens if x[1].endswith((".log", ".jsonl")) or f"{os.sep}runs{os.sep}" in x[1]], opens
 
 
 def test_web_api_overview_serves_the_projects_tab(env, tmp_path):
