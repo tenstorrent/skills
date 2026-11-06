@@ -228,9 +228,9 @@ def _files(p: Project, cwd: str, old: dict, now: float, base: list[str]) -> dict
 
 def _steer(run_dir: Path, provider: str) -> dict | None:
     """The last update written to steer.md and whether the run read it: up to steer.offset when the
-    update hook runs (the provider's steer_hook, or this run's HOOKED_FILE: Codex may run it). A run
-    without it read the update once `ttp note` or `ttp steer` moved steer.offset to the end; short of
-    that it may read steer.md itself, so its read state is unknown (None)."""
+    update hook runs (the provider's steer_hook, or this run's HOOKED_FILE: Codex and Cursor workers
+    may run it). A run without it read the update once `ttp note` or `ttp steer` moved steer.offset to
+    the end; short of that it may read steer.md itself, so its read state is unknown (None)."""
     from .hook import OFFSET_FILE, STEER_FILE, hooked as run_hooked
     f = run_dir / STEER_FILE
     try:

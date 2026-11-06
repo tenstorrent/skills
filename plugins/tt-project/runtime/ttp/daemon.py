@@ -13051,7 +13051,7 @@ class Daemon:
         """{"started": spec digest the run started on, "text": its unread updates} when the task's spec
         changed after the run started and the steer.md update carrying the change was not read before
         the run ended; else None. A worker with the update hook (provider steer_hook, or the run's
-        HOOKED_FILE: Codex may run it) has read up to its steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
+        HOOKED_FILE: Codex and Cursor workers may run it) has read up to its steer.offset; one without gets it from `ttp note` or `ttp steer` (which advance
         that offset too) or reads steer.md itself, so only an update newer than its
         result.json is surely unread. A model-free on_pass is checked in _probe_passed instead."""
         from .hook import STEER_FILE, hooked as run_hooked, unread_update
