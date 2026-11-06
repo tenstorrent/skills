@@ -2939,7 +2939,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   but public keys, `config`, `known_hosts` and control sockets. The worker hook refuses a Bash call
   that names one of them, `gh auth token`, `gh auth status --show-token` and `git credential fill`.
   ssh, git and gh still read them themselves: `ssh -i <key>`, `-o IdentityFile=`, `ssh-add`,
-  `ssh-keygen`, and chmod or test of a key pass. A command ssh runs on another host is checked the
+  `ssh-keygen`, and chmod or test of a key pass, also as the ssh command given to rsync (`-e`,
+  `--rsh`, `RSYNC_RSH`) or git (`GIT_SSH_COMMAND`, `-c core.sshCommand=`); a `stat` with a format
+  (`-c`, `--format`, `--printf`) passes when nothing pipes or redirects its output, and a path with a
+  `..` part never counts as public. A command ssh runs on another host is checked the
   same way (`ssh box 'mkdir -p ~/.ssh'` passes, `ssh box cat ~/.ssh/<key>` does not), quotes inside
   a path do not hide it, and a `find` looking for a private key or credential file by name is
   refused. Known gap: a path a script builds at run time.

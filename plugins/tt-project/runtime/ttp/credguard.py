@@ -42,6 +42,12 @@ SSH_KEY_OPTION_RE = re.compile(r"(?:IdentityFile|CertificateFile|ControlPath|Ide
 # Commands that never print a file's contents or name; ls and stat may name the ~/.ssh dir only
 SILENT = {"mkdir", "chmod", "chown", "touch", "test", "[", "ssh-add", "ssh-keygen"}
 LISTERS = {"ls", "stat"}
+# stat's format options: a stat with one prints only what its format asks for (stat has no escape for contents)
+STAT_FORMAT_RE = re.compile(r"-c.|--format(=|$)|--printf(=|$)")
+# A pipe, a substitution or a file redirect (not 2>) that could hand a listed key name to a reader
+HANDS_ON_RE = re.compile(r"(?<!\|)\|(?!\|)|`|\$\(|<\(|(?<!2)>")
+# Variables that hold an ssh command a client runs: git's and rsync's
+SSH_COMMAND_VARS = ("GIT_SSH_COMMAND=", "RSYNC_RSH=")
 # ssh options that take a value (the next word, or the rest of the same word)
 SSH_VALUE_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
 # Names find may look for that only private keys and credential files have
@@ -68,6 +74,8 @@ REF_WHY = ("refused: a run never writes git refs, tags, releases or file content
 def ssh_public(name: str) -> bool:
     """`name` (a path under ~/.ssh) holds no secret: a public key (a glob of them too), ssh's config or
     host lists, or a control socket (cm-*, or a name with ssh's % tokens)."""
+    if ".." in name.split("/"):
+        return False
     base = name.rstrip("/").rsplit("/", 1)[-1]
     if base.endswith(".pub"):
         return True
@@ -93,11 +101,13 @@ def credential_files(home: str | Path | None = None) -> list[str]:
     return [str(p) for p in out]
 
 
-def _passing_words(argv: list[str]) -> list[str]:
+def _passing_words(argv: list[str], hands_on: bool = True) -> list[str]:
     """The words of `argv` that may name a key: an ssh key option's value, every word of a SILENT
-    command, and a LISTERS word naming only the ~/.ssh dir."""
+    command, a LISTERS word naming only the ~/.ssh dir, and every word of a stat with a format option
+    when the command hands no output on (`hands_on` False)."""
     name = os.path.basename(argv[0])
-    if name in SILENT:
+    if name in SILENT or (name == "stat" and not hands_on
+                          and any(STAT_FORMAT_RE.match(w) or w == "-c" for w in argv[1:])):
         return argv[1:]
     if name in LISTERS:
         return [w for w in argv[1:] if not any(m.group(1) for m in SSH_PATH_RE.finditer(w))]
@@ -138,6 +148,24 @@ def ssh_remote(argv: list[str]) -> str:
     return " ".join(argv[i + 1:])
 
 
+def _ssh_commands(argv: list[str]) -> list[str]:
+    """The ssh commands `argv` gives a client as one string: a GIT_SSH_COMMAND or RSYNC_RSH value,
+    rsync's -e/--rsh, git's -c core.sshCommand."""
+    name = os.path.basename(argv[0])
+    out = [w.split("=", 1)[1] for w in argv if w.startswith(SSH_COMMAND_VARS)]
+    for prev, w in zip(argv, argv[1:]):
+        if name == "rsync":
+            if prev == "--rsh" or re.fullmatch(r"-[a-zA-Z]*e", prev):
+                out.append(w)
+            elif w.startswith("--rsh="):
+                out.append(w[6:])
+            elif re.match(r"-[a-zA-Z]*e.", w) and not w.startswith("--"):
+                out.append(w[w.index("e") + 1:])
+        elif name == "git" and prev == "-c" and w.lower().startswith("core.sshcommand="):
+            out.append(w.split("=", 1)[1])
+    return out
+
+
 def _finds_secret(argv: list[str]) -> bool:
     """A find whose -name or -iname pattern matches a private key or credential file name, with a
     literal part beyond its wildcards (so `-name '*'` and `-name '*.py'` pass)."""
@@ -161,14 +189,20 @@ def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = 
     """Why a Bash call reads a credential store, else None: it names one by path, other than as a
     word a passing command takes (each such word excuses one mention), prints a token, or finds a
     key by name. The command an ssh call runs remotely counts as its own commands."""
-    from .hook import _all_segments
+    from .hook import _all_segments, _segments
     segments = [argv for argv in segments if argv]
+    # ssh commands handed to rsync or git (env assignments read before the parser drops them, each
+    # value once, as both parses see it); only their ssh calls count, so other words excuse nothing
+    values = dict.fromkeys(v for argv in segments + _segments(cmd, strip=False) for v in _ssh_commands(argv))
+    segments += [inner for value in values for inner in _all_segments(value)
+                 if os.path.basename(inner[0]) in SSH_FAMILY]
     segments += [inner for argv in segments for inner in _all_segments(ssh_remote(argv))]
     if any(_prints_token(argv) or _finds_secret(argv) for argv in segments):
         return WHY
     rest = _unquoted(cmd)
+    hands_on = bool(HANDS_ON_RE.search(rest))
     for argv in segments:
-        for w in _passing_words(argv):
+        for w in _passing_words(argv, hands_on):
             if ".ssh" in w:
                 rest = rest.replace(_unquoted(w), " ", 1)
     if STORE_RE.search(rest) or any(not ssh_public(m.group(1) or "") for m in SSH_PATH_RE.finditer(rest)):
