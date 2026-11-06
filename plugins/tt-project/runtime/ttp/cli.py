@@ -7344,6 +7344,8 @@ def cmd_detach(a) -> None:
         die("--why goes with --stop: the reason a stop records")
     if getattr(a, "stop", None):
         sys.exit(_detach_stop(a.stop, getattr(a, "why", None)))
+    if getattr(a, "list", False):
+        sys.exit(_detach_list())
     if getattr(a, "stop_pids", None):
         sys.exit(_detach_stop_pids(a.stop_pids))
     if a.check is None:
@@ -7467,7 +7469,7 @@ def cmd_detach(a) -> None:
         activity.append(state, activity.base(Project(state.parent).name, ev="job", id=aid, job=a.name,
                                              rcfile=str(rc), cmd=activity.head(cmd), start=time.time()))
     with detach.registry(rd) as jobs:
-        jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid,
+        jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, **detach.owner(state=state),
                  **({"pid_start": lk.start_time(pid)} if pid else {}), "started": time.time(),
                  "boot": boot_id(), "queued": pid is None, "status": "running" if pid else "queued",
                  "command": " ".join(cmd)[:300],
@@ -7582,12 +7584,54 @@ def _free_ended_slots(rc: Path) -> None:
               f"it can see its holder gone)")
 
 
+def _caller_task():
+    """(project, task id) of the calling task run (jobstop.caller_task), else None."""
+    from . import jobstop
+    base = os.environ.get("TTP_PROJECT")
+    if not base:
+        return None
+    try:
+        p = Project(base)
+        if not (p.state / "project.db").is_file():
+            return None
+        task = jobstop.caller_task(p, os.environ.get("TTP_TASK") or os.environ.get("TTP_TASK_ID"),
+                                   os.environ.get("TTP_RUN_ID"))
+    except Exception:
+        return None
+    return None if task is None else (p, task)
+
+
+def _task_job(name: str) -> Path | None:
+    """The .rc of the calling task's job `name` from any of its runs (jobstop.task_job_named), else None."""
+    from . import jobstop
+    return jobstop.task_job_named(*me, name) if (me := _caller_task()) else None
+
+
+def _detach_list() -> int:
+    """`ttp detach --list`: the calling task's `ttp detach` jobs across all its runs (jobstop.task_jobs), one
+    line each: run, name, state, pid and .rc. 2 outside a task run."""
+    from . import detach, jobstop
+    if not (me := _caller_task()):
+        print("ttp detach --list: only works inside a tt-project task run (TTP_PROJECT, TTP_TASK and TTP_RUN_ID set)",
+              file=sys.stderr)
+        return 2
+    jobs = jobstop.task_jobs(*me)
+    for run, j in jobs:
+        st, why = detach.state(Path(j["rc"]))
+        print(f"run {run}  {j.get('name') or Path(j['rc']).stem}  {st}{f' ({why})' if why and st != 'running' else ''}"
+              f"  pid {j.get('pid') or '-'}  {j['rc']}")
+    if not jobs:
+        print(f"task #{me[1]} has no detached jobs in its runs of the last {jobstop.SWEEP_DAYS} days")
+    return 0
+
+
 def _detach_stop(what: str, given: str | None = None) -> int:
     """`ttp detach --stop <rc|name> [--why TEXT]`: stop a running job as the daemon stops those of ended tasks
     (jobstop.end), recording `given` with why it was allowed: 0 once stopped or when it no longer runs, 2 when
     no record names it, 3 when refused (jobstop.may_stop).
     A sandboxed caller, which cannot signal it, queues the stop for the daemon. A bare name is a job of
-    $TTP_RUN_DIR; with no job recorded, a run's detached `ttp checks` (checks.rc beside a checks.pid:
+    $TTP_RUN_DIR, else the newest of that name an earlier run of the calling task detached (_task_job); with
+    no job recorded, a run's detached `ttp checks` (checks.rc beside a checks.pid:
     _detach_stop_checks), else a driver a project's own launcher started (_launcher_stop)."""
     from . import detach, jobstop
     from .push import _boxed
@@ -7595,6 +7639,9 @@ def _detach_stop(what: str, given: str | None = None) -> int:
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not detach._entry(rc) and "/" not in what and run_dir:
         rc = (Path(run_dir) / (what if what.endswith(".rc") else f"{what}.rc")).resolve()
+    if (not detach._entry(rc) and "/" not in what and not (rc.name == CHECKS_RC and (rc.parent / CHECKS_PID).is_file())
+            and (earlier := _task_job(what.removesuffix(".rc")))):
+        rc = earlier   # a job of that name an earlier run of this task detached
     if not detach._entry(rc) and rc.name == CHECKS_RC and (rc.parent / CHECKS_PID).is_file():
         return _detach_stop_checks(rc, given)
     if not detach._entry(rc):
@@ -12688,6 +12735,9 @@ def main(argv: list[str] | None = None) -> None:
                    "project's own started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id> folder "
                    "gets a STOP file beside it, then SIGTERM and SIGKILL if it does not exit (exit 2: none found)")
     s.add_argument("--why", metavar="TEXT", help="with --stop: the reason recorded in the job's .lost and stop event")
+    s.add_argument("--list", action="store_true",
+                   help="list this task's detached jobs from all its runs (run, name, state, pid, .rc); --stop "
+                   "takes a name from an earlier run too")
     s.add_argument("--stop-pids", metavar="FILE",
                    help="stop the processes the calling task's own driver listed in a pid file (one pid per line, "
                    "optional start=<token>) under one of the task's results dirs (its run dirs, or a folder t<id>, "

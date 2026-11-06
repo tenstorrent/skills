@@ -1329,7 +1329,8 @@ session and stateless coordinators on every provider.
   then SIGKILL of its group, with `<name>.lost`) adds a line to the job's log and a row to
   `state/job-signals.jsonl` naming the code path and sender; a waiting `ttp lock` logs who signalled it.
   `ttp detach --stop <name|rc> [--why <reason>]` stops a job of an ended task, a job of the caller's own
-  task (from any of its runs; its .lost and stop event name the caller's task and run, the run that
+  task (from any of its runs: a bare name not in this run is the newest of that name an earlier run of the
+  task detached; `ttp detach --list` lists them; its .lost and stop event name the caller's task and run, the run that
   started the job and the reason), or one holding a resource of the calling open priority-1 task;
   anyone else is refused (exit 3). A stopped job is never relaunched at boot. Such a stop (also a spend
   cap's, or the daemon's of an ended task's job) writes `<name>.rc` holding 137 (128 + SIGKILL) beside its
@@ -2957,6 +2958,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - The worker hook's kill guard refuses a Bash call with `pkill` or `killall` (unless scoped with `-P`,
   `-g` or `-s` to the task's own processes) and `kill` of a pid or group outside the task's own
   process tree, also through wrappers, `sh -c` and ssh; it is always on. See `runtime/ttp/killguard.py`.
+  It also passes a kill of the group (or leading pid) of a `ttp detach` job an earlier run of the same
+  task started, once four records agree: the project db names the caller's run and the job's run as runs
+  of that task, the job's run registry names that pid with the start time the live process has now (a
+  reused pid never matches), and the process's own environment names this project, that run folder and
+  that job's `.rc`. A file a worker or project writes (an owner or pgid file under the project's state)
+  is never proof: a project whose own scripts start long-running jobs starts them through `ttp detach`
+  to get this record, and `ttp detach --list` shows a task's jobs across its runs.
 - Which project owns a process: every worker, daemon-run command, `ttp detach` job and `ttp checks`
   command carries `TTP_PROJECT` (the full path of `<project root>/tt-project`) and `TTP_RUN_DIR` (a
   run or check-run folder inside it). A project's reaper or cleanup script signals only processes it

@@ -1238,6 +1238,47 @@ def test_detach_stop_lets_the_owning_task_stop_its_own_job_from_an_earlier_run_a
     assert r.returncode != 0 and "--why goes with --stop" in r.stderr, r.stderr
 
 
+def _task_job(p, tid, run_name, name="nap"):
+    """Task tid's run `run_name` detached `sleep 60` as a worker would (TTP_TASK, TTP_RUN_ID, TTP_RUN_DIR);
+    (rc, pgid, run id)."""
+    run = _add_run(p, tid, run_name)
+    d = p.runs / run_name
+    r = _ttp_run(p, "detach", name, "--", "sleep", "60", env={"TTP_RUN_DIR": str(d), **_as(tid, run)})
+    assert r.returncode == 0, r.stderr
+    rc = (d / f"{name}.rc").resolve()
+    assert _wait_for_path(rc.with_suffix(".started"))
+    return rc, int(rc.with_suffix(".started").read_text().split()[0]), run
+
+
+def test_detach_records_its_owner_and_a_later_run_lists_and_stops_it_by_name(env, tmp_path):
+    """A job's registry entry names its project, task and run; a later run of the same task lists it
+    (`ttp detach --list`) and stops it by its bare name; another task neither sees it by name nor stops it."""
+    p = make(env)
+    tid = p.db.add_task("gate", "s", kind="work", tier="light", origin="user")
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    rc, pgid, first = _task_job(p, tid, "gate-1")
+    try:
+        (entry,) = json.loads((rc.parent / "detached.json").read_text())
+        assert (entry["task"], entry["run"], Path(entry["project"])) == (tid, first, p.base), entry
+        later, theirs = _add_run(p, tid, "gate-2"), _add_run(p, other, "other-1")
+        r = _ttp_run(p, "detach", "--list", env={"TTP_RUN_DIR": str(p.runs / "gate-2"), **_as(tid, later)})
+        assert r.returncode == 0 and f"run {first}  nap  running  pid {pgid}  {rc}" in r.stdout, r.stdout + r.stderr
+        r = _ttp_run(p, "detach", "--list", env={"TTP_RUN_DIR": str(p.runs / "other-1"), **_as(other, theirs)})
+        assert r.returncode == 0 and str(rc) not in r.stdout, r.stdout
+        r = _ttp_run(p, "detach", "--list", env=_as(tid, theirs))
+        assert r.returncode == 2, "a run id of another task proves nothing"
+        r = _ttp_run(p, "detach", "--stop", "nap", env={"TTP_RUN_DIR": str(p.runs / "other-1"), **_as(other, theirs)})
+        assert r.returncode == 2 and os.getpgid(pgid) == pgid, r.stdout + r.stderr
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(other, theirs))
+        assert r.returncode == 3 and "refused" in r.stderr and os.getpgid(pgid) == pgid, r.stderr
+        r = _ttp_run(p, "detach", "--stop", "nap", env={"TTP_RUN_DIR": str(p.runs / "gate-2"), **_as(tid, later)})
+        assert r.returncode == 0 and "stopped detached job nap" in r.stdout, r.stdout + r.stderr
+        assert f"stopped by owning task #{tid} (run {later}) from an earlier run, run {first}" in \
+            rc.with_suffix(".lost").read_text()
+    finally:
+        _end_group(pgid)
+
+
 def test_detach_stop_lets_the_owning_task_stop_a_job_of_its_current_run(env, tmp_path):
     """(b) The run that started the job stops it (by name, from $TTP_RUN_DIR)."""
     p = make(env)

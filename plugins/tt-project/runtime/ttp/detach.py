@@ -622,6 +622,8 @@ def _restamp(rc: Path, pid: int, boot: str, reopen: bool = True) -> None:
 # both by state(), which reads liveness from the job's lock, never its pid, so a pid reused by another
 # process never keeps a record open and a driver still alive (any of its processes) is never closed.
 # Every write goes through registry(), one flock per run, so a close and a new job's entry never race.
+# Each entry also names its owner (project, task, run: owner()), so a later run of the task lists and
+# stops it (`ttp detach --list`, `--stop <name>`, its kill guard: jobstop.task_jobs, own_job_group).
 REGISTRY = "detached.json"
 CLOSED = ("ended", "died")
 CLOSE_DAYS = 14   # the runs whose records the daemon's sweep looks at
@@ -643,6 +645,16 @@ def registry(run_dir: Path):
         yield jobs
         if json.dumps(jobs) != before:
             durable_write(reg, json.dumps(jobs, indent=1))
+
+
+def owner(env=None, state: Path | None = None) -> dict:
+    """Whose job a new registry entry is: the project folder, task id and run id of the run that starts
+    it (from its TTP_* environment), for listing and stopping it from a later run of the same task
+    (jobstop.task_jobs). Shown, never proof alone: a stop or kill also checks the db and the process."""
+    env = os.environ if env is None else env
+    out = {"project": env.get("TTP_PROJECT") or (str(state.parent) if state is not None else None),
+           "task": env.get("TTP_TASK") or env.get("TTP_TASK_ID"), "run": env.get("TTP_RUN_ID")}
+    return {k: int(v) if k != "project" and str(v).isdigit() else v for k, v in out.items() if v}
 
 
 def close(rc: Path, now: float | None = None) -> dict | None:

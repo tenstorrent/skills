@@ -930,6 +930,73 @@ def may_stop(p: Project, rc: Path, caller: str | None, caller_run: str | None = 
     return True, f"priority-1 task #{me['id']} needs {', '.join(common)}"
 
 
+def caller_task(p: Project, caller: str | None, caller_run: str | None) -> int | None:
+    """The calling task's id when its run id is one the project's db records for that task (an id alone,
+    set by hand, or a run of another task never counts), else None."""
+    if not (caller and str(caller).isdigit() and caller_run and str(caller_run).isdigit()):
+        return None
+    if not p.db.one("SELECT id FROM runs WHERE id=? AND task=?", (int(caller_run), int(caller))):
+        return None
+    return int(caller)
+
+
+def task_jobs(p: Project, task: int, now: float | None = None) -> list[tuple[int, dict]]:
+    """(run id, registry entry) of each `ttp detach` job the task's runs of the last SWEEP_DAYS recorded,
+    oldest run first. Only run folders the db records for the task and that lie in the project's runs
+    folder are read, so a registry copied elsewhere never counts."""
+    now = time.time() if now is None else now
+    out = []
+    runs = Path(os.path.realpath(p.runs))
+    for row in p.db.q("SELECT id, dir FROM runs WHERE task=? AND dir IS NOT NULL AND COALESCE(started, 0)>? "
+                      "ORDER BY id", (int(task), now - SWEEP_DAYS * 86400)):
+        d = Path(os.path.realpath(row["dir"]))
+        if d.parent != runs:
+            continue
+        try:
+            jobs = json.loads((d / detach.REGISTRY).read_text())
+        except (OSError, ValueError):
+            continue
+        out += [(row["id"], j) for j in (jobs if isinstance(jobs, list) else [])
+                if isinstance(j, dict) and j.get("rc") and Path(os.path.realpath(j["rc"])).parent == d]
+    return out
+
+
+def task_job_named(p: Project, task: int, name: str) -> Path | None:
+    """The .rc of the task's job called `name` (task_jobs): the newest still running, else the newest."""
+    named = [Path(j["rc"]) for _, j in task_jobs(p, task) if j.get("name") == name]
+    return next((rc for rc in reversed(named) if running(rc)), named[-1] if named else None)
+
+
+def own_job_group(p: Project, pgid: int, caller: str | None, caller_run: str | None) -> Path | None:
+    """The .rc of the live `ttp detach` job whose process group is `pgid` when a run of the calling task
+    started it, else None: the kill guard's own-job rule (killguard), for a job an earlier run detached.
+    No file a worker can write is proof alone. The caller's run must be one the db records for its task
+    (caller_task); the job's run folder one the db records for that task (task_jobs); its registry entry
+    must name pid `pgid` with the start time the live process has now (a reused pid has another); the
+    process must lead its group; and its environment, set by `ttp detach` at start, must name this
+    project, that run folder and that job's .rc. A forged entry naming another task's process fails on
+    that environment; one naming a recycled pid fails on its start time."""
+    task = caller_task(p, caller, caller_run)
+    if task is None or pgid <= 1:
+        return None
+    st = _stat(pgid)
+    now = locks.start_time(pgid)
+    if st is None or st[0] != pgid or not now:
+        return None
+    env = procowner.environ(pgid) or {}
+    if not procowner.owns_env(p.base, env) or procowner.foreign_env(p.base, env):
+        return None
+    for _, j in task_jobs(p, task):
+        rc = Path(j["rc"])
+        if (str(j.get("pid")) != str(pgid) or str(j.get("pid_start") or "") != now
+                or (j.get("task") is not None and str(j.get("task")) != str(task))):
+            continue
+        if (env.get(JOB_ENV) and os.path.realpath(env[JOB_ENV]) == os.path.realpath(rc) and env.get("TTP_RUN_DIR")
+                and os.path.realpath(env["TTP_RUN_DIR"]) == os.path.realpath(rc.parent)):
+            return rc
+    return None
+
+
 def _own_stop(p: Project, rc: Path, t: dict, caller: str | None, caller_run: str | None) -> str | None:
     """Why the job's own task may stop it, or None when the caller is not that task: TTP_TASK names the
     job's task and TTP_RUN_ID a run the project records for that same task (an id alone, set by hand,

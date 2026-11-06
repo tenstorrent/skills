@@ -7,6 +7,8 @@ not start. A host is shared with other workers, projects and people, and `pkill 
 Own process: the worker agent (the pid the runner records in `$TTP_RUN_DIR/child.pid`) or one of its
 descendants, or (Linux) a process whose environment carries this run's TTP_RUN_DIR, such as a
 background job whose shell has ended or a `ttp detach` job. Own group: every process in it is own.
+A `ttp detach` job an earlier run of the same task started is own too, by group or its leading pid
+(jobstop.own_job_group checks the db, the run's registry, the pid's start time and the job's environment).
 A pid or group with no process left passes: the kill finds nothing.
 
 - pkill passes only when scoped to own processes: -P/--parent, -g/--pgroup or -s/--session with
@@ -70,7 +72,8 @@ PIDFILE_RE = re.compile(r"\s*(?:<\s*(\S+)|cat\s+(\S+)|head\s+(?:-n\s*1|-1)\s+(\S
 
 ADVICE = ("kill only what this task started: record `$!` when you start a process and kill that pid, end your "
           "own process group (`kill -- -<pgid>`), and let ttp's own controls (`ttp detach`, `ttp lock`, "
-          "`ttp checks`) end their jobs; never kill by name or pattern; an ended task's detached job, or one "
+          "`ttp checks`) end their jobs; never kill by name or pattern; a job an earlier run of this task "
+          "detached: `ttp detach --list`, then `ttp detach --stop <name>`; an ended task's detached job, or one "
           "holding your priority-1 task's resource: `ttp detach --stop <rc>`; a driver this task started that "
           "listed its pids in a file under the task's results dir: `ttp detach --stop-pids <file>`")
 PARSE = ("the kill guard could not parse this command, and a command with kill, pkill or killall that cannot be "
@@ -167,6 +170,7 @@ class _Procs:
         self.run_dir = run_dir
         self._table: dict[int, tuple[int, int, int]] | None = None
         self._root: int | None = None
+        self._jobs: dict[int, bool] = {}
 
     @property
     def table(self) -> dict[int, tuple[int, int, int]]:
@@ -222,6 +226,26 @@ class _Procs:
         except OSError:
             return False
         return f"TTP_RUN_DIR={self.run_dir}".encode() in env.split(b"\0")
+
+    def task_job(self, pgid: int) -> bool:
+        """Whether `pgid` is the group of a live `ttp detach` job a run of the calling task started, this one
+        or an earlier one (jobstop.own_job_group: the db's runs, the run's registry, the pid's start time and
+        the job's own environment, never a file alone)."""
+        if pgid not in self._jobs:
+            self._jobs[pgid] = False
+            base = os.environ.get("TTP_PROJECT")
+            if base and pgid in self.table:
+                try:
+                    from . import jobstop
+                    from .project import Project
+                    p = Project(base)
+                    if (p.state / "project.db").is_file():
+                        self._jobs[pgid] = jobstop.own_job_group(
+                            p, pgid, os.environ.get("TTP_TASK") or os.environ.get("TTP_TASK_ID"),
+                            os.environ.get("TTP_RUN_ID")) is not None
+                except Exception:
+                    pass
+        return self._jobs[pgid]
 
     def members(self, pgid: int, field: int = 1) -> list[int]:
         return [p for p, s in self.table.items() if s[field] == pgid]
@@ -340,7 +364,8 @@ class _Guard:
                     if t == "own" or (n := int(t)) == 0 and opt != "P" or not self.procs.exists(n):
                         continue
                     ok = (self.procs.own(n) if opt == "P" else
-                          all(self.procs.own(p) for p in self.procs.members(n, 1 if opt == "g" else 2)))
+                          all(self.procs.own(p) for p in self.procs.members(n, 1 if opt == "g" else 2))
+                          or self.procs.task_job(n))
                     if not ok:
                         raise Refused(f"{name} -{opt} {self._show(v)}: {n} is not this task's own process, group or session")
 
@@ -382,10 +407,10 @@ class _Guard:
                     continue
                 if group:
                     bad = [p for p in self.procs.members(n) if not self.procs.own(p)]
-                    if bad:
+                    if bad and not self.procs.task_job(n):
                         raise Refused(f"kill {shown}: process group {n} holds processes this task did not start "
                                       f"(such as {bad[0]})")
-                elif self.procs.exists(n) and not self.procs.own(n):
+                elif self.procs.exists(n) and not self.procs.own(n) and not self.procs.task_job(n):
                     raise Refused(f"kill {shown}: pid {n} is not this task's own process (neither the worker nor a "
                                   "process it started)")
 

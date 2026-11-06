@@ -133,7 +133,8 @@ def run(alias: str | None, specs: list[str], argv: list[str], out=None) -> int:
             # its own start deadline: a caller killed without withdrawing it (SIGKILL) never sees a late start
             detach.enqueue(state, rc, log, cmd, os.getcwd(), dict(os.environ), start_within=START_WAIT_S + START_MARGIN_S)
             with detach.registry(rd) as jobs:
-                jobs.append({"name": name, "rc": str(rc), "log": str(log), "pid": None, "started": time.time(),
+                jobs.append({"name": name, "rc": str(rc), "log": str(log), "pid": None, **detach.owner(),
+                             "started": time.time(),
                              "queued": True, "status": "queued",
                              "command": " ".join(_shown(alias, specs, argv))[:300]})
         print(f"ttp secret env: the sandbox cannot read the secrets store; the daemon runs the command "

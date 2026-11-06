@@ -236,3 +236,46 @@ def test_worker_pretooluse_hook_denies_kills_outside_the_task(kill_tree, monkeyp
     # Outside a worker run (no TTP_RUN_DIR) the hook does nothing.
     monkeypatch.delenv("TTP_RUN_DIR")
     assert hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "pkill -f sleep"}}) == (None, None)
+
+
+def test_kill_guard_allows_a_group_its_tasks_earlier_run_detached_and_nothing_forged(env, tmp_path, monkeypatch):
+    """A later run of a task may kill the group of a `ttp detach` job an earlier run of it started (the
+    db's runs, the run's registry, the pid's start time and the job's environment agree). Refused: another
+    task's job; a forged registry entry in the task's own run naming another task's job; an owner file
+    under the project's state; a recorded start time that is not the live pid's (a recycled pid)."""
+    from ttp import killguard
+    p = make(env)
+    tid = p.db.add_task("gate", "s", kind="work", tier="light", origin="user")
+    other = p.db.add_task("other", "s", kind="work", tier="light", origin="user")
+    rc, pgid, _ = _task_job(p, tid, "gate-1")
+    orc, opgid, _ = _task_job(p, other, "other-1")
+    try:
+        later = _add_run(p, tid, "gate-2")
+        me = p.runs / "gate-2"
+        monkeypatch.setenv("TTP_PROJECT", str(p.base))
+
+        def refusal(group, task=tid, run=later):
+            monkeypatch.setenv("TTP_TASK", str(task))
+            monkeypatch.setenv("TTP_RUN_ID", str(run))
+            return killguard.refusal(f"kill -- -{group}", str(me), str(me))
+
+        assert refusal(pgid) is None
+        assert killguard.refusal(f"kill -9 {pgid}", str(me), str(me)) is None, "its leading pid too"
+        assert refusal(opgid) and "not start" in refusal(opgid), "another task's job"
+        assert refusal(pgid, task=other) and refusal(pgid, run=_add_run(p, other, "other-2")), \
+            "a run of another task, or a task id with another task's run, owns nothing"
+        # Forged: the task's own earlier run's registry names the other task's job (pid and start time).
+        reg = rc.parent / "detached.json"
+        (mine,) = json.loads(reg.read_text())
+        (theirs,) = json.loads((orc.parent / "detached.json").read_text())
+        reg.write_text(json.dumps([mine, {**theirs, "rc": str(rc.parent / "x.rc"), "task": tid}]))
+        assert refusal(opgid), "a forged registry entry is no proof"
+        # An owner file of the project's own (pgid and task id) is never read.
+        (p.state / "jobs.json").write_text(json.dumps({"jobs": [{"pgid": opgid, "task": tid}]}))
+        assert refusal(opgid)
+        # A recycled pid: the recorded start time is not the live process's.
+        reg.write_text(json.dumps([{**mine, "pid_start": str(int(mine["pid_start"]) + 1)}]))
+        assert refusal(pgid), "a pid whose start time differs from the record is another process"
+    finally:
+        _end_group(pgid)
+        _end_group(opgid)
