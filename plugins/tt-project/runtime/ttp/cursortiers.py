@@ -122,11 +122,9 @@ def _read(path: Path) -> dict:
 
 
 def _write(path: Path, data: dict) -> None:
+    from .project import durable_write
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-        tmp.write_text(json.dumps(data, indent=1, sort_keys=True))
-        os.replace(tmp, path)
+        durable_write(path, json.dumps(data, indent=1, sort_keys=True))
     except OSError:
         pass
 
