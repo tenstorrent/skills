@@ -165,10 +165,12 @@ def failed_logs(probe: str, cwd=None, limit: int = LOG_EXCERPT_CHARS) -> str:
 # meaningless where the daemon starts the job, and the token would have the check's reaper end it.
 _SKIP_ENV = ("TTP_PIDNS", "TTP_CGROUP", "TTP_CHECKS_TMP_FD", "TTP_PUSH_RUN_LOCK_FD", "TTP_CHECK_SANDBOX")
 _SECRET_ENV = re.compile(r"TOKEN|SECRET|PASSW|CREDENTIAL|API_?KEY|_KEY$|AUTH", re.I)
+# <name>.started (the wrapper's pid) and <name>.rc are written by rename, so a reader never sees one empty.
 # With TTP_ACTIVITY_LOG and TTP_ACTIVITY_ID set (unset before the job runs), the job's end is appended
 # to that project's activity log (activity.py).
 WRAPPER = ('o="$1" r="$2" s="$3" t="$4" k="$5"; shift 5; a=${TTP_ACTIVITY_LOG-} i=${TTP_ACTIVITY_ID-}; '
-           'unset TTP_ACTIVITY_LOG TTP_ACTIVITY_ID; echo $$ >"$s"; "$@" >"$o" 2>&1 </dev/null; c=$?; '
+           'unset TTP_ACTIVITY_LOG TTP_ACTIVITY_ID; echo $$ >"$s.tmp"; mv "$s.tmp" "$s"; '
+           '"$@" >"$o" 2>&1 </dev/null; c=$?; '
            'rm -rf "$t" "$k"; echo $c >"$r.tmp"; mv "$r.tmp" "$r"; [ -z "$a" ] || '
            'printf \'{"end": %s, "ev": "job_end", "id": "%s", "rc": %s}\\n\' "$(date +%s)" "$i" "$c" >>"$a" 2>/dev/null')
 _TMP_VARS = ("TMPDIR", "TMP", "TEMP")

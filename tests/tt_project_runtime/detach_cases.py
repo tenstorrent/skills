@@ -2191,6 +2191,28 @@ def test_a_detached_job_of_an_unsandboxed_run_keeps_its_privileges(tmp_path, mon
     detach.reap_children()
 
 
+def test_the_wrapper_writes_its_started_file_by_rename_so_no_reader_sees_it_empty(tmp_path):
+    """<name>.started was truncated, then written: a reader in between (running_pid, jobstop, jobuse)
+    read no pid, and a daemon that died before restamping the registry left the relaunched job running.
+    The wrapper renames a full file over it instead; the old file's inode (a reader's view) is untouched."""
+    from ttp import detach, locks
+    rc = tmp_path / "run" / "job.rc"
+    rc.parent.mkdir()
+    detach.started(rc).write_text("stale\n")
+    view = tmp_path / "view"
+    os.link(detach.started(rc), view)   # what a reader that opened the old file sees
+    lock = locks.try_take([locks.job_lock(rc)], "detached job job", "write its pid")
+    try:
+        pid = detach.start(rc, rc.with_suffix(".log"), ["true"], str(tmp_path), dict(os.environ), lock)
+    finally:
+        lock.close()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+    assert detach.started(rc).read_text().split() == [str(pid)]
+    assert view.read_text() == "stale\n", "the wrapper truncated .started in place"
+    assert not [f.name for f in rc.parent.iterdir() if f.name.endswith(".tmp")], "a temp file was left"
+    detach.reap_children()
+
+
 def test_the_no_new_privs_preexec_is_none_off_linux(monkeypatch):
     from ttp import privlock
     monkeypatch.setattr(privlock.os, "uname", lambda: os.uname_result(("Darwin", "h", "r", "v", "m")))
