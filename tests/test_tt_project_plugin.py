@@ -1312,6 +1312,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (real / ".claude" / "settings.json").write_text("{}\n")
     (real / ".config" / "gh").mkdir()
     (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: mine\n")
+    (real / ".ssh").mkdir()
+    (real / ".ssh" / "id_ed25519").write_text("mine\n")
     out.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".gitignore").write_text("__pycache__/\n")
@@ -1344,6 +1346,10 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        pathlib.Path('left.txt').write_text('x')\n"
         "    if os.environ.get('CRED'):\n"
         "        pathlib.Path(REAL, '.config/gh/hosts.yml').write_text('token: x\\n')\n"
+        "    if os.environ.get('SSH'):\n"
+        "        pathlib.Path(REAL, '.ssh/id_ed25519').write_text('x\\n')\n"
+        "        pathlib.Path(REAL, '.ssh/id_new').write_text('x\\n')\n"
+        "        pathlib.Path(REAL, '.ssh/known_hosts').write_text('h k\\n')\n"   # ssh's own appends: not a test's
         "def test_rewrite():\n"   # the account's own tooling (a deploy's `ttp setup`) rewriting a file
         "    for rel, text in (('.local/bin/ttp', '#!/bin/sh\\n'), ('.claude/settings.json', '{}\\n')):\n"
         "        path, tmp = pathlib.Path(REAL, rel), pathlib.Path(REAL, rel + '.tmp')\n"
@@ -1362,7 +1368,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     assert r.returncode == 0 and "62 passed" in r.stdout, r.stdout + r.stderr
     homes = {(out / f"home-{i}").read_text() for i in range(60)}
     assert len(homes) == 60, "tests shared a HOME"
-    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".claude", ".config", ".gitconfig", ".local"] and (real / ".bashrc").read_text() == "mine\n"
+    assert sorted(p.name for p in real.iterdir()) == [".bashrc", ".claude", ".config", ".gitconfig", ".local", ".ssh"] and (real / ".bashrc").read_text() == "mine\n"
     assert (real / ".gitconfig").read_text() == "[t]\n\tmine = 1\n"
     assert not list((real / ".config" / "systemd" / "user").iterdir())
     assert "wrote outside" not in r.stdout
@@ -1377,6 +1383,13 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
     assert "credential files changed" in r.stdout and f"  {real}/.config/gh/hosts.yml: changed\n" in r.stdout, r.stdout
     (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: mine\n")
+    # Any file written under the account's ssh or gh config folder (the damage once done to a host's key).
+    r = run("-k", "test_leak", SSH="1")
+    assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
+    assert "ssh or gh config folder changed" in r.stdout, r.stdout
+    for line in (f"{real}/.ssh/id_ed25519: changed", f"{real}/.ssh/id_new: created"):
+        assert f"  {line}\n" in r.stdout, r.stdout
+    assert "known_hosts" not in r.stdout, r.stdout
     # A rewrite with the same bytes and a new mtime is no change; other bytes still are.
     r = run("-k", "test_rewrite")
     assert r.returncode == 0 and "1 passed" in r.stdout and "wrote outside" not in r.stdout, r.stdout + r.stderr
@@ -1384,6 +1397,30 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
     for line in (f"{real}/.local/bin/ttp: changed", f"{real}/.claude/settings.json: changed"):
         assert f"  {line}\n" in r.stdout, r.stdout
+
+
+def test_spawned_git_and_gh_see_the_temp_home(_temp_home):
+    """Every process a test starts gets the temp HOME, XDG config folder, gh config folder and git
+    global config, and git reads no system config: a spawned git or gh never sees the account's own."""
+    import pwd
+    import shutil
+    import subprocess
+    real = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)   # where ssh and ssh-keygen look, whatever HOME says
+    home = pathlib.Path(os.environ["HOME"])
+    assert home == _temp_home and real not in (home, *home.parents)
+    shown = subprocess.run(["sh", "-c", 'printf "%s\\n" "$HOME" "$XDG_CONFIG_HOME" "$GH_CONFIG_DIR" '
+                            '"$GIT_CONFIG_GLOBAL" "$GIT_CONFIG_NOSYSTEM"'], capture_output=True, text=True).stdout
+    assert shown.split("\n")[:5] == [str(home), str(home / ".config"), str(home / ".config" / "gh"),
+                                      str(home / ".gitconfig"), "1"], shown
+    subprocess.run(["git", "config", "--global", "t.k", "v"], check=True)
+    origin = subprocess.run(["git", "config", "--show-origin", "t.k"], capture_output=True, text=True).stdout
+    assert origin == f"file:{home / '.gitconfig'}\tv\n", origin
+    if shutil.which("gh"):
+        gh = home / ".config" / "gh"
+        gh.mkdir(parents=True)
+        (gh / "config.yml").write_text("git_protocol: ssh\n")
+        r = subprocess.run(["gh", "config", "get", "git_protocol"], capture_output=True, text=True, timeout=60)
+        assert r.stdout.strip() == "ssh", r.stdout + r.stderr
 
 
 def _test_conftest():

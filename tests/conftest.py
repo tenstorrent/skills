@@ -149,6 +149,7 @@ def _point_home(home: str, setenv, delenv) -> None:
     for var, sub in _XDG.items():
         setenv(var, os.path.join(home, sub))
     setenv("GH_CONFIG_DIR", os.path.join(home, ".config", "gh"))
+    setenv("GIT_CONFIG_NOSYSTEM", "1")   # git reads only the temp global config (GIT_CONFIG_GLOBAL)
     for var in _AGENT_HOMES:
         delenv(var)
     if _USER_BASE and not os.environ.get("PYTHONUSERBASE"):
@@ -192,6 +193,49 @@ def credential_marks(before: dict | None = None):
         return json.loads(r.stdout) if r.returncode == 0 else None
     except (OSError, ValueError, subprocess.SubprocessError):
         return None
+
+
+# The account's ssh folder and gh's config folder, whole: each regular file's size, mtime and sha256
+# (compared, never printed), so a session fails when a test wrote any file there. ssh and ssh-keygen find
+# ~/.ssh from the account's passwd entry, not HOME: a test passes them -f/-F/-o UserKnownHostsFile under its
+# temp folder. known_hosts files and sockets are left out: the account's own ssh sessions change them
+# while a suite runs.
+def secret_folders(env=None) -> list[str]:
+    env = _REAL_ENV if env is None else env
+    home = env.get("HOME") or REAL_HOME
+    gh = env.get("GH_CONFIG_DIR") or os.path.join(env.get("XDG_CONFIG_HOME") or os.path.join(home, ".config"), "gh")
+    return [os.path.join(home, ".ssh"), gh]
+
+
+def folder_marks(folders) -> dict[str, tuple]:
+    """{path: (size, mtime_ns, sha256)} of each regular file under `folders`."""
+    import hashlib
+    import stat
+    marks: dict[str, tuple] = {}
+    for top in folders:
+        for root, dirs, names in os.walk(top):
+            for name in names:
+                if name.startswith("known_hosts"):
+                    continue
+                path = os.path.join(root, name)
+                try:
+                    with open(path, "rb", opener=lambda f, fl: os.open(f, fl | os.O_NOFOLLOW | os.O_NONBLOCK)) as fh:
+                        st = os.fstat(fh.fileno())
+                        if not stat.S_ISREG(st.st_mode):
+                            continue
+                        digest = hashlib.sha256()
+                        for chunk in iter(lambda: fh.read(1 << 20), b""):
+                            digest.update(chunk)
+                        marks[path] = (st.st_size, st.st_mtime_ns, digest.hexdigest())
+                except OSError:
+                    continue
+    return marks
+
+
+def folder_changes(before: dict, after: dict) -> list[str]:
+    """One line per created, removed or changed file between two folder_marks."""
+    return [f"  {p}: {'created' if p not in before else 'removed' if p not in after else 'changed'}"
+            for p in sorted(set(before) | set(after)) if before.get(p) != after.get(p)]
 
 
 @pytest.fixture(autouse=True)
@@ -522,6 +566,7 @@ def pytest_sessionstart(session):
     if not os.environ.get("PYTEST_XDIST_WORKER"):
         session.config._ttp_outside = _outside_snapshot(session.config)
         session.config._ttp_creds = credential_marks()
+        session.config._ttp_secret = folder_marks(secret_folders())
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -536,6 +581,12 @@ def pytest_sessionfinish(session, exitstatus):
     if changed:
         _report(session, ["the account's credential files changed while the tests ran (stat only: size, mtime, "
                           "inode; a test must use its temp HOME):"] + [f"  {path}: {how}" for path, how in changed])
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    secret = getattr(session.config, "_ttp_secret", None)
+    moved = folder_changes(secret, folder_marks(secret_folders())) if secret is not None else []
+    if moved:
+        _report(session, ["the account's ssh or gh config folder changed while the tests ran (a test must use "
+                          "its temp HOME, and pass ssh and ssh-keygen paths under it):"] + moved)
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
     if not any(i.path.name.startswith(_SHARDED) for i in session.items):
         return

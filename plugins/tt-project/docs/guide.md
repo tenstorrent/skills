@@ -2731,8 +2731,14 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `gh auth login`, a refreshed token, a rotated key, by you or another run at the same time), a restore
   would undo those, and a copy kept beside the file during a run is one more credential an
   unsandboxed agent could read. The observation says what to log in again instead. The test suite
-  runs with HOME, the XDG folders and GH_CONFIG_DIR in temp folders and fails when one of these files
-  changed; premise checks and guard tests run read-only, under a fresh `mktemp -d` HOME.
+  runs every test, and every process it starts, with HOME, the XDG folders, GH_CONFIG_DIR and git's
+  global config (GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM) in temp folders. It fails when one of these
+  files changed, or when any file under the real `~/.ssh` or gh config folder was written (compared by
+  size, mtime and hash, never printed; known_hosts and sockets left out). ssh and ssh-keygen find
+  `~/.ssh` from the account entry, not HOME, so tests pass them paths under their temp folder. Premise
+  checks and guard tests run read-only, under a fresh `mktemp -d` HOME. The tripwire is
+  `credwatch.snapshot()` and `credwatch.changes()` in `runtime/ttp/credwatch.py`, its path list
+  `credwatch.files()`, for other guards to reuse.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
   `GET <base url>/models` and saves it with its URL as `endpoint/<alias>`; `ttp secret show` lists it
