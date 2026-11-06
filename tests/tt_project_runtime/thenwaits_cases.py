@@ -48,6 +48,8 @@ def test_a_three_stage_chain_moves_through_its_stages_and_a_restart_keeps_the_st
     d = _then_daemon(p, monkeypatch)   # a restart: the stage is the task's, not the daemon's
     _settle_probe(d, tid)
     assert json.loads(p.db.task(tid)["result"])["then_stage"] == 1 and not _ready(p, tid)
+    if tid in d._probes:   # the probe the settle started next (PROBE_EVERY_S 0) ends before the gate is
+        d._probes[tid][0].wait(_load_scaled(60))   # there: its "not yet" is not the settle's answer below
     gate.write_text("")
     _settle_probe(d, tid)
     res = json.loads(p.db.task(tid)["result"])
