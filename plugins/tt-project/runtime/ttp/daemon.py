@@ -15682,7 +15682,8 @@ class Daemon:
             return
         review = self._auto_review(t, str(load_result(t["result"]).get("summary") or ""), add=True)
         self._swept(t, review, start, now)
-        if review is None:
+        # Cancelled or continued by another open task (_stale_source): its owner's review covers the work.
+        if review is None and not self._stale_source(t):
             self._raise_unqueued_review(t, start, last["r"], now)
 
     def _swept(self, t: dict, review: tuple[int, bool] | None, start: float, now: float) -> None:
@@ -16079,6 +16080,27 @@ class Daemon:
         result = load_result(row["result"]) if row and row["status"] not in TERMINAL_TASK_STATES else {}
         return result.get("status") == "waiting" and chaincap.waits_landing(result.get("retry_when"), tid)
 
+    def _continuation_owner(self, task: dict) -> dict | None:
+        """The open task, oldest first, that continues task `task` (its `continues:` label names it): the
+        sole owner of its work from here, whose own finished work gets its own review. A review, a task
+        that waits on `task` landing (it carries none of its work) and a stalled hop (chaincap.hop_stall)
+        own nothing. None when there is none."""
+        tid, now = task["id"], time.time()
+        return next((x for x in self.p.db.q(
+            "SELECT * FROM tasks WHERE kind!='review' AND status NOT IN (?,?,?) AND id!=? AND labels LIKE ? ORDER BY id",
+            (*TERMINAL_TASK_STATES, tid, f'%"continues:{tid}"%'))
+            if continues_id(x) == tid and not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)), None)
+
+    def _stale_source(self, task: dict) -> str:
+        """Why no review of task `task` may be queued now, read live from the records ('' when one may):
+        it was cancelled after its run or sweep read it, or another open task continues it
+        (_continuation_owner), which gets the review of its own work instead."""
+        row = self.p.db.one("SELECT status FROM tasks WHERE id=?", (task["id"],))
+        if row and row["status"] == "cancelled":
+            return "it was cancelled"
+        owner = self._continuation_owner(task)
+        return f"open task #{owner['id']} continues it" if owner else ""
+
     def _auto_review(self, task: dict, summary: str, add: bool = True) -> tuple[int, bool] | None:
         """The review of a finished code task, queued here the way the coordinator would, so a
         routine hand-off needs no coordinator turn: (review id, whether it was added now). An open
@@ -16141,6 +16163,9 @@ class Daemon:
             if prior:
                 return prior["id"], False
             if not add:
+                return None
+            if stale := self._stale_source(task):
+                log(self.p, f"task {task['id']}: no review queued, {stale}")
                 return None
             if published:
                 changes, full = published["changes"], published["sha"]
@@ -16337,10 +16362,15 @@ class Daemon:
             + ([f"pr_branch:{elsewhere}"] if own_step else []) + reviewhold.labels(full, held) \
             + ([extchange.HEAD_LABEL + ext["head"]] if ext else []) \
             + ([chaincap.SPLIT_REVIEW_LABEL + own_split] if stall else [])
-        rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=min(chainprio.of(db, task), urgent.PRIORITY)
-                          if urgent.is_urgent(task) else chainprio.of(db, task), origin="daemon",
-                          budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
-                          depends_on=[task["id"]], labels=labels, **pin_of(task))
+        # Read again where the review is added: a cancel or a continuation since the read above wins.
+        with db.tx():
+            if stale := self._stale_source(task):
+                log(self.p, f"task {task['id']}: no review queued, {stale}")
+                return None
+            rid = db.add_task(title, "\n".join(lines), kind="review", tier=tier, priority=min(chainprio.of(db, task), urgent.PRIORITY)
+                              if urgent.is_urgent(task) else chainprio.of(db, task), origin="daemon",
+                              budget_usd=float(cfg["budget"]["task_default_usd"].get(tier, 8.0)),
+                              depends_on=[task["id"]], labels=labels, **pin_of(task))
         log(self.p, f"task {task['id']}: queued review #{rid} ({tier})" + (
             f", held until the fix of {', '.join(f'#{t} (#{f})' for t, f in sorted(held.items()))} lands or "
             f"its chain ends" if held else ""))
@@ -16958,6 +16988,31 @@ class Daemon:
         # task continuing the same work.
         hop = None if prfix else self._open_hop(code) or (self._open_fix(code) if reuse_fix else None)
         with db.tx():
+            # Read live where the fix would be added: a code task cancelled since its review read it, or
+            # one another open task now continues (one a PR fix or hop above does not already take), gets
+            # no fix or re-review: its findings go to that owner, whose own work gets its own review.
+            row = db.one("SELECT status FROM tasks WHERE id=?", (code["id"],))
+            gone = bool(row and row["status"] == "cancelled")
+            owner = self._continuation_owner(code) if gone or not (prfix or hop) else None
+            if gone or owner:
+                why = ("it was cancelled" if gone else "") + (" and " if gone and owner else "") \
+                    + (f"open task #{owner['id']} continues it" if owner else "")
+                self._nofix = "" if owner else f"code task #{code['id']} it covers was cancelled and no open task continues it"
+                marker = f"Findings of review #{review['id']} "
+                if owner and marker not in (owner["spec"] or ""):
+                    extra = "\n".join([
+                        f"{marker}({review['title']}) of code task #{code['id']} (branch {code['branch']}, head "
+                        f"{head}), which this task continues: fix its blocking findings in this task's own work; "
+                        f"this task's own review checks them once it is done.",
+                        f"Findings to fix:\n{found}",
+                        f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"])
+                    db.update_task(owner["id"], spec=f"{owner['spec'] or ''}\n{extra}")
+                    for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (owner["id"],)):
+                        if r["dir"]:
+                            coord._append_update(Path(r["dir"], "steer.md"), extra, f"review-fix-{review['id']}")
+                log(self.p, f"review {review['id']} failed: no fix or re-review queued for #{code['id']}, {why}"
+                            + (f"; its findings went to #{owner['id']}" if owner else ""))
+                return None
             if prfix or hop:
                 fid = (prfix or hop)["id"]
                 fbranch = (prfix or hop)["branch"] or f"ttp/t{fid}-{worktree.slug((prfix or hop)['title'])}"
