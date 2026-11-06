@@ -3822,6 +3822,17 @@ def landed_heads(db) -> dict[str, str]:
     return out
 
 
+def head_branches(db, heads) -> dict[str, str]:
+    """{head: the branch its push queue row names} for the `heads`; {} when the queue cannot be read."""
+    heads = [h for h in heads if re.fullmatch(r"[0-9a-f]{40,64}", h or "")]
+    try:
+        return {str(r["head"]): str(r["branch"] or "") for k in range(0, len(heads), 500)
+                for r in db.q(f"SELECT head, branch FROM push_queue WHERE head IN "
+                              f"({','.join('?' * len(heads[k:k + 500]))})", tuple(heads[k:k + 500]))}
+    except Exception:   # noqa: BLE001 - no branch only loses the drop, never a push
+        return {}
+
+
 def dependency_heads(repo: Path, base: str, top: str, onto: str, heads: dict[str, str]) -> dict[str, str]:
     """{approved head: landed commit} of the `heads` (landed_heads) inside base..top whose landing is
     on `onto`: a branch built on another task's approved head before that task landed. Its commits up

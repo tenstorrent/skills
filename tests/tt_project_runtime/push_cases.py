@@ -2691,6 +2691,56 @@ def test_a_push_batch_drops_a_childs_copy_of_a_parent_head_its_review_sent_back_
     assert other_branch not in heads
 
 
+@pytest.mark.parametrize("how, landing, ok", [
+    ("chain", {"notes.txt": "a\nB1\nB2\nc\n", "tool.txt": "t1\nt2\n"}, True),
+    ("trailer", {"notes.txt": "a\nB1\nB2\nc\n", "tool.txt": "t1\nt2\n"}, True),
+    ("chain", {"notes.txt": "a\nB1\nB2\nc\n"}, False),              # its tool.txt never landed
+    ("chain", {"notes.txt": "a\nB1 reworked\nc\n", "tool.txt": "t1\nt2\n"}, False),   # B1 only rewritten
+    ("trailer", {"notes.txt": "a\nB1\nB2\nc\n"}, False),
+    ("own branch", {"notes.txt": "a\nB1\nB2\nc\n", "tool.txt": "t1\nt2\n"}, False),
+    ("none", {"notes.txt": "a\nB1\nB2\nc\n", "tool.txt": "t1\nt2\n"}, False)])
+def test_a_push_batch_drops_a_carried_copy_of_another_reviews_commit_only_when_its_rewritten_landing_holds_it_whole(
+        env, monkeypatch, capsys, how, landing, ok):
+    """Push queue case: an approved entry carries a rebased copy of another review's commit (same author,
+    author date and subject; a new sha), and that review landed the commit reworked (a new subject and
+    patch, so neither patch id nor _rewritten matches). Shown by the review chain (the other branch's
+    approved head and its landing) or a Ttp-Replayed-From trailer naming the original, and with every line
+    the copy adds already on the target, the copy is left out: no conflict, the approval holds. A copy
+    that only partly landed (a file left out, a line reworded), a match on the entry's own branch, or
+    no chain or trailer at all is replayed and conflicts, as before."""
+    p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
+    _git_out(repo, "checkout", "-q", "first")
+    (repo / "tool.txt").write_text("t1\nt2\n")
+    _git_out(repo, "add", "tool.txt")
+    _git_out(repo, "commit", "-q", "--amend", "-m", "first: notes and a tool")
+    a = _git_out(repo, "rev-parse", "HEAD")
+    _land_as(other, {"later.txt": "x\n"}, "another change")
+    _git_out(repo, "fetch", "-q", "origin")
+    _git_out(repo, "checkout", "-q", "-B", "e1", "origin/proj")
+    _git_out(repo, "cherry-pick", a)   # the carried copy: a new sha, author, date and subject kept
+    copy = _git_out(repo, "rev-parse", "HEAD")
+    _commit(repo, "more.txt", "own\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    assert copy != a
+    trailer = f"\n\nTtp-Replayed-From: {a}" if how == "trailer" else ""
+    landed = _land_as(other, landing, "first, reworked after its push conflict" + trailer)
+    if how in ("chain", "own branch"):
+        now = time.time()
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated, landed_sha) "
+               "VALUES(?,?,?,?,?,?,?,?)", (7, "first" if how == "chain" else "e1", a, "origin/proj", "pushed",
+                                           now, now, landed))
+    rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
+    if not ok:
+        assert _statuses(m) == ["conflict"], m
+        return
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    pushed = _git_out(origin, "rev-parse", "proj")
+    assert _git_out(origin, "rev-list", "--count", f"{landed}..{pushed}") == "1", "only its own commit"
+    assert _git_out(origin, "show", f"{pushed}:notes.txt") == "a\nB1\nB2\nc", "the landing is kept"
+    assert _git_out(origin, "show", f"{pushed}:more.txt") == "own"
+    assert f"{copy[:10]} as {landed[:10]}); replaying the other 1" in capsys.readouterr().out
+
+
 def test_an_approval_built_on_another_reviews_sent_back_head_waits_for_its_landing(env, monkeypatch):
     """A child approval whose head contains a head another open review approved and got sent back (a
     push conflict) is not batched, where it could only conflict on the parent's files and lose its

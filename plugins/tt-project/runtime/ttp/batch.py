@@ -1020,6 +1020,42 @@ def _rewritten(repo: Path, onto: str, base: str, rest: list[str],
     return found
 
 
+def _cdate(repo: Path, rev: str) -> int:
+    """The committer date of `rev` (0 when unknown)."""
+    out = _git(repo, "log", "-1", "--format=%ct", rev, "--").stdout.strip()
+    return int(out) if out.isdigit() else 0
+
+
+def _held(repo: Path, c: str, onto: str, files: frozenset) -> bool:
+    """Whether `onto` already holds all of commit `c`'s work, so replaying it there could only conflict
+    with its own landing: `c` merged (three-way, base c^) onto `onto` changes no line of its files outside
+    the conflicting regions, and in each such region onto's own lines hold every line `c` adds there,
+    verbatim. A file `c` deletes or adds must be gone or there as well."""
+    try:
+        for path in files:
+            mine, got = _blob(repo, c, path), _blob(repo, onto, path)
+            if mine == got:
+                continue
+            if mine is None or got is None:
+                return False
+            with tempfile.TemporaryDirectory() as d:
+                sides = []
+                for name, text in (("ours", got), ("base", _blob(repo, f"{c}^", path) or b""), ("theirs", mine)):
+                    (Path(d) / name).write_bytes(text)
+                    sides.append(str(Path(d) / name))
+                r = gitmemo.run(["git", "merge-file", "-p", "--diff3", f"--marker-size={_MARK}", *sides],
+                                capture_output=True, timeout=None)
+            if r.returncode < 0 or r.returncode > 127:   # 255: an error (binary)
+                return False
+            regions, gaps = _regions(r.stdout), _gaps(r.stdout, got)
+            if gaps is None or len(gaps) != len(regions) or any(
+                    Counter(theirs) - Counter(base) - Counter(ours) for ours, base, theirs in regions):
+                return False
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return True
+
+
 _MARK = 40          # conflict marker size: no line of a file is taken for one
 
 
@@ -1613,7 +1649,7 @@ class Batch:
                 top = parent
             if i in self.held:   # its push needs a token scope the credential lacks (_hold_scoped)
                 continue
-            if top == base or (on := self._on_tip(tip, base, top)):
+            if top == base or (on := self._on_tip(tip, base, top, str(e.get("branch") or ""))):
                 say(f"entry {e.get('id')} ({e.get('branch')}): already on {self.target}"
                     + (f" (carried by {on[:10]})" if top != base and on != tip else ""))
                 self._set(i, "landed")
@@ -1640,7 +1676,7 @@ class Batch:
                 continue
             self._settling = ([], set(), [])
             resolved: dict[str, list[str]] = {}
-            own, gone = self._landed(h, base, top, resolved)
+            own, gone = self._landed(h, base, top, resolved, str(e.get("branch") or ""))
             if hits := self._markers([c for c in own if c not in gone]):
                 # A commit with a conflict marker never lands: sent back as a non-textual conflict, its
                 # fix runs at standard (conflictfix.tier_for) and rewrites the commits.
@@ -1766,24 +1802,25 @@ class Batch:
         """conflictfix.stray_markers of the entry `commits` this batch would replay."""
         return conflictfix.stray_markers(str(self.repo), "--no-walk=unsorted", *commits, timeout=None) if commits else []
 
-    def _on_tip(self, tip: str, base: str, top: str) -> str:
+    def _on_tip(self, tip: str, base: str, top: str, branch: str = "") -> str:
         """The commit on `tip` that carries the last of base..top's commits when every one is there
         already (_landed), else ""."""
-        own, gone = self._landed(tip, base, top)
+        own, gone = self._landed(tip, base, top, branch=branch)
         if not own or len(gone) < len(own):
             return ""
         order = _git(self.repo, "rev-list", f"{base}..{tip}").stdout.split()   # newest first
         return min(gone.values(), key=lambda c: order.index(c) if c in order else len(order))
 
-    def _landed(self, onto: str, base: str, top: str,
-                resolved: dict[str, list[str]] | None = None) -> tuple[list[str], dict[str, str]]:
+    def _landed(self, onto: str, base: str, top: str, resolved: dict[str, list[str]] | None = None,
+                branch: str = "") -> tuple[list[str], dict[str, str]]:
         """The commits of base..top (merges aside), and those of them already on `onto`, each with
         the commit there that carries it: one naming it in a REPLAYED trailer (a batch that settled
         its replay, or a squash that carries several), else the landing of another task's approved
         head the entry was built on (push.landed_deps: --onto <tip> <that head>), else one with the same patch (`git patch-id
         --stable`, as git cherry), else a newer rewrite of it (_rewritten: it landed
-        conflict-resolved; `resolved` gets those found only through a conflict the landing resolved).
-        Replaying such a commit again could only conflict with its own landing. Oldest first; the first
+        conflict-resolved; `resolved` gets those found only through a conflict the landing resolved), else
+        a carried copy of another review's commit that landed reworked and that `onto` holds whole
+        (_carried_rewrites; `branch` is the entry's own, whose commits are never another's). Replaying such a commit again could only conflict with its own landing. Oldest first; the first
         carrier found wins."""
         own = _git(self.repo, "rev-list", "--reverse", "--no-merges", f"{base}..{top}").stdout.split()
         if not own or base == onto:
@@ -1794,6 +1831,7 @@ class Batch:
             sha, _, body = chunk.partition("\n")
             for c in re.findall(rf"^{REPLAYED}: ([0-9a-f]{{40,64}})[ \t]*$", body, re.M):
                 gone.setdefault(c, sha)
+        named = dict(gone)
         if getattr(self, "_heads", None) is None:
             self._heads = push.landed_heads(self.p.db) if getattr(self, "p", None) else {}
         for c, sha in push.landed_deps(self.repo, base, top, onto, self._heads).items():
@@ -1806,7 +1844,40 @@ class Batch:
                     gone[c] = theirs[mine[c]]
         if rest := [c for c in own if c not in gone]:
             gone.update(_rewritten(self.repo, onto, base, rest, resolved))
+        if rest := [c for c in own if c not in gone]:
+            gone.update(self._carried_rewrites(onto, rest, named, branch))
         return own, {c: gone[c] for c in own if c in gone}
+
+    def _carried_rewrites(self, onto: str, rest: list[str], named: dict[str, str], branch: str) -> dict[str, str]:
+        """{commit: the landing carrying it} for the commits of `rest` an entry carries from another
+        review that landed them rewritten (reworked after a conflict or a finding: a new patch, often a
+        new subject, so neither patch id nor _rewritten matches the carried copy). A copy is known by the
+        author, author date and subject a rebase keeps: shared with a commit a REPLAYED trailer on `onto`
+        names (`named`: {commit: the landing naming it}, a committer date no newer than that landing's),
+        or with a commit of another branch's approved head whose landing (landed_heads, the review chain)
+        is on `onto`. Dropped only when `onto` holds all of the copy's work (_held); one that only partly
+        landed is replayed and conflicts as before."""
+        mine = _idents(self.repo, "--no-walk=unsorted", *rest)
+        key = {(m[0], m[1]): c for c, m in mine.items()}
+        found: dict[str, str] = {}
+        if named:
+            for x, (who, subject, _, _) in _idents(self.repo, "--ignore-missing", "--no-walk=unsorted",
+                                                    *named).items():
+                c = key.get((who, subject))
+                if c and c not in found and _cdate(self.repo, named[x]) >= mine[c][3]:
+                    found[c] = named[x]
+        heads = self._heads if branch and getattr(self, "p", None) and len(found) < len(rest) else {}
+        if heads:   # the entry's own earlier heads are its own work, never carried
+            of = push.head_branches(self.p.db, heads)
+            heads = {d: sha for d, sha in heads.items() if of.get(d, branch) != branch}
+        if heads:
+            for x, (who, subject, _, _) in _idents(self.repo, "--ignore-missing", *heads, f"^{onto}").items():
+                if (c := key.get((who, subject))) and c not in found:
+                    for d, sha in heads.items():
+                        if push.descends(self.repo, x, d) and push.descends(self.repo, sha, onto):
+                            found[c] = sha
+                            break
+        return {c: v for c, v in found.items() if _held(self.repo, c, onto, mine[c][2])}
 
     def _rebase(self, onto: str, top: str, drop: set | frozenset = frozenset()) -> tuple[str, list[str] | None]:
         """Rebase the entry's commits up to `top` onto `onto` in the worktree, settling conflicts that
