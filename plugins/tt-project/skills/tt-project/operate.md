@@ -86,10 +86,9 @@
   the environment does not get past it). Workers are denied the web app's token
   (`state/web.token`): a Read deny rule for Claude Code, and the Bash hook refuses commands
   that name it (Claude Code, and Codex when its hook runs). Codex has no read deny rules and its
-  sandbox does not fence reads. Cursor gets neither: its CLI takes no deny rules or hooks per
-  run (no flag or environment variable), only from a config file (`.cursor/cli.json` in the
-  worktree or the user's own global one), which the harness does not write. A user who runs
-  Cursor workers can add a `Read(...)` deny for the token to their own global Cursor config.
+  sandbox does not fence reads. Cursor takes no deny rules per run, so the harness hook
+  (`ttp.cursorhook`, from the run's own `.cursor/hooks.json`) refuses Read and Grep of the token
+  and Bash commands that name it.
 - These are checks, not a fence. Workers run as the same OS user as the daemon and the user's own
   commands, so a worker that tries hard (a process that leaves its agent's process tree, a script
   that reads the token another way) can still read what that user can. For a hard boundary, run

@@ -15873,7 +15873,7 @@ def test_cursor_worker_gets_no_config_file_or_env_for_the_web_token(env, monkeyp
     argv, extra = get_provider("cursor").build(denied_reads=["/x/state/web.token"], **kw)
     assert (argv, extra) == (get_provider("cursor").build(**kw)[0], {"TTP_DENIED_READS": "/x/state/web.token"})
     notes = (TTP.parents[1] / "skills" / "tt-project" / "operate.md").read_text()
-    assert "Cursor gets neither" in notes and "global" in notes
+    assert "Cursor takes no deny rules per run" in notes and "ttp.cursorhook" in notes
 
 
 CURSOR_HELP = """Usage: agent [options] [command] [prompt...]
