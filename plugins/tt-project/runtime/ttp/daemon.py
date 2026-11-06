@@ -8548,7 +8548,10 @@ class Daemon:
         raises one `observation` naming it and what holds it now (_start_hold, in words). One per wait
         (keyed on its last run); none for a wait already raised as slot_wait or ready_not_started, or
         held by a pause, a logout or the network, which say so themselves. The clock is its record
-        (resumefirst.ready_at), so a daemon restart keeps it. Observation only: dispatch never reads it."""
+        (resumefirst.ready_at), so a daemon restart keeps it. Observation only: dispatch never reads it.
+        One still queued (no turn has read it yet) is read again each check against the gate update_gates
+        read this tick: rewritten when what holds it changed (a spend gate that cleared is not named),
+        retired once the task resumed, left the queue or such a self-reporting hold took it."""
         now = time.time()
         if now - getattr(self, "_resume_wait_checked", 0.0) < every_s:
             return
@@ -8557,8 +8560,13 @@ class Daemon:
         if mins <= 0 or self.cfg_status == "unavailable" or self.settling():
             return
         db = self.p.db
-        late = [(t, at) for t in db.ready_tasks() if (at := resumefirst.ready_at(t)) is not None
-                and now - at >= mins * 60]
+        late = [(t, at, (db.one("SELECT MAX(id) id FROM runs WHERE task=?", (t["id"],)) or {}).get("id") or 0)
+                for t in db.ready_tasks() if (at := resumefirst.ready_at(t)) is not None and now - at >= mins * 60]
+        queued = {r["fingerprint"]: r for r in db.q(
+            "SELECT id, fingerprint, data FROM events WHERE kind='observation' AND status='queued' "
+            "AND fingerprint LIKE ?", (f"{resumefirst.FP}:%",))}
+        for fp in queued.keys() - {f"{resumefirst.FP}:{t['id']}:{ran}" for t, _, ran in late}:
+            obligations._retire(db, now, "resumed or left the queue", fp)
         if not late:
             return
         core = self.cfg.get("core_provider", "claude")
@@ -8566,16 +8574,18 @@ class Daemon:
                "busy": {r["provider"]: r["n"] for r in db.q(
                    "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                    "GROUP BY provider")},
-               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t, _ in late}}}
-        for t, at in late:
+               "logged_out": {prov: self._logged_out(prov) for prov in {t["provider"] or core for t, _, _ in late}}}
+        for t, at, ran in late:
             tid = t["id"]
-            ran = (db.one("SELECT MAX(id) id FROM runs WHERE task=?", (tid,)) or {}).get("id") or 0
             fp = f"{resumefirst.FP}:{tid}:{ran}"
-            if db.one("SELECT id FROM events WHERE fingerprint IN (?,?,?)",
-                      (fp, f"slot_wait:{tid}:{ran}", f"{unstarted.READY_KIND}:{tid}:{ran}")):
+            row = queued.get(fp)
+            if row is None and db.one("SELECT id FROM events WHERE fingerprint IN (?,?,?)",
+                                      (fp, f"slot_wait:{tid}:{ran}", f"{unstarted.READY_KIND}:{tid}:{ran}")):
                 continue
             why = self._start_hold(t, t["provider"] or core, ctx)
             if why in ("paused", "logged_out", "net") or (why is None and self._own_checks_wait(t)):
+                if row is not None:
+                    obligations._retire(db, now, f"held: {why}", fp)
                 continue
             held = self._hold_words(t, why, ctx) if why else (
                 f"nothing dispatch records as a hold ({t['blocked_reason'][:160]})" if t["blocked_reason"]
@@ -8584,8 +8594,14 @@ class Daemon:
                     f"{(now - at) / 60:.0f} min ago and has not resumed; held by {held}. It goes before "
                     f"new work of its priority once that clears: clear the hold if it is ours to clear, "
                     f"else say why it must wait.")
-            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                 (now, "daemon", "observation", fp, "normal", text[:4000], "queued", tid))
+            data = json.dumps({"held": held})
+            if row is not None:   # not read yet: name the hold that is true now
+                if row["data"] != data:
+                    db.x("UPDATE events SET text=?, data=? WHERE id=? AND status='queued'", (text[:4000], data, row["id"]))
+                    log(self.p, f"resume wait: task {tid} now held by {held[:200]}")
+                continue
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "observation", fp, "normal", text[:4000], "queued", tid, data))
             log(self.p, f"resume wait: task {tid} ready {(now - at) / 60:.0f} min, held by {held[:200]}")
 
     def _own_checks_wait(self, task: dict) -> str | None:

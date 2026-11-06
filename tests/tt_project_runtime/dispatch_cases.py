@@ -1674,6 +1674,52 @@ def test_resume_wait_fires_once_for_a_passed_wait_not_started_in_15_min_naming_i
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
+
+def test_a_queued_resume_wait_names_the_hold_true_now_not_a_spend_gate_that_cleared(env, monkeypatch):
+    """The reported case: a resume wait raised while the global daily cap held new work is still queued
+    when the cap is raised. The next check names what holds it now, not the cleared spend gate; once the
+    task starts, the queued observation is retired."""
+    from ttp import coordinator as coord, globalcap as gcap
+    from ttp.daemon import Daemon
+    p = make(env)
+    _no_events(p)
+    p.db.x("UPDATE tasks SET status='done'")
+    core = p.config().get("core_provider", "claude")
+    monkeypatch.setattr(gcap, "total", lambda *a, **k: {"usd": 2017.0, "stale": [], "includes": []})
+    p.set_config("budget.global_daily_usd", 2000)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    assert not d.gates[core].allow_new_work and "global daily cap reached" in d.gates[core].cause, d.gates[core]
+    now = time.time()
+    tid, paused = (p.db.add_task(title, "s", kind="work", tier="light", origin="user", priority=3, **kw)
+                   for title, kw in (("woken wait", {}), ("woken wait on a board", {"labels": ["resource:board"]})))
+    for t in (tid, paused):
+        p.db.update_task(t, result=json.dumps({"status": "waiting", "woke": True}), not_before=now - 20 * 60)
+
+    def check():
+        d._resume_wait_checked = 0.0
+        d.check_resume_wait()
+        return p.db.q("SELECT * FROM events WHERE fingerprint LIKE 'resume_wait:%'")
+
+    first = check()
+    assert [e["task"] for e in first] == [tid, paused]
+    assert "held by the spend gate (no new work at red: global daily cap" in first[0]["text"]
+    p.set_config("budget.global_daily_usd", 3000)   # the cap is raised before a turn read the observation
+    d.cfg = p.config()
+    d.update_gates()
+    assert d.gates[core].allow_new_work, d.gates[core]
+    coord.pause_resource(p, "board", True, reason="maintenance", by="user")   # a hold that says so itself
+    again = check()
+    assert [(e["id"], e["status"]) for e in again] == [(first[0]["id"], "queued"), (first[1]["id"], "handled")]
+    assert json.loads(again[1]["data"])["retired"] == "held: paused"
+    assert "spend gate" not in again[0]["text"], again[0]["text"]
+    assert f"#{tid} woken wait" in again[0]["text"]
+    p.db.update_task(tid, status="running")   # it resumed before any turn read it
+    gone = check()
+    assert gone[0]["status"] == "handled" and json.loads(gone[0]["data"])["retired"] == "resumed or left the queue"
+
+
 def _merge_task(p, **kw):
     """The harness task `ttp upgrade` queues to finish a template merge, as it queues it (cli.upgrade)."""
     from ttp import release
