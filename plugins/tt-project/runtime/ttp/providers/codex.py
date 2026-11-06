@@ -34,7 +34,10 @@ from `ttp note` and `ttp steer` (cli.print_update), which leave them to the hook
 
 Per-run plugins: not possible. Codex loads a plugin only from its install cache under
 `$CODEX_HOME/plugins/cache` (`codex plugin add` copies it there); enabling a local marketplace's
-plugin with `-c` alone loaded none of its skills (measured), and no `-c` key adds a skill folder."""
+plugin with `-c` alone loaded none of its skills (measured), and no `-c` key adds a skill folder.
+An installed plugin does load from a whole `-c plugins={...}` table, also in a run that ignores
+config.toml (measured on 0.160): isolated workers get tt-project's own skills that way
+(own_plugin_args)."""
 from __future__ import annotations
 
 import base64
@@ -80,6 +83,11 @@ PROVIDER_CONFIG_RE = re.compile(r"^\s*(?:\[\s*)?[\"']?(?:model_providers?|cli_au
 # A command the harness's hook denied (logged by codex_core::tools::router): its text is the
 # command's, so it says nothing about the run's login or limits.
 HOOK_DENIAL_RE = re.compile(r"^.*Command blocked by PreToolUse hook.*$\n?", re.M)
+# This plugin's name in Codex's install cache (`plugins/cache/<marketplace>/<name>/<version>/`).
+OWN_PLUGIN = "tt-project"
+# What a plugin may bring besides skills: an isolated run keeps out a copy that brings any of these.
+PLUGIN_EXTRAS = ("hooks", "mcpServers", "apps")
+PLUGIN_EXTRA_FILES = ("hooks", "hooks.json", ".mcp.json", ".app.json")
 
 
 @register
@@ -224,12 +232,14 @@ class Codex(Provider):
 
     def plugin_dirs_why(self, isolated: bool) -> str:
         return ("Codex loads plugins only from those installed in its home (`codex plugin add`)"
-                + ("; worker_isolation also keeps out the plugins installed in your config.toml." if isolated
-                   else "."))
+                + ("; worker_isolation also keeps out the plugins installed in your config.toml, all but "
+                   "tt-project's own." if isolated else "."))
 
     def isolation_args(self) -> list[str]:
         # The user's config.toml holds their MCP servers, plugins, hooks and profiles.
         out = self._ignore_user_config()
+        if out:
+            out += own_plugin_args()   # tt-project's own skills, which the ignored config enabled
         if out and self._hook_held_by_user_config:
             out += self._hook_for(self._hook_held_by_user_config, user_config=False)
         return out
@@ -733,6 +743,41 @@ def hook_sources(cwd: str, user_config: bool = True) -> list[str]:
         if config_has_hooks(_read(dot / "config.toml")):
             found.append(str(dot / "config.toml"))
     return found
+
+
+def own_plugin_args() -> list[str]:
+    """`-c` keys that enable tt-project's installed copy in a run that ignores config.toml, so an
+    isolated worker keeps the plugin's skills, as a run reading the config does. Only a copy that
+    brings nothing but skills (no hooks, MCP servers or apps: those would undo the isolation, and
+    the hook trust bypass would trust its hooks). Of several marketplaces, the one config.toml
+    enables. [] when Codex has no such copy (the skills stay readable by `ttp skill`)."""
+    cache = codex_home() / "plugins" / "cache"
+    try:
+        markets = sorted(d.parent.name for d in cache.glob(f"*/{OWN_PLUGIN}") if d.is_dir())
+    except OSError:
+        return []
+    usable = [m for m in markets if _skills_only(cache / m / OWN_PLUGIN)]
+    if not usable:
+        return []
+    config = _read(codex_home() / "config.toml")
+    enabled = [m for m in usable
+               if re.search(rf"^\s*\[?\s*plugins\.[\"']{re.escape(f'{OWN_PLUGIN}@{m}')}[\"']", config, re.M)]
+    key = f"{OWN_PLUGIN}@{(enabled or usable)[0]}"
+    return ["-c", f"plugins={{{toml_string(key)}={{enabled=true}}}}"]
+
+
+def _skills_only(plugin: Path) -> bool:
+    """Whether every installed version of a plugin has a manifest and brings nothing but skills."""
+    try:
+        versions = [v for v in plugin.iterdir() if v.is_dir()]
+        for v in versions:
+            manifest = json.loads((v / ".codex-plugin" / "plugin.json").read_text())
+            if not isinstance(manifest, dict) or any(k in manifest for k in PLUGIN_EXTRAS) \
+                    or any((v / f).exists() for f in PLUGIN_EXTRA_FILES):
+                return False
+    except (OSError, ValueError):
+        return False
+    return bool(versions)
 
 
 def config_has_hooks(config_toml: str) -> bool:
