@@ -261,6 +261,8 @@ def test_kill_guard_allows_a_group_its_tasks_earlier_run_detached_and_nothing_fo
 
         assert refusal(pgid) is None
         assert killguard.refusal(f"kill -9 {pgid}", str(me), str(me)) is None, "its leading pid too"
+        assert killguard.refusal(f"pkill -g {pgid}", str(me), str(me)) is None, "and pkill scoped to its group"
+        assert killguard.refusal(f"pkill -g {opgid}", str(me), str(me)), "never another task's group"
         assert refusal(opgid) and "not start" in refusal(opgid), "another task's job"
         assert refusal(pgid, task=other) and refusal(pgid, run=_add_run(p, other, "other-2")), \
             "a run of another task, or a task id with another task's run, owns nothing"
