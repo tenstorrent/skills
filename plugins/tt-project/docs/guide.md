@@ -1549,9 +1549,9 @@ session and stateless coordinators on every provider.
   check, maybe before the daemon starts the job. Stage what it needs from the commit inside the job
   (`git archive <sha>` from the repository, not the check's clean checkout). Make its work dir
   inside the job, after it is detached (`W=$(mktemp -d "$TMPDIR/gate.XXXXXX")` or under
-  `$TTP_JOB_DIR`): one made before, under the caller's `TMPDIR`, goes with the caller. A queued job
-  whose directory is gone when the daemon starts it starts in `$TTP_JOB_DIR`, with a line in its
-  log saying so.
+  `$TTP_JOB_DIR`): one made before, under the caller's `TMPDIR`, goes with the caller. A check's
+  queued job whose directory is gone when the daemon starts it starts in `$TTP_JOB_DIR`, with a
+  line in its log saying so (a relaunched job's gone directory still fails it).
   A `ttp detach` run in a PID namespace that /proc does not show (as `unshare --pid` makes) is
   queued the same way, so the pid in a job's record (detached.json) is the host's, stored with that
   pid's start time: every pid check (stops, bounds, remote verdicts) takes a pid whose start time

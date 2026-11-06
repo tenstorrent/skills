@@ -2994,9 +2994,11 @@ def test_a_checks_detached_job_keeps_its_files_after_the_push_exits_busy_and_its
     head = check_tmp / "head"
     head.mkdir(parents=True)
     seen = tmp_path / "seen"
-    job = ('set -e; d=$(mktemp -d "$TMPDIR/x.XXXXXX"); echo staged >"$d/f"; mkdir -p "$TTP_JOB_DIR/w"; '
-           'cp "$d/f" "$TTP_JOB_DIR/w/f"; sleep 0.2; cat "$TTP_JOB_DIR/w/f" "$d/f" >' + shlex.quote(str(seen))
-           + '; printf "%s\\n%s\\n%s\\n" "$PWD" "$TTP_JOB_DIR" "$TMPDIR" >>' + shlex.quote(str(seen)))
+    # As a gate does: stage a head dir under $TMPDIR and copies under $TTP_JOB_DIR, then enter the head dir.
+    job = ('set -e; s=$PWD; d=$(mktemp -d "$TMPDIR/x.XXXXXX"); mkdir "$d/head"; echo staged >"$d/head/f"; '
+           'mkdir -p "$TTP_JOB_DIR/w"; cp "$d/head/f" "$TTP_JOB_DIR/w/f"; cd "$d/head"; cat "$TTP_JOB_DIR/w/f" f >'
+           + shlex.quote(str(seen)) + '; printf "%s\\n%s\\n%s\\n" "$s" "$TTP_JOB_DIR" "$TMPDIR" >>'
+           + shlex.quote(str(seen)))
     check = f"{shlex.quote(sys.executable)} {shlex.quote(str(TTP))} detach gate -- sh -c {shlex.quote(job)}; exit 75"
     e = {**os.environ, "TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report), "TTP_SANDBOX_CHECKS": "1",
          "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": "", "TTP_CHECK_SANDBOX": "tok",
