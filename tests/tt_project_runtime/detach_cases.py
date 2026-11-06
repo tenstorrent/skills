@@ -2550,6 +2550,33 @@ def _check_report(p, marker=None):
     return report
 
 
+def _sandbox_verdict(sandbox, tries=5):
+    """sandbox.status() once its probe answered: on a loaded host a probe can time out, which is no
+    verdict (status probes again on the next call) and makes sandbox.wrap run the command unsandboxed."""
+    for _ in range(tries):
+        pre, why = sandbox.status()
+        if pre or sandbox.TIMED_OUT not in why:
+            return pre, why
+    pytest.fail(f"the sandbox probe timed out {tries} times: {why}")
+
+
+def test_sandbox_verdict_asks_again_after_a_probe_that_timed_out(monkeypatch):
+    """A timed-out probe makes sandbox.wrap run a command as it is (the flake of the sandboxed checks test:
+    its check ran unsandboxed, so `ttp detach` started the job itself); _sandbox_verdict waits for an answer."""
+    from ttp import sandbox
+    answers = iter([(None, f"unshare: {sandbox.TIMED_OUT}"), (None, f"bwrap: {sandbox.TIMED_OUT}"), (["/sb"], "")])
+    monkeypatch.setattr(sandbox, "_STATE", {})
+    monkeypatch.setattr(sandbox, "_probe", lambda: next(answers))
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
+    on = {sandbox.ENV: "1", "TTP_NO_DEVICE": ""}
+    assert sandbox.wrap(["true"], True, on) == ["true"]
+    assert _sandbox_verdict(sandbox) == (["/sb"], "")
+    assert sandbox.wrap(["true"], True, on)[0] == "/sb"
+    monkeypatch.setattr(sandbox, "_STATE", {})
+    monkeypatch.setattr(sandbox, "_probe", lambda: (None, "bwrap: exit 1"))
+    assert _sandbox_verdict(sandbox) == (None, "bwrap: exit 1")   # a real verdict: no sandbox here
+
+
 def test_a_sandboxed_checks_detached_job_is_started_by_the_daemon_and_outlives_the_check(env, tmp_path, monkeypatch):
     """A push check run in the process sandbox (TTP_SANDBOX_CHECKS=1) starts `ttp detach gate -- ...` and
     exits 75. The job is queued (the sandbox would end it with the check), the daemon starts it outside,
@@ -2571,9 +2598,14 @@ def test_a_sandboxed_checks_detached_job_is_started_by_the_daemon_and_outlives_t
          "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": "", "TTP_CHECKS_TMP_FD": "9", "TTP_CHECK_SANDBOX": "tok"}
     for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED"):
         e.pop(k, None)
-    r = subprocess.run(sandbox.wrap(["sh", "-c", check], True, e), env=e, cwd=str(tmp_path),
-                       capture_output=True, text=True, timeout=60)
-    assert r.returncode == 75, r
+    if not sandbox.inside():   # else the check runs in this one, which `ttp detach` sees
+        pre, why = _sandbox_verdict(sandbox)
+        if pre is None:
+            pytest.skip(f"no process sandbox works on this host: {why}")
+    cmd = sandbox.wrap(["sh", "-c", check], True, e)
+    assert sandbox.inside() or cmd[:len(pre)] == pre, "the check must run in the sandbox"
+    r = subprocess.run(cmd, env=e, cwd=str(tmp_path), capture_output=True, text=True, timeout=60)
+    assert r.returncode == 75 and "queued" in r.stdout, r
     rc = report / "gate.rc"
     detach.tend(p)   # the daemon's tick
     assert _wait_for_path(hb), "the job never ran outside the check"
