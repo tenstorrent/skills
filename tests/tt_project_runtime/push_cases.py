@@ -14347,6 +14347,7 @@ def test_a_push_batch_reruns_a_failing_test_once_at_the_same_head_and_goes_on_wh
     [f] = m["flaky_tests"]
     assert f["ids"] == [_FLAKY_ID] and f["cmd"] == _FLAKY_CHECK and f["head"] == m["pushed_sha"]
     assert m["checks"]["flaky"] is True and m["checks"]["reruns"] == 1
+    assert m["checks"]["passed"] == [_FLAKY_CHECK], "a flaky pass clears the check's script_torn count"
     assert not pushpass.passed(p, pushpass.tree_of(p.root, m["pushed_sha"]), _FLAKY_CHECK,
                                pushpass.env_id(p.root, _FLAKY_CHECK, {}, tip)), "a rerun pass is not the tree's pass"
     st, now = {}, time.time()

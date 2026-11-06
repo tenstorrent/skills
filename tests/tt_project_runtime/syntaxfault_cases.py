@@ -266,3 +266,34 @@ def test_push_batch_holds_on_a_transient_syntax_error_again_and_requeues_its_ent
     assert m["checks"]["script_torn"]["scripts"] == [str(whole)], m
     out = capsys.readouterr().out
     assert "the batch is held, not failed" in out and "check failed on" not in out, out
+
+
+def test_a_push_batch_records_each_check_that_passed_as_its_command(env, monkeypatch):
+    """checks.passed (which clears a check's script_torn count in pushq._torn_told) lists every check
+    the batch passed, each as str(cmd)."""
+    a, b = "true", "echo ok"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [a, b])
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    assert m["checks"]["passed"] == [a, b], m
+
+
+def test_a_push_batch_held_script_torn_records_only_the_checks_that_passed_and_a_reused_pass(env, monkeypatch):
+    """Two checks, the first passes and the second is held script_torn: checks.passed lists only the
+    first. The next batch on the same tree reuses the first check's pass, and checks.passed lists it
+    too, with the second check that now passes."""
+    from ttp import push
+    d = env["tmp"] / "torn"
+    d.mkdir()
+    _, _, whole, _ = _torn_repo(d)
+    _outside_temp(monkeypatch)
+    argv, ran = _torn_check(d, [_torn_line(whole), _torn_line(whole), ""])
+    a, torn = "true", f"[ -e f1.txt ] || exit 0; {' '.join(argv)}"
+    p, repo, origin, other = _push_setup(env, monkeypatch, [a, torn])
+    heads = [_entry(repo, "e1", {"f1.txt": "1\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == push.BUSY and m["outcome"] == "script_torn" and ran() == 2, m
+    assert m["checks"]["passed"] == [a], m
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and ran() == 3, m
+    assert m["checks"]["reused"] == 1 and m["checks"]["passed"] == [a, torn], m
