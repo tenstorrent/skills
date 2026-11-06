@@ -15,7 +15,9 @@ with a threshold under `coordinator.course_check` in project.json (0 turns one o
   blocker sweep covers them.
 - spend: a task of one kind open or finished in the last 24 h that spent `spend_ratio` (3) times
   or more the project's 7-day median per finished task of that kind, and at least `spend_min_usd`
-  ($2); the median needs `spend_min_samples` (5) finished tasks.
+  ($2); the median needs `spend_min_samples` (5) finished tasks. At most COSTLY_SHOWN lines, open
+  tasks first, then the costliest finished ones, in id order; one count line names the rest and
+  `ttp course <project>`, which lists them all.
 - idle_turns: the last `idle_turns` (6) or more coordinator turns in a row decided nothing, with
   their cost and what woke them.
 
@@ -39,6 +41,7 @@ DEFAULTS = {"fails_24h": 3, "queued_h": 6, "spend_ratio": 3, "spend_min_usd": 2,
 BAD_RUNS = ("failed", "lost", "timeout", "stalled")
 DAY = 86400
 TITLE_CHARS = 60
+COSTLY_SHOWN = 10   # the 'costly:' lines a digest shows; the rest are one count line
 
 
 def settings(cfg: dict | None) -> dict:
@@ -157,9 +160,19 @@ def idle_turns(db: DB, at: float) -> dict | None:
             "hours": (float(streak[0]["started"] or 0) - float(streak[-1]["started"] or 0)) / 3600, "wakes": wakes}
 
 
-def digest_lines(db: DB, cfg: dict | None, now: float | None = None) -> tuple[list[str], str]:
+def _costly(rows: list[dict], cap: int | None) -> tuple[list[dict], list[dict]]:
+    """(the rows shown, the rest): open tasks first, then the costliest finished ones, shown in id order
+    so a kept row keeps its place."""
+    if cap is None or len(rows) <= cap:
+        return sorted(rows, key=lambda t: t["id"]), []
+    ranked = sorted(rows, key=lambda t: (t["status"] in TERMINAL_TASK_STATES, -t["usd"], t["id"]))
+    return sorted(ranked[:cap], key=lambda t: t["id"]), ranked[cap:]
+
+
+def digest_lines(db: DB, cfg: dict | None, now: float | None = None,
+                 costly_cap: int | None = COSTLY_SHOWN) -> tuple[list[str], str]:
     """The section's lines ([] when nothing trips) and its identity for collapsing (conditions and
-    task ids, no counts or clocks)."""
+    task ids, no counts or clocks). `costly_cap`: the 'costly:' lines shown (None: all)."""
     now = time.time() if now is None else now
     s = settings(cfg)
     lines, ident = [], []
@@ -172,12 +185,18 @@ def digest_lines(db: DB, cfg: dict | None, now: float | None = None) -> tuple[li
                      f"{', '.join(q['why'][:6])}; {q['free']} of {q['slots']} worker slots free | "
                      "unblock or drop the dependency, route around the resource, or cancel")
         ident.append("queued:" + ",".join(str(t["id"]) for t in q["tasks"]))
-    for t in spend(db, s["spend_ratio"], s["spend_min_usd"], s["spend_min_samples"], now):
+    shown, rest = _costly(spend(db, s["spend_ratio"], s["spend_min_usd"], s["spend_min_samples"], now), costly_cap)
+    for t in shown:
         lines.append(f"- costly: #{t['id']} '{t['title']}' ({t['status']}) spent ${t['usd']:.2f}, {t['x']:.1f}x the "
                      f"7-day median ${t['median']:.2f} per done {t['kind']} task | "
                      + ("split it, lower its tier or stop it" if t["status"] not in TERMINAL_TASK_STATES
                         else "find why (retries, scope, tier) before queuing more like it"))
         ident.append(f"spend:{t['id']}")
+    if rest:
+        n_open = sum(1 for t in rest if t["status"] not in TERMINAL_TASK_STATES)
+        lines.append(f"- costly: {len(rest)} more not listed ({n_open} open, {len(rest) - n_open} finished in 24 h; "
+                     f"${sum(t['usd'] for t in rest):.2f}) | list them all: "
+                     f"`ttp course {(cfg or {}).get('name') or '<project>'}`")
     if i := idle_turns(db, s["idle_turns"]):
         woke = ", ".join(f"{k} {v}" for k, v in sorted(i["wakes"].items(), key=lambda kv: (-kv[1], kv[0])))
         lines.append(f"- idle turns: the last {i['n']} coordinator turns decided nothing (${i['usd']:.2f} over "

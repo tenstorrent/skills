@@ -453,13 +453,13 @@ only in the feed and never under "needs you".
   20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
   backstop. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
-  line naming the sections left out. Only the Open tasks section goes row by row, keyed by task id
-  (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,
+  line naming the sections left out. Only the Open tasks section, keyed by task id, and the Course
+  check, keyed by sign and task id (`- costly: #<id>`), go row by row (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,
   each whole, and a line naming every added, changed and removed task and counting the rest; an age or
   read time alone is no change. It still goes whole when a task id repeats, its list is cut short by
   its row limit, its heading changed in more than its counts, more than half its rows changed or its
-  rows only changed order. Every other section (memory, user corrections, promises, chats, course
-  check, resources and the like) is compared as raw text and sent whole on any change, so one changed
+  rows only changed order. Every other section (memory, user corrections, promises, chats,
+  resources and the like) is compared as raw text and sent whole on any change, so one changed
   line there resends the section. Accepted gap: a chats or promises section whose only change is an
   age is resent whole too.
   A new session, a daemon restart, a stateless, failed or
@@ -540,7 +540,8 @@ only in the feed and never under "needs you".
   failed `fails_24h` (3) times in 24 h; queued tasks that never ran held `queued_h` (6) hours on a
   dependency or paused resource while worker slots are free; a task that spent `spend_ratio` (3)
   times the 7-day median of its kind and at least `spend_min_usd` ($2), given `spend_min_samples` (5)
-  finished ones; and the last `idle_turns` (6) coordinator turns in a row that decided nothing.
+  finished ones (at most 10 lines, open tasks first, then a count line; `ttp course <project>` lists
+  them all); and the last `idle_turns` (6) coordinator turns in a row that decided nothing.
   Thresholds live under `coordinator.course_check` (0 turns one off). The coordinator corrects course
   in that turn or says why it is fine.
 - Corrections: a user or chat message that points out a miss is a likely correction, flagged

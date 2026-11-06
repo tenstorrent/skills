@@ -786,6 +786,44 @@ def test_coordsession_delta_sends_open_task_rows_added_changed_and_removed_by_ke
     assert "removed (no longer open): #1;" in tasks(a, *more)[0]
 
 
+def test_coordsession_delta_sends_course_check_rows_by_sign_and_task_id():
+    """The Course check goes row by row like Open tasks, keyed by sign and task id: a costly row already
+    shown and unchanged is not resent, a new or changed one is sent whole and named, the count line
+    is keyed 'costly more', and an age alone is no change."""
+    from ttp import coordsession as cs
+    head = "## Course check (correct course this turn, or say in summary why it is fine)"
+    parts = lambda *rows: _cs_rowparts(head, *rows, key="course_check")
+    cost = lambda n, usd: (f"- costly: #{n} 'task {n}' (done) spent ${usd:.2f}, 5.0x the 7-day median $1.00 per "
+                           "done code task | find why (retries, scope, tier) before queuing more like it")
+    held = "- queued work held: #9 never ran, oldest 6.4h, held by dependency #8; 3 of 8 worker slots free | unblock"
+    fail = "- failing: #5 'task 5' failed 3 times in 24 h ($1.00) | change the approach"
+    rows = [held, fail, *(cost(n, 5) for n in range(10, 18)), "- costly: 7 more not listed (0 open, 7 finished "
+            "in 24 h; $40.00) | list them all: `ttp course demo`"]
+    ack = cs.wake_digest("new", None, parts(*rows), parts(*rows), "f", "f", "g")[1]
+    assert list(ack["keyed"]["course_check"]["rows"])[:3] == ["queued work held #9", "failing #5", "costly #10"]
+    assert list(ack["keyed"]["course_check"]["rows"])[-1] == "costly more"
+    st = {cs.DIGEST: ack}
+
+    def course(*rows):
+        sent, _, why = cs.wake_digest("resume", st, parts(*rows), [], "f", "f", "g")
+        assert why.startswith("delta: "), why
+        return dict(sent).get("course_check"), dict(sent)[cs.DELTA]
+    got, line = course(held.replace("6.4h", "7.0h"), *rows[1:])   # an age alone
+    assert got is None and "Course check" in line.split("Unchanged, not repeated:")[1], line
+    new = cost(20, 9)
+    count = rows[-1].replace("7 more", "8 more").replace("$40.00", "$45.00")
+    got, line = course(*rows[:3], cost(11, 6), *rows[4:-1], new, count)
+    assert got.split("\n") == [head, "(rows since your last wake, by key: added costly #20; changed costly #11, "
+                                "costly more; 9 as last shown, not repeated, their ages grown since)",
+                                cost(11, 6), new, count], got
+    assert "(by row, as their key line says: Course check)" in line
+    got = course(*rows[:2], *rows[3:])[0]   # a costly row dropped from the list
+    assert "removed (no longer shown): costly #10;" in got and "no longer open" not in got
+    # The same task id under two signs is two keys; a repeated key sends the section whole.
+    assert "(rows since" in course(*rows[:2], "- costly: #5 'task 5' (queued) spent $9.00", *rows[2:])[0]
+    assert course(*rows, rows[3])[0] == dict(parts(*rows, rows[3]))["course_check"]
+
+
 def test_coordsession_delta_sends_a_keyed_section_whole_when_rows_cannot_stand_alone():
     """Each case a row update could mislead goes whole: a heading changed in more than its counts, a line
     with no key or a repeated key, a majority of rows changed, rows only reordered, a list cut short by

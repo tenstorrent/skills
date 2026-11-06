@@ -19062,6 +19062,40 @@ def test_course_check_flags_spend_far_above_the_projects_own_median(env):
     assert len(course.digest_lines(p.db, p.config())[0]) == 2
 
 
+def test_course_check_caps_costly_lines_open_first_and_counts_the_rest(env):
+    """Many costly tasks: COSTLY_SHOWN lines, open ones first then the costliest finished, in id order,
+    one count line naming the rest and the command that lists them; the identity names only the shown."""
+    from ttp import course
+    p = make(env)
+    for i in range(20):
+        t = p.db.add_task(f"routine {i}", "s", origin="user", kind="code")
+        p.db.update_task(t, status="done", spent_usd=1.0)
+    done = []   # the median stays $1.00
+    for i in range(14):
+        t = p.db.add_task(f"pricey done {i}", "s", origin="user", kind="code")
+        p.db.update_task(t, status="done", spent_usd=5.0 + i)
+        done.append(t)
+    opened = []
+    for i in range(3):
+        t = p.db.add_task(f"pricey open {i}", "s", origin="user", kind="code")
+        p.db.update_task(t, spent_usd=4.0)
+        opened.append(t)
+    lines, ident = course.digest_lines(p.db, p.config())
+    costly = [ln for ln in lines if ln.startswith("- costly: #")]
+    shown = sorted(opened + done[-7:])   # the 3 open ones, then the 7 costliest finished
+    assert len(costly) == course.COSTLY_SHOWN == 10 and [int(ln.split("#")[1].split(" ")[0]) for ln in costly] == shown
+    assert lines[-1] == (f"- costly: 7 more not listed (0 open, 7 finished in 24 h; ${sum(5.0 + i for i in range(7)):.2f}) | "
+                         f"list them all: `ttp course {p.name}`"), lines[-1]
+    assert ident == "\n".join(f"spend:{t}" for t in shown)
+    every = course.digest_lines(p.db, p.config(), costly_cap=None)[0]
+    assert len([ln for ln in every if ln.startswith("- costly: #")]) == 17 and "more not listed" not in every[-1]
+    # A task joining past the cap changes only the count line, not the shown rows or the identity.
+    extra = p.db.add_task("cheap one", "s", origin="user", kind="code")
+    p.db.update_task(extra, status="done", spent_usd=4.5)
+    again, ident2 = course.digest_lines(p.db, p.config())
+    assert again[:-1] == lines[:-1] and ident2 == ident and again[-1].startswith("- costly: 8 more not listed")
+
+
 def test_course_check_flags_a_run_of_coordinator_turns_that_decided_nothing(env):
     from ttp import course
     p = make(env)

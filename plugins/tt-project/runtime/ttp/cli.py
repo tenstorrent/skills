@@ -2002,6 +2002,16 @@ def cmd_audit(a) -> None:
         print("\n".join(f"- {line}" for line in audit.lines(p.db, window_s=a.hours * 3600, blocked_h=hours, p=p)))
 
 
+def cmd_course(a) -> None:
+    """Read-only: the Course check's lines with every costly task listed (the digest shows COSTLY_SHOWN)."""
+    from . import course
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if not p:
+        die("no tt-project project here; name one: `ttp course <name>`")
+    lines = course.digest_lines(p.db, p.config(), costly_cap=None)[0]
+    print("\n".join(lines) if lines else "Course check: nothing trips")
+
+
 def cmd_echoes(a) -> None:
     """Every retirement and every echo match (echoes.export): what the digest omits too; `--ack` hides one."""
     from . import echoes
@@ -11769,7 +11779,7 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "uninstall")),
+               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "course", "uninstall")),
 )
 
 
@@ -12144,6 +12154,11 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--hours", type=float, default=24, help="the window to audit, in hours (default 24)")
     s.add_argument("--json", action="store_true", help="print JSON")
     s.set_defaults(fn=cmd_audit)
+
+    s = sub.add_parser("course", help="read-only: the Course check's own signs (failing, held, costly, idle "
+                                      "turns) with every costly task listed; the digest shows at most 10 of those")
+    s.add_argument("name", nargs="?", help="the project (default: the one here)")
+    s.set_defaults(fn=cmd_course)
 
     s = sub.add_parser("echoes", help="read-only: every retired rule (its kind, text, replacement, source, time) "
                                       "and every match, directive, advisory, historical or acknowledged, the digest's "
