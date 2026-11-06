@@ -139,7 +139,7 @@ def test_credwatch_covers_every_file_under_the_write_guards_protected_paths_by_s
     time.sleep(0.05)   # past the kernel's coarse ctime tick
     tok = access / "token"
     st = tok.stat()
-    tok.write_text("T1\n")   # same size, mtime put back: only ctime tells
+    tok.write_text("T1\n")   # same size, mtime put back: only ctime tells, as for a chmod (still told, as metadata)
     os.utime(tok, ns=(st.st_atime_ns, st.st_mtime_ns))
     (access / "sub" / "key").unlink()
     (access / "new").write_text("x\n")
@@ -149,7 +149,7 @@ def test_credwatch_covers_every_file_under_the_write_guards_protected_paths_by_s
     after = credwatch.snapshot({p: "store" for p in credwatch.guarded_paths(env, cfg)})
     assert credwatch.changes(before, after) == sorted([
         [str(home / ".config" / "example-missing"), "created"], [str(access / "new"), "created"],
-        [str(access / "sub" / "key"), "removed"], [str(tok), "changed"]])
+        [str(access / "sub" / "key"), "removed"], [str(tok), "metadata"]])
     # A mark taken by an older runtime (no ctime) compares on its own fields only.
     old = {"kinds": before["kinds"], "marks": {p: m[:3] if m else m for p, m in before["marks"].items()}}
     assert [str(tok), "changed"] not in credwatch.changes(old, after)
@@ -263,3 +263,131 @@ def test_credwatch_a_ledgered_change_is_normal_and_a_transcript_line_or_the_file
     (run_dir / "output.jsonl").write_text(json.dumps({"cmd": "gh auth status"}) + "\n" +
                                           json.dumps({"cmd": "gh auth login --with-token"}) + "\n")
     assert credwatch.transcript_hit(run_dir, gh, str(home))[0] == 2
+
+
+def test_credwatch_a_ctime_only_change_is_metadata_told_at_normal_and_fails_no_run(env, monkeypatch):
+    """A chmod of a store (same size, mtime and inode; only ctime moves) is told once at normal severity and
+    the run's hand-off stands; a store whose contents change still counts as changed."""
+    from ttp import credwatch
+    from ttp.daemon import Daemon
+    p = make(env)
+    home = pathlib.Path(os.environ["HOME"])
+    access = home / ".config" / "example-access"
+    access.mkdir(parents=True)
+    (access / "token").write_text("t1\n")
+    (access / "token").chmod(0o600)
+    watched = {str(access / "token"): "store"}
+    before = credwatch.snapshot(watched)
+    time.sleep(0.05)   # past the kernel's coarse ctime tick
+    (access / "token").chmod(0o400)
+    assert credwatch.changes(before, credwatch.snapshot(watched)) == [[str(access / "token"), "metadata"]]
+    (access / "token").chmod(0o600)
+    (env["home"] / "settings.json").write_text(json.dumps({"guards": {"protected_paths": ["~/.config/example-access"]}}))
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; chmod 400 {shlex.quote(str(access / 'token'))}")
+    tid = p.db.add_task("chmod the access token", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    d.dispatch()
+    _finish_runs(p, d)
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert len(rows) == 1 and rows[0]["severity"] == "normal" and "attributes changed" in rows[0]["text"], rows
+    assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
+
+
+def _overlap(p, start: float, end: float | None = None) -> int:
+    """A run of another task whose window spans [start, end) (end None: still open)."""
+    other = p.db.add_task("other run", "s", kind="work", tier="light", origin="user")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (other,))
+    return p.db.x("INSERT INTO runs(task, role, started, ended, status) VALUES(?, 'worker', ?, ?, 'done')",
+                  (other, start, end))
+
+
+def test_credwatch_a_change_seen_by_overlapping_runs_is_told_once_outside_these_runs_and_fails_none(env, monkeypatch):
+    """A store rewritten in place while a run of another project (or another of this project's runs) was open
+    too: no run can be tied to it. It is told once at normal severity as changed outside these runs, and the
+    hand-off stands; the next run that saw the same change adds nothing. A store replaced (new inode) under the
+    same overlap, or rewritten to another size, keeps the high alarm but fails no run; a removal (no time to place it) still fails the run."""
+    from ttp import credwatch
+    from ttp.daemon import Daemon
+    p = make(env)
+    other = _second_project(env, "other-proj")
+    home = pathlib.Path(os.environ["HOME"])
+    access = home / ".config" / "example-access"
+    access.mkdir(parents=True)
+    tok = access / "token"
+    tok.write_text("t1\n")
+    (env["home"] / "settings.json").write_text(json.dumps({"guards": {"protected_paths": ["~/.config/example-access"]}}))
+    _overlap(other, time.time() - 3600)   # another project's run, still open
+    other.db.x("UPDATE runs SET ended=NULL")
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 't2\\n' > {shlex.quote(str(tok))}")
+    tid = p.db.add_task("work beside the other project", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    d.dispatch()
+    _finish_runs(p, d)
+    rows = p.db.q("SELECT severity, text, fingerprint FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert len(rows) == 1 and rows[0]["severity"] == "normal" and "outside these runs" in rows[0]["text"], rows
+    assert p.db.task(tid)["status"] == "done", p.db.task(tid)["result"]
+    # A second run of this project that saw the same change (same path and new ctime): told once in all.
+    run = dict(p.db.one("SELECT * FROM runs WHERE task=?", (tid,)))
+    exit_info = json.loads((pathlib.Path(run["dir"]) / "exit.json").read_text())
+    assert exit_info["cred_changed"] == [[str(tok), "changed"]]
+    second = dict(run, id=_overlap(p, run["started"] - 10, time.time()), task=None, role="worker")
+    got = d._cred_verdicts(second, exit_info, pathlib.Path(run["dir"]))
+    assert credwatch.observe(p.db, second, exit_info["cred_changed"], time.time() + 120, got) == 0
+    assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'credwatch:%'")) == 1
+    # Replaced (a new inode) under the same overlap: high, but no run fails for it.
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'k\\n' > {shlex.quote(str(tok))}.n && "
+                                         f"mv {shlex.quote(str(tok))}.n {shlex.quote(str(tok))}")
+    swap = p.db.add_task("swap", "s", kind="work", tier="light", origin="user")
+    d.dispatch()
+    _finish_runs(p, d)
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
+    assert len(rows) == 2 and rows[1]["severity"] == "high" and "outside these runs" in rows[1]["text"], rows
+    assert p.db.task(swap)["status"] == "done"
+    # Rewritten in place to another size (a test value over a login) under the same overlap: high too.
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'longer value\\n' > {shlex.quote(str(tok))}")
+    resize = p.db.add_task("resize", "s", kind="work", tier="light", origin="user")
+    d.dispatch()
+    _finish_runs(p, d)
+    rows = p.db.q("SELECT severity FROM events WHERE fingerprint LIKE 'credwatch:%' ORDER BY id")
+    assert [r["severity"] for r in rows] == ["normal", "high", "high"] and p.db.task(resize)["status"] == "done", rows
+    # Removed: no ctime places it, so the run that saw it fails as before.
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"rm {shlex.quote(str(tok))}")
+    gone = p.db.add_task("remove", "s", kind="work", tier="light", origin="user")
+    d.dispatch()
+    _finish_runs(p, d)
+    res = json.loads(p.db.task(gone)["result"] or "{}")
+    assert res.get("status") == "failed" and res.get("cred_changed") == [[str(tok), "removed"]], res
+
+
+def test_credwatch_a_change_only_this_run_was_open_for_still_fails_it_and_a_planted_verdict_excuses_nothing(env, monkeypatch):
+    """The run alone was open when the store changed: it fails, high, even when other runs ended before the
+    change or started after it; a verdict file the agent wrote into its own run dir is overwritten."""
+    from ttp import credwatch
+    from ttp.daemon import Daemon
+    p = make(env)
+    other = _second_project(env, "other-proj")
+    home = pathlib.Path(os.environ["HOME"])
+    ssh = home / ".ssh"
+    ssh.mkdir(parents=True, exist_ok=True)
+    key = ssh / "id_example"
+    key.write_text("k\n")
+    now = time.time()
+    _overlap(other, now - 7200, now - 3600)   # ended before
+    _overlap(other, now + 3600, now + 7200)   # starts after
+    plant = json.dumps({str(key): ["shared", 0]})
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'k2\\n' > {shlex.quote(str(key))}.n && "
+                                         f"mv {shlex.quote(str(key))}.n {shlex.quote(str(key))} && "
+                                         f"printf '%s' {shlex.quote(plant)} > \"$TTP_RUN_DIR/{credwatch.VERDICTS}\"")
+    tid = p.db.add_task("rotate a key alone", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    d.dispatch()
+    _finish_runs(p, d)
+    rows = p.db.q("SELECT severity FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert [r["severity"] for r in rows] == ["high"], rows
+    res = json.loads(p.db.task(tid)["result"] or "{}")
+    assert res.get("status") == "failed" and res.get("cred_changed") == [[str(key), "changed"]], res
+    # classify() alone: the same change with an open run of another project would be shared.
+    assert credwatch.runs_at(now, [other.state / "project.db"]) == 0
+    _overlap(other, now - 60)
+    other.db.x("UPDATE runs SET ended=NULL WHERE started=?", (now - 60,))
+    assert credwatch.runs_at(now, [other.state / "project.db"]) == 1

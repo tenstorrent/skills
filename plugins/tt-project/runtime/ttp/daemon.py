@@ -4358,6 +4358,23 @@ class Daemon:
         except Exception:   # the scan only discloses: a failure never costs the run its end
             log(self.p, f"run {r['id']}: outside-writes scan failed\n" + traceback.format_exc())
 
+    def _cred_verdicts(self, r: dict, exit_info: dict, run_dir: Path) -> dict:
+        """credwatch.classify() of the run's credential changes against every project's runs on this host,
+        stored in the run dir for the hand-off check (_cred_changed), before any finish transaction. Always
+        rewritten, so a file the agent left there excuses nothing."""
+        own = self.p.state / "project.db"
+        dbs = [own] + [d for _, d in gcap.local_projects(skip=str(own.resolve()))]
+        try:
+            got = credwatch.classify(exit_info["cred_changed"], exit_info.get("cred_marks") or {},
+                                     r.get("started"), time.time(), dbs, (str(own), r.get("id")))
+            (run_dir / credwatch.VERDICTS).write_text(json.dumps(got))
+            return got
+        except Exception:   # every change fails the run, as before
+            log(self.p, f"run {r['id']}: credential change check failed\n" + traceback.format_exc())
+            with contextlib.suppress(OSError):
+                (run_dir / credwatch.VERDICTS).unlink(missing_ok=True)
+            return {}
+
     def finish_run(self, r: dict, exit_info: dict) -> None:
         db, p = self.p.db, self.p
         held = ""
@@ -4384,7 +4401,8 @@ class Daemon:
             log(p, f"run {r['id']}: masking stored secrets failed\n" + traceback.format_exc())
         if exit_info.get("cred_changed"):
             try:
-                credwatch.observe(db, r, exit_info["cred_changed"], time.time(), run_dir, p)
+                credwatch.observe(db, r, exit_info["cred_changed"], time.time(), run_dir, p,
+                                  self._cred_verdicts(r, exit_info, run_dir))
             except Exception:
                 log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
@@ -17618,7 +17636,8 @@ def _read_result(path: Path) -> dict | None:
 def _cred_changed(run_dir: Path) -> list:
     """The credential changes (credwatch) the runner wrote to the run's exit.json; [] when none."""
     got = (_read_result(run_dir / "exit.json") or {}).get("cred_changed")
-    return [c for c in got if isinstance(c, list) and len(c) == 2] if isinstance(got, list) else []
+    held = credwatch.held(run_dir)   # metadata-only, or seen by several runs (credwatch.classify): no failure
+    return [c for c in got if isinstance(c, list) and len(c) == 2 and c[0] not in held] if isinstance(got, list) else []
 
 
 def _saved_gate(d: dict | None) -> bud.Gate | None:

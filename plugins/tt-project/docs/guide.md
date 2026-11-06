@@ -2849,10 +2849,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   overlapping runs saw it). When this machine's change ledger (`ttp machines change list --all`) has
   an entry made while the run ran that names the path, the change was a recorded, deliberate one: the
   observation is normal severity, names the entry, its project and task, asks for no urgent work, and
-  the run's hand-off stands. Otherwise it is high and quotes the first line of the run's transcript
-  that names the path or runs a command that writes such a file (ssh-keygen without a scratch `-f`,
-  `gh auth`, `git credential`), or, with none, says the run's commands did not show it and gives the
-  file's time, so the search starts there; and the run's hand-off is stored failed. Provider login
+  the run's hand-off stands. A change of ctime alone (a chmod: same size, mtime and inode) is told at
+  normal severity and fails no run. A change made while another run of any project on the host was open
+  too (the file's new ctime falls inside both runs' windows, `credwatch.classify`) is told once as
+  changed outside these runs and fails no run: at normal severity when rewritten in place at the same
+  size, high when the file is new, replaced or resized. Otherwise it is high and quotes the first line
+  of the run's transcript that names the path or runs a command that writes such a file (ssh-keygen
+  without a scratch `-f`, `gh auth`, `git credential`), or, with none, says the run's commands did not
+  show it and gives the file's time, so the search starts there; and the run's hand-off is stored
+  failed (a removal, or a change only this run was open for). Provider login
   files count only when removed or
   rewritten to under half their size, since their CLIs rewrite them on every token refresh. Nothing is
   restored automatically: without reading contents the harness cannot tell damage from a real change (a new

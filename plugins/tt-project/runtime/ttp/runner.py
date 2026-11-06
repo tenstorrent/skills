@@ -630,6 +630,8 @@ def supervise(run_dir: Path) -> int:
         from . import credwatch
         if changed := credwatch.changes(creds, after):
             exit_info["cred_changed"] = changed   # the daemon queues the observation (credwatch.observe)
+            # Stat marks only (size, mtime, inode, ctime): when each changed, for credwatch.classify.
+            exit_info["cred_marks"] = {p: [creds["marks"].get(p), after["marks"].get(p)] for p, _ in changed}
             print(f"runner: credential files changed during the run: {changed}", flush=True)
     if bridge is not None:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
