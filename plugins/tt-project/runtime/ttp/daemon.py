@@ -1792,6 +1792,8 @@ class Daemon:
         # ssh.reuse for this daemon's own ssh calls too: stepclock routes a bare `ssh` with no env= by
         # this process's environment, which launchd and systemd start without the variable.
         os.environ.update(sshmux.env(self.cfg))
+        from . import sudowatch   # checks.refuse_sudo: the sudo wrapper of its runs' test suites refuses sudo
+        os.environ[sudowatch.ENV_REFUSE] = "1" if sudowatch.refusing(cfg=self.cfg) else "0"
         if status != self.cfg_status:
             log(self.p, {"ok": "project.json reads again",
                          "fallback": "project.json is missing or not valid JSON: its last good copy stays in force",
@@ -4090,6 +4092,7 @@ class Daemon:
                    **({"TTP_LEASE_EPOCH": str(self._lease.epoch)} if self._lease else {}),
                    "TTP_PYTHON": sys.executable,   # `ttp` runs under this, not the venv's python3
                    "TTP_SANDBOX_CHECKS": os.environ.get("TTP_SANDBOX_CHECKS", "0"),   # sandbox.opted_in
+                   "TTP_REFUSE_SUDO": os.environ.get("TTP_REFUSE_SUDO", "0"),   # sudowatch.refusing
                    # Tests run straight in its shell take at most one run's share of the host's test slots.
                    **(testslots.worker_env(self.cfg) if role in ("worker", "reviewer") else {}),
                    # A worker's sandbox may run commands in a PID namespace or cgroup of their own, which

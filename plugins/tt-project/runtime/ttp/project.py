@@ -861,7 +861,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # checkout (runnerenv.lock_of; default "", the plugin's own lock of pytest and pytest-xdist).
         # spill_pre_cmd: the project's own read-only go/skip command before a spill to a host (checkspill.pre_check;
         # default none).
-        return {"nice", "python_lock", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
+        # refuse_sudo: true refuses sudo in the project's test suites (sudowatch; default false: recorded only).
+        return {"refuse_sudo", "nice", "python_lock", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
                 "spill_beside_device", "spill_pre_cmd", "spill_quarantine_after", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max", "test_run_min",

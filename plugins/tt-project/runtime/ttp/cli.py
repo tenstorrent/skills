@@ -3960,6 +3960,9 @@ def cmd_checks(a) -> None:
     cfg = p.config() if p and p.exists() else {}
     if not (p and p.exists()):
         p = None
+    else:   # checks.refuse_sudo, for the sudo wrapper of every check this run starts (sudowatch)
+        from . import sudowatch
+        os.environ[sudowatch.ENV_REFUSE] = "1" if sudowatch.refusing(cfg=cfg) else "0"
     from . import checkcap
     checkcap.adopt_identity(p.base if p else None)   # no TTP_TASK: the project run it was started under, if any
     from . import hostcycle
@@ -6644,8 +6647,13 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     seconds it is ended and subprocess.TimeoutExpired raised, unless `extend` (checkwall.Extension) grants
     more; once its `stdout` file has not grown for `silent_s` seconds (0: never), it is ended and
     checkwall.Silent raised (checkwall.wait)."""
-    from . import checkwall
+    from . import checkwall, sudowatch
     proc = None
+    try:   # the check's sudo calls: recorded, or refused under checks.refuse_sudo (sudowatch)
+        watch = sudowatch.Watch(kw["env"] if kw.get("env") is not None else dict(os.environ))
+        kw["env"] = watch.env
+    except OSError:
+        watch = None
     if (slot := _CHECK_YIELD["slot"]) is not None:   # a slot a yield gave up: held again before more work
         slot.hold_again(_checks_slot_told(kw.get("stdout")))
     _CHECK_STOP.update(defer=True, pending=None)
@@ -6691,6 +6699,27 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
         raise
     finally:
         _CHECK_STOP["defer"] = False
+        _sudo_report(watch, proc, group, kw)
+
+
+def _sudo_report(watch, proc, group: bool, kw: dict) -> None:
+    """Say in the check's log what sudo it ran and the root processes that left running (sudowatch),
+    queue that as one observation, and remove the wrapper. Never fails the check."""
+    from . import sudowatch
+    if watch is None:
+        return
+    try:
+        lines = watch.report((proc.pid,) if group and proc is not None else (), "the check")
+        out = kw.get("stdout")
+        if lines and hasattr(out, "write"):
+            try:
+                out.write("".join(f"ttp checks: {ln}\n" for ln in lines))
+                out.flush()
+            except (OSError, ValueError):
+                pass
+        sudowatch.observe(lines, f"{os.environ.get('TTP_RUN_ID') or os.getpid()}:{watch.started}")
+    finally:
+        watch.close()
 
 
 def _end_check(proc: subprocess.Popen, group: bool = True) -> None:

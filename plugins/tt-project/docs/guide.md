@@ -2285,6 +2285,16 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   wherever the other checks run, add a check pinned to this host (`"host": "local"`) that runs only
   that test. A pass's `env_id` holds a hash of the file (never its text): a pass from before the
   file existed or changed is not reused.
+- sudo in test suites: each command `ttp checks` runs and `ttp sandbox -- <cmd>` get a `sudo` wrapper
+  first on PATH. By default it records each call (time, run, command line) and runs the real sudo
+  unchanged; when the suite ends or hits its time limit, the check's log (or `ttp sandbox`'s stderr) lists
+  the calls and any root process started through them that still runs (a `timeout N sudo cmd` whose sudo
+  was killed orphans its root child, which the suite's user cannot end), and the project gets one
+  observation. This never fails a check. `checks.refuse_sudo: true` (default false; per project:
+  `ttp config <project> checks.refuse_sudo true`) makes the wrapper refuse instead: exit 126, a message
+  naming the key, no real sudo. Commands outside test suites are untouched. A PATH wrapper is no fence:
+  a suite that calls `/usr/bin/sudo` by its absolute path, or resets PATH first (`env -i`, `command -p`),
+  bypasses it, unrecorded and unrefused.
 - A waiting hand-off on the run's own detached checks (`retry_when` `ttp checks --result <run dir>`)
   wakes a model only on a failure, a broken probe or a timeout. With an `on_pass` the pass records it;
   a plain code task with a summary and nothing left records `done` (the default on_pass). Any other

@@ -226,8 +226,9 @@ def run(argv: list[str]) -> int:
     pass-through: existing configs that call it keep working), in a sandbox only where the project
     turned one on. A SIGTERM or SIGHUP to this process (a `timeout`, a closed terminal) ends the whole namespace. A pytest run's xdist
     options are dropped where xdist is not installed (testslots.drop_xdist). The command gets the
-    account's leak-pattern file by path (leakfile), as checks do."""
-    from . import hoststate, leakfile, testslots
+    account's leak-pattern file by path (leakfile), as checks do, and the sudo wrapper (sudowatch): once
+    it ends, stderr says what sudo it ran and which root processes that left running."""
+    from . import hoststate, leakfile, sudowatch, testslots
     # The host's real crontab, systemd user units and power state are out of its reach (hoststate)
     run_dir = os.environ.get("TTP_RUN_DIR")
     env = hoststate.fake_env(leakfile.with_path(dict(os.environ)),
@@ -237,34 +238,49 @@ def run(argv: list[str]) -> int:
     if dropped:
         print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
     argv, grant = _test_slots(list(argv), env)
+    try:
+        watch = sudowatch.Watch(env)
+        env = watch.env
+    except OSError:
+        watch = None
     wrapped = wrap(argv)
     plain = wrapped == list(argv)
     if plain and (line := notice()):
         print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
-    guard = hoststate.Guard(env)
     try:
-        proc = subprocess.Popen(wrapped, env=env, pass_fds=grant.fds() if grant else ())
-    except OSError as e:
-        print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
+        guard = hoststate.Guard(env)
+        try:
+            proc = subprocess.Popen(wrapped, env=env, pass_fds=grant.fds() if grant else ())
+        except OSError as e:
+            print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
+            if temp and env.get(hoststate.MARKER):
+                shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
+            return 127 if isinstance(e, FileNotFoundError) else 126
+
+        def end(*_):
+            try:
+                # unshare --kill-child / bwrap --die-with-parent: the namespace goes with it
+                proc.send_signal(signal.SIGTERM) if plain else proc.kill()
+            except OSError:
+                pass
+
+        signal.signal(signal.SIGTERM, end)
+        signal.signal(signal.SIGHUP, end)
+        signal.signal(signal.SIGINT, signal.SIG_IGN)   # a terminal's Ctrl-C reaches the command (or the sandbox init)
+        rc = proc.wait()
+        changed, said = guard.end()
+        for line in said:
+            print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
         if temp and env.get(hoststate.MARKER):
             shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
-        return 127 if isinstance(e, FileNotFoundError) else 126
-
-    def end(*_):
-        try:
-            # unshare --kill-child / bwrap --die-with-parent: the namespace goes with it
-            proc.send_signal(signal.SIGTERM) if plain else proc.kill()
-        except OSError:
-            pass
-
-    signal.signal(signal.SIGTERM, end)
-    signal.signal(signal.SIGHUP, end)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)   # a terminal's Ctrl-C reaches the command (or the sandbox init)
-    rc = proc.wait()
-    changed, said = guard.end()
-    for line in said:
-        print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
-    if temp and env.get(hoststate.MARKER):
-        shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
-    rc = rc if rc >= 0 else 128 - rc
-    return 1 if changed and rc == 0 else rc
+        rc = rc if rc >= 0 else 128 - rc
+        return 1 if changed and rc == 0 else rc
+    finally:
+        if watch is not None:
+            try:
+                lines = watch.report(what="the command")
+                for ln in lines:
+                    print(f"ttp sandbox: {ln}", file=sys.stderr, flush=True)
+                sudowatch.observe(lines, f"{os.environ.get('TTP_RUN_ID') or os.getpid()}:{watch.started}")
+            finally:
+                watch.close()
