@@ -650,9 +650,10 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # route_cooldown_s: how long a tier routed to it (tiers.<tier>.route, route.py) runs on the
                  # core provider after a fallback. effort_fields: per model, the run's effort to extra request
                  # fields (chatbridge.effort_fields). route_wait_s: how long a routed start waits for a full
-                 # slot before it starts on the core provider (route.wait_s).
+                 # slot before it starts on the core provider (route.wait_s). routes: the ordered rule list
+                 # routing runs by kind, tier and label (route.match).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
-                 "route_wait_s"}
+                 "route_wait_s", "routes"}
 
 
 def write_dirs(root: Path, guard: Path, value: Any) -> tuple[list[str], list[str], list[str]]:

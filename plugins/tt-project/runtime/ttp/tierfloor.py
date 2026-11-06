@@ -15,7 +15,8 @@ ordering a reset, power cycle, soak or device job: DEVICE_SPEC). Such a run
 gets tier max(its own, floor tier) and effort max(its own, floor effort), the nearest effort its
 provider takes. The floor is coordinator.conclusion_floor (default DEFAULT: standard, high). A review's
 diff-sized tier is lifted the same way; a task whose pin the user's own words require (pin_required)
-stays as it is. A floor run never routes to the chat provider (route.py; the run note's
+stays as it is. A floor run never routes to the chat provider (route.py, by tier or by a providers.chat.routes
+rule; the run note's
 `conclusion_floor.kept_core` names the model it skipped), and a pin that is no requirement to the chat
 provider or to its provider's light-tier model is dropped at dispatch (unpin), with a spec note.
 A waiting conclusion task's wake whose wait is over may write the answer, so it runs at the floor too;

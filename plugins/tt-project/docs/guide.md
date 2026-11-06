@@ -1064,6 +1064,18 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    counts them apart (`2 escalated to core`) and `ttp stats --runs` ends with their count by kind.
    `"route_timeout_s"` next to a routed tier's `model` sets the time limit of its routed runs in
    place of the tier's `budget.run_timeout_s`; a start on the core provider keeps the tier default.
+   To route by kind and label, not only by tier, set `providers.chat.routes`, an ordered list of
+   rules (default `[]`, off), for example
+   `"routes": [{"kinds": ["code", "work"], "tiers": ["standard"], "model": "<model id>", "effort": "max"}]`.
+   Each rule takes `model` and any of `kinds`, `tiers`, `labels_any` (one of these labels),
+   `labels_none` (none of these), `effort` and `route_timeout_s`; a label `x` also matches `x:<id>`.
+   The first rule a run matches routes it, at the rule's effort and time limit (else the tier's), and
+   the run's `route` record names the rule's index (`rule`); with no match the tier's own `route`
+   applies. Rules never route reviews, coordinator turns, pinned tasks, tier-up retries or conclusion
+   and device runs, and while a rule list is set, urgent tasks, tasks whose hand-off asked for deep and
+   tasks labelled `urgent`, `needs_deep`, `user_deep`, `review_fix` or `untrusted_input` stay on the
+   core provider, the tier's own route included. A missing-model hold applies to that tier's runs
+   routed to that model only. The coordinator can set the list with `config_set` on your word.
    Routed spend uses the `pricing.chat` row for the model (or its `default` row:
    `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. Without a row
    a chat run keeps Claude Code's `--max-budget-usd`, priced at its fallback rate for a model it does

@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """The provider keys a coordinator config_set may write on the user's word (coordinator.settable),
-beyond the fixed USER_SETTABLE list: per-tier routing (route.py) and the chat endpoint (chatbridge.py).
+beyond the fixed USER_SETTABLE list: per-tier and rule routing (route.py) and the chat endpoint (chatbridge.py).
 
 Worker runs carry internal code, so chat text never points them at a free-form URL:
 - providers.chat.endpoint is accepted only as the alias of an endpoint already saved on this host
@@ -23,12 +23,14 @@ EFFORTS = ("", "minimal", "low", "medium", "high", "xhigh", "max")   # "" keeps 
 MODEL_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/@+-]{0,127}$")
 FIELD_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 FIELD_VALUE_MAX = 64
+WORD_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:-]{0,63}$")   # a kind or label in a providers.chat.routes rule
+ROUTES_MAX = 32
 # Field names some gateways read as a destination or credential (api_base, base_url, api_key, extra_headers).
 WIRING_RE = re.compile(r"url|base|host|endpoint|key|token|auth|header|proxy|secret|cred", re.I)
 # The keys and patterns config_set accepts here, as `ttp config --chat-settable list` prints them.
 PATTERNS = (*(f"providers.<{'|'.join(PROVIDERS)}>.tiers.<{'|'.join(TIERS)}>.{k}" for k in ("model", "effort")),
             *(f"providers.chat.tiers.<{'|'.join(TIERS)}>.{k}" for k in ("route", "route_timeout_s")),
-            "providers.chat.endpoint", "providers.chat.effort_fields")
+            "providers.chat.endpoint", "providers.chat.effort_fields", "providers.chat.routes")
 BASE_URL_REFUSAL = ("{key} is never set from chat: the bridge sends requests only to the base URL saved with "
                     "the endpoint's key; save it with `ttp secret endpoint <alias> --url <base url>` on this host, "
                     "then config_set providers.chat.endpoint to <alias>")
@@ -74,6 +76,39 @@ def _route_timeout(key: str):
             raise ValueError(f"{key}: give seconds, more than 0 and at most {ROUTE_TIMEOUT_MAX_S}")
         return int(n) if n == int(n) else n
     return conv
+
+
+def _routes(v):
+    """providers.chat.routes (route.match): a list (or its JSON) of rules, each a model with optional kinds,
+    tiers, labels_any, labels_none, effort and route_timeout_s; [] turns rule routing off."""
+    from .route import RULE_KEYS
+    where = "providers.chat.routes"
+    if isinstance(v, str):
+        try:
+            v = json.loads(v)
+        except ValueError:
+            raise ValueError(f"{where}: give a JSON list of rules") from None
+    if not isinstance(v, list) or len(v) > ROUTES_MAX:
+        raise ValueError(f"{where}: give a list of at most {ROUTES_MAX} rules ([] for none)")
+    out = []
+    for i, r in enumerate(v):
+        at = f"{where}[{i}]"
+        if not isinstance(r, dict) or set(r) - set(RULE_KEYS) or not r.get("model"):
+            raise ValueError(f"{at}: give an object with a model and only {', '.join(RULE_KEYS)}")
+        rule = {"model": _model(f"{at}.model")(r["model"])}
+        for k in ("kinds", "tiers", "labels_any", "labels_none"):
+            if k in r:
+                ws = r[k]
+                if not isinstance(ws, list) or not all(isinstance(w, str) and WORD_RE.match(w) for w in ws) \
+                        or (k == "tiers" and set(ws) - set(TIERS)):
+                    raise ValueError(f"{at}.{k}: give a list of " + ("tiers: " + ", ".join(TIERS) if k == "tiers" else "words"))
+                rule[k] = ws
+        if "effort" in r:
+            rule["effort"] = _effort(f"{at}.effort", "chat")(r["effort"])
+        if "route_timeout_s" in r:
+            rule["route_timeout_s"] = _route_timeout(f"{at}.route_timeout_s")(r["route_timeout_s"])
+        out.append(rule)
+    return out
 
 
 def _endpoint(v):
@@ -135,6 +170,8 @@ def setter(key: str):
         return _endpoint
     if key == "providers.chat.effort_fields":
         return _effort_fields
+    if key == "providers.chat.routes":
+        return _routes
     return None
 
 

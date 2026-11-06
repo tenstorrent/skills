@@ -17,6 +17,17 @@ chatbridge.upstream_of: never its text, a key, a URL or a host). The run's hand-
 coordinator feed shows, is then one route line (fallback_line) naming the reason, never the run's error
 text: the core provider's run that follows is the outcome that counts.
 
+Rules: `providers.chat.routes` (default [], off) routes by kind and label, not only by tier: an ordered
+list of {kinds, tiers, labels_any, labels_none, model, effort, route_timeout_s}; the first rule a run
+matches (match: each list given must hold, labels_any one label, labels_none no label; `x` also matches
+`x:<id>`) routes it to chat at the rule's model, its effort and time limit (else the tier's), and the
+tier's own route is the fallback when no rule matches. The run's route entry names the rule's `rule`
+index. Every exclusion above holds for rules too (reviews, coordinator turns, pins, tier-up retries,
+floor runs: tierfloor.py), and with a rule list set a task labelled urgent, needs_deep, user_deep,
+review_fix or untrusted_input, an urgent one (urgent.is_urgent) or one whose hand-off asked for deep
+routes nowhere, the tier's own route included (KEEP_CORE, kept_core). A model_missing hold is per tier
+and model: it holds the runs of that tier routed to that model.
+
 Effort: a routed run runs at its tier's `providers.chat.tiers.<tier>.effort`, and every request carries
 the fields `providers.chat.effort_fields` gives its model at that effort; config_problems names a
 routed tier whose requests would carry none. Time limit: `providers.chat.tiers.<tier>.route_timeout_s`
@@ -86,6 +97,10 @@ from pathlib import Path
 
 TO = "chat"                 # the provider a tier can be routed to
 KEY = "route"               # the run note's entry
+ROUTES = "routes"           # providers.chat.routes: the ordered rule list (match)
+RULE_KEYS = ("kinds", "tiers", "labels_any", "labels_none", "model", "effort", "route_timeout_s")
+# Labels (or `<label>:...`) the rule list never routes, on top of each rule's labels_none (kept_core).
+KEEP_CORE = ("urgent", "needs_deep", "user_deep", "review_fix", "untrusted_input")
 COOL = "route_cooldown:"    # kv: {"until", "reason", "run"} per routed-to provider
 REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields an endpoint rejected (logged once)
 COOLDOWN_S = 900
@@ -112,8 +127,7 @@ LEASE_GRACE_S = 900         # a lease outlives its run's time limit by this much
 FAULT_ENDS = ("failed", "request_error", "timeout", "stalled")
 
 
-def target(cfg: dict, tier: str) -> tuple[str, str] | None:
-    """(provider, model) the tier's worker runs are routed to, or None (unset: nothing changes)."""
+def _per_tier(cfg: dict, tier: str) -> tuple[str, str] | None:
     from .provallow import allows
     if (cfg.get("core_provider") or "claude") == TO or not allows(cfg, TO):
         return None
@@ -124,9 +138,103 @@ def target(cfg: dict, tier: str) -> tuple[str, str] | None:
     return TO, str(t["model"])
 
 
-def timeout_s(cfg: dict, tier: str) -> float | None:
-    """The tier's routed run time limit (providers.chat.tiers.<tier>.route_timeout_s), or None: the
-    tier's budget.run_timeout_s applies."""
+def target(cfg: dict, tier: str) -> tuple[str, str] | None:
+    """(provider, model) the tier's worker runs may be routed to, or None (unset: nothing changes): the
+    tier's own route, else the first rule (rules) that can match the tier. A task's run: match."""
+    if to := _per_tier(cfg, tier):
+        return to
+    return next(((TO, r["model"]) for _, r in rules(cfg) if not r["tiers"] or tier in r["tiers"]), None)
+
+
+def rules(cfg: dict) -> list[tuple[int, dict]]:
+    """providers.chat.routes as [(index, rule)], each rule's lists made lists of words; a rule that
+    config_problems names is left out. Empty (the default) when chat is the core provider or not allowed."""
+    from .provallow import allows
+    raw = ((cfg.get("providers") or {}).get(TO) or {}).get(ROUTES) if isinstance((cfg.get("providers") or {}).get(TO), dict) else None
+    if not isinstance(raw, list) or (cfg.get("core_provider") or "claude") == TO or not allows(cfg, TO):
+        return []
+    return [(i, r) for i, r in ((i, _rule(r)) for i, r in enumerate(raw)) if r]
+
+
+def _rule(r) -> dict | None:
+    if not isinstance(r, dict) or set(r) - set(RULE_KEYS) or not isinstance(r.get("model"), str) or not r["model"]:
+        return None
+    out = {"model": r["model"]}
+    for k in ("kinds", "tiers", "labels_any", "labels_none"):
+        v = r.get(k, [])
+        if not isinstance(v, list) or not all(isinstance(x, str) and x for x in v):
+            return None
+        out[k] = v
+    if not isinstance(r.get("effort", ""), str):
+        return None
+    v = r.get("route_timeout_s")
+    if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v <= 0):
+        return None
+    return {**out, "effort": r.get("effort", ""), "route_timeout_s": v}
+
+
+def _labels(task: dict) -> list[str]:
+    v = task.get("labels") or "[]"
+    try:
+        v = json.loads(v) if isinstance(v, str) else v
+    except ValueError:
+        return []
+    return [str(x) for x in v] if isinstance(v, list) else []
+
+
+def _has(labels: list[str], names) -> bool:
+    """A label `name` or `name:<anything>` (review_fix:<id>) for any of `names`."""
+    return any(lb == n or lb.startswith(n + ":") for lb in labels for n in names)
+
+
+def kept_core(task: dict) -> bool:
+    """A task the rule list never routes (KEEP_CORE): an urgent one (urgent.is_urgent too), one whose
+    hand-off asked for deep (needs_deep), or one labelled user_deep, review_fix or untrusted_input."""
+    from . import effort, urgent
+    return _has(_labels(task), KEEP_CORE) or urgent.is_urgent(task) or effort.wants_deep(task.get("result"))
+
+
+def match(cfg: dict, task: dict, tier: str) -> dict | None:
+    """Where a run of `task` at `tier` is routed: {"to", "model", "rule"} from the
+    first rule of providers.chat.routes it matches (`rule` its index), else the tier's own route ("rule"
+    None), else None; its effort: run_model, its time limit: timeout_s. With a rule list set, a kept_core task routes
+    nowhere, the tier's own route included. Who may route at all (reviews, pins, retries, the floor): the
+    daemon (eligible, tierfloor)."""
+    got = rules(cfg)
+    if got and kept_core(task):
+        return None
+    labels = _labels(task)
+    for i, r in got:
+        if (r["tiers"] and tier not in r["tiers"]) or (r["kinds"] and str(task.get("kind") or "") not in r["kinds"]) \
+                or (r["labels_any"] and not _has(labels, r["labels_any"])) or _has(labels, r["labels_none"]):
+            continue
+        return {"to": TO, "model": r["model"], "rule": i}
+    if to := _per_tier(cfg, tier):
+        return {"to": to[0], "model": to[1], "rule": None}
+    return None
+
+
+def run_model(cfg: dict, tier: str, entry) -> tuple[str, str] | None:
+    """(model, effort) a run a rule routed (its route entry `entry`) starts with on the chat provider:
+    the rule's model, its effort or else the tier's; None for a run no rule routed (the tier's own)."""
+    if not isinstance(entry, dict) or entry.get("rule") is None or not str(entry.get("model") or ""):
+        return None
+    r = dict(rules(cfg)).get(entry["rule"]) or {}
+    t = (((cfg.get("providers") or {}).get(TO) or {}).get("tiers") or {}).get(tier) or {}
+    return str(entry["model"]), str(r.get("effort") or (t.get("effort") if isinstance(t, dict) else "") or "")
+
+
+def models(cfg: dict, tier: str) -> set[str]:
+    """Every model a run at `tier` may be routed to: the tier's own and each rule's that can match it."""
+    own = _per_tier(cfg, tier)
+    return {*([own[1]] if own else []), *(r["model"] for _, r in rules(cfg) if not r["tiers"] or tier in r["tiers"])}
+
+
+def timeout_s(cfg: dict, tier: str, rule: int | None = None) -> float | None:
+    """The routed run time limit: rule `rule`'s route_timeout_s (match), else the tier's
+    (providers.chat.tiers.<tier>.route_timeout_s), or None: the tier's budget.run_timeout_s applies."""
+    if rule is not None and (r := dict(rules(cfg)).get(rule)) and r["route_timeout_s"]:
+        return float(r["route_timeout_s"])
     t = (((cfg.get("providers") or {}).get(TO) or {}).get("tiers") or {}).get(tier) or {}
     v = t.get("route_timeout_s") if isinstance(t, dict) else None
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v > 0 else None
@@ -157,8 +265,7 @@ def held(db, cfg: dict, tier: str) -> str:
     """The model a routed tier's hold is for while that model is still the configured one, else ''
     (a retry record, release's quiet hourly try, holds nothing)."""
     h = db.kv(MISSING + tier) or {}
-    to = target(cfg, tier)
-    return str(h.get("model") or "") if h and not h.get("retry") and to and to[1] == h.get("model") else ""
+    return str(h.get("model") or "") if h and not h.get("retry") and h.get("model") in models(cfg, tier) else ""
 
 
 def hold(db, tier: str, model: str, run_id: int | None, now: float) -> bool:
@@ -190,7 +297,7 @@ def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str
         to = target(cfg, tier)
         rec = (served or {}).get(to[0] if to else TO) or {}
         fresh = rec.get("ok") and float(rec.get("checked") or 0) > float(h.get("since") or 0)
-        if not to or to[1] != model:
+        if not to or model not in models(cfg, tier):
             why = f"the configured model is now {to[1]}" if to else "the tier is no longer routed"
         elif h.get("retry"):
             if now - float(h.get("at") or 0) < RETRY_QUIET_S:
@@ -618,6 +725,15 @@ def config_problems(raw: dict) -> list[str]:
                 out.append(f"providers.{TO}.tiers.{tier}: its routed requests carry no reasoning effort; set "
                            f"providers.{TO}.tiers.{tier}.effort and providers.{TO}.effort_fields.<model>.<effort> "
                            '(such as {"reasoning_effort": "low"})')
+    raw_rules = chat.get(ROUTES)
+    if raw_rules is not None and not isinstance(raw_rules, list):
+        out.append(f"providers.{TO}.{ROUTES}: give a list of rules; nothing is routed by rule")
+    for i, r in enumerate(raw_rules if isinstance(raw_rules, list) else ()):
+        if not _rule(r):
+            out.append(f"providers.{TO}.{ROUTES}[{i}]: give an object with a model and only {', '.join(RULE_KEYS)} "
+                       "(kinds, tiers and labels lists of words, route_timeout_s seconds over 0); rule skipped")
+        elif bad := [t for t in r.get("tiers") or [] if t not in ("light", "standard", "deep")]:
+            out.append(f"providers.{TO}.{ROUTES}[{i}].tiers: unknown tier {bad[0]!r}; it matches nothing")
     v = chat.get("route_cooldown_s")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
         out.append(f"providers.{TO}.route_cooldown_s: give seconds (0 or more); {COOLDOWN_S} is used")

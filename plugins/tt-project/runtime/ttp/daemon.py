@@ -109,6 +109,7 @@ from . import chaincap
 from . import publishkind
 from . import chatbridge
 from . import route
+from .route import KEY as ROUTE_KEY, run_model as route_run_model   # start_run's local `route` shadows the module
 from . import checkcap
 from . import conflictfix
 from . import correction
@@ -2948,6 +2949,9 @@ class Daemon:
             # pick, a review's sizing, a retry) moves its budget and timeout, never a pinned model or effort.
             # The runner checks that the agent's session resolves the pin before its first turn (check_pin).
             pin = {k: str(task.get(k)) for k in ("model", "effort") if str(task.get(k) or "")}
+            routed = (note or {}).get(ROUTE_KEY) or {}
+            if provider == routed.get("to") and (by_rule := route_run_model(self.cfg, tier, routed)):
+                model, effort = by_rule   # a providers.chat.routes rule's model and effort (route.run_model)
             model = pin.get("model") or model
             effort = pin.get("effort") or effort
             ab = (note or {}).get(effortab.KEY)
@@ -9640,7 +9644,7 @@ class Daemon:
                     routed["waited_s"] = round(now - self._route_waits.pop(task["id"]), 1)
                 routed["fallback"] = why or "none"
             run_prov = routed["to"] if routed and routed["fallback"] == "none" else provider
-            if run_prov != provider and (limit := route.timeout_s(self.cfg, tier)):
+            if run_prov != provider and (limit := route.timeout_s(self.cfg, tier, routed.get("rule"))):
                 routed["timeout_s"] = limit   # the tier's routed run time limit, in place of its run_timeout_s
             if run_prov != ctx["slot"].get(task["id"], provider):
                 # Its tier or the route changed after the slot check: it takes a slot where it runs.
@@ -9997,11 +10001,11 @@ class Daemon:
     def _floor_keeps_core(self, task: dict, tier: str, picked: dict | None) -> str:
         """The routed model (route.py) a floor run (tierfloor.target) skips to run on the core provider,
         or '' when its tier routes nowhere or it is no floor run."""
-        to = route.target(self.cfg, tier)
+        to = route.match(self.cfg, task, tier)
         if not to or not route.eligible(task, picked):
             return ""
         try:
-            return f"{to[0]}:{to[1]}" if tierfloor.target(self.p.db, self.cfg, task) else ""
+            return f"{to['to']}:{to['model']}" if tierfloor.target(self.p.db, self.cfg, task) else ""
         except Exception as e:   # the floor must never hold a task back
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
             return ""
@@ -10042,16 +10046,16 @@ class Daemon:
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)
-            to = (got["provider"], got["model"]) if got else None
+            to = {"to": got["provider"], "model": got["model"], "rule": None} if got else None
         else:
-            to = route.target(self.cfg, tier)
+            to = route.match(self.cfg, task, tier)
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
-        name, model = to
+        name, model = to["to"], to["model"]
         if dp is not None:
             return {**self._route_entry(task, tier, name, model, now), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
-        return self._route_entry(task, tier, name, model, now)
+        return self._route_entry(task, tier, name, model, now, to["rule"])
 
     def _model_pick(self, task: dict, tier: str, peek: bool = False) -> dict | None:
         """This start's model pick (modelpick.pick), or None: the tier's own route decides. `peek`
@@ -10068,21 +10072,22 @@ class Daemon:
             log(self.p, f"task {task.get('id')}: model not picked: {e}")
             return None
 
-    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float) -> dict:
+    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | None = None) -> dict:
+        rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
-            return {"tier": tier, "to": name, "model": model, "fallback": "rerun", "after": after}
+            return {"tier": tier, "to": name, "model": model, **rule, "fallback": "rerun", "after": after}
         try:
             esc = route.escalation(self.p.db, task) if task.get("id") else {}
         except Exception as e:   # escalation must never hold a task back
             log(self.p, f"task {task['id']}: route escalation not checked: {type(e).__name__}: {e}")
             esc = {}
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
-            return {"tier": tier, "to": name, "model": model, "fallback": route.ESCALATED, **esc}
-        why ="model_missing" if route.held(self.p.db, self.cfg, tier) else route.cooling(self.p.db, name, now)
+            return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
+        why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
-        return {"tier": tier, "to": name, "model": model, "fallback": why or "none"}
+        return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none"}
 
     def _slot_provider(self, task: dict, provider: str, ctx: dict) -> str:
         """The provider whose worker slots a start of `task` takes: the one its tier is routed to
@@ -10112,7 +10117,7 @@ class Daemon:
         (route.host_take): (provider, key), or None when the host's slots are all held. A lease file
         that cannot be written never holds the run back (logged)."""
         prov, key = routed["to"], self._route_key(task["id"])
-        limit = route.timeout_s(self.cfg, tier) or (self.cfg["budget"].get("run_timeout_s") or {}).get(tier, 3600)
+        limit = route.timeout_s(self.cfg, tier, routed.get("rule")) or (self.cfg["budget"].get("run_timeout_s") or {}).get(tier, 3600)
         until = now + float(limit) + route.LEASE_GRACE_S
         pid = os.getpid()
         if run_id is not None:
