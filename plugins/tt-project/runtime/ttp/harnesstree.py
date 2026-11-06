@@ -18,8 +18,8 @@ daemon's own uncommitted memory writes there are committed first (_commit_memory
 conflicts, or that git refuses over uncommitted changes there, is undone and kept for the next
 pass (sweep), and reported to the coordinator once per branch head (a refusal only while no harness
 run works in the checkout). Before it merges, an uncommitted copy in the checkout of a file the branch
-changed is set aside when it equals one of the branch's versions of that file since the merge base
-(_settle): backed up under state/harness-land-backups/, put back to HEAD, then the merge writes the
+changed is set aside when it equals one of the branch's versions of that file since the merge base,
+and only when every such copy does (_settle): backed up under state/harness-land-backups/, put back to HEAD, then the merge writes the
 branch's version; every other uncommitted file is left alone. A conflict is merged again only once its branch head or the harness HEAD
 moved: each try briefly leaves MERGE_HEAD in the live checkout, in the way of `ttp upgrade`. A merge
 that changed runtime/ asks the daemon to restart, as `ttp restart` would."""
@@ -246,9 +246,10 @@ def land(p: Project, tid: int) -> str:
 def _settle(p: Project, tid: int, b: str) -> tuple[list[str], Path | None]:
     """Set aside the checkout's uncommitted copies (changed or untracked) of files branch `b` changed
     since its merge base whose content equals one of the branch's versions there (its head's or an
-    earlier one): git would refuse the merge over them though they hold nothing the branch lacks. Each
-    is copied to a dated backup folder under the state, then put back to HEAD (an untracked one
-    removed). Every other uncommitted file is left alone, and nothing while another harness run works
+    earlier one): git would refuse the merge over them though they hold nothing the branch lacks. Only
+    when every such copy qualifies (none a deletion, a symlink, other content or a staged entry that
+    differs from both HEAD and the working copy), else none: git refuses as before. Each is copied to a
+    dated backup folder under the state, then put back to HEAD (an untracked one removed). Every other uncommitted file is left alone, and nothing while another harness run works
     in the checkout (its edits are its own). Returns the files and the backup folder."""
     if checkout_busy(p, tid):
         return [], None
@@ -265,17 +266,24 @@ def _settle(p: Project, tid: int, b: str) -> tuple[list[str], Path | None]:
         return [], None
     st = _git(p.harness, "--literal-pathspecs", "status", "--porcelain", "-z", "--no-renames",
               "--untracked-files=all", "--", *sorted(versions))
+    if st.returncode != 0:
+        return [], None
+    # all or nothing: one copy that cannot go keeps git refusing, so setting the rest aside on every
+    # retry would only churn the checkout and the backups
+    moves = set(_git(p.harness, "diff", "-z", "--name-only", "--no-renames", "HEAD", b).stdout.split("\0"))
     settled = []
-    for e in st.stdout.split("\0") if st.returncode == 0 else []:
-        f = e[3:]
-        if len(e) < 4 or "D" in e[:2] or f not in versions:
-            continue
+    for e in st.stdout.split("\0"):
+        if len(e) < 4 or e[3:] not in moves:
+            continue   # a file the merge leaves as HEAD has it: never in git's way
+        xy, f = e[:2], e[3:]
         fp = p.harness / f
-        if fp.is_symlink() or not fp.is_file():
-            continue
+        if (f not in versions or "D" in xy or xy[0] not in " ?" and xy[1] != " "
+                or fp.is_symlink() or not fp.is_file()):
+            return [], None   # a deletion, or staged content the backup of the working copy would lose
         blob = _git(p.harness, "--literal-pathspecs", "hash-object", "--", f).stdout.strip()
-        if blob in versions[f]:
-            settled.append(f)
+        if blob not in versions[f]:
+            return [], None
+        settled.append(f)
     if not settled:
         return [], None
     backup = p.state / BACKUP_DIR / f"{time.strftime('%Y-%m-%d-%H%M%S')}-t{int(tid)}"

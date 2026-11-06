@@ -279,6 +279,8 @@ only in the feed and never under "needs you".
   branch changed, equal to the branch's head version or an earlier one since the merge base, is backed
   up to `state/harness-land-backups/<date>-t<id>/` and put back so git does not refuse; any other
   uncommitted file is left alone, and a merge still refused puts the copies back and names them.
+  This happens only when it clears every such copy: one that differs, a deletion, or staged content
+  unlike its working copy means none is set aside and git refuses as before, once per pass.
 - A task that has ended (done, failed, cancelled, exhausted) can still leave processes behind. Its own
   ones are those of your user whose environment carries this project's `TTP_PROJECT`, the task's
   `TTP_TASK` and a `TTP_RUN_DIR` of one of its recorded runs. When such processes are the only ones with a

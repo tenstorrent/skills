@@ -415,7 +415,7 @@ def test_a_differing_dirty_checkout_copy_is_left_alone_and_the_land_refused_nami
     from ttp import harnesstree
     b, own = _ht_dirty_copy_setup(p)
     (p.harness / "prompts" / "shared.md").write_text("an edit of its own\n")
-    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")   # equal: set aside, then put back on refusal
+    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")   # equal, but git refuses anyway: left
     head = _hgit(p.harness, "rev-parse", "HEAD").strip()
     assert harnesstree.land(p, b) == "conflict"
     assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
@@ -423,8 +423,34 @@ def test_a_differing_dirty_checkout_copy_is_left_alone_and_the_land_refused_nami
     assert (p.harness / "prompts" / "new [x] y.md").read_text() == "new\n"
     (ev,) = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
     assert "would be overwritten" in ev["text"] and "prompts/shared.md" in ev["text"]
-    assert "harness-land-backups" in ev["text"]
-    assert _ht_backups(p) == {"prompts/new [x] y.md": "new\n"}   # what was set aside stays backed up
+    assert "harness-land-backups" not in ev["text"] and not _ht_backups(p)
+
+
+def test_a_refused_land_retried_each_pass_sets_nothing_aside(env):
+    """Before: each pass backed up the equal copy into a new folder, logged it and rewrote the checkout."""
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    (p.harness / "prompts" / "shared.md").write_text("an edit of its own\n")
+    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")
+    assert [harnesstree.land(p, b) for _ in range(3)] == ["conflict", "conflict-known", "conflict-known"]
+    assert not _ht_backups(p)
+    log = p.logs / "daemon.log"
+    assert "set aside" not in (log.read_text() if log.exists() else "")
+    assert (p.harness / "prompts" / "new [x] y.md").read_text() == "new\n"
+
+
+def test_staged_content_differing_from_an_equal_working_copy_is_never_lost(env):
+    """Before: the working copy (the branch's v2) was backed up and reset to HEAD; the staged X was lost."""
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    (p.harness / "prompts" / "shared.md").write_text("staged X\n")
+    _hgit(p.harness, "add", "prompts/shared.md")
+    (p.harness / "prompts" / "shared.md").write_text("v2\n")
+    assert harnesstree.land(p, b) == "conflict"
+    assert _hgit(p.harness, "show", ":prompts/shared.md") == "staged X\n"
+    assert (p.harness / "prompts" / "shared.md").read_text() == "v2\n" and not _ht_backups(p)
 
 
 def test_an_untracked_checkout_copy_equal_to_a_file_the_branch_adds_lands_with_a_backup(env):
