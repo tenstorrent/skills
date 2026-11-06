@@ -177,14 +177,57 @@ def hidden_paths(bench_dir: Path, out: Path, repos: list, state: Path | None) ->
     claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
     codex = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
     found += [claude / "plugins", claude / "projects", codex / "plugins", codex / "sessions"]
-    return list(dict.fromkeys(Path(p).expanduser().resolve() for p in found))
+    # Both the resolved path and the name it was given: a symlinked home or repo may be named either way.
+    return list(dict.fromkeys(q for p in found for q in (Path(os.path.abspath(Path(p).expanduser())),
+                                                          Path(p).expanduser().resolve())))
 
 
-def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "") -> list[str]:
-    """Why a cell counts as a cheat attempt: its transcript names a hidden path or the landed commit or
-    runs history or forge commands, or it or the candidate's diff shows lines only the held-out tests
-    have (bench.QUOTE_LINES of them, or all when fewer). [] when clean."""
+def _encode(p) -> str:
+    # How Claude Code names a session's folder: its cwd with every non-alphanumeric character as '-'.
+    return re.sub(r"[^A-Za-z0-9]", "-", str(p))
+
+
+def session_dirs(ws: Path) -> list[Path]:
+    """Claude Code's folder for a session started in `ws`, resolved and as named: it saves a large
+    tool output there and tells the agent to read it."""
+    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude").expanduser()
+    return list(dict.fromkeys(c / "projects" / _encode(ws.resolve()) for c in (Path(os.path.abspath(claude)),
+                                                                                 claude.resolve())))
+
+
+def denied_reads(hidden: list[Path], own: list[Path]) -> list[str]:
+    """Read deny rules for `hidden`, each folder also as `/**`. The saved-sessions folder that holds
+    the cell's own session (`own`, from session_dirs) is not denied whole, which would refuse the agent its own saved
+    output: only the folders of sessions started in another hidden path (the original task's
+    worktree) and of earlier cells are. The audit still flags any other folder named there."""
+    out = []
+    for p in hidden:
+        if p not in {o.parent for o in own}:
+            out += [str(p), f"{p}/**"]
+            continue
+        enc = sorted({_encode(q) for q in hidden if not q.is_relative_to(p)})
+        out += [r for e in enc for r in (f"{p}/{e}*", f"{p}/{e}*/**")]
+        cells = p.glob(_encode(Path(tempfile.gettempdir()).resolve() / "cell-") + "*")
+        out += [r for c in sorted(cells) if c.name != own[0].name for r in (str(c), f"{c}/**")]
+    return out
+
+
+def _own_session(text: str, own: list[Path]) -> str:
+    # The text with each mention of the cell's own session folder (in any form) taken out.
+    for form in (f for o in own for f in _forms(o)):
+        text = re.sub(re.escape(form) + r"(?![A-Za-z0-9-])", "", text)
+    return text
+
+
+def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "",
+          session: list[Path] = ()) -> list[str]:
+    """Why a cell counts as a cheat attempt: its transcript names a hidden path (the cell's own
+    `session` folders aside) or the landed commit or runs history or forge commands, or it or the
+    candidate's diff shows lines only the held-out tests have (bench.QUOTE_LINES of them, or all
+    when fewer). [] when clean."""
     own = _strings("\n".join(x for x in transcript.splitlines() if not _system(x)))
+    if session:
+        own = _own_session(own, session)
     out = [f"names {p}" for p in hidden if any(form in own for form in _forms(Path(p)))]
     if task["head"][:12] in transcript:
         out.append("names the landed commit")
@@ -248,7 +291,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         prov = get_provider(provider).use(arm["model"], prices, billing.declared(cfg, provider))
         argv, env = prov.build(role="worker", model=arm["model"], effort=arm["effort"], cwd=str(ws),
                                budget_usd=opts["budget_usd"], read_only=False, schema=None, restrictions={},
-                               denied_reads=[str(p) for p in hidden], web=False)
+                               denied_reads=denied_reads(hidden, session_dirs(ws)), web=False)
         if argv[:3] == [sys.executable, "-m", "ttp.providers.fake"]:   # the dry run's agent: no PYTHONPATH
             argv = [*_boot("ttp.providers.fake"), *argv[3:]]
         spec = {"argv": argv, "env": {**env, "TTP_RUN_DIR": str(run)}, "cwd": str(ws), "provider": provider,
@@ -265,7 +308,12 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
                                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                timeout=opts["timeout_s"] + 300)
         except subprocess.TimeoutExpired:   # the supervisor itself hung: its watchdog ends the agent
-            return {**row, "outcome": "runner_timeout", "passed": False, "wall_s": round(time.time() - began, 1)}
+            row.update(outcome="runner_timeout", passed=False, wall_s=round(time.time() - began, 1))
+            try:   # what the agent spent so far still counts
+                row["cost_usd"] = prov.parse(run / "output.jsonl", run / "stderr.log").cost_usd
+            except Exception:
+                pass
+            return row
         row["wall_s"] = round(time.time() - began, 1)
         try:
             return _finish(row, bench_dir, task, ws, run, keep, start, prov, opts, hidden)
@@ -302,7 +350,7 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     diff = gitmemo.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True, timeout=None).stdout
     row["diff_sha256"] = _sha(diff)
     flags = audit(transcript.decode(errors="replace"), task, hidden,
-                  secret_lines(bench_dir, task), diff.decode(errors="replace"))
+                  secret_lines(bench_dir, task), diff.decode(errors="replace"), session_dirs(ws))
     passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"]) if not flags \
         else (False, "not graded: flagged by the cheat audit")
     row.update(passed=passed, flagged=flags, outcome="flagged" if flags else "pass" if passed else "fail")

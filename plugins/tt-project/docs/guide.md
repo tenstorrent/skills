@@ -1052,8 +1052,12 @@ audited for, the bench and results folders, the source repository (recorded by `
 default the project root) with its git dir and every worktree, the project's state folder, and the
 providers' plugin caches and saved transcripts (`~/.claude/plugins`, `~/.claude/projects`, and
 `plugins` and `sessions` under `$CODEX_HOME`): these hold the landed commit, later code or the
-original task's run. The audit matches each path as a prefix, also written with `~/` or `$HOME/`,
-and skips the provider's own system records. The agent's environment carries no `PYTHONPATH` to the
+original task's run. The audit matches each path as a prefix, resolved and as named, also written
+with `~/` or `$HOME/`, and skips the provider's own system records. The cell's own Claude Code
+session folder (`~/.claude/projects/<its cwd with each non-alphanumeric character as ->`, where a
+large tool output is saved for the agent to read) is neither denied nor flagged: of that folder's
+siblings, the reads denied are those of sessions started in another hidden path and of earlier
+cells, and naming any other one is flagged. A cell whose runner hangs keeps its spend so far. The agent's environment carries no `PYTHONPATH` to the
 harness runtime. A transcript that names a denied path or the landed commit, or runs history or
 forge commands (`git fetch`, `git log --all`, `gh api`), flags the cell as failed. Otherwise the
 held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`;

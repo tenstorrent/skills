@@ -336,3 +336,37 @@ def test_bench_run_records_a_cell_whose_candidate_writes_a_malformed_result_and_
     for o in (out, tmp_path / "h2h-err"):
         assert benchrun.run(tmp_path / "bench", o, arms, 1, 1, _bench_opts(tmp_path), p.config()) == []
         assert len((o / "results.jsonl").read_text().splitlines()) == 2
+
+
+def test_bench_audit_and_deny_rules_leave_a_claude_cell_its_own_session_folder(env, tmp_path, monkeypatch):
+    # Claude Code saves a large tool output under <config>/projects/<encoded cwd>/<session>/tool-results/
+    # and tells the agent to read it: an honest cell doing so is neither flagged nor denied.
+    from ttp import benchrun
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    monkeypatch.delenv("CODEX_HOME", raising=False)
+    projects = (tmp_path / "claude" / "projects").resolve()
+    repo, ws = tmp_path / "repo", Path(tempfile.mkdtemp(prefix="cell-")) / "work"
+    old = projects / benchrun._encode(repo.resolve())
+    earlier = projects / benchrun._encode(Path(tempfile.gettempdir()).resolve() / "cell-zz" / "work")
+    for d in (old, earlier):
+        d.mkdir(parents=True)
+    hidden = benchrun.hidden_paths(tmp_path / "bench", tmp_path / "out", [repo], None)
+    own = benchrun.session_dirs(ws)
+    assert own[-1].parent == projects and not own[-1].exists()
+    task = {"head": "f" * 40}
+
+    def said(path):
+        return json.dumps({"type": "user", "message": {"content": [{"type": "tool_result", "content":
+                           f"Output too large (40KB). Full output saved to: {path}"}]}})
+    saved = own[-1] / "s" / "tool-results" / "x.txt"
+    assert benchrun.audit(said(saved), task, hidden, session=own) == []
+    assert benchrun.audit(said(f"~/{saved.relative_to(Path.home())}" if saved.is_relative_to(Path.home())
+                               else saved), task, hidden, session=own) == []
+    for other in (old / "s.jsonl", earlier / "s.jsonl", Path(f"{own[-1]}-x") / "s.jsonl", projects):
+        assert benchrun.audit(said(other), task, hidden, session=own) == [f"names {projects}"], other
+    assert benchrun.audit(said(saved), task, hidden) == [f"names {projects}"], "no session given: flagged"
+    rules = benchrun.denied_reads(hidden, own)
+    assert str(projects) not in rules and not any(str(own[-1]) in r for r in rules)
+    for want in (f"{old}*", f"{old}*/**", str(earlier), f"{earlier}/**", str(repo.resolve()), f"{repo.resolve()}/**"):
+        assert want in rules, want
+    shutil.rmtree(ws.parent)
