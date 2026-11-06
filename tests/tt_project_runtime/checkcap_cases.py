@@ -10199,8 +10199,8 @@ def locks_queued(checkcap):
 
 def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_then_asks_nothing(env, monkeypatch):
     """#6842 (1): a claim lives only while its asker lives and renews it (while the asked run holds its
-    slot and the asker is not parked), for at most CLAIM_MAX_S; a request whose claim lapsed or was dropped
-    preempts nobody, and the slot goes back to the normal turn."""
+    slot and the asker is not parked, or asked parked within PARKED_CLAIM_S), for at most CLAIM_MAX_S; a
+    request whose claim lapsed or was dropped preempts nobody, and the slot goes back to the normal turn."""
     from ttp import checkcap, locks
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
@@ -10219,12 +10219,17 @@ def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_th
         checkcap.renew_claim("tok1", parked=False)
         assert checkcap.claims() == 0, "a lapsed claim is not renewed"
         assert checkcap.preempted(victim.since) == "", "its request asks nothing any more"
-        checkcap._write(path, {**rec, "at": time.time()})
-        checkcap.renew_claim("tok1", parked=True)
-        assert json.loads(path.read_text())["at"] == pytest.approx(time.time(), abs=5)
         checkcap._write(path, {**rec, "at": old + 1})
         checkcap.renew_claim("tok1", parked=True)
         assert json.loads(path.read_text())["at"] == old + 1, "a parked asker does not renew it"
+        checkcap._write(path, {**rec, "at": (stale := time.time() - 1)})
+        checkcap.renew_claim("tok1", parked=True)
+        assert json.loads(path.read_text())["at"] == stale, "nor a live one it did not ask parked"
+        checkcap.renew_claim("tok1", parked=True, asked_parked=True)
+        assert json.loads(path.read_text())["at"] > stale, "one that asked parked renews it while the asked run holds"
+        checkcap._write(path, {**rec, "at": stale, "made": time.time() - checkcap.PARKED_CLAIM_S - 1})
+        checkcap.renew_claim("tok1", parked=True, asked_parked=True)
+        assert json.loads(path.read_text())["at"] == stale, "for at most PARKED_CLAIM_S from the ask"
         checkcap._write(path, {**rec, "at": time.time() - 1})
         checkcap.renew_claim("tok1", parked=False)
         assert json.loads(path.read_text())["at"] > time.time() - 1, "renewed while the asked run holds"
@@ -10241,9 +10246,69 @@ def test_a_claim_lapses_when_its_asker_dies_or_stops_renewing_and_its_request_th
         checkcap.clear_preempt()
         assert checkcap.preempt("urgent u", checkcap.all_paths(1)) == "victim"
         assert checkcap.preempted(victim.since) == "urgent urgent u", "a request with no claim asks as before"
+        victim.close()
+        for holder in ("", "another run"):   # its slot freed, then taken by another run
+            checkcap.drop_claim("tok1")
+            other = checkcap.acquire(holder, max_wait_s=10) if holder else checkcap.Slot()
+            if holder:
+                locks.relabel(other.f, {"pid": 4242, "pid_start": "s1", "ns_pid": None})
+            try:
+                checkcap._write(path, {**rec, "at": (stale := time.time() - 1)})
+                checkcap.renew_claim("tok1", parked=False)
+                assert json.loads(path.read_text())["at"] == stale, f"not renewed: {holder or 'freed'}"
+            finally:
+                other.close()
     finally:
         checkcap.clear_preempt()
         victim.close()
+
+
+def test_a_parked_asker_keeps_its_claim_while_the_asked_run_takes_longer_than_claim_s_to_free_its_slot(env, monkeypatch):
+    """#6907 (review #6873): a parked urgent asker did not renew its claim, so a victim slower than CLAIM_S
+    to end its command freed its slot after the claim had lapsed, and the waiter first in line took it. A
+    parked asker renews it while the asked run still holds its slot (PARKED_CLAIM_S from the ask at most); it
+    then takes the slot once unparked."""
+    import threading
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    monkeypatch.setattr(checkcap, "CLAIM_S", 1.0)
+    routine = checkcap.acquire("routine", project_name="pa", priority=3, preemptible=True)
+    freed = threading.Event()
+    startable = lambda: freed.is_set() or (checkcap.FREEING.get() or {}).get("holder") == "routine"  # noqa: E731
+    told, got, other = [], [], []
+    t_other = threading.Thread(target=lambda: other.append(checkcap.acquire(
+        "first in line", priority=1, since=time.time() - 600, max_wait_s=8)))
+    t_other.start()
+    assert _wait_for(lambda: locks_queued(checkcap)), "the other waiter is first in line"
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "urgent", project_name="pa", priority=1, urgent=True, tell=told.append, startable=startable,
+        max_wait_s=30)))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine") in told), told
+        assert checkcap.PARKED_LINE in told, "the asker waits for its test slots"
+        time.sleep(3 * checkcap.CLAIM_S)   # the asked run is slow to end its command
+        assert checkcap.claims() == 1, "renewed while parked and the asked run holds its slot"
+        assert checkcap.preempted(routine.since) == "urgent urgent", "so its request still asks"
+        routine.close()
+        time.sleep(0.3)   # its test slots free a little after its cap slot
+        freed.set()
+        t.join(30)
+        t_other.join(30)
+        assert got and got[0] is not None and got[0].f is not None, "the parked asker took the freed slot"
+        assert other == [None], "the waiter first in line did not take it"
+        assert checkcap.claims() == 0 and not list(checkcap.slot_dir().glob(f"{checkcap.CLAIM}.*.json"))
+    finally:
+        freed.set()
+        checkcap.clear_preempt()
+        for h in [routine, *got, *other]:
+            if h is not None:
+                h.close()
 
 
 def test_a_parked_urgent_run_preempts_only_a_run_whose_stop_lets_it_start(env, monkeypatch):

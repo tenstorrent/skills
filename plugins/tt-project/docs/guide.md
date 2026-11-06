@@ -2232,7 +2232,9 @@ session and stateless coordinators on every provider.
   command, frees its slots and queues again at its old arrival, ahead of every later arrival of its
   project, keeping every pass and log it recorded (a pinned run keeps only passes on its pinned commit
   and reruns the rest there), and the urgent run takes the freed slot: a short-lived claim keeps it
-  from every other waiter while the urgent run lives and still waits for it, and lapses within 30 s
+  from every other waiter while the urgent run lives and still waits for it (one that asked while
+  waiting for its test slots keeps it while the preempted run stops, up to 60 s from its ask, and lets
+  it go if it still cannot start 3 s after the slot frees), and lapses within 30 s
   otherwise (a lapsed claim's request asks nothing). An urgent run waiting for its test slots asks
   only a run whose stop leaves its project's test budget and the host's test pool room for it; else
   nobody. Its log and its task's notes say `preempted by urgent #<task>`, its queue entry in
