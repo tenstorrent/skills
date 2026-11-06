@@ -19,6 +19,10 @@ refuses any create, change, move, chmod or delete it can read under a protected 
   command runs) that names one and writes anything; the same inside `sh -c` and shell scripts.
 Words are read after ~, $HOME, ${HOME}, $XDG_CONFIG_HOME and $GH_CONFIG_DIR are expanded with the run's
 environment and symlinks resolved, and the account's own home counts besides HOME. Reads pass as before.
+Text ssh runs on another host is read too: its quoted remote command, a file or heredoc fed to its stdin
+(`ssh host bash < f`, `cat f | ssh host bash`, `<<EOF`) and a file scp or rsync copies there and the remote
+command then runs. It is checked by the same rules with ~ and $HOME as the remote user's home, against a narrow
+list (REMOTE_PATHS: the default keys, ssh config and authorized_keys, where appending a key passes).
 Known gap: a path a program builds at run time from parts no word names (an argument read from a file).
 
 The list is DEFAULT_PATHS plus guards.protected_paths of the account settings and of the project
@@ -26,11 +30,13 @@ The list is DEFAULT_PATHS plus guards.protected_paths of the account settings an
 """
 from __future__ import annotations
 
+import fnmatch
 import json
 import os
 import pwd
 import re
 import shlex
+from pathlib import Path
 
 DEFAULT_PATHS = ("~/.ssh", "~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.aws", "~/.docker/config.json",
                  "~/.kube")
@@ -89,6 +95,10 @@ class KeyHit(str):
 # The plugin's own shipped scripts (setup-box's write ~/.ssh on a remote box, in ssh command text):
 # reviewed code, so the script-file read skips them; a script a run wrote is read
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
+# A host ssh runs text on: its user's home (a placeholder), and what there no run writes
+REMOTE_HOMES = ("/~remote", "/home/*", "/root")
+REMOTE_PATHS = (".ssh/id_*", ".ssh/config", ".ssh/authorized_keys")
+SSH_VALUE_OPTS = set("BbcDEeFIiJLlmOoPpQRSWw")
 WHY = ("a run never creates, changes, moves, chmods or deletes anything under the account's credential folders "
        "({hit} is one; guards.protected_paths lists them): a login a run overwrote is gone for every project on "
        "the host. Read it as before, test against a scratch copy under `mktemp -d` named by another variable "
@@ -143,7 +153,8 @@ def roots(env=None, cfg: dict | None = None) -> list[str]:
 
 
 def _inside(path: str, rts: list[str]) -> str | None:
-    return next((r for r in rts if path == r or path.startswith(r.rstrip("/") + "/")), None)
+    return next((r for r in rts if path == r or path.startswith(r.rstrip("/") + "/")
+                 or "*" in r and fnmatch.fnmatchcase(path, r)), None)
 
 
 def _holds(path: str, rts: list[str]) -> str | None:
@@ -154,7 +165,7 @@ def _holds(path: str, rts: list[str]) -> str | None:
 def _hit(word: str, ctx, ancestor: bool = False) -> str | None:
     if not word or word.startswith("-"):
         return None
-    p = expand(word, ctx[0], ctx[1])
+    p = expand(word, ctx[0], ctx[1], real=len(ctx) < 4)   # a remote path is not resolved here
     return (_holds if ancestor else _inside)(p, ctx[2])
 
 
@@ -225,6 +236,11 @@ def _argv_refusal(argv: list[str], ctx, cmd_env=None) -> str | None:
     store = _store_write(argv)
     if store and _inside(expand(store, cmd_env or ctx[0], "/"), ctx[2]):
         return store
+    if len(ctx) > 3 and name == "ssh-keygen" and store and not any(re.fullmatch(r"-[a-zA-Z]*[RHAY]\w*", a)
+                                                                   for a in args):
+        # On a remote host (where ~/.ssh itself is writable): its default key
+        if h := _inside(expand("~/.ssh/id_", cmd_env or ctx[0], "/", real=False), ctx[2]):
+            return h
     if name == "ssh-keygen":
         return None if _keygen_reads(args) else next((h for w in _keygen_file(args) if (h := _hit(w, ctx))), None)
     if name in WRITE_ALL or name in ("sed", "perl") and any(re.match(r"-[a-zA-Z]*i|--in-place", a) for a in args):
@@ -307,10 +323,12 @@ def _names(code: str, ctx) -> str | None:
     return None
 
 
-def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, script: bool = False) -> str | None:
-    """The protected path a shell command line (or script) writes, as far as its words show."""
+def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, script: bool = False,
+                  copied: dict | None = None) -> str | None:
+    """The protected path a shell command line (or script) writes, as far as its words show. `copied`: the text
+    runs on a remote host, where these local files (by base name) were copied."""
     from . import hook
-    ctx = (env, cwd, rts)
+    ctx = (env, cwd, rts) if copied is None else (env, cwd, rts, True)
     commands, scan = hook._split(cmd)
     if not script and (h := _key_refusal(cmd, commands, ctx)):
         return h
@@ -320,7 +338,8 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, scrip
     for text in (cmd, scan):
         flags = hook._quoting(text)
         for m in REDIRECT_RE.finditer(text):
-            if not flags[m.start()][0] and (h := _hit(m[2], ctx)):
+            if not flags[m.start()][0] and (h := _hit(m[2], ctx)) and not (
+                    copied is not None and ">>" in m[0] and h.endswith("/authorized_keys")):   # adding a key
                 return h
     if "*** Begin Patch" in cmd and (h := patch_refusal(cmd, ctx)):
         return h
@@ -335,7 +354,7 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, scrip
         inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)),
                      None) if name in SHELLS else " ".join(argv[1:]) if name == "eval" else None
         if inner and depth < 2 and (
-                h := shell_refusal(inner, env, cwd, rts, depth + 1)):
+                h := shell_refusal(inner, env, cwd, rts, depth + 1, copied is not None, copied)):
             return h
         # eval parses its words again: an escaped redirect (eval echo x \> f) is one then
         if name == "eval" and "\\" in cmd and depth < 2 and (
@@ -348,18 +367,16 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, scrip
                   for i in range(1, len(a) - 1) if a[i] in ("-c", "-e", "-E", "--eval", "-p", "--print")]
         if h := next((h for c in [scan, *inline] if (h := _code_refusal(c, ctx, depth))), None):
             return h
+    if depth < 3 and "ssh" in cmd and (h := _remote_refusal(cmd, env, cwd, depth, copied or {})):
+        return h
+    if copied is not None:   # a remote script file: the local file scp or rsync sent under its name
+        files = [Path(copied[n]) for a in segments for f in hook._run_files(a) if (n := os.path.basename(f)) in copied]
+        return next((h for f in files if depth < 2 and (h := _script_refusal(f, ctx, depth, copied))), None)
     if depth < 2:
         for f in hook._scripts(segments, cwd):
             if os.path.realpath(f).startswith(PLUGIN_ROOT + os.sep):
                 continue
-            try:
-                text = f.read_text(errors="replace")
-            except OSError:
-                continue
-            first = text.split("\n", 1)[0]
-            h = (shell_refusal(text, env, cwd, rts, depth + 1, True) if f.suffix == ".sh" or any(s in first for s in SHELLS)
-                 else _code_refusal(text, ctx, depth + 1))
-            if h:
+            if h := _script_refusal(f, ctx, depth, copied):
                 return h
     return None
 
@@ -425,6 +442,128 @@ def _ssh_key(argv: list[str], ctx) -> tuple[str | None, bool]:
         if not own and (h := _names(val, ctx)):
             hit, ok = hit or h, ok and word in keys
     return hit, ok
+
+
+def _script_refusal(f: Path, ctx, depth: int, copied: dict | None) -> str | None:
+    """What script file `f` writes: as shell text (a .sh or a shell #! line), else as interpreter code. A file
+    it cannot read passes."""
+    try:
+        text = f.read_text(errors="replace")
+    except OSError:
+        return None
+    first = text.split("\n", 1)[0]
+    if f.suffix == ".sh" or any(s in first for s in SHELLS):
+        return shell_refusal(text, ctx[0], ctx[1], ctx[2], depth + 1, True, copied)
+    return _code_refusal(text, ctx, depth + 1)
+
+
+def _remote_refusal(cmd: str, env, cwd: str, depth: int, copied: dict) -> str | None:
+    """What the text ssh runs on another host in `cmd` writes there: its remote command, and the text its stdin
+    feeds a remote shell or interpreter, checked with the remote home against REMOTE_PATHS."""
+    rhome = REMOTE_HOMES[0]
+    renv, rts = {"HOME": rhome}, [os.path.join(h, p) for h in REMOTE_HOMES for p in REMOTE_PATHS]
+    calls, sent = _ssh_calls(cmd, env, cwd)
+    copied = {**copied, **sent}
+    for words, stdin in calls:
+        text = " ".join(words)
+        names = {os.path.basename(a[0]) for a in _segments_of(text)} if words else {"sh"}
+        h = shell_refusal(text, renv, rhome, rts, depth + 1, True, copied) if words else None
+        if not h and stdin is not None and names & SHELLS:
+            h = shell_refusal(stdin, renv, rhome, rts, depth + 1, True, copied)
+        elif not h and stdin is not None and any(INTERPRETER_RE.match(n) for n in names):
+            h = _code_refusal(stdin, (renv, rhome, rts, True), depth + 1)
+        if h:
+            h = "~" + h[len(rhome):] if h.startswith(rhome + "/") else h
+            return h if h.endswith(" on the remote host") else h + " on the remote host"
+    return None
+
+
+def _segments_of(text: str) -> list[list[str]]:
+    from . import hook
+    return hook._all_segments(hook._split(text)[0])
+
+
+def _ssh_calls(cmd: str, env, cwd: str) -> tuple[list[tuple[list[str], str | None]], dict]:
+    """(the remote command words of each ssh in `cmd`, with the text its stdin gets from a `<` file, a heredoc,
+    a here-string, or `cat FILE`, echo or printf piped in, else None), and the local files scp or rsync copy to a
+    host there, by base name."""
+    from . import hook
+    lines, bodies, pending = [], [], []
+    for line in cmd.replace("\\\n", " ").split("\n"):
+        if pending:
+            delim, dash, body = pending[0]
+            if (line.lstrip("\t") if dash else line) == delim:
+                pending.pop(0)
+            else:
+                body.append(line)
+            continue
+        lines.append(line)
+        flags = hook._quoting(line) if "<<" in line else []
+        for m in hook.HEREDOC_RE.finditer(line):
+            if not flags[m.start()][0]:
+                pending.append((m[3], m[1] == "-", []))
+                bodies.append(pending[-1][2])
+    text = "\n".join(lines)
+    text = "".join(";\n;" if c == "\n" and not q else c for c, (q, _) in zip(text, hook._quoting(text)))
+    try:
+        lex = shlex.shlex(text, posix=True, punctuation_chars=";&|()<>")
+        lex.whitespace_split = True
+        toks = list(lex) + [";"]
+    except ValueError:
+        toks = text.split() + [";"]
+    segs, cur, i = [], {"argv": [], "in": None, "pipe": False}, 0
+    while i < len(toks):
+        t, nxt = toks[i], (toks[i + 1:i + 2] or [""])[0]
+        if t and set(t) <= set(";&|()<>") and set(t) & set("<>"):   # a redirect and its word
+            if t == "<":
+                cur["in"] = ("files", [nxt])
+            elif t in ("<<", "<<<"):
+                cur["in"] = ("text", "\n".join(bodies.pop(0)) if t == "<<" and bodies else nxt)
+            i += 2
+            continue
+        if t and set(t) <= set(";&|()"):
+            segs.append(cur)
+            cur = {"argv": [], "in": None, "pipe": t in ("|", "|&")}
+        else:
+            cur["argv"].append(t)
+        i += 1
+    calls, sent = [], {}
+    for k, seg in enumerate(segs):
+        argv = hook._strip_prefix(seg["argv"])
+        name = os.path.basename(argv[0]) if argv else ""
+        if name in ("scp", "rsync") and len(ops := _operands(argv[1:])) > 1 and ":" in ops[-1]:
+            sent.update({os.path.basename(s.rstrip("/")): expand(s, env, cwd) for s in ops[:-1] if ":" not in s})
+        if name != "ssh" or (words := _ssh_remote(argv[1:])) is None:
+            continue
+        src = seg["in"]
+        prev = hook._strip_prefix(segs[k - 1]["argv"]) if k and seg["pipe"] and not src else []
+        if prev and os.path.basename(prev[0]) == "cat":
+            src = ("files", _operands(prev[1:]))
+        elif prev and os.path.basename(prev[0]) in ("echo", "printf"):
+            src = ("text", " ".join(prev[1:]))
+        stdin = src[1] if src and src[0] == "text" else None
+        for f in src[1] if src and src[0] == "files" else []:
+            try:
+                path = Path(expand(f, env, cwd))
+                if path.stat().st_size <= hook.SCRIPT_MAX_BYTES:
+                    stdin = (stdin or "") + path.read_text(errors="replace") + "\n"
+            except (OSError, ValueError):
+                pass   # unreadable: as a local script file the guard cannot read
+        calls.append((words, stdin))
+    return calls, sent
+
+
+def _ssh_remote(args: list[str]) -> list[str] | None:
+    """The remote command words in ssh's arguments `args` (None: no host)."""
+    i = 0
+    while i < len(args) and args[i].startswith("-"):
+        if args[i] == "--":
+            i += 1
+            break
+        opt = args[i][1:]
+        j = next((k for k, c in enumerate(opt) if c in SSH_VALUE_OPTS), None)
+        i += 2 if j is not None and j == len(opt) - 1 else 1
+    return args[i + 1:] if i < len(args) else None
 
 
 def _assigned(raw: list[str], env) -> dict:

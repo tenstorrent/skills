@@ -3951,7 +3951,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   that uses a key passes only by the key rule above (the remote command is the host's), with no
   other variable before it, no command substitution, no redirect to a built target, and beside it
   only plain commands such as `cd`, `echo` or `cat`; otherwise it is refused as a credential-store
-  read. Add a path for one project with
+  read. Text ssh runs on another host is read too (its remote command, a file, pipe or heredoc on
+  its stdin, a file scp or rsync copied there and then run): with `~` as the remote home it may not
+  change that host's default keys, ssh config or authorized_keys file (appending a key passes).
+  Add a path for one project with
   `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
   account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
   folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and

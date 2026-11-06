@@ -378,3 +378,77 @@ def test_pathguard_refuses_codex_native_apply_patch_in_hook_on_runs(cred_home):
                  f"*** Add File: {h}/.sshx/notes\n+x"):
         out, _ = hook.pre_tool_use(patch(body))
         assert out is None, (body, out)
+
+
+PG_KEYGEN = "ssh-keygen -q -t ed25519 -N '' -f $HOME/.ssh/id_ed25519"
+PG_REMOTE_DENIED = [
+    # (a) a file on ssh's stdin, also through a wrapper script
+    "ssh host 'bash -s' < fix.sh", "ssh -p 22 -o BatchMode=yes host bash < fix.sh", "ssh host < fix.sh",
+    "bash wrap.sh", "ssh host python3 - < fix.py",
+    # (b) piped into ssh
+    "cat fix.sh | ssh host bash", "cat fix.sh | ssh host 'bash -s'", f'echo "{PG_KEYGEN}" | ssh remote sh',
+    # (c) a heredoc
+    f"ssh host bash <<'EOF'\nset -e\n{PG_KEYGEN}\nEOF", "ssh remote 'bash -s' <<-EOF\n\tssh-keygen -N '' -f ~/.ssh/id_rsa\n\tEOF",
+    # (d) copied, then run there
+    "scp fix.sh host: && ssh host bash fix.sh", "rsync -a fix.sh remote:/tmp/ && ssh remote 'bash /tmp/fix.sh'",
+    # (e) the remote command itself, its redirects too
+    "ssh host 'ssh-keygen -f ~/.ssh/id_ed25519'", "ssh host 'echo x > ~/.ssh/authorized_keys'",
+    "ssh host 'ssh-keygen -t ed25519 -N \"\"'", "ssh remote 'rm -rf ~/.ssh'", "ssh host 'cp k /home/u/.ssh/config'",
+    "ssh host \"mv k \\$HOME/.ssh/id_rsa.pub\"", "ssh -J jump host 'ssh other \"echo x > ~/.ssh/config\"'",
+    "bash -c \"ssh host 'tee ~/.ssh/authorized_keys < k'\"",
+]
+PG_REMOTE_ALLOWED = [
+    "ssh host 'mkdir -p ~/.ssh && chmod 700 ~/.ssh && echo x > ~/.ssh/known_hosts'",
+    "ssh host 'test -e ~/.ssh/purpose_key || ssh-keygen -q -t ed25519 -N \"\" -f ~/.ssh/purpose_key'",
+    "ssh host 'bash -s' < ok.sh", "cat ok.sh | ssh host bash", "scp ok.sh host: && ssh host bash ok.sh",
+    "ssh host 'bash -s' < missing.sh", "ssh host 'cat ~/.ssh/id_ed25519.pub' > /tmp/pub", "ssh host 'ssh-keygen -R other'",
+    "ssh host 'cat >> ~/.ssh/authorized_keys' < k.pub", "ssh host bash <<'EOF'\necho hi > /tmp/out\nEOF",
+    "scp fix.sh host: && ssh host 'cat fix.sh'", "cat fix.sh | ssh host 'cat > /tmp/fix.sh'",
+]
+
+
+def _pg_remote_files(w):
+    (w / "fix.sh").write_text(f"#!/bin/bash\nset -e\n{PG_KEYGEN}\n")
+    (w / "fix.py").write_text("import os\nopen(os.path.expanduser('~/.ssh/authorized_keys'), 'w').write('x')\n")
+    (w / "wrap.sh").write_text("#!/bin/bash\nssh host 'bash -s' < fix.sh\n")
+    (w / "ok.sh").write_text("#!/bin/bash\nmkdir -p ~/.ssh\ntest -e ~/.ssh/purpose_key || ssh-keygen -f ~/.ssh/purpose_key\n")
+
+
+@pytest.mark.parametrize("cmd", PG_REMOTE_DENIED)
+def test_pathguard_refuses_text_ssh_runs_on_a_host_writing_its_keys(cred_home, cmd):
+    """A script or command ssh runs on another host (stdin file, pipe, heredoc, a copy run there, the remote
+    command) that writes that host's default keys, ssh config or authorized_keys is refused, ~ read as the
+    remote home."""
+    from ttp import hook
+    _pg_remote_files(cred_home.work)
+    why = pathguard_why(_pg_bash(cmd, cred_home.work))
+    assert why and "on the remote host" in why, cmd
+    out, _ = hook.pre_tool_use(_pg_bash(cmd, cred_home.work))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny", cmd
+
+
+@pytest.mark.parametrize("cmd", PG_REMOTE_ALLOWED)
+def test_pathguard_lets_other_remote_writes_and_purpose_keys_pass(cred_home, cmd):
+    _pg_remote_files(cred_home.work)
+    assert pathguard_why(_pg_bash(cmd, cred_home.work)) is None, cmd
+
+
+def test_pathguard_local_rules_unchanged_by_the_remote_list(cred_home):
+    """Locally all of ~/.ssh stays protected: a purpose key, known_hosts and an appended key are refused."""
+    for cmd in ("test -e ~/.ssh/purpose_key || ssh-keygen -f ~/.ssh/purpose_key", "echo x > ~/.ssh/known_hosts",
+                "cat k.pub >> ~/.ssh/authorized_keys", "mkdir -p ~/.ssh/sub", "bash ok.sh"):
+        _pg_remote_files(cred_home.work)
+        why = pathguard_why(_pg_bash(cmd, cred_home.work))
+        assert why and "on the remote host" not in why, cmd
+    assert pathguard_why(_pg_bash("HOME=/tmp/scratch ssh-keygen -t ed25519", cred_home.work)) is None
+
+
+def test_pathguard_reads_commands_after_a_comment_line(cred_home):
+    """A `#` comment (a script's #! line, a note before a command) ends at its line: the commands after it are
+    read, locally and in a script ssh runs."""
+    from ttp import hook
+    assert hook._segments("#!/bin/sh\nset -e\nrm y # gone\nls") == [["set", "-e"], ["rm", "y"], ["ls"]]
+    w = cred_home.work
+    (w / "gen.sh").write_text("#!/bin/sh\n# make a key\nssh-keygen -q -N '' -f \"$HOME/.ssh/id_rsa\"\n")
+    for cmd in ("bash gen.sh", "# a note\nssh-keygen -f ~/.ssh/id_rsa", "ssh host 'bash -s' < gen.sh"):
+        assert pathguard_why(_pg_bash(cmd, w)), cmd
