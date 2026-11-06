@@ -2941,7 +2941,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   provider match Claude Code, where they differ or miss it, and which open task closes each gap.
   Where the harness hook does not run (Cursor; Codex with hooks off or another hook source), its
   guards, the Stop hand-off check and update hand-over by hook are absent: updates arrive through
-  `ttp note` and `ttp steer`, and a run that ends without a valid hand-off counts a failed attempt.
+  `ttp note` and `ttp steer`: a run that ends without a valid hand-off resumes its session once
+  where the session can be resumed (Codex; `Daemon._handoff_resume`), and otherwise fails the
+  attempt (Cursor, whose chats the harness cannot resume; the next run starts cold).
 - Codex and Cursor report tokens but no cost; their spend is estimated from a price table. Set
   your own rates in project.json as `"pricing": {"codex": {"<model>": [input, cached input,
   output]}}` in $ per million tokens (`"default"` covers other models; same for `cursor`).
