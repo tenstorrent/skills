@@ -1248,6 +1248,34 @@ def test_one_full_checks_run_per_project_at_a_time_freed_by_a_crash(env, tmp_pat
         proc.wait(10)
 
 
+def test_a_timed_wait_whose_first_try_outlasts_it_still_says_what_it_waited_for(env, monkeypatch):
+    """A loaded host: the first poll of a suite-lock or test-slot wait takes longer than its `wait_s`. The
+    wait still says once why it waited before it gives up (was: None and nothing told). A wait_s=0
+    suite-lock try stays silent; a wait_s=0 test-slot try still says what holds its slots."""
+    from ttp import project, testslots
+    monkeypatch.setenv("TTP_TEST_POOL", "2")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "2")
+    real = project.ps_cycle
+    monkeypatch.setattr(project, "ps_cycle", lambda: (time.sleep(0.3), real()))
+    hold, slots = testslots.suite_hold("pa", wait_s=0), testslots.acquire("t1", project_name="pa", wait_s=0)
+    assert hold.files and slots.k == 2
+    try:
+        lines, waits = [], []
+        assert testslots.suite_hold("pa", lines.append, wait_s=0.1, waiting=waits.append) is None
+        assert len(lines) == 1 and "one at a time per project" in lines[0] and waits == [True, False], lines
+        lines.clear()
+        assert testslots.acquire("t2", lines.append, wait_s=0.1, project_name="pb") is None
+        assert len(lines) == 1 and "waiting for a host-wide" in lines[0], lines
+        lines.clear()
+        assert testslots.suite_hold("pa", lines.append, wait_s=0, waiting=waits.append) is None
+        assert lines == [] and waits == [True, False], "a suite-lock try that never waits says nothing"
+        assert testslots.acquire("t2", lines.append, wait_s=0, project_name="pb") is None
+        assert len(lines) == 1 and "waiting for a host-wide" in lines[0], lines
+    finally:
+        hold.close()
+        slots.close()
+
+
 def test_ttp_checks_waits_for_its_project_s_other_full_checks(env, tmp_path, monkeypatch, capsys):
     from ttp import checkcap, cli, locks, testslots
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)

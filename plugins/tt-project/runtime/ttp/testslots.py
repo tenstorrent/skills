@@ -1685,7 +1685,9 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 return Grant(0, [f], time.time() - start)
             if stop and (why := stop()):
                 raise checkcap.Cancelled(why)
-            if wait_s is not None and time.time() - start >= wait_s:
+            # A wait that ran out says once what it waited for, though its first try outlasted `wait_s`.
+            expired = wait_s is not None and time.time() - start >= wait_s
+            if expired and (told or not wait_s):
                 return None
             if not told or time.time() - told >= checklane.TELL_S:
                 if not told and waiting:
@@ -1703,6 +1705,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                               f"first; this run {rank_text(ticket, told, age)}, position {place} of "
                               f"{max(len(q), place)}, {place - 1} waiter(s) ahead, waited {_mins(told - arrival)}), "
                               f"held by {held_by}")
+            if expired:
+                return None
             time.sleep(poll_s(HEAD_POLL_S if pos < slots else POLL_S))
     finally:
         locks.dequeue(ticket)
