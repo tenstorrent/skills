@@ -11691,6 +11691,9 @@ def cmd_doctor(a) -> None:
             continue
         print(f"provider {prov.name}: {'found ' + prov.binary() if prov.available() else 'not installed'}"
               + (f" · account {prov.account()}" if prov.available() and prov.account() else ""))
+    from . import cursortiers
+    if "cursor" in p.config()["providers"] and any(x.name == "cursor" and x.available() for x in all_providers()):
+        print(cursortiers.line(cursortiers.resolve(), p.raw_config()))
     rules = p.config().get("restrictions") or {}
     fence_off = {n for n, c in p.config()["providers"].items() if isinstance(c, dict) and c.get("write_fence") is False}
     gaps = [f"{prov.name} ({prov.write_fence(rules) or f'turned off: providers.{prov.name}.write_fence is false'})"

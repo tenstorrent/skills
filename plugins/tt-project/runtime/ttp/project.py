@@ -38,8 +38,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Tiers name a difficulty class, never a model version: aliases resolve at run time and
         # the project (or the user) pins versions only when it has a reason to. Light runs on the
         # provider's cheaper model where its CLI names one without a version (Claude: sonnet); Codex
-        # has no such alias (light keeps the account's default model at low effort) and Cursor's
-        # `auto` already picks per request. A task's own model/effort pin wins over its tier, and a
+        # has no such alias (light keeps the account's default model at low effort). Cursor takes no
+        # effort: its `auto` tiers resolve at run time to distinct models from the installed CLI's own
+        # model list (cursortiers.py), and stay `auto` when it cannot list them; a tier the project sets
+        # itself wins. A task's own model/effort pin wins over its tier, and a
         # failed light try retries a tier up, on the standard model.
         # billing: how the provider's spend is billed (billing.py). auto: plan windows decide; plan: a
         # plan seat with no meter (no dollar cap, spend is plan spend); usage: always the dollar caps.

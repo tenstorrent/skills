@@ -247,3 +247,167 @@ def test_cursor_workers_under_no_internet_keep_the_sandbox(env, monkeypatch):
     assert any((p.runs / str(run["id"])).resolve().is_relative_to(d.resolve()) for d in added), added
     assert task["status"] == "done"
     assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"
+
+
+# `agent --list-models` as the CLI prints it (its format, from the installed build; names invented).
+CURSOR_MODEL_LIST = (
+    "\x1b[2mAvailable models\x1b[22m\n\n"
+    "\x1b[36mauto\x1b[39m \x1b[2m- Auto\x1b[22m\n"
+    "\x1b[36malpha-5\x1b[39m \x1b[2m- Alpha 5\x1b[22m \x1b[2m(default)\x1b[22m\n"
+    "\x1b[36malpha-5-mini\x1b[39m \x1b[2m- Alpha 5 Mini\x1b[22m\n"
+    "\x1b[36mbeta-4-thinking\x1b[39m \x1b[2m- Beta 4 (Thinking)\x1b[22m\n"
+    "\x1b[32mbeta-4-pro-thinking\x1b[39m \x1b[2m- Beta 4 Pro (Thinking)\x1b[22m \x1b[2m(current)\x1b[22m\n"
+    "\x1b[36mgamma-flash\x1b[39m \x1b[2m- Gamma Flash\x1b[22m\n\n"
+    "\x1b[2mTip: use \x1b[36m--model <id>\x1b[39m (or \x1b[36m/model <id>\x1b[39m in interactive mode) to switch.\x1b[22m\n")
+CURSOR_LOGGED_OUT = ("Error: Authentication required. Run 'agent login', pass --api-key/--auth-token, "
+                     "or set CURSOR_API_KEY/CURSOR_AUTH_TOKEN.\n")
+
+
+def _fake_cursor_lister(tmp_path, version="2026.01.01-aaaaaaa", listing=CURSOR_MODEL_LIST, rc=0, help_text=None):
+    """A fake `agent` that answers --help, --version and --list-models, logging each call."""
+    exe = tmp_path / "bin" / "agent"
+    exe.parent.mkdir(exist_ok=True)
+    (tmp_path / "listing.txt").write_text(listing)
+    (tmp_path / "help.txt").write_text(CURSOR_REAL_HELP if help_text is None else help_text)
+    exe.write_text(f"#!{sys.executable}\nimport sys\nfrom pathlib import Path\nd = Path({str(tmp_path)!r})\n"
+                   "open(d / 'calls.log', 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                   f"if sys.argv[1:] == ['--version']:\n    print({version!r}); sys.exit(0)\n"
+                   "if sys.argv[1:] == ['--help']:\n    print((d / 'help.txt').read_text()); sys.exit(0)\n"
+                   f"print((d / 'listing.txt').read_text()); sys.exit({rc})\n")
+    exe.chmod(0o755)
+    return str(exe)
+
+
+def test_cursor_tiers_resolve_to_distinct_models_from_the_cli_list(env, monkeypatch, tmp_path):
+    from ttp import cursortiers
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    models = cursortiers.parse_models(CURSOR_MODEL_LIST)
+    assert [m["id"] for m in models] == ["auto", "alpha-5", "alpha-5-mini", "beta-4-thinking",
+                                         "beta-4-pro-thinking", "gamma-flash"]
+    assert [m["id"] for m in models if m["default"]] == ["alpha-5"], "(current) is not (default)"
+    # deep: the strongest reasoning model; light: the cheapest; standard: the account default between them.
+    assert cursortiers.pick(models) == {"light": "gamma-flash", "standard": "alpha-5", "deep": "beta-4-pro-thinking"}
+    # No default listed: standard is the model ranked midway; never auto, always three distinct models.
+    plain = [dict(m, default=False) for m in models]
+    got = cursortiers.pick(plain)
+    assert len(set(got.values())) == 3 and "auto" not in got.values() and got["deep"] == "beta-4-pro-thinking"
+    # No reasoning word anywhere: deep is the strongest model; listing order breaks ties.
+    assert cursortiers.pick([{"id": "m-a"}, {"id": "m-b-pro"}, {"id": "m-c-mini"}]) == \
+        {"light": "m-c-mini", "standard": "m-a", "deep": "m-b-pro"}
+    # Fewer models than tiers share them; only auto (or nothing) resolves to nothing.
+    assert cursortiers.pick([{"id": "solo"}]) == {"light": "solo", "standard": "solo", "deep": "solo"}
+    assert cursortiers.pick([{"id": "auto"}]) == {} == cursortiers.pick([])
+    # Through the CLI: the map, the CLI version and the models are kept host-wide.
+    exe = _fake_cursor_lister(tmp_path)
+    cache = tmp_path / "tiers.json"
+    r = cursortiers.resolve(exe, credentials="c1", now=1000.0, path=cache)
+    assert r["source"] == "listed" and r["cli"] == "2026.01.01-aaaaaaa" and r["why"] == ""
+    assert r["tiers"] == {"light": "gamma-flash", "standard": "alpha-5", "deep": "beta-4-pro-thinking"}
+    assert json.loads(cache.read_text())["tiers"] == r["tiers"]
+    assert "deep beta-4-pro-thinking" in cursortiers.line(r) and "2026.01.01-aaaaaaa" in cursortiers.line(r)
+
+
+def test_cursor_tiers_resolve_again_when_the_cli_or_its_login_changes(env, monkeypatch, tmp_path):
+    from ttp import cursortiers
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    exe = _fake_cursor_lister(tmp_path)
+    cache, calls = tmp_path / "tiers.json", tmp_path / "calls.log"
+    first = cursortiers.resolve(exe, credentials="c1", now=1000.0, path=cache)
+    asked = calls.read_text().count("--list-models")
+    assert asked == 1
+    # Same CLI, same login, much later: the kept map answers, the CLI is not asked again.
+    assert cursortiers.resolve(exe, credentials="c1", now=1000.0 + 30 * 86400, path=cache) == first
+    assert calls.read_text().count("--list-models") == 1
+    # An upgrade (the binary changes) with a new model list: resolved again, the new version recorded.
+    _fake_cursor_lister(tmp_path, version="2026.02.02-bbbbbbbbbb",
+                        listing="Available models\n\nnew-lite - New Lite\nnew-core - New Core (default)\n"
+                                "new-max-thinking - New Max Thinking\n")
+    second = cursortiers.resolve(exe, credentials="c1", now=2000.0, path=cache)
+    assert calls.read_text().count("--list-models") == 2
+    assert second["cli"] == "2026.02.02-bbbbbbbbbb"
+    assert second["tiers"] == {"light": "new-lite", "standard": "new-core", "deep": "new-max-thinking"}
+    # A login change resolves again too (the account's models may differ).
+    cursortiers.resolve(exe, credentials="c2", now=2001.0, path=cache)
+    assert calls.read_text().count("--list-models") == 3
+    # force asks at once.
+    cursortiers.resolve(exe, credentials="c2", now=2002.0, path=cache, force=True)
+    assert calls.read_text().count("--list-models") == 4
+
+
+def test_cursor_tiers_fall_back_to_auto_and_say_why(env, monkeypatch, tmp_path):
+    from ttp import cursortiers
+    from ttp.project import DEFAULT_CONFIG
+    monkeypatch.delenv("TTP_TEST_NO_MODELS_PROBE", raising=False)
+    cache, calls = tmp_path / "tiers.json", tmp_path / "calls.log"
+    # Logged out (the real CLI's message, exit 1): auto for every tier, the login named.
+    exe = _fake_cursor_lister(tmp_path, listing=CURSOR_LOGGED_OUT, rc=1)
+    r = cursortiers.resolve(exe, credentials="c1", now=1000.0, path=cache)
+    assert r["source"] == "fallback" and r["tiers"] == dict.fromkeys(cursortiers.TIERS, "auto")
+    assert "logged out" in r["why"] and "logged out" in cursortiers.line(r)
+    cfg = json.loads(json.dumps(DEFAULT_CONFIG))
+    assert cursortiers.apply(cfg, {}, r) == {}
+    assert {t: v["model"] for t, v in cfg["providers"]["cursor"]["tiers"].items()} == dict.fromkeys(cursortiers.TIERS, "auto")
+    # The same message at exit 0 is still logged out, never a model named "Error:".
+    _fake_cursor_lister(tmp_path, listing=CURSOR_LOGGED_OUT, rc=0)
+    assert cursortiers.resolve(exe, credentials="c1b", now=1000.0, path=cache)["source"] == "fallback"
+    # A failed listing is asked again only after RETRY_S, or at once on login.
+    n = calls.read_text().count("--list-models")
+    cursortiers.resolve(exe, credentials="c1b", now=1000.0 + cursortiers.RETRY_S - 1, path=cache)
+    assert calls.read_text().count("--list-models") == n
+    _fake_cursor_lister(tmp_path)   # logged in now
+    assert cursortiers.resolve(exe, credentials="c3", now=1001.0, path=cache)["source"] == "listed"
+    # An old CLI without --list-models (nor `models`): the CLI is not asked, auto stays.
+    _fake_cursor_lister(tmp_path, help_text="Usage: agent [options]\n  --model <model>  Model to use\n")
+    from ttp.providers import base
+    base._CLI_OUTPUT.pop((exe, "--help"), None)
+    r = cursortiers.resolve(exe, credentials="c4", now=1002.0, path=cache)
+    assert r["source"] == "fallback" and "no --list-models" in r["why"]
+    base._CLI_OUTPUT.pop((exe, "--help"), None)
+    # Not installed, or listing off in tests: auto, and said so.
+    assert cursortiers.resolve("", now=1.0, path=cache)["why"] == "the Cursor CLI is not installed"
+    monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")
+    assert cursortiers.resolve(exe, credentials="c5", now=1.0, path=cache)["source"] == "fallback"
+
+
+def test_cursor_tiers_the_projects_own_tiers_win(env, monkeypatch):
+    from ttp import cursortiers
+    from ttp.project import layered
+    resolved = {"source": "listed", "tiers": {"light": "l-mini", "standard": "s-core", "deep": "d-pro-thinking"}}
+    # project.json pins light to auto and deep to its own model: only standard is resolved.
+    raw = {"providers": {"cursor": {"tiers": {"light": {"model": "auto"}, "deep": {"model": "own-model"}}}}}
+    cfg = layered(raw)
+    assert cursortiers.apply(cfg, raw, resolved) == {"standard": "s-core"}
+    tiers = cfg["providers"]["cursor"]["tiers"]
+    assert (tiers["light"]["model"], tiers["standard"]["model"], tiers["deep"]["model"]) == ("auto", "s-core", "own-model")
+    line = cursortiers.line(resolved, raw)
+    assert "light project.json" in line and "standard s-core" in line and "deep project.json" in line
+    # Nothing set: all three resolved. A non-auto default from elsewhere (account settings) is kept.
+    cfg = layered({})
+    cfg["providers"]["cursor"]["tiers"]["light"]["model"] = "account-pick"
+    assert cursortiers.apply(cfg, {}, resolved) == {"standard": "s-core", "deep": "d-pro-thinking"}
+
+
+def test_dispatched_cursor_run_takes_its_tier_from_the_resolved_map(env, monkeypatch):
+    from ttp import cursortiers
+    resolved = {"source": "listed", "cli": "2026.01.01-aaaaaaa", "why": "",
+                "tiers": {"light": "l-mini", "standard": "s-core", "deep": "d-pro-thinking"}}
+    monkeypatch.setattr(cursortiers, "resolve", lambda *a, **k: resolved)
+    p, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                  result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP)
+    assert argv[argv.index("--model") + 1] == "l-mini" and run["model"] == "l-mini"
+    note = json.loads(run["note"])["cursor_tiers"]
+    assert note == {"source": "listed", "cli": "2026.01.01-aaaaaaa", "resolved": {
+        "light": "l-mini", "standard": "s-core", "deep": "d-pro-thinking"}, "why": ""}
+    # Fallback: auto, and why in the run's note.
+    monkeypatch.setattr(cursortiers, "resolve", lambda *a, **k: {
+        "source": "fallback", "tiers": dict.fromkeys(cursortiers.TIERS, "auto"), "why": "logged out", "cli": ""})
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                  result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP)
+    assert argv[argv.index("--model") + 1] == "auto"
+    assert json.loads(run["note"])["cursor_tiers"]["why"] == "logged out"
+    # The project's own light tier wins over the map.
+    monkeypatch.setattr(cursortiers, "resolve", lambda *x, **k: resolved)
+    _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
+                                  result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP,
+                                  before=lambda p: p.set_config("providers.cursor.tiers.light.model", "own-model"))
+    assert argv[argv.index("--model") + 1] == "own-model" and run["model"] == "own-model"

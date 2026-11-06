@@ -40,6 +40,7 @@ from . import ackwait
 from . import pausegone
 from . import urgentfup
 from . import topup
+from . import cursortiers
 from . import seedcap
 from . import turnrules
 from . import checksettle
@@ -1396,6 +1397,7 @@ class Daemon:
         defaults) and says so in one alert, which clears once the file reads again."""
         raw, status = self.p.read_config()
         self.cfg = layered(raw)
+        self._raw_cfg = raw   # which tiers the project sets itself (cursortiers.apply)
         # The process sandbox for checks, off unless the project turns it on: this daemon's own check
         # runs read it here, its workers from their environment (start_run).
         from . import sandbox as process_sandbox
@@ -2838,14 +2840,23 @@ class Daemon:
             raise RuntimeError("this host does not hold the project lease: no model work starts")
         if provider in self._net_holds:
             self._net_holds[provider]["probe"] = time.monotonic()   # the one run that tries the network
-        tiers = self.cfg["providers"].get(provider, {}).get("tiers", {})
+        cfg = self.cfg
+        if provider == "cursor":
+            # Cursor's tiers from its CLI's model list (cursortiers.py); the project's own tiers win.
+            resolved = cursortiers.resolve()
+            cfg = copy.deepcopy(self.cfg)
+            raw = getattr(self, "_raw_cfg", None)
+            set_by = cursortiers.apply(cfg, raw if raw is not None else self.p.read_config()[0], resolved)
+            note = {**(note or {}), "cursor_tiers": {"source": resolved.get("source"), "cli": resolved.get("cli", ""),
+                                                     "resolved": set_by, "why": resolved.get("why", "")}}
+        tiers = cfg["providers"].get(provider, {}).get("tiers", {})
         model = tiers.get(tier, {}).get("model", "")
         effort = tiers.get(tier, {}).get("effort", "")
         if role == "coordinator":
             # Every turn at coordinator.effort, else coordinator.DEFAULT_EFFORT, as the provider takes
             # it; coordinator.model pins the model, so moving its tier's model (say light to a cheaper
             # one for workers) does not move the coordinator with it. Read from the config as it is now.
-            route = coord.coordinator_route(self.cfg, provider)
+            route = coord.coordinator_route(cfg, provider)
             model, effort = route["model"], route["effort"]
             prompt_bytes = sum(len(text.encode("utf-8")) for text in (prompt, system or "", context or "", append_system or ""))
             timeout_s = coordlimits.turn_timeout(self.cfg, provider, effort, prompt_bytes)
