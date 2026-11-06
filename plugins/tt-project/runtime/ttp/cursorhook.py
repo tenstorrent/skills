@@ -198,7 +198,8 @@ def merged(original: str | None) -> str:
 
 
 def _git(cwd: Path, *args: str) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=20)
+    from . import gitmemo   # install and undo run under the daemon's launch: its cap applies
+    return gitmemo.run(["git", "-C", str(cwd), *args], capture_output=True, text=True, timeout=20)
 
 
 def _top(cwd: Path) -> Path | None:
