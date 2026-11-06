@@ -97,7 +97,7 @@ def test_drift_pace_fires_on_spend_ahead_of_wall_or_most_of_the_budget_with_no_c
     wall = lambda share: {"elapsed_s": 1, "limit_s": 2, "share": share}  # noqa: E731
     assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.5, 0.5), wall=wall(0.33)), now)
     assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.5, 0.5), wall=wall(0.34)), now)
-    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.2, 0.2), wall=wall(0.01)), now), "under the floor"
+    assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.49, 0.49), wall=wall(0.01)), now), "under the floor"
     git = lambda c: {"head": "h", "committed": c}  # noqa: E731
     assert "pace" in _dr_flags(_dr_entry(now, spend=spend(0.4, 0.85), wall=wall(0.9), git=git([])), now)
     assert "pace" not in _dr_flags(_dr_entry(now, spend=spend(0.4, 0.85), wall=wall(0.9), git=git(["a.py"])), now)
@@ -186,3 +186,17 @@ def test_drift_a_run_waiting_on_a_lock_is_never_flagged_quiet(env, tmp_path):
         locks.record_wait(run_dir, "w1", now, now + 7200, ["dev"])
     data, _ = _dr_tick(p, now + 7300)
     assert "quiet" in data["runs"][str(rid)]["flags"], "once the wait ends, the quiet clock counts"
+
+
+def test_daemon_watch_runs_writes_drift_flags_into_the_record_and_runs_live_shows_them(env, tmp_path, capsys):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p, run_dir, t, rid = _dr_project(env, tmp_path)
+    (run_dir / "output.jsonl").write_text("".join(_rw_claude_call(f"c{i}", "Bash", command="make all")
+                                                  + _rw_claude_result(f"c{i}", error=True) for i in range(3)))
+    Daemon(p.base).watch_runs()
+    e = json.loads((p.state / "runwatch.json").read_text())["runs"][str(rid)]
+    assert list(e["flags"]) == ["repeat_fail"] and e["drift"]["fired"]["repeat_fail"]["steered"]
+    assert "Drift check" in (run_dir / "steer.md").read_text()
+    cli.main(["runs", "live", p.name])
+    assert "drift: repeat_fail: `make all` failed 3 times" in capsys.readouterr().out
