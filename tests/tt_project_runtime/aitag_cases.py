@@ -289,11 +289,11 @@ def test_curl_and_wget_posts_to_github_slack_jira_and_confluence_need_the_ai_tag
         "cd /tmp && curl -sd @body.json https://api.github.com/repos/a/b/issues/7/comments",
         "timeout 30 curl --data-binary @body.json https://api.github.com/repos/a/b/releases",
         "curl -u u:t -H 'Content-Type: application/json' -d '{\"body\": \"Done\"}' "
-        "https://example.atlassian.net/rest/api/2/issue/X-1/comment",
+        "https://site.example.com/rest/api/2/issue/X-1/comment",
         "curl -X POST --data '{\"fields\": {\"summary\": \"s\", \"description\": \"d\"}}' "
-        "https://example.atlassian.net/rest/api/3/issue",
+        "https://site.example.com/rest/api/3/issue",
         "curl --json '{\"title\": \"t\", \"body\": {\"storage\": {\"value\": \"<p>Notes</p>\"}}}' "
-        "https://example.atlassian.net/wiki/api/v2/pages",
+        "https://site.example.com/wiki/api/v2/pages",
         "wget -qO- --post-data='{\"text\": \"hi\"}' https://slack.com/api/chat.postMessage",
         "timeout 20 curl --url=HTTPS://SLACK.COM/api/chat.postMessage -d text=hi | jq .ok",
         "curl -d @- https://slack.com/api/chat.postMessage < msg.json",
@@ -308,10 +308,10 @@ def test_curl_and_wget_posts_to_github_slack_jira_and_confluence_need_the_ai_tag
         "curl -d @ok.json https://api.github.com/repos/a/b/issues/7/comments",
         "curl -d \"{\\\"text\\\": \\\"$MSG\\\"}\" https://slack.com/api/chat.postMessage",   # built at run time
         "curl -s https://api.github.com/repos/a/b/issues/7/comments",   # a read
-        "curl -G -d q=open https://example.atlassian.net/rest/api/3/issue",
+        "curl -G -d q=open https://site.example.com/rest/api/3/issue",
         "curl -d '{\"query\": \"x\"}' https://slack.com/api/search.messages",
         "curl -X PATCH -d '{\"body\": \"edited\"}' https://api.github.com/repos/a/b/issues/7",   # own body edit
-        "curl -X PUT -d '{\"fields\": {\"labels\": [\"a\"]}}' https://example.atlassian.net/rest/api/3/issue/X-1",
+        "curl -X PUT -d '{\"fields\": {\"labels\": [\"a\"]}}' https://site.example.com/rest/api/3/issue/X-1",
         "curl -d '{\"text\": \"Tests are green.\"}' http://127.0.0.1:8080/api/notify",   # not a post to others
         "curl -d '{\"inputs\": {}}' https://api.github.com/repos/a/b/actions/workflows/1/dispatches",
         "echo curl -d x https://slack.com/api/chat.postMessage")
@@ -326,22 +326,22 @@ def test_curl_and_wget_posts_to_github_slack_jira_and_confluence_need_the_ai_tag
         return {"type": "doc", "version": 1, "content": [{"type": "paragraph", "content": [
             {"type": "text", "text": "hi "}, {"type": "text", "text": end, "marks": [{"type": "em"}]}]}]}
     shapes = (   # (url, body with its end text)
-        ("https://x.atlassian.net/wiki/rest/api/content", lambda end: {
+        ("https://site.example.com/wiki/rest/api/content", lambda end: {
             "type": "page", "title": "t", "space": {"key": "S"},
             "body": {"storage": {"value": f"<p>hi</p><p>{end}</p>", "representation": "storage"}}}),
-        ("https://x.atlassian.net/wiki/rest/api/content/12/child/comment", lambda end: {
+        ("https://site.example.com/wiki/rest/api/content/12/child/comment", lambda end: {
             "type": "comment", "container": {"id": "12", "type": "page"},
             "body": {"storage": {"value": f"<p>{end}</p>", "representation": "storage"}}}),
-        ("https://x.atlassian.net/wiki/api/v2/pages", lambda end: {
+        ("https://site.example.com/wiki/api/v2/pages", lambda end: {
             "spaceId": "1", "status": "current", "title": "t",
             "body": {"representation": "storage", "value": f"<p>hi</p><p>{end}</p>"}}),
-        ("https://x.atlassian.net/wiki/api/v2/footer-comments", lambda end: {
+        ("https://site.example.com/wiki/api/v2/footer-comments", lambda end: {
             "pageId": "1", "body": {"representation": "storage", "value": f"<p>{end}</p>"}}),
-        ("https://x.atlassian.net/rest/api/3/issue/X-1/comment", lambda end: {"body": adf(end)}),
-        ("https://x.atlassian.net/rest/api/3/issue", lambda end: {
+        ("https://site.example.com/rest/api/3/issue/X-1/comment", lambda end: {"body": adf(end)}),
+        ("https://site.example.com/rest/api/3/issue", lambda end: {
             "fields": {"project": {"key": "X"}, "summary": "s", "issuetype": {"name": "Task"}, "description": adf(end)}}),
-        ("https://x.atlassian.net/rest/api/2/issue/X-1/comment", lambda end: {"body": f"hi\n{end}"}),
-        ("https://x.atlassian.net/rest/api/2/issue", lambda end: {
+        ("https://site.example.com/rest/api/2/issue/X-1/comment", lambda end: {"body": f"hi\n{end}"}),
+        ("https://site.example.com/rest/api/2/issue", lambda end: {
             "fields": {"project": {"key": "X"}, "summary": "s", "description": f"d\n{end}"}}),
         ("https://slack.com/api/chat.postMessage", lambda end: {
             "channel": "C1", "text": f"hi {tagged}", "blocks": [
