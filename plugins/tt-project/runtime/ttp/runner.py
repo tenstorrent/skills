@@ -333,6 +333,16 @@ def check_instructions(prov, run_dir: Path, out_path: Path, argv: list[str], env
     return None
 
 
+def _cred_snapshot() -> dict | None:
+    """credwatch.snapshot() of the account's credential files; None when it fails (the run goes on)."""
+    try:
+        from . import credwatch
+        return credwatch.snapshot()
+    except Exception as e:
+        print(f"runner: could not stat the credential files: {type(e).__name__}", flush=True)
+        return None
+
+
 def _env_files(spec: dict) -> dict[str, str]:
     """The secret environment the daemon kept out of run.json (env_files: owner-only JSON files,
     removed with the run's private files), e.g. Codex workers' MCP server tokens."""
@@ -432,6 +442,7 @@ def supervise(run_dir: Path) -> int:
         # The stream guard reads the hook's marker before the agent starts: it could write one itself.
         from .hook import hooked
         pre_hooked = hooked(run_dir)
+        creds = _cred_snapshot()
         child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
                                  start_new_session=True, preexec_fn=preexec)
     except OSError as e:
@@ -613,6 +624,11 @@ def supervise(run_dir: Path) -> int:
                 f"run went without its binding restrictions; "
                 + ("it was stopped" if reason and reason[0] == "instructions_missing" else "its result is held")))
             print(f"runner: {exit_info['error']}", flush=True)
+    if creds is not None and (after := _cred_snapshot()) is not None:
+        from . import credwatch
+        if changed := credwatch.changes(creds, after):
+            exit_info["cred_changed"] = changed   # the daemon queues the observation (credwatch.observe)
+            print(f"runner: credential files changed during the run: {changed}", flush=True)
     if bridge is not None:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
     try:   # before exit.json: the daemon reads the run's output and hand-off only after it

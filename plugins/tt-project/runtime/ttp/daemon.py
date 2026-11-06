@@ -41,6 +41,7 @@ from . import pausegone
 from . import urgentfup
 from . import topup
 from . import cursortiers
+from . import credwatch
 from . import seedcap
 from . import turnrules
 from . import checksettle
@@ -4324,6 +4325,11 @@ class Daemon:
             redact.scrub_run(run_dir)
         except Exception:
             log(p, f"run {r['id']}: masking stored secrets failed\n" + traceback.format_exc())
+        if exit_info.get("cred_changed"):
+            try:
+                credwatch.observe(db, r, exit_info["cred_changed"], time.time())
+            except Exception:
+                log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
         if exit_info.get("launch_auth"):
