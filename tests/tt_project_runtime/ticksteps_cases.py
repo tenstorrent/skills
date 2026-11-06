@@ -172,9 +172,12 @@ def test_the_daemons_checks_start_skips_a_pre_stage_longer_than_its_inline_bound
     p.set_config("delivery.push_branch", "work")
     p.set_config("delivery.push_queue", True)
     p.set_config("delivery.push_checks", ["true"])
-    p.set_config("delivery.check_prestage", {"run": f"touch {mark}; sleep 6", "timeout_s": 30})
-    for name in ("PROBE_TIMEOUT_S", "INLINE_CHILD_S"):   # the start's inline bound, shorter than the pre-stage
-        monkeypatch.setattr(dmod, name, 2, raising=False)
+    # The start's inline bound is shorter than the pre-stage, yet long enough for a real `ttp checks
+    # --detach` to start on a busy host (a 2 s bound timed the start out under load). The pre-stage
+    # touches `mark` first, so a start that runs it fails the test whatever the timing.
+    bound = 60
+    p.set_config("delivery.check_prestage", {"run": f"touch {mark}; sleep {bound * 10}", "timeout_s": 900})
+    monkeypatch.setattr(dmod, "INLINE_CHILD_S", bound)
     tid = p.db.add_task("slow pre-stage", "spec", kind="code", origin="coordinator")
     path, _ = worktree.ensure(p, p.db.task(tid))
     head = _git_out(path, "rev-parse", "HEAD").strip()
@@ -184,7 +187,8 @@ def test_the_daemons_checks_start_skips_a_pre_stage_longer_than_its_inline_bound
     assert out is not None and "checks not started" not in daemon_log(), daemon_log()
     assert _wait_precheck(out) == "0", (out / cli.CHECKS_OUT).read_text()
     again = env["tmp"] / "restarted"
-    assert d._restart_checks(tid, again, {"worktree": str(path), "head": head, "cmd": ["true"]}, "r1") == ""
+    assert d._restart_checks(tid, again, {"worktree": str(path), "head": head, "cmd": ["true"], "fresh": True},
+                              "r1") == ""
     assert _wait_precheck(again) == "0", (again / cli.CHECKS_OUT).read_text()
     assert not mark.exists(), "the daemon's start ran the pre-stage"
 
