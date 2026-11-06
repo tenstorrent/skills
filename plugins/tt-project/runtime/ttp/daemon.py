@@ -116,6 +116,7 @@ from . import detach
 from . import progress
 from . import downtime
 from . import effort
+from . import modelpick
 from . import effortab
 from . import extchange
 from . import failover
@@ -2850,6 +2851,8 @@ class Daemon:
                 # A session wake stops at its dollar or time limit, whichever comes first (coordtools).
                 budget_usd, timeout_s = coordtools.wake_budget(self.cfg, budget_usd, timeout_s)
                 note["turn"].update(timeout_s=timeout_s, wake_budget={"usd": budget_usd, "s": timeout_s})
+        if role != "coordinator":   # a routed model pick runs its option's model and effort
+            model, effort = modelpick.run_model(note, provider, model, effort)
         pin: dict = {}
         if role != "coordinator" and task:
             # The task's own pin (task_add model/effort) wins over its tier: a tier change (an effort
@@ -5889,6 +5892,7 @@ class Daemon:
         if plan_line and (gate := plangate.stored(db.task(task["id"]))):   # tasks queued from it already
             plan_line += "".join(f"\n{n}" for n in plangate.hold_queued(self.p, db, task["id"], gate))
         effort.settle(db, task["id"], "done" if rejects else new, attempts)
+        modelpick.settle(db, task["id"], "done" if rejects else new, attempts)
         try:   # the wake-gate decisions behind this run: a wake that only handed the wait back is a miss
             waitgate.settle_run(db, json.loads(r.get("note") or "{}"), load_result(task["result"]), result,
                                 isinstance(result, dict) and result.get("status") == "waiting")
@@ -9363,8 +9367,11 @@ class Daemon:
                                            **({"unpinned": unpinned} if unpinned else {})}
                 if routed:
                     note[route.KEY] = routed
-                try:
-                    ab = effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)
+                if dp := self._model_pick(task, tier, peek=True):
+                    note[modelpick.KEY] = {k: dp.get(k) for k in ("by", "pick", "p", "why") if k in dp}
+                try:   # a routed model pick runs its option's effort: no A/B arm
+                    ab = None if (routed or {}).get("model_pick") and run_prov == routed["to"] else \
+                        effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)
                 except Exception as e:   # the A/B must never hold a task back
                     ab = None
                     log(self.p, f"task {task['id']}: effort A/B not assigned: {e}")
@@ -9710,14 +9717,37 @@ class Daemon:
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
             return None
 
-    def _route(self, task: dict, tier: str, picked: dict | None, now: float) -> dict | None:
+    def _route(self, task: dict, tier: str, picked: dict | None, now: float, peek: bool = False) -> dict | None:
         """The run note's `route` entry for a worker run of a tier routed to another provider
         (route.py), or None: `fallback` is none when it starts there, else why it starts on the core
         provider (a cool-down after a fallback, or the auth gate holding the endpoint)."""
-        to = route.target(self.cfg, tier)
-        if not to or not route.eligible(task, picked) or self._floor_keeps_core(task, tier, picked):
+        dp = self._model_pick(task, tier, peek=peek)
+        if dp is not None:   # the model pick (modelpick.py) decides this tier's route
+            got = modelpick.target(self.cfg, dp)
+            to = (got["provider"], got["model"]) if got else None
+        else:
+            to = route.target(self.cfg, tier)
+        if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
         name, model = to
+        if dp is not None:
+            return {**self._route_entry(task, tier, name, model, now), "model_pick": True,
+                    **({"pick_effort": got["effort"]} if got["effort"] else {})}
+        return self._route_entry(task, tier, name, model, now)
+
+    def _model_pick(self, task: dict, tier: str, peek: bool = False) -> dict | None:
+        """This start's model pick (modelpick.pick), or None: the tier's own route decides. `peek`
+        reads a kept pick only (no Jev call)."""
+        def parent_diff(t: dict) -> str:
+            got = worktree.diff_lines(self.p, [t["branch"]]) if t.get("branch") else None
+            return f"{len(got)} files, {sum(v or 0 for v in got.values())} lines" if got else ""
+        try:
+            return modelpick.pick(self.p.db, self.cfg, task, tier, jev=self.jev, parent_diff=parent_diff, peek=peek)
+        except Exception as e:   # picking must never hold a task back
+            log(self.p, f"task {task.get('id')}: model not picked: {e}")
+            return None
+
+    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float) -> dict:
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
             return {"tier": tier, "to": name, "model": model, "fallback": "rerun", "after": after}
@@ -9738,7 +9768,7 @@ class Daemon:
         (_route at the task's tier) when that can take a run now, else `provider`."""
         if provider != (task["provider"] or self.cfg.get("core_provider", "claude")):
             return provider
-        routed = self._route(task, task["tier"], None, ctx["now"])
+        routed = self._route(task, task["tier"], None, ctx["now"], peek=True)
         if not routed or routed["fallback"] != "none":
             return provider
         why = self._no_room(routed["to"], ctx)

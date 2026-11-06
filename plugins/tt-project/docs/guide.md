@@ -1043,6 +1043,24 @@ is on in every project of yours on that machine (`jev.enabled` `auto`). While on
 alert text, task specs and coordinator digests to an outside paid service. Turn it off for one
 project with `ttp config <name> jev.enabled false`. Without a key, screening is rules-only.
 
+Model pick (Jev use `model`, `modelpick.py`): off by default. With
+`providers.chat.dispatch.enabled: true`, each standard worker task's model is picked once at its
+first start. `dispatch.options` maps option keys to a `provider`, `model` and `effort`, for example
+`{"routed-top": {"provider": "chat", "model": "<model id>", "effort": "<effort>"}, "core":
+{"provider": "<core provider>"}}`; an option on the chat provider routes the run there (fallback and
+slots as for a routed tier), any other runs on the core provider at its tier. Rules decide every
+clear case, without a model call: core for every kind but code, work and harness, deep tasks,
+retries, device tasks, conclusion runs, urgent tasks, tasks labelled `untrusted_input` and specs
+naming optimization, performance, architecture or hard-debugging work. A light task follows the
+light tier's own route; a pinned provider or model stays pinned. Jev answers only the open cases, from
+a redacted state of about 2,000 characters (kind, tier, labels, title, the spec's head, the paths it
+names, a continuation's parent diff stat, the lineage's earlier route outcomes and the kind's routed
+success rate over 14 days). A routed pick wins only above `dispatch.min_p` (0.6); Jev off, out of
+funds or unsure means core. Each run note has a `dispatch` entry (by, pick, p); a Jev pick is logged
+with the stratum's mean core cost per run over 7 days as its avoided cost and settles right when its
+task ends done on its first try with no fallback, wrong when it escalates; a core pick counts as no
+change. Jev's usual review switches the use off when it saves nothing or changes no decision.
+
 ## Asks
 
 The project asks the user only when a step could affect people badly (destroy someone's work or

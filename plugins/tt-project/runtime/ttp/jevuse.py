@@ -35,7 +35,8 @@ WINDOW_DAYS, MIN_CALLS = 7, 30     # defaults of jev.window_days and jev.min_cal
 IDLE_CALLS = 20                    # default of jev.idle_calls: calls that changed no decision before it goes off
 NO_CHANGE = "no change"            # an outcome: the call changed nothing the rules would not have done
 WAKE_COST_FALLBACK_USD = 0.05      # a coordinator turn's price while none was measured in the window
-LABELS = {"screen": "watcher screening", "effort": "task effort picking", "wake_gate": "wait-wake gating"}
+LABELS = {"screen": "watcher screening", "effort": "task effort picking", "wake_gate": "wait-wake gating",
+          "model": "task model picking"}
 
 
 def _jcfg(cfg: dict) -> dict:
