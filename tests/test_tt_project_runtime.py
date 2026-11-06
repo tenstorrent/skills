@@ -25053,7 +25053,23 @@ def test_cursor_resumes_a_chat_and_loads_plugins_when_its_cli_can(env, tmp_path,
     monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_RESUME_HELP)
     assert Cursor().resume_args("s-9") == ["--resume", "s-9"] and Cursor().resume_args("") == []
     assert Cursor().plugin_args(["/a", "/b"]) == ["--plugin-dir", "/a", "--plugin-dir", "/b"]
-    assert not Cursor().session_saved("s-9", "/w"), "Cursor documents no chat store: never resumed blind"
+    # A chat resumes only once its store is on disk (<config>/chats/<md5 of the cwd>/<chatId>/store.db).
+    monkeypatch.delenv("CURSOR_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    cfg_dir = tmp_path / "cursorcfg"
+    run_env = {"CURSOR_CONFIG_DIR": str(cfg_dir)}
+    assert not Cursor().session_saved("s-9", "/w", run_env), "a lost chat is never resumed blind"
+    store = cfg_dir / "chats" / hashlib.md5(b"/w").hexdigest() / "s-9" / "store.db"
+    store.parent.mkdir(parents=True)
+    store.write_bytes(b"")
+    assert Cursor().session_saved("s-9", "/w", run_env) and Cursor().session_saved("s-9", "/w/", run_env)
+    assert Cursor().session_saved("s-9", "/other", run_env), "a chat filed under another cwd spelling"
+    assert not Cursor().session_saved("s-8", "/w", run_env) and not Cursor().session_saved("s-9", "/w")
+    assert not Cursor().session_saved("../s-9", "/w", run_env) and not Cursor().session_saved("*", "/w", run_env)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    (tmp_path / "xdg" / "cursor").mkdir(parents=True)
+    (tmp_path / "xdg" / "cursor" / "chats").symlink_to(cfg_dir / "chats")
+    assert Cursor().session_saved("s-9", "/w"), "$XDG_CONFIG_HOME/cursor when no CURSOR_CONFIG_DIR"
     monkeypatch.setitem(base._CLI_OUTPUT, ("/x/agent", "--help"), CURSOR_HELP)
     assert Cursor().resume_args("s-9") == [] and Cursor().plugin_args(["/a"]) == []
 

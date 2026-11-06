@@ -119,8 +119,8 @@ def test_cursor_adapter_reads_the_real_cli_help_and_logged_out_status(env, monke
     assert argv[-2:] == ["--mode", "ask"] and "--force" not in argv, "its --mode choices wrap onto later lines"
     assert Cursor().resume_args("s-9") == ["--resume", "s-9"]
     assert Cursor().plugin_args(["/a"]) == ["--plugin-dir", "/a"]
-    # `ls` is an interactive picker and no store is documented: a lost chat is never resumed blind.
-    assert not Cursor().session_saved("s-9", "/w")
+    # No chat store on disk: a lost chat is never resumed blind.
+    assert not Cursor().session_saved("s-9", "/w", {"CURSOR_CONFIG_DIR": "/nonexistent/cursor"})
     # Logged out, `agent status` prints "Not logged in" and still exits 0.
     calls = []
     monkeypatch.setattr(cursor, "status_check", lambda argv, timeout_s=30: calls.append(argv) or (0, "Not logged in\n"))

@@ -120,9 +120,9 @@ def account_label(who: str) -> str:
 @register
 class Cursor(Provider):
     name = "cursor"
-    # resume_args has --resume, but session_saved cannot tell a saved chat from a lost one (a resume of
-    # a lost chat may start an empty one), so a session would lose its history unnoticed.
-    session_gap = "its CLI keeps no chat the harness can check is still saved before a resume"
+    # `--resume <chatId>`, once session_saved finds the chat's store (a resume of a lost chat may start an
+    # empty one). The session's size is the run's summed usage (no per-call usage): it rolls over early.
+    coord_session = "agent"
     binaries = ("agent", "cursor-agent")
     api_host = "api2.cursor.sh"
     login_hint = "run `agent login` there"
@@ -190,10 +190,28 @@ class Cursor(Provider):
 
     def resume_args(self, session_id: str) -> list[str]:
         # `--resume [chatId]` continues a chat; the id is the session_id every stream event carries.
-        # session_saved() stays False: Cursor documents no place its chats are kept, and a resume of
-        # a chat that is gone may start an empty one, so the daemon never resumes a Cursor run yet.
         ok = session_id and re.fullmatch(r"[A-Za-z0-9-]+", session_id)
         return ["--resume", session_id] if ok and "--resume" in cli_output(self.binary() or "agent", "--help") else []
+
+    def session_saved(self, session_id: str, cwd: str, env: dict | None = None) -> bool:
+        # The CLI keeps each chat in <config>/chats/<md5 of the resolved cwd>/<chatId>/store.db, its config
+        # CURSOR_CONFIG_DIR, else $XDG_CONFIG_HOME/cursor, else ~/.cursor (read from cursor-agent
+        # 2026.10.22's bundle; it loads a chat only when that store.db exists). Another cwd spelling: any folder.
+        if not session_id or not re.fullmatch(r"[A-Za-z0-9-]+", session_id):
+            return False
+        bases = []
+        for e in (env or {}, os.environ):
+            if (e.get("CURSOR_CONFIG_DIR") or "").strip():
+                bases.append(Path(e["CURSOR_CONFIG_DIR"]).expanduser())
+            elif (e.get("XDG_CONFIG_HOME") or "").strip():
+                bases.append(Path(e["XDG_CONFIG_HOME"]).expanduser() / "cursor")
+        for base in dict.fromkeys([*bases, Path.home() / ".cursor"]):
+            chats = base / "chats"
+            here = hashlib.md5(os.path.abspath(cwd).encode(), usedforsecurity=False).hexdigest() if cwd else ""
+            if here and (chats / here / session_id / "store.db").is_file() \
+                    or any(chats.glob(f"*/{session_id}/store.db")):
+                return True
+        return False
 
     def plugin_args(self, dirs: list[str]) -> list[str]:
         if not dirs or "--plugin-dir" not in cli_output(self.binary() or "agent", "--help"):

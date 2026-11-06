@@ -1509,13 +1509,13 @@ def test_coordsession_runs_on_every_provider_or_names_why_it_cannot():
     cfg = _cs_cfg()
     gaps = {n: coordsession.gap(get_provider(n)) for n in ("claude", "chat", "codex", "cursor", "fake")}
     assert all(coordsession.on(cfg, n) for n in gaps), "no per-provider opt-out"
-    assert {n for n, g in gaps.items() if g} == {"chat", "cursor"}, gaps
-    assert gaps["cursor"].startswith("cursor: ") and gaps["chat"].startswith("chat: ")
+    assert {n for n, g in gaps.items() if g} == {"chat"}, gaps
+    assert gaps["chat"].startswith("chat: ")
     assert [get_provider(n).tool_hooks for n in ("claude", "chat", "codex", "cursor")] == [True, False, False, False]
-    got = coordsession.decide(cfg, _cs_state(), "k1", "m", "high", lambda s: True, 10.0, no_session=gaps["cursor"])
-    assert got == ("stateless", gaps["cursor"])
+    got = coordsession.decide(cfg, _cs_state(), "k1", "m", "high", lambda s: True, 10.0, no_session=gaps["chat"])
+    assert got == ("stateless", gaps["chat"])
     assert coordsession.decide({}, _cs_state(), "k1", "m", "high", lambda s: True, 10.0,
-                               no_session=gaps["cursor"])[0] == "stateless"
+                               no_session=gaps["chat"])[0] == "stateless"
 
 
 def test_codex_session_context_reads_each_call_and_compaction_from_its_rollout(tmp_path, monkeypatch):
@@ -1686,3 +1686,89 @@ def test_codex_like_coordinator_session_wake_launches_with_the_agent_s_tools_and
     p.set_config("coordinator.session.tools", "read_only")
     r, argv, _, s = turn("EVENTS 2")
     assert s["mode"] == "resume" and seen[-1] == (False, None) and "--coord-tools" in argv
+
+
+def _cs_cli_wakes(env, monkeypatch, provider, stdout, help_text, wakes=2, between=lambda i: None):
+    """Coordinator session wakes of `provider` against the fake CLI (FAKE_CLI), each through a new
+    Daemon (a restart between wakes): [(run row, argv, the turn's session note)]."""
+    from ttp import coordinator as coord
+    from ttp.daemon import Daemon
+    bin_dir = env["tmp"] / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    for name in ("codex", "agent"):
+        exe = bin_dir / name
+        exe.write_text(FAKE_CLI.format(python=sys.executable))
+        exe.chmod(0o755)
+    log_dir = env["tmp"] / "fakecli"
+    monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+    for k, v in (("LOG", str(log_dir)), ("STDOUT", stdout), ("STDERR", ""), ("RC", "0"), ("RESULT", ""),
+                 ("HELP", help_text), ("PACE", "0"), ("SESSION", "{}")):
+        monkeypatch.setenv(f"FAKE_CLI_{k}", v)
+    p = make(env)
+    p.set_config("coordinator.session.mode", "on")
+    head, context = coord.prompt_parts(p)
+    out = []
+    for i in range(wakes):
+        between(i)
+        d = Daemon(p.base)
+        d.cfg = p.config()
+        rid = d.start_run("coordinator", f"EVENTS {i}", provider, "light", str(p.base), read_only=True,
+                          schema=coord.ACTIONS_SCHEMA, system=head, context=context, timeout_s=100,
+                          budget_usd=3.0)
+        exit_file = p.runs / str(rid) / "exit.json"
+        deadline = time.time() + 60
+        while not exit_file.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert exit_file.exists(), (p.runs / str(rid) / "runner.log").read_text()
+        d.reap_runs()
+        r = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+        out.append((r, json.loads((log_dir / "argv.json").read_text()), json.loads(r["note"])["turn"].get("session")))
+    return p, out
+
+
+def test_cursor_coordinator_resumes_its_session_across_wakes_and_a_restart(env, monkeypatch, tmp_path):
+    from ttp import coordsession
+    usage = {"inputTokens": 2_000, "outputTokens": 100, "cacheReadTokens": 1_000, "cacheWriteTokens": 0}
+    stream = _codex_events(*CURSOR_STREAM_OK[:-1], {**CURSOR_STREAM_OK[-1], "usage": usage,
+                                                    "result": json.dumps({"actions": []})})
+    cfg_dir = tmp_path / "cursorcfg"
+    monkeypatch.setenv("CURSOR_CONFIG_DIR", str(cfg_dir))
+    help_text = CURSOR_HELP + "  --resume [chatId]          Resume a chat session\n"
+    store = cfg_dir / "chats" / "x" / "s-9" / "store.db"
+
+    def between(i):
+        if i == 2:   # its chat store gone: a new session, never a blind resume of a lost chat
+            store.unlink()
+        elif not store.exists():
+            store.parent.mkdir(parents=True, exist_ok=True)
+            store.write_bytes(b"")
+    p, wakes = _cs_cli_wakes(env, monkeypatch, "cursor", stream, help_text, wakes=4, between=between)
+    assert [s["mode"] for _, _, s in wakes] == ["new", "resume", "new", "resume"], [s for _, _, s in wakes]
+    for (_, argv, s), resumed in zip(wakes, (False, True, False, True)):
+        assert ("--resume" in argv) is resumed and (not resumed or argv[argv.index("--resume") + 1] == "s-9")
+    assert all(r["session_id"] == "s-9" for r, _, _ in wakes) and p.db.kv(coordsession.KEY)["id"] == "s-9"
+    # The wake's budget: the runner holds it (Cursor has no budget flag), the session seed included.
+    spec = json.loads((p.runs / str(wakes[0][0]["id"]) / "run.json").read_text())
+    assert spec["budget_usd"] == 3.0
+
+
+def test_codex_coordinator_resumes_its_session_across_wakes_and_a_restart(env, monkeypatch, tmp_path):
+    from ttp import coordsession
+    home = tmp_path / "codexhome"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    rollout = home / "sessions" / "2026" / "11" / "05" / "rollout-2026-11-05T00-00-00-th-1.jsonl"
+    stream = _codex_events(*_codex_turn(json.dumps({"actions": []}), inp=2000, cached=1000, out=100))
+
+    def between(i):
+        if i == 2:   # its rollout gone: a new session, never a blind resume
+            rollout.unlink()
+        elif not rollout.exists():
+            rollout.parent.mkdir(parents=True, exist_ok=True)
+            rollout.write_text("")
+    p, wakes = _cs_cli_wakes(env, monkeypatch, "codex", stream, CODEX_EXEC_HELP, wakes=4, between=between)
+    assert [s["mode"] for _, _, s in wakes] == ["new", "resume", "new", "resume"], [s for _, _, s in wakes]
+    for _, argv, _ in (wakes[1], wakes[3]):
+        assert argv[-3:] == ["resume", "th-1", "-"], argv[-6:]
+    assert "resume" not in wakes[0][1] and "resume" not in wakes[2][1]
+    assert p.db.kv(coordsession.KEY)["id"] == "th-1"
+    assert json.loads((p.runs / str(wakes[1][0]["id"]) / "run.json").read_text())["budget_usd"] == 3.0
