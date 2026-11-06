@@ -270,6 +270,13 @@ def main() -> int:
         found = check(p)
         if found not in ("ok", "not running"):   # it runs every few minutes: log only what matters
             print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} watchdog: {found}")
+        try:   # a restart deferred past the old daemon's stop timeout: judge its new daemon now
+            from . import service
+            judged = service.check_deferred(p)
+        except Exception as e:  # never in the way of the hang check
+            judged = f"error: {type(e).__name__}: {e}"
+        if judged not in (None, "pending"):
+            print(f"{time.strftime('%Y-%m-%dT%H:%M:%S')} watchdog: deferred restart {judged}")
     return 0
 
 

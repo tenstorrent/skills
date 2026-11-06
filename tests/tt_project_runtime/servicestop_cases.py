@@ -135,3 +135,64 @@ def test_the_restart_reads_the_stop_timeout_from_the_service_manager(env, monkey
     assert service._manager_view(p) == (service.LAUNCHD_EXIT_TIMEOUT_S, None)
     service._agent(p).write_bytes(plistlib.dumps({"Label": "x", "ExitTimeOut": 45}))
     assert service._manager_view(p) == (45, None)
+    # launchd reads ExitTimeOut 0 as no timeout: the wait is the cap, not launchd's default.
+    service._agent(p).write_bytes(plistlib.dumps({"Label": "x", "ExitTimeOut": 0}))
+    assert service._manager_view(p) == (service.STOP_WAIT_CAP_S, None)
+
+
+def _deferred(env, monkeypatch, ready_at):
+    """A restart deferred because the old daemon (90 s stop timeout) exits only 200 s in."""
+    from ttp import service
+    p, head, clock, froms = _slow_stop_service(env, monkeypatch, exits_at=200, ready_at=ready_at,
+                                               show="TimeoutStopUSec=1min 30s\nMainPID=4242")
+    assert service.restart(p).outcome == "deferred"
+    assert service.check_deferred(p) == "pending", "judged while the old daemon still ran"
+    clock.sleep(120)                           # the old daemon exits; the new one starts on the new runtime
+    return p, head, clock
+
+
+def test_a_deferred_restart_whose_new_daemon_dies_is_rolled_back_later_once(env, monkeypatch):
+    from ttp import service
+    p, head, clock = _deferred(env, monkeypatch, ready_at=None)
+    # A newer restart's record written between the read and the claim is put back, not judged.
+    path, replace = p.state / service.RESTART_DEFERRED, service.os.replace
+
+    def newer_first(src, dst):
+        if Path(dst).name != f"{service.RESTART_DEFERRED}.{os.getpid()}":   # only the claim
+            return replace(src, dst)
+        rec = json.loads(path.read_text())
+        path.write_text(json.dumps({**rec, "at": rec["at"] + 1}))
+        monkeypatch.setattr(service.os, "replace", replace)
+        replace(src, dst)
+    monkeypatch.setattr(service.os, "replace", newer_first)
+    assert service.check_deferred(p) == "pending" and _git_out(p.harness, "rev-parse", "HEAD") == head
+    assert path.exists() and not p.db.one("SELECT id FROM messages WHERE kind='alert'")
+    assert service.check_deferred(p) == "rolled_back"
+    assert _git_out(p.harness, "rev-parse", "HEAD") != head
+    alerts = p.db.q("SELECT text FROM messages WHERE kind='alert' AND severity='high'")
+    assert len(alerts) == 1 and "deferred" in alerts[0]["text"] and "watchdog" in alerts[0]["text"], alerts
+    assert "running again" in alerts[0]["text"]
+    assert service.check_deferred(p) is None and service.check_deferred(p, "new daemon") is None
+    assert len(p.db.q("SELECT id FROM messages WHERE kind='alert' AND severity='high'")) == 1
+
+
+def test_a_deferred_restart_whose_new_daemon_runs_is_left_alone(env, monkeypatch):
+    from ttp import service
+    p, head, clock = _deferred(env, monkeypatch, ready_at=8.0)
+    assert service.check_deferred(p, "new daemon") == "running"
+    assert not (p.state / service.RESTART_DEFERRED).exists()
+    _no_rollback(p, head)
+
+
+def test_a_deferred_restart_is_never_rolled_back_again_once_the_harness_moved_on(env, monkeypatch):
+    from ttp import service
+    # The updater already rolled back (or deployed again): the harness moved past the deferred commit.
+    p, head, clock = _deferred(env, monkeypatch, ready_at=None)
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m",
+             "roll back runtime to abc: handled by the updater")
+    assert service.check_deferred(p) == "superseded"
+    assert not p.db.one("SELECT id FROM messages WHERE kind='alert' AND severity='high'")
+    # A later restart judges the daemon itself: it drops the deferred record.
+    service._defer(p, clock.now, "restarted", set(), 90, 60, None)
+    service.restart(p, restart_fn=lambda p: "restarted")
+    assert not (p.state / service.RESTART_DEFERRED).exists()

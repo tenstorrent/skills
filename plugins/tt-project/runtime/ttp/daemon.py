@@ -1598,6 +1598,10 @@ class Daemon:
             if hang and hang.get("pid") != os.getpid():
                 self.p.db.set_kv("daemon_hang", None)
             self._record_harness_head()
+            try:
+                service.check_deferred(self.p, "new daemon")   # a deferred restart: this daemon ticks
+            except Exception:
+                log(self.p, "deferred restart check error: " + traceback.format_exc().replace("\n", " | ")[:2000])
 
     def _record_harness_head(self) -> None:
         """kv harness_good: the harness commit this daemon ticks on. git runs in a session of its own,

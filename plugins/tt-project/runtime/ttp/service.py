@@ -452,7 +452,10 @@ RESTART_REQUEST, RESTART_RESULT = "restart.request", "restart.result"
 # STOP_MARGIN_S for the kill to land, and only then starts the new daemon's start window.
 STOP_WAIT_CAP_S = 300
 STOP_MARGIN_S = 15
-LAUNCHD_EXIT_TIMEOUT_S = 20   # launchd's default ExitTimeOut: SIGKILL this long after SIGTERM
+LAUNCHD_EXIT_TIMEOUT_S = 20   # launchd's default ExitTimeOut: SIGKILL this long after SIGTERM (0: never)
+# A restart deferred because the old daemon outlived its stop timeout (restart() could not judge the new
+# one) is recorded here; check_deferred judges the new daemon later, from the watchdog or its own start.
+RESTART_DEFERRED = "restart.deferred"
 # A helper that dies without a result (its runtime fails to import, a kill, a reboot) is reaped by the
 # daemon: its own handle says it ended, or its claim outlived HELPER_BOUND_S, longer than a restart's own
 # waits (the old daemon's stop, a new daemon's first tick, twice with a rollback, plus the service
@@ -726,7 +729,8 @@ def _manager_view(p: Project) -> tuple[float, int | None]:
     if sys.platform == "darwin" and _agent(p).exists():
         try:
             job = plistlib.loads(_agent(p).read_bytes())
-            stop = float(job.get("ExitTimeOut") or LAUNCHD_EXIT_TIMEOUT_S)
+            stop = float(job.get("ExitTimeOut", LAUNCHD_EXIT_TIMEOUT_S))
+            stop = stop if stop > 0 else STOP_WAIT_CAP_S   # launchd: 0 means it never kills the daemon
         except (OSError, ValueError, TypeError, AttributeError, plistlib.InvalidFileException):
             stop = LAUNCHD_EXIT_TIMEOUT_S
         return min(stop, STOP_WAIT_CAP_S), None
@@ -792,6 +796,7 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     The result's `outcome` says how it went."""
     from .daemon import start_marker
     restart_fn = restart_fn or restart_service
+    (p.state / RESTART_DEFERRED).unlink(missing_ok=True)   # this restart judges the daemon itself
     stop_s, main = _manager_view(p)
     old = _running_daemons(p, main)
     t0 = time.time()
@@ -809,6 +814,7 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     state, stopped, left = _judge_start(p, t0, old, stop_s, wait_s, tick_wait_s)
     judged = time.time() - t0 - stopped        # how long the new daemon had once the old one was gone
     if state is None:
+        _defer(p, t0, msg, left, stop_s, wait_s, tick_wait_s)
         return _said(f"{msg}; but the old daemon has not exited after {stopped:.0f}s (pid "
                      f"{', '.join(map(str, sorted(left)))}), past its service's stop timeout ({stop_s:.0f}s), so the new one has not "
                      f"started yet. Nothing was rolled back: the new runtime never ran. Check `ttp status {p.name}` "
@@ -823,10 +829,18 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     if state == "busy":
         st = start_marker(p)
         if not (st and float(st.get("started") or 0) >= t0):
+            _defer(p, t0, msg, old | _running_daemons(p, main), stop_s, wait_s, tick_wait_s)
             return _said(f"{msg}; but the old daemon has not exited after {time.time() - t0:.0f}s, so the new one "
                          f"has not started yet. Check `ttp status {p.name}` shortly", "deferred")
         return _said(f"{msg}; the daemon is up but still in its first tick after {time.time() - t0:.0f}s. "
                      f"Check `ttp status {p.name}` shortly", "busy")
+    return _roll_back(p, msg, judged, stopped, stop_s, wait_s, tick_wait_s, restart_fn)
+
+
+def _roll_back(p: Project, msg: str, judged: float, stopped: float, stop_s: float, wait_s: float,
+               tick_wait_s: float | None, restart_fn, note: str = "") -> Restarted:
+    """The new daemon is broken: roll runtime/ back to the last commit a daemon ran well on, restart and alert
+    (restart(), or check_deferred for a restart judged later). `note` opens the alert's failed phase."""
     h = p.harness
     good = (p.db.kv("harness_good") or {}).get("commit")
     changed = _git(h, "log", "--format=%h %s", f"{good}..HEAD", "--", "runtime").stdout.strip() if good else ""
@@ -842,7 +856,7 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
         if _git(h, "restore", f"--source={good}", "--staged", "--worktree", "--", "runtime").returncode != 0:
             _git(h, "checkout", good, "--", "runtime")    # git older than 2.23
     _git(h, "commit", "-q", "-m", f"roll back runtime to {good[:10]}: the daemon did not start with it")
-    phase = (f"Failed phase: the new daemon was not ready {judged:.0f}s after the old one "
+    phase = (note + f"Failed phase: the new daemon was not ready {judged:.0f}s after the old one "
              f"stopped (the old daemon took {stopped:.0f}s to stop; its service's stop timeout is {stop_s:.0f}s). ")
     stop_s, main = _manager_view(p)
     failed = _running_daemons(p, main)
@@ -858,6 +872,91 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
     from .deploy import redeploy_key
     p.db.post("out", text, chat=None, kind="alert", severity="high", ref=redeploy_key(p.name))
     return _said(text, "rolled_back")
+
+
+def _defer(p: Project, t0: float, msg: str, old: set[int], stop_s: float, wait_s: float,
+           tick_wait_s: float | None) -> None:
+    """Record a restart made at t0 that restart() could not judge (the old daemons, old, still ran), with
+    the harness commit it was to start, for check_deferred."""
+    try:
+        r = _git(p.harness, "rev-parse", "HEAD")
+        head = r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError):
+        head = None                            # unknown: check_deferred then does not compare it
+    durable_write(p.state / RESTART_DEFERRED, json.dumps({
+        "at": t0, "msg": msg, "old": sorted(old), "stop_s": stop_s, "wait_s": wait_s,
+        "tick_wait_s": tick_wait_s, "head": head}))
+
+
+def check_deferred(p: Project, who: str = "watchdog", restart_fn=None) -> str | None:
+    """Judge a deferred restart's new daemon (RESTART_DEFERRED) without waiting, as restart() would have:
+    "pending" while an old daemon still runs or the new one is inside its start window (counted from the
+    first look that found the old daemons gone); "running" or "busy" (a slow first tick, left alone) end
+    it; a broken new daemon is rolled back as restart() does (_roll_back) and returns "rolled_back". The
+    record ends with no verdict ("superseded") once the harness moved past the commit it was to start (a
+    later deploy, or a rollback the updater made), and a later restart() removes it: never two rollbacks.
+    Only the caller that claims the record rolls back. None when there is nothing to judge."""
+    from .daemon import HEARTBEAT_STALE_S, _alive, _is_daemon, heartbeat, start_marker
+    path = p.state / RESTART_DEFERRED
+    try:
+        rec = json.loads(path.read_text())
+        t0 = float(rec["at"])
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError, TypeError, KeyError):
+        path.unlink(missing_ok=True)
+        return None
+    hb = heartbeat(p)
+    if hb and float(hb.get("started") or 0) >= t0:
+        path.unlink(missing_ok=True)
+        return "running"
+    try:
+        r = _git(p.harness, "rev-parse", "HEAD")
+    except (OSError, subprocess.SubprocessError):
+        return "pending"
+    if r.returncode != 0:
+        return "pending"                       # unknown: never a reason to drop or roll back
+    if rec.get("head") and r.stdout.strip() != rec["head"]:
+        path.unlink(missing_ok=True)
+        return "superseded"
+    if any(_is_daemon(int(pid)) for pid in rec.get("old") or []) or old_daemon_beats(p, t0, after=t0):
+        return "pending"                       # the restart has not happened yet
+    now = time.time()
+    gone = float(rec.get("gone") or 0)
+    if not gone:
+        gone = now
+        durable_write(path, json.dumps({**rec, "gone": gone}))
+    wait_s = float(rec.get("wait_s") or 60)
+    tick_wait_s = HEARTBEAT_STALE_S if rec.get("tick_wait_s") is None else float(rec["tick_wait_s"])
+    st = start_marker(p)
+    if st and float(st.get("started") or 0) >= t0:
+        pid = int(st.get("pid") or 0)
+        if pid > 0 and _alive(pid) and int(st.get("tick_errors") or 0) < 2:
+            if now < gone + max(wait_s, tick_wait_s):
+                return "pending"
+            path.unlink(missing_ok=True)
+            return "busy"
+    elif now < gone + wait_s:
+        return "pending"
+    claim = path.with_name(f"{RESTART_DEFERRED}.{os.getpid()}")
+    try:
+        os.replace(path, claim)                # one judge rolls back: the daemon's start or the watchdog
+    except FileNotFoundError:
+        return None
+    try:
+        if float(json.loads(claim.read_text()).get("at") or 0) != t0:   # a newer restart's record: not ours
+            os.replace(claim, path)
+            return "pending"
+        msg = str(rec.get("msg") or "restarted")
+        note = (f"The restart was deferred (the old daemon outlived its service's stop timeout), so the {who} "
+                f"checked the new daemon later. ")
+        res = _roll_back(p, msg, now - gone, gone - t0, float(rec.get("stop_s") or 0), wait_s,
+                         rec.get("tick_wait_s"), restart_fn or restart_service, note)
+        if res.outcome == "failed":            # nothing to roll back to: no caller reports it, so alert
+            p.db.post("out", f"{note}{res}", chat=None, kind="alert", severity="high")
+        return res.outcome
+    finally:
+        claim.unlink(missing_ok=True)
 
 
 if __name__ == "__main__":
