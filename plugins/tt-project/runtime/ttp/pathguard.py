@@ -47,11 +47,19 @@ OUTPUT_OPTS = {"curl": ("-o", "--output"), "wget": ("-O", "--output-document", "
 INTERPRETER_RE = re.compile(r"^(?:python[\d.]*|pypy\d*|perl|node|nodejs|deno|bun|ruby|php|tsx|ts-node|lua|Rscript)$")
 SHELLS = {"sh", "bash", "dash", "zsh", "ksh"}
 REDIRECT_RE = re.compile(r"(?<![<>])(?:&|\d)?>>?\|?\s*([\"']?)([^\s\"';&|<>()]+)\1")
-# Code that may write a file: a write call, a mode that writes, a perl or shell redirect
+# Code that may write a file: a write call or a mode that writes (perl's '>', '>>', '+<')
 WRITE_CODE_RE = re.compile(
     r"\b(?:write\w*|unlink\w*|remove\w*|rename\w*|replace|chmod\w*|chown\w*|rmtree|copy\w*|move|symlink\w*|link"
-    r"|mkdirs?\w*|makedirs|truncate\w*|rmdir\w*|touch|dump|save\w*|append\w*|rm_r?f?|cp|mv|ln|sysopen|system|exec\w*"
-    r"|popen|spawn\w*|subprocess|check_call|check_output|run)\b|[\"'][rwabxt]*[wax+][rwabxt]*[\"']|>")
+    r"|mkdirs?\w*|makedirs|truncate\w*|rmdir\w*|touch|dump|save\w*|append\w*|rm_r?f?|cp|mv|ln|sysopen)\b"
+    r"|[\"'][rwabxt]*[wax+][rwabxt]*[\"']|[\"'](?:\+?>>?|\+<)[^\"']*[\"']")
+# A perl or shell redirect (or perl open mode) and its target; a comparison's right side names no path
+TARGET_RE = re.compile(r">>?[&|]?\s*[\"']?([^\s\"'`;,()<>|&]+)")
+# Code that runs a command: it writes only what that command writes
+RUN_CODE_RE = re.compile(r"\b(?:system|exec\w*|popen\w*|spawn\w*|subprocess|check_call|check_output|run)\b|`")
+STR_RE = re.compile(r"'((?:[^'\\\n]|\\.)*)'|\"((?:[^\"\\\n]|\\.)*)\"|`([^`]*)`")
+# Commands in an argv list that write the paths they name (login tools write their store: read as argv)
+ARGV_WRITERS = WRITE_ALL | DEST_LAST | set(OUTPUT_OPTS) | {"dd", "sed", "perl"}
+STORE_TOOLS = {"gh", "docker", "aws", "kubectl", "git", "ssh-keygen"}
 HOME_REF_RE = re.compile(r"~|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
 # Codex patches: the files one adds, changes, deletes or moves to (Codex trims a header line, so blanks
 # around it and its path do not hide one)
@@ -215,10 +223,33 @@ def _argv_refusal(argv: list[str], ctx, cmd_env=None) -> str | None:
     return None
 
 
-def _code_refusal(code: str, ctx) -> str | None:
-    """Interpreter code that names a protected path and may write."""
-    if not WRITE_CODE_RE.search(code):
+def _code_refusal(code: str, ctx, depth: int = 0) -> str | None:
+    """Interpreter code that writes a protected path: a write call or mode with one named in the code
+    (anywhere: a variable may carry it), a redirect or open mode with one as its target, or a command
+    the code runs (os.system, subprocess, exec, backticks) that writes one. Reads pass."""
+    if WRITE_CODE_RE.search(code) and (h := _names(code, ctx)):
+        return h
+    for m in TARGET_RE.finditer(code):
+        if h := _names(m[1], ctx):
+            return h
+    if not RUN_CODE_RE.search(code):
         return None
+    lits = [a or b or c for a, b, c in STR_RE.findall(code)]
+    for i, lit in enumerate(lits):
+        name = os.path.basename(lit)
+        if name in ARGV_WRITERS and (h := _names(code, ctx)):
+            return h
+        if name in STORE_TOOLS and (h := _argv_refusal(lits[i:], ctx)):
+            return h
+        if " " in lit and depth < 2 and (h := shell_refusal(lit, *ctx, depth + 1)):   # a command line
+            return h
+        if re.search(r">>?\s*$", lit) and (h := _names(code, ctx)):   # its target built apart: 'echo x >' + p
+            return h
+    return None
+
+
+def _names(code: str, ctx) -> str | None:
+    """The protected path `code` names: as a path, or as the home folder joined with its parts."""
     for m in re.finditer(r"(?:~|\$\{?(?:HOME|XDG_CONFIG_HOME|GH_CONFIG_DIR)\}?|/)[^\s\"'`;,()\[\]{}<>|&]*", code):
         if m[0] not in ("~", "/") and (h := _hit(m[0], ctx)):
             return h
@@ -253,14 +284,25 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
     for argv in segments:
         if h := _argv_refusal(argv, ctx, prefixed.get(tuple(argv))):
             return h
-    for argv in segments:   # sh -c '...': its redirects too
-        inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)), None)
-        if os.path.basename(argv[0]) in SHELLS and inner and depth < 2 and (
+    for argv in segments:   # sh -c '...' and eval '...': their redirects too
+        argv = argv[1:] if argv[0] == "builtin" and len(argv) > 1 else argv
+        name = os.path.basename(argv[0])
+        inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)),
+                     None) if name in SHELLS else " ".join(argv[1:]) if name == "eval" else None
+        if inner and depth < 2 and (
                 h := shell_refusal(inner, env, cwd, rts, depth + 1)):
             return h
+        # eval parses its words again: an escaped redirect (eval echo x \> f) is one then
+        if name == "eval" and "\\" in cmd and depth < 2 and (
+                h := shell_refusal(re.sub(r"\\(.)", r"\1", cmd), env, cwd, rts, depth + 1)):
+            return h
     names = {os.path.basename(a[0]) for a in segments}
-    if any(INTERPRETER_RE.match(n) for n in names) and (h := _code_refusal(scan, ctx)):
-        return h
+    if any(INTERPRETER_RE.match(n) for n in names):
+        # The line (heredocs too), and each -c/-e code as the interpreter gets it (its string literals unquoted)
+        inline = [a[i + 1] for a in segments if INTERPRETER_RE.match(os.path.basename(a[0]))
+                  for i in range(1, len(a) - 1) if a[i] in ("-c", "-e", "-E", "--eval", "-p", "--print")]
+        if h := next((h for c in [scan, *inline] if (h := _code_refusal(c, ctx, depth))), None):
+            return h
     if depth < 2:
         for f in hook._scripts(segments, cwd):
             if os.path.realpath(f).startswith(PLUGIN_ROOT + os.sep):
@@ -271,7 +313,7 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
                 continue
             first = text.split("\n", 1)[0]
             h = (shell_refusal(text, env, cwd, rts, depth + 1) if f.suffix == ".sh" or any(s in first for s in SHELLS)
-                 else _code_refusal(text, ctx))
+                 else _code_refusal(text, ctx, depth + 1))
             if h:
                 return h
     return None

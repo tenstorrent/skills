@@ -2996,12 +2996,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `~/.docker/config.json`, `~/.kube`, and every path in config `guards.protected_paths`. It reads
   Edit, Write, MultiEdit and NotebookEdit, apply_patch text, MCP tools whose name is not a read
   verb, and shell: redirects, tee, cp, mv, install, rsync, ln, sed and perl `-i`, chmod, chown, rm,
-  truncate, touch, mkdir, `dd of=`, curl or wget output files, `sh -c` and eval text, interpreter
-  one-liners and heredocs (python, perl, node, ruby), the script file a command runs, and the
-  login commands that write these folders (`gh auth login`, `docker login`, `aws configure`,
-  `kubectl config`, `git credential approve`, `ssh-keygen` without `-f` elsewhere). It expands
-  `~`, `$HOME`, `${HOME}`, `$XDG_CONFIG_HOME` and `$GH_CONFIG_DIR`, follows symlinks, and checks
-  both the run's HOME and the account's own home. Reads pass. Add a path for one project with
+  truncate, touch, mkdir, `dd of=`, curl or wget output files, `sh -c` and `eval` text, interpreter
+  one-liners and heredocs (python, perl, node, ruby: a write call or write mode, a redirect, and
+  the commands they run through os.system, subprocess, exec or backticks), the script file a
+  command runs, and the login commands that write these folders (`gh auth login`, `docker login`,
+  `aws configure`, `kubectl config`, `git credential approve`, `ssh-keygen` without `-f`
+  elsewhere). It expands `~`, `$HOME`, `${HOME}`, `$XDG_CONFIG_HOME` and `$GH_CONFIG_DIR`, follows
+  symlinks, and checks both the run's HOME and the account's own home. Reads pass, also in code
+  that runs a command or compares with `>`; code with a write call (a copy too) that names one of
+  these paths anywhere is refused, since a variable may carry it. Add a path for one project with
   `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
   account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
   folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and

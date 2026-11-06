@@ -47,6 +47,16 @@ PG_SHELL_DENIED = [
     "ssh-keygen -t ed25519 -f ~/.ssh/id_new -N ''", "ssh-keygen -t ed25519", "touch ~/.config/example-access/f",
     "ssh box true > ~/.ssh/known_hosts", "bash -c \"ssh box 'cat k' >> ~/.ssh/authorized_keys\"",
     "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: ~/.config/gh/hosts.yml\n+x\n*** End Patch\nEOF",
+    'eval "echo x > ~/.ssh/config"', "eval 'cp a' \"$HOME/.ssh/\"", "bash -c 'eval \"echo x >> ~/.netrc\"'",
+    "python3 -c \"import os; os.system('echo x > ~/.ssh/config')\"",
+    "python3 -c \"import subprocess; subprocess.run(['tee', os.path.expanduser('~/.ssh/config')])\"",
+    "python3 -c \"import subprocess as s; s.run(['gh', 'auth', 'login', '--with-token'])\"",
+    "python3 -c \"import subprocess; subprocess.run('echo x >' + ' ~/.ssh/config', shell=True)\"",
+    "python3 -c \"import subprocess; subprocess.run(['bash', '-c', 'rm -f ~/.ssh/known_hosts'])\"",
+    "python3 -c \"import os; p = os.path.expanduser('~/.ssh/config')\nopen(p, 'w')\"",
+    "perl -e 'system(\"truncate\", \"-s0\", \"$ENV{HOME}/.git-credentials\")'", "ruby -e '`touch ~/.ssh/x`'",
+    'builtin eval "echo x > ~/.ssh/config"', "eval echo x \\> ~/.ssh/config",
+    "perl -e 'open(my $f, \">>\", \"$ENV{HOME}/.ssh/config\")'",
 ]
 PG_SHELL_ALLOWED = [
     "cat ~/.ssh/config", "ls -la ~/.ssh", "ssh -i ~/.ssh/id_rsa host true", "cp ~/.ssh/id_rsa.pub /tmp/pub",
@@ -58,6 +68,9 @@ PG_SHELL_ALLOWED = [
     "H=$(mktemp -d); mkdir -p \"$H/.ssh\"; echo x > \"$H/.ssh/config\"", "kubectl config view", "aws configure list",
     "rsync -e 'ssh -i ~/.ssh/k' src host:dst", "chmod 700 ~",
     "ssh box 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys' < k.pub", "git commit -qm 'docs: > ~/.netrc example'",
+    "python3 -c \"import subprocess; subprocess.run(['ssh','-F','~/.ssh/config','box'])\"",
+    "python3 -c \"print(1>0); import os; print(os.listdir(os.path.expanduser('~/.ssh')))\"",
+    "eval \"cat ~/.ssh/config > /tmp/c\"", "python3 -c \"import os; os.system('ssh -i ~/.ssh/k box true > /tmp/o')\"",
 ]
 
 
