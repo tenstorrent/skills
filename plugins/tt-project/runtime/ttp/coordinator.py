@@ -3138,7 +3138,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     why = prguard.findings_problem(db, text)
                     if why:
                         raise ValueError(f"ask_user rejected: {why}")
-                rec = (a.get("recommendation") or "").strip()
+                text, rec = db.for_user(text), db.for_user((a.get("recommendation") or "").strip())   # notes follow them
                 if a["blocking"] == "restriction":
                     text += f"{_LEAST_NOTE}{least}"
                 elif a["blocking"] == "irreversible" and least:

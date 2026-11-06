@@ -27,7 +27,8 @@ disclosure ("Generated with Claude Code", "written by AI").
 
 Messages to the user themselves (the chat relay, `ttp notify`, the web app) are not posts to others
 and are never tagged: `for_user` drops a trailing tag, model-free, from every message the project sends
-the user's own chats (db.post, outbound) and from a stored hand-off's summary and message (db.dump_result),
+the user's own chats (db.post, outbound; DB.for_user on each model-written part the harness adds text after:
+an ask and its recommendation, a blocked reply and its need, a user step) and from a stored hand-off's summary and message (db.dump_result),
 whoever wrote it (a worker's `message` relayed verbatim once carried one into a reply). Routes the harness cannot see are left to the prompt rule: a script or another
 CLI posting (python, httpie, a gh extension), a URL or body built at run time, Cursor runs (no harness
 hook) and Codex connector tools (its hook gets Bash calls only), gists and connector tools whose name

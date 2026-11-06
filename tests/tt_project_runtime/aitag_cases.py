@@ -376,3 +376,35 @@ def test_ai_tag_for_user_drops_only_a_trailing_tag_and_posts_to_others_keep_thei
     tagged = "Review is ready.\n\n[authored by AI]"
     assert aitag.gh_problem("pr", ["comment", "7", "-b", tagged], p.config()) is None
     assert aitag.tool_problem("mcp__claude_ai_Slack__slack_send_message", {"message": tagged}, p.config()) is None
+
+
+def test_composed_messages_to_the_user_drop_the_tag_of_each_model_written_part(env, monkeypatch):
+    """Review #6541: the harness adds its own text after a model's (an ask's recommendation and timer
+    notes, a blocked reply's 'Needs from you', a user step's command and deadline, a step updated in
+    place without db.post), so the tag of each model-written part is dropped before composing."""
+    from ttp import coordinator as coord, userstep
+    p = make(env)
+    p.db.ai_tag = "(bot)"
+    url = "https://github.com/acme/widgets/pull/7"
+    assert coord.apply(p, [{"type": "ask_user", "text": f"Mark {url} ready for review?\n\n[authored by AI]",
+                            "blocking": "review", "recommendation": "yes, CI is green. (bot)"}]) == []
+    ask = p.db.one("SELECT text FROM messages WHERE kind='ask'")["text"]
+    assert "My recommendation: yes, CI is green." in ask and "AI]" not in ask and "(bot)" not in ask, ask
+    # A blocked reply: its summary and blocked_reason each drop theirs.
+    task, replies = _reply_hand_off(env, p, {"status": "blocked", "summary": "Needs a token. [authored by AI]",
+                                             "question": "Which token?",
+                                             "blocked_reason": "a read token for the repo\n_Written by AI_"})
+    assert task["status"] == "blocked" and len(replies) == 1, replies
+    assert "AI" not in replies[0] and "Needs a token." in replies[0], replies[0]
+    # A user step: the first notify and a repeated one (updated in place) drop it before the command.
+    tid = p.db.add_task("connect the tool", "s", kind="work", origin="coordinator")
+    for i in range(2):
+        _notify_run(env, monkeypatch, p, tid, i, "--step", "sign-in", "--check", CHECK, "--do", "example-cli login",
+                    f"Sign in to the example tool, run {i} [authored by AI]")
+        post = _step_posts(p)[-1]["text"]
+        assert f"run {i}" in post and "To do it: example-cli login." in post and "AI]" not in post, post
+    assert "AI]" not in userstep.for_task(p.db, tid)[0]["text"]
+    assert "AI]" not in p.db.one("SELECT text FROM alerts WHERE key LIKE 'user-step:%'")["text"]
+    # relay itself drops it from a text it is handed: the in-place update writes the message without db.post.
+    assert not userstep.relay(p.db, p.db.task(tid), "sign-in", {"check": CHECK}, "Sign in again.\n[authored by AI]")
+    assert _step_posts(p)[-1]["text"] == "Sign in again." == userstep.for_task(p.db, tid)[0]["text"]

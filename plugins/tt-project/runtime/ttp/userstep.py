@@ -82,6 +82,7 @@ def relay(db: DB, task: dict, kind: str, n: dict, text: str, now: float | None =
     """Open the task's standing item for step `kind`, or update the open one in place. True when it
     posted (the first notify of the step), False when it only updated."""
     now = time.time() if now is None else now
+    text = db.for_user(text)   # the in-place update below skips db.post, which drops it
     sid = f"{task['id']}:{kind}"
     steps, _ = db.kv_dict(STEPS)
     rec, ep = steps.get(sid), _open(db, f"{KEY}:{sid}")

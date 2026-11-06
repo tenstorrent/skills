@@ -1009,6 +1009,12 @@ END""")
         return kept
 
     # messages ------------------------------------------------------------------------------
+    def for_user(self, text):
+        """A model-written part without its trailing AI-authorship tag (aitag.for_user), dropped before the
+        harness adds its own text after it: post sees only the end of the whole message."""
+        from . import aitag
+        return aitag.for_user(text, (self.ai_tag,))
+
     def post(self, direction: str, text: str, chat: str | None = None, channel: str = "chat",
              kind: str = "user", severity: str = "normal", ref: str | None = None,
              handled: bool = False, provenance: str | None = None, ext_id: str | None = None,
@@ -1018,9 +1024,9 @@ END""")
         `context` (inbound): what a relayer added to the user's words; `text` holds only those words.
         `broadcast` (inbound): the id of the broadcast it came with (`ttp say --all`, broadcast.py).
         Outbound messages go to the user's own chats, so a trailing AI-authorship tag is dropped (aitag)."""
-        from . import aitag, alerts
+        from . import alerts
         if direction == "out":
-            text = aitag.for_user(text, (self.ai_tag,))
+            text = self.for_user(text)
         ts = time.time()
         with self.tx():
             mid = self.x("INSERT INTO messages(ts,direction,chat,channel,kind,severity,text,ref,handled,provenance,"

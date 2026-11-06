@@ -5938,8 +5938,8 @@ class Daemon:
             except Exception as e:   # a miss never stops the hand-off
                 log(self.p, f"review {task['id']}: earlier reviews not marked superseded: {e}")
         if task["reply_chat"] and new in ("done", "failed", "blocked"):
-            text = replymsg.text(result) if new == "done" else f"(task #{task['id']} {outcome}) {summary}"
-            need = upd.get("blocked_reason") if new == "blocked" else None
+            text = db.for_user(replymsg.text(result) if new == "done" else f"(task #{task['id']} {outcome}) {summary}")
+            need = db.for_user(upd.get("blocked_reason")) if new == "blocked" else None
             if need and need not in summary:
                 text += f"\nNeeds from you: {need}"
             chat = None if task["reply_chat"] == "all" else task["reply_chat"]
@@ -17451,7 +17451,7 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
         if step is None and userstep.kind_of(n):
             step = userstep.kind_of(n) if end in ("waiting", "blocked") else None
         if step:
-            sent += userstep.relay(db, task, step, n, userstep.item_text(text, n, timefmt.zone(p)))
+            sent += userstep.relay(db, task, step, n, userstep.item_text(db.for_user(text), n, timefmt.zone(p)))
             continue
         if db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? AND ts>?",
                   (text, time.time() - 86400)):
