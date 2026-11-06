@@ -521,7 +521,12 @@ only in the feed and never under "needs you".
   user's own `ttp memory` is unchanged. Known gaps: only quotes are checked, so unquoted text on a
   labelled line with a checked quote is carried; a claim phrased past those label forms ("the user
   ordered '...'", "as the user put it", "User:", another language) is not checked and is carried as
-  data under the header above. A resumed wake sends only the digest sections
+  data under the header above. A new session's first wake's dollar cap is the per-wake cap plus the expected seed cost, within the
+  dollar and hourly caps (seedcap.py): the dearest of the last 3 new-session wakes' seeds (their
+  cache writes and uncached input at their own booked rate), each counted at most 3 times its
+  seeded prompt size (`turn.session.seed_chars`; older wakes without it, their size before the
+  seed) / 4 in tokens. The factor 3 rests on one measured wake, which wrote 2.6 times its size
+  before the seed; its ratio to the seeded size is lower and was not measured. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
   line naming the sections left out. Only the Open tasks section, keyed by task id, and the Course
   check, keyed by sign and task id (`- costly: #<id>`), go row by row (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,

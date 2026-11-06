@@ -1456,6 +1456,38 @@ def test_coordsession_capped_wakes_spending_on_cache_writes_converge(env, monkey
     assert s0["seed_basis"] == "history" and 1.0 < _cs_cap(a0) < 2.5, (s0, a0)
 
 
+def test_coordsession_a_past_seed_is_bounded_by_its_seeded_prompt_size(env, monkeypatch):
+    """Review #6545: turn.prompt_bytes is measured before the session seed (memory, order ledger,
+    handover note, chat) is added, so a seed that grew past SEED_FACTOR times it was clipped and the next
+    first wake's cap fell short. A new-session wake records its seeded size (turn.session.seed_chars),
+    and the bound reads the larger of the two; an older row without it keeps the prompt_bytes bound."""
+    from ttp import coordsession, seedcap
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, seeds=((1.2, 1.5),))
+    rid = p.db.one("SELECT id FROM runs WHERE session_id='OLD0'")["id"]
+    p.db.x("UPDATE runs SET note=json_set(note, '$.turn.prompt_bytes', 10000) WHERE id=?", (rid,))
+    old = round(seedcap.SEED_FACTOR * 10_000 / seedcap.CHARS_PER_TOKEN * seedcap.CACHE_WRITE_1H * _CS_RATE, 2)
+    assert old == 0.15
+    assert seedcap.expected(p.db, p.config(), "fake", "other", 0) == (old, "history")   # an older row: today's bound
+    p.db.x("UPDATE runs SET note=json_set(note, '$.turn.session.seed_chars', 400000) WHERE id=?", (rid,))
+    assert seedcap.expected(p.db, p.config(), "fake", "other", 0) == (1.2, "history")   # not clipped
+    # A seeded size below prompt_bytes, or junk, never tightens the bound below today's.
+    for junk in (5, "junk", -1, None, [1]):
+        p.db.x("UPDATE runs SET note=json_set(note, '$.turn.session.seed_chars', json(?)) WHERE id=?",
+               (json.dumps(junk), rid))
+        assert seedcap.expected(p.db, p.config(), "fake", "other", 0) == (old, "history"), junk
+    # The daemon records the seeded size on a new-session wake (a long chat and handover in its seed
+    # included), not on a resume.
+    seed = coordsession.seed
+    monkeypatch.setattr(coordsession, "seed", lambda *a, **k: seed(*a, **k) + "\n" + "C" * 200_000)
+    s_head, s_context = coordsession.session_prompt_parts(p)
+    sp = {"system": s_head, "context": s_context, "cached": ""}
+    run, a0, prompt, s0 = turn("EVENTS", budget_usd=1.0, session_prompt=sp)
+    assert s0["mode"] == "new" and abs(s0["seed_chars"] - len(prompt)) < 16, (s0, len(prompt))   # prompt.md joins the parts
+    assert s0["seed_chars"] > json.loads(run["note"])["turn"]["prompt_bytes"] + 150_000, s0
+    _, _, _, s1 = turn("EVENTS", budget_usd=1.0, session_prompt=sp)
+    assert s1["mode"] == "resume" and "seed_chars" not in s1, s1
+
+
 def test_coordsession_a_new_session_without_history_prices_its_seed_prompt(env, monkeypatch):
     p, holder, turn = _cs_seed_wakes(env, monkeypatch, **{"budget.estimate_usd_per_mtok": 400.0})
     _, a0, prompt, s0 = turn("EVENTS", budget_usd=1.0)

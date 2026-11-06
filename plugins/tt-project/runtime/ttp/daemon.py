@@ -3094,11 +3094,11 @@ class Daemon:
                 env = {**env, **prov.compact_env(compact_at)}
                 argv = _before_stdin(argv, prov.compact_args(compact_at))
             seed_usd = None
+            # The seeded prompt's size: a later new session's seed cap bounds this wake's seed by it (seedcap.py).
+            seed_chars = sum(len(t or "") for t in (system, context, append_system, prompt))
             if session_mode == "new" and budget_usd is not None and prov.caps_budget:
                 try:   # the seed rides on this wake: its cap covers it, within the dollar caps (seedcap.py)
-                    seed_usd, seed_basis = seedcap.expected(
-                        self.p.db, self.cfg, provider, model,
-                        sum(len(t or "") for t in (system, context, append_system, prompt)))
+                    seed_usd, seed_basis = seedcap.expected(self.p.db, self.cfg, provider, model, seed_chars)
                     g = self.gates.get(provider)
                     room = turnsize.headroom(self.cfg, dict(g.numbers) if g else {})
                     session_cap = seedcap.cap(float(budget_usd), seed_usd, room)
@@ -3115,6 +3115,7 @@ class Daemon:
                    if session_mode == "stateless" and (state or {}).get("rerun") else {}),
                 **({"restore": True} if restoring else {}),
                 **({"compact_at": compact_at} if compact_at else {}),
+                **({"seed_chars": seed_chars} if session_mode == "new" else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
         elif role == "coordinator" and not resume and prov.cache_key_per_session:
             try:   # the agent's cache follows its session: continue the last turn's while warm
