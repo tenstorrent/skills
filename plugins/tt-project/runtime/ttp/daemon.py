@@ -9721,7 +9721,14 @@ class Daemon:
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
             return {"tier": tier, "to": name, "model": model, "fallback": "rerun", "after": after}
-        why = "model_missing" if route.held(self.p.db, self.cfg, tier) else route.cooling(self.p.db, name, now)
+        try:
+            esc = route.escalation(self.p.db, task) if task.get("id") else {}
+        except Exception as e:   # escalation must never hold a task back
+            log(self.p, f"task {task['id']}: route escalation not checked: {type(e).__name__}: {e}")
+            esc = {}
+        if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
+            return {"tier": tier, "to": name, "model": model, "fallback": route.ESCALATED, **esc}
+        why ="model_missing" if route.held(self.p.db, self.cfg, tier) else route.cooling(self.p.db, name, now)
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
         return {"tier": tier, "to": name, "model": model, "fallback": why or "none"}

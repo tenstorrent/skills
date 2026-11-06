@@ -8,9 +8,10 @@ and off whenever the project's providers_allowed leaves chat out (provallow.py).
 A worker run of a routed tier starts on chat when its task pins no provider or model and the start is
 no tier-up retry; reviews and coordinator turns never route. The run's note gets a `route` entry:
 the tier, where it was routed (`to`, `model`), its `fallback` reason (none, down, error, rate_limit,
-auth, malformed, timeout, failed, no_handoff, busy or rerun, with a short `cause` for a run's own end),
+auth, malformed, timeout, failed, no_handoff, busy, rerun or escalated, with a short `cause` for a run's own end),
 whether its spend is `priced`, its wall time and, when the model has effort_fields (chatbridge.py), the
-`effort` it ran at with the fields sent and whether the endpoint `rejected` them. An endpoint fault also
+`effort` it ran at with the fields sent and whether the endpoint `rejected` them; an escalated start
+names its kind (`escalated`) and `cause`. An endpoint fault also
 keeps the failed answer's `upstream` HTTP status and error code (404 model_not_found apart from a 5xx;
 chatbridge.upstream_of: never its text, a key, a URL or a host). The run's hand-off summary, which the
 coordinator feed shows, is then one route line (fallback_line) naming the reason, never the run's error
@@ -49,6 +50,13 @@ failed; a clean exit without a valid result.json: no_handoff) falls back the sam
 cool-down: the endpoint is fine, the run was not. Its task's later runs start on the core provider
 (`rerun`), so a task falls back on its own at most once. A run that handed off (even `failed`) ended
 on its merits: no fallback; a failed light try is retried a tier up as usual.
+
+Escalation (escalation): a routable start goes to the core provider with fallback `escalated` when the
+task is urgent or user-ordered (landing in minutes outweighs the saving), when it fixes a review or
+failed checks of a change its lineage wrote on the routed-to provider, or when its lineage
+(chaincap.chain) has LINEAGE_MISSES routed misses (misses: runs there that fell back on their own or
+handed off failed, and routed changes a review or checks sent back); such a lineage stays on core.
+`ttp status` counts them apart from fallbacks and `ttp stats --runs` ends with their count by kind.
 
 Missing model: a model_missing fallback cools nothing; it holds that tier's route alone (MISSING kv,
 hold), so its runs start on the core provider with fallback `model_missing` and one normal notice
@@ -90,7 +98,11 @@ RUN_CAUSES = ("timeout", "failed", "no_handoff")   # a routed run's own end with
 OWN_CAUSE_WORDS = ("timed out", "stalled", "exited without", "result.json", "exit ")   # fallback_line shows these
 # busy: the routed-to provider's gate or a pause held new work, no fault; busy_wait_expired: its slots
 # (the project's or the host's) stayed full for the whole wait; rerun: the task fell back on its own before.
-REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun")
+# escalated: an urgent, user-ordered or fix start, or a lineage's, kept on the core provider (escalation).
+ESCALATED = "escalated"
+REASONS = ("none", *FAULTS, *RUN_CAUSES, "busy", "busy_wait_expired", "rerun", ESCALATED)
+CHECKS_WOKE = "its checks failed"   # how the daemon's wake text after a task's failed checks starts
+LINEAGE_MISSES = 2          # routed misses (misses) that keep a lineage on the core provider
 WAIT_S = 90.0               # providers.chat.route_wait_s: how long a routed start waits for a slot
 HOST_MAX = 6                # route.host_max unset: the most routed runs seen at once on one key without a 429
 HOST_ENV = "TTP_ROUTE_HOST_MAX"
@@ -350,6 +362,72 @@ def fell_back_before(db, task_id: int) -> int | None:
     return None
 
 
+def _lineage_runs(db, ids: list[int]) -> list[dict]:
+    """Worker runs with a route entry of tasks `ids`, oldest first, each with its entry (`e`) and whether
+    it ran on the provider it was routed to (`on`)."""
+    if not ids:
+        return []
+    rows = db.q(f"SELECT id, task, provider, dir, note FROM runs WHERE role='worker' AND task IN "
+                f"({','.join('?' * len(ids))}) AND note LIKE ? ORDER BY id", (*ids, f'%"{KEY}"%'))
+    return [{"id": int(r["id"]), "task": r["task"], "dir": r["dir"], "e": e, "on": r["provider"] == e.get("to")}
+            for r in rows if (e := of(r["note"]))]
+
+
+def _handed_failed(run: dict) -> bool:
+    try:
+        return json.loads((Path(run["dir"]) / "result.json").read_text()).get("status") == "failed"
+    except (OSError, TypeError, ValueError, AttributeError):
+        return False
+
+
+def misses(db, ch: list[dict]) -> list[str]:
+    """The routed misses of lineage `ch` (chaincap.chain): runs on the routed-to provider that fell back on
+    their own (RUN_CAUSES) or handed off `failed`, routed changes a review sent back (the next hop is a
+    review fix) and checks fixes of a routed change (an escalated start's `sent_back`, once per change)."""
+    from .chaincap import is_review_fix
+    runs, out, seen = _lineage_runs(db, [int(t["id"]) for t in ch]), [], set()
+    for r in runs:
+        if r["on"] and r["e"].get("fallback") in RUN_CAUSES:
+            out.append(f"run {r['id']} fell back")
+        elif r["on"] and _handed_failed(r):
+            out.append(f"run {r['id']} failed")
+        elif r["e"].get("sent_back") == "checks" and (r["task"], r["e"].get("after")) not in seen:
+            seen.add((r["task"], r["e"].get("after")))
+            out.append(f"task {r['task']} sent back by checks")
+    on = {r["task"] for r in runs if r["on"]}
+    out += [f"task {a['id']} sent back by review" for a, b in zip(ch, ch[1:]) if a["id"] in on and is_review_fix(b)]
+    return out
+
+
+def escalation(db, task: dict) -> dict:
+    """Why a routable start of `task` stays on the core provider ({"escalated": kind, "cause"}, with
+    `sent_back` and `after` for a checks fix), or {} to route: an urgent task (urgent.is_urgent) or a
+    user-ordered one (added by the user or answering a chat) must land in minutes; a review fix
+    (chaincap.is_review_fix) of a lineage or a checks-fix wake (CHECKS_WOKE) of a task that ran on the
+    routed-to provider gets its fix there; a lineage with LINEAGE_MISSES routed misses (misses) stays
+    there for its remaining runs."""
+    from . import urgent
+    from .chaincap import chain, is_review_fix
+    from .db import load_result
+    if urgent.is_urgent(task):
+        return {"escalated": "urgent", "cause": f"urgent: {urgent.why(task)}"[:120]}
+    if task.get("origin") == "user" or urgent.user_ordered(task):
+        return {"escalated": "user-ordered", "cause": "ordered by the user"}
+    ch = chain(db, int(task["id"]))
+    runs = _lineage_runs(db, [int(t["id"]) for t in ch])
+    if is_review_fix(task) and any(r["on"] and r["task"] != task["id"] for r in runs):
+        return {"escalated": "review fix", "cause": "fixes a review of a change written on the routed provider"}
+    if str(load_result(task.get("result")).get("woke") or "").startswith(CHECKS_WOKE) and any(r["on"] for r in runs):
+        last = db.one("SELECT id, provider, note FROM runs WHERE task=? AND role='worker' ORDER BY id DESC LIMIT 1",
+                      (task["id"],))
+        own = bool(last) and last["provider"] == (of(last["note"]) or {}).get("to")
+        return {"escalated": "checks fix", "cause": "fixes failed checks of a change written on the routed provider",
+                **({"sent_back": "checks", "after": int(last["id"])} if own else {})}
+    if len(got := misses(db, ch)) >= LINEAGE_MISSES:
+        return {"escalated": "lineage", "cause": f"lineage has {len(got)} routed misses: {', '.join(got[:3])}"[:160]}
+    return {}
+
+
 def price(cfg: dict, prov: str, model: str, usage) -> bool:
     """Book a routed run's spend at `pricing.<prov>` ([$/M input, cached input, output] for the model
     or "default"); with no row the spend is zero and the run is unpriced. Returns whether it was priced."""
@@ -417,6 +495,7 @@ def _rows(db, since: float, until: float | None = None) -> list[dict]:
             out.append({**{k: r[k] for k in ("id", "task", "provider", "model", "status", "cost_usd")},
                         "tier": e.get("tier"), "to": e.get("to"), "fallback": e.get("fallback") or "none",
                         "priced": e.get("priced"), "salvaged": bool(e.get("salvaged")), "waited_s": e.get("waited_s"),
+                        "escalated": e.get("escalated") or "", "cause": e.get("cause") or "",
                         "effort": e.get("effort") if isinstance(e.get("effort"), dict) else None,
                         "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
     return out
@@ -432,8 +511,9 @@ def phrase(db, now: float | None = None) -> str:
     if not rows:
         return ""
     on = [r for r in rows if r["provider"] == r["to"]]
-    fell = [r for r in rows if r["fallback"] not in ("none", "rerun")]
+    fell = [r for r in rows if r["fallback"] not in ("none", "rerun", ESCALATED)]
     reruns = sum(1 for r in rows if r["fallback"] == "rerun")   # the same task starting again, not a new fallback
+    escalated = sum(1 for r in rows if r["fallback"] == ESCALATED)   # kept on core before it ran (escalation)
     to = ", ".join(sorted({str(r["to"]) for r in rows}))
     text = f"routed 24h: {len(on)} run{'s' if len(on) != 1 else ''} to {to}"
     if fell:
@@ -443,6 +523,8 @@ def phrase(db, now: float | None = None) -> str:
         text += f", {len(fell)} fell back ({', '.join(f'{k} {n}' for k, n in sorted(why.items()))})"
     if reruns:
         text += f", {reruns} rerun{'s' if reruns != 1 else ''} on core"
+    if escalated:
+        text += f", {escalated} escalated to core"
     if waited := sum(1 for r in on if r.get("waited_s")):   # got a full slot after waiting (route_wait_s)
         text += f", {waited} after a slot wait"
     if salvaged := sum(1 for r in on if r.get("salvaged")):   # hand-offs kept from a final reply (salvage)
@@ -477,6 +559,8 @@ def runs(db, tier: str | None, since: float, until: float | None = None) -> list
             continue
         out.append({"id": r["id"], "task": r["task"], "tier": t, "provider": r["provider"], "model": r["model"],
                     "outcome": r["status"], "fallback": (e or {}).get("fallback", ""),
+                    **({"escalated": e.get("escalated") or "", "cause": e.get("cause") or ""}
+                       if (e or {}).get("fallback") == ESCALATED else {}),
                     "salvaged": bool((e or {}).get("salvaged")),
                     "priced": (e or {}).get("priced"), "cost_usd": round(float(r["cost_usd"] or 0), 4),
                     "wall_s": round(float(r["ended"]) - float(r["started"]), 1) if r["ended"] and r["started"] else None})
@@ -494,6 +578,12 @@ def runs_text(rows: list[dict]) -> str:
         wall = f"{r['wall_s'] / 60:.1f}m" if r["wall_s"] is not None else "-"
         lines.append(f"{r['id']:<6} {str(r['task'] or ''):<6} {str(r['tier'] or '-'):<9} {str(r['provider']):<9} "
                      f"{str(r['model'] or '-')[:30]:<30} {out[:22]:<22} {wall:>6} {cost:>9}")
+    why: dict[str, int] = {}
+    for r in rows:
+        if r["fallback"] == ESCALATED:
+            why[r.get("escalated") or "?"] = why.get(r.get("escalated") or "?", 0) + 1
+    if why:
+        lines.append(f"escalated to core: {sum(why.values())} ({', '.join(f'{k} {n}' for k, n in sorted(why.items()))})")
     return "\n".join(lines)
 
 

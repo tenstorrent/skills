@@ -794,7 +794,7 @@ def _route_dispatch(p, d, monkeypatch, **task):
     for prov in (d.cfg.get("core_provider", "claude"), "chat", "codex"):
         d.gates[prov] = bud.Gate(prov, regime="windows", max_parallel=6)
     title = task.pop("title", "t")
-    assert coord.apply(p, [{"type": "task_add", "title": title, "spec": "s", "tier": "light", "priority": 1, **task}]) == []
+    assert coord.apply(p, [{"type": "task_add", "title": title, "spec": "s", "tier": "light", "priority": 3, **task}]) == []
     d.dispatch()
     return started[-1] if started else None
 
@@ -844,11 +844,11 @@ def _route_slots(p, d, monkeypatch, n, core_max=1, chat_max=1, chat_open=True, c
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.root), None))
     d.gates[core] = bud.Gate(core, regime="windows", max_parallel=core_max)
     d.gates["chat"] = bud.Gate("chat", regime="windows", max_parallel=chat_max, allow_new_work=chat_open)
-    d.cfg["budget"]["urgent_extra_slots"] = 0   # slot limits, not the urgent lane (its tasks are priority 1)
+    d.cfg["budget"]["urgent_extra_slots"] = 0   # slot limits, not the urgent lane
     for _ in range(core_running):
         p.db.x("INSERT INTO runs(role,provider,started,status,boot_id) VALUES('worker',?,?,'running',?)",
                (core, time.time(), d.boot))
-    assert coord.apply(p, [{"type": "task_add", "title": f"{tag}{i}", "spec": f"s {tag}", "tier": "light", "priority": 1}
+    assert coord.apply(p, [{"type": "task_add", "title": f"{tag}{i}", "spec": f"s {tag}", "tier": "light", "priority": 3}
                            for i in range(n)]) == []
     d.dispatch()
     return started
@@ -884,7 +884,7 @@ def _route_ticks(p, d, monkeypatch, n=0, chat_max=1, chat_running=0, tag="w"):
                (time.time(), d.boot))
     if n:
         assert coord.apply(p, [{"type": "task_add", "title": f"{tag}{i}", "spec": f"s {tag}", "tier": "light",
-                                "priority": 1} for i in range(n)]) == []
+                                "priority": 3} for i in range(n)]) == []
     d.dispatch()
     return started
 
@@ -1579,17 +1579,17 @@ def test_a_routed_run_takes_the_tiers_routed_time_limit(env, monkeypatch):
         "light": {"model": _RT_MODEL, "route": True, "route_timeout_s": 2700},
         "standard": {"model": _RT_MODEL, "route": True}}})
     d = Daemon(p.base)
-    tid = p.db.add_task("a", "s", kind="work", tier="light", priority=1, budget_usd=8.0, labels=[])
+    tid = p.db.add_task("a", "s", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
     prov, tier, k = _dispatch_task(p, d, monkeypatch, tid)
     assert (prov, tier, k["timeout_s"]) == ("chat", "light", 2700.0) and k["note"][route.KEY]["timeout_s"] == 2700.0
     # Unset for the tier: the tier default (start_run's run_timeout_s), as before.
-    tid = p.db.add_task("b", "s", kind="work", tier="standard", priority=1, budget_usd=8.0, labels=[])
+    tid = p.db.add_task("b", "s", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
     monkeypatch.setattr(d, "_pick_effort", lambda task, provider: None)
     prov, tier, k = _dispatch_task(p, d, monkeypatch, tid)
     assert (prov, tier) == ("chat", "standard") and k.get("timeout_s") is None and "timeout_s" not in k["note"][route.KEY]
     # A start on the core provider (a cool-down) keeps the tier default too.
     p.db.set_kv(route.COOL + "chat", {"until": time.time() + 600, "reason": "down"})
-    tid = p.db.add_task("c", "s", kind="work", tier="light", priority=1, budget_usd=8.0, labels=[])
+    tid = p.db.add_task("c", "s", kind="work", tier="light", priority=3, budget_usd=8.0, labels=[])
     prov, _, k = _dispatch_task(p, d, monkeypatch, tid)
     assert prov == d.cfg.get("core_provider", "claude") and k.get("timeout_s") is None
     assert route.timeout_s({"providers": {"chat": {"tiers": {"light": {"route_timeout_s": True}}}}}, "light") is None
@@ -1953,6 +1953,139 @@ def test_route_phrase_counts_reruns_apart_from_real_fallbacks(env, monkeypatch):
     seen["rows"] = [row("none"), row("rate_limit", "claude")]
     assert route.phrase(p.db) == "routed 24h: 1 run to chat, 1 fell back (rate_limit 1)"
 
+
+
+def _routed_run(p, tid, provider="chat", fallback="none", handoff=None):
+    """A finished worker run of task `tid` with a route entry (light tier to chat); `handoff` writes its result.json."""
+    d = p.root / "tmp-runs" / f"r{tid}-{time.time_ns()}"
+    d.mkdir(parents=True)
+    if handoff:
+        (d / "result.json").write_text(json.dumps({"status": handoff, "summary": "x"}))
+    note = {"route": {"tier": "light", "to": "chat", "model": _RT_MODEL, "fallback": fallback}}
+    return p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,dir,note) "
+                  "VALUES(?,'worker',?,?,?,?,'ok',?,?)", (tid, provider, _RT_MODEL, time.time() - 60, time.time(),
+                                                          str(d), json.dumps(note)))
+
+
+def _escalation_start(p, monkeypatch, tid):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p.set_config("providers.chat.tiers.standard", {"model": _RT_MODEL, "route": True})   # a fix may start a tier up
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    prov, _, k = _dispatch_task(p, d, monkeypatch, tid)
+    return prov, k["note"][route.KEY]
+
+
+@pytest.mark.parametrize("fields,kind", [
+    ({"spec": "s\nurgent: the release is blocked"}, "urgent"),   # an `urgent:` line
+    ({"priority": 1}, "urgent"),                                   # the urgent lane's priority
+    ({"origin": "user"}, "user-ordered"),                          # added by the user
+    ({"reply_chat": "c1"}, "user-ordered"),                        # answers a user's chat (the floor keeps it too)
+    ({}, ""),                                                      # routine work routes
+])
+def test_an_urgent_or_user_ordered_task_starts_on_core_as_escalated(env, monkeypatch, fields, kind):
+    from ttp import route
+    p = make(env)
+    _route_config(p)
+    f = {"spec": "s", "priority": 3, **fields}
+    tid = p.db.add_task("t", f.pop("spec"), kind="code", tier="light", budget_usd=8.0, labels=[], **f)
+    if "reply_chat" in fields:   # a chat answer runs on core by the conclusion floor before routing
+        assert route.escalation(p.db, p.db.task(tid))["escalated"] == kind
+        return
+    prov, e = _escalation_start(p, monkeypatch, tid)
+    if not kind:
+        assert prov == "chat" and e["fallback"] == "none"
+        return
+    assert prov != "chat" and e["fallback"] == route.ESCALATED and e["escalated"] == kind, e
+    assert e["cause"].startswith("urgent: the release" if "spec" in fields else ("urgent" if kind == "urgent" else "ordered"))
+
+
+@pytest.mark.parametrize("written_on", ["chat", "claude"])
+def test_a_review_fix_of_a_change_written_on_the_routed_provider_starts_on_core(env, monkeypatch, written_on):
+    from ttp import route
+    p = make(env)
+    _route_config(p)
+    code = p.db.add_task("build", "s", kind="code", tier="light", priority=3, budget_usd=8.0, labels=[])
+    _routed_run(p, code, provider=written_on, handoff="done")
+    p.db.update_task(code, status="done")
+    fix = p.db.add_task(f"Fix review #99: build", "s", kind="code", tier="light", priority=3, budget_usd=8.0,
+                        labels=[f"continues:{code}", "review_fix:99"])
+    prov, e = _escalation_start(p, monkeypatch, fix)
+    if written_on == "chat":
+        assert prov != "chat" and e["fallback"] == route.ESCALATED and e["escalated"] == "review fix", e
+    else:   # a change written on core: its fix routes as any task
+        assert prov == "chat" and e["fallback"] == "none", e
+
+
+@pytest.mark.parametrize("last_on_chat", [True, False])
+def test_a_checks_fix_wake_of_a_routed_change_starts_on_core_and_counts_once_as_sent_back(env, monkeypatch, last_on_chat):
+    from ttp import route
+    from ttp.chaincap import chain
+    p = make(env)
+    _route_config(p)
+    tid = p.db.add_task("build", "s", kind="code", tier="light", priority=3, budget_usd=8.0, labels=[])
+    rid = _routed_run(p, tid, handoff="waiting")
+    if not last_on_chat:   # a core run after the routed one wrote the change under check
+        rid = _routed_run(p, tid, provider="claude", fallback="busy", handoff="waiting")
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "woke": "its checks failed (exit 1); the end ..."}))
+    prov, e = _escalation_start(p, monkeypatch, tid)
+    assert prov != "chat" and e["fallback"] == route.ESCALATED and e["escalated"] == "checks fix", e
+    assert (e.get("sent_back"), e.get("after")) == (("checks", rid) if last_on_chat else (None, None))
+    # Two starts on the same failed checks of one routed change are one miss; without the wake it routes.
+    for _ in range(2):
+        p.db.x("INSERT INTO runs(task,role,provider,started,status,note) VALUES(?,'worker','claude',?,'ok',?)",
+               (tid, time.time(), json.dumps({"route": {"to": "chat", "fallback": "escalated", **e}})))
+    assert route.misses(p.db, chain(p.db, tid)) == ([f"task {tid} sent back by checks"] if last_on_chat else [])
+    p.db.update_task(tid, result=json.dumps({"status": "waiting"}))
+    assert route.escalation(p.db, p.db.task(tid)) == {}
+
+
+def test_a_lineage_with_two_routed_misses_stays_on_core_and_one_miss_still_routes(env, monkeypatch):
+    from ttp import route
+    from ttp.chaincap import chain
+    p = make(env)
+    _route_config(p)
+    root = p.db.add_task("build", "s", kind="code", tier="light", priority=3, budget_usd=8.0, labels=[])
+    _routed_run(p, root, fallback="timeout")              # fell back on its own: miss 1
+    _routed_run(p, root, provider="claude", fallback="rerun", handoff="done")
+    _routed_run(p, root, provider="claude", fallback="busy", handoff="failed")   # a core run's failure: no miss
+    _routed_run(p, root, fallback="down")                 # an endpoint fault: not the run's own, no miss
+    p.db.update_task(root, status="done")
+    hop = p.db.add_task("continue: build", "s", kind="code", tier="light", priority=3, budget_usd=8.0,
+                        labels=[f"continues:{root}"])
+    assert route.misses(p.db, chain(p.db, hop)) == [f"run {p.db.one('SELECT MIN(id) i FROM runs')['i']} fell back"]
+    prov, e = _escalation_start(p, monkeypatch, hop)
+    assert prov == "chat" and e["fallback"] == "none", e
+    _routed_run(p, hop, handoff="failed")                  # handed off failed on chat: miss 2
+    p.db.update_task(hop, status="done")
+    nxt = p.db.add_task("continue: build again", "s", kind="code", tier="light", priority=3, budget_usd=8.0,
+                        labels=[f"continues:{hop}"])
+    prov, e = _escalation_start(p, monkeypatch, nxt)
+    assert prov != "chat" and e["fallback"] == route.ESCALATED and e["escalated"] == "lineage", e
+    assert "2 routed misses" in e["cause"] and "failed" in e["cause"]
+    # A review that sends a routed change back is a miss too.
+    other = p.db.add_task("other", "s", kind="code", tier="light", priority=3, budget_usd=8.0, labels=[])
+    _routed_run(p, other, handoff="done")
+    fix = p.db.add_task("Fix review #7: other", "s", kind="code", tier="light", priority=3, budget_usd=8.0,
+                        labels=[f"continues:{other}", "review_fix:7"])
+    assert route.misses(p.db, chain(p.db, fix)) == [f"task {other} sent back by review"]
+
+
+def test_escalated_starts_are_counted_apart_in_status_and_stats_runs(env, monkeypatch):
+    from ttp import route
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code", tier="light", priority=3, budget_usd=8.0, labels=[])
+    for kind in ("urgent", "lineage", "urgent"):
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,note) VALUES(?,'worker','claude',?,?,'ok',?)",
+               (tid, time.time() - 5, time.time(), json.dumps({"route": {"tier": "light", "to": "chat", "fallback": "escalated",
+                                                                          "escalated": kind, "cause": kind}})))
+    _routed_run(p, tid)
+    assert route.phrase(p.db) == "routed 24h: 1 run to chat, 3 escalated to core"
+    rows = route.runs(p.db, "light", time.time() - 3600)
+    assert [r.get("escalated") for r in rows] == ["urgent", "lineage", "urgent", None]
+    text = route.runs_text(rows)
+    assert "ok (escalated)" in text and text.splitlines()[-1] == "escalated to core: 3 (lineage 1, urgent 2)"
 
 # A stand-in for Claude Code's init event: the user's MCP servers load unless --strict-mcp-config (or
 # deniedMcpServers names them), the user's plugins unless --setting-sources leaves out "user".

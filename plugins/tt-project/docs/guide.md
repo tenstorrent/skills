@@ -977,6 +977,12 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    as `result.json` and marks the run `salvaged`, counted in the `routed 24h:` phrase and `ttp stats
    --runs`. Each fallback's reason (and, for a run's own end, a short `cause`) is in
    the run's `route` record. A run that hands off, even `failed`, is retried a tier up as usual.
+   Some starts stay on the core provider before they run, with the reason `escalated`, its kind and
+   a short `cause`: an urgent or user-ordered task (landing in minutes outweighs the saving), a
+   review fix or failed-checks wake of a change its lineage wrote on the routed provider, and every
+   later run of a lineage with two routed misses (routed runs that fell back on their own or handed
+   off `failed`, and routed changes a review or failed checks sent back). The `routed 24h:` phrase
+   counts them apart (`2 escalated to core`) and `ttp stats --runs` ends with their count by kind.
    `"route_timeout_s"` next to a routed tier's `model` sets the time limit of its routed runs in
    place of the tier's `budget.run_timeout_s`; a start on the core provider keeps the tier default.
    Routed spend uses the `pricing.chat` row for the model (or its `default` row:
