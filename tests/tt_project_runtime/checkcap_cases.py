@@ -6180,11 +6180,47 @@ def test_a_holder_s_queue_age_run_time_and_children_show_apart(env, tmp_path, mo
         lane, = checklane.lane_status("pa", time.time() + 120)[0]["lanes"]
         assert lane["queued_s"] >= lane["age_s"] >= 120 and lane["running_s"] is None, lane
         assert lane["children"] is None or lane["children"] >= 0, lane
+        before = time.time()
         testslots.suite_running(g, 0)
-        lane, = checklane.lane_status("pa", time.time() + 60)[0]["lanes"]
-        assert 59 <= lane["running_s"] <= 61, lane
+        after = time.time()
+        lane, = checklane.lane_status("pa", after + 60)[0]["lanes"]
+        assert 60 <= lane["running_s"] <= round(after - before + 60, 1), lane   # run_since stamped between the two
     finally:
         g.close()
+
+
+def test_a_holder_whose_threads_come_and_go_still_has_its_children_counted(tmp_path, monkeypatch):
+    # A thread of the holder that ends while its children are read is skipped, not taken for the process
+    # gone: the count was "child processes unknown" whenever a pytest or daemon thread ended mid-scan.
+    import threading
+    from ttp import jobuse
+    proc = tmp_path / "proc"
+    for tid, kids in (("100", "200 201 "), ("101", None), ("102", "202")):
+        (proc / "100" / "task" / tid).mkdir(parents=True)
+        if kids is not None:   # 101: a thread that ended between the listing and the read
+            (proc / "100" / "task" / tid / "children").write_text(kids)
+    (proc / "300" / "task" / "300").mkdir(parents=True)   # every thread ended: the process is gone
+    real = jobuse.Path
+    monkeypatch.setattr(jobuse, "Path", lambda x: real(str(x).replace("/proc/", f"{proc}/", 1)))
+    assert sorted(jobuse._children(100)) == [200, 201, 202]
+    assert jobuse._children(300) is None and jobuse._children(400) is None, "gone: unknown, not 0 children"
+    monkeypatch.setattr(jobuse, "Path", real)
+    # Live: this process's threads churn while its tree is read; it is never unknown.
+    stop = []
+    def churn():
+        while not stop:
+            ts = [threading.Thread(target=lambda: None) for _ in range(10)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+    c = threading.Thread(target=churn)
+    c.start()
+    try:
+        assert all(jobuse._tree(os.getpid()) is not None for _ in range(500))
+    finally:
+        stop.append(1)
+        c.join()
 
 
 def test_status_and_the_web_feed_show_the_lane_lines(env, monkeypatch):

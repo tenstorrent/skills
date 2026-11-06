@@ -129,13 +129,22 @@ def _stat(pid: int) -> list[str] | None:
 
 
 def _children(pid: int) -> list[int] | None:
-    kids = []
+    """`pid`'s child pids, from each of its threads; None when the process is gone or unreadable. A thread
+    that ends mid-scan is skipped, so a holder whose threads come and go never reads as unknown."""
+    kids, read = [], False
     try:
-        for t in Path(f"/proc/{pid}/task").iterdir():
-            kids += [int(x) for x in (t / "children").read_text().split()]
-    except (OSError, ValueError):
+        tasks = list(Path(f"/proc/{pid}/task").iterdir())
+    except OSError:
         return None
-    return kids
+    for t in tasks:
+        try:
+            kids += [int(x) for x in (t / "children").read_text().split()]
+        except OSError:
+            continue   # that thread ended meanwhile
+        except ValueError:
+            return None
+        read = True
+    return kids if read else None   # no thread readable: the process ended meanwhile
 
 
 def _tree(pid: int) -> list[int] | None:
