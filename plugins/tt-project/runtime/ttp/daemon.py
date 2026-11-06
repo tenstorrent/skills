@@ -57,6 +57,7 @@ from . import drift
 from . import resumefirst
 from . import rejcool
 from . import stalegate
+from . import sandboxstate
 from . import indexignore
 from . import plangate
 from . import lanewait
@@ -256,7 +257,7 @@ from .project import (
     push_allowed,
     zombie,
 )
-from .providers import fence_on as provider_fence_on, get_provider
+from .providers import get_provider
 from .providers.base import (
     FUNDS_RE,
     Provider,
@@ -1181,6 +1182,7 @@ class Daemon:
         self._spec_held: set[int] = set()   # tasks whose spec wakes a same-wait hand-back holds (logged once)
         self._wait_what_errs: set[str] = set()   # causes of lock-probe errors already logged (_wait_what)
         self._fence_freed_said: set[str] = set()   # sandbox.fence_freed_commands entries left out, logged
+        self._sandbox_said: set[str] = set()   # superseded sandbox settings told once (sandboxstate)
         # Exclusive slot reservations (_slot_reservations): canonical lock -> {"task", "holder", "free_since"},
         # the (lock, task) pairs whose reservation timed out, and the pass's reservers while dispatch runs.
         self._slot_resv: dict[str, dict] = {}
@@ -1411,6 +1413,14 @@ class Daemon:
         except OSError:
             pass
 
+    def _tell_sandbox_superseded(self, key: str, text: str) -> None:
+        """Log and tell the coordinator, once per daemon and setting (one keyed low issue), that a
+        sandbox setting is superseded (sandboxstate); its project.json is left as it is."""
+        if text and key not in self._sandbox_said:
+            self._sandbox_said.add(key)
+            log(self.p, f"sandbox: {text}")
+            self.observe("daemon:sandbox-superseded", text, "low", whole=True, key=f"sandbox-superseded:{key}")
+
     def _load_config(self) -> None:
         """Reload project.json. Missing or broken, its last good copy stays in force; with none, an
         established project starts no coordinator turn or worker run (both would route on the
@@ -1421,7 +1431,9 @@ class Daemon:
         # The process sandbox for checks, off unless the project turns it on: this daemon's own check
         # runs read it here, its workers from their environment (start_run).
         from . import sandbox as process_sandbox
-        os.environ[process_sandbox.ENV] = "1" if (self.cfg.get("sandbox") or {}).get("checks") is True else "0"
+        # sandbox.checks true counts only on the user's own word since runs went unsandboxed (sandboxstate).
+        # start_run tells the coordinator about a superseded one.
+        os.environ[process_sandbox.ENV] = "1" if sandboxstate.state(self.p, self.cfg, sandboxstate.CHECKS_KEY)[0] else "0"
         if status != self.cfg_status:
             log(self.p, {"ok": "project.json reads again",
                          "fallback": "project.json is missing or not valid JSON: its last good copy stays in force",
@@ -2940,8 +2952,14 @@ class Daemon:
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,
                                web=role == "coordinator" or web_needed(role, task))
+        # The write fence counts only on the user's own word since runs went unsandboxed (sandboxstate): a
+        # leftover true is ignored and told to the coordinator once, never rewritten in project.json.
+        fence_on, fence_why, superseded = sandboxstate.fence(self.p, self.cfg, provider)
+        self._tell_sandbox_superseded(sandboxstate.fence_key(provider), superseded)
+        self._tell_sandbox_superseded(sandboxstate.CHECKS_KEY,
+                                      sandboxstate.state(self.p, self.cfg, sandboxstate.CHECKS_KEY)[2])
         if read_only:   # a decision-only turn, unsandboxed unless opted in: its output goes through the action gates
-            argv = prov.read_only_args(argv, on=provider_fence_on(self.cfg, provider), restrictions=restrictions)
+            argv = prov.read_only_args(argv, on=fence_on, restrictions=restrictions)
         session_on = role == "coordinator" and not resume and coordsession.on(self.cfg, provider)
         session_mode = ""   # coordinator.session.mode on: this wake's coordsession.decide()
         if session_on:   # first: a session wake's cache lifetime follows the session's own writes
@@ -3118,7 +3136,6 @@ class Daemon:
                 self.alert(f"write_dirs_missing:{provider}",
                            f"Skipped providers.{provider}.write_dirs entries (not created): {'; '.join(absent)}.",
                            severity="low", every_s=86400)
-            fence_on = provider_fence_on(self.cfg, provider)   # as cli._harness_worker_fenced reads it
             # The project's own host-reaching commands, freed by name like ssh (fencefree).
             freed, left_out = fencefree.commands(self.p.base, (self.cfg.get("sandbox") or {}).get("fence_freed_commands"))
             for why in left_out:
@@ -3338,6 +3355,8 @@ class Daemon:
             stall = self.cfg["budget"].get("stall_s", {}).get(tier) if role != "coordinator" else None
             spec = {"argv": argv, "env": env, "cwd": cwd, "timeout_s": tout, "provider": provider, "stall_s": stall,
                     "sandbox": prov.launch_sandbox(argv) or "none",   # read from argv: what a verifier checks
+                    "sandbox_state": sandboxstate.run_summary(prov.launch_sandbox(argv), fence_on, fence_why,
+                                                              restrictions),
                     "model": model, "effort": effort,
                     **({"pin": pin, "pin_verify": (task or {}).get("pin_verify")
                         or self.cfg["runner"]["pin_verify"]} if pin else {}),
@@ -3401,7 +3420,8 @@ class Daemon:
             except Exception as e:   # bookkeeping: the next session wake then goes at 1h
                 log(self.p, f"run {run_id}: session prompt cache wake not recorded: {e}")
         log(self.p, f"run {run_id} start role={role} provider={provider} tier={tier} task={task and task['id']} "
-                    f"sandbox={prov.launch_sandbox(argv) or 'none'}")
+                    f"sandbox={prov.launch_sandbox(argv) or 'none'} "
+                    f"({sandboxstate.run_summary(prov.launch_sandbox(argv), fence_on, fence_why, restrictions)})")
         return run_id
 
     def _run_dir(self, r: dict) -> Path:

@@ -481,8 +481,7 @@ def test_write_dirs_reach_the_fenced_worker_and_refusals_alert(env, monkeypatch)
     before = _settings(_claude_launch(env, p, wt)["argv"])["sandbox"]["filesystem"]["allowWrite"]
     assert not alerts, "unset: nothing to say"
     (p.root / "notes").mkdir()
-    p.set_config("providers", {**p.config()["providers"], "claude": {
-        **p.config()["providers"].get("claude", {}), "write_dirs": ["notes", "..", "tt-project/harness", "gone"]}})
+    p.set_config("providers.claude.write_dirs", ["notes", "..", "tt-project/harness", "gone"])
     spec = _claude_launch(env, p, wt)
     sandbox = _settings(spec["argv"])["sandbox"]
     allow = sandbox["filesystem"]["allowWrite"]
@@ -701,7 +700,7 @@ def test_a_run_cannot_change_the_worker_sandbox_without_the_user(env, capsys, mo
     capsys.readouterr()
     monkeypatch.delenv("TTP_RUN_ID")
     cli.main(["config", "demo", "providers.claude.write_fence", "true"])
-    assert fence_on(p.config(), "claude")
+    assert fence_on(p.config(), "claude", p)
 
 
 def test_the_coordinator_changes_the_worker_sandbox_only_in_a_turn_carrying_the_users_word(env, capsys):
@@ -714,11 +713,15 @@ def test_the_coordinator_changes_the_worker_sandbox_only_in_a_turn_carrying_the_
     for value in (True, "on", False):
         out = coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": value}])
         assert any("needs the user's approval" in x for x in out), (value, out)
-        assert not fence_on(p.config(), "claude")
+        assert not fence_on(p.config(), "claude", p)
     assert "providers.claude.write_fence" not in coord.HELD_SETTING
     assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": True}],
                        user_turn=True) == []
-    assert fence_on(p.config(), "claude")
+    assert not fence_on(p.config(), "claude", p), "a turn without the user's own message records no user word"
+    mid = p.db.post("in", "turn the worker sandbox back on", chat="relay-chat")
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": True}],
+                       user_turn=True, messages=[mid]) == []
+    assert fence_on(p.config(), "claude", p)
     assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": "false"}],
                        user_turn=True) == []
     assert p.raw_config()["providers"]["claude"]["write_fence"] is False
@@ -802,10 +805,14 @@ def test_a_config_without_the_sandbox_keys_runs_everything_unsandboxed(env, monk
     cfg = p.config()
     assert not (cfg.get("sandbox") or {}).get("checks") and not any((cfg.get("providers") or {}).get(n.name, {}).get("write_fence")
                                             for n in all_providers())
-    assert not any(fence_on(cfg, prov.name) for prov in all_providers())
+    assert not any(fence_on(cfg, prov.name, p) for prov in all_providers())
     Daemon(p.base)
     assert os.environ[sandbox.ENV] == "0" and not sandbox.opted_in()
-    p.set_config("sandbox", {"checks": True})
+    p.set_config("sandbox", {"checks": True})   # no setter recorded: a leftover, superseded
+    Daemon(p.base)
+    assert not sandbox.opted_in()
+    from ttp import configwho
+    p.set_config("sandbox", {"checks": True}, by=configwho.by("user", via="cli"))
     Daemon(p.base)
     assert sandbox.opted_in()
 
@@ -855,3 +862,64 @@ def test_daemon_logs_a_coordinator_turn_that_changed_files_without_a_model_call(
     d._coord_writes({"id": 7}, run)
     assert f"run 7: warning: coordinator turn changed files in {p.harness}" in log()
     assert not calls, "a log line only: no alert, no model call"
+
+
+def test_a_leftover_sandbox_setting_runs_unsandboxed_and_is_told_once(env, monkeypatch):
+    """providers.claude.write_fence true with no user word after the unsandboxed default (a hand edit, the
+    coordinator, the user before that date) starts no Bash sandbox; the run line and run.json say why, the
+    coordinator hears it once at low severity, and project.json is left as it is."""
+    from ttp import configwho, sandboxstate
+    from ttp.providers import claude
+    monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}")   # the sandbox could start
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    monkeypatch.delenv("TTP_SANDBOX_CHECKS", raising=False)
+    p = make(env)
+    old = sandboxstate.UNSANDBOXED_SINCE - 86400
+    for who in (None, configwho.by("coordinator", via="config_set"), configwho.by("user", via="cli")):
+        p.set_config("providers.claude.write_fence", True, by=who)
+        if who and who["by"] == "user":   # the user's word, but from before the harness-wide order
+            recs = p.db.kv_dict(configwho.KEY)[0]
+            p.db.set_kv(configwho.KEY, {**recs, "providers.claude.write_fence": {
+                **recs["providers.claude.write_fence"], "ts": old}})
+        on, why, told = sandboxstate.fence(p, p.config(), "claude")
+        assert not on and "superseded" in why and "only the user's own word" in told, (who, why, told)
+    raw = p.raw_config()
+    spec, log, rid = _launch_role(env, p, "claude", "worker", env["repo"], monkeypatch)
+    assert spec["sandbox"] == "none" and _settings(spec["argv"])["sandbox"].get("enabled") is False
+    assert not [a for a in spec["argv"] if "bwrap" in a or a.startswith("--unshare")]
+    assert "TTP_LOOPBACK_PORTS" not in spec["env"], "no socat proxies"
+    assert spec["sandbox_state"] == "off: providers.claude.write_fence true superseded"
+    assert "sandbox=none (off: providers.claude.write_fence true superseded)" in log.split(f"run {rid} start ", 1)[1]
+    assert p.raw_config() == raw, "project.json is never rewritten"
+    _, log, _ = _launch_role(env, p, "claude", "worker", env["repo"], monkeypatch)
+    rows = p.db.q("SELECT severity FROM issues WHERE watch_key=?", ("sandbox-superseded:providers.claude.write_fence",))
+    assert rows and [r["severity"] for r in rows] == ["low"], "one keyed low issue across runs and daemons"
+    assert log.count("sandbox: providers.claude.write_fence is true") == 2, "once per daemon (two here)"
+
+
+def test_a_sandbox_setting_the_user_made_after_the_order_stays_on(env, monkeypatch):
+    from ttp import configwho, sandboxstate
+    from ttp.providers import claude
+    monkeypatch.setattr(claude, "find_binary", lambda b: f"/usr/bin/{b}")
+    monkeypatch.setattr(claude.sys, "platform", "linux")
+    p = make(env)
+    p.set_config("providers.claude.write_fence", True, by=configwho.by("user", msgs=[3], via="chat"))
+    assert sandboxstate.fence(p, p.config(), "claude") == (True, "on: providers.claude.write_fence set by the user", "")
+    spec, log, rid = _launch_role(env, p, "claude", "worker", env["repo"], monkeypatch)
+    assert spec["sandbox"] == "claude-bash-sandbox" and _settings(spec["argv"])["sandbox"]["enabled"] is True
+    assert spec["sandbox_state"] == "on: providers.claude.write_fence set by the user"
+    assert "sandbox=claude-bash-sandbox (on: providers.claude.write_fence set by the user)" in log
+    assert not p.db.q("SELECT 1 FROM issues WHERE watch_key LIKE 'sandbox-superseded:%'")
+
+
+def test_status_shows_each_running_runs_sandbox_state(env):
+    from ttp import cli
+    p = make(env)
+    tid = p.db.add_task("sandboxed work", "s", kind="work", tier="light", origin="user")
+    d = p.runs / "41"
+    d.mkdir(parents=True)
+    (d / "run.json").write_text(json.dumps({"sandbox": "none", "sandbox_state": "off by default"}))
+    p.db.x("INSERT INTO runs(id,task,role,provider,status,started,dir) VALUES(41,?,'worker','claude','running',?,?)",
+           (tid, time.time(), str(d)))
+    out = cli.status_text(p)
+    assert "sandboxed work" in out and "[sandbox off by default]" in out, out

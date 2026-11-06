@@ -1696,8 +1696,10 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
 # judgement. `ttp config` refuses it inside a run, as every NEEDS_USER key.
 SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS}
 NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
+# The process sandbox for check commands: turning it on is the user's too (sandboxstate); off is the safe side.
+NEEDS_USER["sandbox.checks"] = "restriction"
 NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe side, needs no word
-SAFE_WHEN_OFF = {"coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
+SAFE_WHEN_OFF = {"coordinator.session.tools", "sandbox.checks", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
                  "delivery.never_force"}
@@ -1705,7 +1707,8 @@ SAFE_WHEN_OFF = {"coordinator.session.tools", relay.AGENT_KEY, "delivery.code_ta
 # spend and access are hard gates, the merge list speaks as the owner, the rest change what may land on or
 # overwrite a branch other people use. The agent-orders trust itself is the owner's to turn on.
 HELD_SETTING = {k: {"spend": "gate", "access": "gate", "merge": "speaks"}.get(v, "people")
-                for k, v in NEEDS_USER.items() if k != relay.AGENT_KEY and k not in SANDBOX_KEYS}
+                for k, v in NEEDS_USER.items() if k != relay.AGENT_KEY and k not in SANDBOX_KEYS
+                and k != "sandbox.checks"}
 # The value that turns a SAFE_WHEN_OFF key off (the safe side), where it is not False, "" or [].
 OFF_VALUE = {"coordinator.session.tools": "read_only", "delivery.own_push": "off", "delivery.rebase_replace": "new_branch", "delivery.never_force": True}
 

@@ -30,8 +30,11 @@ def all_providers() -> list[Provider]:
     return [cls() for cls in _REGISTRY.values()]
 
 
-def fence_on(cfg: dict, name: str) -> bool:
-    """Whether the project turned provider `name`'s optional write fence on (providers.<name>.write_fence
-    true). Off by default: workers run without an OS sandbox (no bwrap, no network or PID namespace, sudo
-    works); locks, device holds, pauses, spend caps, checks, review and Restrictions are the gates."""
-    return ((cfg.get("providers") or {}).get(name) or {}).get("write_fence") is True
+def fence_on(cfg: dict, name: str, p=None) -> bool:
+    """Whether project `p`'s workers of provider `name` run in its optional write fence
+    (providers.<name>.write_fence true, set by the user's own word since runs went unsandboxed:
+    sandboxstate.state). Off by default: workers run without an OS sandbox (no bwrap, no network or PID
+    namespace, sudo works); locks, device holds, pauses, spend caps, checks, review and Restrictions are
+    the gates."""
+    from ..sandboxstate import fence
+    return fence(p, cfg, name)[0]

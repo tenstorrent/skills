@@ -15322,10 +15322,13 @@ def test_codex_workers_may_write_run_state_and_git_metadata(env, monkeypatch):
 
 
 def _write_fence(name):
-    """A `before` hook (or a call on a project) that turns provider `name`'s opt-in write fence on."""
+    """A `before` hook (or a call on a project) that turns provider `name`'s opt-in write fence on, as the
+    user's own word does (configwho: runs honour it only from the user, sandboxstate)."""
     def on(p):
+        from ttp import configwho
         providers = p.config().get("providers") or {}
-        p.set_config("providers", {**providers, name: {**(providers.get(name) or {}), "write_fence": True}})
+        p.set_config("providers", {**providers, name: {**(providers.get(name) or {}), "write_fence": True}},
+                     by=configwho.by("user", via="cli"))
     return on
 
 

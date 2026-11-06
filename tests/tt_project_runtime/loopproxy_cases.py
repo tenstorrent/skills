@@ -209,8 +209,7 @@ def test_daemon_gives_fenced_claude_workers_the_host_loopback_ports(env, monkeyp
         return json.loads((p.runs / str(rid) / "run.json").read_text())["env"]
 
     def set_ports(value):
-        provs = p.config()["providers"]
-        p.set_config("providers", {**provs, "claude": {**provs.get("claude", {}), "loopback_ports": value}})
+        p.set_config("providers.claude.loopback_ports", value)
     assert loopproxy.PORTS_ENV not in launch(), "an unfenced worker (the default) shares the host's network"
     _write_fence("claude")(p)
     got = launch()

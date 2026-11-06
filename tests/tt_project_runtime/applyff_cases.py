@@ -359,7 +359,9 @@ def test_a_daemon_taking_neither_request_still_gets_the_merge_task_of_an_unfence
     assert cli._harness_worker_fenced(p)
     off = {**p.config()["providers"], "claude": {**p.config()["providers"].get("claude", {}), "write_fence": False}}
     on = p.config()["providers"]
-    for unfence, refence in [(lambda: p.set_config("providers", off), lambda: p.set_config("providers", on)),
+    from ttp import configwho
+    for unfence, refence in [(lambda: p.set_config("providers", off),
+                              lambda: p.set_config("providers", on, by=configwho.by("user", via="cli"))),
                              (lambda: missing.append("bwrap"), missing.clear),
                              (lambda: p.set_config("core_provider", "fake"),
                               lambda: p.set_config("core_provider", "claude"))]:
