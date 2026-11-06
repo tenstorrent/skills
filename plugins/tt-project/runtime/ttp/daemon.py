@@ -4367,7 +4367,7 @@ class Daemon:
         try:
             got = credwatch.classify(exit_info["cred_changed"], exit_info.get("cred_marks") or {},
                                      r.get("started"), time.time(), dbs, (str(own), r.get("id")))
-            (run_dir / credwatch.VERDICTS).write_text(json.dumps(got))
+            durable_write(run_dir / credwatch.VERDICTS, json.dumps(got))
             return got
         except Exception:   # every change fails the run, as before
             log(self.p, f"run {r['id']}: credential change check failed\n" + traceback.format_exc())
