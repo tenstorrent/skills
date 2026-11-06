@@ -1304,11 +1304,60 @@ def _timed_tx(monkeypatch, db, held: list | None = None) -> list:
     return holds
 
 
+def _lock_clock(monkeypatch, db, delay: float) -> list:
+    """Every write lock `db` takes from now on, on a test clock a loaded host barely stretches:
+    [(seconds held, committed)]. A hold runs from BEGIN IMMEDIATE to its COMMIT or ROLLBACK (the
+    connection's trace callback; after_commit work holds no lock) and counts the CPU this thread and
+    the subprocesses it waited for used, plus the sleep of each git _slow_git started under it: the
+    full `delay` for one that ran to its end, the timeout the round cut it at for one cut."""
+    import resource
+    from ttp import gitmemo
+    holds, state = [], {"open": None, "sleep": 0.0}
+
+    def cpu() -> float:
+        r = resource.getrusage(resource.RUSAGE_CHILDREN)
+        return time.thread_time() + r.ru_utime + r.ru_stime
+
+    def trace(sql: str) -> None:
+        verb = sql.strip().upper()
+        if verb.startswith("BEGIN"):
+            state["open"] = (cpu(), state["sleep"])
+        elif verb in ("COMMIT", "ROLLBACK") and state["open"]:
+            c0, s0 = state["open"]
+            state["open"] = None
+            holds.append((cpu() - c0 + state["sleep"] - s0, verb == "COMMIT"))
+
+    real_spawn, real_audit = gitmemo._spawn, gitmemo.on_audit
+
+    def spawn(argv, t, kw):
+        t0 = time.monotonic()
+        try:
+            r = real_spawn(argv, t, kw)
+        except subprocess.TimeoutExpired:
+            state["sleep"] += min(t, time.monotonic() - t0)
+            raise
+        state["sleep"] += delay
+        return r
+
+    def on_audit(event, args):   # a raw git spawn (not through gitmemo.run) sleeps `delay` too
+        if event == "subprocess.Popen" and state["open"] and not gitmemo._own.get():
+            argv = args[1] if len(args) > 1 else None
+            exe = argv[0] if isinstance(argv, (list, tuple)) and argv else argv
+            if Path(str(exe)).name == "git":
+                state["sleep"] += delay
+        return real_audit(event, args)
+    monkeypatch.setattr(gitmemo, "_spawn", spawn)
+    monkeypatch.setattr(gitmemo, "on_audit", on_audit)
+    db.conn.set_trace_callback(trace)
+    return holds
+
+
 def _finish_holds(env, monkeypatch, strict: bool, slice_s: float = 1.0, warm: bool = True, n: int = 200,
-                  spawns: list | None = None, **slow):
+                  spawns: list | None = None, clock: bool = False, **slow):
     """Finish _big_finish's two runs (strict rounds or not) with every write lock logged (db.SLOW_TX_S
     0) behind a slow git (_slow_git); returns (s, every hold as _timed_tx records it, slow-tx lines, wall s per finish).
-    `spawns` (a list): each git gitmemo spawns is appended as [argv text, under the write lock, "ran" or "cut"]."""
+    `spawns` (a list): each git gitmemo spawns is appended as [argv text, under the write lock, "ran" or "cut"].
+    `clock`: the holds as _lock_clock times them instead (`slow` sets no `slow` pattern)."""
     from ttp import daemon as dmod, db as dbm, gitmemo
     s, runs = _big_finish(env, monkeypatch, n)
     _slow_git(env["tmp"], monkeypatch, **slow)
@@ -1321,6 +1370,8 @@ def _finish_holds(env, monkeypatch, strict: bool, slice_s: float = 1.0, warm: bo
         monkeypatch.setattr(d, "_prefetch_git", lambda task, result: None)
     held = [False]
     holds = _timed_tx(monkeypatch, d.p.db, held)
+    if clock:
+        holds = _lock_clock(monkeypatch, d.p.db, slow.get("delay", 0.02))
     if spawns is not None:
         real_spawn = gitmemo._spawn
 
@@ -1350,8 +1401,9 @@ def _finish_holds(env, monkeypatch, strict: bool, slice_s: float = 1.0, warm: bo
 def test_a_finish_on_a_big_project_behind_a_slow_git_holds_the_write_lock_at_most_3s(env, monkeypatch, strict):
     """sa28: a finish whose warm-up misses the body's reads (each read 0.4 s, the per-read cap 30 s,
     above the 1 s slice) holds the write lock at most 3 s in strict rounds, rolled-back ones included;
-    the one-transaction finish (FINISH_STRICT False) holds it past 3 s, so the slice is what bounds it."""
-    s, holds, lines, walls = _finish_holds(env, monkeypatch, strict, warm=False, delay=0.4)
+    the one-transaction finish (FINISH_STRICT False) holds it past 3 s, so the slice is what bounds it.
+    Timed on _lock_clock: wall time held past 3 s on a host running several suites at once."""
+    s, holds, lines, walls = _finish_holds(env, monkeypatch, strict, warm=False, delay=0.4, clock=True)
     assert s.p.db.task(s.code)["status"] == "done" and s.p.db.task(s.review)["status"] == "pushing"
     longest = max(h for h, _ in holds)
     if strict:
