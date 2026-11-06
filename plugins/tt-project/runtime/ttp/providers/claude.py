@@ -613,8 +613,9 @@ def hook_settings() -> dict:
                                                                          "timeout": 20}]}],
                       # Denies Bash calls that would get around the harness's PR draft guard, and edits
                       # to the harness's gh wrapper and gh.d pre-hooks outside a harness task, and connector
-                      # posts to others without the AI-authorship tag (aitag).
-                      "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|mcp__.*",
+                      # posts to others without the AI-authorship tag (aitag), and file tool reads of a
+                      # credential store (credguard).
+                      "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*",
                                       "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}],
                       # Refuses to end a task run whose result.json is missing or no hand-off (twice at most),
                       # or fails a hand-off check (the checks get handoffcheck.STOP_BUDGET_S in all).

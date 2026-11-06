@@ -11,7 +11,8 @@ def _cred_home(tmp_path, monkeypatch):
     for name in ("id_ed25519", "id_ed25519.pub", "config", "known_hosts", "work-key", "cm-0123abcd"):
         (ssh / name).write_text("x\n")
     monkeypatch.setenv("HOME", str(home))
-    for var in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "CODEX_HOME"):
+    for var in ("GH_CONFIG_DIR", "XDG_CONFIG_HOME", "CODEX_HOME", "DOCKER_CONFIG", "KUBECONFIG",
+                "AWS_SHARED_CREDENTIALS_FILE", "CLOUDSDK_CONFIG", "AZURE_CONFIG_DIR"):
         monkeypatch.delenv(var, raising=False)
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
     return home
@@ -241,6 +242,111 @@ def test_the_setup_box_plan_checks_pass_the_credential_guard(env, tmp_path, monk
     for s in steps:
         for cmd in s["check"].split("  (expect")[0].split("; "):
             assert "credential stores" not in _bash_why(tmp_path, cmd), (s["id"], cmd)
+
+
+# Each kept store (credguard.DIR_STORES and STORE_RE): a file the guard refuses and a neighbour it passes
+EXTRA_STORES = [(".aws/credentials", ".aws/config"), (".aws/sso/cache/t.json", ".aws/cli-history.txt"),
+                (".config/gcloud/credentials.db", ".config/gcloud/configurations/config_default"),
+                (".config/gcloud/application_default_credentials.json", ".config/gcloud/active_config"),
+                (".azure/msal_token_cache.json", ".azure/azureProfile.json"),
+                (".docker/config.json", ".docker/buildx/current"), (".kube/config", ".kube/cache/discovery.json"),
+                (".pypirc", ".config/pip/pip.conf"), (".config/git/credentials", ".config/git/config")]
+
+
+def _store_home(tmp_path, monkeypatch):
+    home = _cred_home(tmp_path, monkeypatch)
+    for refused, allowed in EXTRA_STORES:
+        for name in (refused, allowed):
+            (home / name).parent.mkdir(parents=True, exist_ok=True)
+            (home / name).write_text("x\n")
+    (tmp_path / "work").mkdir()
+    return home
+
+
+def _read_decision(tool, cwd, **args):
+    from ttp import hook
+    out, _ = hook.pre_tool_use({"tool_name": tool, "tool_input": args, "cwd": str(cwd)})
+    return (out or {}).get("hookSpecificOutput", {}).get("permissionDecision", "allow")
+
+
+def test_the_extra_credential_stores_are_refused_and_their_neighbours_pass(env, tmp_path, monkeypatch):
+    from ttp.credguard import credential_files
+    home = _store_home(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    files = credential_files()
+    for refused, allowed in EXTRA_STORES:
+        assert "credential stores" in _bash_why(work, f"cat ~/{refused}"), refused
+        assert "credential stores" not in _bash_why(work, f"cat ~/{allowed}"), allowed
+        assert _read_decision("Read", work, file_path=str(home / refused)) == "deny", refused
+        assert _read_decision("Read", work, file_path=str(home / allowed)) == "allow", allowed
+        assert str(home / allowed) not in files
+    # where a variable moves a store, its new place counts
+    monkeypatch.setenv("KUBECONFIG", str(tmp_path / "kc" / "admin.conf"))
+    assert "credential stores" in _bash_why(work, f"head {tmp_path}/kc/admin.conf")
+    assert _read_decision("Read", work, file_path=str(tmp_path / "kc" / "admin.conf")) == "deny"
+
+
+def test_the_cloud_tools_still_read_their_own_config_and_globs_or_folders_do_not_get_through(env, tmp_path,
+                                                                                         monkeypatch):
+    home = _store_home(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    for cmd in ("kubectl get pods -A", "kubectl --kubeconfig ~/.kube/config get ns",
+                "kubectl --kubeconfig=~/.kube/config get ns", "KUBECONFIG=~/.kube/config helm list",
+                "export KUBECONFIG=~/.kube/config", "env DOCKER_CONFIG=~/.docker docker pull alpine",
+                "docker login ghcr.io", "aws s3 ls", "gcloud auth list", "az account show",
+                "twine upload --config-file ~/.pypirc dist/*", "git credential-store --file x store",
+                "chmod 600 ~/.kube/config ~/.aws/credentials", "ls -la ~/.aws ~/.azure", "mkdir -p ~/.config/gcloud",
+                "GOOGLE_APPLICATION_CREDENTIALS=~/.config/gcloud/application_default_credentials.json python3 a.py",
+                "cat .azure-pipelines.yml", "cat deploy/.azure/pipeline.yml", "ls -d ~/.*", "cat ~/.bash*"):
+        assert "credential stores" not in _bash_why(work, cmd), cmd
+    for cmd in ("cat ~/.aws/*", "cat ~/.aws/cred*", "grep -r token ~/.azure", "tar czf /tmp/g.tgz ~/.config/gcloud",
+                "cp -r ~/.aws/sso /tmp/x", "cat ~/.aws/../.aws/credentials", "base64 ~/.docker/config.json",
+                "export KUBECONFIG=~/.kube/config; cat ~/.kube/config",
+                "kubectl --kubeconfig ~/.kube/config get ns; cat ~/.kube/config",
+                "cat --kubeconfig ~/.kube/config", "ssh box cat ~/.pypirc", "sh -c 'cat ~/.config/git/credentials'",
+                "ls ~/.aws/sso/cache", "cat ~/.kube/conf?g", "cat $HOME/.py*", "cat ~/.a?s/credentials",
+                'head "$HOME"/.config/g[h]/hosts.yml', "cat ~/.*rc", "cat ${HOME}/.a*/s*/cache/*"):
+        assert "credential stores" in _bash_why(work, cmd), cmd
+    # the file tools: a symlink, a store folder, a search over one, a Glob rooted in one
+    (work / "link").symlink_to(home / ".kube" / "config")
+    for tool, args in (("Read", {"file_path": str(work / "link")}),
+                       ("Read", {"file_path": str(home / ".ssh" / "id_ed25519")}),
+                       ("Grep", {"pattern": "token", "path": str(home / ".aws")}),
+                       ("Grep", {"pattern": "token", "path": str(home)}),
+                       ("Grep", {"pattern": "token", "path": str(home / ".config" / "gcloud" / "legacy_credentials")}),
+                       ("Glob", {"pattern": f"{home}/.azure/*"}),
+                       ("Glob", {"pattern": "**/*", "path": str(home / ".docker")})):
+        assert _read_decision(tool, work, **args) == "deny", (tool, args)
+    for tool, args in (("Grep", {"pattern": "region", "path": str(home / ".aws" / "config")}),
+                       ("Grep", {"pattern": "x"}), ("Glob", {"pattern": "**/*.py"}),
+                       ("Glob", {"pattern": "*.json", "path": str(home / ".kube" / "cache")}),
+                       ("Read", {"file_path": str(home / ".ssh" / "id_ed25519.pub")})):
+        assert _read_decision(tool, work, **args) == "allow", (tool, args)
+    # a session coordinator's file tools take the same check (provider parity: coordtools)
+    from ttp import coordtools
+    monkeypatch.setenv(coordtools.DENIED_ENV, "")
+    out, _ = coordtools.pre_tool_use({"tool_name": "Read", "tool_input": {"file_path": str(home / ".aws/sso/cache/t.json")}})
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+def test_the_gh_wrapper_fails_closed_on_ref_writes_when_its_guard_errors_in_a_run(env, tmp_path, monkeypatch):
+    from ttp import prguard
+    ran = []
+    monkeypatch.setattr(prguard, "real_gh", lambda own: "/nonexistent/gh")
+    monkeypatch.setattr(prguard, "run_gh_hooks", lambda *a: None)
+    monkeypatch.setattr(prguard, "_stdin_devnull", lambda: None)
+    monkeypatch.setattr(prguard, "_project_db", lambda: (_ for _ in ()).throw(RuntimeError("guard broke")))
+    monkeypatch.setattr(prguard.os, "execv", lambda real, argv: ran.append(argv[1:]))
+    calls = (["release", "create", "v1"], ["release", "-R", "o/r", "upload", "v1", "a.tgz"],
+             ["pr", "update-branch", "5"], ["repo", "sync", "o/r"])
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    for args in calls:
+        assert prguard.main(["gh", *args], str(tmp_path)) == 1 and ran == [], args
+    assert prguard.main(["gh", "pr", "view", "5"], str(tmp_path)) == 0 and ran == [["pr", "view", "5"]]
+    monkeypatch.delenv("TTP_RUN_DIR")   # outside a run these are no ref writes the wrapper guards
+    for args in calls:
+        ran.clear()
+        assert prguard.main(["gh", *args], str(tmp_path)) == 0 and ran == [args], args
 
 
 def _cred_ref_why():

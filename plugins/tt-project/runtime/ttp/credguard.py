@@ -5,13 +5,19 @@
 Runs are unsandboxed: they can read all of HOME and reach any host. A credential a tool call prints
 stays in the run's log and transcript, so the stores are kept out of tool calls model-free:
 - the daemon gives Claude Code runs a Read deny rule for each file credential_files() names (gh's
-  hosts file, git's and netrc's credential files, the agents' own login files, and every file in
-  ~/.ssh but the known public ones, see ssh_public);
+  hosts file, git's and netrc's credential files, the agents' own login files, the token and key
+  files of aws, gcloud and azure (DIR_STORES), docker's and kubectl's config, ~/.pypirc, and every
+  file in ~/.ssh but the known public ones, see ssh_public);
+- the worker hook refuses a Read, Grep or Glob call that reaches one, also by a symlink, inside one
+  of the folders it names, or one made later in ~/.ssh, and a Grep or Glob over a folder holding one
+  (tool_refusal);
 - the worker hook (hook.py) refuses a Bash call that names one by path (bash_refusal), or prints a
   token (`gh auth token`, `gh auth status --show-token`, `git credential fill`). ssh, git and gh
   read them themselves: a key given to ssh by `-i` or `-o IdentityFile=`, a key path handed to
-  ssh-add or ssh-keygen, mkdir, chmod, chown, touch and test of them, and ls or stat of the ~/.ssh
-  dir itself pass. The words of a command ssh runs on another host are checked the same way, quotes
+  ssh-add or ssh-keygen, a config given by its tool's option (`kubectl --kubeconfig`, CONFIG_OPTIONS)
+  or variable (`KUBECONFIG=`, CONFIG_VARS), mkdir, chmod, chown, touch and test of them, and ls or
+  stat of a store folder itself pass; kubectl, docker, gcloud, aws and az read their own config
+  unnamed. The words of a command ssh runs on another host are checked the same way, quotes
   are dropped before the check (~/.ss''h), and a find whose name test matches a private key or
   credential file is refused. Known gap: a path built at run time inside a script or inline code.
 Secrets stay reachable only through `ttp secret env` (hook.secret_read).
@@ -25,8 +31,7 @@ and the GraphQL mutations doing the same; the hook refuses them sent by curl and
 (hook.api_ref_write). Reads pass. PR merges stay under the charter's merge policy and are not refused
 here (`gh pr merge` is not either).
 A session coordinator's Read, Grep and Glob calls are refused on the files credential_files() named at
-launch and on any other non-public file in ~/.ssh, also one made later or reached by a symlink
-(ssh_secret, coordtools.pre_tool_use).
+launch and on what tool_refusal refuses (coordtools.pre_tool_use).
 """
 from __future__ import annotations
 
@@ -41,7 +46,22 @@ SSH_PATH_RE = re.compile(r"(?<![\w.-])\.ssh(?:/+([^\s\"'`;&|<>()]*))?(?![\w.-])"
 # The other stores by name, or by the variable that moves them
 STORE_RE = re.compile(r"(?:(?<![\w.-])gh|GH_CONFIG_DIR\}?)/+hosts\.ya?ml\b|(?<![\w.-])\.git-credentials\b"
                       r"|(?<![\w.-])\.netrc\b|(?<![\w.-])\.credentials\.json\b"
-                      r"|(?:(?<![\w.-])\.codex|CODEX_HOME\}?)/+auth\.json\b")
+                      r"|(?:(?<![\w.-])\.codex|CODEX_HOME\}?)/+auth\.json\b"
+                      r"|(?:(?<![\w.-])\.docker|DOCKER_CONFIG\}?)/+config\.json\b|(?<![\w.-])\.kube/+config\b"
+                      r"|(?<![\w.-])\.pypirc\b|(?:(?<![\w.-])\.config|XDG_CONFIG_HOME\}?)/+git/+credentials(?![\w.-])")
+# Store folders (the variable that moves each) and the entries in them that hold a token or key; their
+# other entries hold none (aws `config`, gcloud `configurations`, azure `azureProfile.json`)
+DIR_STORES = {".aws": (None, ("credentials", "sso", "cli")),
+              ".config/gcloud": ("CLOUDSDK_CONFIG", ("credentials.db", "access_tokens.db", "legacy_credentials",
+                                                    "application_default_credentials.json")),
+              ".azure": ("AZURE_CONFIG_DIR", ("accessTokens.json", "msal_token_cache.json", "msal_token_cache.bin",
+                                              "service_principal_entries.json", "service_principal_entries.bin"))}
+DIR_RES = {d: re.compile(r"(?<![\w.-])" + re.escape(d).replace("/", "/+") + r"(?:/+([^\s\"'`;&|<>()]*))?(?![\w.-])")
+           for d in DIR_STORES}
+# A tool's option or a variable that hands the tool its own config file: the tool reads it, the run does not
+CONFIG_OPTIONS = {"kubectl": "--kubeconfig", "helm": "--kubeconfig", "k9s": "--kubeconfig", "twine": "--config-file"}
+CONFIG_VARS = ("KUBECONFIG=", "DOCKER_CONFIG=", "AWS_SHARED_CREDENTIALS_FILE=", "CLOUDSDK_CONFIG=",
+               "AZURE_CONFIG_DIR=", "GOOGLE_APPLICATION_CREDENTIALS=")
 SSH_FAMILY = {"ssh", "scp", "sftp", "autossh", "ssh-copy-id"}
 # ssh -o options that only name a key or a socket ssh opens itself (never ProxyCommand: it runs a command)
 SSH_KEY_OPTION_RE = re.compile(r"(?:IdentityFile|CertificateFile|ControlPath|IdentityAgent)[\s=]", re.I)
@@ -61,9 +81,10 @@ FIND_SECRET_NAMES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk"
                      ".git-credentials", ".netrc")
 FIND_NAME_TESTS = {"-name": False, "-iname": True}
 WHY = ("a run never reads credential stores (ssh private keys, gh's hosts file or `gh auth token`, git and netrc "
-       "credential files, the agents' login files): what it prints stays in the run's log and transcript. ssh, git "
-       "and gh read them themselves: give ssh a key with `-i <key>`, give a stored secret to a command with "
-       "`ttp secret env`, and call a store by what it is in text, never by its path")
+       "credential files, the agents' login files, cloud, docker, kube and PyPI credentials): what it prints stays "
+       "in the run's log and transcript. ssh, git, gh and the cloud tools read them themselves: give ssh a key with "
+       "`-i <key>`, give a stored secret to a command with `ttp secret env`, and call a store by what it is in "
+       "text, never by its path")
 
 # GitHub REST routes that move refs or write a repo's files: refs, tags, contents, merges, releases, renames,
 # a PR branch update, and the rules that protect a branch or tag (a branch name may hold slashes)
@@ -98,15 +119,38 @@ def ssh_public(name: str) -> bool:
             or name.split("/", 1)[0] == "config.d")
 
 
+def dir_public(store: str, name: str) -> bool:
+    """`name` (a path under the DIR_STORES folder `store`) holds no token or key: it is none of the
+    folder's secret entries, under one, a glob that takes one, or the folder itself."""
+    first = name.strip("/").split("/", 1)[0]
+    if not first or ".." in name.split("/"):
+        return False
+    from fnmatch import fnmatchcase
+    return not any(fnmatchcase(n, first) for n in DIR_STORES[store][1])
+
+
+def _stores(home: Path) -> list[Path]:
+    """The credential files and folders but ~/.ssh's, where their variables put them (missing ones too)."""
+    env = os.environ.get
+    config = Path(env("XDG_CONFIG_HOME") or home / ".config")
+    out = [Path(env("GH_CONFIG_DIR") or config / "gh") / "hosts.yml", home / ".git-credentials", home / ".netrc",
+           Path(env("CLAUDE_CONFIG_DIR") or home / ".claude") / ".credentials.json",
+           Path(env("CODEX_HOME") or home / ".codex") / "auth.json",
+           Path(env("DOCKER_CONFIG") or home / ".docker") / "config.json", home / ".pypirc",
+           config / "git" / "credentials",
+           *[Path(p) for p in (env("KUBECONFIG") or str(home / ".kube" / "config")).split(os.pathsep) if p]]
+    if env("AWS_SHARED_CREDENTIALS_FILE"):
+        out.append(Path(env("AWS_SHARED_CREDENTIALS_FILE")))
+    for d, (var, names) in DIR_STORES.items():
+        out += [Path(var and env(var) or home / d) / n for n in names]
+    return out
+
+
 def credential_files(home: str | Path | None = None) -> list[str]:
     """The credential files a run's Read tool may not open (absolute paths, missing ones too, but the
     ~/.ssh files that exist and are not public)."""
     home = Path(home or os.path.expanduser("~"))
-    gh = Path(os.environ.get("GH_CONFIG_DIR") or Path(os.environ.get("XDG_CONFIG_HOME") or home / ".config") / "gh")
-    claude = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
-    codex = Path(os.environ.get("CODEX_HOME") or home / ".codex")
-    out = [gh / "hosts.yml", home / ".git-credentials", home / ".netrc", claude / ".credentials.json",
-           codex / "auth.json"]
+    out = _stores(home)
     try:
         out += sorted(p for p in (home / ".ssh").iterdir() if p.is_file() and not ssh_public(p.name))
     except OSError:
@@ -123,7 +167,12 @@ def _passing_words(argv: list[str], hands_on: bool = True) -> list[str]:
                           and any(STAT_FORMAT_RE.match(w) or w == "-c" for w in argv[1:])):
         return argv[1:]
     if name in LISTERS:
-        return [w for w in argv[1:] if not any(m.group(1) for m in SSH_PATH_RE.finditer(w))]
+        return [w for w in argv[1:] if not any(m.group(1) for rx in (SSH_PATH_RE, *DIR_RES.values())
+                                               for m in rx.finditer(w))]
+    option = CONFIG_OPTIONS.get(name)
+    if option:
+        return ([w for prev, w in zip(argv[1:], argv[2:]) if prev == option]
+                + [w for w in argv[1:] if w.startswith(option + "=")])
     if name not in SSH_FAMILY:
         return []
     out = []
@@ -214,15 +263,36 @@ def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = 
         return WHY
     rest = _unquoted(cmd)
     hands_on = bool(HANDS_ON_RE.search(rest))
-    for argv in segments:
-        for w in _passing_words(argv, hands_on):
-            if ".ssh" in w:
-                rest = rest.replace(_unquoted(w), " ", 1)
-    if STORE_RE.search(rest) or any(not ssh_public(m.group(1) or "") for m in SSH_PATH_RE.finditer(rest)):
+    stores = [str(p) for p in _stores(Path(home or os.path.expanduser("~")))]
+    words = [w for argv in segments for w in _passing_words(argv, hands_on)]
+    # a config variable's value, also as an assignment the parser drops (`KUBECONFIG=<file> kubectl ...`)
+    words += [w for argv in _segments(cmd, strip=False) for w in argv if w.startswith(CONFIG_VARS)]
+    for w in map(_unquoted, words):
+        if ".ssh" in w or _names_store(w, stores):   # the whole word, never part of a longer path
+            rest = re.sub(r"(?<![^\s;&|()<>])" + re.escape(w) + r"(?![^\s;&|()<>])", " ", rest, count=1)
+    if _names_store(rest, stores) or any(not ssh_public(m.group(1) or "") for m in SSH_PATH_RE.finditer(rest)):
         return WHY
-    if any(p in rest for p in credential_files(home)[:5]):
+    # a glob the shell expands to a store or into one (`~/.kube/conf?g`, `$HOME/.py*`), but to list it
+    globs = [os.path.expandvars(os.path.expanduser(w.split("=", 1)[-1])) for argv in segments
+             if os.path.basename(argv[0]) not in SILENT | LISTERS for w in argv[1:] if re.search(r"[*?\[]", w)]
+    if globs and any(_glob_takes(g, s) for g in globs if g.startswith("/") for s in credential_files(home)):
         return WHY
     return None
+
+
+def _glob_takes(pattern: str, path: str) -> bool:
+    """The shell expands `pattern` to `path` or a path under it: one glob per path part, a dot name only
+    by a dot pattern."""
+    from fnmatch import fnmatchcase
+    pp, sp = pattern.rstrip("/").split("/"), path.split("/")
+    return len(pp) >= len(sp) and all(fnmatchcase(s, p) and (s[:1] != "." or p[:1] == ".") for p, s in zip(pp, sp))
+
+
+def _names_store(text: str, stores: list[str]) -> bool:
+    """`text` names a store but ~/.ssh: by its usual name (STORE_RE, a DIR_STORES secret entry or the
+    folder itself) or by the path its variable gives it."""
+    return bool(STORE_RE.search(text)) or any(p in text for p in stores) or any(
+        not dir_public(d, m.group(1) or "") for d, rx in DIR_RES.items() for m in rx.finditer(text))
 
 
 def ssh_secret(path: str, search: bool = False, home: str | Path | None = None) -> bool:
@@ -236,6 +306,40 @@ def ssh_secret(path: str, search: bool = False, home: str | Path | None = None) 
     if real == ssh:
         return search
     return real.startswith(ssh + os.sep) and not ssh_public(os.path.relpath(real, ssh))
+
+
+READ_TOOLS = ("Read", "Grep", "Glob")
+
+
+def read_refusal(path: str, search: bool = False, home: str | Path | None = None) -> bool:
+    """Reading `path` reads a credential store (ssh_secret, or a credential_files() entry or a file in
+    one), also by a symlink; with `search` (Grep, Glob), also walking a folder that holds one."""
+    if ssh_secret(path, search, home):
+        return True
+    try:
+        real = os.path.realpath(os.path.expanduser(path))
+        files = [os.path.realpath(f) for f in credential_files(home)]
+    except (OSError, ValueError):
+        return True
+    inside = real.rstrip(os.sep) + os.sep
+    return any(real == f or real.startswith(f + os.sep) or search and f.startswith(inside) and os.path.lexists(f)
+               for f in files)
+
+
+def tool_refusal(tool: str, args: dict, cwd: str | None = None, home: str | Path | None = None) -> str | None:
+    """Why a Read, Grep or Glob call reaches a credential store (read_refusal), else None. A Grep or
+    Glob without a path searches `cwd`; a Glob pattern's fixed folder part (`~/.aws/*`) moves its root."""
+    if tool not in READ_TOOLS:
+        return None
+    cwd = cwd or os.getcwd()
+    search = tool != "Read"
+    path = os.path.expanduser(str(args.get("file_path") or args.get("path") or (cwd if search else "")))
+    if tool == "Glob":
+        fixed = re.split(r"[*?\[{]", str(args.get("pattern") or ""), maxsplit=1)[0]
+        path = os.path.join(path, os.path.expanduser(fixed.rsplit("/", 1)[0] if "/" in fixed else ""))
+    if path and read_refusal(os.path.join(cwd, path), search, home):
+        return "that file holds a credential, or the search walks into one (search a narrower folder): " + WHY
+    return None
 
 
 def ref_write(endpoint: str, method: str, text: str) -> bool:

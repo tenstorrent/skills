@@ -1099,6 +1099,11 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = harness_gh_edit(payload) if payload["tool_name"] in EDIT_TOOLS else harness_gh_patch(payload)
         why = why or local_guard(payload)
         return (_deny(why) if why else None), None
+    if payload.get("tool_name") in ("Read", "Grep", "Glob"):   # a credential store's contents (credguard)
+        from . import credguard
+        why = credguard.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
+                                     str(payload.get("cwd") or os.getcwd()))
+        return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
         from . import aitag
         why = aitag.tool_problem(str(payload["tool_name"]), payload.get("tool_input"), aitag.project_config())

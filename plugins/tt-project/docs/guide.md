@@ -2954,9 +2954,31 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `credwatch.files()`, for other guards to reuse.
 - Runs are unsandboxed, so credential stores are kept out of tool calls model-free (credguard.py).
   Claude Code runs get a Read deny rule for gh's hosts file, `~/.git-credentials`, `~/.netrc`, the
-  agents' login files (Claude's `.credentials.json`, Codex's `auth.json`) and every file in `~/.ssh`
-  but public keys, `config`, `known_hosts` and control sockets. The worker hook refuses a Bash call
-  that names one of them, `gh auth token`, `gh auth status --show-token` and `git credential fill`.
+  agents' login files (Claude's `.credentials.json`, Codex's `auth.json`), every file in `~/.ssh`
+  but public keys, `config`, `known_hosts` and control sockets, and these stores, each guarded only
+  where a model read would show a secret and no task needs to read it:
+  - AWS: `~/.aws/credentials` (or `AWS_SHARED_CREDENTIALS_FILE`), `sso/` and `cli/` (token caches).
+    `config` passes: profiles and regions only.
+  - gcloud (`CLOUDSDK_CONFIG`): `credentials.db`, `access_tokens.db`, `legacy_credentials` and
+    `application_default_credentials.json`. `configurations/` and `active_config` pass.
+  - Azure (`AZURE_CONFIG_DIR`): the token caches and service principal entries. `azureProfile.json`
+    and `config` pass.
+  - Docker (`DOCKER_CONFIG`): `config.json`, whose `auths` may hold a base64 user and password.
+    The rest of `~/.docker` passes.
+  - Kubernetes: `~/.kube/config` or each `KUBECONFIG` file (client keys and tokens);
+    `kubectl config view` shows the same with secrets hidden. `cache/` passes.
+  - PyPI: `~/.pypirc` (upload tokens in plain text). pip's config passes.
+  - git: `~/.config/git/credentials`, like `~/.git-credentials`. git's `config` and `ignore` pass.
+
+  The worker hook refuses a Read, Grep or Glob call that reaches one of them (also by a symlink, a
+  key made after launch, or a search over a folder holding one: search a narrower folder) and a
+  Bash call that names one, also by a glob the shell expands to one (`~/.kube/conf?g`; `ls` and
+  `stat` of a glob pass), plus `gh auth token`, `gh auth status --show-token` and
+  `git credential fill`. The tools read their own config untouched: kubectl, helm, docker, aws,
+  gcloud, az, twine and git, also `--kubeconfig <file>` (kubectl, helm, k9s), twine's
+  `--config-file`, and `KUBECONFIG`, `DOCKER_CONFIG`, `AWS_SHARED_CREDENTIALS_FILE`,
+  `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR` or `GOOGLE_APPLICATION_CREDENTIALS` set to one; `ls` of a
+  store's folder passes, a glob, `..` or a second mention does not.
   ssh, git and gh still read them themselves: `ssh -i <key>`, `-o IdentityFile=`, `ssh-add`,
   `ssh-keygen`, and chmod or test of a key pass, also as the ssh command given to rsync (`-e`,
   `--rsh`, `RSYNC_RSH`) or git (`GIT_SSH_COMMAND`, `-c core.sshCommand=`); a `stat` with a format
@@ -2964,7 +2986,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `..` part never counts as public. A command ssh runs on another host is checked the
   same way (`ssh box 'mkdir -p ~/.ssh'` passes, `ssh box cat ~/.ssh/<key>` does not), quotes inside
   a path do not hide it, and a `find` looking for a private key or credential file by name is
-  refused. Known gap: a path a script builds at run time.
+  refused. Known gaps: a path a script builds at run time, and a variable read later
+  (`cat $KUBECONFIG`). Provider parity: docs/providers.md (Codex runs get the Bash check only,
+  Cursor runs none).
 - Pushes go only through `ttp push` and the push queue. Inside a run, the harness's gh refuses `gh api`
   calls that create, move or delete refs or tags, write file contents, merge branches, update a PR's
   branch, write releases or the rules that protect a branch or tag (branch and tag protection,
@@ -2974,8 +2998,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `gh repo sync` of a named repo; reads of the same endpoints pass, and the hook refuses the same
   requests sent by curl and the like. PR merges follow the charter's merge policy.
 - A session coordinator's Read, Grep and Glob calls are refused on the credential files listed at
-  its launch and on any other non-public file in `~/.ssh`, also a key made later or reached by a
-  symlink.
+  its launch and on what the worker hook's file tool check refuses.
 - Guards in the harness are a second line. Give the account the harness uses a fine-grained token
   that can write only the repositories, and where the host allows it only the branches, its
   projects push to, and protect each repository's default branch (required reviews, no force pushes
