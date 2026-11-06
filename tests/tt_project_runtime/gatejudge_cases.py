@@ -522,3 +522,135 @@ def test_a_blocking_verdict_is_saved_per_tree_and_check_and_expires(tmp_path):
     assert gatejudge.known_new(tmp_path, "tree1", "pytest", 100.0 + gatejudge.BASE_KEEP_S + 1) is None
     said = gatejudge.known_new_text(e, "pytest")
     assert "t.py::test_x" in said and "aaaaaaaaaaaa" in said and "Fix them" in said and "--fresh" in said, said
+
+
+def _stacked_repo(env, tmp_path, monkeypatch):
+    # The gate's base for a task head: a temp repo whose `main` is the push branch tip (test_x passes),
+    # a scratch HOME, and a code task (TTP_TASK). Returns (p, run, git, commit, task id, push tip).
+    from ttp import cli
+    for var, sub in (("HOME", "home"), ("XDG_CONFIG_HOME", "xdg"), ("GH_CONFIG_DIR", "gh")):
+        (tmp_path / "scratch" / sub).mkdir(parents=True)
+        monkeypatch.setenv(var, str(tmp_path / "scratch" / sub))
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (repo / "tests").mkdir()
+
+    def commit(body: str | None, msg: str) -> str:
+        if body is not None:
+            (repo / "tests" / "test_gate.py").write_text(body)
+        (repo / "n.txt").write_text(msg + "\n")
+        subprocess.run([*git, "add", "-A"], check=True)
+        subprocess.run([*git, "commit", "-qm", msg], check=True)
+        return subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    tip = commit(_GATE_OK, "push tip")
+    subprocess.run([*git, "branch", "-M", "main"], check=True)
+    monkeypatch.setattr(cli, "_checks_base", lambda *a: tip)
+    tid = p.db.add_task("A change", "s", kind="code")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    return p, run, git, commit, tid, tip
+
+
+_GATE_OK = "def test_ok():\n    pass\n\n\ndef test_x():\n    pass\n"
+_GATE_BAD = _GATE_OK.replace("def test_x():\n    pass", "def test_x():\n    assert False")
+
+
+@pytest.mark.parametrize("how", ["fork_point", "pr_branch"])
+def test_ttp_checks_judges_a_head_stacked_on_a_local_branch_against_what_it_was_built_on(
+        env, tmp_path, monkeypatch, capsys, how):
+    # A head built on a local merge branch 3 commits past the push branch, where test_x already fails:
+    # the gate reruns on the commit the head was built on (its recorded fork point, else its merge base
+    # with the branch it is stacked on), so test_x is not new on the head; the push tip would call it new.
+    from ttp import cli, worktree
+    p, run, git, commit, tid, tip = _stacked_repo(env, tmp_path, monkeypatch)
+    subprocess.run([*git, "checkout", "-qb", "merge/demo-batch"], check=True)
+    commit(None, "batch 1")
+    commit(_GATE_BAD, "batch 2")
+    built_on = commit(None, "batch 3")
+    subprocess.run([*git, "checkout", "-qb", "ttp/t1-demo"], check=True)
+    commit(_GATE_BAD + "\n\ndef helper():\n    return 1\n", "the change")
+    if how == "fork_point":
+        worktree.record_fork_point(Path.cwd(), tid, built_on)
+        why = "fork point recorded"
+    else:
+        p.db.update_task(tid, labels=json.dumps(["pr_branch:merge/demo-batch"]))
+        subprocess.run([*git, "checkout", "-q", "merge/demo-batch"], check=True)
+        commit(None, "batch 4")   # the batch moves on after the fork: its merge base with the head stays
+        subprocess.run([*git, "checkout", "-q", "ttp/t1-demo"], check=True)
+        why = "merge base with heads/merge/demo-batch, the branch it is stacked on"
+    cli.main(["checks", "--", _FAIL])
+    out = capsys.readouterr().out
+    assert f"base {built_on[:12]}: " in out and why in out, out
+    assert "pre-existing on the base" in out and "tests/test_gate.py::test_x" in out and "LANDING ONLY" in out
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] and rec["excused"][0]["base"] == built_on and why in rec["excused"][0]["base_why"]
+    assert tip != built_on
+
+
+def test_ttp_checks_judges_a_plain_head_against_the_push_branch_as_before(env, tmp_path, monkeypatch, capsys):
+    # A head forked from the push branch: a failure it adds is new (base: its fork point, the push tip).
+    # Once the push branch moves on and the head is rebased onto it, the newer push merge base wins over
+    # the older fork point, so a failure the push branch got meanwhile is pre-existing, as before.
+    from ttp import cli, worktree
+    p, run, git, commit, tid, tip = _stacked_repo(env, tmp_path, monkeypatch)
+    worktree.record_fork_point(Path.cwd(), tid, tip)
+    subprocess.run([*git, "checkout", "-qb", "ttp/t1-demo"], check=True)
+    commit(_GATE_BAD, "the change")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _FAIL])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert f"base {tip[:12]}: the fork point recorded" in out and "new on this head" in out, out
+    subprocess.run([*git, "checkout", "-q", "main"], check=True)
+    newer = commit(_GATE_BAD, "the push branch moves on")
+    monkeypatch.setattr(cli, "_checks_base", lambda *a: newer)
+    subprocess.run([*git, "checkout", "-q", "ttp/t1-demo"], check=True)
+    subprocess.run([*git, "reset", "-q", "--hard", newer], check=True)
+    commit(_GATE_BAD + "\n\ndef helper():\n    return 1\n", "the change, rebased")
+    cli.main(["checks", "--", _FAIL])
+    out = capsys.readouterr().out
+    assert f"base {newer[:12]}: its merge base with the push branch (newer than {tip[:12]}" in out, out
+    assert "pre-existing on the base" in out and "LANDING ONLY" in out
+
+
+def test_ttp_checks_falls_back_to_the_merge_base_when_the_fork_point_was_rebased_away(
+        env, tmp_path, monkeypatch, capsys):
+    # The recorded fork point is on a branch the head no longer contains: never used as the base; the
+    # gate falls back to the head's merge base with the push branch and says why.
+    from ttp import cli, worktree
+    p, run, git, commit, tid, tip = _stacked_repo(env, tmp_path, monkeypatch)
+    subprocess.run([*git, "checkout", "-qb", "merge/old-batch"], check=True)
+    gone = commit(_GATE_BAD, "old batch")
+    worktree.record_fork_point(Path.cwd(), tid, gone)
+    subprocess.run([*git, "checkout", "-qb", "ttp/t1-demo", "main"], check=True)
+    commit(_GATE_BAD, "the change, rebased onto the push branch")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--", _FAIL])
+    assert e.value.code == 1
+    out = capsys.readouterr().out
+    assert (f"base {tip[:12]}: its merge base with the push branch; its recorded fork point {gone[:12]} "
+            "is not an ancestor of the head (rebased away)") in out, out
+    assert "new on this head" in out and "tests/test_gate.py::test_x" in out
+
+
+def test_a_task_worktree_records_its_fork_point_and_a_finished_tasks_is_pruned(env, monkeypatch):
+    # worktree.ensure records the commit each task's worktree was made at: the base a plain task starts
+    # from, or the head of the local branch a task is stacked on (pr_branch). The sweep prunes the ref of
+    # a finished task whose worktree is gone.
+    from ttp import worktree
+    p = make(env)
+    repo = env["repo"]
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    start = subprocess.run([*git, "rev-parse", worktree.resolve_base(p)], capture_output=True, text=True).stdout.strip()
+    plain = p.db.add_task("plain", "s", kind="code")
+    worktree.ensure(p, dict(p.db.task(plain)))
+    assert worktree.fork_point(p.root, plain) == start
+    subprocess.run([*git, "branch", "merge/demo-batch", start], check=True)
+    tip = subprocess.run([*git, "commit-tree", "-p", start, "-m", "batch", f"{start}^{{tree}}"],
+                         capture_output=True, text=True).stdout.strip()
+    subprocess.run([*git, "update-ref", "refs/heads/merge/demo-batch", tip], check=True)
+    stacked = p.db.add_task("stacked", "s", kind="code", labels=["pr_branch:merge/demo-batch"])
+    worktree.ensure(p, dict(p.db.task(stacked)))
+    assert worktree.fork_point(p.root, stacked) == tip != start
+    worktree.remove(p, plain, force=True)
+    p.db.update_task(plain, status="done")
+    assert plain in worktree.prune_rebase_starts(p, [])
+    assert worktree.fork_point(p.root, plain) == "" and worktree.fork_point(p.root, stacked) == tip

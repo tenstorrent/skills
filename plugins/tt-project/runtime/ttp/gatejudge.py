@@ -314,6 +314,8 @@ def undecided(v: dict) -> bool:
 def lines(v: dict) -> list[str]:
     """What the gate says of a verdict."""
     out = []
+    if v.get("base_why"):
+        out.append(f"base {str(v.get('base') or 'none')[:12]}: {v['base_why']}")
     if v.get("pre_existing"):
         out.append(f"pre-existing on the base {str(v.get('base'))[:12]} too (same host), not blocking: "
                    + ", ".join(v["pre_existing"]))

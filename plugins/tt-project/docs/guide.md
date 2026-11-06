@@ -1964,8 +1964,13 @@ session and stateless coordinators on every provider.
 - Tests gate judging (`gatejudge`): when a plain local pytest check of `ttp checks` fails with a complete
   list of at most `checks.judge_max_ids` (default 10) failing ids, only those ids run again at once, on
   the same host and in the same checks slot, never through the queue: once on the head, then those
-  failing again once on the merge base with the push target (each rerun bounded by
-  `checks.judge_rerun_s`, default 600). Failing on both is pre-existing and does not block (reported by
+  failing again once on the head's base (each rerun bounded by `checks.judge_rerun_s`, default 600).
+  The base is the commit the head was built on: the fork point recorded when the task's worktree was
+  made (`refs/ttp/fork-point/t<id>`), else the head's merge base with the branch the task is stacked on
+  (its `pr_branch` or `rebases:` branch), else its merge base with the push target; a candidate that is
+  not an ancestor of the head (a fork point rebased away) is skipped, and a later candidate that
+  descends from the first (the head merged or was rebased onto a newer tip) wins. The check output and
+  its excused record name the base and why. Failing on both is pre-existing and does not block (reported by
   name); passing on the head rerun is flaky: it goes into the project's quarantine
   (`state/test_quarantine.json`: first seen, evidence, expiry after `checks.quarantine_days`, default 7),
   which `ttp status` shows, one fix note goes to the coordinator, and it does not block. Failing on the

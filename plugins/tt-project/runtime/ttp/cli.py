@@ -5144,6 +5144,50 @@ def _checks_base(p: Project | None, top: Path, cmds: list) -> str:
     return r.stdout.strip() if r.returncode == 0 else ""
 
 
+def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str, str]:
+    """The commit the tests gate reruns failing tests on as the base of `head`, and why: the commit
+    the head was built on. Its candidates, each only when it is an ancestor of the head: the fork point
+    recorded when the task's worktree was made (worktree.fork_point, by TTP_TASK); the head's merge
+    base with the branch the task is stacked on (its pr_branch or rebases branch, local then origin);
+    its merge base with `base`, the push branch tip (as before: may be the head itself). The first of
+    them wins, unless a later one descends from it (the head merged or was rebased onto a newer tip):
+    then the newest. ("", why) when none is known: no base rerun."""
+    from . import worktree
+
+    def git(*args: str):
+        return subprocess.run(["git", "-C", top, *args], capture_output=True, text=True)
+
+    def mb(ref: str) -> str:
+        r = git("merge-base", ref, head)
+        return r.stdout.strip() if r.returncode == 0 else ""
+
+    def under(c: str) -> bool:   # a commit before the head, never the head itself
+        return bool(c) and c != head and git("merge-base", "--is-ancestor", c, head).returncode == 0
+
+    cands, notes = [], []
+    tid = os.environ.get("TTP_TASK") or ""
+    task = p.db.task(int(tid)) if tid.isdigit() else None
+    if task:
+        if fork := worktree.fork_point(Path(top), task["id"]):
+            if under(fork):
+                cands.append((fork, f"the fork point recorded when task #{task['id']}'s worktree was made"))
+            else:
+                notes.append(f"its recorded fork point {fork[:12]} is not an ancestor of the head (rebased away)")
+        if b := (worktree.delivery_branch(task) or ("", False))[0]:
+            for ref in (f"refs/heads/{b}", f"refs/remotes/origin/{b}"):
+                if under(m := mb(ref)):
+                    cands.append((m, f"its merge base with {ref.removeprefix('refs/')}, the branch it is stacked on"))
+    if base and (m := mb(base)) and (m == head or under(m)):
+        cands.append((m, "its merge base with the push branch"))
+    if not cands:
+        return "", "; ".join(notes + ["no base known: no base rerun"])
+    pick = cands[0]
+    for c in cands[1:]:
+        if c[0] != pick[0] and git("merge-base", "--is-ancestor", pick[0], c[0]).returncode == 0:
+            pick = (c[0], f"{c[1]} (newer than {pick[0][:12]}, {pick[1]})")
+    return pick[0], "; ".join([pick[1], *notes])
+
+
 CHECKS_RC, CHECKS_PID, CHECKS_OUT = "checks.rc", "checks.pid", "checks.out"   # in the run's directory
 
 CHECKS_TMP, CHECKS_TMP_LOCK = "checks-tmp", "checks-tmp.lock"
@@ -5348,8 +5392,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
     if not ids:
         return None
     s = gatejudge.settings(cfg)
-    mb = subprocess.run(["git", "-C", top, "merge-base", base, head], capture_output=True, text=True) if base else None
-    mb = mb.stdout.strip() if mb is not None and mb.returncode == 0 else ""
+    mb, base_why = _checks_judge_base(p, top, head, base)
     diff = subprocess.run(["git", "-C", top, "diff", "--name-only", f"{mb}..{head}"], capture_output=True,
                           text=True) if mb else None
     changed = diff.stdout.split() if diff is not None and diff.returncode == 0 else None
@@ -5387,7 +5430,7 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
     now = time.time()
     v = {"check": str(c), "head": head,
          **gatejudge.judge(ids, run, p.state, mb, remote or gatejudge.host(), now, touched, s["busy_tries"],
-                           s["busy_wait_s"])}
+                           s["busy_wait_s"]), "base_why": base_why}
     for line in gatejudge.lines(v):
         print(f"ttp checks: {line}", flush=True)
         out.write(f"ttp checks: {line}\n")

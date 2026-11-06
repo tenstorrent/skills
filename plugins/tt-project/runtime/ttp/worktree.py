@@ -463,6 +463,8 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
         _git(p.root, "worktree", "add", str(path), branch, timeout=timeout, env=env)
         # A local copy left behind by the remote's catches up, fast-forward only.
         _git(path, "merge", "--ff-only", "--quiet", f"origin/{branch}", check=False, timeout=timeout, env=env)
+        if not fork_point(p.root, task["id"]):   # an earlier attempt's commits are the task's own
+            record_fork_point(p.root, task["id"], "HEAD", path)
         return
     if not exists:
         _git(p.root, "fetch", "--quiet", "origin", check=False, timeout=timeout)
@@ -487,6 +489,7 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
     # sandbox's placeholder, another worktree being made) cannot refuse it; nothing reads that upstream.
     _git(p.root, "worktree", "add", "--no-track", "-B" if exists else "-b", branch, str(path), start,
          timeout=timeout, env=env)
+    record_fork_point(p.root, task["id"], "HEAD", path)
     if started:
         record_rebase_start(p.root, task["id"], started)
 
@@ -612,19 +615,40 @@ def rebase_start(repo: Path, task_id: int) -> str:
     return _git(repo, "rev-parse", "--verify", "--quiet", f"{REBASE_START_REF}{task_id}^{{commit}}", check=False)
 
 
+FORK_POINT_REF = "refs/ttp/fork-point/t"   # + task id: the commit a task's worktree was made at (its fork point)
+
+
+def record_fork_point(repo: Path, task_id: int, rev: str, where: Path | None = None) -> None:
+    """Record the commit `rev` names (in `where`, else `repo`) as task `task_id`'s fork point
+    (FORK_POINT_REF): the tests gate in `ttp checks` compares the task's head with it, the commit
+    the head was built on, even when that is a local branch past the push branch."""
+    sha = _git(where or repo, "rev-parse", "--verify", "--quiet", f"{rev}^{{commit}}", check=False)
+    if sha:
+        _git(repo, "update-ref", f"{FORK_POINT_REF}{task_id}", sha, check=False)
+
+
+def fork_point(repo: Path, task_id: int) -> str:
+    """The commit record_fork_point recorded for task `task_id`, or "" when none was."""
+    return _git(repo, "rev-parse", "--verify", "--quiet", f"{FORK_POINT_REF}{task_id}^{{commit}}", check=False)
+
+
 def prune_rebase_starts(p: Project, open_tasks: list[dict]) -> list[int]:
-    """Delete the REBASE_START_REF of every finished task whose worktree is gone and that no open
-    task still continues or names (needed_by); returns the task ids pruned. Safe to repeat."""
+    """Delete the REBASE_START_REF and FORK_POINT_REF of every finished task whose worktree is gone
+    and that no open task still continues or names (needed_by); returns the task ids pruned. Safe to
+    repeat."""
     from .db import TERMINAL_TASK_STATES
     pruned = []
-    for line in _git(p.root, "for-each-ref", "--format=%(refname)", REBASE_START_REF[:-1], check=False).split():
-        tail = line[len(REBASE_START_REF):]
+    refs = _git(p.root, "for-each-ref", "--format=%(refname)", REBASE_START_REF[:-1], FORK_POINT_REF[:-1],
+                check=False).split()
+    for line in refs:
+        tail = line.rpartition("/t")[2]
         task = p.db.task(int(tail)) if tail.isdigit() else None
         if (not task or task["status"] not in TERMINAL_TASK_STATES or (p.worktrees / f"t{task['id']}").exists()
                 or needed_by(task, open_tasks)):
             continue
         _git(p.root, "update-ref", "-d", line, check=False)
-        pruned.append(task["id"])
+        if task["id"] not in pruned:
+            pruned.append(task["id"])
     return pruned
 
 
