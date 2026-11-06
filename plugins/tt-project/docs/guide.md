@@ -2625,6 +2625,22 @@ same leading key, or most of the text alike), goes to a harness task, at most on
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 
+## Standing rules and rule cites
+
+Every coordinator digest (the stateless digest, a session's seed and its delta) carries a
+"Standing rules" section built without a model call: the charter's Restrictions and Policies,
+memory entries marked standing, open user orders and holds the user or another person set, one
+line each with a stable id (`R-…`, `P-…`, `M-…`, `o<n>`, `H-<resource>`) and the user message it
+came from. Before a hold, deferral, wait, delivery-route pick or action on a held resource, the
+coordinator checks it and `ttp said <topic>`, and cites in the action's `why` or `text` the rule
+id or user msg #, a safety rule (`safety: <kind>`) or the task whose output it needs
+(`needs #<id>`). A hold-type action (a `task_update` to blocked, `start_after`, `start_when`,
+`gate`, `depends_on`, the coordinator's own `resource_pause`) that cites none of these is still
+applied, then shown once in the next Course check as `uncited hold: …` and counted. The daily
+Self-efficiency audit line `rule cites (24 h)` and `ttp audit`'s `rule_cites` give the hold-type
+actions, the share that cite (target 100%) and the likely corrections that name a standing rule.
+The check covers actions; a session coordinator's direct CLI commands are not checked.
+
 ## Notifications
 
 Alerts go to every attached chat, to the web app, and, if you

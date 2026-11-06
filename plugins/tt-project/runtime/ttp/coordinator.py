@@ -89,6 +89,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     restriction_audit,
     restriction_source,
     reviewcap,
+    rulecite,
     selfreview,
     reviewreuse,
     selfblock,
@@ -1365,6 +1366,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     section("queue_backlog", queuetrim.digest_lines(db, float(db.kv("last_coordinator_turn", 0) or 0), now))
     section("coverage", responsibilities.digest_lines(db))
     section("blocker_sweep", sweep.digest_lines(db, event_ids, now, p.config()))
+    section(rulecite.SECTION, safe_eta(lambda: rulecite.index_lines(p, now), []))
     course_lines, course_id = course.digest_lines(db, p.config(), now)
     from .daemon import log   # daemon imports this module
     own, own_id = coursecheck.lines(db, p.config(), p.state / push.DETACHED, now, lambda m: log(p, m))
@@ -1381,6 +1383,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         if long_due[0]:
             course_lines = (course_lines or [course.HEADER]) + long_due[0]
             course_id += "\n" + "\n".join(long_due[1])
+    if uncited := rulecite.digest_lines(db, now):
+        course_lines = (course_lines or [course.HEADER]) + uncited
+        course_id += "\nrulecite:" + uncited[0].split(" (why:")[0]
     if unplain := plainreply.digest_lines(db, now):
         course_lines = (course_lines or [course.HEADER]) + unplain
         course_id += "\nplainreply:" + unplain[0].split(" | ")[0]
@@ -3792,6 +3797,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                        [a for i, a in enumerate(actions) if i not in failed and isinstance(a, dict)], turn=turn)
     except Exception as e:
         notes.append(f"cause check not recorded: {type(e).__name__}: {str(e)[:200]}")
+    try:   # flag only: a hold, deferral or wait citing no standing rule, safety rule or dependency (rulecite)
+        rulecite.check(p, [a for i, a in enumerate(actions) if i not in failed and isinstance(a, dict)], turn=turn)
+    except Exception as e:
+        notes.append(f"rule cites not checked: {type(e).__name__}: {str(e)[:200]}")
     try:   # flag only: a reply announcing a charter change with no charter_update in its batch
         charterpromise.check(db, [(mid, "reply" if mid in replies else "notify", text) for mid, _, text in sent],
                              actions, turn=turn)
