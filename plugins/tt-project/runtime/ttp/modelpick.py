@@ -55,11 +55,15 @@ def conf(cfg: dict) -> dict:
     return d if isinstance(d, dict) else {}
 
 
+def _opt_ok(o) -> bool:
+    """An option is an object whose provider is a non-blank string (config_problems names the rest)."""
+    return isinstance(o, dict) and isinstance(o.get("provider"), str) and bool(o["provider"].strip())
+
+
 def options(cfg: dict) -> dict[str, dict]:
     """The configured option keys, each with its provider, model and effort."""
     raw = conf(cfg).get("options") or {}
-    return {str(k): v for k, v in raw.items() if isinstance(v, dict) and str(v.get("provider") or "")} \
-        if isinstance(raw, dict) else {}
+    return {str(k): v for k, v in raw.items() if _opt_ok(v)} if isinstance(raw, dict) else {}
 
 
 def enabled(cfg: dict) -> bool:
@@ -106,7 +110,7 @@ def config_problems(raw: dict) -> list[str]:
     if raw_opts is not None and not isinstance(raw_opts, dict):
         out.append(f"{at}.options: give an object of option keys, each with a provider; no options")
     for k, o in (raw_opts.items() if isinstance(raw_opts, dict) else ()):
-        if not isinstance(o, dict) or not isinstance(o.get("provider"), str) or not o["provider"].strip():
+        if not _opt_ok(o):
             out.append(f"{at}.options.{k}: give an object with a provider (and model, effort); ignored")
     if d.get("enabled") is True and not enabled(raw):
         core = raw.get("core_provider") or "claude"

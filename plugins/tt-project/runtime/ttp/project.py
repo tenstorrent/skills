@@ -666,7 +666,10 @@ PROVIDER_KEYS = {"billing", "tiers", "plugin_dirs", "worker_isolation", "write_f
                  # routing runs by kind, tier and label (route.match). model_ranking: its model ids,
                  # smartest first, that stand in for a model that is down (modelrank.py).
                  "endpoint", "base_url", "max_tokens", "context_window", "route_cooldown_s", "effort_fields",
-                 "route_wait_s", "routes", "model_ranking"}
+                 "route_wait_s", "routes", "model_ranking",
+                 # providers.chat only: the rules-first model pick (modelpick.py); its keys (enabled, min_p,
+                 # options) are checked by modelpick.config_problems.
+                 "dispatch"}
 
 
 def write_dirs(root: Path, guard: Path, value: Any) -> tuple[list[str], list[str], list[str]]:

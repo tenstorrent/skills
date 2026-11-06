@@ -261,6 +261,10 @@ def test_model_pick_config_problems_name_each_bad_dispatch_setting():
                                    "d": {"provider": 3}}})
     assert got == [f"providers.chat.dispatch.options.{k}: give an object with a provider (and model, effort); ignored"
                    for k in "abcd"], got
+    # ... and ignored indeed: options() keeps none of them, so none becomes a choice that runs on core.
+    assert set(modelpick.options({"providers": {"chat": {"dispatch": {"options": {
+        **ok["options"], "a": "chat", "b": {"model": "m"}, "c": {"provider": " "}, "d": {"provider": 3}}}}}})) \
+        == {"routed-top", "core"}
     assert probs({"enabled": True, "options": ["routed-top"]}) == [
         "providers.chat.dispatch.options: give an object of option keys, each with a provider; no options",
         *probs({"enabled": True})]
@@ -270,4 +274,21 @@ def test_model_pick_config_problems_name_each_bad_dispatch_setting():
     assert not modelpick.enabled({"providers": {"chat": {"dispatch": {**ok, "enabled": "yes"}}}})
     # project.config_problems carries them.
     from ttp.project import config_problems
-    assert any("dispatch.min_p" in x for x in config_problems({"providers": {"chat": {"dispatch": {**ok, "min_p": 2}}}}))
+    assert [x for x in config_problems({"providers": {"chat": {"dispatch": {**ok, "min_p": 2}}}}) if "dispatch" in x] \
+        == ["providers.chat.dispatch.min_p: give a number from 0 to 1; 0.6 is used"]
+    # A valid dispatch is a known key to the rest of the config checks (no 'unknown key providers.chat.dispatch').
+    assert [x for x in config_problems({"providers": {"chat": {"dispatch": ok}}}) if "dispatch" in x] == []
+
+
+def test_model_pick_dispatch_keys_are_known_and_settable_with_ttp_config(env, capsys):
+    """providers.chat.dispatch was missing from project.PROVIDER_KEYS: `ttp config` refused it as an
+    unknown key, so the model pick could not be turned on from the CLI or chat."""
+    from ttp import cli, project
+    for key in ("providers.chat.dispatch", "providers.chat.dispatch.enabled", "providers.chat.dispatch.min_p",
+                "providers.chat.dispatch.options.routed-top.model"):
+        assert project.unknown_key_hint(key) is None, key
+    assert project.unknown_key_hint("providers.chat.dispatchx") is not None, "a typo is still caught"
+    p = make(env)
+    cli.main(["config", "demo", "providers.chat.dispatch.enabled", "true"])
+    cli.main(["config", "demo", "providers.chat.dispatch.min_p", "0.7"])
+    assert p.raw_config()["providers"]["chat"]["dispatch"] == {"enabled": True, "min_p": 0.7}
