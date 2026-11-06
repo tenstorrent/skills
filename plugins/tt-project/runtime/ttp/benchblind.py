@@ -71,10 +71,14 @@ class Refused(Exception):
 
 def arm_tokens(cells: list[dict]) -> list[str]:
     """Every arm label and metadata value of the batch: the literal tokens no item may show."""
+    def flat(v):   # the values of nested metadata too, never its keys
+        if isinstance(v, (dict, list, tuple)):
+            return [x for y in (v.values() if isinstance(v, dict) else v) for x in flat(y)]
+        return [] if v is None else [v]
     out = set()
     for c in cells:
         for label, arm in (c.get("arms") or {}).items():
-            vals = [label, *(v for k, v in arm.items() if k != "diff" and not isinstance(v, (dict, list)))]
+            vals = [label, *(x for k, v in arm.items() if k != "diff" for x in flat(v))]
             for v in vals:
                 s = str(v).strip()
                 if len(s) >= (3 if s.isdigit() else 2) and s.lower() not in _WORDS:

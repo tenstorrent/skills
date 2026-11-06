@@ -13,7 +13,7 @@ def _blind_cells():
                 f"--- a/ttp/wait.py\n+++ b/ttp/wait.py\n@@ -1,3 +1,4 @@\n"
                 f" import time\n+# ran by {provider} --effort {effort} in runs/{run} (wall 312.5 s, took 4 min)\n"
                 f"+# log: state/runs/{run}/output.jsonl session {session} at 2026-11-05T09:30:00Z\n"
-                f"+def gate(cursor, level='high'):\n+    return cursor.fetchone()  # {who}\n")
+                f"+# served by Zephyr-9\n+def gate(cursor, level='high'):\n+    return cursor.fetchone()  # {who}\n")
     arms = lambda t, n: {
         "opus-medium": {"diff": diff("opus-medium", "claude-opus-5-5", "claude", "medium", 12000 + n,
                                      "0f8e2a1c-1111-2222-3333-444455556666"),
@@ -21,7 +21,8 @@ def _blind_cells():
                         "run_id": 12000 + n, "transcript": f"state/runs/{12000 + n}/output.jsonl", "wall_s": 312.5},
         "glm-top": {"diff": diff("glm-top", "GLM-5.3", "chat", "max", 13000 + n, "aa8e2a1c-1111-2222-3333-444455556666"),
                     "model": "GLM-5.3", "provider": "chat", "effort": "max", "run_id": 13000 + n,
-                    "transcript": f"runs/{13000 + n}/transcript.jsonl", "wall_s": 498.0}}
+                    "transcript": f"runs/{13000 + n}/transcript.jsonl", "wall_s": 498.0,
+                    "usage": {"served_by": ["Zephyr-9"]}}}
     return [{"task": str(t), "criteria": f"criteria of task {t}", "arms": arms(t, n)}
             for n, t in enumerate((501, 502, 503, 504, 505, 506))]
 
@@ -32,7 +33,7 @@ def test_benchblind_leaves_no_arm_identifying_token_in_any_item_or_reviewer_prom
     b = benchblind.prep(cells, tmp_path / "b", seed=7)
     tokens = benchblind.arm_tokens(cells)
     for t in ("opus-medium", "glm-top", "claude-opus-5-5", "GLM-5.3", "claude", "chat", "12000", "13005",
-              "state/runs/12000/output.jsonl", "312.5"):
+              "state/runs/12000/output.jsonl", "312.5", "Zephyr-9"):
         assert t in tokens, t
     seen = []
     benchblind.review(tmp_path / "b", lambda text: seen.append(text) or
@@ -42,7 +43,7 @@ def test_benchblind_leaves_no_arm_identifying_token_in_any_item_or_reviewer_prom
         low = text.lower()
         assert benchblind.leaks(text, tokens) == []
         for t in ("opus", "glm", "claude", "medium", "effort", "max", "runs/", ".jsonl", "0f8e2a1c", "aa8e2a1c",
-                  "312.5", "498", "4 min", "2026-11-05", "co-authored", "from:", "index 0a1b2c3", "1234567abcdef"):
+                  "312.5", "498", "4 min", "2026-11-05", "co-authored", "zephyr", "from:", "index 0a1b2c3", "1234567abcdef"):
             assert t not in low, (t, text[:400])
     # the change itself survives: code, the db cursor and a plain 'high' default are not arm tokens
     assert "def gate(cursor, level='high'):" in b["items"][0]["diff"] and "cursor.fetchone()" in b["items"][0]["diff"]
