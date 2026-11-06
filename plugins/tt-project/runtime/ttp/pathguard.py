@@ -234,18 +234,43 @@ def _code_refusal(code: str, ctx, depth: int = 0) -> str | None:
             return h
     if not RUN_CODE_RE.search(code):
         return None
-    lits = [a or b or c for a, b, c in STR_RE.findall(code)]
-    for i, lit in enumerate(lits):
-        name = os.path.basename(lit)
-        if name in ARGV_WRITERS and (h := _names(code, ctx)):
+    ms = list(STR_RE.finditer(code))
+    lits = [m[1] or m[2] or m[3] or "" for m in ms]
+    # The code with each literal blanked: what lies between literals is code (a variable, a call)
+    bare = STR_RE.sub(lambda m: m[0][0] + "x" * (len(m[0]) - 2) + m[0][-1], code)
+    for i, (m, lit) in enumerate(zip(ms, lits)):
+        words = re.findall(r"[^\s|;&<>()\"'`]+", lit)
+        names, built = {os.path.basename(w) for w in words}, _built(bare, m, lit)
+        if names & ARGV_WRITERS and (h := _names(code, ctx)):   # a write command: its target may be built
             return h
-        if name in STORE_TOOLS and (h := _argv_refusal(lits[i:], ctx)):
+        item = os.path.basename(lit) in STORE_TOOLS   # an argv list item: its args are the literals after it
+        if item and (h := _argv_refusal(lits[i:], ctx)):
+            return h
+        # A login tool with an argument built in code may write its store: unless it only prints a key
+        reads = "ssh-keygen" in names and _keygen_reads(lits[i + 1:] if item else words)
+        if names & STORE_TOOLS and built and not reads and (h := _names(code, ctx)):
             return h
         if " " in lit and depth < 2 and (h := shell_refusal(lit, *ctx, depth + 1)):   # a command line
             return h
-        if re.search(r">>?\s*$", lit) and (h := _names(code, ctx)):   # its target built apart: 'echo x >' + p
-            return h
+        # A redirect whose target the code builds: 'echo x >' + p, f'echo x > {p}', 'cat > %s' % p (2>&1: none)
+        joined = re.match(r"\s*[^\s,\])\n;]", bare[m.end():])   # code goes on right after it: + p, % p
+        for r in re.finditer(r"(?<![<>])>>?\|?(&)?\s*([^\s;&|<>()]*)", lit):
+            if r[1] and re.fullmatch(r"\d+-?|-", r[2].rstrip("'\"`")):
+                continue
+            if (not r[2] or re.search(r"[{}%$]", r[2]) or joined and r.end() == len(lit)) and (
+                    h := _names(code, ctx)):
+                return h
     return None
+
+
+def _built(bare: str, m, lit: str) -> bool:
+    """The literal at `m` is joined with code: a format, template, concatenation or an argv list
+    holding a variable (`bare`: the code with its literals blanked)."""
+    if "{" in lit and bare[m.start() - 1:m.start()] in ("f", "F") or m[3] and "${" in lit:
+        return True
+    after = re.split(r"[\])\n;]", bare[m.end():], maxsplit=1)[0]
+    before = re.split(r"[\[(\n;]", bare[:m.start()])[-1]
+    return bool(re.sub(r"([\"'`])x*\1|[\s,]", "", after + before))
 
 
 def _names(code: str, ctx) -> str | None:

@@ -3003,8 +3003,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `aws configure`, `kubectl config`, `git credential approve`, `ssh-keygen` without `-f`
   elsewhere). It expands `~`, `$HOME`, `${HOME}`, `$XDG_CONFIG_HOME` and `$GH_CONFIG_DIR`, follows
   symlinks, and checks both the run's HOME and the account's own home. Reads pass, also in code
-  that runs a command or compares with `>`; code with a write call (a copy too) that names one of
-  these paths anywhere is refused, since a variable may carry it. Add a path for one project with
+  that runs a command or compares with `>`; code with a write call (a copy too), or that runs a
+  write command (`tee`, `cp`, `dd`, ...), a redirect or a login tool whose target it builds, and
+  names one of these paths anywhere is refused, since a variable may carry it. Add a path for one project with
   `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
   account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
   folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and

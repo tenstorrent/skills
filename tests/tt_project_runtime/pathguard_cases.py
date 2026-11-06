@@ -57,6 +57,20 @@ PG_SHELL_DENIED = [
     "perl -e 'system(\"truncate\", \"-s0\", \"$ENV{HOME}/.git-credentials\")'", "ruby -e '`touch ~/.ssh/x`'",
     'builtin eval "echo x > ~/.ssh/config"', "eval echo x \\> ~/.ssh/config",
     "perl -e 'open(my $f, \">>\", \"$ENV{HOME}/.ssh/config\")'",
+    # a write command whose target the code builds
+    "perl -e 'system(\"tee $ENV{HOME}/.ssh/config\")'",
+    "python3 -c \"import os; p=os.path.expanduser('~/.ssh/config'); os.system('tee ' + p + ' < /tmp/x')\"",
+    "python3 -c \"import subprocess,os; p=os.path.expanduser('~/.ssh/config'); subprocess.run(f'echo x > {p}', shell=True)\"",
+    "python3 -c \"import subprocess,os; p=os.path.expanduser('~/.ssh/config'); subprocess.run('dd if=/tmp/x of=' + p, shell=True)\"",
+    "python3 -c \"import os; p=os.path.expanduser('~/.ssh/config'); os.system('sed -i s/a/b/ ' + p)\"",
+    "python3 -c \"import os; os.system('rm -f %s' % os.path.expanduser('~/.ssh/known_hosts'))\"",
+    "python3 -c \"import os; os.system('echo x | tee ' + os.path.expanduser('~/.ssh/config'))\"",
+    "node -e \"require('child_process').execSync('tee ' + require('os').homedir() + '/.ssh/config')\"",
+    "python3 -c \"import subprocess,os; p=os.path.expanduser('~/.ssh/id_new'); subprocess.run(['ssh-keygen','-t','ed25519','-f',p,'-N',''])\"",
+    "python3 -c \"import os; p=os.path.expanduser('~/.ssh/c'); os.system('cat /tmp/x > %s' % p)\"",
+    "python3 -c \"import os; p=os.path.expanduser('~/.ssh/c'); os.system('bash -c \\\"tee ' + p + '\\\"')\"",
+    "node -e \"const p=require('os').homedir()+'/.ssh/c'; require('child_process').execSync(`cat /tmp/x > ${p}`)\"",
+    "python3 -c \"import os; p=os.path.expanduser('~/.ssh/c'); os.system('echo x >& ' + p)\"",
 ]
 PG_SHELL_ALLOWED = [
     "cat ~/.ssh/config", "ls -la ~/.ssh", "ssh -i ~/.ssh/id_rsa host true", "cp ~/.ssh/id_rsa.pub /tmp/pub",
@@ -71,6 +85,11 @@ PG_SHELL_ALLOWED = [
     "python3 -c \"import subprocess; subprocess.run(['ssh','-F','~/.ssh/config','box'])\"",
     "python3 -c \"print(1>0); import os; print(os.listdir(os.path.expanduser('~/.ssh')))\"",
     "eval \"cat ~/.ssh/config > /tmp/c\"", "python3 -c \"import os; os.system('ssh -i ~/.ssh/k box true > /tmp/o')\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh','-i',os.path.expanduser('~/.ssh/id_rsa'),'box','true'])\"",
+    "python3 -c \"import os; print(len(os.listdir(os.path.expanduser('~/.ssh'))) > 0)\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh-keygen','-lf',os.path.expanduser('~/.ssh/id_rsa.pub')])\"",
+    "python3 -c \"import os; p=os.path.expanduser('~/.ssh/config'); os.system('cat ' + p + ' 2>&1')\"",
+    "python3 -c \"import os; p=os.path.expanduser('~/.ssh/config'); os.system('grep Host ' + p + ' > /tmp/h')\"",
 ]
 
 
