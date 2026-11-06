@@ -191,13 +191,16 @@ def record(state, fp: dict, now: float | None = None) -> dict:
 # prefix, so its wakes are judged on the session's own writes, kept in its kv state under SESSION:
 # {"h1": start of its last 1h wake, "ttl": its last wake's lifetime, "ts": that wake's start, "end": its
 # end (coordsession.record)}. A 1h request never reads a 5m write: a wake that asked for 1h right after a
-# warm 5m wake re-wrote that wake's whole tail. So once the session wrote at 5m, its resumed wakes stay
-# at 5m while that write is warm (TAIL_WARM_S since its wake ended) or the session's 1h write is warm
-# (cache_warm_min), which every 5m wake reads. Any other session wake (a new session, a resume with
-# both cold) goes at 1h when a next wake is likely (likely_next), so the history it writes outlives the
-# many 5-60 min gaps. The handover wake goes at 5m: the next wake starts a new session, which reads none
-# of this one's history. A replay of recorded session wakes with that hit rule put this at 16% under
-# alternating 1h and 5m wakes and 8% under always 1h.
+# warm 5m wake re-wrote that wake's whole tail. So a resumed wake goes at 5m while the session's last 5m
+# write is warm (TAIL_WARM_S since its wake ended). Every other session wake (a new session, a resume
+# after a 1h wake or with its 5m tail gone) goes at 1h when a next wake is likely (likely_next), so the
+# history it writes outlives the many 5-60 min gaps. A warm 1h write behind 5m wakes is not counted on:
+# the cache lookback reaches only the last few blocks, so a resume after a gone 5m tail re-wrote the
+# whole history even with the session's 1h write warm (recorded wakes read only the system prefix).
+# A missed resume re-writes the whole history (~$0.8 at 150k tokens), a 1h write costs ~$0.09 more
+# than a 5m one on the delta: 1h pays once over a third of the gaps run past 5 min, and about half do.
+# The handover wake goes at 5m: the next wake starts a new session, which reads none of this one's
+# history.
 SESSION = "cache"
 TAIL_WARM_S = 300        # a 5m write unread this long is gone
 
@@ -229,9 +232,9 @@ def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, sig
     elif not 0 <= now - h1 < _num(warm_min, WARM_MIN) * 60:
         reason = f"cold: the session last wrote at 1h {max(now - h1, 0) / 60:.0f} min ago"
     elif c.get("ttl") != "1h":
-        return "5m", f"warm: the session wrote at 1h {(now - h1) / 60:.0f} min ago and its wakes since went at 5m"
+        reason = f"cold: the session's 5m wakes since its 1h write {(now - h1) / 60:.0f} min ago are gone"
     else:
-        return "5m", f"warm: the session's last wake went at 1h {(now - h1) / 60:.0f} min ago"
+        reason = f"warm: the session's last wake went at 1h {(now - h1) / 60:.0f} min ago"
     return _cold(reason, now, signals)
 
 

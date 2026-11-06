@@ -1429,9 +1429,10 @@ def test_coordsession_wakes_booked_at_the_running_total_are_re_netted_once(env):
 
 def test_coordsession_cache_ttl_follows_the_sessions_own_writes_on_a_fake_clock():
     """A session wake's lifetime comes from the session's own writes, not the stateless prefix: a resume
-    right after the session's warm 1h wake goes at 5m; one after a 5m wake stays at 5m while that wake's
-    write or the session's 1h write is warm (a 1h request never reads a 5m write: #6327 measured every
-    5m->1h wake re-writing the 5m tail); a new session is cold; the handover wake goes at 5m."""
+    right after a 5m wake stays at 5m while that wake's write is warm (a 1h request never reads a 5m
+    write: #6327 measured every 5m->1h wake re-writing the 5m tail); any other wake goes at 1h when a
+    next wake is likely, also with the session's 1h write warm behind gone 5m wakes (recorded resumes
+    there read only the system prefix and re-wrote the whole history); the handover wake goes at 5m."""
     from ttp import cachettl
     t0 = 1_000_000.0
     likely = lambda: {"running": [7], "due": [], "chat": None, "turns": []}
@@ -1441,25 +1442,32 @@ def test_coordsession_cache_ttl_follows_the_sessions_own_writes_on_a_fake_clock(
     assert choose(None, "new", t0, quiet)[0] == "5m", "a quiet project's new session"
     st = cachettl.session_record(_cs_state(), "new", "1h", t0)
     assert st["cache"] == {"h1": t0, "ttl": "1h", "ts": t0} and st["id"] == "s1", "the rest of the session state stays"
-    ttl, why = choose(st, "resume", t0 + 360)
-    assert (ttl, why) == ("5m", "warm: the session's last wake went at 1h 6 min ago")
+    assert choose(st, "resume", t0 + 360) == \
+        ("1h", "warm: the session's last wake went at 1h 6 min ago; next turn likely: task #7 running")
+    ttl, why = choose(st, "resume", t0 + 360, quiet)
+    assert ttl == "5m" and why.startswith("warm: the session's last wake went at 1h 6 min ago; quiet: "), why
     st = cachettl.session_ended(cachettl.session_record(st, "resume", ttl, t0 + 360), t0 + 480)
     assert st["cache"] == {"h1": t0, "ttl": "5m", "ts": t0 + 360, "end": t0 + 480}
     # The old rule asked for 1h here and re-wrote the 5m wake's whole tail.
     ttl, why = choose(st, "resume", t0 + 600)
     assert (ttl, why) == ("5m", "warm: the session's 5m wake ended 2 min ago; a 1h request would not read it")
-    ttl, why = choose(st, "resume", t0 + 1800)   # the 5m tail is gone, the 1h write is not
-    assert (ttl, why) == ("5m", "warm: the session wrote at 1h 30 min ago and its wakes since went at 5m")
-    st = cachettl.session_record(st, "resume", ttl, t0 + 1800)
+    # The 5m tail is gone, the 1h write is not: the old rule went at 5m and missed (the cache lookback
+    # does not reach a 1h write behind 5m wakes), re-writing the whole history at 5m again.
+    assert choose(st, "resume", t0 + 1800) == ("1h", "cold: the session's 5m wakes since its 1h write 30 min "
+                                                     "ago are gone; next turn likely: task #7 running")
+    assert choose(st, "resume", t0 + 1800, quiet)[0] == "5m", "a quiet project's resume"
+    st = cachettl.session_record(st, "resume", "5m", t0 + 1800)
     assert st["cache"] == {"h1": t0, "ttl": "5m", "ts": t0 + 1800}, "a new wake drops the last one's end"
     assert choose(cachettl.session_ended(st, t0 + 50 * 60), "resume", t0 + 51 * 60)[0] == "5m", \
         "the 1h write is cold, but the long 5m wake's is warm"
     assert choose(st, "resume", t0 + 56 * 60) == \
         ("1h", "cold: the session last wrote at 1h 56 min ago; next turn likely: task #7 running")
-    assert choose(st, "resume", t0 + 1700)[0] == "5m", "the 1h write is warm"
+    assert choose(st, "resume", t0 + 1700)[1].startswith("cold: the session's 5m wakes since its 1h write"), \
+        "a 5m write stamped after now is not warm"
     st1 = cachettl.session_record(st, "resume", "1h", t0 + 56 * 60)
     assert st1["cache"] == {"h1": t0 + 56 * 60, "ttl": "1h", "ts": t0 + 56 * 60}, "a 1h wake restarts the window"
-    assert choose(st1, "resume", t0 + 56 * 60 + 49 * 60)[0] == "5m"
+    assert choose(st1, "resume", t0 + 56 * 60 + 49 * 60)[1].startswith("warm: the session's last wake went at 1h 49")
+    assert choose(st1, "resume", t0 + 56 * 60 + 49 * 60, quiet)[0] == "5m"
     assert choose(st1, "resume", t0 + 56 * 60 + 51 * 60)[1].startswith("cold: the session last wrote at 1h 51 min ago")
     assert choose(st1, "resume", t0 + 600)[1].startswith("cold: the session last wrote at 1h 0 min ago"), \
         "a write stamped after now (a clock step) is not warm"
@@ -1508,11 +1516,13 @@ def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_stateless_
     assert st["cache"]["ttl"] == "1h" and st["cache"]["h1"] <= r["started"] and st["id"] == r["session_id"]
     stateless = p.db.kv(cachettl.KEY)
     r, _, _, session = turn("EVENTS 2")
-    assert session["mode"] == "resume" and ttls(r)[0] == "5m"
-    assert ttls(r)[1].startswith("warm: the session's last wake went at 1h"), ttls(r)
+    assert session["mode"] == "resume" and ttls(r)[0] == "1h"
+    assert ttls(r)[1].startswith("warm: the session's last wake went at 1h 0 min ago; next turn likely"), ttls(r)
     assert p.db.kv(cachettl.KEY) == stateless, "session wakes leave the stateless prefix's record alone"
     c = p.db.kv(coordsession.KEY)["cache"]
-    assert c["ttl"] == "5m" and r["started"] <= c["end"] <= time.time(), c
+    assert c["ttl"] == "1h" and r["started"] <= c["end"] <= time.time(), c
+    st = p.db.kv(coordsession.KEY)   # as if that wake went at 5m (a quiet project)
+    p.db.set_kv(coordsession.KEY, {**st, "cache": {**st["cache"], "ttl": "5m"}})
     r, _, _, session = turn("EVENTS 3")   # right after a 5m wake: a 1h request would not read its write
     assert session["mode"] == "resume" and ttls(r)[0] == "5m"
     assert ttls(r)[1].startswith("warm: the session's 5m wake ended 0 min ago"), ttls(r)
