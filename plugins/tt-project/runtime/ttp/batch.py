@@ -1634,13 +1634,41 @@ class Batch:
     def _union_lost(self, gone: dict, base: str, top: str, onto: str, new: str) -> str:
         """Why a replay onto `onto` that kept both sides' lines of a shared doc (settle_union) does not
         carry the approval of base..top, or "": commits of it left out as landed, or a change of its own
-        diff outside delivery.mechanical_merge_paths and the release files (own_diff)."""
+        diff outside delivery.mechanical_merge_paths and the release files (own_diff), or a line of a
+        settled doc the change deletes that the union brought back (_union_revived)."""
         if gone:
             return "some of its commits were left out as landed"
         if own_diff(self.repo, onto, new, self.cfg, self.mechanical) != own_diff(self.repo, base, top, self.cfg,
                                                                                  self.mechanical):
             return "the change's own diff outside them is no longer the approved one"
+        import fnmatch
+        for f in self._union_files():
+            if any(fnmatch.fnmatchcase(f, g) for g in self.mechanical) and (
+                    ln := self._union_revived(f, base, top, onto, new)) is not None:
+                return f"it brings back a line the change deletes from {f}: {ln[:120]!r}"
         return ""
+
+    def _union_revived(self, path: str, base: str, top: str, onto: str, new: str) -> str | None:
+        """A non-blank line base..top deletes from `path` that the replay onto..new holds more often
+        than a faithful merge would: the onto side's count, plus the change's own net count of it,
+        plus the deletions both sides made (each counted once), or None."""
+        out = _git(self.repo, "diff", "--no-color", "--no-ext-diff", "--no-renames", "-U0", base, top,
+                   "--", path).stdout.splitlines()
+        body = out[next((k for k, ln in enumerate(out) if ln.startswith("@@")), len(out)):]   # past the header
+        gone = Counter(ln[1:] for ln in body if ln.startswith("-") and ln[1:].strip())
+        if not gone:
+            return None
+        added = Counter(ln[1:] for ln in body if ln.startswith("+"))
+
+        def lines(rev: str) -> Counter:
+            r = _git(self.repo, "show", f"{rev}:{path}")
+            return Counter(r.stdout.splitlines() if r.returncode == 0 else [])
+        at_base, at_onto, got = lines(base), lines(onto), lines(new)
+        for ln, n in gone.items():
+            both = min(n, max(0, at_base[ln] - at_onto[ln]))
+            if got[ln] > at_onto[ln] + added[ln] - n + both:
+                return ln
+        return None
 
     def _markers(self, commits: list[str]) -> list[str]:
         """conflictfix.stray_markers of the entry `commits` this batch would replay."""

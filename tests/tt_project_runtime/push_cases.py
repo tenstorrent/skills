@@ -17431,6 +17431,45 @@ def test_a_push_batch_sends_back_a_shared_doc_union_that_would_leave_a_conflict_
     assert "docs/guide.md: keeping both sides would leave a conflict marker" in capsys.readouterr().out
 
 
+def _doc_delete_race(env, monkeypatch, theirs, claim="false claim"):
+    """The approval rewrites a line of docs/guide.md and deletes the false claim after it (and edits
+    plugins/p/f1.txt); a landing then rewrites docs/guide.md as `theirs`, rewriting that same line
+    (settle cannot take it). (p, origin, batch marker)."""
+    p, repo, origin, other = _bump_setup(env, monkeypatch, ["true"])
+    (other / "docs").mkdir()
+    _land_as(other, {"docs/guide.md": f"# Guide\nshared line\n{claim}\nend\n", "plugins/p/f1.txt": "base\n"},
+             "guide")
+    head = _entry(repo, "e1", {"docs/guide.md": "# Guide\nmine line\nend\n", "plugins/p/f1.txt": "1\n"})
+    _land_as(other, {"docs/guide.md": theirs.replace("false claim", claim)}, "target guide")
+    return p, origin, _batch_marker(p, [head])
+
+
+@pytest.mark.parametrize("claim", ["false claim", "-- false claim"])   # the second reads as a diff header
+def test_a_push_batch_sends_back_a_shared_doc_union_that_brings_back_a_deleted_line(env, monkeypatch, claim):
+    """union_deleted_line_back: the branch rewrites the line next to the one the change deletes; keeping
+    both sides' lines would bring the deleted line back, so the change goes back with the line named."""
+    p, origin, marker = _doc_delete_race(env, monkeypatch, "# Guide\ntheirs line\nfalse claim\nend\n", claim)
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert _statuses(m) == ["conflict"], m
+    why = m["results"][0]["detail"]["files"][0]
+    assert f"brings back a line the change deletes from docs/guide.md: {claim!r}" in why, why
+    assert "approval_carried" not in m["results"][0]["detail"], m["results"]
+    assert claim in _git_out(origin, "show", "proj:docs/guide.md")   # nothing of it landed
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "base"
+
+
+def test_a_push_batch_carries_a_shared_doc_union_that_keeps_the_deleted_lines_deleted(env, monkeypatch):
+    """union_clean_settles: the branch also drops the false claim while rewriting the line before; the
+    union keeps it deleted, so the approval carries."""
+    p, origin, marker = _doc_delete_race(env, monkeypatch, "# Guide\ntheirs line\nend\n")
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"], m
+    d = m["results"][0]["detail"]
+    assert "union" in d["settled_by"] and "only conflicts were in shared docs" in d["approval_carried"], d
+    assert "false claim" not in _git_out(origin, "show", "proj:docs/guide.md")
+    assert _git_out(origin, "show", "proj:plugins/p/f1.txt") == "1"
+
+
 def test_an_empty_mechanical_merge_paths_turns_the_shared_doc_carry_off(env, monkeypatch):
     from ttp import batch
     assert batch.mechanical_paths({}) == list(batch.MECHANICAL_PATHS)
