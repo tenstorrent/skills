@@ -154,7 +154,9 @@ def hook_settings(denied_reads=(), *, full: bool = False, protected=(), timeout_
     deny = [str(p) for p in denied_reads if os.path.isabs(p)]
     hook = lambda event: [{"matcher": "*", "hooks": [{"type": "command", "command": f"{cmd} {event}", "timeout": 20}]}]  # noqa: E731
     out = {"hooks": {"PreToolUse": hook(HOOK_EVENT)}, "permissions": {"deny": [f"Read(/{p})" for p in deny]},
-           "env": {"PYTHONPATH": runtime, DENIED_ENV: os.pathsep.join(deny)}}
+           "env": {"PYTHONPATH": runtime, DENIED_ENV: os.pathsep.join(deny)},
+           # No Bash sandbox, even one the user's own settings turn on (as providers.claude.worker_settings).
+           "sandbox": {"enabled": False}}
     if full:
         mine = [str(p) for p in protected if os.path.isabs(p)]
         out["hooks"].update(PostToolUse=hook(POST_EVENT), PostToolUseFailure=hook(FAIL_EVENT))

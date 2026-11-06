@@ -5840,6 +5840,7 @@ def _auto_ttl_daemon(env, monkeypatch, tmp_path):
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
     monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # room for the runtime's own mark
     p = make(env)
+    p.set_config("coordinator.session.mode", "off")   # the stateless turn's cache TTL
     _no_schedule_due(p.db, time.time())
     head, context = coord.prompt_parts(p)
     box = {"d": Daemon(p.base)}
@@ -43719,6 +43720,7 @@ def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkey
     p.set_config("coordinator.model", "reasoning-model")
     p.set_config("coordinator.effort", pin)
     p.set_config("coordinator.turn_timeouts_s.fake", {"low": 300, "high": 1200, "xhigh": 1800})
+    p.set_config("coordinator.session.mode", "off")   # the stateless turn's record
     d = daemon.Daemon(p.base)
     d.update_gates()
     real_popen = daemon.subprocess.Popen
