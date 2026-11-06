@@ -7223,7 +7223,8 @@ def cmd_detach(a) -> None:
             st, why = ser or detach.state(rc)
             if st == "ended":
                 failed = failed or why != "0"
-                print(f"{rc.stem}: job finished rc={why}")
+                stop = None if ser else detach.stopped(rc)
+                print(f"{rc.stem}: " + (f"stopped on purpose rc={why} ({stop})" if stop else f"job finished rc={why}"))
             elif st == "lost":
                 failed = True
                 print(f"{rc.stem}: gone without an exit code ({why})" + ("" if ser else f"; see {rc.with_suffix('.log')}"))

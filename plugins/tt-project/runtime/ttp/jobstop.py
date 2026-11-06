@@ -18,7 +18,8 @@ end() does it in this order:
    broker job (`status -j`) with that exact owner and command is ended once (`kill <id>`). Nothing
    else is: another owner's or another command's job stays. No CLI, or a status call that fails or
    does not parse, skips this step with a note.
-3. detach.stop: <name>.lost records why (task and state), then SIGKILL to the group.
+3. detach.stop: <name>.lost records why (task and state), then SIGKILL to the group; then <name>.rc
+   holding 137 (detach.record_stop) unless the job wrote its own, so a reader of the .rc alone sees it ended.
 4. The job's own lock and every lock slot whose label names the job's .rc (locks.job_fields) are
    checked; a slot still held by a process of the stopped group is freed by ending that process.
 5. One event names the task, job, group, broker jobs ended and locks freed.
@@ -381,6 +382,8 @@ def end(p: Project, rc: Path, why: str, task: int | None = None, reason: str = "
     freed, held = _free(slots, pgid, set(pids), lambda pid, s: detach.signalled(
         rc, signal.SIGKILL, pid, reason, f"{why}; it still held {s.name}", by=BY, group=False, state=p.state,
         task=task))
+    if pgid or not held:   # its wrapper is gone, so no exit code comes: the stop's own (detach.record_stop)
+        detach.record_stop(rc, why)
     out = {"task": task, "job": rc.stem, "rc": str(rc), "pgid": pgid, "broker_jobs": ids, "freed": freed,
            "held": held, "requeued": extra, "note": note if pgid else "no live process group found for it",
            **(fields or {})}

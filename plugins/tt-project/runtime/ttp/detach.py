@@ -35,7 +35,9 @@ before. Only a job that is safe to run again from the start opts in.
 Every signal tt-project sends a job (stop, jobstop) is logged by `signalled`: a line in the job's log and a
 row in state/job-signals.jsonl naming the code path and the sender. A job outlives its run while an open
 task waits on it; tt-project ends one only by SIGKILL of its group with <name>.lost, so an .rc of 143
-means its command alone got SIGTERM from elsewhere (a waiting `ttp lock` logs who: `received`).
+means its command alone got SIGTERM from elsewhere (a waiting `ttp lock` logs who: `received`). An
+owner's stop (jobstop.end) then also writes <name>.rc holding 137 (STOP_RC, record_stop), so a reader of
+the .rc alone sees an ended job; `stopped` tells it from an exit code the job wrote itself.
 """
 from __future__ import annotations
 
@@ -91,7 +93,8 @@ def failed_why(probe: str, rc, cwd=None) -> str:
         for path in _checked(probe, cwd):
             st, why = state(path)
             if st == "ended" and why != "0":
-                return f"job rc={why}"
+                stop = stopped(path)
+                return f"job rc={why}" + (f", stopped on purpose: {stop}" if stop else "")
     except (OSError, ValueError):
         pass
     return f"probe exit {rc}"
@@ -549,6 +552,8 @@ def close(rc: Path, now: float | None = None) -> dict | None:
         except OSError:
             end = time.time() if now is None else now
         upd = {"status": "ended", "exit": int(why) if re.fullmatch(r"-?[0-9]+", why) else None, "ended": end}
+        if (stop := stopped(rc)) is not None:
+            upd.update(stopped=True, why=stop)
     else:
         try:
             end = lost(rc).stat().st_mtime
@@ -751,32 +756,71 @@ def _mark_lost(rc: Path, why: str) -> None:
         pass
 
 
+def _write_first(target: Path, text: str) -> str | None:
+    """Write `text` as `target` unless it exists: None once written, else what stands there (stripped).
+    Never half-written, never over another: a synced temp file hard-linked into place, else (no hard
+    links here) renamed into place while `target` is still absent."""
+    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        durable_write(tmp, text + "\n")
+        os.link(tmp, target)   # atomic create-if-absent
+        return None
+    except FileExistsError:
+        try:
+            return target.read_text().strip()
+        except OSError:
+            return ""
+    except OSError:
+        if target.exists():
+            return ""
+        try:
+            durable_write(target, text + "\n")
+        except OSError:
+            pass
+        return None
+    finally:
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+
+
 def _mark_lost_first(rc: Path, why: str) -> str:
     """Record `why` in <name>.lost unless a reason is already there, and return the one that stands:
     a guess made from the outside never replaces a verdict written meanwhile (stop, remote_verdict)."""
     rc = _markable(rc)
     if rc is None:
         return why
-    target = lost(rc)
-    tmp = target.with_name(f".{target.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    return _write_first(lost(rc), why) or why
+
+
+# A stop on purpose (jobstop.end: `ttp detach --stop`, a spend cap, the daemon ending an ended task's
+# jobs) kills the job's wrapper, which so never writes an exit code. record_stop writes one for it, STOP_RC (a SIGKILL's
+# 128 + 9), so a reader that looks only at <name>.rc (a watcher, a shell probe) sees the job ended, not
+# dead; <name>.lost beside it says who stopped it and why. An .rc the job wrote itself always stands.
+STOP_RC = 128 + signal.SIGKILL
+
+
+def record_stop(rc: Path, why: str) -> bool:
+    """After a stop on purpose (jobstop.end): write <name>.rc holding STOP_RC unless the job wrote one itself (kept as it
+    is), with `why` in <name>.lost unless a reason is already there. True when this wrote the .rc."""
+    rc = _markable(rc, quiet=True)
+    if rc is None or rc.exists():
+        return False
+    _mark_lost_first(rc, why)
+    return _write_first(rc, str(STOP_RC)) is None
+
+
+def stopped(rc: Path) -> str | None:
+    """Why the job at this .rc was stopped on purpose (its .rc holds STOP_RC and <name>.lost says
+    why: record_stop), else None: an exit code the job wrote itself, or no .rc yet."""
+    rc = Path(rc)
     try:
-        durable_write(tmp, why + "\n")
-        os.link(tmp, target)   # atomic create-if-absent: never half-written, never over another
-        return why
-    except FileExistsError:
-        try:
-            return target.read_text().strip() or why
-        except OSError:
-            return why
-    except OSError:   # no hard links here: the plain write, as before
-        if not target.exists():
-            _mark_lost(rc, why)
-        return why
-    finally:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
+        if rc.read_text().strip() != str(STOP_RC):
+            return None
+        return lost(rc).read_text().strip() or "stopped on purpose"
+    except OSError:
+        return None
 
 
 def tend(p: Project) -> None:

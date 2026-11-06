@@ -1182,7 +1182,11 @@ running work is interrupted only by the preemption below:
   `ttp detach --stop <name|rc> [--why <reason>]` stops a job of an ended task, a job of the caller's own
   task (from any of its runs; its .lost and stop event name the caller's task and run, the run that
   started the job and the reason), or one holding a resource of the calling open priority-1 task;
-  anyone else is refused (exit 3). A stopped job is never relaunched at boot.
+  anyone else is refused (exit 3). A stopped job is never relaunched at boot. Such a stop (also a spend
+  cap's, or the daemon's of an ended task's job) writes `<name>.rc` holding 137 (128 + SIGKILL) beside its
+  `<name>.lost` unless the job wrote its own, so a reader of the .rc alone sees an ended job, not a dead
+  one; `ttp detach --check` prints `stopped on purpose rc=137 (<why>)` and the closed record is `ended`
+  with `stopped` and the why.
   `ttp detach --stop <name>` with no job recorded stops a driver
   the project's own launcher started: NAME.pid in the path's folder, $TTP_RUN_DIR or the task's t<id>
   folder, once its pid is verified (start time, user, project), gets a STOP file beside it, then SIGTERM and

@@ -1253,6 +1253,58 @@ def test_detach_stop_lets_the_owning_task_stop_a_job_of_its_current_run(env, tmp
         _end_group(pgid)
 
 
+def test_an_owners_stop_writes_the_rc_so_a_reader_of_the_rc_alone_sees_a_stop_not_a_death(env, tmp_path):
+    """`ttp detach --stop` kills the wrapper, which so never writes an exit code: the stop writes <name>.rc
+    itself (137, an integer every reader parses) beside the .lost, and the readers say stopped on purpose,
+    never gone without an exit code. No temp file is left beside it."""
+    from ttp import detach
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="running")
+    try:
+        run = p.db.one("SELECT id FROM runs WHERE dir=?", (str(rc.parent),))["id"]
+        r = _ttp_run(p, "detach", "--stop", str(rc), "--why", "superseded", env=_as(tid, run))
+        assert r.returncode == 0, r.stderr
+        assert int(rc.read_text()) == detach.STOP_RC == 137
+        assert "superseded" in rc.with_suffix(".lost").read_text()
+        assert not [x for x in rc.parent.iterdir() if x.name.endswith(".tmp")]
+        assert detach.state(rc) == ("ended", "137") and "superseded" in detach.stopped(rc)
+        c = _ttp_run(p, "detach", "--check", str(rc))
+        assert c.returncode == detach.FAILED_RC, c.stdout + c.stderr
+        assert "loop: stopped on purpose rc=137" in c.stdout and "superseded" in c.stdout, c.stdout
+        assert "gone without an exit code" not in c.stdout, c.stdout
+        assert "stopped on purpose" in detach.failed_why(f"ttp detach --check {rc}", 4)
+        e = detach.close(rc)
+        assert (e["status"], e["exit"], e["stopped"]) == ("ended", 137, True) and "superseded" in e["why"], e
+    finally:
+        _end_group(pgid)
+
+
+def test_a_stop_never_overwrites_an_exit_code_the_job_wrote_itself(env, tmp_path):
+    """A job that wrote its own .rc before the stop's record keeps it (and gets no .lost); a natural exit
+    of 137 with no .lost, or a job not stopped (no .rc yet), never reads as stopped; a path outside the
+    project's state and run folders gets no file."""
+    from ttp import detach
+    p = make(env)
+    d = p.runs / "own"
+    d.mkdir(parents=True)
+    rc = d / "job.rc"
+    rc.write_text("0\n")
+    assert detach.record_stop(rc, "stopped by owning task #1") is False
+    assert rc.read_text() == "0\n" and not detach.lost(rc).exists() and detach.stopped(rc) is None
+    nat = d / "nat.rc"
+    nat.write_text("137\n")
+    assert detach.stopped(nat) is None   # its own SIGKILL exit: no stop's reason beside it
+    assert detach.stopped(d / "live.rc") is None and not (d / "live.rc").exists()
+    assert detach.record_stop(d / "fresh.rc", "spend cap reached") is True
+    assert (d / "fresh.rc").read_text() == "137\n" and detach.stopped(d / "fresh.rc") == "spend cap reached"
+    assert detach.record_stop(d / "fresh.rc", "again") is False and detach.stopped(d / "fresh.rc") == "spend cap reached"
+    out = tmp_path / "checkout"
+    out.mkdir()
+    assert detach.record_stop(out / "job.rc", "x") is False and not list(out.iterdir())
+
+
 def test_detach_stop_still_refuses_another_task_or_a_caller_without_a_task_identity(env, tmp_path):
     """(c) Only the job's own task, with a run the project records for it, may stop a job of an open task:
     another task, no task, a task id without a run, a run of another task, or another task claiming the
@@ -1285,8 +1337,9 @@ def test_detach_stop_still_refuses_another_task_or_a_caller_without_a_task_ident
 
 
 def test_a_job_its_own_task_stopped_is_not_relaunched_at_boot(env, tmp_path):
-    """(d) A resumable job its task stopped is never started again by the reboot relaunch, even with its
-    .lost written on this boot: the task wakes instead."""
+    """(d) A resumable job its task stopped is never started again by the reboot relaunch: the stop wrote
+    its .rc, so the reboot found nothing of it to wake for, and the task's own probe reads it ended
+    (detach.FAILED_RC, stopped on purpose) and wakes it."""
     from ttp import detach
     p = make(env)
     tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
@@ -1305,7 +1358,7 @@ def test_a_job_its_own_task_stopped_is_not_relaunched_at_boot(env, tmp_path):
         r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(tid, run))
         assert r.returncode == 0, r.stderr
         assert json.loads(detach.resume_file(rc).read_text())["stopped"]
-        assert not rc.exists()
+        assert rc.read_text().strip() == str(detach.STOP_RC)   # the stop's own end record
         m = json.loads(detach.resume_file(rc).read_text())
         detach.resume_file(rc).write_text(json.dumps({**m, "boot": "an-earlier-boot"}))
         reg = run_dir / "detached.json"
@@ -1314,8 +1367,9 @@ def test_a_job_its_own_task_stopped_is_not_relaunched_at_boot(env, tmp_path):
             {"status": "waiting", "summary": "job running", "retry_after_s": 3600,
              "retry_when": f"ttp detach --check {rc}", "waiting_since": time.time() - 900}))
         _boot_daemon(p)
-        assert _woken(p, tid), "the task slept on a job that was stopped"
-        assert not _job_relaunches(p, tid)
+        assert not _woken(p, tid) and not _job_relaunches(p, tid)
+        c = _ttp_run(p, "detach", "--check", str(rc))
+        assert c.returncode == detach.FAILED_RC and "stopped on purpose" in c.stdout, c.stdout
         assert detach.relaunch(rc, "a-later-boot")[0].startswith("it was stopped")
         time.sleep(0.3)
         assert counter.read_text().split() == ["run"], "the stopped job ran again"
