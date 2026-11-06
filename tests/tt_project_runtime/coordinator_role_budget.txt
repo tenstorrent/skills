@@ -50,3 +50,4 @@
 +400: each user message gets an order or no_order; owner kind fit; reply `cites` of run results (turnrules.py)
 +580: each spec is self-contained with a Context block of what the worker cannot see; plan first (user msg #1785)
 +90: obligation order `supersedes`: older spec steps it replaces; running tasks told (userorder.fan_out)
++90: a `restart: <why>` line in a running task's spec reruns it from a safe point, work kept, max 3 per 6 h (#6301)
