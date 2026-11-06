@@ -2848,6 +2848,41 @@ def test_a_sandboxed_checks_detached_job_is_started_by_the_daemon_and_outlives_t
     assert not list((p.state / detach.BOUND).glob("*.json")), "an ended job's bound record goes"
 
 
+def test_an_unsandboxed_checks_detached_job_is_queued_so_the_checks_reaper_never_ends_it(env, tmp_path, monkeypatch):
+    """A push check or `ttp checks` command run with no process sandbox (none works on the host, or none is
+    asked for) starts `ttp detach gate -- ...`. Started there, the job would carry the check's reaper token
+    and die once the check ended (checkreap): it is queued instead, the daemon starts it without the token,
+    and a reap of the check's token leaves it running to its end."""
+    from ttp import checkreap, cli, detach, push, sandbox
+    monkeypatch.setenv("TTP_DEVICE_NODES", "")
+    p = make(env)
+    report = _check_report(p)
+    hb, go = tmp_path / "hb", tmp_path / "go"
+    tok = checkreap.token()
+    for k, v in {"TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(report), checkreap.MARKER: tok}.items():
+        monkeypatch.setenv(k, v)
+    for k in ("TTP_PIDNS", "TTP_CGROUP", "TTP_DETACHED", "TTP_LOCKS_HELD", "TTP_SANDBOX_CHECKS"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setattr(push, "_boxed", lambda: False)
+    monkeypatch.setattr(detach, "foreign_pidns", lambda: False)
+    monkeypatch.setattr(sandbox, "inside", lambda: False)
+    monkeypatch.chdir(tmp_path)
+    rc = report / "gate.rc"
+    try:
+        try:
+            cli.main(["detach", "gate", "--", "sh", "-c",
+                      f"while [ ! -e {shlex.quote(str(go))} ]; do echo beat >>{shlex.quote(str(hb))}; sleep 0.05; done"])
+        except SystemExit as e:
+            assert not e.code, e
+        assert detach.queued(rc).exists() and not detach.started(rc).exists(), "started inside the check"
+        detach.tend(p)
+        assert _wait_for_path(hb), "the daemon never started it"
+        assert checkreap.reap(tok, grace_s=1) == (0, 0), "the job carries the check's reaper token"
+    finally:
+        go.touch()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "0"
+
+
 def test_a_checks_queued_job_ends_at_its_bound_or_once_its_owner_marker_is_gone(env, tmp_path, monkeypatch):
     """No task waits on a job a check queued: the daemon ends it at its bound (CHECK_JOB_S from its queueing)
     or once the push marker or checks run that owns it is gone, whichever comes first, with the reason in its

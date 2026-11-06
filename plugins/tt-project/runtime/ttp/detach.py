@@ -10,8 +10,9 @@ A sandbox that runs each command in a PID namespace or a cgroup of its own can e
 command started once it returns, a new session or not: the job would die before its first line. As
 for `ttp push --detach`, a launcher that finds itself boxed (push._boxed) queues the job under
 state/detach-queue, with <name>.queued next to its .rc, and the daemon starts it outside the sandbox
-(tend). So does a push check or `ttp checks` command in the check's process sandbox (check_owner):
-no task owns its job, so bound() ends it at CHECK_JOB_S or once the push or checks run that owns the
+(tend). So does a push check or `ttp checks` command (check_owner), sandboxed or not: the check's
+sandbox, or else its reaper by the token in the job's environment (checkreap), would end the job with
+the check. No task owns its job, so bound() ends it at CHECK_JOB_S or once the push or checks run that owns the
 check is gone. A job gone without an exit code gets <name>.lost holding why, so its probe and the next
 run read the reason, never a bare "gone".
 
@@ -66,7 +67,7 @@ from pathlib import Path
 from . import locks, loopproxy, machines, privlock, shorttmp
 from .project import FOLDER, Project, durable_append, durable_write, nice_level, renice, write_json
 
-QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command queued
+QUEUE = "detach-queue"   # under the project's state: <run>-<name>.json per job a sandboxed command or a check queued
 SCRATCH = "detach-tmp"   # under the project's state: <run>-<name>/ is a job's temp dir while it runs
 WORK = "work"            # in a job's record: its durable work dir, $TTP_JOB_DIR
 QUEUED_S = 900           # a queued job the daemon has not started by then is recorded as lost

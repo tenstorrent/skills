@@ -1530,8 +1530,8 @@ session and stateless coordinators on every provider.
   one; `ttp detach --check` prints `stopped on purpose rc=137 (<why>)` and the closed record is `ended`
   with `stopped` and the why.
   anyone else is refused (exit 3). A stopped job is never relaunched at boot.
-  A push check or `ttp checks` command that runs `ttp detach` inside the check's process sandbox (a
-  PID namespace that ends with the check) has its job queued: the daemon starts it outside within
+  A push check or `ttp checks` command that runs `ttp detach` has its job queued, sandboxed or not (the
+  check's process sandbox, a PID namespace, or else its leftover reaper would end it with the check): the daemon starts it outside within
   seconds, with the check's device masking (`TTP_NO_DEVICE`, `TT_VISIBLE_DEVICES`, hidden device
   nodes) and without the check's own fds and reaper token, and its .rc and .log stay in the check's
   report folder. No task owns such a job, so the task sweep and leftover stops never end it; its
