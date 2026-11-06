@@ -2625,6 +2625,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   takes one; a `ttp detach` job's `ttp note` never takes one either.
   One still unread after `steer.ack_after_s` (300 s; 0: off) raises one `steer_unread` event to the
   coordinator, naming the task and the update; it is marked handled once the worker reads it.
+- Drift flags (model-free, from the live run record): a command failing again and again, the same tool
+  call in a loop, files changed outside the paths the spec names, a quiet run (no call, note or commit
+  for 15 min while not waiting on a lock, checks or a detached job) and spend running ahead of the wall
+  clock. Each flag is first told to the worker in its steer.md; still flagged 10 min later, it rides
+  along to the coordinator's next turn as `worker_drift`; only a run past 90% of its budget or a
+  command failed 6 times wakes the coordinator. Thresholds: `coordinator.drift.*` (0: off).
 - Not yet on Cursor: worker plugins, worker isolation, and isolation of coordinator turns from your own CLI config and MCP servers. Cursor
   enforces the `no_internet` restriction only through its sandbox (when the build lists
   `--sandbox` and `--add-dir` and the host can run it; `ttp doctor` says when not) and has no
