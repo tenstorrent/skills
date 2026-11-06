@@ -483,8 +483,8 @@ def _outside_snapshot(config) -> dict:
 # lacks HOME: the child then finds the account's home from its passwd entry). A change to a recorded
 # path fails the session; any other is a warning line. A child that finds the account's home by itself
 # while the session's temp HOME is set is handed its ssh folder where it runs ssh-keygen (without -f
-# outside the home) or ssh-copy-id, by its argv or a shell command's words (ssh_keys_handed); any other
-# (plain ssh, a script calling getpwuid) is not seen: its change is a warning.
+# outside the home) or ssh-copy-id at a command position, by its argv or a shell command's words
+# (ssh_keys_handed); any other (plain ssh, a script calling getpwuid) is not seen: its change is a warning.
 _WRITE_FLAGS = os.O_WRONLY | os.O_RDWR | os.O_CREAT | os.O_TRUNC | os.O_APPEND
 _PATH_CHARS = r"[^\s'\"`;:,=()&|<>]"
 
@@ -555,10 +555,11 @@ class _WriteRecorder:
             if text is not None:
                 for m in self.found.finditer(os.fsdecode(os.fspath(text))):
                     self.wrote(m.group(0))
-        if event == "subprocess.Popen":
-            words = [argv] if isinstance(argv, (str, bytes, os.PathLike)) else [exe] * (exe is not None) + list(argv or ())
+        if event == "subprocess.Popen":   # the program run (exe, else argv[0]), then its arguments
+            words = [argv] if isinstance(argv, (str, bytes, os.PathLike)) else \
+                ([exe] if exe is not None else list(argv or ())[:1]) + list(argv or ())[1:]
         else:
-            words = list(args[-2] or ()) if event != "os.system" else [args[0]]
+            words = [args[-3]] + list(args[-2] or ())[1:] if event != "os.system" else [args[0]]
         if ssh_keys_handed([w for w in words if w is not None],
                            (cwd if event == "subprocess.Popen" else None) or os.getcwd(), self.homes):
             self.record(os.path.join(self.home, ".ssh"))
@@ -590,42 +591,102 @@ class _WriteRecorder:
 
 
 _SSH_KEY_TOOLS = {"ssh-keygen", "ssh-copy-id"}
-_SHELL_BREAKS = {";", "&", "&&", "|", "||", "(", ")", ";;"}
+_SHELL_PUNCT = "();<>|&\n`"
 _KEYGEN_ARGS = set("CDEFGIJMNOPRVYZabfgjmnrstwz")   # ssh-keygen's options that take a value
+# Words that run the next word as a command: wrapper -> (its short options that take a value, positional
+# words before the command); shell keywords; long options that take a separate value.
+_WRAPPERS = {"env": ("uCS", 0), "timeout": ("sk", 1), "nice": ("n", 0), "nohup": ("", 0), "setsid": ("", 0),
+             "stdbuf": ("ioe", 0), "ionice": ("cnpP", 0), "sudo": ("ugCDhprtUT", 0), "exec": ("a", 0),
+             "command": ("", 0), "time": ("fo", 0), "xargs": ("IdEaLnPs", 0), "taskset": ("", 1),
+             "chrt": ("", 1)}
+_KEYWORDS = {"!", "{", "if", "then", "else", "elif", "do", "while", "until"}
+_LONG_ARGS = {"--signal", "--kill-after", "--unset", "--chdir", "--split-string", "--adjustment", "--user",
+              "--group", "--output", "--format", "--input", "--error"}
+
+
+def _shell_commands(word: str) -> list[list[str]]:
+    """`word` split as a shell would, into its simple commands (at ;, &, &&, |, ||, (, ), `, newline)."""
+    import shlex
+    try:
+        lex = shlex.shlex(word, posix=True, punctuation_chars=_SHELL_PUNCT)
+        lex.whitespace, lex.whitespace_split = " \t\r", True
+        tokens = list(lex)
+    except ValueError:
+        tokens = word.split()
+    commands = [[]]
+    for token in tokens:
+        if token and set(token) <= set(_SHELL_PUNCT) - set("<>"):
+            commands.append([])
+        else:
+            commands[-1].append(token)
+    return [c for c in commands if c]
+
+
+def _commands(words: list[str], depth: int = 0):
+    """`words` and each command inside them: a word with spaces or shell punctuation (an `sh -c` command,
+    os.system's string) split as a shell would, and the word after a shell's -c."""
+    yield words
+    if depth > 8:
+        return
+    for i, word in enumerate(words):
+        if re.search(r"[\s;&|()`$<>]", word):
+            inner = _shell_commands(word)
+            if inner != [[word]]:
+                for command in inner:
+                    yield from _commands(command, depth + 1)
+        elif i and re.fullmatch(r"-[A-Za-z]*c", words[i - 1]):
+            yield from _commands([word], depth + 1)
+
+
+def _command_index(words: list[str]) -> int | None:
+    """Where the program `words` run sits: past VAR=value words, shell keywords and wrappers (env, timeout,
+    nice, ...) with their options; None when there is none."""
+    i = 0
+    while i < len(words):
+        word = words[i]
+        if word in _KEYWORDS or re.fullmatch(r"[A-Za-z_]\w*=.*", word):
+            i += 1
+            continue
+        if os.path.basename(word) not in _WRAPPERS:
+            return i
+        takes, positional = _WRAPPERS[os.path.basename(word)]
+        i += 1
+        while i < len(words) and words[i].startswith("-") and words[i] != "-":
+            opt, i = words[i], i + 1
+            if opt == "--":
+                break
+            if opt.startswith("--"):
+                i += "=" not in opt and opt in _LONG_ARGS
+                continue
+            for k, letter in enumerate(opt[1:], 1):
+                if letter in takes:
+                    i += not opt[k + 1:]
+                    break
+        i += positional
+    return None
 
 
 def ssh_keys_handed(words, cwd, homes) -> bool:
-    """True when a child's `words` (its argv; a word with spaces or shell punctuation, as an `sh -c`
-    command or os.system's string, is split as a shell would) run ssh-keygen or ssh-copy-id on the
-    account's ssh folder: they find it from passwd, not HOME. ssh-keygen given -f under a folder outside
-    `homes` (relative to `cwd`) does not; a -f naming ~, a variable or a command does."""
-    import shlex
-    flat: list[str] = []
-    for word in words:
-        word = os.fsdecode(os.fspath(word))
-        if re.search(r"[\s;&|()`$<>]", word):
-            try:
-                lex = shlex.shlex(word, posix=True, punctuation_chars=True)
-                lex.whitespace_split = True
-                flat += list(lex) + [";"]
-            except ValueError:
-                flat += word.split() + [";"]
-        else:
-            flat.append(word)
-    for i, word in enumerate(flat):
-        name = os.path.basename(word)
+    """True when a child's `words` (the program it runs, then its arguments) run ssh-keygen or ssh-copy-id
+    on the account's ssh folder: they find it from passwd, not HOME. Only a command position counts: the
+    first word, past VAR=value words and wrappers such as env or timeout, or after a shell break in an
+    `sh -c` command or os.system's string; a mere mention (`which ssh-keygen`) does not. ssh-keygen given
+    -f under a folder outside `homes` (relative to `cwd`) does not; a -f naming ~, a variable or a command does."""
+    for command in _commands([os.fsdecode(os.fspath(w)) for w in words]):
+        i = _command_index(command)
+        name = os.path.basename(command[i]) if i is not None else None
         if name == "ssh-copy-id":
             return True
         if name != "ssh-keygen":
             continue
         key, j = None, i + 1
-        while j < len(flat) and flat[j] not in _SHELL_BREAKS:
-            opt, j = flat[j], j + 1
+        while j < len(command):
+            opt, j = command[j], j + 1
             if not opt.startswith("-") or opt.startswith("--"):
                 continue
             for k, letter in enumerate(opt[1:], 1):   # getopt: -lf <key>, -qf<key>, -t ed25519
                 if letter in _KEYGEN_ARGS:
-                    value = opt[k + 1:] or (flat[j] if j < len(flat) else "")
+                    value = opt[k + 1:] or (command[j] if j < len(command) else "")
                     j += not opt[k + 1:]
                     if letter == "f":
                         key = value

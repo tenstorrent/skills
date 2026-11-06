@@ -1817,6 +1817,12 @@ def test_ssh_keygen_child_is_handed_the_accounts_ssh_folder(tmp_path):
     assert popen("ssh-keygen -t ed25519 -f \"$HOME/k\"") == {ssh}   # shell=True; a variable may name the home
     assert popen(["ssh-copy-id", "-i", f"{scratch}/k.pub", "host"]) == {ssh}
     assert popen(["env", "A=1", "ssh-keygen", "-t", "ed25519", "-N", ""]) == {ssh}
+    for argv in (["timeout", "-k", "5", "60", "ssh-keygen", "-y"], ["nice", "-n", "5", "env", "-u", "X", "ssh-keygen"],
+                 ["sh", "-c", "A=1 ssh-keygen -y"], ["sh", "-c", "true\nssh-keygen -y"], ["sh", "-c", "echo $(ssh-keygen -y)"],
+                 ["sh", "-c", "ssh-keygen"], ["bash", "-c", "if true; then ssh-keygen -y; fi"]):
+        assert popen(argv) == {ssh}, argv
+    assert handed("subprocess.Popen", ("/usr/bin/ssh-keygen", ["keygen", "-y"], None, None)) == {ssh}   # executable=
+    assert handed("subprocess.Popen", ("/usr/bin/which", ["ssh-keygen", "-y"], None, None)) == set()
     assert popen(["ssh-keygen", "-t", "ed25519", "-f", "k", "-N", ""], f"{home}/work") == {ssh}   # relative, cwd in home
     assert handed("os.system", ("ssh-keygen -q -t ed25519 -N ''",)) == {ssh}
     assert handed("os.exec", ("/usr/bin/ssh-keygen", ["ssh-keygen", "-t", "rsa"], None)) == {ssh}
@@ -1826,7 +1832,12 @@ def test_ssh_keygen_child_is_handed_the_accounts_ssh_folder(tmp_path):
                       (["sh", "-c", f"ssh-keygen -t ed25519 -N '' -f {scratch}/k && cat {scratch}/k.pub"], None),
                       (["ssh-keygen", "-l", "-f", "k.pub"], str(scratch)),
                       (["ssh", "-o", "BatchMode=yes", "host", "true"], None),
-                      (["echo", "ssh-keygen-like"], None)):
+                      (["echo", "ssh-keygen-like"], None),
+                      (["which", "ssh-keygen"], None),   # a mention, not a command position
+                      (["grep", "ssh-keygen", "."], None),
+                      (["git", "commit", "-m", "fix ssh-keygen call"], None),
+                      (["sh", "-c", "grep -r ssh-keygen . | wc -l"], None),
+                      (["sh", "-c", "ssh-keygen -f '/x/my dir/k' -N ''"], None)):
         assert popen(argv, cwd) == set(), argv
     changes = [(f"{ssh}/id_ed25519", "changed")]
     assert c.guarded_changes(changes, popen(["ssh-keygen", "-q", "-t", "ed25519", "-N", ""]), str(home))[0] == \
