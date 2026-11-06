@@ -2494,6 +2494,8 @@ def test_a_sandboxed_checks_detached_job_is_started_by_the_daemon_and_outlives_t
     own fd and reaper variables."""
     from ttp import detach, sandbox
     monkeypatch.setenv("TTP_DEVICE_NODES", "")
+    monkeypatch.setenv("TTP_CHECKS_TMP_FD", "8")      # the daemon's own, as one started from a check has:
+    monkeypatch.setenv("TTP_CHECK_SANDBOX", "outer")  # never passed on to the job
     p = make(env)
     marker = p.state / "pushes" / "m1.json"
     marker.parent.mkdir(parents=True)

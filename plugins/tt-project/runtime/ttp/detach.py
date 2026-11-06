@@ -349,7 +349,8 @@ def _kept_env(env: dict) -> dict:
 def _job_env(saved) -> dict:
     """The daemon's environment with a queued or resume record's `env` over it, loopback proxies left
     out of the record's (one written before _kept_env dropped them)."""
-    return machines.mask_devices({**os.environ, **_kept_env(saved if isinstance(saved, dict) else {})})
+    own = {k: v for k, v in os.environ.items() if k not in _SKIP_ENV}   # a daemon started from a check, say
+    return machines.mask_devices({**own, **_kept_env(saved if isinstance(saved, dict) else {})})
 
 
 def save_resume(rc: Path, log: Path, cmd: list, cwd: str, env: dict, boot: str) -> None:
@@ -595,15 +596,17 @@ def job_pid(rc: Path, pid: int | None = None) -> int:
     return pid
 
 
-def _restamp(rc: Path, pid: int, boot: str) -> None:
+def _restamp(rc: Path, pid: int, boot: str, reopen: bool = True) -> None:
     """Point the run's registry entry of the job at its new process and boot (state reads the boot);
-    a relaunched job's record is open again."""
+    a relaunched job's record is open again (`reopen`; a queued one's keeps what the worker ran)."""
     try:
         with registry(rc.parent) as jobs:
             for j in jobs:
                 if isinstance(j, dict) and j.get("rc") == str(rc):
-                    j.update(pid=pid, pid_start=locks.start_time(pid), boot=boot, started=time.time(),
-                             queued=False, status="running")
+                    j.update(pid=pid, pid_start=locks.start_time(pid), boot=boot)
+                    if not reopen:
+                        continue
+                    j.update(started=time.time(), queued=False, status="running")
                     for k in ("exit", "ended", "why"):
                         j.pop(k, None)
     except OSError:
@@ -993,7 +996,7 @@ def tend(p: Project) -> None:
                         pid = start(rc, log, cmd, m["cwd"], env, lock)
                         renice(pid, nice_level(p.config().get("runner"))[0])
                         from .runner import boot_id
-                        _restamp(rc, pid, boot_id())   # its host pid and start time, never a namespace's
+                        _restamp(rc, pid, boot_id(), reopen=False)   # its host pid and start time, never a namespace's
                 except (OSError, ValueError, TypeError) as e:   # its folder went, say: never retried each tick
                     why = f"the daemon could not start it: {e}"
                 finally:
