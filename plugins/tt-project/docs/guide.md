@@ -1624,7 +1624,11 @@ running work is interrupted only by the preemption below:
   one per 8 cores, at least 2, plus the cores the larger of the 1- and 5-minute load, less one per test slot the project itself holds, leaves under
   0.75 x the cores, at most half the cores, so its own suites never shrink it; `checks.load_extra` 0 keeps the base; a shrink bounds new grants only), the most test workers one project's suites run at once, which also bounds one run's
   grant. No new suite starts while the host's 1-minute load is above its cores (`checks.load_guard`, a factor of the
-  cores, default 1; 0 turns it off): it waits and its lane's wait note says why; running suites go on. Push
+  cores, default 1; 0 turns it off): it waits and its lane's wait note says why; running suites go on. Three
+  passes still let one suite each start past it: one for an urgent or push run, one for a run owed to the user
+  (priority 0), and a floor pass for any run, so load from work outside the queue never stops it while slots
+  are free. The floor goes to the most urgent, oldest run the load alone holds; a run parked for another reason
+  keeps no place in that line. Push
   checks wait there at most `checks.push_load_wait_s` seconds (default 300; `off`: no bound), then start on
   their branch's reserved lane alone, one per lane at a time. Heavy suites
   belong on another host where a project has one allowed (`delivery.checks_host`).

@@ -79,6 +79,7 @@ import contextlib
 import fcntl
 import hashlib
 import json
+import math
 import os
 import re
 import shlex
@@ -287,29 +288,66 @@ def load_guard() -> str:
             + " (checks.load_guard); no new suite starts until it drops, running ones go on")
 
 
-LOAD_PASS = "test-slots-load-pass"   # check-slots/test-slots-load-pass.lock: the one run past the load guard
+LOAD_PASS = "test-slots-load-pass"   # check-slots/test-slots-load-pass.lock: the one urgent run past the load guard
+LOAD_OWED = "test-slots-load-owed"   # the one priority-0 run (owed to the user) past it beside LOAD_PASS's
+LOAD_FLOOR = "test-slots-load-floor"   # the one run of any priority past it, so the queue keeps moving
+LOAD_GATE = "host load: "   # pool_gate's reason while the load guard holds a run (gate_lanes records it)
 
 
 def load_pass_path() -> Path:
     return checkcap.slot_dir() / f"{LOAD_PASS}.lock"
 
 
-def load_passes(priority: int | None = None, push: bool = False) -> bool:
-    """Whether a run may pass the load guard: a push-queue run (`push`) or an urgent one (task `priority`
-    locks.URGENT_PRIORITY or better: priority 1, an `urgent:` line, a user's order) while no other run holds
-    the one load pass (load_pass_path; acquire takes it with its grant). Routine runs never pass."""
-    if not push and (priority is None or priority > locks.URGENT_PRIORITY):
-        return False
+def load_pass_paths(priority: int | None = None, push: bool = False, since: float | None = None) -> list[Path]:
+    """The passes a run may take past the load guard, in the order it tries them: a priority-0 run (an
+    obligation owed to the user, checkcap.OBLIGATION_PRIORITY) its own one (LOAD_OWED), so a less urgent
+    holder of the shared pass never holds it; a push-queue or urgent run (locks.URGENT_PRIORITY or better)
+    the one load pass; and any run the floor pass (LOAD_FLOOR) while no run parked under the load guard goes
+    before it (floor_ahead), so a host whose load comes from other work still starts one check at a time
+    and its queue never stalls while its slots are free."""
+    d, out = checkcap.slot_dir(), []
+    if priority is not None and priority <= checkcap.OBLIGATION_PRIORITY:
+        out.append(d / f"{LOAD_OWED}.lock")
+    if push or (priority is not None and priority <= locks.URGENT_PRIORITY):
+        out.append(load_pass_path())
+    if not floor_ahead(priority, since):
+        out.append(d / f"{LOAD_FLOOR}.lock")
+    return out
+
+
+def floor_ahead(priority: int | None = None, since: float | None = None) -> bool:
+    """Whether a run parked for its test slots (checkcap.PARKED) that the load guard alone holds (its lane's
+    gate says so: gate_lanes) goes before a run at `priority` that arrived at `since` (default now; its own
+    PARKED ticket's, if it holds one): more urgent, or as urgent and older (none: push checks, the least).
+    A parked run held by anything else (its project's budget, the pool) keeps no place for the floor pass."""
+    d = checkcap.slot_dir()
     try:
-        return locks.any_free([load_pass_path()])
+        q = locks.queued(d, checkcap.PARKED)
+    except OSError:
+        return False
+    mine = getattr(checkcap._PARKS, "park", None)
+    rank = ((locks.ticket_priority(mine), locks._arrival(mine)) if mine in q else
+            (math.inf if priority is None else float(priority), time.time() if since is None else since))
+    ahead = {ticket_pid(t) for t in q if t != mine and (locks.ticket_priority(t), locks._arrival(t)) < rank}
+    if not ahead:
+        return False
+    return any(r.get("pid") in ahead and str(r.get("gate") or "").startswith(LOAD_GATE)
+               for r in locks.holder_records(sorted(d.glob(f"{SUITE}.*.lock"))))
+
+
+def load_passes(priority: int | None = None, push: bool = False, since: float | None = None) -> bool:
+    """Whether a run may pass the load guard: one of its passes (load_pass_paths) is free; acquire takes
+    it with its grant."""
+    try:
+        return locks.any_free(load_pass_paths(priority, push, since))
     except OSError:
         return False
 
 
-def load_held(priority: int | None = None, push: bool = False) -> str:
-    """load_guard()'s reason while it holds this run (load_passes: not an urgent or push run past it), else ""."""
+def load_held(priority: int | None = None, push: bool = False, since: float | None = None) -> str:
+    """load_guard()'s reason while it holds this run (load_passes: no pass of its free), else ""."""
     why = load_guard()
-    return "" if not why or load_passes(priority, push) else why
+    return "" if not why or load_passes(priority, push, since) else why
 
 
 def push_load_wait_s(cfg: dict | None = None) -> float | None:
@@ -516,9 +554,9 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     run): it starts only once run_min() slots are free (above). While other runs of its project wait, one
     run takes at most its share of the project's budget (run_share), so up to checklane.project_cap suites
     run side by side. A run that is no nested one takes no test slots while the host is overloaded
-    (load_guard), except one push or urgent run at a time (load_passes: it holds the load pass with its
-    grant): it waits, telling why and passing the reason to `waits` (its lanes' wait note, lane_waits), and
-    `waits` gets "host test slots" again once the load drops. A push check's wait there is bounded
+    (load_guard), except one run per load pass at a time (load_pass_paths: a priority-0 run's, an urgent or
+    push run's, the floor's; it holds the pass with its grant): it waits, telling why and passing the reason
+    to `waits` (its lanes' wait note, lane_waits), and `waits` gets "host test slots" again once the load drops. A push check's wait there is bounded
     (push_load_wait_s): past it, it starts on its branch's reserved lane alone."""
     tell = tell or (lambda _line: None)
     what = f"{kind.name} slots"
@@ -533,12 +571,15 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
     try:
         while True:
             project.ps_cycle()
-            if kind is TESTS and passed is None and (load := load_guard()) and load_passes(priority, bool(push_key)):
-                # Over the load guard one push-queue or urgent run at a time starts (load_passes); its pass
-                # goes with its grant.
-                if (passed := locks.try_take([load_pass_path()], holder, "load-guard pass",
+            if kind is TESTS and passed is None and (load := load_guard()) \
+                    and load_passes(priority, bool(push_key), arrival):
+                # Over the load guard one run per pass starts (load_pass_paths); its pass goes with its grant.
+                if (passed := locks.try_take(load_pass_paths(priority, bool(push_key), arrival), holder,
+                                             "load-guard pass",
                                              extra={"priority": priority} if priority is not None else None)):
-                    tell(f"{what}: past the load guard as the one urgent or push-queue run it admits; {load}")
+                    tell(f"{what}: past the load guard on its "
+                         + {LOAD_OWED: "pass for runs owed to the user", LOAD_PASS: "pass for an urgent or push-queue run"}
+                         .get(Path(passed.name).stem, "floor pass, the one run it admits so the queue moves") + f"; {load}")
             if kind is TESTS and passed is None and (load := load_guard()):
                 if push_key and (bound := push_load_wait_s(cfg)) is not None and time.time() - start >= bound \
                         and (f := locks.try_take([reserved_path(push_key)], holder, "push test slots",
@@ -1027,7 +1068,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     or it has a slot free (pool_now) with nobody queued for one, and the project's budget (project_max) has
     one free. suite_hold's overflow lanes ask it, so a run takes one only once it can start beside the
     holders. With `full` (a full `ttp checks` run, as acquire's), also only while the host's load lets a
-    suite start (load_held: one urgent run passes) and the pool and the budget have run_min() free, so a
+    suite start (load_held: one run per load pass passes) and the pool and the budget have run_min() free, so a
     run whose wait is bounded (checkspill.after_s) takes no host-wide checks slot only to hand it back at
     the bound. A priority-1 run (`priority`) whose project's budget is held only by less urgent runs counts
     its urgent slots instead (urgent_paths), as acquire takes them. A run of the project parked past
@@ -1037,8 +1078,8 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
     to whichever polls first. The reason names the term that failed, for status (checklane._parked)."""
-    if full and (why := load_held(priority)):
-        return f"host load: {why}"
+    if full and (why := load_held(priority, since=since)):
+        return f"{LOAD_GATE}{why}"
     if (ahead := checkcap.starved_ahead(project_name, since, priority=priority)):
         return f"{len(ahead)} run(s) of its project parked longer go first (checkcap.starved_ahead)"
     if full and admitted_ahead(project_name, priority):
