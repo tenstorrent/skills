@@ -24947,7 +24947,7 @@ def test_codex_gets_no_trust_bypass_when_another_hook_source_exists(env, monkeyp
         assert "--dangerously-bypass-hook-trust" not in argv and not _codex_hook_commands(argv), text
         iso = prov.isolation_args()
         assert iso[0] == "--ignore-user-config" and "--dangerously-bypass-hook-trust" in iso, text
-        assert set(_codex_hook_commands(iso + ["-"])) == {"PreToolUse", "PostToolUse"}
+        assert set(_codex_hook_commands(iso + ["-"])) == {"PreToolUse", "PostToolUse", "Stop"}
     (home / "config.toml").write_text('model = "m"\n[projects."/x"]\ntrust_level = "trusted"\n')
     assert "--dangerously-bypass-hook-trust" in worker()[1], "a config without hooks or plugins is no source"
     # Files no run ignores: no hook, isolated or not.
@@ -25032,7 +25032,7 @@ def test_codex_worker_isolation_reaches_the_launched_argv(env, monkeypatch, tmp_
     (p.runs / str(rid) / "STOP").touch()
     argv = json.loads((p.runs / str(rid) / "run.json").read_text())["argv"]
     assert argv[-1] == "-" and "--ignore-user-config" in argv and "--dangerously-bypass-hook-trust" in argv
-    assert set(_codex_hook_commands(argv)) == {"PreToolUse", "PostToolUse"}
+    assert set(_codex_hook_commands(argv)) == {"PreToolUse", "PostToolUse", "Stop"}
 
 
 CURSOR_RESUME_HELP = CURSOR_HELP + """  --resume [chatId]          Resume a chat session
