@@ -6714,8 +6714,12 @@ def test_a_run_waiting_for_its_test_slots_keeps_its_project_s_next_run_off_the_h
         testslots.lane_waits(lane, "a host-wide checks slot")
         assert testslots.pool_room({}, "pa", full=True, priority=2), "still waiting for its own checks slot"
         monkeypatch.setattr(testslots, "load_guard", lambda: "load 99 over 64 cores")
-        assert testslots.acquire("run 12", project_name="pa", wait_s=0.3, priority=2,
-                                 waits=lambda w: testslots.lane_waits(lane, w)) is None
+        floor = _hold_load_floor()   # another run holds the floor pass, so this routine run waits
+        try:
+            assert floor and testslots.acquire("run 12", project_name="pa", wait_s=0.3, priority=2,
+                                               waits=lambda w: testslots.lane_waits(lane, w)) is None
+        finally:
+            floor and floor.close()
         monkeypatch.setattr(testslots, "load_guard", lambda: "")
         rec = locks.holder_records([Path(f.name) for f in lane.files])[0]
         assert str(rec.get("waits")).startswith(testslots.LOAD_WAITS), rec
