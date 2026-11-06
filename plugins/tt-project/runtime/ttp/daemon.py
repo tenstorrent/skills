@@ -1228,6 +1228,7 @@ class Daemon:
         self._on_pass_notes_due = 0.0   # when runs are next swept for notes an unsettled on_pass_cmd queued
         self._reboot_told = False
         self._linger_at, self._linger_off = 0.0, False   # linger last looked at, and what it said
+        self._gh_auth: threading.Thread | None = None   # the host-wide gh login check in flight (ghauth.py)
         self._last_stop: dict = {}   # the clean-stop record this daemon found at start
         self._boot_woken = False
         self._cycles: dict[str, dict | None] = {}   # earlier boot -> its planned host cycle record
@@ -1885,7 +1886,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.alert_slurm_paused, self.check_chats,
+                     self.check_linger, self.check_notifier, self.alert_slurm_paused, self.check_gh_auth, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -4003,6 +4004,29 @@ class Daemon:
         from . import slurmcheck
         if b := slurmcheck.alert_due(self.p.name):
             self.alert(slurmcheck.ALERT_KEY, slurmcheck.alert_text(b), severity="normal")
+
+    def check_gh_auth(self) -> None:
+        """While this project uses gh: the host-wide gh login check (ghauth.py) in a thread when it is due,
+        and one machine-wide alert while it says logged out, naming the host and `gh auth login`; it clears
+        once the check passes."""
+        from . import ghauth
+        db = self.p.db
+        if not ghauth.uses_gh(db):
+            if db.kv(ghauth.KV):
+                db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
+            return
+        st = ghauth.read()
+        if ghauth.due(st, time.time()) and not (self._gh_auth and self._gh_auth.is_alive()) \
+                and (not os.environ.get("PYTEST_CURRENT_TEST") or os.environ.get("TTP_TEST_GH_AUTH")):
+            self._gh_auth = threading.Thread(target=ghauth.check, daemon=True, name="gh-auth")
+            self._gh_auth.start()
+        if st.get("ok") is False:
+            if not db.kv(ghauth.KV):
+                db.set_kv(ghauth.KV, {"since": st.get("since")})
+            when = timefmt.short(float(st.get("since") or time.time()), self.p)
+            self.alert(ghauth.KEY, ghauth.text(st, hostname(), when), severity="normal")
+        elif st.get("ok") and db.kv(ghauth.KV):
+            db.x("DELETE FROM kv WHERE key=?", (ghauth.KV,))
 
     def check_chats(self) -> None:
         """One low status line per relay chat that stopped reading with no listener running (chatgone)."""
@@ -12473,12 +12497,31 @@ class Daemon:
             self._deferral_event(task, d.get("since") or task["created"], "deferral_job_failed",
                                  f"a detached job its start_when waits on failed or left no exit code (exit {rc} of "
                                  f"`ttp detach --check`, not a broken probe): {d.get('when', '')[:300]}")
+        elif rc != 0 and self._gh_logged_out(rc, out, now):
+            log(self.p, f"task {task['id']} start_when hit gh's logout (exit {rc}): folded into the host's gh-auth alert")
         elif rc != 0:
             said = (out or "").strip().splitlines()   # its last line says why (landed: an abandoned producer)
             why = (rc if isinstance(rc, str) else f"exit {rc}") + (f": {said[-1][:300]}" if said else "")
             self._deferral_event(task, d.get("since") or task["created"], "deferral_probe_broken",
                                  f"its start_when probe is broken ({why}; only 0 = start, 1 or 75 = not yet and "
                                  f"ssh's own 255 = host unreachable are valid): {d.get('when', '')[:300]}")
+
+    def _gh_logged_out(self, rc, out: str, now: float) -> bool:
+        """A probe that failed for gh's login, which the host's one gh-auth alert covers rather than a
+        broken-probe event per task: the host check says logged out, or has not looked since it was asked
+        to now (ghauth.nudge). Once it says logged in, the probe is broken as any other."""
+        from . import ghauth
+        if isinstance(rc, str) or not ghauth.auth_failed(rc, out):
+            return False
+        st, window = ghauth.read(), 2 * ghauth.TIMEOUT_S + PROBE_EVERY_S
+        if st.get("ok") is False:
+            return True
+        if float(st.get("nudged") or 0) > float(st.get("checked_at") or 0):
+            return now - float(st["nudged"]) < window
+        if st.get("ok") and now - float(st.get("checked_at") or 0) < window:
+            return False   # gh answered logged in since this probe could have failed: the probe is broken
+        ghauth.nudge(now)
+        return True
 
     def _start_resource_stale(self, task: dict, d: dict, now: float) -> None:
         """A start_when that has said not yet for waiting.start_resource_stale_s while the task names a
@@ -17538,7 +17581,7 @@ class Daemon:
         """The per-user claim key of a condition every project on this machine sees alike: a
         logged-out CLI, a lost VPN or network sign-in (netwait), linger off (downtime), or a low disk on the filesystem the
         guard found short. None otherwise."""
-        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY, "notifier"):
+        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY, "notifier", "gh-auth"):
             return f"{hostname()}|{key}"
         if key == "disk":
             path = (self.p.db.kv("disk_low") or {}).get("path")

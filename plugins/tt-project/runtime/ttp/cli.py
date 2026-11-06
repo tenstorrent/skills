@@ -8745,7 +8745,8 @@ def _own_ttp_word(p: Project | None) -> str:
 # operating ----------------------------------------------------------------------------------------
 def cmd_ci(a) -> None:
     """CI probe for `retry_when`: exit 0 once the commit's GitHub Actions runs completed or one of
-    their jobs hung (in progress past 3x its recent median), 1 while they run, 75 when gh cannot
+    their jobs hung (in progress past 3x its recent median), 1 while they run, 4 when gh is not logged
+    in (a broken probe: the host's gh-auth alert says so), 75 when gh cannot
     answer. Prints one line per run (`done:`, `hung:`, `running:`); see ciwait."""
     from . import ciwait
     rc, lines = ciwait.probe(repo=a.repo, branch=a.branch, sha=a.sha, workflow=a.workflow, run=a.run,
@@ -13471,7 +13472,7 @@ def main(argv: list[str] | None = None) -> None:
 
     from . import ciwait
     s = sub.add_parser("ci", help="exit 0 once a commit's CI runs completed or a job hung, 1 while they run, "
-                                  "75 if gh cannot answer (for retry_when)")
+                                  "75 if gh cannot answer, 4 if gh is not logged in (for retry_when)")
     s.add_argument("--repo", help="owner/repo (default: the repository of the current directory)")
     s.add_argument("--branch", help="the branch whose newest commit's runs to wait for")
     s.add_argument("--sha", help="wait for this commit's runs instead of the branch's newest")

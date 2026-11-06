@@ -44,7 +44,7 @@ import time
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 
-from . import prguard
+from . import ghauth, prguard
 from . import screen as scr
 
 DAY = 86400.0
@@ -69,6 +69,8 @@ _BOUND: contextvars.ContextVar[tuple[float, float] | None] = contextvars.Context
 _RUN: contextvars.ContextVar = contextvars.ContextVar("watcher_run", default=None)
 # one PR's read (_read_pr): _gh appends the timeout of each of its calls that timed out
 _TIMED_OUT: contextvars.ContextVar[list | None] = contextvars.ContextVar("watcher_timed_out", default=None)
+# a prs run (watch_prs): _spawn appends the last error line of each gh call that failed for its login
+_AUTH: contextvars.ContextVar[list | None] = contextvars.ContextVar("watcher_gh_auth", default=None)
 
 
 def _seconds(*values, default: float) -> float:
@@ -190,7 +192,12 @@ def _spawn(args: list[str], timeout: float, cwd: str, run=None):
         return run is None or schedrun.track(run, pid)
 
     try:
-        return boundedchild.run(["gh", *args], timeout, cwd=cwd, on_start=started)
+        res = boundedchild.run(["gh", *args], timeout, cwd=cwd, on_start=started)
+        failed = _AUTH.get()
+        if failed is not None and not res.timed_out and ghauth.auth_failed(res.rc, res.err):
+            err = res.err.decode(errors="replace") if isinstance(res.err, bytes) else str(res.err or "")
+            failed.append((err.strip().splitlines() or [f"exit {res.rc}"])[0][:200])
+        return res
     finally:
         if run is not None and pids:
             run.groups.pop(pids[0], None)
@@ -574,11 +581,15 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
     stint = max(tried.values(), default=0) + 1
     order = sorted(watch, key=lambda t: tried.get(t["pr_url"], 0))
     t0 = _now()
-    with pr_cycle() as cycle:   # one batched read per repo; later asks in the cycle reuse it
-        spawned = cycle.spawned
-        cycle.plan(t["pr_url"] for t in order)
-        results = _read_prs(order, root, workers, pr_timeout)
-        spawned = cycle.spawned - spawned
+    auth_token = _AUTH.set(auth := [])
+    try:
+        with pr_cycle() as cycle:   # one batched read per repo; later asks in the cycle reuse it
+            spawned = cycle.spawned
+            cycle.plan(t["pr_url"] for t in order)
+            results = _read_prs(order, root, workers, pr_timeout)
+            spawned = cycle.spawned - spawned
+    finally:
+        _AUTH.reset(auth_token)
     from . import schedrun
     schedrun.check_stopped()   # a daemon stop (or the timeout's kill) killed its reads: no result to save
     read, missed, timings = 0, [], []
@@ -655,6 +666,10 @@ def watch_prs(daemon, payload: dict | None = None) -> str:
          f"gh reads); gh calls: "
          + ("; ".join(timings) or "none") + (f"; not checked: {'; '.join(missed)}" if missed else ""))
     unapproved = f", {len(flagged)} out of draft unapproved" if flagged else ""
+    if auth:   # never ok: the host-wide gh login check (ghauth) is asked to look now and alerts once
+        ghauth.nudge()
+        return (f"error: gh is not logged in on this host ({auth[0]}): {len(auth)} gh calls failed, "
+                f"{len(order)} PRs not read; the user runs `gh auth login` there")
     if missed:
         shown = "; ".join(missed[:10]) + (f"; {len(missed) - 10} more" if len(missed) > 10 else "")
         return (f"cut short ({read} of {len(order)} PRs read, {changed} changed{unapproved}; "

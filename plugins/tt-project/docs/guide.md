@@ -908,6 +908,17 @@ only in the feed and never under "needs you".
   handles an event without a task naming the device, that decline is kept per device in the
   database: its next idle stretch waits both the grace and the doubling rearm from its last event,
   until a task names the device again.
+- gh logged out (model-free): one check per machine, shared by every project on it, runs `gh auth
+  status` at most every 15 min while a project there uses gh (a PR to watch, or a schedule or
+  probe that calls gh or `ttp ci`). While it fails for the login, one normal alert in the top
+  section names the machine's ssh alias and the step only the user can take (`gh auth login`
+  there). It is sent once per outage, the other projects there show it quietly, and it clears once
+  the check passes. Shipped gh callers never read a logout as ok: pr-watch's run ends with an
+  `error:` status, `ttp ci` exits 4 with a `broken:` line, and a gh call that failed its login asks
+  for a recheck at once. A `start_when` probe that fails for gh's login (exit 4, or `not logged in`
+  in its output) raises no broken-probe event of its own while the host check says logged out; the
+  one alert covers it. A command watcher or schedule of your own that calls gh should do the same:
+  print `{"error": true, ...}` on a gh auth failure, never an ok line.
 - Network outage (model-free): when every task that could start waits on a probe saying this
   machine cannot reach its host (ssh exit 255, confirmed by `ssh <alias> true` failing too; a 255
   that names no host, or whose host answers, is a broken probe for its task), no worker runs and no other task is ready to start, for
