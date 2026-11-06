@@ -1685,6 +1685,7 @@ def test_codex_like_coordinator_session_wake_launches_with_the_agent_s_tools_and
         return argv[:-1] + ["--coord-tools", argv[-1]] if argv and argv[-1] == "-" else argv + ["--coord-tools"], \
             {"TTP_COORD_MARK": "1"}
     monkeypatch.setattr(Fake, "coord_tools", tools)
+    p.set_config("coordinator.session.mode", "off")
     r, argv, _, _ = turn("EVENTS 0")
     assert not seen and "--coord-tools" not in argv, "session mode off: the stateless turn has no tools"
     p.set_config("coordinator.session.mode", "on")

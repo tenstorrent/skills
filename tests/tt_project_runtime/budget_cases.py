@@ -2118,6 +2118,7 @@ def _codex_coordinator(env, monkeypatch, tmp_path):
         monkeypatch.setitem(base._CLI_OUTPUT, (str(exe), *args), text)
     p = make(env)
     p.set_config("core_provider", "codex")
+    p.set_config("coordinator.session.mode", "off")   # stateless turns: a Codex session wake resumes its own session
     d = Daemon(p.base)
 
     def turn(digest="EVENTS", system=None):
