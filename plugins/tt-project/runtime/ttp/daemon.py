@@ -1029,7 +1029,8 @@ def _handoff_of(task: dict) -> str:
 def _findings(fups: list[dict], review: dict, tag: str) -> str:
     """A failed review's findings (its follow-ups) as numbered lines for a fix or re-review spec, each
     reviewer-written title and spec clipped, then enclosed under `tag` as data (spans.wrap)."""
-    return "\n".join(f"{n}. " + spans.wrap(f"{str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}",
+    return "\n".join(f"{n}. " + spans.wrap(f"{coord.clip(f['title'], 200)}: "
+                                            f"{coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}",
                                             f"finding of review #{review['id']}", tag)
                       for n, f in enumerate(fups, 1))
 
@@ -15387,7 +15388,7 @@ class Daemon:
         lines += [f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
                   f"Its hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(task), tag)}"]
         fups = load_result(task.get("result")).get("followups")
-        fups = [str(f["title"])[:120] for f in fups if isinstance(f, dict) and f.get("title")] \
+        fups = [coord.clip(f["title"], 120) for f in fups if isinstance(f, dict) and f.get("title")] \
             if isinstance(fups, list) else []
         if fups:
             lines.append("Its proposed follow-ups (the coordinator queues them separately; not part of this "

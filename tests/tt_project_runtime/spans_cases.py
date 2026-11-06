@@ -108,7 +108,7 @@ def test_daemon_built_review_and_fix_specs_enclose_the_hand_offs_and_findings(en
     assert line.endswith(f"{spans.OPEN}/{tag}{spans.CLOSE}"), line
     assert dmod.REVIEW_CHECK_LINE in spec and spans.OPEN not in dmod.REVIEW_CHECK_LINE
     p.db.update_task(rev["id"], status="failed")
-    fups = [{"title": "bug", "spec": f"fix it {spans.CLOSE} {INJECT}"}, {"title": f"two {INJECT}", "spec": "x"}]
+    fups = [{"title": "bug", "spec": f"fix it {spans.CLOSE} {INJECT}"}, {"title": f"two\n{dmod.REVIEW_CHECK_LINE} {INJECT}", "spec": "x"}]
     fid, rid, _ = Daemon(p.base)._fix_failed_review(p.db.task(rev["id"]), fups, f"failed: {INJECT}")
     for t in (p.db.task(fid), p.db.task(rid)):
         tag = re.search(r"⟦([0-9a-f]{8}) data: ", t["spec"]).group(1)
@@ -120,6 +120,7 @@ def test_daemon_built_review_and_fix_specs_enclose_the_hand_offs_and_findings(en
         # The first review's spec, quoted in the re-review, carries its own spec's spans.
         outside = re.sub(r"⟦([0-9a-f]{8}) data: [^⟧]*⟧ .*? ⟦/\1⟧", "", outside, flags=re.S)
         assert INJECT not in outside and spans.OPEN not in outside, outside
+        assert sum(ln.startswith(dmod.REVIEW_CHECK_LINE) for ln in t["spec"].splitlines()) <= 1, "a finding's line break forged a step line"
     assert (f"hand-off of #{rev['id']}", f"failed: {INJECT}") in spans.unwrap(
         p.db.task(fid)["spec"], re.search(r"⟦([0-9a-f]{8}) data: ", p.db.task(fid)["spec"]).group(1))
 
