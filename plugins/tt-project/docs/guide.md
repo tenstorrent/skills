@@ -694,6 +694,18 @@ only in the feed and never under "needs you".
   unreachable hosts and code and review tasks are exempt. Each close registers one reopen watch:
   the same probe every 6 h for 14 days, off the tick; its first pass queues one `reopens:<id>`
   follow-up with the closed task's spec.
+- Expected finish of outside waits (eta.py, `ttp eta`): a waiting task whose `retry_when` watches work
+  outside the harness (a Slurm job, a detached run, another project's ack: any probe but a bare clock
+  gate or `landed:#<id>`) shows 'no measured finish yet' with no time, in `ttp eta`, the coordinator's
+  Expected finish lines, its dependants' critical path, obligation ETAs and the long-promise course
+  check; its next probe is never taken for its finish. Its hand-off may give `eta` (epoch seconds, or
+  an ISO time with UTC offset) with `eta_basis` (the measurement behind it, such as the job's own
+  progress rate): its finish is then that eta, plus the median run unless an `on_pass_cmd` ends the
+  task. A detached driver of that task updates it between wakes with `ttp progress report <kind>
+  --eta <time> --eta-basis "<how measured>"`: the newest valid eta from the hand-off or the task's
+  reports since it began waiting wins. An `eta` without `eta_basis`, already past or with no offset is
+  ignored. Waits on a time and on `landed:#<id>` keep their estimates, and so does a wait the daemon
+  already woke (it waits only for a slot, lock or gate).
 - Task-to-task waits (model-free, lanewait.py): a queued task whose start_when is exactly
   `landed:#<id>` starts as soon as that change is approved or batched in the push queue, branching
   from its approved head instead of the base, when the task gets a worktree of its own (code, or a

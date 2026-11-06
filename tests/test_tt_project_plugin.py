@@ -684,7 +684,7 @@ def test_shipped_prompts_and_templates_hold_no_one_users_cluster_policy():
     for part in ("Get nodes only through the cluster's scheduler.",
                  "Where the charter names nodes, partitions or limits, stay within them",
                  "never widen your own scope", "allocated, drained, reserved for others or down",
-                 "Release the allocation as soon as the work ends."):
+                 "Release the allocation once the work ends."):
         assert part in worker, part
     coord = flat("template", "prompts", "coordinator.md")
     assert "within any nodes, partitions or limits the charter names" in coord
@@ -721,8 +721,8 @@ def test_prompts_and_charter_template_say_self_heal_then_report():
                  "another person's request", "paraphrases get through it", "heal checks cover what it misses"):
         assert part in coord, part
     worker = flat("prompts", "worker.md")
-    assert ("is fixed in the task, or handed off with a fix plan in `followups`; never handed off `blocked` as a "
-            "question about what to do") in worker
+    assert ("is fixed in the task, or handed off with a fix plan in `followups`; never handed off `blocked` "
+            "asking what to do") in worker
     charter = flat("CHARTER.md")
     assert ("Self-healing: keeping the project stable is a prime directive; check everything it is responsible "
             "for, fix anomalies yourself and report afterwards.") in charter
@@ -770,7 +770,7 @@ def test_worker_prompt_asks_for_narrow_file_reads():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
     for part in ("Read files narrowly: `grep -n` first, then only the ranges you need",
                  "(`sed -n 'a,bp'`, or Read with offset and limit)",
-                 "Do not re-read a range you already read: later calls pay it again."):
+                 "Do not re-read a range: later calls pay it again."):
         assert part in text, part
     for gone in ("Each call re-reads the whole context", "every range a step needs in one call",
                  "parallel tool calls in one message", "Never re-read a range"):
@@ -1735,7 +1735,7 @@ def test_worker_prompt_says_device_hosts_hide_devices_from_direct_opens():
     assert "On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES`" in worker
     assert ("Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource"
             in worker)
-    assert "Never unset or override the masking variables to work around this." in worker
+    assert "Never unset or override the masking variables." in worker
 
 
 def test_runs_without_a_device_never_open_one_through_tests():
@@ -1743,7 +1743,7 @@ def test_runs_without_a_device_never_open_one_through_tests():
     marker exists before deselecting by it; the harness skill ships the opt-in pytest guard."""
     prompts = PLUGIN / "template" / "prompts"
     worker = " ".join((prompts / "worker.md").read_text(encoding="utf-8").split())
-    assert "`TTP_NO_DEVICE=1` in your environment means your task holds no device" in worker
+    assert "`TTP_NO_DEVICE=1` means your task holds no device" in worker
     assert "exact test ids or `-k` expression" in worker
     assert "only after `pytest --markers` shows the repo defines it" in worker
     assert ("only through the device broker, `ttp devq` or `ttp lock` on a device resource, never directly, "
@@ -6579,7 +6579,7 @@ def test_one_line_install_fails_clearly_when_the_ref_has_no_tt_project(install_e
 
 def test_worker_prompt_waits_on_landed_instead_of_blocking_on_another_task():
     text = " ".join((PLUGIN / "template" / "prompts" / "worker.md").read_text(encoding="utf-8").split())
-    assert "Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>`, never `blocked`." in text
+    assert "Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>` (never a sha), never `blocked`." in text
     assert all(len(line) <= 1000 for line in (PLUGIN / "template" / "prompts" / "worker.md").read_text().splitlines())
 
 

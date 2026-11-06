@@ -397,3 +397,141 @@ def test_eta_a_task_waiting_on_another_tasks_landing_starts_after_that_landing(e
     p.db.update_task(n, status="queued", labels=[f"start_when:landed:#{w}"])
     p.db.x("DELETE FROM push_queue WHERE id=?", (q,))
     assert "dependency cycle" in eta.estimate(p.db, w, now)["why"]
+
+
+def _eta_waiting(p, now, kind="work", retry_after=120, **res):
+    """A task the daemon holds on a waiting hand-off (status queued, its next probe `retry_after` s out)."""
+    tid = p.db.add_task(f"waiting {kind}", "s", kind=kind)
+    p.db.update_task(tid, result=json.dumps({"status": "waiting", "summary": "s", **res}), not_before=now + retry_after)
+    return tid
+
+
+def test_eta_outside_work_wait_has_no_measured_finish_without_a_measured_eta(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200, queue wait median 300
+    probes = ["ttp detach --check --host box /runs/7/job", "ssh box \"squeue -h -j 12 | grep -q . && exit 1 || exit 0\"",
+              "ttp ack-wait probe --from peer --hash abc", "ttp checks --result /runs/7/checks"]
+    for probe in probes:
+        t = _eta_waiting(p, now, retry_when=probe)
+        e = eta.estimate(p.db, t, now)
+        # Never 'next probe + a median run': no time at all, and it says why.
+        assert e["end"] is None and "no measured finish yet" in e["why"], probe
+        assert "no measured finish yet" in eta.field(e, p, now) and eta.wake_at(e) is None
+    # The status 'waiting' some callers pass reads the hand-off the same way.
+    w = p.db.add_task("w", "s", kind="work", status="waiting")
+    p.db.update_task(w, result=json.dumps({"status": "waiting", "retry_when": probes[0]}))
+    assert eta.estimate(p.db, w, now)["end"] is None
+    # Its dependants, its obligations and the long-promise course check see no time either.
+    after = p.db.add_task("next step", "s", kind="work", depends_on=[t])
+    e = eta.estimate(p.db, after, now)
+    assert e["end"] is None and e["path"] == [after, t] and "no measured finish yet" in e["why"]
+    u = p.db.add_task("urgent fix", "s", kind="work", priority=1, reply_chat="c1",
+                      depends_on=[t])
+    o = _eta_promise(p, u, "c1", "I'll post the result here.", now)
+    assert eta.obligation_estimate(p.db, o, now)["end"] is None
+    lines, _ = eta.course_lines(p.db, p.config(), now)
+    assert lines and "no measured finish yet" in lines[0]
+
+
+def test_eta_outside_work_wait_uses_a_measured_eta_with_its_basis(env):
+    from datetime import datetime, timezone
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200
+    probe = "ttp detach --check --host box /runs/7/job"
+    basis = "the job's own log: step 40 of 100 after 2 h"
+    # Epoch or ISO with offset; a median run follows when a worker run reads the outcome.
+    t = _eta_waiting(p, now, retry_when=probe, eta=now + 7200, eta_basis=basis)
+    e = eta.estimate(p.db, t, now)
+    assert e["end"] == pytest.approx(now + 7200 + 1200) and [k for k, _ in e["legs"]] == ["outside work", "run"]
+    iso = datetime.fromtimestamp(now + 7200, timezone.utc).astimezone().isoformat()
+    t2 = _eta_waiting(p, now, retry_when=probe, eta=iso, eta_basis=basis)
+    assert eta.estimate(p.db, t2, now)["end"] == pytest.approx(now + 7200 + 1200, abs=1)
+    # An on_pass_cmd records the end model-free: no run after the eta.
+    t3 = _eta_waiting(p, now, retry_when=probe, eta=str(now + 7200), eta_basis=basis, on_pass_cmd="ttp checks --result x --passed")
+    assert eta.estimate(p.db, t3, now)["end"] == pytest.approx(now + 7200)
+    # Ignored: no basis, an eta already past, a naive ISO time (no offset), a non-time.
+    for bad in ({"eta": now + 7200}, {"eta": now + 7200, "eta_basis": "  "}, {"eta": now - 60, "eta_basis": basis},
+                {"eta": datetime.fromtimestamp(now + 7200).isoformat(), "eta_basis": basis},
+                {"eta": "soon", "eta_basis": basis}, {"eta": True, "eta_basis": basis},
+                {"eta": "inf", "eta_basis": basis}, {"eta": "nan", "eta_basis": basis}):
+        b = _eta_waiting(p, now, retry_when=probe, **bad)
+        e = eta.estimate(p.db, b, now)
+        assert e["end"] is None and "no measured finish yet" in e["why"], bad
+
+
+def test_eta_time_and_landing_waits_keep_their_estimates(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200, queue wait median 300
+    # A bare clock gate, `landed:#N`, `ttp landed --task N` terms and no retry_when at all: the next try
+    # plus the usual legs.
+    for res in ({"retry_when": f'test "$(date +%s)" -ge {int(now) + 600}'}, {"retry_when": "landed:#12"},
+                {"retry_when": " landed: 12 "}, {"retry_when": "ttp landed --task 12 && ttp landed --task #13 || exit 1"},
+                {}):
+        t = _eta_waiting(p, now, retry_after=600, **res)
+        assert eta.outside_wait(p.db.task(t), now) is None
+        assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 600 + 300 + 1200), res
+    # A deferred task's start_when is the deferral's, not a waiting hand-off's.
+    d = p.db.add_task("deferred", "s", kind="work", labels=["start_when:ssh box true"])
+    p.db.update_task(d, result=json.dumps({"status": "waiting", "retry_when": "ssh box true"}))
+    assert eta.outside_wait(p.db.task(d), now) is None
+
+
+def test_eta_a_woken_outside_wait_is_due_and_keeps_the_queue_and_run_legs(env):
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200, queue wait median 300
+    # The daemon woke it (its hand-off says why, not_before is past): it waits only for dispatch.
+    t = _eta_waiting(p, now, retry_after=-5, retry_when="ttp detach --check --host box /runs/7/job",
+                     woke="probe passed", waiting_since=now - 3600)
+    assert eta.outside_wait(p.db.task(t), now) is None
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 300 + 1200)
+
+
+def test_eta_outside_wait_reads_a_measured_eta_from_the_task_s_progress_reports(env, monkeypatch, capsys):
+    from ttp import cli, eta, progress
+    p = make(env)
+    now = time.time()
+    _eta_history(p, now)                                   # run median 1200
+    probe, basis = "ttp detach --check --host box /runs/7/job", "step 40 of 100 after 2 h"
+    t = _eta_waiting(p, now, retry_when=probe, eta=now + 7200, eta_basis=basis, waiting_since=now - 600)
+
+    def report(at, eta_=None, basis_=basis, task=t, **kw):
+        rec = progress.record("result", "box/job", "step", env={"TTP_TASK": str(task)}, now=at,
+                              eta="" if eta_ is None else str(eta_), eta_basis=basis_ if eta_ is not None else "")
+        progress.append(p.state, {**rec, **kw})
+    # Reports before this wait began, of another task, with no basis, past or with no eta: ignored.
+    report(now - 900, now + 600)
+    report(now - 60, now + 900, task=t + 1000)
+    report(now - 50, now + 900, basis_=" ")
+    report(now - 40, now - 10)
+    report(now - 30)
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 7200 + 1200)
+    # A newer report with a measured eta wins over the hand-off's, and the newest valid one over older ones.
+    report(now - 20, now + 3600)
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 3600 + 1200)
+    report(now - 10, now + 1800)
+    report(now - 5, now - 1)                              # already past: keeps the last valid one
+    assert eta.estimate(p.db, t, now)["end"] == pytest.approx(now + 1800 + 1200)
+    # A report alone gives a finish to a hand-off with none.
+    t2 = _eta_waiting(p, now, retry_when=probe, waiting_since=now - 600)
+    assert eta.estimate(p.db, t2, now)["end"] is None
+    report(now - 1, now + 2400, task=t2)
+    assert eta.estimate(p.db, t2, now)["end"] == pytest.approx(now + 2400 + 1200)
+    # `ttp progress report --eta --eta-basis` stores them on the line (the task from TTP_TASK).
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.setenv("TTP_TASK", str(t2))
+    cli.main(["progress", "report", "result", "step 50", "--key", "box/job", "--eta", str(now + 3000),
+              "--eta-basis", basis])
+    got = progress.entries(p.state)[-1]
+    assert got["eta"] == str(now + 3000) and got["eta_basis"] == basis and got["task"] == str(t2)
+    assert eta.estimate(p.db, t2, now)["end"] == pytest.approx(now + 3000 + 1200, abs=1)
+    cli.main(["progress", "report", "result", "--key", "box/job", "--eta", "soon"])
+    assert "--eta is ignored" in capsys.readouterr().err
+    assert eta.estimate(p.db, t2, now)["end"] == pytest.approx(now + 3000 + 1200, abs=1)

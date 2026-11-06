@@ -7140,6 +7140,8 @@ def cmd_progress(a) -> None:
     ap.add_argument("--key", default=a.key)
     ap.add_argument("--resource", default=getattr(a, "resource", None) or "")
     ap.add_argument("--holder", default=getattr(a, "holder", None) or "")
+    ap.add_argument("--eta", default=getattr(a, "eta", None) or "")
+    ap.add_argument("--eta-basis", default=getattr(a, "eta_basis", None) or "")
     a = ap.parse_intermixed_args(a.words or [])
     p = here()
     if not p:
@@ -7152,7 +7154,13 @@ def cmd_progress(a) -> None:
     holder = a.holder
     if not holder.strip() and a.kind == "refusal" and a.resource.strip():
         holder = progress.holder_text(p, a.resource.strip())
-    rec = progress.record(a.kind, key, a.reason, resource=a.resource, holder=holder)
+    if a.eta.strip():
+        from .eta import _epoch
+        if _epoch(a.eta) is None or not a.eta_basis.strip():
+            print("ttp progress report: --eta is ignored for the expected finish without --eta-basis, or when it "
+                  "is not epoch seconds or an ISO time with its offset", file=sys.stderr)
+    rec = progress.record(a.kind, key, a.reason, resource=a.resource, holder=holder, eta=a.eta,
+                          eta_basis=a.eta_basis)
     try:
         progress.append(p.state, rec)
     except OSError as e:
@@ -11971,6 +11979,11 @@ def main(argv: list[str] | None = None) -> None:
                                       "are recorded from the lock state (`ttp lock --probe --json`), else unknown")
     m.add_argument("--holder", help="who holds the resource (a task, run, pid or external label), as the driver "
                                     "knows it; shown in the stall observation")
+    m.add_argument("--eta", help="the measured finish of the outside work the task waits on (epoch seconds, or "
+                                 "an ISO time with its offset); with --eta-basis it sets the task's expected "
+                                 "finish (`ttp eta`) until a later report or hand-off, while still ahead")
+    m.add_argument("--eta-basis", help="the measurement behind --eta (such as 'step 40 of 100 after 2 h'); "
+                                       "an --eta without one is ignored")
     m.add_argument("words", nargs=argparse.REMAINDER, metavar="KIND [REASON]",
                    help="KIND: result (a counted result; ends a stall), refusal, stall or failure (count toward "
                         "one); REASON: why, one line (an exit code, the refusal's text); --key may come anywhere")

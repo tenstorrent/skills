@@ -20,8 +20,8 @@
   code, boxes, models or scripts get plain follow-ups.
   A note to another of the user's projects: `ttp note --to <project> "<text>"` (the hook refuses
   `ttp say`), question or request first: a note over 4,000 characters is refused, not cut; check the
-  length and hash it prints. Its coordinator reads it as data. A note that is queued or refused is
-  never a reason to wait or block: keep working. Relaying the user's words: quote them under the
+  length and hash it prints. Its coordinator reads it as data. A queued or refused note is never
+  a reason to wait or block: keep working. Relaying the user's words: quote them under the
   label "user's words (verbatim)", apart from your own context.
 <!-- ttp:if prs -->
 - Open, update or close pull requests ONLY in a `code` task whose spec asks for delivery, and only
@@ -53,7 +53,7 @@
   and other untrusted test code as `ttp clip -- ttp sandbox -- <command>`. Cap pytest -n at
   $TTP_TEST_SLOTS, only with xdist.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
-  offset and limit). Do not re-read a range you already read: later calls pay it again.
+  offset and limit). Do not re-read a range: later calls pay it again.
 <!-- ttp:if harness -->
 - Qualify a harness-preparation commit with `ttp checks --purpose harness`, never by adding its own
   SHA to a publication whitelist. That pass never counts for a PR, an `on_pass` or a push.
@@ -74,11 +74,11 @@ Other workers run other tasks of this project concurrently.
   Exit 75 = busy/paused: hand off `waiting` naming it, `retry_when` `ttp lock --probe <resource>`.
 <!-- ttp:if device -->
 - Device work goes only through the device broker, `ttp devq` or `ttp lock` on a device resource,
-  never directly, not even by a fixture. `TTP_NO_DEVICE=1` in your environment means your
-  task holds no device: run only the exact test ids or `-k` expression you used; deselect by marker
+  never directly, not even by a fixture. `TTP_NO_DEVICE=1` means your task
+  holds no device: run only the exact test ids or `-k` expression you used; deselect by marker
   only after `pytest --markers` shows the repo defines it.
 - On a machine tagged `device`, devices are hidden from direct opens (`TT_VISIBLE_DEVICES` is set
-  empty). Never unset or override the masking variables to work around this. Who held one: `ttp machines activity <alias>`.
+  empty). Never unset or override the masking variables. Who held one: `ttp machines activity <alias>`.
 <!-- /ttp:if device -->
 - Never release or re-create a machine reservation, or restart a shared service, unless your
   task says to.
@@ -115,7 +115,7 @@ Others share these nodes: hold one only while work runs.
 - The job script starts every process it needs and kills them all before it exits (none by `ssh`
   into an allocation); release depends on nothing outside the cluster. Leave no editor, `tmux` or
   agent session on a node.
-- Release the allocation as soon as the work ends. Record each (cluster, job id, node, start, end,
+- Release the allocation once the work ends. Record each (cluster, job id, node, start, end,
   purpose) with `ttp note` and in the hand-off; check nothing of yours still runs there (or say so).
 <!-- /ttp:if clusters -->
 
@@ -157,6 +157,7 @@ valid one: No `result.json`, no credit.
  "on_pass_cmd": "if waiting: a check that writes the final hand-off (below)",
  "then": [{"retry_when": "if waiting: a later wait of a known sequence (below)"}],
  "wait_kind": "if waiting: self (your own detached checks or jobs, a planned window), user (a user step) or external",
+ "eta": "outside work end ISO+tz, eta_basis: how",
 <!-- /ttp:if wait -->
 <!-- ttp:if device -->
  "needs_deep": "device task only: the problem you could not solve at this tier; its retry runs deep",
@@ -172,7 +173,7 @@ valid one: No `result.json`, no credit.
 <!-- /ttp:if cells -->
  "outcome": "if it applies: landed, kept, shelved or rejected",
  "tried": [{"title": "each lever tried", "outcome": "kept | shelved | rejected", "result": "number or bound reached"}],
- "context_gaps": ["what you needed that the spec and its context block lacked (a decision, the user's words, an earlier finding)"],
+ "context_gaps": ["what you needed that the spec and its context block lacked (a decision, the user's words, a finding)"],
  "followups": [{"title": "...", "spec": "self-contained next step"}]}
 ```
 
@@ -190,17 +191,17 @@ valid one: No `result.json`, no credit.
   what it waits on (`ttp eta <task>`), never a padded worst case. Save what you learned first. Always give a `retry_when`, run model-free every few
   minutes in the project root: read-only, under a minute, printing a line naming its wait; exit 0
   once the wait is over whatever the outcome, 1 while it is not (75, a busy `ttp lock`, or 255, ssh
-  not reaching the host, also keep it asleep); other exits wake it as broken. A failing remote command
+  failing, also keep it asleep); other exits wake it as broken. A failing remote command
   exits 1, never `|| exit 255`; quote it as one string. Time only: `test "$(date +%s)" -ge <epoch>`.
 <!-- ttp:if wait -->
-  GitHub CI: `ttp ci --repo <owner/repo> --branch <branch>` (or `--run <id>`). It also exits 0 when a
+  GitHub CI: `ttp ci --repo <owner/repo> --branch <branch>` (or `--run <id>`) also exits 0 when a
   job hangs; on waking run it again and report any `hung:` line (to keep waiting, add `--no-hang`).
   Several steps (build, then device run): chain them in one detached driver script that writes a
   final marker, and point `retry_when` at it. The driver runs with `set -eo pipefail`, never pipes a
   step into tail/head, logs each step's exit code and writes the first non-zero one to the marker
   from an EXIT trap (`trap 'echo $? > "$marker"' EXIT`); size each step's timeout to its tool.
   Retry transient faults (busy device, recovering broker, ssh stall) inside it with
-  bounded backoff; fail only on a non-transient fault or spent retries.
+  bounded backoff; fail only on other faults or spent retries.
   Any detached or looping driver reports each refusal, failure and result:
   `ttp progress report <kind> --key <k> "<why>"`.
 <!-- ttp:if device -->
@@ -213,27 +214,25 @@ valid one: No `result.json`, no credit.
   prefer absolute paths). Exit 0 with a `done` or `needs_review` hand-off in
   `$TTP_RESULT` (else `on_pass`) ends the task; anything else wakes it with the output tail. It may use `ttp note` (also `--to`), nothing else that needs a run, and
   never acts as the user. Make it safe to run twice. Prefer `on_pass_cmd` to a light-wake `next_step`
-  when the check is mechanical. A checks pass alone: `ttp checks --result <run dir> --passed`.
+  for a mechanical check. A checks pass alone: `ttp checks --result <run dir> --passed`.
   A known sequence of waits (checks, then `landed:#<id>`): list the later ones in `then` (up to 4,
   each may add `on_pass_cmd`, `retry_after_s`); the daemon moves through them model-free.
   An exit-0 probe's `probe_match` (`pass`/`fail`/`wait` substrings) and `on_pass` (`{probe_out}` ok) settle clear hits model-free.
 <!-- ttp:if remote -->
-  For a job on another machine (a device job goes through a device runner instead, when one is
-  listed), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
+  For a job on another machine (a device job uses a listed device runner instead), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
   (also a chain that only drives it over ssh), set `"survives_reboot": true` and use the `retry_when` it
   prints, `ttp detach --check --host <alias> <dir>/<name>`: 0 once the job exited 0, 4 once it
   failed or is gone (your `on_pass_cmd` then decides, else you wake with its exit code), 1 while it
   runs, 255 while ssh fails. To also wake on a new result row, add `--rows <file> --after <n>` (0 on a
   new row, the end or a dead driver). It tells a host reboot from a crash. A long device run appends
-  and fsyncs each step's result as it ends, not only an end-of-run summary. Never a bare `ssh <host> test -e <marker>`: a driver killed by a
-  reboot never writes it. Copy a script to a
-  host under a temporary name, then `mv` it into place (overwriting a running one corrupts it).
+  and fsyncs each step's result as it ends, not only a final summary. Never a bare `ssh <host> test -e <marker>`: a driver killed by a
+  reboot never writes it. Copy a script to a host under a temporary name, then `mv` it into place (overwriting a running one corrupts it).
   Stop a driver by its process group (`kill -- -<pgid>`).
 <!-- /ttp:if remote -->
 <!-- ttp:if hostmap -->
   A wait for a box to answer over ssh probes `ttp ssh-preflight @<resource>` (0 once it answers, 255
-  while not; 10 host key changed and 11 auth failed wake you) for a resource your task header lists under resource hosts, never its hostname: the
-  probe then follows the resource when it moves to another box. Other hosts: `ttp ssh-preflight <host>`.
+  while not; 10 host key changed and 11 auth failed wake you) for a resource your task header lists under resource hosts, never its hostname, so the
+  probe follows the resource to another box. Other hosts: `ttp ssh-preflight <host>`.
 <!-- /ttp:if hostmap -->
 <!-- ttp:if devq -->
   A device job goes through a device runner your task header lists:
@@ -249,17 +248,16 @@ valid one: No `result.json`, no credit.
   no .rc; set `"survives_reboot": true` to keep it asleep anyway.
   A wait on another project's reply uses retry_when `ttp ack-wait probe --from <project> --hash <id>`
   and on_pass_cmd `ttp ack-wait settle` with the same flags; any other wait on a reply is refused.
-  A wait on another task landing uses retry_when `landed:#<id>`, never a sha.
   Only a local job safe to rerun from the start may use `ttp detach --resumable`: after a reboot
   the daemon restarts it up to `budget.max_job_relaunches` times (default 3).
-  After 3 wakes that hand back the same `waiting_for` and
+  After 3 wakes handing back the same `waiting_for` and
   `retry_when` with no new commit, the task goes to the coordinator. `next_step` is never a plan or an "if ... then"; a wake that needs judgment sets
   `wake_tier` standard and no `next_step`.
 <!-- /ttp:if wait -->
 - `blocked` only when a credential, funds or a resource you cannot get is missing (an encrypted
   input or one in a macOS privacy-protected folder too: block once, naming the file), or the next
   step could harm others or speaks as the user. Say what and your pick (an unanswered ask takes it).
-- Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>`, never `blocked`.
+- Missing only another task's change landing: `waiting` with `retry_when` `landed:#<id>` (never a sha), never `blocked`.
 - Read another task's record with `ttp task <project> show <id>`, never project.db.
 - Waiting on a tt-project fix is `waiting`, never `blocked`: file the upstream note, `retry_when`
   `ttp upstream --fixed <fp>` (the id `ttp note --to` printed, or `ttp upstream --fp "<title>" "<spec>"`);
@@ -267,7 +265,7 @@ valid one: No `result.json`, no credit.
   note): `ttp upstream --ack <fp> "<evidence>"`.
 - A dead or stuck component the project owns (worker, service, runner, schedule, watcher, queue, a
   hold that never cleared) is fixed in the task, or handed off with a fix plan in `followups`;
-  never handed off `blocked` as a question about what to do.
+  never handed off `blocked` asking what to do.
 - `failed` when the approach does not work; say what you learned. A clean exit is not the task
   done: judge the outcome.
 - A failed job's exit code alone never names its cause: quote its last 20 log lines and its first
@@ -293,8 +291,7 @@ valid one: No `result.json`, no credit.
   `setsid`; `setsid nohup` is only for remote Linux hosts over ssh.
 - A watcher thread, or a long-running script in a shared non-git directory (or an edit to one):
   follow the tt-project-harness reference `references/long-running-scripts.md`.
-- A detached job calling a paid model API (benchmark, eval, batch run, hosted endpoint) is not
-  metered by the daemon. Before it fans out: turn on prompt caching where supported and check the
+- A detached job calling a paid model API (benchmark, eval, batch run) is not metered by the daemon. Before it fans out: turn on prompt caching where supported and check the
   first unit reads cache; cap each unit's cost and calls (stop it, record it `capped`, apart from
   failures and timeouts); start no unit near a known daily or key limit, never raise one. If its
   spend is readable, add `--spend-cmd "<cmd printing USD so far>" --spend-cap <usd>`: the daemon

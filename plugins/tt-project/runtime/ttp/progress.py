@@ -7,6 +7,8 @@ refusal, stall and failure here, one line from bash. Each report is one JSON lin
 state/progress.jsonl: {"ts", "key", "kind", "reason", "source"} plus the reporting driver's pid
 (the caller's parent), boot id and, inside a `ttp detach` job, the job's .rc path, task and run. A refusal
 may name its busy `resource` and `holder` (--holder, else holder_text from the lock state); describe names it.
+A report may carry a measured finish, `eta` with `eta_basis` (--eta, --eta-basis): the reporting task's
+expected finish while it waits on that outside work (eta.outside_wait).
 
 The file is append-only under a lock (progress.lock) and synced per line, so concurrent reports
 never interleave. It needs no daemon: a report made while the daemon is down is read once it is
@@ -109,9 +111,10 @@ def _one_line(text: str, cap: int) -> str:
 
 
 def record(kind: str, key: str, reason: str, env: dict | None = None, now: float | None = None,
-           resource: str = "", holder: str = "") -> dict:
+           resource: str = "", holder: str = "", eta: str = "", eta_basis: str = "") -> dict:
     """The line a report writes, from the caller's environment; a refusal's resource and its holder
-    (holder_text) only when given."""
+    (holder_text), and a measured finish (`eta`, `eta_basis`: eta.outside_wait reads them for the
+    reporting task) only when given."""
     from .runner import boot_id
     env = os.environ if env is None else env
     job = env.get(JOB_ENV) or None
@@ -123,7 +126,9 @@ def record(kind: str, key: str, reason: str, env: dict | None = None, now: float
             "reason": _one_line(reason, REASON_MAX), "source": " ".join(w for w in who if w),
             "pid": pid, "boot": boot_id(), "job": job, "task": task, "run": run,
             **({"resource": _one_line(resource, 200)} if (resource or "").strip() else {}),
-            **({"holder": _one_line(holder, REASON_MAX)} if (holder or "").strip() else {})}
+            **({"holder": _one_line(holder, REASON_MAX)} if (holder or "").strip() else {}),
+            **({"eta": _one_line(eta, 64)} if str(eta or "").strip() else {}),
+            **({"eta_basis": _one_line(eta_basis, REASON_MAX)} if (eta_basis or "").strip() else {})}
 
 
 def holder_text(p, resource: str) -> str:

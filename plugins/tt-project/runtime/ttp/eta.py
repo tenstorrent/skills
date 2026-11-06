@@ -20,6 +20,13 @@ last WINDOW_S days), never a worst case or padding:
   `landed:#N`, or `ttp landed --task N` terms joined by `&&`, optionally ending `|| exit 1`) starts no
   earlier than the latest of those tasks' own expected landing (their finish plus their review and
   landing legs); one already landed (landed.recorded) adds nothing. Any other probe is not judged.
+- outside work: a waiting task whose retry_when watches work outside the harness (outside_wait: any
+  probe but a bare clock gate or a landing wait, such as a Slurm job, a detached run or a peer's ack) has
+  no measured finish yet, unless its hand-off gives `eta` (epoch, or ISO time with offset, still ahead)
+  with `eta_basis` (the measurement behind it), or a `ttp progress report --eta --eta-basis` of the task
+  since it began waiting does (the newest valid one wins): then it finishes at that eta, plus the median
+  run only when no on_pass_cmd ends it. Its next probe time is never taken for its finish. A wait the
+  daemon already woke (`woke` in its hand-off) is due and keeps the usual queue and run legs.
 - hold: a queued or waiting task whose provider's spend gate (kv `gates`) allows no new work starts no
   earlier than the gate's known reset (budget.hold_clears: a cap's period end, a plan window's reset,
   the runaway guard's hour, a provider limit's end); with no known reset it has no estimate and says it
@@ -42,6 +49,7 @@ import json
 import re
 import statistics
 import time
+from pathlib import Path
 
 WINDOW_S = 14 * 86400
 LONG_H = 2.0
@@ -115,6 +123,59 @@ def history(db, now: float | None = None) -> dict:
     return h
 
 
+def _epoch(v) -> float | None:
+    """A hand-off `eta`: epoch seconds, or an ISO time with its UTC offset; None for anything else."""
+    from datetime import datetime
+    if isinstance(v, bool):
+        return None
+    if isinstance(v, (int, float)):
+        return float(v)
+    s = str(v or "").strip()
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    try:
+        d = datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d.timestamp() if d.tzinfo else None
+
+
+def outside_wait(t: dict, now: float, reports=None) -> dict | None:
+    """A waiting task whose retry_when watches work outside the harness (a Slurm job, a detached run, a
+    peer's ack: any probe but a bare clock gate or a landing wait, `landed:#N` or `ttp landed --task N`
+    terms): {"at": the newest measured `eta` (with an `eta_basis`, still ahead) from its hand-off or its
+    `ttp progress report` lines since it began waiting (`reports`: progress.entries lines, or a callable
+    giving them, read only for such a wait), or None, "follows": an on_pass_cmd records the end, no run}.
+    None for any other task, and for one the daemon already woke (its hand-off's `woke`: it is due and
+    waits only for dispatch), which keep the usual estimate."""
+    from .daemon import time_gate
+    from .db import load_result, waiting_handoff
+    from .landed import LANDED_PROBE
+    res = load_result(t.get("result")) if t.get("status") == "waiting" else waiting_handoff(t)
+    probe = str(res.get("retry_when") or "").strip()
+    if (res.get("status") != "waiting" or res.get("woke") or not probe or time_gate(probe) is not None
+            or LANDED_PROBE.fullmatch(probe) or LANDED_ALL.fullmatch(probe)):
+        return None
+
+    def measured(r: dict) -> float | None:
+        at = _epoch(r.get("eta")) if str(r.get("eta_basis") or "").strip() else None
+        return at if at is not None and now < at < float("inf") else None
+    at = measured(res)
+    try:
+        since = float(res.get("waiting_since"))
+    except (TypeError, ValueError):
+        since = None   # no start of this wait on record: an older wait's reports are never read
+    if since is not None:
+        mine = [(ts, r) for r in (reports() if callable(reports) else reports) or []
+                if str(r.get("task") or "") == str(t.get("id")) and (ts := _epoch(r.get("ts"))) is not None
+                and ts >= since]
+        for _, r in sorted(mine, key=lambda x: x[0]):
+            at = measured(r) or at   # a later valid report wins; an invalid one keeps the last
+    return {"at": at, "follows": bool(str(res.get("on_pass_cmd") or "").strip())}
+
+
 class _Est:
     def __init__(self, db, now: float, hist: dict | None = None, core: str | None = None):
         self.db, self.now = db, now
@@ -125,6 +186,17 @@ class _Est:
         self.core = core or "claude"   # the provider of a task with none (config core_provider)
         self._gates = None
         self._owners = None
+        self._reports = None
+
+    def reports(self) -> list[dict]:
+        """The project's `ttp progress report` lines (read once per estimate; none when unreadable)."""
+        if self._reports is None:
+            from . import progress
+            try:
+                self._reports = progress.entries(Path(self.db.path).parent)
+            except Exception:
+                self._reports = []
+        return self._reports
 
     def _held(self, t: dict | None) -> tuple[float | None, str] | None:
         """A queued or waiting task the spend gate of its provider holds: (the gate's known reset or
@@ -276,9 +348,21 @@ class _Est:
                 if e["end"] > start:   # its own finish, review and landing: the probe passes then
                     start, path = e["end"], [tid] + e["path"]
             runs = self._run(t)
-            if not runs:
+            ow = outside_wait(t, now, self.reports) if st != "running" else None
+            if ow and ow["at"] is None:
+                return {**self._none(tid, f"#{tid} waits on outside work: no measured finish yet"), "path": path}
+            if not runs and not (ow and ow["follows"]):
                 return {**self._none(tid, f"no measured {t['kind']} run yet"), "path": path}
-            if st == "running":
+            if ow:   # its hand-off's measured eta; a median run after it unless an on_pass_cmd ends the task
+                legs.append(("outside work", max(0.0, ow["at"] - start)))
+                if not ow["follows"]:
+                    if hold := self._held(t):
+                        if hold[0] is None:
+                            return {**self._held_none(tid, hold[1]), "path": path}
+                        legs[-1] = ("outside work", max(legs[-1][1], hold[0] - start))
+                    begin = start + legs[-1][1]
+                    legs.append(("run", _med(runs)))
+            elif st == "running":
                 r = self.db.one("SELECT started FROM runs WHERE task=? AND status='running' AND role!='coordinator' "
                                 "ORDER BY id DESC LIMIT 1", (tid,))
                 left, over = self._left(runs, now - float(r["started"])) if r and r["started"] else (_med(runs), False)

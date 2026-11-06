@@ -17299,7 +17299,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 31_473), ("question", 24_505)):   # code: +128 for `probe_match` waits; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`)
+    for kind, cap in (("code", 31_593), ("question", 24_505)):   # code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`)
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -22103,7 +22103,7 @@ def test_worker_prompt_asks_for_a_probe_that_exits_0_whatever_the_outcome():
 def test_worker_prompt_says_how_to_wait_on_a_job_on_another_machine():
     prompt = (RUNTIME.parent / "template" / "prompts" / "worker.md").read_text()
     flat = " ".join(prompt.split())
-    assert "or 255, ssh not reaching the host" in flat
+    assert "or 255, ssh failing, also keep it asleep" in flat
     assert "For a job on another machine" in flat
     assert "start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`" in flat
     assert "`ttp detach --check --host <alias> <dir>/<name>`" in flat and "255 while ssh fails" in flat
@@ -22111,7 +22111,7 @@ def test_worker_prompt_says_how_to_wait_on_a_job_on_another_machine():
     assert "add `--rows <file> --after <n>` (0 on a new row, the end or a dead driver)" in flat
     assert 'set `"survives_reboot": true`' in flat
     # Device runners stay first: a device job goes through one, not a remote driver.
-    assert "a device job goes through a device runner instead" in flat
+    assert "a device job uses a listed device runner instead" in flat
 
 
 def _lost_to_reboot(p, d, tmp_path, tid, name="lost", notes=()):
@@ -25816,7 +25816,7 @@ def test_a_note_past_the_hourly_limit_waits_in_the_outbox_and_the_worker_goes_on
     assert "keep working" in capsys.readouterr().err
     # The worker prompt says a queued or refused note is never a reason to wait.
     worker = " ".join((RUNTIME.parent / "template" / "prompts" / "worker.md").read_text().split())
-    assert "A note that is queued or refused is never a reason to wait or block: keep working." in worker
+    assert "A queued or refused note is never a reason to wait or block: keep working." in worker
 
 
 def test_the_daemon_drains_the_note_outbox_in_order_at_the_hourly_rate(env, monkeypatch):
