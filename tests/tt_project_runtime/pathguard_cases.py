@@ -45,6 +45,7 @@ PG_SHELL_DENIED = [
     "gh auth login --with-token < t", "gh auth logout", "gh config set editor vim", "docker login -u x",
     "aws configure set region x", "kubectl config use-context x", "git credential approve < f", "ssh-keygen -R host",
     "ssh-keygen -t ed25519 -f ~/.ssh/id_new -N ''", "ssh-keygen -t ed25519", "touch ~/.config/example-access/f",
+    "ssh box true > ~/.ssh/known_hosts", "bash -c \"ssh box 'cat k' >> ~/.ssh/authorized_keys\"",
     "apply_patch <<'EOF'\n*** Begin Patch\n*** Add File: ~/.config/gh/hosts.yml\n+x\n*** End Patch\nEOF",
 ]
 PG_SHELL_ALLOWED = [
@@ -56,6 +57,7 @@ PG_SHELL_ALLOWED = [
     "python3 -m pytest -q tests/x.py 2>&1 | tail -5", "mkdir -p /tmp/a && echo x > /tmp/a/b",
     "H=$(mktemp -d); mkdir -p \"$H/.ssh\"; echo x > \"$H/.ssh/config\"", "kubectl config view", "aws configure list",
     "rsync -e 'ssh -i ~/.ssh/k' src host:dst", "chmod 700 ~",
+    "ssh box 'mkdir -p ~/.ssh && cat >> ~/.ssh/authorized_keys' < k.pub", "git commit -qm 'docs: > ~/.netrc example'",
 ]
 
 
@@ -106,6 +108,11 @@ def test_pathguard_script_files_a_command_runs(cred_home):
     for cmd in ("bash fix.sh", "sh ./fix.sh", "python3 fix.py"):
         assert pathguard_why(_pg_bash(cmd, w)), cmd
     assert pathguard_why(_pg_bash("python3 ok.py", w)) is None
+    # The plugin's own shipped scripts (setup-box writes ~/.ssh on a remote box, in ssh text) are not read
+    from ttp import pathguard
+    shipped = os.path.join(pathguard.PLUGIN_ROOT, "skills", "setup-box", "scripts", "box_account.py")
+    assert os.path.exists(shipped)
+    assert pathguard_why(_pg_bash(f"python3 {shipped} keys box --run", w)) is None
 
 
 def test_pathguard_list_adds_account_and_project_paths_never_drops_defaults(cred_home):
@@ -151,3 +158,43 @@ def test_pathguard_full_tools_coordinator(cred_home, monkeypatch, tmp_path):
         out, _ = coordtools.pre_tool_use({"tool_name": tool, "tool_input": inp, "cwd": str(cred_home.work)})
         assert out["hookSpecificOutput"]["permissionDecision"] == "deny", tool
         assert "credential folders" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+PG_LOST_KEY = [("Write", {"file_path": "~/.ssh/id_ed25519", "content": "x"}),
+               ("Write", {"file_path": "$HOME/.config/gh/hosts.yml", "content": "token: x"}),
+               ("Edit", {"file_path": "~/.ssh/id_ed25519", "old_string": "a", "new_string": "b"}),
+               ("Edit", {"file_path": "~/.config/gh/hosts.yml", "old_string": "a", "new_string": "b"}),
+               ("Bash", {"command": "cat k > ~/.ssh/id_ed25519"}), ("Bash", {"command": "echo t > ~/.config/gh/hosts.yml"}),
+               ("Bash", {"command": "cp k ~/.ssh/id_ed25519"}), ("Bash", {"command": "cp k $HOME/.config/gh/hosts.yml"}),
+               ("Bash", {"command": "mv k ~/.ssh/id_ed25519.pub"}), ("Bash", {"command": "mv k ~/.config/gh/hosts.yml"})]
+
+
+@pytest.mark.parametrize("provider", ["claude", "chat"])
+def test_pathguard_refuses_the_lost_key_writes_on_hooked_providers(cred_home, provider):
+    """The case that lost a key and a gh login: a Write or Edit call, a redirect, cp or mv onto ~/.ssh/id_*
+    or gh's hosts.yml. Claude Code and the chat provider (Claude Code on a bridge) run the same hook, whose
+    matcher takes these tools; the hook refuses each."""
+    from ttp import hook
+    from ttp.providers import get_provider
+    argv, _ = get_provider(provider).build(role="worker", model="m", effort="high", cwd=str(cred_home.work),
+                                           budget_usd=None, read_only=False, schema=None, restrictions={})
+    raw = argv[argv.index("--settings") + 1]
+    settings = json.loads(raw if raw.lstrip().startswith("{") else open(raw).read())
+    matchers = [m["matcher"] for m in settings["hooks"]["PreToolUse"]
+                if any(h["command"].endswith("PreToolUse") for h in m["hooks"])]
+    for tool, inp in PG_LOST_KEY:
+        assert any(re.fullmatch(m, tool) for m in matchers), (provider, tool)
+        out, _ = hook.pre_tool_use({"tool_name": tool, "tool_input": inp, "cwd": str(cred_home.work)})
+        assert out["hookSpecificOutput"]["permissionDecision"] == "deny", (provider, tool, inp)
+        assert "credential folders" in out["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+def test_pathguard_refuses_the_lost_key_shell_writes_on_codex(cred_home):
+    """Codex's hook matches shell calls only: the same shell forms are refused there (its own apply_patch
+    is the open gap, providers.md); apply_patch text given through the shell is refused."""
+    for tool, inp in PG_LOST_KEY:
+        if tool == "Bash":
+            assert pathguard_why({"tool_name": "exec_command", "tool_input": {"cmd": ["bash", "-lc", inp["command"]]},
+                                  "cwd": str(cred_home.work)}), inp
+    assert pathguard_why(_pg_bash("apply_patch '*** Begin Patch\n*** Add File: ~/.ssh/id_ed25519\n+x\n*** End Patch'",
+                                  cred_home.work))

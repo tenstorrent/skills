@@ -30,6 +30,7 @@ import json
 import os
 import pwd
 import re
+import shlex
 
 DEFAULT_PATHS = ("~/.ssh", "~/.config/gh", "~/.git-credentials", "~/.netrc", "~/.aws", "~/.docker/config.json",
                  "~/.kube")
@@ -58,6 +59,9 @@ MCP_READ_RE = re.compile(r"(?:^|_)(?:read|get|list|search|find|view|stat|info|tr
                          r"grep|glob|cat|head|tail|lookup|status)(?:_|$)", re.I)
 MCP_WRITE_RE = re.compile(r"write|edit|create|move|rename|delete|remove|copy|put|patch|append|chmod|mkdir|upload|"
                           r"save|set|update", re.I)
+# The plugin's own shipped scripts (setup-box's write ~/.ssh on a remote box, in ssh command text):
+# reviewed code, so the script-file read skips them; a script a run wrote is read
+PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
 WHY = ("a run never creates, changes, moves, chmods or deletes anything under the account's credential folders "
        "({hit} is one; guards.protected_paths lists them): a login a run overwrote is gone for every project on "
        "the host. Read it as before, test against a scratch copy under `mktemp -d` named by another variable "
@@ -233,12 +237,13 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
     from . import hook
     ctx = (env, cwd, rts)
     commands, scan = hook._split(cmd)
-    # Redirects: in the line as written, where the `>` is not quoted (_split drops an echo's quoted
-    # words, a quoted redirect target too), and in scan
-    flags = hook._quoting(cmd)
-    for text, quoted in ((cmd, lambda i: flags[i][0]), (scan, lambda i: False)):
+    # Redirects: in the line as written and in scan (_split drops an echo's quoted words, a quoted
+    # redirect target too), where the `>` is not quoted: quoted text is an argument (ssh's remote
+    # command, a message); `sh -c` text is read below
+    for text in (cmd, scan):
+        flags = hook._quoting(text)
         for m in REDIRECT_RE.finditer(text):
-            if not quoted(m.start()) and (h := _hit(m[2], ctx)):
+            if not flags[m.start()][0] and (h := _hit(m[2], ctx)):
                 return h
     if "*** Begin Patch" in cmd and (h := patch_refusal(cmd, ctx)):
         return h
@@ -257,6 +262,8 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
         return h
     if depth < 2:
         for f in hook._scripts(segments, cwd):
+            if os.path.realpath(f).startswith(PLUGIN_ROOT + os.sep):
+                continue
             try:
                 text = f.read_text(errors="replace")
             except OSError:
@@ -320,7 +327,7 @@ def _refusal(payload: dict, env, rts: list[str]) -> str | None:
         return _hit(str(inp.get("file_path") or inp.get("notebook_path") or ""), ctx)
     if tool in ("Bash", "shell", "local_shell", "exec_command"):
         cmd = inp.get("command") or inp.get("cmd") or ""
-        cmd = " ".join(cmd) if isinstance(cmd, list) else str(cmd)
+        cmd = shlex.join(map(str, cmd)) if isinstance(cmd, list) else str(cmd)   # an argv: keep `-c` text one word
         return shell_refusal(cmd, env, ctx[1], rts)
     if tool == "apply_patch" or "*** Begin Patch" in json.dumps(inp):
         return next((h for s in _strings(inp) if (h := patch_refusal(s, ctx))), None)
