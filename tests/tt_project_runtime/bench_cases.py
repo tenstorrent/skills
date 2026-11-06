@@ -245,3 +245,18 @@ def test_bench_run_arms_parse_and_need_two(tmp_path):
     s = benchrun.schedule([1, 2], ["a", "b"], 3, 5)
     assert s == benchrun.schedule([1, 2], ["b", "a"], 3, 5), "the order depends on the seed alone"
     assert len({tuple(c["arm"] for c in s[i:i + 2]) for i in range(0, len(s), 2)}) == 2, "both orders occur"
+
+
+def test_bench_run_cli_dry_run_takes_arms_from_the_command_line_and_refuses_one_arm(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, tid, task = _bench_built(env, tmp_path)
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX)
+    base = ["bench", "run", "--bench", str(tmp_path / "bench"), "--dry-run", "--seed", "3",
+            "--test-cmd", f"{sys.executable} -m pytest -q -p no:cacheprovider"]
+    cli.main([*base, "--out", str(tmp_path / "o"), "--arm", "a=claude:m:medium", "--arm", "b=chat:m2:max"])
+    text = capsys.readouterr().out
+    assert f"task {tid} rep 1 a: pass, $0.00" in text and f"task {tid} rep 1 b: pass" in text
+    assert "2 cell(s) run, seed 3" in text
+    with pytest.raises(SystemExit) as e:
+        cli.main([*base, "--out", str(tmp_path / "o2")])
+    assert e.value.code not in (0, None) and "at least two arms" in capsys.readouterr().err

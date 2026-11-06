@@ -1038,6 +1038,26 @@ manifest records its spec, base, landed commit, stratum (small up to 150 changed
 large) and each held-out file's sha256, and `manifest.sha256` pins the manifest. The bench names no
 model.
 
+`ttp bench run --bench <dir> --out <dir>` then runs a head-to-head of two or more model arms on it.
+An arm is a provider, model and effort: `bench.arms` in the project's config
+(`{"<name>": {"provider": ..., "model": ..., "effort": ...}}`, none shipped) or `--arm
+name=provider:model:effort`. Each task runs once per arm per repeat (`--reps`), the arms of one task
+back to back in an order drawn from `--seed` (random when unset; recorded in `plan.json`). Every cell
+gets a fresh copy of the base workspace in a new temporary folder, the same prompt (the spec under a
+fixed preamble) and the same limits, enforced by the daemon's own run supervisor: `bench.timeout_s`,
+`bench.stall_s` and `bench.budget_usd` (where the provider caps dollars). Before a run the workspace
+must hold one commit on one branch with no remote, reflog or alternates, neither the base nor the
+landed commit and no held-out test content; the bench and results folders are denied to the agent's
+reads. After it, a transcript that names those folders or the landed commit, or runs history or
+forge commands (`git fetch`, `git log --all`, `gh api`), flags the cell as failed. Otherwise the
+held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`;
+wrap it in `ttp sandbox --` to run candidate code sandboxed). Each cell appends a row to
+`results.jsonl` (cost, tokens, wall time, hand-off status, pass or fail, flags, and the sha256 of its
+transcript and diff) and keeps its transcript, diff and test log under `cells/`; a rerun into the same
+folder skips recorded cells and refuses a different plan. `--dry-run` runs every arm on the fake agent:
+no model call and no spend. The cells run as the same user as the command, so the denial and the
+audit, not the operating system, keep a candidate from the bench folder.
+
 ### OpenAI-compatible endpoints (the `chat` provider)
 
 The `chat` provider runs Claude Code workers against any endpoint that speaks the OpenAI Chat
