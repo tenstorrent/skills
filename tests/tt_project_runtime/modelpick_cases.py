@@ -24,9 +24,13 @@ class _ModelJev:
         if self.fail:
             raise self.fail
         assert purpose == "model" and questions["model"]["type"] == "choice"
-        assert set(questions["model"]["options"]) == {"routed-top", "core"}
+        # The live API refuses a choice without `criteria` (HTTP 422); it answers with this shape.
+        assert set(questions["model"]["criteria"]) == {"routed-top", "core"}
+        assert all(isinstance(v, str) and v for v in questions["model"]["criteria"].values())
         self.states.append(state)
-        return {"model": {"choice": self.choice, "probabilities": {self.choice: self.p}}}
+        rest = {k: round(1.0 - self.p, 6) for k in questions["model"]["criteria"] if k != self.choice}
+        return {"model": {"type": "choice", "choice": self.choice, "confidence": self.p,
+                          "probabilities": {self.choice: self.p, **rest}}}
 
 
 def _mp_dispatch(p, d, monkeypatch, title="Tidy the notes module", spec="Rename helpers in notes.py.", **task):

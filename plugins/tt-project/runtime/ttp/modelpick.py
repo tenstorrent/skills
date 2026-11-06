@@ -218,8 +218,10 @@ def _ask(db: DB, cfg: dict, task: dict, tier: str, jev, now: float, parent_diff)
         return None
     opts = options(cfg)
     ans = jev.decide(state(db, task, tier, now, parent_diff), {"model": {
-        "type": "choice", "options": {k: f"{o['provider']} {o.get('model') or ''} {o.get('effort') or ''}".strip()
-                                      for k, o in opts.items()},
+        # The live API takes a choice's options as `criteria` (key: description) and answers `choice` (one key)
+        # with `probabilities` per key; a question without `criteria` is refused (HTTP 422).
+        "type": "choice", "criteria": {k: f"{o['provider']} {o.get('model') or ''} {o.get('effort') or ''}".strip()
+                                       for k, o in opts.items()},
         "instructions": "Which model should run this task? Pick a routed (cheaper) option only when the task is "
                         "routine enough for it to succeed on its first try."}}, purpose="model", timeout=10.0)
     a = (ans or {}).get("model") or {}
