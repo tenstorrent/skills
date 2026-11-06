@@ -2815,7 +2815,10 @@ id or user msg #, a safety rule (`safety: <kind>`) or the task whose output it n
 applied, then shown once in the next Course check as `uncited hold: …` and counted. The daily
 Self-efficiency audit line `rule cites (24 h)` and `ttp audit`'s `rule_cites` give the hold-type
 actions, the share that cite (target 100%) and the likely corrections that name a standing rule.
-The check covers actions; a session coordinator's direct CLI commands are not checked.
+A session coordinator's own CLI holds go through the same check: `ttp task <project> add` or
+`set-when` with `--start-after` or a probe (cite it in `--why`) and `ttp pause --resource` or
+`--machine` (cite it in `--reason`); an uncited one also prints `uncited hold: …`. A worker's or
+the user's commands are not checked.
 
 ## Notifications
 

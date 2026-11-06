@@ -16,6 +16,8 @@ against the user's standing rules and cites the one it follows.
   waits_on, a resource_pause the coordinator set) whose why/text/reason cites no index id, user
   message, safety rule (SAFETY) or dependency (DEPENDS) is recorded. Every hold-type action writes one
   handled HOLD_EVENT event saying whether it cited. Flag only: it never rejects or holds anything.
+  The same check runs on a session coordinator's own CLI holds (cli._cite_hold: `ttp task add` or
+  `set-when` deferrals, `ttp pause --resource/--machine`), with its run id as the turn.
 - digest_lines: the next turn's Course check line 'uncited hold: ...' for those, shown once.
 - audit_line / metric: the daily review's 'rule cites (24 h)' line: hold-type actions, the share that
   cite (target 100%), and likely corrections (correction.py) that name a standing rule."""

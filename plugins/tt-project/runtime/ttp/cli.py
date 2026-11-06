@@ -8471,8 +8471,8 @@ def list_tasks(p, a) -> tuple[list[dict], int, int | None]:
 
 def cmd_task(a) -> None:
     p = need(a.name, sys.argv[1:])
-    if a.action != "add" and a.start_when is not None or a.action not in ("add", "rejudge") and a.why is not None:
-        die("--start-when and --why go with add (--why also with rejudge); for a queued task use set-when")
+    if a.action != "add" and a.start_when is not None or a.action not in ("add", "rejudge", "set-when") and a.why is not None:
+        die("--start-when and --why go with add (--why also with set-when and rejudge); for a queued task use set-when")
     if a.action != "rejudge" and a.dry_run:
         die("--dry-run goes with rejudge")
     if a.action not in ("add", "set-when") and a.start_after is not None:
@@ -8572,6 +8572,10 @@ def cmd_task(a) -> None:
             print(set_when(p.db, int(a.title), a.probe, p, on_pass_cmd=a.on_pass_cmd, start_after=a.start_after))
         except ValueError as e:
             die(str(e))
+        held = {k: v for k, v in (("start_when", a.probe), ("start_after", a.start_after))
+                if v is not None and v.strip().lower() not in ("", "now")}   # a cleared deferral holds nothing
+        if held:
+            _cite_hold(p, {"type": "task_update", "id": int(a.title), **held, "why": a.why})
     elif a.action == "rejudge":
         from .rejudge import rejudge
         if not a.title.strip().isdigit():
@@ -8656,8 +8660,8 @@ def add_task(p, a) -> tuple[int, str]:
     if not a.title.strip():
         raise ValueError("add needs a title")
     d = {"start_after": a.start_after, "start_when": a.start_when, "why": a.why}
-    if a.why is not None and a.start_when is None:
-        raise ValueError("--why explains a --start-when probe; give one")
+    if a.why is not None and a.start_when is None and a.start_after is None:
+        raise ValueError("--why explains a --start-when probe or --start-after; give one")
     budget = getattr(a, "budget", None)
     if budget is not None and budget <= 0:
         raise ValueError("--budget is a dollar amount above 0")
@@ -8669,6 +8673,9 @@ def add_task(p, a) -> tuple[int, str]:
     stale = marker_only_probe(when, p.root)
     from . import userstep
     userstep.sync_deferrals(p.db, [p.db.task(tid)])   # a user-only step's one standing item
+    if after or when:
+        _cite_hold(p, {"type": "task_add", "id": tid, "start_after": a.start_after if after else None,
+                       "start_when": when, "why": a.why})
     return tid, (f"; starts when: {when}" if when else "") \
         + (f"; starts after {timefmt.long(after, p)}" if after else "") + (f"; flagged: {stale}" if stale else "")
 
@@ -9525,18 +9532,44 @@ def _until_task_ok(p: Project | None, by: str, tid: int) -> None:
     ml.check_task(p, tid)
 
 
+def _coord_turn(p: Project) -> int | None:
+    """The run id when this command runs in this project's own coordinator run (a session's Bash tool or
+    a command it started), else None (the user, a worker, another project's coordinator)."""
+    run, mine = os.environ.get("TTP_RUN_ID"), os.environ.get("TTP_PROJECT")
+    if run and not os.environ.get("TTP_TASK") and mine and Path(mine).resolve() == Path(p.base).resolve():
+        row = p.db.one("SELECT id, role FROM runs WHERE id=?", (run,))
+        if row and row["role"] == "coordinator":
+            return int(row["id"])
+    return None
+
+
+def _cite_hold(p: Project, action: dict) -> None:
+    """A hold, deferral or wait set through the CLI by this project's coordinator goes through the same
+    rule-cite check as one in its structured answer (rulecite.check, coordinator.apply): recorded for the
+    daily metric, flagged in the next Course check when it cites nothing. Flag only, never refused. A
+    worker's or the user's command is not checked: a worker defers by its own spec and hand-off (its
+    holds reach the coordinator as task results), and the user's own word is the rule."""
+    turn = _coord_turn(p)
+    if turn is None:
+        return
+    from . import rulecite
+    try:
+        flagged = rulecite.check(p, [action], turn=turn)
+    except Exception as e:
+        print(f"rule cites not checked: {type(e).__name__}: {str(e)[:200]}", file=sys.stderr)
+        return
+    if flagged:
+        print(f"uncited hold: {flagged[0]}; cite the Standing rules id, user msg #, safety rule or dependency "
+              "it follows (--why or --reason), or lift it", file=sys.stderr)
+
+
 def _pause_by(p: Project) -> str:
     """Whom a `ttp pause --resource` is stamped for: the user only when they run it themselves; inside
     a run, the coordinator (its own turn in this project) or a worker, whose pauses the coordinator may lift."""
     from .project import in_run
     if not in_run():
         return "user"
-    run, mine = os.environ.get("TTP_RUN_ID"), os.environ.get("TTP_PROJECT")
-    if run and not os.environ.get("TTP_TASK") and mine and Path(mine).resolve() == Path(p.base).resolve():
-        row = p.db.one("SELECT role FROM runs WHERE id=?", (run,))
-        if row and row["role"] == "coordinator":
-            return "coordinator"
-    return "worker"
+    return "coordinator" if _coord_turn(p) is not None else "worker"
 
 
 def cmd_pause(a) -> None:
@@ -9558,6 +9591,9 @@ def cmd_pause(a) -> None:
                                                 by=_pause_by(p), users_word=not in_run(), end=end))
         except ValueError as e:
             die(str(e))
+        if a.cmd == "pause":
+            _cite_hold(p, {"type": "resource_pause", "machine": a.machine, "paused": True,
+                           "reason": getattr(a, "reason", None)})
         return
     if a.resource:
         from .coordinator import pause_resource
@@ -9570,6 +9606,9 @@ def cmd_pause(a) -> None:
                                                  by=_pause_by(p), end=end, via=f"ttp {a.cmd} --resource"))
         except ValueError as e:
             die(str(e))
+        if a.cmd == "pause":
+            _cite_hold(p, {"type": "resource_pause", "resource": a.resource, "paused": True,
+                           "reason": getattr(a, "reason", None)})
         return
     boot = None
     if a.cmd == "pause" and getattr(a, "until_reboot", False):
@@ -13097,8 +13136,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--start-when", help="add: a probe; the task starts only once it exits 0 (e.g. landed:#<id>)")
     s.add_argument("--start-after", help="add, set-when: a delay (2h, 3d) or ISO time (home zone unless it names "
                    "one) before which it does not start; set-when: now or \"\" clears it")
-    s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe; rejudge: "
-                   "the reason logged with the change")
+    s.add_argument("--why", help="add: plain words for --start-when, shown instead of the probe; add, set-when: "
+                   "the standing rule, user msg # or dependency a deferral follows (a coordinator's uncited one is "
+                   "flagged); rejudge: the reason logged with the change")
     s.add_argument("--dry-run", action="store_true", help="rejudge: show what would change, write nothing")
     s.add_argument("--on-pass-cmd", help="set-when: a waiting task's model-free completion command, run once its "
                    "retry_when passes (\"\" clears it); without a probe its retry_when stays; an "

@@ -141,3 +141,76 @@ def test_the_daily_audit_shows_the_rule_cites_metric_and_corrections_naming_a_st
     assert audit.report(p.db, p=p)["rule_cites"]["cited_pct"] == 50
     # Older than the window: not counted.
     assert rulecite.metric(p, now + 2 * 86400)["holds"] == 0
+
+
+def _rc_scratch_home(tmp_path, monkeypatch):
+    home = tmp_path / "scratch-home"   # never a real credential path (o227)
+    home.mkdir(exist_ok=True)
+    for var, sub in (("HOME", ""), ("XDG_CONFIG_HOME", ".config"), ("GH_CONFIG_DIR", ".config/gh")):
+        monkeypatch.setenv(var, str(home / sub) if sub else str(home))
+
+
+def _rc_as_run(p, monkeypatch, role, task=None, project=None):
+    """Run the next CLI commands as a run of `role` (a session coordinator's Bash tool, or a worker)."""
+    rid = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,?,'running',?)", (task, role, time.time()))
+    monkeypatch.setenv("TTP_RUN_ID", str(rid))
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.base / "state" / "runs" / str(rid)))
+    monkeypatch.setenv("TTP_PROJECT", str(project or p.base))
+    monkeypatch.setenv("TTP_ROLE", role)
+    if task is None:
+        monkeypatch.delenv("TTP_TASK", raising=False)
+    else:
+        monkeypatch.setenv("TTP_TASK", str(task))
+    return rid
+
+
+def test_a_session_coordinators_cli_holds_go_through_the_rule_cite_check(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli, coordinator as coord, rulecite
+    _rc_scratch_home(tmp_path, monkeypatch)
+    p, _, tid = _rc_project(env)
+    turn = _rc_as_run(p, monkeypatch, "coordinator")
+    # Cited: a deferral naming a user msg, a pause naming a safety rule.
+    cli.main(["task", "demo", "add", "smoke run", "--spec", "Do: x", "--start-after", "1h",
+              "--why", "the user asked for it tonight (user msg #41)"])
+    cli.main(["pause", "demo", "--resource", "board-c", "--reason", "required checks fail on it", "--until", "2h"])
+    assert "uncited hold" not in capsys.readouterr().err
+    # Uncited: a set-when deferral with no why, a pause whose reason only says pause, a machine pause.
+    cli.main(["task", "demo", "set-when", str(tid), "--start-after", "3h"])
+    cli.main(["pause", "demo", "--resource", "board-d", "--reason", "pause it for now", "--until", "2h"])
+    err = capsys.readouterr().err
+    assert err.count("uncited hold:") == 2 and f"#{tid} task_update start_after" in err, err
+    rows = p.db.q("SELECT data FROM events WHERE kind=?", (rulecite.HOLD_EVENT,))
+    assert len(rows) == 4 and all(json.loads(r["data"])["turn"] == turn for r in rows)
+    # Lifting or clearing holds nothing.
+    cli.main(["task", "demo", "set-when", str(tid), "--start-after", "now"])
+    cli.main(["resume", "demo", "--resource", "board-d"])
+    assert len(p.db.q("SELECT id FROM events WHERE kind=?", (rulecite.HOLD_EVENT,))) == 4
+    # The next digest's Course check flags them; the daily metric counts them.
+    cc = dict(coord.digest_parts(p, {}, [], [])[0])["course_check"]
+    assert cc.count("- uncited hold:") == 2 and "board-d resource_pause pause" in cc, cc
+    m = rulecite.metric(p)
+    assert m["holds"] == 4 and m["cited"] == 2, m
+    # The same run's structured answer marks nothing of its own turn shown; a later turn's apply does.
+    coord.apply(p, [], turn=turn + 1)
+    assert "course_check" not in dict(coord.digest_parts(p, {}, [], [])[0])
+
+
+@pytest.mark.parametrize("who", ["worker", "spoofed worker", "other project", "user"])
+def test_cli_holds_outside_this_projects_coordinator_run_are_not_checked(env, tmp_path, monkeypatch, capsys, who):
+    from ttp import cli, rulecite
+    _rc_scratch_home(tmp_path, monkeypatch)
+    p, _, tid = _rc_project(env)
+    if who == "worker":
+        _rc_as_run(p, monkeypatch, "worker", task=tid)
+    elif who == "spoofed worker":   # a worker's env naming the coordinator role: its task id still marks it
+        _rc_as_run(p, monkeypatch, "worker", task=tid)
+        monkeypatch.setenv("TTP_ROLE", "coordinator")
+    elif who == "other project":
+        _rc_as_run(p, monkeypatch, "coordinator", project=tmp_path / "elsewhere")
+    cli.main(["task", "demo", "add", "later work", "--spec", "Do: x", "--start-after", "3h"])
+    cli.main(["task", "demo", "set-when", str(tid), "--start-after", "2h"])
+    cli.main(["pause", "demo", "--resource", "board-d", "--reason", "pause it for now", "--until", "2h"])
+    assert "uncited hold" not in capsys.readouterr().err
+    assert p.db.q("SELECT id FROM events WHERE kind=?", (rulecite.HOLD_EVENT,)) == []
+    assert rulecite._records(p.db) == [] and rulecite.metric(p)["holds"] == 0
+    assert p.db.task(tid)["not_before"] is not None   # the command itself works as before
