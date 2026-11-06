@@ -5584,6 +5584,31 @@ def test_a_landing_check_never_waits_behind_task_checks_on_the_project_cap(env, 
         assert p1 and "-x." in p1.files[0].name, "a priority-1 run keeps its own over-cap lane beside it"
         p1.close()
         land.close()
+        # The coordinator's task-less run holds a landing lane: a run under a landing mark (a push batch's)
+        # still starts at once on its own lane, a second coordinator run waits, and so does a second mark run.
+        coord = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0, landing="coordinator")
+        assert coord and "-x." in coord.files[0].name, "the coordinator's run takes a landing lane past the cap"
+        try:
+            mark = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0, landing="mark")
+            assert mark and "-x." in mark.files[0].name, \
+                "a landing-mark run never waits behind the coordinator's landing lane"
+            kinds = sorted(r["landing"] for r in locks.holder_records(testslots.lane_paths("pa", repo=None))
+                           if r.get("landing"))
+            assert kinds == ["coordinator", "mark"], kinds
+            assert testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, wait_s=0,
+                                        landing="coordinator") is None, "one coordinator landing lane at a time"
+            assert testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, wait_s=0,
+                                        landing="mark") is None, "one mark landing lane at a time"
+            mark.close()
+        finally:
+            coord.close()
+        # A mark run holds the lane: the coordinator's run queues under the cap like a task's.
+        mark = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0, landing="mark")
+        try:
+            assert mark and testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, wait_s=0,
+                                                 landing="coordinator") is None
+        finally:
+            mark and mark.close()
     finally:
         for g in hold:
             g and g.close()
@@ -5604,7 +5629,29 @@ def test_a_landing_check_never_waits_behind_task_checks_on_the_project_cap(env, 
     monkeypatch.setenv(landmark.ENV, "/nonexistent/forged-mark")
     assert not cli._landing_check(proj), "a forged landing mark path is no landing check"
     monkeypatch.setattr(landmark, "label", lambda env=None: {"pid": 1})
-    assert cli._landing_check(proj), "a run under a verified landing mark lands, even inside a task"
+    assert cli._landing_check(proj) == "mark", "a run under a verified landing mark lands, even inside a task"
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.setenv(coordtools.ROLE_ENV, "coordinator")
+    assert cli._landing_check(proj) == "mark", "the coordinator's run under a landing mark is a mark run"
+    monkeypatch.setattr(landmark, "label", lambda env=None: None)
+    assert cli._landing_check(proj) == "coordinator"
+
+
+def test_checks_slot_take_passes_its_landing_kind_to_the_lane_hold(env, monkeypatch, tmp_path):
+    # _checks_slot_take hands _landing_check(p) to the lane hold as `landing`, so a push batch's checks
+    # take the mark lane and the coordinator's own run its lane.
+    import types
+    from ttp import cli, testslots
+    _lane_env(monkeypatch)
+    proj = types.SimpleNamespace(name="pa", state=tmp_path / "state")
+    seen = []
+    monkeypatch.setattr(testslots, "suite_hold", lambda *a, **kw: seen.append(kw) or None)
+    for kind in ("mark", "coordinator", ""):
+        seen.clear()
+        monkeypatch.setattr(cli, "_landing_check", lambda p, kind=kind: kind if p is proj else "")
+        got = cli._checks_slot_take(proj, tmp_path / "run", None, "a" * 40, None, lambda *a: None, 0.0,
+                                    time.time(), "", None, 2, None, {}, _LANE_REPO, ["true"], "checks")
+        assert got is None and seen and seen[-1].get("landing") == kind, (kind, seen)
 
 
 def test_cap_turn_counts_one_lane_for_the_old_unkeyed_base(env, monkeypatch):

@@ -4922,17 +4922,20 @@ def _git_out(top: str, *args: str) -> str:
         return ""
 
 
-def _landing_check(p) -> bool:
-    """Whether this `ttp checks` run lands work rather than tests a task: it runs under a verified landing
-    mark (a push batch's or `ttp push`'s checks) or is the project's coordinator's own run for no task. Such
-    a run takes the project's landing lane (testslots.landing_room) and never waits behind its task checks
-    for the project cap. Any other task-less run (a user's, a script's) shares the project's lanes as before."""
+def _landing_check(p) -> str:
+    """Whether this `ttp checks` run lands work rather than tests a task, and how: "mark" under a verified
+    landing mark (a push batch's or `ttp push`'s checks), "coordinator" for the project's coordinator's own
+    run for no task, "" otherwise. Such a run takes a landing lane (testslots.landing_room) and never waits
+    behind its task checks for the project cap; a mark run never waits behind the coordinator's either. Any
+    other task-less run (a user's, a script's) shares the project's lanes as before."""
     from . import coordtools, landmark
     if not p:
-        return False
+        return ""
     if landmark.label() is not None:
-        return True
-    return not os.environ.get("TTP_TASK") and os.environ.get(coordtools.ROLE_ENV) == "coordinator"
+        return "mark"
+    if not os.environ.get("TTP_TASK") and os.environ.get(coordtools.ROLE_ENV) == "coordinator":
+        return "coordinator"
+    return ""
 
 
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
