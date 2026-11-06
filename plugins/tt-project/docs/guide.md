@@ -491,17 +491,23 @@ only in the feed and never under "needs you".
   reasons, user corrections), saved as `state/coord-session/<session id>.md`. The next session's
   first message carries the standing memory, the open order ledger, that handover note and the last
   20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
-  backstop. An injected instruction cannot ride across wakes as a user order: a handover line that
-  claims one (the user's-words label, a cited user message, "the user said ...") is kept only when it
-  cites a logged message from the user (msg #N) whose own words hold each of its quotes, the check
-  charter changes use (the owner's agent's words count too with `coordinator.agent_orders_as_user`);
-  a failing one is dropped and logged as an `order_claim_dropped` event, when it is saved and again
-  when it seeds the next session. A `memory_add` (in either coordinator mode) that quotes words as the
-  user's that fail the same check is refused; a paraphrase is stored as data. The wake after one whose
-  session compacted its history leads with the open order ledger and the last chat exchanges
-  verbatim, saying the summary is the session's own notes. Known gaps: only quotes are checked, so
-  unquoted text on a line with a checked quote is carried; a claim phrased past those patterns is
-  carried as the handover's data, never labelled as the user's word. A resumed wake sends only the digest sections
+  backstop. An injected instruction cannot ride across wakes as a user order: a handover line labelled as
+  the user's words ("user's word(s)", the owner's too, "User (msg #N):", "per the user/owner", "the
+  user/owner said|wrote" right before a quote) is kept only when it cites a logged message from the
+  user (msg #N) whose own words hold each of its quotes, the check charter changes use (the owner's
+  agent's words count too with `coordinator.agent_orders_as_user`); a failing or quote-less labelled
+  line is dropped and logged as an `order_claim_dropped` event, when it is saved and again when it
+  seeds the next session. Unlabelled lines (a paraphrase citing a msg, a quoted term) are carried as
+  the handover's data; put names and terms in backticks. The seed header vouches only for that drop:
+  nothing in the handover is the user's word unless the chat log, order ledger, memory or charter
+  shows it. A `memory_add` (in either coordinator mode) with a labelled line that fails the same check
+  is refused; a paraphrase is stored as data. A coordinator run's `ttp memory` writes are refused
+  (use `memory_add`); the user's own `ttp memory` is unchanged. The wake after one whose session
+  compacted its history leads with the open order ledger and the last chat exchanges verbatim, saying
+  the summary is the session's own notes. Known gaps: only quotes are checked, so unquoted text on a
+  labelled line with a checked quote is carried; a claim phrased past those label forms ("the user
+  ordered '...'", "as the user put it", "User:", another language) is not checked and is carried as
+  data under the header above. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
   line naming the sections left out. Only the Open tasks section, keyed by task id, and the Course
   check, keyed by sign and task id (`- costly: #<id>`), go row by row (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,

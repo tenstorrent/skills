@@ -44,7 +44,8 @@ session:
 3. Pending checks: what you mean to verify, how and when.
 4. Decisions with their reasons, so the next session does not decide them again.
 5. User corrections and standing orders not yet in memory, quoted verbatim with their msg #N:
-   a line claiming a user order whose quote is not in that logged message is dropped.
+   quoted text on a line labelled as the user's words must be that message's own words, or the
+   line is dropped; put names and terms in backticks.
 
 Give ids (task, message, run) with each fact, never a summary of the digest the next session sees
 anyway. What must outlive every session goes in memory (`memory_add`) as well. Return no

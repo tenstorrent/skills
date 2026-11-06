@@ -8906,6 +8906,10 @@ def cmd_memory(a) -> None:
         return
     if not a.text and not a.forget:
         sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
+    from . import coordtools
+    if a.text and coordtools.coordinator_run():   # also past the hook (a command a coordinator tool started)
+        sys.exit("ttp memory: a coordinator writes memory with the `memory_add` action (its `supersedes` too), which checks lines "
+                 "labelled as the user's words against the chat log; `ttp memory` writes are the user's own")
     if (a.title or a.audience) and not a.text:
         sys.exit("--title and --audience go with the memory's text")
     if a.permanent and not a.supersedes:
