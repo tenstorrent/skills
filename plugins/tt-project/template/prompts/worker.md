@@ -141,7 +141,8 @@ contradicts one: fix it in this run and say so in the hand-off. Never edit anoth
 
 Before you finish, write `$TTP_RUN_DIR/result.json` (new each run;
 never write to a run folder named in earlier context). Claude Code's Stop hook refuses a run without
-a valid one; elsewhere it fails an attempt. No `result.json`, no credit.
+a valid one; elsewhere it resumes once to write it where it can, then fails an attempt.
+No `result.json`, no credit.
 
 ```json
 {"status": "done | waiting | blocked | failed | needs_review",
