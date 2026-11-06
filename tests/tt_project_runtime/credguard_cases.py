@@ -61,7 +61,12 @@ def test_a_run_may_not_name_a_credential_store_in_bash(env, tmp_path, monkeypatc
                 "rsync -e 'ssh -o ProxyCommand=\"cat ~/.ssh/work-key\"' a b:",
                 "rsync -e 'ssh -i ~/.ssh/work-key; cat ~/.ssh/work-key' a b:",
                 "rsync -e 'chmod 600 ~/.ssh/work-key' ~/.ssh/work-key b:",
-                "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key' cat ~/.ssh/id_ed25519"):
+                "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key' cat ~/.ssh/id_ed25519",
+                # writes that name a store (an overwrite of gh's hosts file logs gh out host-wide);
+                # pathguard refuses the other writes into ~/.ssh and ~/.config/gh
+                "echo t > ~/.config/gh/hosts.yml", "printf t | tee ~/.config/gh/hosts.yml",
+                "cp /tmp/h $GH_CONFIG_DIR/hosts.yml", "sed -i s/a/b/ ~/.config/gh/hosts.yml",
+                "echo k > ~/.ssh/id_ed25519", "cp k ~/.ssh/work-key", "ssh box 'echo t > ~/.config/gh/hosts.yml'"):
         assert "credential stores" in _bash_why(tmp_path, cmd), cmd
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "ghc"))
     assert "credential stores" in _bash_why(tmp_path, f"cat {tmp_path}/ghc/hosts.yml")
