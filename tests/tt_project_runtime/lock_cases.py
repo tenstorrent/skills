@@ -1147,7 +1147,7 @@ def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
     from ttp import locks, shared
     unshare = shutil.which("unshare")
     probe_ns = [unshare, "--user", "--map-current-user", "--pid", "--fork", "--mount-proc", "true"] if unshare else []
-    if not unshare or subprocess.run(probe_ns, capture_output=True, timeout=30).returncode:
+    if not unshare or _run_to_end(probe_ns, timeout=30).returncode:
         pytest.skip("no unprivileged PID namespaces here")
     p = make(env)
     cfg = p.config()
@@ -1162,14 +1162,20 @@ def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
              f"open({str(ready)!r}, 'w').write('gone')\n"
              f"while os.path.exists({str(stop)!r}): time.sleep(0.05)\n")
     proc = subprocess.Popen(probe_ns[:-1] + [sys.executable, "-c", inner])
+
+    def took():
+        return ready.exists() and ready.read_text().strip().isdigit()
+
     try:
-        assert _wait_for(lambda: ready.exists() and ready.read_text().strip().isdigit(), 30), "taker never took it"
+        # Bounded, and over as soon as the taker answers or dies: a niced test on a busy host waits for CPU.
+        assert _wait_for(lambda: took() or proc.poll() is not None, 120) and took(), "taker never took it"
         out = _ttp_run(p, "lock", "--probe", "build-a").stdout
         assert "from another PID namespace; pid " in out and ") alive" in out, out
         rec = json.loads(_ttp_run(p, "lock", "--probe", "--json", "build-a").stdout)["holders"][0]
         assert rec["alive"] is True and rec["pidns"] != locks._pid_ns() and rec["via"] == "keeper", rec
         stop.touch()
-        assert _wait_for(lambda: ready.read_text() == "gone", 30)
+        assert _wait_for(lambda: ready.read_text() == "gone" or proc.poll() is not None, 120)
+        assert ready.read_text() == "gone", proc.poll()
         out = _ttp_run(p, "lock", "--probe", "build-a").stdout
         assert "(from another PID namespace, which no longer has it) gone" in out, out
     finally:
@@ -1179,6 +1185,37 @@ def test_lock_probe_sees_a_sandboxed_keeper_alive_then_gone(env, tmp_path):
         except subprocess.TimeoutExpired:
             proc.kill()
             proc.wait()
+
+
+def test_run_to_end_fails_only_a_command_still_running_at_its_deadline(monkeypatch):
+    """The sandboxed lock-probe tests failed under load with TimeoutExpired on commands that had already
+    ended with the right answer (unshare's 0, the probe's 75): the niced test process got the CPU back
+    only after the deadline. A clock that jumps past it once the command ended stands in for that."""
+    real, started, reads = subprocess._time, [], []
+
+    class Recorded(subprocess.Popen):
+        def __init__(self, *a, **k):
+            super().__init__(*a, **k)
+            started.append(self)
+
+    def starved():   # the deadline is set on the first read; this process wakes after the command ended
+        reads.append(started[-1] if started else None)
+        if reads.count(reads[-1]) > 1 and started:
+            if started[-1].returncode is None:
+                os.waitid(os.P_PID, started[-1].pid, os.WEXITED | os.WNOWAIT)   # ended, not yet reaped
+            return real() + 3600
+        return real()
+
+    monkeypatch.setattr(subprocess, "Popen", Recorded)
+    monkeypatch.setattr(subprocess, "_time", starved)
+    with pytest.raises(subprocess.TimeoutExpired):   # what the tests saw
+        subprocess.run(["sh", "-c", "echo out; exit 75"], capture_output=True, timeout=30)
+    r = _run_to_end(["sh", "-c", "echo out; exit 75"], text=True, timeout=30)
+    assert (r.returncode, r.stdout) == (75, "out\n")
+    monkeypatch.setattr(subprocess, "_time", real)
+    with pytest.raises(subprocess.TimeoutExpired):   # one still running at its deadline still fails, killed
+        _run_to_end(["sleep", "30"], timeout=0.5)
+    assert started[-1].returncode == -signal.SIGKILL
 
 
 def _foreign_run(p, task, run_id):
@@ -1289,7 +1326,7 @@ def test_lock_probe_inside_a_real_sandbox_sees_a_live_keeper_outside_it_through_
     from ttp import hold, locks
     unshare = shutil.which("unshare")
     ns = [unshare, "--user", "--map-current-user", "--pid", "--fork", "--mount-proc"] if unshare else []
-    if not unshare or subprocess.run(ns + ["true"], capture_output=True, timeout=30).returncode:
+    if not unshare or _run_to_end(ns + ["true"], timeout=30).returncode:
         pytest.skip("no unprivileged PID namespaces here")
     p = make(env)
     t = p.db.add_task("holder", "s", kind="work", origin="user")
@@ -1303,8 +1340,8 @@ def test_lock_probe_inside_a_real_sandbox_sees_a_live_keeper_outside_it_through_
         (rd / hold.BEAT).touch()
 
         def inside():
-            r = subprocess.run(ns + [sys.executable, str(TTP), "lock", "--probe", "--json", "build-a"],
-                               capture_output=True, text=True, timeout=60, env=dict(os.environ, TTP_PROJECT=str(p.base)))
+            r = _run_to_end(ns + [sys.executable, str(TTP), "lock", "--probe", "--json", "build-a"],
+                            text=True, timeout=60, env=dict(os.environ, TTP_PROJECT=str(p.base)))
             assert r.returncode == 75, (r.returncode, r.stdout, r.stderr)
             return json.loads(r.stdout)["holders"][0]
 

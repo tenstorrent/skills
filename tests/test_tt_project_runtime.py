@@ -3525,6 +3525,23 @@ def _load_scaled(seconds: float) -> float:
             factor = 1
     return seconds * min(max(factor, 1.0), 8.0)
 
+
+def _run_to_end(argv, timeout=30, **kw):
+    """subprocess.run(argv, capture_output=True, timeout=timeout, **kw), but the deadline fails only a
+    command still running. On a busy host this test process (a niced worker) may get the CPU back only
+    after the deadline, when the command already ended with its answer; communicate() checks the clock
+    once select returns and raises TimeoutExpired anyway. A command that ended is read to its end."""
+    with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate()
+                raise
+            out, err = proc.communicate(timeout=timeout)   # still bounded: something it left may hold its pipes
+    return subprocess.CompletedProcess(argv, proc.returncode, out, err)
+
 def _wait_for(pred, timeout=30.0) -> bool:
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -34676,8 +34693,7 @@ def _ttp_run(p, *args, env=None, cwd=None, timeout=30):
     for var in ("TTP_RUN_DIR", "TTP_LOCKS_HELD", "TTP_DETACHED"):
         if var not in (env or {}):
             e.pop(var, None)
-    return subprocess.run([sys.executable, str(TTP), *args], env=e, cwd=cwd or str(p.root),
-                          capture_output=True, text=True, timeout=timeout)
+    return _run_to_end([sys.executable, str(TTP), *args], env=e, cwd=cwd or str(p.root), text=True, timeout=timeout)
 
 
 def test_device_names_share_one_lock():
