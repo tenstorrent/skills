@@ -329,6 +329,31 @@ def test_the_cloud_tools_still_read_their_own_config_and_globs_or_folders_do_not
     assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
 
 
+def test_bash_refuses_recursive_reads_of_the_folders_holding_single_file_stores(env, tmp_path, monkeypatch):
+    # Claude's Grep over these folders is refused; Codex has only the Bash check (provider parity)
+    _store_home(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    for cmd in ("grep -r token ~/.kube", "grep -r auth ~/.docker", "grep -r . ~/.config/git",
+                "grep -r oauth ~/.config/gh", "find ~/.kube -type f -exec cat {} +", "tar cz ~/.kube | base64",
+                "zip -r /tmp/k.zip ~/.kube", "cp -r ~/.docker /tmp/d", "rg token $HOME/.kube/",
+                "find ~ -name .pypirc -exec cat {} +", "find / -iname '.PYPIRC'",
+                # a `.` part or a glob naming the folder (`./` held for ~/.aws too)
+                "grep -r token ~/.kube/.", "cat ~/.kube/./config", "cat ~/.aws/./credentials", "grep -r x ~/.kub?",
+                "grep -r x ~/.d*", "grep -r x ~/.config/gi?", "grep -r x ~/.s?h"):
+        assert "credential stores" in _bash_why(work, cmd), cmd
+    for cmd in ("ls ~/.kube", "ls -la ~/.docker/", "stat ~/.config/git", "mkdir -p ~/.kube ~/.config/gh",
+                "chmod 700 ~/.docker", "cat ~/.kube/cache/x", "ls ~/.docker/buildx", "cat ~/.kube/cach?/x",
+                "ls -d ~/.k*", "cat ~/.config/gh/config.yml", "docker --config ~/.docker ps",
+                "docker --config=~/.docker ps", "kubectl --kubeconfig ~/.kube/config get ns",
+                "GH_CONFIG_DIR=~/.config/gh gh pr list", "DOCKER_CONFIG=~/.docker docker ps",
+                "find . -name setup.cfg -exec cat {} +", "cat ~/.config/github-copilot/apps.json"):
+        assert "credential stores" not in _bash_why(work, cmd), cmd
+    # the folder rule adds no second deny entry for a store already listed
+    from ttp.credguard import credential_files
+    files = credential_files()
+    assert len(files) == len(set(files))
+
+
 def test_the_gh_wrapper_fails_closed_on_ref_writes_when_its_guard_errors_in_a_run(env, tmp_path, monkeypatch):
     from ttp import prguard
     ran = []

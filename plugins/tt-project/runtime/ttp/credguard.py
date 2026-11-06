@@ -16,10 +16,12 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
   read them themselves: a key given to ssh by `-i` or `-o IdentityFile=`, a key path handed to
   ssh-add or ssh-keygen, a config given by its tool's option (`kubectl --kubeconfig`, CONFIG_OPTIONS)
   or variable (`KUBECONFIG=`, CONFIG_VARS), mkdir, chmod, chown, touch and test of them, and ls or
-  stat of a store folder itself pass; kubectl, docker, gcloud, aws and az read their own config
-  unnamed. The words of a command ssh runs on another host are checked the same way, quotes
+  stat of a store folder itself pass (any other mention of the folder, or a glob naming it, does
+  not); kubectl, docker, gcloud, aws and az read their own config unnamed. The words of a command
+  ssh runs on another host are checked the same way, quotes
   are dropped before the check (~/.ss''h), and a find whose name test matches a private key or
-  credential file is refused. Known gap: a path built at run time inside a script or inline code.
+  credential file is refused. Known gaps: a path built at run time inside a script or inline code, and a
+  recursive read of all of HOME or ~/.config (`grep -r x ~`).
 Secrets stay reachable only through `ttp secret env` (hook.secret_read).
 
 Pushes go only through `ttp push` and the push queue. The run's bin/gh (prguard.check) refuses, inside
@@ -50,18 +52,22 @@ STORE_RE = re.compile(r"(?:(?<![\w.-])gh|GH_CONFIG_DIR\}?)/+hosts\.ya?ml\b|(?<![
                       r"|(?:(?<![\w.-])\.docker|DOCKER_CONFIG\}?)/+config\.json\b|(?<![\w.-])\.kube/+config\b"
                       r"|(?<![\w.-])\.pypirc\b|(?:(?<![\w.-])\.config|XDG_CONFIG_HOME\}?)/+git/+credentials(?![\w.-])")
 # Store folders (the variable that moves each) and the entries in them that hold a token or key; their
-# other entries hold none (aws `config`, gcloud `configurations`, azure `azureProfile.json`)
+# other entries hold none (aws `config`, gcloud `configurations`, azure `azureProfile.json`, kube `cache`,
+# docker `buildx`, gh `config.yml`). A bare folder counts (`grep -r token ~/.kube`), but to ls, stat or mkdir it
 DIR_STORES = {".aws": (None, ("credentials", "sso", "cli")),
               ".config/gcloud": ("CLOUDSDK_CONFIG", ("credentials.db", "access_tokens.db", "legacy_credentials",
                                                     "application_default_credentials.json")),
               ".azure": ("AZURE_CONFIG_DIR", ("accessTokens.json", "msal_token_cache.json", "msal_token_cache.bin",
-                                              "service_principal_entries.json", "service_principal_entries.bin"))}
+                                              "service_principal_entries.json", "service_principal_entries.bin")),
+              ".kube": (None, ("config",)), ".docker": ("DOCKER_CONFIG", ("config.json",)),
+              ".config/git": (None, ("credentials",)), ".config/gh": ("GH_CONFIG_DIR", ("hosts.yml", "hosts.yaml"))}
 DIR_RES = {d: re.compile(r"(?<![\w.-])" + re.escape(d).replace("/", "/+") + r"(?:/+([^\s\"'`;&|<>()]*))?(?![\w.-])")
            for d in DIR_STORES}
 # A tool's option or a variable that hands the tool its own config file: the tool reads it, the run does not
-CONFIG_OPTIONS = {"kubectl": "--kubeconfig", "helm": "--kubeconfig", "k9s": "--kubeconfig", "twine": "--config-file"}
+CONFIG_OPTIONS = {"kubectl": "--kubeconfig", "helm": "--kubeconfig", "k9s": "--kubeconfig", "twine": "--config-file",
+                  "docker": "--config"}
 CONFIG_VARS = ("KUBECONFIG=", "DOCKER_CONFIG=", "AWS_SHARED_CREDENTIALS_FILE=", "CLOUDSDK_CONFIG=",
-               "AZURE_CONFIG_DIR=", "GOOGLE_APPLICATION_CREDENTIALS=")
+               "AZURE_CONFIG_DIR=", "GOOGLE_APPLICATION_CREDENTIALS=", "GH_CONFIG_DIR=")
 SSH_FAMILY = {"ssh", "scp", "sftp", "autossh", "ssh-copy-id"}
 # ssh -o options that only name a key or a socket ssh opens itself (never ProxyCommand: it runs a command)
 SSH_KEY_OPTION_RE = re.compile(r"(?:IdentityFile|CertificateFile|ControlPath|IdentityAgent)[\s=]", re.I)
@@ -78,7 +84,7 @@ SSH_COMMAND_VARS = ("GIT_SSH_COMMAND=", "RSYNC_RSH=")
 SSH_VALUE_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
 # Names find may look for that only private keys and credential files have
 FIND_SECRET_NAMES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk",
-                     ".git-credentials", ".netrc")
+                     ".git-credentials", ".netrc", ".pypirc")
 FIND_NAME_TESTS = {"-name": False, "-iname": True}
 WHY = ("a run never reads credential stores (ssh private keys, gh's hosts file or `gh auth token`, git and netrc "
        "credential files, the agents' login files, cloud, docker, kube and PyPI credentials): what it prints stays "
@@ -121,10 +127,11 @@ def ssh_public(name: str) -> bool:
 
 def dir_public(store: str, name: str) -> bool:
     """`name` (a path under the DIR_STORES folder `store`) holds no token or key: it is none of the
-    folder's secret entries, under one, a glob that takes one, or the folder itself."""
-    first = name.strip("/").split("/", 1)[0]
-    if not first or ".." in name.split("/"):
+    folder's secret entries, under one, a glob that takes one, or the folder itself (`./` parts dropped)."""
+    parts = [p for p in name.split("/") if p not in ("", ".")]
+    if not parts or ".." in parts:
         return False
+    first = parts[0]
     from fnmatch import fnmatchcase
     return not any(fnmatchcase(n, first) for n in DIR_STORES[store][1])
 
@@ -143,7 +150,7 @@ def _stores(home: Path) -> list[Path]:
         out.append(Path(env("AWS_SHARED_CREDENTIALS_FILE")))
     for d, (var, names) in DIR_STORES.items():
         out += [Path(var and env(var) or home / d) / n for n in names]
-    return out
+    return list(dict.fromkeys(out))
 
 
 def credential_files(home: str | Path | None = None) -> list[str]:
@@ -276,6 +283,12 @@ def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = 
     globs = [os.path.expandvars(os.path.expanduser(w.split("=", 1)[-1])) for argv in segments
              if os.path.basename(argv[0]) not in SILENT | LISTERS for w in argv[1:] if re.search(r"[*?\[]", w)]
     if globs and any(_glob_takes(g, s) for g in globs if g.startswith("/") for s in credential_files(home)):
+        return WHY
+    # or to a store's folder itself (`grep -r token ~/.kub?`)
+    home = Path(home or os.path.expanduser("~"))
+    folders = [str(Path(var and os.environ.get(var) or home / d)) for d, (var, _) in DIR_STORES.items()]
+    if any(g.rstrip("/").count("/") == f.count("/") and _glob_takes(g, f)
+           for g in globs if g.startswith("/") for f in folders + [str(home / ".ssh")]):
         return WHY
     return None
 

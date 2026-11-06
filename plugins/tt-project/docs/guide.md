@@ -2977,8 +2977,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `git credential fill`. The tools read their own config untouched: kubectl, helm, docker, aws,
   gcloud, az, twine and git, also `--kubeconfig <file>` (kubectl, helm, k9s), twine's
   `--config-file`, and `KUBECONFIG`, `DOCKER_CONFIG`, `AWS_SHARED_CREDENTIALS_FILE`,
-  `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR` or `GOOGLE_APPLICATION_CREDENTIALS` set to one; `ls` of a
-  store's folder passes, a glob, `..` or a second mention does not.
+  `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, `GOOGLE_APPLICATION_CREDENTIALS` or `GH_CONFIG_DIR` set to
+  one, and `docker --config <dir>`; `ls`, `stat`, `mkdir` or `chmod` of a store's folder (`~/.kube`,
+  `~/.docker`, `~/.config/git`, `~/.config/gh`, the cloud folders) passes, any other mention of the
+  folder (`grep -r token ~/.kube`, `tar cz ~/.docker`), a glob naming it, `..` or a second mention
+  does not.
   ssh, git and gh still read them themselves: `ssh -i <key>`, `-o IdentityFile=`, `ssh-add`,
   `ssh-keygen`, and chmod or test of a key pass, also as the ssh command given to rsync (`-e`,
   `--rsh`, `RSYNC_RSH`) or git (`GIT_SSH_COMMAND`, `-c core.sshCommand=`); a `stat` with a format
@@ -2986,8 +2989,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `..` part never counts as public. A command ssh runs on another host is checked the
   same way (`ssh box 'mkdir -p ~/.ssh'` passes, `ssh box cat ~/.ssh/<key>` does not), quotes inside
   a path do not hide it, and a `find` looking for a private key or credential file by name is
-  refused. Known gaps: a path a script builds at run time, and a variable read later
-  (`cat $KUBECONFIG`). Provider parity: docs/providers.md (Codex runs get the Bash check only,
+  refused. Known gaps: a path a script builds at run time, a variable read later
+  (`cat $KUBECONFIG`), and a recursive read of all of HOME or `~/.config` (`grep -r x ~`,
+  `find ~ -name config.json -exec cat {} +`). Provider parity: docs/providers.md (Codex runs get the Bash check only,
   Cursor runs none).
 - Pushes go only through `ttp push` and the push queue. Inside a run, the harness's gh refuses `gh api`
   calls that create, move or delete refs or tags, write file contents, merge branches, update a PR's
