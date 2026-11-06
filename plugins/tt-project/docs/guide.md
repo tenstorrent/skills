@@ -1871,6 +1871,8 @@ session and stateless coordinators on every provider.
   they never queue behind task checks: each push branch has one priority slot of its own beyond the
   cap, shared host-wide across projects. Task checks keep their cap and their order. The batch log
   and `ttp status` say when a push holds it (`push priority slot: ...`); a killed push frees it too.
+  A push waiting behind another holder of its slot waits `checks.push_priority_wait_s` at most
+  (account-level, default 1800 s), then says who held it and takes an ordinary host-wide turn instead.
   Waiters take turns by project, within one by task priority. Checks of priority-1 tasks (live-impact
   work: heal self-fixes and interim mitigations are filed at priority 1) go ahead of other projects'
   waiters, taking turns by project among themselves, but at most `checks.priority_turns` turns in a

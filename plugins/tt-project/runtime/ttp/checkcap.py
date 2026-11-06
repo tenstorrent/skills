@@ -31,7 +31,10 @@ approved change waits on them: they never queue behind task checks. Each push br
 slot of its own beyond the cap (`acquire_priority`), keyed by the remote and branch so it is one per
 branch host-wide, across projects. `ttp land`'s checks take one too, keyed by the repository's path
 and the local branch it moves (push.priority_key with no remote). Task checks keep their cap and their order: the priority slot never
-takes one of theirs. It is an OS file lock like the others, so a killed push frees it too.
+takes one of theirs. It is an OS file lock like the others, so a killed push frees it too. A push waiting
+behind another holder of its priority slot waits `checks.push_priority_wait_s` (TTP_CHECKS_PRIORITY_WAIT_S,
+default PRIORITY_WAIT_S) at most, then takes an ordinary host-wide turn instead (its caller's `fallback`), so a
+holder that is itself stuck or waiting never holds every later push of its branch or lane for hours.
 
 Checks of urgent tasks (priority 1 or better, an `urgent:` spec line: user-ordered and live-impact work,
 heal self-fixes, interim mitigations, the review of an urgent change) go next: ahead of every routine
@@ -149,6 +152,8 @@ UPGRADE_SETTLE_S = 10.0   # a newly installed version is adopted once seen this 
 EXTRA_SLOTS = 2   # at most this many slots beyond the cap while the host is lightly loaded (extra())
 PRIORITY_TURNS = locks.URGENT_FIRST   # urgent checks always first (priority_turns(); N > 0 bounds their run)
 PARKED = "checks-parked"   # the queue of runs waiting outside the checks queue for their test slots (acquire)
+PRIORITY_WAIT_S = 1800.0   # default checks.push_priority_wait_s: the longest wait behind another priority holder
+PRIORITY_WAIT_ENV = "TTP_CHECKS_PRIORITY_WAIT_S"
 STARVE_S = 3600.0   # default checks.starve_s: a run waiting this long goes before later arrivals at its priority or lower
 AGED_TURNS = 3   # default urgent turns an aged routine run lets go before its own (aged_turns())
 STARVE_ENV = "TTP_CHECKS_STARVE_S"
@@ -443,6 +448,19 @@ def starve_s() -> float:
     except (TypeError, ValueError):
         v = STARVE_S
     return v if 0 < v < math.inf else STARVE_S
+
+
+def priority_wait_s() -> float:
+    """Seconds a push waits at most behind another holder of its priority slot before it takes an ordinary
+    host-wide turn (acquire_priority's `fallback`): TTP_CHECKS_PRIORITY_WAIT_S, else the account's
+    checks.push_priority_wait_s, else PRIORITY_WAIT_S. Zero, negative, infinite or unreadable: the default."""
+    try:
+        v = float(os.environ.get(PRIORITY_WAIT_ENV)
+                  or (project.load_account_settings().get("checks") or {}).get("push_priority_wait_s")
+                  or PRIORITY_WAIT_S)
+    except (TypeError, ValueError):
+        v = PRIORITY_WAIT_S
+    return v if 0 < v < math.inf else PRIORITY_WAIT_S
 
 
 def aged_turns() -> int:
@@ -806,6 +824,7 @@ class Slot:
         self.spill = None   # a claim on a spill host the checks run on instead (checkspill.Claim)
         self.urgent = False   # a reserved urgent slot beyond the cap (acquire's `urgent`, urgent_key)
         self.since = time.time()   # when it was granted: an older preempt request is not for it (preempted)
+        self.fell_back = False   # a push's ordinary turn, taken after its priority slot stayed held (acquire_priority)
 
     def env(self) -> dict[str, str]:
         """For the check commands' environment: a `ttp checks` or push nested in them runs at once."""
@@ -1332,11 +1351,14 @@ def _take_in_turn(n: int, ticket: Path, ps: list[Path], every: list[Path], holde
 
 
 def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str], None] | None = None,
-                     project_name: str | None = None, state: Path | None = None) -> Slot:
+                     project_name: str | None = None, state: Path | None = None,
+                     fallback: Callable[[], Slot] | None = None) -> Slot:
     """Take the priority slot of the push branch `key` (beyond the cap, ahead of every task waiting in
     the queue), saying so through `tell`. Only another push to the same branch can hold it; then this
-    waits for that one alone. Cap off or nested: no slot, run at once. An unwritable slot directory
-    raises Unavailable. With `state` the slot taken is logged there as for acquire."""
+    waits for that one alone, priority_wait_s() at most when `fallback` is given: past that it says who
+    held it and returns `fallback()` (an ordinary turn), marked `fell_back`. Cap off or nested: no slot,
+    run at once. An unwritable slot directory raises Unavailable. With `state` the slot taken is logged
+    there as for acquire."""
     n = limit()
     if not n or os.environ.get(HELD_ENV):
         return Slot()
@@ -1356,6 +1378,14 @@ def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str]
                      + (f" after {(time.time() - started) / 60:.1f} min" if told else ""))
             record_wait(state, project_name, None, started, time.time(), "push")
             return Slot(f)
+        if fallback is not None and time.time() - started >= (bound := priority_wait_s()):
+            if tell:
+                tell(f"the push priority slot stayed held {bound / 60:g} min by "
+                     f"{_some(locks.held_labels([path])) or 'unknown'} (checks.push_priority_wait_s): taking an "
+                     "ordinary host-wide checks turn instead")
+            slot = fallback()
+            slot.fell_back = True
+            return slot
         if tell and time.time() - told >= TELL_S:
             tell(f"waiting for the push priority slot, held by another push to the same branch: "
                  f"{_some(locks.held_labels([path])) or 'unknown'}")

@@ -912,17 +912,22 @@ def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: s
     state = proj.state if proj else None
     if not who:
         who = checkcap.label(name, "ttp push")
-    if priority:
-        slot = checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state)
-    else:
+
+    def turn() -> checkcap.Slot:   # an ordinary turn in the host-wide queue
         prio, owns = checkcap.task_rank(proj)
         # Its slot is taken once its test slots could be (pool_room) and the host's load lets a suite
         # start (load_held: one run per load pass passes the guard): it never holds one while it waits for either.
         cfg = proj.config() if proj else {}
-        slot = checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
+        return checkcap.acquire(who, f"push checks on {head[:12]}", say, project_name=name,
                                 priority=prio, state=state, owns=owns,
                                 startable=None if os.environ.get(testslots.HELD_ENV)
                                 else lambda: not testslots.load_held(prio) and testslots.pool_room(cfg, name))
+    # A priority slot another push holds past checkcap.priority_wait_s(): an ordinary turn instead, on the
+    # pool's test slots (its reserved lane may be that holder's).
+    slot = checkcap.acquire_priority(priority, who, f"push checks on {head[:12]}", say, name, state,
+                                     fallback=turn) if priority else turn()
+    if getattr(slot, "fell_back", False):
+        priority = ""
     # The run's share of the host's test-worker slots, held and freed with the checks slot (testslots);
     # push-priority checks take the branch's reserved test slot when the pool has none free.
     slot.tests = testslots.acquire(who, say, cfg=proj.config() if proj else {}, project_name=name or "",

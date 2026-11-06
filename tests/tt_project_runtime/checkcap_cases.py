@@ -7109,6 +7109,57 @@ def test_checks_status_names_the_push_priority_holder_and_each_waiters_wait(env,
         locks.dequeue(fresh)
 
 
+def test_a_push_priority_slot_held_by_a_stuck_push_bounds_the_next_pushs_wait_then_it_takes_an_ordinary_turn(
+        env, monkeypatch):
+    """Another push holding the branch's priority slot (stuck, or itself waiting) holds the next push only
+    checks.push_priority_wait_s: past it the waiter says who held it and takes an ordinary host-wide turn,
+    on the pool's test slots rather than the reserved lane. A free slot is still taken at once, a caller
+    without a fallback keeps its old wait, and a bad bound keeps the default."""
+    import threading
+    from ttp import checkcap, push, testslots
+    p = make(env)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
+    monkeypatch.setenv(checkcap.PRIORITY_WAIT_ENV, "0.3")
+    key = "git@example:org/repo#main"
+    stuck = checkcap.acquire_priority(key, "proj2 push batch 1", "push checks")
+    try:
+        told, fell = [], []
+        start = time.time()
+        got = checkcap.acquire_priority(key, "proj push batch 2", "push checks", told.append,
+                                        fallback=lambda: fell.append(1) or checkcap.acquire("proj push batch 2"))
+        try:
+            assert got.fell_back and fell and got.f is not None, "an ordinary host-wide slot"
+            assert time.time() - start < 5, "bounded"
+            assert any("stayed held" in t and "proj2 push batch 1" in t and "ordinary host-wide" in t
+                       for t in told), told
+        finally:
+            got.close()
+        # push.check_slot: the fallback turn takes test slots from the pool, never the reserved lane.
+        keys = []
+        monkeypatch.setattr(testslots, "acquire", lambda *a, **k: keys.append(k.get("push_key")))
+        push.check_slot("abc", told.append, priority=key, proj=p).close()
+        assert keys == [""], keys
+        # No fallback: the old wait (only another push to the branch), unbounded.
+        done = []
+        t = threading.Thread(target=lambda: done.append(checkcap.acquire_priority(key, "proj push 3")), daemon=True)
+        t.start()
+        t.join(1.0)
+        assert not done, "a caller without a fallback waits for the holder"
+    finally:
+        stuck.close()
+    t.join(5)
+    assert done and not done[0].fell_back
+    done[0].close()
+    # A free priority slot is taken at once, no fallback.
+    free = checkcap.acquire_priority(key, "proj push 4", fallback=lambda: pytest.fail("no fallback"))
+    assert not free.fell_back and free.f is not None
+    free.close()
+    for bad in ("0", "-5", "inf", "x"):
+        monkeypatch.setenv(checkcap.PRIORITY_WAIT_ENV, bad)
+        assert checkcap.priority_wait_s() == checkcap.PRIORITY_WAIT_S, bad
+
+
 def test_detached_checks_waiting_for_a_slot_keep_their_place_after_their_worker_run_hands_off(
         env, tmp_path, monkeypatch, capsys):
     # A real `ttp checks --detach` parks for the host-wide slot, then its worker run ends (exit.json): another
