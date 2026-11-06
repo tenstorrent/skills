@@ -209,16 +209,88 @@ def test_overrides_fail_as_assertions(fields):
     ([], "ttnn-visualizer --profiler-path 'x'"),
     ([], "ttnn-visualizer --performance-path 'x'"),
     ([], "ttnn-visualizer --server --host 127.0.0.1 --memory-report-path 'x'"),
+    # The agent starting the app itself, behind a prefix or a wrapper.
+    ([tool_use("Bash", {"command": "cd r && ttnn-visualizer --host 127.0.0.1"})], ""),
+    ([tool_use("Bash", {"command": "nohup ttnn-visualizer --host 127.0.0.1 &"})], ""),
+    ([tool_use("Bash", {"command": "timeout 60 /opt/bin/ttnn-visualizer"})], ""),
+    ([tool_use("Bash", {"command": "uv run --with x ttnn-visualizer"})], ""),
+    ([tool_use("Bash", {"command": "FOO=1 env BAR=2 ttnn-visualizer"})], ""),
+    # Commands handed over that would not stay local.
+    ([], "ttnn-visualizer --serv --host 127.0.0.1 --memory-report-path 'x'"),
+    ([], "ttnn-visualizer"),
+    ([], "ttnn-visualizer --host 0.0.0.0 --memory-report-path 'x'"),
+    ([], "ttnn-visualizer --host=0.0.0.0 --memory-report-path 'x'"),
+    ([], "cd r && ttnn-visualizer --memory-report-path 'x'"),
 ])
 def test_assert_left_to_user_catches_what_belongs_to_the_user(events, command):
     with pytest.raises(AssertionError):
         viz.assert_left_to_user(result(events, command=command))
 
 
-def test_assert_left_to_user_passes_reads_and_a_local_app_command():
-    events = [tool_use("Bash", {"command": "ls reports"}), tool_use("Read", {"file_path": "x"})]
-    viz.assert_left_to_user(
-        result(events, command="ttnn-visualizer --host 127.0.0.1 --memory-report-path 'x'"))
+@pytest.mark.parametrize("command", [
+    "",
+    "ttnn-visualizer --host 127.0.0.1 --memory-report-path 'x'",
+    "ttnn-visualizer --host=127.0.0.1 --memory-report-path 'x'",
+    "ttnn-visualizer --host localhost --memory-report-path 'x'",
+    "ttnn-visualizer --ho ::1 --memory-report-path 'x' --performance-path 'y'",
+    "cd r && ttnn-visualizer --host 127.0.0.1 --memory-report-path x",
+    "tt-perf-report 'ops_perf_results.csv'",
+])
+def test_assert_left_to_user_passes_reads_and_a_local_app_command(command):
+    events = [tool_use("Bash", {"command": "ls reports"}), tool_use("Read", {"file_path": "x"}),
+              tool_use("Bash", {"command": "grep ttnn-visualizer notes.md"})]
+    viz.assert_left_to_user(result(events, command=command))
+
+
+def test_simple_commands_split_operators_and_strip_wrappers():
+    assert viz.simple_commands("cd r && nohup timeout -s KILL 60 ttnn-visualizer --port 1 &") \
+        == [["cd", "r"], ["ttnn-visualizer", "--port", "1"]]
+    assert viz.simple_commands("X=1 uv run --python 3.12 tt-perf-report a.csv | head\nls") \
+        == [["tt-perf-report", "a.csv"], ["head"], ["ls"]]
+    assert viz.simple_commands("echo 'a && b'") == [["echo", "a && b"]]
+    assert viz.simple_commands("echo 'unterminated") == [["echo", "'unterminated"]]
+
+
+def test_app_options_resolve_like_argparse():
+    argv = ["ttnn-visualizer", "--host=::1", "--memory-report", "m", "--perf", "p", "--serv"]
+    assert viz.app_options(argv) == {"--host": ["::1"], "--memory-report-path": ["m"],
+                                     "--performance-path": ["p"], "--server": [""]}
+    # --p is ambiguous (--profiler-path, --performance-path, --port): kept as written.
+    assert viz.app_options(["ttnn-visualizer", "--p", "x"]) == {"--p": [""]}
+
+
+@pytest.mark.parametrize("command, registers", [
+    ("claude mcp add ttnn-visualizer -- ttnn-visualizer-mcp", True),
+    ("codex mcp add ttnn-visualizer -- /opt/bin/ttnn-visualizer-mcp", True),
+    ("pip install ttnn-visualizer && codex mcp add ttnn-visualizer -- ttnn-visualizer-mcp",
+     True),
+    ("echo ttnn-visualizer-mcp", False),
+    ("claude mcp list", False),
+])
+def test_registers_server(command, registers):
+    assert viz.registers_server(command) is registers
+
+
+@pytest.mark.parametrize("command, runs", [
+    ("tt-perf-report ops_perf_results_2026.csv", True),
+    ("tt-perf-report --start-signpost a '<csv>'", True),
+    ("tt-perf-report", False),
+    ("tt-perf-report --help", False),
+    ("echo use tt-perf-report x.csv", False),
+])
+def test_perf_report_command(command, runs):
+    assert viz.perf_report_command(command) is runs
+
+
+@pytest.mark.parametrize("text, named", [
+    ("paged_scaled_dot_product_attention_decode", True),
+    ("The peak is `Paged_Scaled_Dot_Product_Attention_Decode` (op 812)", True),
+    ("scaled_dot_product_attention_decode", False),
+    ("paged_scaled_dot_product_attention_decode_v2", False),
+    ("ttnn.experimental.paged_scaled_dot_product_attention_decode", True),
+])
+def test_names_op_matches_whole_names(text, named):
+    assert viz.names_op(text, "paged_scaled_dot_product_attention_decode") is named
 
 
 VIZ = "mcp__ttnn-visualizer__"

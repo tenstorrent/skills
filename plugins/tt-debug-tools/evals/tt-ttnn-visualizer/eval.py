@@ -39,19 +39,148 @@ TOOLS = ("load_report", "errors", "l1_peak", "memory_profile", "operation_detail
 TOOL_RE = re.compile(r"(?<![A-Za-z0-9])(" + "|".join(TOOLS) + r")(?![A-Za-z0-9_])")
 
 # What the agent must leave to the user: installing, registering, starting the
-# app. Bash is absent under --restricted; this guards hosts that keep it.
+# app. Bash is absent under --restricted; this guards hosts that keep it. The
+# app itself is caught by parsing the command (`app_invocations`), not here.
 FORBIDDEN_COMMAND = re.compile(
     r"pip3?\s+install|python\d*(\.\d+)?\s+-m\s+pip|uv\s+(tool\s+install|add|pip)"
-    r"|pipx|conda\s+install|mcp\s+add|sqlite3|^\s*ttnn-visualizer(?![-\w])",
-    re.M,
+    r"|pipx|conda\s+install|mcp\s+add|sqlite3",
 )
 EDIT_TOOLS = {"Write", "Edit", "MultiEdit", "NotebookEdit"}
 HOST_CONFIG = re.compile(r"\.mcp\.json$|\.claude\.json$|\.claude/settings[^/]*\.json$"
                          r"|\.codex/config\.toml$")
 
 PLAIN_NAME = re.compile(r"[\w.-]+")
-# The app command's report flags, current and deprecated.
-APP_PATH_FLAG = re.compile(r"--(memory-report|profiler|performance)-path(?![-\w])")
+
+# ttnn-visualizer's long options (backend/ttnn_visualizer/app.py). It parses
+# them with argparse, so `--opt=value` and any unambiguous prefix work.
+APP_OPTIONS = ("--memory-report-path", "--profiler-path", "--performance-path",
+               "--tt-metal-home", "--host", "--port", "--server", "--daemon",
+               "--check-config")
+APP_VALUED = {"--memory-report-path", "--profiler-path", "--performance-path",
+              "--tt-metal-home", "--host", "--port"}
+LOOPBACK = {"127.0.0.1", "localhost", "::1", "[::1]"}
+SHELL_OPERATORS = {";", "&&", "||", "|", "&", "|&", ";;", "(", ")"}
+# Words that run the command after them: `nohup x`, `timeout 60 x`, `uv run x`.
+PLAIN_WRAPPERS = {"nohup", "exec", "time", "command", "sudo", "builtin", "setsid"}
+ASSIGNMENT = re.compile(r"[A-Za-z_]\w*=")
+
+
+def simple_commands(text: str) -> list[list[str]]:
+    """Each simple command in a shell string as an argv, with leading variable
+    assignments and wrappers such as `nohup`, `timeout 60`, `env X=1` and
+    `uv run` removed. `cd r && x` gives two commands. A string that does not
+    parse as shell falls back to whitespace splitting."""
+    commands = []
+    for line in (text or "").splitlines():
+        lexer = shlex.shlex(line, posix=True, punctuation_chars=True)
+        lexer.whitespace_split = True
+        lexer.commenters = "#"
+        try:
+            tokens = list(lexer)
+        except ValueError:
+            tokens = line.split()
+        argv = []
+        for token in tokens + [";"]:
+            if token in SHELL_OPERATORS:
+                argv = _unwrap(argv)
+                if argv:
+                    commands.append(argv)
+                argv = []
+            else:
+                argv.append(token)
+    return commands
+
+
+def _unwrap(argv: list[str]) -> list[str]:
+    i = 0
+    while i < len(argv):
+        word = argv[i]
+        if ASSIGNMENT.match(word) or word in PLAIN_WRAPPERS:
+            i += 1
+        elif word == "env":
+            i += 1
+            while i < len(argv) and (argv[i].startswith("-") or ASSIGNMENT.match(argv[i])):
+                i += 1
+        elif word == "nice":
+            i += 1
+            if i < len(argv) and argv[i] == "-n":
+                i += 2
+            elif i < len(argv) and argv[i].startswith("-"):
+                i += 1
+        elif word == "timeout":
+            i += 1
+            while i < len(argv) and argv[i].startswith("-"):
+                i += 2 if argv[i] in ("-s", "-k", "--signal", "--kill-after") else 1
+            i += 1  # the duration
+        elif word in ("uv", "pipenv", "poetry") and argv[i + 1:i + 2] == ["run"]:
+            i += 2
+            while i < len(argv) and argv[i].startswith("-"):
+                valued = argv[i] in ("--with", "--python", "-p", "--project",
+                                     "--directory", "--env-file", "--from")
+                i += 2 if valued else 1
+        else:
+            break
+    return argv[i:]
+
+
+def _program(argv: list[str]) -> str:
+    return argv[0].rsplit("/", 1)[-1] if argv else ""
+
+
+def app_invocations(text: str) -> list[list[str]]:
+    """Every `ttnn-visualizer` command in a shell string, as its argv."""
+    return [argv for argv in simple_commands(text) if _program(argv) == "ttnn-visualizer"]
+
+
+def app_options(argv: list[str]) -> dict[str, list[str]]:
+    """The app's long options as argparse resolves them: `--opt=value`, a
+    separate value, and unambiguous prefixes (`--serv` is `--server`). An
+    ambiguous or unknown option maps under its own spelling."""
+    found: dict[str, list[str]] = {}
+    i = 1
+    while i < len(argv):
+        token = argv[i]
+        i += 1
+        if not token.startswith("--"):
+            continue
+        name, eq, value = token.partition("=")
+        matches = [o for o in APP_OPTIONS if o == name] or \
+                  [o for o in APP_OPTIONS if o.startswith(name)]
+        option = matches[0] if len(matches) == 1 else name
+        if option in APP_VALUED and not eq:
+            value = argv[i] if i < len(argv) else ""
+            i += 1
+        found.setdefault(option, []).append(value)
+    return found
+
+
+def assert_local_app_command(argv: list[str]) -> None:
+    """An app command for the user binds loopback only and never runs the
+    multi-user server mode."""
+    opts = app_options(argv)
+    assert "--server" not in opts, f"server mode: {argv}"
+    hosts = opts.get("--host")
+    assert hosts and all(h in LOOPBACK for h in hosts), f"--host is not loopback: {argv}"
+
+
+def registers_server(text: str) -> bool:
+    """Whether the string holds a `claude|codex mcp add … ttnn-visualizer-mcp`."""
+    return any(_program(argv) in ("claude", "codex") and argv[1:3] == ["mcp", "add"]
+               and any(_program([a]) == "ttnn-visualizer-mcp" for a in argv[3:])
+               for argv in simple_commands(text))
+
+
+def perf_report_command(text: str) -> bool:
+    """Whether the string runs `tt-perf-report` on a CSV."""
+    return any(_program(argv) == "tt-perf-report"
+               and any(not a.startswith("-") and ("csv" in a.lower() or a.startswith("<"))
+                       for a in argv[1:])
+               for argv in simple_commands(text))
+
+
+def names_op(text: str, op: str) -> bool:
+    """Whether `op` appears in the text as a whole op name, not inside a longer one."""
+    return re.search(rf"(?<![\w]){re.escape(op)}(?![\w])", text or "", re.IGNORECASE) is not None
 
 
 def tool_names(entries) -> list[str]:
@@ -91,14 +220,14 @@ def assert_left_to_user(res) -> None:
     any app command it hands over stays on localhost."""
     for name, inp in res.tool_uses():
         if name == "Bash":
-            assert not FORBIDDEN_COMMAND.search(inp.get("command") or ""), inp
+            command = inp.get("command") or ""
+            assert not FORBIDDEN_COMMAND.search(command), inp
+            assert not app_invocations(command), f"started the app itself: {inp}"
         if name in EDIT_TOOLS:
             path = inp.get("file_path") or inp.get("notebook_path") or ""
             assert not HOST_CONFIG.search(path), f"edited host config: {path}"
-    command = res.answer["command"]
-    if APP_PATH_FLAG.search(command):
-        assert "--host 127.0.0.1" in command, command
-        assert "--server" not in command, command
+    for argv in app_invocations(res.answer["command"]):
+        assert_local_app_command(argv)
 
 
 def _server_offered(res) -> bool:
@@ -294,8 +423,9 @@ def eval_memory_fallback_without_server(agent):
 
     res.assert_dispatched("tt-ttnn-visualizer")
     command = res.answer["command"]
-    assert ("--memory-report-path" in command
-            or "ttnn-visualizer-mcp" in res.text()), res.answer
+    opens_report = any("--memory-report-path" in app_options(argv)
+                       for argv in app_invocations(command))
+    assert opens_report or registers_server(command), res.answer
     assert "tt-perf-report" not in command and "sqlite3" not in command, command
     assert_left_to_user(res)
 
@@ -312,9 +442,9 @@ def eval_perf_fallback_without_server(agent):
 
     if res.dispatch_observable:
         assert res.skill in ("tt-ttnn-visualizer", "tt-profiler"), res.skill
-    body = res.text()
-    assert "tt-perf-report" in body or "ttnn-visualizer-mcp" in body, body
-    assert "sqlite3" not in res.answer["command"], res.answer["command"]
+    command = res.answer["command"]
+    assert perf_report_command(command) or registers_server(command), res.answer
+    assert "sqlite3" not in command, command
     assert_left_to_user(res)
 
 
@@ -349,5 +479,5 @@ def eval_uses_mcp_when_present(agent):
         raise SkipEval(f"{SERVER} did not connect ({command})")
 
     grade_mcp_peak(res.tool_calls(), res.offered_tools())
-    assert expected.lower() in res.answer["primary_signal"].lower(), res.answer
+    assert names_op(res.answer["primary_signal"], expected), res.answer
     assert_left_to_user(res)
