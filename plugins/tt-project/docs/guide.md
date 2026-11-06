@@ -3780,15 +3780,21 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   symlinks, and checks both the run's HOME and the account's own home. Reads pass, also in code
   that runs a command or compares with `>`; code with a write call (a copy too), or that runs a
   write command (`tee`, `cp`, `dd`, ...), a redirect or a login tool whose target it builds, and
-  names one of these paths anywhere is refused, since a variable may carry it. A key or config that
-  ssh or scp only reads (`-i`, `-F`, also in `GIT_SSH_COMMAND` when git itself runs with plain
-  words), handed straight to a known run call (`subprocess.run`, `os.system`, perl's `system`, ...)
-  that is a statement of its own and that the code does not define or rebind, does not count there. Add a path for one project with
+  names one of these paths anywhere is refused, since a variable may carry it. That holds for code
+  that only uses a key as an ssh or git identity too (a known false positive): run ssh or git as a
+  plain shell command instead, or name the key as `IdentityFile` in an ssh config. A shell line
+  that uses a key passes only as `ssh|scp|sftp -i KEY ...` (the remote command is the host's) or
+  `GIT_SSH_COMMAND='ssh -i KEY' git fetch|clone|ls-remote ...`, with nothing else that runs a local
+  program: no other variable before it, no git `-c`, `--config-env`, `--upload-pack` or
+  `--template`, no ssh `-F` or `-o ProxyCommand`, `LocalCommand` or `KnownHostsCommand`, no
+  command substitution, no redirect to a built target, and beside it only plain commands such as
+  `cd`, `echo` or `cat`. Add a path for one project with
   `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
   account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
   folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and
   `GH_CONFIG_DIR` instead. Not caught: a path the code builds at run time from parts no word of
-  the command names. Which tools each provider covers is in providers.md.
+  the command names, and a git hook, git config or ssh config an earlier, separate command
+  planted that a later key use runs: a write those make is not blocked. Which tools each provider covers is in providers.md.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
   current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`

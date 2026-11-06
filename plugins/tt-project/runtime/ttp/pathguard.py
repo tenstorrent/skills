@@ -60,27 +60,6 @@ STR_RE = re.compile(r"'((?:[^'\\\n]|\\.)*)'|\"((?:[^\"\\\n]|\\.)*)\"|`([^`]*)`")
 # Commands in an argv list that write the paths they name (login tools write their store: read as argv)
 ARGV_WRITERS = WRITE_ALL | DEST_LAST | set(OUTPUT_OPTS) | {"dd", "sed", "perl"}
 STORE_TOOLS = {"gh", "docker", "aws", "kubectl", "git", "ssh-keygen"}
-# ssh and scp read the files their -i and -F name: options before one that take no value, those whose value
-# is skipped (-p's only when it is a port), and the words a path expression handed to one may use
-SSH_TOOLS = {"ssh", "scp"}
-SSH_FLAGS_RE = re.compile(r"-[46ACNTXYaqrvtpBO3]+")
-SSH_VALUE_OPTS = ("-o", "-l", "-J", "-P")
-PATH_WORDS = {"os", "path", "pathlib", "Path", "expanduser", "expandvars", "join", "home", "homedir", "environ",
-              "getenv", "get", "str", "fspath", "abspath", "realpath", "resolve", "ENV", "HOME", "Dir", "File",
-              "require", "process", "env"}
-# A run call that is a whole statement: its result is not kept, so nothing else can reach its arguments
-RUN_STMT_RE = re.compile(r"(?:^|[;\n])\s*([\w.]+\.)?(system|run|call|check_call|check_output|Popen|exec\w*"
-                         r"|spawn\w*)\s*\(")
-# The runners it may be (perl's and ruby's system and exec are builtins), and the statements that import them
-RUNNERS = {"subprocess": r"run|call|check_call|check_output|Popen", "os": r"system|exec\w*|spawn\w*",
-           "child_process": r"exec\w*|spawn\w*", "": r"system|exec"}
-IMPORT_RE = re.compile(r"(?:^|(?<=[;\n]))\s*(?:import\s+\w+(?:\s*,\s*\w+)*|from\s+(subprocess|os)\s+import\s+(\w+"
-                       r"(?:\s*,\s*\w+)*)|(?:const|let|var)\s+child_process\s*=\s*require\(\s*(['\"])child_process\3\s*\))"
-                       r"\s*(?=[;\n]|$)")
-# git's words that run another program (which inherits GIT_SSH_COMMAND), and a plain word of git's
-GIT_RUNS = {"-c", "--config-env", "--upload-pack", "--receive-pack", "-u", "--exec", "-x", "--exec-path", "foreach",
-            "run", "--extcmd", "--tool", "-t", "-e"}
-GIT_WORD_RE = re.compile(r"[\w./:@+~-]+")
 HOME_REF_RE = re.compile(r"~|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
 # Codex patches: the files one adds, changes, deletes or moves to (Codex trims a header line, so blanks
 # around it and its path do not hide one)
@@ -89,6 +68,21 @@ MCP_READ_RE = re.compile(r"(?:^|_)(?:read|get|list|search|find|view|stat|info|tr
                          r"grep|glob|cat|head|tail|lookup|status)(?:_|$)", re.I)
 MCP_WRITE_RE = re.compile(r"write|edit|create|move|rename|delete|remove|copy|put|patch|append|chmod|mkdir|upload|"
                           r"save|set|update", re.I)
+# A key used as an ssh identity in a plain shell line (ssh -i KEY, GIT_SSH_COMMAND='ssh -i KEY' git fetch): ssh's
+# options that take a value, its -o settings that run a local program, git's commands that only fetch, the words
+# that make git run another program, the wrappers it may run under and the commands that may sit beside it
+SSH_TOOLS = {"ssh", "scp", "sftp"}
+SSH_VALUE_OPTS = set("bBcDEeFIiJLlmOoPpQRSsWwX")
+SSH_RUNS_RE = re.compile(r"(?i)\s*(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match)\b")
+KEY_GIT = {"fetch", "clone", "ls-remote"}
+GIT_RUNS_RE = re.compile(r"-[cu].*|ext::.*|--(?:config|config-env|upload-pack|receive-pack|template|exec-path|exec)(?:=.*)?")
+KEY_WRAPPERS = {"timeout", "nohup", "nice"}
+KEY_SAFE = {"echo", "printf", "true", "false", ":", "test", "[", "cd", "pwd", "ls", "cat", "grep", "head", "tail",
+            "wc", "sleep", "date"}
+KEY_ROUTE = ("To use a key as an ssh identity, run `ssh|scp|sftp -i KEY ...` or `GIT_SSH_COMMAND='ssh -i KEY' git "
+             "fetch|clone|ls-remote ...` as a plain shell command, with nothing else in the line that runs a local "
+             "program or writes, or name the key as IdentityFile in an ssh config, instead of calling them from "
+             "inside interpreter code")
 # The plugin's own shipped scripts (setup-box's write ~/.ssh on a remote box, in ssh command text):
 # reviewed code, so the script-file read skips them; a script a run wrote is read
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
@@ -248,30 +242,28 @@ def _code_refusal(code: str, ctx, depth: int = 0) -> str | None:
     """Interpreter code that writes a protected path: a write call or mode with one named in the code
     (anywhere: a variable may carry it), a redirect or open mode with one as its target, or a command
     the code runs (os.system, subprocess, exec, backticks) that writes one. Reads pass."""
-    ms = list(STR_RE.finditer(code))
-    lits = [m[1] or m[2] or m[3] or "" for m in ms]
-    # The code with each literal blanked: what lies between literals is code (a variable, a call)
-    bare = STR_RE.sub(lambda m: m[0][0] + "x" * (len(m[0]) - 2) + m[0][-1], code)
-    # The whole-code checks skip a key or config file that ssh or scp only reads (-i, -F)
-    rest = _ssh_reads(code, bare, ms)
-    if WRITE_CODE_RE.search(code) and (h := _names(rest, ctx)):
+    if WRITE_CODE_RE.search(code) and (h := _names(code, ctx)):
         return h
     for m in TARGET_RE.finditer(code):
         if h := _names(m[1], ctx):
             return h
     if not RUN_CODE_RE.search(code):
         return None
+    ms = list(STR_RE.finditer(code))
+    lits = [m[1] or m[2] or m[3] or "" for m in ms]
+    # The code with each literal blanked: what lies between literals is code (a variable, a call)
+    bare = STR_RE.sub(lambda m: m[0][0] + "x" * (len(m[0]) - 2) + m[0][-1], code)
     for i, (m, lit) in enumerate(zip(ms, lits)):
         words = re.findall(r"[^\s|;&<>()\"'`]+", lit)
         names, built = {os.path.basename(w) for w in words}, _built(bare, m, lit)
-        if names & ARGV_WRITERS and (h := _names(rest, ctx)):   # a write command: its target may be built
+        if names & ARGV_WRITERS and (h := _names(code, ctx)):   # a write command: its target may be built
             return h
         item = os.path.basename(lit) in STORE_TOOLS   # an argv list item: its args are the literals after it
         if item and (h := _argv_refusal(lits[i:], ctx)):
             return h
         # A login tool with an argument built in code may write its store: unless it only prints a key
         reads = "ssh-keygen" in names and _keygen_reads(lits[i + 1:] if item else words)
-        if names & STORE_TOOLS and built and not reads and (h := _names(rest, ctx)):
+        if names & STORE_TOOLS and built and not reads and (h := _names(code, ctx)):
             return h
         if " " in lit and depth < 2 and (h := shell_refusal(lit, *ctx, depth + 1)):   # a command line
             return h
@@ -281,177 +273,9 @@ def _code_refusal(code: str, ctx, depth: int = 0) -> str | None:
             if r[1] and re.fullmatch(r"\d+-?|-", r[2].rstrip("'\"`")):
                 continue
             if (not r[2] or re.search(r"[{}%$]", r[2]) or joined and r.end() == len(lit)) and (
-                    h := _names(rest, ctx)):
+                    h := _names(code, ctx)):
                 return h
     return None
-
-
-def _ssh_reads(code: str, bare: str, ms: list) -> str:
-    """`code` with each path blanked that a run call (a whole statement) hands ssh or scp as -i or -F
-    before the first operand: in its argv list, its command line, or its GIT_SSH_COMMAND value."""
-    for a, e in _ssh_spans(code, bare, ms):
-        code = code[:a] + " " * (e - a) + code[e:]
-    return code
-
-
-def _ssh_spans(code: str, bare: str, ms: list, depth: int = 0) -> list:
-    starts, spans = {m.start(): m for m in ms}, []
-    if depth < 1:   # code quoted in a command line (python3 -c "..."): its own run calls
-        for m in ms:
-            if RUN_STMT_RE.search(lit := m[1] or m[2] or ""):
-                idx, i = [], 0   # in double quotes \" \\ \$ \` stand for the character: read the code it passes
-                while i < len(lit):
-                    i += bool(m[2] and lit[i] == "\\" and lit[i + 1:i + 2] in ('"', "\\", "$", "`"))
-                    idx.append(i)
-                    i += 1
-                u = "".join(lit[i] for i in idx)
-                inner = list(STR_RE.finditer(u))
-                ibare = STR_RE.sub(lambda i: i[0][0] + "x" * (len(i[0]) - 2) + i[0][-1], u)
-                spans += [(idx[a] + m.start() + 1, idx[e - 1] + m.start() + 2) for a, e in _ssh_spans(u, ibare, inner, 1)
-                          if e > a]
-
-    def lit_at(pos):
-        return starts.get(pos) or bare[pos:pos + 1] in ("f", "F") and starts.get(pos + 1)
-
-    def git_word(w):
-        return GIT_WORD_RE.fullmatch(w) and w not in GIT_RUNS
-
-    def line_items(m):   # a command line literal: ssh's words in it, and code joined right after
-        lit, c, out, cmd, stop = m[1] or m[2] or m[3] or "", m.start() + 1, [], True, None
-        pend, git = None, False   # ssh's words in X='ssh ...': read only when git runs next, with plain words
-        groups = r"\{([^{}]*)\}" if code[m.start() - 1:m.start()] in ("f", "F") else r"\$\{([^{}]*)\}" if m[3] else None
-        for t in re.finditer(r"[^\s;&|]+|[;&|]+", lit):
-            word = t[0].strip("'\"")
-            if stop is not None and t.start() > stop:   # past X='ssh ...': the command comes next
-                pend, git, out, stop = out, os.path.basename(word) == "git" and t[0] == word, [], None
-            elif pend is not None and not re.fullmatch(r"[;&|]+", t[0]):
-                git = git and git_word(t[0])
-            if re.fullmatch(r"[;&|]+", t[0]):   # the next command
-                spans.extend(_ssh_values(out) + (_ssh_values(pend) if pend and git else []))
-                out, cmd, stop, pend = [], True, None, None
-            elif out:
-                left = re.sub(groups, lambda g: "" if _path_expr(g[1]) else "\0", t[0]) if groups else t[0]
-                bad = r"`|\$\(" + (r"|[\0{}]" if groups else "")   # a command substitution, code left in a format
-                out.append((word, (c + t.start(), c + t.end()), not re.search(bad, left)))
-            elif cmd:   # NAME=value words, then the command; ssh as a quoted value (X='ssh -i k') ends with it
-                v = re.match(r"\w+=(['\"]?)", t[0])
-                tool = os.path.basename(word[v.end():] if v else word) in SSH_TOOLS
-                if v and v[1] and tool:
-                    stop = q if (q := lit.find(v[1], t.start() + v.end())) >= 0 else len(lit)
-                cmd, out = bool(v), [("", None, False)] if tool and (not v or v[1]) else []
-        if pend and git:
-            spans.extend(_ssh_values(pend))
-        if stop is not None:   # X='ssh ... with its command in code joined after: never read
-            return
-        if out and (j := re.compile(r"\s*\+\s*").match(bare, m.end())):   # 'ssh -i ' + expanduser('~/.ssh/k')
-            a = j.end()
-            e = _expr_end(bare, a, "+,;\n")
-            out.append((None, (a, e), _path_expr(code[a:e])))
-        spans.extend(_ssh_values(out))
-
-    imports = [(i.start(), i.end()) for i in IMPORT_RE.finditer(bare)]
-    calls = [c.start(2) for c in RUN_STMT_RE.finditer(bare)]
-
-    def runner(call):   # a known runner the code neither defines, rebinds nor replaces the module of
-        mod = (call[1] or "").rstrip(".")
-        if mod not in RUNNERS or re.search(r"setattr|__dict__|\bvars\s*\(|globals|builtins|\.prototype", bare):
-            return False
-        if not mod and not re.fullmatch(RUNNERS[""], call[2]):   # from subprocess import run
-            if not any(re.fullmatch(RUNNERS[i[1]], call[2]) and call[2] in re.split(r"\s*,\s*", i[2])
-                       for i in IMPORT_RE.finditer(bare) if i[1]):
-                return False
-        elif mod and (not re.fullmatch(RUNNERS[mod], call[2])
-                      or re.search(rf"(?<![\w.]){mod}\s*\.\s*{call[2]}\s*=(?!=)", bare)):
-            return False
-        for w in re.finditer(rf"(?<![\w.]){re.escape(mod or call[2])}(?!\w)", code):
-            if not (mod and re.compile(r"\s*\.").match(code, w.end()) or not mod and w.start() in calls
-                    or any(a <= w.start() < e for a, e in imports)):
-                return False
-        return True
-
-    for call in RUN_STMT_RE.finditer(bare):
-        end = _expr_end(bare, call.end(), "")
-        if end >= len(bare) or not re.compile(r"\s*(?:[;\n]|$)").match(bare, end + 1) or "$_" in code[call.end():end]:
-            continue
-        if not runner(call):
-            continue
-        a = re.match(r"\s*(\[?)\s*", bare[call.end():end])
-        pos = call.end() + a.end()
-        m = lit_at(pos)
-        first = m and (m[1] or m[2] or "")
-        if first and os.path.basename(first) in SSH_TOOLS and (a[1] or re.compile(r"\s*,").match(bare, m.end())):
-            items, pos = [("", None, False)], m.end()   # an argv list (perl: the call's own arguments)
-            while j := re.compile(r"\s*,\s*").match(bare, pos):
-                pos = j.end()
-                if (m := lit_at(pos)) and m[3] is None and not (bare[m.start() - 1] in "fF" and "{" in m[0]):
-                    items.append((m[1] or m[2] or "", (m.start() + 1, m.end() - 1), True))
-                    pos = m.end()
-                else:
-                    e = _expr_end(bare, pos, ",")
-                    items.append((None, (pos, e), _path_expr(code[pos:e])))
-                    pos = e
-            spans.extend(_ssh_values(items))
-        elif m:
-            line_items(m)
-        if (code.count("GIT_SSH_COMMAND") == 1 and a[1] and first and os.path.basename(first) == "git"
-                and _git_argv(bare, m.end(), starts, git_word)):   # git itself runs, with plain words
-            for g in re.finditer(r"\bGIT_SSH_COMMAND\s*=\s*|[\"']GIT_SSH_COMMAND[\"']\s*:\s*", code[call.end():end]):
-                if m := lit_at(call.end() + g.end()):
-                    line_items(m)
-    return spans
-
-
-def _git_argv(bare: str, pos: int, starts: dict, ok) -> bool:
-    """Whether git's argv list from `pos` to its closing bracket holds only plain literal words `ok` takes."""
-    while j := re.compile(r"\s*,\s*").match(bare, pos):
-        if not (m := starts.get(j.end())) or m[3] is not None or not ok(m[1] if m[1] is not None else m[2]):
-            return False
-        pos = m.end()
-    return bool(re.compile(r"\s*\]").match(bare, pos))
-
-
-def _ssh_values(items: list) -> list:
-    """The spans of the -i and -F values among ssh's words (word, span, a plain path?), up to its first operand."""
-    out, want, skip = [], False, False
-    for i, (word, span, ok) in enumerate(items[1:], 1):
-        if want:
-            if not ok:
-                break
-            out.append(span)
-            want = False
-        elif skip:
-            skip = False
-        elif word in ("-i", "-F"):
-            want = True
-        elif word and word[:2] in ("-i", "-F") and ok:
-            out.append((span[0] + 2, span[1]) if span[1] - span[0] == len(word) else span)
-        elif word in SSH_VALUE_OPTS or word == "-p" and i + 1 < len(items) and (items[i + 1][0] or "").isdigit():
-            skip = True
-        elif not (word and SSH_FLAGS_RE.fullmatch(word)):
-            break
-    return out
-
-
-def _expr_end(bare: str, pos: int, stops: str) -> int:
-    """Where the expression at `pos` ends: a `stops` character or a closing bracket outside brackets."""
-    depth = 0
-    for i in range(pos, len(bare)):
-        ch = bare[i]
-        if ch in "([{":
-            depth += 1
-        elif ch in ")]}":
-            if depth == 0:
-                return i
-            depth -= 1
-        elif depth == 0 and ch in stops:
-            return i
-    return len(bare)
-
-
-def _path_expr(text: str) -> bool:
-    """Code that only builds a path (from the home folder, the environment, literals): nothing it runs or keeps."""
-    t = STR_RE.sub("''", re.sub(r"\\([\"'])", r"\1", text))   # its literals (quotes escaped in a command line too)
-    return bool(t.strip()) and not re.search(r"[=;`]", t) and set(re.findall(r"[A-Za-z_]\w*", t)) <= PATH_WORDS
 
 
 def _built(bare: str, m, lit: str) -> bool:
@@ -480,11 +304,13 @@ def _names(code: str, ctx) -> str | None:
     return None
 
 
-def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> str | None:
+def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, script: bool = False) -> str | None:
     """The protected path a shell command line (or script) writes, as far as its words show."""
     from . import hook
     ctx = (env, cwd, rts)
     commands, scan = hook._split(cmd)
+    if not script and (h := _key_refusal(cmd, commands, ctx)):
+        return h
     # Redirects: in the line as written and in scan (_split drops an echo's quoted words, a quoted
     # redirect target too), where the `>` is not quoted: quoted text is an argument (ssh's remote
     # command, a message); `sh -c` text is read below
@@ -528,11 +354,83 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
             except OSError:
                 continue
             first = text.split("\n", 1)[0]
-            h = (shell_refusal(text, env, cwd, rts, depth + 1) if f.suffix == ".sh" or any(s in first for s in SHELLS)
+            h = (shell_refusal(text, env, cwd, rts, depth + 1, True) if f.suffix == ".sh" or any(s in first for s in SHELLS)
                  else _code_refusal(text, ctx, depth + 1))
             if h:
                 return h
     return None
+
+
+def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
+    """A command line that uses a protected key as an ssh identity passes only in a plain form that runs no local
+    program: `ssh|scp|sftp -i KEY ...` (its remote command is the remote host's), or `GIT_SSH_COMMAND='ssh -i KEY'
+    git fetch|clone|ls-remote ...` with no other assignment. Beside it only KEY_SAFE commands, no command
+    substitution and no redirect to a built target. Anything else that uses one is refused."""
+    from . import hook
+    hit, bad = None, False
+    for raw in hook._segments(commands, strip=False):
+        argv = hook._strip_prefix(raw)
+        pre, name = raw[:len(raw) - len(argv)], argv[0] if argv else ""
+        sets = [w.split("=", 1) for w in pre if re.match(r"[A-Za-z_]\w*=", w)]
+        keys = [h for w in raw if re.match(r"[A-Za-z_]\w*=.*\b(?:ssh|scp|sftp)\b", w) and (h := _names(w, ctx))]
+        hit = hit or (keys[0] if keys else None)
+        ok = all(re.fullmatch(r"\w+=.*|-.*|\d+[smhd]?", w) or w in KEY_WRAPPERS for w in pre)
+        if name in SSH_TOOLS:   # ssh -i KEY, with no assignment before it
+            h, opts = _ssh_key(argv, ctx)
+            ok = ok and opts and not sets
+        elif name == "git":   # GIT_SSH_COMMAND='ssh -i KEY' git fetch|clone|ls-remote, its only assignment
+            v = sets[0][1] if len(sets) == 1 and sets[0][0] == "GIT_SSH_COMMAND" else ""
+            ssh = shlex.split(v) if v and not re.search(r"[;&|<>`$()\n\\]", VAR_RE.sub("", v)) else []
+            h, opts = _ssh_key(ssh, ctx) if ssh[:1] == ["ssh"] else (None, False)
+            ok = ok and opts and argv[1:2] != [] and argv[1] in KEY_GIT and not any(
+                GIT_RUNS_RE.fullmatch(a) or _names(a, ctx) for a in argv[2:])
+        else:
+            h, ok = None, name in KEY_SAFE and not keys
+        hit, bad = hit or h, bad or not ok
+    if not hit:
+        return None
+    q, esc = "", False   # command substitution: $( or a backtick outside single quotes, <( >( unquoted
+    for i, c in enumerate(cmd):
+        if q == "'":
+            q = "" if c == "'" else q
+        elif esc:
+            esc = False
+        elif c == "\\":
+            esc = True
+        elif c == "'" and not q:
+            q = "'"
+        elif c == '"':
+            q = "" if q else '"'
+        elif c == "`" or cmd[i:i + 2] == "$(" or not q and cmd[i:i + 2] in ("<(", ">("):
+            bad = True
+    flags = hook._quoting(cmd)   # a redirect whose target is built ($_, $f) or not a file (>& $f)
+    for m in [*REDIRECT_RE.finditer(cmd), *re.finditer(r">&\s*(?![\d-])", cmd)]:
+        if not flags[m.start()][0] and (m.re is not REDIRECT_RE or re.search(r"[$`]", m[2])):
+            bad = True
+    return hit if bad else None
+
+
+def _ssh_key(argv: list[str], ctx) -> tuple[str | None, bool]:
+    """(a protected path the options of ssh, scp or sftp `argv` name, whether they run no local program and name
+    none but as -i). Options end at the first operand, for ssh at the one after its host: the rest is the remote
+    command, or a file."""
+    hit, ok, i, host = None, True, 1, argv[:1] != ["ssh"]
+    while i < len(argv) and argv[i] != "--":
+        w = argv[i]
+        if not w.startswith("-") or w == "-":
+            if host:
+                break
+            host, i = True, i + 1
+            continue
+        j = next((k for k, c in enumerate(w[1:], 1) if c in SSH_VALUE_OPTS), None)
+        opt = w[j] if j else ""
+        val = (w[j + 1:] or (argv[i + 1] if i + 1 < len(argv) else "")) if j else ""
+        i += 2 if j and not w[j + 1:] else 1
+        if opt == "F" or opt == "o" and SSH_RUNS_RE.match(val):
+            ok = False
+        elif h := _names(val, ctx):
+            hit, ok = hit or h, ok and opt == "i"
+    return hit, ok
 
 
 def _assigned(raw: list[str], env) -> dict:
@@ -574,7 +472,11 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
     except Exception:
         text = json.dumps(payload.get("tool_input") or {})
         hit = next((p for p in DEFAULT_PATHS + tuple(rts) if p.lstrip("~/") in text), None)
-    return WHY.format(hit=hit) if hit else None
+    if not hit:
+        return None
+    # A key used as an ssh or git identity: name the route that passes
+    route = re.search(r"(?<![\w./-])(?:ssh|scp|sftp)(?![\w.-])|GIT_SSH_COMMAND", json.dumps(payload.get("tool_input") or {}))
+    return WHY.format(hit=hit) + (". " + KEY_ROUTE if route else "")
 
 
 def _refusal(payload: dict, env, rts: list[str]) -> str | None:
