@@ -2119,7 +2119,8 @@ running work is interrupted only by the preemption below:
   new batch never starts while the last one's after_push still runs; a full batch, a
   priority 1-2 review's approval, or one the last batch requeued unchecked after a failing change
   starts at once; 0 = off). Approvals that waited while the last clean batch ran start the next one
-  at once, and priority 1-2 approvals always lead it. `push_solo_paths` (default `[]`, off:
+  at once, and priority 1-2 approvals always lead it. Within a priority, an approval an earlier batch
+  sent back as a conflict leads, so a peer ahead of it cannot send it back a second time. `push_solo_paths` (default `[]`, off:
   git pathspecs a batch takes at most one routine approved change touching; the oldest such change
   leads the next batch and priority 1-2 ones are never held. Two prompt changes that fit a size cap
   alone but not together need no such rule: the batch's cap probes find the one that breaks it),

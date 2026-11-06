@@ -879,8 +879,14 @@ def yields_to(p: Project, name: str) -> list[int]:
 
 
 def _approved(db, name: str) -> list[dict]:
+    """The approved rows for target `name`, best priority first; within a priority an approval an earlier
+    batch sent back as a conflict leads, then by age. A re-approved head would otherwise queue behind
+    the newer approvals of its priority, and a peer ahead of it in the batch touching its lines sends
+    it back again: each repeat costs another conflict fix and review. Leading, it loses at most to
+    what landed before it."""
     return db.q("SELECT q.*, t.priority FROM push_queue q JOIN tasks t ON t.id=q.task WHERE q.status='approved' "
-                "AND t.status='pushing' AND q.target=? ORDER BY t.priority, q.id", (name,))
+                "AND t.status='pushing' AND q.target=? ORDER BY t.priority, NOT EXISTS (SELECT 1 FROM push_queue c "
+                "WHERE c.task=q.task AND c.status='conflict'), q.id", (name,))
 
 
 def dep_waits(p: Project, rows: list[dict], now: float) -> dict[int, dict]:

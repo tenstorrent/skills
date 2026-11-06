@@ -3288,6 +3288,28 @@ def test_a_priority_one_approval_in_a_backlog_of_twenty_goes_in_the_next_batch_a
     assert [r["id"] for r in got] == [hot] + routine[:3], "no growth after a batch that did not end clean"
 
 
+def test_an_approval_sent_back_by_a_conflict_leads_its_priority_in_the_next_batch(env, monkeypatch):
+    """A review re-approved after a batch sent it back as a conflict goes first among the approvals of
+    its priority, ahead of older first-time ones, so a peer ahead of it in the batch cannot send it back
+    a second time; a better priority still goes before it, and an approval carried across a conflict
+    (status carried, never conflict) leads nothing."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=10)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time() + 1
+    _pq_last_batch(s, "pushed", now - 60)
+    _pq_earlier(s)
+    older = [_pq_review(s)[1] for _ in range(2)]
+    hot = _pq_review(s, priority=1)[1]
+    back_task, back = _pq_review(s)
+    carried_task, carried = _pq_review(s)
+    for task, status in ((back_task, "conflict"), (carried_task, "carried")):
+        s.p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+                 (task, s.branch, s.head, "origin/proj", status, now - 600, now - 300))
+    got, why = pushq.due(s.p, now)
+    assert [r["id"] for r in got] == [hot, back, *older, carried], why
+
+
 def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, monkeypatch):
     """No idle gap between batches while approvals wait: one approved before the last clean batch
     (and its after_push) ended starts the next at once, even with a review still running; one approved
