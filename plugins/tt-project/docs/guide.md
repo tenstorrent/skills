@@ -3781,8 +3781,9 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   that runs a command or compares with `>`; code with a write call (a copy too), or that runs a
   write command (`tee`, `cp`, `dd`, ...), a redirect or a login tool whose target it builds, and
   names one of these paths anywhere is refused, since a variable may carry it. A key or config that
-  ssh or scp only reads (`-i`, `-F`, also in `GIT_SSH_COMMAND`), handed straight to a run call that
-  is a statement of its own, does not count there. Add a path for one project with
+  ssh or scp only reads (`-i`, `-F`, also in `GIT_SSH_COMMAND` when git itself runs with plain
+  words), handed straight to a known run call (`subprocess.run`, `os.system`, perl's `system`, ...)
+  that is a statement of its own and that the code does not define or rebind, does not count there. Add a path for one project with
   `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
   account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
   folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and

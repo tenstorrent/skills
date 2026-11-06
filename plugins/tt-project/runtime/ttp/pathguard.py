@@ -69,8 +69,18 @@ PATH_WORDS = {"os", "path", "pathlib", "Path", "expanduser", "expandvars", "join
               "getenv", "get", "str", "fspath", "abspath", "realpath", "resolve", "ENV", "HOME", "Dir", "File",
               "require", "process", "env"}
 # A run call that is a whole statement: its result is not kept, so nothing else can reach its arguments
-RUN_STMT_RE = re.compile(r"(?:^|[;\n])\s*(?:[\w.]+\.)?(?:system|run|call|check_call|check_output|Popen|exec\w*"
+RUN_STMT_RE = re.compile(r"(?:^|[;\n])\s*([\w.]+\.)?(system|run|call|check_call|check_output|Popen|exec\w*"
                          r"|spawn\w*)\s*\(")
+# The runners it may be (perl's and ruby's system and exec are builtins), and the statements that import them
+RUNNERS = {"subprocess": r"run|call|check_call|check_output|Popen", "os": r"system|exec\w*|spawn\w*",
+           "child_process": r"exec\w*|spawn\w*", "": r"system|exec"}
+IMPORT_RE = re.compile(r"(?:^|(?<=[;\n]))\s*(?:import\s+\w+(?:\s*,\s*\w+)*|from\s+(subprocess|os)\s+import\s+(\w+"
+                       r"(?:\s*,\s*\w+)*)|(?:const|let|var)\s+child_process\s*=\s*require\(\s*(['\"])child_process\3\s*\))"
+                       r"\s*(?=[;\n]|$)")
+# git's words that run another program (which inherits GIT_SSH_COMMAND), and a plain word of git's
+GIT_RUNS = {"-c", "--config-env", "--upload-pack", "--receive-pack", "-u", "--exec", "-x", "--exec-path", "foreach",
+            "run", "--extcmd", "--tool", "-t", "-e"}
+GIT_WORD_RE = re.compile(r"[\w./:@+~-]+")
 HOME_REF_RE = re.compile(r"~|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
 # Codex patches: the files one adds, changes, deletes or moves to (Codex trims a header line, so blanks
 # around it and its path do not hide one)
@@ -289,24 +299,36 @@ def _ssh_spans(code: str, bare: str, ms: list, depth: int = 0) -> list:
     if depth < 1:   # code quoted in a command line (python3 -c "..."): its own run calls
         for m in ms:
             if RUN_STMT_RE.search(lit := m[1] or m[2] or ""):
-                inner = list(STR_RE.finditer(lit))
-                ibare = STR_RE.sub(lambda i: i[0][0] + "x" * (len(i[0]) - 2) + i[0][-1], lit)
-                spans += [(a + m.start() + 1, e + m.start() + 1) for a, e in _ssh_spans(lit, ibare, inner, 1)]
+                idx, i = [], 0   # in double quotes \" \\ \$ \` stand for the character: read the code it passes
+                while i < len(lit):
+                    i += bool(m[2] and lit[i] == "\\" and lit[i + 1:i + 2] in ('"', "\\", "$", "`"))
+                    idx.append(i)
+                    i += 1
+                u = "".join(lit[i] for i in idx)
+                inner = list(STR_RE.finditer(u))
+                ibare = STR_RE.sub(lambda i: i[0][0] + "x" * (len(i[0]) - 2) + i[0][-1], u)
+                spans += [(idx[a] + m.start() + 1, idx[e - 1] + m.start() + 2) for a, e in _ssh_spans(u, ibare, inner, 1)
+                          if e > a]
 
     def lit_at(pos):
         return starts.get(pos) or bare[pos:pos + 1] in ("f", "F") and starts.get(pos + 1)
 
+    def git_word(w):
+        return GIT_WORD_RE.fullmatch(w) and w not in GIT_RUNS
+
     def line_items(m):   # a command line literal: ssh's words in it, and code joined right after
         lit, c, out, cmd, stop = m[1] or m[2] or m[3] or "", m.start() + 1, [], True, None
+        pend, git = None, False   # ssh's words in X='ssh ...': read only when git runs next, with plain words
         groups = r"\{([^{}]*)\}" if code[m.start() - 1:m.start()] in ("f", "F") else r"\$\{([^{}]*)\}" if m[3] else None
         for t in re.finditer(r"[^\s;&|]+|[;&|]+", lit):
             word = t[0].strip("'\"")
             if stop is not None and t.start() > stop:   # past X='ssh ...': the command comes next
-                spans.extend(_ssh_values(out))
-                out, stop = [], None
+                pend, git, out, stop = out, os.path.basename(word) == "git" and t[0] == word, [], None
+            elif pend is not None and not re.fullmatch(r"[;&|]+", t[0]):
+                git = git and git_word(t[0])
             if re.fullmatch(r"[;&|]+", t[0]):   # the next command
-                spans.extend(_ssh_values(out))
-                out, cmd, stop = [], True, None
+                spans.extend(_ssh_values(out) + (_ssh_values(pend) if pend and git else []))
+                out, cmd, stop, pend = [], True, None, None
             elif out:
                 left = re.sub(groups, lambda g: "" if _path_expr(g[1]) else "\0", t[0]) if groups else t[0]
                 bad = r"`|\$\(" + (r"|[\0{}]" if groups else "")   # a command substitution, code left in a format
@@ -317,15 +339,41 @@ def _ssh_spans(code: str, bare: str, ms: list, depth: int = 0) -> list:
                 if v and v[1] and tool:
                     stop = q if (q := lit.find(v[1], t.start() + v.end())) >= 0 else len(lit)
                 cmd, out = bool(v), [("", None, False)] if tool and (not v or v[1]) else []
+        if pend and git:
+            spans.extend(_ssh_values(pend))
+        if stop is not None:   # X='ssh ... with its command in code joined after: never read
+            return
         if out and (j := re.compile(r"\s*\+\s*").match(bare, m.end())):   # 'ssh -i ' + expanduser('~/.ssh/k')
             a = j.end()
             e = _expr_end(bare, a, "+,;\n")
             out.append((None, (a, e), _path_expr(code[a:e])))
         spans.extend(_ssh_values(out))
 
+    imports = [(i.start(), i.end()) for i in IMPORT_RE.finditer(bare)]
+    calls = [c.start(2) for c in RUN_STMT_RE.finditer(bare)]
+
+    def runner(call):   # a known runner the code neither defines, rebinds nor replaces the module of
+        mod = (call[1] or "").rstrip(".")
+        if mod not in RUNNERS or re.search(r"setattr|__dict__|\bvars\s*\(|globals|builtins|\.prototype", bare):
+            return False
+        if not mod and not re.fullmatch(RUNNERS[""], call[2]):   # from subprocess import run
+            if not any(re.fullmatch(RUNNERS[i[1]], call[2]) and call[2] in re.split(r"\s*,\s*", i[2])
+                       for i in IMPORT_RE.finditer(bare) if i[1]):
+                return False
+        elif mod and (not re.fullmatch(RUNNERS[mod], call[2])
+                      or re.search(rf"(?<![\w.]){mod}\s*\.\s*{call[2]}\s*=(?!=)", bare)):
+            return False
+        for w in re.finditer(rf"(?<![\w.]){re.escape(mod or call[2])}(?!\w)", code):
+            if not (mod and re.compile(r"\s*\.").match(code, w.end()) or not mod and w.start() in calls
+                    or any(a <= w.start() < e for a, e in imports)):
+                return False
+        return True
+
     for call in RUN_STMT_RE.finditer(bare):
         end = _expr_end(bare, call.end(), "")
         if end >= len(bare) or not re.compile(r"\s*(?:[;\n]|$)").match(bare, end + 1) or "$_" in code[call.end():end]:
+            continue
+        if not runner(call):
             continue
         a = re.match(r"\s*(\[?)\s*", bare[call.end():end])
         pos = call.end() + a.end()
@@ -345,11 +393,21 @@ def _ssh_spans(code: str, bare: str, ms: list, depth: int = 0) -> list:
             spans.extend(_ssh_values(items))
         elif m:
             line_items(m)
-        if code.count("GIT_SSH_COMMAND") == 1:
+        if (code.count("GIT_SSH_COMMAND") == 1 and a[1] and first and os.path.basename(first) == "git"
+                and _git_argv(bare, m.end(), starts, git_word)):   # git itself runs, with plain words
             for g in re.finditer(r"\bGIT_SSH_COMMAND\s*=\s*|[\"']GIT_SSH_COMMAND[\"']\s*:\s*", code[call.end():end]):
                 if m := lit_at(call.end() + g.end()):
                     line_items(m)
     return spans
+
+
+def _git_argv(bare: str, pos: int, starts: dict, ok) -> bool:
+    """Whether git's argv list from `pos` to its closing bracket holds only plain literal words `ok` takes."""
+    while j := re.compile(r"\s*,\s*").match(bare, pos):
+        if not (m := starts.get(j.end())) or m[3] is not None or not ok(m[1] if m[1] is not None else m[2]):
+            return False
+        pos = m.end()
+    return bool(re.compile(r"\s*\]").match(bare, pos))
 
 
 def _ssh_values(items: list) -> list:

@@ -89,6 +89,23 @@ PG_SHELL_DENIED = [
     "python3 -c \"import os; os.system(f'ssh -i {os.system(\\\"tee \\\" + os.path.expanduser(\\\"~/.ssh/k\\\"))} box')\"",
     "python3 -c \"import subprocess,os; subprocess.run('tee \\\"${GIT_SSH_COMMAND#ssh -i }\\\"', shell=True, env=dict(os.environ, GIT_SSH_COMMAND='ssh -i '+os.path.expanduser('~/.ssh/k')))\"",
     "perl -e 'system(\"ssh\", \"-i\", \"$ENV{HOME}/.ssh/k\", \"box\", \"true\"); system(\"tee\", \"$ENV{HOME}/.ssh/k\");'",
+    # a run call the code defines or rebinds itself, or one whose module it replaces
+    'python3 -c "import shutil,os; run=lambda *a: shutil.copy(\'/tmp/x\', a[2]); run(\'ssh\',\'-i\',os.path.expanduser(\'~/.ssh/k\'))"',
+    'node -e "const fs=require(\'fs\'); const run=(...a)=>fs.writeFileSync(a[2],\'x\'); run(\'ssh\',\'-i\',require(\'os\').homedir()+\'/.ssh/k\')"',
+    'python3 -c "import subprocess,os; subprocess=type(\'S\',(),{\'run\':staticmethod(lambda a: open(a[2],\'w\'))}); subprocess.run([\'ssh\',\'-i\',os.path.expanduser(\'~/.ssh/k\')])"',
+    'python3 -c "import os,shutil; os.system=lambda c: shutil.copy(\'/tmp/x\', c.split()[2]); os.system(\'ssh -i \' + os.path.expanduser(\'~/.ssh/k\'))"',
+    'perl -e \'use File::Copy; BEGIN { *CORE::GLOBAL::system = sub { copy("/tmp/x", $_[2]) } } system("ssh", "-i", "$ENV{HOME}/.ssh/k");\'',
+    "python3 - <<'PY'\nimport shutil, os\ndef run(*a): shutil.copy('/tmp/x', a[2])\nrun('ssh', '-i', os.path.expanduser('~/.ssh/k'))\nPY",
+    "python3 - <<'PY'\nfrom subprocess import run\nimport os, shutil\ndef f(run):\n    run(['ssh', '-i', os.path.expanduser('~/.ssh/k'), 'box', 'mkdir -p /tmp/x'])\nf(lambda a: shutil.copy('/tmp/x', a[2]))\nPY",
+    # a GIT_SSH_COMMAND key handed to a program other than git, or to a git or shell that runs other commands
+    'python3 -c "import os; os.system(\\"GIT_SSH_COMMAND=\'ssh -i \\" + os.path.expanduser(\'~/.ssh/k\') + \\"\' env | cut -c24- | xargs touch\\")"',
+    'python3 -c "import subprocess; subprocess.run(\\"GIT_SSH_COMMAND=\'ssh -i ~/.ssh/k\' git rebase -x ./w.sh main && cp a /tmp/r\\", shell=True)"',
+    'python3 -c "import subprocess,os; subprocess.run([\'sh\',\'-c\',\'cp /tmp/x \\"$(env | sed -n s/^GIT_SSH_C[A-Z]*=ssh.-i.//p)\\"\'], env=dict(os.environ, GIT_SSH_COMMAND=\'ssh -i \'+os.path.expanduser(\'~/.ssh/k\')))"',
+    'python3 -c "import subprocess,os; subprocess.run([\'python3\',\'-c\',\'import os,shutil; [shutil.copy(\\"/tmp/x\\", v[7:]) for k,v in os.environ.items() if k.startswith(\\"GIT_SSH\\")]\'], env=dict(os.environ, GIT_SSH_COMMAND=\'ssh -i \'+os.path.expanduser(\'~/.ssh/k\')))"',
+    'python3 -c "import subprocess,os; subprocess.run([\'bash\',\'-c\',\'cp /tmp/x \\"$(printenv | grep -o \\"/[^ ]*/k$\\")\\"\'], env=dict(os.environ, GIT_SSH_COMMAND=\'ssh -i \'+os.path.expanduser(\'~/.ssh/k\')))"',
+    'python3 -c "import subprocess,os; subprocess.run([\'git\',\'-c\',\'alias.x=!cp /tmp/x \\"$(printenv | grep -o \\"/[^ ]*/k$\\")\\"\',\'x\'], env=dict(os.environ, GIT_SSH_COMMAND=\'ssh -i \'+os.path.expanduser(\'~/.ssh/k\')))"',
+    'python3 -c "import subprocess,os; subprocess.run(\'git fetch; printenv | grep -o \\"/[^ ]*/k$\\" | xargs touch\', shell=True, env=dict(os.environ, GIT_SSH_COMMAND=\'ssh -i \'+os.path.expanduser(\'~/.ssh/k\')))"',
+    'python3 -c "import os; os.system(\\"GIT_SSH_COMMAND=\'ssh -i ~/.ssh/k\' env | cut -c24- | xargs touch\\")"',
 ]
 PG_SHELL_ALLOWED = [
     "cat ~/.ssh/config", "ls -la ~/.ssh", "ssh -i ~/.ssh/id_rsa host true", "cp ~/.ssh/id_rsa.pub /tmp/pub",
@@ -118,6 +135,7 @@ PG_SHELL_ALLOWED = [
     "python3 -c \"import subprocess,os; subprocess.run(['ssh','-o','BatchMode=yes','-p','22','-i',os.path.expanduser('~/.ssh/k'),'-F',os.path.join(os.environ['HOME'],'.ssh','config'),'box','touch /tmp/x'])\"",
     "perl -e 'system(\"ssh\", \"-i\", \"$ENV{HOME}/.ssh/k\", \"box\", \"mkdir -p /tmp/x\");'",
     "python3 - <<'PY'\nimport subprocess, os\nsubprocess.run(['ssh', '-i', os.path.expanduser('~/.ssh/k'), 'box', 'mkdir -p /tmp/x'])\nPY",
+    "python3 - <<'PY'\nfrom subprocess import run\nimport os\nrun(['ssh', '-i', os.path.expanduser('~/.ssh/k'), 'box', 'mkdir -p /tmp/x'])\nPY",
 ]
 
 
