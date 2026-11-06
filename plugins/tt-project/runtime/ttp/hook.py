@@ -1125,6 +1125,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why and (HARNESS_GH_RE.search(cmd) or HARNESS_BIN_RE.search(cmd) and GH_D_RE.search(cmd)) \
             and not _harness_task():
         why = HARNESS_GH_WHY
+    if not why and "***" in cmd:   # a patch in the command (`apply_patch <<EOF`), relative paths too
+        why = harness_gh_patch(payload)
     if not why:
         why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
