@@ -60,6 +60,17 @@ STR_RE = re.compile(r"'((?:[^'\\\n]|\\.)*)'|\"((?:[^\"\\\n]|\\.)*)\"|`([^`]*)`")
 # Commands in an argv list that write the paths they name (login tools write their store: read as argv)
 ARGV_WRITERS = WRITE_ALL | DEST_LAST | set(OUTPUT_OPTS) | {"dd", "sed", "perl"}
 STORE_TOOLS = {"gh", "docker", "aws", "kubectl", "git", "ssh-keygen"}
+# ssh and scp read the files their -i and -F name: options before one that take no value, those whose value
+# is skipped (-p's only when it is a port), and the words a path expression handed to one may use
+SSH_TOOLS = {"ssh", "scp"}
+SSH_FLAGS_RE = re.compile(r"-[46ACNTXYaqrvtpBO3]+")
+SSH_VALUE_OPTS = ("-o", "-l", "-J", "-P")
+PATH_WORDS = {"os", "path", "pathlib", "Path", "expanduser", "expandvars", "join", "home", "homedir", "environ",
+              "getenv", "get", "str", "fspath", "abspath", "realpath", "resolve", "ENV", "HOME", "Dir", "File",
+              "require", "process", "env"}
+# A run call that is a whole statement: its result is not kept, so nothing else can reach its arguments
+RUN_STMT_RE = re.compile(r"(?:^|[;\n])\s*(?:[\w.]+\.)?(?:system|run|call|check_call|check_output|Popen|exec\w*"
+                         r"|spawn\w*)\s*\(")
 HOME_REF_RE = re.compile(r"~|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
 # Codex patches: the files one adds, changes, deletes or moves to (Codex trims a header line, so blanks
 # around it and its path do not hide one)
@@ -227,28 +238,30 @@ def _code_refusal(code: str, ctx, depth: int = 0) -> str | None:
     """Interpreter code that writes a protected path: a write call or mode with one named in the code
     (anywhere: a variable may carry it), a redirect or open mode with one as its target, or a command
     the code runs (os.system, subprocess, exec, backticks) that writes one. Reads pass."""
-    if WRITE_CODE_RE.search(code) and (h := _names(code, ctx)):
+    ms = list(STR_RE.finditer(code))
+    lits = [m[1] or m[2] or m[3] or "" for m in ms]
+    # The code with each literal blanked: what lies between literals is code (a variable, a call)
+    bare = STR_RE.sub(lambda m: m[0][0] + "x" * (len(m[0]) - 2) + m[0][-1], code)
+    # The whole-code checks skip a key or config file that ssh or scp only reads (-i, -F)
+    rest = _ssh_reads(code, bare, ms)
+    if WRITE_CODE_RE.search(code) and (h := _names(rest, ctx)):
         return h
     for m in TARGET_RE.finditer(code):
         if h := _names(m[1], ctx):
             return h
     if not RUN_CODE_RE.search(code):
         return None
-    ms = list(STR_RE.finditer(code))
-    lits = [m[1] or m[2] or m[3] or "" for m in ms]
-    # The code with each literal blanked: what lies between literals is code (a variable, a call)
-    bare = STR_RE.sub(lambda m: m[0][0] + "x" * (len(m[0]) - 2) + m[0][-1], code)
     for i, (m, lit) in enumerate(zip(ms, lits)):
         words = re.findall(r"[^\s|;&<>()\"'`]+", lit)
         names, built = {os.path.basename(w) for w in words}, _built(bare, m, lit)
-        if names & ARGV_WRITERS and (h := _names(code, ctx)):   # a write command: its target may be built
+        if names & ARGV_WRITERS and (h := _names(rest, ctx)):   # a write command: its target may be built
             return h
         item = os.path.basename(lit) in STORE_TOOLS   # an argv list item: its args are the literals after it
         if item and (h := _argv_refusal(lits[i:], ctx)):
             return h
         # A login tool with an argument built in code may write its store: unless it only prints a key
         reads = "ssh-keygen" in names and _keygen_reads(lits[i + 1:] if item else words)
-        if names & STORE_TOOLS and built and not reads and (h := _names(code, ctx)):
+        if names & STORE_TOOLS and built and not reads and (h := _names(rest, ctx)):
             return h
         if " " in lit and depth < 2 and (h := shell_refusal(lit, *ctx, depth + 1)):   # a command line
             return h
@@ -258,9 +271,129 @@ def _code_refusal(code: str, ctx, depth: int = 0) -> str | None:
             if r[1] and re.fullmatch(r"\d+-?|-", r[2].rstrip("'\"`")):
                 continue
             if (not r[2] or re.search(r"[{}%$]", r[2]) or joined and r.end() == len(lit)) and (
-                    h := _names(code, ctx)):
+                    h := _names(rest, ctx)):
                 return h
     return None
+
+
+def _ssh_reads(code: str, bare: str, ms: list) -> str:
+    """`code` with each path blanked that a run call (a whole statement) hands ssh or scp as -i or -F
+    before the first operand: in its argv list, its command line, or its GIT_SSH_COMMAND value."""
+    for a, e in _ssh_spans(code, bare, ms):
+        code = code[:a] + " " * (e - a) + code[e:]
+    return code
+
+
+def _ssh_spans(code: str, bare: str, ms: list, depth: int = 0) -> list:
+    starts, spans = {m.start(): m for m in ms}, []
+    if depth < 1:   # code quoted in a command line (python3 -c "..."): its own run calls
+        for m in ms:
+            if RUN_STMT_RE.search(lit := m[1] or m[2] or ""):
+                inner = list(STR_RE.finditer(lit))
+                ibare = STR_RE.sub(lambda i: i[0][0] + "x" * (len(i[0]) - 2) + i[0][-1], lit)
+                spans += [(a + m.start() + 1, e + m.start() + 1) for a, e in _ssh_spans(lit, ibare, inner, 1)]
+
+    def lit_at(pos):
+        return starts.get(pos) or bare[pos:pos + 1] in ("f", "F") and starts.get(pos + 1)
+
+    def line_items(m):   # a command line literal: ssh's words in it, and code joined right after
+        lit, c, out, cmd, stop = m[1] or m[2] or m[3] or "", m.start() + 1, [], True, None
+        groups = r"\{([^{}]*)\}" if code[m.start() - 1:m.start()] in ("f", "F") else r"\$\{([^{}]*)\}" if m[3] else None
+        for t in re.finditer(r"[^\s;&|]+|[;&|]+", lit):
+            word = t[0].strip("'\"")
+            if stop is not None and t.start() > stop:   # past X='ssh ...': the command comes next
+                spans.extend(_ssh_values(out))
+                out, stop = [], None
+            if re.fullmatch(r"[;&|]+", t[0]):   # the next command
+                spans.extend(_ssh_values(out))
+                out, cmd, stop = [], True, None
+            elif out:
+                left = re.sub(groups, lambda g: "" if _path_expr(g[1]) else "\0", t[0]) if groups else t[0]
+                bad = r"`|\$\(" + (r"|[\0{}]" if groups else "")   # a command substitution, code left in a format
+                out.append((word, (c + t.start(), c + t.end()), not re.search(bad, left)))
+            elif cmd:   # NAME=value words, then the command; ssh as a quoted value (X='ssh -i k') ends with it
+                v = re.match(r"\w+=(['\"]?)", t[0])
+                tool = os.path.basename(word[v.end():] if v else word) in SSH_TOOLS
+                if v and v[1] and tool:
+                    stop = q if (q := lit.find(v[1], t.start() + v.end())) >= 0 else len(lit)
+                cmd, out = bool(v), [("", None, False)] if tool and (not v or v[1]) else []
+        if out and (j := re.compile(r"\s*\+\s*").match(bare, m.end())):   # 'ssh -i ' + expanduser('~/.ssh/k')
+            a = j.end()
+            e = _expr_end(bare, a, "+,;\n")
+            out.append((None, (a, e), _path_expr(code[a:e])))
+        spans.extend(_ssh_values(out))
+
+    for call in RUN_STMT_RE.finditer(bare):
+        end = _expr_end(bare, call.end(), "")
+        if end >= len(bare) or not re.compile(r"\s*(?:[;\n]|$)").match(bare, end + 1) or "$_" in code[call.end():end]:
+            continue
+        a = re.match(r"\s*(\[?)\s*", bare[call.end():end])
+        pos = call.end() + a.end()
+        m = lit_at(pos)
+        first = m and (m[1] or m[2] or "")
+        if first and os.path.basename(first) in SSH_TOOLS and (a[1] or re.compile(r"\s*,").match(bare, m.end())):
+            items, pos = [("", None, False)], m.end()   # an argv list (perl: the call's own arguments)
+            while j := re.compile(r"\s*,\s*").match(bare, pos):
+                pos = j.end()
+                if (m := lit_at(pos)) and m[3] is None and not (bare[m.start() - 1] in "fF" and "{" in m[0]):
+                    items.append((m[1] or m[2] or "", (m.start() + 1, m.end() - 1), True))
+                    pos = m.end()
+                else:
+                    e = _expr_end(bare, pos, ",")
+                    items.append((None, (pos, e), _path_expr(code[pos:e])))
+                    pos = e
+            spans.extend(_ssh_values(items))
+        elif m:
+            line_items(m)
+        if code.count("GIT_SSH_COMMAND") == 1:
+            for g in re.finditer(r"\bGIT_SSH_COMMAND\s*=\s*|[\"']GIT_SSH_COMMAND[\"']\s*:\s*", code[call.end():end]):
+                if m := lit_at(call.end() + g.end()):
+                    line_items(m)
+    return spans
+
+
+def _ssh_values(items: list) -> list:
+    """The spans of the -i and -F values among ssh's words (word, span, a plain path?), up to its first operand."""
+    out, want, skip = [], False, False
+    for i, (word, span, ok) in enumerate(items[1:], 1):
+        if want:
+            if not ok:
+                break
+            out.append(span)
+            want = False
+        elif skip:
+            skip = False
+        elif word in ("-i", "-F"):
+            want = True
+        elif word and word[:2] in ("-i", "-F") and ok:
+            out.append((span[0] + 2, span[1]) if span[1] - span[0] == len(word) else span)
+        elif word in SSH_VALUE_OPTS or word == "-p" and i + 1 < len(items) and (items[i + 1][0] or "").isdigit():
+            skip = True
+        elif not (word and SSH_FLAGS_RE.fullmatch(word)):
+            break
+    return out
+
+
+def _expr_end(bare: str, pos: int, stops: str) -> int:
+    """Where the expression at `pos` ends: a `stops` character or a closing bracket outside brackets."""
+    depth = 0
+    for i in range(pos, len(bare)):
+        ch = bare[i]
+        if ch in "([{":
+            depth += 1
+        elif ch in ")]}":
+            if depth == 0:
+                return i
+            depth -= 1
+        elif depth == 0 and ch in stops:
+            return i
+    return len(bare)
+
+
+def _path_expr(text: str) -> bool:
+    """Code that only builds a path (from the home folder, the environment, literals): nothing it runs or keeps."""
+    t = STR_RE.sub("''", re.sub(r"\\([\"'])", r"\1", text))   # its literals (quotes escaped in a command line too)
+    return bool(t.strip()) and not re.search(r"[=;`]", t) and set(re.findall(r"[A-Za-z_]\w*", t)) <= PATH_WORDS
 
 
 def _built(bare: str, m, lit: str) -> bool:

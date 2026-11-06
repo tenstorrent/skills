@@ -71,6 +71,24 @@ PG_SHELL_DENIED = [
     "python3 -c \"import os; p=os.path.expanduser('~/.ssh/c'); os.system('bash -c \\\"tee ' + p + '\\\"')\"",
     "node -e \"const p=require('os').homedir()+'/.ssh/c'; require('child_process').execSync(`cat /tmp/x > ${p}`)\"",
     "python3 -c \"import os; p=os.path.expanduser('~/.ssh/c'); os.system('echo x >& ' + p)\"",
+    # a write next to an ssh or scp word: the key path in a write position, or an ssh -i read beside a write
+    "python3 -c \"import subprocess,os; subprocess.run(['tee','-i',os.path.expanduser('~/.ssh/k')])\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['cp','/tmp/x','-i',os.path.expanduser('~/.ssh/k')])\"",
+    "python3 -c \"import os; os.system('X=ssh tee -i ' + os.path.expanduser('~/.ssh/k'))\"",
+    "python3 -c \"import os; os.system(\\\"X='ssh -i' tee \\\" + os.path.expanduser('~/.ssh/k'))\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['scp','-r','box:/a','-i',os.path.expanduser('~/.ssh/k')])\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['scp','-i',os.path.expanduser('~/.ssh/k'),'box:/a',os.path.expanduser('~/.ssh/k2')])\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh','-i',os.path.expanduser('~/.ssh/k'),'-E',os.path.expanduser('~/.ssh/k'),'box','mkdir x'])\"",
+    "python3 -c \"import subprocess,os; open(subprocess.run(['ssh','-i',os.path.expanduser('~/.ssh/k'),'box','true']).args[2],'w')\"",
+    "python3 -c \"import subprocess,os; a=['ssh','-i',os.path.expanduser('~/.ssh/k')]; subprocess.run(['tee', a[2]])\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh','-i',(k:=os.path.expanduser('~/.ssh/k')),'box','true']); subprocess.run(['tee',k])\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh','-i',os.system('touch '+os.path.expanduser('~/.ssh/x')) or 'k','box','true'])\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh','-i',os.path.expanduser('~/.ssh/k'),'box','true']); subprocess.run(['mkdir',os.path.expanduser('~/.ssh/d')])\"",
+    "python3 -c \"import os; os.system('ssh -i ' + os.path.expanduser('~/.ssh/k') + ' box true > ' + os.path.expanduser('~/.ssh/k'))\"",
+    "python3 -c \"import os; os.system('ssh -i ' + os.path.expanduser('~/.ssh/k') + '; tee \\\"$_\\\"')\"",
+    "python3 -c \"import os; os.system(f'ssh -i {os.system(\\\"tee \\\" + os.path.expanduser(\\\"~/.ssh/k\\\"))} box')\"",
+    "python3 -c \"import subprocess,os; subprocess.run('tee \\\"${GIT_SSH_COMMAND#ssh -i }\\\"', shell=True, env=dict(os.environ, GIT_SSH_COMMAND='ssh -i '+os.path.expanduser('~/.ssh/k')))\"",
+    "perl -e 'system(\"ssh\", \"-i\", \"$ENV{HOME}/.ssh/k\", \"box\", \"true\"); system(\"tee\", \"$ENV{HOME}/.ssh/k\");'",
 ]
 PG_SHELL_ALLOWED = [
     "cat ~/.ssh/config", "ls -la ~/.ssh", "ssh -i ~/.ssh/id_rsa host true", "cp ~/.ssh/id_rsa.pub /tmp/pub",
@@ -90,6 +108,16 @@ PG_SHELL_ALLOWED = [
     "python3 -c \"import subprocess,os; subprocess.run(['ssh-keygen','-lf',os.path.expanduser('~/.ssh/id_rsa.pub')])\"",
     "python3 -c \"import os; p=os.path.expanduser('~/.ssh/config'); os.system('cat ' + p + ' 2>&1')\"",
     "python3 -c \"import os; p=os.path.expanduser('~/.ssh/config'); os.system('grep Host ' + p + ' > /tmp/h')\"",
+    # a key that ssh, scp or git's ssh only reads (-i, -F), with a write word in another argument
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh','-i',os.path.expanduser('~/.ssh/k'),'box','mkdir -p /tmp/x'])\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['git','fetch'], env=dict(os.environ, GIT_SSH_COMMAND='ssh -i '+os.path.expanduser('~/.ssh/k')))\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['scp','-i',os.path.expanduser('~/.ssh/k'),'box:/tmp/a','/tmp/b'], check=True)\"",
+    "python3 -c \"import os; os.system('ssh -i ' + os.path.expanduser('~/.ssh/k') + ' box mkdir -p /tmp/x')\"",
+    "python3 -c \"import os; os.system(f'ssh -i {os.path.expanduser(\\\"~/.ssh/k\\\")} box rm -rf /tmp/x')\"",
+    "python3 -c \"import subprocess; subprocess.run(\\\"GIT_SSH_COMMAND='ssh -i ~/.ssh/k' git clone box:r /tmp/r && cp a /tmp/r\\\", shell=True)\"",
+    "python3 -c \"import subprocess,os; subprocess.run(['ssh','-o','BatchMode=yes','-p','22','-i',os.path.expanduser('~/.ssh/k'),'-F',os.path.join(os.environ['HOME'],'.ssh','config'),'box','touch /tmp/x'])\"",
+    "perl -e 'system(\"ssh\", \"-i\", \"$ENV{HOME}/.ssh/k\", \"box\", \"mkdir -p /tmp/x\");'",
+    "python3 - <<'PY'\nimport subprocess, os\nsubprocess.run(['ssh', '-i', os.path.expanduser('~/.ssh/k'), 'box', 'mkdir -p /tmp/x'])\nPY",
 ]
 
 
