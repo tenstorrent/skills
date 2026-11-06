@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -966,11 +966,13 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     as fetched before the checks; empty when there is none (a new branch, or `ttp checks`).
     TTP_PUSH_BRANCH is the name of that branch on the remote (or the local branch `ttp land` moves),
     short, without refs/heads/, so a check can refuse content by where it goes rather than by the
-    branch checked out; empty for `ttp checks`."""
+    branch checked out; empty for `ttp checks`. TTP_LEAK_PATTERNS_FILE names the account's local
+    leak-pattern file when it has one (leakfile)."""
     output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH" and k not in checkcap.RUN_ONLY_ENV}  # a `ttp checks` run's own state stays out of its checks
     if pp := check_pythonpath(os.environ):
         env["PYTHONPATH"] = pp
+    env = leakfile.with_path(env)   # the account's leak-pattern file, by path, for a check's temp HOME
     return checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or "",
                                "TTP_PUSH_BRANCH": short_branch(branch)})
 

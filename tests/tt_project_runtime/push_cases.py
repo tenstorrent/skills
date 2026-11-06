@@ -7807,6 +7807,119 @@ def test_check_env_drops_only_the_harness_runtime_from_pythonpath(env, tmp_path,
     assert "PYTHONPATH" not in push.check_env("checks", run_dir=run)
 
 
+def _leak_file(tmp_path, monkeypatch, where="home"):
+    """A leak-pattern file under a temp account home (`where` "home": $HOME/.config, "account": only the
+    password database's home, with HOME and XDG_CONFIG_HOME elsewhere, None: none anywhere), its text a
+    marker that must never show up; the session's own TTP_LEAK_PATTERNS_FILE (tests/conftest.py) is dropped."""
+    from ttp import leakfile
+    monkeypatch.delenv("TTP_LEAK_PATTERNS_FILE", raising=False)
+    home, account = tmp_path / "lhome", tmp_path / "account"
+    for h in (home, account):
+        (h / ".config").mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(home / ".config"))
+    monkeypatch.setattr(leakfile, "_account", lambda: str(account))
+    marker = "leak-marker-" + "q7zx"
+    if where is None:
+        return None, marker
+    f = (home if where == "home" else account) / ".config" / "tt-project" / "leak-patterns.txt"
+    f.parent.mkdir(parents=True)
+    f.write_text(f"# patterns\n{marker}\n")
+    return f, marker
+
+
+def test_check_env_carries_the_leak_pattern_file_by_path_only_when_one_exists(env, tmp_path, monkeypatch):
+    """The checks get TTP_LEAK_PATTERNS_FILE, an absolute path, when the account has the file (under
+    $XDG_CONFIG_HOME, $HOME/.config or the password database's home when HOME is a temp one), keep
+    one already set, and get none without the file. Its text is in no value."""
+    from ttp import leakfile, push
+    (tmp_path / "run").mkdir()
+    run = str(tmp_path / "run")
+    monkeypatch.delenv("TTP_CHECKS_TMP_FD", raising=False)
+    f, marker = _leak_file(tmp_path, monkeypatch)
+    got = push.check_env("checks", run_dir=run)
+    assert got["TTP_LEAK_PATTERNS_FILE"] == str(f) and os.path.isabs(got["TTP_LEAK_PATTERNS_FILE"])
+    assert not any(marker in v for v in got.values())
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "nowhere"))   # HOME/.config still has it
+    assert push.check_env("checks", run_dir=run)["TTP_LEAK_PATTERNS_FILE"] == str(f)
+
+    f, marker = _leak_file(tmp_path / "b", monkeypatch, where="account")   # a temp HOME: the account's
+    monkeypatch.setenv("HOME", str(tmp_path / "temp-home"))
+    assert push.check_env("checks", run_dir=run)["TTP_LEAK_PATTERNS_FILE"] == str(f)
+
+    _leak_file(tmp_path / "c", monkeypatch, where=None)
+    assert "TTP_LEAK_PATTERNS_FILE" not in push.check_env("checks", run_dir=run)
+    assert leakfile.path() == ""
+
+    own = tmp_path / "own.txt"
+    own.write_text("x\n")
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TTP_LEAK_PATTERNS_FILE", "own.txt")   # relative: made absolute
+    assert push.check_env("checks", run_dir=run)["TTP_LEAK_PATTERNS_FILE"] == str(own)
+    monkeypatch.setenv("TTP_LEAK_PATTERNS_FILE", str(tmp_path / "missing.txt"))   # stays, the test says why
+    assert push.check_env("checks", run_dir=run)["TTP_LEAK_PATTERNS_FILE"] == str(tmp_path / "missing.txt")
+    own.chmod(0)
+    if not os.access(own, os.R_OK):   # unreadable (not as root): not passed as the account's file
+        monkeypatch.delenv("TTP_LEAK_PATTERNS_FILE")
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path))
+        (tmp_path / "tt-project").mkdir()
+        (tmp_path / "tt-project" / "leak-patterns.txt").symlink_to(own)
+        assert "TTP_LEAK_PATTERNS_FILE" not in push.check_env("checks", run_dir=run)
+
+
+def test_ttp_sandbox_passes_the_leak_pattern_file_by_path(env, tmp_path, monkeypatch):
+    """`ttp sandbox -- <cmd>` gives the command the account's leak-pattern file by path, and none
+    without one; its own environment stays as it was."""
+    from ttp import sandbox
+    seen = []
+
+    def execvpe(file, argv, env_):
+        seen.append(env_.get("TTP_LEAK_PATTERNS_FILE"))
+        raise FileNotFoundError(2, "stub")
+
+    monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: list(argv))
+    monkeypatch.setattr(sandbox.os, "execvpe", execvpe)
+    f, marker = _leak_file(tmp_path, monkeypatch)
+    assert sandbox.run(["true"]) == 127
+    f.unlink()
+    assert sandbox.run(["true"]) == 127
+    assert seen == [str(f), None] and "TTP_LEAK_PATTERNS_FILE" not in os.environ
+
+
+def test_a_pass_records_a_hash_of_the_leak_pattern_file_never_its_text(env, tmp_path, monkeypatch):
+    """A pass's environment key holds the pattern file's hash when there is one, so a pass from before
+    the file existed or changed is not reused; without the file the key is as before."""
+    from ttp import push, pushpass
+    wt = tmp_path / "wt"
+    wt.mkdir()
+    f, marker = _leak_file(tmp_path, monkeypatch)
+    (tmp_path / "run").mkdir()
+    env_ = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    parts = pushpass.env_parts(wt, "true", env_, "")
+    assert parts["leak"] and marker not in json.dumps(parts)
+    f.write_text(f"{marker}\nmore\n")
+    assert pushpass.env_parts(wt, "true", env_, "")["leak"] != parts["leak"]
+    f.unlink()
+    assert "leak" not in pushpass.env_parts(wt, "true", push.check_env("checks", run_dir=str(tmp_path / "run")), "")
+
+
+def test_ttp_checks_runs_with_the_leak_pattern_file_and_never_shows_its_text(env, tmp_path, monkeypatch, capsys):
+    """End to end: a `ttp checks` check sees TTP_LEAK_PATTERNS_FILE, and the file's text appears in
+    no output, log or file the run leaves in its run folder, the repository or the project."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    f, marker = _leak_file(tmp_path, monkeypatch)
+    p.set_config("delivery.push_checks", ['test -r "$TTP_LEAK_PATTERNS_FILE" && echo "leak file: $TTP_LEAK_PATTERNS_FILE"'])
+    cli.main(["checks", "--fresh"])
+    out = capsys.readouterr()
+    assert f"leak file: {f}" in (run / "checks.log").read_text(), out
+    assert marker not in out.out + out.err
+    for root in (run, repo, p.base):
+        for g in Path(root).rglob("*"):
+            if g.is_file() and not g.is_symlink() and g != f:
+                assert marker.encode() not in g.read_bytes(), g
+
+
 def test_ttp_checks_drops_a_pythonpath_pwd_extra_when_only_the_harness_runtime_is_on_pythonpath(env, tmp_path,
                                                                                                  monkeypatch):
     """In a worker run (PYTHONPATH the harness runtime only) a `PYTHONPATH=$PWD python3 -m pytest` extra in a

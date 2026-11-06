@@ -201,8 +201,10 @@ def notice(on: bool = True) -> str:
 def run(argv: list[str]) -> int:
     """`ttp sandbox -- <cmd...>`: run `argv` sandboxed and return its exit code. A SIGTERM or SIGHUP
     to this process (a `timeout`, a closed terminal) ends the whole namespace. A pytest run's xdist
-    options are dropped where xdist is not installed (testslots.drop_xdist)."""
-    from . import testslots
+    options are dropped where xdist is not installed (testslots.drop_xdist). The command gets the
+    account's leak-pattern file by path (leakfile), as checks do."""
+    from . import leakfile, testslots
+    env = leakfile.with_path(dict(os.environ))
     argv, dropped = testslots.drop_xdist(argv)
     if dropped:
         print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
@@ -211,11 +213,11 @@ def run(argv: list[str]) -> int:
         if line := notice():
             print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
         try:
-            os.execvp(argv[0], argv)
+            os.execvpe(argv[0], argv, env)
         except OSError as e:
             print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
             return 127 if isinstance(e, FileNotFoundError) else 126
-    proc = subprocess.Popen(wrapped)
+    proc = subprocess.Popen(wrapped, env=env)
 
     def end(*_):
         try:

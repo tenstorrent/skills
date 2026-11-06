@@ -127,6 +127,21 @@ _XDG = {"XDG_CONFIG_HOME": ".config", "XDG_DATA_HOME": ".local/share", "XDG_STAT
 _AGENT_HOMES = ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "COPILOT_HOME")
 
 
+def _leak_patterns_file() -> None:
+    """The local leak-pattern file (tests/test_tt_project_plugin.py) lives under the account's own
+    config folder, which each test's temp HOME hides: the suite gets it by path, set before any test
+    runs, so the leak test runs instead of skipping. Only the path: its text is never read here."""
+    if os.environ.get("TTP_LEAK_PATTERNS_FILE"):
+        return
+    config = os.environ.get("XDG_CONFIG_HOME") or os.path.join(REAL_HOME, ".config")
+    path = os.path.abspath(os.path.join(config, "tt-project", "leak-patterns.txt"))
+    if os.path.isfile(path):
+        os.environ["TTP_LEAK_PATTERNS_FILE"] = path
+
+
+_leak_patterns_file()
+
+
 def _user_base() -> str | None:
     import site
     return site.getuserbase() if site.ENABLE_USER_SITE else None

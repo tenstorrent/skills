@@ -1626,6 +1626,16 @@ session and stateless coordinators on every provider.
   that pass ran in mode `target` with that batch's tip, not `checks` with an empty tip.
   `env_id` does not cover CHECK_ENV_VARS (`PYTEST_ADDOPTS` and similar), so a reused
   push-queue pass ran under the daemon's values of those variables.
+- Local leak patterns: when the account has a leak-pattern file (`TTP_LEAK_PATTERNS_FILE`, else
+  `$XDG_CONFIG_HOME/tt-project/leak-patterns.txt`, `~/.config/tt-project/leak-patterns.txt`, or
+  that file under the account's home from the password database when HOME is a temp one), local
+  checks and `ttp sandbox -- <cmd>` get `TTP_LEAK_PATTERNS_FILE` set to its absolute path, so a
+  test that runs under a temp HOME (this repository's suite gives every test one) still reads it.
+  Only the path is passed: the file is never printed, logged, copied into a worktree or sent to
+  another host, so a check on another host (`host`, Slurm) skips such a test. To gate pushes on it
+  wherever the other checks run, add a check pinned to this host (`"host": "local"`) that runs only
+  that test. A pass's `env_id` holds a hash of the file (never its text): a pass from before the
+  file existed or changed is not reused.
 - A waiting hand-off on the run's own detached checks (`retry_when` `ttp checks --result <run dir>`)
   wakes a model only on a failure, a broken probe or a timeout. With an `on_pass` the pass records it;
   a plain code task with a summary and nothing left records `done` (the default on_pass). Any other

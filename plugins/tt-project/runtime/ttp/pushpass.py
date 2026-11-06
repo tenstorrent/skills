@@ -39,7 +39,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from . import push
+from . import leakfile, push
 from .project import Project, write_json
 
 STORE = "push_check_passes.json"     # under the project's state: {"passes": [{"key", "tree", "cmd", "batch", "ts", "parts", "head", "tip"}]}
@@ -178,7 +178,8 @@ def _python(py: str | Path | None, roots: list[str]) -> dict:
 def env_parts(wt: Path, cmd: str, env: dict, tip: str) -> dict:
     """The parts of env_id, by name: the command as it runs (argv, with the venv python it is given),
     the interpreter (by content), its version and the installed packages (deps) of that venv and of
-    the python3 on the check's PATH, the active venv and the tip. Paths in the worktree `wt` read the
+    the python3 on the check's PATH, the active venv, the tip and the
+    leak-pattern file's hash when there is one (_leak). Paths in the worktree `wt` read the
     same in every worktree. A check that runs on another machine (push.remote_host) is told by that
     host, its command and env, and the tip."""
     if host := push.remote_host(cmd):
@@ -187,8 +188,19 @@ def env_parts(wt: Path, cmd: str, env: dict, tip: str) -> dict:
     argv = [_local(str(w), roots) for w in push.check_argv(cmd, wt, env, isolate=False)]   # sandboxed or not, the same tests
     venv = _python(push.venv_python(wt, env), roots)
     path = _python(shutil.which("python3", path=env.get("PATH")), roots)
-    return {"argv": argv, **{k: {"venv": venv[k], "python3": path[k]} for k in ("interpreter", "version", "deps")},
-            "active": _local(env.get("VIRTUAL_ENV") or "", roots), "tip": tip or ""}
+    parts = {"argv": argv, **{k: {"venv": venv[k], "python3": path[k]} for k in ("interpreter", "version", "deps")},
+             "active": _local(env.get("VIRTUAL_ENV") or "", roots), "tip": tip or ""}
+    if leak := _leak(env):   # a pass from before the file existed or changed ran fewer leak patterns
+        parts["leak"] = leak
+    return parts
+
+
+def _leak(env: dict) -> str:
+    """A hash of the leak-pattern file `env` names (leakfile; never its text), or "" without one."""
+    try:
+        return hashlib.sha256(Path(p).read_bytes()).hexdigest() if (p := leakfile.path(env)) else ""
+    except OSError:
+        return ""
 
 
 def digest(parts) -> str:
