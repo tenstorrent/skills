@@ -3338,8 +3338,8 @@ def _spill_gate(env, tmp_path, monkeypatch, base_body, head_body):
 def test_a_spilled_failure_on_base_and_head_is_judged_on_the_spill_host_and_lands_without_a_rerun_here(
         env, tmp_path, monkeypatch):
     """Follow-up of the spill hosts' tests gate: a spilled pytest check whose failing test also fails on the
-    base reruns only that test on the spill host (the select plugin shipped there), on the head and the
-    base, and the change lands (landing only) without running the checks again here; the base result is
+    base reruns only that test on the spill host (the select plugin shipped there), on the base only (it
+    fails there too, so the head does not rerun it), and the change lands (landing only) without running the checks again here; the base result is
     saved under the spill host's name. A failure new on the head still runs again here, as before."""
     import threading
     from ttp import cli, gatejudge
@@ -3371,7 +3371,8 @@ def test_a_spilled_failure_on_base_and_head_is_judged_on_the_spill_host_and_land
     assert "did not pass on spill host" not in text, "no rerun here"
     runs = [line.split(" ", 1) for line in marks.read_text().splitlines()]
     assert all("/ttp-check." in where for where, _ in runs), runs
-    assert [kept for _, kept in runs][1:] == ["test_pre"], ("the head rerun ran only the failing test", runs, text)
+    assert len(runs) == 1, ("failing on the base too: no head rerun", runs, text)
+    assert "(rerun on the base" in text and "(rerun on the head" not in text, text
     # The base (no conftest there) ran on the spill host too: its saved result is that host's.
     assert gatejudge.saved_base(p.state, "check-host-a", base, ["tests/test_gate.py::test_pre"], time.time())
     assert not gatejudge.saved_base(p.state, gatejudge.host(), base, ["tests/test_gate.py::test_pre"], time.time())

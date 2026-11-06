@@ -352,7 +352,8 @@ def test_ttp_checks_lets_a_failure_on_base_and_head_land_but_records_no_pass(env
     cli.main(["checks", "--", _FAIL])
     out = capsys.readouterr().out
     assert "pre-existing on the base" in out and "tests/test_gate.py::test_pre" in out and "LANDING ONLY" in out
-    assert "(rerun on the base" in out and "(rerun on the head" not in out, "failing on the base: no head rerun"
+    log = (run / "checks.log").read_text()
+    assert "(rerun on the base" in log and "(rerun on the head" not in log, "failing on the base: no head rerun"
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] and rec["landing_only"]
     assert rec["excused"][0]["pre_existing"] == ["tests/test_gate.py::test_pre"]
@@ -398,10 +399,11 @@ def test_ttp_checks_a_local_failure_whose_base_rerun_cannot_tell_fails_and_saves
 
 
 def test_ttp_checks_quarantines_a_flaky_failure_and_notes_the_coordinator_once(env, tmp_path, monkeypatch, capsys):
+    # test_flaky fails only on its first run (the head's full run); its reruns on the base, then the head, pass.
     from ttp import cli, gatejudge
     count = tmp_path / "count"
     flaky = (f"import pathlib\nC = pathlib.Path({str(count)!r})\n\n\ndef test_flaky():\n"
-             "    n = len(C.read_text()) if C.exists() else 0\n    C.write_text('x' * (n + 1))\n    assert n % 2\n")
+             "    n = len(C.read_text()) if C.exists() else 0\n    C.write_text('x' * (n + 1))\n    assert n\n")
     p, run = _gate_repo(env, tmp_path, monkeypatch, flaky, flaky + "\n\ndef helper():\n    return 1\n")
     cli.main(["checks", "--", _FAIL])
     out = capsys.readouterr().out
