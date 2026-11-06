@@ -74,6 +74,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     plainreply,
     plangate,
     preempt,
+    premise,
     prguard,
     progress,
     projpause,
@@ -2435,6 +2436,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                              (title,))
                 if dup and str(dup["id"]) != str(a.get("continues")):
                     raise InfoRejection(f"duplicate of open task #{dup['id']}")
+                # A premise a check already proved false (premise.repeat): nothing to do, named before the
+                # wider ledger match below, so the refusal cites the check.
+                if (gone := premise.repeat(db, a.get("spec") or "")) is not None:
+                    if not (a.get("force") and tried.differs(a.get("spec") or "", gone)):
+                        raise InfoRejection(premise.rejection(gone))
+                    notes.append(f"task_add {title[:80]!r}: forced past premise check #{gone['id']}")
                 # Work this project already tried, shelved or landed (tried.py): a reworded title with
                 # the same parameters still matches; force passes only with the difference stated.
                 # A hop of a continue chain repeats its earlier hops' titles, not their work.

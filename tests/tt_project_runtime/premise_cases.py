@@ -313,3 +313,68 @@ def test_an_urgent_code_task_checks_its_premise_in_its_own_run_and_drops_a_queue
     assert premise.tend(p.db) == [] and p.db.task(q2)["status"] == "queued"
     _end_check(p, q2, premise="holds", summary="no retry line")
     assert premise.tend(p.db) == [(late, f"premise holds (#{q2})")]
+
+
+def test_a_check_that_rejects_the_premise_without_a_premise_key_counts_as_fails(env):
+    """A check answering `"outcome": "rejected"` and no `premise` key (#6396's shape) said fails in its
+    own words: with full cover its code task is closed, short of cover it still runs."""
+    from ttp import premise
+    p = _premise_project(env)
+    cover = [{"condition": "the renamed helper", "at": "tests/x_cases.py:449"}]
+    answers = {"covered": (dict(outcome="rejected", covered=cover), "done"),
+               "uncited": (dict(outcome="rejected"), "queued"),
+               "says holds": (dict(outcome="rejected", premise="holds", covered=cover), "queued")}
+    cids = {how: _code(p) for how in answers}
+    premise.tend(p.db)
+    for how, cid in cids.items():
+        qid = int(json.loads(p.db.task(cid)["labels"])[0].split(":")[1])
+        _end_check(p, qid, summary="Nothing was lost.", **answers[how][0])
+    premise.tend(p.db)
+    for how, cid in cids.items():
+        assert p.db.task(cid)["status"] == answers[how][1], how
+    assert premise.verdict({"status": "done", "outcome": "kept"}) == ""
+
+
+def _failed_check(p, check, cover=True, age_days=0.0):
+    """A code task with premise `check` and its check, ended "fails" (with or without full cover)."""
+    from ttp import premise
+    cid = _code(p, spec=f"Goal: restore lost lines.\npremise: {check}\nSteps: compare.")
+    premise.tend(p.db)
+    qid = int(json.loads(p.db.task(cid)["labels"])[0].split(":")[1])
+    _end_check(p, qid, premise="fails", summary="Nothing was lost: every line is in the landing.",
+               **({"covered": [{"condition": "each added line", "at": "tests/x_cases.py:449"}]} if cover else {}))
+    premise.tend(p.db)
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - age_days * 86400, qid))
+    return cid, qid
+
+
+def test_task_add_refuses_a_premise_a_check_already_proved_false_for_two_weeks(env):
+    """The repro: three code tasks re-asked whether commit e72d3d2's lines survived its landing
+    e734140 after check #6376 had proved they did. A new task whose premise names only commits a
+    failed premise named (or, naming none, says the same words) is refused naming the check; other
+    commits, a "fails" short of cover, a check older than 14 days or a stated difference pass."""
+    from ttp import coordinator as coord, premise
+    p = _premise_project(env)
+    cid, qid = _failed_check(p, "a line commit e72d3d2 adds to x_cases.py is missing from e734140's copy")
+    _failed_check(p, "a line commit 0a1b2c3 adds is missing from 4d5e6f7's copy", cover=False)
+    _failed_check(p, "a line commit 9a8b7c6 adds is missing from 5d4e3f2's copy", age_days=premise.REPEAT_DAYS + 1)
+    _failed_check(p, "the `ttp runs` command has no help line")
+
+    def add(title, check, **kw):
+        return coord.apply(p, [{"type": "task_add", "title": title, "kind": "code", **kw,
+                                "spec": f"Goal: check it.\npremise: {check}\nSteps: compare."}])
+
+    got = add("verify e72d3d2 survived", "any test line of e72d3d2bbbb00 lost on origin's copy")
+    assert len(got) == 1 and f"premise already proved false by premise check #{qid} (for #{cid})" in got[0] \
+        and "Nothing was lost" in got[0] and f"differs from #{qid}" in got[0], got
+    assert add("check the help line again", "The `ttp runs` command has no help line.")[0].startswith(
+        "task_add: premise already proved false"), "no commit named: the same words match"
+    assert add("verify forced", "e72d3d2 lost a line", force=True)[0].startswith("task_add: premise already")
+    assert not p.db.q("SELECT 1 FROM tasks WHERE title LIKE 'verify %' OR title LIKE 'check the help%'")
+    assert add("verify three commits", "a line of d472bdd, 01690fb or e72d3d2 is missing") == [], "a new commit"
+    assert add("verify uncovered", "a line commit 0a1b2c3 adds is lost") == [], "a fails short of cover"
+    assert add("verify old", "a line commit 9a8b7c6 adds is lost") == [], "older than the window"
+    assert add("verify other help", "the `ttp logs` command has no help line") == [], "other words"
+    forced = add("verify e72d3d2 with force", f"e72d3d2 lost a line; differs from #{qid}: checks the cli copy",
+                 force=True)
+    assert forced == [] and any(f"forced past premise check #{qid}" in n for n in p.db.kv(coord.NOTES_KEY))

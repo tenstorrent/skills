@@ -30,6 +30,11 @@ Model-free, from Daemon.reconcile_tasks and the start of each dispatch pass (ten
 - a pending question whose code task ended (done, failed, cancelled) and that has not started is
   cancelled: nobody reads its answer.
 
+A premise a check proved false (a "fails" that closes its code task) is remembered for REPEAT_DAYS:
+the coordinator's task_add refuses a new task whose `premise:` line repeats it (`repeat`: every
+commit it names is one the failed premise named, or the same words where it names none), naming the
+check, unless the spec says how it differs from that check and is sent with force.
+
 While it waits, the code task's own check is no lane holder (lanewait.holders): it raises no
 lane_wait event. The question is a task of its own: a stuck run of it is stopped at its tier's
 stall_s and its no_progress key names it, and one dispatch never starts is Daemon.check_stall's.
@@ -86,6 +91,8 @@ def verdict(result: dict) -> str:
     if str(result.get("status") or "") != "done":
         return ""
     v = result.get("premise")
+    if v is None and str(result.get("outcome") or "").strip().lower() == "rejected":
+        return "fails"   # the premise rejected in the hand-off's own words: still needs gaps()'s cover
     if isinstance(v, bool):
         return "holds" if v else "fails"
     return VERDICTS.get(str(v or "").strip().lower(), "")
@@ -117,6 +124,52 @@ def gaps(result: dict) -> list[str]:
         if not what or not CITE.search(at):
             out.append(f"no file:line for: {what[:200] or '(unnamed condition)'}")
     return out
+
+
+REPEAT_DAYS = 14
+_SHA = re.compile(r"(?<![\w/.-])(?=[0-9a-f]*[a-f])(?=[0-9a-f]*\d)[0-9a-f]{7,40}(?![\w/-])")
+_ASKED = re.compile(r"^The premise to check: (.*)$", re.M)
+
+
+def _commits(text: str) -> frozenset:
+    """The commits `text` names, by their first 7 hex digits (a short and a full sha are one)."""
+    return frozenset(m.group(0)[:7] for m in _SHA.finditer(text.lower()))
+
+
+def _words(text: str) -> str:
+    return " ".join(re.findall(r"\w+", text.lower()))
+
+
+def repeat(db, spec: str, now: float | None = None) -> dict | None:
+    """The newest premise check of the last REPEAT_DAYS that proved false the premise `spec`'s
+    `premise:` line repeats, or None: a done check whose "fails" closes its code task (verdict and
+    gaps, as _settle reads it), whose premise names every commit the new one names (or, naming none,
+    has the same words). {id, task, ts, summary}."""
+    check = line(spec)
+    if not check:
+        return None
+    mine, said = _commits(check), _words(check)
+    since = (time.time() if now is None else now) - REPEAT_DAYS * 86400
+    for q in db.q("SELECT id, spec, labels, result, COALESCE(updated, created, 0) ts FROM tasks WHERE "
+                  "kind='question' AND status='done' AND labels LIKE ? AND COALESCE(updated, created, 0) >= ? "
+                  "ORDER BY ts DESC, id DESC LIMIT 400", (f'%"{CHECK_LABEL}%', since)):
+        res = load_result(q["result"])
+        if verdict(res) != "fails" or gaps(res) or not (m := _ASKED.search(q["spec"] or "")):
+            continue
+        theirs = m.group(1)
+        if (mine and mine <= _commits(theirs)) or (not mine and said and said == _words(theirs)):
+            owner = next((x[len(CHECK_LABEL):] for x in map(str, _labels(q)) if x.startswith(CHECK_LABEL)), "")
+            return {"id": q["id"], "task": owner, "ts": float(q["ts"]),
+                    "summary": str(res.get("summary") or "").strip()}
+    return None
+
+
+def rejection(hit: dict) -> str:
+    """task_add's refusal of a premise `repeat` found."""
+    return (f"premise already proved false by premise check #{hit['id']}"
+            + (f" (for #{hit['task']})" if hit["task"] else "")
+            + f": {hit['summary'][:300]}. Do not queue it again; if this is really new, add "
+              f"'differs from #{hit['id']}: <how>' to the spec and resend with force: true")
 
 
 def question_spec(task: dict, check: str) -> str:
