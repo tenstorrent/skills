@@ -2908,6 +2908,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s",
                            "push_load_wait_s",
+                           "push_priority_wait_s",   # a push's longest wait behind another priority holder (checkcap.priority_wait_s)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
                            "slurm_overflow"}}   # a Slurm cluster the pool's overflow runs on (slurmcheck)
@@ -2915,7 +2916,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
 ACCOUNT_USER_ONLY = {"checks.spill_hosts", "checks.slurm_overflow"}
 # Host-wide account keys the runtime reads only from the account settings: a project's own copy would
 # show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
-HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max"}
+HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
+                  "checks.push_priority_wait_s"}
 
 
 def layered(raw: dict) -> dict:
