@@ -50,7 +50,7 @@ from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
-from .budget import DOC_SUFFIXES
+from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, approved_heads_may_push, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
                       load_registry, nice_level, open_append_or_null, own_creates_pr_branch, own_push, push_queue_on,
@@ -4963,14 +4963,15 @@ def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str
     if hard:
         say(f"never excused (delivery.push_hard_tests): {' '.join(hard)}")
     if v["flaky"] and s["on"]:
-        new = gatejudge.quarantine(p.state, v["flaky"], {"head": head, "check": str(cmd), "host": host_,
-                                                         "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
-        if new:   # one fix note per newly quarantined test
+        seen = {"head": head, "check": str(cmd), "host": host_, "task": os.environ.get("TTP_TASK") or ""}
+        new = gatejudge.quarantine(p.state, v["flaky"], seen, now, s["days"])
+        if new:   # into the day's deflake task of each module, model-free: a feed line, no coordinator turn
+            tasks = gatejudge.deflake(p.db, new, seen, now, p, task_default_usd(cfg, "standard"))
             # pushq._event's row, written here: pushq imports push (and landed) at import time, and a
             # sibling import inside a function on the push path is refused
             p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                    (time.time(), "daemon", gatejudge.EVENT, "normal",
-                    gatejudge.note_text(new, head, str(cmd))[:6000], "queued", None))
+                    gatejudge.note_text(new, head, str(cmd), tasks)[:6000], "handled", None))
     if gatejudge.blocks(v):
         say(f"new on {head[:10]}, the failure stands: {' '.join(v['new'])}")
         return CHECKS_FAILED

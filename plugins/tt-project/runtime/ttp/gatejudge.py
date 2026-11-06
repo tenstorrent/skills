@@ -11,7 +11,8 @@ base with the push target), then the rest once on the head. Per id:
   confirm it (on a loaded host those reruns alone outlasted a push's checks).
 - passes on the base (or is not there) and on the head rerun: flaky. It goes into the project's
   quarantine (QUARANTINE_FILE: first seen, evidence, expiry after checks.quarantine_days, default 7),
-  which status shows, and one fix note goes to the coordinator. It does not block.
+  which status shows, and into the deflake task of its test module for that day (deflake: model-free,
+  no coordinator note). It does not block.
 - passes on the base (or is not there) and fails on the head rerun: new. It blocks.
 - fails on the base another way, or the head's run shows no mark to compare: it reruns on the head. Failing
   there the same way as on the base, it is pre-existing; failing another way, it is not proven either way,
@@ -39,7 +40,8 @@ checks slot, telling the task to fix them (known_new; --fresh runs it again).
 An entry leaves the quarantine on its expiry, or earlier in two ways only. The daemon's sweep (lift_due,
 every LIFT_EVERY_S) lifts it once its fix landed: a done code task whose title names the test, updated
 since it was first seen flaky, has landed on the push branch (landed.check, as `ttp landed --task`) and
-was not already in the head it last flaked at. Or `ttp quarantine lift <id> --why` lifts it by hand.
+was not already in the head it last flaked at; the deflake task that lists the test (DEFLAKE_KEY) counts
+as named for it even when its cut title does not name it. Or `ttp quarantine lift <id> --why` lifts it by hand.
 Each lift is logged (LIFTS_FILE), shown by `ttp status` for a day and by the daily review's audit. No
 existence check lifts anything: an id whose file or function is not found at the push branch tip is only
 marked so (not_found) in `ttp quarantine list`, `ttp status` and the audit, since a test only on the
@@ -58,9 +60,10 @@ import re
 import socket
 import time
 from contextlib import contextmanager
+from datetime import datetime, timedelta
 from pathlib import Path
 
-from . import checkwait, sharedchecks
+from . import checkwait, sharedchecks, timefmt
 
 QUARANTINE_FILE = "test_quarantine.json"   # in the project's state: {id: entry}
 BASE_FILE = "gate_base.json"               # in the project's state: {"host|base|id": {"failed", "ts"}}
@@ -75,7 +78,9 @@ BUSY = 75           # a rerun's exit when its wrapper's lock or queue admitted i
 BUSY_TRIES = 3      # checks.judge_busy_tries: reruns of one busy rerun
 BUSY_WAIT_S = 600.0  # checks.judge_busy_wait_s: the backoff sleeps of one rerun, in all
 BUSY_FIRST_S = 30.0  # the first backoff; each next one doubles
-EVENT = "checks_flaky_test"   # the queued fix note to the coordinator
+EVENT = "checks_flaky_test"   # the feed line (handled: no coordinator turn) naming the deflake task
+DEFLAKE_KEY = "deflake_tasks"  # kv {task id: {day, module, ids, ts}}: the deflake task of a module's tests of a day
+DEFLAKE_KEEP_S = 30 * 86400.0  # records kept this long, past any quarantine's life
 LIFTS_FILE = "test_quarantine_lifts.jsonl"   # in the project's state: one line per lift
 LIFT_EVERY_S = 600.0   # the daemon's sweep for fixed or gone entries
 LIFT_SHOW_S = 86400.0  # status shows the lifts of the last day
@@ -368,16 +373,79 @@ def not_found(p, ids) -> set[str]:
 
 
 def fix_tasks(db, test_id: str, entry: dict) -> list[int]:
-    """Done code tasks whose title names the test (its function, as a word), updated since it was first
-    seen flaky. A spec that only mentions the test does not make the task its fix."""
+    """Done code tasks whose title names the test (its function, as a word), or the deflake task that lists
+    its exact id, updated since it was first seen flaky. A spec that only mentions the test does not make
+    the task its fix."""
     name = _name(test_id)
     if not name:
         return []
+    since = float(entry.get("first_seen") or 0)
     word = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)")
     rows = db.q("SELECT id, title FROM tasks WHERE kind='code' AND status='done' AND updated>=? "
-                "AND instr(title, ?) ORDER BY id DESC LIMIT 50",
-                (float(entry.get("first_seen") or 0), name))
-    return [r["id"] for r in rows if word.search(r["title"] or "")][:FIX_TRIES]
+                "AND instr(title, ?) ORDER BY id DESC LIMIT 50", (since, name))
+    got = {r["id"] for r in rows if word.search(r["title"] or "")}
+    listed = [int(k) for k, v in db.kv_dict(DEFLAKE_KEY)[0].items()
+              if k.isdigit() and isinstance(v, dict) and test_id in (v.get("ids") or [])]
+    for tid in listed:
+        t = db.task(tid)
+        if t and t["kind"] == "code" and t["status"] == "done" and float(t["updated"] or 0) >= since:
+            got.add(tid)
+    return sorted(got, reverse=True)[:FIX_TRIES]
+
+
+def _next_day(now: float, where) -> float:
+    """The start of the day after `now` in the home zone of `where`."""
+    tz = timefmt.tzinfo(where)
+    day = datetime.fromtimestamp(now, tz).date() + timedelta(days=1)
+    return datetime(day.year, day.month, day.day, tzinfo=tz).timestamp()
+
+
+def deflake_spec(module: str, ids: list[str], day: str, evidence: dict) -> str:
+    return "\n".join([
+        f"Make these tests of {module} deterministic. Each failed, then passed on a rerun at the same head at "
+        f"the tests gate, so it is quarantined (excused there until its fix lands):",
+        *[f"- {i}" for i in ids],
+        f"Last seen at head {str(evidence.get('head') or '')[:12]} with {evidence.get('check') or 'the checks'}.",
+        "Find each one's cause and wait on the real condition, a test clock or an event, not wall time. Do not "
+        "skip, mark xfail or loosen a test. Run each fixed test several times, also under parallel load, before "
+        "the hand-off.",
+        "Do not lift the quarantine and queue no lift task: once this task's change lands on the push branch, "
+        "the daemon lifts these tests itself, model-free.",
+        f"Collected by the tests gate: tests of {module} quarantined on {day} join this task until it starts."])
+
+
+def deflake(db, ids: list[str], evidence: dict, now: float, where, budget_usd: float | None = None) -> list[int]:
+    """File newly quarantined `ids` into one deflake code task per test module and home-zone day: the
+    module's task of that day while it is queued and never started gets them (spec and title rewritten),
+    else a new one, held until the next day starts so the rest of the day's flakes join it. An id already
+    listed by an unfinished deflake task is skipped. Model-free; the tasks touched, ascending."""
+    from .db import TERMINAL_TASK_STATES
+    day, out = timefmt.today(now, where), set()
+    with db.tx():   # one writer at a time: two gates flaking at once never open two tasks
+        recs = {k: v for k, v in db.kv_dict(DEFLAKE_KEY)[0].items()
+                if isinstance(v, dict) and now - float(v.get("ts") or 0) < DEFLAKE_KEEP_S}
+        tasks = {k: db.task(int(k)) for k in recs if k.isdigit()}
+        busy = {i for k, v in recs.items() if tasks.get(k) and tasks[k]["status"] not in TERMINAL_TASK_STATES
+                for i in v.get("ids") or []}
+        for module in sorted({i.partition("::")[0] for i in ids}):
+            new = [i for i in dict.fromkeys(ids) if i.partition("::")[0] == module and i not in busy]
+            if not new:
+                continue
+            key = next((k for k, v in recs.items() if v.get("day") == day and v.get("module") == module
+                        and tasks.get(k) and tasks[k]["status"] == "queued" and not tasks[k]["attempts"]), None)
+            have = list(recs[key]["ids"]) if key else []
+            all_ids = have + new
+            names = ", ".join(dict.fromkeys(_name(i) or i for i in all_ids))
+            title, spec = f"Deflake {module}: {names}"[:200], deflake_spec(module, all_ids, day, evidence)
+            if key:
+                db.update_task(int(key), title=title, spec=spec)
+            else:
+                key = str(db.add_task(title, spec, kind="code", tier="standard", priority=2, origin="daemon",
+                                      budget_usd=budget_usd, not_before=_next_day(now, where)))
+            recs[key] = {"day": day, "module": module, "ids": all_ids, "ts": now}
+            out.add(int(key))
+        db.set_kv(DEFLAKE_KEY, recs)
+    return sorted(out)
 
 
 def lift_due(p, now: float | None = None) -> list[dict]:
@@ -619,12 +687,12 @@ def counts_as_passed(checks: dict, release: bool) -> bool:
     return bool(checks.get("passed")) and not (release and checks.get("excused"))
 
 
-def note_text(ids: list[str], head: str, cmd: str) -> str:
+def note_text(ids: list[str], head: str, cmd: str, tasks: list[int]) -> str:
     many = len(ids) > 1
     return (f"flaky test{'s' if many else ''} at the tests gate: {', '.join(ids)} failed, then passed on a rerun "
             f"at the same head ({head[:12]}) with {cmd}, so {'they were' if many else 'it was'} quarantined and "
-            f"did not block. Queue a fix that makes {'them' if many else 'it'} deterministic (wait on the real "
-            "condition or a test clock, not wall time).")
+            f"did not block; deflake task{'s' if len(tasks) > 1 else ''} "
+            f"{', '.join(f'#{t}' for t in tasks) or 'already open'} (one per test module and day).")
 
 
 NOT_FOUND = "not found at the push-branch tip; lift by hand if the test was removed"

@@ -420,9 +420,81 @@ def test_ttp_checks_quarantines_a_flaky_failure_and_notes_the_coordinator_once(e
     assert "flaky" in out and "quarantined" in out
     q = gatejudge.active(p.state)
     assert list(q) == ["tests/test_gate.py::test_flaky"] and q[next(iter(q))]["evidence"][0]["head"]
-    notes = p.db.q("SELECT text FROM events WHERE kind=? AND status='queued'", (gatejudge.EVENT,))
-    assert len(notes) == 1 and "test_flaky" in notes[0]["text"]
+    # No coordinator note: the day's deflake task of its module, written model-free, and one feed line.
+    assert not p.db.q("SELECT id FROM events WHERE kind=? AND status='queued'", (gatejudge.EVENT,))
+    (t,) = p.db.q("SELECT * FROM tasks WHERE title LIKE 'Deflake %'")
+    assert t["title"] == "Deflake tests/test_gate.py: test_flaky" and t["kind"] == "code" and t["origin"] == "daemon"
+    assert "tests/test_gate.py::test_flaky" in t["spec"] and "premise:" not in t["spec"]
+    notes = p.db.q("SELECT text FROM events WHERE kind=? AND status='handled'", (gatejudge.EVENT,))
+    assert len(notes) == 1 and "test_flaky" in notes[0]["text"] and f"#{t['id']}" in notes[0]["text"]
     assert "quarantined test tests/test_gate.py::test_flaky" in cli.status_text(p)
+
+
+def test_tests_quarantined_on_one_day_share_one_deflake_task_per_module(env):
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    from ttp import gatejudge
+    p = make(env)
+    tz = "America/Los_Angeles"
+    now = datetime(2026, 1, 5, 10, 0, tzinfo=ZoneInfo(tz)).timestamp()
+    a, b, c, d, e, f = (f"tests/test_m.py::test_{n}" for n in "abcdef")
+    other = "tests/test_n.py::test_x"
+    ev = {"head": "f" * 40, "check": "pytest"}
+    (t1,) = gatejudge.deflake(p.db, [a], ev, now, tz)
+    assert gatejudge.deflake(p.db, [b, c, other], ev, now + 3600, tz) == sorted([t1, t1 + 1])
+    assert gatejudge.deflake(p.db, [a], ev, now + 7200, tz) == [], "already listed by an open deflake task"
+    t = p.db.task(t1)
+    assert t["title"] == "Deflake tests/test_m.py: test_a, test_b, test_c" and t["status"] == "queued"
+    assert all(f"- {i}" in t["spec"] for i in (a, b, c)) and other not in t["spec"]
+    # Held until the home zone's next day starts, so the rest of the day's flakes join it.
+    assert t["not_before"] == datetime(2026, 1, 6, tzinfo=ZoneInfo(tz)).timestamp()
+    assert p.db.task(t1 + 1)["title"] == "Deflake tests/test_n.py: test_x"
+    # The next day (home zone) opens a new task, even with the first still queued.
+    (t3,) = gatejudge.deflake(p.db, [d], ev, now + 86400, tz)
+    assert t3 not in (t1, t1 + 1) and "- " + d in p.db.task(t3)["spec"] and d not in p.db.task(t1)["spec"]
+    # A task that already started is never rewritten: a same-day flake after it opens another.
+    p.db.update_task(t3, attempts=1)
+    (t4,) = gatejudge.deflake(p.db, [e], ev, now + 86400 + 60, tz)
+    assert t4 != t3 and e not in p.db.task(t3)["spec"]
+    # A finished task's tests may flake again and get a new task.
+    p.db.update_task(t1, status="done")
+    (t5,) = gatejudge.deflake(p.db, [a, f], ev, now + 86400 + 120, tz)
+    assert t5 == t4 and p.db.task(t4)["title"] == "Deflake tests/test_m.py: test_e, test_a, test_f"
+    assert not p.db.q("SELECT id FROM events WHERE status='queued'")
+
+
+def test_a_deflake_tasks_landing_lifts_its_tests_model_free_even_past_its_cut_title(env, monkeypatch):
+    from ttp import cli, gatejudge, worktree
+    names = [f"test_{n}_" + "x" * 80 for n in "abc"]
+    tests = "".join(f"def {n}():\n    pass\n\n\n" for n in names)
+    p, repo, other = _quarantine_repo(env, monkeypatch, {"tests/test_q.py": tests})
+    now = time.time()
+    ids = [f"tests/test_q.py::{n}" for n in names]
+    ev = {"head": _git_out(repo, "rev-parse", "origin/proj"), "check": "pytest", "host": "h", "task": "1"}
+    gatejudge.quarantine(p.state, ids, ev, now - 60)
+    (tid,) = gatejudge.deflake(p.db, ids, ev, now - 60, p)
+    assert names[2] not in p.db.task(tid)["title"], "the title is cut: only the deflake record names it"
+    assert gatejudge.lift_due(p, now) == [], "not lifted before the fix landed"
+    path, branch = worktree.ensure(p, p.db.task(tid))
+    p.db.update_task(tid, status="done", branch=branch)
+    _commit(path, "fix.txt", "fixed\n")
+    _git_out(other, "fetch", "-q", str(path), branch)
+    _git_out(other, "cherry-pick", _git_out(path, "rev-parse", "HEAD"))
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    with pytest.raises(SystemExit) as landed:
+        cli.main(["landed", "--task", str(tid)])
+    assert landed.value.code == 0
+    tasks = len(p.db.q("SELECT id FROM tasks"))
+    got = gatejudge.lift_due(p, now)
+    assert sorted(x["id"] for x in got) == sorted(ids) and all(f"its fix #{tid} landed" in x["why"] for x in got)
+    assert gatejudge.active(p.state, now) == {}
+    # No model run: no task, no queued event for the coordinator.
+    assert len(p.db.q("SELECT id FROM tasks")) == tasks and not p.db.q("SELECT id FROM events WHERE status='queued'")
+    # The record names exact ids: a same-named test of another module (cut from the title) is not its fix.
+    assert gatejudge.fix_tasks(p.db, "tests/test_other.py::" + names[2], {"first_seen": 0}) == []
+    assert gatejudge.fix_tasks(p.db, ids[2], {"first_seen": 0}) == [tid]
 
 
 def test_a_detached_release_check_keeps_release_across_a_daemon_restart(env, monkeypatch):

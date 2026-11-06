@@ -2841,7 +2841,11 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   on the head and is compared with that rerun: failing on the base another way blocks. A rerun's selection stays in its own pytest process: a pytest a
   test starts never inherits it. Passing on the head rerun is flaky: it goes into the project's quarantine
   (`state/test_quarantine.json`: first seen, evidence, expiry after `checks.quarantine_days`, default 7),
-  which `ttp status` shows, one fix note goes to the coordinator, and it does not block. Failing on the
+  which `ttp status` shows, and it does not block. No coordinator note: the tests newly quarantined on one
+  day (home zone) go into one deflake code task per test module, written model-free (title `Deflake
+  <module>: <tests>`, origin daemon, no premise check). It is held until the next day starts so the rest of
+  the day's flakes of that module join it; a task that already started is never rewritten (a later flake
+  opens another), and a test listed by an unfinished deflake task is not added again. Failing on the
   head rerun and passing on (or missing from) the base blocks, as does a rerun that cannot tell (a base
   rerun that cannot tell excuses nothing: its tests rerun on the head). Only the
   tests proven new (a conclusive head rerun failed them and a real base result on the same host passed or
@@ -2855,7 +2859,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   excuses nothing and joins no other run. `checks.judge: false` turns judging off.
 - Quarantine lifts: a quarantined test leaves the quarantine early in two ways only. Every 10 minutes the
   daemon lifts one whose fix landed: a done code task whose title names the test (its function or full
-  id; a spec that only mentions it does not count), updated since it was first seen flaky, that
+  id; a spec that only mentions it does not count) or the deflake task that lists its exact id (its title
+  may be cut), updated since it was first seen flaky, that
   `ttp landed --task <id>` finds on the push branch and that was not already in the head the test last
   flaked at. It reads local refs only. Or `ttp quarantine lift <test id> --why <text>` lifts one by hand.
   Each lift is logged with the test id, the reason and the commit in `state/test_quarantine_lifts.jsonl`;

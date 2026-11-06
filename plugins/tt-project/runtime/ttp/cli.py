@@ -6691,10 +6691,12 @@ def _checks_judge(a, p: Project | None, c, rc: int, output: str, cwd: str, env: 
         print(f"ttp checks: {line}", flush=True)
         out.write(f"ttp checks: {line}\n")
     if v["flaky"]:
-        new = gatejudge.quarantine(p.state, v["flaky"], {"head": head, "check": str(c), "host": v["host"],
-                                                         "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
-        if new:   # one fix note per newly quarantined test
-            pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c)), queued=True)
+        seen = {"head": head, "check": str(c), "host": v["host"], "task": os.environ.get("TTP_TASK") or ""}
+        new = gatejudge.quarantine(p.state, v["flaky"], seen, now, s["days"])
+        if new:   # into the day's deflake task of each module, model-free: a feed line, no coordinator turn
+            from . import budget as bud
+            tasks = gatejudge.deflake(p.db, new, seen, now, p, bud.task_default_usd(cfg, "standard"))
+            pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(c), tasks), queued=False)
     if gatejudge.blocks(v):
         if not gatejudge.proven(v):
             return None
