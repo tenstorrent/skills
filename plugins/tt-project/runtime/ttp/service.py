@@ -623,7 +623,9 @@ def reap_restart_request(p: Project, started: float) -> str | None:
                  f"exited with code {rc}" if rc is not None else f"left no result after {age:.0f}s")
         text = (f"The restart helper {how}: it {ended}. The old daemon (pid {os.getpid()}) still runs the "
                 f"previous runtime; nothing was restarted or rolled back. logs/restart.log: {log or 'empty'}")
-        p.db.post("out", f"The requested daemon restart failed. {text}", chat=None, kind="alert", severity="high")
+        from .deploy import redeploy_key
+        p.db.post("out", f"The requested daemon restart failed. {text}", chat=None, kind="alert", severity="high",
+                  ref=redeploy_key(p.name))
     durable_write(p.state / RESTART_RESULT, json.dumps({"at": at, "finished": time.time(), "outcome": outcome,
                                                         "text": text, "reaped": True}))
     taken.unlink(missing_ok=True)
@@ -853,7 +855,8 @@ def restart(p: Project, wait_s: float = 60, restart_fn=None, tick_wait_s: float 
             f"{good[:10]}, the last version that ran (a new commit; nothing was deleted). Rolled back: {commits}. "
             + phase + ("" if msg == "restarted" else f"The service manager said: {msg}. ")
             + ("The daemon is running again." if back else f"It still does not start: check `ttp logs {p.name}`."))
-    p.db.post("out", text, chat=None, kind="alert", severity="high")
+    from .deploy import redeploy_key
+    p.db.post("out", text, chat=None, kind="alert", severity="high", ref=redeploy_key(p.name))
     return _said(text, "rolled_back")
 
 

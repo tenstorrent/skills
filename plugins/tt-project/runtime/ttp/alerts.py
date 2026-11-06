@@ -81,6 +81,7 @@ CLEARED_TEXT = {
     "heal": "Heal check {arg} passes again.",
     "heal-hold": "The device hold heal check {arg} reported has a tenant again or ended.",
     "deploy-pending": "{arg} runs the newest release now.",
+    "redeploy": "A later deploy runs on this host: {arg} and every other project here run the installed release.",
     "deploy-behind": "The deploy to {arg} no longer fails: it runs the release, or its upgrade is owned and pending again.",
     "machine": "Machine condition {arg} is over: no longer reported.",
     "machine-change": "Machine change #{arg} is closed or no longer overdue.",
@@ -245,6 +246,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if kind == "deploy-behind":
         from . import deploy
         return deploy.holds_behind(db, arg, now)
+    if kind == "redeploy":   # a rolled-back runtime or failed restart: until a later deploy here runs
+        from . import deploy
+        return deploy.holds_redeploy(arg, since, now)
     if kind == "deploy-pending":
         from . import deploy
         return deploy.holds_pending(db, arg)
@@ -330,7 +334,7 @@ def _checkable(key: str) -> bool:
     return key.partition(":")[0] in ("auth", "limit", "budget", "relayed", "disk", "coordinator", "run-start",
                                          "schedule", "release-older", "integrity", "integrity-host", "pr-ready", "config",
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_script_torn", "push_scope", "heal",
-                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "daemon-hang", "paused", "fleethold",
+                                         "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
                                          "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step")
 
 
@@ -343,6 +347,8 @@ def _since(ep: dict) -> float:
 def cleared(db: DB, m: dict, now: float) -> bool:
     """A tracked alert (high, or a status condition) whose condition no longer holds: not worth
     delivering late. Other lower-severity messages sharing the key are news whatever the state."""
+    if m.get("kind") == "alert" and m.get("handled") and not tracked("alert", m.get("severity"), m.get("ref")):
+        return True   # an alert with no condition, acknowledged by its id (ack)
     return (tracked(m.get("kind") or "", m.get("severity"), m.get("ref"))
             and not active(db, m["ref"], m["ts"], now))
 
@@ -397,10 +403,12 @@ def _outage(db: DB, key: str, now: float) -> bool:
 
 
 def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
-    """Acknowledge the episode of a message id printed by `ttp alerts`; retries preserve the receipt.
-    A condition that still holds stays open, acknowledged: it moves to the feed, its repeats page
-    nobody, and the sweep closes it once it clears, so a new occurrence alerts again. A live outage
-    is refused. Anything else closes now; the caller releases a machine-wide claim (`cleared` set)."""
+    """Acknowledge the episode of a message id printed by `ttp alerts`, `ttp status` or the web app;
+    retries preserve the receipt. A condition that still holds stays open, acknowledged: it moves to the
+    feed, its repeats page nobody, and the sweep closes it once it clears, so a new occurrence alerts
+    again. A live outage is refused. Anything else closes now; the caller releases a machine-wide claim
+    (`cleared` set). An alert with no episode (no condition key) closes by its id: it leaves the top
+    section and undelivered chat alerts at once, instead of after KEYLESS_TTL."""
     if not why or not why.strip():
         raise ValueError("acknowledging an alert requires a non-empty --why")
     now = time.time() if now is None else now
@@ -408,8 +416,10 @@ def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
     with db.tx():
         m = db.one("SELECT * FROM messages WHERE id=? AND direction='out' AND chat IS NULL", (message,))
         ep = episode(db, m["ref"], m["ts"]) if m and tracked(m["kind"], m["severity"], m["ref"]) else None
+        if not ep and m and m["kind"] == "alert":
+            return _ack_keyless(db, m, why, now)
         if not ep:
-            raise ValueError(f"no keyed alert with message id #{message}")
+            raise ValueError(f"no alert with message id #{message}: `ttp alerts <project>` lists the open ones")
         if ep["cleared"] is not None:
             return ep
         if prior := acked(db, ep):
@@ -432,6 +442,18 @@ def ack(db: DB, message: int, why: str, now: float | None = None) -> dict:
         db.post("out", f"Acknowledged alert #{message} ({ep['key']}): {why}. It stays in the feed until "
                 f"the condition clears.", chat=None, kind="info", severity="low", ref=ep["key"])
         return {**ep, "acked": rec}
+
+
+def _ack_keyless(db: DB, m: dict, why: str, now: float) -> dict:
+    """Close an alert that has no episode, within ack's transaction: marked handled, it leaves the top
+    section and is never delivered late (cleared). A repeat ack returns the first one's time."""
+    out = {"id": None, "key": m["ref"] or "", "message": m["id"], "raised": m["ts"], "severity": m["severity"],
+           "cleared": now, "cleared_why": why}
+    if m["handled"]:
+        return out
+    db.x("UPDATE messages SET handled=1 WHERE id=?", (m["id"],))
+    db.post("out", f"Acknowledged alert #{m['id']}: {why}", chat=None, kind="resolved", severity="low", ref=m["ref"])
+    return out
 
 
 def close_key(db: DB, key: str, why: str, now: float | None = None, text: str | None = None) -> list[dict]:
@@ -672,7 +694,7 @@ def needs_you(db: DB, now: float, limit: int = 20) -> list[dict]:
     whatever their age and are never cut by `limit`, which only caps the alerts after them."""
     asks = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
                 "AND kind='ask' AND handled=0 ORDER BY id DESC")
-    rows = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
+    rows = db.q("SELECT id,ts,kind,severity,text,ref,handled FROM messages WHERE direction='out' AND chat IS NULL "
                 "AND kind='alert' AND ts>? ORDER BY id DESC LIMIT 300", (now - 14 * DAY,))
     for m in asks:
         m.pop("ref")
@@ -680,7 +702,7 @@ def needs_you(db: DB, now: float, limit: int = 20) -> list[dict]:
     for m in rows:
         if len(out) >= limit - len(asks):
             break
-        ref = m.pop("ref")
+        ref, handled = m.pop("ref"), m.pop("handled")
         if not _top(m["severity"], ref):
             continue
         if ref:
@@ -689,7 +711,7 @@ def needs_you(db: DB, now: float, limit: int = 20) -> list[dict]:
             seen.add(ref)
             if not active(db, ref, m["ts"], now) or acked(db, episode(db, ref, m["ts"])):
                 continue   # over, or acknowledged (in the feed)
-        elif now - m["ts"] >= KEYLESS_TTL:   # an alert with no condition to check stays an hour
+        elif now - m["ts"] >= KEYLESS_TTL or handled:   # no condition to check: an hour, or until acknowledged
             continue
         out.append(m)
     return asks + out
@@ -700,17 +722,17 @@ def feed(db: DB, now: float, limit: int = 30) -> list[dict]:
     live status conditions (state 'status'), acknowledged live alerts (state 'acked', with why),
     cleared alerts (with when they cleared). Open asks and
     live alerts are in the top section."""
-    rows = db.q("SELECT id,ts,kind,severity,text,ref FROM messages WHERE direction='out' AND chat IS NULL "
+    rows = db.q("SELECT id,ts,kind,severity,text,ref,handled FROM messages WHERE direction='out' AND chat IS NULL "
                 "AND kind!='ask' AND ts>? ORDER BY id DESC LIMIT ?", (now - FEED_DAYS * DAY, limit * 3))
     out = []
     for m in rows:
-        ref = m.pop("ref")
+        ref, handled = m.pop("ref"), m.pop("handled")
         m["state"] = "info" if m["kind"] in ("info", "resolved") else "fyi"
         if m["kind"] == "alert" and _top(m["severity"], ref):
             ep = episode(db, ref, m["ts"]) if ref else None
             if ref and active(db, ref, m["ts"], now) and (ack := acked(db, ep)):
                 m["state"], m["acked_why"] = "acked", ack.get("why")   # live, but the user knows
-            elif (ref and active(db, ref, m["ts"], now)) or (not ref and now - m["ts"] < KEYLESS_TTL):
+            elif (ref and active(db, ref, m["ts"], now)) or (not ref and now - m["ts"] < KEYLESS_TTL and not handled):
                 continue   # in the top section
             else:
                 m["state"] = "cleared"

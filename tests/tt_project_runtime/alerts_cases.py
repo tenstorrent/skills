@@ -5355,3 +5355,92 @@ def test_a_fault_that_recurs_after_staying_cleared_past_the_window_alerts_again(
     p.db.post("out", "an unchecked report", chat=None, kind="alert", severity="high", ref="unknown-kind")
     clock[0] += alerts.DAY + 1
     assert any(ep["key"] == "unknown-kind" for ep in alerts.sweep(p.db, clock[0]))
+
+
+def _redeploy_setup(env, tmp_path, alone=True):
+    """Project p holds a rollback alert about 'alpha', the one project on this host, which the rollback
+    left on 0.4.9 while the installed release is 0.5.0; plus an unrelated keyed and an unkeyed alert.
+    `alone`: p is registered elsewhere, so alpha is the only project on this host."""
+    from ttp import deploy, project
+    p = make(env)
+    if alone:
+        project.register(p.name, {"host": "elsewhere", "dir": str(p.root)})
+    _deploy_lib("0.5.0")
+    base, _ = _deploy_project(tmp_path, "alpha", "0.4.9")
+    ids = {"rb": p.db.post("out", "The daemon did not start after a runtime change, so the harness runtime was "
+                           "rolled back to abc", kind="alert", severity="high", ref=deploy.redeploy_key("alpha")),
+           "keyed": p.db.post("out", "Unrelated condition", kind="alert", severity="high", ref="unrelated:x"),
+           "plain": p.db.post("out", "Unrelated note with no condition", kind="alert", severity="high")}
+    return p, base, ids
+
+
+def _deploy_alpha(base, version, started):
+    """alpha's later deploy: its files and the release at `version`, its daemon started at `started`
+    and ticked on the files since."""
+    rt = base / "harness" / "runtime" / "ttp"
+    (rt / "__init__.py").write_text(f'__version__ = "{version}"\n')
+    os.utime(rt / "__init__.py", (started - 1, started - 1))
+    _deploy_lib(version)
+    hb = base / "state" / "heartbeat"
+    data = json.loads(hb.read_text())
+    data["receipt"].update(version=version, started=started)
+    hb.write_text(json.dumps(data))
+    os.utime(base / "state" / "tick_done", (started + 1, started + 1))
+
+
+@pytest.mark.parametrize("version", ["0.5.0", "0.5.1"])
+def test_a_rollback_alert_clears_once_a_later_deploy_on_the_host_is_verified_running(env, tmp_path, version):
+    """The rollback alert leaves 'needs you', status and late chat delivery once every project here runs
+    the installed release on a daemon started after the alert: the rolled-back version or any later one.
+    A daemon that only ran on since before the alert, or a project still behind, keeps it. Unrelated
+    alerts stay."""
+    from ttp import alerts, overview
+    from ttp.cli import status_text
+    p, base, ids = _redeploy_setup(env, tmp_path)
+    now = time.time()
+    shown = lambda t: {m["id"] for m in alerts.needs_you(p.db, t)}   # noqa: E731
+    assert shown(now + 1) == set(ids.values())
+    assert f"needs you (alert {ids['rb']}, " in status_text(p)
+    assert overview.deployed()["rc"] == overview.PENDING and alerts.sweep(p.db, now + 1) == []
+    # Every project runs the installed release, but on the daemon from before the alert: no later deploy.
+    _deploy_alpha(base, "0.4.9", now - 60)
+    assert overview.deployed()["rc"] == overview.OK and shown(now + 2) == set(ids.values())
+    _deploy_alpha(base, version, now + 5)
+    assert overview.deployed(now=now + 10)["rc"] == overview.OK
+    assert shown(now + 10) == {ids["keyed"], ids["plain"]}
+    st = status_text(p)
+    assert f"alert {ids['rb']}," not in st and f"alert {ids['keyed']}," in st and f"alert {ids['plain']}," in st, st
+    rb = p.db.one("SELECT * FROM messages WHERE id=?", (ids["rb"],))
+    assert alerts.cleared(p.db, rb, now + 10), "a chat that has not read it yet never gets it late"
+    assert [e["key"] for e in alerts.sweep(p.db, now + 10)] == ["redeploy:alpha"]
+    told = p.db.q("SELECT text FROM messages WHERE kind='resolved' AND ref='redeploy:alpha'")
+    assert [m["text"] for m in told] == ["Cleared: A later deploy runs on this host: alpha and every other project "
+                                         "here run the installed release."]
+    feed = {m["id"]: m["state"] for m in alerts.feed(p.db, now + 11)}
+    assert feed[ids["rb"]] == "cleared" and ids["keyed"] not in feed
+
+
+def test_ack_closes_an_alert_with_no_condition_key_by_the_id_status_shows(env, tmp_path, capsys):
+    """`ttp alerts <project> --ack <id>` takes the id status and the web app show: an unkeyed alert closes
+    at once (no hour in 'needs you', no late chat delivery), told once; a repeat is a no-op. Other alerts
+    stay, and an id that is no alert names the command that lists them."""
+    from ttp import alerts
+    from ttp.cli import main
+    from ttp.notifier import alerts_since
+    p, _, ids = _redeploy_setup(env, tmp_path, alone=False)
+    now = time.time()
+    assert main(["alerts", p.name, "--ack", str(ids["plain"]), "--why", "seen, handled by hand"]) in (None, 0)
+    assert f"Acknowledged alert #{ids['plain']}: seen, handled by hand" in capsys.readouterr().out
+    assert {m["id"] for m in alerts.needs_you(p.db, now + 1)} == {ids["rb"], ids["keyed"]}
+    row = p.db.one("SELECT * FROM messages WHERE id=?", (ids["plain"],))
+    assert alerts.cleared(p.db, row, now + 1)
+    assert [r["cleared"] for r in alerts_since(p, 0) if r["id"] == ids["plain"]] == [True]
+    feed = {m["id"]: m["state"] for m in alerts.feed(p.db, now + 1)}
+    assert feed[ids["plain"]] == "cleared"
+    again = alerts.ack(p.db, ids["plain"], "again", now + 2)
+    assert again["cleared"] and again["message"] == ids["plain"]
+    told = p.db.q("SELECT text FROM messages WHERE kind='resolved' AND text LIKE 'Acknowledged alert%'")
+    assert [m["text"] for m in told] == [f"Acknowledged alert #{ids['plain']}: seen, handled by hand"]
+    ask = p.db.post("out", "Which board?", kind="ask", severity="high")
+    with pytest.raises(ValueError, match=r"no alert with message id #\d+: `ttp alerts <project>` lists"):
+        alerts.ack(p.db, ask, "x", now + 3)

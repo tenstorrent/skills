@@ -1549,7 +1549,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines = [head]
     for m in attention(db, now, p)[:6]:
         text = " ".join(m["text"].split())
-        what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else "alert"
+        what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
         lines.append(f"  needs you ({what}, {since(m['ts'], now)} ago): {clip(text, 300)}")
     # Blocked tasks: those that wait on the user join the top; the rest are the project's to move.
     from . import waits
@@ -13054,7 +13054,7 @@ def main(argv: list[str] | None = None) -> None:
                         "takes the template merge over from it even while it still shows activity")
     s.set_defaults(fn=cmd_upgrade)
 
-    s = sub.add_parser("alerts", help="list broadcast alerts or acknowledge a keyed alert")
+    s = sub.add_parser("alerts", help="list broadcast alerts or acknowledge one")
     s.add_argument("name", help="the project")
     s.add_argument("--after", type=int, default=0, help="only alerts after this message id (default 0: all)")
     s.add_argument("--floor", default="high", help="the lowest severity listed: low, normal, high or critical "
@@ -13062,7 +13062,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--json", action="store_true", help="print JSON")
     s.add_argument("--health", action="store_true", help="with --json: {alerts, health: {heartbeat_age_s, service, "
                    "paused}}, the heartbeat's age taken on this host (the desktop notifier's daemon-down check)")
-    s.add_argument("--ack", type=int, metavar="ID", help="acknowledge the keyed alert of this message id: it closes, or moves to the feed while it holds")
+    s.add_argument("--ack", type=int, metavar="ID", help="acknowledge the alert of this message id (the id status and the web app show): "
+                   "it closes, or a keyed one moves to the feed while it holds")
     s.add_argument("--why", help="reason for acknowledging the alert (required with --ack)")
     s.set_defaults(fn=cmd_alerts)
 

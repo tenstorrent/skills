@@ -84,6 +84,15 @@ user alert also clears when escalation moves to the coordinator or a known fault
 current failure; the check remains unhealthy until it passes. Known faults never silence a
 prolonged whole-box outage.
 
+An alert with no condition key closes at once when acknowledged by the id `ttp status` and the web
+app show, and stays out of later chat delivery. The deploy rollback alert ("the daemon did not
+start after a runtime change") and a failed requested restart carry the key `redeploy:<project>`:
+they clear by themselves once a later deploy on that host is verified running, the facts
+`ttp deployed` reads (every project there runs the installed release, any version, and this
+project's daemon started after the alert). Other one-shot deploy and upgrade lines (a stuck
+upgrade merge, a restored release, an upgrade recovered at start) are below high, so they appear
+only in the feed and never under "needs you".
+
 ## Budget
 
 - Subscription plans: a plan's capacity is lost at each reset, so the project uses it. Below the

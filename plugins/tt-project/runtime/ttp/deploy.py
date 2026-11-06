@@ -53,6 +53,25 @@ def pending_key(name: str) -> str:
     return f"deploy-pending:{name}"
 
 
+def redeploy_key(name: str) -> str:
+    """The alert of a runtime change this project's daemon did not start on (service.py: a rollback, or a
+    requested restart that failed): it holds until a later deploy on this host is verified running."""
+    return f"redeploy:{name}"
+
+
+def holds_redeploy(name: str, since: float, now: float) -> bool:
+    """`redeploy:<name>` holds until `ttp deployed` passes for the release installed on this host (every
+    project here runs it, or a newer one, by its daemon's receipt and completed a tick on its files) and
+    this project's daemon started after the alert. Any later verified version clears it, not only the one
+    rolled back; a probe that cannot tell keeps it."""
+    try:
+        report = overview.deployed(now=now, allow_newer=True)
+    except Exception:   # noqa: BLE001 - a condition check never breaks the reader
+        return True
+    row = next((r for r in report.get("projects") or [] if r.get("name") == name), None)
+    return report["rc"] != overview.OK or not row or float(row.get("daemon_started") or 0) < since
+
+
 def restart_wait(p) -> float:
     """delivery.deploy_restart_wait_s of the reporting project: how long a daemon may take to restart onto
     files already at the release before that counts as failed."""

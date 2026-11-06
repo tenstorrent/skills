@@ -481,7 +481,8 @@ def deploy_status(name: str, entry: dict, target: str, commit: str | None, now: 
         if r.get("provenance") != "verified":
             return done(CANNOT, f"receipt unverified: {r.get('why') or 'unknown provenance'}")
         rv, rc = str(r.get("version") or "?"), r.get("commit")
-        row.update(running_version=rv, running_commit=rc, instance=r.get("instance"))
+        row.update(running_version=rv, running_commit=rc, instance=r.get("instance"),
+                   daemon_started=float(r.get("started") or 0))
         # A newer release passes when it holds the target commit: by git where it can tell, else by version.
         newer = allow_newer and is_newer(rv, target)
         if newer and _contains(commit, rc) is False:

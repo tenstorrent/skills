@@ -11895,6 +11895,8 @@ def test_a_new_daemon_that_fails_under_the_manager_is_rolled_back_with_its_outpu
     res = service.restart(p, wait_s=0.3, tick_wait_s=0.3)
     assert res.outcome == "rolled_back" and out in res, res
     assert _git_out(p.harness, "rev-parse", "HEAD") != head
+    alert = p.db.one("SELECT ref, severity FROM messages WHERE kind='alert' AND text LIKE 'The daemon did not start%'")
+    assert alert == {"ref": f"redeploy:{p.name}", "severity": "high"}, "a later verified deploy clears it"
 
 
 def test_an_old_daemon_still_ticking_after_the_restart_is_never_rolled_back(env, monkeypatch):
@@ -23757,8 +23759,9 @@ def test_alerts_ack_closes_the_displayed_message_episode_once_and_keeps_history(
     assert len(p.db.q("SELECT id FROM messages WHERE kind='resolved'")) == 1
 
 
-@pytest.mark.parametrize("case", ["unknown", "unkeyed", "info", "missing_why", "blank_why", "why_only"])
+@pytest.mark.parametrize("case", ["unknown", "info", "missing_why", "blank_why", "why_only"])
 def test_alerts_ack_refuses_invalid_requests_without_mutation(env, case):
+    # An unkeyed alert is acknowledged, not refused: alerts_cases.py, ack_closes_an_alert_with_no_condition_key.
     from ttp import cli
     p = make(env)
     mid = p.db.post("out", "Not a keyed alert", kind="info" if case == "info" else "alert",
@@ -23918,7 +23921,7 @@ def test_the_top_section_holds_only_what_needs_the_user_and_the_rest_is_a_feed(e
     assert feed[1]["state"] == "cleared" and feed[1]["cleared_at"], feed[1]
     assert feed[2]["state"] == "fyi"
     lines = status_text(p).splitlines()
-    assert lines[1].startswith("  needs you (ask ") and "(ask #" not in lines[1] and lines[2].startswith("  needs you (alert, "), lines
+    assert lines[1].startswith("  needs you (ask ") and "(ask #" not in lines[1] and lines[2].startswith("  needs you (alert "), lines
     assert "recent:" in lines and "Only 1.0 GB free" not in "\n".join(lines[:lines.index("recent:")]), lines
     assert any("(cleared " in ln and "Only 1.0 GB free" in ln for ln in lines[lines.index("recent:"):]), lines
 
