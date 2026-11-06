@@ -24148,3 +24148,52 @@ def test_a_review_of_a_head_already_failed_keeps_that_verdict_with_no_run_and_no
     p.db.update_task(forced["id"], provider="claude")
     d.dispatch()
     assert started == [first, forced["id"]], "a forced review runs"
+
+
+def test_a_task_add_whose_git_check_times_out_is_deferred_never_rejected(env, monkeypatch):
+    """A task_add continuing a task with a branch is applied under a spent git deadline, or deferred and
+    applied on the next tick (actdefer.retry), never rejected for the timeout; a malformed branch is
+    still rejected. After actdefer.MAX_TRIES timeouts it is rejected, saying it timed out."""
+    import subprocess
+    p = make(env)
+    from ttp import actdefer, coordinator as coord, gitmemo
+    old = p.db.add_task("old", "s", kind="code")
+    b = f"ttp/t{old}-old"
+    p.db.update_task(old, status="failed", branch=b, labels=json.dumps([f"pr_branch:{b}"]))
+    with p.db.tx(), gitmemo.bounded(45, 0):   # the transaction's git deadline already spent
+        assert coord.apply(p, [{"type": "task_add", "title": "finish old", "kind": "code", "continues": old,
+                                "spec": f"pr_branch: {b}\nfinish it"}]) == []
+    actdefer.retry(p)
+    new = p.db.one("SELECT * FROM tasks WHERE title='finish old'")
+    assert new and f"pr_branch:{b}" in new["labels"] and not actdefer.pending(p.db)
+    with gitmemo.bounded(45, 0):
+        bad = coord.apply(p, [{"type": "task_update", "id": new["id"], "pr_branch": "bad..name"}])
+    assert len(bad) == 1 and "not one valid branch name" in bad[0], bad
+
+    real, fails = coord._continued, [2]
+
+    def slow(*a, **k):   # its git check times out before it writes anything
+        if fails[0]:
+            fails[0] -= 1
+            raise subprocess.TimeoutExpired(["git", "check-ref-format", "--branch", b], 0)
+        return real(*a, **k)
+    monkeypatch.setattr(coord, "_continued", slow)
+    p.db.update_task(new["id"], status="failed")
+    act = {"type": "task_add", "title": "again", "kind": "code", "continues": new["id"], "spec": "s"}
+    assert coord.apply(p, [act]) == []
+    assert any("deferred, not rejected" in n for n in p.db.kv(coord.NOTES_KEY))
+    assert [x["action"]["title"] for x in actdefer.pending(p.db)] == ["again"]
+    assert not p.db.one("SELECT id FROM tasks WHERE title='again'")
+    actdefer.retry(p)   # times out once more: kept, one try further
+    assert [x["tries"] for x in actdefer.pending(p.db)] == [1]
+    out = actdefer.retry(p)
+    assert len(out) == 1 and out[0].endswith(": applied"), out
+    assert p.db.one("SELECT id FROM tasks WHERE title='again'") and not actdefer.pending(p.db)
+    assert not p.db.kv(coord.REJECTED_KEY, [])
+    fails[0] = 99
+    p.db.x("DELETE FROM tasks WHERE title='again'")
+    assert coord.apply(p, [act]) == []
+    for _ in range(actdefer.MAX_TRIES):
+        actdefer.retry(p)
+    assert not actdefer.pending(p.db)
+    assert any("timed out" in x for x in p.db.kv(coord.REJECTED_KEY, [])), p.db.kv(coord.REJECTED_KEY)

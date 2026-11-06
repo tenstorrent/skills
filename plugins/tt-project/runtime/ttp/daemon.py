@@ -55,6 +55,7 @@ from . import runclass
 from . import configwho
 from . import integrate
 from . import settlehook
+from . import actdefer
 from . import sidefx
 from . import looks
 from . import machinecap
@@ -2337,6 +2338,8 @@ class Daemon:
         self._run_step(lambda: coord.expire_asks(self.p, hold=any(g.level == "red" for g in self.gates.values())),
                        "expire_asks")
         self._run_step(self.check_ask_timer)
+        # coordinator actions a git timeout deferred (actdefer): applied again, outside any finish transaction
+        self._run_step(lambda: [log(self.p, x) for x in actdefer.retry(self.p)], "apply_deferred_actions")
         self._run_step(lambda: scr.expire_mutes(self.p.db, where=self.p), "expire_mutes")
         self._run_step(lambda: scr.end_task_mutes(self.p.db, where=self.p), "end_task_mutes")
         self._run_step(self.check_mute_ends)

@@ -18,6 +18,7 @@ import json
 import os
 import re
 import shlex
+import subprocess
 import time
 import uuid
 from datetime import datetime
@@ -28,6 +29,7 @@ from zoneinfo import ZoneInfo
 from . import budget as bud, locks
 from . import (   # one name per line: two changes adding names merge without a conflict
     accountset,
+    actdefer,
     anchors,
     askauto,
     askrethink,
@@ -2736,7 +2738,7 @@ def untrusted_update(task: dict, a: dict, upd: dict) -> str:
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None, skip_actions: frozenset | set = frozenset(),
-          on_action=None) -> list[str]:
+          on_action=None, deferred_tries: int = 0) -> list[str]:
     """Apply validated actions. Returns human-readable notes about rejected ones, fed back next turn.
     Notes on actions applied with a change (NOTES_KEY) reach the next digest as information only.
     `messages`: the user messages the daemon started this turn for (a charter change they approved
@@ -2750,7 +2752,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
     are skipped and a note says so. `applied`, when given, is filled with the indexes of the actions
     that went through (mustact.settle). `on_action(i)` is called before action i is applied and the
     indexes in `skip_actions` are refused unapplied (Daemon._coord_journal: an action the daemon was cut off
-    in twice is skipped, so the rest of the turn still applies)."""
+    in twice is skipped, so the rest of the turn still applies). A task_add or task_update whose git check
+    timed out before it wrote anything is deferred, never rejected (actdefer; `deferred_tries`: its earlier
+    timeouts)."""
     db, problems, notes = p.db, [], []
     cfg = p.config()
     # For the stale-restriction check (_restriction_conflicts): the restrictions before this turn's
@@ -2802,6 +2806,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             continue
         if on_action is not None:
             on_action(i)
+        wrote_before = getattr(getattr(db, "conn", None), "total_changes", None)
         try:
             a = normalize_action(a)
             if t == "reply":
@@ -4279,6 +4284,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             else:
                 raise ValueError(f"unknown action {t!r}")
         except Exception as e:   # one bad action is reported back; it never aborts the turn
+            if isinstance(e, subprocess.TimeoutExpired) and wrote_before is not None and actdefer.deferrable(
+                    t, deferred_tries, db.conn.total_changes != wrote_before):
+                notes.append(actdefer.defer(db, order[k][1], default_chat, str(e), deferred_tries))
+                continue   # a spent time budget says nothing about the action: the next tick applies it
             failed.add(i)
             sent_as = f"; {GATE_MARK}: {json.dumps(order[k][1], ensure_ascii=False, default=str)}" \
                 if isinstance(e, DraftGateRejection) else ""

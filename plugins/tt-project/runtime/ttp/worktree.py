@@ -497,19 +497,19 @@ def _create(p: Project, task: dict, path: Path, branch: str, carried: str, timeo
         record_rebase_start(p.root, task["id"], started)
 
 
-_VALID_BRANCHES: dict[str, bool] = {}
+# What `git check-ref-format --branch` refuses anywhere in a name: a control character, space, ~ ^ : ? * [ \,
+# "..", "@{" or "//". Checked in-process: no git spawn, so no spent tick or transaction deadline refuses it.
+_BAD_REF = re.compile(r"[\x00-\x20\x7f~^:?*\[\\]|\.\.|@\{|//")
 
 
 def valid_branch(name: str) -> bool:
-    """Whether `name` is one valid branch name (`git check-ref-format --branch`): never prose, several
-    words, an option-like `-x`, main/master or HEAD (a task never carries a protected branch)."""
-    if not name or name != name.strip() or any(c.isspace() for c in name) or name.startswith("-") \
+    """Whether `name` is one valid branch name (git's check-ref-format rules for refs/heads/<name>, as
+    `git check-ref-format --branch` prints it back unchanged): never prose, several words, an option-like
+    `-x`, main/master or HEAD (a task never carries a protected branch)."""
+    if not name or name.startswith(("-", "/")) or name.endswith(("/", ".")) or _BAD_REF.search(name) \
             or name in ("HEAD", "main", "master"):
         return False
-    if name not in _VALID_BRANCHES:
-        r = subprocess.run(["git", "check-ref-format", "--branch", name], capture_output=True, text=True)
-        _VALID_BRANCHES[name] = r.returncode == 0 and r.stdout.strip() == name
-    return _VALID_BRANCHES[name]
+    return not any(c.startswith(".") or c.endswith(".lock") for c in name.split("/"))
 
 
 # A spec line naming the branch a task delivers onto (coordinator: task_add labels it; push: --own
