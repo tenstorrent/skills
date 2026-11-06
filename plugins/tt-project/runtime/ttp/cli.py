@@ -11701,7 +11701,7 @@ TASK_TIERS = ("light", "standard", "deep")                              # as cha
 COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
-                  "machines", "logs", "doctor")),
+                  "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "host-run", "detach", "devq", "push", "land", "clip", "sandbox", "pool-wait", "pool-admit",
                       "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
@@ -12114,7 +12114,7 @@ def main(argv: list[str] | None = None) -> None:
     s.set_defaults(fn=cmd_push_audit)
 
     s = sub.add_parser("runs", help="running worker and reviewer runs")
-    rs = s.add_subparsers(dest="runs_cmd", required=True)
+    rs = s.add_subparsers(dest="runs_cmd", required=True, help="what to show")
     s = rs.add_parser("live", help="what each running worker or reviewer run is doing now, model-free: its note, "
                                    "tool call, changed files, last checks line, spend, wall share and steer state")
     s.add_argument("name", nargs="?", help="the project (default: the one here)")

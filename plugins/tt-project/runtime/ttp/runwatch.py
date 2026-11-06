@@ -18,6 +18,7 @@ import subprocess
 import time
 from pathlib import Path
 
+from . import gitmemo
 from .project import Project, write_json
 from .providers import get_provider
 
@@ -137,7 +138,7 @@ def _tools(provider: str, out: Path, old: dict, now: float) -> dict:
 
 def _git(cwd: str, *args: str) -> str | None:
     try:
-        r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=20)
+        r = gitmemo.run(["git", "-C", cwd, *args], capture_output=True, text=True, timeout=20)
     except (OSError, subprocess.SubprocessError):
         return None
     return r.stdout if r.returncode == 0 else None
