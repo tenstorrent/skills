@@ -135,7 +135,8 @@ def test_repoid_keeps_nothing_it_cannot_vouch_for(env, tmp_path, monkeypatch):
     monkeypatch.delenv("GIT_CEILING_DIRECTORIES")
     # another git setting in the environment is another key
     assert runs_of(repo, top) == 0 or runs_of(repo, top) == 0
-    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "1")
+    # (the suite already sets GIT_CONFIG_NOSYSTEM=1: flip it to change the setting)
+    monkeypatch.setenv("GIT_CONFIG_NOSYSTEM", "" if os.environ.get("GIT_CONFIG_NOSYSTEM") else "1")
     assert runs_of(repo, top) == 1
     # an answer older than MAX_AGE_S is read again
     monkeypatch.setattr(repoid, "MAX_AGE_S", 0.0)

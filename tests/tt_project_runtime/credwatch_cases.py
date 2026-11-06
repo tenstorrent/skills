@@ -94,6 +94,6 @@ def test_credwatch_premise_checks_and_guard_tests_run_read_only_under_a_scratch_
     for text in (spec, (prompts / "kind-question.md").read_text(), (prompts / "kind-code.md").read_text(),
                  (RUNTIME.parent / "skills" / "tt-project-harness" / "references" / "self-check.md").read_text()):
         flat = " ".join(text.split())
-        assert "HOME, XDG_CONFIG_HOME and GH_CONFIG_DIR" in flat and "fresh `mktemp -d`" in flat, flat[:300]
+        assert all(v in flat for v in ("HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR")) and "fresh `mktemp -d`" in flat, flat[:300]
     for text in (spec, (prompts / "kind-question.md").read_text()):
         assert "write nothing outside your run folder" in " ".join(text.split())
