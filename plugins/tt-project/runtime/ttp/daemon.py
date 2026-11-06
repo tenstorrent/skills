@@ -131,6 +131,7 @@ from . import downtime
 from . import effort
 from . import modelpick
 from . import modelrank
+from . import modeltrip
 from . import effortab
 from . import extchange
 from . import failover
@@ -1906,6 +1907,7 @@ class Daemon:
         self._run_step(self.sweep_schedule_gaps)
         self._run_step(self.review_jev)
         self._run_step(self.end_effort_ab)
+        self._run_step(self.trip_model_routing)
         self._run_step(self.watch_cli_versions)
         self._run_step(self.reap_locks)
         self._run_step(self.reap_task_records)
@@ -2009,6 +2011,18 @@ class Daemon:
             self._load_config()
             self.alert("effort-ab-decided", f"Effort A/B ended: {got} effort is now the standard for code tasks "
                        f"(`ttp stats --effort-ab`).", severity="low", every_s=0)
+
+    def trip_model_routing(self, every_s: float = 3600) -> None:
+        """The model-pick tripwire (modeltrip.check): a stratum whose routed tasks go wrong more often than
+        its core ones goes back to the core model, with a decision memory and one low notice."""
+        now = time.time()
+        if now - getattr(self, "_model_trip_checked", 0.0) < every_s:
+            return
+        self._model_trip_checked = now
+        for t in modeltrip.check(self.p, self.cfg, now):
+            if t.get("memory_error"):
+                log(self.p, f"model trip {t['stratum']}: decision memory not written: {t['memory_error']}")
+            self.alert(f"model-trip:{t['stratum']}", modeltrip.text(t), severity="low", every_s=0)
 
     def tend_holds(self) -> None:
         """Log each whole-run hold kept for detached jobs once it ends, and rebuild one whose keeper
@@ -10098,7 +10112,7 @@ class Daemon:
                 if routed:
                     note[route.KEY] = routed
                 if dp := self._model_pick(task, tier, peek=True):
-                    note[modelpick.KEY] = {k: dp.get(k) for k in ("by", "pick", "p", "why") if k in dp}
+                    note[modelpick.KEY] = {k: dp.get(k) for k in ("by", "pick", "p", "why", "tier") if k in dp}
                 try:   # a routed model pick runs its option's effort: no A/B arm
                     ab = None if (routed or {}).get("model_pick") and run_prov == routed["to"] else \
                         effortab.assign(db, self.cfg, task, tier, run_prov, jev=self.jev)

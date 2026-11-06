@@ -1279,13 +1279,23 @@ names, a continuation's parent diff stat, the lineage's earlier route outcomes a
 success rate over 14 days). A routed pick wins only above `dispatch.min_p` (0.6); Jev off, out of
 funds or unsure means core. The pick applies only at the tier it was picked at: a light wake, a deep or escalated start and a
 conclusion floor run start as with dispatch off, and a routed option needs the chat provider in
-`providers_allowed` and not the core provider. Each run note has a `dispatch` entry (by, pick, p); a Jev pick is logged
+`providers_allowed` and not the core provider. Each run note has a `dispatch` entry (by, pick, p, tier); a Jev pick is logged
 with the stratum's mean core cost per run over 7 days as its avoided cost and settles right when its
 task ends done on its first try with no fallback, wrong when it escalates; a core pick counts as no
 change. Jev's usual review switches the use off when it saves nothing or changes no decision.
 `ttp doctor` and the daemon name a bad dispatch setting: enabled with no option on the chat provider
 with a model (or the chat provider core or not allowed), a `min_p` outside 0 to 1 (0.6 is used), and
 an option that is not an object with a `provider` (ignored).
+
+Model-pick tripwire (`modeltrip.py`, model-free, inactive while dispatch is off): per stratum (kind,
+tier and one task label, `*` for any), each picked task that ended in the last `days` is a routed or a
+core sample, bad when it failed, its last checks failed, a review of it failed or it got a review fix
+or continuation. Once both sides have `min_samples` and routed's bad rate is more than `margin_pts`
+points above core's, the stratum's tasks go to core (rule `tripwire`), a decision memory records it
+and one low notice goes out. Only a newer passing head-to-head result for that stratum turns routing
+back on (`ttp model-trip --h2h <kind/tier/label> --ok --ref <result>`); samples then count from it.
+`ttp model-trip` lists the strata. Settings: `providers.chat.dispatch.tripwire` (`min_samples` 10,
+`margin_pts` 10, `days` 14).
 
 ## Asks
 

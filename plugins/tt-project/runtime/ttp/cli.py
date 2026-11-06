@@ -6638,6 +6638,29 @@ def _since_s(v: str) -> float:
     return float(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
 
 
+def cmd_model_trip(a) -> None:
+    """`ttp model-trip`: the strata the model-pick tripwire holds on core (modeltrip.py); --h2h records a
+    head-to-head result for one, and a passing one newer than its trip turns routing back on."""
+    from . import modeltrip
+    p = need(a.name, sys.argv[1:]) if a.name else here()
+    if p is None:
+        die("ttp model-trip: no project here (run it in a project or its run, or name one)")
+    if a.h2h:
+        if a.ok == a.worse or not a.ref:
+            die("ttp model-trip --h2h <kind/tier/label>: give exactly one of --ok or --worse, and --ref", 2)
+        rec = modeltrip.head_to_head(p.db, a.h2h, a.ok, a.ref)
+        print(f"ttp model-trip: head-to-head for {a.h2h} recorded ({'passed' if rec['ok'] else 'worse'})")
+        return
+    trips, h2h = p.db.kv(modeltrip.TRIPS) or {}, p.db.kv(modeltrip.H2H) or {}
+    for k in sorted(set(trips) | set(h2h)):
+        held = k in trips and not modeltrip._rearmed(trips[k], h2h.get(k))
+        print(f"{k}: {'on core' if held else 'routed'}"
+              + (f"; tripped at routed {trips[k]['routed']}, core {trips[k]['core']} (bad, n)" if k in trips else "")
+              + (f"; head-to-head {'passed' if h2h[k]['ok'] else 'worse'} ({h2h[k]['ref']})" if k in h2h else ""))
+    if not trips and not h2h:
+        print("ttp model-trip: no stratum tripped")
+
+
 def cmd_throughput(a) -> None:
     """`ttp throughput`: where tasks waited over the window, per lane against its limit (throughput.py);
     --apply raises the sizing limits that held work while there was headroom; --undo N reverts one."""
@@ -12547,7 +12570,8 @@ COMMAND_GROUPS = (
                                          "deployed", "goal", "hours")),
     ("admin", ("setup", "upgrade", "start", "stop", "restart", "adopt", "prune", "secret", "consent",
                "notifier", "schedules", "heal", "upstream", "lease", "replicate", "check-plan", "stats", "audit",
-               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "echoes", "course", "uninstall", "bench")),
+               "push-audit", "ttr", "selfchange", "spend-today", "throughput", "model-trip", "echoes", "course",
+               "uninstall", "bench")),
 )
 
 
@@ -13114,6 +13138,15 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--days", type=float, default=0, help="look back only this many days (default: all)")
     s.add_argument("--json", action="store_true", help="print the matches as JSON")
     s.set_defaults(fn=cmd_said)
+
+    s = sub.add_parser("model-trip", help="strata the model-pick tripwire sent back to the core model; --h2h "
+                                          "records a head-to-head result (a passing one re-enables routing)")
+    s.add_argument("name", nargs="?", help="project (default: the one here)")
+    s.add_argument("--h2h", metavar="KIND/TIER/LABEL", help="the stratum ('*' label: any) a head-to-head result is for")
+    s.add_argument("--ok", action="store_true", help="routed held up against core in the head-to-head")
+    s.add_argument("--worse", action="store_true", help="routed did worse than core in the head-to-head")
+    s.add_argument("--ref", help="where the head-to-head result is (a path or task id)")
+    s.set_defaults(fn=cmd_model_trip)
 
     s = sub.add_parser("throughput", help="waits per lane (worker, resource, checks, review, push, chains, deferrals, "
                                           "provider) against their limits; --apply raises the limits that held work "
