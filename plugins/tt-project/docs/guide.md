@@ -2902,6 +2902,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   when the worker's call is stopped (SIGINT or SIGTERM), is withdrawn and never runs later; one
   already started keeps running.
 - Workers run without a sandbox by default (no bwrap, no network or PID namespace; sudo works).
+  When the agent ends, the runner ends what it left in its process group (but a pid the hand-off lists
+  in `leftover_procs` with how and when it stops) and the run's own sandbox trees nothing owns any more:
+  a `bwrap` (a write fence's, or one from a run before the unsandboxed default) runs in its own session
+  with its proxy listeners (1080, 3128, loopback ports) and outlives the agent otherwise. The daemon's
+  sweep, at start and then each pass, ends the project's orphaned sandbox trees of ended runs and writes
+  a `sandbox_trees_stopped` receipt; a `ttp detach` job's tree, a live run's and any with a protected,
+  device or foreign member stay. `ttp leftover-procs --sandboxes [--dry-run]` does the same on request
+  (exit 2 when it kept a tree). A project runs unsandboxed once its run lines say `sandbox=none` and
+  that command finds no tree.
   `providers.<name>.write_fence: true` turns the provider's write fence on (Claude's Bash sandbox,
   Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. A sandboxed
   worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged

@@ -326,3 +326,190 @@ def test_an_ended_task_whose_run_row_still_says_running_is_refused(env, tmp_path
         assert not p.db.one("SELECT id FROM events WHERE kind=?", (leftoverstop.EVENT,))
     finally:
         _ls_end(proc)
+
+
+# Sandbox trees of ended runs (sandboxreap): a bwrap root (here a shell script named bwrap, so its comm
+# is "bwrap") with one child standing in for its proxy listener.
+_SR_BWRAP = """#!/bin/sh
+sleep 300 </dev/null >/dev/null 2>&1 &
+echo $! > "$SR_READY.tmp" && mv "$SR_READY.tmp" "$SR_READY"
+wait
+"""
+
+
+def _sr_bin(tmp_path):
+    exe = tmp_path / "srbin" / "bwrap"
+    if not exe.exists():
+        exe.parent.mkdir(parents=True)
+        exe.write_text(_SR_BWRAP)
+        exe.chmod(0o755)
+    return exe
+
+
+def _sr_ready(ready, wait=20.0):
+    deadline = time.monotonic() + wait
+    while not ready.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert ready.exists(), "the fake sandbox did not start"
+    return int(ready.read_text())
+
+
+def _sr_spawn(tmp_path, name, env_extra, wrap=False):
+    """A fake sandbox tree in its own session with `env_extra`: (the process started, the bwrap root's pid,
+    its child's pid). `wrap`: started by a shell of the same environment (the tree is not orphaned)."""
+    ready = tmp_path / f"{name}.ready"
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
+    env = {**env, **env_extra, "SR_READY": str(ready)}
+    exe = str(_sr_bin(tmp_path))
+    argv = ["sh", "-c", f'"{exe}" & echo $! > "$SR_READY.root"; wait'] if wrap else [exe]
+    proc = subprocess.Popen(argv, env=env, start_new_session=True)
+    child = _sr_ready(ready)
+    root = int((tmp_path / f"{name}.ready.root").read_text()) if wrap else proc.pid
+    return proc, root, child
+
+
+def _sr_alive(pid):
+    try:
+        stat = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return False
+    return stat.rsplit(")", 1)[1].split()[0] != "Z"
+
+
+def _sr_marks(p, run):
+    return {"TTP_PROJECT": str(p.base), "TTP_RUN_DIR": str(p.runs / run)}
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/environ").exists(), reason="Linux /proc only")
+def test_sandbox_reap_ends_only_an_ended_run_s_orphaned_own_tree(env, tmp_path):
+    """reap() ends an ended run's orphaned bwrap tree whole (root and its listener); a live run's tree, a
+    `ttp detach` job's, another project's, one whose run dir is outside the runs folder and one a process
+    of the same run still owns are not touched; a tree with a guarded member is kept whole and reported."""
+    from ttp import sandboxreap
+    p = make(env)
+    for r in ("ended", "live", "guarded", "owned"):
+        (p.runs / r).mkdir(parents=True, exist_ok=True)
+    ended = lambda d: pathlib.Path(d).name != "live"
+    procs = {}
+    try:
+        procs["ended"] = _sr_spawn(tmp_path, "ended", _sr_marks(p, "ended"))
+        procs["live"] = _sr_spawn(tmp_path, "live", _sr_marks(p, "live"))
+        procs["detached"] = _sr_spawn(tmp_path, "detached", {**_sr_marks(p, "ended"), "TTP_DETACHED": "1"})
+        procs["project"] = _sr_spawn(tmp_path, "project", {**_sr_marks(p, "ended"),
+                                                           "TTP_PROJECT": str(tmp_path / "other" / "tt-project")})
+        procs["outside"] = _sr_spawn(tmp_path, "outside", {**_sr_marks(p, "ended"), "TTP_RUN_DIR": str(tmp_path / "x")})
+        procs["owned"] = _sr_spawn(tmp_path, "owned", _sr_marks(p, "owned"), wrap=True)
+        procs["guarded"] = _sr_spawn(tmp_path, "guarded", _sr_marks(p, "guarded"))
+        guarded = {procs["guarded"][2]}
+        found, kept = sandboxreap.reap(p.base, ended, guarded, dry=True)
+        assert {t["root"] for t in found} == {procs["ended"][1]}, found
+        assert {m["pid"] for m in found[0]["members"]} == set(procs["ended"][1:])
+        assert [k["root"] for k in kept] == [procs["guarded"][1]], kept
+        assert f"member pid {procs['guarded'][2]}" in kept[0]["why"]
+        assert all(_sr_alive(pid) for _, *pids in procs.values() for pid in pids), "a dry run signals nothing"
+        found, kept = sandboxreap.reap(p.base, ended, guarded, term_s=2)
+        procs["ended"][0].wait(timeout=10)
+        assert not any(_sr_alive(pid) for pid in procs["ended"][1:])
+        for name, (_, *pids) in procs.items():
+            if name != "ended":
+                assert all(_sr_alive(pid) for pid in pids), name
+        assert "1 sandbox tree of ended runs (2 processes; runs ended)" in sandboxreap.summary(found)
+    finally:
+        for proc, root, child in procs.values():
+            for pid in (child, root):
+                _ls_kill(pid)
+            proc.wait(timeout=10)
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/environ").exists(), reason="Linux /proc only")
+def test_sandbox_trees_of_ended_runs_go_by_the_daemon_sweep_and_the_leftover_procs_route(env, tmp_path, capsys,
+                                                                                        monkeypatch):
+    """The daemon's sweep ends a tree whose run has its exit.json and writes one receipt; one whose run row
+    still says running stays. `ttp leftover-procs --sandboxes --dry-run` names a tree and signals nothing,
+    then without --dry-run ends it; exit 0 when nothing was kept."""
+    from ttp import cli, sandboxreap
+    p = make(env)
+    monkeypatch.chdir(p.root)
+    done, live = p.runs / "sr-done", p.runs / "sr-live"
+    for d in (done, live):
+        d.mkdir(parents=True)
+    (done / "exit.json").write_text("{}")
+    tid = p.db.add_task("sr", "s", kind="work", tier="light", origin="user")
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(live)))
+    procs = []
+    try:
+        procs.append(_sr_spawn(tmp_path, "done", _sr_marks(p, "sr-done")))
+        procs.append(_sr_spawn(tmp_path, "live", _sr_marks(p, "sr-live")))
+        (t,) = sandboxreap.sweep(p)
+        assert t["root"] == procs[0][1]
+        procs[0][0].wait(timeout=10)
+        (ev,) = p.db.q("SELECT * FROM events WHERE kind=?", (sandboxreap.EVENT,))
+        assert "runs sr-done" in ev["text"] and str(procs[0][1]) in ev["data"]
+        assert sandboxreap.sweep(p) == [] and _sr_alive(procs[1][1])
+        p.db.x("UPDATE runs SET status='ok' WHERE dir=?", (str(live),))
+        with pytest.raises(SystemExit) as e:
+            cli.main(["leftover-procs", "--sandboxes", "--dry-run"])
+        out = capsys.readouterr().out
+        assert e.value.code == 0 and f"would end sandbox tree {procs[1][1]} of run sr-live: 2 processes" in out, out
+        assert _sr_alive(procs[1][1])
+        with pytest.raises(SystemExit) as e:
+            cli.main(["leftover-procs", "--sandboxes"])
+        assert e.value.code == 0 and f"ended sandbox tree {procs[1][1]}" in capsys.readouterr().out
+        procs[1][0].wait(timeout=10)
+        assert not _sr_alive(procs[1][2])
+    finally:
+        for proc, root, child in procs:
+            for pid in (child, root):
+                _ls_kill(pid)
+            proc.wait(timeout=10)
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/environ").exists(), reason="Linux /proc only")
+def test_the_runner_ends_its_agent_s_group_and_its_own_orphaned_sandbox_tree_at_the_end(env, tmp_path, monkeypatch):
+    """When the agent exits, the runner ends what it left in its process group and the run's own bwrap
+    tree, which runs in its own session and was orphaned when the agent went."""
+    from ttp import runner
+    p = make(env)
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    run_dir = p.runs / "sr-runner"
+    run_dir.mkdir(parents=True)
+    (run_dir / "prompt.md").write_text("x")
+    ready, grp = tmp_path / "rn.ready", tmp_path / "grp.pid"
+    script = (f'sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {shlex.quote(str(grp))}; '
+              f'setsid -f {shlex.quote(str(_sr_bin(tmp_path)))} </dev/null >/dev/null 2>&1; '
+              f'while [ ! -f {shlex.quote(str(ready))} ]; do sleep 0.05; done')
+    (run_dir / "run.json").write_text(json.dumps({
+        "argv": ["sh", "-c", script], "cwd": str(tmp_path), "timeout_s": 60, "provider": "fake",
+        "env": {**_sr_marks(p, "sr-runner"), "SR_READY": str(ready)}}))
+    pids = []
+    try:
+        assert runner.supervise(run_dir) == 0
+        pids = [int(grp.read_text()), int(ready.read_text())]
+        for pid in pids:
+            _ls_gone(pid)
+            assert not _sr_alive(pid), pid
+    finally:
+        for pid in pids:
+            _ls_kill(pid)
+
+
+def test_no_shipped_default_starts_a_sandbox(env, monkeypatch):
+    """Every run is unsandboxed by default: a Claude worker's settings turn the Bash sandbox off (even one the
+    user's own settings turn on) and its launch records no sandbox; the coordinator session's settings do
+    the same; `ttp sandbox` runs only when a project turned it on; the project default leaves it off."""
+    from ttp import coordtools, project, sandbox
+    from ttp.providers.claude import Claude
+    monkeypatch.setattr(Claude, "supports", lambda self, flag: True)
+    monkeypatch.setattr(Claude, "hook_rewrites", lambda self: False)
+    for read_only in (False, True):
+        argv, _ = Claude().build(role="worker", model="m", effort="high", cwd="/tmp", budget_usd=1.0,
+                                 read_only=read_only, schema=None, restrictions={})
+        if "--settings" in argv:
+            assert json.loads(argv[argv.index("--settings") + 1])["sandbox"] == {"enabled": False}
+        assert Claude().launch_sandbox(argv) == ""
+    assert coordtools.hook_settings()["sandbox"] == {"enabled": False}
+    assert coordtools.hook_settings(full=True)["sandbox"] == {"enabled": False}
+    monkeypatch.delenv(sandbox.ENV, raising=False)
+    assert not sandbox.opted_in() and not sandbox.opted_in({})
+    assert project.DEFAULT_CONFIG["sandbox"]["checks"] is False

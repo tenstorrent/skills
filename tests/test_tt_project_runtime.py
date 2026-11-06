@@ -3636,22 +3636,32 @@ def test_agent_ends_when_its_runner_dies(env, tmp_path, pdeathsig):
                 os.kill(pid, signal.SIGKILL)
 
 
-def test_runner_watchdog_leaves_the_group_alone_after_a_normal_end(env, tmp_path):
-    # A run that ends normally tells its watchdog so: nothing of the group is signalled afterwards.
-    tool_file = tmp_path / "tool.pid"
-    run_dir = _runner_dir(tmp_path, ["sh", "-c", f"sleep 120 & echo $! > {tool_file}"])
+def test_runner_ends_the_group_after_a_normal_end_but_a_listed_leftover(env, tmp_path):
+    # A run that ends normally tells its watchdog so; the runner itself then ends what the agent left in
+    # its group, but for a pid the hand-off lists in leftover_procs with how and when it stops.
     code = ("import sys; from pathlib import Path; from ttp import runner; "
             "runner.PDEATHSIG = False; sys.exit(runner.supervise(Path(sys.argv[1])))")
-    tool = None
-    try:
-        assert subprocess.run([sys.executable, "-c", code, str(run_dir)], cwd=str(RUNTIME), timeout=60,
-                              env={**os.environ, "PYTHONPATH": str(RUNTIME)}).returncode == 0
-        tool = int(tool_file.read_text())
-        time.sleep(1)
-        assert not _pid_gone(tool)
-    finally:
-        with contextlib.suppress(OSError, TypeError):
-            os.kill(tool, signal.SIGKILL)
+    for listed in (False, True):
+        tool_file = tmp_path / f"tool-{listed}.pid"
+        hand_off = ""
+        if listed:
+            hand_off = (f'; printf \'{{"status":"done","leftover_procs":[{{"pid":%s,"stop":"kill","ends":"soon"}}]}}\' '
+                        f'$(cat {tool_file}) > {tmp_path / f"r{listed}" / "run" / "result.json"}')
+        (tmp_path / f"r{listed}").mkdir()
+        run_dir = _runner_dir(tmp_path / f"r{listed}", ["sh", "-c", f"sleep 120 & echo $! > {tool_file}{hand_off}"])
+        tool = None
+        try:
+            assert subprocess.run([sys.executable, "-c", code, str(run_dir)], cwd=str(RUNTIME), timeout=60,
+                                  env={**os.environ, "PYTHONPATH": str(RUNTIME)}).returncode == 0
+            tool = int(tool_file.read_text())
+            if listed:
+                time.sleep(1)
+                assert not _pid_gone(tool), "a listed leftover was ended"
+            else:
+                assert _wait_for(lambda: _pid_gone(tool), 10), "the agent's leftover tool outlived the run"
+        finally:
+            with contextlib.suppress(OSError, TypeError):
+                os.kill(tool, signal.SIGKILL)
 
 
 def _unused_port() -> int:

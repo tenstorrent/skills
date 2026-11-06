@@ -6490,6 +6490,8 @@ def cmd_leftover_procs(a) -> None:
     """A hand-off check (worker.handoff_checks): exit 1 while a done hand-off's task still has live
     processes in its own worktree (leftoverprocs.py), 0 when it has none, 2 when it cannot tell."""
     from . import leftoverprocs
+    if a.sandboxes:
+        sys.exit(_leftover_sandboxes(a))
     if a.stop is not None:
         sys.exit(_leftover_stop(a))
     path = a.result or os.environ.get("TTP_RESULT_JSON") or ""
@@ -6507,6 +6509,30 @@ def cmd_leftover_procs(a) -> None:
     if msg:
         print(msg)
     sys.exit(rc)
+
+
+def _leftover_sandboxes(a) -> int:
+    """`ttp leftover-procs --sandboxes [--dry-run]`: end this project's sandbox trees (bwrap with its proxy
+    listeners) whose runs have ended and that nothing owns any more (sandboxreap). 0 when none is left, 2 when
+    one is kept (a guarded, foreign or device member) or this caller cannot see the host's processes."""
+    from . import sandboxreap
+    from .push import _boxed
+    p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else here()
+    if p is None:
+        die("ttp leftover-procs --sandboxes: no project here; run it from the project root")
+    if not sandboxreap.ls.PROC.is_dir() or _boxed():
+        print("ttp leftover-procs --sandboxes: this caller cannot see the host's processes (no /proc, or a PID "
+              "namespace); the daemon's sweep ends them", file=sys.stderr)
+        return 2
+    found, kept = sandboxreap.reap(p.base, sandboxreap.run_ended(p), sandboxreap.ls._guarded(p),
+                                   lambda pid, env: sandboxreap.ls._untouchable(p, pid, env), dry=a.dry_run)
+    for t in found:
+        print(f"{'would end' if a.dry_run else 'ended'} sandbox tree {t['root']} of run {Path(t['run_dir']).name}: "
+              f"{len(t['members'])} process{'es' if len(t['members']) != 1 else ''}")
+    for k in kept:
+        print(f"kept sandbox tree {k['root']} of run {Path(k['run_dir']).name}: {k['why']}", file=sys.stderr)
+    print(sandboxreap.summary(found, "would end" if a.dry_run else "ended"))
+    return 2 if kept else 0
 
 
 def _leftover_stop(a) -> int:
@@ -12628,7 +12654,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--stop", type=int, metavar="TASK", help="stop this ended task's own leftover processes")
     s.add_argument("--pid", type=int, action="append", help="with --stop: only this pid (repeatable); "
                                                             "refused unless it is the task's own")
-    s.add_argument("--dry-run", action="store_true", help="with --stop: list what it would stop and refuse")
+    s.add_argument("--sandboxes", action="store_true",
+                   help="end this project's sandbox trees (bwrap with its proxy listeners) whose runs have ended and "
+                        "that nothing owns any more; the daemon also does it at start and on each sweep")
+    s.add_argument("--dry-run", action="store_true", help="with --stop or --sandboxes: list what it would stop and refuse")
     s.set_defaults(fn=cmd_leftover_procs)
 
     s = sub.add_parser("goal", help="stock goal checks, one JSON line per observation; exit 0 met, 1 not, "

@@ -25,6 +25,8 @@
 - ends the child's whole process group, its tools too, TERM then KILL, when the runner itself dies
   (killed outright): a watchdog process does it on every platform, and on Linux the kernel also
   sends the child SIGTERM at once (PR_SET_PDEATHSIG);
+- when the agent ends, ends what it left in its process group and the run's own sandbox trees that
+  outlived it (bwrap with its proxy listeners, which runs in its own session: sandboxreap);
 - starts the child `nice` levels below itself (run.json; workers and reviewers only), so all it
   starts runs niced too, and records the level the child ran at in exit.json (`nice`);
 - holds a slot of each resource an `exclusive:` task names from before the child starts until it
@@ -61,6 +63,7 @@ from .project import Project, durable_write, lower_priority
 
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
+END_GRACE_S = 5.0   # a normal end: TERM to what the agent left in its group, KILL this long after
 PRE_GRANT_EVERY_S = 30   # a whole-run take that waits asks the project's pre-grant check again this often
 PRE_GRANT_FRESH_S = 3    # a pre-grant answer older than this is asked again once the take has the slot
 POLL_S = 5
@@ -277,6 +280,78 @@ def _start_watchdog(pgid: int):
     finally:
         os.close(r)
     return w, proc
+
+
+def end_group(pgid: int, grace_s: float = END_GRACE_S) -> bool:
+    """TERM to process group `pgid`, then KILL to what is left after grace_s. True when it had members."""
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except OSError:
+        return False
+    end = time.monotonic() + grace_s
+    while time.monotonic() < end:
+        time.sleep(0.1)
+        try:
+            os.killpg(pgid, 0)
+        except OSError:
+            return True
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except OSError:
+        pass
+    return True
+
+
+def _group_left(pgid: int, keep: set[int]) -> list[dict] | None:
+    """The members of process group `pgid` but those in `keep`, as leftoverstop.end takes them; None
+    without /proc."""
+    from . import leftoverstop as ls
+    if not ls.PROC.is_dir():
+        return None
+    out = []
+    for pid in ls._uid_pids():
+        try:
+            if int((ls.PROC / str(pid) / "stat").read_text().rsplit(")", 1)[1].split()[3]) != pgid:
+                continue
+        except (OSError, IndexError, ValueError):
+            continue
+        if pid not in keep and (start := ls._start(pid)) is not None:
+            out.append({"pid": pid, "start": start, "cmd": ls._cmd(pid)})
+    return out
+
+
+def end_leftovers(pgid: int, run_dir: Path, project: str | None) -> None:
+    """Once the agent ended: what is left of its process group (tools it left running; `ttp detach`
+    jobs, detached checks and pushes run in their own sessions and are not in it; a pid its hand-off
+    lists in leftover_procs with how and when it stops stays), then the sandbox trees of this run that
+    nothing owns any more (sandboxreap: bwrap with its proxy listeners, which starts its own session and
+    outlives the group)."""
+    try:
+        from . import leftoverprocs
+        try:
+            keep = leftoverprocs.allowed(json.loads((run_dir / "result.json").read_text()))
+        except (OSError, ValueError, AttributeError):
+            keep = set()
+        if not keep:
+            ended = end_group(pgid)
+        elif (left := _group_left(pgid, keep)) is not None:
+            from . import leftoverstop
+            ended = bool(left) and bool(leftoverstop.end(left, END_GRACE_S))
+        else:
+            ended = False
+            print(f"runner: left process group {pgid} running: its hand-off lists leftover_procs", flush=True)
+        if ended:
+            print(f"runner: ended the processes left in the agent's process group {pgid}", flush=True)
+        if project:
+            from . import sandboxreap
+            mine = os.path.realpath(run_dir)
+            found, kept = sandboxreap.reap(project, lambda d: d == mine)
+            if found:
+                print(f"runner: {sandboxreap.summary(found, 'ended')}", flush=True)
+            for k in kept:
+                print(f"runner: kept sandbox tree {k['root']}: {k['why']}", flush=True)
+    except Exception as e:   # never lose the run's exit.json to a cleanup fault
+        print(f"runner: could not end the run's leftover processes: {type(e).__name__}: {e}", flush=True)
 
 
 def remove_files(paths: list[str]) -> None:
@@ -604,6 +679,7 @@ def supervise(run_dir: Path) -> int:
             watchdog.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
+    end_leftovers(child.pid, run_dir, env_extra.get("TTP_PROJECT"))
     remove_files(spec.get("private_files") or [])
     remove_tmp(run_dir, spec)
     if held:

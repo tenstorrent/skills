@@ -2515,6 +2515,13 @@ class Daemon:
                     log(self.p, r["text"])
         except Exception:
             log(self.p, "stopping the leftover processes of ended tasks failed\n" + traceback.format_exc())
+        try:   # sandbox trees (bwrap and its proxy listeners) that outlived their runs; the first pass is at start
+            if due:
+                from . import sandboxreap
+                if found := sandboxreap.sweep(self.p):
+                    log(self.p, sandboxreap.summary(found))
+        except Exception:
+            log(self.p, "stopping the sandbox trees of ended runs failed\n" + traceback.format_exc())
         try:
             self.stop_cancelled_checks()
         except Exception:
