@@ -24890,8 +24890,8 @@ def test_codex_worker_hook_delivers_the_steer_once_and_denies_bypasses(env, monk
     _, argv = worker()
     assert "--dangerously-bypass-hook-trust" in argv and argv[-1] == "-"
     cmds = _codex_hook_commands(argv)
-    assert set(cmds) == {"PreToolUse", "PostToolUse"} and "-m ttp.hook PreToolUse" in cmds["PreToolUse"]
-    assert re.search(r'hooks\.PreToolUse=\[\{matcher="Bash"', " ".join(argv)), "only shell calls are checked"
+    assert set(cmds) == {"PreToolUse", "PostToolUse", "Stop"} and "-m ttp.hook PreToolUse" in cmds["PreToolUse"]
+    assert re.search(r'hooks\.PreToolUse=\[\{matcher="Bash\|', " ".join(argv)), "shell calls are checked"
     p = make(env)
     p.set_config("delivery.push_checks", [SUITE])
     run = tmp_path / "run"

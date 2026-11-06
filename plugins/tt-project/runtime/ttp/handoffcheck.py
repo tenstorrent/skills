@@ -17,7 +17,7 @@ and its later hand-off is checked). They run before the transaction that records
 (prefetch, from Daemon._prefetch_lint), so the write lock never waits on them; verdict reads that
 answer and runs them itself only when prefetch did not.
 
-They also run in the worker's own session first (at_stop, from the Claude Code Stop hook in hook.py), so
+They also run in the worker's own session first (at_stop, from the Claude Code or Codex Stop hook in hook.py), so
 a rejection is fixed by the session that wrote the hand-off rather than by a new cold run. The daemon
 passes each task run its send-backs so far and the cap (SENDBACKS_ENV, "used/cap"); a check that exits 1
 refuses the stop with its output while used + the run's own refusals (STOP_FILE) stay under the cap,

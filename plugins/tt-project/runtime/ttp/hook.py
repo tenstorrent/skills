@@ -28,7 +28,7 @@ the file's size and mtime with the last one checked), the hook parses it as the 
 it is no hand-off (not JSON, not an object, or no hand-off status), hands the worker the error with
 its line and column, once per version of the file. A valid done or needs_review hand-off of a code task
 with no branch on record (NO_BRANCH_ENV) that names no PR, `published` change or top-level `branch` +
-`head` gets a warning naming those fields, since the daemon could queue no review of it. A Stop hook (Claude Code, task runs only: the
+`head` gets a warning naming those fields, since the daemon could queue no review of it. A Stop hook (Claude Code and Codex, task runs only: the
 daemon sets HANDOFF_GUARD_ENV) refuses to end a run whose result.json is missing or no hand-off, with
 a one-line reason; it lets the run end when `stop_hook_active` is set or after MAX_STOP_BLOCKS
 refusals, so it never loops, and stays silent in a subagent and outside a task run. On a valid hand-off
@@ -52,8 +52,8 @@ only as a plain expansion and sets no variable by a built name (`eval`, `declare
 os.environ). A test can so put a fake gh behind the wrapper. Known gap: a script that sets TTP_PROJECT
 some other way it cannot see.
 
-Outside a harness task it denies Edit/Write calls on the harness's bin/gh and the project's gh.d
-pre-hooks (prguard.run_gh_hooks), and Bash calls naming their path (`$TTP_PROJECT/harness/bin/gh`,
+Outside a harness task it denies Edit/Write calls (and Codex apply_patch calls naming them) on the
+harness's bin/gh and the project's gh.d pre-hooks (prguard.run_gh_hooks), and Bash calls naming their path (`$TTP_PROJECT/harness/bin/gh`,
 `$TTP_PROJECT/harness/bin/gh.d`, or gh.d together with the bin dir), as the web token check does:
 any mention.
 
@@ -824,6 +824,11 @@ def secret_read(cmd: str, segments: list[list[str]], cwd: str) -> str | None:
 
 
 EDIT_TOOLS = {"Edit", "Write", "MultiEdit", "NotebookEdit"}
+PATCH_TOOLS = {"apply_patch"}   # Codex's file edits: one patch text naming each file it changes
+# A file a patch names (codex-cli 0.160: `*** Add File: p`, `*** Update File: p`, `*** Delete File: p`, `*** Move to: p`),
+# read loosely (case, spacing) so a header Codex might still take is never missed
+PATCH_FILE_RE = re.compile(r"^[ \t]*\*\*\*[ \t]*(?:(?:Add|Update|Delete)[ \t]+File|Move[ \t]+to)[ \t]*:[ \t]*(.*?)[ \t\r]*$",
+                           re.M | re.I)
 HARNESS_GH_WHY = ("the harness's gh wrapper (bin/gh) and the project's gh pre-hooks (bin/gh.d) change only in a "
                   "harness task: other runs never edit, move or disable them, and a command naming their path is "
                   "refused (call gh by its name; read them with the Read tool)")
@@ -856,6 +861,17 @@ def harness_gh_edit(payload: dict) -> str | None:
     if path not in (gh, gh + ".d") and not path.startswith(gh + ".d" + os.sep) and not HARNESS_GH_RE.search(name):
         return None
     return None if _harness_task() else HARNESS_GH_WHY
+
+
+def harness_gh_patch(payload: dict) -> str | None:
+    """harness_gh_edit for each file a Codex apply_patch call names (tool_input.command, the patch text)."""
+    inp = payload.get("tool_input")
+    text = inp if isinstance(inp, str) else next((v for k in ("command", "input", "patch")
+                                                  if isinstance(v := (inp or {}).get(k), str)), "")
+    for name in PATCH_FILE_RE.findall(text):
+        if why := harness_gh_edit({**payload, "tool_input": {"file_path": name}}):
+            return why
+    return None
 
 
 # Commands the Claude Code fence frees by name (providers/claude.py FENCE_EXCLUDED, also after `timeout N`):
@@ -1060,8 +1076,8 @@ def _deny(why: str) -> dict:
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
-    if payload.get("tool_name") in EDIT_TOOLS:
-        why = harness_gh_edit(payload)
+    if payload.get("tool_name") in EDIT_TOOLS | PATCH_TOOLS:
+        why = harness_gh_edit(payload) if payload["tool_name"] in EDIT_TOOLS else harness_gh_patch(payload)
         return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
         from . import aitag

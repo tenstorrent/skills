@@ -26,7 +26,10 @@ that names `state/web.token`.
 
 Harness hook (measured on codex-cli 0.160). Codex sends the same PreToolUse/PostToolUse payload as
 Claude Code (`tool_name` "Bash", `tool_input.command`) and takes the same deny and added-context
-replies, so workers get `ttp.hook` through `-c hooks.*` keys, never a file under `~/.codex`. Codex
+replies. File edits come as `tool_name` "apply_patch" with the patch text in `tool_input.command`, MCP
+calls as `mcp__<server>__<tool>` with the tool's arguments, and the end of a turn as a Stop event
+(`stop_hook_active`, no tool) that takes Claude Code's `{"decision": "block", "reason": ...}` and goes
+on with the reason as the next prompt. So workers get `ttp.hook` through `-c hooks.*` keys, never a file under `~/.codex`. Codex
 runs a hook only once its hash is trusted, and silently skips a `-c` hook that is not, so the hook
 needs `--dangerously-bypass-hook-trust`. That flag trusts every hook of the run, so it is passed
 only when no other hook source exists (hook_sources); otherwise the worker gets coordinator updates
@@ -53,6 +56,7 @@ from datetime import datetime
 from pathlib import Path
 
 from . import register
+from .claude import STOP_HOOK_TIMEOUT_S   # the same allowance for the hand-off checks at a stop
 from .base import (AUTH_RE, LIMIT_RE, MAX_ARG_BYTES, Provider, RunUsage, cli_output, price_row, request_rejected,
                    status_check, stderr_tail, strict_schema, drop_nulls, head80, input_hash, isolated_module_argv, jsonl_from,
                    CMD_MAX)
@@ -829,14 +833,23 @@ def _payloads(item: dict) -> list[dict]:
     return []
 
 
+# The tool calls the harness hook checks first, as claude.hook_settings does: shell calls, file edits (Codex
+# edits files only through apply_patch) and MCP connector calls (`mcp__<server>__<tool>`). A regex, as
+# measured on codex-cli 0.160.
+PRE_TOOL_MATCHER = "Bash|apply_patch|mcp__.*"
+
+
 def hook_config_args() -> list[str]:
-    """`-c` keys that route Bash calls and every tool result through `ttp.hook` (see the module
-    docstring). PYTHONPATH is set in the command itself, so the worker's own commands keep theirs."""
+    """`-c` keys that route shell, edit and MCP calls, every tool result and the end of a turn (Stop: the
+    hand-off guard) through `ttp.hook` (see the module docstring). PYTHONPATH is set in the command
+    itself, so the worker's own commands keep theirs."""
     runtime = str(Path(__file__).resolve().parents[2])
     cmd = f"env PYTHONPATH={shlex.quote(runtime)} {shlex.join(isolated_module_argv('ttp.hook', runtime))}"
     out = []
-    for event, matcher in (("PreToolUse", "Bash"), ("PostToolUse", "*")):
-        entry = f"[{{matcher={toml_string(matcher)},hooks=[{{type=\"command\",command={toml_string(f'{cmd} {event}')},timeout=20}}]}}]"
+    for event, matcher, timeout in (("PreToolUse", PRE_TOOL_MATCHER, 20), ("PostToolUse", "*", 20),
+                                    ("Stop", None, STOP_HOOK_TIMEOUT_S)):
+        hook = f"{{type=\"command\",command={toml_string(f'{cmd} {event}')},timeout={timeout}}}"
+        entry = f"[{{{'' if matcher is None else f'matcher={toml_string(matcher)},'}hooks=[{hook}]}}]"
         out += ["-c", f"hooks.{event}={entry}"]
     return out
 
