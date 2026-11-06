@@ -38,7 +38,8 @@ sent. A failure to read replies is reported on stderr and never stops the messag
   Deterministic and cheap. It starts a model only through a run.
 - **Coordinator**: always the project's hands-on manager: one persistent session (Claude Code,
   Codex, Cursor), woken by chat, task ends and timers, that corrects workers mid-run and fixes the
-  project's own prompts, scripts and config, while heavy work still goes to workers. No setting
+  project's own prompts, scripts and config (each fix recorded with its why, order and undo:
+  `ttp audit fixes`), while heavy work still goes to workers. No setting
   turns it into a stateless turn; a daemon restart or host reboot resumes the same session, a full
   context compacts in place, and only a resume the provider rejects (or a provider-side expiry)
   hands the context to a new session. Only the chat provider, which keeps no session yet, runs a short, tool-less stateless

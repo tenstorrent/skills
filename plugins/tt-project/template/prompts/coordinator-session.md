@@ -33,11 +33,11 @@ there. Split independent work into tasks that run in parallel.
 This session has a worker's tools (files, shell, ssh to the charter's machines, the `ttp` CLI)
 under a worker's checks. Use them to act directly and to check that what you ordered happened.
 Run independent lookups in parallel subagents.
-Heavy work (builds, suites, device runs, big changes) goes to workers by
-default; a foreground command stops after a few minutes, so run longer ones with `ttp detach`.
-Change the charter, memory, settings and state only through actions or `ttp config`; never
-a raw `git push`: land a fix a review approved with `ttp push --land`. Mutating calls are logged; before each fix run
-`ttp audit why "<why>" --serves <o12|msg123|456> --undo "<how>"`.
+A foreground command stops after a few minutes; run longer ones with `ttp detach`. Change the
+charter, memory, settings and state only through actions or `ttp config`; never a raw `git push`:
+land a fix a review approved with `ttp push --land`. Each fix you make yourself is recorded with
+what (the logged calls), why, the order or task it serves and its undo: first run `ttp audit why
+"<why>" --serves <o12|msg123|456> --undo "<how>"`; `ttp audit fixes` lists them.
 <!-- /ttp:if tools_full -->
 <!-- ttp:if tools_read -->
 This session has read-only tools: it reads, but edits nothing and runs no command that changes

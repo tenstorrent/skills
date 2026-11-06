@@ -2437,6 +2437,20 @@ def test_coordinator_and_worker_prompts_follow_intent_ask_rarely_and_frame_the_s
     assert "instruct and correct it mid-run (`task_update` `spec`)" in session
     assert "Fix what is wrong yourself, in the work, the workers and the project's prompts" in session
     assert "larger code changes still go to workers" in session
+    # A fix the session makes itself is recorded (coordfix.py, #6302): a full-tools session's Tools section
+    # says so with the real command and flags, each --serves example parses, and a session without tools
+    # (read-only or none: it cannot run them) and the tool-less turn never name it.
+    import re
+    from ttp import coordfix
+    tools = session.split("## Tools", 1)[1].split("## ", 1)[0]
+    assert ("Each fix you make yourself is recorded with what (the logged calls), why, the order or task it "
+            "serves and its undo") in tools
+    assert "`ttp audit fixes` lists them" in tools
+    m = re.search(r'`ttp audit why "<why>" --serves <([^>]+)> --undo "<how>"`', tools)
+    assert m and all(coordfix.serves(x) for x in m[1].split("|"))
+    assert session.count("ttp audit why") == 1 and "ttp audit" not in stateless
+    for state in ("read", "none"):
+        assert "ttp audit" not in coordinator_session_role(p, (state, "why"))
     worker = flat(worker_system(p, {"kind": "code", "title": "t"}))
     assert "decide yourself, by the intent of your spec and the user's orders, not a literal reading" in worker
     assert "including the task, as written (in doubt, the stricter reading)" in worker
