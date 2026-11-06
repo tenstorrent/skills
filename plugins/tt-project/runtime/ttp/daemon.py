@@ -48,6 +48,7 @@ from . import seedcap
 from . import turnrules
 from . import checksettle
 from . import coordwrites
+from . import spans
 from . import checksgone
 from . import streamguard
 from . import userorder
@@ -1018,6 +1019,19 @@ class _FinishRound:
         for p, stamp, msg in self.buf:
             _log_write(p, stamp, msg)
         return bool(done)
+
+
+def _handoff_of(task: dict) -> str:
+    """The source label of task `task`'s hand-off summary quoted in a spec the daemon builds (spans.wrap)."""
+    return f"hand-off of #{task['id']}"
+
+
+def _findings(fups: list[dict], review: dict, tag: str) -> str:
+    """A failed review's findings (its follow-ups) as numbered lines for a fix or re-review spec, each
+    reviewer-written title and spec clipped, then enclosed under `tag` as data (spans.wrap)."""
+    return "\n".join(f"{n}. " + spans.wrap(f"{str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}",
+                                            f"finding of review #{review['id']}", tag)
+                      for n, f in enumerate(fups, 1))
 
 
 class Daemon:
@@ -15039,10 +15053,11 @@ class Daemon:
                  if ahead else f"its hand-off names {', '.join(named[:5])}" if named
                  else f"its hand-off names no commit: find its commits with `git -C {h} log`")
         summary = str(load_result(task.get("result")).get("summary") or "")
+        tag = spans.new_tag()   # this spec's delimiter: the worker's hand-off is enclosed with it as data
         lines = [f"Independently review the change of harness task #{task['id']} ({task['title']}) in this "
                  f"project's harness repo ({h}): {where}.",
                  f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
-                 f"Its hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}",
+                 f"Its hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(task), tag)}",
                  REVIEW_CHECK_LINE,
                  "The harness has no remote: review only. If it passes, hand off `done`; never run `ttp push`, "
                  "approve it for the push queue or copy harness files into a code branch. Leave the harness's "
@@ -15368,14 +15383,16 @@ class Daemon:
             lines.append(f"No branch of it is on record in this project, so its diff is not in the project root's "
                          f"git: read it with `gh pr diff {pr}`, or check out head {full} in a clone of the PR's "
                          f"repository of your own.")
+        tag = spans.new_tag()   # this spec's delimiter: the worker's own text is enclosed with it as data
         lines += [f"Its spec: {coord.clip(task.get('spec'), AUTO_REVIEW_SPEC_CHARS)}",
-                  f"Its hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]
+                  f"Its hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(task), tag)}"]
         fups = load_result(task.get("result")).get("followups")
         fups = [str(f["title"])[:120] for f in fups if isinstance(f, dict) and f.get("title")] \
             if isinstance(fups, list) else []
         if fups:
             lines.append("Its proposed follow-ups (the coordinator queues them separately; not part of this "
-                         "change, so not a finding by themselves): " + "; ".join(fups[:MAX_FOLLOWUPS]))
+                         "change, so not a finding by themselves): "
+                         + spans.wrap("; ".join(fups[:MAX_FOLLOWUPS]), f"follow-ups of #{task['id']}", tag))
         # A split head whose hop stalls is reviewed on its own now (_release_split_reviews).
         own_split = chaincap.split_head(task)
         stall = chaincap.stalled_hop(db, task["id"]) if own_split else None
@@ -16130,8 +16147,8 @@ class Daemon:
         only = push.REVIEW_ONLY_LABEL in push._labels(review) + push._labels(first)
         tier, tsrc = effort.fix_tier(db, code, review, fups)   # db.add_task: a fix never runs light
         rtier = "deep" if review["tier"] == "deep" else "standard"   # a re-review never runs light
-        found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
-                          for n, f in enumerate(fups, 1))
+        tag = spans.new_tag()   # this spec's delimiter: the reviewer's findings and hand-off are data
+        found = _findings(fups, review, tag)
         # An open fix of the PR's findings (pr_findings_owner) on this stack takes these findings too:
         # a PR has one fixer.
         root, key = self._stack_root(code), prguard.pr_key(code.get("pr_url") or "")
@@ -16231,7 +16248,7 @@ class Daemon:
                     f"Review #{review['id']} ({review['title']}) of code task #{code['id']} (branch "
                     f"{code['branch']}, head {head}) {owner} Re-review #{rid} checks each once this task is done.",
                     f"Findings to fix:\n{found}",
-                    f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"])
+                    f"The review's hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(review), tag)}"])
                 db.update_task(fid, spec=f"{(prfix or hop)['spec'] or ''}\n{extra}",
                                labels=[*json.loads((prfix or hop)["labels"] or "[]"), f"review_fix:{review['id']}"])
                 for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (fid,)):
@@ -16246,7 +16263,7 @@ class Daemon:
                                f"finding once this task is done." if only else
                                f"Leave the push to re-review #{rid}, which checks each finding once this task is done."),
                     f"Findings to fix:\n{found}",
-                    f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]))
+                    f"The review's hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(review), tag)}"]))
             moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
             coord._take_over_dependents(db, review["id"], rid)
         log(self.p, f"review {review['id']} failed: "
@@ -16265,8 +16282,8 @@ class Daemon:
         base_title = re.sub(r"^(?:Fix review #\d+: )+", "", code["title"])
         tier, tsrc = effort.fix_tier(db, code, review, fups)
         rtier = "deep" if review["tier"] == "deep" else "standard"
-        found = "\n".join(f"{n}. {str(f['title'])[:200]}: {coord.clip(f.get('spec'), FOLLOWUP_SPEC_CHARS)}"
-                          for n, f in enumerate(fups, 1))
+        tag = spans.new_tag()   # this spec's delimiter: the reviewer's findings and hand-off are data
+        found = _findings(fups, review, tag)
         where = extchange.place(ch)
         with db.tx():
             fid = db.add_task(f"Fix review #{review['id']}: {base_title}"[:200], "", kind="code", tier=tier,
@@ -16299,7 +16316,7 @@ class Daemon:
                 f"Push nothing to this project's push branch, and open no pull request. Re-review #{rid} "
                 f"checks each finding once this task is done.",
                 f"Findings to fix:\n{found}",
-                f"The review's hand-off: {coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS)}"]))
+                f"The review's hand-off: {spans.wrap(coord.clip(summary, AUTO_REVIEW_SUMMARY_CHARS), _handoff_of(review), tag)}"]))
             moved = [t["id"] for t in coord._open_dependents(db, review["id"])]
             coord._take_over_dependents(db, review["id"], rid)
         log(self.p, f"review {review['id']} failed: queued fix #{fid} of the external change ({where}) and "

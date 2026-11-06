@@ -742,7 +742,8 @@ def _prompt_head(p: Project) -> tuple[str, str, str]:
 
 
 def _sha(text: str) -> str:
-    return hashlib.sha256(text.encode()).hexdigest()[:16]
+    """A row's or section's hash, without its provenance delimiters: a new tag each turn is no change."""
+    return hashlib.sha256(spans.strip(text).encode()).hexdigest()[:16]
 
 
 def _standing_entry(e: dict) -> bool:
@@ -1126,8 +1127,9 @@ def _flag_names(e: dict) -> list[str]:
             for x in got if x]
 
 
-def _worker_line(p: Project, e: dict, now: float) -> tuple[str, str]:
-    """(a running run's line, at most WORKER_LINE_CHARS, and its ident without clocks or dollars)."""
+def _worker_line(p: Project, e: dict, now: float, tag: str) -> tuple[str, str]:
+    """(a running run's line, at most WORKER_LINE_CHARS past its step's delimiters, and its ident without
+    clocks or dollars). The step (the worker's note or tool input) is enclosed under `tag` as data."""
     if e.get("gone"):
         return f"- #{e.get('task')} | run {e.get('run')}: run dir gone", "gone"
     t = e.get("last_tool") or {}
@@ -1149,15 +1151,21 @@ def _worker_line(p: Project, e: dict, now: float) -> tuple[str, str]:
     ident = " | ".join([step, files, _TICKS_RE.sub("", check), steer, flags])
     tail = [clip(check, 40), money] + ([steer + ago] if steer else []) + ([flags] if flags else [])
     tail_text = " | ".join([files] + tail)
+    label = f"worker step of #{e.get('task')}"
     room = WORKER_LINE_CHARS - len(f"- #{e.get('task')} |  | ") - len(tail_text)
-    return f"- #{e.get('task')} | {clip(step, max(room, 20))} | {tail_text}"[:WORKER_LINE_CHARS], ident
+    # Clipped before it is enclosed, and the cut falls on the tail: a cut never drops the span's end.
+    head = f"- #{e.get('task')} | {spans.wrap(clip(step, max(room, 20)), label, tag)} | "
+    return head + tail_text[:max(WORKER_LINE_CHARS - len(spans.strip(head)), 0)], ident
 
 
-def workers_lines(p: Project, db, seen: dict | None, fold: bool, now: float) -> tuple[list[str], list[str], dict]:
+def workers_lines(p: Project, db, seen: dict | None, fold: bool, now: float,
+                  tag: str | None = None) -> tuple[list[str], list[str], dict]:
     """(the Running workers section, its unfolded form, {run id: ident hash} to store): one line per
     run runwatch.json lists that the runs table still has running, capped at coordinator.live_view_chars
     (0: off; past it flagged runs first, then '+N more'). `fold`: a session wake, whose runs unchanged
-    since `seen` go on one line. Writes no state."""
+    since `seen` go on one line. `tag`: the turn's delimiter enclosing each worker's step (spans.wrap).
+    Writes no state."""
+    tag = tag or spans.new_tag()
     cap = int(p.config()["coordinator"].get("live_view_chars", 1200) or 0)
     try:
         runs = json.loads((p.state / "runwatch.json").read_text()).get("runs") or {}
@@ -1172,7 +1180,7 @@ def workers_lines(p: Project, db, seen: dict | None, fold: bool, now: float) -> 
     made = []
     for e in got:
         try:
-            made.append((e, *_worker_line(p, e, now)))
+            made.append((e, *_worker_line(p, e, now, tag)))
         except (TypeError, ValueError, KeyError, AttributeError):   # a malformed entry never breaks the digest
             made.append((e, f"- #{e.get('task')} | run {e.get('run')}: runwatch entry unreadable", "unreadable"))
 
@@ -1234,6 +1242,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     shown: list[tuple[str, list[str]]] = []
     uncollapsed: list[tuple[str, list[str]]] = []
     shas: dict = {}
+    tag = spans.new_tag()   # this turn's delimiter: workers' and relayers' text below is enclosed with it
 
     def section(key: str, body: list[str], ident: str | None = None, short: str | None = None,
                 full: list[str] | None = None) -> None:
@@ -1424,6 +1433,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 lines.append(anchors.group_line(*grouped[t["id"]], ts, now, p))
             continue
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
+        if note:   # clipped before it is enclosed, so a cut never drops the span's end
+            note = spans.wrap(note, f"{'blocked reason' if t['blocked_reason'] else 'hand-off'} of #{t['id']}", tag)
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         note = f"{anchors.describe(*held, p)}: {note}" if held else note
         clash = file_overlap.digest_note(t)
@@ -1447,7 +1458,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     rows_whole = lines
     lines, shas[TASK_ROWS_SEEN_KEY] = collapse_rows(p, db, lines, rows, seen, event_ids, msg_ids, now)
     section("tasks", lines, full=rows_whole)
-    wk_lines, wk_whole, wk_seen = workers_lines(p, db, seen, whole is not None, now)
+    wk_lines, wk_whole, wk_seen = workers_lines(p, db, seen, whole is not None, now, tag)
     if wk_seen:
         shas[WORKER_ROWS_SEEN_KEY] = wk_seen
     section("workers", wk_lines, full=wk_whole)
@@ -1463,6 +1474,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     for k, t in enumerate(finished):
         summary = ("see new events" if f"task:{t['id']}" in in_events
                    else clip(load_result(t["result"]).get("summary"), FINISHED_CHARS) if k < FINISHED_DETAIL else "")
+        summary = spans.wrap(summary, f"hand-off of #{t['id']}", tag) if summary and summary != "see new events" \
+            else summary
         lines.append(f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], TITLE_CHARS)}"
                      + verified.handoff_line(load_result(t["result"])) + (f" — {summary}" if summary else ""))
     section("finished", lines)
@@ -1542,7 +1555,6 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(upstream.digest_line(p, p.config()))
     section("upstream", lines)
     lines = ["\n# NEW EVENTS"]
-    tag = spans.new_tag()   # this turn's delimiter: untrusted spans below are enclosed with it
     if msg_ids:
         rows = db.q(f"SELECT * FROM messages WHERE id IN ({','.join('?' * len(msg_ids))}) ORDER BY id", msg_ids)
         flagged = ({int(k): v for k, v in corrections.items()} if corrections is not None
@@ -1590,13 +1602,13 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         if rejected and db.kv(REJECTED_REPLY_KEY, False) else ""
     sent = [str(x) for x in rejected]
     for x in dict.fromkeys(sent):   # the same refusal sent more than once is shown once, with its count
-        tag = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
+        why = "rejected again, as on the turn before: do not send it as is" if rejection_key(x) in again \
             else "your previous turn's action was refused, information only: nothing to fix" \
             if informational_rejection(x) else "your previous turn's action was rejected; fix or drop it"
         if sent.count(x) > 1:
-            tag += f"; sent {sent.count(x)} times"
+            why += f"; sent {sent.count(x)} times"
         reason = x.replace(f" {INFO_MARK}", "")
-        lines.append(f"- [{tag}] {reason[:_rejection_cap(reason)]}{told}")
+        lines.append(f"- [{why}] {reason[:_rejection_cap(reason)]}{told}")
     for x in rejcool.digest_lines(db, where=p):
         lines.append(f"- [counted, not woken: the same unchanged cause as a rejected action] {x}")
     for x in db.kv(NOTES_KEY, []) or []:

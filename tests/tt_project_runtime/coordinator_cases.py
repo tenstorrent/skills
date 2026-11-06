@@ -7563,7 +7563,7 @@ def test_an_identical_open_ask_is_not_posted_twice(env):
 
 def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
     p = make(env)
-    from ttp import coordinator as coord
+    from ttp import coordinator as coord, spans
     long = "word " * 400
     for i in range(coord.FINISHED_ROWS + 3):
         tid = p.db.add_task(f"old task {i}", origin="user")
@@ -7581,7 +7581,7 @@ def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
     assert len(finished) == coord.FINISHED_ROWS
     assert f"#{done} done: fresh task — see new events" in finished[0], "the hand-off was repeated"
     detail = finished[1:coord.FINISHED_DETAIL]
-    assert detail and all(len(row) < coord.FINISHED_CHARS + 40 and row.endswith("…") for row in detail)
+    assert detail and all(len(spans.strip(row)) < coord.FINISHED_CHARS + 40 and spans.strip(row).endswith("…") for row in detail)
     assert all(re.fullmatch(r"- #\d+ done: old task \d+", row) for row in finished[coord.FINISHED_DETAIL:]), \
         "older rows repeat their summaries"
     sent = background.split("## Recently sent to the user")[1].splitlines()[1]
@@ -7591,7 +7591,7 @@ def test_the_digest_cuts_background_rows_but_keeps_new_events_whole(env):
     # A follow-up alone (its hand-off was in an earlier batch) does not stand in for the summary.
     fup = p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
                  (time.time(), f"task:{done}", "followup_proposed", "normal", "proposed follow-up: x", "new"))
-    assert f"#{done} done: fresh task — fresh word" in coord.digest(p, {}, [fup], [])
+    assert f"#{done} done: fresh task — fresh word" in spans.strip(coord.digest(p, {}, [fup], []))
 
 
 
@@ -22721,6 +22721,7 @@ def test_coordinator_running_workers_section_none_one_and_off(env):
     One run: one line under 160 chars with step, files (outside spec), check, spend of budget and wall
     share, steer read state and flags, the last two only when runwatch carries them."""
     from ttp import coordinator as coord
+    from ttp import spans
     p = make(env)
     assert "workers" not in dict(coord.digest_parts(p, {}, [], [])[0])
     gone = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(1,'worker','done',?)", (time.time(),))
@@ -22731,14 +22732,14 @@ def test_coordinator_running_workers_section_none_one_and_off(env):
     e = next(iter(runs.values()))
     text = dict(coord.digest_parts(p, {}, [], [])[0])["workers"]
     head, line = text.split("\n")
-    assert head == coord.WORKERS_HEAD and len(line) <= coord.WORKER_LINE_CHARS, text
-    assert line.startswith(f"- #{e['task']} | editing part 0 | files 3 (2 outside spec) | pass (412 passed"), line
+    assert head == coord.WORKERS_HEAD and len(spans.strip(line)) <= coord.WORKER_LINE_CHARS, text
+    assert spans.strip(line).startswith(f"- #{e['task']} | editing part 0 | files 3 (2 outside spec) | pass (412 passed"), line
     assert "$0.42 of $8.00, 31% of wall" in line and "steer: unread" in line and line.endswith("outside_spec"), line
     runs[str(e["run"])].update(steer={"last": "", "read": None}, flags=[], files_outside_spec=0,
                                note="x" * 400)
     (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
     line = dict(coord.digest_parts(p, {}, [], [])[0])["workers"].split("\n")[1]
-    assert "steer" not in line and "outside" not in line and len(line) <= coord.WORKER_LINE_CHARS, line
+    assert "steer" not in line and "outside" not in line and len(spans.strip(line)) <= coord.WORKER_LINE_CHARS, line
     runs[str(e["run"])].update(spend={"task_usd": "n/a", "budget_usd": 8}, flags="loop")
     (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
     assert "runwatch entry unreadable" in dict(coord.digest_parts(p, {}, [], [])[0])["workers"]
@@ -22754,6 +22755,7 @@ def test_coordinator_running_workers_section_caps_with_flagged_first(env):
     """Ten runs past coordinator.live_view_chars: the section stays within it, flagged runs come first
     and '+N more' counts the rest."""
     from ttp import coordinator as coord
+    from ttp import spans
     p = make(env)
     long = {i: {"note": f"part {i}: " + "editing the digest builder and its tests " * 3} for i in range(10)}
     long[7]["flags"], long[9]["flags"] = ["loop"], {"pace": "90% spent"}
@@ -22763,9 +22765,9 @@ def test_coordinator_running_workers_section_caps_with_flagged_first(env):
     assert len(text) <= 1200 and lines[-1].startswith("- +"), text
     shown = len(lines) - 2
     assert lines[-1] == f"- +{10 - shown} more" and 2 < shown < 10, text
-    assert lines[1].startswith(f"- #{runs[7]['task']} | part 7") and lines[1].endswith("| loop"), lines[1]
-    assert lines[2].startswith(f"- #{runs[9]['task']} | part 9") and lines[2].endswith("| pace"), lines[2]
-    assert all(len(ln) <= coord.WORKER_LINE_CHARS for ln in lines), lines
+    assert spans.strip(lines[1]).startswith(f"- #{runs[7]['task']} | part 7") and lines[1].endswith("| loop"), lines[1]
+    assert spans.strip(lines[2]).startswith(f"- #{runs[9]['task']} | part 9") and lines[2].endswith("| pace"), lines[2]
+    assert all(len(spans.strip(ln)) <= coord.WORKER_LINE_CHARS for ln in lines), lines
     p.set_config("coordinator.live_view_chars", 5000)
     assert len(dict(coord.digest_parts(p, {}, [], [])[0])["workers"].split("\n")) == 11, "all fit: no '+N more'"
 
@@ -22776,6 +22778,7 @@ def test_coordinator_running_workers_fold_unchanged_rows_on_session_wakes(env):
     section text the same, so the session delta resends nothing; a changed step resends that row whole.
     A stateless turn never folds, and `whole` always has every line."""
     from ttp import coordinator as coord, coordsession as cs
+    from ttp import spans
     p = make(env)
     runs = _rw_runs(p, 8)
 
@@ -22804,7 +22807,7 @@ def test_coordinator_running_workers_fold_unchanged_rows_on_session_wakes(env):
     first_run["note"] = "running the checks"
     (p.state / "runwatch.json").write_text(json.dumps({"runs": runs}))
     fourth = dict(build(seen3)[0])["workers"].split("\n")
-    assert fourth[1].startswith(f"- #{first_run['task']} | running the checks") and fourth[2].startswith("- 7 as last"), fourth
+    assert spans.strip(fourth[1]).startswith(f"- #{first_run['task']} | running the checks") and fourth[2].startswith("- 7 as last"), fourth
     assert len(dict(build(seen3, session=False)[0])["workers"].split("\n")) == 9, "a stateless turn shows every run"
     # Measured on this fixture (8 runs): the full section and a delta where no row changed.
     tokens = len(full) / 4

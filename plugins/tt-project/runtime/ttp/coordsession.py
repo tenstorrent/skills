@@ -66,7 +66,7 @@ import json
 import re
 import time
 
-from . import cachettl
+from . import cachettl, spans
 
 KEY = "coord_session"
 GUARD_KEY = "coord_session_guard"
@@ -289,7 +289,9 @@ def fail(cfg: dict, state, now: float) -> tuple[dict, bool]:
 
 
 def _sha(text: str) -> str:
-    return hashlib.sha256(str(text).encode("utf-8", "replace")).hexdigest()[:16]
+    """A section's or row's hash, without its provenance delimiters (spans.strip): a new tag each turn is
+    no change."""
+    return hashlib.sha256(spans.strip(str(text)).encode("utf-8", "replace")).hexdigest()[:16]
 
 
 def fingerprint(seen) -> str:
