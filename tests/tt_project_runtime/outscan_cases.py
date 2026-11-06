@@ -295,6 +295,12 @@ def test_runs_git_push_refuses_a_leak_in_a_message_an_added_line_or_a_tag_messag
         assert out.returncode != 0 and f"the tag v{n} (its message)" in out.stderr and cls in out.stderr, out.stderr
         assert leak not in out.stderr
     assert _remote_refs(repo) == before
+    # git called by its path would skip the wrapper: a run's Bash call doing so is refused.
+    from ttp import hook
+    assert "skips the run's leak scan" in hook.git_push_bypass([["/usr/bin/git", "push", "origin", "work"]])
+    assert hook.git_push_bypass([["/usr/bin/git", "log"]]) is None
+    monkeypatch.delenv("TTP_TASK")
+    assert hook.git_push_bypass([["/usr/bin/git", "push", "origin", "work"]]) is None
 
 
 def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusing_a_removed_leak(

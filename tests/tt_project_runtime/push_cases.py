@@ -12681,7 +12681,7 @@ def test_a_code_tasks_run_never_pushes_to_the_push_branch_while_code_tasks_may_p
     run_env["TTP_TASK"] = str(tid)
     p.set_config("delivery.code_tasks_may_push", True)
     assert push.resolve(p, repo) == ("origin", "proj", False)
-    assert deny("/usr/bin/git push origin HEAD:proj") is None
+    assert "skips the run's leak scan" in hook.git_push_bypass([["/usr/bin/git", "push", "origin", "HEAD:proj"]])
     out = git_push("origin", "HEAD:proj")
     assert out.returncode == 0, out.stderr
     assert _git_out(origin, "rev-parse", "proj") == _git_out(repo, "rev-parse", "HEAD")

@@ -57,8 +57,8 @@ harness's bin/gh and the project's gh.d pre-hooks (prguard.run_gh_hooks), and Ba
 `$TTP_PROJECT/harness/bin/gh.d`, or gh.d together with the bin dir), as the web token check does:
 any mention.
 
-In a code task's run that may not push to the push branch (gitguard.py) it denies `git push` with
-git called by a path, which skips the run's bin/git.
+In a run it denies `git push` with git called by a path, which skips the run's bin/git: its push
+branch guard (gitguard.py) and its leak scan (outscan.py).
 
 It denies kill, pkill and killall aimed at processes outside the task's own process tree, also through
 wrappers, `sh -c` and ssh (killguard.py); that check fails closed on a command it cannot parse.
@@ -640,7 +640,7 @@ def draft_bypass(text: str, path_changed: bool = False, trusted: bool = True) ->
 
 def git_push_bypass(segments: list[list[str]]) -> str | None:
     """Why a Bash call that pushes with git called by a path (around the run's bin/git, gitguard.py)
-    is refused while this run may not push to the push branch, else None."""
+    is refused in a run: it would skip the push branch guard and the leak scan; else None."""
     from . import gitguard
     pushes = [s for s in segments if os.path.basename(s[0]) == "git" and "/" in s[0]
               and gitguard.split(s[1:])[1] == "push"]
@@ -651,9 +651,11 @@ def git_push_bypass(segments: list[list[str]]) -> str | None:
             return forced
         branch, why = gitguard.guarded_branch(dict(os.environ))
     except Exception:
-        return None
-    return (f"{why}. git called by its path skips the run's push guard: push with plain `git` from PATH"
-            if branch else None)
+        branch, why = "", ""
+    if branch:
+        return f"{why}. git called by its path skips the run's push guard: push with plain `git` from PATH"
+    return ("git called by its path skips the run's leak scan of what a push sends (outscan.py): push with "
+            "plain `git` from PATH" if os.environ.get("TTP_TASK") else None)
 
 
 def _segments(cmd: str, strip: bool = True) -> list[list[str]]:
