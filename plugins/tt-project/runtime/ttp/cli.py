@@ -12884,7 +12884,7 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("rest", nargs="*", help=argparse.SUPPRESS)
     s.add_argument("--hours", type=float, default=24, help="the window to audit, in hours (default 24)")
     s.add_argument("--since", help="with fixes: from a delay back (6h, 2d) or an ISO time (default: --hours)")
-    s.add_argument("--serves", help="with why: the order or task the fix serves: o171, msg#1776 or #6302")
+    s.add_argument("--serves", help="with why: the order or task the fix serves: o171, msg1776 or task6302")
     s.add_argument("--undo", help="with why: the command or steps that undo it (`none: <why>` when nothing can)")
     s.add_argument("--done", action="store_true", help="with why: later changes in this run carry no why")
     s.add_argument("--json", action="store_true", help="print JSON")

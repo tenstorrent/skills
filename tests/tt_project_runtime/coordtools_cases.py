@@ -621,6 +621,25 @@ def test_a_hands_on_fix_records_what_why_the_order_it_serves_and_its_undo(tmp_pa
         _ttp_main(*why)
 
 
+def test_the_digest_and_error_name_shell_safe_serves_forms(env):
+    from ttp import coordfix
+    p = make(env)
+    now = time.time()
+    _fix_rows(p, [{"ts": now - 50, "tool": "Bash", "target": "rm y", "what": "Bash rm y", "exit": 0}], now - 60)
+    lines = coordfix.digest_lines(p.db, now - 55, now)
+    assert lines, "a missing-why entry flags a digest line"
+    header = lines[0]
+    assert "--serves " in header, header
+    assert "--serves #" not in header, "the digest example must show a form bash does not comment out"
+    assert "msg123" in header and "task456" in header, "the shell-safe forms are the ones shown"
+    with pytest.raises(ValueError) as ei:
+        coordfix.serves("the plan")
+    msg = str(ei.value)
+    assert "--serves " in msg, msg
+    assert "--serves #" not in msg, "the error text must show a form bash does not comment out"
+    assert "msg1776" in msg and "task6302" in msg, "the shell-safe forms are the ones named"
+
+
 def _fix_rows(p, rows, started):
     """A finished coordinator run whose audit file holds `rows`."""
     from ttp import coordtools

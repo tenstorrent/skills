@@ -6,7 +6,9 @@ workers and the project's own prompts, scripts, charter notes and config itself)
 A full-tools coordinator's mutating calls are logged to its run's AUDIT file (coordtools.post_tool_use).
 Before a fix it runs `ttp audit why "<why>" --serves <ref> --undo "<how>"` (cmd_audit): that writes the
 run's INTENT, and every mutating call after it in the same run (one wake) carries the why, the order or
-task it serves (`o171`, `msg#1776` or `#6302`) and the undo, until the next `ttp audit why` or
+task it serves (`o171`, `msg1776` or `task6302`; the parser also takes `#` forms but the examples
+show the shell-safe ones: an unquoted `#` starts a comment in bash) and the undo, until the next
+`ttp audit why` or
 `ttp audit why --done`. Each entry's what is the Bash call's description, else its tool and target.
 
 A mutating call with no why is flagged once, in the next coordinator digest (digest_lines: the calls
@@ -36,7 +38,7 @@ def serves(raw: str) -> str:
         return f"user msg #{int(m[1])}"
     if m := re.fullmatch(r"(?:task)?#?(\d+)", s):
         return f"task #{int(m[1])}"
-    raise ValueError(f"--serves {raw!r}: name an obligation (o171), a user message (msg#1776) or a task (#6302)")
+    raise ValueError(f"--serves {raw!r}: name an obligation (o171), a user message (msg1776) or a task (task6302)")
 
 
 def declare(run_dir: str | Path, why: str, serves_ref: str, undo: str) -> dict:
@@ -108,7 +110,7 @@ def digest_lines(db, since: float, now: float | None = None) -> list[str]:
     if not missing:
         return []
     return ([f"## Hands-on changes with no recorded why: {len(missing)} (say why in this turn; before each fix run "
-             "`ttp audit why \"<why>\" --serves <o12|msg#123|#456> --undo \"<how>\"`)"]
+             "`ttp audit why \"<why>\" --serves <o12|msg123|task456> --undo \"<how>\"`)"]
             + [f"- run {e['run']}: {what(e)}" for e in missing[:SHOWN]]
             + ([f"- and {len(missing) - SHOWN} more (`ttp audit fixes`)"] if len(missing) > SHOWN else []))
 
