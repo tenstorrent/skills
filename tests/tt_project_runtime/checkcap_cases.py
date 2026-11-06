@@ -6729,6 +6729,7 @@ def test_a_spill_bounded_checks_wait_with_the_floor_pass_free_starts_on_it_with_
     monkeypatch.delenv("TTP_CHECKS_LOAD_GUARD", raising=False)
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     monkeypatch.setattr(checkcap, "_load", lambda: 900.0)
+    monkeypatch.setattr(checkcap, "cpu_demand", lambda: 900.0)
     monkeypatch.setenv("TTP_TEST_POOL", "4")
     assert testslots.load_guard() and testslots.pool_room({}, "px", full=True), "the floor is free"
     p = make(env)
