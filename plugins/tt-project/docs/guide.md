@@ -1288,12 +1288,14 @@ with a model (or the chat provider core or not allowed), a `min_p` outside 0 to 
 an option that is not an object with a `provider` (ignored).
 
 Model-pick tripwire (`modeltrip.py`, model-free, inactive while dispatch is off): per stratum (kind,
-tier and one task label, `*` for any), each picked task that ended in the last `days` is a routed or a
-core sample, bad when it failed, its last checks failed, a review of it failed or it got a review fix
-or continuation. Once both sides have `min_samples` and routed's bad rate is more than `margin_pts`
+tier and one task label, `*` for any), each task open to routing (a Jev pick, or core because Jev was
+unavailable or the tripwire held it) that ended in the last `days` is a routed or a core sample; starts
+the rules force to core (hard, device, urgent and the like) count on neither side. A sample is bad when it failed, its last checks failed, a review of it failed or
+it got a review fix or continuation. Once both sides have `min_samples` and routed's bad rate is more than `margin_pts`
 points above core's, the stratum's tasks go to core (rule `tripwire`), a decision memory records it
 and one low notice goes out. Only a newer passing head-to-head result for that stratum turns routing
-back on (`ttp model-trip --h2h <kind/tier/label> --ok --ref <result>`); samples then count from it.
+back on (`ttp model-trip --h2h <kind/tier/label> --ok --ref <result>`); samples then count from it
+(a worse result moves no window).
 `ttp model-trip` lists the strata. Settings: `providers.chat.dispatch.tripwire` (`min_samples` 10,
 `margin_pts` 10, `days` 14).
 

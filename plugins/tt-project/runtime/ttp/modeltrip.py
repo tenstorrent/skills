@@ -4,22 +4,26 @@
 the core model. Model-free; inactive while the model dispatcher (modelpick.py) is off.
 
 A stratum is a task's kind, the tier it was picked at and one of its labels ('*': any label; a label
-naming a task id, such as `continues:<id>`, is no stratum). Each task with a model pick (the run note's
-modelpick.KEY entry) that ended done or failed in the last `days` is one sample: routed when its pick
-is an option on the routed-to provider, else core. A sample is bad when the task failed, a run's last
+naming a task id, such as `continues:<id>`, is no stratum). Each task that was open to routing (its first
+run note's modelpick.KEY entry is a Jev pick, or a rules pick of why `jev_unavailable` or `tripwire`;
+other rule-forced core starts, such as hard, device or urgent tasks, are riskier by design and count on
+neither side) and ended done or failed in the last `days` is one sample: routed when its pick is an
+option on the routed-to provider, else core. A sample is bad when the task failed, a run's last
 `ttp checks` failed, a review of it failed, or it got rework (a review fix or a continuation of it).
 
 `check` trips a stratum once both sides have `min_samples` samples and the routed bad rate exceeds
 core's by more than `margin_pts` points: `modelpick.rules` then sends its tasks to core (why
 `tripwire`), a decision memory records it and the caller sends one low notice. Only a newer passing
 head-to-head result for that stratum (`head_to_head`, `ttp model-trip --h2h`) re-enables it; samples
-then count from that result on. Settings: `providers.chat.dispatch.tripwire` (DEFAULTS).
+then count from that result on (a worse result moves no window). Settings:
+`providers.chat.dispatch.tripwire` (DEFAULTS).
 """
 from __future__ import annotations
 
 import json
 import re
 import time
+from fractions import Fraction
 
 from . import chaincap, modelpick
 from .db import DB, review_subject
@@ -29,13 +33,14 @@ H2H = "model_h2h"         # kv: {stratum: {at, ok, ref}}
 ANY = "*"
 DEFAULTS = {"min_samples": 10, "margin_pts": 10.0, "days": 14}
 ID_LABEL = re.compile(r":\d+$")
+OPEN_WHY = ("jev_unavailable", "tripwire")   # rules picks of a task open to routing (Jev failed, or held)
 
 
 def settings(cfg: dict) -> dict:
     raw = modelpick.conf(cfg).get("tripwire")
     out = dict(DEFAULTS)
     for k, v in (raw.items() if isinstance(raw, dict) else ()):
-        if k in DEFAULTS and isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+        if k in DEFAULTS and isinstance(v, (int, float)) and not isinstance(v, bool) and v >= (k == "min_samples"):
             out[k] = v
     return out
 
@@ -66,7 +71,7 @@ def samples(p, cfg: dict, since: float, until: float) -> dict[int, dict]:
     from .prguard import CHECKS_FILE
     from .route import TO
     db, opts = p.db, modelpick.options(cfg)
-    out: dict[int, dict] = {}
+    out: dict[int, dict | None] = {}   # None: the task's first pick was forced to core by the rules
     for r in db.q("SELECT r.id, r.task, r.started, r.note, t.kind, t.labels, t.status FROM runs r JOIN tasks t "
                   "ON t.id=r.task WHERE r.role='worker' AND r.started>=? AND r.started<? AND r.note LIKE ? "
                   "AND t.status IN ('done','failed') ORDER BY r.id", (since, until, f'%"{modelpick.KEY}"%')):
@@ -76,16 +81,21 @@ def samples(p, cfg: dict, since: float, until: float) -> dict[int, dict]:
             dp = None
         if not isinstance(dp, dict):
             continue
-        s = out.get(r["task"])
-        if s is None:
-            side = "routed" if (opts.get(str(dp.get("pick") or "")) or {}).get("provider") == TO else "core"
-            s = out[r["task"]] = {"side": side, "strata": strata(dict(r), str(dp.get("tier") or "standard")),
+        if r["task"] not in out:   # the first run's pick decides; a later retry start's rules pick does not
+            if dp.get("by") == "jev" or (dp.get("by") == "rules" and dp.get("why") in OPEN_WHY):
+                side = "routed" if (opts.get(str(dp.get("pick") or "")) or {}).get("provider") == TO else "core"
+                out[r["task"]] = {"side": side, "strata": strata(dict(r), str(dp.get("tier") or "standard")),
                                   "at": float(r["started"]), "bad": r["status"] == "failed"}
+            else:
+                out[r["task"]] = None
+        if (s := out[r["task"]]) is None:
+            continue
         try:
             rec = json.loads((p.runs / str(r["id"]) / CHECKS_FILE).read_text())
         except (OSError, ValueError):
             rec = None
         s["bad"] |= isinstance(rec, dict) and rec.get("passed") is False
+    out = {i: s for i, s in out.items() if s}
     if not out:
         return out
     for rv in db.q("SELECT t.labels, t.title, s.outcome FROM review_stats s JOIN tasks t ON t.id=s.task WHERE s.ts>=?",
@@ -115,8 +125,8 @@ def check(p, cfg: dict, now: float | None = None) -> list[dict]:
     counts: dict[str, dict[str, list[int]]] = {}
     for s in samples(p, cfg, now - st["days"] * 86400, now).values():
         for k in s["strata"]:
-            if s["at"] <= float((h2h.get(k) or {}).get("at") or 0):
-                continue   # before the head-to-head that (re-)armed it
+            if (h := h2h.get(k) or {}).get("ok") and s["at"] <= float(h.get("at") or 0):
+                continue   # before the passing head-to-head that (re-)armed it
             c = counts.setdefault(k, {"routed": [0, 0], "core": [0, 0]})[s["side"]]
             c[0] += s["bad"]
             c[1] += 1
@@ -125,7 +135,8 @@ def check(p, cfg: dict, now: float | None = None) -> list[dict]:
         if k in trips and not _rearmed(trips[k], h2h.get(k)):
             continue
         (rb, rn), (cb, cn) = c["routed"], c["core"]
-        if min(rn, cn) < st["min_samples"] or 100.0 * (rb / rn - cb / cn) <= st["margin_pts"]:
+        # exact: 100 * (rb/rn - cb/cn) > margin_pts, in integers and fractions (no float boundary error)
+        if min(rn, cn) < st["min_samples"] or 100 * (rb * cn - cb * rn) <= Fraction(st["margin_pts"]) * rn * cn:
             continue
         trips[k] = {"at": now, "routed": [rb, rn], "core": [cb, cn], "margin_pts": st["margin_pts"]}
         new.append({"stratum": k, **trips[k]})
