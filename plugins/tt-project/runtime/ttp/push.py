@@ -15,7 +15,10 @@ from when it is first in line: waiters queue beside the lock, an urgent or user-
 then by age (take).
 Each check runs at most four times the last measured check run, at least 4 h
 (`delivery.push_checks_timeout_s` overrides it, 0 for no limit), counting its run time, wall time less its waits for a grant
-and for a test-pool slot (checkwait, `ttp pool-wait`): one that ran past it is ended and fails the push. One still waiting for a
+and for a test-pool slot (checkwait, `ttp pool-wait`): one that ran past it is ended and fails the push, except one still
+making progress: running, not waiting for a pool slot, with a new output line in the last CHECK_PROGRESS_S, it runs
+on (a loaded host slows every test) until its output stops that long or its run time reaches CHECK_STRETCH times the
+limit, the runaway bound. One still waiting for a
 test-pool slot once its wall time less grant waits reaches the limit is ended and exits 75, busy, not failed: the pool's wait, not
 the change; one still waiting for a grant at the limit plus the push wait exits 75, queued, not run. Past 4 h of test-pool waits
 in all (`delivery.push_pool_wait_s`, 0 for no bound) the check is ended and exits 75, saying how long it waited for the pool; the
@@ -66,6 +69,8 @@ CHECK_LIMIT_FLOOR_S = 4 * 3600   # a push check's time limit with no measured ch
 CHECK_LIMIT_FACTOR = 4           # times the last measured check run
 POOL_WAIT_S = 4 * 3600          # how long a push check may wait for test-pool slots unless delivery.push_pool_wait_s says
 CHECK_POLL_S = 5.0               # how often a timed check's waits for a grant are read (checkwait)
+CHECK_PROGRESS_S = 180.0         # past its limit, a check with an output line this recent is still progressing
+CHECK_STRETCH = 3                # a progressing check runs on past its limit up to this many times it
 POOL_SAY_S = 60.0                # how often the push log gives a check's live test-pool wait so far
 POOL_STATUS_SUFFIX = ".pool"     # beside a detached push's marker: its check's test-pool wait so far
 QUEUED = 1075                    # once()'s answer for a check still queued at its outer bound: never a process's code
@@ -4493,12 +4498,16 @@ def _copy_out(stream, collect: workerloss.Collector, keep: deque | None = None) 
         stream.close()
 
 
-def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[str], None]) -> int:
+def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[str], None],
+                collect: workerloss.Collector | None = None) -> int:
     """Wait for check `proc`; its exit code. Its time limit (check_limit_s) counts its run time: its wall time
     since it started less its waits for a grant (a `ttp lock`, a checks lane, a host-wide checks slot) and for a
     test-pool slot (`ttp pool-wait`, in the check or any of its shards) that it recorded in `waits` (checkwait),
     each kept once seen (checkwait.Seen: a waiter that died open still waited). Run past the limit, it is ended
-    within a poll (CHECK_POLL_S): 124, timed out, with its elapsed time. Still waiting for a pool slot once its
+    within a poll (CHECK_POLL_S): 124, timed out, with its elapsed time. Except while it progresses: running, not
+    waiting for a pool slot, its output (`collect`, the lines it streams) gained a line in the last
+    CHECK_PROGRESS_S; then it runs on until its output stops that long or its run time reaches CHECK_STRETCH
+    times the limit. Still waiting for a pool slot once its
     wall time less its grant waits reached the limit, it is ended: POOL_BUSY, busy, never a failure (a pool that
     stayed full, not the change), so a push never waits on a full pool much past the limit. Still waiting for a
     grant once its limit plus the push's own wait bound
@@ -4509,6 +4518,7 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
     `ttp push --result`; at the end the log gives the seconds it waited in all."""
     started = time.time()
     pool_s, pooling, told = 0.0, False, None
+    stretched = False   # said once that it runs on past its limit while progressing
     seen_grants, seen_pool = checkwait.Seen(), checkwait.Seen()   # a wait once counted stays counted
     try:
         while True:
@@ -4545,13 +4555,27 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
                     f"{(now - started) / 60:.0f} min and was ended before it ran: {cmd}{where(cmd)}")
                 return QUEUED
             if not queued and run_s >= check_limit_s:
-                _kill_tree(proc.pid)
-                proc.wait()
-                say(f"check ran past its limit of {check_limit_s:.0f} s and was ended: timed out after "
-                    f"{now - started:.0f} s: {cmd}{where(cmd)} ({run_s:.0f} s counted; {pool_s:.0f} s waiting for a "
-                    f"test-pool slot and {granted:.0f} s waiting for a grant not counted; "
-                    "delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h)")
-                return 124
+                ceiling = check_limit_s * CHECK_STRETCH
+                quiet = now - collect.at if collect is not None and collect.at else None
+                if not pooling and quiet is not None and quiet < CHECK_PROGRESS_S and run_s < ceiling:
+                    if not stretched:
+                        stretched = True
+                        say(f"check past its limit of {check_limit_s:.0f} s but still making progress (its last "
+                            f"output line {quiet:.0f} s ago): it runs on while its output keeps coming, ended "
+                            f"after {CHECK_PROGRESS_S:.0f} s without a line or at {ceiling:.0f} s counted: "
+                            f"{cmd}{where(cmd)}")
+                else:
+                    _kill_tree(proc.pid)
+                    proc.wait()
+                    why = "" if not stretched else (
+                        f"; it ran on past the limit while progressing, until {ceiling:.0f} s counted"
+                        if run_s >= ceiling else f"; it ran on past the limit while progressing, until "
+                        f"{quiet or 0:.0f} s without an output line")
+                    say(f"check ran past its limit of {check_limit_s:.0f} s and was ended: timed out after "
+                        f"{now - started:.0f} s: {cmd}{where(cmd)} ({run_s:.0f} s counted; {pool_s:.0f} s waiting for a "
+                        f"test-pool slot and {granted:.0f} s waiting for a grant not counted; "
+                        f"delivery.push_checks_timeout_s; unset: 4x the last measured check run, at least 4 h{why})")
+                    return 124
             if not queued and pooling and ran >= check_limit_s:
                 _kill_tree(proc.pid)
                 proc.wait()
@@ -4560,7 +4584,8 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
                     "run; every pool host was busy or held)")
                 return POOL_BUSY
             try:
-                return proc.wait(timeout=min(CHECK_POLL_S, max(check_limit_s - (ran if pooling else run_s), 0.05)))
+                left = check_limit_s - (ran if pooling else run_s)
+                return proc.wait(timeout=CHECK_POLL_S if left <= 0 else min(CHECK_POLL_S, max(left, 0.05)))
             except subprocess.TimeoutExpired:
                 pass
     finally:
@@ -4631,7 +4656,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], seen: 
         reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect, kept), daemon=True)
         reader.start()
         try:
-            rc = _timed_wait(proc, waits, cmd, say)
+            rc = _timed_wait(proc, waits, cmd, say, collect)
             _end_group(proc.pid)   # what it left running ends first: nothing writes after the compare
             changed, said = guard.end()
             for line in said:

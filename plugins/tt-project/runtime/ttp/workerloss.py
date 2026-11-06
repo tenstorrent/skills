@@ -35,7 +35,7 @@ KEPT = 20000   # a Collector keeps at most this many lost tests' sections
 class Collector:
     """What lost() reads from a check's output as it streams, for a runner that keeps only its last
     lines: each lost test's failure section (its header and the runner's line) and the last lines
-    (the pytest summary). reset() before each run of the check."""
+    (the pytest summary), and when its last line came (at). reset() before each run of the check."""
 
     def __init__(self) -> None:
         self.reset()
@@ -45,8 +45,10 @@ class Collector:
         self.prev = ""
         self.tail: deque[str] = deque(maxlen=5)
         self.setup = setupfault.Scan()
+        self.at = 0.0   # when the last line came (0: none yet), for a push check's progress past its limit
 
     def feed(self, line: str) -> None:
+        self.at = time.time()
         line = line.rstrip("\r\n")
         if _MESSAGE.match(line) and len(self.sections) < KEPT:
             self.sections.append(f"{self.prev}\n{line}")

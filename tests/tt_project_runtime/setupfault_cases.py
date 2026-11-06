@@ -109,7 +109,7 @@ def test_push_run_one_a_check_ended_at_its_pool_wait_bound_waits_never_fails(tmp
     repo.mkdir()
     for rc, want in ((push.POOL_STARVED, push.BUSY), (1, push.CHECKS_FAILED), (124, push.CHECKS_FAILED)):
         calls = []
-        monkeypatch.setattr(push, "_timed_wait", lambda proc, waits, cmd, say, rc=rc: (calls.append(1), proc.wait(), rc)[2])
+        monkeypatch.setattr(push, "_timed_wait", lambda proc, waits, cmd, say, collect=None, rc=rc: (calls.append(1), proc.wait(), rc)[2])
         said = []
         assert push._run_one("true", repo, dict(os.environ), said.append) == want, (rc, said)
         assert len(calls) == 1, (rc, said)

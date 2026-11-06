@@ -16876,6 +16876,77 @@ def test_a_push_check_time_limit_counts_run_time_not_its_wait_for_a_test_pool_sl
     assert rc == 0 and "test-pool slot" not in said, said
 
 
+def _progress_timed_wait(monkeypatch, tmp_path, lines_until, ends_at, limit_s=900.0, every=60, collect=True):
+    """push._timed_wait on a fake clock from 1000 for a running check that prints an output line every `every`
+    seconds until `lines_until` seconds in, and exits 0 at `ends_at`. (exit code, what the push said, seconds)."""
+    from ttp import push, workerloss
+    clock = [1000.0]
+    monkeypatch.setattr(push.time, "time", lambda: clock[0])
+    monkeypatch.setattr(push, "check_limit_s", limit_s)
+    monkeypatch.setattr(push, "check_queue_s", 60.0)
+    monkeypatch.setattr(push, "pool_wait_s", None)
+    monkeypatch.setattr(push, "_kill_tree", lambda pid: setattr(proc, "killed", True))
+    waits = tmp_path / "waits"
+    waits.mkdir(parents=True)
+    out = workerloss.Collector()
+    proc = _ClockCheck(clock, 1000.0 + ends_at, at={1000.0 + t: lambda: out.feed("....  [ 10%]\n")
+                                                    for t in range(every, int(lines_until) + 1, every)})
+    said = []
+    rc = push._timed_wait(proc, waits, "pytest -q", said.append, out if collect else None)
+    return rc, "\n".join(said), clock[0] - 1000.0
+
+
+def test_a_push_check_still_making_progress_runs_on_past_its_limit_up_to_its_stretch(monkeypatch, tmp_path):
+    """On a loaded host a check's tests keep finishing past the time limit: while its output keeps coming
+    (a line within CHECK_PROGRESS_S) and it waits for no pool slot, it runs on, saying so once, up to
+    CHECK_STRETCH times the limit. A check with no output that recent ends at the limit, as before."""
+    from ttp import push
+    assert push.CHECK_PROGRESS_S == 180 and push.CHECK_STRETCH == 3
+    # Progressing to the end at 1600 s, past the 900 s limit: it passes.
+    rc, said, t = _progress_timed_wait(monkeypatch, tmp_path / "a", 1560, 1600)
+    assert rc == 0 and t == 1600 and "ran past its limit" not in said, said
+    assert said.count("still making progress") == 1 and "at 2700 s counted" in said, said
+    # Progressing until 1000 s, then silent (hung): ended once CHECK_PROGRESS_S passes without a line.
+    rc, said, t = _progress_timed_wait(monkeypatch, tmp_path / "b", 1020, 5000)
+    assert rc == 124 and 1200 <= t < 1200 + 5, (t, said)
+    assert "ran past its limit of 900 s and was ended" in said and "180 s without an output line" in said, said
+    # Output forever (a runaway loop that prints): ended at CHECK_STRETCH times the limit.
+    rc, said, t = _progress_timed_wait(monkeypatch, tmp_path / "c", 10 ** 5, 10 ** 5)
+    assert rc == 124 and 2700 <= t < 2700 + 5, (t, said)
+    assert "until 2700 s counted" in said, said
+    # No output line in the last CHECK_PROGRESS_S at the limit: no progress, ended at the limit.
+    rc, said, t = _progress_timed_wait(monkeypatch, tmp_path / "d", 600, 5000)
+    assert rc == 124 and 900 <= t < 905 and "still making progress" not in said, (t, said)
+    # Output nobody watches (no collector): the limit as before.
+    rc, said, t = _progress_timed_wait(monkeypatch, tmp_path / "e", 10 ** 5, 5000, collect=False)
+    assert rc == 124 and 900 <= t < 905, (t, said)
+
+
+def test_a_push_check_waiting_for_a_pool_slot_past_its_limit_is_no_progress(monkeypatch, tmp_path):
+    """Lines a check prints while it waits for a test-pool slot (`ttp pool-wait` says it waits) are no
+    progress: past the limit, still waiting for a slot, it is ended at the limit."""
+    from ttp import checkwait, locks, push, workerloss
+    clock = [1000.0]
+    monkeypatch.setattr(push.time, "time", lambda: clock[0])
+    monkeypatch.setattr(push, "check_limit_s", 900.0)
+    monkeypatch.setattr(push, "check_queue_s", 60.0)
+    monkeypatch.setattr(push, "pool_wait_s", None)
+    monkeypatch.setattr(push, "_kill_tree", lambda pid: setattr(proc, "killed", True))
+    waits = tmp_path / "waits"
+    (waits / checkwait.POOL).mkdir(parents=True)
+    locks.record_wait(waits / checkwait.POOL, "shard-1", 1000.0, None)
+    out = workerloss.Collector()
+    proc = _ClockCheck(clock, 10.0 ** 5, at={1000.0 + t: lambda: out.feed("waiting for a pool slot\n")
+                                             for t in range(60, 5000, 60)})
+    said = []
+    try:
+        rc = push._timed_wait(proc, waits, "run-shards", said.append, out)
+    finally:
+        locks.record_wait(waits / checkwait.POOL, "shard-1", 1000.0, clock[0])
+    assert rc == 124 and 900 <= clock[0] - 1000 < 905, clock[0]
+    assert "still making progress" not in "\n".join(said)
+
+
 def test_a_push_check_waiting_past_its_pool_bound_ends_starved_naming_the_pool_wait(monkeypatch, tmp_path):
     """Waiting for a test-pool slot past delivery.push_pool_wait_s (below its time limit), the check is ended
     saying how long it waited for the pool, never a silent timeout: POOL_STARVED, no test ran (setupfault), so
