@@ -434,7 +434,12 @@ def guard(payload: dict) -> str | None:
     gaps: a user's own editor edit to the charter, memory or project.json during the call is put back
     (saved and reported), not recognised as theirs; a call whose post hook never runs (an interrupted
     call) and a write by a process the call left in the background are not checked; a script that also
-    forges the write log passes."""
+    forges the write log passes. Write/log race: durable_write logs only after its os.replace and
+    fsync_dir, and tree_writes only after its git command ends, so a check inside that window takes
+    ttp's own write as unlogged and puts it back (saved and reported), and a ttp write landing between
+    this read and the put-back is overwritten unsaved. Restore-to-snapshot: the put-back restores the
+    pre-call snapshot, so a call holding a logged ttp write and a later unlogged edit to the same file
+    also undoes the ttp write (the combined content is saved)."""
     from pathlib import Path
     from .project import durable_append, durable_write, note_protected, protected_log
     run = os.environ.get("TTP_RUN_DIR")

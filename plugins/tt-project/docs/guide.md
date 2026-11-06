@@ -490,7 +490,13 @@ only in the feed and never under "needs you".
   command) and the notice names it. A guarded file outside a project's harness folder has no write log:
   its change is only reported, never put back. Known gap: your own editor edit to the charter, memory
   or `project.json` while a coordinator Bash call runs is put back too (saved and reported), as the
-  guard cannot tell it from the coordinator's.
+  guard cannot tell it from the coordinator's. Known gap (write/log race): `ttp` logs a file write
+  only after the file is replaced and its folder synced, and a git command's changes only after the
+  command ends, so a guard check inside that window takes `ttp`'s own write as unlogged and puts it
+  back (saved and reported); a `ttp` write that lands between the guard's read and its put-back is
+  overwritten without being saved. Known gap (restore-to-snapshot): the put-back restores the file
+  as it was before the call, so when one call holds a logged `ttp` write and later an unlogged edit
+  to the same file, the put-back undoes the `ttp` write too (the combined content is saved).
   The state database is not compared (the daemon writes it all the time); only the command-text
   check covers it. Any raw `git push` and any `ttp push` that lands or moves a tag is denied, by the hook and again
   at run time by `ttp push` and the harness's `git` wrapper: code goes through a work branch, a
