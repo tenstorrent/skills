@@ -390,7 +390,7 @@ def _cmd_daemon(env, monkeypatch, tmp_path, cmd, **kw):
     return p, d, runs, cid
 
 
-def _ran(d, cid):
+def _premise_ran(d, cid):
     """Wait (bounded) for task `cid`'s premise command the daemon started to end."""
     d._premise_runs[cid][0].wait(timeout=20)
 
@@ -399,7 +399,7 @@ def test_a_premise_command_that_exits_0_lets_the_code_task_dispatch_with_no_ques
     p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, f"test -d {tmp_path}")
     d.dispatch()
     assert runs == [] and cid in d._premise_runs, "held until its premise command answered"
-    _ran(d, cid)
+    _premise_ran(d, cid)
     d.dispatch()
     assert [k["task"]["id"] for _, k in runs] == [cid]
     assert not p.db.q("SELECT 1 FROM tasks WHERE kind='question'"), "no model run checked the premise"
@@ -411,7 +411,7 @@ def test_a_premise_command_that_exits_1_closes_the_task_with_its_record_and_one_
     (tmp_path / "landed.flag").write_text("")
     p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, cmd)
     d.dispatch()
-    _ran(d, cid)
+    _premise_ran(d, cid)
     d.dispatch()
     t = p.db.task(cid)
     res = json.loads(t["result"])
@@ -433,7 +433,7 @@ def test_a_premise_command_with_another_exit_or_a_timeout_falls_back_to_the_ligh
     from ttp import premise
     p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, "test -d / && exit 3")
     d.dispatch()
-    _ran(d, cid)
+    _premise_ran(d, cid)
     d.dispatch()
     q = p.db.one("SELECT * FROM tasks WHERE kind='question'")
     code = p.db.task(cid)
@@ -460,7 +460,7 @@ def test_a_premise_command_reruns_before_a_dispatch_after_a_long_queue_wait(env,
     cmd = f"test -e {tmp_path}/landed.flag && exit 1 || exit 0"
     p, d, runs, cid = _cmd_daemon(env, monkeypatch, tmp_path, cmd)
     d.dispatch()
-    _ran(d, cid)
+    _premise_ran(d, cid)
     d._premise_cmds(time.time())   # it passed; the task still waits in the queue (say, for a slot)
     assert d._premise_ok[cid][1] == cmd and cid not in d._premise_runs
     d._premise_cmds(time.time())
@@ -469,7 +469,7 @@ def test_a_premise_command_reruns_before_a_dispatch_after_a_long_queue_wait(env,
     d._premise_ok[cid] = (time.time() - 31 * 60, cmd)   # past premise.recheck_min (30)
     d.dispatch()
     assert cid in d._premise_runs
-    _ran(d, cid)
+    _premise_ran(d, cid)
     d.dispatch()
     assert p.db.task(cid)["status"] == "done" and runs == [] and cid not in d._premise_ok
 
