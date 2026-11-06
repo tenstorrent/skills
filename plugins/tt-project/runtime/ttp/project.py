@@ -489,6 +489,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # each a name in bin/ or {command, env: [VAR, ...]} (also frees `VAR=... name ...`).
     # checks: run check and test commands in their own PID namespace (sandbox.py); off by default.
     "sandbox": {"fence_freed_commands": [], "checks": False},
+    # Paths no run writes (pathguard): added to its built-in credential folders, never replacing them;
+    # also an account setting (ttp config --account), which every project on the host adds.
+    "guards": {"protected_paths": []},
     # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the
@@ -2894,6 +2897,7 @@ def unregister(name: str) -> None:
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude"},
+                "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
                 "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
                 "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
                            "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",

@@ -1076,6 +1076,9 @@ def _deny(why: str) -> dict:
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not os.environ.get("TTP_RUN_DIR"):
         return None, None
+    from . import pathguard
+    if why := pathguard.refusal(payload):   # a write into a credential folder, on any tool
+        return _deny(why), None
     if payload.get("tool_name") in EDIT_TOOLS | PATCH_TOOLS:
         why = harness_gh_edit(payload) if payload["tool_name"] in EDIT_TOOLS else harness_gh_patch(payload)
         return (_deny(why) if why else None), None

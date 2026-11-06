@@ -352,7 +352,8 @@ def _full_pre_tool_use(tool: str, args: dict, payload: dict):
     from . import hook
     if tool == ANSWER_TOOL:   # the turn's structured answer, checked as in read-only mode
         return _answer_check(payload)
-    why = full_refusal(tool, args, str(payload.get("cwd") or os.getcwd()))
+    from . import pathguard
+    why = pathguard.refusal(payload) or full_refusal(tool, args, str(payload.get("cwd") or os.getcwd()))
     if why:
         return hook._deny(why)
     if tool in EDITS or tool == "Bash":   # a worker's own checks
