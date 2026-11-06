@@ -977,8 +977,11 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     ps, every = paths(n), all_paths(n)
     queued_as = holder + (OBLIGATION_MARK if priority is not None and priority < 1 else "")
     try:
-        parked = bool(startable and not startable())
-        f = (None if parked or locks.queued(slot_dir(), RESOURCE) or _running(every, same)
+        twin = _running(every, same)   # before its gate: a twin waiter takes no load pass (_drop_pass)
+        parked = not twin and bool(startable and not startable())
+        if twin:
+            _drop_pass()
+        f = (None if parked or twin or locks.queued(slot_dir(), RESOURCE)
              else _take(n, ps, every, holder, what, same, label=label))
         if f:
             locks.mark_served(slot_dir(), RESOURCE, project_name)
@@ -1008,6 +1011,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 raise Cancelled(why)
             twin = _running(every, same)
             was, parked = parked, not twin and bool(startable and not startable())
+            if twin:
+                _drop_pass()
             try:
                 park = _park(parked, park, queued_as, since, project_name, priority)
             except OSError as e:
@@ -1261,6 +1266,14 @@ def ask_yield(want: str, pid: int | None = None, wait_s: float | None = None) ->
         req.unlink(missing_ok=True)   # an unanswered request is withdrawn: the run never acts on it late
         ack.unlink(missing_ok=True)
     return ""
+
+
+def _drop_pass() -> None:
+    """A run waiting on its twin's checks runs no tests: the load pass its gate took (testslots.full_startable,
+    reserve_load_pass) goes back, so another run parked under the load guard may take it. Its gate takes one
+    again once the twin is gone."""
+    from . import testslots
+    testslots.release_load_pass()
 
 
 def _park(parked: bool, park: Path | None, holder: str, since: float, project_name: str | None,

@@ -8437,3 +8437,86 @@ def test_checks_run_gives_its_slot_up_while_its_command_waits_and_holds_one_for_
     assert log.count("gave up its host-wide checks slot") == 2, log
     assert not list(checkcap.slot_dir().glob(f"{checkcap.YIELD}.*")) and checkcap.line() == ""
     assert not locks.held_labels(checkcap.all_paths())
+
+
+def test_a_twin_waiter_holds_no_load_pass(env, monkeypatch):
+    """Review #6605: a routine run whose same checks already run elsewhere waits for their result and runs
+    no tests, so it holds no load pass meanwhile: the floor stays free for another run parked under the guard,
+    at its first try and on every poll of the wait."""
+    from ttp import checkcap, locks, testslots
+    _host_of_64(monkeypatch, load=84.5)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.05)
+    d = checkcap.slot_dir()
+    twin = checkcap._take(4, checkcap.paths(4), checkcap.all_paths(4), "twin run", "x", "K", label={})
+    assert twin
+    floor = d / f"{testslots.LOAD_FLOOR}.lock"
+    assert locks.any_free([floor])
+    seen = []
+
+    class Lanes:
+        def __init__(self, f):
+            self.files = [f]
+    lane = Lanes(locks.try_take([d / f"{testslots.SUITE}.pa.repo.0.lock"], "run a", "ttp checks"))
+
+    def done():
+        seen.append(locks.any_free([floor]))
+        return False
+    try:
+        slot = checkcap.acquire("run a", "x", max_wait_s=0.6, project_name="pa", priority=2, same="K", done=done,
+                                startable=lambda: testslots.full_startable(lane, {}, "pa", "run a", priority=2))
+        assert slot is None
+        other = testslots.pool_gate({}, "pb", full=True, priority=2)
+    finally:
+        testslots.release_load_pass()
+        twin.close()
+        lane.files[0].close()
+    assert seen and all(seen), f"floor held during the twin wait: {seen}"
+    assert other == "", other
+
+
+def test_a_twin_waiter_gives_back_a_pass_it_took_before_the_twin_started(env, monkeypatch):
+    """A run whose gate took the floor pass and then queued, whose same checks then started elsewhere, lets
+    the pass go while it waits on them (checkcap.acquire)."""
+    from ttp import checkcap, locks, testslots
+    _host_of_64(monkeypatch, load=84.5)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.05)
+    d = checkcap.slot_dir()
+    floor = d / f"{testslots.LOAD_FLOOR}.lock"
+    held, twin = [], []
+
+    class Lanes:
+        def __init__(self, f):
+            self.files = [f]
+    lane = Lanes(locks.try_take([d / f"{testslots.SUITE}.pa.repo.0.lock"], "run a", "ttp checks"))
+    busy = [checkcap._take(4, checkcap.paths(4), checkcap.all_paths(4), f"busy {i}", "x", f"B{i}", label={})
+            for i in range(4)]   # every slot busy: the run queues holding the pass its gate took
+
+    def stop():
+        if not twin:   # after its first try one busy run ends and its same checks (key K) take that slot
+            assert not locks.any_free([floor]), "the gate took no pass"
+            busy.pop().close()
+            twin.append(checkcap._take(4, checkcap.paths(4), checkcap.all_paths(4), "twin run", "x", "K",
+                                       label={}))
+        else:
+            held.append(not locks.any_free([floor]))
+        return ""
+    try:
+        checkcap.acquire("run a", "x", max_wait_s=0.6, project_name="pa", priority=2, same="K", stop=stop,
+                         startable=lambda: testslots.full_startable(lane, {}, "pa", "run a", priority=2))
+    finally:
+        testslots.release_load_pass()
+        for f in busy + twin:
+            f and f.close()
+        lane.files[0].close()
+    assert all(busy) and twin and twin[0], "the busy slots or the twin could not start"
+    assert held and not any(held), f"floor held while the twin ran: {held}"
+
+
+def test_testslots_acquire_keeps_its_ps_snapshot():
+    """Review #6605: one `ps` per poll cycle (project.ps_snapshot) wraps testslots.acquire itself, not a helper
+    inserted above it."""
+    from ttp import testslots
+    assert hasattr(testslots.acquire, "__wrapped__")
+    assert not hasattr(testslots._pass_told, "__wrapped__")

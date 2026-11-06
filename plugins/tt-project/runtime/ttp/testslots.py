@@ -589,7 +589,6 @@ def _take(ps: list, own: list, top: int, holder: str, what: str = "test slots",
     return k, files
 
 
-@project.ps_snapshot()
 def _pass_told(what: str, passed, load: str) -> str:
     return (f"{what}: past the load guard on its "
             + {LOAD_OWED: "pass for runs owed to the user", LOAD_URGENT: "pass for urgent runs",
@@ -597,6 +596,7 @@ def _pass_told(what: str, passed, load: str) -> str:
             .get(Path(passed.name).stem, "floor pass, the one run it admits so the queue moves") + f"; {load}")
 
 
+@project.ps_snapshot()
 def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: float | None = None,
             cfg: dict | None = None, project_name: str | None = None, push_key: str = "",
             kind: Kind = TESTS, priority: int | None = None, stop: Callable[[], str] | None = None,
