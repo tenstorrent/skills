@@ -3,11 +3,12 @@
 """AI-authorship disclosure: what a run posts where people other than the user read it ends with a tag
 (delivery.ai_tag, default "[authored by AI]"; "" turns the guard off).
 
-Two guards refuse a post without it, model-free; the refusal tells the run to add the tag:
+Three guards refuse a post without it, model-free; the refusal tells the run to add the tag:
 
 - The worker `gh` wrapper (prguard.check, gh_problem here): the body of `gh issue create`,
-  `gh issue comment`, `gh pr comment` and `gh pr review`, and a comment, review or issue written
-  through `gh api` (REST POST/PATCH/PUT to an issue, comment or review endpoint; a GraphQL mutation with
+  `gh issue comment`, `gh pr comment` and `gh pr review`, the `--comment` of `gh issue|pr close|reopen`,
+  the notes of `gh release create|edit`, and a comment, review, issue, release or team discussion written
+  through `gh api` (REST POST/PATCH/PUT to such an endpoint, gist comments too; a GraphQL mutation with
   a `body`). A body gh would get some other way (`--editor`, `--web`, a template) is refused with a hint
   to pass `--body-file`. PR bodies and edits of an issue's or PR's own body (`gh pr create`, `gh pr
   edit`, `gh issue edit`, the pulls and issues/<n> endpoints, createPullRequest, updatePullRequest,
@@ -15,15 +16,20 @@ Two guards refuse a post without it, model-free; the refusal tells the run to ad
 - The PreToolUse hook (hook.pre_tool_use, tool_problem here) on connector tools (`mcp__<server>__<tool>`)
   whose name says they post: send, post, reply, draft or create a message, comment, issue, page or
   email (Slack, Jira, Confluence, mail). Each text field (text, message, body, comment, description,
-  and the like) of such a call must end with the tag.
+  and the like) of such a call must end with the tag. An event or invite tool counts when its input
+  names guests (attendees, invitees).
+- The Bash PreToolUse hook (http_problem here, also for Codex runs): a `curl` or `wget` that sends a body
+  to a literal GitHub, Slack, Jira or Confluence URL that posts (HTTP_POST_URL_RE).
 
 "Ends with" reads the last line that has text, after trailing HTML tags and comments (a hidden
 `<!-- ttp -->` line may follow) and whitespace: the tag anywhere in it, any case, or a similar
 disclosure ("Generated with Claude Code", "written by AI").
 
 Messages to the user themselves (the chat relay, `ttp notify`, the web app) are not posts to others
-and are never tagged. Routes the harness cannot see (a script posting over HTTP, another CLI) are
-left to the prompt rule."""
+and are never tagged. Routes the harness cannot see are left to the prompt rule: a script or another
+CLI posting (python, httpie, a gh extension), a URL or body built at run time, Cursor runs (no harness
+hook) and Codex connector tools (its hook gets Bash calls only), gists and connector tools whose name
+says neither post nor invite (a shared document)."""
 from __future__ import annotations
 
 import json
@@ -86,18 +92,28 @@ COMMENT_VALUES = {"-b", "--body", "-F", "--body-file", "-R", "--repo"}
 ISSUE_CREATE_VALUES = {"-a", "--assignee", "-b", "--body", "-F", "--body-file", "-l", "--label", "-m",
                        "--milestone", "-p", "--project", "-R", "--repo", "-t", "--title", "-T", "--template",
                        "--recover"}
-# (command, sub) -> (its options that take a value, whether a body is required)
-GH_POSTS = {("issue", "create"): (ISSUE_CREATE_VALUES, True),
-            ("issue", "comment"): (COMMENT_VALUES, True),
-            ("pr", "comment"): (COMMENT_VALUES, True),
-            ("pr", "review"): (COMMENT_VALUES, False)}   # an approval without a body posts no text
+CLOSE_VALUES = {"-c", "--comment", "-r", "--reason", "--duplicate-of", "-R", "--repo"}
+RELEASE_VALUES = {"-n", "--notes", "-F", "--notes-file", "-t", "--title", "--target", "--tag", "--notes-start-tag",
+                  "--discussion-category", "-R", "--repo"}
+BODY = (("--body", "-b"), ("--body-file", "-F"))   # (inline options, file options)
+# (command, sub) -> (its options that take a value, whether a body is required, where the text is)
+GH_POSTS = {("issue", "create"): (ISSUE_CREATE_VALUES, True, BODY),
+            ("issue", "comment"): (COMMENT_VALUES, True, BODY),
+            ("pr", "comment"): (COMMENT_VALUES, True, BODY),
+            ("pr", "review"): (COMMENT_VALUES, False, BODY),   # an approval without a body posts no text
+            **{(c, s): (CLOSE_VALUES, False, (("--comment", "-c"), ())) for c in ("issue", "pr")
+               for s in ("close", "reopen")},
+            # a release's notes (--generate-notes and --notes-from-tag are GitHub's text, left alone)
+            **{("release", s): (RELEASE_VALUES, False, (("--notes", "-n"), ("--notes-file", "-F")))
+               for s in ("create", "edit")}}
 
 # REST endpoints that post text others read: a new issue, issue and commit comments, PR review
-# comments and reviews. A PR's or an issue's own body (pulls, issues/<n>) is left alone.
-_REPO = r"^/?(?:repos/[^/]+/[^/]+|repositories/\d+)/"
-API_POST_RE = re.compile(_REPO + r"(?:issues/\d+/comments|issues/comments/\d+|pulls/\d+/comments(?:/\d+/replies)?"
-                         r"|pulls/comments/\d+|pulls/\d+/reviews(?:/\d+(?:/events)?)?|commits/[^/]+/comments"
-                         r"|comments/\d+|issues)/?$")
+# comments and reviews, releases, gist comments, team discussions. A PR's or an issue's own body
+# (pulls, issues/<n>) is left alone.
+API_POST_RE = re.compile(r"^/?(?:(?:repos/[^/]+/[^/]+|repositories/\d+)/(?:issues/\d+/comments|issues/comments/\d+"
+                         r"|pulls/\d+/comments(?:/\d+/replies)?|pulls/comments/\d+|pulls/\d+/reviews(?:/\d+(?:/events)?)?"
+                         r"|commits/[^/]+/comments|comments/\d+|issues|releases(?:/\d+)?)"
+                         r"|gists/[^/]+/comments(?:/\d+)?|(?:orgs/[^/]+/)?teams/[^/]+/discussions(?:/\d+(?:/comments(?:/\d+)?)?)?)/?$")
 GQL_BODY_EDIT_RE = re.compile(r"\b(?:createPullRequest|updatePullRequest|updateIssue|createCommitOnBranch)\b")
 # Mutations that post text others read: a query naming one is checked even beside a body edit.
 GQL_POST_RE = re.compile(r"\b(?:add\w+|submit\w+|create(?:Issue|Discussion)|update\w*Comment|"
@@ -115,18 +131,18 @@ def gh_problem(cmd: str, rest: list[str], cfg: dict, stdin_text: str | None = No
     spec = GH_POSTS.get((cmd, rest[0]))
     if spec is None:
         return None
-    values, required = spec
+    values, required, (inline_keys, file_keys) = spec
     more = rest[1:]
     if rest[0] == "comment" and "--delete-last" in more:
         return None
     from . import prbody
     opts, _ = prbody._scan(more, values)
-    files = [opts[k] for k in ("--body-file", "-F") if k in opts]
-    inline = [opts[k] for k in ("--body", "-b") if k in opts]
+    files = [opts[k] for k in file_keys if k in opts]
+    inline = [opts[k] for k in inline_keys if k in opts]
     what = f"`gh {cmd} {rest[0]}`"
     if files:
         try:
-            body = prbody._read(files[-1], stdin_text, cwd, "--body-file")
+            body = prbody._read(files[-1], stdin_text, cwd, file_keys[0])
         except prbody._Unread as e:
             return f"refused: cannot read {e} to check it for the AI-authorship tag ({SETTING}); {BODY_HOW}"
     elif inline:
@@ -169,6 +185,9 @@ POST_TOOL_RE = re.compile(r"(?:send|post|reply|forward|schedule|draft|create|add
                           r"[\w-]*?(?:message|comment|issue|page|e?mail|draft|reply|post|worklog|thread)", re.I)
 _READS = r"(?:get|list|search|read|fetch|find|lookup|delete|remove)"
 NOT_POST_RE = re.compile(rf"(?:^|_){_READS}(?:_|$)|^{_READS}(?=[A-Z_]|$)")
+# An event or invite others get only when it names guests (an event on one's own calendar is not a post).
+EVENT_TOOL_RE = re.compile(r"(?:create|update|edit|add|schedule|send|quick)[\w-]*?(?:event|invit|meeting)", re.I)
+GUEST_KEY_RE = re.compile(r"attendee|guest|invitee|participant|recipient", re.I)
 # A field of its input that carries the text people read (key words compared without case, `_` or `-`).
 TEXT_KEYS = ("text", "message", "body", "comment", "description", "markdown", "html", "content")
 
@@ -208,28 +227,133 @@ def _texts(tool_input, depth: int = 0) -> list[str]:
     return out
 
 
-def posts(tool_name: str) -> bool:
-    """Whether a connector tool posts text that others read, by its name."""
+def _guests(v, depth: int = 0) -> bool:
+    if isinstance(v, dict) and depth < 4:
+        return any(GUEST_KEY_RE.search(str(k)) and any(t.strip() for t in _leaves(x)) or _guests(x, depth + 1) for k, x in v.items())
+    return isinstance(v, list) and depth < 4 and any(_guests(x, depth + 1) for x in v)
+
+
+def posts(tool_name: str, tool_input=None) -> bool:
+    """Whether a connector tool posts text that others read, by its name (an event or invite: when its
+    input names guests)."""
     if not tool_name.startswith("mcp__"):
         return False
     own = tool_name.split("__", 2)[-1]
-    return bool(POST_TOOL_RE.search(own)) and not NOT_POST_RE.search(own)
+    if NOT_POST_RE.search(own):
+        return False
+    return bool(POST_TOOL_RE.search(own)) or bool(EVENT_TOOL_RE.search(own)) and _guests(tool_input)
 
 
 def tool_problem(tool_name: str, tool_input, cfg: dict | None) -> str | None:
     """Why a connector tool call must not run for want of the tag, or None."""
     the_tag = tag(cfg)
-    if not the_tag or not posts(str(tool_name or "")):
-        return None
     if isinstance(tool_input, str):
         try:
             tool_input = json.loads(tool_input)
         except ValueError:
             tool_input = {"text": tool_input}
+    if not the_tag or not posts(str(tool_name or ""), tool_input):
+        return None
     for text in _texts(tool_input):
         if not ends_with_tag(text, the_tag):
             return refusal(the_tag, f"what {tool_name.split('__', 2)[-1]} posts") + \
                 " (each text field: message, body, description)"
+    return None
+
+
+# --- direct HTTP posts (the Bash PreToolUse hook) ---------------------------------------------------
+
+# A literal URL of an API call that posts text others read: GitHub (the REST endpoints above), Slack
+# messages and webhooks, Jira issues and comments, Confluence pages and comments.
+HTTP_POST_URL_RE = re.compile(
+    r"^https?://(?:api\.github\.com/(?P<gh>[^?#]+)|(?:[\w-]+\.)?slack\.com/api/chat\.(?:postMessage|postEphemeral"
+    r"|scheduleMessage|update)\b|hooks\.slack\.com/(?:services|workflows|triggers)/"
+    r"|[^/?#]+(?:/[^?#]*)?/rest/api/(?:2|3|latest)/issue(?:/[^/?#]+/comment(?:/\d+)?)?/?(?:[?#]|$)"
+    r"|[^/?#]+(?:/[^?#]*)?/(?:rest/api/content(?:/\d+(?:/child/comment)?)?|api/v2/(?:pages|blogposts|footer-comments"
+    r"|inline-comments)(?:/\d+)?)/?(?:[?#]|$))", re.I)
+CURL_DATA = {"-d", "--data", "--data-raw", "--data-binary", "--data-ascii", "--data-urlencode", "--json",
+             "-F", "--form", "--form-string"}
+WGET_DATA = {"--post-data", "--post-file", "--body-data", "--body-file"}
+SHELL_EXPANSION_RE = re.compile(r"\$[{(A-Za-z_]|`")
+
+
+def _file(path: str, cwd: str) -> str:
+    if path in ("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"):
+        raise ValueError("stdin")
+    with open(os.path.join(cwd, path), encoding="utf-8", errors="replace") as f:
+        return f.read()
+
+
+def _http_texts(opt: str, value: str, cwd: str) -> list[str]:
+    """The text fields of one data option's value (JSON, form fields or a `@file`)."""
+    if opt in ("--post-file", "--body-file") or value.startswith("@") and opt not in ("--data-raw", "--form-string"):
+        value = _file(value if opt in WGET_DATA else value[1:], cwd)
+    try:
+        data = json.loads(value)
+    except ValueError:
+        from urllib.parse import parse_qsl
+        fields = [value.partition("=")[::2]] if opt in ("-F", "--form", "--form-string", "--data-urlencode") \
+            else parse_qsl(value, keep_blank_values=True)
+        data = {}
+        for k, v in fields:
+            if opt in ("-F", "--form") and v[:1] in ("@", "<"):   # a form field's text from a file
+                data[k] = _file(v[1:].split(";")[0], cwd)
+                continue
+            try:   # a Slack webhook's `payload=<json>`
+                data[k] = json.loads(v) if k == "payload" else v
+            except ValueError:
+                data[k] = v
+    return _texts(data) if isinstance(data, (dict, list)) else []
+
+
+CURL_VALUE_SHORTS = set("AbCcDEeHKmoPQrTtUuwXxYyz")   # curl's short options that take a value (not -d, -F)
+
+
+def _data_options(seg: list[str], keys: set[str]) -> list[tuple[str, str]]:
+    """(option, value) of each data option in a curl or wget call: `--data x`, `--data=x`, `-dx`, `-sd x`."""
+    out = []
+    for i, a in enumerate(seg):
+        nxt = seg[i + 1] if i + 1 < len(seg) else ""
+        if a.startswith("--"):
+            opt, eq, val = a.partition("=")
+            if opt in keys:
+                out.append((opt, val if eq else nxt))
+        elif a.startswith("-") and len(a) > 1:
+            for j, c in enumerate(a[1:], 1):   # a cluster of short flags: the first value option takes the rest
+                if f"-{c}" in keys:
+                    out.append((f"-{c}", a[j + 1:] or nxt))
+                if f"-{c}" in keys or c in CURL_VALUE_SHORTS:
+                    break
+    return out
+
+
+def http_problem(segments: list[list[str]], cwd: str, cfg: dict | None = None) -> str | None:
+    """Why a curl or wget call in a Bash command must not run for want of the tag, or None: it sends a
+    body to a literal posting URL (HTTP_POST_URL_RE) whose text fields do not end with it. A text
+    ending in a shell expansion (`$MSG`) cannot be read beforehand and is left to the prompt rule."""
+    for seg in segments:
+        prog = os.path.basename(seg[0]) if seg else ""
+        if prog not in ("curl", "wget"):
+            continue
+        urls = [m for a in seg[1:] if (m := HTTP_POST_URL_RE.match(a.removeprefix("--url=")))]
+        if not urls or (urls[0]["gh"] is not None and not API_POST_RE.match(urls[0]["gh"])):
+            continue
+        if prog == "curl" and any(a in ("-G", "--get") for a in seg):
+            continue
+        keys = CURL_DATA if prog == "curl" else WGET_DATA
+        the_tag = tag(project_config() if cfg is None else cfg)
+        if not the_tag:
+            return None
+        for opt, value in _data_options(seg, keys):
+            try:
+                texts = _http_texts(opt, value, cwd)
+            except (OSError, ValueError):
+                return (f"refused: cannot read the body of this {prog} post beforehand to check it for the "
+                        f"AI-authorship tag {the_tag!r} ({SETTING}); write it to a file and pass it with "
+                        f"{'-d @<file>' if prog == 'curl' else '--post-file <file>'}, ending with the tag")
+            for text in texts:
+                if not ends_with_tag(text, the_tag) and not SHELL_EXPANSION_RE.search(_last_line(text)):
+                    return refusal(the_tag, f"this {prog} post") + " (each text field: text, body, comment)"
     return None
 
 

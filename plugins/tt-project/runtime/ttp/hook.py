@@ -1098,6 +1098,9 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
+    if not why:   # a curl or wget post to others (aitag)
+        from . import aitag
+        why = aitag.http_problem(segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         path_changed, trusted = path_change(scan), _project_trusted(cmd)
         for f in _scripts(segments, str(payload.get("cwd") or os.getcwd())):

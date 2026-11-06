@@ -778,7 +778,7 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
                     return f"refused: the gh alias {cmd!r} runs a shell command that may change a PR's draft state"
                 return None
             return check(_expand(expansion, rest), real, db, stdin_text, _depth + 1, allowed, seen, cfg)
-    if cmd in ("pr", "issue", "api"):   # what others read ends with the AI-authorship tag (aitag)
+    if cmd in ("pr", "issue", "release", "api"):   # what others read ends with the AI-authorship tag (aitag)
         from . import aitag
         why = aitag.gh_problem(cmd, rest, _project_config() if cfg is None else cfg, stdin_text)
         if why:
@@ -1025,7 +1025,8 @@ STDIN_COMMANDS = frozenset((("secret", "set"), ("variable", "set"), ("gist", "cr
 # What gh reads as stdin: `-` and the paths that name fd 0.
 STDIN_PATHS = frozenset(("-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"))
 # Posts whose body the AI-authorship check (aitag) reads, from stdin too.
-AITAG_STDIN = frozenset((("issue", "create"), ("issue", "comment"), ("pr", "comment"), ("pr", "review")))
+AITAG_STDIN = frozenset((("issue", "create"), ("issue", "comment"), ("pr", "comment"), ("pr", "review"),
+                         ("release", "create"), ("release", "edit")))
 
 
 def needs_stdin(args: list[str]) -> bool:

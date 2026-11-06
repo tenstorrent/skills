@@ -2189,13 +2189,19 @@ running work is interrupted only by the preemption below:
   everything a run posts where people other than the user read it ends with. Prompts state the rule,
   and two model-free guards refuse a post whose last text line lacks the tag (or a similar disclosure
   such as "Generated with Claude Code"; trailing HTML and a hidden `<!-- ttp -->` line may follow):
-  the worker `gh` wrapper for `gh issue create`, `gh issue comment`, `gh pr comment`, `gh pr review`
-  and comment, review or issue posts through `gh api` (REST and GraphQL); and, for Claude Code runs, a
-  PreToolUse hook on connector tools (`mcp__*`) whose name says they send, post, draft or create a
-  message, comment, issue, page or email (Slack, Jira, Confluence, mail). PR bodies, edits of an
-  issue's or PR's own body and commit messages are left as they are, and messages to the user (the
-  chat relay, `ttp notify`, the web app) are never tagged. Posts the harness cannot see (a script
-  posting over HTTP, another CLI, Codex or Cursor connector tools) rely on the prompt rule.
+  the worker `gh` wrapper for `gh issue create`, `gh issue comment`, `gh pr comment`, `gh pr review`,
+  the `--comment` of `gh issue|pr close|reopen`, the notes of `gh release create|edit`, and comment,
+  review, issue, release, gist-comment or team-discussion posts through `gh api` (REST and GraphQL);
+  for Claude Code runs, a PreToolUse hook on connector tools (`mcp__*`) whose name says they send,
+  post, draft or create a message, comment, issue, page or email (Slack, Jira, Confluence, mail), or
+  an event or invite that names guests; and the Bash hook (Claude Code and Codex runs) on `curl` or
+  `wget` sending a body to a literal GitHub, Slack (messages, webhooks), Jira (issues, comments) or
+  Confluence (pages, comments) URL that posts. PR bodies, edits of an issue's or PR's own body and
+  commit messages are left as they are, and messages to the user (the chat relay, `ttp notify`, the
+  web app) are never tagged. Known gaps, left to the prompt rule: a script or another CLI posting
+  (python, httpie, a gh extension), a URL or body built at run time (`$URL`, a text ending in `$MSG`),
+  GitHub GraphQL over curl, gists, connector tools whose name says neither post nor invite (a shared
+  document), Codex connector tools (its hook gets Bash calls only) and Cursor runs (no harness hook).
 - Change windows: the template charter's Policies line `- Change windows: none` means disruptive
   work (restarts, rollouts, anything that disturbs others) may run whenever it is safe, and waiting
   for a lull is never a blocker. A team that works in change windows lists them on that line

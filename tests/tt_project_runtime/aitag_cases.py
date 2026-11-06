@@ -212,3 +212,110 @@ def test_replies_and_notifies_to_the_user_go_out_untagged_while_posts_to_others_
     prompts = pathlib.Path(aitag.__file__).parents[2] / "template" / "prompts"
     worker = (prompts / "worker.md").read_text()
     assert "Posts others (not the user) read end with `[authored by AI]`" in worker
+
+
+def test_gh_close_comments_release_notes_and_more_api_posts_need_the_ai_tag(env, tmp_path):
+    from ttp import prguard
+    p = make(env)
+    cfg = p.config()
+    tagged = "Shipped.\n\n[authored by AI]"
+    (tmp_path / "notes.md").write_text("Shipped.\n")
+    (tmp_path / "tagged.md").write_text(tagged)
+
+    def why(*args, stdin=None):
+        return prguard.check(list(args), "/bin/false", stdin_text=stdin, cfg=cfg)
+    refused = (("issue", "close", "7", "-c", "Fixed"), ("pr", "close", "7", "--comment=Superseded", "-d"),
+               ("issue", "reopen", "7", "--comment", "Back"), ("pr", "reopen", "7", "-cBack"),
+               ("release", "create", "v1", "--notes", "Shipped."), ("release", "create", "v1", "-n", "Shipped.",
+                                                                   "--generate-notes"),
+               ("release", "edit", "v1", "-F", str(tmp_path / "notes.md")),
+               ("release", "create", "v1", "--notes-file", "-"),
+               ("api", "repos/a/b/releases", "-f", "tag_name=v1", "-f", "body=Shipped."),
+               ("api", "-X", "PATCH", "repos/a/b/releases/5", "-f", "body=Shipped."),
+               ("api", "gists/abc/comments", "-f", "body=hi"),
+               ("api", "orgs/o/teams/t/discussions/3/comments", "-f", "body=hi"))
+    for args in refused:
+        w = why(*args, stdin="Shipped." if "-" in args else None)
+        assert w and "AI-authorship tag '[authored by AI]'" in w, (args, w)
+    for args in (("issue", "close", "7"), ("pr", "close", "7", "-d"), ("issue", "close", "7", "-c", tagged),
+                 ("issue", "close", "7", "-r", "not planned"), ("pr", "reopen", "7", "-c", tagged),
+                 ("release", "create", "v1", "--generate-notes"), ("release", "create", "v1", "--notes-from-tag"),
+                 ("release", "create", "v1", "-n", tagged, "-t", "Shipped."),
+                 ("release", "edit", "v1", "-F", str(tmp_path / "tagged.md")), ("release", "edit", "v1", "--draft=false"),
+                 ("release", "list"), ("api", "repos/a/b/releases"), ("api", "gists/abc/comments"),
+                 ("api", "repos/a/b/releases", "-f", "tag_name=v1", "-f", "body=" + tagged),
+                 ("api", "-X", "DELETE", "repos/a/b/releases/5")):
+        assert why(*args, stdin=tagged) is None, args
+    # Through the wrapper, notes on stdin are checked and reach gh as they came.
+    gh = _gh_runner(p, tmp_path)
+    rc, err, ran = gh("release", "edit", "v1", "--notes", "Shipped.")
+    assert rc == 1 and ran == [] and "AI-authorship tag" in err
+    rc, err, ran = gh("pr", "close", "7", "-c", tagged)
+    assert rc == 0 and ran, err
+
+
+def test_connector_invites_with_guests_need_the_ai_tag_but_own_events_do_not(env, tmp_path, monkeypatch):
+    p = make(env)
+    invite = {"summary": "Sync", "description": "Agenda: build status",
+              "attendees": [{"email": "a@example.com"}]}
+    for tool in ("mcp__claude_ai_Google_Calendar__create_event", "mcp__calendar__updateEvent",
+                 "mcp__calendar__send_invitation"):
+        why = _post_hook(monkeypatch, tmp_path, p, tool, invite)
+        assert why and "AI-authorship tag" in why, tool
+    tagged = {**invite, "description": "Agenda: build status\n[authored by AI]"}
+    for tool, inp in (("mcp__claude_ai_Google_Calendar__create_event", tagged),
+                      ("mcp__claude_ai_Google_Calendar__create_event", {**invite, "attendees": []}),
+                      ("mcp__claude_ai_Google_Calendar__create_event", {"summary": "Focus", "description": "x"}),
+                      ("mcp__claude_ai_Google_Calendar__list_events", {"attendees": ["a@example.com"]}),
+                      ("mcp__claude_ai_Google_Calendar__delete_event", invite)):
+        assert _post_hook(monkeypatch, tmp_path, p, tool, inp) is None, (tool, inp)
+
+
+def test_curl_and_wget_posts_to_github_slack_jira_and_confluence_need_the_ai_tag(env, tmp_path, monkeypatch):
+    p = make(env)
+    (tmp_path / "body.json").write_text('{"body": "Looks good."}')
+    (tmp_path / "ok.json").write_text('{"body": "Looks good.\\n[authored by AI]"}')
+
+    monkeypatch.chdir(tmp_path)
+
+    def bash(cmd):
+        return _post_hook(monkeypatch, tmp_path, p, "Bash", {"command": cmd})
+    refused = (
+        "curl -s -X POST https://slack.com/api/chat.postMessage -H 'Authorization: Bearer x' "
+        "--json '{\"channel\": \"C1\", \"text\": \"Build is green\"}'",
+        "curl -d 'channel=C1&text=Build+is+green' https://slack.com/api/chat.postMessage",
+        "curl -F text='Build is green' -F channel=C1 https://slack.com/api/chat.update",
+        "curl -X POST -d 'payload={\"text\": \"hi\"}' https://hooks.slack.com/services/T0/B0/xyz",
+        "cd /tmp && curl -sd @body.json https://api.github.com/repos/a/b/issues/7/comments",
+        "timeout 30 curl --data-binary @body.json https://api.github.com/repos/a/b/releases",
+        "curl -u u:t -H 'Content-Type: application/json' -d '{\"body\": \"Done\"}' "
+        "https://example.atlassian.net/rest/api/2/issue/X-1/comment",
+        "curl -X POST --data '{\"fields\": {\"summary\": \"s\", \"description\": \"d\"}}' "
+        "https://example.atlassian.net/rest/api/3/issue",
+        "curl --json '{\"title\": \"t\", \"body\": {\"storage\": {\"value\": \"<p>Notes</p>\"}}}' "
+        "https://example.atlassian.net/wiki/api/v2/pages",
+        "wget -qO- --post-data='{\"text\": \"hi\"}' https://slack.com/api/chat.postMessage",
+        "timeout 20 curl --url=HTTPS://SLACK.COM/api/chat.postMessage -d text=hi | jq .ok",
+        "curl -d @- https://slack.com/api/chat.postMessage < msg.json",
+        "curl -d @missing.json https://slack.com/api/chat.postMessage")
+    for cmd in refused:
+        why = bash(cmd.replace("cd /tmp && ", ""))
+        assert why and "AI-authorship tag '[authored by AI]'" in why, (cmd, why)
+        assert ("cannot read" in why) == ("@-" in cmd or "missing" in cmd), (cmd, why)
+    passed = (
+        "curl --json '{\"channel\": \"C1\", \"text\": \"Build is green\\n[authored by AI]\"}' "
+        "https://slack.com/api/chat.postMessage",
+        "curl -d @ok.json https://api.github.com/repos/a/b/issues/7/comments",
+        "curl -d \"{\\\"text\\\": \\\"$MSG\\\"}\" https://slack.com/api/chat.postMessage",   # built at run time
+        "curl -s https://api.github.com/repos/a/b/issues/7/comments",   # a read
+        "curl -G -d q=open https://example.atlassian.net/rest/api/3/issue",
+        "curl -d '{\"query\": \"x\"}' https://slack.com/api/search.messages",
+        "curl -X PATCH -d '{\"body\": \"edited\"}' https://api.github.com/repos/a/b/issues/7",   # own body edit
+        "curl -X PUT -d '{\"fields\": {\"labels\": [\"a\"]}}' https://example.atlassian.net/rest/api/3/issue/X-1",
+        "curl -d '{\"text\": \"Tests are green.\"}' http://127.0.0.1:8080/api/notify",   # not a post to others
+        "curl -d '{\"inputs\": {}}' https://api.github.com/repos/a/b/actions/workflows/1/dispatches",
+        "echo curl -d x https://slack.com/api/chat.postMessage")
+    for cmd in passed:
+        assert bash(cmd) is None, cmd
+    p.set_config("delivery.ai_tag", "")
+    assert bash(refused[0]) is None
