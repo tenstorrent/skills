@@ -14885,13 +14885,13 @@ def test_a_push_check_time_limit_counts_its_wait_for_a_test_pool_slot_as_wall_ti
     assert rc == 0 and "test-pool slot" not in said, said
 
 
-def test_a_push_check_waiting_past_its_pool_bound_fails_naming_the_pool_wait(monkeypatch, tmp_path):
-    """Waiting for a test-pool slot past delivery.push_pool_wait_s (below its time limit), the check is ended and
-    fails saying how long it waited for the pool, never a silent timeout and never a queued (75) answer; 0 is
-    no bound."""
+def test_a_push_check_waiting_past_its_pool_bound_ends_starved_naming_the_pool_wait(monkeypatch, tmp_path):
+    """Waiting for a test-pool slot past delivery.push_pool_wait_s (below its time limit), the check is ended
+    saying how long it waited for the pool, never a silent timeout: POOL_STARVED, no test ran (setupfault), so
+    _run_one holds the push (BUSY), never a failed check; 0 is no bound."""
     from ttp import push
     rc, said, t = _clock_timed_wait(monkeypatch, tmp_path / "a", 10.0 ** 5, 3000.0, None, 10 ** 6)
-    assert rc == 124 and 3000 <= t < 3010, (rc, t)
+    assert rc == push.POOL_STARVED and 3000 <= t < 3010, (rc, t)
     assert "check waited 3000 s for a test-pool slot, past its bound of 3000 s, and was ended" in said, said
     assert "delivery.push_pool_wait_s" in said and "ran past its limit" not in said, said
     rc, said, t = _clock_timed_wait(monkeypatch, tmp_path / "b", 10.0 ** 5, None, 5000, 5100)

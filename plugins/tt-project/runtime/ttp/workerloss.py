@@ -16,6 +16,8 @@ import time
 from collections import deque
 from pathlib import Path
 
+from . import setupfault
+
 RERUNS = 1
 MARKER = "worker_loss.json"   # in a run's directory: its checks stopped at a lost test worker
 # Only a lost test's own report counts: its failure section, a '_ name _' header line followed by
@@ -42,6 +44,7 @@ class Collector:
         self.sections: list[str] = []
         self.prev = ""
         self.tail: deque[str] = deque(maxlen=5)
+        self.setup = setupfault.Scan()
 
     def feed(self, line: str) -> None:
         line = line.rstrip("\r\n")
@@ -49,6 +52,7 @@ class Collector:
             self.sections.append(f"{self.prev}\n{line}")
         self.prev = line
         self.tail.append(line)
+        self.setup.feed(line)
 
     def text(self) -> str:
         return "\n".join([*self.sections, *self.tail])

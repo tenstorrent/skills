@@ -1398,7 +1398,21 @@ running work is interrupted only by the preemption below:
   wait itself reports it once over with `ttp pool-wait --waited <seconds>`. While a check waits,
   the push log gives the seconds so far every minute and `ttp push --result` shows them; at the
   end the log gives the whole pool wait. Past `delivery.push_pool_wait_s` of pool wait (default
-  4 h, 0 no bound) the check is ended, saying how long it waited.
+  4 h, 0 no bound) the check is ended, saying how long it waited; no test ran, so it is an
+  infrastructure fault (below), never a failed check.
+- A check that fails before any test ran is the host or its pool, not the change: its output
+  names a work or head dir gone before the copy (`cd: <absolute dir outside the repository>: No
+  such file or directory`), an empty or corrupt archive (tar's `This does not look like a tar
+  archive` or `Unexpected EOF in archive`, gzip's `not in gzip format`, `rsync error:`) or no free
+  pool slot (`no free slot`, `no <name> pool free`), and no test verdict (a pytest count or result
+  line, TAP `ok`/`not ok`, an upper-case `PASS` or `FAIL`, a traceback). `ttp push`, `ttp land`,
+  `ttp checks` and the push queue run it again up to 2 times (no free pool slot: not at once);
+  still so, the push log says `infrastructure fault: ... no test ran`, `ttp push` exits 75 with a
+  `retry_when`, `ttp checks` exits 75 with `infra_fault: no-test-ran` in checks.json, and the push
+  queue holds the batch (`setup_fault`) and tries it again after 10 min. It never counts as passed.
+  Any test verdict in the output keeps a failure a failure. A gate of your own that knows it ran
+  nothing can say so directly: exit 75. A job a check detaches makes its work dir inside the job,
+  after it is detached, so it outlives the check (see `ttp detach` above).
   A check script that runs its own test pool and is granted fewer slots than it planned asks
   `ttp pool-admit --planned N --granted K [--files F] [--what <pool>]` before it starts the shards:
   exit 0 starts them; exit 3 means the run on K slots is estimated to go past the time the check

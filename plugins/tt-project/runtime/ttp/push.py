@@ -41,7 +41,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner,
-               sandbox, scriptwatch, settinghold, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
+               sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -64,6 +64,7 @@ CHECK_POLL_S = 5.0               # how often a timed check's waits for a grant a
 POOL_SAY_S = 60.0                # how often the push log gives a check's live test-pool wait so far
 POOL_STATUS_SUFFIX = ".pool"     # beside a detached push's marker: its check's test-pool wait so far
 QUEUED = 1075                    # once()'s answer for a check still queued at its outer bound: never a process's code
+POOL_STARVED = 1124              # _timed_wait's answer for a check ended at its pool-wait bound: never a process's code
 QUEUED_RETRY_S = 1800            # a push whose check stayed queued is tried again after this
 TIMINGS = "push_checks.json"   # under the project's state: how long the last full check run took
 BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a rerun replaces it
@@ -4044,7 +4045,7 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
     with its elapsed time. Still waiting for a grant once its limit plus the push's own wait bound
     (check_queue_s) have gone by since it started, not counting its pool waits, it is ended without having run:
     QUEUED, a transient answer, never a failure. Waiting for a test-pool slot past pool_wait_s in all, it is
-    ended: 124, saying how long it waited for the pool. While it waits for a pool slot the push log gives the
+    ended: POOL_STARVED, saying how long it waited for the pool (no free slot, never a failure: setupfault). While it waits for a pool slot the push log gives the
     seconds so far every POOL_SAY_S, and pool_status (a detached push's marker side file) has them for
     `ttp push --result`; at the end the log gives the seconds it waited in all."""
     started = time.time()
@@ -4076,7 +4077,7 @@ def _timed_wait(proc: subprocess.Popen, waits: Path, cmd: Any, say: Callable[[st
                 say(f"check waited {pool_s:.0f} s for a test-pool slot, past its bound of {pool_wait_s:.0f} s, "
                     f"and was ended: {cmd}{where(cmd)} (delivery.push_pool_wait_s; unset: "
                     f"{POOL_WAIT_S / 3600:.0f} h; every pool host was busy or held that long)")
-                return 124
+                return POOL_STARVED
             if queued and now - started - pool_s >= check_limit_s + check_queue_s:
                 _kill_tree(proc.pid)
                 proc.wait()
@@ -4167,7 +4168,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
             shutil.rmtree(waits, ignore_errors=True)
             if mark:
                 mark.close()
-    reruns = 0
+    reruns = setup_reruns = 0
     while True:
         rc = scriptwatch.rerun(once, bool, None if remote_host(cmd) else str(cmd), repo, env, say, on_pass=True)
         if rc == 0:
@@ -4175,6 +4176,18 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         if rc == QUEUED:   # it never ran: the host's queue, not the change
             say(f"queued, not run: {cmd}{where(cmd)}; not pushing. Hand off `waiting`; retry_when: "
                 f"test \"$(date +%s)\" -ge {int(time.time()) + QUEUED_RETRY_S}")
+            return BUSY
+        # Failed before any test ran (its work dir gone, a bad archive, no free pool slot): the host or its pool,
+        # not the change. A setup fault runs again up to setupfault.RERUNS times; a starved pool waits.
+        fault = setupfault.starved() if rc == POOL_STARVED else (
+            None if rc == BUSY or remote_host(cmd) else setupfault.found(collect.setup, repo))
+        if fault:
+            if fault["kind"] == "setup" and setup_reruns < setupfault.RERUNS:
+                setup_reruns += 1
+                say(setupfault.rerun_line(fault, str(cmd), setup_reruns))
+                continue
+            say(f"{setupfault.line(fault, str(cmd))}; not pushing. Hand off `waiting`; retry_when: "
+                f"test \"$(date +%s)\" -ge {int(time.time()) + setupfault.RETRY_S}")
             return BUSY
         # A test worker lost mid-run is the host, not the change: once more (workerloss).
         if remote_host(cmd) or reruns >= workerloss.RERUNS or not workerloss.only(loss := workerloss.lost(collect.text())):

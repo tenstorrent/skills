@@ -36,7 +36,7 @@ from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox
 from .devq import unmask_devices
-from . import chatgone, checkwait, scriptwatch, sshcmd, syntaxfault, timefmt, workerloss
+from . import chatgone, checkwait, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -3444,6 +3444,7 @@ def cmd_checks(a) -> None:
     worker_loss = None   # test workers lost again on the rerun: an infrastructure fault (workerloss)
     gate_busy = None     # the gate's rerun found no slot after its retries (gatejudge.undecided): no verdict
     torn = None          # a transient syntax error outside the change, again on the rerun (syntaxfault): no verdict
+    setup = None         # failed before any test ran, again on its reruns or no free pool slot (setupfault): no verdict
     tree_gone = ""   # the clean checkout was removed under a check: killed, never a failure of the change
     run_env: dict = {}   # what the checks run in, for the pass's envs (pushpass.check_envs)
     join_rec, joined = None, None   # this run's checkjoin record; the run it followed and how
@@ -3745,7 +3746,7 @@ def cmd_checks(a) -> None:
                     out.flush()
                     check_start = out.tell()
                 began = time.monotonic()
-                loss_reruns = torn_reruns = 0
+                loss_reruns = torn_reruns = setup_reruns = 0
                 try:
                     while True:
                         rc = scriptwatch.rerun(
@@ -3770,6 +3771,16 @@ def cmd_checks(a) -> None:
                             torn_reruns += 1
                             said(syntaxfault.rerun_line(found, str(c)))
                             time.sleep(syntaxfault.SETTLE_S)
+                            continue
+                        # Failed before any test ran (its work dir gone, a bad archive, no free pool slot):
+                        # again up to setupfault.RERUNS times, a starved pool not at all (setupfault).
+                        if (rc not in (0, 75) and not push.remote_host(c)
+                                and (fault := setupfault.found(setupfault.scan(_log_since(out, log, check_start)), cwd))):
+                            if fault["kind"] == "pool" or setup_reruns >= setupfault.RERUNS:
+                                setup = {"check": str(c), **fault}
+                                break
+                            setup_reruns += 1
+                            said(setupfault.rerun_line(fault, str(c), setup_reruns))
                             continue
                         # A test worker lost mid-run is the host, not the change: once more (workerloss).
                         if rc == 0 or push.remote_host(c) or loss_reruns >= workerloss.RERUNS:
@@ -3803,6 +3814,9 @@ def cmd_checks(a) -> None:
                         break
                     if torn_reruns and (found := syntaxfault.transient(_log_since(out, log, check_start), cwd, base, head)):
                         torn = {"check": str(c), "scripts": found}
+                        out.write(_check_took(c, rc, began))
+                        break
+                    if setup is not None:
                         out.write(_check_took(c, rc, began))
                         break
                     if loss_reruns and workerloss.infra(loss := workerloss.lost(_log_since(out, log, check_start))):
@@ -3971,6 +3985,15 @@ def cmd_checks(a) -> None:
             write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
                                                              "commands": todo, "skipped": skipped, "ts": time.time(),
                                                              "purpose": purpose, "infra_fault": syntaxfault.INFRA})
+            print(f"ttp checks: {said}", file=sys.stderr)
+            sys.exit(75)
+        # Failed before any test ran, again on its reruns (or no free pool slot): no verdict (setupfault).
+        if setup is not None and not passed and not _CHECK_STOP.get("stopped"):
+            said = f"{setupfault.line(setup, setup['check'])}. Run the checks again later"
+            out.write(f"ttp checks: {said}\n")
+            write_json(Path(run_dir) / prguard.CHECKS_FILE, {"head": head, "worktree": top, "passed": False,
+                                                             "commands": todo, "skipped": skipped, "ts": time.time(),
+                                                             "purpose": purpose, "infra_fault": setupfault.INFRA})
             print(f"ttp checks: {said}", file=sys.stderr)
             sys.exit(75)
         # The gate's rerun found no slot (an admission timeout): no verdict, never a failure of the head.

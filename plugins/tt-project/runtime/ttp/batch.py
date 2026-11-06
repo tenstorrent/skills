@@ -50,7 +50,7 @@ from collections import Counter, deque
 from pathlib import Path
 
 from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfault, landmark, locks, push, pushpass, runner, scopehold,
-               scriptwatch, syntaxfault, testslots, workerloss, urgent,
+               scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
 from . import gitmemo
@@ -91,7 +91,7 @@ TOP_DEF = re.compile(r"^(?:async[ \t]+def|def|class)[ \t]+([A-Za-z_]\w*)", re.M)
 LEAD_KEY = re.compile(r"""["']?([A-Za-z_][\w.-]*)["']?[ \t]*[:=](?![=/])""")   # `"key":`, `key =`, `key:`
 TOP_START = re.compile(r"(?:@|(?:async[ \t]+)?def[ \t]|class[ \t])")
 EXIT = {"pushed": 0, "landed": 0, "nothing": 0, "busy": push.BUSY, "env_fault": push.BUSY, "moved": push.KEPT_MOVING,
-        "worker_loss": push.BUSY, "script_torn": push.BUSY, "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED,
+        "worker_loss": push.BUSY, "script_torn": push.BUSY, "setup_fault": push.BUSY, "rejected": push.REJECTED, "refused": push.REFUSED, "tip_failed": push.CHECKS_FAILED,
         "yielded": 0}
 
 
@@ -1417,6 +1417,12 @@ class Batch:
                 self.checks["script_torn"] = {"check": e.check, "scripts": e.scripts}
                 return self._all("requeued", "script_torn", f"{e}; the batch is held, not failed, and retried later",
                                  keep=("landed", "refused"))
+            except setupfault.Infra as e:
+                # A check that failed before any test ran, again on its reruns (or no free pool slot): the
+                # host or its pool, never the entries; every one goes back, retried after setupfault.RETRY_S.
+                self.checks["setup_fault"] = {"check": e.check, **e.fault}
+                return self._all("requeued", "setup_fault", f"{e}; the batch is held, not failed, and retried later",
+                                 keep=("landed", "refused"))
             if outcome == "held":   # a round of its own: each one holds at least one more entry
                 rnd -= 1
                 say("the rest of the batch goes again without the held entries")
@@ -2038,14 +2044,15 @@ class Batch:
         test workers runs once more (workerloss); lost again, every worker exiting cleanly, it raises
         workerloss.Infra: the host, never a failure of the batch's entries. A failure on a transient syntax
         error in a script outside the change runs once more too (syntaxfault); so again, it raises
-        syntaxfault.Infra."""
+        syntaxfault.Infra. One that failed before any test ran runs again up to setupfault.RERUNS times (a pool
+        with no free slot not at all); still so, it raises setupfault.Infra."""
         collect = workerloss.Collector()
 
         def once():
             collect.reset()
             return _stream(_check_argv(cmd, self.wt), self.wt, env=run_env, pass_fds=checkdirs.inherited(),
                            collect=collect, urgent_mark=self._urgent_mark())
-        reruns = torn = 0
+        reruns = torn = setup = 0
         while True:
             rc, tail, _ = scriptwatch.rerun(once, lambda r: r[0] != 0, None if push.remote_host(cmd) else str(cmd),
                                             self.wt, env, say, on_pass=True)
@@ -2057,6 +2064,12 @@ class Batch:
                 torn = 1
                 say(syntaxfault.rerun_line(found, str(cmd)))
                 time.sleep(syntaxfault.SETTLE_S)
+                continue
+            if rc != push.BUSY and (fault := setupfault.found(collect.setup, self.wt)):
+                if fault["kind"] == "pool" or setup >= setupfault.RERUNS:
+                    raise setupfault.Infra(fault, str(cmd))
+                setup += 1
+                say(setupfault.rerun_line(fault, str(cmd), setup))
                 continue
             loss = workerloss.lost(collect.text())
             if reruns >= workerloss.RERUNS:
