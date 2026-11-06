@@ -1081,13 +1081,16 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         return _deny(why), None
     if payload.get("tool_name") in EDIT_TOOLS | PATCH_TOOLS:
         why = harness_gh_edit(payload) if payload["tool_name"] in EDIT_TOOLS else harness_gh_patch(payload)
+        why = why or local_guard(payload)
         return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
         from . import aitag
         why = aitag.tool_problem(str(payload["tool_name"]), payload.get("tool_input"), aitag.project_config())
+        why = why or local_guard(payload)
         return (_deny(why) if why else None), None
     if payload.get("tool_name") != "Bash":
-        return None, None
+        why = local_guard(payload)
+        return (_deny(why) if why else None), None
     cmd = str((payload.get("tool_input") or {}).get("command") or "")
     commands, scan = _split(cmd)
     segments = _segments(commands)
@@ -1145,6 +1148,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         why, hint, rewrite = device_test_run(commands, cmd)
     if not why:
+        why = local_guard(payload)
+    if not why:
         cwd = str(payload.get("cwd") or os.getcwd())
         hint = "\n\n".join(h for h in (hint, fenced_script(segments, commands, cwd), wide_read(commands, cwd)) if h)
         out = {"hookEventName": "PreToolUse", **({"additionalContext": hint} if hint else {})}
@@ -1153,6 +1158,30 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
             out.update(permissionDecision="allow", updatedInput={**payload["tool_input"], "command": rewrite})
         return ({"hookSpecificOutput": out} if len(out) > 1 else None), None
     return _deny(why), None
+
+
+def local_guard(payload: dict) -> str | None:
+    """Why one of the project's own guards (project.json guards.local, localguard.py) refuses this tool
+    call, logged to the refusal log with kind local:<file>; asked after the built-in guards."""
+    from . import aitag, localguard
+    tool = str(payload.get("tool_name") or "")
+    args = payload.get("tool_input") if isinstance(payload.get("tool_input"), dict) else {}
+    try:
+        cfg = aitag.project_config()
+    except Exception as e:   # unreadable settings: the listed guards cannot be found, so none is skipped silently
+        return f"the project's settings could not be read for its local guards ({type(e).__name__})" \
+            if tool == "Bash" else None
+    if (tool == "Bash" or tool in EDIT_TOOLS) and (f := localguard.names_guard(
+            cfg, localguard.harness_dir(), tool, args, str(payload.get("cwd") or os.getcwd()))) and not _harness_task():
+        return (f"the project's local guard {f.name} ({localguard.KEY}) changes only in a harness task: other runs "
+                f"never edit, move or disable it, and a command naming its path is refused (read it with the Read tool)")
+    hit = localguard.refusal(cfg, tool, args)
+    if not hit:
+        return None
+    if os.environ.get("TTP_RUN_DIR"):
+        _log_refusal(str(args.get("command") or "") if tool == "Bash" else f"{tool} {json.dumps(args)[:400]}",
+                     kind=hit[0], reason=hit[1])
+    return hit[1]
 
 
 def idle_wait(cmd: str) -> str | None:

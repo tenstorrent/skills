@@ -363,7 +363,8 @@ def _full_pre_tool_use(tool: str, args: dict, payload: dict):
         if tool == "Bash" and (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") != "deny":
             snapshot(payload)
         return out
-    return None
+    why = hook.local_guard(payload)   # the project's own guards (localguard.py) on its other tools
+    return hook._deny(why) if why else None
 
 
 def _guard_key(payload: dict) -> str:
@@ -560,7 +561,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         if tool == ANSWER_TOOL:   # the turn's structured answer (module doc)
             return _answer_check(payload), None
         if tool == "Bash":
-            why = bash_refusal(str(args.get("command") or ""))
+            from .hook import local_guard
+            why = bash_refusal(str(args.get("command") or "")) or local_guard(payload)
             return (_deny(why) if why else None), None
         return _deny(f"a session coordinator has read-only tools only; {tool or 'this tool'} is not one"), None
     except Exception as e:   # fail closed

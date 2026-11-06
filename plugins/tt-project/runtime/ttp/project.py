@@ -485,6 +485,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # passes, 1 sends the run back with the output (handoff_check_max_sendbacks times, then the task
     # goes to review), anything else is a broken check: accepted, the coordinator told once.
     "worker": {"handoff_checks": [], "handoff_check_max_sendbacks": 2},
+    # The project's own tool guards (localguard.py): Python files, by path from the harness folder and
+    # outside runtime/ and prompts/, each with refusal(cmd) (and optionally tool_refusal(tool, input)),
+    # asked after the built-in guards on every worker and coordinator tool call. Never edit runtime/ files.
+    "guards": {"local": []},
     # A running worker that has not read a coordinator update (steer.md) for ack_after_s raises one
     # steer_unread event to the coordinator (steerack.py); 0: off.
     "steer": {"ack_after_s": 300},

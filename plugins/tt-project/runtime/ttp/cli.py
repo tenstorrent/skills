@@ -11495,7 +11495,9 @@ def _settle_merge(tmp: Path, ident: list[str], files: list[str]) -> str:
             if f not in imports:
                 blocks.append(f)
     if left or not files:
-        return "the merge conflicts in " + ", ".join(left)
+        hint = ("; a project's own tool guards belong in guards.local files outside runtime/ (localguard.py), "
+                "never in edits to runtime/ttp/hook.py") if "runtime/ttp/hook.py" in left else ""
+        return "the merge conflicts in " + ", ".join(left) + hint
     _git(tmp, "add", "--", *files)
     _git(tmp, *ident, "commit", "-q", "--no-edit", "--no-verify")
     print("settled the template merge's conflicts, which needed no judgment: " + ", ".join(files))
@@ -11806,6 +11808,9 @@ def cmd_doctor(a) -> None:
             and (prov.write_fence(rules) or prov.name in fence_off and prov.fence_optional)]
     if gaps:
         print("unfenced providers (their workers can write anywhere, project.db included): " + ", ".join(gaps))
+    from . import localguard
+    for line in localguard.report(p.config(), p.harness):
+        print(line)
     from .coordinator import dir_list
     for prov in all_providers():
         pcfg = p.config()["providers"].get(prov.name, {})
