@@ -2083,7 +2083,8 @@ def test_pr_watch_batched_reads_find_what_per_pr_reads_find(env, monkeypatch):
 def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatch, fail, per_pr):
     """A batched read that times out, or is refused (rate limit, auth), fails each of its PRs as per-PR
     calls would, with no gh call per PR: a timeout reports them cut by the call timeout, a refusal reads
-    them as gh errors. Any other failure lets each PR ask gh itself, as before batching."""
+    them as gh errors (an auth refusal reports an error, never ok). Any other failure lets each PR ask gh
+    itself, as before batching."""
     from ttp import watchers
     from ttp.daemon import Daemon
     p, gh = _pr_batch_setup(env, monkeypatch, {i: _gql_node(i) for i in range(1, 6)})
@@ -2097,6 +2098,8 @@ def test_a_failed_batched_read_fails_its_prs_or_lets_each_ask_gh(env, monkeypatc
     assert not p.db.kv("pr_signatures")
     if fail == "hang":
         assert status.startswith("cut short (0 of 5") and "acme/widgets#1 (5 s gh call timeout)" in status, status
+    elif "401" in fail[1]:   # a logged-out gh is an error, never ok
+        assert status.startswith("error: gh is not logged in") and "gh auth login" in status, status
     else:
         assert status == "ok (5 PRs, 0 changed)", status
 
