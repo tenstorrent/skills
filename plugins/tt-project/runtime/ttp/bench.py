@@ -140,6 +140,12 @@ def workspace(repo: Path, base: str, dest: Path) -> str:
     """A fresh repository at `dest` holding `base`'s tracked files in one commit, with no remotes,
     tags, reflog or other history; returns its tree id (equal to `base`'s tree)."""
     _archive(repo, base, dest)
+    return seal(dest)
+
+
+def seal(dest: Path) -> str:
+    """Make the files in `dest` a fresh repository with one commit and no remotes, tags or reflog;
+    returns its tree id."""
     env = {**os.environ, **_EPOCH}
     git = ["git", "-C", str(dest), "-c", "user.name=bench", "-c", "user.email=bench@localhost",
            "-c", "core.logAllRefUpdates=false", "-c", "commit.gpgsign=false"]
