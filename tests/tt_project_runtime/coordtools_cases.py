@@ -973,3 +973,24 @@ def test_every_git_writer_on_the_harness_checkout_logs_its_protected_writes():
              '    _git(p.harness, "checkout", "-q", "-b", "main")\n    _git(wt, "merge", "x")\n'
              '    with tree_writes(h):\n        _git(h, "merge", "--abort")\n')
     assert [(line, sub) for _, line, sub in _harness_git_writers(probe)] == [(2, "merge"), (3, "merge"), (4, "checkout")]
+
+
+def test_session_coordinator_settings_turn_the_bash_sandbox_off_like_a_workers(tmp_path):
+    # Unsandboxed runs: both the read-only and the full tool set's --settings carry sandbox enabled false.
+    from ttp import coordtools
+    assert coordtools.hook_settings()["sandbox"] == {"enabled": False}
+    assert coordtools.hook_settings(full=True, timeout_s=60)["sandbox"] == {"enabled": False}
+    cfg = {"coordinator": {"session": {"mode": "on", "tools": "full"}}}
+    for session_mode in ("", "new", "resume"):
+        args = coordtools.session_tool_args(cfg, project="p", root=str(tmp_path), session_mode=session_mode)
+        got = json.loads(args[args.index("--settings") + 1])
+        assert got["sandbox"] == {"enabled": False}, session_mode
+    assert coordtools.full_tools(cfg, "new") and not coordtools.full_tools(cfg, "")
+
+
+def test_session_on_with_a_provider_is_off_for_one_that_runs_no_session():
+    # Daemon wake_budget passes the coordinator's provider: a codex or cursor turn keeps its plain budget.
+    from ttp import coordtools
+    assert coordtools.session_on({}) and coordtools.session_on({}, "claude") and coordtools.session_on({}, "fake")
+    assert not coordtools.session_on({}, "codex") and not coordtools.session_on({}, "cursor")
+    assert not coordtools.session_on({"coordinator": {"session": {"mode": "off"}}}, "claude")

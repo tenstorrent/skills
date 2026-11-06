@@ -97,6 +97,11 @@ def test_coordsession_record_counts_wakes_and_context_of_its_session():
     assert line == "coordinator session (on): s1 · 2 wakes · 935 context tokens · last: continued", line
     assert cs.status_line(_cs_cfg(mode="off"), None) == ""
     assert cs.status_line({}, None).startswith("coordinator session (on): none · 0 wakes"), "on by default"
+    # Only a provider that runs a session shows the line: a codex or cursor coordinator stays silent.
+    for prov in ("codex", "cursor"):
+        assert cs.status_line({"core_provider": prov}, None) == "", prov
+        assert cs.status_line({**_cs_cfg(), "core_provider": prov}, st) == "", prov
+    assert cs.status_line({"core_provider": "claude"}, None).startswith("coordinator session (on)")
 
 
 def _cs_stream(path, calls):

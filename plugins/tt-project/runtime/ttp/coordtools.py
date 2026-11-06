@@ -104,9 +104,12 @@ def session(cfg: dict) -> dict:
     return s if isinstance(s, dict) else {}
 
 
-def session_on(cfg: dict) -> bool:
-    """coordinator.session.mode == "on" (unset: the default, coordsession.DEFAULTS); anything else is off."""
-    from .coordsession import DEFAULTS
+def session_on(cfg: dict, provider: str | None = None) -> bool:
+    """coordinator.session.mode == "on" (unset: the default, coordsession.DEFAULTS); anything else is off.
+    With `provider`, also off for a provider that never runs a session (coordsession.PROVIDERS)."""
+    from .coordsession import DEFAULTS, PROVIDERS
+    if provider is not None and provider not in PROVIDERS:
+        return False
     mode = session(cfg).get("mode")
     return str(DEFAULTS["mode"] if mode is None else mode).strip().lower() == "on"
 

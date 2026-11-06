@@ -428,6 +428,8 @@ def asked_full(actions) -> bool:
 def status_line(cfg: dict, state) -> str:
     """`ttp status --verbose`: the session's short id, wakes, context size and last decision."""
     st = state if isinstance(state, dict) else {}
+    if ((cfg or {}).get("core_provider") or "claude") not in PROVIDERS:
+        return ""   # this coordinator's provider never runs a session
     mode = str(settings(cfg).get("mode")).lower()
     if mode == "off" and not st:
         return ""

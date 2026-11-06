@@ -2846,7 +2846,7 @@ class Daemon:
             timeout_s = coordlimits.turn_timeout(self.cfg, provider, effort, prompt_bytes)
             note = {**(note or {}), "turn": {"prompt_bytes": prompt_bytes, "provider": provider,
                     "model": model, "effort": effort, "timeout_s": timeout_s}}
-            if coordtools.session_on(self.cfg):
+            if coordtools.session_on(self.cfg, provider):
                 # A session wake stops at its dollar or time limit, whichever comes first (coordtools).
                 budget_usd, timeout_s = coordtools.wake_budget(self.cfg, budget_usd, timeout_s)
                 note["turn"].update(timeout_s=timeout_s, wake_budget={"usd": budget_usd, "s": timeout_s})

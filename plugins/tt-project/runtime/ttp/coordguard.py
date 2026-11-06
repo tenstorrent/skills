@@ -56,11 +56,14 @@ def session_cfg(cfg: dict) -> dict:
 
 
 def mode_on(cfg: dict) -> bool:
-    """coordinator.session.mode reads on (True, "on" and the like; unset: the default, coordsession.DEFAULTS);
-    off, shadow or bad: False."""
+    """coordinator.session.mode reads on (True, "on" and the like; unset: the default, coordsession.DEFAULTS)
+    and the coordinator's provider (core_provider, as the daemon resolves it) runs a session
+    (coordsession.PROVIDERS); off, shadow, bad or another provider: False."""
+    from .coordsession import DEFAULTS, PROVIDERS
+    if ((cfg or {}).get("core_provider") or "claude") not in PROVIDERS:
+        return False
     m = session_cfg(cfg).get("mode")
     if m is None:
-        from .coordsession import DEFAULTS
         m = DEFAULTS["mode"]
     return m is True or (isinstance(m, str) and m.strip().lower() in ON)
 
@@ -131,7 +134,8 @@ def check(db, cfg: dict, now: float | None = None) -> dict | None:
         if db.kv(BASELINE_KEY) is None and db.kv(KEY) is None:
             return None
         db.x("DELETE FROM kv WHERE key IN (?,?)", (BASELINE_KEY, KEY))
-        return {"event": "off", "text": "coordinator session mode is off: the spend guard's baseline and state are cleared"}
+        return {"event": "off", "text": "coordinator session mode is off (or its provider runs no session): "
+                                        "the spend guard's baseline and state are cleared"}
     base, _ = db.kv_dict(BASELINE_KEY)
     if not base:
         rec = _mode_set(db)

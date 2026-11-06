@@ -192,3 +192,42 @@ def test_the_daemon_session_guard_raises_an_issue_and_a_low_notify_and_closes_it
     d.check_coord_guard()
     assert p.db.kv(coordguard.KEY)["tripped"] is False
     assert not p.db.q("SELECT id FROM issues WHERE source=? AND status='open'", (coordguard.SOURCE,))
+
+
+def test_the_session_guard_stays_inert_for_a_coordinator_provider_that_runs_no_session(env, monkeypatch):
+    # The mode defaults on, but only coordsession.PROVIDERS run a session: a codex or cursor coordinator's own
+    # stateless turns are never compared with a baseline, so no false "session overspent" trip, issue or notify.
+    from ttp import coordguard, coordsession, daemon
+    from ttp.cli import status_text
+    now = time.time()
+    p = _guard_project(env, now)
+    _coord_runs(p, now + 60, 50, 5.0, step_s=60)   # a busy day of the provider's own stateless turns
+    for prov in ("codex", "cursor"):
+        cfg = {**p.config(), "core_provider": prov}
+        assert not coordguard.mode_on(cfg) and not coordsession.on(cfg, prov), prov
+        assert coordguard.check(p.db, cfg, now) is None and coordguard.check(p.db, cfg, now + 3600) is None, prov
+        assert p.db.kv(coordguard.KEY) is None and p.db.kv(coordguard.BASELINE_KEY) is None, prov
+        assert coordguard.status_line(p.db, cfg, now + 3600) is None, prov
+        assert coordsession.status_line(cfg, None) == "", prov
+    # A baseline left from a claude coordinator is cleared once the provider moves to codex.
+    assert coordguard.check(p.db, {**p.config(), "core_provider": "claude"}, now)["event"] == "baseline"
+    assert coordguard.check(p.db, {**p.config(), "core_provider": "codex"}, now + 1)["event"] == "off"
+    assert p.db.kv(coordguard.BASELINE_KEY) is None
+    # The daemon reads the project's own core_provider: no baseline, trip, issue or notify for codex.
+    monkeypatch.setattr(daemon.Daemon, "_coord_guard_checked", 0.0, raising=False)
+    p.set_config("core_provider", "codex")
+    d = daemon.Daemon(p.base)
+    d.check_coord_guard()
+    d._coord_guard_checked = 0.0
+    d.check_coord_guard()
+    assert p.db.kv(coordguard.KEY) is None and p.db.kv(coordguard.BASELINE_KEY) is None
+    assert not p.db.q("SELECT id FROM issues WHERE source=?", (coordguard.SOURCE,))
+    assert not [m for m in p.db.q("SELECT text FROM messages WHERE direction='out'")
+                if "coordinator session" in m["text"]]
+    text = status_text(p, verbose=True)
+    assert "session guard" not in text and "coordinator session (" not in text, text
+    # A claude coordinator with the mode unset still gets the guard.
+    p.set_config("core_provider", "claude")
+    d = daemon.Daemon(p.base)
+    d.check_coord_guard()
+    assert p.db.kv(coordguard.BASELINE_KEY)["turns"] == 70
