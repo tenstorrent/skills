@@ -2979,6 +2979,12 @@ def test_a_checks_detached_job_keeps_its_files_after_the_push_exits_busy_and_its
     own outside the check's: it writes files there and finds them later. Both go once it ends."""
     from ttp import detach, sandbox
     monkeypatch.setenv("TTP_DEVICE_NODES", "")
+    # The check must run sandboxed, so its `ttp detach` queues the job: a probe slowed by a loaded host
+    # is waited out, never read as "no sandbox here" (the job would then start at once, in the scratch).
+    monkeypatch.setattr(sandbox, "PROBE_S", 600)
+    monkeypatch.setattr(sandbox, "_STATE", {})
+    if not (sandbox.inside() or sandbox.status()[0]):
+        pytest.skip(f"no PID-namespace sandbox here: {sandbox.status()[1]}")
     p = make(env)
     marker = p.state / "pushes" / "m1.json"
     marker.parent.mkdir(parents=True)
@@ -2999,11 +3005,11 @@ def test_a_checks_detached_job_keeps_its_files_after_the_push_exits_busy_and_its
         e.pop(k, None)
     r = subprocess.run(sandbox.wrap(["sh", "-c", check], True, e), env=e, cwd=str(head),
                        capture_output=True, text=True, timeout=60)
-    assert r.returncode == 75, r
+    assert r.returncode == 75 and "queued" in r.stdout, r
     shutil.rmtree(check_tmp)   # the push that exited busy removes its check scratch
     rc = report / "gate.rc"
     detach.tend(p)
-    assert _wait_for_path(rc), detach.lost(rc).read_text() if detach.lost(rc).exists() else r
+    assert _wait_for_path(rc, 300), detach.lost(rc).read_text() if detach.lost(rc).exists() else r
     log = (report / "gate.log").read_text()
     assert rc.read_text().strip() == "0", log
     staged, staged2, cwd, work, tmp = seen.read_text().splitlines()
@@ -3032,11 +3038,12 @@ def test_a_job_detached_from_a_ttp_checks_command_keeps_a_temp_dir_after_the_che
     found = [f for f in tmp_path.rglob("gate.*") if f.suffix in (".log", ".queued")]
     assert found, "the job was neither started nor queued"
     rc = found[0].with_suffix(".rc")
-    _wait_for(lambda: not check_tmp.exists(), 30)
+    _wait_for(lambda: not check_tmp.exists(), 300)
     assert not check_tmp.exists(), "the checks run removed its TMPDIR"
     detach.tend(p)   # starts it, were it queued
     go.touch()
-    assert _wait_for_path(rc), (rc.with_suffix(".log").read_text() if rc.with_suffix(".log").exists() else "")
+    assert _wait_for_path(rc, 300), (detach.lost(rc).read_text() if detach.lost(rc).exists() else
+                                     rc.with_suffix(".log").read_text() if rc.with_suffix(".log").exists() else "")
     assert rc.read_text().strip() == "0", rc.with_suffix(".log").read_text()
     made, job_tmp, work = seen.read_text().splitlines()
     assert Path(made).parent == Path(job_tmp) and not Path(job_tmp).is_relative_to(check_tmp)

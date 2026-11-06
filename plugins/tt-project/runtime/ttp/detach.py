@@ -224,11 +224,12 @@ def _drop(record: Path) -> None:
     shutil.rmtree(record, ignore_errors=True)
 
 
-def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
+def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock, *, check: bool = False) -> int:
     """Start the job's wrapper in a session of its own, holding `lock` (its job lock, which the
     caller took and closes after), with a fresh temp dir of its own, fenced with no_new_privs: no
     process of the job gains privileges (sudo fails), whoever starts it (a worker, or the daemon for a
-    queued, relaunched or heal fix job); a privileged step goes through `ttp host-run`. Returns its pid."""
+    queued, relaunched or heal fix job); a privileged step goes through `ttp host-run`. A `check`'s queued
+    job whose cwd went with its push starts in its work dir; any other job's gone cwd fails it. Returns its pid."""
     record = scratch(rc)
     if record.exists() and not record.is_symlink():   # left by an earlier start of it that never ran
         _drop(record)
@@ -243,7 +244,7 @@ def start(rc: Path, log: Path, cmd: list, cwd: str, env: dict, lock) -> int:
     work = record / WORK
     work.mkdir(mode=0o700)
     env = {**env, **{var: str(tmp) for var in _TMP_VARS}, "TTP_JOB_DIR": str(work), "TTP_DETACHED": "1"}
-    if not os.path.isdir(cwd):   # a check's clean checkout, gone with its push before the daemon started the job
+    if check and not os.path.isdir(cwd):   # a check's checkout, gone with its push before the job started
         cmd = ["sh", "-c", 'echo "ttp detach: its directory $0 is gone: started in its work dir $PWD" >&2; exec "$@"',
                cwd, *cmd]
         cwd = str(work)
@@ -1020,7 +1021,7 @@ def tend(p: Project) -> None:
                         cmd, env = list(m["command"]), _job_env(m.get("env"))
                         if isinstance(m.get("bound"), dict):   # a check's: recorded first, so a crash leaves no unbounded job
                             write_json(p.state / BOUND / q.name, {**m["bound"], "rc": str(rc)})
-                        pid = start(rc, log, cmd, m["cwd"], env, lock)
+                        pid = start(rc, log, cmd, m["cwd"], env, lock, check=isinstance(m.get("bound"), dict))
                         renice(pid, nice_level(p.config().get("runner"))[0])
                         from .runner import boot_id
                         _restamp(rc, pid, boot_id(), reopen=False)   # its host pid and start time, never a namespace's
