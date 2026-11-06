@@ -1169,7 +1169,19 @@ running work is interrupted only by the preemption below:
   review sweeps skip `review.sweep_after_s` and `review.unreviewed_per_pass` for it. An urgent task in
   review for 10 minutes raises `review_stall`.
 - Push queue: an approved head of an urgent task's review starts its batch at once; a running batch
-  or deploy still goes first.
+  or deploy still goes first. An urgent approval stops a running batch's search for a failing entry
+  only if it was approved within `delivery.push_yield_grace_s` (300 s) of that batch's first check,
+  and a batch stops at most once, so a stream of urgent approvals never keeps a batch from landing.
+  Later urgent approvals lead the next batch, which starts as soon as the running one ends; after a
+  stop, the next batch takes the urgent approvals it stopped for, never the stopped batch's own
+  entries again.
+- Landing checks: a `ttp checks` run for no task (a push batch's, the coordinator's or a user's) or
+  under a landing mark never waits behind the project's task checks for `checks.test_project_max`:
+  one at a time takes the project's landing lane past its lanes and cap. The host-wide cap and its
+  push slot still apply, and priority-1 runs keep their own lane past the cap.
+- Rejected pushes: a push rejected for authentication keeps its approvals queued and retries as soon
+  as a model-free dry-run push shows push access works (checked every 2 minutes, at the latest after
+  30 minutes). Its alert clears then, or once a batch pushes. Other rejections retry after 30 minutes.
 - Waiting lists: resource reservations, `ttp lock` waiters, `ttp checks` slots and device runner
   queues serve urgent waiters first, a user-ordered one (a fresh `urgent:` line) ahead of other urgent
   ones. Held locks, holds, pauses and recovery owners stay as they are.

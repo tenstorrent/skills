@@ -4136,6 +4136,68 @@ def test_a_batch_that_could_not_push_puts_its_approvals_back_without_a_model_run
     assert pushq.due(s.p, time.time() + 10 ** 6)[0], "it goes out with the next batch"
 
 
+def test_a_push_rejected_for_authentication_retries_once_push_access_works_and_its_alert_clears(env, monkeypatch):
+    # A batch's push fails for the credential: the approvals stay queued and the queue backs off, but a
+    # model-free dry-run push (at most every AUTH_PROBE_S) ends the backoff once it works, and the
+    # push_rejected alert clears then, not only once a batch pushes.
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    _pq_plan(s, outcome="rejected", row="requeued",
+             message="push to origin/proj was rejected: fatal: could not read Username for 'https://example.com': "
+                     "terminal prompts disabled")
+    _pq_hand_off(env, s)
+    since = time.time()
+    _pq_batch(s)
+    _pq_tend(s)
+    st = s.p.db.kv(pushq.KV)
+    assert st.get("auth_wait") and st["backoff_until"] > time.time()
+    text, = [r["text"] for r in s.p.db.q("SELECT text FROM messages WHERE kind='alert' AND ref='push_rejected'")]
+    assert "as soon as push access works again" in text and "this alert clears then" in text, text
+    probes, ok = [], {"v": False}
+    monkeypatch.setattr(pushq, "_auth_probe", lambda p, remote, branch: probes.append((remote, branch)) or ok["v"])
+    now = time.time()
+    rows, why = pushq.due(s.p, now + pushq.AUTH_PROBE_S)
+    assert rows == [] and "rejected for authentication" in why and probes == [("origin", "proj")], why
+    assert pushq.due(s.p, now + pushq.AUTH_PROBE_S + 10)[0] == [] and len(probes) == 1, "probed at most every AUTH_PROBE_S"
+    assert alerts.holds(s.p.db, "push_rejected", since, now)
+    ok["v"] = True
+    rows, why = pushq.due(s.p, now + 2 * pushq.AUTH_PROBE_S + 1)
+    assert len(probes) == 2 and (rows or "backing off" not in why), why
+    st = s.p.db.kv(pushq.KV)
+    assert not st.get("backoff_until") and not st.get("auth_wait") and st["auth_ok_at"] > since
+    assert not alerts.holds(s.p.db, "push_rejected", since, now + 2 * pushq.AUTH_PROBE_S + 1), \
+        "push access works again: the alert no longer needs the user"
+
+
+def test_only_a_credential_rejection_waits_on_the_push_access_probe(env, monkeypatch, tmp_path):
+    # A protected-branch refusal is the change's, not the credential's: it keeps the fixed backoff. The
+    # probe itself is a dry-run push that changes nothing: it passes against a reachable remote and fails
+    # against one it cannot reach. Scratch HOME and git/gh config: no real credential path is read.
+    import subprocess
+    from types import SimpleNamespace
+    from ttp import pushq
+    for k in ("HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"):
+        monkeypatch.setenv(k, str(tmp_path / "home"))
+    (tmp_path / "home").mkdir()
+    assert pushq.AUTH_RE.search("fatal: Authentication failed for 'https://example.com/r.git/'")
+    assert pushq.AUTH_RE.search("git@example.com: Permission denied (publickey).")
+    assert not pushq.AUTH_RE.search("! [remote rejected] HEAD -> main (protected branch hook declined)")
+    run = lambda *a, cwd=tmp_path: subprocess.run(["git", *a], cwd=cwd, check=True, capture_output=True)  # noqa: E731
+    run("init", "-q", "--bare", "remote.git")
+    run("init", "-q", "-b", "proj", "w")
+    w = tmp_path / "w"
+    run("-c", "user.name=t", "-c", "user.email=t@example.com", "commit", "-q", "--allow-empty", "-m", "x", cwd=w)
+    run("remote", "add", "origin", str(tmp_path / "remote.git"), cwd=w)
+    run("push", "-q", "origin", "proj", cwd=w)
+    run("fetch", "-q", "origin", cwd=w)
+    before = subprocess.run(["git", "rev-parse", "proj"], cwd=tmp_path / "remote.git", capture_output=True, text=True).stdout
+    assert pushq._auth_probe(SimpleNamespace(root=w), "origin", "proj")
+    assert subprocess.run(["git", "rev-parse", "proj"], cwd=tmp_path / "remote.git",
+                          capture_output=True, text=True).stdout == before, "the probe pushes nothing"
+    run("remote", "set-url", "origin", str(tmp_path / "missing.git"), cwd=w)
+    assert not pushq._auth_probe(SimpleNamespace(root=w), "origin", "proj")
+
+
 def test_dead_batches_retry_with_a_growing_pause_and_three_in_a_row_raise_an_alert(env, monkeypatch):
     from ttp import alerts, pushq
     s = _pq(env, monkeypatch)

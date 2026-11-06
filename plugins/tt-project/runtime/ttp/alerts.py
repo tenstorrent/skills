@@ -260,7 +260,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         from . import heal
         return heal.cleared_why(db, arg, now, hold=True) is None
     # The push queue (pushq.py): each lasts until a batch finalized after it was raised shows otherwise.
-    if key == "push_rejected":
+    if key == "push_rejected":   # over once push access works again (pushq._auth_back) or a batch pushed
+        if float((db.kv("push_queue") or {}).get("auth_ok_at") or 0) >= since:
+            return False
         return not db.one("SELECT id FROM push_batches WHERE outcome='pushed' AND finalized>=? LIMIT 1", (since,))
     if key == "after_push_failed":   # also over once no after_push will run (pushq.AFTER_PUSH_OFF)
         if db.kv("after_push_off") or float(db.kv("after_push_ok_at") or 0) >= since:

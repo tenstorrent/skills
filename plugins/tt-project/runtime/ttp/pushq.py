@@ -93,6 +93,10 @@ SETUP_ALERT = "push_setup_fault"   # keyed per check (setup_key) while its batch
 DEFAULT_SETUP_AFTER = 3         # delivery.push_setup_fault_escalate_after: setup_fault holds of one check in a row before it (0 = off)
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
+AUTH_PROBE_S = 120.0            # after a push rejected for authentication, push access is checked this often
+AUTH_RE = re.compile(r"could not read (?:Username|Password)|Authentication failed|Permission denied \(publickey|"
+                     r"Invalid username or password|terminal prompts disabled|requested URL returned error: 40[13]",
+                     re.I)   # a push rejection that is the credential's, not the change's
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
 DEFAULT_LANDING_ALERT_H = 4     # delivery.push_landing_alert_h: approvals waiting this long with no landing alert (high)
 LANDING_ALERT = "push_not_landing"   # the keyed alert while nothing lands despite batches (alerts.holds)
@@ -224,6 +228,41 @@ def _refusal(p: Project, remote: str, branch: str, allow: bool = False) -> str:
     if not allow and _default_branch(p, remote) == branch:
         return f"refusing to push to {remote}/{branch}, the remote's default branch: {push.PROTECTED_HINT}"
     return ""
+
+
+def _auth_back(p: Project, st: dict, remote: str, branch: str, now: float) -> bool:
+    """After a push rejected for authentication (st["auth_wait"]), whether push access works again: a
+    model-free dry-run push of the branch to itself (_auth_probe), at most every AUTH_PROBE_S and never in
+    a write transaction. Once it works the backoff ends, so the next batch starts at once, and the
+    push_rejected alert clears (alerts.holds reads "auth_ok_at")."""
+    aw = st.get("auth_wait")
+    if not isinstance(aw, dict) or p.db.conn.in_transaction:
+        return False
+    if now - float(aw.get("probed") or aw.get("at") or 0) < AUTH_PROBE_S:
+        return False
+    aw["probed"] = now
+    ok = _auth_probe(p, remote, branch)
+    if ok:
+        st.pop("auth_wait", None)
+        st.pop("backoff_until", None)
+        st["auth_ok_at"] = now
+        _event(p.db, None, "push_auth_ok", f"push access to {remote}/{branch} works again: the push queue "
+                                           f"retries now", queued=False)
+    p.db.set_kv(KV, st)
+    return ok
+
+
+def _auth_probe(p: Project, remote: str, branch: str) -> bool:
+    """Whether git may push to `remote` again: `git push --dry-run` of the branch's remote-tracking ref
+    onto itself authenticates as a push does and changes nothing. A refusal past authentication (a
+    non-fast-forward) counts as working; a network or credential failure does not."""
+    try:
+        r = _git(p, "push", "--dry-run", "--porcelain", remote,
+                 f"refs/remotes/{remote}/{branch}:refs/heads/{branch}", timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return False
+    out = f"{r.stdout or ''}\n{r.stderr or ''}"
+    return r.returncode == 0 or (not AUTH_RE.search(out) and "rejected" in out)
 
 
 def _state(db) -> dict:
@@ -1090,8 +1129,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     if push.lock_name(remote, branch) in paused or "push" in paused:
         return [], "the push resource is paused"
     st = _state(db)
-    if float(st.get("backoff_until") or 0) > now:
-        return [], f"backing off until {_at(float(st['backoff_until']), now, p)}"
+    if float(st.get("backoff_until") or 0) > now and not _auth_back(p, st, remote, branch, now):
+        why = " (the last push was rejected for authentication: it retries once push access works)" \
+            if st.get("auth_wait") else ""
+        return [], f"backing off until {_at(float(st['backoff_until']), now, p)}{why}"
     if held := envfault.held(p, now):   # a check runner the host lacks: checks would only fail on it
         return [], held
     if not locks.any_free(push.lock_paths(p, remote, branch)) or any(
@@ -2026,6 +2067,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             st.pop("bad_tip", None)
         if outcome in ("pushed", "landed", "nothing"):
             st.pop("backoff_until", None)
+            st.pop("auth_wait", None)
         if outcome == "tip_failed" and tip and tip not in (st.get("tips_told") or []):
             st["tips_told"] = ((st.get("tips_told") or []) + [tip])[-TIPS_TOLD:]
             _event(db, None, "push_tip_failed", f"the push branch tip {_short(tip)} of {b['target']} fails its checks: "
@@ -2045,9 +2087,17 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             st["backoff_until"] = max(float(st.get("backoff_until") or 0), now + setupfault.RETRY_S)
         if outcome == "rejected":
             st["backoff_until"] = now + BACKOFF_MAX_S
-            later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: "
-                                           f"{str(m.get('message') or _tail_of(m, None, 5))[:1500]}. "
-                                           f"The approvals stay queued and are retried in {BACKOFF_MAX_S // 60} min.", "high"))
+            why = str(m.get('message') or _tail_of(m, None, 5))[:1500]
+            if auth := bool(AUTH_RE.search(why)):   # the credential: retried once push access works (_auth_back)
+                st["auth_wait"] = {"at": now}
+            else:
+                st.pop("auth_wait", None)
+            later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: {why}. "
+                                           f"The approvals stay queued and are retried " + (
+                                               f"as soon as push access works again (checked every "
+                                               f"{AUTH_PROBE_S / 60:g} min, at the latest in {BACKOFF_MAX_S // 60} "
+                                               f"min); this alert clears then." if auth else
+                                               f"in {BACKOFF_MAX_S // 60} min."), "high"))
         later += _held_told(p, st, b, m, now, "script_torn") + _held_told(p, st, b, m, now, "setup_fault")
         db.set_kv(KV, st)
         later += _hold_scoped(p, b, m, now)
