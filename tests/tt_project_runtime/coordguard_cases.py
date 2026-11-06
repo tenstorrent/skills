@@ -231,3 +231,75 @@ def test_the_session_guard_stays_inert_for_a_coordinator_provider_that_runs_no_s
     d = daemon.Daemon(p.base)
     d.check_coord_guard()
     assert p.db.kv(coordguard.BASELINE_KEY)["turns"] == 70
+
+
+def _session_wake(p, t, mode, usd, cache_write=0, output=0):
+    """A session-mode coordinator wake priced at $1 per million weighted tokens (budget.TOKEN_WEIGHTS),
+    so budget.estimate_cost prices its seed exactly."""
+    p.db.x("INSERT INTO runs(role, provider, model, started, ended, status, cost_usd, cache_write_tokens, "
+           "output_tokens, note) VALUES('coordinator', 'claude', 'opus', ?, ?, 'ok', ?, ?, ?, ?)",
+           (t, t + 60, usd, cache_write, output, json.dumps({"turn": {"session": {"mode": mode}}})))
+
+
+def test_the_session_guard_spreads_a_new_sessions_seed_over_the_day_but_still_trips_a_rollover_loop(env):
+    from ttp import coordguard
+    now = time.time()
+    p = _guard_project(env, now)   # $10/day, $1/turn: the first hour's allowance is about $3.82
+    _session_on(p)
+    coordguard.check(p.db, p.config(), now)
+    first = coordguard.allowance(p.db.kv(coordguard.BASELINE_KEY), coordguard.MIN_H)
+    # A switch-on whose first seed failed and was paid again, then 4 resumed wakes: $6.50 in 0.6 h,
+    # $4.50 of it two seeds (2M and 1.6M cache-write tokens at weight 1.25).
+    _session_wake(p, now + 60, "new", 2.5, output=0, cache_write=2_000_000)
+    _session_wake(p, now + 300, "new", 2.0, cache_write=1_600_000)
+    for i in range(4):
+        _session_wake(p, now + 600 + i * 300, "resume", 0.5, output=100_000)
+    t = now + 0.6 * 3600
+    usd, raw, turns, deferred = coordguard.counted(p.db, p.config(), now, 0.6)
+    assert abs(raw - 6.5) < 1e-6 and turns == 6, (raw, turns)
+    assert abs(deferred - 4.5 * 23 / 24) < 0.01 and usd < first < raw, (usd, deferred, first)
+    assert coordguard.check(p.db, p.config(), t) is None, "one-time seeds alone never trip it"
+    assert not coordguard.tripped(p.db, t)
+    assert f"ok: ${usd:.2f} of" in coordguard.status_line(p.db, p.config(), t)
+    # A full day counts every seed whole: the daily limit is unchanged.
+    assert coordguard.counted(p.db, p.config(), now, 24)[3] == 0
+    # A third seed in the window (a rollover loop) counts whole and trips it, with a pause sized to the overrun.
+    _session_wake(p, now + 2000, "new", 2.5, cache_write=2_000_000)
+    got = coordguard.check(p.db, p.config(), t)
+    g = p.db.kv(coordguard.KEY)
+    assert got["event"] == "trip" and not got["hold"], got
+    assert "$9.00 in 7 turns" in g["why"] and "seeds spread over a day" in g["why"], g["why"]
+    assert coordguard.MIN_PAUSE_H < g["pause_h"] < coordguard.PAUSE_H, g
+    assert abs(g["until"] - (t + g["pause_h"] * 3600)) < 1, g
+    assert g["pause_h"] == round(coordguard.pause_for(p.config(), g["usd"] / g["allowance"], False), 3)
+
+
+def test_the_session_guard_pauses_a_small_first_overrun_briefly_and_a_repeat_or_runaway_for_pause_h(env):
+    from ttp import coordguard
+    cfg = {"coordinator": {"session": {"mode": "on"}}}
+    assert coordguard.pause_for(cfg, 1.04, False) == coordguard.MIN_PAUSE_H
+    assert coordguard.pause_for(cfg, 1.5, False) == coordguard.PAUSE_H / 2
+    assert coordguard.pause_for(cfg, coordguard.FULL_PAUSE_AT, False) == coordguard.PAUSE_H
+    assert coordguard.pause_for(cfg, 9.0, False) == coordguard.PAUSE_H
+    assert coordguard.pause_for(cfg, 1.04, True) == coordguard.PAUSE_H, "a repeat trip gets the whole pause"
+    short = {"coordinator": {"session": {"pause_h": 0.5}}}
+    assert coordguard.pause_for(short, 1.01, False) == 0.5, "never longer than pause_h"
+    now = time.time()
+    p = _guard_project(env, now)
+    _session_on(p)
+    coordguard.check(p.db, p.config(), now)
+    first = coordguard.allowance(p.db.kv(coordguard.BASELINE_KEY), coordguard.MIN_H)
+    _coord_runs(p, now + 60, 4, first / 4 * 1.05, step_s=300)   # 5% over in the first hour
+    t = now + 1800
+    got = coordguard.check(p.db, p.config(), t)
+    g = p.db.kv(coordguard.KEY)
+    assert got["event"] == "trip" and g["pause_h"] == coordguard.MIN_PAUSE_H, g
+    assert g["until"] == t + coordguard.MIN_PAUSE_H * 3600 and "for 1 h (sized to the overrun" in got["text"], got
+    assert coordguard.check(p.db, p.config(), g["until"])["event"] == "untrip"
+    # The same small overrun again within the week: the whole pause_h.
+    t2 = g["until"] + 600
+    _coord_runs(p, t2 - 500, 4, first / 4 * 1.05, step_s=60)
+    got = coordguard.check(p.db, p.config(), t2)
+    g = p.db.kv(coordguard.KEY)
+    assert got["event"] == "trip" and g["pause_h"] == coordguard.PAUSE_H and "a repeat trip" in got["text"], g
+    assert g["until"] == t2 + coordguard.PAUSE_H * 3600

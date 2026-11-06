@@ -79,6 +79,17 @@ def _seeds(db, cfg: dict, provider: str, model: str | None, chars: int = 0) -> l
     return got
 
 
+def seed_of(db, cfg: dict, provider: str, r) -> float:
+    """A past new-session wake's seed (_seed: its cache writes plus uncached input at its own booked
+    rate, at most SEED_FACTOR times its prompt size, never more than it booked); r is a runs row with
+    cost_usd, the four token columns and note."""
+    try:
+        turn = json.loads(r["note"] or "{}").get("turn") or {}
+    except (ValueError, AttributeError):
+        turn = {}
+    return _seed(r, turn if isinstance(turn, dict) else {}, cfg, 0)
+
+
 def expected(db, cfg: dict, provider: str, model: str, chars: int) -> tuple[float, str]:
     """(dollars, basis) a new session's seed is expected to cost: "history" or "estimate"."""
     seeds = _seeds(db, cfg, provider, model or None, chars) or _seeds(db, cfg, provider, None, chars)

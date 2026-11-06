@@ -7578,7 +7578,8 @@ class Daemon:
     def check_coord_guard(self) -> None:
         """Model-free spend guard of the persistent coordinator session (coordguard): records the stateless
         baseline at switch-on and, over its allowance, reverts the coordinator to stateless turns for
-        coordinator.session.pause_h with one issue and a low notify; the issue closes when it un-trips."""
+        a pause sized to the overrun (at most coordinator.session.pause_h) with one issue and a low notify; the issue
+        closes when it un-trips."""
         from . import coordguard
         now = time.time()
         if now - getattr(self, "_coord_guard_checked", 0.0) < coordguard.CHECK_S:

@@ -439,10 +439,14 @@ only in the feed and never under "needs you".
   context window (`context_window_tokens`; 0 reads it from a `[1m]` model id, else no cap) less
   `rollover_margin_tokens` (40000). `rollover_tokens` above 0 (default 0) sets a fixed limit instead. A resumed wake that fails is rerun at once as a
   stateless turn, so each message and event is handled once; `max_failures_per_h` (3) failed resumes
-  within an hour run every turn stateless for `pause_h` (6) hours and raise an issue. While the
-  session spend guard has tripped, turns are stateless. A coordinator on a provider that runs no
-  session (only Claude Code does) keeps stateless turns, with no spend guard and no session line in
-  `ttp status`. `ttp status --verbose` shows the session's
+  within an hour run every turn stateless for `pause_h` (6) hours and raise an issue. The session
+  spend guard compares the session's coordinator spend with the stateless baseline (a day's
+  baseline plus 3 turns at a full day, prorated with early headroom before that); the first two
+  new-session seeds in its window count spread over a day, later ones whole. Over it, turns are
+  stateless for 1 h on a first small overrun, rising to `pause_h` at twice the allowance or on a
+  repeat trip within 7 days; a third trip holds them until the mode is set again. A coordinator on a
+  provider that runs no session (only Claude Code does) keeps stateless turns, with no spend guard
+  and no session line in `ttp status`. `ttp status --verbose` shows the session's
   short id, wakes, context size and last decision. `ttp stats <name> --coord-session` reports each
   day's wakes, $/wake, context growth and tool calls per wake, rollovers and cache-read share beside
   the stateless baseline (the 7 days before the first session wake: turns/day, $/turn), and flags
