@@ -21,7 +21,7 @@ exit 1
     return ["sh", str(script)], lambda: int(count.read_text()) if count.exists() else 0
 
 
-def _gone(d) -> str:
+def _head_gone(d) -> str:
     """A pool copy whose head dir is gone, as a shard prints it (the path outside the repository)."""
     return (f"pool-copy: line 154: cd: {d}/scratch/gate.Ab12/head: No such file or directory\n"
             "tar: This does not look like a tar archive\ntar: Exiting with failure status due to previous errors\n"
@@ -40,19 +40,19 @@ def test_setupfault_names_only_faults_before_any_test_ran(tmp_path):
     repo = tmp_path / "repo"
     repo.mkdir()
     found = lambda text: setupfault.found(setupfault.scan(text), repo)
-    assert found(_gone(tmp_path))["kind"] == "setup"
-    assert found(_gone(tmp_path))["lines"][0].endswith("No such file or directory")
+    assert found(_head_gone(tmp_path))["kind"] == "setup"
+    assert found(_head_gone(tmp_path))["lines"][0].endswith("No such file or directory")
     for bad in (_BAD_TAR, "gzip: stdin: not in gzip format\n", "gzip: stdin: unexpected end of file\n",
                 "rsync error: some files could not be transferred (code 23)\n"):
         assert found(bad)["kind"] == "setup", bad
     assert found(_STARVED)["kind"] == "pool" and found("no free slot on any test host\n")["kind"] == "pool"
-    assert found(_gone(tmp_path) + _STARVED)["kind"] == "pool", "the pool is starved now: wait, never rerun at once"
+    assert found(_head_gone(tmp_path) + _STARVED)["kind"] == "pool", "the pool is starved now: wait, never rerun at once"
     assert found(f"x: line 3: cd: {repo}/build: No such file or directory\n") is None, "the change's own dir"
     assert found("x: line 3: cd: build: No such file or directory\n") is None
     assert found("exit status 1\nsomething broke\n") is None
     for verdict in ("1 failed, 3 passed in 2.1s", "FAILED tests/test_a.py::test_b - assert 0", "not ok 3 - copies",
                     "test_hsc.sh: FAIL", "PASS test_one.sh", "Traceback (most recent call last):", "2 errors in 1.0s"):
-        assert found(_gone(tmp_path) + verdict + "\n") is None, verdict
+        assert found(_head_gone(tmp_path) + verdict + "\n") is None, verdict
         assert found(verdict + "\n" + _BAD_TAR) is None, verdict
     assert setupfault.scan("").verdict is False and found("") is None
 
@@ -66,12 +66,12 @@ def test_push_run_one_reruns_a_check_that_failed_before_any_test_ran_and_holds_i
     repo = tmp_path / "repo"
     repo.mkdir()
     n = setupfault.RERUNS + 1
-    cases = {"gone_then_pass": ([_gone(tmp_path), ""], 0, 2),
-             "gone": ([_gone(tmp_path)], push.BUSY, n),
+    cases = {"gone_then_pass": ([_head_gone(tmp_path), ""], 0, 2),
+             "gone": ([_head_gone(tmp_path)], push.BUSY, n),
              "bad_tar": ([_BAD_TAR], push.BUSY, n),
              "starved": ([_STARVED], push.BUSY, 1),
-             "then_real": ([_gone(tmp_path), "FAILED tests/test_a.py::test_b\n1 failed in 0.1s\n"], push.CHECKS_FAILED, 2),
-             "real": (["test_hsc.sh: FAIL\n" + _gone(tmp_path)], push.CHECKS_FAILED, 1),
+             "then_real": ([_head_gone(tmp_path), "FAILED tests/test_a.py::test_b\n1 failed in 0.1s\n"], push.CHECKS_FAILED, 2),
+             "real": (["test_hsc.sh: FAIL\n" + _head_gone(tmp_path)], push.CHECKS_FAILED, 1),
              "plain": (["it broke\n"], push.CHECKS_FAILED, 1)}
     for name, (runs, want, ran_n) in cases.items():
         d = tmp_path / name
@@ -110,7 +110,7 @@ def test_ttp_checks_a_check_that_failed_before_any_test_ran_is_an_infra_fault_ex
     from ttp import cli, setupfault
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     (tmp_path / "a").mkdir()
-    argv, ran = _setup_check(tmp_path / "a", [_gone(tmp_path), ""])
+    argv, ran = _setup_check(tmp_path / "a", [_head_gone(tmp_path), ""])
     cli.main(["checks", "--", *argv])
     assert ran() == 2 and json.loads((run / "checks.json").read_text())["passed"] is True
     (tmp_path / "b").mkdir()
@@ -134,7 +134,7 @@ def test_push_batch_holds_a_check_that_failed_before_any_test_ran_and_requeues_i
     from ttp import push, setupfault
     d = env["tmp"] / "setup"
     d.mkdir()
-    argv, ran = _setup_check(d, [_gone(d)])
+    argv, ran = _setup_check(d, [_head_gone(d)])
     p, repo, origin, other = _bump_setup(env, monkeypatch, [f"[ -e plugins/p/f1.txt ] || exit 0; {' '.join(argv)}"])
     rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]), monkeypatch)
     assert rc == push.BUSY and m["outcome"] == "setup_fault" and ran() == setupfault.RERUNS + 1, m
