@@ -140,7 +140,7 @@ def test_the_restart_reads_the_stop_timeout_from_the_service_manager(env, monkey
     assert service._manager_view(p) == (service.STOP_WAIT_CAP_S, None)
 
 
-def _deferred(env, monkeypatch, ready_at):
+def _ss_deferred(env, monkeypatch, ready_at):
     """A restart deferred because the old daemon (90 s stop timeout) exits only 200 s in."""
     from ttp import service
     p, head, clock, froms = _slow_stop_service(env, monkeypatch, exits_at=200, ready_at=ready_at,
@@ -153,7 +153,7 @@ def _deferred(env, monkeypatch, ready_at):
 
 def test_a_deferred_restart_whose_new_daemon_dies_is_rolled_back_later_once(env, monkeypatch):
     from ttp import service
-    p, head, clock = _deferred(env, monkeypatch, ready_at=None)
+    p, head, clock = _ss_deferred(env, monkeypatch, ready_at=None)
     # A newer restart's record written between the read and the claim is put back, not judged.
     path, replace = p.state / service.RESTART_DEFERRED, service.os.replace
 
@@ -178,7 +178,7 @@ def test_a_deferred_restart_whose_new_daemon_dies_is_rolled_back_later_once(env,
 
 def test_a_deferred_restart_whose_new_daemon_runs_is_left_alone(env, monkeypatch):
     from ttp import service
-    p, head, clock = _deferred(env, monkeypatch, ready_at=8.0)
+    p, head, clock = _ss_deferred(env, monkeypatch, ready_at=8.0)
     assert service.check_deferred(p, "new daemon") == "running"
     assert not (p.state / service.RESTART_DEFERRED).exists()
     _no_rollback(p, head)
@@ -187,7 +187,7 @@ def test_a_deferred_restart_whose_new_daemon_runs_is_left_alone(env, monkeypatch
 def test_a_deferred_restart_is_never_rolled_back_again_once_the_harness_moved_on(env, monkeypatch):
     from ttp import service
     # The updater already rolled back (or deployed again): the harness moved past the deferred commit.
-    p, head, clock = _deferred(env, monkeypatch, ready_at=None)
+    p, head, clock = _ss_deferred(env, monkeypatch, ready_at=None)
     _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m",
              "roll back runtime to abc: handled by the updater")
     assert service.check_deferred(p) == "superseded"

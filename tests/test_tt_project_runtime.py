@@ -27233,6 +27233,8 @@ DURABLE_EXEMPT = {
     ("landff.py", "os.replace(req, taken)"): "claims a landing request for the daemon; a claim lost to a crash only fails the waiting `ttp land`, which lands nothing",
     ("applyff.py", "os.replace(req, taken)"): "claims a fast-forward request for the daemon; a claim lost to a crash only fails the waiting --apply, which leaves main as it was",
     ("service.py", "os.replace(req, taken)"): "claims a restart request for one process; a reboot restarts the daemon anyway",
+    ("service.py", "os.replace(path, claim)"): "claims a deferred restart's check for one judge (a rename, no new data): one lost to a crash leaves no check, never a second rollback",
+    ("service.py", "os.replace(claim, path)"): "hands back a newer restart's deferred record claimed by mistake (a rename, no new data)",
     ("upstream.py", 'os.replace(src, src.with_name(QUEUED_FILE + ".filed"))'): "marks a run's queued notes filed; a rename lost to a crash only repeats sends that are dropped as duplicates",
     ("upstream.py", 'os.replace(src, src.with_name(ACKS_QUEUED + ".filed"))'): "marks a run's queued acks filed; a rename lost to a crash only records the same ack again, which still closes the item",
     ("batch.py", "path.write_bytes(text.encode())"): "git merge-file's inputs, in a temporary directory removed after",
