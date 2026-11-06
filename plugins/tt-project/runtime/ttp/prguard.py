@@ -1059,7 +1059,12 @@ def needs_stdin(args: list[str]) -> bool:
         return False
     if not args[0].startswith("-") and args[0] not in GH_COMMANDS:
         return True
-    if tuple(args[:2]) in STDIN_COMMANDS or STDIN_PATHS.intersection(args):
+    return tuple(args[:2]) in STDIN_COMMANDS or names_stdin(args)
+
+
+def names_stdin(args: list[str]) -> bool:
+    """Whether gh `args` name stdin explicitly: the needs_stdin forms but STDIN_COMMANDS and extensions."""
+    if STDIN_PATHS.intersection(args):
         return True
     if STDIN_PATHS.intersection(_opts(args, ("--input", "--body-file", "--notes-file"))):
         return True
@@ -1176,9 +1181,14 @@ def main(argv: list[str], own_dir: str) -> int:
         stdin_text = stdin_raw.decode("utf-8", "replace")
     from . import outscan
     try:
-        if stdin_text is None and not os.isatty(0) and outscan.gh_wants_stdin(args, real):
+        how = None if stdin_text is not None or os.isatty(0) else outscan.gh_stdin(args, real)
+        if how == "read":
             stdin_text = sys.stdin.read()   # scanned here, then passed on to gh
+        elif how == "probe":
+            stdin_text = outscan.probe_stdin()
         why = outscan.gh_problem(args, stdin_text, real)
+    except outscan.StdinRefused as e:
+        why = str(e)
     except Exception as e:   # fails closed: a run's gh call may carry what the scan is for
         why = f"refused: the leak scan failed ({type(e).__name__}); nothing was sent"
     if why:

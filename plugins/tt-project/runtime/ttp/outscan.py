@@ -12,8 +12,10 @@ the run read. It looks for:
 It covers a run's outward writes (TTP_TASK set):
 - every `gh` call through the run's bin/gh (prguard.main), its gh alias expanded: its arguments, and
   the files and stdin it sends (--body-file, --notes-file, --input, -F file and -F key=@file, gist
-  files, and stdin wherever gh keeps it: gist create, variable and secret set, workflow run, an alias
-  or extension; not auth login or codespace ssh, see STDIN_UNSCANNED);
+  files, and stdin wherever gh reads it: '-' or a stdin path, gist create, variable and secret set,
+  workflow run --json and the key and alias imports when their flags leave stdin as the input, and an
+  extension or shell alias once its stdin shows data or EOF within PROBE_STDIN_S (see gh_stdin); not
+  auth login or codespace ssh, see STDIN_UNSCANNED);
 - `ttp note --to` / `--reply` and `ttp notify`.
 A daemon's chat post (slack.Slack._body) cannot be refused without losing the message: stored values
 are masked there already (redact.scrub) and credential shapes are masked by mask_shapes().
@@ -25,6 +27,8 @@ from __future__ import annotations
 
 import os
 import re
+import select
+import time
 from typing import Callable
 
 # Credential shapes. Written so this file's own text matches none of them (the plugin's leak test).
@@ -156,15 +160,99 @@ def gh_resolve(args: list[str], real: str | None) -> tuple[list[str], str]:
 STDIN_UNSCANNED = frozenset((("auth", "login"), ("codespace", "ssh")))
 
 
-def gh_wants_stdin(args: list[str], real: str | None) -> bool:
-    """Whether a run's `gh <args>` may send its stdin off the host, so the scan reads it first (and gh
-    then gets it as read): every call prguard.needs_stdin keeps stdin for, after alias expansion, but
-    STDIN_UNSCANNED. A shell alias or an extension may read it too."""
-    from .prguard import needs_stdin
-    if not in_run() or not needs_stdin(args):
+# How long the scan waits for data or EOF on the stdin of a call whose stdin use it cannot know (an
+# extension, `extension exec`, a shell alias) before it refuses: it never reads ahead to EOF blind, so
+# an open pipe nobody writes to or closes (a parent's) cannot hang the call.
+PROBE_STDIN_S = 3
+# Value-taking flags of the commands that read stdin without '-' unless given a file, to find their
+# file arguments.
+_STDIN_VALUE_FLAGS = {
+    ("gist", "create"): ("-d", "--desc", "-f", "--filename"),
+    ("ssh-key", "add"): ("-t", "--title", "--type"),
+    ("gpg-key", "add"): ("-t", "--title"),
+    ("alias", "import"): (),
+    ("secret", "set"): ("-b", "--body", "-f", "--env-file", "-a", "--app", "-e", "--env", "-o", "--org",
+                        "-r", "--repos", "-v", "--visibility", "-R", "--repo"),
+    ("variable", "set"): ("-b", "--body", "-f", "--env-file", "-e", "--env", "-o", "--org", "-r", "--repos",
+                          "-v", "--visibility", "-R", "--repo"),
+}
+
+
+class StdinRefused(Exception):
+    """The scan could not read a call's stdin; the message is the one-line refusal."""
+
+
+def _flags(rest: list[str], value_flags: tuple) -> tuple[dict, list[str]]:
+    """The flags (name: value, or '' for a switch) and the positionals of gh arguments `rest`."""
+    flags, pos, it = {}, [], iter(rest)
+    for a in it:
+        if a == "--":
+            pos += list(it)
+        elif a.startswith("--"):
+            name, eq, val = a.partition("=")
+            flags[name] = val if eq else (next(it, "") if name in value_flags else "")
+        elif a.startswith("-") and a != "-":
+            name, val = a[:2], a[2:].removeprefix("=")
+            flags[name] = val or (next(it, "") if name in value_flags else "")
+        else:
+            pos.append(a)
+    return flags, pos
+
+
+def _gh_reads_stdin(args: list[str]) -> bool:
+    """Whether gh itself reads stdin (not a terminal) for one of prguard.STDIN_COMMANDS without '-', by
+    its flags: gist create, ssh-key and gpg-key add and alias import with no file argument; variable and
+    secret set with no (non-empty) --body/-b and no --env-file/-f, or with --env-file -; workflow run only with --json."""
+    from .prguard import STDIN_PATHS
+    cmd = tuple(args[:2])
+    if cmd == ("workflow", "run"):
+        return "--json" in _flags(args[2:], ("-r", "--ref", "-f", "--raw-field", "-F", "--field", "-R",
+                                             "--repo"))[0]
+    if cmd not in _STDIN_VALUE_FLAGS:
         return False
+    flags, pos = _flags(args[2:], _STDIN_VALUE_FLAGS[cmd])
+    if cmd in (("secret", "set"), ("variable", "set")):
+        env = flags.get("--env-file") or flags.get("-f")   # gh takes an empty one as not given
+        return env in STDIN_PATHS if env else not (flags.get("--body") or flags.get("-b"))
+    return not pos or bool(STDIN_PATHS.intersection(pos))
+
+
+def gh_stdin(args: list[str], real: str | None) -> str | None:
+    """How the scan reads a run's `gh <args>` stdin before gh (which then gets it as read): "read" to EOF
+    where gh itself reads it (an explicit '-' or stdin path, or a command that reads it by its flags, see
+    _gh_reads_stdin); "probe" where its use is unknown (an extension, `extension exec`, a shell alias),
+    see probe_stdin; None where gh leaves it alone, so a caller's stdin (a `while read` loop's) stays
+    unread and an open idle pipe cannot hang the call, and for STDIN_UNSCANNED. Aliases are expanded."""
+    from .prguard import GH_COMMANDS, names_stdin, needs_stdin
+    if not in_run() or not needs_stdin(args):
+        return None
     resolved, shell = gh_resolve(args, real)
-    return bool(shell) or tuple(resolved[:2]) not in STDIN_UNSCANNED and needs_stdin(resolved)
+    if shell or not resolved or resolved[0] not in GH_COMMANDS and not resolved[0].startswith("-") \
+            or resolved[:2] == ["extension", "exec"]:
+        return "probe"
+    if tuple(resolved[:2]) in STDIN_UNSCANNED:
+        return None
+    return "read" if names_stdin(resolved) or _gh_reads_stdin(resolved) else None
+
+
+def probe_stdin(wait_s: float = PROBE_STDIN_S) -> str:
+    """fd 0 read whole for a call whose stdin use is unknown, once it shows data or EOF within `wait_s`;
+    StdinRefused when it shows neither (an idle open pipe), does not end within prguard.HOOK_TIMEOUT_S
+    or is over HOOK_STDIN_MAX, so nothing unscanned leaves and nothing hangs."""
+    from .prguard import HOOK_STDIN_MAX, HOOK_TIMEOUT_S, _read_stdin
+    fix = "give it its input from a file or </dev/null; nothing was sent"
+    if not select.select([0], [], [], wait_s)[0]:
+        raise StdinRefused(f"refused: this gh call may send its stdin and the leak scan saw no data or end "
+                           f"on it within {wait_s:g} s; {fix}")
+    try:
+        data = _read_stdin(time.monotonic() + HOOK_TIMEOUT_S)
+    except TimeoutError:
+        raise StdinRefused(f"refused: gh's stdin did not end within {HOOK_TIMEOUT_S} s, so the leak scan "
+                           f"could not read it; {fix}") from None
+    except ValueError:
+        raise StdinRefused(f"refused: gh's stdin is over {HOOK_STDIN_MAX >> 20} MiB, more than the leak "
+                           f"scan reads; nothing was sent") from None
+    return data.decode()
 
 
 def _read(path: str) -> str:

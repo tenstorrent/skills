@@ -166,3 +166,71 @@ def test_runs_gh_scans_kept_stdin_aliases_and_field_files(env, tmp_path, monkeyp
     log.write_text("")
     r = _gh_main(p, tmp_path, ["auth", "login", "--with-token"], _OUT_SHAPE.encode(), fake=fake)
     assert r.returncode == 0 and _OUT_SHAPE in log.read_text()
+
+
+_OUT_ARGS_GH = '''#!{python}
+import os, sys
+a = sys.argv[1:]
+if a[:2] == ["alias", "list"]:
+    print("sh: !cat $1 | gh gist create")
+    sys.exit(0)
+with open(os.environ["FAKE_GH_LOG"], "a") as f:   # like gh where its flags leave stdin alone: never reads it
+    f.write(" ".join(a) + "\\n")
+'''
+
+
+def test_runs_gh_reads_stdin_ahead_only_where_gh_reads_it(env, tmp_path, monkeypatch):
+    """Review #6495: a command whose flags leave stdin alone is not read ahead, so an open idle pipe does
+    not hang it and a `while read` loop keeps its lines; where those flags leave stdin as the input, a
+    leak on it is still refused; an extension or shell alias with an idle pipe is refused, not hung."""
+    p = _outscan_project(env, monkeypatch)
+    fake = tmp_path / "argsbin"
+    fake.mkdir()
+    (fake / "gh").write_text(_OUT_ARGS_GH.format(python=sys.executable))
+    (fake / "gh").chmod(0o755)
+    log, f = tmp_path / "gh.log", tmp_path / "f.txt"
+    f.write_text("all green\n")
+    idle = [["workflow", "run", "w", "-f", "a=b"], ["variable", "set", "X", "--body", "v"],
+            ["secret", "set", "X", "-bv"], ["variable", "set", "X", "--env-file", str(f)],
+            ["secret", "set", "X", "-f", str(f)], ["gist", "create", str(f)], ["gist", "create", "-d", "x", str(f)],
+            ["ssh-key", "add", str(f), "-t", "k"], ["gpg-key", "add", str(f)], ["alias", "import", str(f)]]
+    for args in idle:
+        log.write_text("")
+        rd, wr = os.pipe()
+        try:
+            t0 = time.monotonic()
+            r = _gh_main(p, tmp_path, args, fake=fake, stdin=rd)
+            took = time.monotonic() - t0
+        finally:
+            os.close(rd)
+            os.close(wr)
+        assert r.returncode == 0 and took < 5 and log.read_text().count("\n") == 1, (args, took, r.stderr)
+    for args in (["myext", "send"], ["sh", "x"], ["extension", "exec", "myext"]):
+        log.write_text("")
+        rd, wr = os.pipe()
+        try:
+            t0 = time.monotonic()
+            r = _gh_main(p, tmp_path, args, fake=fake, stdin=rd)
+            took = time.monotonic() - t0
+        finally:
+            os.close(rd)
+            os.close(wr)
+        err = r.stderr.decode()
+        assert r.returncode == 1 and took < 10 and "nothing was sent" in err and log.read_text() == "", (args, err)
+    for args in (["secret", "set", "X"], ["variable", "set", "X", "--env-file=-"], ["variable", "set", "X", "-b", ""],
+                 ["ssh-key", "add", "-t", "k"], ["gpg-key", "add"], ["alias", "import"], ["gist", "create", "-p"]):
+        log.write_text("")
+        r = _gh_main(p, tmp_path, args, f"x {_OUT_SHAPE}".encode(), fake=fake)
+        assert r.returncode == 1 and "refused" in r.stderr.decode() and log.read_text() == "", args
+    # `while read x; do gh workflow run w -f a=$x; done < list` calls gh once per line.
+    from ttp import prguard
+    (tmp_path / "list").write_text("one\ntwo\n")
+    code = ("import sys; from ttp import prguard; "
+            "sys.exit(prguard.main(['gh', 'workflow', 'run', 'w', '-f', 'a=' + sys.argv[2]], sys.argv[1]))")
+    log.write_text("")
+    r = subprocess.run(["sh", "-c", 'while read x; do "$0" -c "$1" "$2" "$x"; done < "$3"', sys.executable, code,
+                        str(p.harness / "bin"), str(tmp_path / "list")], capture_output=True, timeout=60,
+                       env={**os.environ, "PATH": f"{p.harness / 'bin'}:{fake}:{os.environ['PATH']}",
+                            "TTP_PROJECT": str(p.base), "FAKE_GH_LOG": str(log)},
+                       cwd=str(pathlib.Path(prguard.__file__).parents[1]))
+    assert log.read_text() == "workflow run w -f a=one\nworkflow run w -f a=two\n", r.stderr
