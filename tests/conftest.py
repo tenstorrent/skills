@@ -115,9 +115,9 @@ def _git_global_config() -> None:
 _git_global_config()
 
 
-# No test writes into the account's own home folder: each one runs with HOME, the XDG folders and the
-# agent CLIs' config folders in a fresh temp folder of its own (_temp_home), and every process it starts
-# inherits them. Python's user packages stay importable from the account's own user base. A session
+# No test writes into the account's own home folder: each one runs with HOME, the XDG folders, gh's and the
+# agent CLIs' config folders in a fresh temp folder of its own (_temp_home), the session outside tests in
+# one of its own (_session_home), and every process they start inherits them. Python's user packages stay importable from the account's own user base. A session
 # also fails when, at its end, one of the account's own files below (HOME_WATCHED, under REAL_HOME) or
 # an untracked file in the repository the suite runs from is new or changed: what a test wrote there by
 # an absolute path, or relative to its working folder.
@@ -133,12 +133,65 @@ def _user_base() -> str | None:
 
 
 _USER_BASE = _user_base()
+_REAL_ENV = dict(os.environ)   # the account's own environment, for the credential snapshot below
 HOME_WATCHED = (".bash_profile", ".bash_login", ".bashrc", ".profile", ".zprofile", ".zshrc", ".zshenv",
                 ".gitconfig", ".gitmodules", ".config/git/config", ".ssh/config", ".ssh/authorized_keys",
                 ".mcp.json", ".ripgreprc", ".idea", ".vscode", ".claude/settings.json",
                 ".claude/settings.local.json", ".claude/CLAUDE.md", ".claude/skills", ".claude/agents",
                 ".claude/commands", ".claude/hooks", ".codex/config.toml", ".config/systemd/user",
                 "Library/LaunchAgents", ".local/bin/ttp")
+
+
+def _point_home(home: str, setenv, delenv) -> None:
+    """HOME, the XDG folders and gh's config folder under `home`; the agent CLIs' own config folders unset
+    (they fall back under HOME); the account's user packages still importable."""
+    setenv("HOME", home)
+    for var, sub in _XDG.items():
+        setenv(var, os.path.join(home, sub))
+    setenv("GH_CONFIG_DIR", os.path.join(home, ".config", "gh"))
+    for var in _AGENT_HOMES:
+        delenv(var)
+    if _USER_BASE and not os.environ.get("PYTHONUSERBASE"):
+        setenv("PYTHONUSERBASE", _USER_BASE)
+
+
+def _session_home() -> None:
+    """The same for the whole session, before any test module is imported: code that runs at collection,
+    in a session fixture or between tests never sees the account's home either."""
+    import atexit
+    import shutil
+    import tempfile
+    home = tempfile.mkdtemp(prefix="ttp-test-home-")
+    atexit.register(shutil.rmtree, home, True)
+    _point_home(home, os.environ.__setitem__, lambda var: os.environ.pop(var, None))
+
+
+_session_home()
+
+
+# The account's credential files (gh's hosts file, git's and netrc's credential files, ssh private keys,
+# the providers' login files) as the plugin's own list names them (credwatch.files), read by a child under
+# the account's real environment and compared by stat only (size, mtime, inode; never contents, as
+# credwatch.changes does): a session fails when one changed.
+_HERE = Path(__file__).resolve().parent
+_RUNTIME = next((d / "plugins" / "tt-project" / "runtime" for d in (_HERE.parent, _HERE)
+                 if (d / "plugins" / "tt-project" / "runtime" / "ttp" / "credwatch.py").is_file()), None)
+_CRED_SCRIPT = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nfrom ttp import credwatch\n"
+                "before = json.load(sys.stdin)\nnow = credwatch.snapshot()\n"
+                "print(json.dumps(now if before is None else credwatch.changes(before, now)))\n")
+
+
+def credential_marks(before: dict | None = None):
+    """credwatch.snapshot() of the account's credential files, or with `before` the changes since it
+    ([[path, how], ...]); None when the plugin's runtime is not beside this file or the child fails."""
+    if _RUNTIME is None:
+        return None
+    try:
+        r = subprocess.run([sys.executable, "-I", "-c", _CRED_SCRIPT, str(_RUNTIME)], input=json.dumps(before),
+                           capture_output=True, text=True, timeout=60, env=_REAL_ENV, cwd=os.sep)
+        return json.loads(r.stdout) if r.returncode == 0 else None
+    except (OSError, ValueError, subprocess.SubprocessError):
+        return None
 
 
 @pytest.fixture(autouse=True)
@@ -148,13 +201,7 @@ def _temp_home(tmp_path_factory, monkeypatch):
     root.mkdir(mode=0o700, exist_ok=True)
     import tempfile
     home = tempfile.mkdtemp(prefix="home-", dir=root)
-    monkeypatch.setenv("HOME", home)
-    for var, sub in _XDG.items():
-        monkeypatch.setenv(var, os.path.join(home, sub))
-    for var in _AGENT_HOMES:
-        monkeypatch.delenv(var, raising=False)
-    if _USER_BASE and not os.environ.get("PYTHONUSERBASE"):
-        monkeypatch.setenv("PYTHONUSERBASE", _USER_BASE)
+    _point_home(home, monkeypatch.setenv, lambda var: monkeypatch.delenv(var, raising=False))
     if os.environ.get("GIT_CONFIG_GLOBAL"):   # a `git config --global` of its own: tests never share one
         own = Path(home, ".gitconfig")   # a copy, not an include: see _git_global_config
         own.write_bytes(_session_git_config(os.environ["GIT_CONFIG_GLOBAL"]))
@@ -474,6 +521,7 @@ def pytest_sessionstart(session):
     _STARTED = time.time()
     if not os.environ.get("PYTEST_XDIST_WORKER"):
         session.config._ttp_outside = _outside_snapshot(session.config)
+        session.config._ttp_creds = credential_marks()
 
 
 def pytest_sessionfinish(session, exitstatus):
@@ -482,6 +530,12 @@ def pytest_sessionfinish(session, exitstatus):
     if written:
         _report(session, ["tests wrote outside their temp folders (the account's home folder or the "
                           "repository the suite runs from):"] + written)
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
+    creds = getattr(session.config, "_ttp_creds", None)
+    changed = credential_marks(creds) if creds else None
+    if changed:
+        _report(session, ["the account's credential files changed while the tests ran (stat only: size, mtime, "
+                          "inode; a test must use its temp HOME):"] + [f"  {path}: {how}" for path, how in changed])
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
     if not any(i.path.name.startswith(_SHARDED) for i in session.items):
         return

@@ -1298,7 +1298,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     account's own files. Every test (forked or not) runs with HOME, the XDG folders and git's global
     config in temp folders that the processes it starts inherit, and a session fails, naming the paths,
     when a test still wrote one of the account's own files by an absolute path, or left an untracked
-    file in the repository the suite runs from."""
+    file in the repository the suite runs from. Code run at import or collection sees a session temp HOME
+    too, and a session fails when a credential file (gh's hosts file here) changed, by stat alone."""
     import shutil
     import subprocess
     real, repo, out = tmp_path / "realhome", tmp_path / "repo", tmp_path / "out"
@@ -1309,18 +1310,24 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     (real / ".local" / "bin" / "ttp").write_text("#!/bin/sh\n")
     (real / ".claude").mkdir()
     (real / ".claude" / "settings.json").write_text("{}\n")
+    (real / ".config" / "gh").mkdir()
+    (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: mine\n")
     out.mkdir()
     subprocess.run(["git", "init", "-q", str(repo)], check=True)
     (repo / ".gitignore").write_text("__pycache__/\n")
     shutil.copy(pathlib.Path(__file__).with_name("conftest.py"), repo / "conftest.py")
+    (repo / "plugins" / "tt-project").mkdir(parents=True)   # the plugin's credential list (credwatch)
+    (repo / "plugins" / "tt-project" / "runtime").symlink_to(RUNTIME.parent)
     (repo / "test_tt_project_home.py").write_text(
         "import os, pathlib, subprocess, pytest\n"
         "REAL = os.environ['REAL']\n"
+        "assert not os.environ['HOME'].startswith(REAL) and not os.environ['GH_CONFIG_DIR'].startswith(REAL)\n"
         "@pytest.mark.parametrize('i', range(60))\n"
         "def test_home(i):\n"
         "    home = pathlib.Path.home()\n"
         "    assert str(home) != REAL and not str(home).startswith(REAL) and [p.name for p in home.iterdir()] == ['.gitconfig']\n"
         "    assert os.environ['XDG_CONFIG_HOME'] == str(home / '.config') and 'CLAUDE_CONFIG_DIR' not in os.environ\n"
+        "    assert os.environ['GH_CONFIG_DIR'] == str(home / '.config' / 'gh')\n"
         "    sh = 'echo \"$HOME\"; cd ~ && printf x > .bashrc && git config --global t.k v'\n"
         "    if i == 0:\n"
         "        sh += ' && python3 -c \"import pytest\"'   # the account's user packages still import\n"
@@ -1335,6 +1342,8 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        pathlib.Path(REAL, '.bashrc').write_text('changed\\n')\n"
         "        pathlib.Path(REAL, '.config/systemd/user/x.service').write_text('')\n"
         "        pathlib.Path('left.txt').write_text('x')\n"
+        "    if os.environ.get('CRED'):\n"
+        "        pathlib.Path(REAL, '.config/gh/hosts.yml').write_text('token: x\\n')\n"
         "def test_rewrite():\n"   # the account's own tooling (a deploy's `ttp setup`) rewriting a file
         "    for rel, text in (('.local/bin/ttp', '#!/bin/sh\\n'), ('.claude/settings.json', '{}\\n')):\n"
         "        path, tmp = pathlib.Path(REAL, rel), pathlib.Path(REAL, rel + '.tmp')\n"
@@ -1342,7 +1351,7 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
         "        os.replace(tmp, path)\n"
         "        os.utime(path, ns=(path.stat().st_atime_ns, path.stat().st_mtime_ns + 10**9))\n")
     env = {**os.environ, "HOME": str(real), "REAL": str(real), "OUT": str(out), "TTP_TEST_JOBS": "3"}
-    for var in ("CI", "GIT_CONFIG_GLOBAL", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
+    for var in ("CI", "GIT_CONFIG_GLOBAL", "GH_CONFIG_DIR", "XDG_CONFIG_HOME", "XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"):
         env.pop(var, None)
 
     def run(*args, **extra):
@@ -1360,9 +1369,14 @@ def test_every_test_gets_its_own_temp_home_and_a_session_that_writes_outside_fai
     # A test that still writes there, by an absolute path or relative to its working folder.
     r = run("-k", "test_leak", LEAK="1")
     assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
-    assert "tests wrote outside their temp folders" in r.stdout, r.stdout
+    assert "tests wrote outside their temp folders" in r.stdout and "credential files changed" not in r.stdout, r.stdout
     for line in (f"{real}/.bashrc: changed", f"{real}/.config/systemd/user/x.service: created", f"{repo}/left.txt: created"):
         assert f"  {line}\n" in r.stdout, r.stdout
+    # A credential file rewritten by an absolute path (the damage once done to a host's gh login).
+    r = run("-k", "test_leak", CRED="1")
+    assert r.returncode == 1 and "1 passed" in r.stdout, r.stdout + r.stderr
+    assert "credential files changed" in r.stdout and f"  {real}/.config/gh/hosts.yml: changed\n" in r.stdout, r.stdout
+    (real / ".config" / "gh" / "hosts.yml").write_text("github.com:\n    oauth_token: mine\n")
     # A rewrite with the same bytes and a new mtime is no change; other bytes still are.
     r = run("-k", "test_rewrite")
     assert r.returncode == 0 and "1 passed" in r.stdout and "wrote outside" not in r.stdout, r.stdout + r.stderr
