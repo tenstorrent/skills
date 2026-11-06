@@ -575,8 +575,8 @@ def pytest_sessionfinish(session, exitstatus):
     creds = getattr(session.config, "_ttp_creds", None)
     changed = credential_marks(creds) if creds else None
     if changed:
-        _report(session, ["the account's credential files or protected paths changed while the tests ran (stat "
-                          "only: size, mtime, ctime, inode; a test must use its temp HOME):"] + [f"  {path}: {how}" for path, how in changed])
+        _report(session, ["the account's credential files changed while the tests ran (stat only: size, mtime, "
+                          "inode; a test must use its temp HOME):"] + [f"  {path}: {how}" for path, how in changed])
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
     secret = getattr(session.config, "_ttp_secret", None)
     moved = folder_changes(secret, folder_marks(secret_folders())) if secret is not None else []
