@@ -1119,9 +1119,10 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     # spent its checks on the others (batch._close marks them "untested").
     untested = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("untested")]
     yielded = [r for r in rows if last and r["batch"] == last["id"] and _detail(r).get("yielded")]
-    if yielded and (hot := [r for r in rows if r["id"] not in tried and _yields(db, r)]):
+    if yielded and (hot := [r for r in rows if r["id"] not in tried and r["batch"] != last["id"] and _yields(db, r)]):
         # The last batch stopped its search for these (batch.Batch._yield_now): they go alone, before
-        # the approvals it requeued, so no routine one's failure costs them a bisect again.
+        # the approvals it requeued, so no routine one's failure costs them a bisect again. Its own
+        # entries never count here, urgent or not: taking them again would only restart its search.
         return hot[:cap], (f"{len(hot)} urgent or priority-1 approval{'s' if len(hot) != 1 else ''} that "
                            f"{last['id']} stopped its search for; its {len(yielded)} requeued approval"
                            f"{'s' if len(yielded) != 1 else ''} go next")

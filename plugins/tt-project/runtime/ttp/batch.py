@@ -81,6 +81,7 @@ DROP_CONFIG = ("-c", "rebase.autoSquash=false", "-c", "rebase.missingCommitsChec
 RESCUES = 1                        # checks per batch of the entries after a blamed one, replayed without it
 NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
+YIELD_GRACE_S = 300.0              # delivery.push_yield_grace_s: an urgent approval stops a batch only if approved this soon after its checks began
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
 CARRY_TRIES = 5                    # recorded passes of one check on other tips tried for a carry (verdictcarry)
@@ -1305,6 +1306,7 @@ class Batch:
         self.pre_existing: list[dict] = []     # failures whose tests failed on the tip alone too: {ids, tip, cmd, entry, runs}
         self.fail_rc: dict[str, int] = {}      # a failed check's output tail -> its exit code (_tip_ids)
         self.yielded_to: list[int] = []        # queue ids of urgent approvals the search stopped for (_yield_now)
+        self.checks_at: float | None = None    # when this batch's first check began (_check): the yield grace counts from it
 
     # results
 
@@ -1938,6 +1940,8 @@ class Batch:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
         runs no command. A check whose failing tests pass on one rerun at `head` passes (_flaky)."""
+        if self.checks_at is None:
+            self.checks_at = time.time()
         self._checkout(head)
         stale = push.stale_versions(self.wt, self.tip) if push.version_guard(self.d) else []
         if stale:
@@ -2422,12 +2426,16 @@ class Batch:
         batch. Then the search stops: the prefix known to pass goes, a blamed entry stays blamed, the
         rest is requeued "yielded", and the queue runs the urgent ones alone next (pushq.due), so they
         never wait out the rest of a bisect. The requeued ones are searched anew on the new tip: no entry
-        is blamed on a tip it was not checked on, and the urgent ones are never in that search."""
+        is blamed on a tip it was not checked on, and the urgent ones are never in that search. Only
+        approvals made within delivery.push_yield_grace_s of this batch's first check stop it, and it
+        stops once at most (_yield_late)."""
         if not self.yielded_to and self._may_yield():
             try:
                 skip = self.m.get("yield_skip") if isinstance(self.m.get("yield_skip"), dict) else {}
                 skip = set(skip.get("ids") or []) if self.tip and skip.get("tip") == self.tip else set()
-                self.yielded_to = [i for i in urgent.approvals_waiting(self.p.db, self.target) if i not in skip]
+                late = self._yield_late()
+                self.yielded_to = [i for i in urgent.approvals_waiting(self.p.db, self.target)
+                                   if i not in skip and i not in late]
             except Exception as e:      # a queue it cannot read: the search goes on as before
                 say(f"cannot read the push queue for urgent approvals: {type(e).__name__}: {e}")
             if self.yielded_to:
@@ -2435,6 +2443,20 @@ class Batch:
                 say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, self.yielded_to))} "
                     f"wait{'s' if n == 1 else ''}: the search stops here and {'they go' if n > 1 else 'it goes'} next")
         return bool(self.yielded_to)
+
+    def _yield_late(self) -> set[int]:
+        """Queue ids of approved rows for this target approved more than delivery.push_yield_grace_s
+        (YIELD_GRACE_S) after this batch's checks began: they never stop it, so a stream of urgent
+        approvals cannot restart batch after batch; they go first in the next batch (pushq.due), which
+        starts as soon as this one ends."""
+        if self.checks_at is None:
+            return set()
+        try:
+            grace = max(0.0, float(self.d.get("push_yield_grace_s", YIELD_GRACE_S)))
+        except (TypeError, ValueError):
+            grace = YIELD_GRACE_S
+        return {r["id"] for r in self.p.db.q("SELECT id FROM push_queue WHERE status='approved' AND target=? "
+                                              "AND created>?", (self.target, self.checks_at + grace))}
 
     def _urgent_mark(self) -> bool:
         """Whether this batch's checks run under an urgent landing mark (_stream): one of its entries is

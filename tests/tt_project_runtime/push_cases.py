@@ -2136,6 +2136,65 @@ def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_th
         "no gap after a stopped search: the requeued ones go on at once"
 
 
+@pytest.mark.parametrize("grace", [None, 0])
+def test_an_urgent_approval_past_the_yield_grace_never_stops_the_batch(env, monkeypatch, grace):
+    """delivery.push_yield_grace_s: an urgent approval made within it of the batch's first check stops
+    the search (default 300 s); one made later never does, so the batch blames entry 6 and lands the rest."""
+    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    if grace is not None:
+        p.set_config("delivery.push_yield_grace_s", grace)
+    _approved_mid_search(p, monkeypatch, 2, 1)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    if grace is None:
+        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+    else:
+        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+
+
+def test_a_stream_of_urgent_approvals_every_few_minutes_still_lets_a_batch_land(env, monkeypatch):
+    """A new urgent approval after every check, each made minutes after the batch's checks began (past
+    the default grace): none stops the batch, which finishes its search and lands every entry but the
+    culprit; the urgent ones wait for the next batch."""
+    from ttp import batch
+    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    real, ran = batch.Batch._check, []
+
+    def check(self, head, checks):
+        got = real(self, head, checks)
+        ran.append(head)
+        tid = p.db.add_task(f"hot {len(ran)}", "s", kind="review", origin="coordinator", priority=1)
+        p.db.update_task(tid, status="pushing")
+        at = self.checks_at + batch.YIELD_GRACE_S + 180 * len(ran)
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) "
+               "VALUES(?, 'u', ?, 'origin/proj', 'approved', ?, ?)", (tid, "0" * 40, at, at))
+        return got
+    monkeypatch.setattr(batch.Batch, "_check", check)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and not m.get("yielded_to"), m
+    assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
+    assert len(ran) == 5, "the full head, three probes and the rescue: never cut short"
+
+
+def test_after_a_stopped_search_its_own_urgent_entries_never_take_the_place_of_the_ones_it_stopped_for(env, monkeypatch):
+    """The batch requeued urgent entries of its own when it stopped for a newer urgent approval: the
+    next batch takes the newer one alone, not its own entries again (that only restarts its search)."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
+    _pq_earlier(s)
+    rows = [_pq_review(s, priority=1)[1], _pq_review(s, priority=1)[1]]
+    now = time.time()
+    s.p.db.x("INSERT INTO push_batches(id, marker, target, started) VALUES('b1', 'm', 'origin/proj', ?)", (now,))
+    s.p.db.x("UPDATE push_queue SET status='batched', batch='b1' WHERE id IN (?,?)", tuple(rows))
+    hot = _pq_review(s, priority=1)[1]
+    m = {"outcome": "yielded", "ended": now, "yielded_to": [hot],
+         "results": [{"id": r, "status": "requeued", "detail": {"yielded": True}} for r in rows]}
+    pushq._apply(s.p, {"id": "b1", "target": "origin/proj"}, m, lambda *a, **k: None, now)
+    s.p.db.x("UPDATE push_batches SET after_finalized=? WHERE id='b1'", (now,))
+    got, why = pushq.due(s.p, now + 1)
+    assert [r["id"] for r in got] == [hot] and "b1 stopped its search for" in why, why
+
+
 def test_a_pushed_approval_the_batch_carried_across_a_shared_doc_conflict_is_noted_on_its_review(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)
