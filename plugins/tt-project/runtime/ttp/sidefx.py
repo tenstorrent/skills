@@ -57,6 +57,11 @@ PATTERN_OPTS = {"-e", "--regexp", "--expression"}
 SSH_VALUE_OPTS = set("bcDEeFIiJLlmOoPpRSWw")
 REGEX_LITERAL_RE = re.compile(r"(?:^|(?<=[\s(!,~;{&|]))/(?:[^/\\\n]|\\.)+/")
 REGEX_PATH_RE = re.compile(r"\^|\\[dDwWsSbB.(){}+*?|]|\$(?![\w{(])")   # anchors or escapes: pattern text, not a path
+# Words before a command that leave the next word in command position, with their options that take a value
+PREFIXES = {"sudo": set("ugChprtUD"), "env": set("uCS"), "xargs": set("IinPLldsEae"), "time": set("fo"),
+            "nice": set("n"), "nohup": set(), "exec": set("a"), "command": set(), "builtin": set(), "!": set(),
+            "if": set(), "then": set(), "else": set(), "elif": set(), "while": set(), "until": set(), "do": set(),
+            "{": set()}
 LOCAL_TEXT_MAX = 50000   # longer commands (a big heredoc) are read as they are
 TOOL_OUTPUT_RE = re.compile(r"/\.claude/projects/[^/]+/tool-results(?:/|$)")
 HARMLESS = ("/dev/null", "/dev/stdout", "/dev/stderr", "/dev/fd/", "/dev/tty", "/proc/self/")
@@ -110,9 +115,10 @@ def _local_text(cmd: str, depth: int = 0) -> str:
         at = i + len(t) if i >= 0 else at
     new: dict[int, str] = {}
     punct = [all(c in "();<>|&\n" for c in t) for t in toks]
+    commands = _commands(toks, punct)
     for i, t in enumerate(toks):
         name = t.rsplit("/", 1)[-1]
-        if punct[i] or name not in GREPS | PROGS | SHELLS | {"ssh"}:
+        if punct[i] or name not in GREPS | PROGS | SHELLS | {"ssh"} or i not in commands:
             continue
         j, words, explicit = i + 1, [], False
         while j < len(toks) and not punct[j]:
@@ -148,6 +154,30 @@ def _local_text(cmd: str, depth: int = 0) -> str:
     for k in sorted(new, reverse=True):
         if spans[k] and new[k] != toks[k]:
             out = out[:spans[k][0]] + new[k] + out[spans[k][1]:]
+    return out
+
+
+def _commands(toks: list[str], punct: list[bool]) -> set[int]:
+    """The indexes of the words in command position: the first word of each command (after ; | & ( or a
+    newline), past VAR=val, sudo, env, xargs, time and the like and their options. A redirect's target
+    and a command's arguments are not, so an argument ending in /rg or /sed is no grep or sed."""
+    out, at_cmd, opts, skip = set(), True, None, False
+    for i, t in enumerate(toks):
+        if punct[i]:
+            at_cmd, opts, skip = (at_cmd, opts, True) if any(c in "<>" for c in t) else (True, None, False)
+        elif skip:   # a redirect's target
+            skip = False
+        elif not at_cmd:
+            continue
+        elif opts is not None and t.startswith("-") and len(t) > 1:
+            skip = len(t) == 2 and t[1] in opts   # an option that takes the next word
+        elif re.fullmatch(r"[A-Za-z_]\w*=.*", t, re.S):
+            continue
+        elif t in PREFIXES:
+            opts = PREFIXES[t]
+        else:
+            out.add(i)
+            at_cmd, opts = False, None
     return out
 
 

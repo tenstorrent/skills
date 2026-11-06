@@ -204,6 +204,35 @@ def test_outside_writes_skips_regex_text_ssh_remote_commands_and_saved_tool_outp
     assert found("echo hi 2>&1 > /tmp/s") == {"/tmp/s"} and found("echo 'unclosed > /tmp/u") == {"/tmp/u"}
 
 
+def test_outside_writes_reads_a_tool_name_only_in_command_position(tmp_path, scratch_home):
+    from ttp import sidefx
+    wt, rd = tmp_path / "wt", tmp_path / "run"
+    wt.mkdir(), rd.mkdir()
+    h = str(scratch_home)
+
+    def found(*cmds):
+        (rd / "output.jsonl").write_text(json.dumps(_claude_calls(*(("Bash", {"command": c}) for c in cmds))[0]) + "\n")
+        return {f["path"] for f in sidefx.scan(rd, str(wt))}
+
+    # an argument ending in /rg, /sed, /ssh or /sh is no tool: the write targets after it stay named
+    assert f"{h}/.ssh/authorized_keys" in found("cp ./tools/rg ~/.ssh/authorized_keys")
+    assert f"{h}/.ssh/a" in found("rm -rf ~/x/sed ~/.ssh/a")
+    assert f"{h}/.ssh/b" in found("cp /opt/bin/ssh ~/.ssh/b")
+    assert f"{h}/.config/c" in found("mv /usr/bin/sh $HOME/.config/c")
+    assert found("echo x > /tmp/rg /tmp/o") >= {"/tmp/o"}   # a redirect target named rg is no grep
+    # a tool in command position, behind sudo, VAR=val, xargs, time or a separator, still has its text blanked
+    lt = sidefx._local_text
+    assert lt("sudo rg /etc/x ~/.ssh") == "sudo rg  ~/.ssh"
+    assert lt("sudo -u root rg /etc/x f") == "sudo -u root rg  f"
+    assert lt("FOO=1 sed -n '/^a/p' f") == "FOO=1 sed -n 'p' f"
+    assert lt("find . | xargs grep /x") == "find . | xargs grep "
+    assert lt("a; ssh host rm /tmp/r") == "a; ssh host  "
+    assert lt("time awk '/x/ {print}' f") == "time awk ' {print}' f"
+    assert lt("if grep -q /x f; then rm y; fi") == "if grep -q  f; then rm y; fi"
+    assert found("sudo rg x ~/.ssh", "FOO=1 sed -n p f", "find . | xargs grep /x",
+                 "a; ssh host rm /tmp/r", "time awk '/x/ {print}' f > out.txt") == {f"{h}/.ssh"}
+
+
 def test_a_later_failed_run_that_touched_nothing_keeps_the_earlier_runs_writes_named(env, tmp_path, scratch_home):
     from ttp.daemon import Daemon
     from ttp import prompts
