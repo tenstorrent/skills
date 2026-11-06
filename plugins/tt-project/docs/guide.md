@@ -459,11 +459,17 @@ prolonged whole-box outage.
   tools unless `no_internet`) under a worker's PreToolUse checks, so it can edit, build, ssh to the
   machines its charter allows and run the `ttp` CLI. Direct writes to the charter, the memory
   files, `harness/project.json` and the state database are denied, each naming the action or
-  command that applies the same checks (`charter_update`, `memory_add`, `config_set`, `ttp config`);
-  any raw `git push` and any `ttp push` that lands or moves a tag is denied, by the hook and again
+  command that applies the same checks (`charter_update`, `memory_add`, `config_set`, `ttp config`).
+  As those checks read the command text, each Bash call is also compared before and after: a change
+  to the charter, a memory file or `project.json` that `ttp` itself did not write (a variable, glob or
+  script write) is put back and reported in the tool result and as a `coord_protected_write` event.
+  The state database is not compared (the daemon writes it all the time); only the command-text
+  check covers it. Any raw `git push` and any `ttp push` that lands or moves a tag is denied, by the hook and again
   at run time by `ttp push` and the harness's `git` wrapper: code goes through a work branch, a
   worker task, review and the push queue, and a channel tag moves only in a release cut task. A
-  coordinator run holds no device (`TTP_NO_DEVICE=1`), so the worker device-run rule binds it. A
+  coordinator run holds no device (`TTP_NO_DEVICE=1`), so the worker device-run rule binds it: a
+  device test run outside `ttp sandbox` is denied with the sandboxed form as its hint, never
+  rewritten as a worker's is, since heavy device work goes to a worker task. A
   foreground command stops at `tool_timeout_s` (300, at most 600); a longer or background one is
   denied with a pointer to `ttp detach` or a worker task. Each mutating call (the command or file,
   its exit code) goes to the run's `tool-audit.jsonl` and `progress.md`, which the web run view

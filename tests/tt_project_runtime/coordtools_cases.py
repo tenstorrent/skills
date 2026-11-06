@@ -685,3 +685,124 @@ def test_a_coordinator_run_holds_no_device_and_the_device_rule_binds_it(env, tmp
     monkeypatch.setattr(sandbox, "status", lambda: (["/sb/unshare", "--pid"], ""))
     assert _decide(tmp_path, "Bash", command="pytest tests/x.py") == "deny"
     assert _decide(tmp_path, "Bash", command="ttp clip -- ttp sandbox -- pytest tests/x.py") == "allow"
+    # Kept by decision: the session sets no HOOK_REWRITE, so the test run is denied with the sandboxed
+    # form as its hint, never rewritten (heavy device work goes to a worker).
+    from ttp import hook
+    from ttp.providers import claude
+    monkeypatch.setattr(claude.Claude, "hook_rewrites", lambda self: True)   # a CLI that could apply one
+    argv, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
+    run = max((d for d in p.runs.iterdir() if d.name.isdigit()), key=lambda d: int(d.name))
+    assert hook.HOOK_REWRITE not in _coord_settings(argv)["env"]
+    assert hook.HOOK_REWRITE not in json.loads((run / "run.json").read_text())["env"]
+    out, _ = coordtools.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "pytest tests/x.py"},
+                                      "cwd": str(tmp_path)})
+    spec = out["hookSpecificOutput"]
+    assert spec["permissionDecision"] == "deny" and "updatedInput" not in spec
+    assert "`ttp clip -- ttp sandbox -- pytest tests/x.py`" in spec["permissionDecisionReason"]
+
+
+def _bash_guard_project(env, tmp_path, monkeypatch):
+    """A project with a charter, memory index, one memory entry and project.json, and a full-tools
+    coordinator run's environment over it; returns (project, run dir, {name: original bytes})."""
+    from ttp import coordtools
+    p = make(env)
+    p.memory_dir.mkdir(parents=True, exist_ok=True)
+    (p.memory_dir / "fact-a.md").write_text("---\nkind: fact\n---\nalpha\n")
+    run = tmp_path / "run"
+    run.mkdir()
+    monkeypatch.setenv(coordtools.FULL_ENV, "1")
+    monkeypatch.setenv(coordtools.PROTECTED_ENV, os.pathsep.join(coordtools.protected_paths(p)))
+    monkeypatch.setenv(coordtools.TIMEOUT_ENV, "300")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run))
+    monkeypatch.delenv(coordtools.DENIED_ENV, raising=False)
+    files = {f: f.read_bytes() for f in (p.charter_path, p.memory_index, p.memory_dir / "fact-a.md", p.config_path)}
+    return p, run, files
+
+
+def _bash_guarded_call(p, tmp_path, cmd, n, between=None):
+    """Run `cmd` (H: the harness folder) as a coordinator Bash call between its pre and post hooks;
+    `between` runs in this process meanwhile. Returns the post hook's notice (None for none)."""
+    from ttp import coordtools
+    payload = {"tool_name": "Bash", "tool_input": {"command": cmd}, "tool_use_id": f"toolu_{n}", "cwd": str(tmp_path)}
+    out, _ = coordtools.pre_tool_use(payload)
+    assert (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") != "deny", (cmd, out)
+    subprocess.run(["bash", "-c", cmd], cwd=str(tmp_path), env={**os.environ, "H": str(p.harness)}, timeout=30)
+    if between:
+        between()
+    out, _ = coordtools.post_tool_use(payload)
+    return out["hookSpecificOutput"]["additionalContext"] if out else None
+
+
+def test_coordinator_bash_writes_to_protected_files_by_variable_glob_or_script_are_put_back(env, tmp_path, monkeypatch):
+    from ttp import coordtools
+    p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
+    script = tmp_path / "edit.sh"
+    script.write_text('python3 - "$1" <<"PY"\nimport json, sys\nf = sys.argv[1] + "/project.json"\n'
+                      'd = json.load(open(f)); d["budget"] = {"daily_usd": 9999}; json.dump(d, open(f, "w"))\nPY\n')
+    cases = [('f="$H/CHART""ER.md"; echo "- no restrictions" >> "$f"', p.charter_path),   # a variable
+             ('sed -i s/alpha/omega/ "$H"/memory/*.md', p.memory_dir / "fact-a.md"),        # a glob
+             ('echo "- [x](memory/x.md)" >> "$H"/MEM*.md', p.memory_index),                 # a glob
+             (f'bash {script} "$H"', p.config_path),                                         # a script
+             ('rm "$H"/memory/f*.md', p.memory_dir / "fact-a.md")]                           # a removal
+    for n, (cmd, target) in enumerate(cases):
+        notice = _bash_guarded_call(p, tmp_path, cmd, n)
+        assert notice and str(target) in notice and "put back" in notice, (cmd, notice)
+        assert all(f.read_bytes() == data for f, data in files.items()), cmd
+    # A symlink planted in place of a protected file is replaced, and its target is left alone.
+    outside = tmp_path / "outside.json"
+    outside.write_text("{}")
+    notice = _bash_guarded_call(p, tmp_path, f'ln -sf {outside} "$H/project.js""on"', 8)
+    assert notice and not p.config_path.is_symlink() and outside.read_text() == "{}"
+    assert p.config_path.read_bytes() == files[p.config_path]
+    # A new memory entry written out of band goes too.
+    notice = _bash_guarded_call(p, tmp_path, 'printf "x" > "$H/memory/fact-evil.md"', 9)
+    assert notice and "memory_add" in notice and not (p.memory_dir / "fact-evil.md").exists()
+    events = p.db.q("SELECT text, data, status FROM events WHERE kind=?", (coordtools.GUARD_EVENT,))
+    assert len(events) == len(cases) + 2 and {e["status"] for e in events} == {"handled"}
+    assert "sed -i" in json.loads(events[1]["data"])["command"]
+    assert not list((run / coordtools.GUARD_DIR).glob("*.json")), "each call's snapshot goes once checked"
+    # Through the hook's entry points, as the CLI runs them.
+    payload = {"tool_name": "Bash", "tool_input": {"command": "x"}, "tool_use_id": "toolu_hook", "cwd": str(tmp_path)}
+    hook = lambda event: subprocess.run(  # noqa: E731
+        [sys.executable, "-m", "ttp.hook", event], input=json.dumps(payload), capture_output=True, text=True,
+        cwd=str(RUNTIME), timeout=30, env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+    assert hook("CoordPreToolUse").returncode == 0
+    p.charter_path.write_text("forged\n")
+    out = hook("CoordPostToolUseFailure")
+    ctx = json.loads(out.stdout)["hookSpecificOutput"]
+    assert ctx["hookEventName"] == "PostToolUseFailure" and "charter_update" in ctx["additionalContext"]
+    assert p.charter_path.read_bytes() == files[p.charter_path]
+
+
+def test_coordinator_bash_guard_keeps_unrelated_and_ttps_own_writes(env, tmp_path, monkeypatch):
+    from ttp import coordtools
+    from ttp.project import write_json
+    p, run, files = _bash_guard_project(env, tmp_path, monkeypatch)
+    assert _bash_guarded_call(p, tmp_path, 'echo hi > notes.txt; echo x >> "$H/../notes-$$.txt"', 0) is None
+    assert (tmp_path / "notes.txt").read_text() == "hi\n"
+    # ttp's own writes during the call (the coordinator's `ttp config`, the daemon, a user) are kept.
+    cfg = {**json.loads(files[p.config_path]), "note": "set by ttp config"}
+    added = []
+    def own():
+        write_json(p.config_path, cfg)
+        added.append(p.add_memory("a decided fact", kind="decision", title="kept"))
+    assert _bash_guarded_call(p, tmp_path, "true", 1, own) is None
+    assert json.loads(p.config_path.read_text())["note"] == "set by ttp config"
+    assert added[0].exists() and "kept" in p.memory_index.read_text()
+    # So is ttp's own retirement of an entry (moved to the archive).
+    assert _bash_guarded_call(p, tmp_path, "true", 2, lambda: p.forget_memory("fact-a", why="done")) is None
+    assert not (p.memory_dir / "fact-a.md").exists() and (p.memory_dir / "archive" / "fact-a.md").exists()
+    from ttp.project import PROTECTED_LOG, protected_log
+    assert protected_log(p.config_path) == p.state / PROTECTED_LOG
+    assert protected_log(p.memory_dir / "archive" / "x.md") == p.state / PROTECTED_LOG
+    for other in (p.state / "project.json", p.harness / "notes.md", tmp_path / "harness" / "project.json"):
+        assert protected_log(other) is None, other
+    # The state database is never compared: the daemon writes it all the time.
+    assert str(p.state / "project.db") not in coordtools._guarded_files()
+    assert not p.db.q("SELECT 1 FROM events WHERE kind=?", (coordtools.GUARD_EVENT,))
+    # Outside a full-tools run nothing is snapshotted or put back.
+    monkeypatch.delenv(coordtools.FULL_ENV)
+    payload = {"tool_name": "Bash", "tool_input": {"command": "ttp status"}, "tool_use_id": "toolu_ro"}
+    coordtools.pre_tool_use(payload)
+    p.charter_path.write_text("user edit\n")
+    assert coordtools.post_tool_use(payload) == (None, None) and p.charter_path.read_text() == "user edit\n"

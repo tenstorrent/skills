@@ -17,13 +17,18 @@ the push queue; a channel tag moves only in a release cut task after its candida
 --queue`, `--result` and `--free` stay), and no foreground command past coordinator.session.tool_timeout_s
 (TOOL_TIMEOUT_S; the CLI's own Bash timeout is set to it too): longer work goes to `ttp detach` or a
 worker. Every call that is not a read (Bash off the read-only list, Edit, Write) is logged with its
-exit to the run's AUDIT file and its progress.md, which the web app shows (post_tool_use). Accepted
-gaps, as for a worker: the Bash checks read the command text, so a command that builds a protected
-path or a push at run time (a variable, a glob, a script file) is not seen; the deny rules still fence
-the file tools, and a push is refused again at run time: `ttp push` (cli.cmd_push) and the harness's git
+exit to the run's AUDIT file and its progress.md, which the web app shows (post_tool_use). The Bash
+checks read the command text, so a command that builds a protected path at run time (a variable, a glob,
+a script file) passes them; around each Bash call a guard compares the charter, memory and project.json
+with a snapshot taken before it (snapshot, guard), puts back what changed outside ttp's own writes (which
+project.protected_log records) and reports it in the tool result and as an event. The state database is
+not compared, as the daemon writes it all the time: only the command-text refusal covers it. A push built
+at run time is refused again at run time: `ttp push` (cli.cmd_push) and the harness's git
 wrapper (gitguard.main) refuse a landing or any `git push` in a coordinator run (coordinator_run: FULL_ENV,
 or ROLE_ENV, which the daemon sets for every run). A coordinator run also holds no device
-(TTP_NO_DEVICE=1), so the worker device-run rule binds it. Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
+(TTP_NO_DEVICE=1), so the worker device-run rule binds it; hook_settings sets no hook.HOOK_REWRITE, so
+a device test run is denied with the `ttp sandbox` form as its hint, never rewritten (heavy device work
+goes to a worker). Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
 (also a session's stateless fallback) never gets them: the fallback keeps the read-only set below.
 
 Read-only tools ("read_only", any value but "full"): Read (and Grep/Glob where the CLI has them) on the project folder, and Bash for a fixed list of
@@ -81,6 +86,8 @@ PROTECTED_ENV = "TTP_COORD_PROTECTED"   # the files no tool writes directly, os.
 TIMEOUT_ENV = "TTP_COORD_TOOL_TIMEOUT_S"
 POST_EVENT, FAIL_EVENT = "CoordPostToolUse", "CoordPostToolUseFailure"
 AUDIT = "tool-audit.jsonl"   # in the run dir: one line per mutating tool call
+GUARD_DIR = "coord-guard"   # in the run dir: each Bash call's snapshot of the protected files (snapshot, guard)
+GUARD_EVENT = "coord_protected_write"   # the event of a protected file guard put back
 TOOL_TIMEOUT_S = 300   # a foreground command's limit by default
 MAX_TOOL_TIMEOUT_S = 600   # the CLI's own Bash ceiling
 MODES = ("full", "read_only")
@@ -340,8 +347,125 @@ def _full_pre_tool_use(tool: str, args: dict, payload: dict):
     if why:
         return hook._deny(why)
     if tool in EDITS or tool == "Bash":   # a worker's own checks
-        return hook.pre_tool_use(payload)[0]
+        out = hook.pre_tool_use(payload)[0]
+        if tool == "Bash" and (out or {}).get("hookSpecificOutput", {}).get("permissionDecision") != "deny":
+            snapshot(payload)
+        return out
     return None
+
+
+def _guard_key(payload: dict) -> str:
+    key = re.sub(r"[^A-Za-z0-9_-]", "", str(payload.get("tool_use_id") or ""))[:80]
+    if not key:
+        import hashlib
+        key = hashlib.sha256(json.dumps(payload.get("tool_input") or {}, sort_keys=True).encode()).hexdigest()[:32]
+    return key
+
+
+def _guarded_files() -> list[str]:
+    """The files a coordinator Bash call's guard compares: the charter (and sibling CHARTER* files), the
+    memory index, every memory entry and project.json; never the state database, which the daemon writes
+    all the time (only the command-text refusal covers it)."""
+    out = set()
+    for f in [d for d in os.environ.get(PROTECTED_ENV, "").split(os.pathsep) if d]:
+        if os.path.basename(f) == "project.db":
+            continue
+        if os.path.isdir(f):
+            out.update(os.path.join(d, n) for d, _, names in os.walk(f) for n in names
+                       if not (n.startswith(".") and n.endswith(".tmp")))   # durable_write's temporary files
+        else:
+            out.add(f)
+            name, parent = os.path.basename(f), os.path.dirname(f)
+            if name.startswith("CHARTER") and os.path.isdir(parent):
+                out.update(os.path.join(parent, n) for n in os.listdir(parent) if n.startswith("CHARTER"))
+    return sorted({os.path.abspath(x) for x in out})   # not realpath: a symlink planted there is put back, never followed
+
+
+def _digests(files: list[str]) -> dict[str, tuple[str, bytes]]:
+    import hashlib
+    out = {}
+    for f in files:
+        try:
+            data = open(f, "rb").read()
+        except (FileNotFoundError, IsADirectoryError, NotADirectoryError):
+            continue
+        out[f] = (hashlib.sha256(data).hexdigest(), data)
+    return out
+
+
+def snapshot(payload: dict) -> None:
+    """Before a full-tools coordinator's Bash call: record the protected files' hashes (and their bytes,
+    once per content) in the run dir, for guard to compare after the call."""
+    from pathlib import Path
+    from .project import durable_write
+    run = os.environ.get("TTP_RUN_DIR")
+    if not run:
+        return
+    d = Path(run) / GUARD_DIR
+    ts = time.time()   # before the reads: a logged write while they run counts
+    files = _digests(_guarded_files())
+    for sha, data in files.values():
+        if not (d / "blobs" / sha).exists():
+            durable_write(d / "blobs" / sha, data, sync=False)
+    durable_write(d / f"{_guard_key(payload)}.json",
+                  json.dumps({"ts": ts, "files": {f: sha for f, (sha, _) in files.items()}}), sync=False)
+
+
+def guard(payload: dict) -> str | None:
+    """After a full-tools coordinator's Bash call: put back every protected file the call changed,
+    created or removed outside ttp's own writes (project.protected_log names those), from the snapshot,
+    record an event, and return the notice for the tool result (None: nothing changed out of band).
+    It reads files, not commands, so a variable, glob or script write is caught too. Accepted gaps: a
+    call whose post hook never runs (an interrupted call) and a write by a process the call left in the
+    background are not checked, and a script that also forges the write log passes."""
+    from pathlib import Path
+    from .project import durable_write, note_protected, protected_log
+    run = os.environ.get("TTP_RUN_DIR")
+    snap = Path(run) / GUARD_DIR / f"{_guard_key(payload)}.json" if run else None
+    if snap is None or not snap.exists():
+        return None
+    before = json.loads(snap.read_text())
+    files = sorted(set(before["files"]) | set(_guarded_files()))
+    now = {f: sha for f, (sha, _) in _digests(files).items()}
+    logs = {protected_log(f) for f in files} - {None}
+    logged = set()
+    for log in logs:
+        for path in (log.with_name(log.name + ".1"), log):
+            try:
+                lines = path.read_text().splitlines()
+            except OSError:
+                continue
+            for line in lines:
+                try:
+                    e = json.loads(line)
+                    if e["ts"] >= before["ts"]:
+                        logged.add((e["path"], e["sha"]))
+                except (ValueError, KeyError, TypeError):
+                    continue
+    bad = [f for f in files if before["files"].get(f) != now.get(f) and (f, now.get(f)) not in logged]
+    for f in bad:
+        if f in before["files"]:
+            durable_write(Path(f), (snap.parent / "blobs" / before["files"][f]).read_bytes())
+        else:
+            os.unlink(f)
+            note_protected(f)
+    snap.unlink(missing_ok=True)
+    if not bad:
+        return None
+    how = sorted({_protected_why(next((p for p in os.environ.get(PROTECTED_ENV, "").split(os.pathsep)
+                                       if p and _protected_hit(f, [p])), f)) for f in bad})
+    text = (f"tt-project: this command changed {', '.join(bad)} outside the coordinator's checks; each is put "
+            f"back as it was before the call. " + "; ".join(how))
+    try:
+        from .project import Project
+        Project(next(iter(logs)).parent.parent).db.x(
+            "INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+            (time.time(), "coordinator", GUARD_EVENT, "normal", text[:1500],
+             json.dumps({"files": bad, "command": str((payload.get("tool_input") or {}).get("command") or "")[:500]}),
+             "handled"))
+    except Exception:   # the files are back either way; only the record is lost
+        pass
+    return text
 
 
 def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
@@ -371,22 +495,32 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         return _deny(f"the coordinator tool check failed ({type(e).__name__})"), None
 
 
-def post_tool_use(payload: dict, failed: bool = False) -> tuple[None, None]:
-    """Log a full-tools coordinator's mutating call (Edit, Write, a Bash command off the read-only
-    list) with its exit to the run's AUDIT file and progress.md (the web app's run view). A failed
-    call's exit code is read from its error ("Exit code N"), else 1. Never blocks the call."""
+def post_tool_use(payload: dict, failed: bool = False) -> tuple[dict | None, None]:
+    """Put back what a full-tools coordinator's Bash call wrote to a protected file out of band (guard;
+    its notice goes into the tool result), and log the coordinator's mutating call (Edit, Write, a Bash
+    command off the read-only list) with its exit to the run's AUDIT file and progress.md (the web app's
+    run view). A failed call's exit code is read from its error ("Exit code N"), else 1. Never blocks
+    the call."""
+    notice = None
+    try:
+        if os.environ.get(FULL_ENV) == "1" and payload.get("tool_name") == "Bash":
+            notice = guard(payload)
+    except Exception:
+        pass
+    out = {"hookSpecificOutput": {"hookEventName": "PostToolUseFailure" if failed else "PostToolUse",
+                                  "additionalContext": notice}} if notice else None
     try:
         run = os.environ.get("TTP_RUN_DIR")
         tool = str(payload.get("tool_name") or "")
         args = payload.get("tool_input") or {}
         if not run or os.environ.get(FULL_ENV) != "1" or payload.get("agent_id"):
-            return None, None
+            return out, None
         if tool == "Bash" and bash_refusal(str(args.get("command") or "")) is not None:
             what = str(args.get("command") or "")
         elif tool in EDITS:
             what = str(args.get("file_path") or args.get("notebook_path") or "")
         else:
-            return None, None
+            return out, None
         m = re.search(r"[Ee]xit code (\d+)", str(payload.get("error") or ""))
         code = (int(m.group(1)) if m else 1) if failed else 0
         from pathlib import Path
@@ -398,7 +532,7 @@ def post_tool_use(payload: dict, failed: bool = False) -> tuple[None, None]:
         durable_append(Path(run) / "progress.md", f"{timefmt.clock()} coordinator {tool} exit {code}: {line}\n")
     except Exception:
         pass
-    return None, None
+    return out, None
 
 
 def wake_budget(cfg: dict, turn_usd: float | None, turn_timeout_s: float) -> tuple[float | None, float]:

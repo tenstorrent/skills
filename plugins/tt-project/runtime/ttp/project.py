@@ -1884,6 +1884,7 @@ class Project:
         def undo() -> None:   # the transaction this ran in rolled back: so does the entry
             if not same:
                 path.unlink(missing_ok=True)
+                note_protected(path)
             if line:
                 self._reindex_memory(drop=[line])
         self.db.on_rollback(undo)
@@ -2134,6 +2135,7 @@ class Project:
                 continue
             dst.parent.mkdir(parents=True, exist_ok=True)
             os.replace(src, dst)
+            note_protected(src), note_protected(dst)
             done.append(dst)
             moved.append(name)
         if dry_run:
@@ -2162,6 +2164,7 @@ class Project:
                 a, b = self.memory_dir / "archive" / f"{n}.md", self.memory_dir / f"{n}.md"
                 if a.exists() and not b.exists():
                     os.replace(a, b)
+                    note_protected(a), note_protected(b)
             fsync_dir(self.memory_dir)
             fsync_dir(self.memory_dir / "archive")
             self._reindex_memory(add=dropped, before=before, after=after)
@@ -2565,6 +2568,53 @@ def durable_write(path: Path, text: str | bytes, mode: int | None = None, sync: 
         raise
     if sync:
         fsync_dir(path.parent)
+    note_protected(path, data)
+
+
+PROTECTED_LOG = "protected-writes.jsonl"   # in a project's state dir (protected_log)
+PROTECTED_LOG_MAX = 256 * 1024   # then it moves to <name>.1, which coordtools.guard reads too
+
+
+def protected_log(path: str | Path) -> Path | None:
+    """The log of ttp's own writes to `path` when it is a project's charter, memory index, a memory entry
+    (also archived) or project.json; else None. A session coordinator's Bash guard (coordtools.guard)
+    keeps a change it finds logged and puts back any other."""
+    s = str(path)
+    name = os.path.basename(s)
+    if not (name in ("project.json", "MEMORY.md") or name.startswith("CHARTER") or f"{os.sep}memory{os.sep}" in s):
+        return None
+    real = Path(os.path.realpath(s))
+    for harness in list(real.parents)[:3]:
+        if harness.name == "harness" and harness.parent.name == FOLDER:
+            rel = real.relative_to(harness).parts
+            if rel[0] == "memory" and len(rel) > 1 or len(rel) == 1 and rel[0] in ("project.json", "MEMORY.md") \
+                    or len(rel) == 1 and rel[0].startswith("CHARTER"):
+                state = harness.parent / "state"
+                return state / PROTECTED_LOG if state.is_dir() else None
+            return None
+    return None
+
+
+def note_protected(path: str | Path, data: bytes | None = None) -> None:
+    """Log that ttp wrote `path` (its new bytes `data`, else read now; a missing file logs its removal)
+    when it is protected (protected_log). Never fails the write it follows."""
+    try:
+        log = protected_log(path)
+        if log is None:
+            return
+        import hashlib
+        if data is None:
+            try:
+                data = Path(path).read_bytes()
+            except FileNotFoundError:
+                pass
+        sha = hashlib.sha256(data).hexdigest() if data is not None else None
+        if log.exists() and log.stat().st_size > PROTECTED_LOG_MAX:
+            os.replace(log, log.with_name(log.name + ".1"))
+        with open(log, "a") as f:
+            f.write(json.dumps({"ts": time.time(), "path": os.path.abspath(path), "sha": sha}) + "\n")
+    except OSError:
+        pass
 
 
 def replace_copy(src: str | Path, dst: str | Path, *, follow_symlinks: bool = True) -> str:
@@ -2695,6 +2745,7 @@ def durable_append(path: Path, text: str) -> bool:
         os.fsync(f.fileno())
     if new:
         fsync_dir(path.parent)
+    note_protected(path)
     return True
 
 
