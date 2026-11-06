@@ -2072,3 +2072,38 @@ def test_a_spilled_failure_whose_head_rerun_cannot_tell_still_runs_again_here_an
     assert "tests the base passes on that host" not in text, text
     assert not json.loads((run / "checks.json").read_text())["passed"]
     assert not (p.state / gatejudge.NEW_FILE).exists() or not json.loads((p.state / gatejudge.NEW_FILE).read_text())
+
+
+def _spill_gate_unproven(env, tmp_path, monkeypatch, at):
+    """A spilled failure whose gate rerun at `at` ("head" or "base") cannot tell (exit 255, an ssh reset,
+    or a timeout) on the spill host: the gate keeps it new but never proven, so the spill host's fault is
+    not counted there; the checks run again here (whose own rerun fails the same way: exit 1)."""
+    import threading
+    from ttp import cli, gatejudge
+    base = "def test_ok():\n    pass\n\n\ndef test_x():\n    pass\n"
+    p, repo, run = _spill_gate(env, tmp_path, monkeypatch, base,
+                               base.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
+    real = gatejudge.rerun
+    faults = iter([(255, "ssh: connection reset\n"), (None, "")] * 4)
+
+    def rerun(run_, where, ids, *a, **k):
+        return next(faults) if where == at else real(run_, where, ids, *a, **k)
+    monkeypatch.setattr(gatejudge, "rerun", rerun)
+    lane = _spill_lane(p, repo)
+    threading.Timer(2.0, lane.close).start()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "--fresh"])
+    assert e.value.code == 1
+    text = (run / "checks.log").read_text()
+    assert "rerun at once on check-host-a" in text, text
+    assert "tests the base passes on that host" not in text, ("a fault there is no proof", text)
+    assert "did not pass on spill host check-host-a" in text, text
+    assert not json.loads((run / "checks.json").read_text())["passed"]
+
+
+def test_a_spilled_failure_whose_head_rerun_there_cannot_tell_is_not_counted_there(env, tmp_path, monkeypatch):
+    _spill_gate_unproven(env, tmp_path, monkeypatch, "head")
+
+
+def test_a_spilled_failure_whose_base_rerun_there_cannot_tell_is_not_counted_there(env, tmp_path, monkeypatch):
+    _spill_gate_unproven(env, tmp_path, monkeypatch, "base")

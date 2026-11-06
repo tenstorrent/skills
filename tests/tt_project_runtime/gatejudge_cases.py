@@ -82,6 +82,31 @@ def test_gate_judge_proves_new_only_from_a_conclusive_head_rerun_and_a_real_base
     assert gatejudge.known_new(tmp_path, "mix", "pytest", 1001.0)["new"] == [a]
 
 
+def test_gate_judge_proven_holds_only_ids_the_head_rerun_failed_again_and_the_base_passed(tmp_path):
+    """`new` keeps a failure a rerun could not tell about; `proven` names only one a parsed head rerun failed
+    again and a parsed (or saved) base rerun passed, so a spill host's fault is never read as proof."""
+    from ttp import gatejudge
+    a, c = "tests/test_a.py::test_pre", "tests/test_a.py::test_new"
+    v = gatejudge.judge([a, c], _fake_run({a: True, c: True}, {a: True, c: False}, []), tmp_path / "1", "b1",
+                        "host-a", 1000.0)
+    assert v["new"] == [c] and v["proven"] == [c]
+    # The saved base result of that run proves it again without a base rerun.
+    v = gatejudge.judge([c], _fake_run({c: True}, {}, []), tmp_path / "1", "b1", "host-a", 1000.0)
+    assert v["new"] == [c] and v["proven"] == [c]
+    hit = f"FAILED {c} - x\n1 failed in 0.1s\n"
+    cases = (lambda at, ids: (255, "ssh: connection reset\n"),          # head rerun: ssh fault
+             lambda at, ids: (None, ""),                                    # head rerun: timed out
+             lambda at, ids: (1, "boom\n"),                                # head rerun: incomplete list
+             lambda at, ids: (1, hit) if at == "head" else (255, ""),      # base rerun could not run
+             lambda at, ids: (1, hit) if at == "head" else (None, ""))     # base rerun timed out
+    for n, run in enumerate(cases):
+        v = gatejudge.judge([c], run, tmp_path / f"u{n}", "b2", "host-a", 1000.0)
+        assert v["new"] == [c] and v["proven"] == [] and gatejudge.blocks(v), (n, v)
+    # No base to compare with: blocks, never proven.
+    v = gatejudge.judge([c], _fake_run({c: True}, {}, []), tmp_path / "2", "", "host-a", 1000.0)
+    assert v["new"] == [c] and v["proven"] == []
+
+
 def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of_it(tmp_path):
     from ttp import gatejudge
     a, b = "tests/test_a.py::test_p[x1]", "tests/test_a.py::test_q"
