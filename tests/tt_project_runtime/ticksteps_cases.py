@@ -696,6 +696,7 @@ GIT_HELPER_OWN_TIMEOUT = {
     ("loopcheck.py", "_git"): "only `ttp doctor --loop` setting up its scratch repositories (loopcheck.setup)",
     ("remotecheck.py", "_git"): "only remotecheck.main, the check process `ttp checks` starts (_BOOT)",
     ("checktree.py", "_git_run"): "only `ttp checks` (cli.py) naming the tree it checks, 20 s, its own process",
+    ("outscan.py", "_git"): "only outscan.push_problem in the pre-push hook git starts for a run's push (gitguard.HOOK), 60 s",
 }
 
 
