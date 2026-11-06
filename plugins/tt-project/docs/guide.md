@@ -2751,6 +2751,23 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   for `ttp drain` (listed, waited for with `--jobs`, recorded as interrupted with `--reboot`), so a
   planned host cycle does not cut it midway; a claim whose supervisor is gone, from an earlier boot
   or past its limit does not. Every run goes to `state/host-run.jsonl`.
+- No run writes under the account's credential folders. Before any tool call, the hook
+  (pathguard.py) refuses a create, change, move, chmod or delete under `~/.ssh`, gh's config dir
+  (`~/.config/gh` or `$GH_CONFIG_DIR`), `~/.git-credentials`, `~/.netrc`, `~/.aws`,
+  `~/.docker/config.json`, `~/.kube`, and every path in config `guards.protected_paths`. It reads
+  Edit, Write, MultiEdit and NotebookEdit, apply_patch text, MCP tools whose name is not a read
+  verb, and shell: redirects, tee, cp, mv, install, rsync, ln, sed and perl `-i`, chmod, chown, rm,
+  truncate, touch, mkdir, `dd of=`, curl or wget output files, `sh -c` and eval text, interpreter
+  one-liners and heredocs (python, perl, node, ruby), the script file a command runs, and the
+  login commands that write these folders (`gh auth login`, `docker login`, `aws configure`,
+  `kubectl config`, `git credential approve`, `ssh-keygen` without `-f` elsewhere). It expands
+  `~`, `$HOME`, `${HOME}`, `$XDG_CONFIG_HOME` and `$GH_CONFIG_DIR`, follows symlinks, and checks
+  both the run's HOME and the account's own home. Reads pass. Add a path for one project with
+  `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
+  account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
+  folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and
+  `GH_CONFIG_DIR` instead. Not caught: a path the code builds at run time from parts no word of
+  the command names. Which tools each provider covers is in providers.md.
 - No `ttp` command prints a saved key. `ttp secret check [alias]` tests one (reachable, auth ok or
   auth failed), lists the model ids it serves and marks each `providers.<p>.tiers.*.model` of the
   current project it does not serve, with no key, URL or host in its output, and `ttp secret env <alias> -- <command>` gives it to a command in `OPENAI_API_KEY`
