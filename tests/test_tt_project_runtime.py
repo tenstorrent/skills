@@ -7,6 +7,7 @@ import atexit
 import contextlib
 import errno
 import gettext
+import hashlib
 import importlib.machinery
 import io
 import json
@@ -907,6 +908,15 @@ def _clone_project(env, name):
     cfg = json.loads(p.config_path.read_text())
     cfg.update(root=str(p.root), created=time.time(), id=secrets.token_hex(4))
     write_json(p.config_path, cfg)
+    log = p.state / "protected-writes.jsonl"   # bootstrap's own protected writes, at this root
+    if log.is_file():
+        lines = []
+        for line in (snap["base"] / "state" / log.name).read_text().splitlines():
+            rec = json.loads(line)
+            f = p.base / os.path.relpath(rec["path"], snap["base"])
+            rec.update(ts=time.time(), path=str(f), sha=hashlib.sha256(f.read_bytes()).hexdigest())
+            lines.append(json.dumps(rec) + "\n")
+        log.write_text("".join(lines))
     _rewrite_history(p.harness, snap)
     # The database as bootstrap fills it, at this time.
     db = p.db
@@ -935,6 +945,9 @@ def _project_picture(p) -> dict:
         if rel.startswith(("harness/.git/objects/", "harness/.git/logs/", "harness/.git/refs/heads/",
                            "state/project.db")) or rel in ("harness/project.json", "harness/.git/index"):
             continue   # object and commit ids differ by the commits' times; compared through git below
+        elif rel == "state/protected-writes.jsonl":   # ttp's own protected writes: their times, paths and digests vary
+            files[rel] = [json.loads(line)["path"].rsplit(os.sep + "tt-project" + os.sep, 1)[-1]
+                          for line in f.read_text().splitlines()]
         else:
             files[rel] = "dir" if f.is_dir() else (f.read_bytes(), stat.S_IMODE(f.lstat().st_mode))
     cfg = json.loads(p.config_path.read_text())
