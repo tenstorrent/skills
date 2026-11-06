@@ -13027,6 +13027,8 @@ class Daemon:
             # (a reboot or a network blip). Both mean "not yet". A model run cannot make a "not yet"
             # probe pass, so past `max_hold_s` the coordinator decides instead of a wake.
             start, peer = self._peer_hold(task, prev, since, max_hold, now)
+            if now >= start + max_hold:   # a user-marker gate is timed from when the marker appeared
+                start = max(start, userpause.gate_opened(prev.get("retry_when"), self.cfg, self.p.root, now) or 0)
             held = now >= start + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
