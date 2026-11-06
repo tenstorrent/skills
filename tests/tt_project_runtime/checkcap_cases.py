@@ -10776,3 +10776,122 @@ def test_a_rerun_within_one_checks_run_runs_every_test_file_again(env, tmp_path,
     out = capsys.readouterr().out
     assert "passed" in out, out
     assert sorted(ran.read_text().split()) == ["a", "a", "b", "b"], ran.read_text()
+
+
+def test_checks_with_no_task_started_under_a_project_run_queue_as_that_run(env, tmp_path):
+    # A `ttp checks` whose environment names no task (a tool started it from a temp clone with the run's
+    # variables cleared) under a project's run counts as that run: its queue group, label and task are the run's.
+    import json
+    import os
+    import sys
+    p = make(env)
+    code = ("import json, os; from ttp import checkcap; i = checkcap.adopt_identity(); n = checkcap.queue_name(None); "
+            "print(json.dumps({'name': n, 'label': checkcap.label(n, 'w'), 'task': checkcap._task_run()[0], "
+            "'other': checkcap.inherited(os.getppid(), base=os.environ['ELSEWHERE'])}))")
+    base = {k: v for k, v in os.environ.items() if k != "TTP_TEST_NO_INHERIT"}
+    run = lambda e: json.loads(subprocess.run(   # noqa: E731
+        ["sh", "-c", 'env -u TTP_TASK -u TTP_RUN_ID -u TTP_PROJECT "$0" -c "$1"; :', sys.executable, code],
+        env={**base, "PYTHONPATH": str(RUNTIME), "ELSEWHERE": str(tmp_path / "elsewhere"), **e},
+        capture_output=True, text=True, timeout=60, check=True).stdout)
+    got = run({"TTP_TASK": "42", "TTP_RUN_ID": "9", "TTP_PROJECT": str(p.base)})
+    assert got["name"] == p.name and got["task"] == "42"
+    assert got["label"] == f"{p.name} task #42 (run 9) w"
+    assert got["other"] == {}, "with its own project named, another project's run is not adopted"
+    bare = run({"TTP_RUN_ID": "9", "TTP_PROJECT": str(p.base)})   # no task above it: no project
+    assert bare["name"] is None and bare["label"] == "no project w"
+    gone = run({"TTP_TASK": "42", "TTP_PROJECT": str(tmp_path / "no-such-project")})
+    assert gone["name"] is None, "a run of a project that does not exist is not adopted"
+
+
+def test_checks_with_no_project_queue_behind_every_project_waiter(env, monkeypatch):
+    import time
+    from ttp import checkcap, locks
+    d = checkcap.slot_dir()
+    now = time.time()
+    bare = locks.enqueue(d, checkcap.RESOURCE, "no project w", since=now - 7200)   # aged, and first to arrive
+    a = locks.enqueue(d, checkcap.RESOURCE, "pa task #1 w", since=now - 60, group="pa", priority=3)
+    b = locks.enqueue(d, checkcap.RESOURCE, "pb task #2 w", since=now - 30, group="pb")
+    try:
+        assert locks.fair_order(d, checkcap.RESOURCE, **checkcap.order()) == [a, b, bare]
+        assert checkcap.state()["queued"] == ["pa task #1 w", "pb task #2 w", "no project w"]
+        assert not locks.my_turn(d, checkcap.RESOURCE, bare, 2, fair=True, **checkcap.order())
+        assert locks.my_turn(d, checkcap.RESOURCE, bare, 3, fair=True, **checkcap.order())
+        assert locks.fair_order(d, checkcap.RESOURCE, aged_before=now - 3600)[0] == bare, "only with bare_last"
+    finally:
+        for t in (bare, a, b):
+            locks.dequeue(t)
+
+
+def test_checks_with_no_project_hold_at_most_bare_slots_at_once(env, monkeypatch):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    first = checkcap.acquire(checkcap.label(None, "w"))
+    try:
+        assert first.f is not None
+        assert checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=0.2) is None, "one run with no project at once"
+        mine = checkcap.acquire(checkcap.label("pa", "w"), project_name="pa", max_wait_s=5)
+        assert mine is not None and mine.f is not None, "a project's run takes a free slot"
+        mine.close()
+        monkeypatch.setenv(checkcap.BARE_SLOTS_ENV, "2")
+        second = checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=5)
+        assert second is not None and second.f is not None
+        second.close()
+    finally:
+        first.close()
+
+
+def test_checks_status_flags_a_slot_holder_running_no_test(env, monkeypatch):
+    # Status reads whether each host-wide slot holder's commands use CPU: one held for idle_hold_s() with none
+    # running is flagged with `ttp checks-yield`, a busy one is not. Nothing is stopped or asked.
+    import os
+    import sys
+    import time
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
+    code = ("import sys; from ttp import checkcap; s = checkcap.acquire(checkcap.label(sys.argv[1], 'w'), "
+            "project_name=sys.argv[1]); print('held', flush=True); sys.stdin.read()")
+    procs = {}
+    try:
+        for name in ("pa", "pb"):
+            procs[name] = subprocess.Popen([sys.executable, "-c", code, name], stdin=subprocess.PIPE,
+                                           stdout=subprocess.PIPE, text=True,
+                                           env={**os.environ, "PYTHONPATH": str(RUNTIME)})
+            assert procs[name].stdout.readline().strip() == "held"
+        busy, idle = procs["pa"].pid, procs["pb"].pid
+        reads = {busy: iter([10.0, 11.0, 12.0, 13.0]), idle: iter([5.0, 5.0, 5.0, 5.0])}
+        monkeypatch.setattr(checkcap, "tests_cpu_s", lambda pid: next(reads[pid]))
+        later = time.time() + checkcap.IDLE_HOLD_S + 60
+        got = {a["holder"]: a for a in checkcap.holder_activity(now=later, sample_s=0)}
+        assert got["pa w"]["tests"] is True and not got["pa w"]["idle"]
+        assert got["pb w"]["tests"] is False and got["pb w"]["idle"]
+        assert "ttp checks-yield" in checkcap.activity_text(got["pb w"])
+        assert "IDLE" not in checkcap.activity_text(got["pa w"])
+        now = {a["holder"]: a for a in checkcap.holder_activity(sample_s=0)}
+        assert not now["pb w"]["idle"], "held under idle_hold_s(): not flagged yet"
+        reads = {busy: iter([10.0, 11.0]), idle: iter([5.0, 5.0])}
+        monkeypatch.setenv(checkcap.IDLE_HOLD_ENV, "0.001")
+        line = checkcap.line(activity=True)
+        assert "no test running: pb w" in line and "pa w (held" not in line and "ttp checks-yield" in line
+        assert "no test running" not in checkcap.line(), "without activity the line reads no process"
+        assert all(p.poll() is None for p in procs.values()), "status stops nothing"
+    finally:
+        for p in procs.values():
+            p.kill()
+            p.wait()
+
+
+def test_checks_tests_cpu_counts_what_a_holder_started_not_itself(tmp_path):
+    import sys
+    import time
+    from ttp import checkcap
+    burn = f"{sys.executable} -c 'import time\nwhile time.process_time() < 0.6: pass'"
+    sh = subprocess.Popen(["sh", "-c", f"{burn}; touch {tmp_path / 'done'}; sleep 30"])
+    try:
+        deadline = time.time() + 60
+        while not (tmp_path / "done").exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert checkcap.tests_cpu_s(sh.pid) >= 0.6, "a reaped command's CPU counts"
+        assert checkcap.tests_cpu_s(2 ** 22 + 7) is None, "a pid that is gone reads None"
+    finally:
+        sh.kill()
+        sh.wait()

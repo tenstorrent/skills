@@ -1652,7 +1652,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     # Routine diagnostics print only with --verbose; a line that reports an anomaly always prints.
     from . import checkcap, checkjoin, checklane, checkspill, heal, locks, shared, slurmcheck, testslots
     if verbose:
-        if host := checkcap.line():
+        if host := checkcap.line(activity=True):
             lines.append(host)
         lines.extend(testslots.use_lines())
         lines.extend(checklane.lane_lines(p.name, p.config(), now))
@@ -3514,6 +3514,8 @@ def cmd_checks(a) -> None:
     cfg = p.config() if p and p.exists() else {}
     if not (p and p.exists()):
         p = None
+    from . import checkcap
+    checkcap.adopt_identity(p.base if p else None)   # no TTP_TASK: the project run it was started under, if any
     from . import hostcycle
     if cyc := hostcycle.hold(p):   # a planned cycle of this host would cut them short
         print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
@@ -4977,8 +4979,9 @@ def _checks_lane_status(as_json: bool) -> int:
     top = subprocess.run(["git", "-C", str(Path.cwd()), "rev-parse", "--show-toplevel"], capture_output=True,
                          text=True).stdout.strip()
     here_repo = testslots.repo_key(top) if top else ""
-    from . import checkjoin, checkspill, diskgate, hostload, slurmcheck
+    from . import checkcap, checkjoin, checkspill, diskgate, hostload, slurmcheck
     followers = checkjoin.status_lines(p.state)
+    holders = checkcap.holder_activity()   # whether each host-wide slot holder runs tests now
     disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
@@ -4991,6 +4994,7 @@ def _checks_lane_status(as_json: bool) -> int:
                           "slurm_paused": slurmcheck.tripped(),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "disk": disk,
+                          "host_holders": holders,
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
@@ -5001,6 +5005,9 @@ def _checks_lane_status(as_json: bool) -> int:
         print("check runs per host:")
         print("\n".join(f"  {line}" for line in hostload.lines(s=load)))
         print(f"  {diskgate.line(disk)}")
+        if holders:
+            print("host-wide checks slot holders:")
+            print("\n".join(f"  {checkcap.activity_text(a)}" for a in holders))
         if followers:
             print("following another run of their task (checkjoin), no suite of their own:")
             print("\n".join(followers))
@@ -5067,7 +5074,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         tell("light checks only (syntax, lint, format or validation: checklane, checks.light_cmds, --light): "
              "running now, outside the project's checks slot")
         return checkcap.Slot()
-    prio, owns = checkcap.task_rank(p)
+    prio, owns = checkcap.task_rank(p or checkcap.adopted_project())
     cfg = p.config() if p else {}
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
@@ -5084,7 +5091,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     first = True
     # An urgent run never waits behind routine ones (checkcap: urgent slots): it tries the pool's hosts at once
     # (a first bound of 0 s here), then, with none free, a reserved urgent slot here, before the Slurm overflow.
-    urgent = checkcap.is_urgent(prio)
+    urgent = checkcap.is_urgent(prio) and p is not None   # an adopted task's run never takes an urgent slot
     pool_first = urgent and spill_to and bool(checkspill.hosts(cfg))
     moved = _HeadMoved(top, head)   # its task replacing the head while it waits drops the run
     while True:
@@ -5324,9 +5331,9 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why
             lane_at = time.time()   # the waits log counts only the time after it as the host's (throughput)
-            slot = kept_slot if kept_slot is not None else checkcap.acquire(checkcap.label(p.name if p else None), f"ttp checks on {head[:12]}", tell,
+            slot = kept_slot if kept_slot is not None else checkcap.acquire(checkcap.label(checkcap.queue_name(p)), f"ttp checks on {head[:12]}", tell,
                                     waiting, left, arrived,
-                                    p.name if p else None, prio, same, done, stop,
+                                    checkcap.queue_name(p), prio, same, done, stop,
                                     p.state if p else None, owns, cap=checklane.project_cap(cfg), lane_at=lane_at,
                                     startable=startable,
                                     parks=lambda on: testslots.lane_waits(
@@ -5342,7 +5349,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             # in the foreground none free by the end of the same wait hands over to detached checks too.
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, testslots.SLOT_WAITS)
-            slot.tests = testslots.acquire(checkcap.label(p.name if p else None), tell, left,
+            slot.tests = testslots.acquire(checkcap.label(checkcap.queue_name(p)), tell, left,
                                            p.config() if p else {}, p.name if p else "",
                                            push_key=checkcap.urgent_key(slot), priority=prio, stop=stop,
                                            since=arrived, full=True,   # a full run waits for checks.test_run_min
@@ -5372,7 +5379,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                 time.sleep(testslots.poll_s(testslots.POLL_S))
         slot.tests.files += suite.files   # the suite lock ends with the run's test slots
         slot.suite = suite   # its label shows the run's wall-time cap (testslots.suite_running)
-        if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(p.name if p else None))):
+        if not os.environ.get(testslots.HELD_ENV) and (ports := testslots.port_block(checkcap.label(checkcap.queue_name(p)))):
             slot.tests.files.append(ports[0])   # the run's own ports, freed with its test slots
             slot.tests.extra.update(ports[1])
         return slot

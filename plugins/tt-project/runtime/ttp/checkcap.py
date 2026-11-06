@@ -199,6 +199,14 @@ SHIELD_PCT = 90   # a run that cannot resume is never asked once its log's last 
 # commands it starts (push.check_env), so a `ttp checks` nested in them is not labelled preempted nor kept from
 # its own rerank or re-execution.
 RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV, RESUME_ENV)
+BARE_SLOTS = 1   # default checks.bare_slots: host-wide slots held at once by runs with no project (acquire)
+BARE_SLOTS_ENV = "TTP_CHECKS_BARE_SLOTS"
+INHERIT_DEPTH = 64   # ancestors read at most for the project run a `ttp checks` was started under (inherited)
+NO_INHERIT_ENV = "TTP_TEST_NO_INHERIT"   # tests: never take the identity of the process running them
+IDLE_HOLD_S = 600.0   # default checks.idle_hold_s: a slot held this long with no test running is flagged (line)
+IDLE_HOLD_ENV = "TTP_CHECKS_IDLE_HOLD_S"
+ACTIVE_SAMPLE_S = 0.5   # holder_activity reads each holder's tests' CPU twice, this far apart
+ACTIVE_FRAC = 0.05      # ... and counts them running at this share of one core or more
 
 
 def slot_dir() -> Path:
@@ -519,8 +527,23 @@ def is_small(cost: dict | None) -> bool:
 
 
 def order() -> dict:
-    """locks.fair_order's (and my_turn's) ordering arguments for the checks queue."""
-    return {"urgent_max": priority_turns(), "aged_before": aged_before(), "aged_turns": aged_turns()}
+    """locks.fair_order's (and my_turn's) ordering arguments for the checks queue: runs with no project last."""
+    return {"urgent_max": priority_turns(), "aged_before": aged_before(), "aged_turns": aged_turns(),
+            "bare_last": True}
+
+
+def bare_slots() -> int:
+    """Host-wide slots runs with no project hold at once: TTP_CHECKS_BARE_SLOTS, else the account's
+    checks.bare_slots, else BARE_SLOTS; at least 1 (they still run once no project waits)."""
+    for v in (os.environ.get(BARE_SLOTS_ENV), (project.load_account_settings().get("checks") or {}).get("bare_slots")):
+        if v not in (None, "") and (n := _number(v)) is not None:
+            return max(n, 1)
+    return BARE_SLOTS
+
+
+def _bare_held(every: list[Path]) -> int:
+    """Slots among `every` held now by a run with no project (its label's checks_project empty)."""
+    return sum(1 for r in locks.holder_records(every) if "checks_project" in r and not r["checks_project"])
 
 
 def aged_before(now: float | None = None) -> float:
@@ -821,9 +844,66 @@ def upgraded(init: Path | None = None, now: float | None = None, settle: float |
     return new if now - _SEEN["since"] >= (UPGRADE_SETTLE_S if settle is None else settle) else ""
 
 
+_IDENT: dict = {}   # adopt_identity(): the project run a `ttp checks` with no TTP_TASK was started under
+
+
+def inherited(pid: int, base: Path | None = None, depth: int = INHERIT_DEPTH) -> dict:
+    """The task of the nearest of `pid` and its ancestors that names a project (TTP_PROJECT): with TTP_TASK set
+    there and the project existing (and, with `base`, being that one), {"task", "run", "base", "project"}
+    (project: its name). {} otherwise: that nearest project context decides, no further ancestor (procfs shows
+    each process's starting environment, which can name a task its parent has since left). An unreadable
+    process (another user's, no /proc) also ends the walk."""
+    from . import jobuse, procowner
+    for _ in range(depth):
+        if pid <= 1 or (env := procowner.environ(pid)) is None:
+            return {}
+        if env.get("TTP_PROJECT"):
+            there = procowner.base_of(env["TTP_PROJECT"])
+            if not env.get("TTP_TASK") or not there or (base is not None and there != procowner.base_of(base)):
+                return {}
+            p = project.Project(there)
+            return {"task": env["TTP_TASK"], "run": env.get("TTP_RUN_ID") or "", "base": str(there),
+                    "project": p.name} if p.exists() else {}
+        try:
+            pid = int((jobuse._stat(pid) or ["", "0"])[1])
+        except ValueError:
+            return {}
+    return {}
+
+
+def adopt_identity(base: Path | None = None) -> dict:
+    """For a `ttp checks` run with no TTP_TASK (a tool that cleared its environment, a temp clone outside the
+    project): the task, run and project of the project run it was started under (inherited from its parent
+    up; with `base`, its own project's only), which its slot label, priority and queue group then are
+    (label, task_rank, queue_name). {} with its own TTP_TASK set or no such run: it queues as a run with no
+    project, behind every project's waiter (fair_order's bare_last, bare_slots)."""
+    _IDENT.clear()
+    if not os.environ.get("TTP_TASK") and not os.environ.get(NO_INHERIT_ENV):
+        _IDENT.update(inherited(os.getppid(), base))
+    return dict(_IDENT)
+
+
+def _task_run() -> tuple[str | None, str | None]:
+    """The task and run this process runs for: TTP_TASK and TTP_RUN_ID, else the adopted ones (adopt_identity)."""
+    if task := os.environ.get("TTP_TASK"):
+        return task, os.environ.get("TTP_RUN_ID")
+    return _IDENT.get("task"), _IDENT.get("run")
+
+
+def queue_name(p) -> str | None:
+    """The project a `ttp checks` run queues for host-wide slots as: its own (`p`), else the adopted one
+    (adopt_identity); None: a run with no project."""
+    return p.name if p else _IDENT.get("project")
+
+
+def adopted_project():
+    """The adopted project (adopt_identity) as a Project, for its task's priority (task_rank); None without."""
+    return project.Project(_IDENT["base"]) if _IDENT.get("base") else None
+
+
 def label(project_name: str | None, what: str = "") -> str:
     """Who holds or waits for a slot, as status lines show it: the project and the task's run."""
-    task, run = os.environ.get("TTP_TASK"), os.environ.get("TTP_RUN_ID")
+    task, run = _task_run()
     who = f"{project_name or 'no project'}" + (f" task #{task} (run {run or '?'})" if task else "")
     return who + requeued() + (f" {what}" if what else "")
 
@@ -845,7 +925,7 @@ def task_rank(p) -> tuple[int | None, list[str]]:
     """(task_priority(p), the ids of the open obligations behind an OBLIGATION_PRIORITY boost, else []).
     An urgent task (urgent.is_urgent) ranks at least urgent.PRIORITY, a user-ordered one (a fresh `urgent:`
     line) urgent.ORDERED_PRIORITY, as an obligation owner."""
-    task = os.environ.get("TTP_TASK") or ""
+    task = _task_run()[0] or ""
     if p is None or not task.isdigit():
         return None, []
     try:
@@ -917,8 +997,73 @@ def _project(holder: str) -> str:
     return holder.split(" task #", 1)[0].split(" ttp checks", 1)[0]
 
 
-def line() -> str:
-    """One status line, or "" when nothing runs or waits."""
+def idle_hold_s() -> float:
+    """Seconds a host-wide slot is held with no test running before status flags it (holder_activity):
+    TTP_CHECKS_IDLE_HOLD_S, else the account's checks.idle_hold_s, else IDLE_HOLD_S. Zero, negative,
+    infinite or unreadable: the default."""
+    try:
+        v = float(os.environ.get(IDLE_HOLD_ENV)
+                  or (project.load_account_settings().get("checks") or {}).get("idle_hold_s") or IDLE_HOLD_S)
+    except (TypeError, ValueError):
+        v = IDLE_HOLD_S
+    return v if 0 < v < math.inf else IDLE_HOLD_S
+
+
+def tests_cpu_s(pid: int) -> float | None:
+    """The CPU seconds of what process `pid` started (its live descendants', with every reaped child's), not its
+    own: the checks process's commands. None when it cannot be read (gone, another PID namespace, no /proc)."""
+    from . import jobuse
+    tree, own = jobuse._tree(pid), jobuse._stat(pid)
+    if not tree or not own:
+        return None
+    hz = jobuse._hz()
+    try:
+        reaped = sum(int(x) for x in own[13:15]) / hz
+    except (ValueError, IndexError):
+        return None
+    return reaped + sum(jobuse._cpu(x, hz) for x in tree[1:])
+
+
+def holder_activity(now: float | None = None, cpu: Callable[[int], float | None] | None = None,
+                    sample_s: float = ACTIVE_SAMPLE_S) -> list[dict]:
+    """Each holder of a host-wide checks slot (the cap's and the ones load opened beyond it) with whether its
+    process tree runs tests now: {"holder", "pid", "held_s", "tests", "idle"}. `tests`: what it started used
+    ACTIVE_FRAC of one core or more over `sample_s` (tests_cpu_s read twice), None when that cannot be read;
+    `idle`: no test running and held idle_hold_s() or longer, so status flags it. Status only: it stops,
+    preempts or asks nothing (accepted gap: one sample, so a suite between steps may read idle)."""
+    n = limit()
+    recs = [r for r in locks.holder_records(all_paths(n)) if not r.get("shared")] if n else []
+    if not recs:
+        return []
+    cpu = cpu or tests_cpu_s
+    pids = [r.get("pid") if isinstance(r.get("pid"), int) else None for r in recs]
+    first = [cpu(p) if p else None for p in pids]
+    if sample_s > 0 and any(x is not None for x in first):
+        time.sleep(sample_s)
+    now = time.time() if now is None else now
+    bound, out = idle_hold_s(), []
+    for r, p, a in zip(recs, pids, first):
+        b = cpu(p) if p and a is not None else None
+        # a drop: a process left the tree (an orphan of its commands), so they ran
+        tests = None if a is None or b is None else b < a or b - a >= max(ACTIVE_FRAC * sample_s, 1e-9)
+        held = max(0.0, now - float(r.get("since") or now))
+        out.append({"holder": str(r.get("holder") or ""), "pid": p, "held_s": held, "tests": tests,
+                    "idle": tests is False and held >= bound})
+    return out
+
+
+def activity_text(a: dict) -> str:
+    """One holder of holder_activity, as status says it."""
+    what = {True: "tests running", False: "no test running", None: "its processes cannot be read"}[a["tests"]]
+    out = f"{a['holder']}: {what}, held {_dur(a['held_s'])}"
+    return out + (f"; IDLE: it holds one of the host's checks slots with no test running (over "
+                  f"{_dur(idle_hold_s())}); a check that waits on something else gives the slot up meanwhile "
+                  "with `ttp checks-yield`" if a["idle"] else "")
+
+
+def line(activity: bool = False) -> str:
+    """One status line, or "" when nothing runs or waits. With `activity` it also names each slot holder that
+    has held its slot idle_hold_s() or longer with no test running (holder_activity)."""
     s = state()
     if not s["running"] and not s["queued"] and not s["priority"] and not s["parked"] and not s["urgent"]:
         return ""
@@ -938,6 +1083,10 @@ def line() -> str:
                 + _some([_aged(h, t, now) for h, t in s["parked"]]))
     if s["running"]:
         out += f" (running: {_some(s['running'])})"
+    if activity and s["running"] and (idle := [a for a in holder_activity(now) if a["idle"]]):
+        out += ("; holding a slot with no test running: " + _some([f"{a['holder']} (held {_dur(a['held_s'])})"
+                                                                     for a in idle])
+                + " (a check waiting on something else gives its slot up with `ttp checks-yield`)")
     if s["ahead"]:
         out += "; next per project: " + ", ".join(f"{k} {v} ahead" for k, v in list(s["ahead"].items())[:6])
     return out
@@ -1719,6 +1868,9 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
     room = _room(n, every, mine) if room is None else room
     if room <= 0 or cores_short(every) or diskgate.saturated():
         return None
+    if label is not None and "checks_project" in label and not label["checks_project"] \
+            and _bare_held(every) >= bare_slots():   # a run with no project: at most bare_slots() at once
+        return None
     f = locks.try_take(ps, holder, what, key=same, extra=label)
     if f is None and (x := extra(n)):
         f = locks.try_take(every[n:n + x], holder, what, key=same, extra=label)
@@ -1796,9 +1948,10 @@ def record_wait(state: Path | None, project_name: str | None, priority: int | No
     0: none), stored as "cap" so throughput judges the wait by it; None (no project lane): no field.
     `lane_at`: when the run got its repository's lane (`ttp checks` queues for it before this slot, from
     the same `queued_at`), stored as "lane_at": only the time after it waited for the host."""
-    task = os.environ.get("TTP_TASK") or ""
+    task, run = _task_run()
+    task = task or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
-           "run": os.environ.get("TTP_RUN_ID") or None, "priority": priority, "slot": slot,
+           "run": run or None, "priority": priority, "slot": slot,
            "queued_at": round(queued_at, 3), "granted_at": round(granted_at, 3)}
     if cap is not None:
         rec["cap"] = int(cap)
