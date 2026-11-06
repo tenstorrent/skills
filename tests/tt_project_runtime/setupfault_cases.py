@@ -55,6 +55,13 @@ def test_setupfault_names_only_faults_before_any_test_ran(tmp_path):
         assert found(_head_gone(tmp_path) + verdict + "\n") is None, verdict
         assert found(verdict + "\n" + _BAD_TAR) is None, verdict
     assert setupfault.scan("").verdict is False and found("") is None
+    # a gate's own shard lines saying no test ran (its local fallback after a starved pool) are no verdict
+    gate = ("no CPU pool free after 120 s; running shards locally\n" + _head_gone(tmp_path)
+            + "FAIL shard 3 (infra); no verdict\nhead run did not complete (infra); no verdict\n")
+    assert found(gate)["kind"] == "pool" and found(_head_gone(tmp_path) + "FAIL shard 3 (infra); no verdict\n")
+    assert found("FAIL shard 1 (infra); no verdict\n")["kind"] == "setup"
+    assert found(gate + "FAIL tests/test_a.sh\n") is None, "a real FAIL from another shard stays a failure"
+    assert found("FAIL shard 1 (infra); no verdict\n1 failed in 0.2s\n") is None
 
 
 def test_push_run_one_reruns_a_check_that_failed_before_any_test_ran_and_holds_it_after(tmp_path):

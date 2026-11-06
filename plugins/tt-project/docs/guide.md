@@ -1403,9 +1403,10 @@ running work is interrupted only by the preemption below:
 - A check that fails before any test ran is the host or its pool, not the change: its output
   names a work or head dir gone before the copy (`cd: <absolute dir outside the repository>: No
   such file or directory`), an empty or corrupt archive (tar's `This does not look like a tar
-  archive` or `Unexpected EOF in archive`, gzip's `not in gzip format`, `rsync error:`) or no free
-  pool slot (`no free slot`, `no <name> pool free`), and no test verdict (a pytest count or result
-  line, TAP `ok`/`not ok`, an upper-case `PASS` or `FAIL`, a traceback). `ttp push`, `ttp land`,
+  archive` or `Unexpected EOF in archive`, gzip's `not in gzip format`, `rsync error:`), its own
+  `no verdict` (`FAIL <shard> (infra); no verdict`) or no free pool slot (`no free slot`, `no <name>
+  pool free`), and no test verdict (a pytest count or result line, TAP `ok`/`not ok`, an upper-case
+  `PASS` or `FAIL` on a line not saying `no verdict`, a traceback). `ttp push`, `ttp land`,
   `ttp checks` and the push queue run it again up to 2 times (no free pool slot: not at once);
   still so, the push log says `infrastructure fault: ... no test ran`, `ttp push` exits 75 with a
   `retry_when`, `ttp checks` exits 75 with `infra_fault: no-test-ran` in checks.json, and the push

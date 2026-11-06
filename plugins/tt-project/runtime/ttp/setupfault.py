@@ -4,15 +4,16 @@
 
 A check that copies the head to a test pool, or waits for one, can fail before its first test: the head or
 work dir it copies from is gone (`cd: <absolute dir>: No such file or directory`), the archive it sends is
-empty or corrupt (tar's `This does not look like a tar archive` or `Unexpected EOF in archive`, gzip's `not
-in gzip format` or `unexpected end of file`, rsync's `rsync error:`), or no pool had a free slot (`no free
-slot`, `no <name> pool free`, or the push's own pool-wait bound, push.POOL_STARVED). found() names such a
-fault in a failed check's output only when no test verdict is in it (VERDICT: a pytest count or result line,
-a TAP `ok`/`not ok`, an upper-case PASS or FAIL word, a Python traceback): a check whose tests ran and failed
-stays a failure. The runners (`ttp push`, `ttp land`, `ttp checks`, the push queue) rerun a setup fault up
-to RERUNS times; still so, or a pool with no free slot at once, it is an infrastructure fault: no verdict,
-never passed and never failed (`ttp push` and `ttp land` exit BUSY, `ttp checks` 75 with infra_fault INFRA
-in checks.json, the push queue holds the batch and tries it again after RETRY_S).
+empty or corrupt (tar's `This does not look like a tar archive` or `Unexpected EOF in archive`, gzip's `not in
+gzip format` or `unexpected end of file`, rsync's `rsync error:`), the runner itself says `no verdict` (`FAIL
+<shard> (infra); no verdict`), or no pool had a free slot (`no free slot`, `no <name> pool free`, or the
+push's own pool-wait bound, push.POOL_STARVED). found() names such a fault in a failed check's output only
+when no test verdict is in it (VERDICT: a pytest count or result line, a TAP `ok`/`not ok`, an upper-case PASS
+or FAIL word on a line not saying `no verdict`, a Python traceback): a check whose tests ran and failed stays
+a failure. The runners (`ttp push`, `ttp land`, `ttp checks`, the push queue) rerun a setup fault up to RERUNS
+times; still so, or a pool with no free slot at once, it is an infrastructure fault: no verdict, never passed
+and never failed (`ttp push` and `ttp land` exit BUSY, `ttp checks` 75 with infra_fault INFRA in checks.json,
+the push queue holds the batch and tries it again after RETRY_S).
 """
 from __future__ import annotations
 
@@ -27,9 +28,13 @@ _SIGNS = (("setup", re.compile(r"\bcd: (?P<path>/[^:\n]*): No such file or direc
           ("setup", re.compile(r"\btar: (?:This does not look like a tar archive|Unexpected EOF in archive)"
                                r"|\bgzip: stdin: (?:not in gzip format|unexpected end of file)|^rsync error: ")),
           ("pool", re.compile(r"\bno (?:free )?(?:[\w-]+ )?(?:pool|slot)s? (?:is |was )?(?:free|available|left)\b"
-                              r"|\bno free (?:test[- ])?(?:pool|slot|host)s?\b", re.I)))
+                              r"|\bno free (?:test[- ])?(?:pool|slot|host)s?\b", re.I)),
+          ("setup", re.compile(r"\bno verdict\b", re.I)))
 VERDICT = re.compile(r"\b\d+ (?:passed|failed|errors?|xfailed|xpassed)\b|^(?:PASSED|FAILED|ERROR) \S+::"
                      r"|^(?:not )?ok \d+\b|\b(?:PASS|PASSED|FAIL|FAILED)\b|^Traceback \(most recent call last\)")
+
+
+NO_VERDICT = re.compile(r"\bno verdict\b", re.I)    # a runner's own word that no test ran: never a verdict
 
 
 class Scan:
@@ -44,7 +49,7 @@ class Scan:
         if self.verdict:
             return
         line = line.rstrip("\r\n")
-        if VERDICT.search(line):
+        if VERDICT.search(line) and not NO_VERDICT.search(line):
             self.verdict = True
             return
         for kind, sign in _SIGNS:
