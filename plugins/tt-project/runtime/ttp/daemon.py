@@ -5522,6 +5522,14 @@ class Daemon:
                            blocked_reason=f"{RESOURCE_BUSY_NOTE} before the run could start; retries")
             return
         rstatus = result.get("status") if isinstance(result, dict) else None
+        redo = None   # a hand-off the Stop hook also refuses for a valid status: resumed, never taken (below)
+        if own and status == "ok" and rstatus in HANDOFF_STATES and \
+                not load_result(task["result"]).get(HANDOFF_RESUME_KEY):
+            from .hook import handoff_problem
+            # A bad `then` or a waits-only `continue:` follow-up (hook.handoff_problem): a provider without a
+            # Stop hook gets the session back once to fix it, as one with a hook is refused in-run.
+            if handoff_problem(run_dir / RESULT_FILE) and (redo := self._handoff_resume(r, task, usage, run_dir)):
+                rstatus, result = None, {}
         # A project's own result rule (`done` plus a verdict): the change must not proceed. The task is
         # stored failed, so its fix and re-review follow and nothing is approved, but the review itself
         # worked: it shows as changes_needed and spends no attempt (db.CHANGES_NEEDED).
@@ -5601,7 +5609,7 @@ class Daemon:
             if how:
                 log(self.p, f"task {task['id']} hand-off: its checks wait {how}")
         jobs = _detached_jobs(run_dir)
-        if jobs and (rstatus is None and status in ("ok", "timeout", "stalled")
+        if jobs and not redo and (rstatus is None and status in ("ok", "timeout", "stalled")
                      or rstatus == "waiting" and not result.get("retry_when")):
             # A job this run detached is still the task's work in flight: the task waits until each
             # job wrote its .rc or is gone (a kill, a reboot) instead of spending an attempt, and the
@@ -5660,7 +5668,7 @@ class Daemon:
             new, status = "failed", "refused_wait"   # an attempt, but no deep retry (effort.RETRY_FAILED)
         elif own and status == "ok" and rstatus not in HANDOFF_STATES and not refusal and \
                 not load_result(task["result"]).get(HANDOFF_RESUME_KEY) and \
-                (back := self._handoff_resume(r, task, usage, run_dir)):
+                (back := redo or self._handoff_resume(r, task, usage, run_dir)):
             # What a Stop hook does in-run (hook.stop): a provider without one gets the same session back
             # once, told what is wrong, instead of a cold rerun. Not an attempt; a second miss fails as below.
             new, resumed = "queued", back

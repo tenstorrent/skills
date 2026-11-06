@@ -340,3 +340,76 @@ def test_the_hand_off_resume_prompt_names_the_problem_and_a_changed_spec(env):
     assert "The spec changed" not in text
     p.db.update_task(tid, spec="build only the CPU target")
     assert "The spec changed:\nbuild only the CPU target" in worker_resume(p, p.db.task(tid), lost)
+
+
+# The two hand-offs with a valid status that the Stop hook (hook.handoff_problem) also refuses: a bad `then`
+# list (thenwaits.problem) and a done hand-off whose `continue:` follow-up only waits (chaincap.waits_only).
+BAD_THEN = {"status": "waiting", "summary": "checks run", "retry_when": "true", "then": []}
+WAITS_ONLY = {"status": "done", "summary": "built", "followups": [
+    {"title": "continue: wait for the checks", "spec": "report the result"}]}
+
+
+def test_a_bad_then_or_a_waits_only_follow_up_resumes_the_session_once_without_a_stop_hook(env, monkeypatch, tmp_path):
+    from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
+    from ttp.hook import handoff_problem
+    for bad, said in ((BAD_THEN, "`then` must be a non-empty list"), (WAITS_ONLY, "only waits")):
+        (tmp_path / "result.json").write_text(json.dumps(bad))
+        why = handoff_problem(tmp_path / "result.json")
+        assert why and said in why, why
+        p = make(env)
+        _sessions(env, monkeypatch, "s1")
+        d = Daemon(p.base)
+        t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps(bad))
+        res = load_result(t["result"])
+        # Not taken: no stored `then`, no follow-up task, no attempt; told the Stop hook's own text.
+        assert t["status"] == "queued" and t["attempts"] == 0, (said, dict(t))
+        assert res[HANDOFF_RESUME_KEY]["session"] == "s1" and why in res["woke"], (said, res)
+        assert "then" not in res and "then_refused" not in res and "followups" not in res, (said, res)
+        assert not p.db.q("SELECT id FROM tasks WHERE id > ?", (t["id"],)), said
+        assert d._resumable(t, "fake")["cause"] == "handoff"
+        # The resumed session fixes it: the hand-off is taken.
+        monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({"status": "done", "summary": "built", "followups": []}))
+        d.dispatch()
+        run = _task_runs(p, t["id"])[-1]
+        assert json.loads((pathlib.Path(run["dir"]) / "run.json").read_text())["argv"][-2:] == ["--resume", "s1"]
+        assert why in (pathlib.Path(run["dir"]) / "prompt.md").read_text()
+        _finish_runs(p, d)
+        t = p.db.task(t["id"])
+        assert t["status"] == "done" and t["attempts"] == 1, (said, dict(t))
+
+
+def test_a_second_bad_then_or_waits_only_hand_off_is_taken_as_before(env, monkeypatch):
+    from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
+    for bad in (BAD_THEN, WAITS_ONLY):
+        p = make(env)
+        _sessions(env, monkeypatch, "s1")
+        d = Daemon(p.base)
+        t = _no_handoff_run(env, p, d, monkeypatch, result=json.dumps(bad))
+        assert HANDOFF_RESUME_KEY in load_result(t["result"])
+        d.dispatch()
+        _finish_runs(p, d)
+        t = p.db.task(t["id"])
+        res = load_result(t["result"])
+        assert HANDOFF_RESUME_KEY not in res and len(_task_runs(p, t["id"])) == 2, dict(t)
+        assert t["status"] == ("queued" if bad is BAD_THEN else "done"), dict(t)
+        if bad is BAD_THEN:
+            assert "then_refused" in res and "then" not in res, res
+
+
+def test_a_provider_with_a_stop_hook_takes_a_bad_then_or_waits_only_hand_off_as_before(env, monkeypatch):
+    """Claude's Stop hook refuses these in-run; one that still reaches the daemon is taken unchanged."""
+    from ttp.daemon import Daemon, HANDOFF_RESUME_KEY
+    from ttp.providers.fake import Fake
+    for bad in (BAD_THEN, WAITS_ONLY):
+        p = make(env)
+        _sessions(env, monkeypatch, "s1")
+        d = Daemon(p.base)
+        with monkeypatch.context() as m:
+            m.setattr(Fake, "stop_hook", True, raising=False)
+            t = _no_handoff_run(env, p, d, m, result=json.dumps(bad))
+        res = load_result(t["result"])
+        assert HANDOFF_RESUME_KEY not in res and "woke" not in res and len(_task_runs(p, t["id"])) == 1, dict(t)
+        if bad is BAD_THEN:
+            assert t["status"] == "queued" and "then_refused" in res, (dict(t), res)
+        else:
+            assert t["status"] == "done", dict(t)
