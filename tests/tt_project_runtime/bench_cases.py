@@ -138,7 +138,7 @@ def _bench_built(env, tmp_path):
     repo, git, commit, rev = _bench_repo(tmp_path)
     tid = _bench_land(git, commit, rev, "keep", {"mod.py": "def old():\n    return 1\n\n\ndef new():\n    return 2\n",
                                                   "tests/test_mod.py": "import mod\n\n\ndef test_old():\n    assert mod.old() == 1"
-                                                  "\n\n\ndef test_new():\n    assert mod.new() == 2\n"},
+                                                  "\n\n\ndef test_new():\n    assert mod.new() == 2, 'new() returns two'\n"},
                       p, "Add new() returning 2.", 2_000_000.0)
     m = bench.prep(p.db, repo, tmp_path / "bench", 1_000_000.0)
     assert [t["task"] for t in m["tasks"]] == [tid]
@@ -231,6 +231,22 @@ def test_bench_run_cell_cannot_reach_the_landed_commit_later_history_or_the_held
                            task, [tmp_path / "bench"])
     assert flags == [f"names {tmp_path / 'bench'}", "names the landed commit", "runs 'gh api'", "runs 'git fetch'"]
     assert benchrun.audit("git log --oneline; pytest -q", task, [tmp_path / "bench"]) == []
+    secret = benchrun.secret_lines(tmp_path / "bench", task)
+    assert secret == {"tests/test_mod.py": ["def test_new():", "    assert mod.new() == 2, 'new() returns two'"]}
+    seen = json.dumps({"type": "user", "content": [{"text": "    assert mod.new() == 2, 'new() returns two'\n"}]})
+    assert benchrun.audit(seen, task, [], secret) == ["shows 1 line(s) only the held-out tests have"]
+    assert benchrun.audit("", task, [], secret, diff="+    assert mod.new() == 2,  'new() returns two'") \
+        == ["shows 1 line(s) only the held-out tests have"], "a copied test in the diff is caught, spacing aside"
+    assert benchrun.audit("", task, [], secret, diff="+    assert mod.new() == 2") == []
+    # A candidate that copies the hidden file in by its path fails as flagged, never graded.
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"cp {tmp_path / 'bench' / str(tid) / 'heldout' / 'tests' / 'test_mod.py'} tests/ && {_BENCH_FIX}")
+    rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h-copy", arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert [r["outcome"] for r in rows] == ["flagged", "flagged"] and not any(r["passed"] for r in rows)
+    # A results line torn by a crash is skipped and its cell runs again on a line of its own.
+    res = tmp_path / "h2h-copy" / "results.jsonl"
+    res.write_text(res.read_text().splitlines()[0] + "\n" + '{"task": ')
+    again = benchrun.run(tmp_path / "bench", tmp_path / "h2h-copy", arms, 1, 1, _bench_opts(tmp_path), p.config())
+    assert len(again) == 1 and json.loads(res.read_text().splitlines()[-1])["arm"] == again[0]["arm"]
 
 
 def test_bench_run_arms_parse_and_need_two(tmp_path):
@@ -242,6 +258,8 @@ def test_bench_run_arms_parse_and_need_two(tmp_path):
             benchrun.parse_arm(bad)
     with pytest.raises(benchrun.BenchError, match="two arms"):
         benchrun.run(tmp_path, tmp_path / "o", {"a": {}}, 1, 1, {}, {})
+    with pytest.raises(benchrun.BenchError, match="arm names"):
+        benchrun.run(tmp_path, tmp_path / "o", {"a": {}, "../b": {}}, 1, 1, {}, {})
     s = benchrun.schedule([1, 2], ["a", "b"], 3, 5)
     assert s == benchrun.schedule([1, 2], ["b", "a"], 3, 5), "the order depends on the seed alone"
     assert len({tuple(c["arm"] for c in s[i:i + 2]) for i in range(0, len(s), 2)}) == 2, "both orders occur"

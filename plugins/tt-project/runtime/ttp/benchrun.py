@@ -33,6 +33,7 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import bench
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -111,13 +112,46 @@ def leaks(ws: Path, task: dict) -> list[str]:
     return out
 
 
-def audit(transcript: str, task: dict, hidden: list[Path]) -> list[str]:
-    """Why a cell's transcript counts as a cheat attempt: a hidden path, the landed commit, history or
-    forge commands. [] when clean."""
+def secret_lines(bench_dir: Path, task: dict) -> dict[str, list[str]]:
+    """{path: lines} of each held-out file that its base copy lacks: what only the hidden tests show."""
+    out = {}
+    for path in task["heldout"]:
+        base = bench_dir / str(task["task"]) / "workspace" / path
+        have = set(base.read_text(errors="replace").splitlines()) if base.is_file() else set()
+        out[path] = [x for x in (bench_dir / str(task["task"]) / "heldout" / path).read_text(errors="replace")
+                     .splitlines() if x not in have]
+    return out
+
+
+def _strings(raw: str) -> str:
+    # The transcript as written plus every string in its JSON lines, unescaped.
+    found = [raw]
+
+    def walk(v):
+        if isinstance(v, str):
+            found.append(v)
+        for x in v.values() if isinstance(v, dict) else v if isinstance(v, list) else ():
+            walk(x)
+    for line in raw.splitlines():
+        try:
+            walk(json.loads(line))
+        except ValueError:
+            pass
+    return "\n".join(found)
+
+
+def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None = None, diff: str = "") -> list[str]:
+    """Why a cell counts as a cheat attempt: its transcript names a hidden path or the landed commit or
+    runs history or forge commands, or it or the candidate's diff shows lines only the held-out tests
+    have (bench.QUOTE_LINES of them, or all when fewer). [] when clean."""
     out = [f"names {p}" for p in hidden if str(p) in transcript]
     if task["head"][:12] in transcript:
         out.append("names the landed commit")
     out += sorted({f"runs {m.group(0)!r}" for m in CHEAT.finditer(transcript)})
+    if (long := sum(len(x) >= bench.QUOTE_LEN for xs in (secret or {}).values() for x in set(xs))) and \
+            (n := bench.quotes(_strings(transcript) + "\n" + diff, {"x": [x for xs in secret.values() for x in xs]})) \
+            >= min(bench.QUOTE_LINES, long):
+        out.append(f"shows {n} line(s) only the held-out tests have")
     return out
 
 
@@ -173,10 +207,13 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
                    if provider == "chat" else {})}
         durable_write(run / "run.json", json.dumps(spec, indent=1))
         began = time.time()
-        with open(run / "runner.log", "wb") as log:
-            subprocess.run([sys.executable, "-m", "ttp.runner", str(run)], cwd=str(run), env=_clean_env(),
-                           stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
-                           timeout=opts["timeout_s"] + 300)
+        try:
+            with open(run / "runner.log", "wb") as log:
+                subprocess.run([sys.executable, "-m", "ttp.runner", str(run)], cwd=str(run), env=_clean_env(),
+                               stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
+                               timeout=opts["timeout_s"] + 300)
+        except subprocess.TimeoutExpired:   # the supervisor itself hung: its watchdog ends the agent
+            return {**row, "outcome": "runner_timeout", "passed": False, "wall_s": round(time.time() - began, 1)}
         row["wall_s"] = round(time.time() - began, 1)
         u = prov.parse(run / "output.jsonl", run / "stderr.log")
         row.update(cost_usd=u.cost_usd, cost_estimated=u.estimated, input_tokens=u.input_tokens,
@@ -189,7 +226,8 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         subprocess.run(["git", "-C", str(ws), "add", "-A"], capture_output=True)
         diff = subprocess.run(["git", "-C", str(ws), "diff", "--cached", start], capture_output=True).stdout
         row["diff_sha256"] = _sha(diff)
-        flags = audit(transcript.decode(errors="replace"), task, [bench_dir.resolve(), out.resolve()])
+        flags = audit(transcript.decode(errors="replace"), task, [bench_dir.resolve(), out.resolve()],
+                      secret_lines(bench_dir, task), diff.decode(errors="replace"))
         passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"]) if not flags \
             else (False, "not graded: flagged by the cheat audit")
         row.update(passed=passed, flagged=flags, outcome="flagged" if flags else "pass" if passed else "fail")
@@ -209,6 +247,8 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
     """Run every cell of the plan not yet in <out>/results.jsonl; returns the rows this call added."""
     if len(arms) < 2:
         raise BenchError("a head-to-head needs at least two arms")
+    if bad := [a for a in arms if not re.fullmatch(r"[A-Za-z0-9_.-]+", a)]:
+        raise BenchError(f"arm names take letters, digits, '.', '_' and '-' only: {bad}")
     man = verified(bench_dir)
     tasks = {t["task"]: t for t in man["tasks"][:limit or None]}
     plan = {"bench": str(bench_dir.resolve()), "manifest_sha256": (bench_dir / "manifest.sha256").read_text().split()[0],
@@ -222,15 +262,20 @@ def run(bench_dir: Path, out: Path, arms: dict, reps: int, seed: int, opts: dict
     else:
         durable_write(out / "plan.json", json.dumps(plan, indent=1) + "\n")
     done = set()
-    if (out / "results.jsonl").exists():
-        done = {(r["task"], r["rep"], r["arm"]) for r in map(json.loads, (out / "results.jsonl").read_text().splitlines())}
+    for line in (out / "results.jsonl").read_text().splitlines() if (out / "results.jsonl").exists() else []:
+        try:
+            r = json.loads(line)
+            done.add((r["task"], r["rep"], r["arm"]))
+        except (ValueError, KeyError, TypeError):
+            continue   # a line torn by a crash: its cell runs again
     added = []
     for cell in plan["cells"]:
         if (cell["task"], cell["rep"], cell["arm"]) in done:
             continue
         row = {**run_cell(bench_dir, out, tasks[cell["task"]], cell, arms[cell["arm"]], opts, cfg), "seed": seed}
-        with open_append(out / "results.jsonl") as f:
-            f.write(json.dumps(row) + "\n")
+        with open_append(out / "results.jsonl", "ab+") as f:
+            torn = f.seek(0, 2) > 0 and f.seek(-1, 2) >= 0 and f.read(1) != b"\n"
+            f.write((b"\n" if torn else b"") + json.dumps(row).encode() + b"\n")
             f.flush()
             os.fsync(f.fileno())
         added.append(row)
