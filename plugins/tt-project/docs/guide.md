@@ -876,6 +876,23 @@ project overrides any entry, for example `ttp config <name> providers.claude.tie
 A task's own model or effort pin wins over its tier. A failed light try is retried at standard,
 on the standard model.
 
+### Blind review for model comparisons
+
+`python3 -m ttp.benchblind` scores a comparison's outputs without the reviewer knowing which arm
+wrote them. `prep <cells.json> --out <dir> [--seed N]` takes each replayed task's acceptance
+criteria and every arm's diff with its metadata (model, provider, effort, run id, transcript,
+timings), and writes anonymised items: commit headers, trailers and blob ids are dropped, and model
+and provider names, effort settings, run and session ids, timestamps, elapsed times, transcript
+paths and every metadata value in the batch are masked. Prep refuses a batch where one still shows.
+The arms of each task take letters in an order shuffled from the seed, and the items are shuffled
+too. The seed and labels go to `<dir>/seal.json` (mode 0600), pinned by its sha256 in
+`<dir>/batch.json`. `review <dir> [--provider P --model M --effort E]` runs one decision-only,
+schema-checked call per unscored item on that provider, with only the criteria and the anonymised
+diff, on a fixed rubric (criteria 0-4, correctness 0-4, tests 0-2, scope 0-2). `score <dir> <item>
+'<json>'` records a score by hand. `reveal <dir>` needs every item scored. It checks the seal and
+that the labels reproduce from the seed, then writes the labels, seed and per-arm totals into
+batch.json, so the scores can be audited. After that the batch takes no more scores.
+
 ### Effort A/B for standard-tier code tasks
 
 Standard code runs default to high effort. To measure whether medium effort holds quality, the A/B
