@@ -174,3 +174,65 @@ def test_a_start_when_that_fails_for_gh_login_is_folded_into_the_host_alert(env,
     events.clear()
     d._start_verdict(task, 4, now + 6 + 2 * ghauth.TIMEOUT_S + PROBE_EVERY_S)
     assert len(broken()) == 1
+
+
+def test_a_waiting_tasks_retry_when_that_fails_for_gh_login_sleeps_on_the_host_alert(env, monkeypatch):
+    """A retry_when probe (`ttp ci`) that exits gh's 4 wakes no model run while the host check says
+    logged out (or has yet to answer a nudge): the task keeps sleeping and says it waits on the host's
+    gh login. Once gh is logged in, a probe still exiting 4 wakes the task as broken."""
+    from ttp import ghauth
+    from ttp.daemon import Daemon
+    _stub_gh(env, monkeypatch, rc=4, err="To get started with GitHub CLI, please run:  gh auth login")
+    p = make(env)
+    probe = "ttp ci --branch main"
+    now = time.time()
+    tid = p.db.add_task("wait on ci", "s", kind="code", origin="coordinator")
+    p.db.x("UPDATE tasks SET result=?, not_before=? WHERE id=?",
+           (json.dumps({"status": "waiting", "retry_when": probe, "waiting_since": now - 60}), now + 600, tid))
+    d = Daemon(p.base)
+    woke = []
+    monkeypatch.setattr(d, "_wake_waiting", lambda t, why, at, extra=None: woke.append(why))
+
+    def hold(rc, at):
+        d._probe_rc[tid] = (rc, at, probe)
+        d._probe_out[tid] = ("broken: gh is not logged in on this host; the user runs `gh auth login`", at, probe)
+        t = p.db.task(tid)
+        d._hold_waiting(t, json.loads(t["result"]), at)
+        return p.db.task(tid)
+    t = hold(4, now)
+    assert not woke, "woken before the host check answered"
+    assert float(ghauth.read()["nudged"]) == now
+    assert "gh" in t["blocked_reason"] and "log" in t["blocked_reason"] and t["not_before"] > now, t["blocked_reason"]
+    ghauth._write(None, {"ok": False, "since": now, "checked_at": now + 1, "error": "x"})
+    t = hold(4, now + 2)
+    assert not woke, "woken while the host alert covers it"
+    assert "gh" in t["blocked_reason"] and t["not_before"] > now + 2
+    ghauth._write(None, {"ok": True, "checked_at": now + 3})
+    hold(4, now + 4)
+    assert len(woke) == 1 and woke[0].startswith("probe broken: exit 4"), woke
+
+
+def test_the_tick_path_gh_nudge_never_waits_on_a_running_host_check(env, monkeypatch):
+    """The daemon's nudge skips, not waits, while another daemon holds the host check's lock (its
+    `gh auth status` answers anyway)."""
+    import fcntl
+    from ttp import ghauth
+    from ttp.daemon import Daemon
+    _stub_gh(env, monkeypatch, rc=4, err="To get started with GitHub CLI, please run:  gh auth login")
+    p = make(env)
+    d = Daemon(p.base)
+    lock = ghauth._home(None) / ghauth.LOCK
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    fd = os.open(lock, os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    try:
+        t0 = time.monotonic()
+        res = []
+        th = threading.Thread(target=lambda: res.append(d._gh_logged_out(4, "gh auth login", time.time())),
+                              daemon=True)
+        th.start()
+        th.join(5)
+        assert not th.is_alive() and res == [True], "the tick waited on another daemon's gh check"
+        assert time.monotonic() - t0 < 5 and "nudged" not in ghauth.read()
+    finally:
+        os.close(fd)

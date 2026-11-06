@@ -12520,7 +12520,7 @@ class Daemon:
             return now - float(st["nudged"]) < window
         if st.get("ok") and now - float(st.get("checked_at") or 0) < window:
             return False   # gh answered logged in since this probe could have failed: the probe is broken
-        ghauth.nudge(now)
+        ghauth.nudge(now, block=False)   # a busy lock: the check running now answers anyway
         return True
 
     def _start_resource_stale(self, task: dict, d: dict, now: float) -> None:
@@ -13349,13 +13349,15 @@ class Daemon:
         since = float(prev["waiting_since"])
         rc, at, _ = self._probe_rc.get(tid, (None, 0.0, ""))
         fresh = at >= since and now - at <= 2 * PROBE_EVERY_S
+        gh_down = False   # a gh logout the host's one gh-auth alert covers: not yet, never a wake per task
         if fresh and rc == 0:
             self._probe_passed(task, now)
         elif fresh and detach.failed_check(str(prev.get("retry_when") or ""), rc):
             self._job_failed(task, now)
         elif fresh and _push_not_landed(prev.get("retry_when"), rc):
             self._push_finished_unpushed(task, now)
-        elif fresh and rc not in NOT_YET_RCS:
+        elif fresh and rc not in NOT_YET_RCS and not (gh_down := self._gh_logged_out(
+                rc, (self._probe_out.get(tid) or ("",))[0], now)):
             raw = self._probe_raw(tid, str(prev.get("retry_when") or ""))
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}"
                                + (f" ({raw[:300]})" if raw else ""), now, {"probe_raw": raw} if raw else None)
@@ -13373,7 +13375,8 @@ class Daemon:
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
             # Nor is a user pause (userpause): only the user's word lifts it. Nor a reply wait while
             # its peer is recovering (ackwait.peer_recovering): it raises once the peer can act again.
-            if held and (gate is None or gate <= now) \
+            # Nor a gh logout: the host's one gh-auth alert asks the user.
+            if held and (gate is None or gate <= now) and not gh_down \
                     and not userpause.is_probe(prev.get("retry_when"), self.cfg) \
                     and not (peer if peer is not None else
                              ackwait.peer_recovering(prev.get("retry_when"), self.cfg, self.p.harness)[0]):
@@ -13383,7 +13386,9 @@ class Daemon:
             retry = waitpoll.capped(self.cfg, task, prev, _retry_s(prev))
             nb = now + retry if held else min(now + retry, start + max_hold)
             what = self._wait_what(tid, prev)
-            says = "host unreachable" if rc == 255 else "not yet"
+            says = "host unreachable" if rc == 255 else \
+                "gh is logged out on this host (the host's gh-auth alert asks for `gh auth login`)" if gh_down \
+                else "not yet"
             db = self.p.db
             db.update_task(tid, not_before=nb, blocked_reason=(
                 f"waiting for {what}; its probe says {says}; next try "

@@ -90,8 +90,9 @@ def _write(home: Path | None, st: dict) -> None:
     write_json(_home(home) / STATE, st, 0o600)
 
 
-def nudge(now: float | None = None, home: Path | None = None) -> None:
-    """Ask for a recheck at the next check, whatever EVERY_S says (a gh call just failed its login)."""
+def nudge(now: float | None = None, home: Path | None = None, block: bool = True) -> None:
+    """Ask for a recheck at the next check, whatever EVERY_S says (a gh call just failed its login).
+    block=False (the daemon's tick) skips it while another daemon holds the lock: its check answers anyway."""
     now = time.time() if now is None else now
 
     def put():
@@ -99,7 +100,7 @@ def nudge(now: float | None = None, home: Path | None = None) -> None:
         if float(st.get("nudged") or 0) <= float(st.get("checked_at") or 0):
             _write(home, {**st, "nudged": now})
     try:
-        _locked(home, put, block=True)
+        _locked(home, put, block=block)
     except OSError:
         pass
 
