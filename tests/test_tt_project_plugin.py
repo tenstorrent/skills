@@ -1467,6 +1467,37 @@ def test_ssh_and_gh_folder_marks_stat_only_and_open_no_file(tmp_path, monkeypatc
                                                        f"  {ssh}/id_new: created"])
 
 
+def test_the_session_fails_when_a_protected_path_of_the_real_home_changed(tmp_path, monkeypatch):
+    """The session's credential check covers the write guard's protected paths (guards.protected_paths
+    too) of the account's real home: a file created or rewritten under one between session start and end
+    fails the session; an untouched one does not. The "real" home here is a scratch folder."""
+    import time
+    c = _test_conftest()
+    real = tmp_path / "real"
+    access = real / ".config" / "example-access"
+    access.mkdir(parents=True)
+    (access / "token").write_text("t1\n")
+    (real / ".tt-project").mkdir()
+    (real / ".tt-project" / "settings.json").write_text(
+        json.dumps({"guards": {"protected_paths": ["~/.config/example-access"]}}))
+    monkeypatch.setattr(c, "_REAL_ENV", {"HOME": str(real), "PATH": os.environ.get("PATH", "")})
+    before = c.credential_marks()
+    assert before and str(access / "token") in before["marks"], before
+
+    def finish():
+        cfg = types.SimpleNamespace(_ttp_creds=before, pluginmanager=types.SimpleNamespace(get_plugin=lambda n: None))
+        session = types.SimpleNamespace(config=cfg, items=[], exitstatus=pytest.ExitCode.OK)
+        c.pytest_sessionfinish(session, 0)
+        return session.exitstatus
+    assert finish() == pytest.ExitCode.OK
+    time.sleep(0.05)   # past the kernel's coarse ctime tick
+    (access / "token").write_text("T1\n")
+    (access / "new").write_text("x\n")
+    got = c.credential_marks(before)
+    assert [str(access / "token"), "changed"] in got and [str(access / "new"), "created"] in got, got
+    assert finish() == pytest.ExitCode.TESTS_FAILED
+
+
 @pytest.mark.parametrize("cpus,env,jobs", [
     (1, {}, 1), (2, {}, 1), (3, {}, 1), (6, {}, 3), (8, {}, 4), (14, {}, 4), (64, {}, 4),
     (14, {"CI": "false"}, 4), (14, {"CI": ""}, 4),

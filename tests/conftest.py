@@ -171,9 +171,10 @@ _session_home()
 
 
 # The account's credential files (gh's hosts file, git's and netrc's credential files, ssh private keys,
-# the providers' login files) as the plugin's own list names them (credwatch.files), read by a child under
-# the account's real environment and compared by stat only (size, mtime, inode; never contents, as
-# credwatch.changes does): a session fails when one changed.
+# every file under the write guard's protected paths (pathguard.paths()), the providers' login files) as the
+# plugin's own list names them (credwatch.files), read by a child under the account's real environment and
+# compared by stat only (size, mtime, ctime, inode; never contents, as credwatch.changes does): a session
+# fails when one changed.
 _HERE = Path(__file__).resolve().parent
 _RUNTIME = next((d / "plugins" / "tt-project" / "runtime" for d in (_HERE.parent, _HERE)
                  if (d / "plugins" / "tt-project" / "runtime" / "ttp" / "credwatch.py").is_file()), None)
@@ -574,8 +575,8 @@ def pytest_sessionfinish(session, exitstatus):
     creds = getattr(session.config, "_ttp_creds", None)
     changed = credential_marks(creds) if creds else None
     if changed:
-        _report(session, ["the account's credential files changed while the tests ran (stat only: size, mtime, "
-                          "inode; a test must use its temp HOME):"] + [f"  {path}: {how}" for path, how in changed])
+        _report(session, ["the account's credential files or protected paths changed while the tests ran (stat "
+                          "only: size, mtime, ctime, inode; a test must use its temp HOME):"] + [f"  {path}: {how}" for path, how in changed])
         session.exitstatus = pytest.ExitCode.TESTS_FAILED
     secret = getattr(session.config, "_ttp_secret", None)
     moved = folder_changes(secret, folder_marks(secret_folders())) if secret is not None else []

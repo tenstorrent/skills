@@ -6,12 +6,15 @@ Runs are unsandboxed, so a tool call can write any file in HOME, a login file to
 patch for ~/.config/gh/ to a hook on the live HOME overwrote gh's hosts file and logged gh out on the
 host). The runner (runner.supervise) takes snapshot() as an agent starts and again once it ended, and
 writes changes() of the two to the run's exit.json; the daemon (observe) then queues one high
-observation per changed path for the coordinator, naming the run. Only stat is read (size, mtime,
-inode), never a file's contents.
+observation per changed path for the coordinator, naming the run, and fails the run's hand-off. Only
+stat is read (size, mtime, ctime, inode), never a file's contents: no key or token is opened or hashed,
+and ctime still tells a same-size rewrite whose mtime was put back.
 
 Two kinds of file (files()):
-- stores: gh's hosts file, git's and netrc's credential files and the ssh private keys. Nothing a run
-  does rewrites them: created, removed or any change of size, mtime or inode counts.
+- stores: gh's hosts file, git's and netrc's credential files, the ssh private keys, and every file
+  under the write guard's protected paths (guarded_paths: pathguard.paths(), the folders walked). Nothing
+  a run does rewrites them: created, removed or any change of size, mtime, ctime or inode counts. Files
+  their own tools rewrite in normal use are left out (CHURN: ssh's known_hosts, gh's state file, caches).
 - logins: the providers' own login files (Provider.credential_files). Their CLIs rewrite them on every
   token refresh, so only a removal, or a rewrite to under half the size it had, counts.
 
@@ -26,11 +29,15 @@ store_paths() is the one list of credential stores here, for a credential write 
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 # ~/.ssh files that hold no secret
 SSH_PUBLIC = {"config", "known_hosts", "known_hosts.old", "authorized_keys", "authorized_keys2", "rc", "environment"}
 SHRINK = 0.5   # a login file rewritten below this share of its size counts as damaged
+CHURN_NAMES = ("known_hosts", "state.yml")   # file names (prefixes) their tools rewrite in normal use
+CHURN_DIRS = {"cache", "http-cache"}          # folders of cached responses (aws sso and cli, kube)
+MAX_FILES = 2000                             # files walked per protected folder
 
 
 def ssh_private(name: str) -> bool:
@@ -53,6 +60,49 @@ def store_paths(home: str | Path | None = None, env=None) -> list[str]:
 
 
 
+def guarded_paths(env=None, cfg: dict | None = None) -> list[str]:
+    """The write guard's protected paths (pathguard.paths(): defaults, the account's and the project's
+    guards.protected_paths) for HOME and the account's own home: each regular file under them (lstat, no
+    symlink followed, CHURN left out, MAX_FILES per folder), and each missing one itself, so a run that
+    creates it is caught too."""
+    from . import pathguard
+    env = os.environ if env is None else env
+    try:
+        listed = pathguard.paths(cfg)
+    except Exception:   # unreadable settings: the defaults still count
+        listed = list(pathguard.DEFAULT_PATHS)
+    out: list[str] = []
+    for home in pathguard._homes(env):
+        for top in dict.fromkeys(pathguard.expand(p, env, "/", home, real=False) for p in listed):
+            if top in ("/", "") or not os.path.isabs(top):
+                continue
+            if not os.path.lexists(top):
+                out.append(top)
+            elif os.path.isfile(top) and not os.path.islink(top):
+                out.append(top)
+            else:
+                out += _walk(top)
+    return list(dict.fromkeys(out))
+
+
+def _walk(top: str) -> list[str]:
+    out: list[str] = []
+    for root, dirs, names in os.walk(top):
+        dirs[:] = sorted(d for d in dirs if d not in CHURN_DIRS)
+        for name in sorted(names):
+            if name.startswith(CHURN_NAMES):
+                continue
+            path = os.path.join(root, name)
+            try:
+                if stat.S_ISREG(os.lstat(path).st_mode):
+                    out.append(path)
+            except OSError:
+                continue
+            if len(out) >= MAX_FILES:
+                return out
+    return out
+
+
 def login_paths() -> list[str]:
     """Every provider's login files, as the providers name them."""
     from .providers import all_providers
@@ -67,18 +117,19 @@ def login_paths() -> list[str]:
 
 def files() -> dict[str, str]:
     """{path: "store" | "login"} of this account."""
-    out = {p: "login" for p in login_paths()}
+    out = {p: "store" for p in guarded_paths()}
+    out.update({p: "login" for p in login_paths()})
     out.update({p: "store" for p in store_paths()})
     return out
 
 
 def mark(path: str) -> list[int] | None:
-    """[size, mtime_ns, inode] of `path`, None when it is missing (stat only, never contents)."""
+    """[size, mtime_ns, inode, ctime_ns] of `path`, None when it is missing (stat only, never contents)."""
     try:
         st = os.stat(path)
     except OSError:
         return None
-    return [st.st_size, st.st_mtime_ns, st.st_ino]
+    return [st.st_size, st.st_mtime_ns, st.st_ino, st.st_ctime_ns]
 
 
 def snapshot(watched: dict[str, str] | None = None) -> dict:
@@ -94,7 +145,7 @@ def changes(before: dict, after: dict) -> list[list[str]]:
     was, now, kinds = before.get("marks") or {}, after.get("marks") or {}, {**after.get("kinds", {}), **before.get("kinds", {})}
     for path in sorted(set(was) | set(now)):
         a, b = was.get(path), now.get(path)
-        if a == b:
+        if a == b or a and b and a[:len(b)] == b[:len(a)]:   # a mark from an older runtime: its fields only
             continue
         login = kinds.get(path) == "login"
         if b is None:

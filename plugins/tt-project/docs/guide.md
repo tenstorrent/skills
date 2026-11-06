@@ -2800,9 +2800,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
 - Text from logs, issues and chats is treated as data, not instructions.
 - Credential tripwire (credwatch): the runner stats your credential files as each run's agent starts
   and once it ended: gh's hosts file, `~/.git-credentials`, `~/.netrc`, the ssh private keys in `~/.ssh`
-  and each provider's login file. Only size, mtime and inode are compared, never contents. A change
-  queues one high observation for the coordinator naming the run and the path (one per path and
-  minute when several overlapping runs saw it). Provider login files count only when removed or
+  and each provider's login file, plus every file under the write guard's protected paths (its defaults
+  and `guards.protected_paths`, in HOME and the account's own home; known_hosts, gh's state file and
+  cache folders left out). Only size, mtime, ctime and inode are compared, never contents: no key or
+  token is opened or hashed, and ctime still shows a same-size rewrite. A change queues one high
+  observation for the coordinator naming the run and the path (one per path and minute when several
+  overlapping runs saw it), and the run's hand-off is stored failed. Provider login files count only when removed or
   rewritten to under half their size, since their CLIs rewrite them on every token refresh. Nothing is
   restored automatically: without reading contents the harness cannot tell damage from a real change (a new
   `gh auth login`, a refreshed token, a rotated key, by you or another run at the same time), a restore
@@ -2810,7 +2813,7 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   unsandboxed agent could read. The observation says what to log in again instead. The test suite
   runs every test, and every process it starts, with HOME, the XDG folders, GH_CONFIG_DIR and git's
   global config (GIT_CONFIG_GLOBAL, GIT_CONFIG_NOSYSTEM) in temp folders. It fails when one of these
-  files changed, or when any file under the real `~/.ssh` or gh config folder was written (stat only:
+  files (protected paths included) changed, or when any file under the real `~/.ssh` or gh config folder was written (stat only:
   size, mtime, ctime and inode, no file there opened or read; known_hosts and sockets left out). ssh
   and ssh-keygen find `~/.ssh` from the account entry, not HOME, so tests pass them paths under their temp folder. Premise
   checks and guard tests run read-only, under a fresh `mktemp -d` HOME. The tripwire is

@@ -97,3 +97,95 @@ def test_credwatch_premise_checks_and_guard_tests_run_read_only_under_a_scratch_
         assert all(v in flat for v in ("HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR")) and "fresh `mktemp -d`" in flat, flat[:300]
     for text in (spec, (prompts / "kind-question.md").read_text()):
         assert "write nothing outside your run folder" in " ".join(text.split())
+
+
+def test_credwatch_covers_every_file_under_the_write_guards_protected_paths_by_stat_only(tmp_path, monkeypatch):
+    """The tripwire watches what pathguard protects (its defaults and guards.protected_paths), every file
+    under a protected folder and a missing path itself: a created, removed or rewritten file counts, a
+    same-size rewrite whose mtime was put back too (ctime). Files their tools rewrite (known_hosts, gh's
+    state file, caches) are left out, and no watched file is ever opened."""
+    import builtins
+    import io
+    import time
+    from ttp import credwatch, pathguard
+    home = tmp_path / "h"
+    access = home / ".config" / "example-access"
+    (access / "sub").mkdir(parents=True)
+    (access / "cache").mkdir()
+    (access / "token").write_text("t1\n")
+    (access / "sub" / "key").write_text("k\n")
+    (access / "cache" / "c.json").write_text("{}")
+    (home / ".ssh").mkdir()
+    (home / ".ssh" / "known_hosts").write_text("h k\n")
+    (home / ".ssh" / "config").write_text("Host x\n")
+    (home / ".config" / "gh").mkdir()
+    (home / ".config" / "gh" / "state.yml").write_text("checked: 1\n")
+    monkeypatch.setattr(pathguard, "_homes", lambda env: [str(home)])
+    cfg = {"guards": {"protected_paths": ["~/.config/example-access", "~/.config/example-missing"]}}
+    env = {"HOME": str(home)}
+
+    def refuse(*a, **k):
+        raise AssertionError(f"credwatch opened {a[:1]}")
+    for mod, name in ((builtins, "open"), (io, "open"), (os, "open"), (pathlib.Path, "open")):
+        monkeypatch.setattr(mod, name, refuse)
+    watched = {p: "store" for p in credwatch.guarded_paths(env, cfg)}
+    before = credwatch.snapshot(watched)
+    monkeypatch.undo()
+    monkeypatch.setattr(pathguard, "_homes", lambda env: [str(home)])
+    assert {str(access / "token"), str(access / "sub" / "key"), str(home / ".ssh" / "config"),
+            str(home / ".config" / "example-missing"), str(home / ".netrc")} <= set(watched), sorted(watched)
+    assert not any(p.endswith(("known_hosts", "state.yml", "c.json")) for p in watched), sorted(watched)
+    assert credwatch.changes(before, credwatch.snapshot(watched)) == [], "an unchanged run passes"
+    time.sleep(0.05)   # past the kernel's coarse ctime tick
+    tok = access / "token"
+    st = tok.stat()
+    tok.write_text("T1\n")   # same size, mtime put back: only ctime tells
+    os.utime(tok, ns=(st.st_atime_ns, st.st_mtime_ns))
+    (access / "sub" / "key").unlink()
+    (access / "new").write_text("x\n")
+    (home / ".config" / "example-missing").write_text("y\n")
+    (access / "cache" / "c.json").write_text("{\"a\": 1}")
+    (home / ".ssh" / "known_hosts").write_text("h k\nh2 k2\n")
+    after = credwatch.snapshot({p: "store" for p in credwatch.guarded_paths(env, cfg)})
+    assert credwatch.changes(before, after) == sorted([
+        [str(home / ".config" / "example-missing"), "created"], [str(access / "new"), "created"],
+        [str(access / "sub" / "key"), "removed"], [str(tok), "changed"]])
+    # A mark taken by an older runtime (no ctime) compares on its own fields only.
+    old = {"kinds": before["kinds"], "marks": {p: m[:3] if m else m for p, m in before["marks"].items()}}
+    assert [str(tok), "changed"] not in credwatch.changes(old, after)
+    # files(): the account's own list includes them (pathguard.paths() reads the project's settings).
+    monkeypatch.setattr(pathguard, "paths", lambda cfg=None: list(pathguard.DEFAULT_PATHS) + ["~/.config/example-access"])
+    monkeypatch.setenv("HOME", str(home))
+    assert credwatch.files()[str(access / "new")] == "store"
+
+
+def test_credwatch_a_run_that_changes_a_protected_path_fails_its_hand_off_and_a_quiet_run_passes(env, monkeypatch):
+    """A path the account's guards.protected_paths lists is watched over each run: a run that writes under
+    it raises one high observation and its `done` hand-off is stored failed; a run that leaves it alone is done."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    home = pathlib.Path(os.environ["HOME"])
+    access = home / ".config" / "example-access"
+    access.mkdir(parents=True)
+    (access / "token").write_text("t1\n")
+    (env["home"] / "settings.json").write_text(json.dumps({"guards": {"protected_paths": ["~/.config/example-access"]}}))
+    monkeypatch.setenv("TTP_FAKE_SHELL", "true")
+    quiet = p.db.add_task("quiet run", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    d.dispatch()
+    _finish_runs(p, d)
+    assert p.db.task(quiet)["status"] == "done"
+    assert not p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"printf 'x\\n' > {shlex.quote(str(access / 'token'))}")
+    tid = p.db.add_task("write the access token", "s", kind="work", tier="light", origin="user")
+    d.dispatch()
+    _finish_runs(p, d)
+    run = p.db.one("SELECT id FROM runs WHERE task=?", (tid,))
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert len(rows) == 1 and rows[0]["severity"] == "high", rows
+    assert f"run {run['id']} of task #{tid}" in rows[0]["text"] and str(access / "token") in rows[0]["text"]
+    task = p.db.task(tid)
+    res = json.loads(task["result"] or "{}")
+    assert task["status"] != "done" and res.get("status") == "failed", (task["status"], res)
+    assert res.get("handoff_status") == "done" and res.get("cred_changed") == [[str(access / "token"), "changed"]], res
+    assert "credential files changed" in res["summary"]

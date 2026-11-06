@@ -5528,6 +5528,12 @@ class Daemon:
         rejects = rstatus == "done" and task["kind"] == "review" and review_rejects(result)
         if rejects:
             rstatus, result = "failed", dict(result, status=CHANGES_NEEDED)
+        if own and rstatus in HANDOFF_STATES and rstatus != "failed" and (cred := _cred_changed(run_dir)):
+            # The run changed a credential file (credwatch, observed above): its hand-off never stands.
+            rstatus, result = "failed", dict(result, status="failed", handoff_status=rstatus, cred_changed=cred,
+                                             summary=f"Failed: credential files changed during the run "
+                                                     f"({'; '.join(f'{p} {h}' for p, h in cred)[:400]}). Its "
+                                                     f"hand-off said: {result.get('summary') or ''}"[:1500])
         summary = str((result.get("summary") if isinstance(result, dict) else None)
                       or (usage.final_text or usage.error or "")[:1500])
         if status in FREE_ENDS and not rstatus and r.get("id"):
@@ -17530,6 +17536,12 @@ def _read_result(path: Path) -> dict | None:
         return data if isinstance(data, dict) else None
     except (OSError, ValueError):
         return None
+
+
+def _cred_changed(run_dir: Path) -> list:
+    """The credential changes (credwatch) the runner wrote to the run's exit.json; [] when none."""
+    got = (_read_result(run_dir / "exit.json") or {}).get("cred_changed")
+    return [c for c in got if isinstance(c, list) and len(c) == 2] if isinstance(got, list) else []
 
 
 def _saved_gate(d: dict | None) -> bud.Gate | None:
