@@ -27436,6 +27436,7 @@ def test_an_empty_run_json_fails_the_run_without_crashing_its_supervisor(env):
     ("push_queue", [True, False], ["yes", 1]),
     ("push_batch_s", [0, 900, 1.5], [-1, "soon", True, None, float("nan"), float("inf")]),
     ("push_batch_max", [1, 8, 8.0], [0, 2.5, "eight", False]),
+    ("push_age_s", [0, 14400, 1.5], [-1, "4h", True, None]),
     ("after_push", [[], ["true", "./deploy.sh x"], "make deploy"], [["Deploy everything now"]]),
     ("after_push_timeout_s", [1, 1800], [0, -5, "long"]),
 ])

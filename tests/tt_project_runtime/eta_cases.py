@@ -552,3 +552,37 @@ def test_expected_finish_names_tasks_with_no_estimate_for_one_reason_on_one_line
     assert lines[1:] == [f"- #{a}, #{b}, #{c}: ETA: no estimate yet (no measured work run yet)"], lines
     assert eta.state_lines(p.db, p, skip={a, b})[1:] == [f"- #{c} third new work: ETA: no estimate yet (no measured work run yet)"]
     assert eta.state_lines(p.db, p, skip={a, b, c}) == [], "ids shown elsewhere leave no shared line naming them"
+
+
+def test_eta_of_a_queued_approval_counts_the_approvals_ahead_of_it(env):
+    """#6857: the eta of an approval still waiting for a batch is the batches it waits for (the approvals
+    ahead of it in the queue's order, aging included, per push_batch_max) times the median batch, plus
+    what is left of a running batch; with no measured batch it keeps the median landing."""
+    from ttp import eta
+    p = make(env)
+    now = time.time()
+    p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+           (999, "b", "h", "t", "pushed", now - 9000, now - 8400))   # median landing 600
+    ids = {}
+    for name, prio in (("hot", 1), ("mine", 3), ("a", 2), ("b", 2), ("c", 2), ("later", 3)):   # approval order
+        tid = ids[name] = p.db.add_task(f"Review {name}", "s", kind="review", priority=prio, status="pushing")
+        p.db.x("INSERT INTO push_queue(task,branch,head,target,status,created,updated) VALUES(?,?,?,?,?,?,?)",
+               (tid, "b", "h", "t", "approved", now - 60, now - 60))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2})
+    assert [k for k, _ in e["legs"]] == ["landing"] and e["end"] == pytest.approx(now + 600), "no batch measured yet"
+    for i, d in enumerate((1200, 1800, 2400)):
+        p.db.x("INSERT INTO push_batches(id,marker,target,started,ended,finalized,after_finalized,outcome) "
+               "VALUES(?,?,?,?,?,?,?,?)", (f"b{i}", "m", "t", now - 20000 + i * 5000, None, None,
+                                            now - 20000 + i * 5000 + d, "pushed"))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2})
+    assert e["legs"] == [("landing (4 approvals ahead)", pytest.approx(3 * 1800))], e["legs"]
+    assert eta.estimate(p.db, ids["hot"], now, delivery={"push_batch_max": 2})["end"] == pytest.approx(now + 1800)
+    assert eta.estimate(p.db, ids["later"], now)["legs"][0][0] == "landing (5 approvals ahead)", "default cap 8"
+    # Waited two periods of push_age_s, it joins the priority-2 lane and leads it (approved before them).
+    p.db.x("UPDATE push_queue SET created=? WHERE task=?", (now - 7200, ids["mine"]))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2, "push_age_s": 3600})
+    assert e["legs"] == [("landing (1 approval ahead)", pytest.approx(1800))]
+    # A running batch adds what is left of its median.
+    p.db.x("INSERT INTO push_batches(id,marker,target,started) VALUES('live','m','t',?)", (now - 600,))
+    e = eta.estimate(p.db, ids["mine"], now, delivery={"push_batch_max": 2, "push_age_s": 3600})
+    assert e["end"] == pytest.approx(now + 1200 + 1800)

@@ -3759,6 +3759,55 @@ def test_an_approval_sent_back_by_a_conflict_leads_its_priority_in_the_next_batc
     assert [r["id"] for r in got] == [hot, back, *older, carried], why
 
 
+def test_a_stream_of_priority_two_approvals_cannot_keep_an_old_priority_three_one_out_of_batches(env, monkeypatch):
+    """#6857: priority 3-4 approvals waited about 10.7 h while priority 1-2 approvals refilled every batch.
+    delivery.push_age_s ages an approval one priority per period waited, never past priority 2: once it
+    reaches the priority-2 lane it is older than the stream and leads it; priority 1 still goes first."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=2, push_age_s=3600)
+    s.p.db.update_task(s.review, status="done")
+    now = time.time() + 1
+    _pq_last_batch(s, "tip_failed", now - 4000)   # past the gap; not clean, so the cap stays 2
+    _pq_earlier(s)                                # none independent: only priority and age decide
+    old = _pq_review(s, priority=3)[1]
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now, old))
+    taken_at = None
+    for k in range(6):   # every 20 min two more priority-2 approvals arrive; each batch takes two
+        t = now + 1200 * k
+        for _ in range(2):
+            s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (t, _pq_review(s, priority=2)[1]))
+        got = [r["id"] for r in pushq.due(s.p, t)[0]]
+        assert len(got) == 2
+        if old in got:
+            taken_at = k
+            assert got[0] == old, "aged to priority 2, the older approval leads the stream"
+            break
+        s.p.db.x(f"DELETE FROM push_queue WHERE id IN ({','.join('?' * len(got))})", got)
+    assert taken_at == 3, "taken by the first batch once it waited push_age_s, never before"
+    # Priority 1 (urgent) still goes first: an aged approval never passes priority 2.
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - 10 * 3600, old))
+    hot = _pq_review(s, priority=1)[1]
+    got = [r["id"] for r in pushq.due(s.p, now)[0]]
+    assert got == [hot, old], got
+    assert [r["aged_priority"] for r in pushq._approved(s.p.db, "origin/proj", now, 3600)][:2] == [1, 2]
+    # Priority 4 needs two periods; push_age_s 0 turns aging off.
+    s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?)", (hot, old))
+    four = _pq_review(s, priority=4)[1]
+    for age, rank in ((3599, 4), (3600, 3), (7200, 2), (10 ** 6, 2)):
+        s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - age, four))
+        [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 3600) if r["id"] == four]
+        assert (r["priority"], r["aged_priority"]) == (4, rank), age
+        assert (pushq._prio(r) <= pushq.FAST_PRIORITY) == (rank == 2)
+    [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 0) if r["id"] == four]
+    assert r["aged_priority"] == 4, "push_age_s 0: no aging"
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now + 7200, four))   # a clock step back
+    [r] = [r for r in pushq._approved(s.p.db, "origin/proj", now, 3600) if r["id"] == four]
+    assert r["aged_priority"] == 4, "a future approval time never makes it worse or better"
+    s.p.set_config("delivery.push_age_s", 0)
+    s.p.db.x("UPDATE push_queue SET created=? WHERE id=?", (now - 10 ** 6, four))
+    assert four not in [r["id"] for r in pushq.due(s.p, now)[0]], "off: the priority-2 approvals keep it out"
+
+
 def test_an_approval_sent_back_by_a_conflict_keeps_its_lead_over_an_older_peer_sharing_its_files(env, monkeypatch):
     """Review #6565: fast_ids counts a routine row independent only against older ones, so an older peer
     changing the re-approved head's file went first (due's fast reorder, the wait path, _one_solo) and

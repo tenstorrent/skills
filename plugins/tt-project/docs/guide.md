@@ -2554,7 +2554,12 @@ session and stateless coordinators on every provider.
   new batch never starts while the last one's after_push still runs; a full batch, a
   priority 1-2 review's approval, or one the last batch requeued unchecked after a failing change
   starts at once; 0 = off). Approvals that waited while the last clean batch ran start the next one
-  at once, and priority 1-2 approvals always lead it. Within a priority, an approval an earlier batch
+  at once, and priority 1-2 approvals always lead it. `push_age_s` (default 14400, 4 h; 0 = off):
+  an approval of priority 3 or worse sorts one priority better per this many seconds it has waited,
+  never better than priority 2, so a steady stream of priority 1-2 approvals cannot keep it out of
+  batches; aged to priority 2 it is older than that stream and leads it, while priority 1 and urgent
+  approvals still go first. `ttp eta` of an approved change counts the approvals ahead of it and the
+  measured batch time. Within a priority, an approval an earlier batch
   sent back as a conflict leads, so a peer ahead of it cannot send it back a second time: an older
   routine approval sharing its files is not independent of it, and a solo-path batch takes it first. `push_solo_paths` (default `[]`, off:
   git pathspecs a batch takes at most one routine approved change touching; the oldest such change
@@ -2961,6 +2966,7 @@ is open raises one `cap_wait` event naming the key.
 | `checks.test_project_max` | from cores and memory, at least 2 (`auto`) | a project's suites at once | convenience |
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
 | `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once; a backlog after a clean batch grows it up to 3x) | convenience |
+| `delivery.push_age_s` | 14400 s (4 h) | a priority 3+ approval in the push queue sorts one priority better per period waited (never past 2) | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
 | `retry_when` / `start_when` probe (`waiting.poll_s`) | 90 s (20-180 s); only a `start_when` probe of an arbitrary command that keeps saying not-yet backs off, to at most 600 s (`MAX_EVERY_S`) with the wait's length; landing (`landed:#`, ttp landed), job (detach --check), checks --result, push --result, lock --probe, CI, ack-wait, upstream --fixed and date (`test "$(date ...`) probes, and every `retry_when` probe, keep `waiting.poll_s`; a pass wakes the task at once whatever its timer | a waiting or deferred task before its probe runs again | convenience |
 | auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |

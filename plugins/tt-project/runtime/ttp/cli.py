@@ -2153,9 +2153,10 @@ def cmd_eta(a) -> None:
         die("no tt-project project here; name one: `ttp eta <task> <name>`")
     ref, now = str(a.target).lstrip("#"), time.time()
     if ref.isdigit():
-        e = eta.estimate(p.db, int(ref), now, core=eta.core_of(p))
+        e = eta.estimate(p.db, int(ref), now, core=eta.core_of(p), delivery=p.config().get("delivery"))
     elif (o := obligations.get(p.db, ref)) is not None:
-        e = eta.obligation_estimate(p.db, o, now, eta._Est(p.db, now, core=eta.core_of(p)))
+        e = eta.obligation_estimate(p.db, o, now, eta._Est(p.db, now, core=eta.core_of(p),
+                                                           delivery=p.config().get("delivery")))
     else:
         die(f"not a task id or obligation: {a.target}")
     if a.json:

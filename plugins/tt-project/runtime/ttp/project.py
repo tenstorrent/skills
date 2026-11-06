@@ -612,7 +612,7 @@ EXTRA_KEYS = {
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
     "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
-                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_landing_alert_h", "push_script_torn_escalate_after",
+                 "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_age_s", "push_landing_alert_h", "push_script_torn_escalate_after",
                  "push_setup_fault_escalate_after", "after_push",
                  "push_solo_paths", "push_cap_tests", "push_rerun_s", "mechanical_merge_paths",
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
@@ -901,18 +901,22 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # waited push_batch_s, push_batch_max are waiting or approvals waited out the last batch; after a batch
 # that did not end clean, not before push_min_gap_s passed since it ended unless it is full or priority
 # 1-2; after a clean one a backlog grows a batch up to pushq.BATCH_GROW times push_batch_max)
+# push_age_s: an approval sorts one priority better per this many seconds waited, never past priority 2
+# (pushq._approved; 0 = off), so a stream of priority 1-2 approvals cannot starve a routine one.
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
 # push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 # push_script_torn_escalate_after: batches held script_torn on one check this many times in a row raise a
 # high alert (pushq._held_told; 0 = off); push_setup_fault_escalate_after: the same for batches held
 # setup_fault (a check that failed before any test ran, after its reruns).
 PUSH_QUEUE_DEFAULTS = {"push_queue": False, "push_batch_s": 300, "push_batch_max": 8, "push_min_gap_s": 1800,
+                       "push_age_s": 14400,
                        "push_landing_alert_h": 4, "push_script_torn_escalate_after": 3,
                        "push_setup_fault_escalate_after": 3,
                        "after_push_timeout_s": 1800, "deploy_restart_wait_s": 900}
 # key: (minimum, whether the minimum itself is allowed, whole numbers only)
 PUSH_QUEUE_NUMBERS = {"push_batch_s": (0, True, False), "push_batch_max": (1, True, True),
-                      "push_min_gap_s": (0, True, False), "push_landing_alert_h": (0, True, False),
+                      "push_min_gap_s": (0, True, False), "push_age_s": (0, True, False),
+                      "push_landing_alert_h": (0, True, False),
                       "push_script_torn_escalate_after": (0, True, True),
                       "push_setup_fault_escalate_after": (0, True, True),
                       "after_push_timeout_s": (0, False, False), "deploy_restart_wait_s": (0, True, False)}
