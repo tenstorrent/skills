@@ -1643,7 +1643,7 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
               chat: str | None = None, now: float | None = None) -> str:
     """Record the order user message `message` carries, or update the open one recorded for it. Returns
     a note."""
-    from . import timefmt
+    from . import replan, timefmt
     now = time.time() if now is None else now
     text = " ".join(str(text or "").split())[:TEXT_MAX]
     if not text:
@@ -1663,6 +1663,12 @@ def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, ac
             raise ValueError(f"order (message #{message}): {why}")
         if o:
             pr = o["promise"]
+            if due_at is not None and due_at != pr["due"] and replan.missed(pr, now):
+                new = sorted(set(ids) - set(_owner_ids(o)))   # a new owner is a plan change (replan.py)
+                if not new:
+                    raise ValueError(replan.refusal(o, timefmt.long(pr["due"], p)))
+                replan.note_miss(pr, now)
+                replan.note_move(pr, due_at, now, f"new owner #{', #'.join(map(str, new))}", None, "order")
             pr["tasks"] = sorted(set(pr["tasks"]) | set(ids))
             pr["class"] = action_class
             if due_at is not None and due_at != pr["due"]:

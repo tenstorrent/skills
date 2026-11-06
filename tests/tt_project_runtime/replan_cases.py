@@ -166,3 +166,23 @@ def test_replan_prompt_rule_and_docs(env):
     guide = (RUNTIME.parent / "docs" / "guide.md").read_text()
     assert "A missed promise or order is a trigger to change approach, never only to post a new time" in coord_md
     assert "### A missed promise changes the plan" in guide and "`missed promises`" in guide
+
+
+def test_replan_order_resent_with_a_new_due_after_a_miss_needs_a_new_owner(env, monkeypatch):
+    """Re-sending a missed order's `order` action with a later due is the same move: refused alone,
+    kept with a new owner."""
+    from ttp import coordinator as coord, obligations as ob
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("build it", "s", kind="code", priority=2, reply_chat="c1")
+    other = p.db.add_task("build it another way", "s", kind="code", priority=2)
+    mid = p.db.post("in", "please build it", chat="c1")
+    oid = ob.add_order(p, "build it", mid, [tid], due=now + 600, action_class="change", now=now).split()[1]
+    monkeypatch.setattr(time, "time", lambda: now + 1200)
+    act = {"type": "obligation", "order": mid, "text": "build it", "action_class": "change", "due": now + 7200}
+    out = coord.apply(p, [{**act, "owners": [tid]}])
+    assert any("a new time alone is refused" in n for n in out), out
+    assert ob.get(p.db, oid)["promise"]["due"] == now + 600
+    assert coord.apply(p, [{**act, "owners": [other]}]) == []
+    pr = ob.get(p.db, oid)["promise"]
+    assert pr["due"] == now + 7200 and pr["moves"][-1]["plan"] == f"new owner #{other}"
