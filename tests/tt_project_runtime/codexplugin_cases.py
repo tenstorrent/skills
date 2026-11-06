@@ -103,3 +103,15 @@ def test_codex_isolation_enables_one_marketplace_preferring_the_configs(env, mon
     # Another plugin of the same marketplace is never enabled with it.
     _codex_install(home, market="b-market").parent.parent.joinpath("lint").mkdir()
     assert list(_codex_plugin_table(worker()[0].isolation_args())) == ["tt-project@b-market"]
+
+
+def test_codex_isolation_prefers_the_cached_copy_of_the_runtime_version(env, monkeypatch, tmp_path):
+    from ttp import __version__
+    worker, home, _ = _codex_hooks(monkeypatch, tmp_path)
+    _codex_install(home, market="a-market", version="0.0.1")
+    _codex_install(home, market="b-market", version=__version__)
+    (home / "config.toml").write_text('model = "m"\n[plugins."tt-project@a-market"]\nenabled = true\n')
+    assert _codex_plugin_table(worker()[0].isolation_args()) == {"tt-project@b-market": {"enabled": True}}
+    # #6515's rule stays: a copy at the version that brings more than skills is never enabled.
+    _codex_install(home, market="b-market", version="0.0.2", extra=("hooks.json",))
+    assert _codex_plugin_table(worker()[0].isolation_args()) == {"tt-project@a-market": {"enabled": True}}

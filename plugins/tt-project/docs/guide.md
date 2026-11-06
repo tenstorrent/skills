@@ -2804,7 +2804,14 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   its home (`codex plugin add` copies them there), so a run cannot add one for itself without
   changing your Codex setup; plugins you install yourself load as usual. An isolated worker, which
   skips your `config.toml`, still gets tt-project's own installed skills (enabled by `-c`, only while
-  that copy brings no hooks, MCP servers or apps). A `plugin_dirs` set for
+  that copy brings no hooks, MCP servers or apps; of several, the one at the runtime's version).
+  `ttp setup` (so also a deploy that runs it) and `ttp doctor` keep that copy at the installed
+  release: each release folder is also a one-plugin Codex marketplace, and when Codex's cached
+  tt-project differs from the release, they run `codex plugin add tt-project@tenstorrent-skills`
+  once (with a timeout), first moving the marketplace to the release when its folder serves another
+  version, unless it also serves another installed plugin. Nothing runs without `codex` on PATH or a
+  registered tenstorrent-skills marketplace, none at the release, and a failure is a printed line,
+  never fatal. A `plugin_dirs` set for
   Codex (or for a Cursor build without `--plugin-dir`) raises one low alert per value and a
   `ttp doctor` line saying workers run without them.
 - Coordinator updates reach a running worker on every provider: through the hook after a tool call

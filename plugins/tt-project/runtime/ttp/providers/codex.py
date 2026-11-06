@@ -756,8 +756,9 @@ def own_plugin_args() -> list[str]:
     """`-c` keys that enable tt-project's installed copy in a run that ignores config.toml, so an
     isolated worker keeps the plugin's skills, as a run reading the config does. Only a copy that
     brings nothing but skills (no hooks, MCP servers or apps: those would undo the isolation, and
-    the hook trust bypass would trust its hooks). Of several marketplaces, the one config.toml
-    enables. [] when Codex has no such copy (the skills stay readable by `ttp skill`)."""
+    the hook trust bypass would trust its hooks). Of several marketplaces, the one whose copy is
+    this runtime's version, then the one config.toml enables. [] when Codex has no such copy (the
+    skills stay readable by `ttp skill`)."""
     cache = codex_home() / "plugins" / "cache"
     try:
         markets = sorted(d.parent.name for d in cache.glob(f"*/{OWN_PLUGIN}") if d.is_dir())
@@ -769,7 +770,10 @@ def own_plugin_args() -> list[str]:
     config = _read(codex_home() / "config.toml")
     enabled = [m for m in usable
                if re.search(rf"^\s*\[?\s*plugins\.[\"']{re.escape(f'{OWN_PLUGIN}@{m}')}[\"']", config, re.M)]
-    key = f"{OWN_PLUGIN}@{(enabled or usable)[0]}"
+    from .. import __version__
+    from ..codexmarket import cached
+    pick = min(usable, key=lambda m: (__version__ not in cached(codex_home(), m), m not in enabled))
+    key = f"{OWN_PLUGIN}@{pick}"
     return ["-c", f"plugins={{{toml_string(key)}={{enabled=true}}}}"]
 
 

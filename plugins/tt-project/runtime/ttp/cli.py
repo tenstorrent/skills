@@ -10144,6 +10144,9 @@ def cmd_setup(a) -> None:
     from . import claudemarket
     for ln in claudemarket.reconcile(cur, __version__):
         print(ln)
+    from . import codexmarket
+    for ln in codexmarket.reconcile(cur, __version__):
+        print(ln)
     from . import notifier
     for ln in notifier.refresh(send_test=True, always=True):   # an installed notifier runs this code from now on
         print(ln)
@@ -10205,7 +10208,7 @@ def _cycle_hold(paths: list[str], a, where=None, auto_rec: Project | None = None
 
 
 from .release import SETUP_JOURNAL  # noqa: E402  (release.hold_reason holds automatic upgrades while it exists)
-SETUP_PARTS = ("runtime", "template", "bin", "skills", ".claude-plugin")    # skills: readable by workers of any project
+SETUP_PARTS = ("runtime", "template", "bin", "skills", ".claude-plugin", ".codex-plugin")    # skills: readable by workers of any project
 
 
 def _install_parts(src_root: Path, lib: Path) -> None:
@@ -10218,6 +10221,9 @@ def _install_parts(src_root: Path, lib: Path) -> None:
     if (lib / ".claude-plugin").is_dir():
         from . import claudemarket
         claudemarket.write(lib)     # Claude Code's tt-project marketplace points here (claudemarket.py)
+    if (lib / ".codex-plugin").is_dir():
+        from . import codexmarket
+        codexmarket.write(lib)      # and Codex's, when its cache lags the release (codexmarket.py)
 
 
 SETUP_LOCK = ".setup.lock"      # in HOME_DIR/lib: its flock holder runs `ttp setup` or _recover_setup
@@ -11836,6 +11842,9 @@ def cmd_doctor(a) -> None:
         print(line)
     from . import initiator
     if line := initiator.doctor_line(p):
+        print(line)
+    from . import codexmarket
+    for line in codexmarket.doctor_lines():
         print(line)
     from . import upstream
     for line in upstream.doctor_lines(p):
