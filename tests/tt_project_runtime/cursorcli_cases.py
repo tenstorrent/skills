@@ -173,7 +173,12 @@ def test_cursor_workers_get_the_sandbox_only_when_the_build_and_host_allow_it(en
 
 
 def test_dispatched_cursor_worker_is_fenced_with_its_run_dir_writable(env, monkeypatch):
+    from ttp import cursorhook
     from ttp.providers import cursor
+    installed = []   # (cwd, whether the hooks file was there once installed)
+    real = cursorhook.install
+    monkeypatch.setattr(cursorhook, "install", lambda cwd, rd: real(cwd, rd) or installed.append(
+        (cwd, (Path(cwd) / ".cursor" / "hooks.json").exists())) or "")
     monkeypatch.setattr(cursor, "sandbox_host_gap", lambda: "")
     monkeypatch.setattr(cursor, "sandbox_network_gap", lambda help_text: "")
     p, run, task, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
@@ -183,11 +188,13 @@ def test_dispatched_cursor_worker_is_fenced_with_its_run_dir_writable(env, monke
     run_dir = p.runs / str(run["id"])
     assert any(run_dir.resolve().is_relative_to(d.resolve()) for d in added), (added, run_dir)
     assert task["status"] == "done", "result.json reached the daemon"
-    assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"
+    assert not (env["repo"] / ".cursor").exists(), "the run's hooks file is gone at run end"
+    assert installed == [(str(env["repo"]), True)], "the worker ran with the harness hook"
     # Coordinator turns and read-only runs answer only: no sandbox flags.
     _, _, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _codex_events(*CURSOR_STREAM_OK),
                                 role="coordinator", read_only=True, help_text=CURSOR_REAL_HELP)
     assert "--sandbox" not in argv and "--add-dir" not in argv
+    assert len(installed) == 1, "a coordinator turn's hooks are its session's (coordsession)"
 
 
 def test_cursor_workers_keep_the_network_when_the_sandbox_would_block_it(env, monkeypatch):
@@ -211,7 +218,7 @@ def test_cursor_workers_keep_the_network_when_the_sandbox_would_block_it(env, mo
                                    result={"status": "done", "summary": "ok"}, help_text=CURSOR_REAL_HELP)
     assert "--force" in argv and "--sandbox" not in argv and "--add-dir" not in argv, argv
     assert task["status"] == "done"
-    assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"
+    assert not (env["repo"] / ".cursor").exists(), "the run's hooks file is gone at run end"
 
 
 def test_cursor_workers_under_no_internet_keep_the_sandbox(env, monkeypatch):
@@ -246,7 +253,7 @@ def test_cursor_workers_under_no_internet_keep_the_sandbox(env, monkeypatch):
     added = [Path(argv[i + 1]) for i, a in enumerate(argv) if a == "--add-dir"]
     assert any((p.runs / str(run["id"])).resolve().is_relative_to(d.resolve()) for d in added), added
     assert task["status"] == "done"
-    assert not (env["repo"] / ".cursor").exists(), "the harness writes no Cursor config file"
+    assert not (env["repo"] / ".cursor").exists(), "the run's hooks file is gone at run end"
 
 
 # `agent --list-models` as the CLI prints it (its format, from the installed build; names invented).
@@ -547,3 +554,122 @@ def test_doctor_names_the_rate_each_cursor_tier_uses(env, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "cursor tiers from the CLI's model list" in out
     assert "deep d-pro $15/$1.5/$75 (the top rate" in out, out
+
+
+# A Cursor CLI's hook runner, as build 2026.10.22-27dcf5f runs a project's `.cursor/hooks.json`: each
+# entry of the event whose matcher (a regex search on tool_name; "Stop" for stop) fits runs in bash in
+# the workspace with the CLI's environment, the payload on stdin. FAKE_CURSOR_CALLS lists [event,
+# payload]; it prints each call's replies.
+FAKE_CURSOR = """#!{python}
+import json, os, re, subprocess, sys
+ws = sys.argv[sys.argv.index("--workspace") + 1]
+conf = json.load(open(os.path.join(ws, ".cursor", "hooks.json")))
+out = []
+for event, payload in json.loads(os.environ["FAKE_CURSOR_CALLS"]):
+    payload = {{"cwd": ws, **payload}}
+    replies = []
+    for e in conf["hooks"].get(event, []):
+        m = e.get("matcher") or ""
+        if m not in ("", "*") and not re.search(m, "Stop" if event == "stop" else payload.get("tool_name", "")):
+            continue
+        r = subprocess.run(["bash", "-c", e["command"]], input=json.dumps(payload), capture_output=True,
+                           text=True, cwd=ws, timeout=e.get("timeout", 30))
+        replies.append({{"rc": r.returncode, "out": json.loads(r.stdout) if r.stdout.strip() else None,
+                         "err": r.stderr[-2000:]}})
+    out.append(replies)
+print(json.dumps(out))
+"""
+
+
+def _cursor_hooked(tmp_path, monkeypatch, calls, *, denied=()):
+    """A worker run's hooks file installed in a workspace and the fake CLI run against it: (replies,
+    run dir). The run ends as the runner ends one (remove_private)."""
+    from ttp import runner
+    from ttp.providers.cursor import Cursor
+    ws = tmp_path / "ws"
+    ws.mkdir(exist_ok=True)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(exist_ok=True)
+    (run_dir / "run.json").write_text("{}")
+    exe = tmp_path / "fake-agent"
+    exe.write_text(FAKE_CURSOR.format(python=sys.executable))
+    exe.chmod(0o755)
+    monkeypatch.setattr(Cursor, "binary", lambda self: str(exe))
+    argv, extra = Cursor().build(role="worker", model="", effort="", cwd=str(ws), budget_usd=1, read_only=False,
+                                 schema=None, restrictions="", denied_reads=list(denied))
+    assert Cursor().prepare_run(str(ws), run_dir) == ""
+    try:
+        env = {**os.environ, **extra, "TTP_RUN_DIR": str(run_dir), "TTP_TASK": "7", "TTP_HANDOFF_GUARD": "1",
+               "PYTHONPATH": "", "FAKE_CURSOR_CALLS": json.dumps(calls)}
+        r = subprocess.run(argv[:1] + ["--workspace", str(ws)], capture_output=True, text=True, env=env, timeout=120)
+        assert r.returncode == 0, r.stderr
+        return [[x["out"] for x in replies] for replies in json.loads(r.stdout)], run_dir
+    finally:
+        runner.remove_private(run_dir)
+
+
+def test_cursor_workers_run_the_harness_guards_through_the_project_hooks_file(env, monkeypatch, tmp_path):
+    from ttp.hook import HOOKED_FILE
+    token = tmp_path / "proj" / "state" / ("web" + ".token")
+    shell = lambda cmd: ["preToolUse", {"tool_name": "Shell", "tool_input": {"command": cmd, "cwd": str(tmp_path)}}]
+    calls = [shell("env -i gh pr ready 7"), shell(f"cat {token}"), shell("pkill -f sleep"),
+             ["preToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(token)}}],
+             ["preToolUse", {"tool_name": "Grep", "tool_input": {"pattern": "x", "file_path": os.path.relpath(token, tmp_path / "ws")}}],
+             shell("ls"), ["preToolUse", {"tool_name": "Read", "tool_input": {"file_path": str(tmp_path / "ok.txt")}}],
+             ["preToolUse", {"tool_name": "ReadLints", "tool_input": {}}]]
+    got, run_dir = _cursor_hooked(tmp_path, monkeypatch, calls, denied=[str(token)])
+    for i, why in enumerate(("draft", "web token", "name or pattern", "credentials", "credentials")):
+        [reply] = got[i]
+        assert reply["permission"] == "deny" and why in reply["user_message"], (i, reply)
+        assert reply["agent_message"] == reply["user_message"]
+    assert got[5] == [None] and got[6] == [None] and got[7] == [None], "allowed calls get no reply"
+    assert (run_dir / HOOKED_FILE).exists(), "ttp note / ttp steer leave updates to the hook"
+    assert not (tmp_path / "ws" / ".cursor").exists(), "the run's hooks file is gone at run end"
+
+
+def test_a_cursor_worker_gets_an_update_once_and_cannot_stop_without_its_hand_off(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    coord._append_update(run_dir / "steer.md", "Also say PINEAPPLE.", "k1")
+    post = ["postToolUse", {"tool_name": "Shell", "tool_input": {"command": "ls"}, "tool_output": "ok"}]
+    got, _ = _cursor_hooked(tmp_path, monkeypatch, [post, post, ["stop", {"status": "completed", "loop_count": 0}],
+                                                    ["stop", {"status": "completed", "loop_count": 1}],
+                                                    ["stop", {"status": "aborted", "loop_count": 0}]])
+    assert "PINEAPPLE" in got[0][0]["additional_context"] and got[1] == [None], "handed over once"
+    assert "result.json" in got[2][0]["followup_message"], got[2]
+    assert got[3] == [None] and got[4] == [None], "a stop after the follow-up, or an aborted run, ends"
+
+
+def test_cursor_hooks_file_merges_with_the_checkout_and_leaves_it_as_it_was(env, monkeypatch, tmp_path):
+    from ttp import cursorhook
+    repo = tmp_path / "repo"
+    git = lambda *a, at=repo: subprocess.run(["git", "-C", str(at), *a], capture_output=True, text=True, check=True).stdout
+    (repo / ".cursor").mkdir(parents=True)
+    git("init", "-q")
+    own = '{"version": 1, "hooks": {"stop": [{"command": "./mine.sh"}]}}\n'
+    (repo / ".cursor" / "hooks.json").write_text(own)
+    git("add", ".")
+    git("-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "own hooks")
+    a, b = tmp_path / "run-a", tmp_path / "run-b"
+    a.mkdir(), b.mkdir()
+    assert cursorhook.install(str(repo), str(a)) == "" and cursorhook.install(str(repo), str(b)) == ""
+    hooks = json.loads((repo / ".cursor" / "hooks.json").read_text())["hooks"]
+    assert hooks["stop"][0] == {"command": "./mine.sh"} and "-m ttp.cursorhook stop" in hooks["stop"][1]["command"]
+    assert len(hooks["preToolUse"]) == 1, "a second run joins the same file"
+    assert git("status", "--porcelain") == "", "tracked: skip-worktree; the sidecar: info/exclude"
+    cursorhook.undo(a)
+    assert "ttp.cursorhook" in (repo / ".cursor" / "hooks.json").read_text(), "run b still uses it"
+    cursorhook.undo(b)
+    cursorhook.undo(b)   # twice (runner and daemon both clean up): no harm
+    assert (repo / ".cursor" / "hooks.json").read_text() == own and sorted(os.listdir(repo / ".cursor")) == ["hooks.json"]
+    assert git("ls-files", "-v", ".cursor/hooks.json").startswith("H "), "skip-worktree cleared"
+    # Untracked in a checkout: listed in info/exclude, and the dir the harness made is removed again.
+    other = tmp_path / "other"
+    other.mkdir()
+    git("init", "-q", at=other)
+    assert cursorhook.install(str(other), str(a)) == ""
+    assert git("status", "--porcelain", at=other) == ""
+    cursorhook.undo(a)
+    assert not (other / ".cursor").exists() and not (a / cursorhook.RUN_STATE).exists()
+    assert "/.cursor/hooks.json" in (other / ".git" / "info" / "exclude").read_text()

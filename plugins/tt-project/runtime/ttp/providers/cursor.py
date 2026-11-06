@@ -21,12 +21,12 @@ unfenced and `write_fence()` says why.
 | Fence writes to a list of dirs | yes with `--sandbox enabled`: Landlock + seccomp, kernel 6.2+ with unprivileged user namespaces; extra dirs in `.cursor/sandbox.json` `additionalReadwritePaths` | yes, Seatbelt |
 | Unix socket under `state/` from the sandbox | not documented | not documented |
 
-Credential reads: not enforced. Cursor's permission deny rules and hooks live only in a config file
-(`.cursor/cli.json` in the worktree, or the user's own global one); no CLI flag or environment
-variable sets them for one run, and the harness writes neither file, so `denied_reads` is ignored
-and the harness hook does not run here. `CURSOR_CONFIG_DIR` would move the whole global config
-folder per run, but Cursor does not document whether the login, MCP servers and hooks move with
-it, so it is not used."""
+Harness hook and credential reads: a worker or reviewer run gets the harness hook through the
+project hooks file Cursor loads from its workspace (`.cursor/hooks.json`; no CLI flag or environment
+variable sets hooks for one run). prepare_run merges the hook's entries into that file for the run
+(ttp.cursorhook: install, undo at run end), so the Bash guards, live updates and the Stop hand-off
+guard match a Claude worker's. `denied_reads` reaches that hook as TTP_DENIED_READS, refused for the
+Read and Grep tools; shell reads go through the hook's own credential guard."""
 from __future__ import annotations
 
 import hashlib
@@ -36,6 +36,7 @@ import re
 import time
 from pathlib import Path
 
+from .. import cursorhook
 from . import register
 from .base import (_CLI_OUTPUT, AUTH_RE, CMD_MAX, LIMIT_RE, Provider, RunUsage, cli_output, head80, input_hash,
                    jsonl_from, price_row, request_rejected, status_check, stderr_tail)
@@ -154,7 +155,10 @@ class Cursor(Provider):
             argv += ["--force"]
         elif re.search(r"--mode\b[\s\S]{0,400}?\bask\b", help_text):   # its choices may wrap
             argv += ["--mode", "ask"]   # answers only: no edits and no commands
-        return argv, {}
+        return argv, ({cursorhook.DENIED_READS_ENV: os.pathsep.join(map(str, denied_reads))} if denied_reads else {})
+
+    def prepare_run(self, cwd: str, run_dir: Path) -> str:
+        return cursorhook.install(cwd, str(run_dir))
 
     def _sandbox_gap(self, restrictions: dict | None = None) -> str:
         """Why workers run without `--sandbox enabled`; "" when they get it. Under the no_internet

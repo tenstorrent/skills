@@ -38,6 +38,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
 from . import sidefx
+from . import cursorhook
 from . import pausegone
 from . import urgentfup
 from . import topup
@@ -3160,6 +3161,8 @@ class Daemon:
         tmp_env: dict = {}
         try:
             redact.private_dir(run_dir)   # owner-only: it holds the run's output and transcript
+            if role != "coordinator" and (why := prov.prepare_run(cwd, run_dir)):
+                log(self.p, f"run {run_id}: {provider} run set-up incomplete: {why}")
             # A fenced worker gets a temp dir of its own (a writable root; never in the worktree): on
             # macOS git's xcrun shim otherwise fails to write its cache, and tools that honour TMPDIR
             # stay off the shared /tmp. A short one (shorttmp), so a socket a test binds beneath it
@@ -3338,6 +3341,7 @@ class Daemon:
                  (time.time(), json.dumps({**(note or {}), "never_started": True}), run_id))
             runner.remove_files(private)
             shorttmp.remove(tmp_env.get("TMPDIR"))
+            cursorhook.undo(run_dir)
             raise
         try:
             # Its start beside its pid, as child.pid has it: a pid reused later is not this supervisor.

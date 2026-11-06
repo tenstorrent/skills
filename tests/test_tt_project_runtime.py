@@ -15858,8 +15858,9 @@ def test_cursor_read_only_run_does_not_force_writes(env, monkeypatch):
 
 
 def test_cursor_worker_gets_no_config_file_or_env_for_the_web_token(env, monkeypatch):
-    """Cursor takes deny rules only from a config file, never per run: a worker run writes none into
-    the user's worktree and its argv does not name the token; the limit is documented."""
+    """Cursor takes deny rules only from a config file, never per run: the run's argv does not name
+    the token, the denied reads reach the harness hook (cursorhook) in its env alone, and no config
+    file is left in the user's worktree once the run ends."""
     from ttp.providers import get_provider
     from ttp.providers.cursor import Cursor
     _, run, _, argv, _ = _cli_run(env, monkeypatch, "cursor", _cursor_result("all done"),
@@ -15869,7 +15870,8 @@ def test_cursor_worker_gets_no_config_file_or_env_for_the_web_token(env, monkeyp
     monkeypatch.setattr(Cursor, "binary", lambda self: "/nonexistent/agent")
     kw = dict(role="worker", model="auto", effort="low", cwd=str(env["repo"]), budget_usd=None, schema=None,
               restrictions={}, read_only=False)
-    assert get_provider("cursor").build(denied_reads=["/x/state/web.token"], **kw) == get_provider("cursor").build(**kw)
+    argv, extra = get_provider("cursor").build(denied_reads=["/x/state/web.token"], **kw)
+    assert (argv, extra) == (get_provider("cursor").build(**kw)[0], {"TTP_DENIED_READS": "/x/state/web.token"})
     notes = (TTP.parents[1] / "skills" / "tt-project" / "operate.md").read_text()
     assert "Cursor gets neither" in notes and "global" in notes
 

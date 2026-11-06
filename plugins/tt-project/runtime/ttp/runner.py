@@ -306,6 +306,8 @@ def remove_private(run_dir: Path) -> None:
         remove_tmp(run_dir, spec)
     except (OSError, ValueError, AttributeError):
         pass
+    from . import cursorhook
+    cursorhook.undo(run_dir)   # a Cursor run's hooks file (none for other agents)
 
 
 def check_instructions(prov, run_dir: Path, out_path: Path, argv: list[str], env: dict, waited_s: float) -> dict | None:

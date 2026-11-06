@@ -310,6 +310,11 @@ class Provider:
         """Arguments that load extra skill plugins for one run; [] when the agent cannot."""
         return []
 
+    def prepare_run(self, cwd: str, run_dir: Path) -> str:
+        """Set up what a worker run needs in its cwd before it starts (Cursor: the harness hook's
+        `.cursor/hooks.json`); "" or why it could not. runner.remove_private undoes it."""
+        return ""
+
     def plugin_dirs_gap(self, dirs: list[str], isolated: bool) -> str:
         """The line saying this agent's workers run without the plugins in `dirs`, for when
         plugin_args loaded none of them (the daemon's one alert and `ttp doctor`)."""
