@@ -2391,6 +2391,78 @@ def test_a_push_batch_replays_heads_in_order_and_keeps_an_approval_only_when_the
         assert _git_out(origin, "show", f"proj:{path}") == tip.rstrip("\n")
 
 
+CAP_BASE = ('def test_prompt_size(env):\n'
+            '    for kind, cap in (("code", 31_473), ("question", 24_505)):   # code: +128 for waits; +30 both: cites\n'
+            '        assert size(kind) <= cap\n')
+
+
+def test_merge3_counters_add_both_raises_of_a_cap_and_keep_both_reasons():
+    """Two changes each raise one test's prompt size cap by what their own text needs (the push
+    conflict that sent approvals back most often): the cap gets old + both raises and the comment
+    both reasons, ours first. Anything else stays a conflict: a lowered number, a code edit beside
+    the numbers, a reworded reason, a cap only one side raised while the other edited the comment
+    only, a `#` inside a string, and a file the caller did not mark (counters off)."""
+    from ttp.batch import merge3
+    tip = CAP_BASE.replace("31_473", "31_593").replace("+128 for waits;", "+128 for waits; code: +120 for eta;")
+    change = CAP_BASE.replace("31_473", "31_551").replace("24_505", "24_583").replace("# code:", "# +78 both: acks; code:")
+    kinds: set = set()
+    got = merge3(tip, CAP_BASE, change, py=True, hunks=True, counters=True, kinds=kinds)
+    assert got == CAP_BASE.replace("31_473", "31_671").replace("24_505", "24_583").replace(
+        "# code: +128 for waits;", "# +78 both: acks; code: +128 for waits; code: +120 for eta;"), got
+    assert kinds == {"counters"}
+    assert merge3(tip, CAP_BASE, change, py=True, hunks=True) is None, "counters off: a conflict as before"
+    lowered = change.replace("31_551", "31_400")
+    assert merge3(tip, CAP_BASE, lowered, py=True, hunks=True, counters=True) is None, "a lowered cap"
+    edited = change.replace("for kind, cap in", "for kind, limit in")
+    assert merge3(tip, CAP_BASE, edited, py=True, hunks=True, counters=True) is None, "a code edit"
+    reworded = change.replace("+30 both: cites", "+30 both: the charter's cites")
+    assert merge3(tip, CAP_BASE, reworded, py=True, hunks=True, counters=True) is None, "a reworded reason"
+    note_only = CAP_BASE.replace("# code:", "# +78 both: acks; code:").replace("31_473", "31_473")
+    tip_note = CAP_BASE.replace("31_473", "31_593").replace("# code:", "# +120: eta; code:")
+    assert merge3(tip_note, CAP_BASE, note_only, py=True, hunks=True, counters=True) is None, \
+        "no number both raised: no counters"
+    s_base = 'x = f("a # 5", 10)  # base\n'
+    assert merge3(s_base.replace("10", "12").replace("# base", "# base; t"), s_base,
+                  s_base.replace("10", "11").replace("a # 5", "a # 6"), py=True, counters=True) is None, \
+        "a number inside a string that holds a #"
+    assert merge3(s_base.replace("10", "12").replace("# base", "# base; t"), s_base,
+                  s_base.replace("10", "11").replace("# base", "# base; c"), py=True, counters=True) == \
+        'x = f("a # 5", 13)  # base; t; c\n', "a quoted # is no comment"
+
+
+@pytest.mark.parametrize("case", ["counters", "counters_code", "own_logic"])
+def test_a_push_batch_settles_a_test_cap_both_sides_raised_and_keeps_the_approval(env, monkeypatch, case):
+    """Replayed push conflicts of approved heads in one batch. `counters`: the tip and the change each
+    raised one test's prompt size cap with a reason (the conflict that sent #6434's approval back
+    twice): settled in the batch, the checks run on the result and both land with no model.
+    `counters_code` (the same line outside a test file, where a number is no allowance) and
+    `own_logic` (both changed one line of a function) still go back to the review as a conflict."""
+    path = {"counters": "tests/test_caps.py", "counters_code": "pkg/caps.py", "own_logic": "pkg/m.py"}[case]
+    base = CAP_BASE if case != "own_logic" else "def f(x):\n    return x + 1\n"
+    if case == "own_logic":
+        tip, change = base.replace("x + 1", "x + 2"), base.replace("x + 1", "x * 3")
+    else:
+        tip = base.replace("31_473", "31_593").replace("+30 both: cites", "+30 both: cites; code: +120 for eta")
+        change = base.replace("24_505", "24_565").replace("31_473", "31_533").replace("# code:", "# +60 both: acks; code:")
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    (other / path).parent.mkdir(parents=True)
+    _commit(other, path, base)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {path: tip}), _entry(repo, "e2", {path: change})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    if case == "counters":
+        assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+        d = m["results"][1]["detail"]
+        assert d["settled"] == [path] and d["settled_by"] == ["counters"], d
+        assert _git_out(origin, "show", f"proj:{path}") == base.replace("31_473", "31_653").replace(
+            "24_505", "24_565").replace("# code:", "# +60 both: acks; code:").replace(
+            "+30 both: cites", "+30 both: cites; code: +120 for eta").rstrip("\n")
+    else:
+        assert _statuses(m) == ["pushed", "conflict"], m
+        assert m["results"][1]["detail"]["files"] == [path], m
+        assert _git_out(origin, "show", f"proj:{path}") == tip.rstrip("\n")
+
+
 def test_merge3_keeps_the_final_newline_as_the_sides_had_it(env):
     """git ends each side of a conflict at the end of the file with a newline. The settled result ends
     as the sides had it: without one where none had it, with one where a side added it."""

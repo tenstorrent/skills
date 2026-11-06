@@ -2269,8 +2269,9 @@ session and stateless coordinators on every provider.
   that need no judgment are settled in the batch and judged by those checks: version lines, lines
   both sides added at one spot, and changes of different lines that git calls a conflict only
   because they are adjacent (also a block one side added right beside a line the other only
-  reworded or deleted, each line as its side wrote it), and edits of different cells of one Markdown
-  table row. A conflict only in the shared release files (the version files,
+  reworded or deleted, each line as its side wrote it), edits of different cells of one Markdown
+  table row, and numbers in a test file that both sides only raised (two changes each raising one
+  prompt size cap: the cap gets both raises, the trailing comment both sides' added reasons). A conflict only in the shared release files (the version files,
   changesets, the release changeset, a CHANGELOG.md) is settled mechanically: both sides' notes
   stay, a changeset both sides created keeps a file each, and the approval holds as long as the
   change's own diff outside those files is still the approved one. A conflict left only in shared

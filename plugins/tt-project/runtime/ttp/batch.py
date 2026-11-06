@@ -496,23 +496,52 @@ def _counters(mine: list[str], old: list[str], theirs: list[str]) -> list[str] |
             continue
         eol = o[len(o.rstrip("\r\n")):]
         (co, mo), (cb, mb), (ct, mt) = (_code_comment(x.rstrip("\r\n")) for x in (o, b, t))
-        if _NUM.sub("0", co) != _NUM.sub("0", cb) or _NUM.sub("0", ct) != _NUM.sub("0", cb):
+        spans = [_numbers(x) for x in (co, cb, ct)]
+        if not _skeleton(co, spans[0]) == _skeleton(cb, spans[1]) == _skeleton(ct, spans[2]):
             return None
-        nums = [[n.group() for n in _NUM.finditer(x)] for x in (co, cb, ct)]
         code, at = [], 0
-        for n, (x, y, z) in zip(_NUM.finditer(cb), zip(*nums)):
+        for (i, j), (x, y, z) in zip(spans[1], zip(*([c[i:j] for i, j in sp] for c, sp in zip((co, cb, ct), spans)))):
             vx, vy, vz = (int(v.replace("_", "")) for v in (x, y, z))
             if vx < vy or vz < vy or any(v.startswith("0") and v != "0" for v in (x, y, z)):
                 return None
             raised |= vx > vy and vz > vy
             v = vx + vz - vy
-            code += [cb[at:n.start()], f"{v:_}" if "_" in x + y + z else str(v)]
-            at = n.end()
+            code += [cb[at:i], f"{v:_}" if "_" in x + y + z else str(v)]
+            at = j
         note = _comment_parts(mo, mb, mt)
         if note is None:
             return None
         out.append("".join(code) + cb[at:] + note + eol)
     return out if raised else None
+
+
+def _numbers(code: str) -> list[tuple[int, int]]:
+    """The spans of the integer literals (_NUM) in `code` outside quoted strings."""
+    out, quote, i = [], "", 0
+    while i < len(code):
+        c = code[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif (m := _NUM.match(code, i)) and not (i and (code[i - 1].isalnum() or code[i - 1] in "_.")):
+            out.append(m.span())
+            i = m.end()
+            continue
+        i += 1
+    return out
+
+
+def _skeleton(code: str, spans: list[tuple[int, int]]) -> str:
+    """`code` with each number span (_numbers) replaced by a 0."""
+    out, at = [], 0
+    for i, j in spans:
+        out += [code[at:i], "0"]
+        at = j
+    return "".join(out) + code[at:]
 
 
 def _code_comment(line: str) -> tuple[str, str]:
