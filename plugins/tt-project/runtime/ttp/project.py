@@ -240,6 +240,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # worker slot is taken: one observation per task names it and the running tasks
                     # holding the slots (Daemon.check_slot_wait; 0: off).
                     "urgent_slot_wait_min": 10,
+                    # A task waiting this long on a queue, cap or admission (checks, push, worker slots, a device
+                    # or lock, an outside pool, CPU): one must-act item per task and queue with unblock options,
+                    # raised again each such span until the coordinator acts (queuewait.py; 0: off).
+                    "queue_wait_escalate_min": 30,
                     # A user-ordered urgent task (fresh `urgent:` line) with a machine or device resource
                     # still queued this long, or waiting this long in `ttp lock`: one high observation
                     # names what holds it (Daemon.check_urgent_start; 0: off).

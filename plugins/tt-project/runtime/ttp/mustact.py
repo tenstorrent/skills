@@ -22,12 +22,14 @@ import time
 from . import msgparts, obligations
 
 REWAKE_KIND = "must_act_rewake"
-KINDS = (*obligations.MUST_ACT_KINDS, REWAKE_KIND)
+QUEUE_KIND = "queue_wait"   # queuewait.KIND: a wait on a queue or cap past its threshold, re-raised per mark
+KINDS = (*obligations.MUST_ACT_KINDS, REWAKE_KIND, QUEUE_KIND)
 KV = "must_act"                 # {"told": {fingerprint: at}}: the model-free updates already posted
 TOLD_KEPT = 200
 SECTION = "Must act now"
 LATE = {obligations.PROMISE_KIND: "promise overdue", obligations.ORDER_KIND: "order overdue",
-        obligations.ORDER_LATE_KIND: "order not started", obligations.CLAIM_KIND: "claim does not hold"}
+        obligations.ORDER_LATE_KIND: "order not started", obligations.CLAIM_KIND: "claim does not hold",
+        QUEUE_KIND: "queue wait"}
 
 
 def item(ev) -> dict | None:
@@ -63,6 +65,10 @@ def block(db, ids) -> str:
         first = (ev["text"] or "").split("\n", 1)[0][:300]
         again = " (second wake: you did not act on it last turn)" if ev["kind"] == REWAKE_KIND else ""
         again += " (re-plan: missed twice)" if it.get("replan") else ""
+        if ev["kind"] == QUEUE_KIND:
+            again = (" (queue wait: queue its fix now (config_set, task_add or task_update naming the key or "
+                     "updating the task), or reply naming the key and the safety rule that holds it; else it "
+                     "comes back at the next mark)")
         owners = f"; owners #{', #'.join(map(str, it.get('tasks') or []))}" if it.get("tasks") else "; no owner task"
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
     if not out:
@@ -88,6 +94,7 @@ def _id(v) -> int | None:
 def acted(it: dict, actions: list, applied) -> str | None:
     """How an applied action of the turn acted on must-act item `it`; None when none did."""
     key, chat, owners = it["key"], obligations._chat(it.get("chat")), set(it.get("tasks") or [])
+    queue = it.get("kind") == QUEUE_KIND
     for i in sorted(applied or ()):
         a = actions[i] if 0 <= i < len(actions) else None
         if not isinstance(a, dict):
@@ -102,6 +109,11 @@ def acted(it: dict, actions: list, applied) -> str | None:
                 return f"task_add continues owner #{a['continues']}"
         elif t == "obligation" and str(a.get("key") or "").strip() == key:
             return f"obligation action on {key}"
+        elif queue:   # any config change, or words naming the item (the rule that holds it)
+            if t == "config_set":
+                return "config_set"
+            if t in ("reply", "notify") and any(_names(v, key) for v in a.values() if isinstance(v, str)):
+                return f"{t} names {key}"
         elif t == "reply" and (chat == "all" or obligations._chat(a.get("chat")) in (chat, "all")):
             return f"reply to chat {chat}"
         elif t == "notify":
@@ -140,7 +152,14 @@ def settle(p, ids, actions, applied, now: float | None = None) -> list[tuple[str
     issues: list[tuple[str, str]] = []
     for ev in events(db, ids):
         it = item(ev)
-        if not it or not isinstance(actions, list) or acted(it, actions, applied):
+        if not it or not isinstance(actions, list):
+            continue
+        if it.get("kind") == QUEUE_KIND:   # acted: no more raises for this wait; else the next mark raises it
+            if acted(it, actions, applied):
+                from . import queuewait
+                queuewait.record_act(db, str(it.get("episode") or ""), now)
+            continue
+        if acted(it, actions, applied):
             continue
         o = obligations.get(db, it["key"])
         if o and not obligations._open(o):

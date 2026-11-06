@@ -1833,6 +1833,7 @@ class Daemon:
                 self.check_resume_wait,
                 self.check_checks_wait,
                 self.check_urgent_check_wait,
+                self.check_queue_waits,
                 self.check_checks_owner,
                 self.check_checks_stall,
                 self.check_cap_wait,
@@ -7266,7 +7267,7 @@ class Daemon:
                      + "\n".join(f"- {line}" for line in jev_lines))
         if payload.get("unblock_report", s["name"] == "daily-review"):
             try:
-                spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db))
+                spec += "\n\nUnblocking quality:\n" + "\n".join(f"- {line}" for line in unblock.lines(db, cfg=self.cfg))
                 spec += (f"\n\nStuck longer than {sweep.REVIEW_LONG_H:g}h, with the blocker sweep's outcome:\n"
                          + "\n".join(f"- {line}" for line in sweep.review_lines(db, where=self.p)))
                 moved = failover.review_lines(db, where=self.p)
@@ -8217,6 +8218,24 @@ class Daemon:
                   task))
             status = "coalesced"
             log(self.p, f"urgent checks wait: {text[:300]}")
+
+    def check_queue_waits(self, every_s: float = 60) -> None:
+        """Model-free queue-wait escalation (queuewait.py): a task waiting past coordinator.queue_wait_escalate_min
+        on a checks, push, worker, device, lock, pool or CPU queue raises one must-act item with unblock options."""
+        now = time.time()
+        if now - getattr(self, "_queue_waits_checked", 0.0) < every_s:
+            return
+        self._queue_waits_checked = now
+        from . import checkcap, queuewait
+        if queuewait.threshold_s(self.cfg) <= 0 or self.settling():
+            return
+        try:
+            host = {**checkcap.state(), "limit_set": checkcap._set_limit() is not None}
+        except (OSError, checkcap.Unavailable) as e:   # no host checks view: the task-level waits still count
+            log(self.p, f"queue waits: no host checks state ({type(e).__name__}: {e})")
+            host = {}
+        for fp in queuewait.scan(self.p, self.cfg, now, host, locks.device_locks(self.cfg), os.cpu_count() or 0):
+            log(self.p, f"queue wait raised: {fp}")
 
     def check_cap_wait(self, every_s: float = 60) -> None:
         """Model-free cap wait (loadcaps): a ready device task held only by device.max_tasks for

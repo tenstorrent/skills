@@ -941,8 +941,9 @@ def triggers_by_day(db: DB, now: float, days: int = TRIGGER_DAYS) -> str:
     return " | ".join(out)
 
 
-def lines(db: DB, now: float | None = None) -> list[str]:
-    """The daily review's 'Unblocking quality' lines."""
+def lines(db: DB, now: float | None = None, cfg: dict | None = None) -> list[str]:
+    """The daily review's 'Unblocking quality' lines (`cfg`: the project's, for the queue-wait threshold)."""
+    from . import queuewait
     now = time.time() if now is None else now
     out = [f"stuck now (inventory, whenever it started): {inventory_line(inventory(db, now))}",
            f"holds with no anchor (no ask, resource, until or when), by age: {unanchored_line(unanchored(db, now))}"]
@@ -962,4 +963,5 @@ def lines(db: DB, now: float | None = None) -> list[str]:
     out.append(f"coordinator triggers, 24 h: {triggers_line(db, now - 86400)}")
     out.append(f"coordinator triggers by day, {TRIGGER_DAYS} d: {triggers_by_day(db, now)}")
     out.append(f"{reviewcap.TRIGGER}, 24 h: {reviewcap.daily_line(db, now - 86400)}")
+    out.append(queuewait.daily_line(db, cfg, now))
     return out

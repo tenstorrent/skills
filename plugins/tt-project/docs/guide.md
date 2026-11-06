@@ -2580,6 +2580,26 @@ is open raises one `cap_wait` event naming the key.
 | `delivery.push_min_gap_s` | 1800 s, only after a batch that did not end clean | the next push | safety |
 | `budget.max_parallel_workers` | 6 | worker runs at once | safety (spend) |
 
+### Queue waits over 30 minutes
+
+A task that waits longer than `coordinator.queue_wait_escalate_min` (default 30, 0: off) on a queue,
+cap or admission becomes a must-act item for the coordinator, keyed `qwait-<task>-<queue>`. Covered:
+the checks queue (a host-wide checks slot, or a worker polling its own detached `ttp checks`), the push
+queue, worker slots (the next ready task, never started while every slot is taken), a device or other `ttp lock`
+resource, an outside batch pool and CPU admission. The item names the queue, its cap and occupancy, who
+holds and waits for each place, and the wait so far. Its unblock options come from config and host state
+without a model call: spill to an allowed check host (only when the project or account lists one), raise
+a cap within the host's limit (never a cap the user or account set), let it go ahead of routine work,
+route to another allowed device, cut the stale queued tail, or cancel it (never a user's own task). A
+resource the user paused leaves no option: the user is told once.
+
+The coordinator must act on it that turn, in either the per-wake or the persistent session and on every
+provider: a `config_set`, a `task_add` or `task_update` naming the key or updating the task, or a reply
+naming the key and the safety rule that holds it. With none, the item comes back at the next 30-minute
+mark. At most 3 new items are raised a minute, longest waits first. It clears once the wait ends. The daily review's Unblocking quality section shows
+`queue_wait_over`: waits over the threshold in 24 h by queue, max and p95 wait, and minutes from the
+mark to the first unblock action.
+
 ## Standby snapshots
 
 Off by default: with `failover.standby` unset, nothing is written or shipped and `ttp status` shows
