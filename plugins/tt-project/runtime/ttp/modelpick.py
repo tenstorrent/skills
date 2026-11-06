@@ -18,7 +18,9 @@ STATE_CHARS (kind, tier, labels, title, the spec's head, the paths it names and 
 continuation's parent diff stat, the lineage's earlier route outcomes and the kind's routed success rate
 over SUCCESS_DAYS). A routed pick wins only above `dispatch.min_p`; Jev unavailable, off or unsure: core.
 
-The pick is kept per task (kv PICK) so later starts of the task reuse it, written to each run's note
+The pick is kept per task (kv PICK) so later starts of the task at the same tier reuse it (another tier's
+start or a floor run starts as with dispatch off); a routed option needs the chat provider allowed
+(providers_allowed) and not the core provider, as route.target. Each pick is written to each run's note
 (KEY: by, pick, p) and, for a Jev call, to jev_calls with the cost it avoided (a routed pick: the
 stratum's mean core cost per worker run over AVOID_DAYS). `settle` marks a routed pick right when its
 task ends done on its first try with no fallback, wrong when it escalates (a fallback, a retry or a
@@ -72,10 +74,13 @@ def min_p(cfg: dict) -> float:
 
 
 def routed(cfg: dict, key: str) -> bool:
-    """Whether option `key` runs on the routed-to (chat) provider."""
+    """Whether option `key` runs on the routed-to (chat) provider, which the project allows and which
+    is not its core provider (as route.target)."""
+    from .provallow import allows
     from .route import TO
     o = options(cfg).get(key) or {}
-    return o.get("provider") == TO and bool(str(o.get("model") or ""))
+    return o.get("provider") == TO and bool(str(o.get("model") or "")) \
+        and (cfg.get("core_provider") or "claude") != TO and allows(cfg, TO)
 
 
 def core_key(cfg: dict) -> str:
@@ -238,11 +243,13 @@ def _ask(db: DB, cfg: dict, task: dict, tier: str, jev, now: float, parent_diff)
 def pick(db: DB, cfg: dict, task: dict, tier: str, jev=None, now: float | None = None, parent_diff=None,
          peek: bool = False) -> dict | None:
     """This start's pick ({by, pick, p, ...}), or None when dispatch is off or no pick applies (the
-    tier's own route then decides). The first pick is kept for the task's later starts; `peek` only
-    reads a kept one and never calls Jev."""
+    tier's own route then decides). The first pick is kept for the task's later starts at the tier it
+    was picked at (another tier's start gets None); `peek` only reads a kept one and never calls Jev."""
     if not enabled(cfg) or task.get("kind") == "review" or not task.get("id"):
         return None
     kept = db.kv(f"{PICK}{task['id']}")
+    if isinstance(kept, dict) and kept.get("tier", "standard") != tier:
+        return None   # a light wake or a deep start: its tier's own route decides; the kept pick still settles
     if isinstance(kept, dict):   # a retry runs on core; its kept pick still settles at the end
         return kept if not int(task.get("attempts") or 0) else {"by": "rules", "pick": core_key(cfg), "p": None,
                                                                  "why": "retry"}
@@ -258,7 +265,7 @@ def pick(db: DB, cfg: dict, task: dict, tier: str, jev=None, now: float | None =
             got = _ask(db, cfg, task, tier, jev, now, parent_diff)
         except Exception as e:   # picking must never hold a task back: core
             got = {"by": "rules", "pick": core_key(cfg), "p": None, "why": "jev_unavailable", "jev_error": type(e).__name__}
-    got = got or {"by": "rules", "pick": core_key(cfg), "p": None, "why": why or "jev_unavailable"}
+    got = {**(got or {"by": "rules", "pick": core_key(cfg), "p": None, "why": why or "jev_unavailable"}), "tier": tier}
     db.set_kv(f"{PICK}{task['id']}", got)
     return got
 

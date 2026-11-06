@@ -180,3 +180,45 @@ def test_model_pick_without_jev_falls_back_to_core(env, monkeypatch):
     tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch, title="Look", kind="work", tier="light")
     assert prov == "chat" and modelpick.KEY not in note and "model_pick" not in note[route.KEY]
     assert d.jev.states == []
+
+
+def test_model_pick_applies_only_at_its_own_tier_and_never_to_a_floor_run(env, monkeypatch):
+    from ttp import modelpick, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _mp_config(p)
+    p.set_config("providers.chat.tiers.deep", {"model": "example-org/deep-model"})   # deep is not routed
+    d = Daemon(p.base)
+    d.jev = _ModelJev()
+    now = time.time()
+    # A core pick (the rules' 'hard' pick) leaves a later light wake to the light tier's route.
+    core = p.db.add_task("Speed up", "Optimize the cache in notes.py.", kind="code", tier="standard")
+    assert modelpick.pick(p.db, d.cfg, p.db.task(core), "standard", jev=d.jev)["why"] == "hard"
+    light = d._route(p.db.task(core), "light", None, now)
+    assert light and light["to"] == "chat" and light["model"] == "example-org/light-model" and "model_pick" not in light
+    assert d._model_pick(p.db.task(core), "light", peek=True) is None
+    # A routed pick runs only at the standard tier: a deep start and a floor run start on core.
+    tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch)
+    assert prov == "chat" and note[route.KEY]["model_pick"] is True
+    task = p.db.task(tid)
+    assert d._route(task, "standard", None, now)["model_pick"] is True
+    assert d._route(task, "deep", None, now) is None
+    monkeypatch.setattr("ttp.tierfloor.target", lambda db, cfg, t: {"tier": "standard", "effort": "high"})
+    assert d._route(task, "standard", None, now) is None
+    # The kept pick still settles.
+    assert p.db.kv(f"{modelpick.PICK}{tid}")["pick"] == "routed-top"
+
+
+def test_model_pick_honours_providers_allowed_and_a_chat_core(env, monkeypatch):
+    from ttp import modelpick, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    _mp_config(p)
+    core = p.config().get("core_provider") or "claude"
+    p.set_config("providers_allowed", [core])
+    d = Daemon(p.base)
+    d.jev = _ModelJev()
+    assert modelpick.target(d.cfg, {"pick": "routed-top"}) is None
+    tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch)
+    assert prov == core and route.KEY not in note
+    assert not modelpick.routed({**d.cfg, "providers_allowed": None, "core_provider": "chat"}, "routed-top")

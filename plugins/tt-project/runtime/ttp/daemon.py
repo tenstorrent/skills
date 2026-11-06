@@ -9737,11 +9737,14 @@ class Daemon:
 
     def _model_pick(self, task: dict, tier: str, peek: bool = False) -> dict | None:
         """This start's model pick (modelpick.pick), or None: the tier's own route decides. `peek`
-        reads a kept pick only (no Jev call)."""
+        reads a kept pick only (no Jev call). A floor run (tierfloor.target) gets None: it starts as
+        with dispatch off."""
         def parent_diff(t: dict) -> str:
             got = worktree.diff_lines(self.p, [t["branch"]]) if t.get("branch") else None
             return f"{len(got)} files, {sum(v or 0 for v in got.values())} lines" if got else ""
         try:
+            if not modelpick.enabled(self.cfg) or tierfloor.target(self.p.db, self.cfg, task):
+                return None
             return modelpick.pick(self.p.db, self.cfg, task, tier, jev=self.jev, parent_diff=parent_diff, peek=peek)
         except Exception as e:   # picking must never hold a task back
             log(self.p, f"task {task.get('id')}: model not picked: {e}")

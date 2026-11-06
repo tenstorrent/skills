@@ -1056,7 +1056,9 @@ light tier's own route; a pinned provider or model stays pinned. Jev answers onl
 a redacted state of about 2,000 characters (kind, tier, labels, title, the spec's head, the paths it
 names, a continuation's parent diff stat, the lineage's earlier route outcomes and the kind's routed
 success rate over 14 days). A routed pick wins only above `dispatch.min_p` (0.6); Jev off, out of
-funds or unsure means core. Each run note has a `dispatch` entry (by, pick, p); a Jev pick is logged
+funds or unsure means core. The pick applies only at the tier it was picked at: a light wake, a deep or escalated start and a
+conclusion floor run start as with dispatch off, and a routed option needs the chat provider in
+`providers_allowed` and not the core provider. Each run note has a `dispatch` entry (by, pick, p); a Jev pick is logged
 with the stratum's mean core cost per run over 7 days as its avoided cost and settles right when its
 task ends done on its first try with no fallback, wrong when it escalates; a core pick counts as no
 change. Jev's usual review switches the use off when it saves nothing or changes no decision.
