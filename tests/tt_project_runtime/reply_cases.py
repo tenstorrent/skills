@@ -200,3 +200,28 @@ def test_a_long_worker_reply_is_posted_as_parts_and_cut_only_past_the_cap_saying
     assert f"{len(huge) - cut.index(chr(10) + chr(10) + '[')} more chars not posted here" in cut
     assert "task #7's hand-off" in cut
 
+
+
+def test_a_reply_whose_hand_off_ends_with_the_ai_tag_reaches_the_chat_without_it(env):
+    """Reply #1834: a worker's chat `message` (in its on_pass too) ended with '[authored by AI]' and was
+    posted verbatim. The chat is the user's own, so the tag is dropped there and from the stored hand-off."""
+    from ttp.db import load_result
+    p = make(env)
+    body = ("The always-on coordinator is now the default.\n\n- **Next:** a review, then the push queue.")
+    tagged = body + "\n\n[authored by AI]\n"
+    task, replies = _reply_hand_off(env, p, {"status": "done", "summary": "Default on. [authored by AI]",
+                                             "message": tagged,
+                                             "on_pass": {"status": "done", "message": tagged, "summary": "x"}})
+    assert task["status"] == "done" and replies == [body]
+    stored = load_result(task["result"])
+    assert stored["message"] == body and stored["summary"] == "Default on." and stored["on_pass"]["message"] == body
+    # Every message to the user's chats drops it: a coordinator reply, a notify, an ask, a broadcast,
+    # the project's own configured tag too; an inbound note (another project's channel) keeps its text.
+    p.db.ai_tag = "(bot)"
+    for kind, chat, text in (("reply", "c1", "Tests are green.\n_Written by AI_"), ("info", None, "Pushed. (bot)"),
+                             ("ask", None, "Merge it?\n\n[Authored by AI]")):
+        mid = p.db.post("out", text, chat=chat, kind=kind)
+        assert "AI" not in p.db.one("SELECT text FROM messages WHERE id=?", (mid,))["text"].split("\n")[-1]
+        assert "(bot)" not in p.db.one("SELECT text FROM messages WHERE id=?", (mid,))["text"]
+    mid = p.db.post("in", "A note for you.\n\n[authored by AI]", chat="peer", kind="note")
+    assert p.db.one("SELECT text FROM messages WHERE id=?", (mid,))["text"].endswith("[authored by AI]")

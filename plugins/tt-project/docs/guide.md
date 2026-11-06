@@ -2233,7 +2233,9 @@ running work is interrupted only by the preemption below:
   Confluence (pages, comments) URL that posts (not on a local host); a structured body (Confluence
   storage, Jira ADF, Slack `blocks`) is one post judged by its last text. PR bodies, edits of an issue's or PR's own body and
   commit messages are left as they are, and messages to the user (the chat relay, `ttp notify`, the
-  web app) are never tagged. Known gaps, left to the prompt rule: a script or another CLI posting
+  web app) are never tagged: the daemon drops a trailing tag (or a similar disclosure line) from every
+  message it records for the user's chats and from a stored hand-off's summary, message and question,
+  whoever wrote it. Known gaps, left to the prompt rule: a script or another CLI posting
   (python, httpie, a gh extension), a URL or body built at run time (`$URL`, a text ending in `$MSG`),
   GitHub GraphQL over curl, gists, connector tools whose name says neither post nor invite (a shared
   document), Codex connector tools (its hook gets Bash calls only) and Cursor runs (no harness hook).

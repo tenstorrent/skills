@@ -397,6 +397,7 @@ class DB:
         self._after_commit: list[Callable[[], Any]] = []
         self._on_rollback: list[Callable[[], Any]] = []
         self.billing_memo: dict = {}   # billing._since: plan readings and runs, reused until a write
+        self.ai_tag = ""   # the project's delivery.ai_tag, which post drops from a message to the user (aitag.for_user)
         self.conn.row_factory = sqlite3.Row
         self.conn.execute(f"PRAGMA busy_timeout={int(BUSY_TIMEOUT_S * 1000)}")
         retry_busy(lambda: self.conn.execute("PRAGMA journal_mode=WAL"))
@@ -1015,8 +1016,11 @@ END""")
         """`provenance` (inbound): how the message came in, set by the code that received it, never
         taken from the sender. Only some count as the user's word for a PR approval (prguard).
         `context` (inbound): what a relayer added to the user's words; `text` holds only those words.
-        `broadcast` (inbound): the id of the broadcast it came with (`ttp say --all`, broadcast.py)."""
-        from . import alerts
+        `broadcast` (inbound): the id of the broadcast it came with (`ttp say --all`, broadcast.py).
+        Outbound messages go to the user's own chats, so a trailing AI-authorship tag is dropped (aitag)."""
+        from . import aitag, alerts
+        if direction == "out":
+            text = aitag.for_user(text, (self.ai_tag,))
         ts = time.time()
         with self.tx():
             mid = self.x("INSERT INTO messages(ts,direction,chat,channel,kind,severity,text,ref,handled,provenance,"
@@ -1504,7 +1508,11 @@ def dump_result(result: dict, limit: int = RESULT_MAX_CHARS) -> str:
     """A hand-off as JSON of at most `limit` chars for tasks.result. Values are shortened, never the
     serialized text, so every reader can parse it; the full hand-off stays in the run directory.
     The summary is what readers show and status/waits drive retries, so those go last: other fields
-    shrink first, then the largest of them are dropped, then the summary shrinks."""
+    shrink first, then the largest of them are dropped, then the summary shrinks. The texts a hand-off
+    gives the coordinator and the user (summary, message, question, and on_pass's) drop a trailing
+    AI-authorship tag (aitag.for_user): the tag is for posts others read."""
+    from .aitag import for_user
+    result = _for_user(result, for_user)
     text = json.dumps(result, ensure_ascii=False)
     if len(text) <= limit:
         return text
@@ -1528,6 +1536,16 @@ def dump_result(result: dict, limit: int = RESULT_MAX_CHARS) -> str:
             if isinstance(rest.get("waits"), int):
                 last["waits"] = rest["waits"]
             return json.dumps(last, ensure_ascii=False)
+
+
+USER_TEXT_KEYS = ("summary", "message", "question")
+
+
+def _for_user(result: dict, strip: Callable[[Any], Any]) -> dict:
+    out = {k: strip(v) if k in USER_TEXT_KEYS else v for k, v in result.items()}
+    if isinstance(out.get("on_pass"), dict):
+        out["on_pass"] = {k: strip(v) if k in USER_TEXT_KEYS else v for k, v in out["on_pass"].items()}
+    return out
 
 
 def _clip(value: Any, cap: int) -> Any:

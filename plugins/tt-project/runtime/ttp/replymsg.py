@@ -1,6 +1,7 @@
 """What a task that answers a chat (`reply_chat`) posts there, and when it posts nothing.
 
-The chat gets the hand-off's `message` verbatim when it is present and non-empty, else its `summary`.
+The chat gets the hand-off's `message` verbatim when it is present and non-empty, else its `summary`
+(less a trailing AI-authorship tag, which db.post drops from every message to the user: aitag.for_user).
 The chat sees nothing else of the run: not its tool output, not its final reply. A done hand-off whose
 text is empty, or only describes the run ("returned them as the message for the user") with no content
 of its own, delivers nothing: `undelivered` names why, and the daemon sends the task to review instead
@@ -71,4 +72,5 @@ def prompt_block(task: dict) -> str:
             f"This task answers a chat. The daemon posts result.json `{FIELD}` there verbatim (else `summary`); "
             "the chat sees nothing else of your run, not your tool output or final reply. Put the deliverable "
             f"itself in `{FIELD}`: the full answer, steps or text asked for, ready to read. A `{FIELD}` that only "
-            "describes your run (\"returned them as the message\") is not posted: the task goes to review.")
+            "describes your run (\"returned them as the message\") is not posted: the task goes to review. The chat "
+            "is the user's own: no AI-authorship tag.")

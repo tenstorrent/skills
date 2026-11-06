@@ -1489,6 +1489,11 @@ class Project:
     def db(self) -> DB:
         if self._db is None:
             self._db = DB(self.state / "project.db")
+            try:   # the tag a message to the user drops (aitag.for_user); the default one goes anyway
+                cfg = json.loads(self.config_path.read_text())
+                self._db.ai_tag = str(((cfg.get("delivery") or {}).get("ai_tag")) or "")
+            except (OSError, ValueError, AttributeError):
+                pass
         return self._db
 
     # config -----------------------------------------------------------------------------------
