@@ -736,3 +736,128 @@ def test_ttp_checks_a_review_task_keeps_the_push_branch_base(env, tmp_path, monk
     assert e.value.code == 1
     out = capsys.readouterr().out
     assert f"base {tip[:12]}: its merge base with the push branch" in out and "new on this head" in out, out
+
+
+def _quarantine_repo(env, monkeypatch, files: dict):
+    # A project pushing to origin/proj whose tip holds `files` ({path: text}); returns (p, repo, other).
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    for path, text in files.items():
+        (other / path).parent.mkdir(parents=True, exist_ok=True)
+        (other / path).write_text(text)
+        _git_out(other, "add", path)
+    _git_out(other, "commit", "-qm", "tests")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    return p, repo, other
+
+
+def _land_fix(p, repo, other, title: str) -> int:
+    # A done code task titled `title` whose one commit lands on origin/proj as a rebased copy.
+    tid, path, branch = _code_task(p, f"t{len(p.db.q('SELECT id FROM tasks'))}")
+    p.db.update_task(tid, title=title)
+    _commit(path, f"fix{tid}.txt", "fixed\n")
+    _git_out(other, "fetch", "-q", str(path), branch)
+    _git_out(other, "cherry-pick", _git_out(path, "rev-parse", "HEAD"))
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    _git_out(repo, "fetch", "-q", "origin")
+    return tid
+
+
+def test_quarantine_lifts_an_entry_whose_fix_landed_and_keeps_one_whose_fix_did_not(env, monkeypatch):
+    from ttp import audit, gatejudge
+    tests = "def test_fixed():\n    pass\n\n\ndef test_open():\n    pass\n\n\ndef test_again():\n    pass\n"
+    p, repo, other = _quarantine_repo(env, monkeypatch, {"tests/test_q.py": tests})
+    now = time.time()
+    old_head = _git_out(repo, "rev-parse", "origin/proj")
+    ids = [f"tests/test_q.py::{n}" for n in ("test_fixed", "test_open", "test_again")]
+    gatejudge.quarantine(p.state, ids, {"head": old_head, "check": "pytest", "host": "h", "task": "1"}, now - 60)
+    fix = _land_fix(p, repo, other, "make test_fixed and test_again deterministic")
+    # A work task naming the test, and a code task naming it whose commit never landed, lift nothing.
+    p.db.add_task("look at test_open", "s", kind="work")
+    tid, path, _ = _code_task(p, "unlanded")
+    p.db.update_task(tid, title="fix test_open")
+    _commit(path, "open.txt", "x\n")
+    # test_again flaked again at a head that already held the fix: the fix did not fix it.
+    gatejudge.quarantine(p.state, [ids[2]], {"head": _git_out(repo, "rev-parse", "origin/proj"), "check": "pytest",
+                                             "host": "h", "task": "2"}, now - 30)
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    (got,) = gatejudge.lift_due(p, now)
+    assert (got["id"], got["commit"]) == (ids[0], tip) and f"its fix #{fix} landed" in got["why"]
+    assert [e["id"] for e in gatejudge.lifts(p.state, 0)] == [ids[0]]
+    assert sorted(gatejudge.active(p.state, now)) == [ids[2], ids[1]]
+    assert gatejudge.lift_due(p, now) == []   # nothing more to lift
+    lines = gatejudge.status_lines(p.state, now)
+    assert any(ln.startswith("quarantine lifted") and ids[0] in ln and f"#{fix}" in ln for ln in lines)
+    assert any("tests lifted from the flaky-test quarantine: 1" in ln and ids[0] in ln
+               for ln in audit.lines(p.db, now=now, p=p))
+
+
+def test_quarantine_lifts_an_id_that_no_longer_names_a_test_and_logs_it(env, monkeypatch):
+    from ttp import gatejudge
+    files = {"tests/test_q.py": ("import pytest\n\n\n@pytest.mark.parametrize('x', [\n    1, 2])\n"
+                                 "def test_now_param(x):\n    pass\n\n\ndef test_plain():\n    pass\n\n\n"
+                                 "def test_fixture_param(x):\n    pass\n\n\nclass TestK:\n"
+                                 "    @pytest.mark.parametrize('y', [1])\n    def test_m(self, y):\n        pass\n"),
+             "tests/cases/area_cases.py": "def test_in_case():\n    pass\n"}
+    p, repo, other = _quarantine_repo(env, monkeypatch, files)
+    now = time.time()
+    keep = ["tests/test_q.py::test_plain", "tests/test_q.py::test_now_param[1]",
+            "tests/test_q.py::test_fixture_param[a]", "tests/test_q.py::test_in_case"]
+    drop = ["tests/test_q.py::test_now_param", "tests/test_q.py::test_removed", "tests/test_old.py::test_x",
+            "tests/test_q.py::TestK::test_m"]
+    gatejudge.quarantine(p.state, keep + drop, {"head": "", "check": "pytest", "host": "h", "task": ""}, now - 60)
+    got = gatejudge.lift_due(p, now)
+    tip = _git_out(repo, "rev-parse", "origin/proj")
+    assert sorted(x["id"] for x in got) == sorted(drop)
+    assert all(x["commit"] == tip and "no longer names a test" in x["why"] for x in got)
+    assert sorted(gatejudge.active(p.state, now)) == sorted(keep)
+    assert sorted(e["id"] for e in gatejudge.lifts(p.state, now - 1)) == sorted(drop)
+    assert all(e["by"] == "daemon" for e in gatejudge.lifts(p.state, now - 1))
+    # No readable push branch: nothing is judged gone.
+    p.set_config("delivery.push_branch", "origin/nowhere")
+    assert gatejudge.lift_due(p, now) == []
+
+
+def test_quarantine_lift_interrupted_mid_write_leaves_the_old_file_whole(tmp_path, monkeypatch):
+    from ttp import gatejudge
+    now = time.time()
+    gatejudge.quarantine(tmp_path, ["t::a", "t::b"], {"head": "h"}, now)
+    path = tmp_path / gatejudge.QUARANTINE_FILE
+    before = path.read_text()
+
+    def cut(*a):
+        raise OSError("power cut")
+    monkeypatch.setattr(os, "replace", cut)
+    with pytest.raises(OSError):
+        gatejudge.lift(tmp_path, ["t::a"], "fixed", now=now)
+    assert path.read_text() == before and sorted(gatejudge.active(tmp_path, now)) == ["t::a", "t::b"]
+    assert gatejudge.lifts(tmp_path, 0) == []   # a lift that did not happen is never logged
+    assert not [f for f in tmp_path.iterdir() if f.name.endswith(".tmp")]
+
+
+def test_ttp_quarantine_lists_and_lifts_by_hand(env, monkeypatch, capsys):
+    from ttp import cli, gatejudge
+    p = make(env)
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    gatejudge.quarantine(p.state, ["tests/test_a.py::test_x"], {"head": "h"}, time.time())
+
+    def ttp(*args):
+        try:
+            cli.main(["quarantine", *args])
+        except SystemExit as e:
+            return e.code
+        return 0
+    assert ttp("list") == 0
+    assert "quarantined test tests/test_a.py::test_x" in capsys.readouterr().out
+    assert ttp("lift", "tests/test_a.py::test_x") == 2   # no --why
+    assert ttp("lift", "tests/test_a.py::test_y", "--why", "gone") == 1
+    assert gatejudge.active(p.state)
+    assert ttp("lift", "tests/test_a.py::test_x", "--why", "its fix landed") == 0
+    assert "lifted tests/test_a.py::test_x" in capsys.readouterr().out
+    assert gatejudge.active(p.state) == {}
+    (e,) = gatejudge.lifts(p.state, 0)
+    assert (e["id"], e["why"], e["by"]) == ("tests/test_a.py::test_x", "its fix landed", "hand")
+    assert ttp("list") == 0
+    out = capsys.readouterr().out
+    assert "quarantine lifted" in out and "its fix landed" in out and "quarantined test" not in out

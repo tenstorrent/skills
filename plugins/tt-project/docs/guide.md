@@ -2028,6 +2028,16 @@ session and stateless coordinators on every provider.
   excused check counts for this change's landing only: the run reads `LANDING ONLY`, its pass is never
   recorded for reuse, and `ttp checks --release` (a release cut's or a required whole-suite check)
   excuses nothing and joins no other run. `checks.judge: false` turns judging off.
+- Quarantine lifts: every 10 minutes the daemon lifts a quarantined test whose fix landed (a done code
+  task naming the test, updated since it was first seen flaky, that `ttp landed --task <id>` finds on the
+  push branch and that was not already in the head the test last flaked at) or whose id no longer names a
+  test at the push branch tip (its file or function is gone, or a bare id whose function is now
+  parametrized). It reads local refs only. Each lift is logged with the test id, the reason and the commit
+  in `state/test_quarantine_lifts.jsonl`; `ttp status` shows the last day's lifts and the daily review's
+  audit lists them. A test that is still flaky fails again, passes its rerun and is quarantined anew.
+  `ttp quarantine list` shows the quarantine and the last day's lifts; `ttp quarantine lift <test id>
+  --why <text>` lifts one by hand, logged the same way. The file is rewritten whole (a temporary file
+  renamed over it), so never edit it by hand.
 - Checks receive a writable, absolute `TTP_RUN_DIR`, never empty or `/`. Foreground `ttp checks`
   uses the worker's run directory. Detached checks, pushes and push-queue batches each
   get a unique directory under the project's `state/check-reports/`, outside the checked worktree.

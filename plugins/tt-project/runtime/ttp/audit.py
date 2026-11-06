@@ -48,7 +48,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, obligations, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, obligations, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -521,6 +521,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(pre)
     if plain := plainreply.audit_line(db, since):
         out.append(plain)
+    if p is not None and (lifted := gatejudge.lifts(p.state, since)):
+        out.append(f"tests lifted from the flaky-test quarantine: {len(lifted)}: " + "; ".join(
+            f"{e.get('id')} ({e.get('why')}, by {e.get('by')})" for e in lifted[:TOP]) + _more(lifted))
     turns = coordinator_turns(db, since)
     if turns["n"]:
         noop = (f"{turns['noop']} decided nothing (${turns['noop_usd']:.2f})" if turns["logged"] else

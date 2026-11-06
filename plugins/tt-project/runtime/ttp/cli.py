@@ -7342,6 +7342,28 @@ def cmd_landed(a) -> None:
     sys.exit(landed.run(p, a))
 
 
+def cmd_quarantine(a) -> None:
+    """`ttp quarantine list`: the tests the gate quarantined as flaky and the lifts of the last day.
+    `ttp quarantine lift <test id> --why <text>`: drop one, logged as the daemon's lifts are (gatejudge)."""
+    from . import gatejudge
+    p = here()
+    if not p:
+        die("ttp quarantine: no project here (run it in a project or with TTP_PROJECT set)")
+    now = time.time()
+    if a.action == "lift":
+        if not a.test_id or not (a.why or "").strip():
+            die("ttp quarantine lift: give the test id and --why <text>")
+        if not gatejudge.lift(p.state, [a.test_id], a.why.strip(), by=f"task {os.environ.get('TTP_TASK')}"
+                              if os.environ.get("TTP_TASK") else "hand", now=now):
+            die(f"ttp quarantine lift: {a.test_id} is not quarantined (`ttp quarantine list` shows them)", 1)
+        print(f"lifted {a.test_id}: {a.why.strip()}")
+        return
+    if a.test_id:
+        die("ttp quarantine list takes no test id")
+    lines = gatejudge.status_lines(p.state, now)
+    print("\n".join(lines) if lines else "no test is quarantined, and none was lifted in the last day")
+
+
 def cmd_ack_wait(a) -> None:
     """`ttp ack-wait probe|settle --from <project> --hash <h>`: wait model-free for another project's
     reply to a note (ackwait.py). probe: 0 once the reply is in this machine's inbox, 1 while not, 2
@@ -12866,6 +12888,13 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--task", type=int, help="the task whose landing to look for")
     s.add_argument("--onto", help="the branch to look on (default: delivery.push_branch)")
     s.set_defaults(fn=cmd_landed)
+
+    s = sub.add_parser("quarantine", help="list the tests the tests gate quarantined as flaky (and the last day's "
+                                          "lifts), or lift one by hand with --why (logged)")
+    s.add_argument("action", choices=["list", "lift"])
+    s.add_argument("test_id", nargs="?", help="lift: the pytest id, as `ttp quarantine list` shows it")
+    s.add_argument("--why", help="lift: why it may go (a fix landed, the test was removed, ...)")
+    s.set_defaults(fn=cmd_quarantine)
 
     s = sub.add_parser("ack-wait", help="wait model-free for another project's reply to a `ttp note --to`: probe "
                                         "(a retry_when: 0 once replied, 1 while not, 2 if it cannot tell) or settle "

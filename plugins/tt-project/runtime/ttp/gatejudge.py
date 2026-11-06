@@ -28,6 +28,14 @@ a spill host's run with ids proven new on that host's base is not run again here
 is ruled out), and a later `ttp checks` of the same tree and check fails at once, before it queues for a
 checks slot, telling the task to fix them (known_new; --fresh runs it again).
 
+An entry leaves the quarantine on its expiry, or earlier when the daemon's sweep (lift_due, every
+LIFT_EVERY_S) finds it fixed or gone: a done code task naming the test, updated since it was first seen
+flaky, has landed on the push branch (landed.check, as `ttp landed --task`) and was not already in the
+head it last flaked at; or its id no longer names a test at the push branch tip (its file or function
+is gone, or a bare id whose function is now parametrized). `ttp quarantine lift <id> --why` lifts one by
+hand. Each lift is logged (LIFTS_FILE), shown by `ttp status` for a day and by the daily review's audit.
+A test that is still flaky fails again, passes its rerun and is quarantined anew.
+
 Nothing in the repository is edited, skipped or loosened: the quarantine is a harness record only the
 gate reads. An excused check counts for this change's landing only: its pass is never recorded, so
 no later run, release check or required whole-suite pass reuses it, and `ttp checks --release`
@@ -58,6 +66,10 @@ BUSY_TRIES = 3      # checks.judge_busy_tries: reruns of one busy rerun
 BUSY_WAIT_S = 600.0  # checks.judge_busy_wait_s: the backoff sleeps of one rerun, in all
 BUSY_FIRST_S = 30.0  # the first backoff; each next one doubles
 EVENT = "checks_flaky_test"   # the queued fix note to the coordinator
+LIFTS_FILE = "test_quarantine_lifts.jsonl"   # in the project's state: one line per lift
+LIFT_EVERY_S = 600.0   # the daemon's sweep for fixed or gone entries
+LIFT_SHOW_S = 86400.0  # status shows the lifts of the last day
+FIX_TRIES = 5          # candidate fix tasks checked per entry and sweep, newest first
 _COUNT = re.compile(r"\b(\d+) (passed|failed|errors?)\b")   # the counts in pytest's summary line
 
 
@@ -169,6 +181,130 @@ def quarantine(state: Path, ids: list[str], evidence: dict, now: float, days: fl
             e["evidence"] = ([*(e.get("evidence") or []), {**evidence, "ts": now}])[-EVIDENCE_MAX:]
         _save(path, d)
     return new
+
+
+def lift(state: Path, ids: list[str], why: str, commit: str = "", by: str = "daemon",
+         now: float | None = None) -> dict:
+    """Drop `ids` from the quarantine, under its lock and written whole (a temporary file renamed over
+    it), and log each lift; {id: entry} of those that were in it."""
+    now = time.time() if now is None else now
+    path = Path(state) / QUARANTINE_FILE
+    with _locked(path):
+        d = _load(path)
+        gone = {i: d.pop(i) for i in ids if i in d}
+        if gone:
+            _save(path, d)
+    from .project import durable_append
+    for i in gone:
+        durable_append(Path(state) / LIFTS_FILE, json.dumps(
+            {"ts": now, "id": i, "why": why, "commit": commit, "by": by}, sort_keys=True) + "\n")
+    return gone
+
+
+def lifts(state: Path, since: float) -> list[dict]:
+    """The lifts logged since `since`, oldest first."""
+    try:
+        text = (Path(state) / LIFTS_FILE).read_text()
+    except OSError:
+        return []
+    out = []
+    for line in text.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(e, dict) and float(e.get("ts") or 0) >= since:
+            out.append(e)
+    return out
+
+
+def _name(test_id: str) -> str:
+    """The test function of a pytest id, without its parameters."""
+    return test_id.rpartition("::")[2].partition("[")[0]
+
+
+def _defs(repo: Path, tip: str, test_id: str) -> list[bool] | None:
+    """Per definition of the test's function at `tip` (any .py file under the test file's top folder):
+    whether it is parametrized. [] when its file or function is gone, None when git cannot tell."""
+    from .landed import _git
+    path, name = test_id.partition("::")[0], _name(test_id)
+    if not path or not re.fullmatch(r"\w+", name):
+        return None
+    if _git(repo, "cat-file", "-e", f"{tip}:{path}").returncode != 0:
+        return []
+    got = _git(repo, "grep", "-n", "-E", rf"^\s*(async\s+)?def {name}\(", tip, "--", path.partition("/")[0] or ".")
+    if got.returncode not in (0, 1):
+        return None
+    out, files = [], {}
+    for hit in got.stdout.splitlines():
+        f, _, rest = hit[len(tip) + 1:].partition(":")
+        n = int(rest.partition(":")[0] or 0)
+        if f not in files:
+            files[f] = _git(repo, "show", f"{tip}:{f}").stdout.splitlines()
+        lines = files[f]
+        indent = len(lines[n - 1]) - len(lines[n - 1].lstrip())
+        k, block = n - 2, []
+        while k >= 0 and lines[k].strip():   # its decorators, up to a blank line or other code
+            ind, s = len(lines[k]) - len(lines[k].lstrip()), lines[k].strip()
+            if not (ind > indent or ind == indent and s[:1] in "@)]"):
+                break
+            block.append(s)
+            k -= 1
+        out.append(any("parametrize" in s for s in block))
+    return out
+
+
+def gone(repo: Path, tip: str, test_id: str) -> bool:
+    """Whether `test_id` no longer names a test at `tip`: its file or function is gone, or it is a bare id
+    and every definition is now parametrized. An id with parameters whose function is not decorated may
+    take them from a fixture: not gone."""
+    defs = _defs(repo, tip, test_id)
+    if defs is None:
+        return False
+    return not defs or ("[" not in test_id.rpartition("::")[2] and all(defs))
+
+
+def fix_tasks(db, test_id: str, entry: dict) -> list[int]:
+    """Done code tasks naming the test (its function, as a word), updated since it was first seen flaky."""
+    name = _name(test_id)
+    if not name:
+        return []
+    word = re.compile(rf"(?<!\w){re.escape(name)}(?!\w)")
+    rows = db.q("SELECT id, title, spec FROM tasks WHERE kind='code' AND status='done' AND updated>=? "
+                "AND (instr(title, ?) OR instr(spec, ?)) ORDER BY id DESC LIMIT 50",
+                (float(entry.get("first_seen") or 0), name, name))
+    return [r["id"] for r in rows if word.search(f"{r['title']}\n{r['spec']}")][:FIX_TRIES]
+
+
+def lift_due(p, now: float | None = None) -> list[dict]:
+    """The daemon's sweep: lift each active entry whose fix landed or whose id is gone (see the module
+    docstring). Local refs only, never a fetch. The lifts made: [{id, why, commit}]."""
+    from . import landed
+    now = time.time() if now is None else now
+    q = active(p.state, now)
+    if not q:
+        return []
+    repo = Path(p.root)
+    try:
+        tip, _ = landed._tip(repo, landed._push_ref(p, repo), False)
+    except ValueError:
+        tip = ""
+    out = []
+    for i, e in sorted(q.items()):
+        heads = [str(x.get("head") or "") for x in e.get("evidence") or [] if isinstance(x, dict)]
+        why = commit = ""
+        for tid in fix_tasks(p.db, i, e):
+            rc, words = landed.check(p, repo, tid=tid, fetch=False)
+            # A fix already in the head that last flaked did not fix it.
+            if rc == 0 and not (heads[-1:] and heads[-1] and landed.check(p, repo, tid=tid, onto=heads[-1],
+                                                                          fetch=False)[0] == 0):
+                why, commit = f"its fix #{tid} landed ({words})", tip
+                break
+        if not why and tip and gone(repo, tip, i):
+            why, commit = "its test id no longer names a test on the push branch", tip
+        if why and lift(p.state, [i], why, commit, now=now):
+            out.append({"id": i, "why": why, "commit": commit})
+    return out
 
 
 def saved_base(state: Path, where: str, base: str, ids: list[str], now: float) -> dict[str, bool]:
@@ -350,8 +486,14 @@ def note_text(ids: list[str], head: str, cmd: str) -> str:
 
 
 def status_lines(state: Path, now: float, at=lambda ts: time.strftime("%Y-%m-%d %H:%M", time.localtime(ts))) -> list[str]:
-    """One line per quarantined test, for `ttp status`."""
+    """One line per quarantined test and per lift of the last day, for `ttp status`."""
     return [f"quarantined test {i}: first seen {at(float(e.get('first_seen') or 0))}, expires "
             f"{at(float(e['expires']))}, seen flaky {len(e.get('evidence') or [])} time(s); "
             "it never counts as passed for a release or whole-suite check"
-            for i, e in sorted(active(state, now).items())]
+            for i, e in sorted(active(state, now).items())] + [
+        lift_line(e, at) for e in lifts(state, now - LIFT_SHOW_S)]
+
+
+def lift_line(e: dict, at) -> str:
+    commit = f" at {str(e['commit'])[:12]}" if e.get("commit") else ""
+    return f"quarantine lifted {at(float(e.get('ts') or 0))}: {e.get('id')}: {e.get('why')}{commit} (by {e.get('by')})"

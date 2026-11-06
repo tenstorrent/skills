@@ -41,6 +41,7 @@ from . import sidefx
 from . import cursorhook
 from . import pausegone
 from . import usersite
+from . import gatejudge
 from . import urgentfup
 from . import topup
 from . import cursortiers
@@ -1160,6 +1161,7 @@ class Daemon:
         self._machine_probes = machine_ledger.Probes(self.p, log=lambda m: log(self.p, m))
         self._machines_routed = 0.0
         self._coverage_at = 0.0
+        self._quarantine_at = 0.0
         self._probe_rc: dict[int, tuple[int | str, float, str]] = {}   # last verdict: exit code or why, when, probe
         self._stale_user_held: set[str] = set()   # wait_stale fingerprints already logged as held by the user
         self._urgent_own_logged: dict[int, int] = {}   # task -> run whose own-wait hold check_urgent_start logged
@@ -1884,6 +1886,7 @@ class Daemon:
                 self.route_machines,
                 self.check_route_models,
                 self.refresh_coverage,
+                self.lift_quarantine,
                 self.sweep_holds,
                 self.sweep_reviews,
                 self.sweep_unreviewed,
@@ -2413,6 +2416,19 @@ class Daemon:
             responsibilities.refresh(self.p, self.cfg, now)
         except Exception:
             log(self.p, "health coverage inventory failed\n" + traceback.format_exc())
+
+    def lift_quarantine(self) -> None:
+        """Lift quarantined flaky tests whose fix landed or whose id is gone (gatejudge.lift_due), model-free:
+        a few git reads every gatejudge.LIFT_EVERY_S while any is quarantined."""
+        now = time.time()
+        if now - self._quarantine_at < gatejudge.LIFT_EVERY_S:
+            return
+        self._quarantine_at = now
+        try:
+            for x in gatejudge.lift_due(self.p, now):
+                log(self.p, f"quarantine: lifted {x['id']}: {x['why']}")
+        except Exception:
+            log(self.p, "quarantine lift sweep failed\n" + traceback.format_exc())
 
     def _machine_page(self, page: dict, now: float) -> bool:
         """Deliver one page; whether it went out (or already had: a resend is idempotent)."""
