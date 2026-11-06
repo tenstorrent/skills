@@ -2745,7 +2745,7 @@ def test_a_push_batch_records_a_commit_it_drops_on_a_landing_that_resolved_a_con
     p, repo, origin, other, a = _landed_fixture(env, monkeypatch)
     _land_as(other, {"notes.txt": "a\nb theirs\nc\n"}, "the target edits line b")
     _git_out(other, "fetch", "-q", str(repo), "first")
-    landed_as = _rewrite(other, a, {"notes.txt": "a\nB1 resolved\nc\n"})
+    landed_as = _rewrite(other, a, {"notes.txt": "a\nB 1\nc\n"})   # a looser rewrite of "B1"
     _git_out(other, "push", "-q", "origin", "HEAD:proj")
     head = _on_top(repo, a, "e1", {"more.txt": "own\n"})
     rc, m = _run_batch(p, _batch_marker(p, [head]), monkeypatch)
@@ -2775,24 +2775,28 @@ def test_a_push_batch_without_a_resolved_drop_tells_the_coordinator_nothing(env)
     assert not p.db.q("SELECT * FROM events WHERE kind=?", (pushq.DROPPED_EVENT,))
 
 
-@pytest.mark.parametrize("amend, resolution, dropped", [
-    ("1\nfix from review\n", "1 resolved\n", False),       # the amend's line is lost in the resolution
-    ("1\nfix from review\n", "b theirs\n1\n", False),     # both sides taken, but not the amend's line
-    ("1\nfix from review\n", "b theirs\n1\nfix from review\n", True),  # the resolution holds it
-    (None, "1 resolved\n", True),                           # not amended: the resolution rewrote its line
-    (None, "b theirs\n1\n", True),                         # not amended: both sides taken
+@pytest.mark.parametrize("amend, resolution, dropped, named", [
+    ("1\nfix from review\n", "1 resolved\n", False, False),       # the amend's line is lost in the resolution
+    ("1\nfix from review\n", "b theirs\n1\n", False, False),     # both sides taken, but not the amend's line
+    ("1\nfix from review\n", "b theirs\n1\nfix from review\n", True, False),  # the resolution holds it verbatim
+    (None, "1 resolved\n", True, False),                    # not amended: a superset line holds every word of it
+    (None, "b theirs\n1\n", True, False),                  # not amended: both sides taken
     # the resolution adds a line of its own as well: as many new lines, but "fix" pairs with none
-    ("1\nfix\n", "merged 1\nextra\n", False),
-    # every line the amend adds that the landing lacks pairs with one the resolution rewrote
-    ("1\nfix from review\n", "merged 1\nfix from review, merged\n", True),
-    ("1\nfix\n", "merged 1\n", False),                    # two missing lines, one rewritten: no pairing
-    ("1\n2\n", "merged 1 and 2\n", False),               # one rewritten line pairs with one line only
+    ("1\nfix\n", "merged 1\nextra\n", False, False),
+    # every line the amend adds that the landing lacks is inside a line the resolution rewrote
+    ("1\nfix from review\n", "merged 1\nfix from review, merged\n", True, False),
+    ("1\nfix\n", "merged 1\n", False, False),             # two missing lines, one rewritten: no pairing
+    ("1\n2\n", "merged 1 and 2\n", False, False),        # one rewritten line pairs with one line only
+    # a looser rewrite (a word changed): dropped, and named for a check
+    ("1\nfix from review\n", "1\nfix from a review\n", True, False),
+    ("1\nfix from review\n", "1\nfixed from review\n", True, True),
 ], ids=["amend-rewritten", "amend-both-sides", "amend-kept", "rewritten", "both-sides", "amend-unpaired",
-        "amend-all-paired", "amend-short", "amend-one-to-one"])
+        "amend-all-paired", "amend-short", "amend-one-to-one", "amend-superset", "amend-loose"])
 def test_a_rewritten_landing_carries_a_commit_only_when_its_resolution_accounts_for_every_added_line(
-        tmp_path, amend, resolution, dropped):
+        tmp_path, amend, resolution, dropped, named):
     """The repro: an amend made before its older copy landed adds a line inside the region where the
-    landing resolved a conflict. It is dropped (and named) only when the resolution accounts for it."""
+    landing resolved a conflict. It is dropped only when the resolution accounts for it, and named for
+    a check only when a line survives as a looser rewrite (not verbatim, nor inside a superset line)."""
     from ttp import batch
     repo = tmp_path / "r"
     repo.mkdir()
@@ -2814,7 +2818,7 @@ def test_a_rewritten_landing_carries_a_commit_only_when_its_resolution_accounts_
     landed_as = _rewrite(repo, x, {"f.txt": f"a\n{resolution}c\n"}, later=500)
     resolved: dict = {}
     assert batch._rewritten(repo, landed_as, base, [mine], resolved) == ({mine: landed_as} if dropped else {})
-    assert resolved == ({mine: ["f.txt"]} if dropped else {}), "a drop on a resolved conflict is named"
+    assert resolved == ({mine: ["f.txt"]} if named else {}), "only a drop on a looser rewrite is named"
 
 
 @pytest.mark.parametrize("change", ["author", "date", "subject", "files", "older", "amended", "none"])

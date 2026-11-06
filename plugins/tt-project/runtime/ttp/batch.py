@@ -1035,7 +1035,9 @@ def _carries(repo: Path, c: str, landed: str, files: frozenset, resolved: list[s
     landing resolved those), and inside each such region the landing's lines account for every line
     `c` adds there (_explained). An amend made before the landing adds work its landed copy lacks, also
     inside a region the landing resolved: that commit is replayed, so the work lands or comes back as a
-    conflict, never dropped. The files whose answer relied on a resolved region go to `resolved`."""
+    conflict, never dropped. The files whose answer relied on a resolved region's looser rewrites go to
+    `resolved`; not a file whose every added line is in the landing verbatim or inside a rewritten line
+    holding all its words (_holds): nothing can be lost there, so nobody is asked to check it."""
     try:
         for path in files:
             mine, got = _blob(repo, c, path), _blob(repo, landed, path)
@@ -1059,8 +1061,9 @@ def _carries(repo: Path, c: str, landed: str, files: frozenset, resolved: list[s
                     if gaps is None or len(gaps) != len(regions) or not all(
                             _explained(*side, gap) for side, gap in zip(regions, gaps)):
                         return False
-                    if resolved is not None:
-                        resolved.append(path)
+                    if resolved is not None and not all(_explained(*side, gap, _holds)
+                                                        for side, gap in zip(regions, gaps)):
+                        resolved.append(path)   # a line survives only as a looser rewrite: worth a check
     except (OSError, subprocess.SubprocessError):
         return False
     return True
@@ -1136,16 +1139,17 @@ def doc_merge_text(recs: list) -> str:
     return "; ".join(out)
 
 
-def _explained(ours: list[bytes], base: list[bytes], theirs: list[bytes], got: list[bytes]) -> bool:
+def _explained(ours: list[bytes], base: list[bytes], theirs: list[bytes], got: list[bytes],
+               like=None) -> bool:
     """Whether the landing's lines `got` for a conflict region account for every line commit c's side
     (`theirs`) adds over `base` there: each one not in `got` verbatim pairs, one to one, with a similar
     line `got` adds over `ours` that is not c's (a line rewritten while resolving: _paired). A line left
     unpaired is work the landed copy lacks, such as an amend's added line, even when the resolution adds
-    as many lines of its own."""
+    as many lines of its own. `like` replaces _similar as the pairing test."""
     new = Counter(theirs) - Counter(base)
     missing = list((new - Counter(got)).elements())
     rewrites = list(((Counter(got) - Counter(ours)) - Counter(theirs)).elements())
-    return _paired(missing, rewrites)
+    return _paired(missing, rewrites, like or _similar)
 
 
 _PAIRS_MAX = 40000      # missing x rewritten lines compared at most; more keeps the commit in the replay
@@ -1166,18 +1170,26 @@ def _similar(a: bytes, b: bytes) -> bool:
     return wa <= wb or wb <= wa or difflib.SequenceMatcher(None, a.strip(), b.strip(), autojunk=False).ratio() >= _SIMILAR
 
 
-def _paired(missing: list[bytes], rewrites: list[bytes]) -> bool:
-    """Whether each line of `missing` pairs with its own similar line of `rewrites` (_similar), one to
-    one (a bipartite matching by augmenting paths). Too many lines to compare is no pairing."""
+def _holds(a: bytes, b: bytes) -> bool:
+    """Whether line `b` holds every word and mark of line `a` (a rewrite that only adds). A blank line is like none."""
+    wa = _words(a)
+    return bool(wa) and wa <= _words(b)
+
+
+def _paired(missing: list[bytes], rewrites: list[bytes], like=None) -> bool:
+    """Whether each line of `missing` pairs with its own similar line of `rewrites` (`like`, default
+    _similar), one to one (a bipartite matching by augmenting paths). Too many lines to compare is no
+    pairing."""
+    like = like or _similar
     if not missing:
         return True
     if len(missing) > len(rewrites) or len(missing) * len(rewrites) > _PAIRS_MAX:
         return False
-    like = [[j for j, r in enumerate(rewrites) if _similar(m, r)] for m in missing]
+    pairs = [[j for j, r in enumerate(rewrites) if like(m, r)] for m in missing]
     owner: dict[int, int] = {}
 
     def take(i: int, seen: set) -> bool:
-        for j in like[i]:
+        for j in pairs[i]:
             if j not in seen:
                 seen.add(j)
                 if j not in owner or take(owner[j], seen):
