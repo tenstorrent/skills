@@ -433,12 +433,14 @@ only in the feed and never under "needs you".
   (`machine_change_overdue`) is normal, high only on a machine tagged `serving`, `live` or `server`
   past its end with no passing until-probe, and each project hears of one change once per episode,
   whether from its own daemon or relayed by another project's.
-- `coordinator.session` sets the persistent coordinator session (on by default): with `mode` `on`
-  (Claude), each coordinator wake resumes one agent session instead of a fresh turn; `off` runs
-  every wake as the stateless turn; `shadow` is reserved. A project with no value of its own
-  follows the default, so new and upgraded projects run the session; a user turns it off for their
-  own project with `ttp config <name> coordinator.session.mode off` (kept across upgrades). A
-  project's coordinator may set the mode itself (`config_set`). A new session starts
+- `coordinator.session` sets the persistent coordinator session (on by default): with `mode` `on`,
+  each coordinator wake resumes one agent session instead of a fresh turn (Claude Code, Codex and
+  Cursor today, with per-provider tools and guards in providers.md; the chat provider not yet, and
+  its coordinator runs stateless turns); `off` runs every wake as the stateless turn; `shadow` is
+  reserved. A project with no value of its own follows the default, so new and upgraded projects
+  run the session; a user turns it off for their own project with
+  `ttp config <name> coordinator.session.mode off` (kept across upgrades). A project's coordinator
+  may set the mode itself (`config_set`). A new session starts
   when there is none, the system prompt, stable context or action schema changed, the model or
   effort changed, the context reached its limit, the last session turn did not end ok, or its
   transcript is gone (a host move). The context is the last model call's prompt and answer; the

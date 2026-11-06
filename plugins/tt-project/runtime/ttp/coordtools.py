@@ -1,7 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """The tools and the per-wake budget of a coordinator in session mode (coordinator.session.mode
-"on"). With the mode off or unset, nothing here changes how a coordinator turn launches: the stateless
+"on"). Claude takes the hooks below through --settings; an agent without tool_hooks gets them through
+its own hook config (Provider.coord_tools: Codex runs HOOK_EVENT and POST_EVENT per call), and a
+whole-wake guard (wake_snapshot, wake_guard) puts back protected files after any such wake. With the mode off or unset, nothing here changes how a coordinator turn launches: the stateless
 turn has no tools.
 
 Full tools (coordinator.session.tools "full", the default): a session wake (a new or resumed session)
