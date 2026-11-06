@@ -50,7 +50,10 @@ def test_a_run_may_not_name_a_credential_store_in_bash(env, tmp_path, monkeypatc
                 "TOKEN=$(gh auth token) env", "gh auth status --show-token", "gh auth status -t",
                 "printf 'host=github.com\\n' | git credential fill", "cat ~/.git-credentials", "cat ~/.netrc",
                 "cat ~/.claude/.credentials.json", "jq . \"$CODEX_HOME/auth.json\"", "cat ~/.codex/auth.json",
-                "ttp lock x -- cat ~/.ssh/id_ed25519"):
+                "ttp lock x -- cat ~/.ssh/id_ed25519", "cat ~/.ss''h/id_ed25519", "cat ~/.s\"s\"h/work-key",
+                "cat ~/.\\ssh/id_ed25519", "ssh box 'cat ~/.ssh/id_ed25519'", "ssh -p 22 box cat .ssh/work-key",
+                "ssh box 'mkdir -p ~/.ssh; tar c ~/.ssh'", "find ~ -name id_ed25519 -exec cat {} +",
+                "find ~ -name 'id_*' | xargs cat", "find / -iname '*.NETRC' -exec cat {} \\;"):
         assert "credential stores" in _bash_why(tmp_path, cmd), cmd
     monkeypatch.setenv("GH_CONFIG_DIR", str(tmp_path / "ghc"))
     assert "credential stores" in _bash_why(tmp_path, f"cat {tmp_path}/ghc/hosts.yml")
@@ -66,7 +69,10 @@ def test_ssh_git_and_gh_still_use_the_credential_stores_themselves(env, tmp_path
                 "test -f ~/.ssh/id_ed25519 && echo yes", "ls -la ~/.ssh", "ls ~/.ssh/", "cat ~/.ssh/config",
                 "cat ~/.ssh/id_ed25519.pub", "cat ~/.ssh/*.pub", "grep box ~/.ssh/known_hosts",
                 "gh auth status", "gh pr view 7", "git status", "git credential-cache exit",
-                "echo the netrc file and gh's hosts file"):
+                "echo the netrc file and gh's hosts file", "ssh box 'mkdir -p ~/.ssh'", "ssh box mkdir -p ~/.ssh",
+                "ssh -l me -p 22 box 'chmod 700 ~/.ssh && ls ~/.ssh'", "ssh -i ~/.ssh/work-key box ls -la .ssh",
+                "chmod 600 ~/.ss''h/work-key", "find . -name '*.py' -exec wc -l {} +", "find ~ -name '*'",
+                "find ~ -name 'id_*.pub'"):
         assert credguard.bash_refusal(cmd, hook._all_segments(hook._split(cmd)[0])) is None, cmd
         assert "credential stores" not in _bash_why(tmp_path, cmd), cmd
 
@@ -79,6 +85,7 @@ def test_a_run_may_not_write_refs_tags_or_contents_through_an_http_client(env, t
                 f"curl --request PATCH {api}/git/refs/heads/main --data @body.json",
                 f"curl -X PUT {api}/contents/README.md -d @c.json",
                 f"wget --post-data=x {api}/merges",
+                f"timeout 30 curl -d '{{\"body\": \"Notes\\n[authored by AI]\"}}' {api}/releases",   # tagged, still a release
                 f"python3 -c \"import requests; requests.patch('{api}/git/refs/heads/main', json={{}})\"",
                 f"python3 -c \"import requests; requests.delete('{api}/git/refs/heads/x')\"",
                 "curl -X POST https://api.github.com/graphql -d '{\"query\":\"mutation{createRef(input:{})}\"}'"):

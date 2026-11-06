@@ -11,7 +11,9 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
   token (`gh auth token`, `gh auth status --show-token`, `git credential fill`). ssh, git and gh
   read them themselves: a key given to ssh by `-i` or `-o IdentityFile=`, a key path handed to
   ssh-add or ssh-keygen, mkdir, chmod, chown, touch and test of them, and ls or stat of the ~/.ssh
-  dir itself pass. Known gap: a path built at run time inside a script or inline code.
+  dir itself pass. The words of a command ssh runs on another host are checked the same way, quotes
+  are dropped before the check (~/.ss''h), and a find whose name test matches a private key or
+  credential file is refused. Known gap: a path built at run time inside a script or inline code.
 Secrets stay reachable only through `ttp secret env` (hook.secret_read).
 
 Pushes go only through `ttp push` and the push queue. The run's bin/gh (prguard.check) refuses, inside
@@ -40,6 +42,12 @@ SSH_KEY_OPTION_RE = re.compile(r"(?:IdentityFile|CertificateFile|ControlPath|Ide
 # Commands that never print a file's contents or name; ls and stat may name the ~/.ssh dir only
 SILENT = {"mkdir", "chmod", "chown", "touch", "test", "[", "ssh-add", "ssh-keygen"}
 LISTERS = {"ls", "stat"}
+# ssh options that take a value (the next word, or the rest of the same word)
+SSH_VALUE_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
+# Names find may look for that only private keys and credential files have
+FIND_SECRET_NAMES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk",
+                     ".git-credentials", ".netrc")
+FIND_NAME_TESTS = {"-name": False, "-iname": True}
 WHY = ("a run never reads credential stores (ssh private keys, gh's hosts file or `gh auth token`, git and netrc "
        "credential files, the agents' login files): what it prints stays in the run's log and transcript. ssh, git "
        "and gh read them themselves: give ssh a key with `-i <key>`, give a stored secret to a command with "
@@ -115,16 +123,54 @@ def _prints_token(argv: list[str]) -> bool:
     return False
 
 
+def ssh_remote(argv: list[str]) -> str:
+    """The command an ssh call runs on the other host (its words after the destination), else ''."""
+    if not argv or os.path.basename(argv[0]) not in ("ssh", "autossh"):
+        return ""
+    i = 1
+    while i < len(argv) and argv[i].startswith("-") and argv[i] != "-":
+        if argv[i] == "--":
+            i += 1
+            break
+        flags = argv[i][1:]
+        j = next((k for k, c in enumerate(flags) if c in SSH_VALUE_FLAGS), None)
+        i += 2 if j is not None and j == len(flags) - 1 else 1
+    return " ".join(argv[i + 1:])
+
+
+def _finds_secret(argv: list[str]) -> bool:
+    """A find whose -name or -iname pattern matches a private key or credential file name, with a
+    literal part beyond its wildcards (so `-name '*'` and `-name '*.py'` pass)."""
+    if not argv or os.path.basename(argv[0]) != "find":
+        return False
+    from fnmatch import fnmatchcase
+    for flag, pat in zip(argv[1:], argv[2:]):
+        if flag not in FIND_NAME_TESTS or not re.search(r"\w", re.sub(r"\[[^\]]*\]|[*?]", "", pat)):
+            continue
+        fold = (lambda t: t.lower()) if FIND_NAME_TESTS[flag] else (lambda t: t)
+        if any(fnmatchcase(fold(n), fold(pat)) for n in FIND_SECRET_NAMES):
+            return True
+    return False
+
+
+def _unquoted(text: str) -> str:
+    return re.sub(r"[\"'\\]", "", text)
+
+
 def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = None) -> str | None:
     """Why a Bash call reads a credential store, else None: it names one by path, other than as a
-    word a passing command takes (each such word excuses one mention), or prints a token."""
-    if any(_prints_token(argv) for argv in segments if argv):
+    word a passing command takes (each such word excuses one mention), prints a token, or finds a
+    key by name. The command an ssh call runs remotely counts as its own commands."""
+    from .hook import _all_segments
+    segments = [argv for argv in segments if argv]
+    segments += [inner for argv in segments for inner in _all_segments(ssh_remote(argv))]
+    if any(_prints_token(argv) or _finds_secret(argv) for argv in segments):
         return WHY
-    rest = cmd
+    rest = _unquoted(cmd)
     for argv in segments:
-        for w in _passing_words(argv) if argv else []:
+        for w in _passing_words(argv):
             if ".ssh" in w:
-                rest = rest.replace(w, " ", 1)
+                rest = rest.replace(_unquoted(w), " ", 1)
     if STORE_RE.search(rest) or any(not ssh_public(m.group(1) or "") for m in SSH_PATH_RE.finditer(rest)):
         return WHY
     if any(p in rest for p in credential_files(home)[:5]):
