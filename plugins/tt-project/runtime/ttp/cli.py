@@ -3425,6 +3425,14 @@ def cmd_checks(a) -> None:
         sys.exit(0 if checkgaps.ready(p, a.gap, getattr(a, "gap_config", None)) else 1)
     if a.result:
         sys.exit(_checks_passed(Path(a.result)) if a.passed else _checks_result(Path(a.result)))
+    if getattr(a, "reap", False):
+        from . import leftoverchecks
+        p = here()
+        if not p:
+            die("ttp checks --reap: no project found")
+        for r in leftoverchecks.reap(p, dry_run=a.dry_run):
+            print(r["text"])
+        sys.exit(0)
     if getattr(a, "settle", None):
         sys.exit(_checks_settle(Path(a.settle), a.head))
     if a.cmd[:1] and a.cmd[0] in checksqueue.ACTIONS:   # park, cancel, resume a queued run; list the queue
@@ -12872,6 +12880,10 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--passed", action="store_true",
                    help="with --result: exit 0 only when they finished and passed, 1 when they failed, died "
                         "or still run (for an on_pass_cmd; a wait keeps plain --result)")
+    s.add_argument("--reap", action="store_true",
+                   help="run nothing: stop this user's leftover ttp checks runs (their run ended or their folder "
+                        "is gone) that hold or wait for a host checks slot, as the daemon does (leftoverchecks)")
+    s.add_argument("--dry-run", action="store_true", help="with --reap: only list what it would stop")
     s.add_argument("--settle", metavar="RUN_DIR",
                    help="an on_pass_cmd: on a pass of the run's detached checks on --head, write the final "
                         "hand-off to $TTP_RESULT; else exit 1 writing nothing")

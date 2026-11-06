@@ -1932,6 +1932,7 @@ class Daemon:
                 self.check_urgent_check_wait,
                 self.check_queue_waits,
                 self.check_checks_owner,
+                self.reap_leftover_checks,
                 self.check_checks_stall,
                 self.check_cap_wait,
                 self.check_progress,
@@ -8937,6 +8938,18 @@ class Daemon:
         for r in jobstop.sweep_cancelled_checks(self.p, seen):   # first tick: those holding or waiting for a lane
             log(self.p, r["text"])
         self._cancel_seen = last
+
+    def reap_leftover_checks(self, every_s: float = 60, now: float | None = None) -> None:
+        """Model-free, at most every `every_s`: stop this user's leftover `ttp checks` runs that hold or wait in
+        the host-wide checks queue though their run has ended or their folder is gone (leftoverchecks: SIGTERM, then
+        SIGKILL; their tickets dropped, one line here and in the checks waits log each)."""
+        from . import leftoverchecks
+        now = time.time() if now is None else now
+        if now - getattr(self, "_reap_checks_at", 0.0) < every_s:
+            return
+        self._reap_checks_at = now
+        for r in leftoverchecks.reap(self.p):
+            log(self.p, r["text"])
 
     def check_checks_owner(self, every_s: float = 60, now: float | None = None) -> None:
         """Model-free: a checks lane held by a check whose task has ended (checklane.finished_holders)
