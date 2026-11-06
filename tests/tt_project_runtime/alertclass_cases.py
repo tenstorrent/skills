@@ -30,7 +30,9 @@ ALERT_SITES = {
     ("grants.py", "reconcile"): [("decisions", "a setting changed on the user's word in the charter")],
     ("relay.py", "ordered"): [("decisions", "a charter change applied on the owner's agent's order, with its old text")],
     ("service.py", "reap_restart_request"): [("outages", "a requested daemon restart failed")],
-    ("service.py", "restart"): [("outages", "the daemon did not start on a runtime change; rolled back")],
+    ("service.py", "_roll_back"): [("outages", "the daemon did not start on a runtime change; rolled back")],
+    ("service.py", "check_deferred"): [("outages", "a deferred restart's new daemon did not start and nothing "
+                                                   "could be rolled back")],
     ("userstep.py", "relay"): [("user-blocker", "a user-only step (a sign-in, a device code, a credential) opened")],
     ("watchdog.py", "_recover"): [("outages", "a hung daemon was restarted, or could not be"),
                                   ("outages", "the daemon hung repeatedly")],
