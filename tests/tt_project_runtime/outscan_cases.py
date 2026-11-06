@@ -234,3 +234,118 @@ def test_runs_gh_reads_stdin_ahead_only_where_gh_reads_it(env, tmp_path, monkeyp
                             "TTP_PROJECT": str(p.base), "FAKE_GH_LOG": str(log)},
                        cwd=str(pathlib.Path(prguard.__file__).parents[1]))
     assert log.read_text() == "workflow run w -f a=one\nworkflow run w -f a=two\n", r.stderr
+
+
+def _push_run(env, tmp_path, monkeypatch):
+    """A project with planted values, a clone of a bare origin holding one clean commit on main, and
+    `push(*args)` running `git push <args>` in a run through the harness's git wrapper: (p, repo, push)."""
+    p = _outscan_project(env, monkeypatch)
+    origin, repo = tmp_path / "leak-origin.git", tmp_path / "leak-repo"
+    subprocess.run(["git", "init", "-q", "--bare", "-b", "main", str(origin)], check=True)
+    subprocess.run(["git", "init", "-q", "-b", "main", str(repo)], check=True)
+    _git_out(repo, "remote", "add", "origin", str(origin))
+    for k, v in (("user.name", "Test"), ("user.email", "test@example.com"), ("commit.gpgsign", "false"),
+                 ("tag.gpgsign", "false")):
+        _git_out(repo, "config", k, v)
+    _commit(repo, "README.md", "hello\n")
+    _git_out(repo, "push", "-q", "origin", "main")
+    (tmp_path / "run").mkdir()
+    run_env = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(tmp_path / "run")}
+    wrapper = RUNTIME.parent / "template" / "bin" / "git"
+
+    def push(*args):
+        return subprocess.run([str(wrapper), "push", *args], cwd=repo, env=run_env, capture_output=True,
+                              text=True, timeout=60)
+    return p, repo, push
+
+
+def _remote_refs(repo):
+    return _git_out(repo, "ls-remote", "origin")
+
+
+def test_runs_git_push_refuses_a_leak_in_a_message_an_added_line_or_a_tag_message(env, tmp_path, monkeypatch):
+    """Every run's git push goes through the leak scan in its pre-push hook (gitguard.HOOK ->
+    outscan.pre_push): a stored secret, a token shape or a forbidden-data pattern is refused in a commit
+    message, an added line (also one a diff header could hide) and an annotated tag's message, naming the
+    commit, path and class but never the value; nothing reaches the remote."""
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    before = _remote_refs(repo)
+    leaks = {_OUT_SECRET: "stored secret (slot acme)", _OUT_SHAPE: "GitHub token shape",
+             "serial " + _OUT_FORBIDDEN: "forbidden-data pattern 'board serial'"}
+    for n, (leak, cls) in enumerate(leaks.items()):
+        cases = {"message": (f"notes.txt", "clean\n", f"fix: {leak}"),
+                 "fake diff in message": ("notes.txt", "clean\n", f"x\n\ndiff --git a/n b/n\n+++ b/n\n@@ -1 +1 @@\n {leak}"),
+                 "added line": ("src/conf.txt", f"key = {leak}\n", "add conf"),
+                 "added line like a header": ("src/conf.txt", f"++ {leak}\n", "add conf")}
+        for name, (path, text, msg) in cases.items():
+            _git_out(repo, "checkout", "-q", "-B", "work", "main")
+            (repo / path).parent.mkdir(exist_ok=True)
+            (repo / path).write_text(text)
+            _git_out(repo, "add", path)
+            _git_out(repo, "commit", "-qm", msg)
+            sha = _git_out(repo, "rev-parse", "--short", "HEAD")
+            out = push("origin", "work")
+            assert out.returncode != 0 and "git push refused" in out.stderr and cls in out.stderr, (name, out.stderr)
+            assert "nothing was sent" in out.stderr and f"commit {sha}" in out.stderr, (name, out.stderr)
+            assert ("(its message)" if "message" in name else f"({path})") in out.stderr, (name, out.stderr)
+            assert leak not in out.stderr and _OUT_FORBIDDEN not in out.stderr, name
+        _git_out(repo, "checkout", "-q", "main")
+        _git_out(repo, "tag", "-a", f"v{n}", "-m", f"release notes: {leak}")
+        out = push("origin", f"v{n}")
+        assert out.returncode != 0 and f"the tag v{n} (its message)" in out.stderr and cls in out.stderr, out.stderr
+        assert leak not in out.stderr
+    assert _remote_refs(repo) == before
+
+
+def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusing_a_removed_leak(
+        env, tmp_path, monkeypatch, capsys):
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    own_hook = tmp_path / "own-hook"
+    (repo / ".git" / "hooks" / "pre-push").write_text(f"#!/bin/sh\ncat >/dev/null\necho ran >> {own_hook}\n")
+    (repo / ".git" / "hooks" / "pre-push").chmod(0o755)
+    # A clean push goes, and the repository's own pre-push hook still runs after the scan.
+    _git_out(repo, "checkout", "-q", "-b", "clean")
+    _commit(repo, "a.txt", "the build passed\n")
+    _git_out(repo, "tag", "-a", "v1", "-m", "release one")
+    out = push("origin", "clean", "v1")
+    assert out.returncode == 0, out.stderr
+    assert own_hook.read_text() == "ran\n" and "refs/tags/v1" in _remote_refs(repo)
+    # A leaky commit the remote already has (pushed outside a run) is not sent again: pushing it under a
+    # new name, or a clean commit on top of it, passes.
+    _git_out(repo, "checkout", "-q", "-b", "old", "main")
+    _commit(repo, "old.txt", f"{_OUT_SHAPE}\n")
+    _git_out(repo, "push", "-q", "--no-verify", "origin", "old")
+    assert push("origin", "old:refs/heads/copy").returncode == 0
+    _commit(repo, "new.txt", "clean\n")
+    out = push("origin", "old")
+    assert out.returncode == 0, out.stderr
+    # A later commit that removes the leak still refuses: the earlier commit carries it.
+    _git_out(repo, "checkout", "-q", "-b", "fixup", "main")
+    _commit(repo, "b.txt", f"token {_OUT_SECRET}\n")
+    first = _git_out(repo, "rev-parse", "--short", "HEAD")
+    _commit(repo, "b.txt", "token from ttp secret acme\n")
+    for args in (["origin", "fixup"], ["--no-verify", "origin", "fixup"], ["-o", "x", "origin", "fixup"]):
+        out = push(*args)
+        assert out.returncode != 0 and f"commit {first} (b.txt)" in out.stderr and "removes it" in out.stderr, out.stderr
+    # A remote-tracking ref set by hand does not mark it as already on the remote.
+    _git_out(repo, "update-ref", "refs/remotes/origin/fixup", "HEAD")
+    assert push("origin", "fixup").returncode != 0
+    # A merge whose own resolution adds the leak is refused too.
+    _git_out(repo, "checkout", "-q", "-B", "side", "main")
+    _commit(repo, "s.txt", "side\n")
+    _git_out(repo, "checkout", "-q", "-B", "merged", "clean")
+    _git_out(repo, "merge", "-q", "--no-commit", "--no-ff", "side")
+    (repo / "s.txt").write_text(f"side\n{_OUT_SHAPE}\n")
+    _git_out(repo, "add", "s.txt")
+    _git_out(repo, "commit", "-qm", "merge side")
+    out = push("origin", "merged")
+    assert out.returncode != 0 and "(s.txt)" in out.stderr and "GitHub token shape" in out.stderr, out.stderr
+    assert "refs/heads/fixup" not in _remote_refs(repo) and "refs/heads/merged" not in _remote_refs(repo)
+    # A remote the hook cannot list refuses (fails closed) rather than scanning nothing.
+    import io
+    from ttp import outscan
+    monkeypatch.chdir(repo)
+    head = _git_out(repo, "rev-parse", "clean")
+    monkeypatch.setattr(sys, "stdin", io.StringIO(f"refs/heads/clean {head} refs/heads/clean {'0' * 40}\n"))
+    assert outscan.pre_push(["gone", str(tmp_path / "missing.git")]) == 1
+    assert "could not list what the remote has" in capsys.readouterr().err

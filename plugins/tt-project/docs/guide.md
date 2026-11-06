@@ -2975,7 +2975,13 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   extension or shell alias, whose stdin use is unknown, is refused unless its stdin shows data or
   its end within 3 s (give it a file or `</dev/null`); not `auth login`, whose stdin is gh's own
   token, or `codespace ssh`, which streams it as a session),
-  `ttp note --to` / `--reply` and `ttp notify`. Each is checked for every stored secret
+  `ttp note --to` / `--reply`, `ttp notify`, and every `git push` through the harness's `bin/git`
+  (its pre-push hook, which `--no-verify` does not skip, runs before the repository's own): the
+  messages, added lines and file paths of each commit the push sends, merges' own changes and
+  annotated tags' messages, but nothing the remote already has (read from the remote with
+  `git ls-remote`, not from local tracking refs). A later commit that removes a leak does not clear
+  it, since the earlier commit still goes: rewrite that commit. A push whose remote or commits cannot
+  be read is refused too. Each is checked for every stored secret
   value (as is and JSON-escaped), common credential shapes (forge, chat and cloud tokens, private-key
   headers) and the project's forbidden-data patterns. A hit is refused with one line naming its class
   (the secret's slot, the shape or the pattern's label), never the text, and nothing is sent. A chat

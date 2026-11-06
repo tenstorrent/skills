@@ -3,9 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # git for tt-project runs: the real git further down PATH. Inside a run (TTP_TASK set), a call naming
 # `push` goes through ttp/gitguard.py first, which keeps a code task off the push branch while
-# delivery.code_tasks_may_push is off. In a coordinator run (TTP_ROLE=coordinator, or full tools)
-# every push goes there too and is refused; a guard that fails to load refuses it as well.
-# Every other call execs the real git at once.
+# delivery.code_tasks_may_push is off and scans what the push sends for leaks (ttp/outscan.py).
+# In a coordinator run (TTP_ROLE=coordinator, or full tools) every push goes there too and is
+# refused; a guard that fails to load refuses it as well. Every other call execs the real git at once.
 # The real git is the first git on PATH that is no tt-project git wrapper: another project's
 # harness bin/ further down PATH holds a copy, and taking it would make the two exec each other.
 # Only a script can be a wrapper: a candidate whose first line is no `#!` line (the real git, a

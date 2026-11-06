@@ -11,7 +11,10 @@ For a guarded run (TTP_TASK is a code task of TTP_PROJECT, code_tasks_may_push o
 set) the push runs with a pre-push hook of the harness's: git itself names every ref the push would
 update, whatever the refspec, and the hook refuses one that is the push branch (on any remote, also
 a delete). The repository's own pre-push hook still runs after it. `--no-verify` cannot skip it.
-Anything else, or any fault reading the project, runs the real git unchanged.
+Every run's push (TTP_TASK set) also runs outscan.pre_push from that hook, before the repository's
+own: a push that would send a stored secret, a credential shape or a forbidden-data pattern, in a
+commit message, an added line or a tag message, is refused (outscan.py). A fault setting the scan up
+refuses the push; a fault reading the push branch guard's project skips only that guard.
 
 With delivery.never_force on, a run's push that forces in any form (--force, -f, --force-with-lease,
 --force-if-includes, a `+refspec`) is refused before git runs (forced, never_force_refusal), except a
@@ -30,13 +33,20 @@ VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-pr
 PUSH_VALUE_OPTS = {"--push-option", "--receive-pack", "--exec", "--repo"}
 FORCE_OPTS = ("--force", "--force-with-lease", "--force-if-includes")
 HOOK = """#!/bin/sh
-# tt-project: refuses a push to the push branch from a code task's run (ttp/gitguard.py).
+# tt-project: a run's pre-push hook (ttp/gitguard.py). Refuses a push to the push branch from a code
+# task's run and a push that sends a leak (ttp/outscan.py), then runs the repository's own pre-push.
 nl='
 '
 input=$(cat)
-if printf '%s' "$input${input:+$nl}" | awk -v r="$TTP_PUSH_GUARD_REF" '$3 == r { f = 1 } END { exit !f }'; then
+if [ -n "$TTP_PUSH_GUARD_REF" ] &&
+    printf '%s' "$input${input:+$nl}" | awk -v r="$TTP_PUSH_GUARD_REF" '$3 == r { f = 1 } END { exit !f }'; then
     echo "tt-project: $TTP_PUSH_GUARD_WHY" >&2
     exit 1
+fi
+if [ -n "$TTP_PUSH_SCAN_RT" ]; then
+    printf '%s' "$input${input:+$nl}" | "$TTP_PUSH_SCAN_PY" -I -c \\
+        'import sys; sys.path.insert(0, sys.argv[1]); from ttp.outscan import pre_push; sys.exit(pre_push(sys.argv[2:]))' \\
+        "$TTP_PUSH_SCAN_RT" "$@" || exit 1
 fi
 orig=${TTP_PUSH_GUARD_HOOKS:+$TTP_PUSH_GUARD_HOOKS/pre-push}
 if [ -n "$orig" ] && [ -x "$orig" ]; then
@@ -175,18 +185,26 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
     globals_, sub, rest = split(args)
     if sub != "push":
         return [real, *args], env
+    scan = bool(env.get("TTP_TASK"))
     try:
         branch, why = guarded_branch(env)
-        if not branch:
-            return [real, *args], env
-        branch = _branch_name(real, globals_, branch)
+        branch = branch and _branch_name(real, globals_, branch)
+    except Exception:   # a fault reading the project skips this guard; push.code_run_landing still holds
+        branch, why = "", ""
+    if not branch and not scan:
+        return [real, *args], env
+    try:
         hooks = "" if "--no-verify" in rest else _hooks_dir(real, globals_)
         guard = _hook_file()
-    except Exception:   # a fault reading the project never stops git; push.code_run_landing still holds
+    except Exception as e:
+        if scan:   # the leak scan fails closed
+            raise ValueError(f"git push refused: its leak scan could not be set up ({type(e).__name__}: {e}); "
+                             "nothing was sent") from None
         return [real, *args], env
     rest = [a for a in rest if a not in ("--no-verify", "--verify")]
-    env = {**env, "TTP_PUSH_GUARD_REF": f"refs/heads/{branch}", "TTP_PUSH_GUARD_WHY": why,
-           "TTP_PUSH_GUARD_HOOKS": hooks}
+    env = {**env, "TTP_PUSH_GUARD_REF": f"refs/heads/{branch}" if branch else "", "TTP_PUSH_GUARD_WHY": why,
+           "TTP_PUSH_GUARD_HOOKS": hooks, "TTP_PUSH_SCAN_RT": str(Path(__file__).resolve().parents[1]) if scan else "",
+           "TTP_PUSH_SCAN_PY": sys.executable}
     # after the caller's own options: the last core.hooksPath wins, so theirs never replaces the guard
     return [real, *globals_, "-c", f"core.hooksPath={guard}", "push", "--verify", *rest], env
 
@@ -209,7 +227,11 @@ def main(argv: list[str]) -> int:
     if why:
         print(f"tt-project: {why}", file=sys.stderr)
         return 1
-    cmd, env = command(real, args, dict(os.environ))
+    try:
+        cmd, env = command(real, args, dict(os.environ))
+    except ValueError as e:
+        print(f"tt-project: {e}", file=sys.stderr)
+        return 1
     sys.stdout.flush()
     os.execve(real, cmd, env)
     return 127

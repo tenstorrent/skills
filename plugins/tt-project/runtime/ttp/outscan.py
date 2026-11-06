@@ -16,7 +16,10 @@ It covers a run's outward writes (TTP_TASK set):
   workflow run --json and the key and alias imports when their flags leave stdin as the input, and an
   extension or shell alias once its stdin shows data or EOF within PROBE_STDIN_S (see gh_stdin); not
   auth login or codespace ssh, see STDIN_UNSCANNED);
-- `ttp note --to` / `--reply` and `ttp notify`.
+- `ttp note --to` / `--reply` and `ttp notify`;
+- every `git push` through the run's bin/git: its pre-push hook (gitguard.HOOK) runs pre_push(), which
+  scans the commit messages and added lines (and their paths) of every commit the push sends and the
+  messages of the annotated tags it sends; never what the remote already has (`git ls-remote`).
 A daemon's chat post (slack.Slack._body) cannot be refused without losing the message: stored values
 are masked there already (redact.scrub) and credential shapes are masked by mask_shapes().
 
@@ -28,6 +31,8 @@ from __future__ import annotations
 import os
 import re
 import select
+import subprocess
+import tempfile
 import time
 from typing import Callable
 
@@ -281,3 +286,110 @@ def gh_problem(args: list[str], stdin_text: str | None, real: str | None = None)
     why = problem(" ".join(["gh", *words]), *texts)
     return why and f"refused: {why}"
 
+
+
+# --- git push (the pre-push hook) ----------------------------------------------------------------
+
+LS_REMOTE_S = 120   # listing the refs of the remote a push goes to
+
+
+def _git(*args: str, **kw) -> subprocess.CompletedProcess:
+    return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace", timeout=60, **kw)
+
+
+def _remote_has(url: str) -> dict[str, str]:
+    """{object: type} of the objects the remote at `url` advertises (tags also peeled) that this
+    repository has: what a push never sends again. Read from the remote itself, not from
+    remote-tracking refs a run can set to anything. Raises ValueError when it cannot be listed."""
+    r = subprocess.run(["git", "ls-remote", url], capture_output=True, text=True, errors="replace",
+                       timeout=LS_REMOTE_S, stdin=subprocess.DEVNULL)
+    if r.returncode:
+        raise ValueError(f"could not list what the remote has (git ls-remote exited {r.returncode})")
+    shas = {w[0] for line in r.stdout.splitlines() if (w := line.split())}
+    if not shas:
+        return {}
+    out = _git("cat-file", "--batch-check", input="\n".join(sorted(shas)) + "\n").stdout
+    return {w[0]: w[1] for line in out.splitlines() if len(w := line.split()) == 3}
+
+
+def push_problem(lines: list[str], url: str, p=None) -> str | None:
+    """Why the push whose pre-push input is `lines` (`<local ref> <sha> <remote ref> <sha>`), going to
+    `url`, must not run: a commit message, an added line or a file path of a commit it sends, or the
+    message of an annotated tag it sends, holds a leak. Run in the repository. Raises ValueError when
+    what it sends cannot be read."""
+    hit = matcher(p)
+    has = _remote_has(url)
+    tips = []
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 4 or not parts[1].strip("0") or parts[1] in has:   # a delete, or nothing new
+            continue
+        obj = parts[1]
+        for _ in range(8):   # an annotated tag, or a tag of a tag: its message goes too
+            if obj in has or _git("cat-file", "-t", obj).stdout.strip() != "tag":
+                break
+            body = _git("cat-file", "tag", obj).stdout
+            if cls := hit(body):
+                return refusal("git push", cls, f"the tag {parts[2].removeprefix('refs/tags/')} (its message)")
+            obj = body.split()[1]   # "object <sha>"
+        if _git("rev-parse", "--verify", "-q", f"{obj}^{{commit}}").returncode == 0:
+            tips.append(obj)
+    if not tips:
+        return None
+    with tempfile.TemporaryFile("w+") as revs:
+        revs.write("".join(f"{t}\n" for t in tips))
+        revs.write("".join(f"^{h}\n" for h, kind in has.items() if kind == "commit"))
+        revs.flush()
+        revs.seek(0)
+        # %B stops at a NUL, so no message can forge the \0 lines; --cc shows what a merge adds itself
+        proc = subprocess.Popen(["git", "log", "--stdin", "-p", "--cc", "--text", "--no-renames", "--no-color",
+                                 "--no-ext-diff", "--no-textconv", "--format=%x00commit %h%n%B%n%x00end"],
+                                stdin=revs, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                text=True, errors="replace")
+        commit, path, state, cls = "", "", "", None
+        try:
+            for out in proc.stdout:
+                if out.startswith("\0commit "):
+                    commit, path, state = out[8:].strip(), "", "message"
+                elif out.startswith("\0end"):
+                    state = "header"
+                elif state == "message":
+                    cls = hit(out)
+                elif out.startswith("diff "):
+                    path, state = "", "header"
+                elif state == "header":
+                    if out.startswith("+++ "):
+                        path = out[4:].strip().removeprefix("b/")
+                        cls = hit(path)
+                    elif out.startswith("@@"):
+                        state = "hunk"
+                elif out.startswith("+"):   # a hunk's added line (a merge's: one + per parent)
+                    cls = hit(out)
+                if cls:
+                    break
+        finally:
+            if cls:
+                proc.kill()
+            proc.stdout.close()
+            rc = proc.wait()
+    if cls:
+        where = f"commit {commit} " + (f"({path})" if state != "message" else "(its message)")
+        return (refusal("git push", cls, where) + "; rewrite that commit, since a later commit that "
+                "removes it still sends it")
+    if rc:
+        raise ValueError(f"could not read the commits it sends (git log exited {rc})")
+    return None
+
+
+def pre_push(argv: list[str]) -> int:
+    """The pre-push hook's entry: argv is git's (remote name, url), the ref lines come on stdin. Exit 1,
+    with the reason on stderr, refuses the push; a fault reading it refuses too."""
+    import sys
+    try:
+        why = push_problem(sys.stdin.read().splitlines(), argv[1] if len(argv) > 1 else argv[0], _project())
+    except Exception as e:   # fails closed
+        why = f"git push refused: {e}; nothing was sent"
+    if why:
+        print(f"tt-project: {why}", file=sys.stderr)
+        return 1
+    return 0
