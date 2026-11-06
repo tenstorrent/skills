@@ -470,14 +470,19 @@ only in the feed and never under "needs you".
   baseline plus 3 turns at a full day, prorated with early headroom before that); the first two
   new-session seeds in its window count spread over a day, later ones whole. Over it, turns are
   stateless for 1 h on a first small overrun, rising to `pause_h` at twice the allowance or on a
-  repeat trip within 7 days; a third trip holds them until the mode is set again. A coordinator on a
+  repeat trip within 7 days; a third trip holds them until the mode is set again. A trip whose
+  window re-reads at or under its allowance after its turns were re-netted is withdrawn at once and
+  leaves the trip count. A coordinator on a
   provider that runs no session (the chat provider, for now) keeps stateless turns, with no spend guard
   and no session line in `ttp status`. `ttp status --verbose` shows the session's
   short id, wakes, context size and last decision. `ttp stats <name> --coord-session` reports each
   day's wakes, $/wake, context growth and tool calls per wake, rollovers and cache-read share beside
   the stateless baseline (the 7 days before the first session wake: turns/day, $/turn), and flags
   the break-even (at most 2 tool calls and 20k context growth per wake) and a day costing more
-  than the baseline's $/day. In session mode the system prompt is the
+  than the baseline's $/day. Each day also names why wakes did not resume (handover, rollover with
+  its mean context size, a new session and its cause, spend guard, failed resume, pause, a provider that keeps no session, decide
+  failed), the fallback-to-stateless rate over wakes with the mode on only, wakes with the mode off
+  by cause, and failed session wakes with their transcript's error. In session mode the system prompt is the
   Restrictions, the coordinator role with `prompts/coordinator-session.md` and the charter verbatim:
   the same bytes every wake while the charter is unchanged, so the prompt cache holds. Once the
   context reaches its limit, one last resumed wake also returns a `session_note` (at most
