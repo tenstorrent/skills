@@ -1689,6 +1689,12 @@ running work is interrupted only by the preemption below:
   run's prompt starts with the why and the new instructions. A run that ends on its own before the
   stop keeps its outcome. At most `budget.restart_max` (3) restarts per task per
   `budget.restart_window_h` (6); a later one is refused with the reason. Each is logged with its why.
+- User orders mid-run: a recorded order (an `obligation` with `order`) and any Goals or Restrictions
+  change reach, once, every running run they affect (userorder.py): the order's owners, tasks
+  answering its chat, tasks whose spec, unlanded branch or resources name what it names, and for a
+  Restrictions change every run. The update quotes the user's words and lists the `supersedes`
+  steps it replaces. Each fan-out, or that it matched no running task, is logged as a
+  `user_order_fanout` event naming the tasks told.
 - Detection: an urgent task ready over 2 minutes with a free slot and nothing holding it makes the
   daemon run dispatch at once and raise one `ready_not_started` event. A deadline task (a fresh
   `urgent:` line or an obligation owner) whose resources are free but whose slots are all taken is
@@ -4404,6 +4410,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   takes one; a `ttp detach` job's `ttp note` never takes one either.
   One still unread after `steer.ack_after_s` (300 s; 0: off) raises one `steer_unread` event to the
   coordinator, naming the task and the update; it is marked handled once the worker reads it.
+  The worker acks each update with one `ttp note "update: <what changes in its plan>"` line, so its
+  progress shows the change; a newer order wins over older spec steps.
 - Drift flags (model-free, from the live run record): a command failing again and again since it last
   worked, the same tool call in a loop, files a code worker changed outside the paths the spec names
   (never a reviewer; not files its branch changed before the run), a quiet run (no call, note or commit

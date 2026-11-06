@@ -701,9 +701,10 @@ def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsy
 # session prompt's Tools section (800, coordtools.py), plus its Running workers line (140, #6311),
 # plus handover item 5's verbatim-check rule (130, #6502), plus the workers' start-context line (270,
 # ctxfork.py, user msgs #2116, #2119), plus 170 of session-prompt text the batch-1 merge (142) and the
-# full-harness line (28, #7760) added; the stateless role's cap is untouched.
+# full-harness line (28, #7760) added, plus its lines on update acks and order fan-out to running
+# tasks (360, #6313); the stateless role's cap is untouched.
 # Session mode only; it never widens coordinator_role(p)'s cap.
-SESSION_ROLE_ROOM = 2900 + 100 + 1300 + 800 + 140 + 130 + 270 + 170
+SESSION_ROLE_ROOM = 2900 + 100 + 1300 + 800 + 140 + 130 + 270 + 170 + 360
 
 _CS_CHARTER = ("# demo\n\n## Goals\nShip v1.\n\n## Restrictions\n- Never push to main (user msg #1).\n\n"
                "## Policies\nLabel every number.\n")
@@ -3506,3 +3507,30 @@ def test_wakecost_daemon_alarms_once_and_asks_the_same_session_to_shrink(env, mo
     monkeypatch.setenv("TTP_FAKE_COST", "12")
     turn()
     assert p.db.kv("alerts_sent")["coord-wake-cost"] == sent   # one alarm per episode, not one per wake
+
+
+def test_the_mid_run_lines_of_both_coordinator_prompts_name_only_real_action_fields():
+    """#6313: what the coordinator prompts say about mid-run updates, restarts and order fan-out names
+    only real things: each backticked name is an action type, an ACTIONS_SCHEMA field or the event kind
+    steerack raises, and the `restart: <why>` line they name is the one preempt parses."""
+    import re as _re
+    from ttp import coordinator as coord, preempt, steerack
+    prompts = Path(coord.__file__).parents[2] / "template" / "prompts"
+    session = (prompts / "coordinator-session.md").read_text()
+    role = (prompts / "coordinator.md").read_text()
+    managing = session.split("## Managing", 1)[1].split("\n## ", 1)[0]
+    running = next(x for x in role.split("\n- ") if x.startswith("`task_update` on a running task"))
+    start = role.index("Record a user order as `obligation`")
+    order = role[start:role.index("alone moves a due.", start)]
+    known = (set(coord.ACTION_TYPES) | set(coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"])
+             | {steerack.KIND})
+    for where, text in (("session Managing", managing), ("task_update on a running task", running),
+                        ("user order", order)):
+        names = set(_re.findall(r"`([a-z_]+)`", text))
+        assert names and not names - known, (where, sorted(names - known))
+    named = set(_re.findall(r"`([a-z_]+)`", managing + running + order))
+    assert {"task_update", "spec", "obligation", "order", "supersedes", "steer_unread"} <= named
+    for text in (managing, running):
+        assert "`restart: <why>`" in text and preempt._RESTART_LINE.search("restart: <why>")
+    # A name the schema lacks is caught: the check is not vacuous.
+    assert "affects" not in known and "affects" in set(_re.findall(r"`([a-z_]+)`", "`affects`")) - known

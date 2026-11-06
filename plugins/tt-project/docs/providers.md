@@ -81,7 +81,7 @@ Claude Code measured on 2026-11-02, Codex CLI on 2026-10-09:
 | Structured output | pass | pass | not measured |
 | Write fence | pass on 2.1.296 (refused: read-only file system): off by default; `providers.claude.write_fence` true turns on the Bash sandbox where it can start (Linux with bwrap and socat, macOS); ssh, scp, sftp, rsync, git's network commands (fetch, pull, push, ls-remote, clone, remote and submodule update), `ttp lock`, `ttp machines` and `ttp devq` run outside it by name | off by default (`danger-full-access`); with `providers.codex.write_fence` true or `no_internet`, workspace-write: pass (refused: read-only file system) | off: the sandbox denies network by default and no CLI flag allows it, so workers run with `--force` alone; on under `no_internet`, built, not measured live |
 | Resume | pass | pass | not measured |
-| Steer mid-run | pass (hook) | unsupported: no hook, the worker reads `steer.md` between steps | not measured (worker and reviewer runs get the hook's `postToolUse`; not run live) |
+| Steer mid-run | pass (hook) | the hook where it runs (tested on 0.160), else the worker's next `ttp note` or `ttp steer` prints the update | not measured (worker and reviewer runs get the hook's `postToolUse`; not run live); else the worker's next `ttp note` or `ttp steer` prints the update |
 | Plan meter | pass (seven-day; the run reported no five-hour window) | pass (seven-day) | not measured |
 
 The steer row was measured before Codex workers got the harness hook. Codex was also run live on
@@ -217,7 +217,7 @@ passed again for Claude Code with workers in the write fence (38 s, $0.12).
   short-lived checkouts (`ttp checks`' clean checkout, after_push) are scratch clones that borrow
   the repository's objects, not worktrees: with them no command failed on a worktree path.
 - Codex: the harness hook runs only where hooks are on and no other hook source exists.
-  Otherwise a worker sees an update only when it reads `steer.md` between steps.
+  Otherwise a worker gets an update from its next `ttp note` or `ttp steer`.
 - Stream guard (Codex without the hook, Cursor): weaker than a hook's deny. It reads the call
   from the output stream once the call has started, so a quick command may already have run. A
   call whose result is in the stream when the check ends has finished: the guard logs it

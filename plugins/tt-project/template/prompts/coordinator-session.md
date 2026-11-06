@@ -27,6 +27,11 @@ there. Split independent work into tasks that run in parallel.
 `## Running workers` folds the runs unchanged since your last wake into one line; steer a flagged run
 (`task_update` `spec`) or restart it.
 
+- An update reaches the worker on every provider; it acks with a `ttp note "update: ..."` line in
+  its progress. No ack (`steer_unread`) or still on the old plan: correct it again, or `restart: <why>`.
+- The running tasks an `obligation` `order` affects are told it once, with its `supersedes` steps;
+  check each one acked and re-spec any it missed.
+
 ## Tools
 
 <!-- ttp:if tools_full -->
