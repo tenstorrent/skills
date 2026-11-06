@@ -7186,7 +7186,8 @@ def cmd_detach(a) -> None:
     `--rows <file> --after <n>` it exits 0 also once that file has more than n lines, and 0 (never 4)
     once a job ended or is gone, else 1: one probe that wakes on a new result row, the end or a dead
     driver; a path no `ttp detach` recorded is never gone then, only a new row wakes it. A series
-    driver's own dir (<dir>/pid, optional <dir>/EXIT) runs while its pid lives and ends at EXIT or a dead pid. From a command a sandbox would end with everything it started,
+    driver's own dir (<dir>/pid or <dir>/lock, optional <dir>/EXIT) runs while the flock it holds on <dir>/lock
+    is taken (else while its pid lives) and ends at EXIT, a free lock or a dead pid. From a command a sandbox would end with everything it started,
     the daemon starts the job (detach.py).
     A run that ends without a hand-off after a detach is also brought back as waiting on its jobs. The
     resources an `exclusive:` task holds for its whole run stay held until its jobs end (hold.py), or
@@ -7663,11 +7664,15 @@ _REMOTE_CHECK = r'''p=$1
 case $p in "~"|"~/"*) p=$HOME${p#\~} ;; esac
 p=${p%/}; p=${p%.rc}
 if [ -e "$p.rc" ]; then echo "rc $(cat "$p.rc")"; exit 0; fi
-if [ ! -s "$p.pid" ] && [ -d "$p" ] && { [ -e "$p/EXIT" ] || [ -s "$p/pid" ]; }; then
-  if [ -e "$p/EXIT" ]; then
-    c=$(tr -d " \t\r\n" <"$p/EXIT" 2>/dev/null | head -c 16)
-    case $c in ""|*[!0-9]*) echo "rc" ;; *) echo "rc $c" ;; esac; exit 0
+if [ ! -s "$p.pid" ] && [ -d "$p" ] && { [ -e "$p/EXIT" ] || [ -s "$p/pid" ] || [ -e "$p/lock" ]; }; then
+  e() { c=$(tr -d " \t\r\n" <"$p/EXIT" 2>/dev/null | head -c 16)
+    case $c in ""|*[!0-9]*) echo "rc" ;; *) echo "rc $c" ;; esac; exit 0; }
+  [ ! -e "$p/EXIT" ] || e
+  if [ -e "$p/lock" ] && command -v flock >/dev/null 2>&1; then
+    if flock -n "$p/lock" true 2>/dev/null; then [ ! -e "$p/EXIT" ] || e; echo "series"; else echo "running lock"; fi
+    exit 0
   fi
+  [ -s "$p/pid" ] || { echo "running lock"; exit 0; }
   pid=$(cat "$p/pid")
   if kill -0 "$pid" 2>/dev/null || ps -p "$pid" >/dev/null 2>&1; then echo "running $pid"; else echo "series"; fi
   exit 0
@@ -7861,8 +7866,8 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
     With `rows` (a file on that host): 0 once it has more than `after` lines or one job ended or is
     gone, else 1 (_rows_verdict); a path with no driver recorded (no .rc, no .pid) is never read as
     gone then, only a new row wakes it; ssh failing is still 255. A series driver's own dir
-    (<dir>/pid, optional <dir>/EXIT holding its exit code) is read by those: running while the pid
-    lives, ended once EXIT exists, gone once the pid is dead. With `mirror` (a local folder) each answer's
+    (<dir>/pid or <dir>/lock, optional <dir>/EXIT holding its exit code) is read by those: running while
+    its lock is held (else its pid lives), ended once EXIT exists, gone once the lock is free or the pid dead. With `mirror` (a local folder) each answer's
     log tail and end are copied there (detach.mirror_probe), and a job whose end was mirrored reads as
     that end when ssh fails, not 255."""
     from .detach import FAILED_RC, mirror_end, mirror_name, mirror_probe, mirror_read, mirror_save
@@ -7915,7 +7920,7 @@ def _detach_check_remote(host: str, prefixes: list, rows: str | None = None, aft
             print(f"{name}: gone without an exit code: no driver was recorded at {pre} on {host}")
         elif out[0] == "series":
             failed = True
-            print(f"{name}: series driver gone without an EXIT (its pid is dead); see {pre.removesuffix('.rc')}/log on {host}")
+            print(f"{name}: series driver gone without an EXIT (its lock is free or its pid dead); see {pre.removesuffix('.rc')}/log on {host}")
         else:
             failed = True
             why = _GONE_WHY.get(out[-1].strip(), _GONE_WHY["unknown"])   # "boot", "gone same", "gone unknown"

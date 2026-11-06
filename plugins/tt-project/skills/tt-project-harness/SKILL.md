@@ -224,6 +224,12 @@ read the one for the lever you change.
   default. A project that sets `sandbox.checks: true` has `ttp checks`, `delivery.push_checks` and the
   push queue run every local check in a process sandbox: its own PID namespace and /proc, so it sees
   and can signal only its own process tree, and nothing it starts outlives it (sudo fails inside).
+- A pid recorded inside a `ttp checks` run (`$$`, `os.getpid()`) is local to that run's PID namespace:
+  to another check or the daemon the same number is another process or none. A gate or driver that
+  other checks attach to holds an flock on a file in its folder for its whole life, probed with
+  `flock -n` (`ttp detach --check <dir>` reads `<dir>/lock` so), or is started with `ttp detach`,
+  which a check hands to the daemon. A gate that yields (exit 75) writes its exit code and stays
+  queued, never deleted as dead.
 - Run other test commands the same way: `ttp sandbox -- <command>` (a plain run unless the project
   turned the sandbox on, or `TTP_NO_DEVICE=1` hides the device nodes).
 - A reaper or cleanup script signals only processes it can prove are this project's: `TTP_PROJECT`

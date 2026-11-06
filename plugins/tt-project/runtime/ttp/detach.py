@@ -1054,23 +1054,37 @@ def recorded(rc: Path) -> bool:
 
 
 def series(rc: Path) -> tuple[str, str] | None:
-    """A series driver's own dir at this path less its .rc (<dir>/pid, optional <dir>/EXIT holding
-    its exit code), as state() reads a job: ("ended", code, "?" when EXIT holds none) once EXIT
-    exists, ("running", "") while the pid lives, ("lost", why) once it is dead. None for no such dir."""
+    """A series driver's own dir at this path less its .rc (<dir>/pid and or <dir>/lock, optional
+    <dir>/EXIT holding its exit code), as state() reads a job: ("ended", code, "?" when EXIT holds none)
+    once EXIT exists, ("running", "") while it lives, ("lost", why) once it is gone. A driver that holds
+    an flock on <dir>/lock for its life is judged by that lock, which the kernel frees when it exits:
+    its pid may be from a PID namespace of its own (one started inside a sandboxed check), where the
+    same number here is another process or none. Without a lock, by its pid. None for no such dir."""
     rc = Path(rc).expanduser()
     d = rc.with_suffix("") if rc.suffix == ".rc" else rc
     if not d.is_dir():
         return None
-    if (d / "EXIT").exists():
+
+    def ended() -> tuple[str, str] | None:
+        if not (d / "EXIT").exists():
+            return None
         try:
             code = "".join((d / "EXIT").read_text(errors="replace").split())[:16]
         except OSError:
             code = ""
         return "ended", code if code.isdigit() else "?"
+    if out := ended():
+        return out
+    lock = d / "lock"
+    free = locks.free_state(lock) if lock.exists() else None
+    if free is False:
+        return "running", ""
+    if free is True:   # the driver writes EXIT before its lock goes free: look again
+        return ended() or ("lost", f"series driver lock {lock} is free with no EXIT; see {d / 'log'}")
     try:
         pid = int((d / "pid").read_text().strip())
     except (OSError, ValueError):
-        return None
+        return ("running", f"series driver lock {lock}: state unknown here") if lock.exists() else None
     from .liveness import pid_state, DEAD, UNKNOWN, FOREIGN
     if (st := pid_state(pid)) == DEAD:
         return "lost", f"series driver pid {pid} is dead with no EXIT; see {d / 'log'}"

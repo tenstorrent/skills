@@ -85,6 +85,80 @@ def test_detach_series_with_a_foreign_namespace_driver_is_running_not_lost(gone_
         assert st == "lost" and "is dead" in why
 
 
+@pytest.fixture
+def held_lock(tmp_path):
+    """A series driver dir whose <dir>/lock a live process (the driver) holds with flock; yields (dir, release)."""
+    import fcntl
+    d = tmp_path / "gate"
+    d.mkdir()
+    fd = os.open(d / "lock", os.O_RDWR | os.O_CREAT)
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    state = {"fd": fd}
+
+    def release():
+        if state["fd"] is not None:
+            os.close(state["fd"])
+            state["fd"] = None
+    yield d, release
+    release()
+
+
+def test_detach_series_judges_a_held_lock_never_a_pid_from_another_namespace(held_lock, gone_pid, pidns):
+    """A gate started inside a sandboxed check records its pid in that check's own PID namespace: here the
+    same number is dead, or another live process (a kernel thread). Its held lock says it runs; once the
+    kernel frees the lock with no EXIT it is lost, whatever process now has that pid number."""
+    from ttp import detach
+    d, release = held_lock
+    for other in (gone_pid, 1, os.getpid()):
+        (d / "pid").write_text(f"{other}\n")
+        assert detach.series(d) == ("running", ""), other
+    release()
+    for other in (1, os.getpid()):   # a live process here owns the number: still lost, never "running"
+        (d / "pid").write_text(f"{other}\n")
+        st, why = detach.series(d)
+        assert st == "lost" and "lock" in why and "free with no EXIT" in why, (other, why)
+    (d / "pid").unlink()   # a lock alone names a driver too
+    assert detach.series(d)[0] == "lost"
+
+
+def test_detach_series_reports_a_yielded_gate_by_its_exit_code_not_as_gone(held_lock, pidns, monkeypatch):
+    """A gate that yields (exit 75) writes EXIT before the kernel frees its lock: the reader gets the 75 and
+    keeps it queued, never "gone with no rc"."""
+    from ttp import detach
+    d, release = held_lock
+    (d / "pid").write_text("1\n")
+    (d / "EXIT").write_text("75\n")
+    release()
+    assert detach.series(d) == ("ended", "75")
+    # EXIT written in the instant between the reader's first look and the lock going free
+    (d / "EXIT").unlink()
+    real = detach.locks.free_state
+
+    def free_then_exit(path):
+        (d / "EXIT").write_text("75\n")
+        return real(path)
+    monkeypatch.setattr(detach.locks, "free_state", free_then_exit)
+    assert detach.series(d) == ("ended", "75")
+
+
+@pytest.mark.skipif(not shutil.which("flock"), reason="no flock(1) here")
+def test_remote_series_check_judges_the_drivers_lock_not_its_pid(held_lock, tmp_path):
+    from ttp import cli
+    d, release = held_lock
+
+    def check():
+        return subprocess.run(["sh", "-c", cli._REMOTE_CHECK, "sh", str(d)], capture_output=True, text=True,
+                              timeout=30).stdout.strip()
+    (d / "pid").write_text("1\n")   # alive here, but not the driver
+    assert check() == "running lock"
+    release()
+    assert check() == "series"
+    (d / "pid").unlink()
+    assert check() == "series"
+    (d / "EXIT").write_text("75\n")
+    assert check() == "rc 75"
+
+
 def test_recover_setup_never_rolls_back_under_a_foreign_namespace_setup(gone_pid, pidns, tmp_path, monkeypatch):
     from ttp import cli, project
     from ttp.runner import boot_id
