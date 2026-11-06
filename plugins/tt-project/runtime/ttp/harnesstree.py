@@ -17,7 +17,10 @@ database), nothing uncommitted is left in them and no detached job or `ttp push`
 daemon's own uncommitted memory writes there are committed first (_commit_memory). A merge that
 conflicts, or that git refuses over uncommitted changes there, is undone and kept for the next
 pass (sweep), and reported to the coordinator once per branch head (a refusal only while no harness
-run works in the checkout). A conflict is merged again only once its branch head or the harness HEAD
+run works in the checkout). Before it merges, an uncommitted copy in the checkout of a file the branch
+changed is set aside when it equals one of the branch's versions of that file since the merge base
+(_settle): backed up under state/harness-land-backups/, put back to HEAD, then the merge writes the
+branch's version; every other uncommitted file is left alone. A conflict is merged again only once its branch head or the harness HEAD
 moved: each try briefly leaves MERGE_HEAD in the live checkout, in the way of `ttp upgrade`. A merge
 that changed runtime/ asks the daemon to restart, as `ttp restart` would."""
 from __future__ import annotations
@@ -37,6 +40,7 @@ IDENT = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
 REPORTED_KEY = "harness_merge_reported"   # kv: task id -> the branch head a conflict was reported for
 CONFLICT_KEY = "harness_merge_conflicted"  # kv: task id -> [branch head, harness HEAD, "conflict"|"refused"] last seen
 MERGE_MSG = "tt-project: land harness task"   # the start of land's merge message (MERGE_MSG mid-merge)
+BACKUP_DIR = "harness-land-backups"   # state/<it>/<date>-t<id>/: the checkout's copies a land set aside
 SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 TASK_BRANCH_RE = re.compile(r"ttp/harness-t\d+")   # a harness task's own branch
 
@@ -189,6 +193,7 @@ def land(p: Project, tid: int) -> str:
             if last == pair + ["conflict"]:
                 return "conflict-known"     # the same two commits conflict again: no merge until one moves
             from .upjournal import _differs, _put_back, _touched
+            settled, backup = _settle(p, tid, b)
             touched = _touched(p.harness, before, b)
             clean = [f for f in touched if f not in _differs(p.harness, touched)]
             with tree_writes(p.harness):
@@ -203,8 +208,11 @@ def land(p: Project, tid: int) -> str:
                     # git refused only after writing them (the template guard on main refuses a branch that
                     # holds a template merge): left there, they fail `ttp upgrade --apply`'s fast-forward
                     _put_back(p.harness, clean)
+                    _restore(p, settled, backup)   # not landed: the checkout keeps its copies as they were
         if r.returncode != 0:
             said = (r.stdout + r.stderr).strip()
+            if settled:
+                said += f" (land set aside and put back {', '.join(settled)}; backup in {backup})"
             # a refusal over files another live run is editing passes when it commits; else it needs a hand
             if conflicted or ("would be overwritten" in said and not checkout_busy(p, tid)):
                 # a refusal leaves no MERGE_HEAD and passes once the checkout's changes go: tried each pass
@@ -233,6 +241,69 @@ def land(p: Project, tid: int) -> str:
     _git(p.harness, "branch", "-d", b)
     _set_conflicted(p, tid, None)
     return outcome or "merged"
+
+
+def _settle(p: Project, tid: int, b: str) -> tuple[list[str], Path | None]:
+    """Set aside the checkout's uncommitted copies (changed or untracked) of files branch `b` changed
+    since its merge base whose content equals one of the branch's versions there (its head's or an
+    earlier one): git would refuse the merge over them though they hold nothing the branch lacks. Each
+    is copied to a dated backup folder under the state, then put back to HEAD (an untracked one
+    removed). Every other uncommitted file is left alone, and nothing while another harness run works
+    in the checkout (its edits are its own). Returns the files and the backup folder."""
+    if checkout_busy(p, tid):
+        return [], None
+    base = _git(p.harness, "merge-base", "HEAD", b).stdout.strip()
+    if not base:
+        return [], None
+    versions: dict[str, set[str]] = {}
+    out = _git(p.harness, "log", "-z", "--raw", "--no-abbrev", "--no-renames", "--format=", f"{base}..{b}")
+    words = [w.strip("\n") for w in out.stdout.split("\0")] if out.returncode == 0 else []
+    for meta, f in zip(words, words[1:]):
+        if meta.startswith(":") and len(meta.split()) >= 5 and set(meta.split()[3]) != {"0"}:
+            versions.setdefault(f, set()).add(meta.split()[3])   # the blob a branch commit left at f
+    if not versions:
+        return [], None
+    st = _git(p.harness, "--literal-pathspecs", "status", "--porcelain", "-z", "--no-renames",
+              "--untracked-files=all", "--", *sorted(versions))
+    settled = []
+    for e in st.stdout.split("\0") if st.returncode == 0 else []:
+        f = e[3:]
+        if len(e) < 4 or "D" in e[:2] or f not in versions:
+            continue
+        fp = p.harness / f
+        if fp.is_symlink() or not fp.is_file():
+            continue
+        blob = _git(p.harness, "--literal-pathspecs", "hash-object", "--", f).stdout.strip()
+        if blob in versions[f]:
+            settled.append(f)
+    if not settled:
+        return [], None
+    backup = p.state / BACKUP_DIR / f"{time.strftime('%Y-%m-%d-%H%M%S')}-t{int(tid)}"
+    for f in settled:
+        src = p.harness / f
+        durable_write(backup / f, src.read_bytes(), mode=src.stat().st_mode & 0o777)
+    with tree_writes(p.harness):   # back to HEAD's version, an untracked one removed (names taken literally)
+        for f in settled:
+            if _git(p.harness, "cat-file", "-e", f"HEAD:{f}").returncode == 0:
+                _git(p.harness, "--literal-pathspecs", "checkout", "HEAD", "--", f)
+            else:
+                _git(p.harness, "--literal-pathspecs", "rm", "-q", "--cached", "--ignore-unmatch", "--", f)
+                (p.harness / f).unlink(missing_ok=True)
+    from .daemon import log
+    log(p, f"harness worktree of task {tid}: set aside {len(settled)} uncommitted cop"
+           f"{'y' if len(settled) == 1 else 'ies'} equal to branch {b}'s content ({', '.join(settled)}); "
+           f"backup in {backup}")
+    return settled, backup
+
+
+def _restore(p: Project, settled: list[str], backup: Path | None) -> None:
+    """Put the copies _settle set aside back into the checkout (the merge did not land); the backup stays."""
+    if not settled or backup is None:
+        return
+    with tree_writes(p.harness):
+        for f in settled:
+            src = backup / f
+            durable_write(p.harness / f, src.read_bytes(), mode=src.stat().st_mode & 0o777)
 
 
 def _commit_memory(p: Project, tid: int) -> None:

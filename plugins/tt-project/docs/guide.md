@@ -275,6 +275,10 @@ only in the feed and never under "needs you".
   whose branch still holds unmerged commits, or a branch that does not fast-forward),
   with `TTP_HARNESS_LANDING_WHY` saying what the worker can do. A harness-landed check should fail only
   on `refused`: a worker's sandbox cannot write the harness checkout, so it can never merge there itself.
+  Before that merge, an uncommitted copy in the harness checkout (changed or untracked) of a file the
+  branch changed, equal to the branch's head version or an earlier one since the merge base, is backed
+  up to `state/harness-land-backups/<date>-t<id>/` and put back so git does not refuse; any other
+  uncommitted file is left alone, and a merge still refused puts the copies back and names them.
 - A task that has ended (done, failed, cancelled, exhausted) can still leave processes behind. Its own
   ones are those of your user whose environment carries this project's `TTP_PROJECT`, the task's
   `TTP_TASK` and a `TTP_RUN_DIR` of one of its recorded runs. When such processes are the only ones with a

@@ -359,3 +359,90 @@ def test_a_memory_lock_held_past_its_bound_never_deadlocks_land_or_the_writers(e
     assert harnesstree.land(p, b) == "merged"   # the next pass, once the holder let go
     index = (p.harness / "MEMORY.md").read_text()
     assert "(edited by the task)" in index and f"memory/{entry.name}" in index and old.name not in index
+
+
+def _ht_dirty_copy_setup(p):
+    """Harness task b, in a worktree of its own, whose branch changes prompts/shared.md twice (v1, then
+    v2) and adds prompts/new [x] y.md; HEAD holds prompts/shared.md as v0. Returns (b, own)."""
+    from ttp import harnesstree
+    _commit_in_harness_tree(p.harness, "prompts/shared.md", "v0\n", "shared v0")
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)   # a works in the checkout: b gets a worktree
+    p.db.x("UPDATE runs SET status='done'")
+    _commit_in_harness_tree(own, "prompts/shared.md", "v1\n", "b: shared v1")
+    _commit_in_harness_tree(own, "prompts/shared.md", "v2\n", "b: shared v2")
+    _commit_in_harness_tree(own, "prompts/new [x] y.md", "new\n", "b: new file")
+    p.db.update_task(b, status="done")
+    return b, own
+
+
+def _ht_backups(p):
+    root = p.state / "harness-land-backups"
+    return {str(f.relative_to(d)): f.read_text() for d in sorted(root.iterdir()) for f in d.rglob("*")
+            if f.is_file()} if root.is_dir() else {}
+
+
+def test_a_dirty_checkout_copy_equal_to_the_branch_head_lands_with_a_backup(env):
+    """Before: git refused the merge ('would be overwritten') and the commits waited for a hand cleanup."""
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    (p.harness / "prompts" / "shared.md").write_text("v2\n")   # someone copied the branch's file in
+    (p.harness / "prompts" / "wip.md").write_text("half done\n")
+    assert harnesstree.land(p, b) == "merged"
+    assert _hgit(p.harness, "show", "HEAD:prompts/shared.md") == "v2\n"
+    assert (p.harness / "prompts" / "shared.md").read_text() == "v2\n"
+    assert _hgit(p.harness, "status", "--porcelain", "--", "prompts").strip() == "?? prompts/wip.md"
+    assert _ht_backups(p) == {"prompts/shared.md": "v2\n"}
+    assert "harness-land-backups" in (p.logs / "daemon.log").read_text()
+    assert not p.db.q("SELECT id FROM events WHERE kind='harness_merge_conflict'")
+
+
+def test_a_dirty_checkout_copy_equal_to_an_earlier_branch_version_lands_with_a_backup(env):
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    (p.harness / "prompts" / "shared.md").write_text("v1\n")   # the branch's version before its head
+    assert harnesstree.land(p, b) == "merged"
+    assert (p.harness / "prompts" / "shared.md").read_text() == "v2\n"
+    assert not _hgit(p.harness, "status", "--porcelain").strip()
+    assert _ht_backups(p) == {"prompts/shared.md": "v1\n"}
+
+
+def test_a_differing_dirty_checkout_copy_is_left_alone_and_the_land_refused_naming_it(env):
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    (p.harness / "prompts" / "shared.md").write_text("an edit of its own\n")
+    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")   # equal: set aside, then put back on refusal
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert harnesstree.land(p, b) == "conflict"
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+    assert (p.harness / "prompts" / "shared.md").read_text() == "an edit of its own\n"
+    assert (p.harness / "prompts" / "new [x] y.md").read_text() == "new\n"
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict'")
+    assert "would be overwritten" in ev["text"] and "prompts/shared.md" in ev["text"]
+    assert "harness-land-backups" in ev["text"]
+    assert _ht_backups(p) == {"prompts/new [x] y.md": "new\n"}   # what was set aside stays backed up
+
+
+def test_an_untracked_checkout_copy_equal_to_a_file_the_branch_adds_lands_with_a_backup(env):
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    (p.harness / "prompts" / "new [x] y.md").write_text("new\n")
+    assert harnesstree.land(p, b) == "merged"
+    assert _hgit(p.harness, "show", "HEAD:prompts/new [x] y.md") == "new\n"
+    assert not _hgit(p.harness, "status", "--porcelain").strip()
+    assert _ht_backups(p) == {"prompts/new [x] y.md": "new\n"}
+
+
+def test_dirty_copies_are_never_set_aside_while_another_harness_run_works_in_the_checkout(env):
+    p = make(env)
+    from ttp import harnesstree
+    b, own = _ht_dirty_copy_setup(p)
+    _harness_run(p, _harness_task(p, "c"))   # c's run works in the checkout: its copies are its own
+    (p.harness / "prompts" / "shared.md").write_text("v1\n")
+    assert harnesstree.land(p, b) == "busy"
+    assert (p.harness / "prompts" / "shared.md").read_text() == "v1\n" and not _ht_backups(p)
