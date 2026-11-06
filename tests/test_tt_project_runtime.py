@@ -3531,16 +3531,26 @@ def _run_to_end(argv, timeout=30, **kw):
     """subprocess.run(argv, capture_output=True, timeout=timeout, **kw), but the deadline fails only a
     command still running. On a busy host this test process (a niced worker) may get the CPU back only
     after the deadline, when the command already ended with its answer; communicate() checks the clock
-    once select returns and raises TimeoutExpired anyway. A command that ended is read to its end."""
+    once select returns and raises TimeoutExpired anyway. A command that ended is read to its end.
+    The deadline counts only time in which this process ran: it waits in slices of at most 1 s, and a slice
+    that took far longer was a stall (the whole host, or this process and the command frozen together),
+    which used none of the command's time, so it counts as one slice."""
+    left = timeout
     with subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE, **kw) as proc:
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            if proc.poll() is None:
-                proc.kill()
-                proc.communicate()
-                raise
-            out, err = proc.communicate(timeout=timeout)   # still bounded: something it left may hold its pipes
+        while True:
+            last = time.monotonic()
+            try:
+                out, err = proc.communicate(timeout=max(min(1.0, left), 0.01))
+                break
+            except subprocess.TimeoutExpired:
+                if proc.poll() is not None:
+                    out, err = proc.communicate(timeout=timeout)   # still bounded: something it left may hold its pipes
+                    break
+                left -= min(time.monotonic() - last, 1.5)
+                if left <= 0:
+                    proc.kill()
+                    proc.communicate()
+                    raise
     return subprocess.CompletedProcess(argv, proc.returncode, out, err)
 
 def _wait_for(pred, timeout=30.0) -> bool:

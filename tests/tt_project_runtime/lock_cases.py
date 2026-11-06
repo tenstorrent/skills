@@ -1236,6 +1236,38 @@ def test_run_to_end_fails_only_a_command_still_running_at_its_deadline(monkeypat
     assert started[-1].returncode == -signal.SIGKILL
 
 
+def test_run_to_end_does_not_count_a_stall_of_the_host_against_a_running_command(monkeypatch):
+    """A stall that freezes the test process and its command together (a busy host) passed the deadline
+    while the command still ran, so it was killed though it had used none of its time. A clock that jumps
+    an hour after its first read in a call (which sets the deadline) stands in for that; a command that
+    hangs still fails, also when every read is a stall."""
+    reads = []
+
+    def stalled():
+        reads.append(1)
+        return time.perf_counter() + (3600 if len(reads) > 1 else 0)
+
+    monkeypatch.setattr(subprocess, "_time", stalled)
+    monkeypatch.setattr(time, "monotonic", stalled)
+    cmd = ["sh", "-c", "sleep 1; echo out; exit 75"]
+    with pytest.raises(subprocess.TimeoutExpired):   # what a fixed deadline does
+        subprocess.run(cmd, capture_output=True, timeout=30)
+    reads.clear()
+    r = _run_to_end(cmd, text=True, timeout=30)
+    assert (r.returncode, r.stdout) == (75, "out\n")
+
+    def stalling():
+        reads.append(1)
+        return time.perf_counter() + 3600 * len(reads)
+
+    monkeypatch.setattr(subprocess, "_time", stalling)
+    monkeypatch.setattr(time, "monotonic", stalling)
+    t0 = time.perf_counter()
+    with pytest.raises(subprocess.TimeoutExpired):
+        _run_to_end(["sleep", "30"], timeout=2)
+    assert time.perf_counter() - t0 < 20
+
+
 def _foreign_run(p, task, run_id):
     """A running run row of `task` whose folder is a temp dir, recorded on this boot: what a sandboxed probe
     judges a foreign holder through."""
