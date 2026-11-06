@@ -8189,8 +8189,14 @@ def test_ttp_sandbox_passes_the_leak_pattern_file_by_path(env, tmp_path, monkeyp
         seen.append(env_.get("TTP_LEAK_PATTERNS_FILE"))
         raise FileNotFoundError(2, "stub")
 
+    def execvp(*_a, **_k):
+        # A regression to os.execvp would exec the real command and replace this test process, so the
+        # suite would end 0 and the drop of the env (and the leak-pattern file) would never be seen.
+        raise AssertionError("sandbox.run used os.execvp: the leak-pattern env is dropped")
+
     monkeypatch.setattr(sandbox, "wrap", lambda argv, *a, **k: list(argv))
     monkeypatch.setattr(sandbox.os, "execvpe", execvpe)
+    monkeypatch.setattr(sandbox.os, "execvp", execvp)
     f, marker = _leak_file(tmp_path, monkeypatch)
     assert sandbox.run(["true"]) == 127
     f.unlink()
