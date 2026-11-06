@@ -7420,6 +7420,11 @@ def test_the_load_guard_judges_cpu_by_runnable_demand_and_io_pressure_by_its_own
     s = hostload.snapshot()
     assert s["load"][1] == 67.0 and s["demand"] == 34.0 and not hostload.overloaded({**s, "running": 4, "cap": 4})
     assert "CPU demand 34.0 cores" in hostload.lines(s=s)[0] and "over its limit" not in hostload.lines(s=s)[0]
+    # A measured host state: load 61.3 on 64 cores, user+system about 57% (idle 42%), 25 tasks in D state
+    # on filesystem locks: I/O-bound, not CPU-overloaded.
+    _fake_cpu(monkeypatch, tmp_path, busy=37, running=38, blocked=25, load=61.3)
+    assert checkcap.cpu_demand() == 37.0 and testslots.load_guard() == ""
+    assert not hostload.overloaded({**hostload.snapshot(), "running": 4, "cap": 4})
     # (b) runnable demand over the cores (all busy, 90 tasks wanting a core): held as the CPU limit.
     _fake_cpu(monkeypatch, tmp_path, busy=64, running=91, blocked=0, load=60.0)
     why = testslots.load_guard()
