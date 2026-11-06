@@ -8373,7 +8373,8 @@ class Daemon:
         checks lane longer than checks.wait_event_s (default 900, 0: off) raises one `checks_slot_wait`
         event naming the waiter and the holders (checklane.wait_events); one per wait episode (keyed on the
         waiter's task and arrival), never for a short wait. Those events are recorded 'coalesced': only
-        checklane.wait_wake's one per queue incident, and its re-wakes (escalation, likely hang, ownerless
+        checklane.wait_wake's one per queue incident, and its re-wakes (escalation, a long holder that is stalled
+        by check_checks_stall's readings (a likely hang), an ownerless
         holder), wake the coordinator. An active `daemon:checks_slot_wait` observation_mute covering one
         records it 'muted' instead."""
         now = time.time()
@@ -8381,7 +8382,7 @@ class Daemon:
             return
         self._checks_wait_checked = now
         import statistics
-        from . import checklane, checkwall
+        from . import checklane, checkstall, checkwall
         db = self.p.db
         events = checklane.wait_events(self.p.name, self.cfg, now)
         recent = checkwall.recent(self.p.state, now)
@@ -8394,7 +8395,7 @@ class Daemon:
                 and not checklane.open_precheck(db, task, h.get("holder"))
 
         was = db.kv(checklane.INCIDENT_KEY)
-        why, inc = checklane.wait_wake(events, was, self.cfg, now, median, ended)
+        why, inc = checklane.wait_wake(events, was, self.cfg, now, median, ended, db.kv_dict(checkstall.KV)[0])
         if inc != was:
             db.set_kv(checklane.INCIDENT_KEY, inc)
 

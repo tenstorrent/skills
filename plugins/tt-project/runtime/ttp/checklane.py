@@ -69,9 +69,9 @@ WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events). Only one o
 per queue incident (wait_wake: from the first waiter past the threshold until none is); the incident wakes it
 again only when a decision is due: its longest waiter past `checks.wait_escalate_s` (default WAIT_ESCALATE_S,
 then once per as long again; 0: never), a holder running `checks.wait_hang_factor` (default WAIT_HANG_FACTOR;
-0: never) times the recent median checks run (a likely hang when its checks log has stopped growing for
-checkwall.SILENT_S, or names none; else "slow", with the host's load), or a holder whose task has ended (no
-owner to fix it).
+0: never) times the recent median checks run whose log has also stopped growing (checkstall; a likely hang:
+one still printing results is named slow under load, with the host's load, and wakes nobody), or a holder
+whose task has ended (no owner to fix it).
 """
 from __future__ import annotations
 
@@ -101,7 +101,8 @@ MAX_LANES = 4
 MAX_WAIT_S = 300.0
 WAIT_EVENT_S = 900.0
 WAIT_ESCALATE_S = 7200.0  # a queue incident wakes the coordinator again once its longest wait passes this
-WAIT_HANG_FACTOR = 3.0    # a holder running this many times the recent median checks run is a likely hang
+WAIT_HANG_FACTOR = 3.0    # a holder running this many times the recent median checks run is a likely hang if stalled
+HANG_CPU_IDLE_S = 300.0   # ... and, where the daemon reads its tree's CPU, idle this long (five readings)
 INCIDENT_KEY = "checks_wait_incident"   # kv: the open queue incident (wait_wake)
 LONG_WAIT_S = 600.0       # ttp status and the digest list a wait longer than this
 TELL_S = 60.0             # a waiter says who holds the lanes this often
@@ -431,12 +432,30 @@ def lane_labels(project_name: str, keys, cfg: dict | None = None, known: dict | 
 
 def _lane_waits_on(project_name: str, base: str, key: str, q: list, cfg: dict | None, label: str) -> list[str]:
     """What each waiter in lane `base`'s queue `q` (in turn order) waits on: the lane itself while its
-    lanes are all held; with one free, the project cap (testslots.cap_turn: a waiter behind the lane's
-    first ones waits for them, and they for the cap)."""
+    lanes are all held; with one free, the project cap only while the project's running checks fill it
+    (testslots.cap_turn's count: testslots.project_held), else the host gate a run of the project holding a
+    lane waits on (_host_gate: the test-slot pool or the load guard), else nothing (about to start)."""
     held = _held_numbered(base)
     n = 1 if key.startswith("w") else max(1, slots(cfg, held))
-    capped = project_cap(cfg) > 0
-    return [label if held >= n else CAP_LABEL if capped else "nothing (about to start)" for _ in q]
+    if held >= n:
+        return [label for _ in q]
+    cap = project_cap(cfg)
+    on = CAP_LABEL if cap > 0 and len(testslots.project_held(project_name)) >= cap else \
+        _host_gate(project_name) or "nothing (about to start)"
+    return [on for _ in q]
+
+
+HOST_GATE = "the host's gate: "   # _host_gate's prefix (waits()' limit "host")
+
+
+def _host_gate(project_name: str) -> str:
+    """What holds the project's checks below its cap: the host-wide gate (the gate pool_gate recorded, else
+    what it waits for: testslots.gate_lanes, lane_waits) of a run of the project that holds a lane and
+    still waits for its test slots; "" when none does."""
+    for r in locks.holder_records(testslots.lane_paths(project_name, repo=None)):
+        if r.get("granted") is False and (r.get("gate") or r.get("waits")):
+            return HOST_GATE + " ".join(str(r.get("gate") or r.get("waits")).split())[:200]
+    return ""
 
 
 def _pid_queued(pid, project_name: str = "") -> str:
@@ -865,9 +884,10 @@ def _ticket_task(t: Path) -> str:
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
     """The project's waiters for a lane that have waited over `over_s`, in queue order (the aging step
     of `cfg`, checks.priority_age_s — the order the lanes grant): task, waited_s, since (arrival),
-    position (1-based), the lane's label (lane_labels), what it waits on (the lane, or the project cap:
-    _lane_waits_on), the limit holding it ("lanes" or "project_cap"), the holders' records (of the
-    lane, or of every lane for the cap) and how many lanes the repository has now (slots_note)."""
+    position (1-based), the waiter's run (`run`, from its label) and who it is (`who`: _waiter_name), the
+    lane's label (lane_labels), what it waits on (the lane, the project cap or a host gate:
+    _lane_waits_on), the limit holding it ("lanes", "project_cap", "host" or "" for none), the holders'
+    records (of the lane, else of every lane) and how many lanes the repository has now (slots_note)."""
     now = time.time() if now is None else now
     age = priority_age_s(cfg)
     pre = f"{testslots.SUITE}.{locks.group_id(project_name)}"
@@ -885,10 +905,17 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
-                    out.append({"task": _ticket_task(t), "waited_s": waited, "since": locks._arrival(t),
+                    try:
+                        text = t.read_text()
+                    except OSError:
+                        text = ""
+                    task = _ticket_task(t)
+                    out.append({"task": task, "run": _run_of(text), "who": _waiter_name(task, text, t.name),
+                                "waited_s": waited, "since": locks._arrival(t),
                                 "position": i + 1, "of": len(q), "lane": labels[key], "waits_on": on[i],
                                 "holders": lane_recs if on[i] == labels[key] else all_recs,
-                                "limit": "lanes" if on[i] == labels[key] else "project_cap", "slots_note": note})
+                                "limit": "lanes" if on[i] == labels[key] else "project_cap" if on[i] == CAP_LABEL
+                                else "host" if on[i].startswith(HOST_GATE) else "", "slots_note": note})
     except OSError:
         return []
     return out
@@ -901,7 +928,7 @@ def long_wait_lines(project_name: str, cfg: dict | None, now: float | None = Non
     out = []
     for w in waits(project_name, cfg, now, over_s):
         held = "; ".join(holder_text(h, now, cfg) for h in w["holders"][:3]) or "lanes free, about to start"
-        out.append(f"checks lane wait: {'#' + w['task'] if w['task'] else 'a run'} has waited {mins(w['waited_s'])} "
+        out.append(f"checks lane wait: {w['who']} has waited {mins(w['waited_s'])} "
                    f"on {w['waits_on']} (position {w['position']} of {w['of']} in {w['lane']}), behind {held}")
     return out
 
@@ -916,7 +943,7 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
     out = []
     for w in waits(project_name, cfg, now, limit):
         held = "; ".join(holder_text(h, now, cfg) for h in w["holders"][:3]) or "no holder (lanes free, about to start)"
-        who = f"#{w['task']}" if w["task"] else "a run with no task"
+        who = w["who"]
         out.append({"fingerprint": f"checks_slot_wait:{w['task'] or 'run'}:{w['since']:.0f}",
                     "task": int(w["task"]) if w["task"] else None,
                     "waited_s": w["waited_s"], "holders": w["holders"],
@@ -926,24 +953,48 @@ def wait_events(project_name: str, cfg: dict | None, now: float | None = None) -
                              f"per project; a waiter cheaper than the holders gets a lane after checks.max_wait_s; "
                              f"light checks (ttp checks --light, checks.light_cmds) never wait. This wait was held "
                              f"by " + (f"the per-repository lane limit (checks.slots): {w['slots_note']}."
-                                       if w["limit"] == "lanes" else "the project cap (checks.test_project_max)."))})
+                                       if w["limit"] == "lanes" else "the project cap (checks.test_project_max)."
+                                       if w["limit"] == "project_cap" else f"{w['waits_on']}."))})
     return out
+
+
+def _waiter_name(task: str, label: str, ticket: str = "") -> str:
+    """A lane waiter for a person: its task (#N), else its run (run N, from its label: "run <id>"), else
+    its label's command and pid (testslots.suite_hold's "<project>: full checks (pid N)"), else its
+    ticket's name, so a wait with no task still says whose it is."""
+    if task:
+        return f"#{task}"
+    if run := _run_of(label):
+        return f"run {run} (no task)"
+    what = " ".join(str(label or "").split(": ", 1)[-1].split())[:120]
+    return f"a run with no task ({what or 'ticket ' + ticket})"
 
 
 def _holder_key(rec: dict) -> str:
     return f"{rec.get('task') or rec.get('holder') or 'run'}:{rec.get('pid')}:{rec.get('run_since') or rec.get('since')}"
 
 
+def _hung(h: dict, now: float, cfg: dict | None, marks: dict | None, stat=None) -> bool:
+    """Whether lane holder `h` looks hung by checkstall's view: its log has not grown for its stall
+    threshold and, where the daemon's CPU reading of its tree (`marks`, kv checkstall.KV) is known, the
+    tree has used no CPU for HANG_CPU_IDLE_S. A holder that names no log, or a stall watch that is off
+    (checks.stall_s 0), is never hung: elapsed time alone says slow, not hung."""
+    from . import checkstall
+    v = checkstall.view(h, now, cfg, (marks or {}).get(checkstall.key(h)), **({"stat": stat} if stat else {}))
+    return bool(v and v["stalled"] and (v["cpu_idle_s"] is None or v["cpu_idle_s"] >= HANG_CPU_IDLE_S))
+
+
 def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: float,
-              median_s: float | None = None, ended=lambda holder: False) -> tuple[list[str], dict | None]:
+              median_s: float | None = None, ended=lambda holder: False, marks: dict | None = None,
+              stat=None) -> tuple[list[str], dict | None]:
     """Whether this tick's `checks_slot_wait` events (wait_events) wake the coordinator: (the reasons, none
     when they do not, and the queue incident to keep). An incident opens with the first waiter past
     checks.wait_event_s (reason "new") and closes once no waiter is past it (None). Within it, a wake again
     only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
-    (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, whose output
-    stopped growing: printing(); once per holder), "slow" (the same, still printing; once per holder) and
-    "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck only once no review
-    reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
+    (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, that is also
+    stalled (_hung: its log still, its CPU idle where `marks` knows it; `stat` is for tests), once per
+    holder; such a holder still progressing is only kept in the incident's "slow", for wake_text) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
+    only once no review reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
     if not events:
         return [], None
     inc = json.loads(json.dumps(incident)) if isinstance(incident, dict) else {}   # never the caller's lists
@@ -960,10 +1011,13 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     factor = wait_hang_factor(cfg)
     # A holder still waiting for a later gate (testslots.lane_waits) is not hung: its clock starts once
     # it has its test slots (granted_at), or with its commands (run_since).
-    over = (lambda h: factor > 0 and median_s and median_s > 0 and not h.get("waits")
-            and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now) > factor * median_s)
-    for name, test in (("hang", lambda h: over(h) and not printing(h, now, cfg)),
-                       ("slow", lambda h: over(h) and printing(h, now, cfg)),
+    def long(h: dict) -> bool:
+        return bool(factor > 0 and median_s and median_s > 0 and not h.get("waits")
+                    and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now)
+                    > factor * median_s)
+
+    inc["slow"] = [k for k, h in holders.items() if long(h) and not _hung(h, now, cfg, marks, stat)][-20:]
+    for name, test in (("hang", lambda h: long(h) and _hung(h, now, cfg, marks, stat)),
                        ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h)))):
         seen = list(inc.get(name) or [])
         for k, h in holders.items():
@@ -975,34 +1029,30 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     return why, inc
 
 
-def printing(h: dict, now: float, cfg: dict | None = None) -> bool:
-    """Whether lane holder `h` is running its commands and its checks log grew within checkwall.SILENT_S
-    (checkstall.view): slow, not hung. A holder naming no log has nothing to show it working."""
-    from . import checkstall, checkwall
-    v = checkstall.view(h, now, cfg)
-    return v is not None and v["log_idle_s"] < checkwall.SILENT_S
-
-
-def host_load() -> str:
-    """"92 on 64 cores": this host's 1-minute load and its cores, for a slow holder's line ("unknown")."""
-    from . import hostload
-    ld = hostload.loads()
-    return f"{ld[0]:.0f} on {checkcap.cores()} cores" if ld else "unknown"
-
-
 def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, now: float,
-              median_s: float | None = None, load=host_load) -> str:
-    """The waking `checks_slot_wait` event's text: the reasons, then the longest waiter's own event text."""
+              median_s: float | None = None, load=None) -> str:
+    """The waking `checks_slot_wait` event's text: the reasons, a slow holder's count with the host's load
+    (`load`, default _load_text), then the longest waiter's own event text."""
     head = max(events, key=lambda e: float(e.get("waited_s") or 0))
-    over = f"a holder has run over {wait_hang_factor(cfg):g}x the recent median checks run ({mins(median_s or 0)})"
+    over = f"over {wait_hang_factor(cfg):g}x the recent median checks run ({mins(median_s or 0)})"
     say = {"new": f"a checks queue incident started ({len(events)} waiting past {mins(wait_event_s(cfg))})",
            "escalate": f"its longest wait passed {mins(wait_escalate_s(cfg))}",
-           "hang": f"{over} and its output stopped growing: a likely hang",
-           "slow": f"{over} and is still printing results: slow (host load {load() if 'slow' in why else ''})",
+           "hang": f"a holder has run {over} and its log stopped growing, its CPU idle: a likely hang",
            "ownerless": "a holder's task has ended: nobody owns its fix"}
-    return (f"Checks queue: {'; '.join(say[w] for w in why)}. {head['text']} Further waiters of this "
+    slow = len(inc.get("slow") or [])
+    return (f"Checks queue: {'; '.join(say[w] for w in why)}. "
+            + (f"{slow} holder{'s' if slow > 1 else ''} ran {over} but {'are' if slow > 1 else 'is'} still "
+               f"progressing (log growing): slow under load ({(load or _load_text)()}), not hung. " if slow else "")
+            + f"{head['text']} Further waiters of this "
             f"incident (open {mins(now - float(inc['start']))}) show in the digest's `checks slot wait:` "
             f"lines and ttp status, not as new wakes.")
+
+
+def _load_text() -> str:
+    """The host's 1-minute load on its cores for a person ("1-minute load 63.2 on 64 cores")."""
+    ld, c = checkcap._load(), checkcap.cores()
+    return (f"1-minute load {ld:.1f} on {c} cores" if ld == ld and ld != float("inf")
+            else f"load unknown, {c} cores")
 
 
 def log_reclaim(state: Path | None, rec: dict, why: str) -> None:

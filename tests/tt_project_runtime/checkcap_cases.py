@@ -2412,30 +2412,30 @@ def test_wall_cap_progress_reads_never_close_the_check_log_the_run_still_writes(
 
 def test_a_queue_incident_calls_a_holder_still_printing_slow_with_the_host_load_and_a_silent_one_a_likely_hang(
         tmp_path):
-    from ttp import checklane, checkwall
+    """A holder past the hang factor that still prints is slow: kept in the incident's "slow", named with
+    the host load in the next wake's text, and wakes nobody itself. One whose log stopped growing past its
+    stall threshold (checkstall) is a likely hang; one naming no log is neither."""
+    from ttp import checklane, checkstall
     now = time.time()
     printing, silent = tmp_path / "printing.log", tmp_path / "silent.log"
     printing.write_text("..... [ 80%]\n")
     silent.write_text("..... [ 40%]\n")
-    os.utime(silent, (now - checkwall.SILENT_S - 60,) * 2)
+    os.utime(silent, (now - checkstall.STALL_MIN_S - 60,) * 2)
     busy = {"task": "21", "pid": 4242, "run_since": now - 5000, "command": "pytest -q", "log": str(printing)}
     hung = {"task": "22", "pid": 4243, "run_since": now - 5000, "command": "pytest -q", "log": str(silent)}
     nolog = {"task": "23", "pid": 4244, "run_since": now - 5000, "command": "make check"}
     cfg = {"checks": {"wait_hang_factor": 3}}
     evs = _queue_events(1, holders=[busy])
     why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 300.0)
-    assert why == ["slow"] and len(inc["slow"]) == 1 and not inc["hang"], (why, inc)
-    text = checklane.wake_text(why, evs, inc, cfg, now, 300.0, load=lambda: "92 on 64 cores")
-    assert "still printing results: slow (host load 92 on 64 cores)" in text and "likely hang" not in text, text
-    assert checklane.wait_wake(evs, inc, cfg, now + 60, 300.0)[0] == [], "once per holder"
+    assert why == [] and len(inc["slow"]) == 1 and not inc["hang"], (why, inc)
     evs = _queue_events(1, holders=[busy, hung, nolog])
     why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 300.0)
-    assert why == ["hang", "slow"] and len(inc["hang"]) == 2 and len(inc["slow"]) == 1, (why, inc)
-    text = checklane.wake_text(why, evs, inc, cfg, now, 300.0, load=lambda: "92 on 64 cores")
-    assert "output stopped growing: a likely hang" in text and "slow (host load" in text, text
+    assert why == ["hang"] and len(inc["hang"]) == 1 and len(inc["slow"]) == 1, (why, inc)
+    text = checklane.wake_text(why, evs, inc, cfg, now, 300.0, load=lambda: "1-minute load 92.0 on 64 cores")
+    assert "its log stopped growing, its CPU idle: a likely hang" in text, text
+    assert "1 holder ran over 3x" in text and "slow under load (1-minute load 92.0 on 64 cores), not hung" in text, text
     # Not over the factor: neither.
     assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 100}}, now, 300.0)[0] == []
-    assert checklane.host_load() == "unknown" or " on " in checklane.host_load()
 
 
 def test_ttp_checks_stops_a_check_with_no_output_as_a_timeout_and_spares_one_that_prints(env, tmp_path, monkeypatch, capsys):
@@ -4821,12 +4821,17 @@ def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_own
     try:
         a, rec = _run_holder(p, tmp_path, {"TTP_RUN_DIR": str(run), "TTP_RUN_ID": "77", **daemon.task_env(work)})
         procs.append(a)
+        log = run / "checks.log"   # its commands' log (testslots.suite_running), last grown 2 min ago
+        log.write_text("collected 10 items\n")
+        os.utime(log, (time.time() - 120,) * 2)
+        rec.update(log=str(log), run_since=time.time() - 120)
         evs = _queue_events(3, holders=[rec])
         monkeypatch.setattr(checklane, "wait_events", lambda *a, **k: evs)
         d = Daemon(p.base)
         d.check_checks_wait(every_s=0)
         assert len(_queue_wakes(p)) == 1, "a holder at the median: no hang"
         d.cfg.setdefault("checks", {})["wait_hang_factor"] = 1e-6   # its run is now far over the median
+        d.cfg["checks"]["stall_s"] = 60   # and its log stalled (checkstall.view)
         for _ in range(2):
             d.check_checks_wait(every_s=0)
         wakes = _queue_wakes(p)
@@ -4835,7 +4840,8 @@ def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_own
         assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 0}}, now, 600.0)[0] == [], \
             "checks.wait_hang_factor 0: never"
         kept = {"start": 1.0, "hang": [], "ownerless": []}
-        assert checklane.wait_wake(evs, kept, {"checks": {"wait_hang_factor": 1e-6}}, now, 600.0)[0] == ["hang"]
+        assert checklane.wait_wake(evs, kept, {"checks": {"wait_hang_factor": 1e-6, "stall_s": 60}}, now,
+                                   600.0)[0] == ["hang"]
         assert kept == {"start": 1.0, "hang": [], "ownerless": []}, "the stored incident is never changed in place"
         d.cfg["checks"]["wait_hang_factor"] = 0
         # the daemon's review precheck of a just-finished code task joins the holders: its review reads it
@@ -5608,6 +5614,10 @@ def test_a_holder_waiting_for_test_slots_says_so_and_is_no_likely_hang(env, tmp_
         evs = _queue_events(1, holders=[rec])
         assert checklane.wait_wake(evs, {"start": 1.0}, cfg, float(rec["granted_at"]) + 60, 300.0)[0] == [], \
             "its clock starts at its grant, not when it took the lane"
+        log = tmp_path / "checks.log"   # its commands' log, never grown since its grant: stalled (checkstall)
+        log.write_text("")
+        os.utime(log, (float(rec["granted_at"]),) * 2)
+        evs = _queue_events(1, holders=[{**rec, "log": str(log), "run_since": float(rec["granted_at"])}])
         assert checklane.wait_wake(evs, {"start": 1.0}, cfg, float(rec["granted_at"]) + 1000, 300.0)[0] == ["hang"]
     finally:
         g.close()
