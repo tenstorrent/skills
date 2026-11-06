@@ -6,7 +6,7 @@ action apply, a due move on an obligation whose current due has passed is refuse
 changes the plan on its critical path (plan_change): a task_add naming it or continuing an owner, a
 task_update of an owner changing priority, resources, depends_on, status or spec, an owner attached, a
 config_set on a key the obligation or its owners name (the bottleneck), or a `justify` naming what
-changed. A move citing the user's own message is never refused. A reply giving a new time in the chat of
+changed. A move citing the user's own message, sent in its chat after its due was set, is never refused. A reply giving a new time in the chat of
 a missed promise with no plan change is flagged (flag_reply). A second miss makes the overdue item a
 must-act re-plan (REPLAN_TEXT). audit_line is the daily review's metric. Model-free throughout, and the
 same for session and stateless coordinators on every provider: all of it runs in coordinator.apply and
@@ -20,6 +20,8 @@ import time
 
 FLAG_KIND = "promise_moved_unchanged"
 PLAN_FIELDS = ("priority", "resources", "depends_on", "status", "spec")
+PLAN_COLS = {"priority": "priority", "resources": "labels", "depends_on": "depends_on", "status": "status",
+             "spec": "spec"}   # the task column each plan field lands in (resources ride in labels)
 JUSTIFY_MIN_WORDS = 3
 KEPT = 20   # misses and moves kept per obligation
 REPLAN_TEXT = ("\nMissed twice: re-plan now (a new split, route or owner: task_add naming it, or task_update of its "
@@ -70,6 +72,50 @@ def refusal(o: dict, due_text: str) -> str:
             f"true, with a time from Expected finish (`ttp eta {o['id']}`).")
 
 
+def user_asked(db, o: dict, mid: int) -> str | None:
+    """Why the user's message `mid` cannot ask for a move of `o`'s due (None when it can): it must be in the
+    promise's chat and come after its current due was set (set_at, else created). An older message, the
+    order's own included, never asked for this move."""
+    from . import obligations
+    pr = o.get("promise") or {}
+    row = db.one("SELECT ts, chat FROM messages WHERE id=?", (int(mid),))
+    if not row:
+        return f"#{mid} is not a message"
+    if obligations._chat(row["chat"]) != pr.get("chat"):
+        return f"#{mid} is in chat {obligations._chat(row['chat'])}, not the promise's chat {pr.get('chat')}"
+    if float(row["ts"]) <= float(pr.get("set_at") or o.get("created") or 0):
+        return f"#{mid} came before its current due was set, so it did not ask for this move"
+    return None
+
+
+def snapshot(db, actions: list) -> dict[int, dict]:
+    """The plan fields (PLAN_COLS) of each task a task_update in `actions` names, read before the batch
+    applies: plan_change compares them with the task after it."""
+    out = {}
+    for a in actions:
+        if isinstance(a, dict) and a.get("type") == "task_update" and (tid := _int(a.get("id"))) is not None \
+                and tid not in out and (t := db.task(tid)):
+            out[tid] = {f: t[c] for f, c in PLAN_COLS.items()}
+    return out
+
+
+def _changed(db, a: dict, before: dict[int, dict] | None) -> list[str]:
+    """The plan fields task_update `a` changes. With `before` (snapshot, the batch applied): those it names
+    whose column differs now; without (not applied): those whose value differs from the task's. A spec
+    update is appended to the spec, so it counts only when its text is not in the spec already."""
+    named = [f for f in PLAN_FIELDS if a.get(f) not in (None, "")]
+    t = db.task(int(a["id"])) if named else None
+    if not t:
+        return []
+    was = before.get(int(a["id"])) if before is not None else {f: t[c] for f, c in PLAN_COLS.items()}
+    if was is None:
+        return []
+    named = [f for f in named if f != "spec" or str(a["spec"]).strip() not in str(was["spec"] or "")]
+    if before is not None:
+        return [f for f in named if was[f] != t[PLAN_COLS[f]]]
+    return [f for f in named if str(a[f]) != str(was[f])]
+
+
 def _bottleneck_text(db, o: dict, owners: set[int]) -> str:
     parts = [o.get("text") or ""] + [str(j.get("why") or "") for j in (o.get("eta_justified") or {}).values()]
     for tid in owners:
@@ -79,9 +125,11 @@ def _bottleneck_text(db, o: dict, owners: set[int]) -> str:
     return "\n".join(parts)
 
 
-def plan_change(db, o: dict, actions: list, skip=(), since: float | None = None) -> str | None:
+def plan_change(db, o: dict, actions: list, skip=(), since: float | None = None,
+                before: dict[int, dict] | None = None) -> str | None:
     """What in `actions` (indexes in `skip` were refused) changes obligation `o`'s plan; None when nothing.
-    `since`: when the batch started applying; an owner attached from then on is new."""
+    `since`: when the batch started applying; an owner attached from then on is new. `before`: owners'
+    plan fields before the batch (snapshot); a task_update setting a field to its value is no change."""
     key = o["id"]
     owners = {int(t) for t in o.get("owners") or {}} | set((o.get("promise") or {}).get("tasks") or [])
     neck = None
@@ -95,8 +143,7 @@ def plan_change(db, o: dict, actions: list, skip=(), since: float | None = None)
             if _int(a.get("continues")) in owners:
                 return f"task_add continues #{a['continues']}"
         elif t == "task_update" and _int(a.get("id")) in owners:
-            changed = [f for f in PLAN_FIELDS if a.get(f) not in (None, "")]
-            if changed:
+            if changed := _changed(db, a, before):
                 return f"task_update #{a['id']} changes {', '.join(changed)}"
         elif t == "obligation" and str(a.get("key") or "").strip() == key:
             new = {x for x in (_int(v) for v in a.get("owners") or []) if x is not None
@@ -116,7 +163,8 @@ def plan_change(db, o: dict, actions: list, skip=(), since: float | None = None)
     return None
 
 
-def batch_plans(db, actions: list, skip=(), now: float | None = None, since: float | None = None) -> dict[str, str]:
+def batch_plans(db, actions: list, skip=(), now: float | None = None, since: float | None = None,
+                before: dict[int, dict] | None = None) -> dict[str, str]:
     """{obligation id: plan change} for each open, missed promise this batch re-plans."""
     from . import obligations
     now = time.time() if now is None else now
@@ -124,7 +172,7 @@ def batch_plans(db, actions: list, skip=(), now: float | None = None, since: flo
     for o in obligations.items(db):
         pr = o.get("promise")
         if pr and obligations._open(o) and (missed(pr, now) or pr.get("misses")):
-            if plan := plan_change(db, o, actions, skip, since):
+            if plan := plan_change(db, o, actions, skip, since, before):
                 out[o["id"]] = plan
     return out
 

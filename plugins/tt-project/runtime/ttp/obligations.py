@@ -1639,6 +1639,12 @@ def _owners_known(db, tids) -> list[int]:
     return ids
 
 
+def open_order(db, message: int) -> dict | None:
+    """The open obligation recorded for the order user message `message` carries, if any."""
+    return next((x for x in _load(db)["items"].values()
+                 if _open(x) and (x.get("promise") or {}).get("order") == int(message)), None)
+
+
 def add_order(p, text: str, message: int, owners=(), due=None, start_by=None, action_class: str | None = None,
               chat: str | None = None, now: float | None = None) -> str:
     """Record the order user message `message` carries, or update the open one recorded for it. Returns

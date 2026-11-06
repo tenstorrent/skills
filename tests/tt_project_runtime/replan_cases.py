@@ -186,3 +186,68 @@ def test_replan_order_resent_with_a_new_due_after_a_miss_needs_a_new_owner(env, 
     assert coord.apply(p, [{**act, "owners": [other]}]) == []
     pr = ob.get(p.db, oid)["promise"]
     assert pr["due"] == now + 7200 and pr["moves"][-1]["plan"] == f"new owner #{other}"
+
+
+def test_replan_user_asked_move_needs_a_newer_message_in_its_chat(env, monkeypatch):
+    """`message` carries a missed move only when the user wrote it in the promise's chat after its due was
+    set: an older message, the order's own message and one from another chat are refused, saying why."""
+    from ttp import coordinator as coord, obligations as ob
+    p, ob, oid, tid, other, late = _rp_setup(env, monkeypatch)
+    due = ob.get(p.db, oid)["promise"]["due"]
+    old = p.db.post("in", "hello, unrelated", chat="c1")
+    elsewhere = p.db.post("in", "push it to tomorrow", chat="c2")
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (late - 10 * 86400, old))
+    for mid, why in ((old, "came before its current due was set"), (elsewhere, "not the promise's chat")):
+        out = coord.apply(p, [{"type": "obligation", "key": oid, "due": late + 3600, "message": mid}])
+        assert any("a new time alone is refused" in n and why in n for n in out), (mid, out)
+        assert ob.get(p.db, oid)["promise"]["due"] == due
+    newer = p.db.post("in", "move it to tomorrow morning, no rush", chat="c1")
+    assert coord.apply(p, [{"type": "obligation", "key": oid, "due": late + 3600, "message": newer}]) == []
+    assert ob.get(p.db, oid)["promise"]["moves"][-1]["user"] == newer
+    # An order's own message came before the due it set.
+    now = time.time()
+    t2 = p.db.add_task("build it", "s", kind="code", priority=2, reply_chat="c1")
+    mid = p.db.post("in", "please build it", chat="c1")
+    o2 = ob.add_order(p, "build it", mid, [t2], due=now + 600, action_class="change", now=now).split()[1]
+    monkeypatch.setattr(time, "time", lambda: now + 1200)
+    out = coord.apply(p, [{"type": "obligation", "key": o2, "due": now + 7200, "message": mid}])
+    assert any("came before its current due was set" in n for n in out), out
+    assert ob.get(p.db, o2)["promise"]["due"] == now + 600
+
+
+def test_replan_same_value_task_update_is_no_plan_change(env, monkeypatch):
+    """A task_update setting an owner's field to the value it already has changes no plan: the missed move
+    is refused; a real change in the same field lets it through."""
+    from ttp import coordinator as coord
+    p, ob, oid, tid, other, late = _rp_setup(env, monkeypatch)
+    due = ob.get(p.db, oid)["promise"]["due"]
+    spec = p.db.task(tid)["spec"]
+    for same in ({"priority": 2}, {"spec": spec}, {"priority": 2, "spec": spec}):
+        out = coord.apply(p, [{"type": "task_update", "id": tid, **same},
+                              {"type": "obligation", "key": oid, "due": late + 3600}])
+        assert any("a new time alone is refused" in n for n in out), (same, out)
+        assert ob.get(p.db, oid)["promise"]["due"] == due
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1},
+                           {"type": "obligation", "key": oid, "due": late + 3600}]) == []
+    assert ob.get(p.db, oid)["promise"]["moves"][-1]["plan"] == f"task_update #{tid} changes priority"
+
+
+def test_replan_order_resent_takes_the_batchs_plan_change(env, monkeypatch):
+    """A re-sent missed order's new due follows the key+due rule: an owner's task_update in the same batch
+    (which its refusal names) lets it through; nothing, or a same-value update, is refused."""
+    from ttp import coordinator as coord, obligations as ob
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("build it", "s", kind="code", priority=2, reply_chat="c1")
+    mid = p.db.post("in", "please build it", chat="c1")
+    oid = ob.add_order(p, "build it", mid, [tid], due=now + 600, action_class="change", now=now).split()[1]
+    monkeypatch.setattr(time, "time", lambda: now + 1200)
+    act = {"type": "obligation", "order": mid, "text": "build it", "action_class": "change", "due": now + 7200}
+    for extra in ([], [{"type": "task_update", "id": tid, "priority": 2}]):
+        out = coord.apply(p, [*extra, act])
+        assert any("a new time alone is refused" in n for n in out), (extra, out)
+        assert ob.get(p.db, oid)["promise"]["due"] == now + 600
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1, "spec": "new approach: split it"}, act])
+    assert out == [], out
+    pr = ob.get(p.db, oid)["promise"]
+    assert pr["due"] == now + 7200 and pr["moves"][-1]["plan"].startswith(f"task_update #{tid} changes")

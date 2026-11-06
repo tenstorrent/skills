@@ -2407,8 +2407,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
         except (TypeError, ValueError):
             pass   # the action itself is refused with its reason when it is applied
     failed: set[int] = set()   # indexes of refused actions (causefix: a refused fix is no fix)
-    due_moves: list[tuple[int, dict, str]] = []   # (index, action, key) of `obligation` due moves
+    due_moves: list[tuple[int, dict, str, str | None]] = []   # (index, action, key, plan) of `obligation` due moves
     started = time.time()   # an obligation owner attached from now on is this batch's (replan)
+    plan_before = replan.snapshot(db, [a for _, a in order])   # owners' plan fields before the batch
     for k, (i, a) in enumerate(order):
         t = a.get("type")
         key = f"{turn}.{i}" if turn is not None else None
@@ -3650,9 +3651,15 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             elif t == "obligation":
                 oid, owners = str(a.get("key") or "").strip(), [int(x) for x in a.get("owners") or []]
                 if a.get("order") is not None and not oid:   # the order a user message carries
+                    had = obligations.open_order(db, int(a["order"]))
+                    move = had is not None and a.get("due") not in (None, "") \
+                        and obligations._when(a["due"], "order due") != had["promise"]["due"]
+                    new = sorted(set(owners) - set(obligations._owner_ids(had))) if move else []
                     notes.append(obligations.add_order(p, str(a.get("text") or ""), int(a["order"]), owners,
-                                                       due=a.get("due"), start_by=a.get("start_by"),
+                                                       due=None if move else a.get("due"), start_by=a.get("start_by"),
                                                        action_class=a.get("action_class")))
+                    if move:   # a re-sent order's new due: after the batch, as `key`+`due` (replan)
+                        due_moves.append((i, a, had["id"], f"new owner #{', #'.join(map(str, new))}" if new else None))
                     fan_orders.append((None, int(a["order"]), a.get("supersedes") or []))
                 elif a.get("order") is not None:   # `key` stands for the order the message carries
                     with db.tx():
@@ -3663,7 +3670,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     fan_orders.append((oid, int(a["order"]), a.get("supersedes") or []))
                 elif a.get("due") not in (None, "") and oid and not owners \
                         and not any(str(a.get(f) or "").strip() for f in ("evidence", "why")):
-                    due_moves.append((i, a, oid))   # after the batch: a missed one needs its plan change (replan)
+                    due_moves.append((i, a, oid, None))   # after the batch: a missed one needs its plan change (replan)
                 elif not oid:
                     oid = obligations.add(p, str(a.get("text") or ""), owners, by="coordinator",
                                           milestones=a.get("milestones") or [])
@@ -3759,7 +3766,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 _charter_retry_now(p, a, str(e), key, announced, filled=(filled[0], why) if filled else None)
             if t == "config_set" and a.get("key"):
                 cfg_refused[str(a["key"])] = str(e)
-    plans = _apply_due_moves(p, actions, due_moves, failed, problems, notes, started)
+    plans = _apply_due_moves(p, actions, due_moves, failed, problems, notes, started, plan_before)
     for k, before, upd in new_ask_holds:
         ask = next((mid for at, mid in turn_asks if at > k), None)
         now_labels = json.loads((db.task(before["id"]) or before)["labels"] or "[]")
@@ -7117,13 +7124,15 @@ def _users_withdrawal(p: Project, name: str, user_turn: bool, why: str | None,
 
 
 def _apply_due_moves(p: Project, actions: list, moves: list, failed: set, problems: list, notes: list,
-                     since: float) -> dict:
-    """Apply the batch's `obligation` due moves once the rest of it went through: one past its due needs a
-    plan change of this batch or the user's message (`message`), else it is refused (replan.py). Returns
-    the batch's plan changes by obligation id, for the reply check (record_promises). `since`: when the
-    batch started applying (an owner attached since is a new one)."""
-    plans = replan.batch_plans(p.db, actions, failed, since=since)
-    for i, a, oid in moves:
+                     since: float, before: dict | None = None) -> dict:
+    """Apply the batch's `obligation` due moves (a re-sent order's new due too) once the rest of it went
+    through: one past its due needs a plan change of this batch (or the move's own: a re-sent order's new
+    owner) or the user's message (`message`) in its chat after its due was set, else it is refused
+    (replan.py). Returns the batch's plan changes by obligation id, for the reply check (record_promises).
+    `since`: when the batch started applying (an owner attached since is a new one); `before`: owners'
+    plan fields before it (replan.snapshot)."""
+    plans = replan.batch_plans(p.db, actions, failed, since=since, before=before)
+    for i, a, oid, own in moves:
         try:
             user = None
             if a.get("message") not in (None, ""):
@@ -7131,8 +7140,12 @@ def _apply_due_moves(p: Project, actions: list, moves: list, failed: set, proble
                 if not _users_own(p.db, [mid]):
                     raise ValueError(f"`message` #{mid} is not a message the user wrote: cite the user's own "
                                      f"message that asks for the new time")
+                o = obligations.get(p.db, oid)
+                if o and o.get("promise") and replan.missed(o["promise"], time.time()) \
+                        and (why := replan.user_asked(p.db, o, mid)):
+                    raise ValueError(f"{replan.refusal(o, timefmt.long(o['promise']['due'], p))} Not `message`: {why}.")
                 user = mid
-            notes.append(obligations.set_due(p, oid, a["due"], plan=plans.get(oid), user=user))
+            notes.append(obligations.set_due(p, oid, a["due"], plan=plans.get(oid) or own, user=user))
             if str(a.get("justify") or "").strip():
                 notes.append(eta.justify(p, oid, str(a["justify"])))
         except Exception as e:
