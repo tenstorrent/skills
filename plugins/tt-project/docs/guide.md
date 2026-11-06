@@ -1147,15 +1147,23 @@ uses to compare two models or efforts on this project's own work. `--since` is t
 compared models' release dates, so neither saw the changes. It keeps done code and work tasks created
 since then whose change landed through one push queue row and adds or changes tests; their landed
 tests are held out as graders. It excludes, with the reason, a task whose spec quotes 3 or more lines
-of the fix, whose held-out tests use a repository symbol the base lacks and the spec does not name, or
-whose landing range on the push branch is unclear (a fast-forward, a squash, several pushes). A task
-whose spec says its branch starts from another task's branch (a review fix) is replayed from that
-parent's recorded head to its own branch head, so its workspace has the parent's work; it is excluded
-when the repository lacks that head or the head is not under its branch. Each kept task gets `<id>/workspace`, the base commit's tracked files in a fresh repository with one commit
-and no remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the
-manifest records its spec, base, landed commit, stratum (small up to 150 changed non-test lines, else
-large) and each held-out file's sha256, and `manifest.sha256` pins the manifest. The bench names no
-model.
+of the fix, whose held-out tests use a repository symbol the base lacks and the spec does not name
+(`from m import x`, `import a.b` and attribute chains on either), or whose landing range on the push
+branch is unclear (a fast-forward, a squash, several pushes); a review or fix task that pushed the
+change counts as its landing. A task whose spec says its branch starts from another task's branch (a
+review fix) is replayed from that parent's recorded head to its own branch head, so its workspace has
+the parent's work; it is excluded when the repository lacks that head or the head is not under its
+branch. Every test file the change adds or changes is held out, and only the
+held-out tests are scanned. Then it validates each test the change adds: it runs them, with the
+head's test files in place, on a copy of the base (each must fail) and of the landed head (each must
+pass all 3 runs), inside `ttp sandbox`, and keeps only those fail-to-pass tests; a task with none is
+excluded with the reason. `--test-cmd` sets the pytest command (one plain pytest run, default
+`python3 -m pytest -q -p no:cacheprovider`) and `--no-validate` skips this step. Each kept task gets
+`<id>/workspace`, the base commit's tracked files in a fresh repository with one commit and no
+remotes, tags or reflog, and `<id>/heldout`, the landed copy of its held-out test files; the manifest
+records its spec, base, landed commit, stratum (small up to 150 changed non-test lines, else large),
+its graded tests and each held-out file's sha256, plus `validated`, the test command and rounds, and
+`manifest.sha256` pins the manifest. The bench names no model.
 
 `ttp bench run --bench <dir> --out <dir>` then runs a head-to-head of two or more model arms on it.
 An arm is a provider, model and effort: `bench.arms` in the project's config
