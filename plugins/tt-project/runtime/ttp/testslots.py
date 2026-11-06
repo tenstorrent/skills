@@ -723,11 +723,13 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                 passed = passed.close()
             if stop and (why := stop()):
                 raise checkcap.Cancelled(why)
-            if wait_s is not None and waited >= wait_s:
-                return None
+            # Told before giving up too: a caller whose wait ends on this try (a slow one, or wait_s 0)
+            # still learns why it got no slots.
             if not told or time.time() - told >= TELL_S:
                 told = time.time()
                 tell(f"waiting for a host-wide {kind.name} slot: {why} ({checkcap._some(locks.held_labels(ps))})")
+            if wait_s is not None and waited >= wait_s:
+                return None
             time.sleep(poll_s(POLL_S))
     finally:
         guard and guard.close()

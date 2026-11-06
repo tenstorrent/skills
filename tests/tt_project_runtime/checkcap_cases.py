@@ -6212,6 +6212,30 @@ def test_a_project_s_concurrent_suites_share_its_worker_ceiling_and_its_push_lan
         g.close()
 
 
+def test_a_run_that_gets_no_test_slots_within_its_wait_is_told_why_even_on_its_first_try(env, monkeypatch):
+    """acquire() tells why before it gives up: with wait_s 0, or a first try slower than wait_s (a loaded
+    host), the caller still learns what holds its slots, not None alone."""
+    from ttp import project, testslots
+    _slot_sizes(monkeypatch, 32, 8, TTP_TEST_PROJECT_WORKERS=4)
+    a = testslots.acquire("a", project_name="pa", wait_s=0)
+    assert a and a.k == 4
+    try:
+        told = []
+        assert testslots.acquire("a2", told.append, project_name="pa", wait_s=0) is None
+        assert any("checks.test_project_workers" in t for t in told), told
+        cycle = project.ps_cycle
+        monkeypatch.setattr(project, "ps_cycle", lambda: (time.sleep(0.3), cycle())[1])
+        told = []
+        assert testslots.acquire("a3", told.append, project_name="pa", wait_s=0.2) is None
+        assert any("checks.test_project_workers" in t for t in told), told
+        told = []
+        b = testslots.acquire("b", told.append, project_name="pb", wait_s=0.2)
+        assert b and b.k == 4 and not any(t.startswith("waiting") for t in told), told
+        b.close()
+    finally:
+        a.close()
+
+
 def test_a_project_can_set_its_own_test_run_max(env):
     from ttp import project, testslots
     p = make(env)
