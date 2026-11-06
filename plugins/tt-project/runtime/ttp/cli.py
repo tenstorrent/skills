@@ -12137,7 +12137,7 @@ TASK_TIERS = ("light", "standard", "deep")                              # as cha
 COMMAND_GROUPS = (
     ("everyday", ("new", "connect", "web", "status", "say", "listen", "list", "overview", "find", "task",
                   "memory", "obligation", "config", "pause", "resume", "drain", "alerts", "issues", "mute",
-                  "machines", "runs", "logs", "doctor")),
+                  "quarantine", "machines", "runs", "logs", "doctor")),
     ("inside a run", ("note", "steer", "notify", "progress", "checks", "checks-shard", "checks-yield", "lock",
                       "host-run", "detach", "devq", "push", "land", "clip", "sandbox", "pool-wait", "pool-admit",
                       "pool-shard", "skill", "killscan", "svcscan", "leftover-procs", "said", "hostcheck")),
@@ -12891,7 +12891,7 @@ def main(argv: list[str] | None = None) -> None:
 
     s = sub.add_parser("quarantine", help="list the tests the tests gate quarantined as flaky (and the last day's "
                                           "lifts), or lift one by hand with --why (logged)")
-    s.add_argument("action", choices=["list", "lift"])
+    s.add_argument("action", choices=["list", "lift"], help="list the quarantine, or lift one test from it")
     s.add_argument("test_id", nargs="?", help="lift: the pytest id, as `ttp quarantine list` shows it")
     s.add_argument("--why", help="lift: why it may go (a fix landed, the test was removed, ...)")
     s.set_defaults(fn=cmd_quarantine)
