@@ -3044,7 +3044,9 @@ def test_no_local_logs_leave_the_estimate_unknown_and_the_gate_alone(env, tmp_pa
     day = __import__("ttp.globalcap", fromlist=["day_bounds"]).day_bounds(b, now) or (now - 86400, now)
     assert ls.estimate(b, day[0], day[1], now) is None
     assert ls.source("claude", "", now - 60, now) == (0.0, ls.source("claude", "", now - 60, now)[1], "usage")
-    assert "unknown" in ls.source("claude", "", now - 60, now)[1] and ls.source("codex", "", 0, now)[:2] == (0.0, "")
+    assert "unknown" in ls.source("claude", "", now - 60, now)[1]
+    cx = ls.source("codex", "", 0, now)
+    assert cx[0] == 0.0 and "other Codex sessions on this machine (unknown" in cx[1], cx
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
     assert g.level == "green" and g.numbers["global_today"] == 0, (g.level, g.reasons, g.numbers)
     assert "other Claude Code sessions on this machine (unknown" in g.numbers["global_includes"]
