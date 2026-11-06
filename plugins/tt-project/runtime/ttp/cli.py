@@ -5156,7 +5156,7 @@ def _checks_judge_base(p: Project, top: str, head: str, base: str) -> tuple[str,
     from . import worktree
 
     def git(*args: str):
-        return subprocess.run(["git", "-C", top, *args], capture_output=True, text=True)
+        return gitmemo.run(["git", "-C", top, *args], capture_output=True, text=True)
 
     def mb(ref: str) -> str:
         r = git("merge-base", ref, head)
