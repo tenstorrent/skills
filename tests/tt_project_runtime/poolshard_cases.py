@@ -34,8 +34,11 @@ def _shard_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
-    st = pathlib.Path(f"/proc/{pid}/stat")
-    return not (st.exists() and st.read_text().rsplit(")", 1)[1].split()[0] == "Z")
+    try:
+        st = pathlib.Path(f"/proc/{pid}/stat").read_text()
+    except OSError:   # gone between the kill probe and the read
+        return False
+    return st.rsplit(")", 1)[1].split()[0] != "Z"
 
 
 def test_pool_shard_with_no_file_progress_is_ended_its_job_cancelled_and_its_files_rerun_on_the_next_pool(

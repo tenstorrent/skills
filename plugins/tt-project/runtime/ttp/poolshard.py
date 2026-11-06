@@ -208,7 +208,7 @@ def attempt(cmd: list[str], pool: str, shard: str, win: float, done: re.Pattern,
     wait = checkwait.begin(f"pool shard {shard} on {pool} before its first file", pool=True)
     lines: queue.Queue = queue.Queue()
     proc = None
-    try:
+    try:   # own session: a stalled shard is ended whole (its process group), batch-job client included
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, env=env,
                                 stdin=subprocess.DEVNULL, start_new_session=True)
 
