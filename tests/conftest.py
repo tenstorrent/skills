@@ -195,8 +195,8 @@ def credential_marks(before: dict | None = None):
         return None
 
 
-# The account's ssh folder and gh's config folder, whole: each regular file's size, mtime and sha256
-# (compared, never printed), so a session fails when a test wrote any file there. ssh and ssh-keygen find
+# The account's ssh folder and gh's config folder, whole: each regular file's size, mtime, ctime and inode
+# (stat only: no file there is ever opened or read), so a session fails when a test wrote any file there. ssh and ssh-keygen find
 # ~/.ssh from the account's passwd entry, not HOME: a test passes them -f/-F/-o UserKnownHostsFile under its
 # temp folder. known_hosts files and sockets are left out: the account's own ssh sessions change them
 # while a suite runs.
@@ -208,8 +208,8 @@ def secret_folders(env=None) -> list[str]:
 
 
 def folder_marks(folders) -> dict[str, tuple]:
-    """{path: (size, mtime_ns, sha256)} of each regular file under `folders`."""
-    import hashlib
+    """{path: (size, mtime_ns, ctime_ns, inode)} of each regular file under `folders`, by lstat alone:
+    private keys and gh's token are never opened or read."""
     import stat
     marks: dict[str, tuple] = {}
     for top in folders:
@@ -219,16 +219,11 @@ def folder_marks(folders) -> dict[str, tuple]:
                     continue
                 path = os.path.join(root, name)
                 try:
-                    with open(path, "rb", opener=lambda f, fl: os.open(f, fl | os.O_NOFOLLOW | os.O_NONBLOCK)) as fh:
-                        st = os.fstat(fh.fileno())
-                        if not stat.S_ISREG(st.st_mode):
-                            continue
-                        digest = hashlib.sha256()
-                        for chunk in iter(lambda: fh.read(1 << 20), b""):
-                            digest.update(chunk)
-                        marks[path] = (st.st_size, st.st_mtime_ns, digest.hexdigest())
+                    st = os.lstat(path)
                 except OSError:
                     continue
+                if stat.S_ISREG(st.st_mode):
+                    marks[path] = (st.st_size, st.st_mtime_ns, st.st_ctime_ns, st.st_ino)
     return marks
 
 

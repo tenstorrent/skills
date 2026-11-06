@@ -1431,6 +1431,42 @@ def _test_conftest():
     return mod
 
 
+def test_ssh_and_gh_folder_marks_stat_only_and_open_no_file(tmp_path, monkeypatch):
+    """The session's check of the account's ssh and gh config folders never opens or reads a file there
+    (private keys, gh's token): it marks each regular file by lstat alone, and still sees a same-size
+    rewrite whose mtime was put back (ctime), a new file and a removed one."""
+    import builtins
+    import io
+    c = _test_conftest()
+    ssh, gh = tmp_path / ".ssh", tmp_path / "gh"
+    (ssh / "sub").mkdir(parents=True)
+    gh.mkdir()
+    (ssh / "id_ed25519").write_text("key\n")
+    (ssh / "sub" / "id_rsa").write_text("rsa\n")
+    (ssh / "known_hosts").write_text("h k\n")
+    (ssh / "link").symlink_to(ssh / "id_ed25519")
+    (gh / "hosts.yml").write_text("oauth_token: x\n")
+
+    def refuse(*a, **k):
+        raise AssertionError(f"folder_marks opened {a[:1]}")
+    for mod, name in ((builtins, "open"), (io, "open"), (os, "open"), (os, "fdopen"), (pathlib.Path, "open")):
+        monkeypatch.setattr(mod, name, refuse)
+    before = c.folder_marks([str(ssh), str(gh)])
+    monkeypatch.undo()
+    assert sorted(before) == sorted(map(str, (ssh / "id_ed25519", ssh / "sub" / "id_rsa", gh / "hosts.yml")))
+    import time
+    time.sleep(0.05)   # past the kernel's coarse ctime tick
+    key = ssh / "id_ed25519"
+    st = key.stat()
+    key.write_text("KEY\n")   # same size, mtime put back: only ctime tells
+    os.utime(key, ns=(st.st_atime_ns, st.st_mtime_ns))
+    (gh / "hosts.yml").unlink()
+    (ssh / "id_new").write_text("x\n")
+    after = c.folder_marks([str(ssh), str(gh)])
+    assert c.folder_changes(before, after) == sorted([f"  {gh}/hosts.yml: removed", f"  {key}: changed",
+                                                       f"  {ssh}/id_new: created"])
+
+
 @pytest.mark.parametrize("cpus,env,jobs", [
     (1, {}, 1), (2, {}, 1), (3, {}, 1), (6, {}, 3), (8, {}, 4), (14, {}, 4), (64, {}, 4),
     (14, {"CI": "false"}, 4), (14, {"CI": ""}, 4),
