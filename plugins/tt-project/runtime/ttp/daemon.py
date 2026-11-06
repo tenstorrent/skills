@@ -4351,8 +4351,8 @@ class Daemon:
                     log(p, f"run {r['id']} of task {r['task']}: {held}")
                 return
         run_dir = self._run_dir(r)
-        if r["role"] == "coordinator" and not self._lean_reap:
-            self._coord_writes(r, run_dir)   # before its output is applied
+        if r["role"] == "coordinator":
+            self._coord_writes(r, run_dir, report=not self._lean_reap)   # before its output is applied
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
         try:   # the runner masks them too, unless it died first: before the output or hand-off is read
             redact.scrub_run(run_dir)
@@ -4709,16 +4709,19 @@ class Daemon:
             except Exception:
                 log(self.p, f"run {run_dir.name}: coordinator protected-file snapshot failed\n" + traceback.format_exc())
 
-    def _coord_writes(self, r: dict, run_dir: Path) -> None:
+    def _coord_writes(self, r: dict, run_dir: Path, report: bool = True) -> None:
         """Logs a warning when a coordinator turn changed files in the harness folder or the repo
-        checkout (coordwrites): no model call, no alert; the turn's end stands. First, on an agent without
-        ttp's tool hooks, the whole-wake protected-file guard (coordtools.wake_guard) puts back and reports
-        a charter, memory or project.json change no ttp writer logged."""
+        checkout (coordwrites; skipped without `report`, on a lean reap): no model call, no alert; the
+        turn's end stands. First, always (a lean reap too), on an agent without ttp's tool hooks, the
+        whole-wake protected-file guard (coordtools.wake_guard) puts back and reports a charter, memory
+        or project.json change no ttp writer logged."""
         try:
             if notice := coordtools.wake_guard(run_dir, coordtools.protected_paths(self.p)):
                 log(self.p, f"run {r['id']}: {notice}")
         except Exception:
             log(self.p, f"run {r['id']}: coordinator protected-file guard failed\n" + traceback.format_exc())
+        if not report:
+            return
         try:
             if changed := coordwrites.changed(run_dir):
                 log(self.p, f"run {r['id']}: warning: coordinator turn changed files in {', '.join(changed)} "

@@ -107,6 +107,23 @@ def test_a_reap_cut_off_in_a_slow_step_is_retried_once_lean_and_applied_once(env
     assert "never finished" in (p.logs / "daemon.log").read_text()
 
 
+def test_a_lean_reap_of_a_coordinator_without_tool_hooks_still_runs_the_whole_wake_guard(env, tmp_path):
+    """An earlier daemon cut off before the wake guard: the lean retry still puts back a charter the
+    wake changed outside ttp's writers and records it; only the coordwrites report is skipped."""
+    from ttp import coordtools
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, [])
+    before = p.charter_path.read_text()
+    coordtools.wake_snapshot(tmp_path / "coord-run", coordtools.protected_paths(p))
+    p.charter_path.write_text(before + "\n- loosened\n")
+    p.db.set_kv(dm.REAP_KEY, {str(rid): {"pid": 1, "started": 0, "lean": False, "at": time.time()}})
+    dm.Daemon(p.base).reap_runs()
+    assert p.db.one("SELECT id FROM messages WHERE ref=?", (f"reap-lean:{rid}",)), "reaped lean"
+    assert p.charter_path.read_text() == before
+    assert p.db.q("SELECT id FROM events WHERE kind='coord_protected_write'")
+
+
 def test_a_lean_reap_cut_off_too_quarantines_the_run_instead_of_looping(env, tmp_path, monkeypatch):
     from ttp import coordinator as coord
     from ttp import daemon as dm
