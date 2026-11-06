@@ -4860,6 +4860,14 @@ def _git_out(top: str, *args: str) -> str:
         return ""
 
 
+def _landing_check(p) -> bool:
+    """Whether this `ttp checks` run lands work rather than tests a task: it runs for no task (a push batch's
+    check, the coordinator's or a user's) or under a verified landing mark. Such a run takes the project's
+    landing lane (testslots.landing_room) and never waits behind its task checks for the project cap."""
+    from . import landmark
+    return bool(p) and (not os.environ.get("TTP_TASK") or landmark.label() is not None)
+
+
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
                       done, prio, owns, cfg: dict, repo: str, cmds: list, what: str, top: str = "",
                       lock: str = "", restart: bool = False, yielder=None, moved=None, urgent: bool = False):
@@ -4936,6 +4944,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         if suite is None and (suite := hold(repo, lanes_now, lock=lock,
                                             cap=checklane.project_cap(cfg), cap_note=checklane.cap_note(cfg),
                                             worktree=top, headroom=checklane.headroom, pending=True, running=True,
+                                            landing=_landing_check(p),
                                             startable=lambda: testslots.pool_room(
                                                 cfg, p.name if p else None, priority=prio, since=arrived))) is None:
             if tree is not None:

@@ -1226,7 +1226,15 @@ def over_cap_room(project_name: str, cap: int) -> bool:
     """Whether a priority-1 waiter may take an overflow lane past the project's full cap of `cap`: the cap
     is full and no lane of the project (pending ones too) is already held past it ("over_cap")."""
     return (cap > 0 and len(project_held(project_name)) >= cap
-            and not any(r.get("over_cap") for r in locks.holder_records(lane_paths(project_name, repo=None))))
+            and not any(r.get("over_cap") and not r.get("landing")
+                        for r in locks.holder_records(lane_paths(project_name, repo=None))))
+
+
+def landing_room(project_name: str) -> bool:
+    """Whether a landing check (task-less or under a landing mark) may take the project's landing lane:
+    no lane of the project is held as one ("landing") already. It skips the project's lanes and cap."""
+    return bool(project_name) and not any(
+        r.get("landing") for r in locks.holder_records(lane_paths(project_name, repo=None)))
 
 
 def _reclaim(path, tell, state) -> bool:
@@ -1336,7 +1344,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                cap_note: str = "", worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
                repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None,
-               running: bool = False) -> Grant | None:
+               running: bool = False, landing: bool = False) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -1477,6 +1485,14 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                     if over:   # one priority-1 run at a time past the project's full cap
                         f = locks.try_take(extra_lanes, label, what,
                                            extra={**fields, "overflow": True, "over_cap": True, "urgent": True})
+                    if f is None and landing and landing_room(project_name):
+                        # A landing check (a push batch's or another task-less one) never waits behind the
+                        # project's task checks: one at a time takes its own lane past the lanes and the cap.
+                        f = locks.try_take(extra_lanes, label, what,
+                                           extra={**fields, "overflow": True, "over_cap": True, "landing": True})
+                        if f is not None and tell:
+                            tell("took the project's landing lane: a task-less or landing check never waits "
+                                 "behind its task checks (the host-wide cap still applies)")
                     if f is not None and (cheaper or urgent) and "-x." in os.path.basename(f.name):
                         held_by = "; ".join(checklane.holder_text(r, time.time()) for r in pool[:3])
                         if tell and cheaper:

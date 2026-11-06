@@ -5280,6 +5280,41 @@ def test_a_p1_check_takes_one_lane_past_a_cap_full_of_routine_runs_only_with_hea
             g and g.close()
 
 
+def test_a_landing_check_never_waits_behind_task_checks_on_the_project_cap(env, monkeypatch):
+    # The project's cap of 2 is full of task runs and the repository's lane is held. A task-less landing
+    # check (a push batch's or another landing one) starts at once on the landing lane, without headroom
+    # or priority; a second landing check waits while it is held; a priority-1 run keeps its own over-cap
+    # lane beside it; an ordinary run still waits. Only a task-less run or one under a landing mark lands.
+    from ttp import cli, locks, testslots
+    _lane_env(monkeypatch)
+    hold = [testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, priority=2, worktree="/w/a", wait_s=0),
+            testslots.suite_hold("pa", repo=_REPO_B, slots=1, cap=2, priority=2, worktree="/w/b", wait_s=0)]
+    try:
+        assert all(g and g.files for g in hold) and len(testslots.project_held("pa")) == 2
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0) is None, "an ordinary run waits"
+        told = []
+        land = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0, landing=True, tell=told.append)
+        assert land and "-x." in land.files[0].name, "a landing check starts at once past the lanes and the cap"
+        rec, = [r for r in locks.holder_records(testslots.lane_paths("pa", repo=None)) if r.get("landing")]
+        assert rec["over_cap"] is True and any("landing lane" in x for x in told), told
+        assert testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, wait_s=0, landing=True) is None, \
+            "one landing lane per project at a time"
+        p1 = testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, priority=1, wait_s=0,
+                                  worktree="/w/c", headroom=lambda: True)
+        assert p1 and "-x." in p1.files[0].name, "a priority-1 run keeps its own over-cap lane beside it"
+        p1.close()
+        land.close()
+    finally:
+        for g in hold:
+            g and g.close()
+    import types
+    proj = types.SimpleNamespace(name="pa")
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    assert cli._landing_check(proj) and not cli._landing_check(None)
+    monkeypatch.setenv("TTP_TASK", "12")
+    assert not cli._landing_check(proj), "a task's own checks queue under the cap as before"
+
+
 def test_cap_turn_counts_one_lane_for_the_old_unkeyed_base(env, monkeypatch):
     # The old one-slot base ('test-suite.<gid>', no repository key) has one lane: with it held, its aged
     # waiter cannot start and must not take the cap's last room from a repository waiter with a free lane.
