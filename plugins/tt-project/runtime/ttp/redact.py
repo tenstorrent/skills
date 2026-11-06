@@ -14,7 +14,7 @@ becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for eve
   and the daemon again before it reads the hand-off);
 - text sent to a helper model or service (Jev, Slack) and endpoint client errors.
 
-Every private-key block (PEM `-----BEGIN <type> PRIVATE KEY-----` to its END line, PGP PRIVATE KEY
+Every private-key block (PEM, from its `BEGIN <type> PRIVATE KEY` line to its END line, PGP PRIVATE KEY
 BLOCK) becomes KEY_MASK the same way, stored or not, raw or JSON-escaped; one cut off before its END
 line (a lone BEGIN line too) is masked to the end of its string (the first character a key body never
 holds, such as the quote closing a JSON string), so JSONL stays valid; a lone END line is masked with
