@@ -19676,7 +19676,7 @@ if m.get("outcome") is None:
         sys.exit(3)
     rows = plan.get("rows") or {}
     write(outcome=plan.get("outcome", "pushed"), tip=plan.get("tip"), pushed_sha=plan.get("sha"),
-          version=plan.get("version"), checks={"runs": 1, "seconds": 2.0}, rounds=1, message=plan.get("message"),
+          version=plan.get("version"), checks=plan.get("checks") or {"runs": 1, "seconds": 2.0}, rounds=1, message=plan.get("message"),
           **({"tip_check": plan["tip_check"]} if "tip_check" in plan else {}),
           **({"tip_passed": True} if plan.get("tip_passed") else {}),
           **({"fast_forward": plan["ff"]} if "ff" in plan else {}),

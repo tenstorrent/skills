@@ -1878,9 +1878,11 @@ class Batch:
             if hit := pushpass.passed(self.p, tree, str(cmd), eid):
                 say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
                 self.checks["reused"] = self.checks.get("reused", 0) + 1
+                self._passed(cmd)
             elif carried := self._carried(head, cmd, parts):
                 say(f"{carried}: {cmd}")
                 self.checks.setdefault("carried", []).append(f"{carried}: {cmd}")
+                self._passed(cmd)
                 if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or "", carried):
                     say(f"could not record the pass of {cmd}: {why}")
             else:
@@ -1918,8 +1920,10 @@ class Batch:
                     if self._flaky(head, cmd, rc, tail, env, slot.env()):
                         if resume:
                             resume.unlink(missing_ok=True)
+                        self._passed(cmd)
                         continue
                     return cmd, tail
+                self._passed(cmd)
                 if why := pushpass.record(self.p, tree, str(cmd), eid, self.id, parts, head, self.tip or ""):
                     say(f"could not record the pass of {cmd}: {why}")
                 if resume:
@@ -1935,6 +1939,11 @@ class Batch:
         except Exception as e:   # a cost note never fails a batch
             say(f"suite cost not recorded: {e}")
         return None
+
+    def _passed(self, cmd) -> None:
+        """Note a check that passed (ran, reused or carried) in checks.passed: its script_torn count clears (pushq)."""
+        if str(cmd) not in self.checks.setdefault("passed", []):
+            self.checks["passed"].append(str(cmd))
 
     def _run_check(self, cmd, run_env: dict, env: dict) -> tuple[int | None, str]:
         """Run one check in the worktree: (exit code, output tail). A failure whose only failures are lost

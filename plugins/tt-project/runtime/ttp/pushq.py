@@ -9,6 +9,7 @@ Rows in push_queue are the source of truth; each batch has a push_batches row an
 state/pushes/. A review task waits in the status `pushing` while its rows are in the queue."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -84,6 +85,9 @@ HOLD_S = 1800                   # after tip_failed, approvals already tried on t
 TIP_FAILS = 2                   # tip_failed batches in a row on one tip before it is known bad: alerted, never checked alone
 BAD_TIP_RETRY_S = 6 * 3600      # a known-bad tip with nothing new to try: the tried approvals run again after this
 BAD_TIP_ALERT = "push_tip_failing"   # the keyed alert while the push branch tip is known bad (alerts.holds)
+TORN_ALERT = "push_script_torn"   # keyed per check (torn_key) while its batches keep being held script_torn (alerts.holds)
+DEFAULT_TORN_AFTER = 3          # delivery.push_script_torn_escalate_after: script_torn holds of one check in a row before it (0 = off)
+TORN_RUNS = 10                  # batch ids kept per check
 BACKOFF_STEP_S = 300            # a dead batch's rows wait 5 min per try ...
 BACKOFF_MAX_S = 1800            # ... and at most 30 min
 DYING_AFTER = 3                 # batches that die in a row before push_queue_dying is raised
@@ -228,6 +232,48 @@ def _event(db, task: dict | None, kind: str, text: str, queued: bool, severity: 
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), f"task:{task['id']}" if task else "daemon", kind, severity, text[:6000],
           "queued" if queued else "handled", task["id"] if task else None))
+
+
+def torn_key(check: str) -> str:
+    """The TORN_ALERT key of one check command."""
+    return f"{TORN_ALERT}:{hashlib.sha1(check.encode()).hexdigest()[:12]}"
+
+
+def _torn_told(p: Project, st: dict, b: dict, m: dict, now: float) -> list[tuple]:
+    """Count the batch's script_torn hold (batch: a check failing twice on a transient syntax error outside the
+    change) per check in st["torn"]; the delivery.push_script_torn_escalate_after-th in a row of one check
+    returns its TORN_ALERT, once until it clears. A check the batch passed (checks.passed), or a pushed batch,
+    clears its count and so the alert (alerts.holds). Another check's hold neither counts nor clears it."""
+    checks = m.get("checks") if isinstance(m.get("checks"), dict) else {}
+    passed = {str(c) for c in checks.get("passed") or []}
+    outcome = str(m.get("outcome"))
+    torn = {k: v for k, v in (st.get("torn") or {}).items()
+            if isinstance(v, dict) and outcome != "pushed" and k not in passed}
+    later = []
+    held = checks.get("script_torn") if outcome == "script_torn" else None
+    if isinstance(held, dict) and held.get("check"):
+        cmd, prev = str(held["check"]), torn.get(str(held["check"])) or {}
+        scripts = list(dict.fromkeys([*map(str, held.get("scripts") or []), *(prev.get("scripts") or [])]))[:10]
+        rec = {"key": torn_key(cmd), "n": int(prev.get("n") or 0) + 1, "runs": [*(prev.get("runs") or []), b["id"]][-TORN_RUNS:],
+               "scripts": scripts, "since": prev.get("since") or now, "alerted": bool(prev.get("alerted"))}
+        torn[cmd] = rec
+        after = int(_num(_delivery(p).get("push_script_torn_escalate_after"), DEFAULT_TORN_AFTER, int, 0))
+        if after and rec["n"] >= after and not rec["alerted"]:
+            rec["alerted"] = True
+            logs = p.state / "pushes"
+            later.append((rec["key"], f"Push batches to {b['target']} were held {rec['n']} times in a row because the "
+                                      f"check `{cmd}` failed twice on a transient syntax error in "
+                                      f"{', '.join(scripts) or 'a script'} outside the change: something rewrites "
+                                      f"{'that script' if len(scripts) == 1 else 'those scripts'} in place while the check "
+                                      f"runs. Batches {', '.join(map(str, rec['runs']))} (logs: {logs}/<batch>.log). The "
+                                      f"approvals stay queued and are retried every {syntaxfault.RETRY_S // 60} min; find "
+                                      f"what writes the script and make it rename a temp file into place. This clears "
+                                      f"once that check passes.", "high"))
+    if torn:
+        st["torn"] = torn
+    else:
+        st.pop("torn", None)
+    return later
 
 
 def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
@@ -1939,6 +1985,7 @@ def _apply(p: Project, b: dict, m: dict, alert: Callable, now: float) -> None:
             later.append(("push_rejected", f"The push queue's push to {b['target']} was rejected: "
                                            f"{str(m.get('message') or _tail_of(m, None, 5))[:1500]}. "
                                            f"The approvals stay queued and are retried in {BACKOFF_MAX_S // 60} min.", "high"))
+        later += _torn_told(p, st, b, m, now)
         db.set_kv(KV, st)
         later += _hold_scoped(p, b, m, now)
         for tid in dict.fromkeys(r["task"] for r in rows):

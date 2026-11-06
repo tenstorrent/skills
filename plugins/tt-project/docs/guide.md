@@ -1981,7 +1981,11 @@ running work is interrupted only by the preemption below:
   so a batch rerun after a reboot does not run them again), `push_landing_alert_h` (default 4:
   when approvals have waited this many hours with nothing landed on the push branch and at least
   two batches tried them, one high alert says so, with the attempt count and how many a host
-  reboot cut short; it clears when a batch lands; 0 = off), `after_push`
+  reboot cut short; it clears when a batch lands; 0 = off), `push_script_torn_escalate_after`
+  (default 3: when batches are held this many times in a row because one check failed twice on a
+  transient syntax error in a script outside the change, one high `push_script_torn` alert names the
+  check, the scripts and the batches; each check counts on its own, and the alert clears once that
+  check passes or a batch pushes; 0 = off), `after_push`
   (commands in the same form as `push_checks`, for example a deploy) and `after_push_timeout_s`
   (default 1800). A batch that ends without writing an outcome is retried with a growing pause,
   and three such batches in a row raise a high alert, unless the host rebooted while it ran: then

@@ -17739,3 +17739,69 @@ def test_a_detached_head_is_rescued_once_only_with_new_commits_and_only_for_its_
                             s.p.root)["branch"] == f"rescue/t{work}-{head[:12]}"
     # A failed hand-off keeps nothing on record.
     assert not _detached_finish(env, s, d, a, {"status": "failed", "summary": "no"}, wt)["branch"]
+
+
+def test_repeated_script_torn_holds_of_one_check_raise_one_alert_until_that_check_passes(env, monkeypatch):
+    """A batch held script_torn (a check failing twice on a transient syntax error outside the change) goes back to
+    the queue. Two holds of one check raise nothing; the third in a row raises one high alert naming the check,
+    the script and the batches. Another check counts on its own. A batch that passes the check clears its count
+    and the alert; a pushed batch clears every count."""
+    from ttp import alerts, pushq
+    s = _pq(env, monkeypatch)
+    db = s.p.db
+    _pq_hand_off(env, s)
+    a, b = "make test", "make lint"
+
+    def torn(cmd, script="/srv/h/run.sh"):
+        _pq_plan(s, outcome="script_torn", row="requeued",
+                 checks={"runs": 1, "seconds": 2.0, "script_torn": {"check": cmd, "scripts": [script]}})
+        bid = _pq_batch(s)
+        _pq_tend(s)
+        return bid
+
+    def ran(outcome, row, passed):
+        _pq_plan(s, outcome=outcome, row=row, checks={"runs": 1, "seconds": 2.0, "passed": passed})
+        _pq_batch(s)
+        _pq_tend(s)
+
+    alerted = lambda cmd: db.q("SELECT text FROM messages WHERE kind='alert' AND ref=?", (pushq.torn_key(cmd),))
+    count = lambda cmd: ((db.kv(pushq.KV) or {}).get("torn") or {}).get(cmd, {}).get("n", 0)
+    holds = lambda cmd: alerts.holds(db, pushq.torn_key(cmd), 0, time.time())
+    runs = [torn(a), torn(a)]
+    assert (count(a), alerted(a), holds(a)) == (2, [], False), "two holds raise nothing"
+    torn(b)   # another check: counted apart, never resets or raises the first
+    assert (count(a), count(b), alerted(b)) == (2, 1, [])
+    runs.append(torn(a, "/srv/h/other.sh"))
+    [msg] = alerted(a)
+    assert a in msg["text"] and "/srv/h/run.sh" in msg["text"] and "/srv/h/other.sh" in msg["text"], msg
+    assert all(str(r) in msg["text"] for r in runs) and holds(a) and not holds(b)
+    torn(a)
+    assert count(a) == 4 and len(alerted(a)) == 1, "one alert, not one per hold"
+    ran("moved", "requeued", [b])   # passing the other check clears only that one
+    assert (count(a), count(b), holds(a)) == (4, 0, True)
+    ran("moved", "requeued", [a])
+    assert (count(a), holds(a)) == (0, False), "a pass of the check clears it"
+    torn(a), torn(a)
+    assert count(a) == 2 and len(alerted(a)) == 1, "counting starts again after a pass"
+    torn(b)
+    ran("pushed", "pushed", [])
+    assert "torn" not in db.kv(pushq.KV), "a pushed batch clears every count"
+
+
+@pytest.mark.parametrize("after,holds,raised", [(1, 1, 1), (0, 4, 0)])
+def test_script_torn_escalation_follows_its_delivery_setting(env, monkeypatch, after, holds, raised):
+    """delivery.push_script_torn_escalate_after sets the holds in a row before the alert; 0 turns it off; a
+    value that is not a whole number >= 0 is refused."""
+    from ttp import coordinator, pushq
+    s = _pq(env, monkeypatch, push_script_torn_escalate_after=after)
+    _pq_hand_off(env, s)
+    for _ in range(holds):
+        _pq_plan(s, outcome="script_torn", row="requeued",
+                 checks={"runs": 1, "seconds": 2.0, "script_torn": {"check": "make test", "scripts": ["/x.sh"]}})
+        _pq_batch(s)
+        _pq_tend(s)
+    got = s.p.db.q("SELECT id FROM messages WHERE kind='alert' AND ref=?", (pushq.torn_key("make test"),))
+    assert len(got) == raised
+    for bad in (-1, 1.5, "x"):
+        with pytest.raises(ValueError):
+            coordinator.push_queue_number("push_script_torn_escalate_after", bad)

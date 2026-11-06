@@ -432,6 +432,7 @@ USER_SETTABLE = {
     "delivery.push_batch_max": lambda v: push_queue_number("push_batch_max", v),
     "delivery.push_min_gap_s": lambda v: push_queue_number("push_min_gap_s", v),
     "delivery.push_landing_alert_h": lambda v: push_queue_number("push_landing_alert_h", v),
+    "delivery.push_script_torn_escalate_after": lambda v: push_queue_number("push_script_torn_escalate_after", v),
     "delivery.after_push": lambda v: push.checks_of(v),
     "delivery.after_push_timeout_s": lambda v: push_queue_number("after_push_timeout_s", v),
     "delivery.deploy_restart_wait_s": lambda v: push_queue_number("deploy_restart_wait_s", v),
