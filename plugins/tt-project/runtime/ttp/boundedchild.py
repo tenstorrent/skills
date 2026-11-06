@@ -182,10 +182,10 @@ def _hook(box: list, grace: float) -> dict:
 
 
 def _go_on(saved: dict) -> None:
-    """A signal that came while the child was starting goes on now: the group is killed (box holds the
-    child, or None when it never started) and the signal goes on to the caller's earlier handler."""
-    if saved.get("pending"):
-        saved["handler"](saved["pending"][0], None)
+    """Signals that came while the child was starting go on now: the group is killed (box holds the
+    child, or None when it never started) and each signal goes on to the caller's earlier handler."""
+    for signum in dict.fromkeys(saved.get("pending") or ()):
+        saved["handler"](signum, None)
 
 
 def _unhook(saved: dict) -> None:
