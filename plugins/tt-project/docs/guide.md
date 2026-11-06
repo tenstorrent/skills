@@ -1327,8 +1327,10 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    endpoint then cools down for `providers.chat.route_cooldown_s` seconds (default 900), while the
    tier's runs start on the core provider. A 404 for a model the endpoint does not serve (its wording
    names the model, or the endpoint's /models list leaves it out) is `model_missing` instead: no
-   cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
-   until `providers.chat.tiers.<tier>.model` changes or the model-free /models check lists the model
+   cool-down, but that tier's route to that model holds (each missing model on its own), with one
+   normal notice naming the provider, tier, model and the setting it came from, until that setting
+   (`providers.chat.tiers.<tier>.model`, or `providers.chat.routes[<i>].model` for a rule's model)
+   changes or the model-free /models check lists the model
    again. That check runs once per machine and endpoint for every project on it
    (`runtime/ttp/served.py`): every 30 seconds while any project there routes work to `chat` (a tier,
    a route, a run class, babysitting or a ranked pin), else every 5 minutes (account-level

@@ -6366,17 +6366,14 @@ class Daemon:
             if fell == "model_missing" and routed.get(modelrank.KEY):   # a ranked stand-in refused: skip it
                 modelrank.refused(db, r["model"] or routed["model"], r["id"], time.time())
                 log(self.p, f"model ranking: {routed['to']} refused {r['model'] or routed['model']} (run {r['id']})")
-            elif fell == "model_missing":   # only this tier's route holds, until its model is served or changed
+            elif fell == "model_missing":   # only this tier's route to this model holds, until it is served or changed
                 model = r["model"] or routed["model"]
                 if route.hold(db, routed["tier"], model, r["id"], time.time()):
                     log(self.p, f"route: {routed['to']} does not serve {model}; tier {routed['tier']} held (run {r['id']})")
                     if not modelrank.pick(db, self.cfg, self.p.state, model, time.time()):   # else its switch alerts
-                        self.alert(f"route-model-missing:{routed['tier']}",
-                                   f"The {routed['to']} provider no longer serves model {model} "
-                                   f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
-                                   f"runs now start on the core provider; routing resumes on its own once the model is "
-                                   f"served again (checked every 30 seconds) or the tier's model is changed. Served models: "
-                                   f"`ttp status`.", severity="normal", every_s=0)
+                        self.alert(f"route-model-missing:{routed['tier']}|{model}",
+                                   route.missing_notice(self.cfg, routed["to"], routed["tier"], model),
+                                   severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         elif r["provider"] == modelrank.TO and isinstance(note.get(modelrank.KEY), dict) and r["model"] and \
@@ -12928,7 +12925,7 @@ class Daemon:
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         if core_only:
             return None
-        why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
+        why = "model_missing" if route.held(self.p.db, self.cfg, tier, model) else route.cooling(self.p.db, name, now)
         where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
         if pick:   # a model pick routes one tier to several models (modelpick.py): one switch per model
             key = f"{tier}:pick:{model}"

@@ -1503,7 +1503,7 @@ def test_a_routed_run_refused_its_model_by_claude_code_holds_the_tier_with_one_n
         assert run["status"] == "fallback" and route.of(run["note"])["fallback"] == "model_missing", (n, run["note"])
         p.db.update_task(tid, status="done")
     assert route.held(p.db, d.cfg, "light") == _RT_MODEL and route.cooling(p.db, "chat", time.time()) == ""
-    assert alerts == [("route-model-missing:light", "normal")]
+    assert alerts == [("route-model-missing:light|" + _RT_MODEL, "normal")]
     prov, _, note = _route_dispatch(p, d, monkeypatch, title="next")
     assert prov == d.cfg.get("core_provider", "claude") and note[route.KEY]["fallback"] == "model_missing"
     # Other run errors stay as they were: a bridge error cools, a clean bridge leaves no endpoint fault.
@@ -1511,6 +1511,84 @@ def test_a_routed_run_refused_its_model_by_claude_code_holds_the_tier_with_one_n
     assert route.fell_back("failed", {"bridge": {"last_fault": "down"}}, refused) == "down"
     assert route.fell_back("ok", {"bridge": {"last_fault": "error"}}, refused) == ""
     assert route.fell_back("failed", {}, "the worker read about unrecognized models") == ""
+
+
+def test_missing_rule_models_hold_apart_and_name_their_rule(env, monkeypatch):
+    """Task #6561: a held model a providers.chat.routes rule set names that rule in the status line and
+    the alert (a tier's own model keeps its wording), and two missing rule models on one tier hold
+    together, one alert each, instead of each new hold replacing the other."""
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    rules = [{"kinds": ["code"], "tiers": ["standard"], "model": "rule-model-a"},
+             {"kinds": ["work"], "tiers": ["standard"], "model": "rule-model-b"}]
+    _route_config(p, routes=rules)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "observe", lambda *a, **k: None)
+    alerts = []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: alerts.append((key, text)))
+
+    def refuse(tier, model, rule):
+        tid = p.db.add_task(f"{model}-{len(alerts)}", "", kind="work", tier=tier, priority=3, budget_usd=8.0, labels=[])
+        p.db.update_task(tid, status="running")
+        entry = {"tier": tier, "to": "chat", "model": model, "fallback": "none", **({"rule": rule} if rule is not None else {})}
+        rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                     "VALUES(?,'worker','chat',?,?,'running',?,?)", (tid, model, time.time() - 30, d.boot,
+                     json.dumps({"route": entry})))
+        rd = p.runs / str(rid)
+        rd.mkdir(parents=True)
+        (rd / "output.jsonl").write_text(json.dumps({"type": "result", "subtype": "error_during_execution",
+                                                     "is_error": True, "total_cost_usd": 0.0, "usage": {}, "session_id": "s",
+                                                     "result": '[claude-code:unrecognized_model] {"model":"%s"}' % model}) + "\n")
+        p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+        d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                     {"rc": 1, "started": time.time() - 30, "ended": time.time(), "bridge": {"last_fault": "error"}})
+        p.db.update_task(tid, status="done")
+
+    for _ in range(2):   # both rule models refused, twice over: each holds once, neither replaces the other
+        refuse("standard", "rule-model-a", 0)
+        refuse("standard", "rule-model-b", 1)
+    refuse("light", _RT_MODEL, None)
+    assert [k for k, _ in alerts] == ["route-model-missing:standard|rule-model-a",
+                                      "route-model-missing:standard|rule-model-b",
+                                      "route-model-missing:light|" + _RT_MODEL], alerts
+    assert sorted(route.holds(p.db)) == ["light|" + _RT_MODEL, "standard|rule-model-a", "standard|rule-model-b"]
+    for m in ("rule-model-a", "rule-model-b"):
+        assert route.held(p.db, d.cfg, "standard", m) == m
+    a, b, own = (t for _, t in alerts)
+    assert "(providers.chat.routes[0].model)" in a and "or providers.chat.routes[0].model is changed" in a, a
+    assert "(providers.chat.routes[1].model)" in b and "tiers.standard" not in b, b
+    assert f"(providers.chat.tiers.light.model). Light runs now start on the core provider" in own
+    assert "or the tier's model is changed" in own and "routes[" not in own, own
+    lines = route.model_lines(p.db, d.cfg, p.state, time.time(), lambda ts: "now")
+    assert ("routing: standard held since now: chat does not serve rule-model-a; runs start on the core provider "
+            "until providers.chat.routes[0].model changes or the endpoint lists it (checked every 30 seconds)") in lines, lines
+    assert any("serve rule-model-b;" in l and "until providers.chat.routes[1].model changes" in l for l in lines), lines
+    assert (f"routing: light held since now: chat does not serve {_RT_MODEL}; runs start on the core provider "
+            "until providers.chat.tiers.light.model changes or the endpoint lists it (checked every 30 seconds)") in lines, lines
+    # A model set by both the tier and a rule names both; changing one rule's model ends only its hold.
+    assert route.sources(d.cfg, "light", _RT_MODEL) == ["providers.chat.tiers.light.model"]
+    p.set_config("providers.chat.routes", [rules[0], {**rules[1], "model": "rule-model-c"},
+                                           {"tiers": ["light"], "model": _RT_MODEL}])
+    d._load_config()
+    assert route.sources(d.cfg, "light", _RT_MODEL) == ["providers.chat.tiers.light.model", "providers.chat.routes[2].model"]
+    assert [(t, m) for t, m, _ in route.release(p.db, d.cfg, {}, time.time())] == [("standard", "rule-model-b")]
+    assert route.held(p.db, d.cfg, "standard", "rule-model-a") == "rule-model-a" and not route.held(p.db, d.cfg, "standard", "rule-model-b")
+
+
+def test_a_per_tier_missing_hold_record_is_still_read_and_moves_to_its_model_key(env):
+    """The per-tier key (route.MISSING + tier) from before holds were per model is still read, and a
+    re-hold of its model moves it to MISSING + tier + '|' + model without a new notice."""
+    from ttp import route
+    p = make(env)
+    _route_config(p)
+    cfg = p.config()
+    p.db.set_kv(route.MISSING + "light", {"model": _RT_MODEL, "since": time.time() - 60})
+    assert route.held(p.db, cfg, "light") == _RT_MODEL == route.held(p.db, cfg, "light", _RT_MODEL)
+    assert route.held(p.db, cfg, "light", "other-model") == ""
+    assert not route.hold(p.db, "light", _RT_MODEL, 7, time.time())
+    assert p.db.kv(route.MISSING + "light") is None and p.db.kv(route.MISSING + "light|" + _RT_MODEL)["model"] == _RT_MODEL
+    assert route.held(p.db, cfg, "light") == _RT_MODEL
 
 
 def test_a_refused_model_the_endpoint_still_lists_retries_hourly_with_one_notice(env, monkeypatch, mock_chat):
@@ -1569,7 +1647,7 @@ def test_a_refused_model_the_endpoint_still_lists_retries_hourly_with_one_notice
         assert route.held(p.db, d.cfg, "light") == ""   # one routed run tries it again
         refused_run(n)
         assert route.held(p.db, d.cfg, "light") == _RT_MODEL
-    assert alerts == [("route-model-missing:light", "normal")], alerts
+    assert alerts == [("route-model-missing:light|" + _RT_MODEL, "normal")], alerts
 
 
 def test_a_model_missing_hold_ends_when_the_endpoint_lists_it_or_the_config_changes(env, monkeypatch, mock_chat):

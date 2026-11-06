@@ -69,10 +69,12 @@ failed checks of a change its lineage wrote on the routed-to provider, or when i
 handed off failed, and routed changes a review or checks sent back); such a lineage stays on core.
 `ttp status` counts them apart from fallbacks and `ttp stats --runs` ends with their count by kind.
 
-Missing model: a model_missing fallback cools nothing; it holds that tier's route alone (MISSING kv,
-hold), so its runs start on the core provider with fallback `model_missing` and one normal notice
-names the provider, tier and model. The hold ends (release, each daemon tick) once the tier's
-configured model changes or the model-free /models check lists the model again: the host's one shared poll
+Missing model: a model_missing fallback cools nothing; it holds that tier's route to that model alone
+(MISSING kv per tier and model, hold; two missing rule models of one tier hold apart), so its runs
+start on the core provider with fallback `model_missing` and one normal notice names the provider,
+tier, model and the settings it came from (sources: the tier's model or a providers.chat.routes
+rule's). The hold ends (release, each daemon tick) once no setting routes the tier to that model or the
+model-free /models check lists the model again: the host's one shared poll
 (served.py: every 30 s while any project routes to chat, else every 5 min), with the project's own check
 (every minute while a tier or run class routes: models_every, providers.chat.models_every_s) the fallback when
 the shared files cannot be written. Each writes the served ids, its time and HTTP status to
@@ -108,7 +110,8 @@ KEEP_CORE = ("urgent", "needs_deep", "user_deep", "review_fix", "untrusted_input
 COOL = "route_cooldown:"    # kv: {"until", "reason", "run"} per routed-to provider
 REJECTED = "route_effort_rejected:"   # kv: <model>|<effort> whose effort_fields an endpoint rejected (logged once)
 COOLDOWN_S = 900
-MISSING = "route_model_missing:"   # kv per routed tier: {"model", "since", "run"} while its model is not served
+MISSING = "route_model_missing:"   # kv per routed tier and model (MISSING + tier + "|" + model; MISSING + tier
+                                   # before holds were per model): {"model", "since", "run"} while it is not served
 MODELS_FILE = "endpoint-models.json"   # under the project state dir: {provider: {"ids", "checked", "ok", "check"}}
 MODELS_EVERY_S = 60         # the daemon's model-free /models check runs this often per provider (models_every)
 RETRY_QUIET_S = 86400       # a re-hold of the same model this soon after its quiet retry sends no new notice
@@ -296,28 +299,60 @@ def cool(db, cfg: dict, prov: str, reason: str, run_id: int | None, now: float) 
     db.set_kv(COOL + prov, {"until": now + cooldown_s(cfg), "reason": reason, "run": run_id})
 
 
-def held(db, cfg: dict, tier: str) -> str:
-    """The model a routed tier's hold is for while that model is still the configured one, else ''
-    (a retry record, release's quiet hourly try, holds nothing)."""
-    h = db.kv(MISSING + tier) or {}
-    return str(h.get("model") or "") if h and not h.get("retry") and h.get("model") in models(cfg, tier) else ""
+def held(db, cfg: dict, tier: str, model: str | None = None) -> str:
+    """The model (`model`, else any) a routed tier holds while it is still one the tier may route to,
+    else '' (a retry record, release's quiet hourly try, holds nothing)."""
+    ok = models(cfg, tier)
+    for key, h in sorted(holds(db).items()):
+        m = h.get("model")
+        if key.partition("|")[0] == tier and not h.get("retry") and m in ok and model in (None, m):
+            return str(m)
+    return ""
 
 
 def hold(db, tier: str, model: str, run_id: int | None, now: float) -> bool:
-    """Hold the tier's route: its endpoint does not serve `model`. True when the hold is new (the user
-    is told); a re-hold of the same model within RETRY_QUIET_S of its quiet retry (release) is not."""
-    h = db.kv(MISSING + tier) or {}
+    """Hold the tier's route to `model`: its endpoint does not serve it (other models the tier routes to
+    hold apart). True when the hold is new (the user is told); a re-hold of the same model within
+    RETRY_QUIET_S of its quiet retry (release) is not. A per-tier record of `model` moves to its key."""
+    key, old = f"{MISSING}{tier}|{model}", db.kv(MISSING + tier) or {}
+    h = db.kv(key) or (old if old.get("model") == model else {})
+    if old.get("model") == model:
+        db.set_kv(key, h)
+        db.x("DELETE FROM kv WHERE key=?", (MISSING + tier,))
     if h.get("model") == model and not h.get("retry"):
         return False
     quiet = h.get("model") == model and now - float(h.get("at") or 0) < RETRY_QUIET_S
-    db.set_kv(MISSING + tier, {"model": model, "since": now, "run": run_id})
+    db.set_kv(key, {"model": model, "since": now, "run": run_id})
     return not quiet
 
 
 def holds(db) -> dict[str, dict]:
-    """Every tier's model_missing hold record, by tier (a stale one included: release drops those)."""
+    """Every model_missing hold record by its key after MISSING, '<tier>|<model>' (a per-tier record from
+    before: '<tier>'), a stale one included: release drops those."""
     rows = db.q("SELECT key FROM kv WHERE substr(key, 1, ?) = ?", (len(MISSING), MISSING))
     return {r["key"][len(MISSING):]: h for r in rows if isinstance(h := db.kv(r["key"]), dict)}
+
+
+def sources(cfg: dict, tier: str, model: str) -> list[str]:
+    """The settings that route `tier`'s runs to `model` (its hold ends once none does): the tier's own
+    providers.chat.tiers.<tier>.model, then each providers.chat.routes[<i>].model; the tier's if none."""
+    own = _per_tier(cfg, tier)
+    out = [f"providers.{TO}.tiers.{tier}.model"] if own and own[1] == model else []
+    out += [f"providers.{TO}.{ROUTES}[{i}].model" for i, r in rules(cfg)
+            if r["model"] == model and (not r["tiers"] or tier in r["tiers"])]
+    return out or [f"providers.{TO}.tiers.{tier}.model"]
+
+
+def missing_notice(cfg: dict, to: str, tier: str, model: str) -> str:
+    """The route-model-missing alert for `tier`'s hold on `model`, naming the settings it came from."""
+    src = sources(cfg, tier, model)
+    if src == [f"providers.{TO}.tiers.{tier}.model"]:
+        runs, change = f"{tier.capitalize()} runs", "the tier's model is changed"
+    else:
+        runs, change = f"{tier.capitalize()} runs routed to it", f"{' and '.join(src)} {'is' if len(src) == 1 else 'are'} changed"
+    return (f"The {to} provider no longer serves model {model} ({', '.join(src)}). {runs} now start on the "
+            f"core provider; routing resumes on its own once the model is served again (checked every 30 seconds) or "
+            f"{change}. Served models: `ttp status`.")
 
 
 def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str]]:
@@ -327,8 +362,8 @@ def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str
     nothing it proves: the tier tries one routed run again (a quiet retry record) without a new notice
     for RETRY_QUIET_S, so a model the endpoint lists but refuses costs one run an hour and one notice."""
     out = []
-    for tier, h in holds(db).items():
-        model = str(h.get("model") or "")
+    for suffix, h in holds(db).items():
+        tier, key, model = suffix.partition("|")[0], MISSING + suffix, str(h.get("model") or "")
         to = target(cfg, tier)
         rec = (served or {}).get(to[0] if to else TO) or {}
         fresh = rec.get("ok") and float(rec.get("checked") or 0) > float(h.get("since") or 0)
@@ -340,17 +375,17 @@ def release(db, cfg: dict, served: dict, now: float) -> list[tuple[str, str, str
             why = "its quiet retry ended"
         elif fresh and model not in (rec.get("ids") or []):
             if not h.get("gone"):
-                db.set_kv(MISSING + tier, {**h, "gone": rec.get("checked")})
+                db.set_kv(key, {**h, "gone": rec.get("checked")})
             continue
         elif fresh and h.get("gone") and float(rec.get("checked") or 0) > float(h["gone"]):
             why = "the endpoint lists it again"
         elif fresh and not h.get("gone"):
-            db.set_kv(MISSING + tier, {"model": model, "retry": True, "at": now})
+            db.set_kv(key, {"model": model, "retry": True, "at": now})
             out.append((tier, model, "the endpoint still lists it; one routed run tries it again"))
             continue
         else:
             continue
-        db.x("DELETE FROM kv WHERE key=?", (MISSING + tier,))
+        db.x("DELETE FROM kv WHERE key=?", (key,))
         out.append((tier, model, why))
     return out
 
@@ -455,11 +490,13 @@ def model_lines(db, cfg: dict, state: Path, now: float, at) -> list[str]:
     at its last /models check (`at(ts)`: a time in the home zone)."""
     rec = read_served(state).get(TO) or {}
     out = []
-    for tier, h in sorted(holds(db).items()):
-        if held(db, cfg, tier):
+    for suffix, h in sorted(holds(db).items()):
+        tier, model = suffix.partition("|")[0], str(h.get("model") or "")
+        if held(db, cfg, tier, model):
+            src = sources(cfg, tier, model)
             out.append(f"routing: {tier} held since {at(float(h.get('since') or now))}: {TO} does not serve "
-                       f"{h.get('model')}; runs start on the core provider until providers.{TO}.tiers.{tier}.model "
-                       f"changes or the endpoint lists it (checked every 30 seconds)")
+                       f"{model}; runs start on the core provider until {' and '.join(src)} "
+                       f"change{'s' * (len(src) == 1)} or the endpoint lists it (checked every 30 seconds)")
     if rec:
         ids = rec.get("ids") or []
         state_txt = "" if rec.get("ok") else f" (failed: {rec.get('check') or '?'}; ids from the last good check)"
