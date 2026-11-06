@@ -20973,8 +20973,9 @@ def test_an_on_pass_done_code_task_the_direct_review_missed_gets_one_from_the_ba
 
 @pytest.mark.parametrize("case", ["not_code", "no_review_step"])
 def test_an_on_pass_done_task_gets_no_review_where_a_hand_off_gets_none(env, monkeypatch, tmp_path, case):
-    """As after a worker's hand-off: a task that is not code, or a project whose delivery has no
-    review step (no review_before_pr, no push branch), gets no review from on_pass or the sweeps."""
+    """As after a worker's hand-off: a task that is not code and whose branch changes nothing, or a
+    project whose delivery has no review step (no review_before_pr, no push branch), gets no review
+    from on_pass or the sweeps."""
     p = make(env)
     from ttp import daemon as dmod
     monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
@@ -20982,9 +20983,14 @@ def test_an_on_pass_done_task_gets_no_review_where_a_hand_off_gets_none(env, mon
         p.set_config("delivery.review_before_pr", False)
         p.set_config("delivery.push_branch", "")
     d = dmod.Daemon(p.base)
-    tid, _ = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
-    if case == "not_code":
+    tid, path = _checks_wait_task(p, tmp_path, DONE_ON_PASS)
+    if case == "not_code":   # a work task whose branch has no commit of its own
         p.db.x("UPDATE tasks SET kind='work' WHERE id=?", (tid,))
+        git = ["git", "-C", str(path)]
+        subprocess.run([*git, "reset", "-q", "--hard", "HEAD~1"], check=True, capture_output=True)
+        head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+        checks = tmp_path / f"run-{tid}" / "checks.json"
+        checks.write_text(json.dumps({**json.loads(checks.read_text()), "head": head}))
     _settle_probe(d, tid)
     task = p.db.task(tid)
     assert task["status"] == "done", (task["status"], task["result"])
@@ -38408,7 +38414,9 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     _end_run(p, d, row)
     assert p.db.task(work)["status"] == "done"
     assert str(work) in (p.db.kv(dm.KV_BACKUP) or {}), p.db.kv(dm.KV_BACKUP)
-    assert not p.db.q("SELECT id FROM tasks WHERE kind='review' AND id!=?", (review,)), "no review for a work task"
+    # Its branch changes something: like a code task, it gets one review.
+    assert [r["title"] for r in p.db.q("SELECT title FROM tasks WHERE kind='review' AND id!=?", (review,))] \
+        == [f"Review #{work}: work in a worktree"]
 
 
 def test_a_continued_own_worktree_work_task_starts_from_the_old_branch(env):
