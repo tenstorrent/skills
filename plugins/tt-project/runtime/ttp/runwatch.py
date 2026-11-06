@@ -120,13 +120,13 @@ def _progress(f: Path) -> tuple[str, str]:
 
 def _tools(provider: str, out: Path, old: dict, now: float) -> dict:
     offset, recent, last = int(old.get("offset") or 0), list(old.get("recent") or []), old.get("last_tool")
-    fails, tool_at = dict(old.get("fails") or {}), None
+    fails, streak, tool_at = dict(old.get("fails") or {}), dict(old.get("fail_streak") or {}), None
     try:
         size = out.stat().st_size
     except OSError:
         size = 0
     if size < offset:   # the stream was replaced (a restarted run): read it afresh
-        offset, recent, last, fails = 0, [], None, {}
+        offset, recent, last, fails, streak = 0, [], None, {}, {}
     try:
         events, offset = get_provider(provider).activity(out, offset)
     except Exception:
@@ -145,12 +145,18 @@ def _tools(provider: str, out: Path, old: dict, now: float) -> dict:
             known["error"] = bool(ev["is_error"])
             if known["error"] and known.get("cmd"):
                 fails[known["cmd"]] = fails.get(known["cmd"], 0) + 1
+                streak[known["cmd"]] = streak.get(known["cmd"], 0) + 1
+            elif known.get("cmd"):   # it works now: drift's repeat_fail counts only failures since
+                streak.pop(known["cmd"], None)
             if last and last["id"] == ev["id"]:
                 last.update(done=True, is_error=bool(ev["is_error"]), ended=ts)
     recent = recent[-RECENT:]
     if len(fails) > MAX_FAILS:   # keep the commands that failed most
         fails = dict(sorted(fails.items(), key=lambda kv: -kv[1])[:MAX_FAILS])
-    return {"offset": offset, "recent": recent, "last_tool": last, "fails": fails, "tool_at": tool_at,
+    if len(streak) > MAX_FAILS:
+        streak = dict(sorted(streak.items(), key=lambda kv: -kv[1])[:MAX_FAILS])
+    return {"offset": offset, "recent": recent, "last_tool": last, "fails": fails, "fail_streak": streak,
+            "tool_at": tool_at,
             "pending_s": round(now - last["since"]) if last and not last["done"] else None,
             "failed_last_20": sum(1 for c in recent[-20:] if c.get("error"))}
 

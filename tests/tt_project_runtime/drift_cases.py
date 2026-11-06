@@ -20,9 +20,10 @@ def _dr_flags(e, now, named=(), waiting=False, **cfg):
 
 def test_drift_repeat_fail_fires_at_three_failures_of_one_command_and_not_at_two():
     now = time.time()
-    assert "repeat_fail" in _dr_flags(_dr_entry(now, fails={"pytest -q x": 3, "make": 1}), now)
-    assert "repeat_fail" not in _dr_flags(_dr_entry(now, fails={"pytest -q x": 2, "make": 2}), now)
-    assert "repeat_fail" not in _dr_flags(_dr_entry(now, fails={"pytest -q x": 9}), now, repeat_fail=0), "0: off"
+    assert "repeat_fail" in _dr_flags(_dr_entry(now, fail_streak={"pytest -q x": 3, "make": 1}), now)
+    assert "repeat_fail" not in _dr_flags(_dr_entry(now, fail_streak={"pytest -q x": 2, "make": 2}), now)
+    assert "repeat_fail" not in _dr_flags(_dr_entry(now, fails={"pytest -q x": 3}), now), "fixed since"
+    assert "repeat_fail" not in _dr_flags(_dr_entry(now, fail_streak={"pytest -q x": 9}), now, repeat_fail=0), "0: off"
 
 
 def test_drift_repeat_fail_counts_tries_of_one_command_that_differ_only_in_wrappers(env, tmp_path):
@@ -49,9 +50,9 @@ def test_drift_loop_fires_on_four_same_inputs_in_the_last_30_calls_only():
     assert len(old) == 31 and "loop" not in _dr_flags(_dr_entry(now, recent=old), now)
     assert "loop" not in _dr_flags(_dr_entry(now, recent=same4), now, loop=0)
     failing = [{"id": f"f{i}", "tool": "Bash", "error": True, "h": "m", "cmd": "make"} for i in range(4)]
-    flags = _dr_flags(_dr_entry(now, recent=failing, fails={"make": 4}), now)
+    flags = _dr_flags(_dr_entry(now, recent=failing, fail_streak={"make": 4}), now)
     assert "repeat_fail" in flags and "loop" not in flags, "one repeated failing command is one flag"
-    assert "loop" in _dr_flags(_dr_entry(now, recent=failing, fails={"make": 4}), now, repeat_fail=0)
+    assert "loop" in _dr_flags(_dr_entry(now, recent=failing, fail_streak={"make": 4}), now, repeat_fail=0)
 
 
 def test_drift_outside_spec_counts_only_files_outside_named_paths_and_their_folders():
@@ -73,6 +74,34 @@ def test_drift_outside_spec_counts_only_files_outside_named_paths_and_their_fold
     assert "outside_spec" in _dr_flags(e, now, named=named) and e["outside_n"] == 3
     assert "outside_spec" not in _dr_flags(_dr_entry(now, files=allowed + out3[:2]), now, named=named)
     assert "outside_spec" not in _dr_flags(_dr_entry(now, files=out3), now, named=[]), "a spec naming no path"
+    bare = ["plugins/tt-project/runtime/ttp/runwatch.py", "plugins/tt-project/runtime/ttp/daemon.py"]
+    assert drift.outside(bare + ["web/x.js"], ["runwatch.py"]) == ["web/x.js"], "a bare name: the folder it is in"
+
+
+def test_drift_outside_spec_judges_only_a_code_workers_own_changes_never_a_reviewer(env, tmp_path):
+    from ttp import drift
+    p = make(env)
+    spec = "Change plugins/tt-project/runtime/ttp/drift.py only."
+    out3 = ["plugins/other/a.py", "scripts/b.py", "plugins/tt-project/web/c.js"]
+
+    def flags(kind, role, first, later):
+        t = p.db.add_task("t", spec, kind=kind)
+        run_dir = tmp_path / f"r{t}"
+        run_dir.mkdir()
+        rid = p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+                     (t, role, "claude", time.time(), "running", str(run_dir)))
+        now = time.time()
+        data = {"runs": {str(rid): _dr_entry(now, run=rid, task=t, role=role, files=first)}}
+        drift.check(p, p.config(), data, now)
+        data["runs"][str(rid)]["files"] = later
+        drift.check(p, p.config(), data, now + 60)
+        return data["runs"][str(rid)]["flags"]
+
+    assert "outside_spec" in flags("code", "worker", [], out3), "a code worker's own edits"
+    assert "outside_spec" not in flags("code", "worker", out3, out3), "changed before the run: inherited"
+    assert "outside_spec" not in flags("review", "reviewer", out3, out3)
+    assert "outside_spec" not in flags("review", "reviewer", [], out3), "a reviewer edits nothing to judge"
+    assert "outside_spec" not in flags("review", "worker", [], out3)
 
 
 def test_drift_quiet_fires_after_quiet_s_unless_a_lock_checks_or_detach_wait_is_pending():
@@ -144,6 +173,34 @@ def test_drift_ladder_steers_once_then_one_ride_along_event_and_never_repeats(en
         assert _dr_tick(p, now + later)[1] == []
     assert (run_dir / "steer.md").read_text().count("## Update") == 1
     assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='worker_drift'")["n"] == 1
+
+
+def test_drift_step_two_skips_a_command_that_works_again_after_the_update(env, tmp_path):
+    p, run_dir, t, rid = _dr_project(env, tmp_path, quiet=False)
+    out = run_dir / "output.jsonl"
+    out.write_text("".join(_rw_claude_call(f"c{i}", "Bash", command="make all")
+                           + _rw_claude_result(f"c{i}", error=True) for i in range(3)))
+    now = time.time()
+    assert set(_dr_tick(p, now)[0]["runs"][str(rid)]["flags"]) == {"repeat_fail"}
+    with open(out, "a") as f:
+        f.write(_rw_claude_call("ok", "Bash", command="cd /w && make all 2>&1 | tail -5") + _rw_claude_result("ok"))
+    data, ids = _dr_tick(p, now + 600)
+    e = data["runs"][str(rid)]
+    assert ids == [] and e["flags"] == {} and e["fails"] == {"make all": 3} and e["fail_streak"] == {}
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='worker_drift'")["n"] == 0
+
+
+def test_drift_step_two_skips_a_flag_the_worker_answered_with_a_note_after_the_update(env, tmp_path):
+    p2, run_dir2, t2, rid2 = _dr_project(env, tmp_path, quiet=False)
+    now = time.time()
+    (run_dir2 / "output.jsonl").write_text("".join(_rw_claude_call(f"c{i}", "Bash", command="make all")
+                                                   + _rw_claude_result(f"c{i}", error=True) for i in range(3)))
+    (run_dir2 / "progress.md").write_text("17:00 started\n")
+    assert "repeat_fail" in _dr_tick(p2, now)[0]["runs"][str(rid2)]["flags"]
+    with open(run_dir2 / "progress.md", "a") as f:
+        f.write("17:02 make all fails on purpose: the test reproduces the bug before the fix\n")
+    data, ids = _dr_tick(p2, now + 600)
+    assert "repeat_fail" in data["runs"][str(rid2)]["flags"] and ids == [], "the note answers step 2"
 
 
 def runwatch_path(p):

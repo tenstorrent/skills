@@ -4,17 +4,20 @@
 runwatch tick, Daemon.watch_runs), with a cheap ladder before the coordinator spends a turn on them.
 
 Flags, each with its threshold under coordinator.drift.<name> (0 turns that flag off):
-- repeat_fail (3): the same normalised shell command (runwatch.norm_command) failed this many times;
+- repeat_fail (3): the same normalised shell command (runwatch.norm_command) failed this many times since
+  it last succeeded;
 - loop (4): the same tool input (its hash) this many times among the run's last LOOP_WINDOW calls;
-- outside_spec (3): this many changed files outside the paths the task spec names and their folders,
-  only when it names some; tests, changesets and docs never count;
+- outside_spec (3): this many files the run changed (not those already changed when it was first seen)
+  outside the paths the task spec names and their folders, only for a worker on an EDIT_KINDS task whose
+  spec names some; tests, changesets and docs never count;
 - quiet_s (900): no tool call or result, note or commit for this long while no `ttp lock`, `ttp checks`
   or detach wait is pending (the runner's stall_s still ends a stalled run later);
 - pace (1.5): past PACE_FLOOR of the budget, the run's share of the task budget is over this times the
   share of its wall limit used; or over PACE_NO_COMMIT of the budget is spent with no commit.
 
 Ladder, once per flag per run: 1) an update in the run's steer.md naming the evidence; 2) still flagged
-raise_s (600) later, one ride-along `worker_drift` event to the coordinator; 3) only for pace past
+raise_s (600) later and no `ttp note` since the update, one ride-along `worker_drift` event to the
+coordinator; 3) only for pace past
 WAKE_PACE of the budget or a command failed WAKE_REPEAT_FAIL times, one normal event that wakes it.
 Active flags go in the run's runwatch entry as "flags" ({flag: evidence}); "drift" keeps the ladder.
 Unread updates are steerack's own event; nothing here repeats it.
@@ -36,7 +39,8 @@ LOOP_WINDOW = 30
 PACE_FLOOR = 0.5        # below half the budget a run never counts as fast (replay: 0.25 flagged 9% of runs, all noise)
 PACE_NO_COMMIT = 0.8
 WAKE_PACE = 0.9
-WAKE_REPEAT_FAIL = 6
+WAKE_REPEAT_FAIL = 6    # failures of one command over the run, while it is still flagged
+EDIT_KINDS = ("code", "harness")   # task kinds whose worker changes files: only they get outside_spec
 # a pending call that waits on purpose: a lock, the checks, a detached job or another queue
 WAIT_RE = re.compile(r"\bttp\s+(?:lock|checks|detach|devq|pool-wait|push|land|ci|ack-wait|host-run)\b")
 _PATH_RE = re.compile(r"(?<![\w/:.-])(?:[\w.-]+/)+[\w.-]*|(?<![\w/.-])[\w-]+\.(?:py|md|js|ts|json|sh|toml|ya?ml|txt|cfg)\b")
@@ -70,7 +74,8 @@ def spec_paths(spec: str) -> list[str]:
 def outside(files: list[str], named: list[str]) -> list[str]:
     """The changed files that are neither a named path, under one, in a named file's folder, nor a test,
     changeset or doc. A named path may be the tail of the repository path."""
-    dirs = set()
+    dirs = {posixpath.dirname(f) for f in files for n in named   # a bare file name: the folder it is in
+            if "/" not in n and posixpath.basename(f) == n}
     for n in named:
         leaf = posixpath.basename(n)
         dirs.add(posixpath.dirname(n) if "." in leaf else n)   # a file's folder, or the folder itself
@@ -88,20 +93,22 @@ def outside(files: list[str], named: list[str]) -> list[str]:
 def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float) -> dict[str, str]:
     """{flag: evidence} for runwatch entry `e` under settings `s`; `waiting`: a lock wait is open."""
     flags: dict[str, str] = {}
-    if s["repeat_fail"] > 0 and e.get("fails"):
-        cmd, n = max(e["fails"].items(), key=lambda kv: kv[1])
+    streak = e.get("fail_streak") or {}   # failures since each command's last success
+    if s["repeat_fail"] > 0 and streak:
+        cmd, n = max(streak.items(), key=lambda kv: kv[1])
         if n >= s["repeat_fail"]:
             flags["repeat_fail"] = f"`{cmd[:100]}` failed {n} times"
     recent = (e.get("recent") or [])[-LOOP_WINDOW:]
     if s["loop"] > 0:
         top = Counter(c.get("h") for c in recent if c.get("h")).most_common(1)
         c = next((c for c in recent if top and c.get("h") == top[0][0]), {})
-        failing = s["repeat_fail"] > 0 and (e.get("fails") or {}).get(c.get("cmd") or "", 0) >= s["repeat_fail"]
+        failing = s["repeat_fail"] > 0 and streak.get(c.get("cmd") or "", 0) >= s["repeat_fail"]
         if top and top[0][1] >= s["loop"] and not failing:   # a failing repeat is repeat_fail's, told once
             flags["loop"] = f"the same {c.get('tool')} call {top[0][1]} times in the last {len(recent)}" + (
                 f": `{c['cmd'][:80]}`" if c.get("cmd") else "")
     if s["outside_spec"] > 0 and named:
-        out = outside(e.get("files") or [], named)
+        before = set((e.get("drift") or {}).get("base_files") or [])
+        out = outside([f for f in e.get("files") or [] if f not in before], named)
         e["outside_n"] = len(out)
         if len(out) >= s["outside_spec"]:
             flags["outside_spec"] = f"{len(out)} changed files outside the spec's paths: {', '.join(out[:5])}"
@@ -128,7 +135,9 @@ def detect(e: dict, s: dict, named: list[str], waiting: bool, now: float) -> dic
 def _wakes(flag: str, e: dict) -> bool:
     if flag == "pace":
         return float((e.get("spend") or {}).get("share") or 0) > WAKE_PACE
-    return flag == "repeat_fail" and max((e.get("fails") or {}).values(), default=0) >= WAKE_REPEAT_FAIL
+    fails = e.get("fails") or {}   # a still-failing command's failures over the whole run
+    return flag == "repeat_fail" and max((fails.get(c, 0) for c in e.get("fail_streak") or {}),
+                                         default=0) >= WAKE_REPEAT_FAIL
 
 
 def _event(db, e: dict, flag: str, evidence: str, step: int, now: float) -> int | None:
@@ -157,21 +166,24 @@ def check(p, cfg: dict, data: dict, now: float) -> list[int]:
     specs = {}
     tasks = sorted({e["task"] for e in runs if e.get("task")})
     if tasks and s["outside_spec"] > 0:
-        rows = p.db.q(f"SELECT id, spec FROM tasks WHERE id IN ({','.join('?' * len(tasks))})", tasks)
-        specs = {r["id"]: spec_paths(r["spec"] or "") for r in rows}
+        rows = p.db.q(f"SELECT id, kind, spec FROM tasks WHERE id IN ({','.join('?' * len(tasks))})", tasks)
+        specs = {r["id"]: spec_paths(r["spec"] or "") for r in rows if r["kind"] in EDIT_KINDS}
     ids = [e["run"] for e in runs]
     dirs = {r["id"]: r["dir"] for r in p.db.q(f"SELECT id, dir FROM runs WHERE id IN ({','.join('?' * len(ids))})",
                                                ids)} if ids else {}
     raised = []
     for e in runs:
         st = e.setdefault("drift", {})
+        if "base_files" not in st:   # what its branch had changed before this run: not this run's drift
+            st["base_files"] = list(e.get("files") or [])
         head = (e.get("git") or {}).get("head")
         if head and head != st.get("head"):
             st["head_at"] = now if st.get("head") else float(e.get("started") or now)
             st["head"] = head
         run_dir = Path(dirs.get(e["run"]) or Path(p.runs) / str(e["run"]))
         waiting = any(end is None for _, end in wait_spans(run_dir))
-        flags = detect(e, s, specs.get(e.get("task")) or [], waiting, now)
+        named = specs.get(e.get("task")) or [] if e.get("role") == "worker" else []
+        flags = detect(e, s, named, waiting, now)
         e["flags"] = flags
         fired = st.setdefault("fired", {})
         for flag in FLAGS:
@@ -187,11 +199,12 @@ def check(p, cfg: dict, data: dict, now: float) -> list[int]:
                 _append_update(run_dir / STEER_FILE,
                                f"Drift check (harness, model-free), {flag}: {flags[flag]}. Fix the cause, or "
                                f"say with `ttp note` why this is right.", key=f"drift-{e['run']}-{flag}")
-                rec["steered"] = now
+                rec["steered"], rec["note"] = now, e.get("note") or ""
             if _wakes(flag, e) and not rec["woke"]:
                 rec["woke"] = now
                 raised.append(_event(p.db, e, flag, flags[flag], 3, now))
-            elif not rec["raised"] and not rec["woke"] and s["raise_s"] > 0 and now - rec["since"] >= s["raise_s"]:
+            elif (not rec["raised"] and not rec["woke"] and s["raise_s"] > 0 and now - rec["since"] >= s["raise_s"]
+                  and (e.get("note") or "") == rec.get("note", e.get("note") or "")):   # a note since the update answers it
                 rec["raised"] = now
                 raised.append(_event(p.db, e, flag, flags[flag], 2, now))
     return [i for i in raised if i]
