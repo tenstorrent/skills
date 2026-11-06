@@ -2502,7 +2502,7 @@ session and stateless coordinators on every provider.
   whoever wrote it. Known gaps, left to the prompt rule: a script or another CLI posting
   (python, httpie, a gh extension), a URL or body built at run time (`$URL`, a text ending in `$MSG`),
   GitHub GraphQL over curl, gists, connector tools whose name says neither post nor invite (a shared
-  document), Codex connector tools (its hook gets Bash calls only) and Cursor runs (no harness hook).
+  document) and Cursor runs (no harness hook).
 - Change windows: the template charter's Policies line `- Change windows: none` means disruptive
   work (restarts, rollouts, anything that disturbs others) may run whenever it is safe, and waiting
   for a lull is never a blocker. A team that works in change windows lists them on that line

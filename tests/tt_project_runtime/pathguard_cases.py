@@ -190,11 +190,44 @@ def test_pathguard_refuses_the_lost_key_writes_on_hooked_providers(cred_home, pr
 
 
 def test_pathguard_refuses_the_lost_key_shell_writes_on_codex(cred_home):
-    """Codex's hook matches shell calls only: the same shell forms are refused there (its own apply_patch
-    is the open gap, providers.md); apply_patch text given through the shell is refused."""
+    """Codex's hook gets shell calls as exec_command argv: the same shell forms are refused there; apply_patch
+    text given through the shell is refused."""
     for tool, inp in PG_LOST_KEY:
         if tool == "Bash":
             assert pathguard_why({"tool_name": "exec_command", "tool_input": {"cmd": ["bash", "-lc", inp["command"]]},
                                   "cwd": str(cred_home.work)}), inp
     assert pathguard_why(_pg_bash("apply_patch '*** Begin Patch\n*** Add File: ~/.ssh/id_ed25519\n+x\n*** End Patch'",
                                   cred_home.work))
+
+
+def test_pathguard_refuses_codex_native_apply_patch_in_hook_on_runs(cred_home):
+    """A hook-on Codex run sends its native patch tool to PreToolUse (codex-cli 0.160, measured: tool_name
+    "apply_patch", the patch in tool_input.command, absolute paths) once the matcher takes it. The shipped
+    matcher matches it and Bash; the hook refuses a patch into ~/.ssh, gh's dir or a configured path and
+    lets one elsewhere through."""
+    from ttp import hook
+    from ttp.providers.codex import hook_config_args
+    args = hook_config_args()
+    pre = next(a for a in args if a.startswith("hooks.PreToolUse="))
+    matcher = re.search(r'matcher="([^"]*)"', pre).group(1)
+    for tool in ("Bash", "apply_patch"):
+        assert re.fullmatch(matcher, tool), (matcher, tool)
+    (cred_home.acct / "settings.json").write_text(json.dumps({"guards": {"protected_paths": ["~/.config/example-access"]}}))
+    h, w = cred_home.home, cred_home.work
+
+    def patch(body):
+        return {"tool_name": "apply_patch", "tool_input": {"command": f"*** Begin Patch\n{body}\n*** End Patch"},
+                "cwd": str(w)}
+    denied = [f"*** Add File: {h}/.ssh/id_ed25519\n+x", f"*** Update File: {h}/.config/gh/hosts.yml\n@@\n-a\n+b",
+              f"*** Update File: {w}/notes.txt\n*** Move to: {h}/.ssh/notes", f"*** Delete File: {h}/.ssh/config",
+              f"*** Add File: {h}/.config/example-access/token\n+x", "*** Add File: link\n+x",
+              f"*** Update File:   {h}/.config/gh/hosts.yml  \n@@\n-a\n+b", f"  *** Add File: {h}/.ssh/k\n+x",
+              f"*** Add File: {w}/../h/.ssh/config\n+x", f"*** Add File: {w}/ok.txt\n+ok\n*** Add File: {h}/.ssh/k2\n+y"]
+    for body in denied:
+        out, _ = hook.pre_tool_use(patch(body))
+        assert out and out["hookSpecificOutput"]["permissionDecision"] == "deny", body
+        assert "credential folders" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    for body in (f"*** Add File: {w}/ok.txt\n+ok", f"*** Update File: {w}/src/a.py\n@@\n-a\n+b",
+                 f"*** Add File: {h}/.sshx/notes\n+x"):
+        out, _ = hook.pre_tool_use(patch(body))
+        assert out is None, (body, out)

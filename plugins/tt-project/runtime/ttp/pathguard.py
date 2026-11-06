@@ -53,8 +53,9 @@ WRITE_CODE_RE = re.compile(
     r"|mkdirs?\w*|makedirs|truncate\w*|rmdir\w*|touch|dump|save\w*|append\w*|rm_r?f?|cp|mv|ln|sysopen|system|exec\w*"
     r"|popen|spawn\w*|subprocess|check_call|check_output|run)\b|[\"'][rwabxt]*[wax+][rwabxt]*[\"']|>")
 HOME_REF_RE = re.compile(r"~|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
-# Codex patches: the files one adds, changes, deletes or moves to
-PATCH_FILE_RE = re.compile(r"^\*\*\* (?:Add File|Update File|Delete File|Move to): (.+?)\s*$", re.M)
+# Codex patches: the files one adds, changes, deletes or moves to (Codex trims a header line, so blanks
+# around it and its path do not hide one)
+PATCH_FILE_RE = re.compile(r"^\s*\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+?)\s*$", re.M)
 MCP_READ_RE = re.compile(r"(?:^|_)(?:read|get|list|search|find|view|stat|info|tree|show|fetch|query|describe|"
                          r"grep|glob|cat|head|tail|lookup|status)(?:_|$)", re.I)
 MCP_WRITE_RE = re.compile(r"write|edit|create|move|rename|delete|remove|copy|put|patch|append|chmod|mkdir|upload|"
