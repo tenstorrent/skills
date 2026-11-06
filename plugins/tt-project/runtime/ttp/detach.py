@@ -567,9 +567,10 @@ def foreign_pidns() -> bool:
 def job_pid(rc: Path, pid: int | None = None) -> int:
     """The host pid of the job's wrapper (it leads the job's session and group): `pid`, else its registry
     entry's, else the one <name>.started holds; 0 when none is known or that pid now names another process
-    (a recycled pid): one whose start time differs from the entry's pid_start, or, with none recorded, a
-    live one whose arguments do not name the job's .rc. A job is only ever started in the host's PID
-    namespace (cmd_detach queues one from a sandbox to the daemon), so its pid is never a namespace's."""
+    (a recycled pid): one whose start time differs from the entry's pid_start, or, with none recorded, one
+    whose arguments do not name the job's .rc. A pid no process holds stays: the job's group may live on.
+    A job is started in the host's PID namespace (cmd_detach queues one from a sandbox to the daemon),
+    so its pid is the host's."""
     rc = Path(rc)
     j = _entry(rc)
     if pid is None:
@@ -582,9 +583,11 @@ def job_pid(rc: Path, pid: int | None = None) -> int:
     if pid <= 1:
         return 0
     born, now = j.get("pid_start") if j.get("pid") == pid else None, locks.start_time(pid)
+    if now is None:   # the wrapper is gone; its group may live on, and no pid is reused while it does
+        return pid
     if born is not None:
         return pid if now == str(born) else 0
-    if now is not None and Path(f"/proc/{pid}/cmdline").exists():
+    if Path(f"/proc/{pid}/cmdline").exists():
         try:
             return pid if str(rc).encode() in Path(f"/proc/{pid}/cmdline").read_bytes() else 0
         except OSError:
