@@ -66,11 +66,14 @@ def enabled(cfg: dict) -> bool:
     return conf(cfg).get("enabled") is True and any(routed(cfg, k) for k in options(cfg))
 
 
+def _p_ok(v) -> bool:
+    return isinstance(v, (int, float)) and not isinstance(v, bool) and 0 <= v <= 1
+
+
 def min_p(cfg: dict) -> float:
-    try:
-        return float(conf(cfg).get("min_p", MIN_P))
-    except (TypeError, ValueError):
-        return MIN_P
+    """dispatch.min_p, a number from 0 to 1; unset or anything else: MIN_P (config_problems names it)."""
+    v = conf(cfg).get("min_p", MIN_P)
+    return float(v) if _p_ok(v) else MIN_P
 
 
 def routed(cfg: dict, key: str) -> bool:
@@ -81,6 +84,38 @@ def routed(cfg: dict, key: str) -> bool:
     o = options(cfg).get(key) or {}
     return o.get("provider") == TO and bool(str(o.get("model") or "")) \
         and (cfg.get("core_provider") or "claude") != TO and allows(cfg, TO)
+
+
+def config_problems(raw: dict) -> list[str]:
+    """What is wrong with project.json's providers.chat.dispatch (none when it is unset)."""
+    from .provallow import allows
+    from .route import TO
+    provs = raw.get("providers") if isinstance(raw.get("providers"), dict) else {}
+    d = provs[TO].get("dispatch") if isinstance(provs.get(TO), dict) else None
+    at = f"providers.{TO}.{KEY}"
+    if d is None:
+        return []
+    if not isinstance(d, dict):
+        return [f"{at}: give an object (enabled, min_p, options); dispatch is off"]
+    out = []
+    if "enabled" in d and not isinstance(d["enabled"], bool):
+        out.append(f"{at}.enabled: give true or false; dispatch is off")
+    if "min_p" in d and not _p_ok(d["min_p"]):
+        out.append(f"{at}.min_p: give a number from 0 to 1; {MIN_P} is used")
+    raw_opts = d.get("options")
+    if raw_opts is not None and not isinstance(raw_opts, dict):
+        out.append(f"{at}.options: give an object of option keys, each with a provider; no options")
+    for k, o in (raw_opts.items() if isinstance(raw_opts, dict) else ()):
+        if not isinstance(o, dict) or not isinstance(o.get("provider"), str) or not o["provider"].strip():
+            out.append(f"{at}.options.{k}: give an object with a provider (and model, effort); ignored")
+    if d.get("enabled") is True and not enabled(raw):
+        core = raw.get("core_provider") or "claude"
+        why = (f"{TO} is the core provider; nothing to route" if core == TO else
+               f"providers_allowed leaves out {TO}; nothing is routed" if not allows(raw, TO) else
+               f'no option runs on the {TO} provider with a model (such as {{"provider": "{TO}", '
+               f'"model": "<model id>"}}); dispatch is off')
+        out.append(f"{at}.enabled: {why}")
+    return out
 
 
 def core_key(cfg: dict) -> str:

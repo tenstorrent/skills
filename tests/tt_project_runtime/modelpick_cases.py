@@ -226,3 +226,48 @@ def test_model_pick_honours_providers_allowed_and_a_chat_core(env, monkeypatch):
     tid, prov, tier, note = _mp_dispatch(p, d, monkeypatch)
     assert prov == core and route.KEY not in note
     assert not modelpick.routed({**d.cfg, "providers_allowed": None, "core_provider": "chat"}, "routed-top")
+
+
+def test_model_pick_config_problems_name_each_bad_dispatch_setting():
+    from ttp import modelpick, route
+
+    def probs(dispatch, **top):
+        return [x for x in route.config_problems({**top, "providers": {"chat": {"dispatch": dispatch}}})
+                if ".dispatch" in x]
+    ok = {"enabled": True, "min_p": 0.7, "options": {"routed-top": {"provider": "chat", "model": "m", "effort": "max"},
+                                                    "core": {"provider": "claude"}}}
+    assert route.config_problems({}) == [] and probs(ok) == [] and probs({"enabled": False}) == []
+    assert probs({**ok, "min_p": 0}) == [] and probs({**ok, "min_p": 1}) == []
+    # Off by default: no dispatch, or one that does not say enabled true.
+    assert not modelpick.enabled({}) and not modelpick.enabled({"providers": {"chat": {"dispatch": {
+        "options": ok["options"]}}}})
+    # Enabled with no routed option: one problem, naming why.
+    for opts in ({}, {"core": {"provider": "claude"}}, {"r": {"provider": "chat"}}, {"r": {"provider": "chat", "model": ""}}):
+        got = probs({"enabled": True, "options": opts})
+        assert got == ["providers.chat.dispatch.enabled: no option runs on the chat provider with a model (such as "
+                       '{"provider": "chat", "model": "<model id>"}); dispatch is off'], (opts, got)
+    assert probs({"enabled": True}) == got
+    assert probs(ok, core_provider="chat") == ["providers.chat.dispatch.enabled: chat is the core provider; "
+                                               "nothing to route"]
+    assert probs(ok, providers_allowed=["codex"]) == ["providers.chat.dispatch.enabled: providers_allowed leaves "
+                                                      "out chat; nothing is routed"]
+    # min_p outside 0..1 (or not a number): named, and the default is used.
+    for bad in (-0.1, 1.5, "0.7", True, None):
+        assert probs({**ok, "min_p": bad}) == ["providers.chat.dispatch.min_p: give a number from 0 to 1; 0.6 is used"], bad
+        assert modelpick.min_p({"providers": {"chat": {"dispatch": {"min_p": bad}}}}) == modelpick.MIN_P
+    assert modelpick.min_p({"providers": {"chat": {"dispatch": ok}}}) == 0.7
+    # Options that are not objects with a provider: one problem each; the routed one still counts.
+    got = probs({**ok, "options": {**ok["options"], "a": "chat", "b": {"model": "m"}, "c": {"provider": " "},
+                                   "d": {"provider": 3}}})
+    assert got == [f"providers.chat.dispatch.options.{k}: give an object with a provider (and model, effort); ignored"
+                   for k in "abcd"], got
+    assert probs({"enabled": True, "options": ["routed-top"]}) == [
+        "providers.chat.dispatch.options: give an object of option keys, each with a provider; no options",
+        *probs({"enabled": True})]
+    # Wrong shapes of dispatch itself and of enabled.
+    assert probs("on") == ["providers.chat.dispatch: give an object (enabled, min_p, options); dispatch is off"]
+    assert probs({**ok, "enabled": "yes"}) == ["providers.chat.dispatch.enabled: give true or false; dispatch is off"]
+    assert not modelpick.enabled({"providers": {"chat": {"dispatch": {**ok, "enabled": "yes"}}}})
+    # project.config_problems carries them.
+    from ttp.project import config_problems
+    assert any("dispatch.min_p" in x for x in config_problems({"providers": {"chat": {"dispatch": {**ok, "min_p": 2}}}}))

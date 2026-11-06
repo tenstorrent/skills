@@ -707,7 +707,8 @@ def runs_text(rows: list[dict]) -> str:
 
 
 def config_problems(raw: dict) -> list[str]:
-    """What is wrong with project.json's routing settings (none when it has none)."""
+    """What is wrong with project.json's routing settings, the model pick's (providers.chat.dispatch)
+    included (none when it has none)."""
     provs = raw.get("providers") if isinstance(raw.get("providers"), dict) else {}
     out = []
     for name, entry in provs.items():
@@ -754,7 +755,8 @@ def config_problems(raw: dict) -> list[str]:
         ranking_of(chat.get("model_ranking"))
     except ValueError as e:
         out.append(f"{e}; nothing is ranked")
-    return out
+    from .modelpick import config_problems as dispatch_problems
+    return out + dispatch_problems(raw)
 
 
 def wait_s(cfg: dict) -> float:

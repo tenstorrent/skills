@@ -1253,6 +1253,9 @@ conclusion floor run start as with dispatch off, and a routed option needs the c
 with the stratum's mean core cost per run over 7 days as its avoided cost and settles right when its
 task ends done on its first try with no fallback, wrong when it escalates; a core pick counts as no
 change. Jev's usual review switches the use off when it saves nothing or changes no decision.
+`ttp doctor` and the daemon name a bad dispatch setting: enabled with no option on the chat provider
+with a model (or the chat provider core or not allowed), a `min_p` outside 0 to 1 (0.6 is used), and
+an option that is not an object with a `provider` (ignored).
 
 ## Asks
 
