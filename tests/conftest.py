@@ -48,6 +48,7 @@ import json
 import os
 import re
 import selectors
+import shlex
 import signal
 import struct
 import subprocess
@@ -191,6 +192,29 @@ def _session_home() -> None:
 
 
 _session_home()
+
+
+def _checks_python_env() -> None:
+    """A stand-in for the checks' pinned Python env (runnerenv), made once per session: its python,
+    python3 and pytest run the interpreter running these tests, so a `ttp checks` in a test never builds one.
+    runnerenv's own tests unset TTP_TEST_CHECKS_PYTHON_ENV."""
+    import atexit
+    import json
+    import platform
+    import shutil
+    import tempfile
+    d = Path(tempfile.mkdtemp(prefix="ttp-test-pyenv-"))
+    atexit.register(shutil.rmtree, str(d), True)
+    (d / "bin").mkdir()
+    for name, tail in (("python", ""), ("python3", ""), ("pytest", " -m pytest")):
+        (d / "bin" / name).write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)}{tail} "$@"\n')
+        (d / "bin" / name).chmod(0o755)
+    (d / "ttp-env.json").write_text(json.dumps({"key": "test", "lock": "test", "lock_sha256": "0" * 64,
+                                                "python": platform.python_version(), "pytest": pytest.__version__}))
+    os.environ.setdefault("TTP_TEST_CHECKS_PYTHON_ENV", str(d))
+
+
+_checks_python_env()
 
 
 # The account's credential files (gh's hosts file, git's and netrc's credential files, ssh private keys,

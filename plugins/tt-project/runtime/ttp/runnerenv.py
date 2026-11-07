@@ -84,7 +84,9 @@ def ensure(lock: Path | None = None) -> dict:
     """The info of the env built from `lock` (default LOCK), building it first when there is none:
     {key, lock, lock_sha256, python, pytest, path}. Unavailable when it cannot be built."""
     if test := os.environ.get("TTP_TEST_CHECKS_PYTHON_ENV"):   # tests: a ready env of the suite's own
-        return _read(Path(test)) or _fail(Path(test), "the test env is not whole")
+        if test not in _ready:
+            _ready[test] = _read(Path(test)) or _fail(Path(test), "the test env is not whole")
+        return _ready[test]
     lock = Path(lock or LOCK)
     try:
         text = lock.read_bytes()
@@ -119,8 +121,8 @@ def _build(home: Path, link: Path, key: str, lock: Path, text: bytes, base: str)
     env = {**_clean(dict(os.environ)), "PIP_USER": "0", "PIP_DISABLE_PIP_VERSION_CHECK": "1"}
     steps = [[base, "-m", "venv", "--system-site-packages", str(new)],
              [str(new / "bin" / "python"), "-m", "pip", "install", "-q", "-r", str(lock)],
-             [str(new / "bin" / "python"), "-c", "import json, platform, pytest; "
-              "print(json.dumps([platform.python_version(), pytest.__version__]))"]]
+             [str(new / "bin" / "python"), "-c", "import json, platform\ntry:\n import pytest; v = pytest.__version__\n"
+              "except ImportError:\n v = None\nprint(json.dumps([platform.python_version(), v]))"]]
     out = ""
     for argv in steps:
         try:
