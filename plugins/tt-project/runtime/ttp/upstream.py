@@ -191,9 +191,7 @@ def append(name: str, task: int | None, followups) -> int:
         out = b""
         again = []
         for n in notes:
-            title = str(n["title"]).strip()[:TITLE_CHARS]
-            spec = cut(str(n.get("spec") or "").strip(), f"the hand-off of {name} #{task}" if task else "its hand-off")
-            fp = fingerprint(title, spec)
+            title, spec, fp = _as_filed(name, task, n)
             if fp in have:
                 if had.get(fp, {}).get("project") == name and not had[fp].get("via"):
                     again.append(fp)
@@ -210,6 +208,19 @@ def append(name: str, task: int | None, followups) -> int:
         if resolution(fp, recs) and not regressed(fp, recs):
             regress(fp, "filed again after its resolution", name)
     return out.count(b"\n")
+
+
+def _as_filed(name: str, task: int | None, n: dict) -> tuple[str, str, str]:
+    """(title, spec, fp) of hand-off note `n` as `append` files it."""
+    title = str(n["title"]).strip()[:TITLE_CHARS]
+    spec = cut(str(n.get("spec") or "").strip(), f"the hand-off of {name} #{task}" if task else "its hand-off")
+    return title, spec, fingerprint(title, spec)
+
+
+def filed_fps(name: str, task: int | None, followups) -> set[str]:
+    """The fps `append` gives a hand-off's `upstream:` notes (after `reroute`), before they are filed."""
+    fups = [f for f in followups if isinstance(f, dict) and f.get("title")] if isinstance(followups, list) else []
+    return {_as_filed(name, task, f)[2] for f in reroute(fups)[0] if is_note(f)}
 
 
 def note_text(text: str) -> str:
@@ -1306,13 +1317,63 @@ def at_least(version: str, fixed_in: str) -> bool:
 
 
 WONTFIX_RC = 3
+NEVER_FILED_ASK_S = 45   # never_filed's time for asking the forward targets
+NEVER_FILED_RC = 4   # neither 0 nor a not-yet (daemon.NOT_YET_RCS): the wait is raised as a broken probe
 
 
 def fixed(p: project.Project, fp: str) -> int:
     """`ttp upstream --fixed`: 0 once p's running daemon is at or above the note's fixed_in, 1 before
     that (or while the note has no resolution), 2 when p's running version is unknown, 3 when the note
-    was closed as not a plugin bug (wontfix): no fix ships, the wait is over and the task wakes to replan."""
+    was closed as not a plugin bug (wontfix): no fix ships, the wait is over and the task wakes to replan,
+    4 when no note `fp` was ever filed (`never_filed`): no fix can come, so a wait on it wakes its owner."""
     return fixed_status(p, fp)[0]
+
+
+def never_filed(p: project.Project, fp: str) -> tuple[bool, str]:
+    """(True, '') when note `fp` is in no inbox, resolved log or outbox this machine reads and no forward
+    target's inbox holds it; else (False, where it was found, or why that is unknown). A forward target
+    that cannot be asked keeps it unknown, so an unreachable machine never ends a real wait."""
+    if _known_here(fp, p.state):
+        return False, "known here"
+    unasked, start = [], time.monotonic()
+    for target in lookup_targets():
+        if time.monotonic() - start + STATUS_TIMEOUT_S > NEVER_FILED_ASK_S:   # a probe answers within a minute
+            unasked.append(target)
+            continue
+        out, err = ssh_pipe(target, f"upstream --note-state {fp}", b"", STATUS_TIMEOUT_S)
+        try:
+            got = json.loads((out or b"").decode(errors="replace").strip().splitlines()[-1])
+        except (ValueError, IndexError):
+            got = None
+        if not isinstance(got, dict):
+            unasked.append(target)
+        elif got.get("inbox"):
+            return False, f"in {target}'s inbox"
+    return (False, f"could not ask {', '.join(unasked)} whether it holds it") if unasked else (True, "")
+
+
+def _known_here(fp: str, state: Path | None) -> bool:
+    return bool(_find(fp)[0] or any(r.get("fp") == fp for r in _records()) or _queued(fp, state, None))
+
+
+FIXED_PROBE = re.compile(r"\bupstream\s+--fixed(?:=|\s+)[\"']?([0-9a-fA-F]{16})(?![0-9a-zA-Z])")
+
+
+def unfiled_waits(probe, state: Path | None = None, pending=()) -> list[str]:
+    """The note ids `probe` waits on with `ttp upstream --fixed` that were never filed, as far as this
+    machine tells without asking another: in no inbox, resolved log or outbox here and not in `pending`
+    (a hand-off's own notes, filed after its probe is read). None while this machine has forward
+    targets, since a note may be known only there (`never_filed` asks them when the probe runs)."""
+    fps = list(dict.fromkeys(m.lower() for m in FIXED_PROBE.findall(str(probe or ""))))
+    if not fps or lookup_targets():
+        return []
+    return [fp for fp in fps if fp not in pending and not _known_here(fp, state)]
+
+
+def unfiled_words(fps: list[str]) -> str:
+    return (f"`ttp upstream --fixed {fps[0]}` waits on a note never filed (no inbox, resolved log or outbox here "
+            f"holds {', '.join(fps)}), so no fix can come; wait on the id `ttp note --to` printed or "
+            f"`ttp upstream --fp \"<title>\" \"<spec>\"` gives for a filed note")
 
 
 def fixed_status(p: project.Project, fp: str) -> tuple[int, str]:
@@ -1321,6 +1382,14 @@ def fixed_status(p: project.Project, fp: str) -> tuple[int, str]:
     fp = _check_fp(fp)
     n = _find(fp)[0]
     what = f"note {fp}" + (f" ({' '.join(str(n.get('title') or '').split())[:120]})" if n else " (not in this machine's inbox)")
+    if not n:
+        unknown, where = never_filed(p, fp)
+        if unknown:
+            return NEVER_FILED_RC, (f"unknown note {fp}: never filed (in no inbox, resolved log or outbox here, nor "
+                                    f"on a forward target): no fix can come; wait on the id `ttp note --to` printed "
+                                    f"or `ttp upstream --fp \"<title>\" \"<spec>\"` gives")
+        if where != "known here":
+            what += f" ({where})"
     if wf := wontfixed(fp):
         return WONTFIX_RC, f"{what}: wontfix, closed as not a plugin bug ({' '.join(str(wf.get('note') or '').split())[:200]}): " \
                            f"no fix ships"

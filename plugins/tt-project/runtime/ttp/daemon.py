@@ -5962,6 +5962,16 @@ class Daemon:
                       f"one (a login or status check), or the task wakes only at its retry timer", "queued", task["id"]))
         if rstatus == "waiting" and thenwaits.KEY in result:
             result = self._check_then(task, r, run_dir, result)
+        if rstatus == "waiting" and isinstance(result.get("retry_when"), str) and (unfiled := upstream.unfiled_waits(
+                result["retry_when"], self.p.state, upstream.filed_fps(self.p.name, task["id"], result.get("followups")))):
+            # It would sleep until its deferral ran out: dropped, said loudly; the task wakes at its retry timer.
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (time.time(), f"task:{task['id']}", "handoff_probe_refused", "normal",
+                  f"#{task['id']} {task['title']}: its waiting hand-off's retry_when was not stored: "
+                  f"{upstream.unfiled_words(unfiled)}; the task wakes at its retry timer", "queued", task["id"]))
+            log(self.p, f"task {task['id']} hand-off: retry_when refused: note {unfiled[0]} never filed")
+            result = {**{k: v for k, v in result.items() if k != "retry_when"},
+                      "retry_when_refused": result["retry_when"][:200]}
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
             result = self._pin_handoff_probe(task, r, run_dir, result)
             result, how = checks_settle_fill(task, result, run_dir, push._own_ttp(self.p))

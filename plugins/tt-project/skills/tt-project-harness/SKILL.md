@@ -151,7 +151,8 @@ read the one for the lever you change.
   its batch pushed. A sandboxed `--resolve`, `--ack` or `--regress` is queued in the run's directory and
   recorded when the run ends. Work
   waiting on it hands off `waiting` with retry_when `ttp upstream --fixed <fp>` (0 once this
-  project's running daemon has the fix). The daemon then tells the coordinator once, and the
+  project's running daemon has the fix; 4 for an id never filed, which wakes the task as a broken
+  probe, and such a wait is refused when it is set). The daemon then tells the coordinator once, and the
   project closes the note with `ttp upstream --ack <fp> "<evidence>"` (or `ttp note --confirms <fp>
   "<evidence>"`). The fixing project reads that ack model-free as its receipt, so a worker never also
   sends it a note to confirm the fix; a new problem goes in its own note, without `--confirms`. A note

@@ -362,6 +362,104 @@ def test_upstream_fixed_prints_the_note_and_what_it_read(env, monkeypatch, capsy
     assert rc == 2 and out == "" and "not a note fingerprint" in err, (out, err)
 
 
+def test_upstream_fixed_on_a_never_filed_note_exits_as_a_broken_probe_not_a_not_yet(env, monkeypatch, capsys):
+    """`ttp upstream --fixed <fp>` on an id no one filed said "open, no fix recorded yet" and exited 1, a
+    not-yet, so a task waiting on it slept until its deferral ran out. An fp in no inbox, resolved log or
+    outbox, and on no forward target, now prints "never filed" and exits NEVER_FILED_RC, which the daemon
+    reads as a broken probe. Filed, fixed, outbox-only and forward-target-only notes exit as before, and a
+    forward target that cannot be asked keeps the wait (an unreachable machine never ends a real one)."""
+    from ttp import cli, daemon, upstream
+    p = make(env)
+    monkeypatch.chdir(p.base)
+    _runs_version(p, "0.2.9")
+    assert upstream.NEVER_FILED_RC not in (0, *daemon.NOT_YET_RCS)
+    note = {"title": "upstream: a made-up fault", "spec": "s"}
+    upstream.append("demo", 4, [note])
+    filed = upstream.fingerprint(note["title"], note["spec"])
+    unknown, fixed_fp, queued, remote = "0123456789abcdef", "fedcba9876543210", "00000000000000aa", "00000000000000bb"
+    upstream.resolve(fixed_fp, "0.2.9", "", "")    # its resolution came back over the forward exchange only
+    (p.state / upstream.OUTBOX_FILE).write_text(json.dumps({"fp": queued, "to": "made-up-peer", "text": "t"}) + "\n")
+    answers = {}
+    monkeypatch.setattr(upstream, "lookup_targets", lambda: list(answers))
+    monkeypatch.setattr(upstream, "ssh_pipe", lambda target, args, data, timeout: answers[target](args))
+    capsys.readouterr()
+
+    def probe(fp):
+        rc = _upstream_cli(cli, "--fixed", fp)
+        return rc, capsys.readouterr().out.strip()
+
+    rc, out = probe(unknown)
+    assert rc == upstream.NEVER_FILED_RC and out.startswith(f"unknown note {unknown}: never filed"), out
+    assert probe(filed)[0] == 1
+    assert probe(fixed_fp)[0] == 0
+    rc, out = probe(queued)
+    assert rc == 1 and "waiting for a fix" in out, out
+    answers["made-up-target"] = lambda args: (json.dumps({"fp": remote, "inbox": remote in args}).encode(), "")
+    rc, out = probe(remote)
+    assert rc == 1 and "in made-up-target's inbox" in out, out
+    assert probe(unknown)[0] == upstream.NEVER_FILED_RC, "a target that answered no kept the wait"
+    answers["made-up-down"] = lambda args: (None, "ssh: connect timed out")
+    rc, out = probe(unknown)
+    assert rc == 1 and "could not ask made-up-down" in out, out
+    monkeypatch.setattr(upstream, "NEVER_FILED_ASK_S", 0)    # out of time: the targets left count as unasked
+    answers["made-up-target"] = lambda args: (json.dumps({"inbox": False}).encode(), "")
+    rc, out = probe(unknown)
+    assert rc == 1 and "could not ask made-up-target, made-up-down" in out, out
+    monkeypatch.setattr(upstream, "NEVER_FILED_ASK_S", 45)
+    p.db.set_kv("daemon", {})
+    assert probe(unknown)[0] == 2 and probe(filed)[0] == 2
+    del answers["made-up-down"]
+    assert probe(unknown)[0] == upstream.NEVER_FILED_RC, "an unknown running version hid a never-filed id"
+
+
+def test_a_new_wait_on_a_never_filed_note_is_refused_where_it_is_set(env, monkeypatch, capsys):
+    """A start_when (coordinator or `ttp task set-when`), a set-when retry_when and a waiting hand-off's
+    retry_when that wait on `ttp upstream --fixed <fp>` for an id never filed here are refused, naming it.
+    A filed note, the hand-off's own `upstream:` note (filed after its probe is read) and any id while a
+    forward target exists (it may be known only there) are kept."""
+    from ttp import cli, upstream
+    from ttp import coordinator as coord
+    from ttp import daemon as dmod
+    p = make(env)
+    monkeypatch.chdir(p.base)
+    unknown = "0123456789abcdef"
+    note = {"title": "upstream: a made-up harness fault", "spec": "s"}
+    upstream.append("demo", 4, [note])
+    filed = upstream.fingerprint(note["title"], note["spec"])
+    problems = coord.apply(p, [{"type": "task_add", "title": "later", "spec": "s",
+                                "start_when": f"ttp upstream --fixed {unknown.upper()}"}])
+    assert problems and f"never filed" in problems[0] and unknown in problems[0], problems
+    assert not p.db.q("SELECT id FROM tasks WHERE title='later'")
+    assert not coord.apply(p, [{"type": "task_add", "title": "later", "spec": "s",
+                                "start_when": f"ttp upstream --fixed {filed}"}])
+    waiting = _due_waiting_task(p, "exit 1")
+    before = p.db.task(waiting)["result"]
+    with pytest.raises(SystemExit):
+        cli.main(["task", "demo", "set-when", str(waiting), f"ttp upstream --fixed '{unknown}'"])
+    assert unknown in capsys.readouterr().err and p.db.task(waiting)["result"] == before
+    with monkeypatch.context() as m:
+        m.setattr(upstream, "lookup_targets", lambda: ["made-up-target"])
+        assert upstream.unfiled_waits(f"ttp upstream --fixed {unknown}", p.state) == []
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    own = {"title": "upstream: a made-up worker prompt gap", "spec": "made-up spec"}
+    for probe, fups in ((f"ttp upstream --fixed={unknown}", []),
+                        (f"ttp upstream --fixed {upstream.fingerprint(own['title'], own['spec'])}", [own])):
+        monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
+            "status": "waiting", "summary": "waits on a fix", "waiting_for": "a fix", "retry_after_s": 900,
+            "retry_when": probe, "followups": fups}))
+        tid = p.db.add_task(f"waits on {probe}", "s", kind="work", tier="light", origin="user")
+        assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?",
+                                                 (tid,)))
+        res = json.loads(p.db.task(tid)["result"])
+        refused = _events(p, tid, "handoff_probe_refused")
+        if fups:
+            assert res["retry_when"] == probe and not refused, (res, refused)
+        else:
+            assert "retry_when" not in res and res["retry_when_refused"] == probe, res
+            assert len(refused) == 1 and f"{unknown}" in refused[0]["text"] and "never filed" in refused[0]["text"]
+
+
 def test_upstream_fixed_in_a_sandbox_reads_the_running_version_ttp_status_reads(env, monkeypatch):
     """In a worker's sandbox (its own pid namespace) the daemon's pid probe fails, so `ttp upstream
     --fixed` said "running daemon version is unknown" while `ttp status` showed it running. It now reads

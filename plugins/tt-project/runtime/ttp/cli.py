@@ -9043,6 +9043,9 @@ def _set_when(db, tid: int, probe: str | None, p=None, on_pass_cmd: str | None =
                 from .probevars import pin
                 probe = pin(probe, "retry_when")   # a run's own $TTP_RUN_DIR is unset where probes run
                 check_task_refs(db, probe, "retry_when")
+                from . import upstream
+                if p and (unfiled := upstream.unfiled_waits(probe, p.state)):
+                    raise ValueError(f"retry_when refused: {upstream.unfiled_words(unfiled)}")
                 from .waitheal import always_passes
                 if on_pass_cmd is None and prev.get("on_pass_cmd") is not None and always_passes(probe):
                     # A caller acting on an older view of the task (a watcher that read the hand-off before
@@ -12738,7 +12741,8 @@ def main(argv: list[str] | None = None) -> None:
                                             "in that version")
     s.add_argument("--fixed", metavar="FP", help="probe: print the note, its state and the running version; exit 0 once "
                                                   "this project's running daemon has note FP's fix, 1 before, 2 when "
-                                                  "unknown, 3 when closed as not a bug (wontfix)")
+                                                  "unknown, 3 when closed as not a bug (wontfix), 4 when FP was "
+                                                  "never filed")
     s.add_argument("--ack", nargs=2, metavar=("FP", "EVIDENCE"), help="close note FP: the fix works here")
     s.add_argument("--regress", nargs=2, metavar=("FP", "REASON"), help="record that note FP's shipped fix did not "
                                                                         "hold: blocks its close by silence")

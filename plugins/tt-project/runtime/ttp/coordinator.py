@@ -1902,9 +1902,12 @@ def check_start_when(probe: str, p: Project | None = None) -> None:
     Known gap: a probe that passes these but fails when run (127: no such command; a bare
     `git cat-file -e` exits 128) is only raised to the coordinator after the daemon's first run of
     it, once, as a `deferral_probe_broken` event. With `p`, a probe that names a task id this
-    project does not have is refused (check_task_refs)."""
+    project does not have is refused (check_task_refs), as is a wait on a note never filed (upstream.unfiled_waits)."""
     if p:
         check_task_refs(p.db, probe)
+        from . import upstream
+        if unfiled := upstream.unfiled_waits(probe, p.state):
+            raise ValueError(f"start_when {clip(probe, 160)!r} refused: {upstream.unfiled_words(unfiled)}")
     if landed.LANDED_PROBE.fullmatch(probe):
         if p and not landed.can_check(p):   # it would only ever exit 2: refused now, not broken later
             raise ValueError(f"start_when {clip(probe, 160)!r} refused: {landed.NO_CHECK}")
