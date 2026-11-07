@@ -1139,6 +1139,8 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                           "stalled": _stalled(r, now, cfg),
                           **({} if running is not None else {"waits_on": _pid_queued(r.get("pid"), project_name) or _parked(r)
                                                                 or "no host queue (starting, or an older runtime)"})})
+            # Parked outside the host queue for its test slots (_parked): a waiter that keeps its lane.
+            lanes[-1]["parked"] = running is None and lanes[-1]["waits_on"].startswith(testslots.PARKED_WAITS)
         q = testslots.suite_order(project_name, _live_tickets(base), now, age=age)
         on = _lane_waits_on(project_name, base, key, q, cfg, labels[key])
         waiters = []
@@ -1227,7 +1229,8 @@ def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = N
 
 def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: float | None = None,
                 names: dict | None = None, db=None) -> str:
-    """lane_status as lines for a person (`ttp checks status`)."""
+    """lane_status as lines for a person (`ttp checks status`). A lane holder parked outside the host
+    queue for its test slots (lane_status's `parked`) is listed with the waiters, never as a holder."""
     now = time.time() if now is None else now
     n = _explicit_slots(cfg)
     lines = [f"checks lanes of {project_name}: "
@@ -1247,7 +1250,10 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
         lines.append(f"  {where}" + (" (this one)" if r["id"] == here_repo else "")
                      + (f": {slots_note(cfg, len([h for h in r['lanes'] if not h['overflow']]))}"
                         if r["kind"] != "wrapper lock" and _explicit_slots(cfg) is None else ""))
+        parked = [h for h in r["lanes"] if h.get("parked")]
         for h in r["lanes"]:
+            if h.get("parked"):
+                continue
             alive = {True: "alive", False: "DEAD (its lane is reclaimed by the next waiter)"}.get(h["alive"], "alive unknown")
             run = (f", running {h['command']!r} for {mins(h['running_s'])}" if h["running_s"] is not None
                    else f", not running yet: waits on {h['waits_on']}")
@@ -1258,12 +1264,16 @@ def status_text(project_name: str, cfg: dict | None, here_repo: str = "", now: f
             lines.append(f"    holder{extra}: {_who(h)}{why}, {alive}, "
                          f"queued {mins(h['queued_s'])}, held {mins(h['age_s'])}{run}, "
                          f"{_kids(h['children'], h['running_s'] is not None)}{h['stalled']}{ended}")
-        if not r["lanes"]:
-            lines.append("    holder: none (a waiter is about to start)")
+        if len(parked) == len(r["lanes"]):
+            lines.append("    holder: none (the parked waiters below keep their lanes while they wait)" if parked
+                         else "    holder: none (a waiter is about to start)")
+        for h in parked:
+            lines.append(f"    waiter (parked): {_who(h)}{f' for {w}' if (w := h.get('why')) else ''}, "
+                         f"queued {mins(h['queued_s'])}, waits on {h['waits_on']}")
         for w in r["waiters"]:
             lines.append(f"    waiter {w['position']}{' (next)' if w['next'] else ''}: {_who(w)}"
                          + f", {w['label']}"
                          + f", waited {mins(w['waited_s'])}, waits on {w['waits_on']}")
-        if not r["waiters"]:
+        if not r["waiters"] and not parked:
             lines.append("    waiters: none")
     return "\n".join(lines)

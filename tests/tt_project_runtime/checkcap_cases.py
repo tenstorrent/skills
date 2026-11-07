@@ -7210,6 +7210,45 @@ def test_a_checks_run_parked_for_its_test_budget_reads_so_in_status_until_it_sta
         got and got[0] and got[0].close()
 
 
+def test_slot_status_lists_a_run_parked_for_its_test_slots_as_a_waiter_never_a_holder(env, tmp_path, monkeypatch):
+    """[note 0781a4c0bc1d23dc]: `ttp checks --slot-status` (checklane.status_text) lists a run parked outside
+    the host queue (labelled through the real writer, cli._checks_slot) under the waiters, never on a
+    'holder:' line, and never says 'waiters: none' while it is parked."""
+    import io
+    import threading
+    from ttp import checkcap, checklane, cli, testslots
+    p = make(env)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "4")
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.delenv("TTP_DETACHED", raising=False)
+    monkeypatch.delenv(testslots.HELD_ENV, raising=False)
+    monkeypatch.delenv(checkcap.HELD_ENV, raising=False)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 30.0)
+    _budget_of_one(monkeypatch)
+    full = testslots.acquire("running", project_name=p.name)
+    got = []
+    t = threading.Thread(target=lambda: got.append(
+        cli._checks_slot(p, run_dir, io.StringIO(), "f" * 40, False, cmds=["true"], top=str(p.base))))
+    t.start()
+    try:
+        assert _wait_for(lambda: any(h.get("parked") for lane in checklane.lane_status(p.name) for h in lane["lanes"]))
+        text = checklane.status_text(p.name, p.config())
+        assert "waiter (parked): " in text and f"waits on {testslots.PARKED_WAITS}, outside the host queue" in text
+        holders = [ln for ln in text.splitlines() if ln.strip().startswith("holder")]
+        assert holders == ["    holder: none (the parked waiters below keep their lanes while they wait)"], text
+        assert "waiters: none" not in text
+        full.close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None
+        assert "waiter (parked)" not in checklane.status_text(p.name, p.config())
+    finally:
+        full.close()
+        t.join(30)
+        got and got[0] and got[0].close()
+
+
 def test_checks_and_push_checks_wait_for_their_projects_test_budget_without_a_host_slot(env, tmp_path, monkeypatch):
     """#5452: `ttp checks` (cli._checks_slot) and push checks (push.check_slot) of a project whose
     test-worker budget is full take no host-wide checks slot while they wait: no grant is logged and
