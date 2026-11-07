@@ -79,7 +79,7 @@ def same_wait(db: DB, at: float, now: float) -> list[dict]:
     groups: dict[tuple[int, str], list[float]] = {}
     waits: dict[str, tuple[int, str]] = {}
     for r in db.q(f"SELECT e.task, e.ts, e.data FROM events e JOIN tasks t ON t.id=e.task WHERE e.kind='wait_stale' "
-                  f"AND e.ts>? AND t.{where} ORDER BY e.ts", (now - WINDOW_S, *args)):
+                  f"AND e.status!='coalesced' AND e.ts>? AND t.{where} ORDER BY e.ts", (now - WINDOW_S, *args)):
         d = stalegate.event_data(r["data"]).get("wait_stale") or {}
         key = (int(r["task"]), str((d.get("snap") or {}).get("probe") or ""))
         groups.setdefault(key, []).append(float(r["ts"]))

@@ -142,6 +142,17 @@ def pending(p, cfg: dict, probe: Any) -> str | None:
     return None
 
 
+def own_checks(p, cfg: dict, result: dict) -> str | None:
+    """Why a waiting hand-off's own `ttp checks --result` / `ttp push --result` wait is still live
+    (pending: queued for the daemon, its checks or push process alive, a host checks slot wait
+    included), else None: not such a wait, or its run is dead or lost, which is a real fault."""
+    if result.get("status") != "waiting":
+        return None
+    probe = result.get("retry_when")
+    got = bud.result_wait(probe)
+    return pending(p, cfg, probe) if got and got[0] in ("checks", "push") else None
+
+
 def log(db: DB, task: int, d: Decision, avoided_usd: float = 0.0, now: float | None = None) -> int:
     return db.x("INSERT INTO wake_gate(ts,task,decision,by,reason,jev_call,avoided_usd) VALUES(?,?,?,?,?,?,?)",
                 (time.time() if now is None else now, task, "wake" if d.wake else "skip", d.by, d.reason[:300],

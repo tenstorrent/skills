@@ -8334,7 +8334,8 @@ class Daemon:
         push queue sent back, a wait whose probe passed, a requeue). One per stay in the
         queue (keyed on its last run), retired once it starts or such a hold takes it. A task with a
         queued announced_not_started, or a slot_wait or urgent_start event for the same wait, is left to that one; a review
-        held for its own pre-review checks is a checks wait. An urgent task (urgent.is_urgent) past
+        held for its own pre-review checks is a checks wait, and so is a woken wait whose own `ttp checks` or
+        `ttp push` run is still live (_own_checks_wait: queued for a host checks slot, or running). An urgent task (urgent.is_urgent) past
         READY_P1_S that dispatch would start now (no hold at all) also kicks dispatch from here, once per
         check (_kick_dispatch): a slow tick never keeps it waiting for the tick's own dispatch step.
         A late task with no recorded hold whose provider has a ready backlog (_ready_backlog: more ready
@@ -8388,7 +8389,8 @@ class Daemon:
             slots_only = hot and why == "gate" and tid in ctx.get("full", {}) and wait_s > 0 and self._start_hold(
                 t, prov, dict(ctx, busy={}, holds={}, full={}, branch={}, full_why={})) is None
             if ((why in self.SKIP_HOLDS or not free) and not (hot and (slots_only or why is None))) \
-                    or (t["kind"] == "review" and self._precheck_holds(t, now)):
+                    or (t["kind"] == "review" and self._precheck_holds(t, now)) \
+                    or (why is None and (why := self._own_checks_wait(t))):
                 self._unstarted_held.add(tid)
                 obligations._retire(db, now, f"held: {why or 'no free slot'}", fp)
                 continue
@@ -8561,7 +8563,7 @@ class Daemon:
                       (fp, f"slot_wait:{tid}:{ran}", f"{unstarted.READY_KIND}:{tid}:{ran}")):
                 continue
             why = self._start_hold(t, t["provider"] or core, ctx)
-            if why in ("paused", "logged_out", "net"):
+            if why in ("paused", "logged_out", "net") or (why is None and self._own_checks_wait(t)):
                 continue
             held = self._hold_words(t, why, ctx) if why else (
                 f"nothing dispatch records as a hold ({t['blocked_reason'][:160]})" if t["blocked_reason"]
@@ -8573,6 +8575,16 @@ class Daemon:
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
                  (now, "daemon", "observation", fp, "normal", text[:4000], "queued", tid))
             log(self.p, f"resume wait: task {tid} ready {(now - at) / 60:.0f} min, held by {held[:200]}")
+
+    def _own_checks_wait(self, task: dict) -> str | None:
+        """Why a woken wait's own `ttp checks` or `ttp push` run is still live (waitgate.own_checks: queued
+        for the daemon or a host checks slot, or running), the hold the wake gate re-defers it for, else
+        None. A dead or lost run is no hold: it pages as before."""
+        try:
+            return waitgate.own_checks(self.p, self.cfg, load_result(task["result"]))
+        except Exception as e:   # the test only saves pages: a failure leaves the alarm as it was
+            log(self.p, f"task {task['id']}: own checks wait unreadable: {type(e).__name__}: {e}")
+            return None
 
     # Holds with an alert of their own, or no free slot: ready_not_started leaves them out.
     SKIP_HOLDS = frozenset({"paused", "resource", "device", "logged_out", "net", "gate", "optional", "caps"})
@@ -13398,7 +13410,8 @@ class Daemon:
 
     def _stale_wait_event(self, task: dict, prev: dict, since: float, max_hold: float) -> bool:
         """Once per wait: its probe has said "not yet" for `max_hold_s`. The task keeps sleeping. False
-        for a wait only the user's word ends (progress.user_hold, the test the progress check uses)."""
+        for a wait only the user's word ends (progress.user_hold, the test the progress check uses). A
+        wait on its own still-live checks or push run folds into the checks backlog line (_checks_backlog)."""
         db = self.p.db
         fp = f"wait_stale:{task['id']}:{since:.0f}"
         try:
@@ -13414,6 +13427,9 @@ class Daemon:
                 log(self.p, f"task {task['id']} wait_stale not raised: user hold")
             return False
         if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
+            return True
+        if live := self._own_checks_wait(task):   # the host checks backlog: one line, no page per task
+            self._checks_backlog(task, prev, fp, since, max_hold, live)
             return True
         wait, cur, fresh = self._stale_snap(task, prev, time.time())
         try:   # the same wait a turn decided nothing on, unchanged since: no turn (stalegate.py)
@@ -13441,6 +13457,46 @@ class Daemon:
               json.dumps({"wait_stale": {"wait": wait, "snap": cur}})))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
         return True
+
+    def _checks_backlog(self, task: dict, prev: dict, fp: str, since: float, max_hold: float, live: str) -> None:
+        """A wait_stale on a wait whose own checks or push run is live (_own_checks_wait): recorded
+        'coalesced' under its fingerprint (once per wait) and folded into the one queued
+        `checks_backlog` event, which names each such wait, the oldest and who holds the host checks
+        slots. One coordinator line per wake for the backlog, never one page per task."""
+        from . import checkcap
+        db, now = self.p.db, time.time()
+        try:
+            st = checkcap.state()
+            slots = (f"host checks: {len(st['running'])} running (cap {st['limit']}), {len(st['queued'])} queued"
+                     + (f"; running: {'; '.join(h[:120] for h in st['running'][:4])}" if st["running"] else "")
+                     + (f"; push priority slot: {st['priority'][0][:120]}" if st["priority"] else "")) \
+                if st["limit"] else "no host checks cap"
+        except Exception:   # the slot holders are words only
+            slots = "host checks slots unreadable"
+        ev = db.one("SELECT id, data FROM events WHERE kind='checks_backlog' AND status='queued' ORDER BY id DESC LIMIT 1")
+        waits = (json.loads(ev["data"] or "{}") if ev else {}).get("checks_backlog") or []
+        waits = [w for w in waits if w.get("task") != task["id"]] + [
+            {"task": task["id"], "title": str(task["title"])[:80], "since": since, "live": live}]
+        old = min(waits, key=lambda w: float(w["since"]))
+        text = (f"Checks backlog: {len(waits)} task(s) have waited over {max_hold / 3600:g} h on their own checks, "
+                f"which are still live: " + "; ".join(f"#{w['task']} {w['title']} ({w['live']})" for w in waits[:20])
+                + f". Oldest: #{old['task']}, waiting {(now - float(old['since'])) / 3600:.1f} h. {slots}. "
+                f"Not a fault: each wakes once its checks end, and a dead or lost run still pages on its own. "
+                f"Act only if the backlog itself is wrong.")
+        data = json.dumps({"checks_backlog": waits})
+        with db.tx():
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
+                 (now, "daemon", "wait_stale", fp, "normal",
+                  f"#{task['id']} {task['title']} has waited {max_hold / 3600:g} h on its own checks ({live}); "
+                  f"folded into the checks backlog line.", "coalesced", task["id"],
+                  json.dumps({"wait_stale": {"wait": stalegate.wait_key(task["id"], since)}})))
+            if ev:
+                db.x("UPDATE events SET text=?, data=?, ts=? WHERE id=?", (text[:4000], data, now, ev["id"]))
+            else:
+                db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,data) VALUES(?,?,?,?,?,?,?,?)",
+                     (now, "daemon", "checks_backlog", f"checks_backlog:{now:.0f}", "low", text[:4000], "queued", data))
+        log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h on its own live checks ({live}); "
+                    f"folded into the checks backlog ({len(waits)})")
 
     def _stale_snap(self, task: dict, prev: dict, now: float) -> tuple[str, dict, bool]:
         """(wait key, stalegate.snap, fresh) for a waiting task: fresh when its probe answered since the

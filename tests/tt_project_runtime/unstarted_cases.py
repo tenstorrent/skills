@@ -876,3 +876,54 @@ def test_an_urgent_lock_wait_names_only_the_holders_of_the_lock_it_waits_on(env,
             os.close(fd)
         locks.record_wait(run_dir, "push:1:1.0", start, start + 20 * 60)
 
+
+
+def _own_checks_wait(p, name, state, tmp_path, now):
+    """A queued task woken from a wait on its own `ttp checks --result <run>`: the run is `live` (its pid
+    alive, as while it runs or waits for a host checks slot), `queued` (for the daemon) or `dead` (a pid
+    record that no longer matches, no exit code)."""
+    from ttp import cli, detach
+    from ttp.daemon import dump_result
+    from ttp.runner import proc_start
+    run = p.runs / name
+    run.mkdir(parents=True)
+    if state == "queued":
+        detach.enqueue(p.state, run / cli.CHECKS_RC, run / "checks.log", ["ttp", "checks"], str(tmp_path), {},
+                       checks={"cmd": ["--", "true"], "fresh": False, "worktree": str(tmp_path), "head": "x"})
+    else:
+        (run / cli.CHECKS_PID).write_text(json.dumps(
+            {"pid": os.getpid(), "started": proc_start(os.getpid()) if state == "live" else "an earlier start"}))
+    tid = p.db.add_task(f"sleeps on {state} checks", "s", kind="code", tier="light", origin="coordinator")
+    p.db.update_task(tid, not_before=now - 1, result=dump_result(
+        {"status": "waiting", "retry_when": f"ttp checks --result {run}", "waiting_since": now - 3600,
+         "woke": "timer"}))
+    return tid, run
+
+
+def test_ready_not_started_skips_a_task_on_its_own_live_or_queued_checks_and_pages_a_dead_one(
+        env, monkeypatch, tmp_path):
+    """check_unstarted and check_resume_wait: a woken wait whose own `ttp checks` run is live (running or
+    waiting for a host checks slot) or queued for the daemon is held by that run, never 'held by nothing';
+    one whose run is dead with no exit code still pages, as does a live one once its run ends."""
+    from ttp import cli, resumefirst
+    p, d, check = _ready_setup(env, monkeypatch)
+    d.settling = lambda: False
+    start = time.time()
+    live, _ = _own_checks_wait(p, "5001", "live", tmp_path, start)
+    queued, _ = _own_checks_wait(p, "5002", "queued", tmp_path, start)
+    dead, _ = _own_checks_wait(p, "5003", "dead", tmp_path, start)
+    check(start + 60)
+    d.cfg["coordinator"]["resume_wait_min"] = 5
+    monkeypatch.setattr(time, "time", lambda: start + 6 * 60)
+    d.check_resume_wait()
+    resumed = p.db.q("SELECT task FROM events WHERE fingerprint LIKE ?", (f"{resumefirst.FP}:%",))
+    assert [r["task"] for r in resumed] == [dead], resumed
+    got = check(start + 11 * 60)
+    assert [e["task"] for e in got] == [dead], [(e["task"], e["text"]) for e in got]
+    assert "held by nothing dispatch records as a hold" in got[0]["text"]
+    assert len(check(start + 30 * 60)) == 1, "held ones stay held, the dead one is raised once"
+    # The live run ends: nothing holds it now, so it counts from that check and pages after its threshold.
+    (p.runs / "5001" / cli.CHECKS_RC).write_text("0\n")
+    assert [e["task"] for e in check(start + 31 * 60)] == [dead]
+    assert live in [e["task"] for e in check(start + 42 * 60)]
+    assert queued not in [e["task"] for e in check(start + 42 * 60)]

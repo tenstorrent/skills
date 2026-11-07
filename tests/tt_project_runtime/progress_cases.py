@@ -1889,3 +1889,45 @@ def test_a_wait_on_a_resource_the_user_paused_raises_no_probe_stall_until_the_li
     for i in range(21):
         progress.note_probe(p.db, ids["lifted"], "ttp lock --probe box-lifted", 75, "busy", lifted + 60 + i * 180)
     assert f"probe:#{ids['lifted']}" in check(lifted + 60 + 21 * 180)
+
+
+def test_wait_stale_on_own_live_checks_folds_into_one_backlog_line_once_per_wait_and_a_dead_run_still_pages(
+        env, tmp_path):
+    """_stale_wait_event on waits whose own `ttp checks` run is live (running, or waiting for a host checks
+    slot): each recorded 'coalesced' once per wait and folded into one queued checks_backlog event naming
+    them; a wait whose run is dead with no exit code raises its own queued wait_stale as before."""
+    from ttp import cli
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    d = Daemon(p.base)
+
+    def waiter(name, alive):
+        run = p.runs / name
+        run.mkdir(parents=True)
+        (run / cli.CHECKS_PID).write_text(json.dumps(
+            {"pid": os.getpid(), "started": proc_start(os.getpid()) if alive else "an earlier start"}))
+        return _due_waiting_task(p, f"ttp checks --result {run}", since_ago=7 * 3600)
+
+    def stale(tid):
+        t = p.db.task(tid)
+        prev = json.loads(t["result"])
+        assert d._stale_wait_event(t, prev, prev["waiting_since"], 6 * 3600)
+    a, b, dead = waiter("6001", True), waiter("6002", True), waiter("6003", False)
+    for _ in range(3):   # every tick: once per wait, never once per task per tick
+        for tid in (a, b, dead):
+            stale(tid)
+    rows = p.db.q("SELECT task, status FROM events WHERE kind='wait_stale' ORDER BY task")
+    assert [(r["task"], r["status"]) for r in rows] == [(a, "coalesced"), (b, "coalesced"), (dead, "queued")]
+    backlog = p.db.q("SELECT * FROM events WHERE kind='checks_backlog'")
+    assert len(backlog) == 1 and backlog[0]["status"] == "queued", backlog
+    text = backlog[0]["text"]
+    assert text.startswith("Checks backlog: 2 task(s)") and f"#{a} " in text and f"#{b} " in text, text
+    assert f"#{dead} " not in text and "its checks still run" in text and "Oldest: #" in text, text
+    # Its turn handles the line: the next stale checks wait opens a new one.
+    p.db.x("UPDATE events SET status='handled' WHERE kind='checks_backlog'")
+    c = waiter("6004", True)
+    stale(c)
+    stale(a)
+    rows = p.db.q("SELECT text FROM events WHERE kind='checks_backlog' AND status='queued'")
+    assert len(rows) == 1 and rows[0]["text"].startswith("Checks backlog: 1 task(s)") and f"#{c} " in rows[0]["text"]
