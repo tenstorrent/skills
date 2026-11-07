@@ -3461,7 +3461,7 @@ def test_checks_test_project_max_caps_a_projects_checks_at_once_over_all_its_lan
 def test_checks_test_project_max_auto_sizes_from_the_host_over_a_fixed_account_number(env, capsys, monkeypatch):
     """A fixed account checks.test_project_max (set when the default was one check at a time) held a project's
     checks under what the host fits, and a project had no way back to the host-sized cap: "auto" is that."""
-    from ttp import checklane, cli, coordinator, project, testslots
+    from ttp import checkcap, checklane, cli, coordinator, project, testslots
     _lane_env(monkeypatch)
     monkeypatch.delenv("TTP_TEST_PROJECT_MAX", raising=False)
     monkeypatch.setenv("TTP_TEST_POOL", "32")
@@ -3491,8 +3491,11 @@ def test_checks_test_project_max_auto_sizes_from_the_host_over_a_fixed_account_n
     # The waiter at the cap says where the fixed number comes from and what the host fits.
     a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, wait_s=0)
     told = []
-    assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, wait_s=0.3, tell=told.append,
-                                cap_note=note) is None
+    # No wall-clock deadline (wait_s), which a slow first poll under load passes before the first line:
+    # the wait ends once it has told (stop), however long that took.
+    with pytest.raises(checkcap.Cancelled):
+        testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, tell=told.append, cap_note=note,
+                             stop=lambda: "told" if told else "")
     assert "(checks.test_project_max 3, set in the account settings; the host fits" in told[0], told
     a.close()
     # config_set takes auto for the cap, not for the test-worker budget, which is a number of slots.
