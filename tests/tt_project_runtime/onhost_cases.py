@@ -357,7 +357,7 @@ def test_an_internal_error_applying_an_action_is_named_a_harness_fault_never_a_b
     assert got.startswith("task_update: not applied: an internal harness error") and type(err).__name__ in got, got
     assert "fields: id, priority, type" in got and "harness fault" in got and "coordinator.py:" in got, got
     ev = p.db.q("SELECT source, status, text FROM events WHERE kind='action_fault'")
-    assert len(ev) == 1 and ev[0]["source"] == "harness" and ev[0]["status"] == "queued", ev
+    assert len(ev) == 1 and ev[0]["source"] == "harness" and ev[0]["status"] == "handled", ev   # a record
     # A refusal of a field the coordinator wrote stays as it was: it names the field, value and form.
     (got,) = coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": "nonsense"}], turn=2)
     assert "waits_on 'nonsense' is not one of ask:<id>" in got and "internal" not in got, got
