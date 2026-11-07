@@ -112,12 +112,28 @@ def _real(name: str) -> str | None:
     return shutil.which(name, path=path + os.pathsep + "/usr/bin:/bin")
 
 
+_POPEN = subprocess.Popen   # its own probes: never counted as, or stopped like, the run's commands
+
+
+def _run(cmd: list[str], input: str | None = None, timeout: float = 30) -> subprocess.CompletedProcess:
+    """subprocess.run for the guard's own crontab and systemctl calls, on the Popen of import time."""
+    with _POPEN(cmd, stdin=subprocess.PIPE if input is not None else subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True) as p:
+        try:
+            out, err = p.communicate(input, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            raise
+    return subprocess.CompletedProcess(cmd, p.returncode, out, err)
+
+
 def _crontab() -> str | None | bool:
     """The real crontab's text; None when there is none; False when it cannot be read."""
     if not (real := _real("crontab")):
         return False
     try:
-        r = subprocess.run([real, "-l"], capture_output=True, text=True, timeout=30)
+        r = _run([real, "-l"])
     except (OSError, subprocess.SubprocessError):
         return False
     return r.stdout if r.returncode == 0 else None if "no crontab" in r.stderr.lower() else False
@@ -184,9 +200,8 @@ def restore(before: dict, d: dict) -> list[str]:
                     keep.insert(0, ln)
             keep += list((Counter(removed) - Counter(keep)).elements())
             real = _real("crontab")
-            r = subprocess.run([real, "-"], input="".join(f"{ln}\n" for ln in keep), text=True,
-                               capture_output=True, timeout=30) if keep or before["crontab"] is not None \
-                else subprocess.run([real, "-r"], capture_output=True, text=True, timeout=30)
+            r = _run([real, "-"], input="".join(f"{ln}\n" for ln in keep)) \
+                if keep or before["crontab"] is not None else _run([real, "-r"])
             if r.returncode:
                 errors.append(f"crontab: {r.stderr.strip()[:200]}")
     top = _real_dir()
@@ -208,7 +223,7 @@ def restore(before: dict, d: dict) -> list[str]:
         except OSError as e:
             errors.append(f"{rel}: {e.strerror or e}")
     if d.get("units") and (sc := _real("systemctl")):
-        subprocess.run([sc, "--user", "daemon-reload"], capture_output=True, timeout=60)
+        _run([sc, "--user", "daemon-reload"], timeout=60)
     return errors
 
 
