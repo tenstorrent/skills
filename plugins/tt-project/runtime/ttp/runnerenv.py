@@ -120,6 +120,7 @@ def ready(lock: Path | None) -> bool:
         home.mkdir(parents=True, exist_ok=True)
         with open(home / f".{key}.lock", "a") as fh:
             fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)   # held: a build runs already
+        # own session: the env build outlives this call by design; its flock ends it once and a rerun reuses it
         subprocess.Popen([_base_python(), "-I", __file__, str(lock.resolve())], stdin=subprocess.DEVNULL,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
                          env=_clean(dict(os.environ)))
