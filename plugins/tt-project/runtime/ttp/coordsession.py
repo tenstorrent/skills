@@ -68,8 +68,9 @@ Per-row updates (coordinator.session.row_delta, on by default): only a changed O
 against the row hashes the acknowledged wake saved. It sends its header, a line naming the rows added,
 changed and removed by key and counting the rest, then the added and changed rows, each whole with its
 current age. Never a partial row or a text diff. The section goes whole, as without per-row updates,
-when: a key repeats (a group line is keyed by its hash), the list is cut short by its row limit
-(cut_line()), its header changed in more than its counts, more than half its rows changed, the rows it
+when: a key repeats (a group line is keyed by its hash), the line naming the open tasks past the row
+limit (cut_line(), keyed CUT_KEY, so a task moved past the limit is not called closed) cannot name every
+one of them, its header changed in more than its counts, more than half its rows changed, the rows it
 kept changed order, there are no row hashes acknowledged, or the whole section is shorter. A task the
 section no longer shows is called no longer open (a Course check row: no longer shown) unless a group
 line still names it. Every other
@@ -127,7 +128,8 @@ COURSE = "course_check"   # the Course check section (course.py)
 TICKS = re.compile(r"\b\d+(?:\.\d+)?\s?(?:h|min|m|s)\b")
 _READ_RE = re.compile(r"\(read [^()]*\)")
 OPEN_ROWS = 60   # the Open tasks section's row limit
-CUT_NAMED = 40   # the most open tasks past it named one by one
+CUT_NAMED = 300   # the most open tasks past it named one by one (past it the section goes whole)
+CUT_KEY = "~cut"   # the cut line's row key: a group line, so a task it names is not called closed
 _CUT = "- (open tasks past this list's limit of"
 CHATS_SHOWN = 10   # the Chats attached section's row limit (it has no line for the chats past it)
 _ROW_KEY = re.compile(r"- (#\d+) \| ")   # an Open tasks row's key, its task id
@@ -388,13 +390,17 @@ def sections(parts: list[tuple[str, str]]) -> dict:
 
 def _key_rows(text: str, section: str = ROWS) -> list[tuple[str, str]] | None:
     """A keyed section's (row key, line) after its header (a line with no key, such as a group line, is
-    keyed '~' and its hash), or None when a key repeats or the list is cut short by its row limit."""
+    keyed '~' and its hash; the cut line CUT_KEY), or None when a key repeats or the cut line does not
+    name every open task past the row limit."""
     out = []
     for ln in text.split("\n")[1:]:
         if not ln.strip():
             continue
         if ln.startswith(_CUT):
-            return None
+            if not ln.endswith(")") or ln.endswith(" more)"):
+                return None
+            out.append((CUT_KEY, ln))
+            continue
         out.append((_row_key(section, ln) or f"~{_sha(_unticked(ln))}", ln))
     keys = [k for k, _ in out]
     return None if len(set(keys)) < len(keys) else out

@@ -870,12 +870,14 @@ def test_coordsession_open_tasks_names_the_open_tasks_past_its_row_limit(env):
     assert "past this list" not in rows()
     extra = [p.db.add_task(f"x{n}", "s", origin="user") for n in range(2)]
     assert rows().split("\n")[-1] == cs.cut_line(extra) == f"{cs._CUT} {cs.OPEN_ROWS} rows, 2: #{extra[0]}, #{extra[1]})"
-    # A list cut short by its limit is sent whole: no row hashes, so no task is ever called closed.
-    assert "tasks" not in cs.rows(coord.digest_parts(p, {}, [], [])[0])
+    # A list cut short by its limit still goes by row: its cut line is keyed too, and a task it names is not
+    # called closed.
+    before = cs.rows(coord.digest_parts(p, {}, [], [])[0])["tasks"]
+    assert cs.CUT_KEY in before["rows"]
     p.db.add_task("urgent", "s", origin="user", priority=0)
     parts = coord.digest_parts(p, {}, [], [])[0]
-    assert cs._row_delta("tasks", dict(parts)["tasks"], {"head": "x", "rows": {}}) is None
-    assert f"#{late}" in dict(parts)["tasks"].split("\n")[-1]
+    got = cs._row_delta("tasks", dict(parts)["tasks"], before)
+    assert f"#{late}" in dict(parts)["tasks"].split("\n")[-1] and "removed" not in got, got
 
 
 def _cs_rowparts(head, *rows, key="tasks"):
@@ -997,7 +999,12 @@ def test_coordsession_delta_sends_a_keyed_section_whole_when_rows_cannot_stand_a
     assert whole(_cs_rowparts(head, *one, rows[0]))                                   # ...or a key twice
     assert whole(_cs_rowparts(head, *[r.replace("running", "queued") for r in rows[:5]], *rows[5:]))  # 5 of 8
     assert whole(_cs_rowparts(head, *rows[1:], rows[0]))                              # reordered only
-    assert whole(_cs_rowparts(head, *one, cs.cut_line([20])))                         # past the row limit
+    many = cs.cut_line(list(range(20, 21 + cs.CUT_NAMED)))
+    assert many.endswith(" and 1 more)") and whole(_cs_rowparts(head, *one, many))  # not all named past the limit
+    # Every task past the row limit named: still by row, and a row moved past the limit is not called closed.
+    cut = sent(_cs_rowparts(head, *one[:-1], cs.cut_line([8, 20])))["tasks"]
+    assert "added 1 other line; changed #4;" in cut and "removed" not in cut, cut
+    assert cut.split("\n")[-1] == cs.cut_line([8, 20]) and rows[0] not in cut
     assert whole(_cs_rowparts(head, *one), row_delta=False)                           # the setting off
     old = {cs.DIGEST: {k: v for k, v in st[cs.DIGEST].items() if k != "keyed"}}       # before this change
     assert whole(_cs_rowparts(head, *one), state=old)
