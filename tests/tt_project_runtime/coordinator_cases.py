@@ -22968,3 +22968,87 @@ def test_task_update_replace_is_refused_off_one_exact_step_or_on_a_safety_line(e
     assert problems and why in " ".join(map(str, problems)), problems
     assert p.db.task(tid)["spec"] == _STEPS_SPEC
     assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+_QUOTED = 'In the user\'s words: "run the full sweep tonight"'
+
+
+def _spec_edit_running(p, tid, tmp_path):
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    return run_dir / "steer.md"
+
+
+def test_task_update_spec_retire_line_drops_every_copy_and_keeps_the_history(env, tmp_path):
+    # A re-sent update repeats a quotation: `retire:` drops each copy from the live spec, the worker is told
+    # it no longer applies, and the earlier text stays in the events.
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC + "\n\n## Update\n" + _QUOTED + "\n\n## Update\n" + _QUOTED, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    upd = 'retire: "' + _QUOTED + '"\nRun only the quick sweep.'
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert "run the full sweep tonight" not in spec.split("Retired (")[0]
+    assert spec.count("run the full sweep tonight") == 1 and "Retired (this earlier text no longer applies" in spec
+    assert spec.endswith("Run only the quick sweep.") and "never push to main" in spec and "1. profile it" in spec
+    told = steer.read_text()
+    assert "Retired (this earlier text no longer applies; do not act on it)" in told and "full sweep tonight" in told
+    assert 'retire: "' not in told and "Run only the quick sweep." in told
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert json.loads(ev["data"]) == {"old": _QUOTED, "new": "", "how": "retire", "copies": 2}
+
+
+def test_task_update_spec_replace_line_makes_the_whole_spec_and_keeps_safety_lines(env, tmp_path):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC + "\n\n## Update\n" + _QUOTED, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    upd = "replace:\nGoal: run the quick sweep and report its numbers.\n- keep content generic"
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert spec.startswith("Goal: run the quick sweep and report its numbers.")
+    assert "full sweep" not in spec and "profile it" not in spec and "## Update" not in spec
+    kept = spec.split("Kept from the earlier spec (safety lines change only through the charter):\n")[1]
+    assert kept.split("\n") == ["Restrictions:", "- deliver through review", "never push to main",
+                                "guards: keep the lock on the board"]   # "- keep content generic" is already there
+    told = steer.read_text()
+    assert coord.WHOLE_SPEC_REPLACED in told and "quick sweep" in told and "replace:" not in told
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    data = json.loads(ev["data"])
+    assert data["how"] == "replace" and data["old"] == _STEPS_SPEC + "\n\n## Update\n" + _QUOTED and data["new"] == spec
+
+
+@pytest.mark.parametrize("upd, why", [
+    ('retire: "run the whole sweep tonight"', "matches no earlier spec text"),
+    ('retire: "sweep"', "too short"),
+    ('retire: "never push to main"', "touches a safety line"),
+    ('retire: "- keep content generic"', "touches a safety line"),
+    ("Do this first.\nreplace:\nGoal: x", "must be the update's first line"),
+    ("replace:\n\n", "needs the new spec"),
+    ('replace:\nGoal: x\nretire: "1. profile it"', "drop its `retire:` lines"),
+])
+def test_task_update_spec_retire_or_replace_line_is_refused_not_ignored(env, upd, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}])
+    assert problems and why in " ".join(map(str, problems)) and f"#{tid} rejected" in " ".join(map(str, problems))
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+@pytest.mark.parametrize("upd", ["Replace: the loader with the streaming one.", "Retire: the old flag.",
+                                 'retire "1. profile it"', "replace: the loader"])
+def test_task_update_spec_without_an_exact_edit_line_is_appended_as_before(env, tmp_path, upd):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    steer = _spec_edit_running(p, tid, tmp_path)
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC + "\n\n## Update\n" + upd
+    assert upd in steer.read_text() and coord.WHOLE_SPEC_REPLACED not in steer.read_text()
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []

@@ -3091,10 +3091,18 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 elif a.get("text"):
                     # Kept as the reason, a note would outlive the state it described.
                     spec = "\n\n".join(x for x in (spec, a["text"]) if x)
-                base = task["spec"]
+                base, whole, history = task["spec"], False, []
+                if spec:   # its `retire:` and `replace:` lines edit the live spec (spec_edits)
+                    try:
+                        base, spec, whole, history = spec_edits(base, spec)
+                    except ValueError as e:
+                        raise ValueError(f"#{task['id']} rejected: {e}") from None
                 if a.get("replace") is not None:   # one step replaced or withdrawn; the old text goes to history
-                    base, said = replace_step(task["spec"], a["replace"])
+                    if whole:
+                        raise ValueError(f"#{task['id']} rejected: `replace:` replaces the whole spec; drop the `replace` field")
+                    base, said = replace_step(base, a["replace"])
                     spec = "\n\n".join(x for x in (spec, said) if x)
+                    history.append({"old": a["replace"]["old"], "new": a["replace"].get("new") or ""})
                 # Last, so the field wins over a `pr_branch:` line of the same update (recorded_pr_branch).
                 spec = "\n\n".join(x for x in (spec, branch_line) if x)
                 if a.get("priority"):
@@ -3127,7 +3135,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"#{task['id']} rejected: {e}") from None
                     if why := cells.problem(spec):
                         raise ValueError(f"#{task['id']} rejected: {why}")
-                    upd["spec"] = base + "\n\n## Update\n" + spec
+                    upd["spec"] = spec if whole else base + "\n\n## Update\n" + spec
                     prev = load_result(upd.get("result") or task["result"])
                     if task["status"] != "running" and prev.pop("stale_wakes", None) is not None:
                         # A re-plan: the wait it hands back next is not compared with the old plan's.
@@ -3176,11 +3184,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
-                if base != task["spec"]:
+                for h in history:   # the append-only history of what the live spec no longer says
                     db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
-                         (time.time(), "coordinator", STEP_REPLACED_KIND, "low", f"#{task['id']}: a spec step replaced",
-                          json.dumps({"old": a["replace"]["old"], "new": a["replace"].get("new") or ""}), "handled",
-                          task["id"]))
+                         (time.time(), "coordinator", STEP_REPLACED_KIND, "low",
+                          f"#{task['id']}: {'the whole spec' if whole else 'a spec step'} replaced", json.dumps(h),
+                          "handled", task["id"]))
                 if upd.get("spec"):
                     userorder.respec(db, task["id"])
                 if upd.get("status", task["status"]) not in TERMINAL_TASK_STATES \
@@ -3209,7 +3217,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if spec and task["status"] == "running":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:
-                            _append_update(Path(r["dir"], "steer.md"), spec, key)
+                            _append_update(Path(r["dir"], "steer.md"),
+                                           f"{WHOLE_SPEC_REPLACED}\n\n{spec}" if whole else spec, key)
                     if upd.get("status") != "cancelled" and (why := preempt.restart_line(spec)):
                         # The run went the wrong way: stopped at a safe point (after its `ttp lock`s), requeued
                         # with this spec and its work kept, no attempt spent (preempt.request_restart).
@@ -6446,6 +6455,57 @@ def replace_step(spec: str, rep) -> tuple[str, str]:
             f"{' '.join(new.split())[:300]!r}" if new.strip() else
             f"Step withdrawn (no longer required): {' '.join(old.split())[:300]!r}")
     return spec[:start] + new + spec[start + len(old):], said
+
+
+# A task_update `spec` may also edit the live spec by its own lines: `retire: "<exact earlier text>"` drops
+# every copy of that text (a re-sent update repeats it), and a first line `replace:` makes the rest of the
+# update the whole live spec. Both lines are exact forms, so a plain "Replace: the loader" step stays
+# appended. A quote matching nothing is refused, never ignored. The spec's safety lines are never retired
+# and survive a replace. Each earlier text goes to a STEP_REPLACED_KIND event; the worker reads the notice.
+_RETIRE_LINE = re.compile(r'^\s*retire:\s*"(.+)"\s*$', re.I)
+_REPLACE_LINE = re.compile(r"^\s*replace:\s*$", re.I)
+WHOLE_SPEC_REPLACED = "The whole spec was replaced: everything it said before no longer applies. It now reads:"
+
+
+def spec_edits(spec: str, update: str) -> tuple[str, str, bool, list[dict]]:
+    """(the live spec, the update text to add or, when whole, the new spec, whole, history entries) for a
+    task_update `update`; ValueError on a quote matching nothing, a safety line or a misplaced `replace:`."""
+    lines = update.split("\n")
+    first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
+    whole = [i for i, ln in enumerate(lines) if _REPLACE_LINE.match(ln)]
+    retires = [i for i, ln in enumerate(lines) if _RETIRE_LINE.match(ln)]
+    if whole:
+        if whole != [first]:
+            raise ValueError("a `replace:` line must be the update's first line, alone: the rest becomes the whole spec")
+        if retires:
+            raise ValueError("an update with `replace:` replaces the whole spec: drop its `retire:` lines")
+        new = "\n".join(lines[first + 1:]).strip()
+        if not new:
+            raise ValueError("`replace:` needs the new spec on the lines after it")
+        old_lines = spec.split("\n")
+        have = {ln.strip() for ln in new.split("\n")}
+        kept = list(dict.fromkeys(old_lines[i].strip() for i in sorted(_safety_lines(spec))
+                                  if old_lines[i].strip() not in have))
+        if kept:
+            new += "\n\nKept from the earlier spec (safety lines change only through the charter):\n" + "\n".join(kept)
+        return new, new, True, [{"old": spec, "new": new, "how": "replace"}]
+    history = []
+    for i in retires:
+        quote = _RETIRE_LINE.match(lines[i]).group(1)
+        if len(quote.strip()) < 8:
+            raise ValueError(f"`retire:` quote {quote!r} is too short to name one text: quote at least 8 characters")
+        if not (n := spec.count(quote)):
+            raise ValueError(f"`retire:` quote {quote[:120]!r} matches no earlier spec text: quote it exactly")
+        safety, at = _safety_lines(spec), 0
+        while (at := spec.find(quote, at)) >= 0:
+            if hit := sorted(safety & set(range(spec.count("\n", 0, at), spec.count("\n", 0, at + len(quote)) + 1))):
+                raise ValueError(f"`retire:` quote touches a safety line ({spec.split(chr(10))[hit[0]].strip()[:120]!r}): "
+                                 f"Restrictions and guards change only through the charter")
+            at += len(quote)
+        spec = spec.replace(quote, "")
+        lines[i] = f"Retired (this earlier text no longer applies; do not act on it): {' '.join(quote.split())[:300]!r}"
+        history.append({"old": quote, "new": "", "how": "retire", "copies": n})
+    return spec, "\n".join(lines), False, history
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:
