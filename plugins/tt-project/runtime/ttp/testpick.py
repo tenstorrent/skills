@@ -42,8 +42,9 @@ def enabled(cfg: dict | None) -> bool:
 
 
 def _git(top: Path, *args: str) -> str | None:
+    from . import gitmemo
     try:
-        r = subprocess.run(["git", "-C", str(top), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
+        r = gitmemo.run(["git", "-C", str(top), *args], capture_output=True, text=True, timeout=GIT_TIMEOUT_S)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return r.stdout if r.returncode == 0 else None
