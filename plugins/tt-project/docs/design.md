@@ -59,6 +59,11 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    `continue:` follow-up, a repeat block of a non-urgent task) starts no turn alone: it joins the
    next turn something else starts, or starts one an hour after it was raised. It stays queued
    in the database, so a restart keeps it (pagesev.py).
+   A batch of only plain hand-offs (a normal task_done of no review, with no follow-up proposed, no
+   waiting parent, no live dependent and no text asking for a decision or naming a Restriction) does
+   the same, for both coordinator modes and every provider: it joins the next wake of any other
+   cause or the idle wake, at the latest `coordinator.plain_done_hold_max_s` (3600 s; 0: off) after
+   its oldest event, and shows in Recently finished meanwhile (Daemon._plain_done_held).
    A retry the daemon schedules by itself (after a refusal or a run with no verdict) starts no
    turn; the final attempt's outcome does. The daily review skips a period with no work.
 3. No run starts when its provider's gate forbids it. Every run has a wall clock and a budget.

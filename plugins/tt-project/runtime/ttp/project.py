@@ -263,6 +263,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # Routine events (task done, follow-ups, notes, normal observations) wait up to
                     # this long for company while every worker slot is busy or runnable work is queued.
                     "batch_s": 300,
+                    # A batch of only plain hand-offs (a normal task_done of no review with nothing to
+                    # queue or decide) starts no turn: it joins the next wake of any other cause or the
+                    # idle wake, at most this long after its oldest event (the idle_wake_s default; 0: off).
+                    "plain_done_hold_max_s": 3600,
                     # Routine event-only turns (task done, follow-ups, upstream notes, check-slot waits,
                     # waits) start no sooner than this long after the last turn ended, unless a slot is
                     # free with nothing ready to fill it (eventhold.py; 0: off).

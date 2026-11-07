@@ -15246,6 +15246,115 @@ def test_a_plain_task_done_waits_for_company_even_with_an_idle_slot(env):
     assert not d._batch_hold([ev, note], now)
 
 
+def _plain_hold_setup(env, monkeypatch, hold=None, idle=6 * 3600):
+    """A quiet project with idle slots, its last turn now and every coordinator turn's events recorded."""
+    p, d, clock, _ = _batch_setup(env, monkeypatch, busy=0)
+    p.set_config("coordinator.idle_wake_s", idle)
+    p.set_config("coordinator.starve_wake_s", 6 * 3600)
+    if hold is not None:
+        p.set_config("coordinator.plain_done_hold_max_s", hold)
+    d.cfg = p.config()
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    turns = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: turns.append(((k.get("note") or {}).get("events"), clock[0])))
+    return p, d, clock, turns
+
+
+def _plain_done_event(p, clock, text="done: all fine", severity="normal", kind="code"):
+    tid = p.db.add_task("finished", "s", status="done", kind=kind)
+    return p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                  (clock[0], f"task:{tid}", "task_done", severity, text, "queued", tid)), tid
+
+
+def test_a_plain_done_only_batch_waits_past_batch_s_for_the_next_wake_of_another_cause(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    assert p.config()["coordinator"]["plain_done_hold_max_s"] == 3600, "on by default, the idle wake interval"
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, batch + 900, step=30), "a plain hand-off woke a turn after batch_s"
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev,))["status"] == "queued", "the held event was dropped"
+    assert p.db.kv("plain_done_held") == [ev]
+    # Another cause (a failure) starts the turn and the held hand-off rides it.
+    _event(p, clock, "task_failed", "high")
+    assert _turn_within(d, clock, turns, 120), "the failure did not wake its turn"
+    assert ev in turns[0][0], "the held hand-off did not ride the next wake"
+
+
+def test_a_held_plain_done_batch_rides_the_turn_a_user_message_starts(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, batch + 300, step=30)
+    p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    assert _turn_within(d, clock, turns, 120) and ev in turns[0][0]
+
+
+def test_a_held_plain_done_batch_wakes_at_the_hold_cap_or_the_idle_wake(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, hold=1200)
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, 1200 - 60, step=30)
+    assert _turn_within(d, clock, turns, 300, step=30), "the hold outlasted coordinator.plain_done_hold_max_s"
+    assert turns[0][0] == [ev]
+
+
+def test_a_held_plain_done_batch_rides_the_idle_wake(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, idle=1800)   # sooner than the cap
+    start = clock[0]
+    ev, _ = _plain_done_event(p, clock)
+    assert _turn_within(d, clock, turns, 3000, step=30)
+    assert 1800 <= turns[0][1] - start < 1800 + 120 and ev in turns[0][0], "it did not ride the idle wake"
+
+
+def test_plain_done_hold_max_s_0_turns_the_hold_off(env, monkeypatch):
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, hold=0)   # the batch wakes once batch_s passed
+    _plain_done_event(p, clock)
+    assert _turn_within(d, clock, turns, float(p.config()["coordinator"]["batch_s"]) + 120, step=30)
+
+
+def test_a_held_plain_done_batch_survives_a_daemon_restart(env, monkeypatch):
+    from ttp.daemon import Daemon
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch, hold=1800)
+    ev, _ = _plain_done_event(p, clock)
+    assert not _turn_within(d, clock, turns, 900, step=30)
+    d = Daemon(p.base)
+    d.cfg = p.config()
+    d.update_gates()
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: turns.append(((k.get("note") or {}).get("events"), clock[0])))
+    assert p.db.one("SELECT status FROM events WHERE id=?", (ev,))["status"] == "queued"
+    assert not _turn_within(d, clock, turns, 800, step=30), "a restart released the held batch"
+    assert _turn_within(d, clock, turns, 300, step=30) and turns[0][0] == [ev], "the cap counts from the event"
+
+
+@pytest.mark.parametrize("case", ["high", "failed", "review", "followup", "parent", "dependent", "unqueued",
+                                  "restriction", "message", "must_act"])
+def test_never_held_events_wake_as_they_did_without_the_plain_done_hold(env, monkeypatch, case):
+    """Each kind the hold must never take starts its turn as before: at once, or after batch_s at the
+    latest, never at the hold cap or the idle wake."""
+    from ttp import daemon as dm, mustact
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    ev, tid = _plain_done_event(
+        p, clock, severity="high" if case == "high" else "normal", kind="review" if case == "review" else "code",
+        text={"unqueued": f"Continue follow-up {dm.UNQUEUED_TAG}: add it", "restriction":
+              "done, but the next step would break a Restriction"}.get(case, "done: all fine"))
+    if case == "failed":
+        p.db.x("UPDATE events SET kind='task_failed' WHERE id=?", (ev,))
+    if case == "followup":
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (clock[0], f"task:{tid}", "followup_proposed", "normal", "f", "queued", tid))
+    if case == "parent":
+        p.db.x("UPDATE tasks SET parent=? WHERE id=?", (p.db.add_task("parent", "s", status="waiting"), tid))
+    if case == "dependent":
+        dep = p.db.add_task("next", "s", status="waiting")
+        p.db.x("UPDATE tasks SET depends_on=? WHERE id=?", (json.dumps([tid]), dep))
+    if case == "message":
+        p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
+    if case == "must_act":
+        _event(p, clock, mustact.KINDS[0])
+    assert _turn_within(d, clock, turns, batch + 60, step=15), f"{case} waited for the plain-done hold"
+    assert ev in turns[0][0] and p.db.kv("plain_done_held") is None
+
+
 
 def test_blocker_sweep_carries_a_valid_not_yet_due_still_blocked_forward_until_the_item_changes(env):
     p = make(env)

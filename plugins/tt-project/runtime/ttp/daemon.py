@@ -655,6 +655,9 @@ BACKUP_TRIES = 3            # a backup push that fails this often (network, auth
 BACKUP_RETRY_S = 900        # times the try count: the wait before a failed backup push is tried again
 KV_DIRTY_MAIN = "dirty_main"   # kv: key of the main checkout's dirty tracked paths last reported
 UNQUEUED_TAG = "NOT queued by the daemon"   # on a `continue:` follow-up no hop was queued for
+# A plain hand-off whose text asks the turn for a decision is never held (Daemon._plain_done_held).
+PLAIN_DONE_ASKS = (UNQUEUED_TAG, "No continue hop finishes its split head", chaincap.NO_COMMIT_TRIGGER)
+PLAIN_DONE_HELD_KEY = "plain_done_held"   # kv: ids of the plain hand-offs last held, so the hold logs once
 CONTINUE_UNQUEUED = "continue_unqueued"   # event: a done task's `continue:` follow-up has no continuing task
 CONTINUE_UNQUEUED_AFTER_S = 1800   # how long after task_done before it is raised
 CONTINUE_UNQUEUED_WINDOW_S = 86400   # task_done events older than this are not checked
@@ -9907,7 +9910,9 @@ class Daemon:
         # Ride-along events (pagesev.rides_along) start no turn: they join the next one something else
         # starts, or start one themselves RIDE_ALONG_MAX_S after the oldest was raised.
         rides = [e for e in evs if pagesev.rides_along(e)]
-        if not msgs and len(rides) == len(evs) and (
+        # So do plain hand-offs (_plain_done_held), up to coordinator.plain_done_hold_max_s.
+        held = [] if msgs or rerun or len(rides) == len(evs) else self._plain_done_held(evs, now)
+        if not msgs and len(rides) + len(held) == len(evs) and (
                 not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
             if coord.rejection_due(db, now):
                 # A rejection no turn carried in coord.REJECTION_WAIT_S starts one, so none is dropped.
@@ -10140,6 +10145,34 @@ class Daemon:
                    and not (t["blocked_reason"] or "").startswith((PAUSED_NOTE, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                                                                      BRANCH_HELD_NOTE))
                    and not self._precheck_holds(t, now))
+
+    def _plain_done_held(self, evs: list[dict], now: float) -> list[dict]:
+        """The events of `evs` that are not ride-alongs, when each is a plain hand-off (_plain_done) of
+        a task that is no review, names no Restriction and asks the turn nothing, raised less than
+        coordinator.plain_done_hold_max_s ago (default the idle_wake_s default; 0: off); else []. They
+        start no turn: they join the next one any other cause starts, or the idle wake. They stay
+        queued, so a restart keeps them and their clock."""
+        try:
+            cap = float(self.cfg["coordinator"].get("plain_done_hold_max_s", 3600) or 0)
+            own = [e for e in evs if not pagesev.rides_along(e)]
+            if cap <= 0 or not own or now - min(e["ts"] for e in own) >= cap:
+                return []
+            for e in own:
+                if not self._plain_done(e) or (self.p.db.task(e["task"]) or {}).get("kind") == "review":
+                    return []
+                row = self.p.db.one("SELECT text FROM events WHERE id=?", (e.get("id"),))
+                text = (row["text"] if row else "") or ""
+                if any(m in text for m in PLAIN_DONE_ASKS) or "restriction" in text.lower():
+                    return []
+            ids = sorted(e["id"] for e in own if e.get("id") is not None)
+            if self.p.db.kv(PLAIN_DONE_HELD_KEY) != ids:
+                self.p.db.set_kv(PLAIN_DONE_HELD_KEY, ids)
+                log(self.p, f"coordinator turn held (plain done): events {ids} wait for the next wake "
+                    f"of another cause or the idle wake, at most {cap:.0f} s")
+            return own
+        except Exception:   # the hold only saves money: a failure runs the turn
+            log(self.p, "coordinator plain done hold failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            return []
 
     def _plain_done(self, e: dict) -> bool:
         """A normal task_done with no follow-up proposed, no live task depending on it and no waiting
