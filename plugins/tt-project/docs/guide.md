@@ -3425,7 +3425,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   whoever wrote it. Known gaps, left to the prompt rule: a script or another CLI posting
   (python, httpie, a gh extension), a URL or body built at run time (`$URL`, a text ending in `$MSG`),
   GitHub GraphQL over curl, gists, connector tools whose name says neither post nor invite (a shared
-  document) and Cursor runs (no harness hook).
+  document) and Cursor coordinator turns (no harness hook; Cursor worker and reviewer runs
+  get these guards through its `preToolUse` hook, which sees Shell and MCP calls).
 - Change windows: the template charter's Policies line `- Change windows: none` means disruptive
   work (restarts, rollouts, anything that disturbs others) may run whenever it is safe, and waiting
   for a lull is never a blocker. A team that works in change windows lists them on that line
