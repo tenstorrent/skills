@@ -8848,7 +8848,7 @@ def test_preemption_asks_a_run_never_preempted_before_over_one_already_preempted
         for f in checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"):
             f.unlink()
         fresh.close()
-        assert checkcap.preempt("urgent", every, "mine") == "mine [preempted by urgent #9]", "the only one left"
+        assert checkcap.preempt("urgent", every, "mine") == "mine", "the only one left (its slot: no requeue text)"
     finally:
         for f in checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"):
             f.unlink()
