@@ -207,6 +207,7 @@ from . import verified
 from . import waitgate
 from . import waitheal
 from . import watchdup
+from . import wakemode
 from . import queuetrim
 from . import schedrun
 from . import screen as scr
@@ -3074,6 +3075,7 @@ class Daemon:
                         prompt = prompt + "\n\n" + coordsession.handover_ask(state)
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            prompt = self._wake_mode_line(session_mode, why, True, prompt)   # before the seed cap counts it
             seed_usd = None
             if session_mode == "new" and budget_usd is not None and prov.caps_budget:
                 try:   # the seed rides on this wake: its cap covers it, within the dollar caps (seedcap.py)
@@ -3109,6 +3111,9 @@ class Daemon:
             except Exception as e:   # only saves money: the turn starts a session of its own
                 log(self.p, f"coordinator session reuse skipped: {type(e).__name__}: {e}")
                 thread = ""
+        if role == "coordinator" and not resume and not session_on:
+            prompt = self._wake_mode_line(
+                "stateless", str(((note or {}).get("turn") or {}).get("session_off") or "not recorded"), False, prompt)
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
             window = window.get(tier) if isinstance(window, dict) else window
@@ -4398,6 +4403,15 @@ class Daemon:
             "(session_id=? OR (session_id IS NULL AND note LIKE ?))",
             (before if before is not None else 1 << 62, task, session, f"%{session}%"))
             if o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session)
+
+    def _wake_mode_line(self, mode: str, why: str, session: bool, prompt: str) -> str:
+        """The coordinator wake's prompt led by its real mode and today's counts, from the record `ttp stats
+        --coord-session` reads, never the mode setting (wakemode.py). A fault runs the wake without it."""
+        try:
+            return wakemode.prompt_line(self.p.db, timefmt.home(self.p), mode, why, session=session) + "\n\n" + prompt
+        except Exception as e:
+            log(self.p, f"coordinator wake mode line failed: {type(e).__name__}: {e}"[:300])
+            return prompt
 
     def renet_coord_sessions(self) -> list[tuple[int, float, float]]:
         """Once per project (kv COORD_RENET_KEY): resumed coordinator session wakes booked before

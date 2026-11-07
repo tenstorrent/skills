@@ -42,7 +42,7 @@ def test_a_large_coordinator_system_prompt_goes_by_file_and_execs(env, monkeypat
     assert argv[argv.index("--system-prompt-file") + 1] == str(run / "system.md")
     assert "--system-prompt" not in argv and (run / "system.md").read_text() == head
     assert max(len(os.fsencode(a)) for a in argv) < ARG_STRLEN
-    assert "EVENTS" == (run / "prompt.md").read_text(), "the text is in the file, not the prompt"
+    assert "EVENTS" == _unmoded((run / "prompt.md").read_text()), "the text is in the file, not the prompt"
     # The same argv execs: no E2BIG before the agent starts.
     stub = _stub_agent(tmp_path)
     done = subprocess.run([str(stub), *argv[1:]], env={**os.environ, **spec["env"]}, timeout=30)
@@ -56,13 +56,13 @@ def test_an_inline_system_prompt_past_the_argument_limit_leads_the_prompt(env, m
     argv = spec["argv"]
     assert not [a for a in argv if a.startswith("--system-prompt")], "no file flag and too long: not inline"
     assert max(len(os.fsencode(a)) for a in argv) < ARG_STRLEN
-    assert (run / "prompt.md").read_text() == head + "\n\nEVENTS", "the text leads what the agent reads"
+    assert _unmoded((run / "prompt.md").read_text()) == head + "\n\nEVENTS", "the text leads what the agent reads"
     stub = _stub_agent(tmp_path)
     assert subprocess.run([str(stub), *argv[1:]], env={**os.environ, **spec["env"]}, timeout=30).returncode == 0
     # Text that fits one argument still goes inline on such a CLI.
     spec, run = _start_coordinator(env, monkeypatch, {claude.SYSTEM_PROMPT_FILE: False}, "SHORT-HEAD")
     assert spec["argv"][spec["argv"].index("--system-prompt") + 1] == "SHORT-HEAD"
-    assert (run / "prompt.md").read_text() == "EVENTS"
+    assert _unmoded((run / "prompt.md").read_text()) == "EVENTS"
     # The limit is the one guard: at it inline, one byte past it not.
     path = tmp_path / "edge.md"
     path.write_text("x" * base.MAX_ARG_BYTES)
@@ -80,14 +80,14 @@ def test_a_cached_coordinator_turn_keeps_a_too_long_head_in_its_input(env, monke
     assert spec["stdin"] == "input.jsonl" and "--input-format" in spec["argv"]
     assert not [a for a in spec["argv"] if a.startswith("--system-prompt")]
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
-    assert [b["text"] for b in blocks] == [head, "STABLE-CONTEXT", "EVENTS"]
+    assert [_unmoded(b["text"]) for b in blocks] == [head, "STABLE-CONTEXT", "EVENTS"]
     assert [("cache_control" in b) for b in blocks] == [False, True, False], "one breakpoint, after both"
     # With the file flag the head stays the system prompt and the input is unchanged.
     spec, run = _start_coordinator(env, monkeypatch, {claude.SYSTEM_PROMPT_FILE: True}, head,
                                    context="STABLE-CONTEXT", ttl="1h")
     assert "--system-prompt-file" in spec["argv"]
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
-    assert [b["text"] for b in blocks] == ["STABLE-CONTEXT", "EVENTS"]
+    assert [_unmoded(b["text"]) for b in blocks] == ["STABLE-CONTEXT", "EVENTS"]
 
 
 def _start_worker(p, monkeypatch, flags, system):

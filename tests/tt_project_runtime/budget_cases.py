@@ -2142,7 +2142,7 @@ def test_codex_coordinator_turns_continue_the_warm_session_and_read_the_cache(en
     from ttp import coordinator as coord
     p, d, turn = _codex_coordinator(env, monkeypatch, tmp_path)
     first, argv, prompt = turn()
-    assert first["status"] == "ok" and "resume" not in argv and prompt == "EVENTS"
+    assert first["status"] == "ok" and "resume" not in argv and _unmoded(prompt) == "EVENTS"
     assert json.loads(first["note"])["turn"]["thread"] == {**json.loads(first["note"])["turn"]["thread"],
                                                            "turn": 1, "why": "no earlier turn"}
     for k in range(2, 5):
@@ -2150,7 +2150,7 @@ def test_codex_coordinator_turns_continue_the_warm_session_and_read_the_cache(en
         thread = json.loads(r["note"])["turn"]["thread"]
         assert argv[-3:] == ["resume", first["session_id"], "-"], argv
         assert r["status"] == "ok" and r["session_id"] == first["session_id"] and thread["turn"] == k, thread
-        assert prompt == coord.THREAD_CONTINUED + f"\n\nEVENTS {k}", "a continued turn is told its history is stale"
+        assert _unmoded(prompt) == coord.THREAD_CONTINUED + f"\n\nEVENTS {k}", "a continued turn is told its history is stale"
         assert "except any the digest below lists as rejected" in coord.THREAD_CONTINUED, "rejected actions were not applied"
         assert any(a.startswith("developer_instructions=") for a in argv[:argv.index("resume")]), \
             "the same stable prefix goes with it"

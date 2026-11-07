@@ -110,6 +110,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     upstream,
     userwords,
     verified,
+    wakemode,
     watchdup,
     worktree,
     yesask,
@@ -2394,6 +2395,19 @@ def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list
     return text
 
 
+def _wakemode_checked(p: Project, text: str, notes: list) -> str:
+    """A reply, notify or ask as wakemode.guard posts it: a claim that the coordinator runs in its always-on
+    session is sent marked (unverified) with the recorded wake mode when the wake is stateless or most of
+    today's wakes were. Any fault posts the text unchanged: a message is never lost to this check.
+    Kept apart so the live-state claim check can take it in as one of its claims."""
+    try:
+        text, why = wakemode.guard(p.db, timefmt.home(p), text)
+        notes += why
+    except Exception as e:
+        notes.append(f"wakemode: the session-claim check failed ({type(e).__name__}: {e}); the message went unchecked")
+    return text
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None) -> list[str]:
@@ -2465,6 +2479,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
+                a["text"] = _wakemode_checked(p, a["text"], notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 turnrules.record_cites(db, chat, cites, replies[-1])
@@ -3199,6 +3214,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     why = prguard.findings_problem(db, text)
                     if why:
                         raise ValueError(f"ask_user rejected: {why}")
+                text = _wakemode_checked(p, text, notes)
                 text, rec = db.for_user(text), db.for_user((a.get("recommendation") or "").strip())   # notes follow them
                 least = db.for_user(least)   # the least-disruptive part is appended mid-message: its tag would stay
                 if a["blocking"] == "restriction":
@@ -3249,6 +3265,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     obligations.check_claims(a["claims"], p)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
+                a["text"] = _wakemode_checked(p, a["text"], notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
                 if a.get("claims"):

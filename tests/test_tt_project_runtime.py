@@ -717,6 +717,12 @@ def host_tz(monkeypatch):
 MAKE_BRIEF = "Keep the README friendly."
 
 
+def _unmoded(text: str) -> str:
+    """A coordinator prompt without the wake-mode line the daemon puts first (wakemode.py)."""
+    from ttp import wakemode
+    return re.sub("(?m)^" + re.escape(wakemode.HEAD) + ".*\n\n", "", text)
+
+
 def make(env, name="demo"):
     from ttp.project import register
     p = _clone_project(env, name)
@@ -5822,7 +5828,7 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
     assert spec["stdin"] == "input.jsonl"
     assert "--input-format" in spec["argv"] and spec["argv"][spec["argv"].index("--system-prompt") + 1] == head
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
-    assert [b["text"] for b in blocks] == [context, "EVENTS"]
+    assert [_unmoded(b["text"]) for b in blocks] == [context, "EVENTS"]
     for ttl, supported in (("off", True), ("1h", False)):
         spec, run = start(ttl, supported)
         assert "stdin" not in spec and not (run / "input.jsonl").exists()
@@ -24885,7 +24891,7 @@ def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, 
     assert argv[-3:] == ["resume", THREAD, "-"], "options after the resume subcommand"
     # The coordinator's system text goes the same way; it has no compact window.
     argv, prompt = start("coordinator", system=system, read_only=True)
-    assert overrides(argv)["developer_instructions"] == system and prompt == "PROMPT-MARKER"
+    assert overrides(argv)["developer_instructions"] == system and _unmoded(prompt) == "PROMPT-MARKER"
     assert "model_auto_compact_token_limit" not in overrides(argv) and argv[-1] == "-"
     # Text too long for one argument leads the prompt, as before.
     big = "x" * 200_000
