@@ -3122,6 +3122,20 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   that job's `.rc`. A file a worker or project writes (an owner or pgid file under the project's state)
   is never proof: a project whose own scripts start long-running jobs starts them through `ttp detach`
   to get this record, and `ttp detach --list` shows a task's jobs across its runs.
+- No installs into the shared user site (`guards.user_site`, `auto` by default; `on` also holds it on a
+  host of one project): on a host whose `ttp list` shows more than one project, every project imports the
+  same `~/.local`, so one `pip install --user` changes every project's packages. There every worker,
+  reviewer and coordinator run, and the checks the daemon starts, get `PIP_REQUIRE_VIRTUALENV=1`,
+  `PIP_USER=0` and `PIP_BREAK_SYSTEM_PACKAGES=0`, so pip itself refuses an install outside a virtualenv
+  on every provider, scripts included. The worker hook also refuses `pip install --user` (pip, pip3,
+  `python3 -m pip`, `uv pip --system`, `setup.py install --user`, through wrappers, `sh -c` and eval),
+  `--break-system-packages`, `--isolated`, a `--target` or `--prefix` under `.local`, a bare pip install
+  under `sudo` or `env -i`, and unsetting or overriding those variables or the same `pip config` names;
+  a pip command that installs nothing (download, list, show, freeze, wheel) may carry its own
+  `PIP_REQUIRE_VIRTUALENV=0`. Each refusal is counted on one queued ride-along `user_site_install`
+  event per run for the coordinator, never a user alert. Install into a venv the project owns:
+  `python3 -m venv <dir>` or `uv venv <dir>`, then `<dir>/bin/python -m pip install ...`. See
+  `runtime/ttp/usersite.py`.
 - Which project owns a process: every worker, daemon-run command, `ttp detach` job and `ttp checks`
   command carries `TTP_PROJECT` (the full path of `<project root>/tt-project`) and `TTP_RUN_DIR` (a
   run or check-run folder inside it). A project's reaper or cleanup script signals only processes it
