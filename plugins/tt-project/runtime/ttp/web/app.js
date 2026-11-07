@@ -346,6 +346,7 @@ async function refresh() {
   }
   put($("#why"), h.why_idle ? `<b>Idle:</b> ${esc(h.why_idle)}` : `${h.running} run${h.running === 1 ? "" : "s"} working.` +
     (h.held ? ` <b>Held:</b> ${esc(h.held)}` : ""));
+  text($("#selfwatch"), st.selfwatch || "");
   text($("#top"), [h.spend.in_flight ? `~${money(h.spend.in_flight)} so far in running work` : "",
     h.spend.top_7d ? `Top spender, 7 days: ${h.spend.top_7d.source} ${money(h.spend.top_7d.usd)}` : "",
     h.spend.caps_line ? `Project caps: ${h.spend.caps_line}` : "",

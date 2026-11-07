@@ -2380,6 +2380,7 @@ class Daemon:
                 self.check_cap_wait,
                 self.check_progress,
                 self.check_churn,
+                self.check_self_watch,
                 self.check_host_load,
                 self.check_idle_capacity,
                 self.check_obligations,
@@ -9872,6 +9873,50 @@ class Daemon:
             churnwatch.record(self.p.logs / churnwatch.FILE, obs, now, self.__dict__.setdefault("_churn_log", {}),
                               lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
+
+    def check_self_watch(self) -> None:
+        """Model-free watch on this host and this project's own process tree (selfwatch): one snapshot
+        line for status, the web app and the coordinator, and a run of this project's that runs away
+        (spawn rate, processes or load share past selfwatch.* for its window) is stopped: its own
+        process groups TERM then KILL, one event on its task and one notify. Never signals a process
+        this project does not own."""
+        from . import selfwatch
+        now, s = time.time(), selfwatch.settings(self.cfg)
+        due = selfwatch.BREACH_EVERY_S if getattr(self, "_selfwatch_breach", False) else s["every_s"]
+        if not s["every_s"] or now - getattr(self, "_selfwatch_at", 0.0) < due:
+            return
+        self._selfwatch_at = now
+        w = self.__dict__.setdefault("_selfwatch", selfwatch.Watch(self.p.base, cores=checkcap.cores()))
+        snap = w.step(s, now)
+        self._selfwatch_breach = bool(snap["breach"])
+        db = self.p.db
+        snap["stopped"] = (db.kv(selfwatch.KV) or {}).get("stopped")
+        for r in snap.pop("runaway"):
+            numbers = (f"{r['procs']} processes, {r['spawn_s']:g} new/s, {r['cpu']:g} cores, "
+                       f"{r['rss'] / 2**30:.1f} GB; host load {snap['host'].get('load1')} on {snap['host']['cores']} cores")
+            what = f"run {r['run']}" + (f" of task #{r['task']}" if r["task"] else "")
+            if not s["act"]:
+                log(self.p, f"self-watch: {what} past a limit for {s['window_s']:g} s ({r['why']}; {numbers}); "
+                            "selfwatch.act is off: not stopped")
+                continue
+            run = db.one("SELECT id, dir FROM runs WHERE id=? AND status='running'", (r["run"],)) \
+                if str(r["run"]).isdigit() else None
+            if run:
+                try:
+                    runner.request_stop(self._run_dir(run), f"selfwatch: {r['why']}")
+                except OSError:
+                    pass
+            done = selfwatch.stop(w, r, s["grace_s"])
+            text = (f"Self-watch stopped {what}: {r['why']} for {s['window_s']:g} s ({numbers}). TERM to process "
+                    f"group(s) {done['groups'] or '-'} and pid(s) {done['pids'] or '-'}, KILL to {done['killed'] or '-'}; "
+                    f"their locks are released with them.")
+            log(self.p, text)
+            task = int(r["task"]) if str(r["task"] or "").isdigit() else None
+            db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                 (now, "daemon", "selfwatch_runaway", "normal", text, "new", task))
+            self.alert(f"selfwatch:runaway:{r['run']}", text, severity="normal", every_s=0)
+            snap["stopped"] = {"ts": now, "run": r["run"], "task": r["task"], "why": r["why"]}
+        db.set_kv(selfwatch.KV, snap)
 
     def retire_coord_guard(self) -> None:
         """Once per daemon start: the coordinator session spend guard is gone (every wake resumes the

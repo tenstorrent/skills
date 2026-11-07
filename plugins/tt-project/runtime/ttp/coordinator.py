@@ -1438,6 +1438,9 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 if kept and low else f"; {len(kept)} finished tasks' worktrees kept (hand-off artifacts or open "
                 f"tasks): " + clip(", ".join(f"#{t}" for t in kept), 200) if kept else "")
         lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
+    from . import selfwatch
+    if sw := selfwatch.line(db.kv(selfwatch.KV), now):
+        lines.append(f"## Self-watch: {sw[len('self-watch: '):]}")
     section("host", lines)
     from . import overseer
     section("loop_health", overseer.digest_lines(p, now))   # results, from the overseer's last pass

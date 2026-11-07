@@ -1710,6 +1710,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
                      + (f" in {pr['project']} (shared: holds in every project)" if pr.get("shared") else "")
                      + (f": {pr['reason']}" if pr.get("reason") else "") + (f"; {pr['end']}" if pr.get("end") else "")
                      + f" — resume: ttp resume {p.name} --resource {pr['resource']}")
+    from . import selfwatch
+    if sw := selfwatch.line(db.kv(selfwatch.KV), now):
+        lines.append(sw)
     disk = db.kv("disk_low")
     if disk:
         lines.append(f"disk: only {disk['free_gb']} GB free under {disk['path']} (guard {disk.get('threshold_gb', '?')} GB); "
