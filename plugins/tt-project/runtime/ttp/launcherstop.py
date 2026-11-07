@@ -25,7 +25,7 @@ import time
 from pathlib import Path
 
 from .jobstop import _stat
-from .project import durable_write
+from .project import FOLDER, durable_write
 from .runner import proc_start
 
 STOP_FILE = "STOP"
@@ -237,6 +237,8 @@ def foreign(folder: Path, root: Path, project: Path) -> str | None:
             break
         if a != project and (a / "state" / "project.db").is_file():
             return f"{folder} is inside another tt-project project ({a})"
+        if (a / FOLDER / "state" / "project.db").is_file():     # a nested project's own root
+            return f"{folder} is inside another tt-project project ({a / FOLDER})"
     return None
 
 

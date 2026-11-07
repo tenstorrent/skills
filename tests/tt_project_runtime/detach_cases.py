@@ -1969,8 +1969,8 @@ def test_detach_stop_reports_a_registered_stop_that_fails_or_leaves_processes(en
 
 
 def test_detach_stop_never_runs_a_registered_stop_on_another_projects_job(env, tmp_path):
-    """A job folder outside the project root, inside another tt-project project's folder, or with a process
-    of another project is refused; the stop command never runs."""
+    """A job folder outside the project root, inside another tt-project project's folder or a nested
+    project's own root, or with a process of another project is refused; the stop command never runs."""
     p = make(env)
     script = _stop_script(tmp_path, 'touch "$(dirname "$0")/called"')
     outside = tmp_path / "elsewhere" / "run1"
@@ -1980,10 +1980,15 @@ def test_detach_stop_never_runs_a_registered_stop_on_another_projects_job(env, t
     (other / "state" / "project.db").write_text("")
     inner = other / "gates" / "run1"
     inner.mkdir(parents=True)
+    (p.root / "nested2" / "tt-project" / "state").mkdir(parents=True)
+    (p.root / "nested2" / "tt-project" / "state" / "project.db").write_text("")
+    beside = p.root / "nested2" / "gates" / "run1"
+    beside.mkdir(parents=True)
     p.set_config("detach.launcher_stops", {str(tmp_path / "**"): str(script), "**": str(script)})
     (p.root / "gates").mkdir()
     (p.root / "gates" / "link").symlink_to(outside)
     for folder, why in ((outside, "outside the project root"), (inner, "another tt-project project"),
+                        (beside, "another tt-project project"),
                         (p.root / "gates" / "link", "outside the project root"),
                         (p.root / "gates" / "..", "the project's own folder"),
                         (p.runs, "the project's own folder")):
