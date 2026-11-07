@@ -2020,7 +2020,11 @@ session and stateless coordinators on every provider.
   order. A hung command need not wait for the cap: one whose output has not grown for 10 min is stopped the
   same way and reported as "no output for 10 min" (a timeout, never a pass). A check object's `"silent_s"`
   (seconds) sets that limit for a check that is silent longer by design, and 0 turns it off. A full run of
-  the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
+  the tt-project test suite lists its 15 slowest test calls just above its `ttp-suite:` line. Every check runs in a
+  pinned Python env the harness owns, the user site off, so `pip install --user` never changes what a check imports;
+  `checks.python_lock` (project setting, default the plugin's lock of pytest and pytest-xdist) names its lock, and
+  `ttp checks --freeze-lock <file>` writes one that pins the user site's packages too (tt-project-harness
+  push-checks reference, "The pinned Python env"). `checks.wrap_cmd` (project setting, default unset) runs each command given after `ttp checks --`
   behind the project's own lock or queue command, the command passed as separate arguments; a missing wrapper
   fails the checks, and `delivery.push_checks` never go through it. A wrapper running its own test pool starts
   each shard, local or over ssh, as `ttp checks-shard -- <cmd>`, so the shard counts toward that host's checks slots.
