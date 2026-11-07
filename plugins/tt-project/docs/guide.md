@@ -207,7 +207,10 @@ only in the feed and never under "needs you".
 - These keys (and `budget.push_spend_to`) are account-level: `ttp config --account KEY VALUE` writes them to
   `~/.tt-project/settings.json` (mode 0600), which every project on the machine reads under its own
   `project.json` (a project may still override a key, except `budget.push_spend_to`, which is read
-  from the account settings only). `ttp config --account KEY` reads one; an
+  from the account settings only). Four `providers.chat` keys are account-level too, read by their
+  own code rather than merged into each project's settings: `model_ranking`, `ranking_source`,
+  `ranking_every_s` and `ranking_key_file` (see the chat provider's model ranking below).
+  `ttp config --account KEY` reads one; an
   empty value removes it. The same holds for a project's own keys: `ttp config <name> KEY ''` removes KEY
   from `project.json`, so its default applies again, and a key whose default is a list or an object
   refuses a value of another type without writing it, except the plain forms its reader takes
@@ -1198,9 +1201,30 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (at
    most hourly while a tier routes) lists the model again. That check stores only the served ids and
    its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
-   To keep work on the endpoint instead, set `providers.chat.model_ranking` to its model ids, smartest
-   first (for example by a public intelligence ranking you trust; empty by default, and nothing changes
-   without it). A routed start whose model is down, held as above or left out of the last good /models
+   To keep work on the endpoint instead, the daemon keeps a ranking of its model ids, smartest first,
+   in `providers.chat.model_ranking`: account-wide (`ttp config --account providers.chat.model_ranking
+   '["id-a", "id-b"]'`, in `~/.tt-project/settings.json`), so every project on the machine that uses
+   `chat` reads it; a project's own value wins (`[]` turns it off for that project). A model-free
+   refresher (`runtime/ttp/rankfresh.py`) keeps the account value current wherever `chat` has an
+   endpoint, with nothing to turn on: weekly (`providers.chat.ranking_every_s`, account-level, default
+   604800, at least 3600) and whenever the /models check lists a model no earlier refresh saw, it
+   fetches the Artificial Analysis Intelligence Index from its data API
+   (`providers.chat.ranking_source`, account-level, default
+   `https://artificialanalysis.ai/api/v2/language/models`) and ranks every served id seen so far by
+   it. Ids and index names are compared normalised (lower case, no org prefix or `:tag`, no
+   quantisation tokens such as `fp8`, with or without trailing variant words such as `reasoning`); an
+   id that matches nothing goes last, in sorted order, and is named in the log. One daemon on the
+   machine refreshes at a time. The API needs a key (a free one from Artificial Analysis; their data
+   needs attribution, which the log and feed line give): the daemon reads `ARTIFICIAL_ANALYSIS_API_KEY`
+   from its environment, else the first line of the file `providers.chat.ranking_key_file` names
+   (account-level, an absolute path; set by the user only, as is `ranking_source`, since the key is
+   sent there). The key never goes into settings, logs or prompts. Without a key nothing is fetched,
+   the last ranking stays and the account gets one user-only item asking for one, which clears once a
+   key is there. Each change (by the refresher or `ttp config --account`) appends one line to
+   `~/.tt-project/model-ranking.jsonl` (time, source and index version, old and new lists, trigger,
+   unmatched ids) and posts one low feed line; no change, no line. A failed fetch, or an answer that
+   matches no served id, keeps the last ranking (never empties it), retries an hour later and raises
+   one observation per outage (`error: true`). A routed start whose model is down, held as above or left out of the last good /models
    check, then runs the highest-ranked model that check lists and that no run was refused, at the
    tier's effort; its run's `route` record names the model it stands in for (`model_rank`). A stand-in
    that is refused too is skipped for a day and the next one runs. A task's own model pin on `chat`

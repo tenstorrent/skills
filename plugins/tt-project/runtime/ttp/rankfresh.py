@@ -131,7 +131,7 @@ def due(served: list[str], now: float, st: dict | None = None) -> str:
     st = read_state() if st is None else st
     if st.get("outage"):
         return str(st["outage"].get("trigger") or "weekly") if now - float(st.get("tried") or 0) >= RETRY_S else ""
-    if set(served) - set(st.get("seen") or []):
+    if st.get("refreshed") and set(served) - set(st.get("seen") or []):   # the first refresh is the schedule's
         return "new model"
     return "weekly" if now - float(st.get("refreshed") or 0) >= setting(EVERY_KEY) else ""
 

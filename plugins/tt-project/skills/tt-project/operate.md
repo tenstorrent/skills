@@ -107,7 +107,11 @@
   with no attempt spent and a cool-down (`route_cooldown_s`, default 900). A 404 for a model the
   endpoint no longer serves (`model_missing`) holds only that tier's route, with one notice, until its
   model changes or the hourly model-free /models check lists it again; `ttp status` shows the hold
-  and the served ids. `providers.chat.model_ranking` (model ids, smartest first; empty by default)
+  and the served ids. `providers.chat.model_ranking` (model ids, smartest first; account-wide, a project's
+  own value wins; kept current by the model-free refresher from the Artificial Analysis Intelligence
+  Index weekly and on a newly served model, which needs an API key: `ARTIFICIAL_ANALYSIS_API_KEY` or
+  `ttp config --account providers.chat.ranking_key_file <path>`; each change in
+  `~/.tt-project/model-ranking.jsonl`; a failed fetch keeps the last ranking)
   runs the highest-ranked served model instead while a routed or preference-pinned model is down,
   with one low alert per switch, and goes back once it is served; a required pin waits. A routed run that times out,
   fails or ends without a valid hand-off also falls back, once per task, recorded with its cause. Per

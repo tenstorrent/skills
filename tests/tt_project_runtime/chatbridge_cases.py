@@ -2763,3 +2763,167 @@ def test_a_wait_call_is_refused_only_in_a_run(env, monkeypatch):
     for val in ("", "0", "yes"):
         monkeypatch.setenv("TTP_WAITS_IDLE", val)
         assert hook.idle_wait("sleep 600") is None, val
+
+
+# The ranking refresher (rankfresh.py): fake names and a fake index, never the network.
+def _fake_index(*entries, version="v-test", more=False):
+    """One index page: (slug, score) pairs."""
+    return {"tier": "free", "intelligence_index_version": version, "pagination": {"has_more": more},
+            "data": [{"id": f"uuid-{i}", "slug": slug, "name": slug.upper(),
+                      "evaluations": {"artificial_analysis_intelligence_index": score}}
+                     for i, (slug, score) in enumerate(entries)]}
+
+
+def _rank_home(env, monkeypatch):
+    from ttp import project, rankfresh
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "rank-home")
+    monkeypatch.delenv(rankfresh.KEY_ENV, raising=False)
+    return project.HOME_DIR
+
+
+def test_the_account_model_ranking_applies_under_a_projects_own(env, monkeypatch):
+    """User's order: every project using the chat provider gets the ranking; account-wide, a project's own wins."""
+    from ttp import cli, modelrank, project, rankfresh
+    home = _rank_home(env, monkeypatch)
+    p = make(env)
+    _route_config(p)
+    cli.main(["config", "--account", "budget.timezone", "UTC"])   # an older account key stays beside it
+    cli.main(["config", "--account", rankfresh.KEY, '["rank-a", "rank-b"]'])
+    raw = json.loads((home / "settings.json").read_text())
+    assert raw["providers"]["chat"]["model_ranking"] == ["rank-a", "rank-b"] and raw["budget"]["timezone"] == "UTC"
+    assert "providers" not in project.load_account_settings()   # never merged into a project's settings
+    assert "chat" not in (project.layered({}).get("providers") or {})
+    assert modelrank.ranking({"providers": {"chat": {"endpoint": "x"}}}) == ["rank-a", "rank-b"]
+    assert modelrank.ranking({}) == ["rank-a", "rank-b"]
+    assert modelrank.ranking({"providers": {"chat": {"model_ranking": ["own"]}}}) == ["own"]
+    assert modelrank.ranking({"providers": {"chat": {"model_ranking": []}}}) == []   # a project may turn it off
+    # Another account key set later keeps the ranking; '' removes it; each change is in the ranking log.
+    cli.main(["config", "--account", "budget.timezone", "UTC"])
+    assert project.account_value(rankfresh.KEY) == ["rank-a", "rank-b"]
+    cli.main(["config", "--account", rankfresh.KEY, ""])
+    assert project.account_value(rankfresh.KEY) is None and "providers" not in json.loads((home / "settings.json").read_text())
+    log = [json.loads(x) for x in (home / rankfresh.LOG).read_text().splitlines()]
+    assert [(r["old"], r["new"], r["trigger"]) for r in log] == [([], ["rank-a", "rank-b"], "set"), (["rank-a", "rank-b"], [], "set")]
+    with pytest.raises(SystemExit):
+        cli.main(["config", "--account", rankfresh.KEY, "3"])
+    with pytest.raises(SystemExit):
+        cli.main(["config", "--account", rankfresh.EVERY_KEY, "60"])
+    # The source and key file decide where the key goes: a run may only clear them.
+    monkeypatch.setenv("TTP_RUN_ID", "1")
+    for k, v in ((rankfresh.SOURCE_KEY, "https://example.invalid/x"), (rankfresh.KEY_FILE_KEY, "/tmp/k")):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "--account", k, v])
+        assert project.account_value(k) is None
+
+
+def test_rank_maps_served_ids_to_the_index_by_normalised_name():
+    from ttp import rankfresh
+    entries, version = rankfresh.fetch("https://example.invalid/models", "k", lambda url, key: _fake_index(
+        ("alpha-2-5", 60), ("alpha-2-5-reasoning", 70), ("beta-7b", 50), ("gamma-1", 65), ("unscored", None)))
+    assert version == "v-test"
+    served = ["Org/Beta-7B-FP8", "zz-unknown", "org/alpha-2.5:latest", "aa-unknown", "Gamma_1"]
+    assert rankfresh.rank(served, entries) == (["org/alpha-2.5:latest", "Gamma_1", "Org/Beta-7B-FP8", "aa-unknown",
+                                                "zz-unknown"], ["aa-unknown", "zz-unknown"])
+    # Pages are followed while the index says there are more.
+    pages = {"https://example.invalid/m": _fake_index(("one", 1), more=True),
+             "https://example.invalid/m?page=2": _fake_index(("two", 2))}
+    assert len(rankfresh.fetch("https://example.invalid/m", "k", lambda url, key: pages[url])[0]) == 2
+    for bad in ({"data": "x"}, [], {"data": []}):
+        with pytest.raises(ValueError):
+            rankfresh.fetch("https://example.invalid/m", "k", lambda url, key, b=bad: b)
+
+
+def test_the_ranking_refresh_logs_each_change_and_a_failed_fetch_keeps_the_last(env, monkeypatch):
+    from ttp import modelrank, project, rankfresh
+    home = _rank_home(env, monkeypatch)
+    calls, answer = [], [_fake_index(("rank-a", 70), ("rank-b", 60))]
+
+    def get(url, key):
+        calls.append((url, key))
+        if isinstance(answer[0], Exception):
+            raise answer[0]
+        return answer[0]
+    now = 1_000_000.0
+    served = ["rank-b", "rank-a", "odd-one"]
+    assert rankfresh.due(served, now) == "weekly"   # never refreshed
+    res = rankfresh.refresh(served, "weekly", now, "secret-key", get)
+    assert res["changed"] and res["new"] == ["rank-a", "rank-b", "odd-one"] and res["unmapped"] == ["odd-one"]
+    assert modelrank.ranking({}) == ["rank-a", "rank-b", "odd-one"] and calls[0][1] == "secret-key"
+    assert "odd-one" in rankfresh.change_text(res) and "Artificial Analysis" in rankfresh.change_text(res)
+    # Not due again until a week passes; the same answer then changes nothing and logs nothing.
+    assert rankfresh.due(served, now + 3600) == "" and rankfresh.refresh(served, "weekly", now + 3600, "k", get) == {}
+    week = now + rankfresh.EVERY_S
+    assert rankfresh.due(served, week) == "weekly" and not rankfresh.refresh(served, "weekly", week, "k", get)["changed"]
+    # A failed fetch, then an answer matching nothing: the ranking stays, one outage, retried hourly.
+    for i, fault in enumerate((OSError("down"), _fake_index(("other", 1)))):
+        answer[0] = fault
+        t = week + rankfresh.EVERY_S + i * rankfresh.RETRY_S
+        res = rankfresh.refresh(served, "weekly", t, "k", get)
+        assert res["error"] and res["outage_new"] == (i == 0) and res["since"] == week + rankfresh.EVERY_S
+        assert modelrank.ranking({}) == ["rank-a", "rank-b", "odd-one"]
+        assert rankfresh.read_state()["outage"]["error"] is True
+        assert rankfresh.due(served, t + 60) == "" and rankfresh.due(served, t + rankfresh.RETRY_S) == "weekly"
+    answer[0] = _fake_index(("rank-a", 70), ("rank-b", 80), version="v-2")
+    res = rankfresh.refresh(served, "weekly", t + rankfresh.RETRY_S, "k", get)
+    assert res["changed"] and res["ended"] and rankfresh.read_state()["outage"] is None
+    log = [json.loads(x) for x in (home / rankfresh.LOG).read_text().splitlines()]
+    assert [(r["old"], r["new"], r["trigger"], r["version"]) for r in log] == [
+        ([], ["rank-a", "rank-b", "odd-one"], "weekly", "v-test"),
+        (["rank-a", "rank-b", "odd-one"], ["rank-b", "rank-a", "odd-one"], "weekly", "v-2")]
+    assert all("Artificial Analysis" in r["source"] and r["unmapped"] == ["odd-one"] for r in log)
+    for f in ("settings.json", rankfresh.LOG, rankfresh.STATE):   # the key is never stored
+        assert "secret-key" not in (home / f).read_text()
+    assert project.account_value(rankfresh.KEY) == ["rank-b", "rank-a", "odd-one"]
+
+
+def test_a_newly_served_model_refreshes_the_ranking_through_the_daemon(env, monkeypatch):
+    """The served-models check lists a new model: the daemon refreshes at once; no key, one user-only item."""
+    from ttp import alerts, modelrank, rankfresh, route
+    from ttp.daemon import Daemon
+    home = _rank_home(env, monkeypatch)
+    monkeypatch.setenv("TTP_TEST_MODEL_RANKING", "1")
+    p = make(env)
+    _route_config(p)
+    d = Daemon(p.base)
+    d._load_config()
+    posted, seen = [], []
+    monkeypatch.setattr(d, "alert", lambda key, text, severity="high", **k: posted.append((key, text, severity)))
+    monkeypatch.setattr(d, "observe", lambda source, text, **k: seen.append((source, text, k)))
+    index = [_fake_index(("rank-a", 70), ("rank-b", 60))]
+    monkeypatch.setattr(rankfresh, "_get", lambda url, key: index[0])
+
+    def tick():
+        d._rank_tried = 0.0
+        d.refresh_model_ranking()
+        if d._rank_job:
+            d._rank_job.join(10)
+        d.refresh_model_ranking()   # posts what the thread found
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b"], time.time())
+    tick()   # no key: nothing fetched, one user-only item
+    assert posted == [(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, "normal")] and not (home / rankfresh.STATE).exists()
+    assert alerts.holds(p.db, rankfresh.NEEDS_KEY, 0, time.time())
+    keyfile = env["tmp"] / "aa-key"
+    keyfile.write_text("file-key\n")
+    from ttp import project
+    project.set_account_setting(rankfresh.KEY_FILE_KEY, str(keyfile))
+    assert rankfresh.api_key() == "file-key" and not alerts.holds(p.db, rankfresh.NEEDS_KEY, 0, time.time())
+    posted.clear()
+    tick()
+    assert modelrank.ranking(d.cfg) == ["rank-b"] and len(posted) == 1 and posted[0][2] == "low"
+    tick()   # nothing new: no refresh, no line
+    assert len(posted) == 1
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b", "rank-a"], time.time())
+    assert rankfresh.due(modelrank.served(p.state), time.time()) == "new model"
+    tick()
+    assert modelrank.ranking(d.cfg) == ["rank-a", "rank-b"] and len(posted) == 2
+    assert json.loads((home / rankfresh.LOG).read_text().splitlines()[-1])["trigger"] == "new model"
+    # The index goes away: one observation, flagged an error; the ranking stays.
+    index[0] = {"error": "gone"}
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-b", "rank-a", "rank-c"], time.time())
+    tick()
+    d._rank_tried = 0.0
+    d.refresh_model_ranking()   # not due again within the hour
+    assert modelrank.ranking(d.cfg) == ["rank-a", "rank-b"] and len(posted) == 2
+    assert len(seen) == 1 and seen[0][0] == "model-ranking" and seen[0][1].startswith("error:")
+    # A project with no chat endpoint never refreshes.
+    assert not rankfresh.configured({"providers": {"chat": {"model_ranking": ["x"]}}}) and not rankfresh.configured({})
