@@ -44420,8 +44420,9 @@ def test_sweep_digest_and_budget_digest_list_credits_as_a_provider_holds_unblock
     assert "free window resets and paid credits are an unblock path" in " ".join(src.split())
 
 
-def _assert_openai_strict_schema(schema):
-    """Check the conservative subset used by every coordinator schema adapter."""
+def _assert_openai_strict_schema(schema, all_required=True):
+    """Check the conservative subset used by every coordinator schema adapter (all_required=False:
+    Claude's sparse form, which requires only each object's own fields)."""
     allowed = {'type', 'properties', 'required', 'additionalProperties', 'items', 'enum',
                'anyOf', '$defs', '$ref', 'description', 'title'}
     assert set(schema) <= allowed, schema
@@ -44429,15 +44430,18 @@ def _assert_openai_strict_schema(schema):
     types = [types] if isinstance(types, str) else types
     if 'object' in types or 'properties' in schema:
         assert schema.get('additionalProperties') is False, schema
-        assert set(schema.get('required', [])) == set(schema.get('properties', {})), schema
+        if all_required:
+            assert set(schema.get('required', [])) == set(schema.get('properties', {})), schema
+        else:
+            assert set(schema.get('required', [])) <= set(schema.get('properties', {})), schema
         for sub in schema.get('properties', {}).values():
-            _assert_openai_strict_schema(sub)
+            _assert_openai_strict_schema(sub, all_required)
     if 'items' in schema:
-        _assert_openai_strict_schema(schema['items'])
+        _assert_openai_strict_schema(schema['items'], all_required)
     for sub in schema.get('anyOf', []):
-        _assert_openai_strict_schema(sub)
+        _assert_openai_strict_schema(sub, all_required)
     for sub in schema.get('$defs', {}).values():
-        _assert_openai_strict_schema(sub)
+        _assert_openai_strict_schema(sub, all_required)
 
 
 def test_strict_schema_visits_anyof_definitions_and_refuses_free_objects():

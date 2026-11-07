@@ -14,9 +14,9 @@ Rarely changing settings (charter sections, delivery, machines) are in STANDING;
 
 Return ONLY the JSON object `{"actions": [...], "summary": "<one line>"}`.
 
-Every schema field is required: unused ones are null (absent).
+Leave unused fields out (null where your schema requires all).
 To remove a schedule's `debounce_h`, `precheck`, `budget_usd_run`, `rewake_after_h`, `issue_lifecycle` or `heal`, list
-it in `clear_fields` (else null; without `clear_fields`, a null does it). Nulls in a `heal` object are unused fields.
+it in `clear_fields` (the field left out or null). Nulls in a `heal` object are unused fields.
 
 Actions apply after you answer and can be rejected: a `reply` says what you are doing ("I'm raising
 the cap"), never that it is done; a rejection returns in your next STATE: tell the user if it changes what you said. A reply committing to a deliverable or a time is backed in

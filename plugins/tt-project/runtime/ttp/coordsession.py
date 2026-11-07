@@ -230,6 +230,12 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
     return "resume", "continued"
 
 
+def salvaged_line(n) -> str:
+    """The resumed wake's lead after its last wake's answer was cut off at its budget end and applied."""
+    return (f"Your last wake ran out of budget on its final answer before it ran. The harness applied that "
+            f"answer as sent ({int(n)} actions): do not send it again.")
+
+
 def limit(cfg: dict, state, model: str = "") -> float:
     """The context size at which the session compacts in place: compact_tokens when above 0, else the
     session's first prompt (base_tokens) or its size after its last compaction (compact_floor), the
@@ -281,6 +287,9 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     st.pop("rejected", None)
     if ok:
         st.pop("idle_fails", None)
+        st.pop("salvaged", None)   # the wake it was told in ran
+        if turn.get("salvaged"):   # its answer, cut off at its budget end, was applied: the next wake is told
+            st["salvaged"] = int(turn["salvaged"])
     if ok and str(summary or "").strip():
         st["recent"] = ([x for x in (st.get("recent") or []) if isinstance(x, dict)]
                         + [{"at": now, "summary": str(summary).strip()[:RECENT_CHARS]}])[-RECENT_WAKES:]

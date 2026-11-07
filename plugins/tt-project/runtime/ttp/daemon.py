@@ -3144,6 +3144,8 @@ class Daemon:
                 except Exception as e:   # today's digest, unacknowledged: the next session wake sends it whole
                     ack, sent_why = None, f"digest failed: {type(e).__name__}: {e}"[:200]
                     log(self.p, f"coordinator session {sent_why}")
+            if session_mode == "resume" and (n := (state or {}).get("salvaged")):
+                prompt = coordsession.salvaged_line(n) + "\n\n" + prompt
             restoring = session_mode == "resume" and bool((state or {}).get("restore"))
             if session_mode in ("new", "resume") and session_prompt:
                 system, context = session_prompt["system"], session_prompt["context"]
@@ -4954,6 +4956,8 @@ class Daemon:
             # Its process died without a result on this boot (a crash, an OOM kill): restarted once with
             # no attempt spent; a restart that dies the same way counts one, so a crash loop still ends.
             note.update(lost_to_crash=True)   # still a failure to the runaway guard
+        elif r["role"] == "coordinator" and status in bud.WASTED and _salvageable_answer(status, usage, note):
+            note["not_waste"] = "answer"   # its whole answer, cut off by its budget, is applied (_finish_coordinator)
         elif status == "failed" and _resume_never_started(note, usage) and not refused:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
             if ctxfork.forked(note):   # its next start skips the fork (ctxfork.prepare)
@@ -5142,6 +5146,13 @@ class Daemon:
             log(self.p, f"coordinator run {r['id']} timed out: " + json.dumps(details, sort_keys=True))
             db.set_kv("last_coordinator_timeout", {"run": r["id"], "at": time.time(), **details})
         out = usage.structured if isinstance(usage.structured, dict) else last_json_object(usage.final_text or "")
+        if note.get("not_waste") == "answer":
+            # Its budget ran out on its whole final answer: apply it (validated like any), not rerun the batch.
+            log(self.p, f"coordinator run {r.get('id')}: over its budget on its final answer; applying its "
+                        f"{len(usage.answer['actions'])} actions")
+            out, status = usage.answer, "ok"
+            if isinstance((note.get("turn") or {}).get("session"), dict):   # its session resumes, told it was applied
+                note["turn"]["session"] = {**note["turn"]["session"], "salvaged": len(out["actions"])}
         if not isinstance((out or {}).get("actions"), list) \
                 and isinstance((early := last_json_object(getattr(usage, "actions_text", "") or "")), dict) \
                 and isinstance(early.get("actions"), list):
@@ -18275,6 +18286,13 @@ def _list_cost(r: dict, usage) -> float:
 
 def _has_tokens(usage) -> bool:
     return bool(usage.input_tokens or usage.output_tokens or usage.cache_read_tokens or usage.cache_write_tokens)
+
+
+def _salvageable_answer(status: str, usage, note: dict) -> bool:
+    """A coordinator wake (a session's new or resumed wake, or a provider gap's stateless turn) whose
+    budget ended it on a whole final answer the run could not apply (RunUsage.answer)."""
+    answer = getattr(usage, "answer", None)
+    return isinstance(answer, dict) and isinstance(answer.get("actions"), list) and turnsize.over_budget(status, usage)
 
 
 def _resume_never_started(note: dict, usage) -> bool:

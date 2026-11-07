@@ -2477,3 +2477,17 @@ def test_coordsession_row_delta_ignores_the_open_tasks_overlap_advice_coming_and
     got = dict(sent)["tasks"].split("\n")
     assert got[0] == advised and got[1].startswith("(rows since your last wake, by key: changed #1;"), got
     assert got[2:] == [clash], got
+
+
+def test_coordsession_the_wake_after_a_salvaged_answer_resumes_and_is_told_it_was_applied(env, monkeypatch):
+    from ttp import coordsession
+    p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
+    first, _, _, _ = turn("EVENTS 1")
+    sid = first["session_id"]
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "salvaged": 3})   # as record() leaves it
+    r, argv, prompt, session = turn("EVENTS 2")
+    assert argv[-2:] == ["--resume", sid] and session["mode"] == "resume", session
+    assert coordsession.salvaged_line(3) in prompt and prompt.endswith("EVENTS 2")
+    assert "salvaged" not in p.db.kv(coordsession.KEY)
+    _, _, prompt, _ = turn("EVENTS 3")
+    assert "do not send it again" not in prompt

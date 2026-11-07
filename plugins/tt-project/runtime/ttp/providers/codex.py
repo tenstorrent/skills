@@ -574,6 +574,10 @@ class Codex(Provider):
                 u.structured = drop_nulls(json.loads(last))
             except ValueError:
                 pass
+        if not cache_reports and isinstance(u.structured, dict) and isinstance(u.structured.get("actions"), list):
+            # Cut off before its turn completed (the runner's budget check) after a whole JSON answer:
+            # the daemon may apply it (Daemon._finish_coordinator). A cut-off message never parses.
+            u.answer = u.structured
         blob = u.error + " " + err
         if AUTH_RE.search(blob) and not u.output_tokens:
             u.auth_failed = True

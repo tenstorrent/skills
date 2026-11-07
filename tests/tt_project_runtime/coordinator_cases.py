@@ -23126,3 +23126,169 @@ def test_a_retired_quotation_leaves_the_readback_and_the_worker_prompt(env, caps
         assert "never push to main" in text
     [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
     assert broad in json.loads(ev["data"])["old"]
+
+
+# A coordinator turn whose budget ended it on its whole final answer: the answer is applied, not wasted.
+SALVAGE_ANSWER = {"actions": [{"type": "reply", "chat": "c1", "text": "ok", "severity": None, "title": None}],
+                  "summary": "s"}
+
+
+def _answer_call(tid="t1", inp=None, parent=None):
+    return {"type": "assistant", "parent_tool_use_id": parent,
+            "message": {"id": f"m-{tid}", "usage": {}, "content": [
+                {"type": "tool_use", "id": tid, "name": "StructuredOutput", "input": inp or SALVAGE_ANSWER}]}}
+
+
+def _claude_result(subtype="error_max_budget_usd", structured=None):
+    return {"type": "result", "subtype": subtype, "is_error": subtype != "success", "total_cost_usd": 1.3,
+            "usage": {"input_tokens": 1, "output_tokens": 1}, "result": "", "structured_output": structured}
+
+
+def _claude_parse(tmp_path, events):
+    from ttp.providers.claude import Claude
+    path = tmp_path / "output.jsonl"
+    path.write_text("".join(json.dumps(e) + "\n" for e in events))
+    return Claude().parse(path)
+
+
+def test_claude_keeps_an_unrun_final_answer_at_budget_end_without_nulls(tmp_path):
+    init = {"type": "system", "subtype": "init", "session_id": "s"}
+    u = _claude_parse(tmp_path, [init, _answer_call(), _claude_result()])
+    assert u.answer == {"actions": [{"type": "reply", "chat": "c1", "text": "ok"}], "summary": "s"}
+    assert u.structured is None
+    # A retry after a refused first call: the newest one, still unrun, is the answer.
+    refused = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "is_error": True}]}}
+    newer = {"actions": [{"type": "reply", "chat": "c1", "text": "second"}]}
+    assert _claude_parse(tmp_path, [_answer_call(), refused, _answer_call("t2", newer), _claude_result()]).answer == newer
+
+
+def test_claude_keeps_no_answer_that_ran_was_denied_came_from_a_subagent_or_ended_otherwise(tmp_path):
+    ran = {"type": "user", "message": {"content": [{"type": "tool_result", "tool_use_id": "t1", "content": "ok"}]}}
+    denied = {"type": "user", "message": {"content": [
+        {"type": "tool_result", "tool_use_id": "t1", "is_error": True, "content": "denied by hook"}]}}
+    assert _claude_parse(tmp_path, [_answer_call(), ran, _claude_result()]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call(), denied, _claude_result()]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call(parent="sub1"), _claude_result()]).answer is None
+    for subtype in ("error_max_turns", "error_during_execution", "success"):
+        assert _claude_parse(tmp_path, [_answer_call(), _claude_result(subtype)]).answer is None, subtype
+    # A result that carried the answer anyway: that one stands, nothing is salvaged.
+    assert _claude_parse(tmp_path, [_answer_call(), _claude_result(structured=SALVAGE_ANSWER)]).answer is None
+    assert _claude_parse(tmp_path, [_answer_call()]).answer is None   # cut before any result line
+
+
+def test_codex_and_cursor_keep_a_whole_answer_cut_off_by_the_runners_budget_check(tmp_path):
+    from ttp.providers import get_provider
+    text = json.dumps(SALVAGE_ANSWER)
+    msg = {"type": "item.completed", "item": {"type": "agent_message", "text": text}}
+    done = {"type": "turn.completed", "usage": {"input_tokens": 1, "cached_input_tokens": 0, "output_tokens": 1}}
+    out = tmp_path / "codex.jsonl"
+    out.write_text(json.dumps(msg) + "\n")
+    assert get_provider("codex").parse(out).answer == {"actions": [{"type": "reply", "chat": "c1", "text": "ok"}],
+                                                       "summary": "s"}
+    out.write_text(json.dumps(msg) + "\n" + json.dumps(done) + "\n")
+    assert get_provider("codex").parse(out).answer is None   # its turn completed: a plain answer
+    out.write_text(json.dumps({**msg, "item": {"type": "agent_message", "text": text[:-5]}}) + "\n")
+    assert get_provider("codex").parse(out).answer is None   # a cut-off message never parses
+    cur = tmp_path / "cursor.jsonl"
+    said = {"type": "assistant", "message": {"content": [{"type": "text", "text": text}]}}
+    cur.write_text(json.dumps(said) + "\n")
+    assert get_provider("cursor").parse(cur).answer["actions"][0]["text"] == "ok"
+    cur.write_text(json.dumps(said) + "\n" + json.dumps({"type": "result", "result": text}) + "\n")
+    assert get_provider("cursor").parse(cur).answer is None
+
+
+def test_only_a_stateless_coordinator_turn_over_its_budget_is_salvageable(tmp_path):
+    from ttp.daemon import _salvageable_answer
+    u = _claude_parse(tmp_path, [_answer_call(), _claude_result()])
+    stateless = {"turn": {"session": {"mode": "stateless"}}}
+    assert _salvageable_answer("failed", u, stateless) and _salvageable_answer("failed", u, {})
+    assert _salvageable_answer("budget", u, {})
+    for mode in ("new", "resume"):   # a session wake's cut-off answer is applied too; its session resumes
+        assert _salvageable_answer("failed", u, {"turn": {"session": {"mode": mode}}}), mode
+    other = _claude_parse(tmp_path, [_answer_call(), _claude_result("error_max_turns")])
+    other.answer = u.answer
+    assert not _salvageable_answer("failed", other, stateless)   # another ending
+    u.answer = {"summary": "no actions"}
+    assert not _salvageable_answer("failed", u, stateless)
+
+
+@pytest.mark.parametrize("prior", ["none", "resumable"])
+def test_a_salvaged_coordinator_session_wake_is_applied_not_wasted_and_its_session_resumes(env, prior):
+    """A session wake (new, or a resume of a saved session) cut off at its budget end on its unrun final
+    StructuredOutput call: its answer is applied, not counted as waste, and the next wake resumes the
+    same session, told the answer was applied (never a fresh seeded session or a stateless turn)."""
+    from ttp import budget as bud
+    from ttp import coordsession as cs
+    from ttp.daemon import Daemon
+    p = make(env)
+    key, model, effort = "k1", "m", "high"
+    if prior == "resumable":
+        p.db.set_kv(cs.KEY, {"id": "s1", "key": key, "model": model, "effort": effort, "last_ok": True,
+                             "provider": "claude", "wakes": 2})
+    mode, why = cs.decide(p.config(), p.db.kv(cs.KEY), key, model, effort, lambda sid: True, time.time())
+    assert mode == ("resume" if prior == "resumable" else "new"), (mode, why)
+    session = {"mode": mode, "why": why, "key": key, "model": model, "effort": effort, "provider": "claude"}
+    answer = {"actions": [{"type": "task_add", "title": "salvaged task", "spec": "s", "kind": None, "tier": None}],
+              "summary": "s"}
+    rid = p.db.x("INSERT INTO runs(role,provider,model,started,status,note,session_id) VALUES('coordinator',"
+                 "'claude','m',?,'running',?,?)", (time.time() - 60, json.dumps({"turn": {"session": session}}),
+                                                   "s1" if mode == "resume" else None))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 1.0, "timeout_s": 600}))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(e) + "\n" for e in [
+        {"type": "system", "subtype": "init", "session_id": "s1"}, _answer_call(inp=answer), _claude_result()]))
+    Daemon(p.base).finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                              {"rc": 1, "started": time.time() - 60, "ended": time.time()})
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert json.loads(run["note"])["not_waste"] == "answer" and not bud.wasted(run), run
+    assert len(p.db.q("SELECT id FROM tasks WHERE title='salvaged task'")) == 1
+    st = p.db.kv(cs.KEY)
+    assert st["id"] == "s1" and st["last_ok"] and st["salvaged"] == 1 and not st.get("rerun"), st
+    nxt = cs.decide(p.config(), st, key, model, effort, lambda sid: True, time.time())
+    assert nxt[0] == "resume", nxt
+    # The next wake that ends ok was told; a later one is not told again.
+    st = cs.record(st, None, "s1", {**session, "mode": "resume", "why": nxt[1]}, True, time.time())
+    assert "salvaged" not in st
+
+
+def test_claude_schema_requires_only_each_objects_own_fields_and_codex_stays_all_required(tmp_path):
+    from ttp import coordinator as coord
+    from ttp.providers import get_provider
+    from ttp.providers.base import strict_schema
+    loose = strict_schema(coord.ACTIONS_SCHEMA, require_all=False)
+    item = loose["properties"]["actions"]["items"]
+    assert loose["required"] == ["actions"] and item["required"] == ["type"]
+    assert item["additionalProperties"] is False and "null" in item["properties"]["severity"]["type"]
+    assert item["properties"]["claims"]["items"]["required"] == ["text"]
+    strict = strict_schema(coord.ACTIONS_SCHEMA)
+    assert set(strict["properties"]["actions"]["items"]["required"]) == set(item["properties"])
+    kw = dict(role="coordinator", model="", effort="low", cwd=str(tmp_path), budget_usd=1, read_only=True,
+              schema=coord.ACTIONS_SCHEMA, restrictions={})
+    for name in ("claude", "chat"):
+        argv, _ = get_provider(name).build(**kw)
+        assert json.loads(argv[argv.index("--json-schema") + 1]) == loose, name
+    argv, _ = get_provider("codex").build(**kw)
+    assert json.loads(pathlib.Path(argv[argv.index("--output-schema") + 1]).read_text()) == strict
+
+
+def test_an_answer_without_nulls_parses_to_the_same_actions_as_a_padded_one(tmp_path):
+    """Under the sparse schema a null is padding, as under the all-required one: a schedule field is
+    cleared only through clear_fields, and left-out fields keep their values."""
+    from ttp import coordinator as coord
+    props = coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"]
+    bare = [{"type": "reply", "chat": "c1", "text": "ok"},
+            {"type": "schedule_set", "name": "n", "probe": "true"},
+            {"type": "schedule_set", "name": "n", "clear_fields": ["debounce_h"]},
+            {"type": "task_update", "id": 3, "status": "queued", "heal": {"preset": "x"}}]
+    padded = [{**dict.fromkeys(props), **a} for a in bare]
+    padded[3]["heal"] = {"preset": "x", "pattern": None}
+    sparse_null = [*bare[:1], {**bare[1], "debounce_h": None, "precheck": None}, *bare[2:]]
+    got = [_claude_parse(tmp_path, [_claude_result("success", {"actions": acts, "summary": "s"})]).structured
+           for acts in (bare, padded, sparse_null)]
+    assert got[0] == got[1] == got[2], got
+    assert got[0]["actions"][1] == {"type": "schedule_set", "name": "n", "probe": "true"}
+    assert got[0]["actions"][2] == {"type": "schedule_set", "name": "n", "debounce_h": None}
+    # A sparse answer outside any schema (text) keeps its legacy explicit-null clear, as before.
+    from ttp.providers.base import drop_nulls
+    assert drop_nulls({"type": "schedule_set", "debounce_h": None}) == {"type": "schedule_set", "debounce_h": None}

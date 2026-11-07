@@ -355,6 +355,10 @@ class Cursor(Provider):
                 u.structured = json.loads(u.final_text)
             except ValueError:
                 pass
+        if not data and isinstance(u.structured, dict) and isinstance(u.structured.get("actions"), list):
+            # Cut off before its result (the runner's budget check) after a whole JSON answer: the
+            # daemon may apply it (Daemon._finish_coordinator). A cut-off message never parses.
+            u.answer = u.structured
         return u
 
     def account(self) -> str:
