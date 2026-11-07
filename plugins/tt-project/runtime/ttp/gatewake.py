@@ -9,7 +9,7 @@ hold needs a decision (held()):
 
 - a queued task the user ordered or that is urgent (urgent.user_ordered / urgent.is_urgent), or that
   owns an open obligation (an owed promise, obligations.owner_due), and that the red gate holds: the
-  coordinator turn guard's red (gate `lane`) lets such tasks start, so it holds none of them;
+  coordinator turn guard's red of older runtimes (gate `lane`) lets such tasks start, so it holds none of them;
 - a red the provider reports as its own spend limit (budget.red_class "spend limit"): funds only the
   user can add.
 

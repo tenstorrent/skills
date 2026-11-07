@@ -16,8 +16,8 @@ an older release, so it leads the lane, ahead of priority-1 work. One holds the 
   auth gate, a pause or a resource lock. With the burst slots full too, dispatch preempts the lowest-priority
   routine run of its provider at a safe point (preempt.py; budget.urgent_preempt, default on): stopped
   with its work kept and queued again at its place, never urgent work, a review, a push or a run holding
-  a lock. The coordinator turn guard's red is no such hold: it holds routine work only, and urgent and
-  user-ordered tasks (user_ordered) start under the rest of the gate (budget.for_task).
+  a lock. The coordinator turn guard is no such hold: it holds no worker run (budget.Gate.coord_hold;
+  a gate saved by an older runtime with a `lane` lets user_ordered tasks start, budget.for_task).
 - Review: an urgent code task's review is queued as soon as it hands off (done or needs_review)
   at priority 1; the review sweeps skip review.sweep_after_s and review.unreviewed_per_pass for it,
   and an urgent task in review for WAIT_S raises the review_stall event (Daemon._raise_review_stalls).

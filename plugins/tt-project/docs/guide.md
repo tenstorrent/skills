@@ -224,9 +224,10 @@ only in the feed and never under "needs you".
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
   Its coordinator signal (self-started coordinator turns past `budget.hourly_coordinator_usd`, or
-  too many of them on a plan) defers those turns and holds routine work only: turns for your
-  messages, urgent tasks and user-ordered tasks (answering a chat, owning an obligation) still start,
-  under the dollar caps. `ttp status` says so in its slots line.
+  too many of them on a plan) throttles the coordinator only: its self-started turns wait until the
+  trailing hour is back under the limit, then one turn takes everything queued meanwhile. Your
+  messages and must-act items still wake it at once, and worker tasks keep starting under the normal
+  caps. `ttp status` says so on its coordinator line.
 - A coordinator turn that goes over `coordinator.turn_budget_usd` is never retried as is: its batch is
   halved down to single items; a single item runs once more alone at the ceiling
   (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above the hourly coordinator limit
@@ -1336,8 +1337,7 @@ running work is interrupted only by the preemption below:
   fresh `urgent:` line or an obligation's required owner may take `budget.urgent_extra_slots` (2;
   0 turns it off) more, the `urgent:` line first; priority 1 alone never does. A fresh `urgent:` line
   takes them at a green, yellow or orange gate (an orange plan gate of 0 slots too); an obligation
-  owner only while the gate allows a slot. A red gate (the coordinator turn guard's red holds routine
-  work only), the dollar caps, the auth gate, pauses and locks still hold it.
+  owner only while the gate allows a slot. A red gate, the dollar caps, the auth gate, pauses and locks still hold it.
 - Preemption: with those extra slots full too, dispatch stops the lowest-priority routine run of its
   provider at a safe point (`budget.urgent_preempt`, on by default): the run's work is kept and its
   task goes back to the queue with no attempt spent, marked "preempted for user-ordered urgent work;

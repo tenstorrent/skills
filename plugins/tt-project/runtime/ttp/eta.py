@@ -30,7 +30,7 @@ last WINDOW_S days), never a worst case or padding:
 - hold: a queued or waiting task whose provider's spend gate (kv `gates`) allows no new work starts no
   earlier than the gate's known reset (budget.hold_clears: a cap's period end, a plan window's reset,
   the runaway guard's hour, a provider limit's end); with no known reset it has no estimate and says it
-  is held by the spend cap. A coordinator turn guard's red holds routine work only (budget.for_task).
+  is held by the spend cap. A coordinator turn guard's red saved by an older runtime holds routine work only (budget.for_task).
 A blocked, failed or cancelled task on the path, or a leg with no measured sample, gives no
 estimate ('no estimate yet', with why): never a guess.
 
