@@ -2180,6 +2180,11 @@ class Batch:
         self.steps.go("checks")
         return slot
 
+    def _check_env(self) -> dict:
+        """The env the batch's checks run in (push.check_env), in the project's pinned Python env."""
+        return push.check_env("target", self.tip, self.check_run_dir, self.branch,
+                              lock=push.runnerenv.lock_of(self.p.config(), self.wt))
+
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
         version guard (push.stale_versions, with `delivery.plugin_version_guard` on) comes first and
@@ -2212,7 +2217,11 @@ class Batch:
             return push.NONE_APPLY, ""
         say(f"checking {head[:10]}")
         self.checks["runs"] += 1
-        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
+        try:
+            env = self._check_env()
+        except push.runnerenv.Unavailable as e:
+            say(f"{head[:10]}: {e}")
+            return "python env", str(e)
         tree, run = pushpass.tree_of(self.wt, head), []
         for n, cmd in enumerate(todo):
             parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
@@ -2515,7 +2524,10 @@ class Batch:
             return None
         say(f"rerunning the {len(ids)} failing test(s) on the tip {tip[:10]} alone, up to {TIP_RERUNS} times: "
             f"{' '.join(ids)}")
-        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
+        try:
+            env = self._check_env()
+        except push.runnerenv.Unavailable:
+            return None
         self._runners([cmd], env)
         slot = self._slot(tip)
         try:
@@ -2561,7 +2573,10 @@ class Batch:
         todo = [c for c in todo if pushpass.resumable(c)]
         if not todo:
             return False
-        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
+        try:
+            env = self._check_env()
+        except push.runnerenv.Unavailable:
+            return False
         self._runners(todo, env)
         tree, slot, started = pushpass.tree_of(self.wt, plain), None, time.time()
         try:

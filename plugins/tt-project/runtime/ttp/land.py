@@ -163,7 +163,11 @@ def _checks(p: Project, wt: Path, new: str, base: str, say: Callable[[str], None
             return 0
         say(f"{new[:10]}: {push.NONE_APPLY}; not landing: {push.NONE_APPLY_FIX}")
         return CHECKS_FAILED
-    env = push.check_env("target", base, branch=branch)
+    try:
+        env = push.check_env("target", base, branch=branch, lock=push.runnerenv.lock_of(p.config(), wt))
+    except push.runnerenv.Unavailable as e:
+        say(f"{e}; not landing")
+        return CHECKS_FAILED
     steps.between()
     if why := push.runner_wait(todo, wt, env, say, p):
         return why

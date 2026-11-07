@@ -959,6 +959,9 @@ def own_lane_key(repo: Path, remote: str, cfg: dict | None) -> str:
     return priority_key(repo, remote, OWN_LANE)
 
 
+check_lock: Path | None = None   # the lock check_env uses when given none: the project's (`ttp push` sets it)
+
+
 def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "",
               lock: Path | None = None) -> dict[str, str]:
     """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
@@ -976,7 +979,8 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
         env["PYTHONPATH"] = pp
     env = leakfile.with_path(env)   # the account's leak-pattern file, by path, for a check's temp HOME
     return runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
-                                                "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}), lock)
+                                                "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}),
+                           lock or check_lock)
 
 
 def short_branch(ref: str) -> str:
@@ -3572,7 +3576,7 @@ def _reused(repo: Path, head: str, todo: list, run_dir: str | None, reuse: Calla
     try:
         parts = pushpass.check_env_parts(repo, todo, check_env("own", "", run_dir)) if tree else []
         return reuse(tree, todo, [pushpass.digest(x) for x in parts], parts) if tree else ""
-    except (OSError, ValueError):
+    except (OSError, ValueError, runnerenv.Unavailable):
         return ""
 
 
@@ -4379,6 +4383,14 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     global last_ff, last_reach, last_after, pending_after, check_limit_s, check_queue_s, pool_wait_s
     last_ff, last_reach, last_after, pending_after = [], None, None, None
     check_limit_s, check_queue_s, pool_wait_s = limit_s, wait_s, pool_s
+    global check_lock
+    check_lock = runnerenv.lock_of(p.config(), repo)
+    try:   # the checks' pinned Python env, made first (runnerenv): no check runs without it
+        if checks:
+            print(f"ttp push: {runnerenv.describe(runnerenv.ensure(check_lock))}", file=sys.stderr)
+    except runnerenv.Unavailable as e:
+        print(f"ttp push: {e}; not pushing", file=sys.stderr)
+        return CHECKS_FAILED
     if own:   # delivery.push_exclude_paths guards the push branch only
         say_target(repo, remote, branch)
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
