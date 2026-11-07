@@ -10,8 +10,8 @@ per changed path for the coordinator, naming the run: normal when this machine's
 the change as made while the run ran, else high with the run's transcript line that shows it, or the
 file's time when none does. A change the ledger does not record fails the run's hand-off, unless
 classify() finds the run could not have been told from others: a change of a store's ctime alone
-(metadata), or one made while another run of any project on the host was open too (shared). Those are
-told once, at normal severity unless a store is new, replaced or resized, and fail no run. Only stat is
+(metadata), or one made while another run of any project on the host was open too (shared), unless the
+run's own transcript names it or runs a writer for it. Those are told once, at normal severity unless a store is new, replaced or resized, and fail no run. Only stat is
 read (size, mtime, ctime, inode), never a file's contents: no key or token is opened or hashed, and
 ctime still tells a same-size rewrite whose mtime was put back.
 
@@ -282,7 +282,7 @@ def runs_at(t: float, dbs: list, own: tuple[str, int] | None = None) -> int:
 
 
 def classify(changed: list, marks: dict, start: float | None, end: float, dbs: list,
-             own: tuple[str, int] | None = None) -> dict:
+             own: tuple[str, int] | None = None, run_dir: str | Path | None = None, home: str = "") -> dict:
     """{path: [verdict, change time ns]} for the changes of `changed` that do not fail the run; the rest
     (removed, shrunk, any change without the runner's marks) fail it as before. `marks` is the runner's
     {path: [before, after]} (exit.json cred_marks). Verdicts:
@@ -292,8 +292,9 @@ def classify(changed: list, marks: dict, start: float | None, end: float, dbs: l
       cannot tell which, if any, made it. Told once as changed outside these runs: at normal severity
       when rewritten in place at the same size, else high (shared_alarm: a store created, replaced by a
       new inode, or rewritten to another size, as a lost or swapped key or login would be).
-    A change only this run was open for keeps failing it."""
-    out = {}
+    A change only this run was open for keeps failing it, and so does a shared one when this run's own
+    transcript (output.jsonl in `run_dir`) names the path or runs a writer for it (transcript_hit)."""
+    out, home = {}, home or os.environ.get("HOME") or os.path.expanduser("~")
     for path, how in changed:
         pair = marks.get(path) if isinstance(marks, dict) else None
         if how == "metadata":
@@ -304,6 +305,8 @@ def classify(changed: list, marks: dict, start: float | None, end: float, dbs: l
         before, after = pair
         t = after[3] / 1e9
         if not (start is not None and start <= t <= end) or runs_at(t, dbs, own) < 1:
+            continue
+        if transcript_hit(run_dir, path, home):   # this run wrote it, whoever else saw it
             continue
         same = before and before[0] == after[0] and before[2] == after[2]
         out[path] = ["shared" if same else "shared_alarm", after[3]]

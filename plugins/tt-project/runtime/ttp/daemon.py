@@ -4858,7 +4858,7 @@ class Daemon:
         dbs = [own] + [d for _, d in gcap.local_projects(skip=str(own.resolve()))]
         try:
             got = credwatch.classify(exit_info["cred_changed"], exit_info.get("cred_marks") or {},
-                                     r.get("started"), time.time(), dbs, (str(own), r.get("id")))
+                                     r.get("started"), time.time(), dbs, (str(own), r.get("id")), run_dir)
             durable_write(run_dir / credwatch.VERDICTS, json.dumps(got))
             return got
         except Exception:   # every change fails the run, as before

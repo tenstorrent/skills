@@ -391,3 +391,51 @@ def test_credwatch_a_change_only_this_run_was_open_for_still_fails_it_and_a_plan
     _overlap(other, now - 60)
     other.db.x("UPDATE runs SET ended=NULL WHERE started=?", (now - 60,))
     assert credwatch.runs_at(now, [other.state / "project.db"]) == 1
+
+
+def test_credwatch_a_shared_change_still_fails_the_run_whose_own_transcript_writes_that_store(env, monkeypatch):
+    """Two overlapping runs see one change of a made-up key under a temp HOME. The run whose transcript runs a
+    writer for it (ssh-keygen with no scratch -f) fails, high, quoting that line; the other keeps the shared
+    verdict and passes. A transcript naming the path counts too, and one naming another path does not."""
+    from ttp import credwatch
+    from ttp import daemon as dm
+    from ttp.daemon import Daemon
+    p = make(env)
+    other = _second_project(env, "other-proj")
+    home = pathlib.Path(os.environ["HOME"])
+    ssh = home / ".ssh"
+    ssh.mkdir(parents=True, exist_ok=True)
+    key = ssh / "id_example"
+    key.write_text("k1\n")
+    _overlap(other, time.time() - 3600)   # another project's run, still open
+    other.db.x("UPDATE runs SET ended=NULL")
+    writer = json.dumps({"type": "assistant", "cmd": "ssh-keygen -t ed25519 -N '' -C x"})
+    monkeypatch.setenv("TTP_FAKE_SHELL", f"echo {shlex.quote(writer)}; sleep 0.05; "
+                                         f"printf 'k2\\n' > {shlex.quote(str(key))}")
+    tid = p.db.add_task("write a key beside the other project", "s", kind="work", tier="light", origin="user")
+    d = Daemon(p.base)
+    d.dispatch()
+    _finish_runs(p, d)
+    run = dict(p.db.one("SELECT * FROM runs WHERE task=?", (tid,)))
+    assert credwatch.transcript_hit(run["dir"], str(key), str(home)), "the writer line reached output.jsonl"
+    assert credwatch.held(run["dir"]) == {}
+    res = json.loads(p.db.task(tid)["result"] or "{}")
+    assert res.get("status") == "failed" and res.get("cred_changed") == [[str(key), "changed"]], res
+    rows = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'credwatch:%'")
+    assert len(rows) == 1 and rows[0]["severity"] == "high" and "ssh-keygen -t ed25519" in rows[0]["text"], rows
+    # The other run that saw the same change, with a transcript that does not write it: shared, no failure.
+    exit_info = json.loads((pathlib.Path(run["dir"]) / "exit.json").read_text())
+    quiet = env["tmp"] / "quiet-run"
+    quiet.mkdir()
+    (quiet / "output.jsonl").write_text(json.dumps({"cmd": f"cat {ssh}/id_example.pub"}) + "\n")
+    (quiet / "exit.json").write_text(json.dumps(exit_info))
+    second = dict(run, id=_overlap(p, run["started"] - 10, time.time()), task=None, role="worker", dir=str(quiet))
+    got = d._cred_verdicts(second, exit_info, quiet)
+    assert got.get(str(key), [None])[0] == "shared" and dm._cred_changed(quiet) == [], got
+    # A third whose transcript names the path itself fails as well.
+    named = env["tmp"] / "named-run"
+    named.mkdir()
+    (named / "output.jsonl").write_text(json.dumps({"cmd": "cp /tmp/k ~/.ssh/id_example"}) + "\n")
+    (named / "exit.json").write_text(json.dumps(exit_info))
+    third = dict(second, id=_overlap(p, run["started"] - 10, time.time()), dir=str(named))
+    assert d._cred_verdicts(third, exit_info, named) == {} and dm._cred_changed(named) == [[str(key), "changed"]]
