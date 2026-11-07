@@ -66,8 +66,8 @@ wait first, cli._checks_slot); with no pool host free it takes a reserved urgent
 beyond the cap and the load's extras, as push checks have one per branch, each with a reserved test lane
 (testslots' reserved lane keyed urgent_key) and past its project's cap of running checks. Only urgent runs take
 one, so at most that many run above the cap at once; the cores and disk gates do not hold it (as for push checks).
-With those held too, an urgent waiter that has waited preempt_after_s() since its arrival asks, once per request
-(PREEMPT_ASKED_ENV, kept over a re-execution), one routine run on a cap slot to step back (preempt): one never
+With those held too, an urgent waiter that has waited preempt_after_s() since its arrival asks, one live ask at a time
+(PREEMPT_ASKED_ENV, kept over a re-execution; again preempt_after_s() after one lapsed), one routine run on a cap slot to step back (preempt): one never
 preempted before first, then its own project's, then the least urgent, then the latest granted (it loses the least
 work). It ends its command, lets its slots go and queues again at its old arrival, ahead of every later arrival at
 its priority or a less urgent one whatever the project turns (a requeued ticket: locks.requeued_place), so it
@@ -526,7 +526,7 @@ def aged_before(now: float | None = None) -> float:
 
 
 def starved_ahead(project_name: str | None, since: float | None = None, now: float | None = None,
-                  priority: int | None = None, cost: dict | None = None) -> list[Path]:
+                  priority: int | None = None, cost: dict | None = None, ticket: Path | None = None) -> list[Path]:
     """The other parked runs of `project_name` (PARKED tickets) that have waited starve_s() or longer, arrived
     before the asking run (its own PARKED ticket's arrival, else `since`, else now: a newcomer's) and go before
     it: those at its priority or a more urgent one, and a less urgent one only on its turn (_aged_turn: after
@@ -537,14 +537,15 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     A run of `cost` (checklane.cost) is not held by one at its priority or less urgent whose run costs
     CHEAP_FACTOR times as much (checklane.much_cheaper: a targeted run beside full suites), its run's lane
     label's cost by the run id in its ticket; a short one (is_small: shortest first) is held there only by
-    short ones (locks.is_small), whatever the others' costs; a landing's ticket always holds it."""
+    short ones (locks.is_small), whatever the others' costs; a landing's ticket always holds it.
+    With `ticket`, for that PARKED ticket's run instead of this thread's."""
     now = time.time() if now is None else now
     edge, gid = aged_before(now), locks.group_id(project_name)
     try:
         q = locks.queued(slot_dir(), PARKED)
     except OSError:
         return []
-    mine = getattr(_PARKS, "park", None)
+    mine = ticket if ticket is not None else getattr(_PARKS, "park", None)
     me = locks._arrival(mine) if mine in q else now if since is None else since
     rank = locks.ticket_priority(mine) if mine in q else math.inf if priority is None else float(priority)
     aged = [t for t in q if t != mine and locks.ticket_group(t) == gid and locks._arrival(t) <= edge
@@ -1105,7 +1106,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     to give its slot up (preempt), once a wait, and then takes the first one that frees, in turn or not:
     the freed slot is its own (its claim) and it looks every CLAIM_POLL_S, so it starts within a second of the
     asked run letting go. Asked while parked, it keeps the claim parked; still parked HANDOVER_S after that run
-    let go, it drops it and the slot goes to the next waiter.
+    let go, it drops it and the slot goes to the next waiter. Once its ask lapsed or was dropped, it may ask
+    again preempt_after_s() later (never while its earlier request lives).
     `preemptible`: the caller stops its checks when asked (preempted), so its slot's label says it may be
     asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`.
     `small` (is_small): its queue and PARKED tickets mark a short run (locks.SMALL_TICKET), which goes first
@@ -1151,7 +1153,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             parks(True)
     except OSError as e:
         raise _unavailable(e) from e
-    started, told, checked, parked_told = time.time(), 0.0, time.time(), parked
+    started, told, checked, parked_told, lapsed = time.time(), 0.0, time.time(), parked, 0.0
     try:
         while True:
             if done and ((ticket is None and not parked) or time.time() - checked >= DONE_S):
@@ -1208,6 +1210,14 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 if parked and (gone := claim_freed_s(claim)) is not None and gone >= HANDOVER_S:
                     drop_claim(claim)
                     claim = ""
+            if not f and asked and not claim_live(claim):
+                # Its ask lapsed or was dropped (the asked run kept its slot, or the asker parked): no request
+                # lives any more, so preempt_after_s() after that it may ask again, one live ask at a time.
+                lapsed = lapsed or time.time()
+                if time.time() - lapsed >= preempt_after_s():
+                    drop_claim(claim)
+                    asked, claim, lapsed = "", "", 0.0
+                    os.environ.pop(PREEMPT_ASKED_ENV, None)
             if (not f and not asked and not twin and urgent and is_urgent(priority)
                     and time.time() - since >= preempt_after_s()):
                 # Only a run whose stop lets this one start: parked, its test slots must fit once that run's free.

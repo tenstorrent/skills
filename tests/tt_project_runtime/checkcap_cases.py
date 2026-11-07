@@ -8619,6 +8619,110 @@ def test_upgraded_names_a_runtime_tree_changed_on_disk_without_a_version_bump(en
     assert checkcap.upgraded(init, now=9999.0, settle=0) == "", "re-executed for it once already: never a loop"
 
 
+def test_a_routine_run_leaves_freed_test_slots_to_a_parked_urgent_run_of_its_own_project(env, monkeypatch):
+    """#7124 (a, c): a routine run leaves a run's worth of free test slots to a priority-1 run of its own
+    project parked for them (own_urgent_parked; a priority-0 one holds it through checkcap.owed_ahead), though
+    that run arrived later and is under starve_s; its pool_gate names the reserve and the urgent run takes the
+    slots. With no urgent run of its project parked, or only one that left the room untaken UNTAKEN_S, the
+    routine run is not held."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (1, 1))   # one run's worth free
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    monkeypatch.setattr(testslots, "_ROOM_SINCE", {})
+    monkeypatch.setattr(testslots, "_OWN_ROOM_SINCE", {})
+    now = time.time()
+    assert checkcap.starve_s() > 120
+    routine = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "A task #1 ttp checks", now - 120, group="A",
+                            priority=3)
+    try:
+        assert testslots.pool_gate({}, "A", priority=3, since=now - 120) == "", "(c) no urgent run of A parked"
+        urgent = locks.enqueue(checkcap.slot_dir(), checkcap.PARKED, "A task #2 ttp checks", now - 60, group="A",
+                               priority=1)
+        try:
+            why = testslots.pool_gate({}, "A", priority=3, since=now - 120)
+            assert testslots.OWN_RESERVE in why, why
+            assert testslots.OWN_RESERVE not in testslots.pool_gate({}, "B", priority=3), "only its own project's"
+            assert testslots.pool_room({}, "A", priority=1, since=now - 60), "the urgent run has room"
+            g = testslots.acquire("A task #2 ttp checks", project_name="A", priority=1, wait_s=0)
+            assert g is not None and g.k >= 1, "the urgent run takes the freed slots"
+            g.close()
+            monkeypatch.setattr(testslots, "UNTAKEN_S", 0.0)
+            assert testslots.pool_gate({}, "A", priority=3, since=now - 120) == "", \
+                "one that leaves the room untaken keeps none"
+        finally:
+            locks.dequeue(urgent)
+        assert testslots.pool_gate({}, "A", priority=3, since=now - 120) == ""
+    finally:
+        locks.dequeue(routine)
+
+
+def test_own_urgent_parked_and_urgent_parked_keep_separate_untaken_counts(env, monkeypatch):
+    """#7124 with #7029: own_urgent_parked (its project's parked urgent runs) and urgent_parked (other
+    projects') count UNTAKEN_S in separate records, so one pool_gate poll calling both never restarts the
+    other's count: an own urgent run that left the room untaken UNTAKEN_S keeps no slots though an urgent
+    run of another project is counted in between."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "_ROOM_SINCE", {})
+    monkeypatch.setattr(testslots, "_OWN_ROOM_SINCE", {})
+    clock = [1000.0]
+    monkeypatch.setattr(testslots.time, "time", lambda: clock[0])
+    d = checkcap.slot_dir()
+    own = locks.enqueue(d, checkcap.PARKED, "A task #2 ttp checks", clock[0] - 60, group="A", priority=1)
+    other = locks.enqueue(d, checkcap.PARKED, "B task #3 ttp checks", clock[0] - 60, group="B", priority=1)
+    try:
+        assert testslots.own_urgent_parked("A", 3, fits=1) == 1
+        clock[0] += testslots.UNTAKEN_S
+        assert testslots.urgent_parked("A", 3, need=1, room=1) == 1, "the other project's run: its count starts"
+        assert testslots.own_urgent_parked("A", 3, fits=1) == 0, "the own run's count was not restarted"
+        assert testslots.urgent_parked("A", 3, need=1, room=1) == 1, "nor the other's by the own count"
+    finally:
+        locks.dequeue(own)
+        locks.dequeue(other)
+
+
+def test_a_parked_urgent_run_whose_ask_lapsed_asks_again_and_takes_the_routine_holders_slot(env, monkeypatch):
+    """#7124 (b): a parked urgent run asked a routine holder that did not stop; once its claim lapsed (no live
+    request), it asks again preempt_after_s() later, never while the first request lives, and takes the slot
+    when that run lets go. One wasted ask no longer ends preemption for the rest of its wait."""
+    import threading
+    from ttp import checkcap
+    _preempt_cap_of_one(monkeypatch)
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "1")
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.1")
+    monkeypatch.setattr(checkcap, "CLAIM_S", 0.5)
+    monkeypatch.setattr(checkcap, "PARKED_CLAIM_S", 0.5)
+    victim = checkcap.acquire("routine 5", priority=5, preemptible=True)
+    freed = [False]   # the victim's test slots: free once it stops (testslots counts them so under FREEING)
+    told, got, asked_at = [], [], []
+
+    def tell(line):
+        told.append(line)
+        if line == checkcap.PREEMPT_LINE.format("routine 5"):
+            asked_at.append(time.time())
+    t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+        "urgent", priority=0, urgent=True, tell=tell, max_wait_s=30,
+        startable=lambda: checkcap.FREEING.get() is not None or freed[0])))
+    t.start()
+    try:
+        assert _wait_for(lambda: len(asked_at) >= 2, 15), told
+        assert asked_at[1] - asked_at[0] >= checkcap.PARKED_CLAIM_S + 1.0 - 0.2, \
+            "asked again only once the first request lapsed and preempt_after_s passed"
+        assert checkcap.preempted(victim.since) == "urgent urgent", "the second request is live"
+        freed[0] = True
+        victim.close()
+        gone = time.time()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None
+        assert time.time() - gone < 3.0
+    finally:
+        checkcap.clear_preempt()
+        victim.close()
+        t.join(30)
+        got and got[0] and got[0].close()
+
+
 def test_a_checks_wait_ends_once_its_task_moves_the_branch_off_the_head_and_never_on_a_detached_head(tmp_path):
     """#5893: cli._HeadMoved (asked by _checks_slot_take's stop) is "" while the branch tip is the head,
     the reason once a new commit moves it, and "" for a wait that began on a detached HEAD."""
@@ -9264,11 +9368,12 @@ def test_an_urgent_checks_run_past_its_grace_preempts_one_routine_run_of_its_own
         assert sum(m.startswith("urgent checks with every") for m in told) == 1, "one preemption per request"
         got[0].close()
         checkcap.clear_preempt()
-        # The same request again (a re-execution keeps its arrival): it never asks a second time.
+        # The same request again (a re-execution keeps its arrival): it does not ask again at once; only
+        # preempt_after_s after its earlier ask lapsed may it (#7124).
         mine = checkcap.acquire("mine p2", project_name="mine", priority=2, preemptible=True)
         told.clear()
         assert checkcap.acquire("urgent", project_name="mine", priority=1, urgent=True, tell=told.append,
-                                since=since, max_wait_s=1.0) is None
+                                since=since, max_wait_s=0.3) is None
         assert not any(m.startswith("urgent checks with every") for m in told), told
         assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"))
     finally:

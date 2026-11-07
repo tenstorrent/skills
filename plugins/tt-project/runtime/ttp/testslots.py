@@ -298,6 +298,7 @@ LOAD_GATE = "host load: "   # pool_gate's reason while the load guard holds a ru
 STARVED_GATE = " run(s) of its project parked longer go first (checkcap.starved_ahead)"   # its reason's end there
 OWED_GATE = " owed run(s) of its project parked go first by priority (checkcap.owed_ahead)"   # its reason's end there
 BUDGET_GATE = "its project's test-worker budget: "   # its reason's start while the project's budget holds the run
+OWN_RESERVE = "kept for its project's urgent run(s) parked for their test slots"   # pool_gate's reason there
 
 
 def load_pass_path() -> Path:
@@ -1194,7 +1195,9 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     run leaves them to its project's parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
-    to whichever polls first; one its own gate holds otherwise keeps none. The reason names the term that failed, for status (checklane._parked)."""
+    to whichever polls first; one its own gate holds otherwise keeps none. A routine run also leaves `need`
+    to each urgent run of its own project parked for its test slots that could start, whatever its arrival
+    (own_urgent_parked: OWN_RESERVE). The reason names the term that failed, for status (checklane._parked)."""
     if full and (why := load_held(priority, since=since)):
         return f"{LOAD_GATE}{why}"
     if (ahead := checkcap.starved_ahead(project_name, since, priority=priority, cost=cost)):
@@ -1230,7 +1233,31 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     if min(s[1], pool - used - kept) < need:
         return (f"the host's test pool: {pool - used} of {pool} free, a run needs {need}"
                 + (f", {kept} kept for {kept // need} urgent run(s) of other projects parked ahead" if kept else ""))
+    room = min(own_free if own else pool, pool - used - kept)
+    if (n := own_urgent_parked(project_name, priority, room // need)) and room - need * n < need:
+        return f"{room} test slot(s) free, a run needs {need}, {need * n} {OWN_RESERVE} ({n})"
     return ""
+
+
+def own_urgent_parked(project_name: str | None, priority: int | None, fits: int = 0) -> int:
+    """How many urgent runs (locks.URGENT_PRIORITY or better) of `project_name` itself parked for their test
+    slots now (checkcap.PARKED tickets) a routine run (an int `priority` past locks.URGENT_PRIORITY) leaves
+    room to, whatever their arrival, so a freed slot of its project goes to them first. Only those that could
+    start: not held by a run of the project parked longer (checkcap.starved_ahead for that ticket), and not
+    one of the `fits` most urgent and oldest the free room fits that left it untaken UNTAKEN_S (_untaken):
+    some other hold keeps it off them, so slots kept for it would sit idle. 0 for an urgent run or none."""
+    if not project_name or not isinstance(priority, int) or priority <= locks.URGENT_PRIORITY:
+        return 0
+    gid = locks.group_id(project_name)
+    try:
+        q = locks.queued(checkcap.slot_dir(), checkcap.PARKED)
+    except OSError:
+        return 0
+    mine = sorted((t for t in q if locks._urgent(t) and locks.ticket_group(t) == gid
+                   and not checkcap.starved_ahead(project_name, ticket=t)),
+                  key=lambda t: (locks.ticket_priority(t), locks._arrival(t)))
+    stale = _untaken(mine[:max(0, fits)], seen=_OWN_ROOM_SINCE)
+    return sum(1 for t in mine if str(t) not in stale)
 
 
 def urgent_parked(project_name: str | None, priority: int | None = None, since: float | None = None,
@@ -1270,18 +1297,20 @@ def urgent_parked(project_name: str | None, priority: int | None = None, since: 
 
 UNTAKEN_S = 300.0   # a parked urgent run that leaves free pool room untaken this long keeps no slots
 _ROOM_SINCE: dict = {}   # _untaken(): each parked ticket this process saw beside free room, and since when
+_OWN_ROOM_SINCE: dict = {}   # the same for own_urgent_parked's tickets, so neither caller resets the other's
 
 
-def _untaken(tickets: list, now: float | None = None) -> set:
+def _untaken(tickets: list, now: float | None = None, seen: dict | None = None) -> set:
     """Of `tickets` (the parked runs the pool's free room fits now, most urgent and oldest first), those
     (paths, as str) this process has seen so for UNTAKEN_S or longer: a run that could start takes free
     room within a poll, so one that leaves it untaken is held by something else. Room taken or gone
-    starts its count again."""
+    starts its count again. `seen`: the record to count in (default _ROOM_SINCE)."""
     now = time.time() if now is None else now
+    seen = _ROOM_SINCE if seen is None else seen
     keep = {str(t) for t in tickets}
-    for k in set(_ROOM_SINCE) - keep:
-        del _ROOM_SINCE[k]
-    return {k for k in keep if now - _ROOM_SINCE.setdefault(k, now) >= UNTAKEN_S}
+    for k in set(seen) - keep:
+        del seen[k]
+    return {k for k in keep if now - seen.setdefault(k, now) >= UNTAKEN_S}
 
 
 def _group_free(d: Path, gid: str, budget: int, run_max: int) -> int:
