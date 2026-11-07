@@ -8942,14 +8942,22 @@ class Daemon:
     def reap_leftover_checks(self, every_s: float = 60, now: float | None = None) -> None:
         """Model-free, at most every `every_s`: stop this user's leftover `ttp checks` runs that hold or wait in
         the host-wide checks queue though their run has ended or their folder is gone (leftoverchecks: SIGTERM, then
-        SIGKILL; their tickets dropped, one line here and in the checks waits log each)."""
-        from . import leftoverchecks
+        SIGKILL; their tickets dropped, one line here and in the checks waits log each). One process at a time:
+        past STEP_BUDGET_S it stops and resumes there next tick; a process whose reads or stop outlast
+        leftoverchecks.PROBE_S is left for a later pass, logged once."""
+        from . import checkcap, leftoverchecks, leftoverstop
         now = time.time() if now is None else now
-        if now - getattr(self, "_reap_checks_at", 0.0) < every_s:
+        if "leftover_checks" not in self._step_cursor and now - getattr(self, "_reap_checks_at", 0.0) < every_s:
             return
         self._reap_checks_at = now
-        for r in leftoverchecks.reap(self.p):
-            log(self.p, r["text"])
+        slots, guarded = Path(checkcap.slot_dir()), leftoverstop._guarded(self.p)
+        rows = self._resume_order("leftover_checks", [{"id": pid} for pid in leftoverchecks.pids()])
+        for i, r in enumerate(rows):
+            if self._step_over(f"leftover ttp checks scan, pid {r['id']}") and i:
+                self._step_cursor["leftover_checks"] = rows[i - 1]["id"]   # the rest go first next tick
+                break
+            for rec in leftoverchecks.reap_one(self.p, r["id"], slots, guarded):
+                log(self.p, rec["text"])
 
     def check_checks_owner(self, every_s: float = 60, now: float | None = None) -> None:
         """Model-free: a checks lane held by a check whose task has ended (checklane.finished_holders)

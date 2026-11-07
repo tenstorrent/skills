@@ -200,3 +200,105 @@ def test_ttp_checks_reap_logs_each_stop_to_the_project_log_but_a_dry_run_does_no
     assert capsys.readouterr().out.splitlines() == ["reap line dry=True", "reap line dry=False"]
     text = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
     assert "reap line dry=False" in text and "dry=True" not in text
+
+
+class _LcClock:
+    """The daemon module's `time`, with a monotonic clock the test moves (the step budget reads it)."""
+
+    def __init__(self):
+        self.t = 1000.0
+
+    def monotonic(self):
+        return self.t
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+def test_the_leftover_checks_step_keeps_its_budget_and_finishes_many_leftovers_over_several_ticks(env, tmp_path, monkeypatch):
+    """Five leftovers whose stops take 25 s each (on the step's clock): no tick spends more than the step
+    budget plus the one stop it started in budget, the step resumes on the next tick (not a minute later),
+    and every leftover is stopped."""
+    from ttp import daemon as dmod
+    from ttp import leftoverchecks
+    p = make(env)
+    procs = []
+    try:
+        for n in range(5):
+            cell = tmp_path / f"cell{n}"
+            (cell / "run").mkdir(parents=True)
+            proc, _ = _lc_spawn(tmp_path, monkeypatch, {"TTP_RUN_DIR": str(cell / "run")}, name=f"r{n}", cwd=cell / "work")
+            procs.append(proc)
+            shutil.rmtree(cell)
+        clock = _LcClock()
+        monkeypatch.setattr(dmod, "time", clock)
+        real_stop = leftoverchecks.stop
+
+        def slow_stop(*a, **k):
+            clock.t += 25
+            return real_stop(*a, **k)
+        monkeypatch.setattr(leftoverchecks, "stop", slow_stop)
+        d = dmod.Daemon(p.base)
+        spent = []
+        for _ in range(4):
+            before = clock.t
+            d._run_step(d.reap_leftover_checks, "reap_leftover_checks")
+            spent.append(clock.t - before)
+        assert all(proc.gone_within(15) for proc in procs)
+        assert max(spent) <= dmod.STEP_BUDGET_S + 25, spent
+        assert len([s for s in spent if s]) >= 2, f"the stops spread over ticks: {spent}"
+        text = (p.logs / "daemon.log").read_text()
+        assert all(text.count(f"stopped leftover ttp checks pid {proc.pid} ") == 1 for proc in procs), text[-2000:]
+    finally:
+        _lc_end(*procs)
+
+
+@pytest.mark.parametrize("where", ["read", "stop"])
+def test_a_leftover_checks_read_or_stop_that_hangs_times_out_and_does_not_hold_the_step(env, tmp_path, monkeypatch, where):
+    """A /proc read (or a stop's signalling) that hangs on one process: the step leaves it after
+    leftoverchecks.PROBE_S, stops the other leftover, logs the hung one once (not again while it is still
+    stuck) and handles it on a later tick once it answers."""
+    from ttp import daemon as dmod
+    from ttp import leftoverchecks, leftoverstop
+    p = make(env)
+    monkeypatch.setattr(leftoverchecks, "PROBE_S", 0.5, raising=False)
+    monkeypatch.setattr(leftoverstop, "TERM_S", 0.2)
+    procs = []
+    release = threading.Event()
+    try:
+        for n in range(2):
+            cell = tmp_path / f"cell{n}"
+            (cell / "run").mkdir(parents=True)
+            proc, _ = _lc_spawn(tmp_path, monkeypatch, {"TTP_RUN_DIR": str(cell / "run")}, name=f"h{n}", cwd=cell / "work")
+            procs.append(proc)
+            shutil.rmtree(cell)
+        hung, other = procs
+        if where == "read":
+            real_argv = leftoverchecks._argv
+            monkeypatch.setattr(leftoverchecks, "_argv", lambda pid: (pid != hung.pid or release.wait(30))
+                                and real_argv(pid))
+        else:
+            real_end = leftoverstop.end
+            monkeypatch.setattr(leftoverstop, "end", lambda targets, *a, **k: (
+                all(t["pid"] != hung.pid for t in targets) or release.wait(30)) and real_end(targets, *a, **k))
+        d = dmod.Daemon(p.base)
+
+        def tick():   # in time: well before the hang (30 s) ends
+            d._reap_checks_at = 0.0
+            began = time.monotonic()
+            d.reap_leftover_checks()
+            return time.monotonic() - began < 12
+        log = p.logs / "daemon.log"
+        assert tick(), "the hung process holds the step"
+        assert other.gone_within(15) and hung.alive()
+        said = [x for x in log.read_text().splitlines() if f" {hung.pid} " in x and "left " in x]
+        assert len(said) == 1, log.read_text()[-2000:]
+        assert tick(), "the hung process holds the step"
+        assert [x for x in log.read_text().splitlines() if f" {hung.pid} " in x and "left " in x] == said, \
+            "logged once while it stays stuck"
+        release.set()
+        leftoverchecks._stuck[hung.pid].join(15)
+        assert tick() and hung.gone_within(15)
+    finally:
+        release.set()
+        _lc_end(*procs)
