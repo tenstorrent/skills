@@ -16,6 +16,20 @@ US_REFUSED = [
     "uv pip install --system x", "pip config set global.user true", "pip config set global.require-virtualenv false",
     "python3 setup.py install --user", "easy_install --user x", "ttp clip -- pip install --user x",
     "timeout 60 pip3.10 install --user x", "cd /tmp && pip install -U --user pytest==9.2.0",
+    # ensurepip drops PIP_*, so only the hook stops it
+    "python3 -m ensurepip --user", "python -m ensurepip --upgrade --user", "python3 -Im ensurepip --us",
+    "python3 -mensurepip --user", "python3 -X dev -m ensurepip --user", "python3 -m ensurepip --root $HOME/.local",
+    # an install directory under ~/.local, inline, exported or through env
+    "PIP_TARGET=~/.local/lib/python3.10/site-packages pip install x", "export PIP_PREFIX=$HOME/.local",
+    "PIP_ROOT=\"$HOME/.local\" python3 -m pip install x", "env PIP_TARGET=${HOME}/.local/lib pip install x",
+    "PIP_PREFIX=~/.local; export PIP_PREFIX", "declare -x PIP_TARGET=$HOME/.local/lib",
+    "pip config set global.target $HOME/.local/lib",
+    # behind find -exec, xargs or parallel
+    "find . -name '*.whl' -exec pip install --user {} \\;", "find . -exec pip3 install --user {} +",
+    "find dl -execdir python3 -m pip install --user {} ;", "find . -ok pip install --break-system-packages {} \\;",
+    "find . -exec sh -c 'pip install --user \"$1\"' _ {} \\;", "ls | xargs env PIP_USER=1 pip install",
+    "ls | xargs -I {} env PIP_TARGET=$HOME/.local pip install {}", "parallel pip install --user ::: a b",
+    "ls | parallel -j 4 --joblog j.log pip install --user {}", "find . -exec python3 -m ensurepip --user \\;",
 ]
 US_ALLOWED = [
     "pip install x", ".venv/bin/pip install -e .", "python3 -m venv .v && .v/bin/python -m pip install pytest",
@@ -24,6 +38,11 @@ US_ALLOWED = [
     "python3 script.py --user", "pip install --upgrade x", "pip install --use-pep517 x", "export PIP_REQUIRE_VIRTUALENV=1",
     "PIP_USER=0 pip install x", "sudo /opt/v/bin/pip install x", "git commit -m 'pip install --user is refused'",
     "pip install --target ./vendor x", "python3 -m pytest -q", "unset PIP_INDEX_URL",
+    ".venv/bin/python -m ensurepip --upgrade", "python3 -m ensurepip --version", "python3 -c 'import ensurepip' --user",
+    "PIP_TARGET=.venv/lib/python3.10/site-packages pip install x", "export PIP_PREFIX=$HOME/venvs/a",
+    "PIP_TARGET=~/.local/lib pip download -d dl x", "pip config set global.target ./vendor",
+    "find . -exec grep -l 'pip install --user' {} +", "find . -name '*.pyc' -exec rm {} \\;",
+    "ls | xargs -n1 echo pip install --user", "parallel echo {} ::: --user", "ls | xargs .venv/bin/pip install",
 ]
 
 

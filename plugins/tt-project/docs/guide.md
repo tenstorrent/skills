@@ -3592,9 +3592,11 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   reviewer and coordinator run, and the checks the daemon starts, get `PIP_REQUIRE_VIRTUALENV=1`,
   `PIP_USER=0` and `PIP_BREAK_SYSTEM_PACKAGES=0`, so pip itself refuses an install outside a virtualenv
   on every provider, scripts included. The worker hook also refuses `pip install --user` (pip, pip3,
-  `python3 -m pip`, `uv pip --system`, `setup.py install --user`, through wrappers, `sh -c` and eval),
-  `--break-system-packages`, `--isolated`, a `--target` or `--prefix` under `.local`, a bare pip install
-  under `sudo` or `env -i`, and unsetting or overriding those variables or the same `pip config` names;
+  `python3 -m pip`, `uv pip --system`, `setup.py install --user`, through wrappers, `sh -c`, eval,
+  `find -exec`, xargs and parallel), `python3 -m ensurepip --user` (ensurepip drops the `PIP_*`
+  variables), `--break-system-packages`, `--isolated`, a `--target`, `--prefix` or `--root` (or
+  `PIP_TARGET`, `PIP_PREFIX`, `PIP_ROOT`) under `.local`, a bare pip install under `sudo` or `env -i`,
+  and unsetting or overriding those variables or the same `pip config` names;
   a pip command that installs nothing (download, list, show, freeze, wheel) may carry its own
   `PIP_REQUIRE_VIRTUALENV=0`. Each refusal is counted on one queued ride-along `user_site_install`
   event per run for the coordinator, never a user alert. Install into a venv the project owns:
