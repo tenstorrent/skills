@@ -1948,10 +1948,18 @@ def urgent_waits(project_name: str | None, now: float | None = None, min_s: floa
 
 def urgent_wait_text(w: dict) -> str:
     """One urgent_waits entry in words: the queue, the waiter, how long and what holds it."""
+    f = urgent_wait_fold(w)
+    return f"urgent checks {f['item']} in {f['group']}; {f['ctx']}"
+
+
+def urgent_wait_fold(w: dict) -> dict:
+    """urgent_wait_text's parts, the event's `fold` data (coordinator.fold_events): one NEW EVENTS line per
+    queue names each waiter and what holds the queue now once."""
     held = "; ".join(w["held_by"][:8]) + (f"; and {len(w['held_by']) - 8} more" if len(w["held_by"]) > 8 else "")
-    head = (f"urgent checks {w['holder']} (priority {w['priority']:g}) have waited {w['waited_s'] / 60:.0f} min in "
-            f"the host-wide {w['queue']} queue; held by: ")
     if w.get("load"):   # the load guard, not the pool's slots: name it and its passes' holders
-        return (head + f"the host load guard ({w['load']}); its load passes held by: "
-                + (held or "none right now (its next try takes one)"))
-    return head + (held or 'nothing held right now (the next turn is due)')
+        ctx = (f"held by: the host load guard ({w['load']}); its load passes held by: "
+               + (held or "none right now (its next try takes one)"))
+    else:
+        ctx = "held by: " + (held or 'nothing held right now (the next turn is due)')
+    return {"group": f"the host-wide {w['queue']} queue", "ctx": ctx,
+            "item": f"{w['holder']} (priority {w['priority']:g}) have waited {w['waited_s'] / 60:.0f} min"}

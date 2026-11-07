@@ -8797,10 +8797,11 @@ class Daemon:
             text = checkcap.urgent_wait_text(w)
             m = re.search(r"\btask (\d+)\b|#(\d+)", w["holder"])
             task = int(m[1] or m[2]) if m else None
-            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) "
+                 "VALUES(?,?,?,?,?,?,?,?,?)",
                  (now, "daemon", checkcap.URGENT_WAIT, fp, "normal", text[:4000],
                   "muted" if scr.count_muted(db, f"daemon:{checkcap.URGENT_WAIT}", text, "normal", now) else status,
-                  task))
+                  task, json.dumps({"fold": checkcap.urgent_wait_fold(w)})))
             status = "coalesced"
             log(self.p, f"urgent checks wait: {text[:300]}")
 
@@ -13593,18 +13594,22 @@ class Daemon:
         probe = str(prev.get("retry_when") or "")
         got = self._probe_out.get(task["id"])
         last = got[0] if got and got[2] == probe else ""
+        head = (f"#{task['id']} {task['title']} has waited {max_hold / 3600:g} h for {what}; its probe still says "
+                f"not yet. Blocking gate: {probe[:200]}; last output: {last or '(none seen)'}.")
+        notes = ((f"Note: {end}. " if (end := waitheal.probe_flag(probe)) else "")
+                 + (f"Note: the checks it waits on ({', '.join(str(d) for d in gone)}) are neither queued nor running: "
+                    f"their ticket left the checks queue, so the daemon wakes it within {checksgone.GRACE_S / 60:g} min. "
+                    if (gone := self._stuck_checks(probe)) else ""))
+        # Several in one wake: NEW EVENTS says the shared words once (coordinator.fold_events).
+        folded = {"group": "probe waits past max_hold_s", "item": f"{head} {notes}".strip(),
+                  "ctx": "Each keeps sleeping and no worker run is spent. Decide for each: fix its probe (`ttp task "
+                         "set-when <id> \"<cmd>\"`), clear it (\"\") so it wakes at its timer, or cancel the task."}
         db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
              (time.time(), "daemon", "wait_stale", fp, "normal",
-              f"#{task['id']} {task['title']} has waited {max_hold / 3600:g} h for {what}; its probe still says "
-              f"not yet. Blocking gate: {probe[:200]}; last output: {last or '(none seen)'}. "
-              f"It keeps sleeping and no worker run is spent. "
-              + (f"Note: {end}. " if (end := waitheal.probe_flag(probe)) else "")
-              + (f"Note: the checks it waits on ({', '.join(str(d) for d in gone)}) are neither queued nor running: "
-                 f"their ticket left the checks queue, so the daemon wakes it within {checksgone.GRACE_S / 60:g} min. "
-                 if (gone := self._stuck_checks(probe)) else "")
+              f"{head} It keeps sleeping and no worker run is spent. {notes}"
               + f"Decide: fix its probe (`ttp task set-when {task['id']} \"<cmd>\"`), clear it (\"\") so it wakes "
               f"at its timer, or cancel the task.", "queued", task["id"],
-              json.dumps({"wait_stale": {"wait": wait, "snap": cur}})))
+              json.dumps({"wait_stale": {"wait": wait, "snap": cur}, "fold": folded})))
         log(self.p, f"task {task['id']} probe not yet after {max_hold / 3600:g} h; raised to the coordinator")
         return True
 

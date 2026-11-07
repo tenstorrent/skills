@@ -16,10 +16,13 @@ A wait whose cause an open task already owns (an active throughput-class mute's 
 item on the same queue was acted on with) folds into it: one act per queue cause, not per waiting task.
 The coordinator acts in that turn (mustact.acted: a config_set, a task_add or task_update naming the item's
 key or updating the task, or a reply or notify naming the key and the safety rule that holds it). Not acted
-on, the next threshold mark raises it again (fingerprint per mark). With no option left the user is told
-once. Once the wait ends its open events are settled. daily_line() is the daily review's metric."""
+on, a later threshold mark raises it again (fingerprint per mark), only once what it says changed (its
+holders, cap or options: sig()) or REPEAT_MARKS marks after its last raise. With no option left the user is told
+once. Once the wait ends its open events are settled. daily_line() is the daily review's metric.
+Each event's data carries `fold` (FOLD): the parts the coordinator's NEW EVENTS joins into one line per queue."""
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -32,6 +35,8 @@ DEFAULT_MIN = 30.0
 HIST_KEEP_S = 7 * 86400.0
 HIST_MAX = 300
 MAX_RAISE = 3   # new items per scan, so a long queue never floods the coordinator with wakes
+REPEAT_MARKS = 4   # an unchanged, unacted wait is raised again at most every this many marks
+FOLD = "fold"   # in event data: {"group", "item", "ctx", "opts"} (coordinator.fold_events)
 NAMES = {"checks": "checks queue", "push": "push queue", "workers": "worker slots", "device": "device queue",
          "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission"}
 # Words other observations use for a queue, so a mute of one (screen.mutes) matches its waits.
@@ -229,17 +234,40 @@ def key(w: dict) -> str:
     return f"qwait-{w['task']}-{w['queue']}"
 
 
-def text(w: dict, opts: list[str], now: float, note: str = "") -> str:
+NO_OPTION = "No option is open to the project (a user pause or a cap the user set holds it): the user is told."
+
+
+def _parts(w: dict, now: float, note: str = "") -> tuple[str, str, str]:
+    """(queue name, the item's own words, the queue's state now) of wait `w`."""
     cap = w.get("cap")
     run, que = list(w.get("running") or []), list(w.get("queued") or [])
     some = lambda xs: "; ".join(xs[:4]) + ("; ..." if len(xs) > 4 else "") or "none seen"   # noqa: E731
-    head = (f"{key(w)}: #{w['task']} has waited {(now - w['since']) / 60:.0f} min on the "
-            f"{NAMES.get(w['queue'], w['queue'])}{' ' + w['res'] if w.get('res') else ''}: {len(run)} running"
-            f" (cap {cap if cap else 'unknown'}{', ' + w['cap_why'] if w.get('cap_why') else ''}), {len(que)} queued."
-            f" Holding: {some(run)}. Waiting: {some(que)}." + (f" {note}" if note else ""))
+    name = f"{NAMES.get(w['queue'], w['queue'])}{' ' + w['res'] if w.get('res') else ''}"
+    ctx = (f"{len(run)} running (cap {cap if cap else 'unknown'}{', ' + w['cap_why'] if w.get('cap_why') else ''}),"
+           f" {len(que)} queued. Holding: {some(run)}. Waiting: {some(que)}." + (f" {note}" if note else ""))
+    return name, f"{key(w)}: #{w['task']} has waited {(now - w['since']) / 60:.0f} min", ctx
+
+
+def text(w: dict, opts: list[str], now: float, note: str = "") -> str:
+    name, item, ctx = _parts(w, now, note)
+    head = f"{item} on the {name}: {ctx}"
     if not opts:
-        return head + " No option is open to the project (a user pause or a cap the user set holds it): the user is told."
+        return f"{head} {NO_OPTION}"
     return head + " Options: " + " | ".join(f"({i}) {o}" for i, o in enumerate(opts, 1))
+
+
+def fold(w: dict, opts: list[str], now: float, note: str = "") -> dict:
+    """The event's FOLD data: one line per queue in NEW EVENTS, the newest state once, each item's key and
+    its options kept (an empty `opts`: NO_OPTION)."""
+    name, item, ctx = _parts(w, now, note)
+    return {"group": f"the {name}", "item": item, "ctx": ctx, "opts": list(opts) or [NO_OPTION]}
+
+
+def sig(w: dict, opts: list[str]) -> str:
+    """What a raise says that matters: the queue, its cap, who holds it and the options. Not the queued
+    count or the minutes waited, which change every scan."""
+    raw = json.dumps([w["queue"], w.get("res"), w.get("cap"), sorted(w.get("running") or []), opts])
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
 def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, device: set | None = None,
@@ -268,17 +296,25 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         sp = spill if w["queue"] in ("checks", "cpu", "pool") else None
         opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores, sp)
         msg = text(w, opts, now, spill_note(sp))
-        if ev := db.one("SELECT id, text FROM events WHERE kind=? AND status='queued' AND data LIKE ?",
+        if ev := db.one("SELECT id, text, data FROM events WHERE kind=? AND status='queued' AND data LIKE ?",
                         (KIND, f'%"key": "{k}"%')):
-            if ev["text"] != msg[:4000]:   # still unread: the holders, occupancy and options of this scan, not
-                db.x("UPDATE events SET text=? WHERE id=?", (msg[:4000], ev["id"]))   # the raise's
+            got = json.loads(ev["data"] or "{}")
+            now_fold = fold(w, opts, now, spill_note(sp))
+            if ev["text"] != msg[:4000] or got.get(FOLD) != now_fold:   # still unread: the holders, occupancy
+                got[FOLD] = now_fold   # and options of this scan, not the raise's, in its text and its FOLD data
+                db.x("UPDATE events SET text=?, data=? WHERE id=?", (msg[:4000], json.dumps(got), ev["id"]))
             continue
         if _cause_owner(db, st, w, now) is not None:
             continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
-        data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep}}
+        said = sig(w, opts)
+        if rec.get("sig") == said and mark - int(rec.get("mark") or 0) < REPEAT_MARKS:
+            continue   # raised before and nothing it says changed: no new wake for the same words
+        data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep},
+                FOLD: fold(w, opts, now, spill_note(sp))}
         fp = f"{KIND}:{ep}:{mark}"
         if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data):
             raised.append(fp)   # the longest waits first; the rest at a later scan
+            rec.update(sig=said, mark=mark)
         if not opts and ep not in told:
             told.append(ep)
             msgparts.post(db, f"#{w['task']} has waited {(now - w['since']) / 60:.0f} min on the "

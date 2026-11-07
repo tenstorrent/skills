@@ -2455,3 +2455,18 @@ def test_coordsession_wakemode_guard_posts_the_text_when_its_check_breaks(env, m
     coord.apply(p, [{"type": "reply", "text": _WM_CLAIM, "chat": "c1"}], turn=1)
     assert _wm_sent(p, "reply") == _WM_CLAIM
     assert any("went unchecked" in n for n in p.db.kv(coord.NOTES_KEY, []))
+
+
+def test_coordsession_row_delta_ignores_the_open_tasks_overlap_advice_coming_and_going():
+    """The Open tasks header carries the overlap advice only while a row has an overlap note. That note
+    coming or going changes no row's key: the section still goes by row, with the header as it is now."""
+    from ttp import coordsession as cs
+    head = "## Open tasks (id | status | tier | priority | age | title | last note)"
+    advised = head[:-1] + "; overlap: runs beside, conflicts settle at landing)"
+    rows = tuple(f"- #{n} | running | deep | p2 | 5.0h | code: task {n} | its checks run" for n in range(1, 7))
+    st = {cs.DIGEST: cs.wake_digest("new", None, [], _cs_rowparts(head, *rows), "f", "f", "g")[1]}
+    clash = "- #1 | running | deep | p2 | 5.0h | code: task 1 | overlaps #2 on a.py; its checks run"
+    sent, _, why = cs.wake_digest("resume", st, _cs_rowparts(advised, clash, *rows[1:]), [], "f", "f", "g")
+    got = dict(sent)["tasks"].split("\n")
+    assert got[0] == advised and got[1].startswith("(rows since your last wake, by key: changed #1;"), got
+    assert got[2:] == [clash], got

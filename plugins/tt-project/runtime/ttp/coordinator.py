@@ -672,6 +672,58 @@ EVENT_CHARS = 1500
 # A plan's product arrives as these events; the daemon sizes them to fit, so they show whole.
 EVENT_CHARS_BY_KIND = {"followup_proposed": 4300, "task_notes": 6000, "upstream_note": 4300,
                        "charter_retry": 8000, budgetkind.KIND: 2000, reviewcap.REVIEW_AREA_EVENT: 2600}
+# NEW EVENTS joins events of these kinds that carry `fold` data ({group, item, ctx[, opts]}: queuewait.fold,
+# checkcap.urgent_wait_fold, the daemon's wait_stale) into one line per kind and group, when a wake has
+# several: the group's newest state (ctx) once, then each item with its own key and options.
+FOLD_KINDS = ("queue_wait", "urgent_check_wait", "wait_stale")
+SLOT_WAIT = "checks_slot_wait"   # several wakes of one queue incident in a batch: the newest is shown whole
+
+
+def _fold_of(e) -> dict | None:
+    try:
+        f = (json.loads(e["data"] or "{}") or {}).get("fold")
+    except (TypeError, ValueError, AttributeError):
+        return None
+    return f if isinstance(f, dict) and all(isinstance(f.get(k), str) for k in ("group", "item", "ctx")) else None
+
+
+def fold_events(events: list, tag: str) -> dict:
+    """{event id: its NEW EVENTS line, or None when an earlier line already carries it} for the events
+    folded (FOLD_KINDS with `fold` data, several of a kind and group; several checks_slot_wait wakes of one
+    queue incident). An event not in it is shown on its own line."""
+    groups: dict = {}
+    for e in events:
+        if e["kind"] in FOLD_KINDS and (f := _fold_of(e)):
+            groups.setdefault((e["kind"], f["group"]), []).append((e, f))
+        elif e["kind"] == SLOT_WAIT and str(e["fingerprint"] or "").startswith(f"{SLOT_WAIT}:incident:"):
+            groups.setdefault((SLOT_WAIT, str(e["fingerprint"]).split(":")[2]), []).append((e, None))
+    out: dict = {}
+    for (kind, group), got in groups.items():
+        if len(got) < 2:
+            continue
+        sev = "high" if any(e["severity"] == "high" for e, _ in got) else got[-1][0]["severity"]
+        if kind == SLOT_WAIT:   # the newest wake of the incident says its state now and why it woke
+            e = got[-1][0]
+            text = e["text"] if len(e["text"]) <= EVENT_CHARS else e["text"][:EVENT_CHARS] + " … [cut]"
+            out[e["id"]] = (f"- [{kind} from {e['source']}, severity {sev}; the newest of {len(got)} wakes of this "
+                            f"queue incident in this batch, the earlier ones not repeated] {spans.wrap(text, kind, tag)}")
+            out.update({x["id"]: None for x, _ in got[:-1]})
+            continue
+        opts = [list(f.get("opts") or []) for _, f in got]
+        common = [o for o in opts[0] if all(o in x for x in opts[1:])]
+        items = []
+        for (_, f), mine in zip(got, opts):
+            own = [o for o in mine if o not in common]
+            items.append(f["item"] + (f" (options: {' | '.join(own)})" if own else ""))
+        body = (f"on {group}, now: {clip(got[-1][1]['ctx'], EVENT_CHARS)}"
+                + (f" Options for each: {' | '.join(common)}." if common else "")
+                + f" Each: {'; '.join(items)}")
+        out[got[0][0]["id"]] = (f"- [{kind} from daemon, {len(got)} folded into one line, severity {sev}] "
+                                f"{spans.wrap(body, kind, tag)}")
+        out.update({e["id"]: None for e, _ in got[1:]})
+    return out
+
+
 # A refusal that carries the user's approved charter text to resend exactly (_charter_approval) keeps
 # up to this much of it in the digest and the charter_retry event: a clipped copy gets reworded.
 RESEND_CHARS = 6000
@@ -1601,7 +1653,12 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                              f"{spans.wrap(m['context'], 'relayer context', tag)}")
             else:
                 lines.append(f"{head} {m['text']}")
+    folded = fold_events(events, tag)
     for e in events:
+        if e["id"] in folded:
+            if folded[e["id"]]:
+                lines.append(folded[e["id"]])
+            continue
         cap = EVENT_CHARS_BY_KIND.get(e["kind"], EVENT_CHARS)
         text = e["text"] if len(e["text"]) <= cap else e["text"][:cap] + " … [cut]"
         lines.append(f"- [{e['kind']} from {e['source']}, severity {e['severity']}] "

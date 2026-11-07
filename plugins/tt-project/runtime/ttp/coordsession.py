@@ -401,8 +401,9 @@ def _key_rows(text: str, section: str = ROWS) -> list[tuple[str, str]] | None:
 
 
 def _head(text: str) -> str:
-    """A section's header line without its counts, hashed."""
-    return _sha(re.sub(r"\d+", "#", text.split("\n", 1)[0]))
+    """A section's header line without its counts or a note after ';' in its closing parenthesis (the Open
+    tasks overlap advice comes and goes with its rows; the delta sends the header as it is now), hashed."""
+    return _sha(re.sub(r"\d+", "#", re.sub(r";[^()]*\)$", ")", text.split("\n", 1)[0])))
 
 
 def rows(parts: list[tuple[str, str]]) -> dict:

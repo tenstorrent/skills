@@ -22843,3 +22843,80 @@ def test_digest_labels_several_action_notes_once(env):
     assert d.count("applied, nothing to fix") == 1
     assert ("- [notes on your previous turn's actions: applied, nothing to fix]\n  - first applied note\n"
             "  - second applied note") in d
+
+
+def _fold_event(p, kind, text, fold=None, fp=None, severity="normal", task=None, extra=None):
+    data = {**(extra or {}), **({"fold": fold} if fold else {})}
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
+           (time.time(), "daemon", kind, fp or f"{kind}:{time.time()}:{text[:20]}", severity, text, "queued", task,
+            json.dumps(data) if data else None))
+    return p.db.one("SELECT MAX(id) id FROM events")["id"]
+
+
+def test_digest_folds_queue_waits_into_one_line_per_queue_keeping_keys_and_options(env):
+    """Several queue_wait events on one queue share one NEW EVENTS line: the queue's newest state once, the
+    options every item has once, then each item with its key and its own options. Must act now still names
+    every key. Another queue keeps its own line; a lone event keeps its own text."""
+    from ttp import coordinator as coord, mustact, queuewait
+    p = make(env)
+    ids = []
+    for tid, mins, ctx in ((7, 228, "4 running (cap 4), 22 queued. Holding: old."),
+                           (8, 53, "4 running (cap 4), 21 queued. Holding: run A; run B.")):
+        opts = ["cut the stale queued tail: cancel this project's older queued checks runs",
+                f"cancel it if it is no longer needed: task_update {tid} status cancelled"]
+        w = {"task": tid, "queue": "checks", "res": "", "since": time.time() - mins * 60}
+        ids.append(_fold_event(p, "queue_wait", queuewait.text(w, opts, time.time()) + f" {ctx}",
+                               {"group": "the checks queue", "item": f"qwait-{tid}-checks: #{tid} has waited {mins} min",
+                                "ctx": ctx, "opts": opts}, severity="high",
+                               extra={"must_act": {"key": f"qwait-{tid}-checks", "chat": "all", "tasks": [tid],
+                                                   "kind": "queue_wait"}}))
+    ids.append(_fold_event(p, "queue_wait", "qwait-9-push: #9 has waited 40 min on the push queue: LONE TEXT",
+                           {"group": "the push queue", "item": "qwait-9-push: #9 has waited 40 min", "ctx": "c",
+                            "opts": ["o"]}, severity="high"))
+    d = coord.digest(p, {}, ids, [])
+    ev = d.split("# NEW EVENTS", 1)[1]
+    lines = [ln for ln in ev.split("\n") if ln.startswith("- [queue_wait")]
+    assert len(lines) == 2, lines
+    one = lines[0]
+    assert one.startswith("- [queue_wait from daemon, 2 folded into one line, severity high]"), one
+    assert "on the checks queue, now: 4 running (cap 4), 21 queued. Holding: run A; run B." in one
+    assert "Holding: old." not in one   # the older state is not repeated
+    assert one.count("cut the stale queued tail") == 1 and "Options for each: cut the stale queued tail" in one
+    assert ("qwait-7-checks: #7 has waited 228 min (options: cancel it if it is no longer needed: task_update 7 "
+            "status cancelled)") in one and "task_update 8 status cancelled" in one
+    assert "LONE TEXT" in lines[1]   # alone on its queue: shown as raised
+    block = mustact.block(p.db, ids)
+    assert "qwait-7-checks" in block and "qwait-8-checks" in block
+
+
+def test_digest_folds_urgent_check_and_stale_waits_and_slot_wait_incident_wakes(env):
+    """urgent_check_wait: one line per queue, what holds it once, each waiter named. wait_stale: the shared
+    decide words once, each wait's own words kept. checks_slot_wait: of several wakes of one queue incident
+    the newest is shown whole; another incident keeps its line. Events with no fold data show as before."""
+    from ttp import checkcap, coordinator as coord
+    p = make(env)
+    ws = [{"holder": f"demo task #{t} (run {t}0)", "priority": 1, "waited_s": 660, "queue": "checks-parked",
+           "held_by": ["demo task #5 (run 50) (x4)", "other task #6 (run 60) (x8)"]} for t in (1, 2, 3)]
+    ids = [_fold_event(p, checkcap.URGENT_WAIT, checkcap.urgent_wait_text(w), checkcap.urgent_wait_fold(w))
+           for w in ws]
+    assert checkcap.urgent_wait_text(ws[0]) == (
+        "urgent checks demo task #1 (run 10) (priority 1) have waited 11 min in the host-wide checks-parked "
+        "queue; held by: demo task #5 (run 50) (x4); other task #6 (run 60) (x8)")
+    shared = ("Each keeps sleeping and no worker run is spent. Decide for each: fix its probe (`ttp task set-when "
+              "<id> \"<cmd>\"`), clear it (\"\") so it wakes at its timer, or cancel the task.")
+    for t in (4, 5):
+        ids.append(_fold_event(p, "wait_stale", f"#{t} t has waited 6 h for x. Decide: ...",
+                               {"group": "probe waits past max_hold_s", "item": f"#{t} t has waited 6 h for x{t}.",
+                                "ctx": shared}))
+    for n, start in ((1, 100), (2, 100), (3, 200)):
+        ids.append(_fold_event(p, "checks_slot_wait", f"Checks queue: wake {n} of incident {start}.",
+                               fp=f"checks_slot_wait:incident:{start}:escalate:{n}"))
+    ev = coord.digest(p, {}, ids, []).split("# NEW EVENTS", 1)[1]
+    urgent = [ln for ln in ev.split("\n") if ln.startswith("- [urgent_check_wait")]
+    assert len(urgent) == 1 and urgent[0].count("held by:") == 1, urgent
+    assert all(f"demo task #{t} (run {t}0) (priority 1) have waited 11 min" in urgent[0] for t in (1, 2, 3))
+    stale = [ln for ln in ev.split("\n") if ln.startswith("- [wait_stale")]
+    assert len(stale) == 1 and stale[0].count("Decide for each") == 1 and "x4." in stale[0] and "x5." in stale[0]
+    slot = [ln for ln in ev.split("\n") if ln.startswith("- [checks_slot_wait")]
+    assert len(slot) == 2 and "wake 2 of incident 100" in slot[0] and "the newest of 2 wakes" in slot[0], slot
+    assert "wake 1 of" not in ev and "wake 3 of incident 200" in slot[1]
