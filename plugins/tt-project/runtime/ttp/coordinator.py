@@ -120,6 +120,7 @@ from . import replan
 from . import topup
 from . import probevars
 from . import onhost
+from . import claimcheck
 from . import coordsession
 from . import spans
 from . import coordtools
@@ -1495,7 +1496,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             continue
         note = clip(t["blocked_reason"] or load_result(t["result"]).get("summary"), NOTE_CHARS)
         if note:   # clipped before it is enclosed, so a cut never drops the span's end
-            note = spans.wrap(note, f"{'blocked reason' if t['blocked_reason'] else 'hand-off'} of #{t['id']}", tag)
+            note = spans.wrap(note, f"{'blocked reason' if t['blocked_reason'] else 'hand-off'} of #{t['id']}", tag) \
+                + ("" if t["blocked_reason"] else claimcheck.handoff_mark(load_result(t["result"])))
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         note = f"{anchors.describe(*held, p)}: {note}" if held else note
         clash = file_overlap.short(file_overlap.digest_note(t))
@@ -1541,7 +1543,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         summary = spans.wrap(summary, f"hand-off of #{t['id']}", tag) if summary and summary != "see new events" \
             else summary
         lines.append(f"- #{t['id']} {task_outcome(t)}: {clip(t['title'], TITLE_CHARS)}"
-                     + verified.handoff_line(load_result(t["result"])) + (f" — {summary}" if summary else ""))
+                     + verified.handoff_line(load_result(t["result"])) + (f" — {summary}" if summary else "")
+                     + (claimcheck.handoff_mark(load_result(t["result"])) if summary else ""))
     section("finished", lines)
     said = " ".join(str(e["text"] or "") for e in events)
     if msg_ids:
@@ -2519,6 +2522,16 @@ def _wakemode_checked(p: Project, text: str, notes: list) -> str:
     return text
 
 
+def _claims_checked(p: Project, a: dict, notes: list) -> tuple[str, list]:
+    """A reply or notify as claimcheck.check sends it: a status claim that did not hold goes prefixed with what is
+    true, one nothing could check with '(unverified)' after it. Returns (text, the false claims)."""
+    text, false, unverified = claimcheck.check(p, a["text"], a.get("claims"))
+    if false or unverified:
+        notes.append(f"claimcheck: {len(false)} claim(s) did not hold and {unverified} could not be checked when "
+                     f"sent; they went marked. Check live state first and back each status claim with `claims`")
+    return text, false
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None) -> list[str]:
@@ -2591,8 +2604,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"], false = _claims_checked(p, a, notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
+                claimcheck.raise_false(db, false, f"your reply #{replies[-1]} (chat {chat or 'all'})")
                 turnrules.record_cites(db, chat, cites, replies[-1])
                 sent.append((replies[-1], chat, a["text"]))
                 if a.get("claims"):
@@ -3396,8 +3411,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
                 a["text"] = _wakemode_checked(p, a["text"], notes)
+                a["text"], false = _claims_checked(p, a, notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
+                claimcheck.raise_false(db, false, f"your notify #{sent[-1][0]}")
                 if a.get("claims"):
                     claimed.append((sent[-1][0], None, a["claims"]))
                 workernotify.handled(db, said)

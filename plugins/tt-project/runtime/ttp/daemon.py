@@ -37,6 +37,7 @@ from pathlib import Path
 
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
+from . import claimcheck
 from . import sidefx
 from . import cursorhook
 from . import pausegone
@@ -5170,6 +5171,10 @@ class Daemon:
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
         applied: list = []
+        try:   # before the batch's transaction: a claim's probe never holds the write lock
+            claimcheck.prerun(self.p, actions, self._probe_env())
+        except Exception:
+            log(self.p, "claimcheck: claim probes not run\n" + traceback.format_exc())
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=coord.user_turn(db, note.get("messages") or []),
                                turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
                                applied=applied)
@@ -6801,7 +6806,7 @@ class Daemon:
             and not stale
         # The summary takes what the digest's cap leaves after the header, push note and daemon lines.
         room = min(1200, coord.EVENT_CHARS - len(head) - len(push_note) - len(text))
-        text = f"{head}{_cut(summary, max(200, room), where)}{push_note}{text}"
+        text = f"{head}{_cut(summary, max(200, room), where)}{claimcheck.handoff_mark(result)}{push_note}{text}"
         if hop or requeued or quick:
             chaincap.add_notice(db, text)
         if not approval:   # an approval has its push_queued event; the batch's outcome closes the task
@@ -18647,9 +18652,12 @@ def relay_worker_notifies(p: Project, task: dict, run_dir: Path, handoff: dict |
         if step:
             sent += userstep.relay(db, task, step, n, userstep.item_text(db.for_user(text), n, timefmt.zone(p)))
             continue
+        checked, false, _ = claimcheck.check(p, body)   # status claims: checked against the records, else marked
+        text = headline.join(task['title'], checked, 80, f"#{task['id']} ") if checked != body else text
         if db.one("SELECT id FROM messages WHERE direction='out' AND kind='alert' AND text=? AND ts>?",
                   (text, time.time() - 86400)):
             continue
+        claimcheck.raise_false(db, false, f"#{task['id']}'s `ttp notify` in run {run_dir.name}")
         sev = n.get("severity") if n.get("severity") in ("low", "normal") else "normal"
         if hold_for and sev == "normal":
             n_held = workernotify.hold(db, task, text, run_dir.name, end, hold_for)
