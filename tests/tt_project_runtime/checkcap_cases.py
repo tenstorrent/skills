@@ -3461,6 +3461,7 @@ def test_checks_test_project_max_caps_a_projects_checks_at_once_over_all_its_lan
 def test_checks_test_project_max_auto_sizes_from_the_host_over_a_fixed_account_number(env, capsys, monkeypatch):
     """A fixed account checks.test_project_max (set when the default was one check at a time) held a project's
     checks under what the host fits, and a project had no way back to the host-sized cap: "auto" is that."""
+    import pytest
     from ttp import checkcap, checklane, cli, coordinator, project, testslots
     _lane_env(monkeypatch)
     monkeypatch.delenv("TTP_TEST_PROJECT_MAX", raising=False)
