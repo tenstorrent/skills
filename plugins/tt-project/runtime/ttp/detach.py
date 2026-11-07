@@ -687,7 +687,9 @@ def close(rc: Path, now: float | None = None) -> dict | None:
         return None
     if locks.any_free([locks.job_lock(rc)]):   # no process of the job writes its log any more
         from . import redact
-        redact.scrub_file(rc.with_suffix(".log"))   # scrub_run left it while the job ran (live_job_logs)
+        left: list = []   # scrub_run left it while the job ran (live_job_logs); a big one is masked detached
+        redact.scrub_file(rc.with_suffix(".log"), redact.STEP_FILE_BYTES, left)
+        redact.scrub_later(left, rc.with_name("scrub.log"))
     if st == "ended":
         try:
             end = rc.stat().st_mtime

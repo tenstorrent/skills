@@ -727,7 +727,10 @@ def supervise(run_dir: Path) -> int:
         exit_info["bridge"] = bridge.stats()   # endpoint fault kinds for routing's fallback (route.py)
     try:   # before exit.json: the daemon reads the run's output and hand-off only after it
         from . import redact
-        redact.scrub_run(run_dir)
+        left: list = []
+        redact.scrub_run(run_dir, left=left)
+        for f in left:
+            print(f"runner: not masked, over {redact.MAX_FILE_BYTES >> 20} MiB: {f}", flush=True)
     except Exception as e:
         print(f"runner: could not mask stored secrets in the run: {type(e).__name__}", flush=True)
     _write_exit(run_dir, exit_info)

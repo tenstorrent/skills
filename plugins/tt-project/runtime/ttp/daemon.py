@@ -4740,7 +4740,13 @@ class Daemon:
             self._coord_writes(r, run_dir, report=not self._lean_reap)   # before its output is applied
         runner.remove_private(run_dir)   # the runner removes them too, unless it died first
         try:   # the runner masks them too, unless it died first: before the output or hand-off is read
-            redact.scrub_run(run_dir)
+            left: list = []   # within the step: each file capped, the run time-limited; the rest detached
+            redact.scrub_run(run_dir, step=True, left=left)
+            if left:
+                pid = redact.scrub_later(left, run_dir / "scrub.log")
+                log(p, f"run {r['id']}: {len(left)} file(s) too big or past the time limit to mask in the daemon "
+                       f"step ({', '.join(Path(f).name for f in left[:5])}): "
+                       + (f"masked by detached job {pid} (scrub.log)" if pid else "the detached masking job did not start"))
         except Exception:
             log(p, f"run {r['id']}: masking stored secrets failed\n" + traceback.format_exc())
         if exit_info.get("cred_changed"):

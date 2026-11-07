@@ -1464,3 +1464,109 @@ def test_scrub_run_leaves_a_live_detached_jobs_log_whole_and_masks_it_once_the_j
         assert redact.scrub_run(run) == 1
     text = log.read_text()
     assert _no_key(text, lines) and _masked(text) and "line 49\n" in text
+
+
+class _TrackedRead:
+    """An open file that records how many bytes each read asks for (a whole-file read: the file's size)."""
+
+    def __init__(self, fh, size, reads):
+        self._fh, self._size, self._reads = fh, size, reads
+
+    def read(self, n=-1):
+        self._reads.append(self._size if n is None or n < 0 else n)
+        return self._fh.read(n)
+
+    def readlines(self, *a):
+        self._reads.append(self._size)
+        return self._fh.readlines(*a)
+
+    def __iter__(self):
+        self._reads.append(self._size)
+        return iter(self._fh)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self._fh.close()
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+
+def test_ending_a_run_with_a_large_output_file_reads_it_capped_and_a_detached_job_masks_its_key(env, monkeypatch):
+    """User msg #1918: the daemon's run-end masking (reap_runs, finish_run) reads each run file within a
+    fixed cap and each run within a time limit; a file over the cap is masked by a detached job, every
+    line kept, and so is a big detached-job log the sweep closes (detach.close)."""
+    import builtins
+    from ttp import daemon as dm
+    from ttp import detach, project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    p = make(env)
+    block, lines = _key_block()
+    run_dir = env["tmp"] / "big-run"
+    run_dir.mkdir()
+    (run_dir / "output.jsonl").write_text(json.dumps({"actions": [], "_cost": 0.01}))
+    (run_dir / "exit.json").write_text(json.dumps({"rc": 0, "ended": time.time()}))
+    filler = "".join(f"step {i}: " + "y" * 90 + "\n" for i in range(15000))   # about 1.5 MiB
+    big, bg = run_dir / "job.log", run_dir / "bg.log"
+    for f in (big, bg):
+        f.write_text(filler + block + filler + "last line\n")
+    before = big.read_text()
+    (run_dir / "bg.started").write_text("1\n")   # a detached job, still writing bg.log at the run's end
+    rid = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note) VALUES(?,?,?,?,?,?,?)",
+                 ("coordinator", "fake", time.time(), "running", str(run_dir), "x", "{}"))
+    cap = 1 << 20
+    monkeypatch.setattr(redact, "STEP_FILE_BYTES", cap, raising=False)
+    reads: list[int] = []
+    watched = {str(big), str(bg)}
+    real_open, real_rb, real_rt = builtins.open, pathlib.Path.read_bytes, pathlib.Path.read_text
+
+    def tracked_open(file, *a, **k):
+        fh = real_open(file, *a, **k)
+        return _TrackedRead(fh, os.path.getsize(file), reads) if str(file) in watched else fh
+
+    def whole(real):
+        def read(self, *a, **k):
+            if str(self) in watched:
+                reads.append(self.stat().st_size)
+            return real(self, *a, **k)
+        return read
+
+    def in_step(fn):
+        with monkeypatch.context() as m:
+            m.setattr(builtins, "open", tracked_open)
+            m.setattr(pathlib.Path, "read_bytes", whole(real_rb))
+            m.setattr(pathlib.Path, "read_text", whole(real_rt))
+            return fn()
+
+    d = dm.Daemon(p.base)
+    t0 = time.monotonic()
+    in_step(lambda: d._run_step(d.reap_runs))
+    assert time.monotonic() - t0 < dm.STEP_BUDGET_S
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] != "running"
+    assert max(reads, default=0) <= cap + 1, f"the daemon step read {max(reads)} bytes of a big run file"
+
+    def masked(f):
+        for _ in range(300):
+            if redact.KEY_MASK in f.read_text():
+                return True
+            time.sleep(0.1)
+        return False
+    assert masked(big), (run_dir / "scrub.log").read_text() if (run_dir / "scrub.log").exists() else "no scrub.log"
+    assert big.read_text() == before.replace(block.rstrip("\n"), redact.KEY_MASK), "a line was lost"
+    assert "detached job" in (p.logs / "daemon.log").read_text()
+    assert redact.KEY_MASK not in bg.read_text()   # left whole while its job ran
+    rc = run_dir / "bg.rc"
+    (run_dir / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+    rc.write_text("0\n")
+    reads.clear()
+    assert in_step(lambda: detach.close(rc))["status"] == "ended"
+    assert max(reads, default=0) <= cap + 1, f"the sweep read {max(reads)} bytes of a big job log"
+    assert masked(bg) and bg.read_text() == before.replace(block.rstrip("\n"), redact.KEY_MASK)
+    assert _no_key((run_dir / "scrub.log").read_text(), lines)
+    left: list = []   # past its time limit, the whole folder is left for the detached job
+    monkeypatch.setattr(redact, "STEP_SCRUB_S", 0.0, raising=False)
+    (run_dir / "late.log").write_text(block)
+    assert redact.scrub_run(run_dir, step=True, left=left) == 0 and left == [run_dir]
+    assert redact.main([str(run_dir)]) == 0 and _no_key((run_dir / "late.log").read_text(), lines)

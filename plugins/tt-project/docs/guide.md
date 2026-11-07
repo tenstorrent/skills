@@ -3349,7 +3349,8 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   END line. Beyond the places above it is masked in `ttp note` text, the `ttp say` outbox, `ttp
   status` and `ttp logs` output and every web app answer. A running worker's own files hold what it
   printed until the run ends; the web app and `ttp status` mask it when they show it. A detached job's
-  log is masked once the job ends. A block cut short in plain text is masked through its last key
+  log is masked once the job ends. The daemon reads at most 8 MiB of each run file and spends at most
+  10 s per run on this; a bigger file is masked by a separate background job, with no lines lost. A block cut short in plain text is masked through its last key
   line, so prose after a quoted marker line is kept. The Claude Code
   and Codex session transcripts are masked at run end; Cursor and the `chat` provider keep none the
   harness knows of.

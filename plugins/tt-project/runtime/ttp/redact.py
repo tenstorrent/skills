@@ -11,7 +11,8 @@ becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for eve
 - the database (Db.x): event, note, notify, message and hand-off text, so every `ttp` command and the
   chat relay that read it back never show a value;
 - a run's folder and its agent's own session transcript once the run ends (scrub_run: the runner,
-  and the daemon again before it reads the hand-off);
+  and the daemon again before it reads the hand-off, within STEP_FILE_BYTES per file and STEP_SCRUB_S
+  per run: what is left over is masked by a detached job, scrub_later);
 - text sent to a helper model or service (Jev, Slack) and endpoint client errors.
 
 Every private-key block (PEM, from its `BEGIN <type> PRIVATE KEY` line to its END line, PGP PRIVATE KEY
@@ -29,12 +30,20 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
+import sys
+import time
 from pathlib import Path
 from typing import Any
 
 MIN_LEN = 8                      # shorter values would mask ordinary words
 SECRET_FIELD_RE = re.compile(r"key|token|secret|passw", re.I)
-MAX_FILE_BYTES = 256 << 20       # a run file bigger than this is left alone (never seen in practice)
+MAX_FILE_BYTES = 256 << 20       # a run file bigger than this is left alone, and named (never seen in practice)
+# Inside a daemon step (a run's end, the detached-job sweep): a file bigger than this, and every file not
+# reached within STEP_SCRUB_S of a run's scrub, is masked by a detached job (scrub_later), never read there.
+STEP_FILE_BYTES = 8 << 20
+STEP_SCRUB_S = 10.0
+SESSION_HEAD_BYTES = 4 << 20     # session_id reads no more of a run's output than this
 BUILTIN = ("jev", "slack")       # slots whose other fields (via, user_id, url) are not secret
 _cache: dict[str, Any] = {"sig": None, "pairs": []}
 KEY_MASK = "[private key redacted]"
@@ -169,14 +178,23 @@ def _variants(value: str) -> list[str]:
     return [value] if esc == value else [value, esc]
 
 
-def scrub_file(path: Path) -> int:
+def scrub_file(path: Path, cap: int = MAX_FILE_BYTES, left: list | None = None) -> int:
     """Masks every private-key block and stored secret value in the file, rewritten whole (same mode)
-    only when one is in it. Returns how many it masked; 0 for a missing, unreadable or oversized file."""
+    only when one is in it. Returns how many it masked; 0 for a missing, unreadable or oversized file.
+    It reads at most `cap` bytes: a bigger file is added to `left` (scrub_later, or named by the caller)."""
     found = pairs()
+    path = Path(path)
     try:
-        if not path.is_file() or path.is_symlink() or path.stat().st_size > MAX_FILE_BYTES:
+        if not path.is_file() or path.is_symlink():
             return 0
-        data = path.read_bytes()
+        data = None
+        if path.stat().st_size <= cap:
+            with open(path, "rb") as f:
+                data = f.read(cap + 1)
+        if data is None or len(data) > cap:   # over the cap, or grown past it since
+            if left is not None:
+                left.append(path)
+            return 0
     except OSError:
         return 0
     n = 0
@@ -202,15 +220,13 @@ def session_id(output: Path) -> str:
     """The agent's session id from the start of a run's output (Claude `session_id`, Codex `thread_id`)."""
     try:
         with open(output, "rb") as f:
-            for _ in range(50):
-                line = f.readline()
-                if not line:
-                    break
-                m = re.search(rb'"(?:session_id|thread_id)"\s*:\s*"([A-Za-z0-9-]{8,80})"', line)
-                if m:
-                    return m.group(1).decode()
+            head = f.read(SESSION_HEAD_BYTES)
     except OSError:
-        pass
+        return ""
+    for line in head.split(b"\n", 50)[:50]:
+        m = re.search(rb'"(?:session_id|thread_id)"\s*:\s*"([A-Za-z0-9-]{8,80})"', line)
+        if m:
+            return m.group(1).decode()
     return ""
 
 
@@ -231,22 +247,41 @@ def live_job_logs(files: list[Path]) -> set[Path]:
     return out
 
 
-def scrub_run(run_dir: Path) -> int:
+def scrub_run(run_dir: Path, step: bool = False, left: list | None = None) -> int:
     """Masks private keys and stored secrets in every file of a finished run's folder (output, logs,
     hand-off) but the logs a detached job still writes (live_job_logs), and in the agent's own session
-    transcript for that run. Returns how many it masked; safe to run twice."""
+    transcript for that run. Returns how many it masked; safe to run twice.
+
+    The files it did not mask go to `left`: each over MAX_FILE_BYTES, and in a daemon `step` each over
+    STEP_FILE_BYTES, or, once past STEP_SCRUB_S, the folder itself in place of all of them; for scrub_later."""
     run_dir = Path(run_dir)
-    n = 0
+    cap, until = (STEP_FILE_BYTES, time.monotonic() + STEP_SCRUB_S) if step else (MAX_FILE_BYTES, None)
+    left = [] if left is None else left
+    n, files, start = 0, [], len(left)
+
+    def out_of_time() -> bool:   # then the detached job takes the whole folder (scrub_run again: safe twice)
+        if until is None or time.monotonic() <= until:
+            return False
+        del left[start:]
+        left.append(run_dir)
+        return True
     try:
-        files = [f for f in run_dir.rglob("*") if f.is_file() and not f.is_symlink()]
+        for f in run_dir.rglob("*"):
+            if out_of_time():
+                return n
+            if f.is_file() and not f.is_symlink():
+                files.append(f)
         live = live_job_logs(files)
     except OSError:
         files, live = [], set()
     for f in files:
+        if out_of_time():
+            return n
         if f not in live:
-            n += scrub_file(f)
+            n += scrub_file(f, cap, left)
     try:
-        spec = json.loads((run_dir / "run.json").read_text())
+        with open(run_dir / "run.json", "rb") as f:
+            spec = json.loads(f.read(cap))
     except (OSError, ValueError):
         spec = {}
     sid = session_id(run_dir / "output.jsonl")
@@ -258,8 +293,35 @@ def scrub_run(run_dir: Path) -> int:
         except Exception:
             paths = []
         for p in paths:
-            n += scrub_file(p)
+            if out_of_time():
+                return n
+            n += scrub_file(p, cap, left)
     return n
+
+
+def scrub_later(paths: list, log: Path) -> int | None:
+    """Masks `paths` (files, or a run's folder: scrub_run) in a detached `python -m ttp.redact` job with
+    no size cap or time limit, outside the daemon's tick; its counts, and any file it still had to leave
+    (over MAX_FILE_BYTES), go to `log`. The job's pid, or None when it could not start."""
+    if not paths:
+        return None
+    runtime = str(Path(__file__).resolve().parent.parent)
+    try:
+        with open(log, "ab") as out:
+            return subprocess.Popen([sys.executable, "-m", "ttp.redact", *map(str, paths)], cwd=runtime,
+                                    env={**os.environ, "PYTHONPATH": runtime}, stdin=subprocess.DEVNULL,
+                                    stdout=out, stderr=out, start_new_session=True).pid
+    except OSError:
+        return None
+
+
+def main(argv: list[str]) -> int:
+    left: list = []
+    n = sum(scrub_run(Path(a), left=left) if Path(a).is_dir() else scrub_file(Path(a), left=left) for a in argv)
+    print(f"{time.strftime('%Y-%m-%d %H:%M:%S')} redact: masked {n} in {len(argv)} path(s)", flush=True)
+    for f in left:
+        print(f"redact: not masked, over {MAX_FILE_BYTES >> 20} MiB: {f}", flush=True)
+    return 1 if left else 0
 
 
 def private_dir(path: Path) -> Path:
@@ -268,3 +330,7 @@ def private_dir(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True, mode=0o700)
     os.chmod(path, 0o700)
     return path
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
