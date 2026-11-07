@@ -75,7 +75,9 @@ names the provider, tier and model. The hold ends (release, each daemon tick) on
 configured model changes or the daemon's model-free /models check (at most hourly while a tier routes:
 MODELS_EVERY_S) lists the model again. That check writes the served ids, its time and HTTP status to
 the project state dir's MODELS_FILE, never the key or URL; `ttp status` and doctor show holds and ids
-(model_lines), so a worker can pick a replacement without the key.
+(model_lines), so a worker can pick a replacement without the key. With providers.chat.model_ranking
+set, a routed start whose model is held or unlisted runs the highest-ranked served model instead
+(modelrank.py), and its entry names the model it stands in for (modelrank.KEY).
 
 Salvage: a routed run on the endpoint that exited cleanly without a result.json but printed its
 hand-off in its final reply keeps it (salvage): exactly one top-level JSON object in that reply,
@@ -737,6 +739,11 @@ def config_problems(raw: dict) -> list[str]:
     v = chat.get("route_cooldown_s")
     if v is not None and (isinstance(v, bool) or not isinstance(v, (int, float)) or v < 0):
         out.append(f"providers.{TO}.route_cooldown_s: give seconds (0 or more); {COOLDOWN_S} is used")
+    from .modelrank import ranking_of
+    try:
+        ranking_of(chat.get("model_ranking"))
+    except ValueError as e:
+        out.append(f"{e}; nothing is ranked")
     return out
 
 

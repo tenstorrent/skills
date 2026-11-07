@@ -127,6 +127,7 @@ from . import progress
 from . import downtime
 from . import effort
 from . import modelpick
+from . import modelrank
 from . import effortab
 from . import extchange
 from . import failover
@@ -2955,6 +2956,10 @@ class Daemon:
                 model, effort = by_rule   # a providers.chat.routes rule's model and effort (route.run_model)
             model = pin.get("model") or model
             effort = pin.get("effort") or effort
+            if provider == modelrank.TO and pin.get("model") and not failover.required(self.p.db, task) and (
+                    got := self._rank_pick(f"task #{task.get('id')}'s pin", f"pin:{pin['model']}", pin["model"], time.time())):
+                model = pin["model"] = got[0]   # a preference pin on a model that is down (modelrank.py)
+                note = {**(note or {}), modelrank.KEY: got[1]}
             ab = (note or {}).get(effortab.KEY)
             if not pin.get("effort") and isinstance(ab, dict) and ab.get("effort"):
                 effort = str(ab["effort"])   # the task's effort A/B arm or Jev's pick (effortab.assign)
@@ -4687,16 +4692,20 @@ class Daemon:
                     db.set_kv(seen, {"run": r["id"], "ts": time.time()})   # logged once per model and effort
                     log(self.p, f"route: {r['model']} rejected its effort_fields at effort "
                                 f"{sent['effort'] or '-'} ({', '.join(sent['fields'])}); run {r['id']} went on without them")
-            if fell == "model_missing":   # only this tier's route holds, until its model is served or changed
+            if fell == "model_missing" and routed.get(modelrank.KEY):   # a ranked stand-in refused: skip it
+                modelrank.refused(db, r["model"] or routed["model"], r["id"], time.time())
+                log(self.p, f"model ranking: {routed['to']} refused {r['model'] or routed['model']} (run {r['id']})")
+            elif fell == "model_missing":   # only this tier's route holds, until its model is served or changed
                 model = r["model"] or routed["model"]
                 if route.hold(db, routed["tier"], model, r["id"], time.time()):
                     log(self.p, f"route: {routed['to']} does not serve {model}; tier {routed['tier']} held (run {r['id']})")
-                    self.alert(f"route-model-missing:{routed['tier']}",
-                               f"The {routed['to']} provider no longer serves model {model} "
-                               f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
-                               f"runs now start on the core provider; routing resumes on its own once the model is "
-                               f"served again (checked hourly) or the tier's model is changed. Served models: "
-                               f"`ttp status`.", severity="normal", every_s=0)
+                    if not modelrank.pick(db, self.cfg, self.p.state, model, time.time()):   # else its switch alerts
+                        self.alert(f"route-model-missing:{routed['tier']}",
+                                   f"The {routed['to']} provider no longer serves model {model} "
+                                   f"(providers.{routed['to']}.tiers.{routed['tier']}.model). {routed['tier'].capitalize()} "
+                                   f"runs now start on the core provider; routing resumes on its own once the model is "
+                                   f"served again (checked hourly) or the tier's model is changed. Served models: "
+                                   f"`ttp status`.", severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
         if "split" not in note:   # the split steer may have fired after `r` was read
@@ -10016,6 +10025,9 @@ class Daemon:
         if self._precheck_holds(task, now):
             ctx["held_by"][task["id"]] = self._precheck_words(task)
             return "held"
+        if why := self._required_model_down(task, provider, now):
+            ctx["held_by"][task["id"]] = why
+            return "held"
         if coord.task_resources(task) & ctx["paused"].keys():
             ctx["holds"][task["id"]] = {"kind": "pause", "resource": sorted(coord.task_resources(task)
                                                                             & ctx["paused"].keys())[0]}
@@ -10198,9 +10210,44 @@ class Daemon:
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
+        ranked = self._rank_pick(f"tier {tier}", tier, model, now) if why in ("", "model_missing") else None
+        if ranked:   # its model is down: the smartest model still served (modelrank.py)
+            model, why = ranked[0], ""
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
-        return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none"}
+        return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none",
+                **({modelrank.KEY: ranked[1]} if ranked else {})}
+
+    def _required_model_down(self, task: dict, provider: str, now: float) -> str:
+        """Why a task whose required model pin (failover.required) on chat is down (modelrank.down) waits,
+        else '': such a pin is never swapped for a ranked model."""
+        model = str(task.get("model") or "")
+        if provider != route.TO or not model:
+            return ""
+        try:
+            why = modelrank.down(self.p.db, self.cfg, self.p.state, model, now)
+            return f"its required model {model} is down on {route.TO} ({why}); it waits until that is served again" \
+                if why and failover.required(self.p.db, task) else ""
+        except Exception as e:   # the ranking must never hold a task back
+            log(self.p, f"task {task.get('id')}: model ranking not checked: {type(e).__name__}: {e}")
+            return ""
+
+    def _rank_pick(self, where: str, key: str, model: str, now: float) -> tuple[str, dict] | None:
+        """(the model to run, {"from", "why"}) when `model` is down and the ranking (modelrank.py) names one
+        served, with one low alert per switch of `key`; else None, and a switch kept for `key` ends."""
+        try:
+            got = modelrank.pick(self.p.db, self.cfg, self.p.state, model, now)
+            if not got:
+                if last := modelrank.back(self.p.db, key):
+                    log(self.p, f"model ranking: {where} back on {last.get('from')} (was {last.get('to')})")
+                return None
+            if modelrank.switch(self.p.db, key, model, got[0], now):
+                log(self.p, f"model ranking: {where} moves from {model} ({got[1]}) to {got[0]}")
+                self.alert(f"model-rank:{key}", modelrank.text(where, model, got[0], got[1]), severity="low", every_s=0)
+            return got[0], {"from": model, "why": got[1]}
+        except Exception as e:   # the ranking must never hold a task back
+            log(self.p, f"model ranking not applied ({where}): {type(e).__name__}: {e}")
+            return None
 
     def _slot_provider(self, task: dict, provider: str, ctx: dict) -> str:
         """The provider whose worker slots a start of `task` takes: the one its tier is routed to
