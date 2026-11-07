@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -959,7 +959,8 @@ def own_lane_key(repo: Path, remote: str, cfg: dict | None) -> str:
     return priority_key(repo, remote, OWN_LANE)
 
 
-def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "") -> dict[str, str]:
+def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "",
+              lock: Path | None = None) -> dict[str, str]:
     """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
     or the push queue, to delivery.push_branch), `own` (`ttp push --own`, the task's own branch) or
     `checks` (`ttp checks`, which pushes nothing). TTP_PUSH_TIP is the tip of the branch pushed to,
@@ -967,14 +968,15 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     TTP_PUSH_BRANCH is the name of that branch on the remote (or the local branch `ttp land` moves),
     short, without refs/heads/, so a check can refuse content by where it goes rather than by the
     branch checked out; empty for `ttp checks`. TTP_LEAK_PATTERNS_FILE names the account's local
-    leak-pattern file when it has one (leakfile)."""
+    leak-pattern file when it has one (leakfile). Every check runs in the pinned Python env built
+    from `lock` (default runnerenv.LOCK), the user site off: runnerenv.Unavailable when it cannot be made."""
     output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH" and k not in checkcap.RUN_ONLY_ENV}  # a `ttp checks` run's own state stays out of its checks
     if pp := check_pythonpath(os.environ):
         env["PYTHONPATH"] = pp
     env = leakfile.with_path(env)   # the account's leak-pattern file, by path, for a check's temp HOME
-    return checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode, "TTP_PUSH_TIP": tip or "",
-                               "TTP_PUSH_BRANCH": short_branch(branch)})
+    return runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
+                                                "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}), lock)
 
 
 def short_branch(ref: str) -> str:
