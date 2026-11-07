@@ -1872,7 +1872,11 @@ session and stateless coordinators on every provider.
   checks start in task-priority order across them, and a priority-1 check whose lanes are held only by less urgent
   runs starts beside them in an extra lane while the load is under half the cores, never in a worktree that already
   runs checks. When `checks.test_project_max` is full of less urgent runs, that priority-1 check still starts at once
-  in an extra lane past the cap, one such lane per project at a time; it never stops a running check. Unset, `checks.slots` (chat-settable, a whole number; `checks.suite_concurrency` is its chat-settable
+  in an extra lane past the cap, one such lane per project at a time; it never stops a running check. A full
+  `ttp checks` run of an urgent or priority-1 task skips that wait: it takes a lane at once and queues for a
+  host-wide checks slot (where it preempts routine runs), never behind runs that only queue there, and still
+  runs only within these bounds unless it holds a reserved urgent slot. A waiting run reads `checks.slots` again
+  at each poll. Unset, `checks.slots` (chat-settable, a whole number; `checks.suite_concurrency` is its chat-settable
   alias) is the number of runs the host's test-slot pool fits side by side, at least 2 and at most 4, and lower only
   when available memory is under 8 GiB per lane. Runs at once do not collide: each has its own clean checkout,
   TMPDIR, output folder and block of ports (`TTP_PORT_BASE`, `TTP_PORT_COUNT`, for suites that bind fixed ports);

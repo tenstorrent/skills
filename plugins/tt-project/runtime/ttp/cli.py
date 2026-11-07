@@ -5165,8 +5165,9 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                 return None
         if suite is None and lock and _wrap_lane_after(cfg):
             suite = testslots.Grant()   # checks.wrap_lane "after": the step inside the wrapper takes the lane
-        # The repository's lanes are read again at every try: unset, they follow the host's load (checklane.capacity).
-        lanes_now = lambda held: checklane.slots(cfg, held)   # noqa: E731
+        # The repository's lanes are read again at every try, checks.slots too (a raised one takes a waiting run
+        # at its next poll): unset, they follow the host's load (checklane.capacity).
+        lanes_now = lambda held: checklane.slots(p.config() if p else cfg, held)   # noqa: E731
         # Its repository's lanes bound running suites only: while it waits for its grants below, the next
         # waiter takes a lane and queues in those gates too (most urgent first); claim_running keeps the bound.
         if suite is None and (suite := hold(repo, lanes_now, lock=lock,

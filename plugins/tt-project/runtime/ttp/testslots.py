@@ -1543,7 +1543,10 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     says the run can start now, so no extra lane is held by a run that waits for test slots.
     `running` (with `pending`): the repository's lanes bound only running suites: a lane whose run still
     waits for its host grants leaves its place to the next waiter, which queues in those gates beside it
-    (most urgent first there), and claim_running checks the bound when a run gets its grants."""
+    (most urgent first there), and claim_running checks the bound when a run gets its grants. There an
+    urgent or priority-1 waiter (checkcap.is_urgent) takes a lane at once, past its place, the lanes' count
+    and the cap: it never waits behind holders that only queue for a host-wide slot, and the host queue,
+    where it preempts routine runs, and claim_running decide when it runs."""
     from . import checklane
     age = age_s() if age is None else age
     if not project_name or os.environ.get(HELD_ENV) or os.environ.get(checkcap.HELD_ENV):
@@ -1585,6 +1588,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
             n_all = len([x for x in mine if locks._slot_labels([x])])
             only_running = running and pending and not lock
             n_held = len([x for x in mine if locks._slot_labels([x]) and not _pending(x)]) if only_running else n_all
+            at_once = only_running and checkcap.is_urgent(priority)
             slots = max(1, int(count(n_held) or 1))
             # Take only from the first `slots` files: with fewer holders, one of them is free. Holders past a
             # shrunk count still count, here and for the cheaper and urgent checks below. Holders still
@@ -1633,7 +1637,9 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                     # Recount under the guard: a run that took a lane since the count above (and left the
                     # queue) is not free room, so a stale count never admits past the bound.
                     free = min(free, slots - _numbered_held(base, only_running)) if free > 0 else free
-                    if free > 0 and pos < free:
+                    if at_once:   # a place that only queues it for its host grants: claim_running bounds running
+                        f = locks.try_take(lanes, label, what, extra=fields)
+                    elif free > 0 and pos < free:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(lanes, label, what, extra=fields)
                         else:

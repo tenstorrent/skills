@@ -4138,6 +4138,85 @@ def test_a_long_holder_is_a_likely_hang_only_when_its_log_and_cpu_stalled_else_s
     assert checklane.wait_wake(evs, {"start": 1.0}, cfg, t0 + 1700, 600.0, marks=idle, stat=stat)[0] == []
 
 
+def test_urgent_and_p1_runs_reach_the_host_queue_past_lanes_held_by_runs_only_queued_for_a_host_slot(
+        env, monkeypatch):
+    """12 runs hold the repository's 12 places: 2 run (the project's cap of 2 is full) and 10, one of them
+    a p1, only wait for a host-wide checks slot (none headroom or the over-cap lane lets past). A p1 and an urgent run
+    still take a place at once, even with no headroom, and queue for the host-wide slot, where the urgent
+    one preempts a routine run by the existing rule; a routine run still waits, and running stays capped."""
+    import threading
+    from ttp import checkcap, testslots
+    _slot_sizes(monkeypatch, 32, 4)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    twelve = lambda _held: 12   # noqa: E731
+    hold = lambda prio, **k: testslots.suite_hold(   # noqa: E731
+        "pa", repo=_LANE_REPO, slots=twelve, cap=2, wait_s=0, pending=True, running=True, priority=prio,
+        headroom=lambda: False, **k)
+    places = [hold(2 + i % 2) for i in range(11)] + [hold(1)]   # the p1 only waits for a host slot
+    host, got, told = [], [], []
+    try:
+        assert all(g and g.files for g in places)
+        assert testslots.claim_running(places[0], "pa", twelve, 2) and testslots.claim_running(places[1], "pa", twelve, 2)
+        assert len(testslots.project_held("pa")) == 2 and len(locks_held_lanes("pa")) == 12
+        assert hold(2) is None, "a routine run waits for the project's cap of running checks"
+        p1, urgent = hold(1, who="p1 run"), hold(0, who="urgent run")
+        assert p1 and p1.files and urgent and urgent.files, "never held behind runs only queued for a host slot"
+        assert testslots._pending(Path(urgent.files[0].name)), "it holds its place waiting, not running"
+        assert len(testslots.project_held("pa")) == 2, "no running bound moved"
+        assert not testslots.claim_running(p1, "pa", twelve, 2), "a routine slot keeps the project's cap"
+        # In the host queue: every host-wide slot is busy with a routine run, so the urgent run asks it to
+        # give up its slot (checks.urgent_slots 0) and takes the slot it frees.
+        host.append(checkcap.acquire("routine", priority=3, preemptible=True))
+        t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+            "urgent run", priority=0, urgent=True, tell=told.append, max_wait_s=30)))
+        t.start()
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine") in told), told
+        host.pop().close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None
+    finally:
+        checkcap.clear_preempt()
+        for g in places + host + got + [locals().get("p1"), locals().get("urgent")]:
+            g and g.close()
+    assert testslots.project_held("pa") == []
+
+
+def locks_held_lanes(project_name: str) -> list:
+    from ttp import locks, testslots
+    return [x for x in testslots.lane_paths(project_name, repo=None) if locks._slot_labels([x])]
+
+
+def test_a_waiting_ttp_checks_run_takes_a_raised_checks_slots_without_a_restart(env, tmp_path, monkeypatch, capsys):
+    """checks.slots raised while a run waits for its repository's one lane: the run reads it at its next
+    poll and starts, never only once it restarts."""
+    import threading
+    from ttp import checkcap, cli, locks, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 20)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    p.set_config("checks.slots", 1)
+    key = testslots.repo_key(repo)
+    hold = testslots.suite_hold(p.name, repo=key, slots=1)   # a running suite holds the one lane
+    queued = lambda: locks.queued(checkcap.slot_dir(), testslots._suite_resource(p.name, key))   # noqa: E731
+    raise_it = threading.Thread(target=lambda: _wait_for(queued) and p.set_config("checks.slots", 2))
+    raise_it.start()
+    seen = tmp_path / "seen"
+    try:
+        t0 = time.time()
+        cli.main(["checks", "--", f"sh -c 'touch {seen}'"])
+        assert seen.exists() and time.time() - t0 < 15, "it waited out its bound on the old checks.slots"
+        assert "waiting for this project's other full checks" in capsys.readouterr().out
+    finally:
+        raise_it.join(30)
+        hold.close()
+
+
 _RUNNING_HOLDER = """
 import os, signal, sys, time
 from pathlib import Path
