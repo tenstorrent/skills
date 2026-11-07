@@ -58,8 +58,9 @@ def test_files(cmd: str, top: Path) -> list[str]:
         words = shlex.split(cmd)
     except ValueError:
         return []
-    files = [w for w in words if w.endswith(".py") and "::" not in w and (top / w).is_file()]
-    return files if files and not any(w.startswith("-k") or w == "-m" for w in words) else []
+    args = words[next((i for i, w in enumerate(words) if w.rsplit("/", 1)[-1] == "pytest"), 0):]
+    files = [w for w in args if w.endswith(".py") and "::" not in w and (top / w).is_file()]
+    return files if files and not any(w.startswith("-k") or w.startswith("-m") for w in args) else []
 
 
 def _first(n) -> int:
