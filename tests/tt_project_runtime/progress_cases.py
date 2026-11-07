@@ -1913,7 +1913,11 @@ def test_wait_stale_on_own_live_checks_folds_into_one_backlog_line_once_per_wait
         t = p.db.task(tid)
         prev = json.loads(t["result"])
         assert d._stale_wait_event(t, prev, prev["waiting_since"], 6 * 3600)
+    from ttp import pagesev
     a, b, dead = waiter("6001", True), waiter("6002", True), waiter("6003", False)
+    stale(a)
+    first = p.db.one("SELECT * FROM events WHERE kind='checks_backlog'")
+    assert pagesev.rides_along(first), first   # starts no coordinator turn by itself
     for _ in range(3):   # every tick: once per wait, never once per task per tick
         for tid in (a, b, dead):
             stale(tid)
@@ -1921,6 +1925,10 @@ def test_wait_stale_on_own_live_checks_folds_into_one_backlog_line_once_per_wait
     assert [(r["task"], r["status"]) for r in rows] == [(a, "coalesced"), (b, "coalesced"), (dead, "queued")]
     backlog = p.db.q("SELECT * FROM events WHERE kind='checks_backlog'")
     assert len(backlog) == 1 and backlog[0]["status"] == "queued", backlog
+    # A fold keeps the flag and the first fold's ts, so the line waits at most RIDE_ALONG_MAX_S.
+    assert pagesev.rides_along(backlog[0]) and backlog[0]["ts"] == first["ts"], backlog
+    own = p.db.one("SELECT * FROM events WHERE kind='wait_stale' AND task=?", (dead,))
+    assert not pagesev.rides_along(own), own   # a dead run's own wait_stale still pages
     text = backlog[0]["text"]
     assert text.startswith("Checks backlog: 2 task(s)") and f"#{a} " in text and f"#{b} " in text, text
     assert f"#{dead} " not in text and "its checks still run" in text and "Oldest: #" in text, text

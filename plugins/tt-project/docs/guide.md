@@ -874,7 +874,8 @@ only in the feed and never under "needs you".
   whose own `ttp checks` or `ttp push` run is still live (running, or queued for a host checks slot)
   is held by that run; once past `waiting.max_hold_s` such waits fold into one queued
   `checks_backlog` line (count, oldest wait, who holds the host checks slots), never one `wait_stale`
-  per task. A run that is dead or lost with no result still pages.
+  per task; that line rides along with the next coordinator turn (at the latest an hour after its
+  first fold) and starts none by itself. A run that is dead or lost with no result still pages.
   Dispatch itself is model-free: each daemon tick starts every ready task a free slot can take,
   never after a coordinator turn. Both events are counted observations that ride with the next
   coordinator turn; neither wakes it on its own.

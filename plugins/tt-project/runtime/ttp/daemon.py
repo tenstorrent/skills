@@ -13462,7 +13462,9 @@ class Daemon:
         """A wait_stale on a wait whose own checks or push run is live (_own_checks_wait): recorded
         'coalesced' under its fingerprint (once per wait) and folded into the one queued
         `checks_backlog` event, which names each such wait, the oldest and who holds the host checks
-        slots. One coordinator line per wake for the backlog, never one page per task."""
+        slots. One coordinator line per wake for the backlog, never one page per task. The line rides
+        along (pagesev.RIDE_ALONG): it starts no turn by itself and joins the next one something else
+        starts, at the latest RIDE_ALONG_MAX_S after its first fold (a fold keeps its ts)."""
         from . import checkcap
         db, now = self.p.db, time.time()
         try:
@@ -13483,7 +13485,7 @@ class Daemon:
                 + f". Oldest: #{old['task']}, waiting {(now - float(old['since'])) / 3600:.1f} h. {slots}. "
                 f"Not a fault: each wakes once its checks end, and a dead or lost run still pages on its own. "
                 f"Act only if the backlog itself is wrong.")
-        data = json.dumps({"checks_backlog": waits})
+        data = json.dumps({"checks_backlog": waits, pagesev.RIDE_ALONG: True})
         with db.tx():
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
                  (now, "daemon", "wait_stale", fp, "normal",
@@ -13491,7 +13493,7 @@ class Daemon:
                   f"folded into the checks backlog line.", "coalesced", task["id"],
                   json.dumps({"wait_stale": {"wait": stalegate.wait_key(task["id"], since)}})))
             if ev:
-                db.x("UPDATE events SET text=?, data=?, ts=? WHERE id=?", (text[:4000], data, now, ev["id"]))
+                db.x("UPDATE events SET text=?, data=? WHERE id=?", (text[:4000], data, ev["id"]))
             else:
                 db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,data) VALUES(?,?,?,?,?,?,?,?)",
                      (now, "daemon", "checks_backlog", f"checks_backlog:{now:.0f}", "low", text[:4000], "queued", data))
