@@ -7662,6 +7662,30 @@ def test_a_full_runs_room_counts_a_priority_1_runs_urgent_slots_as_acquire_takes
         held.close()
 
 
+def test_an_owed_priority_0_run_takes_the_urgent_grant_past_its_projects_budget_held_by_priority_1_runs(
+        env, monkeypatch):
+    """An owed run (priority 0) whose project's budget is held only by priority-1 runs takes the urgent
+    grant, as a priority-1 run does past routine holders (an owed run waited 19 min behind two p1 suites
+    while a p1 pre-check got the urgent slot). A priority-1 run behind priority-1 holders still waits, and
+    nothing passes a priority-0 holder."""
+    from ttp import testslots
+    _budget_of_one(monkeypatch)
+    held = testslots.acquire("p1 suite", project_name="A", priority=1)
+    try:
+        assert not testslots.pool_room({}, "A", full=True, priority=1), "as urgent as its holder: it waits"
+        assert testslots.pool_room({}, "A", full=True, priority=0), "more urgent than every holder"
+        owed = testslots.acquire("owed", project_name="A", priority=0, wait_s=0, full=True)
+        assert owed and owed.k == 1, "acquire agrees"
+        owed.close()
+    finally:
+        held.close()
+    held = testslots.acquire("owed holder", project_name="A", priority=0)
+    try:
+        assert not testslots.pool_room({}, "A", full=True, priority=0), "no urgent slots past a priority-0 holder"
+    finally:
+        held.close()
+
+
 def test_a_run_waiting_for_its_test_slots_keeps_its_project_s_next_run_off_the_host_checks_slots(env, monkeypatch):
     """A run that holds a host-wide checks slot and still waits for its test slots (its lane labelled by
     the real writers: lane_waits(SLOT_WAITS), acquire's load-guard label; or its ticket in its project's

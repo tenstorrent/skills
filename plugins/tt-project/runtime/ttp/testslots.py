@@ -504,8 +504,8 @@ def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
 
 
 def urgent_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
-    """One project's urgent slots beyond its budget: one run's grant (`n`), for a priority-1 waiter whose
-    project's budget is held only by less urgent runs (acquire)."""
+    """One project's urgent slots beyond its budget: one run's grant (`n`), for a priority-1 or better waiter
+    (an owed priority-0 run too) whose project's budget is held only by runs less urgent than it (acquire)."""
     return (locks.slot_paths(checkcap.slot_dir(), f"{kind.own}.{locks.group_id(project_name)}-x", n)
             if project_name else [])
 
@@ -827,7 +827,8 @@ def acquire(holder: str, tell: Callable[[str], None] | None = None, wait_s: floa
                     ahead = line[:line.index(mine)] if mine in line else line
                     if (not ahead and own_free < min(want, len(own)) and priority is not None and priority <= 1
                             and (recs := locks.holder_records(own))
-                            and all(_rank(r) > 1 for r in recs) and locks.any_free(urgent := urgent_paths(name, top, kind))):
+                            and all(_rank(r) > priority for r in recs)
+                            and locks.any_free(urgent := urgent_paths(name, top, kind))):
                         own, own_free = urgent, _free(urgent)
                         what = f"{kind.name} slots (urgent: its project's budget is held by less urgent runs)"
                 if own:   # never more than its budget has left, holders past a budget that shrank counted
@@ -1288,7 +1289,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     need = min(min(run_min(cfg, top), pool), len(own) or pool) if full else 1
     own_free = _own_free(project_name, own) if own else 0
     if (own and priority is not None and priority <= 1 and own_free < need
-            and (recs := locks.holder_records(own)) and all(_rank(r) > 1 for r in recs)
+            and (recs := locks.holder_records(own)) and all(_rank(r) > priority for r in recs)
             and locks.any_free(urgent := urgent_paths(project_name, top))):
         own_free = _free(urgent)
     if own and own_free < need:
