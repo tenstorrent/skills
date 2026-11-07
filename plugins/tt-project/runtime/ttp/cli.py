@@ -7855,12 +7855,14 @@ def _detach_stop(what: str, given: str | None = None) -> int:
 
 def _detach_stop_checks(rc: Path, given: str | None) -> int:
     """`ttp detach --stop <run>/checks.rc`: stop the run's detached `ttp checks` (jobstop.stop_checks: the
-    may_stop rule, then end_checks). 0 once stopped or when they no longer run, 1 when they still run, 2
-    outside a tt-project run, 3 when refused. A sandboxed caller queues the stop for the daemon."""
+    may_stop rule, then end_checks; a review precheck's folder counts as its code task's, jobstop.task_of).
+    0 once stopped or when they no longer run, 1 when they still run, 2 outside a tt-project run or
+    precheck, 3 when refused. A sandboxed caller queues the stop for the daemon."""
     from . import jobstop
     from .push import _boxed
     run_dir = rc.parent
-    base = run_dir.parent.parent.parent if run_dir.parent.name == "runs" else None
+    # a run's folder (state/runs/<id>) or the daemon's review precheck (state/prechecks/t<task>-<head>)
+    base = run_dir.parent.parent.parent if run_dir.parent.name in ("runs", "prechecks") else None
     if base is None or not (base / "state").is_dir():
         print(f"ttp detach --stop: {rc} is not the checks of a tt-project run", file=sys.stderr)
         return 2

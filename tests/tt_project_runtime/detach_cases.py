@@ -2386,6 +2386,99 @@ def test_detach_stop_of_checks_refuses_a_group_of_another_project_or_task(env, t
             _stop_checks_group(proc)
 
 
+def _precheck_checks(p, code, head, env=None):
+    """The daemon's review precheck of task `code` on `head` (state/prechecks/t<code>-<head>, no runs row)
+    whose detached `ttp checks` (a sleeping group leader, TTP_TASK code) left a JSON checks.pid: (dir, process)."""
+    from ttp.runner import proc_start
+    d = p.state / "prechecks" / f"t{code}-{head}"
+    d.mkdir(parents=True)
+    proc = subprocess.Popen(["sleep", "300"], start_new_session=True,
+                            env={**os.environ, "TTP_TASK": str(code), "TTP_PROJECT": str(p.base), **(env or {})})
+    (d / "checks.pid").write_text(json.dumps({"pid": proc.pid, "started": proc_start(proc.pid), "ts": time.time()}))
+    return d, proc
+
+
+def test_detach_stop_maps_a_review_precheck_folder_to_its_code_task(env, tmp_path):
+    """`ttp detach --stop state/prechecks/t<id>-<head>/checks.rc` is not refused as outside a run: the folder
+    maps to code task <id> (jobstop.task_of) and may_stop applies: refused while that task is open, stopped
+    once it is done. A folder of another name, or a prechecks folder outside a project, is never stopped."""
+    from ttp import jobstop
+    p = make(env)
+    code = p.db.add_task("c", "s", kind="code", tier="light", origin="user")
+    p.db.update_task(code, status="running")
+    d, proc = _precheck_checks(p, code, "ab12cd34ef56")
+    odd = p.state / "prechecks" / "x-ab12cd34ef56"
+    odd.mkdir()
+    (odd / "checks.pid").write_text((d / "checks.pid").read_text())
+    loose = tmp_path / "elsewhere" / "state" / "prechecks" / f"t{code}-ab12cd34ef56"
+    loose.mkdir(parents=True)
+    (loose / "checks.pid").write_text((d / "checks.pid").read_text())
+    try:
+        assert jobstop.task_of(p, d / "checks.rc")["id"] == code and jobstop.task_of(p, odd / "checks.rc") is None
+        r = _ttp_run(p, "detach", "--stop", str(d / "checks.rc"))
+        assert r.returncode == 3 and f"task #{code} is running" in r.stderr and proc.poll() is None, r.stderr
+        r = _ttp_run(p, "detach", "--stop", str(odd / "checks.rc"))
+        assert r.returncode == 3 and "no task of this project" in r.stderr and proc.poll() is None, r.stderr
+        r = _ttp_run(p, "detach", "--stop", str(loose / "checks.rc"))
+        assert r.returncode == 3 and proc.poll() is None, r.stderr
+        p.db.update_task(code, status="done")
+        r = _ttp_run(p, "detach", "--stop", str(d / "checks.rc"))
+        assert r.returncode == 0 and f"task #{code} is done" in r.stdout, (r.stdout, r.stderr)
+        assert "not the checks of a tt-project run" not in r.stderr and proc.wait(timeout=10)
+        (ev,) = _stopped_events(p)
+        assert ev["task"] == code
+    finally:
+        _stop_checks_group(proc)
+
+
+def test_the_sweep_ends_a_review_precheck_once_no_review_reads_it(env, tmp_path):
+    """sweep_prechecks (in the daemon's jobstop.sweep) stops a review precheck's live checks once no review
+    labelled precheck:<name> is queued, running or waiting (one in the push queue, done, or none at all),
+    past the grace; it keeps those inside the grace, those an open task's hand-off waits on and those whose
+    checks.rc is written. open_precheck agrees: a review in the push queue no longer owns its lane."""
+    from ttp import checklane, jobstop
+    p = make(env)
+    later = time.time() + 3600
+
+    def task(kind, status, **kw):
+        t = p.db.add_task(kind, "s", kind=kind, tier="light", origin="user", **kw)
+        p.db.update_task(t, status=status)
+        return t
+
+    procs = []
+    try:
+        code = task("code", "done")
+        d_read, pr_read = _precheck_checks(p, code, "aaaaaaaaaaaa")
+        rev = task("review", "queued", labels=["precheck:" + d_read.name])
+        orphan = task("code", "done")
+        d_orphan, pr_orphan = _precheck_checks(p, orphan, "bbbbbbbbbbbb")
+        named = task("code", "done")
+        d_named, pr_named = _precheck_checks(p, named, "cccccccccccc")
+        w = task("work", "waiting")
+        p.db.update_task(w, result=json.dumps({"status": "waiting", "retry_when": f"ttp checks --result {d_named}"}))
+        ending = task("code", "done")
+        d_ending, pr_ending = _precheck_checks(p, ending, "dddddddddddd")
+        (d_ending / "checks.rc").write_text("0\n")
+        procs = [pr_read, pr_orphan, pr_named, pr_ending]
+        assert jobstop.sweep_prechecks(p) == [] and all(x.poll() is None for x in procs), "stopped inside the grace"
+        (r,) = jobstop.sweep_prechecks(p, later)
+        assert r["task"] == orphan and d_orphan.name in r["text"] and pr_orphan.wait(timeout=10)
+        holder = f"run {d_read.name}"
+        for status in checklane.PRECHECK_READERS:
+            p.db.update_task(rev, status=status)
+            assert checklane.open_precheck(p.db, str(code), holder), status
+            assert jobstop.sweep_prechecks(p, later) == [] and pr_read.poll() is None, status
+        p.db.update_task(rev, status="pushing")
+        assert not checklane.open_precheck(p.db, str(code), holder), "a review in the push queue reads it no more"
+        rs = [x for x in jobstop.sweep(p, later) if x.get("job") == "checks"]
+        assert [x["task"] for x in rs] == [code] and pr_read.wait(timeout=10), rs
+        assert pr_named.poll() is None and pr_ending.poll() is None
+        assert jobstop.sweep_prechecks(p, later) == [] and len(_stopped_events(p)) == 2
+    finally:
+        for x in procs:
+            _stop_checks_group(x)
+
+
 def test_the_sweep_ends_a_done_tasks_detached_checks_only_when_nothing_waits_on_them(env, tmp_path):
     """sweep_done_checks stops a done task's live detached checks past the grace, and keeps those an open
     task's `ttp checks --result` wait, the task's own hand-off or a joined checks run still consume, those
