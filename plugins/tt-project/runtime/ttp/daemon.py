@@ -14471,6 +14471,7 @@ class Daemon:
                     "OR labels LIKE '%\"start_when:%')")
         seen = db.kv(refwaits.SEEN_KEY, {}) or {}
         keep: dict = {}
+        peers = refwaits.peer_names(db, self.p.name, self.p.harness) if rows else set()
         for t in rows:
             prev = load_result(t["result"])
             d = deferral(t)
@@ -14479,14 +14480,25 @@ class Daemon:
                 continue
             ep = d.get("since") if d.get("when") else prev.get("waiting_since")
             ep = f"{float(ep):.0f}" if isinstance(ep, (int, float)) else f"u{float(t['created'] or 0):.0f}"
-            text = " ".join(str(x or "") for x in (prev.get("waiting_for") if waiting else "",
-                                                   d.get("why"), t["blocked_reason"]))
-            named = refwaits.refs(text, own=t["id"])
-            if not named:
+            # The facts the daemon wrote into the note are no refs of their own: a fact about another
+            # project's task would otherwise keep itself alive.
+            text = " ".join(str(x or "") for x in (prev.get("waiting_for") if waiting else "", d.get("why"),
+                                                   refwaits.FACT_RE.sub("", str(t["blocked_reason"] or ""))))
+            named = refwaits.refs(text, own=t["id"], peers=peers)
+            stale = refwaits.stale_facts(prev.get(refwaits.FACTS_KEY) if waiting else [], t["blocked_reason"],
+                                         named)
+            if not named and not stale:
                 continue
             had = seen.get(str(t["id"])) or {}
             done = list(had.get("seen") or []) if had.get("ep") == ep else []
             keep[str(t["id"])] = {"ep": ep, "seen": done}
+            if stale:   # facts kept from a ref it no longer names as its own (another project's task)
+                t = self._drop_ref_facts(t, prev, stale)
+                if not t:
+                    continue
+                prev = load_result(t["result"])
+            if not named:
+                continue
             new = [(k, fact) for k, fact in refwaits.over(db, named) if k not in done]
             if not new:
                 continue
@@ -14494,6 +14506,25 @@ class Daemon:
             self._refresh_ref_wait(t, prev, d, [f for _, f in new], now)
         if keep != seen:
             db.set_kv(refwaits.SEEN_KEY, keep)
+
+    def _drop_ref_facts(self, t: dict, prev: dict, stale: list[str]) -> dict | None:
+        """Drop `stale` facts from a waiting task's refs_over and its note; the task as it is now, or None
+        when it moved meanwhile."""
+        tid, db = t["id"], self.p.db
+        upd: dict = {}
+        if any(f in stale for f in prev.get(refwaits.FACTS_KEY) or []):
+            upd["result"] = dump_result({**prev, refwaits.FACTS_KEY: [
+                f for f in prev.get(refwaits.FACTS_KEY) or [] if f not in stale]})
+        note = str(t["blocked_reason"] or "")
+        if not note.startswith(refwaits.HELD_NOTES):
+            upd["blocked_reason"] = refwaits.strip_facts(note, stale)
+        with db.tx():
+            cur = db.task(tid) or {}
+            if cur.get("status") != "queued" or cur.get("result") != t["result"]:
+                return None
+            db.update_task(tid, **upd)
+        log(self.p, f"task {tid} wait note: dropped {'; '.join(stale)} (not this project's)")
+        return db.task(tid)
 
     def _refresh_ref_wait(self, t: dict, prev: dict, d: dict, facts: list[str], now: float) -> None:
         tid, db = t["id"], self.p.db
