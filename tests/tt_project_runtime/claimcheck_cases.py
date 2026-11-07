@@ -127,3 +127,48 @@ def test_a_hand_off_claiming_a_live_state_without_evidence_reads_unverified(env)
     digest = coord.digest(p, {}, [], [])
     line = next(ln for ln in digest.splitlines() if ln.startswith(f"- #{tid} "))
     assert "unverified: claims a live state, cites no command output" in line, line
+
+
+def test_each_task_and_run_is_judged_by_the_claim_of_its_own_clause(env):
+    from ttp import claimcheck, coordinator as coord
+    p = make(env)
+    done = p.db.add_task("a", "s", kind="work", status="done")
+    run = p.db.add_task("b", "s", kind="work", status="running")
+    queued = p.db.add_task("c", "s", kind="work", status="queued")
+    for turn, text in enumerate((f"#{done} landed and #{run} is running.", f"#{run} is running, #{done} finished.",
+                                 f"#{done}, #{done} and #{done} landed.", f"#{run} is running but #{queued} will be "
+                                 f"started later."), 1):
+        coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=turn)
+        assert _cc_sent(p)[-1] == text, _cc_sent(p)[-1]
+    assert not _cc_false_events(p)
+    # One false part: only its task is named.
+    text = f"#{done} landed and #{queued} is running."
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=9)
+    assert _cc_sent(p)[-1] == f"{claimcheck.FALSE_MARK} (#{queued} is queued): {text}", _cc_sent(p)[-1]
+    # Bound to no one claim (a verbless clause with other words, two claims): unverified, never false.
+    text = f"#{queued} on the box, #{run} is running and #{done} landed."
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=10)
+    assert _cc_sent(p)[-1] == f"#{queued} on the box, #{run} is running and #{done} landed (unverified).", _cc_sent(p)
+    assert len(_cc_false_events(p)) == 1
+
+
+def test_an_ended_run_started_and_a_worker_notify_on_its_own_run_are_not_false(env):
+    from ttp import claimcheck, coordinator as coord, daemon
+    p = make(env)
+    tid = p.db.add_task("smoke", "s", kind="work", status="done")
+    p.db.x("INSERT INTO runs(id,task,role,status) VALUES(4321,?,'worker','done')", (tid,))
+    text = "Run 4321 started at 13:00 and passed."
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=1)
+    assert _cc_sent(p)[-1] == text, _cc_sent(p)
+    coord.apply(p, [{"type": "reply", "text": "Run 4321 is running.", "chat": "c1"}], turn=2)
+    assert _cc_sent(p)[-1].startswith(f"{claimcheck.FALSE_MARK} (run 4321 is done)"), _cc_sent(p)
+    # Relayed when the run has ended: the worker's own task and run were running when it wrote this.
+    run_dir = env["tmp"] / "4321"
+    run_dir.mkdir()
+    (run_dir / daemon.NOTIFY_FILE).write_text(
+        json.dumps({"ts": time.time(), "severity": "low", "text": f"#{tid} is running the smoke in run 4321."}) + "\n")
+    with p.db.tx():
+        daemon.relay_worker_notifies(p, p.db.task(tid), run_dir, {"status": "done"})
+    got = _cc_sent(p, "alert")
+    assert got[-1].endswith(f"#{tid} is running the smoke in run 4321."), got
+    assert len(_cc_false_events(p)) == 1

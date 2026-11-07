@@ -14,9 +14,10 @@ check() judges each claim sentence, first backing that applies:
   `due`, a `task` or an `action` is tracked by obligations.record_claims and sent as written;
 - a config key it names (`budget.daily_usd`, or an ALIASES phrase such as 'daily cap') with 'to <value>':
   the live config must hold that value;
-- the tasks it names (#id): running for 'running'/'restarted', started for 'started', not running for
-  'stopped', done for the rest;
-- the runs it names ('run 123'): running, or ended for the other verbs.
+- the tasks (#id) and runs ('run 123') it names, each by the claim of its own clause (_bound; a binding
+  that is ambiguous is unverified, never false): a task running for 'running'/'restarted', started for
+  'started', not running for 'stopped', done for the rest; a run running, any run for 'started', ended for
+  the rest. A worker notify's own task and run (relayed after its run ended) count as running then.
 A claim that does not hold is not sent as written: it goes prefixed with what is true (FALSE_MARK), and
 the caller wakes the coordinator with a high `claim_false` event. A claim nothing could check goes with
 UNVERIFIED after it. Callers: coordinator.apply (replies and notifies, turn and session mode) and
@@ -54,6 +55,10 @@ _TASK = re.compile(r"(?i)(?<!msg )(?<!message )(?<!pr )(?<!issue )(?<!order )(?<
 _RUN = re.compile(r"(?i)\brun (\d{1,9})\b")
 _KEY = re.compile(r"\b([a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)+)\b")
 _VALUE = re.compile(r"(?i)\bto\s+\$?([\w.:-]+)")
+# Verbs that only bind an id to an ended state ('#1 finished'); not claims on their own.
+_ENDED = re.compile(r"(?i)\b(?:finished|completed|merged|ended|done|passed)\b")
+_FILLER = {"task", "tasks", "run", "runs", "the", "both", "also", "too", "then", "and", "but"}
+_CLAUSE = re.compile(r"(?i)[,;]|\s(?:and|but)\s")
 _SPLIT = re.compile(r"((?<=[.!?;])[ \t]+|\n)")
 _WORD = re.compile(r"[a-z0-9]{3,}")
 
@@ -63,10 +68,39 @@ def _verb(sentence: str) -> str | None:
     s = _CODE.sub(" ", sentence)
     if not s.strip() or s.rstrip().endswith("?") or onhost.MARK in s or s.lstrip().startswith(FALSE_MARK):
         return None
-    for m in _VERB.finditer(s):
-        if not _HEDGE.search(s[:m.start()]):
-            return m["v"].lower()
+    for m in _verbs(s):
+        return m["v"].lower()
     return None
+
+
+def _verbs(s: str) -> list:
+    """The unhedged claim verb matches of `s` (backticked code already blanked)."""
+    return [m for m in _VERB.finditer(s) if not _HEDGE.search(s[:m.start()])]
+
+
+def _bound(sentence: str) -> list[tuple[str, int, str | None]]:
+    """Each task ('task') and run ('run') id of `sentence` with the class of the claim verb its own clause
+    (split on ',', ';', ' and ', ' but ') holds, or the sentence's one claim class when its clause holds
+    none; None where that is ambiguous (several classes). An id whose clause holds only a hedged verb is
+    not claimed and left out."""
+    s = _CODE.sub(" ", sentence)
+    verbs = [(m.start(), _cls(m["v"].lower())) for m in _verbs(s)]
+    every = {c for _, c in verbs}
+    verbs += [(m.start(), "done") for m in _ENDED.finditer(s) if not _HEDGE.search(s[:m.start()])]
+    cuts = [0] + [m.end() for m in _CLAUSE.finditer(s)] + [len(s)]
+    out = []
+    for kind, rx in (("task", _TASK), ("run", _RUN)):
+        for m in rx.finditer(s):
+            lo = max(c for c in cuts if c <= m.start())
+            hi = min(c for c in cuts if c > m.start())
+            own = {c for at, c in verbs if lo <= at < hi}
+            if not own and (_VERB.search(s[lo:hi]) or _ENDED.search(s[lo:hi])):
+                continue   # its clause's verb is a plan or a condition: no claim about it
+            # A verbless clause of ids alone ('#1, #2 and #3 landed') takes the sentence's one claim class.
+            alone = set(re.findall(r"[a-z]+", _RUN.sub(" ", _TASK.sub(" ", s[lo:hi])).lower())) <= _FILLER
+            cls = own or (every if alone else set())
+            out.append((kind, int(m.group(1)), next(iter(cls)) if len(cls) == 1 else None))
+    return out
 
 
 def detect(text: str) -> list[str]:
@@ -104,7 +138,7 @@ def _same(live, said: str) -> bool:
         return str(live).strip().lower() == said.rstrip(".").lower()
 
 
-def _judge(p, sentence: str, verb: str, claims: list, now: float) -> tuple[str, str]:
+def _judge(p, sentence: str, verb: str, claims: list, now: float, own: dict | None = None) -> tuple[str, str]:
     """('ok' | 'false' | 'unverified', what is true or why)."""
     cls = _cls(verb)
     if c := _entry(sentence, claims):
@@ -128,22 +162,40 @@ def _judge(p, sentence: str, verb: str, claims: list, now: float) -> tuple[str, 
             continue
         if (m := _VALUE.search(sentence[sentence.find(key) if key in sentence else 0:])) and cls == "done":
             return ("ok", f"{key} is {live}") if _same(live, m.group(1)) else ("false", f"{key} is {live}")
-    ids = [int(x) for x in _TASK.findall(_CODE.sub(" ", sentence))]
-    tasks = [t for t in (p.db.task(i) for i in ids) if t]
-    if tasks:
-        bad = []
-        for t in tasks:
+    own = own or {}
+    bad, good, open_ = [], 0, 0
+    for kind, i, c in _bound(sentence):
+        if kind == "task":
+            t = p.db.task(i)
+            if not t:
+                continue
             st = t["status"]
-            ran = st == "running" or bool(p.db.one("SELECT id FROM runs WHERE task=? LIMIT 1", (t["id"],)))
-            good = {"run": st == "running", "start": ran, "stop": st != "running", "done": st == "done"}[cls]
-            if not good:
-                bad.append(f"#{t['id']} is {st}")
-        return ("false", "; ".join(bad)) if bad else ("ok", "task records")
-    for rid in _RUN.findall(sentence):
-        r = p.db.one("SELECT status FROM runs WHERE id=?", (int(rid),))
-        if r:
-            good = r["status"] == "running" if cls in ("run", "start") else r["status"] != "running"
-            return ("ok", "run record") if good else ("false", f"run {rid} is {r['status']}")
+            if i == own.get("task"):   # the writer's own task, judged after its run ended: it ran when it wrote
+                good, open_ = (good + 1, open_) if c in ("run", "start") else (good, open_ + 1)
+                continue
+            ran = st == "running" or bool(p.db.one("SELECT id FROM runs WHERE task=? LIMIT 1", (i,)))
+            ok = {"run": st == "running", "start": ran, "stop": st != "running", "done": st == "done"}.get(c)
+            state = f"#{i} is {st}"
+        else:
+            r = p.db.one("SELECT status FROM runs WHERE id=?", (i,))
+            if not r:
+                continue
+            if i == own.get("run"):
+                good, open_ = (good + 1, open_) if c in ("run", "start") else (good, open_ + 1)
+                continue
+            # A run that exists has started; 'running' and 'restarted' need it running, the rest ended.
+            ok = {"run": r["status"] == "running", "start": True}.get(c, r["status"] != "running") if c else None
+            state = f"run {i} is {r['status']}"
+        if ok is None:
+            open_ += 1   # which claim it is bound to is ambiguous: never judged false
+        elif ok:
+            good += 1
+        else:
+            bad.append(state)
+    if bad:
+        return "false", "; ".join(bad)
+    if good and not open_:
+        return "ok", "task and run records"
     return "unverified", "nothing could check it"
 
 
@@ -152,8 +204,10 @@ def _mark(sentence: str) -> str:
     return (sentence[:m.start()] + f" {UNVERIFIED}" + sentence[m.start():]) if m else f"{sentence} {UNVERIFIED}"
 
 
-def check(p, text: str, claims: list | None = None, now: float | None = None) -> tuple[str, list[tuple[str, str]], int]:
-    """(text to send, [(false sentence, what is true)], count marked unverified)."""
+def check(p, text: str, claims: list | None = None, now: float | None = None,
+          own: dict | None = None) -> tuple[str, list[tuple[str, str]], int]:
+    """(text to send, [(false sentence, what is true)], count marked unverified). `own` ({'task': id, 'run': id}):
+    the writer's own task and run, whose state at the end of its run is not what its notify claimed."""
     now = time.time() if now is None else now
     try:
         head, cut, tail = (text or "").partition(STATUS_TAIL)   # onhost's honest status lines: the harness's own
@@ -163,7 +217,7 @@ def check(p, text: str, claims: list | None = None, now: float | None = None) ->
             verb = _verb(parts[k])
             if not verb:
                 continue
-            got, why = _judge(p, parts[k], verb, claims or [], now)
+            got, why = _judge(p, parts[k], verb, claims or [], now, own)
             lead = parts[k][:len(parts[k]) - len(parts[k].lstrip())]
             if got == "false":
                 false.append((parts[k].strip(), why))
