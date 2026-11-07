@@ -3554,9 +3554,12 @@ class Daemon:
         """Stop the detached checks that still wait for a host-wide checks slot though nobody will read
         their result: those of an ended task's runs (done, failed or changes_needed, cancelled, however
         long ago), of a run whose task is gone, and of an ended run that has no task. Each holds a place
-        other tasks' checks wait behind. A cancel request (cli.CHECKS_SLOT_CANCEL) names the waiter by pid
-        and start time and why, and only that process honours it, only while it waits: checks that hold a
-        slot already run on to their end. Runs started within REAP_CHECKS_WINDOW_S only."""
+        other tasks' checks wait behind. Also those of a live task's earlier run once the task moved to a
+        newer run (re-dispatched; _moved_checks): one task never holds two checks runs. A cancel request
+        (cli.CHECKS_SLOT_CANCEL) names the waiter by pid and start time and why, and only that process
+        honours it, only while it waits (for its lane, a slot, its test slots while parked on its lane, or
+        a run it follows): it leaves the queue and frees its lane; checks that hold a slot already run on
+        to their end. Runs started within REAP_CHECKS_WINDOW_S only."""
         now = time.time()
         if now - getattr(self, "_reaped_checks", 0.0) < every_s:
             return
@@ -3566,7 +3569,7 @@ class Daemon:
         for r in self.p.db.q(f"SELECT runs.id, runs.dir, runs.task, tasks.status FROM runs LEFT JOIN tasks ON tasks.id=runs.task "
                              f"WHERE runs.started > ? AND (tasks.status IN ({marks}) OR (tasks.id IS NULL AND "
                              "(runs.task IS NOT NULL OR runs.status != 'running')))",
-                             (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES)):
+                             (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES)) + self._moved_checks(now):
             run_dir = self._run_dir(r)
             try:
                 wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
@@ -3575,7 +3578,10 @@ class Daemon:
             info = _read_checks_pid(run_dir)
             if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
                 continue
-            why = f"task #{r['task']} ended ({r['status']})" if r["status"] else \
+            if r.get("newer") and self._checks_still_wanted(r, run_dir, info):
+                continue
+            why = f"task #{r['task']} moved to run {r['newer']}" if r.get("newer") else \
+                f"task #{r['task']} ended ({r['status']})" if r["status"] else \
                 f"task #{r['task']} is gone" if r["task"] is not None else f"run {r['id']} ended and has no task"
             req = {"pid": info["pid"], "started": info["started"], "why": why}
             try:
@@ -3590,6 +3596,41 @@ class Daemon:
                 continue
             log(self.p, f"run {r['id']}: asked its checks (pid {info['pid']}) to stop waiting for a host-wide "
                         f"checks slot: {why}")
+
+    def _moved_checks(self, now: float) -> list[dict]:
+        """The ended worker runs of live tasks that have a newer worker run (re-dispatched, or woken again),
+        each with "newer" (the task's latest run): reap_waiting_checks stops their waiting checks unless
+        _checks_still_wanted."""
+        marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+        return self.p.db.q(
+            "SELECT runs.id, runs.dir, runs.task, tasks.status, (SELECT MAX(n.id) FROM runs n "
+            "WHERE n.task=runs.task AND n.role!='coordinator') AS newer FROM runs JOIN tasks ON tasks.id=runs.task "
+            "WHERE runs.started > ? AND runs.status != 'running' AND runs.role != 'coordinator' "
+            f"AND tasks.status NOT IN ({marks}) AND EXISTS (SELECT 1 FROM runs n WHERE n.task=runs.task "
+            "AND n.id > runs.id AND n.role != 'coordinator')", (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES))
+
+    def _checks_still_wanted(self, r: dict, run_dir: Path, info: dict) -> str:
+        """Why an earlier run's waiting checks (_moved_checks) stay, or "": a live task's recorded wait names
+        that run (its retry_when, then, on_pass_cmd or next_step: the task's own hand-off still points at
+        them, or another task waits on them), or another run follows them (checkjoin: it joined them, or
+        they superseded it), whose outcome it would lose."""
+        from . import checkjoin
+        tail = re.compile(re.escape(f"{run_dir.parent.name}/{run_dir.name}") + r"(?![\w.-])")
+        marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+        for t in self.p.db.q(f"SELECT id, result FROM tasks WHERE status NOT IN ({marks}) AND result LIKE ?",
+                             (*TERMINAL_TASK_STATES, f"%{run_dir.name}%")):
+            res = load_result(t["result"])
+            waits = [res.get(k) for k in ("retry_when", "on_pass_cmd", "next_step")]
+            waits += [w.get(k) for w in (res.get("then") or []) if isinstance(w, dict)
+                      for k in ("retry_when", "on_pass_cmd")]
+            if any(isinstance(w, str) and tail.search(w) for w in waits):
+                return f"task #{t['id']} waits on them"
+        recs = checkjoin.records(self.p.state, prune=False)
+        mine = {x.get("id") for x in recs if x.get("pid") == info.get("pid") and x.get("run") == run_dir.name
+                and not x.get("outcome")}
+        if any(x.get("follows") in mine and x.get("alive") is not False and not x.get("outcome") for x in recs):
+            return "another run follows them"
+        return ""
 
     def reap_runs(self) -> None:
         up = self._awake.tick()

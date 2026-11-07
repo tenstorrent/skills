@@ -201,6 +201,99 @@ def test_daemon_asks_only_an_ended_tasks_still_waiting_checks_to_stop_waiting(en
         proc.wait()
 
 
+def test_daemon_stops_a_live_tasks_earlier_runs_waiting_checks_once_it_moved_to_a_newer_run(env, tmp_path):
+    # #7172: a task re-dispatched (or woken again) whose earlier run's detached checks still wait or park
+    # holds two checks runs; they are stopped unless a task's wait names them or another run follows them.
+    from ttp import checkjoin, cli
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    proc = subprocess.Popen(["sleep", "60"])
+    try:
+        started = proc_start(proc.pid)
+        runs = tmp_path / "runs"
+
+        def task_of(status, result=None):
+            tid = p.db.add_task("t", "s", kind="code")
+            p.db.x("UPDATE tasks SET status=?, result=?, updated=? WHERE id=?",
+                   (status, json.dumps(result) if result else None, time.time(), tid))
+            return tid
+
+        def run_of(tid, status="ok", role="worker", waits=True):
+            rid = p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+                         (tid, role, "fake", time.time(), status))
+            run_dir = runs / str(rid)
+            run_dir.mkdir(parents=True)
+            p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+            if waits:
+                (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": proc.pid, "started": started}))
+                (run_dir / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"pid": proc.pid}))
+            return rid, run_dir
+
+        def probe(run_dir):
+            return f"ttp checks --result {run_dir}"
+        # its retry_when moved to the newer run's checks, and a re-dispatched task running its newer run
+        moved = task_of("waiting")
+        old, old_dir = run_of(moved)
+        new, new_dir = run_of(moved)
+        p.db.x("UPDATE tasks SET result=? WHERE id=?",
+               (json.dumps({"status": "waiting", "retry_when": probe(new_dir)}), moved))
+        redone = task_of("running")
+        old2, old2_dir = run_of(redone)
+        new2, _ = run_of(redone, status="running", waits=False)
+        stop = {old_dir: f"task #{moved} moved to run {new}", old2_dir: f"task #{redone} moved to run {new2}"}
+        keep = []
+        # the task's own hand-off still waits on the earlier run's checks (a later wake reads them)
+        own = task_of("waiting")
+        _, d = run_of(own)
+        run_of(own, waits=False)
+        p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"status": "waiting", "retry_when": probe(d)}), own))
+        keep.append(d)
+        # another task waits on them, in a later step of its known sequence, by a path relative to the root
+        theirs = task_of("waiting")
+        _, d = run_of(theirs)
+        run_of(theirs, waits=False)
+        task_of("waiting", {"status": "waiting", "retry_when": "true",
+                            "then": [{"retry_when": f"ttp checks --result state/{d.parent.name}/{d.name}"}]})
+        keep.append(d)
+        # another run joined them (checkjoin): it would lose its outcome
+        joined = task_of("queued")
+        _, d = run_of(joined)
+        run_of(joined, waits=False)
+        lead = checkjoin.register(p.state, task=str(joined), head="h", commit_ts=0, key="k", group="g", run=d.name,
+                                  arrived=time.time(), pid=proc.pid)
+        follower = checkjoin.register(p.state, task="99", head="h", commit_ts=0, key="k", group="g2", run="x",
+                                      arrived=time.time())
+        checkjoin.update(follower, phase=checkjoin.JOINED, follows=checkjoin.read(lead)["id"])
+        keep.append(d)
+        # the earlier run still runs, the newer run is a coordinator's, or the task has one run only
+        for runs_of in (("running", "ok"), ("ok", "coordinator"), ("ok",)):
+            t = task_of("queued")
+            _, d = run_of(t, status=runs_of[0])
+            if len(runs_of) > 1:
+                run_of(t, role="worker" if runs_of[1] == "ok" else runs_of[1], waits=False)
+            keep.append(d)
+        # a name that only starts with the run's (runs/12 vs runs/123) is not a wait on it
+        prefix = task_of("waiting")
+        _, d = run_of(prefix)
+        run_of(prefix, waits=False)
+        task_of("waiting", {"status": "waiting", "retry_when": probe(d) + "0"})
+        stop[d] = f"task #{prefix} moved to run "
+        Daemon(p.base).reap_waiting_checks(every_s=0)
+        for run_dir, why in stop.items():
+            req = json.loads((run_dir / cli.CHECKS_SLOT_CANCEL).read_text())
+            assert req["pid"] == proc.pid and req["started"] == started and req["why"].startswith(why), req
+        assert not [d for d in keep if (d / cli.CHECKS_SLOT_CANCEL).exists()], \
+            [d.name for d in keep if (d / cli.CHECKS_SLOT_CANCEL).exists()]
+        assert not (new_dir / cli.CHECKS_SLOT_CANCEL).exists(), "the task's latest run keeps its checks"
+        checkjoin.forget(p.state)   # the follower ended: the earlier run's checks follow nobody's wait now
+        Daemon(p.base).reap_waiting_checks(every_s=0)
+        assert (keep[2] / cli.CHECKS_SLOT_CANCEL).exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def test_a_slot_cancel_request_ends_only_its_own_waiter_and_only_while_it_waits(env, tmp_path, monkeypatch, capsys):
     from ttp import checkcap, cli
     from ttp.runner import proc_start
@@ -1178,11 +1271,13 @@ def test_ttp_checks_waits_for_its_project_s_other_full_checks(env, tmp_path, mon
         "with the other run gone it runs, and frees the project's suite lock at its end"
 
 
+@pytest.mark.parametrize("moved", [False, True])
 def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_stop_once_their_task_ended(
-        env, tmp_path, monkeypatch, capsys):
+        env, tmp_path, monkeypatch, capsys, moved):
     """The per-project suite-lock wait is told like the checks-slot wait: CHECKS_SLOT_WAIT names it, the
-    `--result` probe says queued, and the daemon's cancel for an ended task ends it with nothing run."""
-    from ttp import cli, testslots
+    `--result` probe says queued, and the daemon's cancel for an ended task ends it with nothing run;
+    `moved` (#7172): so does its cancel for a live task that moved to a newer run, freeing the queue."""
+    from ttp import checkcap, cli, locks, testslots
     from ttp.daemon import Daemon
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
@@ -1201,17 +1296,21 @@ def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_
         assert f"waiting (pid {info['pid']}, not running) for this project's other full checks" in said, said
         assert f"held by {p.name}: full checks (pid {os.getpid()})" in said and "host-wide" not in said, said
         tid = p.db.add_task("t", "s", kind="code")
-        p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
+        p.db.x("UPDATE tasks SET status=?, updated=? WHERE id=?", ("queued" if moved else "done", time.time(), tid))
         p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
                (tid, "worker", "fake", time.time(), "ok", str(run)))
+        newer = moved and p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+                                 (tid, "worker", "fake", time.time(), "running", str(tmp_path / "newer")))
         Daemon(p.base).reap_waiting_checks(every_s=0)
         assert _wait_for(lambda: (run / cli.CHECKS_RC).exists()), "the cancel did not end the wait"
+        assert not locks.queued(checkcap.slot_dir(), testslots._suite_resource(p.name, testslots.repo_key(repo))), \
+            "it left the project's checks queue"
     finally:
         hold.close()
     assert (run / cli.CHECKS_RC).read_text().strip() == "1" and not ran.exists()
     assert not (run / cli.CHECKS_SLOT_WAIT).exists()
-    assert f"not run: stopped waiting for this project's other full checks: task #{tid} ended (done)" in \
-        (run / "checks.log").read_text()
+    why = f"task #{tid} moved to run {newer}" if moved else f"task #{tid} ended (done)"
+    assert f"not run: stopped waiting for this project's other full checks: {why}" in (run / "checks.log").read_text()
 
 
 _SUITE_RUN = "touch {started}; while [ ! -e {release} ]; do sleep 0.05; done"
