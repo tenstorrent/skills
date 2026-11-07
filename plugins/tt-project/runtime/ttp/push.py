@@ -4042,6 +4042,10 @@ def _kill_tree(pid: int) -> None:
             pass
 
 
+# A local check's group leader: it ends the check's group should the push die before the check ends.
+CHECK_GROUP = (sys.executable, "-I", str(Path(__file__).with_name("checkgroup.py")))
+
+
 def _end_group(pgid: int) -> None:
     """SIGKILL what is left of an ended check's process group `pgid` (its pid, started in a session of its
     own): a background process it left behind ends with it, as no namespace reaps it (sandbox.py)."""
@@ -4183,14 +4187,16 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         # in it goes ahead of non-landing waiters (landmark.py). No other check inherits one.
         mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
         try:
-            proc = subprocess.Popen(testslots.low_priority(check_argv(cmd, repo, env)), cwd=repo,
+            # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
+            proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--",
+                                     *testslots.low_priority(check_argv(cmd, repo, env))], cwd=repo,
                                     env={**{k: v for k, v in env.items() if k != landmark.ENV}, checkwait.ENV: str(waits),
                                          **({landmark.ENV: str(mark.path)} if mark else {}),
                                          # its run-time limit, for a sharded pool run's admission (pooladmit)
                                          **({pooladmit.LIMIT_ENV: f"{time.time():.0f}:{check_limit_s:.0f}"}
                                             if check_limit_s is not None else {})},
                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, pass_fds=checkdirs.inherited(),
-                                    start_new_session=True)   # its own group: _end_group ends what it leaves behind
+                                    start_new_session=True)
         except BaseException:
             if mark:
                 mark.close()

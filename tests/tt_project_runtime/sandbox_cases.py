@@ -525,3 +525,40 @@ def test_a_check_run_without_a_sandbox_ends_the_processes_it_left_behind(tmp_pat
         else:
             os.kill(pid, signal.SIGKILL)
             pytest.fail(f"the check's leftover process {pid} outlived it (exit {rc})")
+
+
+def test_a_check_whose_push_is_killed_outright_ends_with_it(tmp_path):
+    """A check runs in a group of its own, so a SIGKILL of its push (or of the push's group) does not
+    reach it: its group leader (checkgroup) sees the push gone and kills the check's whole group."""
+    from ttp import push
+    pidfile = tmp_path / "left.pid"
+    check = f"sleep 300 </dev/null >/dev/null 2>&1 & echo $! > {pidfile}; sleep 300"
+    start = ("import os, subprocess, sys, time\n"   # the push: its check in a session of its own, as _run_one
+             "subprocess.Popen([*sys.argv[1:4], str(os.getpid()), '--', 'bash', '-c', sys.argv[4]],"
+             " start_new_session=True)\ntime.sleep(300)\n")
+    pusher = subprocess.Popen([sys.executable, "-c", start, *push.CHECK_GROUP, check], start_new_session=True)
+    try:
+        deadline = time.time() + 30
+        while not (pidfile.exists() and pidfile.read_text().strip()) and time.time() < deadline:
+            time.sleep(0.05)
+        left = int(pidfile.read_text())
+        os.killpg(pusher.pid, signal.SIGKILL)   # the push's group: the check's own group is not in it
+        pusher.wait()
+        deadline = time.time() + 15
+        while time.time() < deadline:
+            try:
+                os.kill(left, 0)
+            except ProcessLookupError:
+                break
+            stat = Path(f"/proc/{left}/stat")
+            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                break
+            time.sleep(0.1)
+        else:
+            os.kill(left, signal.SIGKILL)
+            pytest.fail(f"the check's process {left} outlived its killed push")
+    finally:
+        try:
+            os.killpg(pusher.pid, signal.SIGKILL)
+        except OSError:
+            pass
