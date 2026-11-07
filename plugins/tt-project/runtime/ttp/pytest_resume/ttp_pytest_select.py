@@ -12,9 +12,10 @@ TTP_PYTEST_SELECT_FILES, one entry per line (testpick, a task's targeted `ttp ch
 tests matching an entry: a path keeps the tests defined in that file (a case file an aggregator test
 file executes, or a test file), `path::name` the test function `name` of test file `path`. The filters
 combine (a test must pass each one set). A run that keeps none exits 5, pytest's "no tests" status.
-It acts only in the pytest run it was loaded into: it takes its TTP_PYTEST_SELECT* variables out of
-the environment, so a pytest a test starts runs all its own tests; xdist workers get them from their
-controller."""
+It acts only in the pytest process it was loaded into and its xdist workers: it takes its load, its
+TTP_PYTEST_SELECT* settings and its folder on PYTHONPATH out of the environment, so a pytest a test
+starts runs without it. An xdist controller, which runs no test, keeps them: its workers, started after
+it loads, load the plugin from the environment they inherit and get the settings from the controller."""
 from __future__ import annotations
 
 import inspect
@@ -30,24 +31,53 @@ FILES_ENV = "TTP_PYTEST_SELECT_FILES"
 NAME = "ttp_pytest_select"
 
 
-def _strip_env() -> dict:
-    """The TTP_PYTEST_SELECT* variables, taken out of the environment children inherit. The plugin's load
-    (PYTEST_ADDOPTS) stays: an xdist worker loads it from there, and a load with no variables keeps all."""
-    return {k: os.environ.pop(k) for k in [k for k in os.environ if k.startswith(ENV)]}
+def _strip_env() -> None:
+    """Take the plugin's load, settings and folder out of the environment children inherit."""
+    for k in [k for k in os.environ if k.startswith(ENV)]:
+        os.environ.pop(k, None)
+    words = os.environ.get("PYTEST_ADDOPTS", "").split()
+    kept = [w for i, w in enumerate(words) if not (w == "-p" and words[i + 1:i + 2] == [NAME]
+                                                   or w == NAME and words[i - 1:i] == ["-p"] or w == "-p" + NAME)]
+    if kept:
+        os.environ["PYTEST_ADDOPTS"] = " ".join(kept)
+    else:
+        os.environ.pop("PYTEST_ADDOPTS", None)
+    here = os.path.dirname(os.path.realpath(__file__))
+    pp = os.environ.get("PYTHONPATH")
+    if pp is not None:
+        rest = [e for e in pp.split(os.pathsep) if not e or os.path.realpath(e) != here]
+        if any(rest):
+            os.environ["PYTHONPATH"] = os.pathsep.join(rest)
+        else:
+            os.environ.pop("PYTHONPATH", None)
 
 
+def _controller(config) -> bool:
+    """This process is an xdist controller that starts workers (they inherit its environment)."""
+    o = getattr(config, "option", None)
+    return not hasattr(config, "workerinput") and getattr(o, "dist", "no") not in ("no", None) \
+        and bool(getattr(o, "tx", None)) and not getattr(o, "collectonly", False)
+
+
+@pytest.hookimpl(tryfirst=True)
 def pytest_configure(config):
     given = getattr(config, "workerinput", None)
-    config._ttp_select_env = dict(given.get(NAME) or {}) if given is not None else _strip_env()
+    if given is not None and given.get(NAME) is not None:
+        config._ttp_select_env = dict(given[NAME])
+    else:   # read before the strip
+        config._ttp_select_env = {k: v for k, v in os.environ.items() if k.startswith(ENV)}
+    if not _controller(config):
+        _strip_env()
 
 
 @pytest.hookimpl(optionalhook=True)
 def pytest_configure_node(node):
-    node.workerinput[NAME] = node.config._ttp_select_env
+    node.workerinput[NAME] = getattr(node.config, "_ttp_select_env", {})
 
 
 def pytest_collection_modifyitems(config, items):
-    env = getattr(config, "_ttp_select_env", {})
+    env = getattr(config, "_ttp_select_env", None)
+    env = {k: v for k, v in os.environ.items() if k.startswith(ENV)} if env is None else env
     pattern, ids, files = env.get(ENV), env.get(IDS_ENV), env.get(FILES_ENV)
     if not pattern and ids is None and files is None:
         return

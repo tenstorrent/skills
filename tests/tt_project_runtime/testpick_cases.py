@@ -289,6 +289,45 @@ def test_the_select_plugin_keeps_only_the_listed_case_files_and_tests(tmp_path):
     assert ran == ["test_a1", "test_a2", "test_top"], r.stdout[-2000:]
 
 
+_NESTED_OUTER = """import os, subprocess, sys, pathlib
+
+
+def test_outer():
+    leaked = [k for k in os.environ if k.startswith("TTP_PYTEST_SELECT")]
+    assert not leaked and "ttp_pytest_select" not in os.environ.get("PYTEST_ADDOPTS", ""), os.environ
+    assert PLUGIN_DIR not in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    inner = pathlib.Path(__file__).parent / "inner"
+    for pp in ("", os.environ.get("PYTHONPATH", "")):   # a test that sets its own PYTHONPATH, and one that keeps it
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(inner),
+                            str(inner)], cwd=inner, env={**os.environ, "PYTHONPATH": pp},
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0 and "1 passed" in r.stdout, r.stdout + r.stderr
+"""
+
+
+@pytest.mark.parametrize("workers", [[], ["-n", "2"]], ids=["serial", "xdist"])
+def test_a_nested_pytest_a_targeted_test_starts_runs_its_own_tests(tmp_path, workers):
+    """The targeted checks' select setting (testpick.narrow: PYTEST_ADDOPTS, TTP_PYTEST_SELECT_FILES and the
+    plugin folder on PYTHONPATH) acts only in the checks' own pytest and its xdist workers: a pytest a test
+    starts neither fails on the missing plugin module nor deselects all its tests (exit 5)."""
+    from ttp import pushpass
+    if workers:
+        pytest.importorskip("xdist")
+    t = tmp_path / "proj"
+    (t / "tests" / "inner").mkdir(parents=True)
+    (t / "tests" / "inner" / "test_inner.py").write_text("def test_inner():\n    pass\n")
+    (t / "tests" / "test_outer.py").write_text(_NESTED_OUTER.replace("PLUGIN_DIR", repr(str(pushpass.PLUGIN_DIR))))
+    (t / "tests" / "test_other.py").write_text("def test_other():\n    pass\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_PYTEST_", "PYTEST_XDIST"))}
+    env.update({"PYTHONPATH": str(pushpass.PLUGIN_DIR), "PYTEST_ADDOPTS": f"-p {pushpass.SELECT_PLUGIN}",
+                "TTP_PYTEST_SELECT_FILES": "tests/test_outer.py\n"})
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(t), *workers,
+                        "tests/test_outer.py", "tests/test_other.py", "-rA"],
+                       cwd=t, env=env, capture_output=True, text=True, timeout=300)
+    ran = sorted(re.findall(r"^PASSED \S+::(\w+)", r.stdout, re.M))
+    assert r.returncode == 0 and ran == ["test_outer"], r.stdout[-3000:] + r.stderr[-2000:]
+
+
 def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite():
     import ttp
     root = pathlib.Path(ttp.__file__).parent
