@@ -11835,6 +11835,9 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
     if problem:
         holder = release.finish_holder(p)
         tid = holder["task"] if holder else None
+        if not tid and (explicit or took_over) and (done := _finish_cancelled_merge(p, ident, base)):
+            _apply_upgrade(p, done)
+            return
         # No timer: the open task (tid) is the one merge at a time. The last one holds the next off only when it
         # ended without landing this release on these same own files; a newer release or a local edit queues
         # the next at once.
@@ -12960,6 +12963,75 @@ def _keep_local_blocks(ours: str, base: str, theirs: str) -> str | None:
     for i, _, lines in sorted(((where(i), k, lines) for k, (i, lines) in enumerate(groups)), reverse=True):
         out[i:i] = lines
     return "".join(out)
+
+
+def _cancelled_resolution(p: Project) -> tuple[int, str]:
+    """(task, commit): the newest merge the last template-merge task committed in a worktree of the harness
+    (or on its own branch) before it was cancelled. Such a commit was made after the task was queued, is
+    not in main and takes in template commits main lacks. (0, "") when there is none."""
+    from . import harnesstree, release
+    t = p.db.one("SELECT id, status, created FROM tasks WHERE kind='harness' AND title=? ORDER BY id DESC LIMIT 1",
+                 (release.UPGRADE_TASK_TITLE,))
+    if not t or t["status"] != "cancelled":
+        return 0, ""
+    h = p.harness
+    out = subprocess.run(["git", "-C", str(h), "worktree", "list", "--porcelain"], capture_output=True, text=True)
+    skip = {str(h.resolve()), str((p.state / "upgrade-merge").resolve()), str((p.state / "upgrade-resolution").resolve())}
+    heads, path = [], ""
+    for line in out.stdout.splitlines():
+        if line.startswith("worktree "):
+            path = str(Path(line[9:]).resolve())
+        elif line.startswith("HEAD ") and path not in skip:
+            heads.append(line[5:])
+    b = subprocess.run(["git", "-C", str(h), "rev-parse", "-q", "--verify", f"refs/heads/{harnesstree.branch(t['id'])}"],
+                       capture_output=True, text=True)
+    heads += [b.stdout.strip()] if b.returncode == 0 else []
+    best = (0.0, "")
+    for sha in dict.fromkeys(heads):
+        at = subprocess.run(["git", "-C", str(h), "show", "-s", "--format=%ct", sha], capture_output=True, text=True)
+        mb = subprocess.run(["git", "-C", str(h), "merge-base", sha, "upstream"], capture_output=True, text=True)
+        if at.returncode or mb.returncode or float(at.stdout.strip() or 0) < float(t["created"]) - 60:
+            continue
+        if any(subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", c, "HEAD"]).returncode == 0
+               for c in (sha, mb.stdout.strip())):
+            continue    # nothing main lacks, or no template commit main lacks: not a merge of the template
+        best = max(best, (float(at.stdout.strip()), sha))
+    return (int(t["id"]), best[1]) if best[1] else (0, "")
+
+
+def _finish_cancelled_merge(p: Project, ident: list[str], base: str) -> str:
+    """A host-side upgrade whose merge conflicts finishes, model-free, the merge a cancelled merge task left
+    committed (_cancelled_resolution): only when that commit merges the current `upstream` and main (`base`)
+    with no conflict and the result compiles and imports. Nothing is hand-resolved. Returns the checked
+    commit for `--apply`, or "" (a conflict or failed check is said; the caller queues a task as before)."""
+    tid, sha = _cancelled_resolution(p)
+    if not sha:
+        return ""
+    h, tmp = p.harness, p.state / "upgrade-resolution"
+    subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    subprocess.run(["git", "-C", str(h), "worktree", "prune"], capture_output=True)
+    _git(h, "worktree", "add", "-q", "--detach", str(tmp), sha)
+    try:
+        for ref, what in (("upstream", "the current template"), (base, "main")):
+            r = subprocess.run(["git", "-C", str(tmp), *ident, "merge", "--no-edit", ref], capture_output=True,
+                               text=True)
+            if r.returncode != 0:
+                subprocess.run(["git", "-C", str(tmp), "merge", "--abort"], capture_output=True)
+                print(f"harness task #{tid} (cancelled) left a merge {sha[:12]}, but it conflicts with {what}: "
+                      f"a merge task resolves it")
+                return ""
+        problem = _runtime_problem(tmp)
+        if problem:
+            print(f"harness task #{tid} (cancelled) left a merge {sha[:12]}, but {problem}: a merge task resolves it")
+            return ""
+        merged = _git(tmp, "rev-parse", "HEAD")
+        print(f"harness task #{tid} was cancelled with a merge committed ({sha[:12]}); it merges with the current "
+              f"template and main with no conflict, compiles and imports ({merged[:12]}): applying it, no task")
+        return merged
+    finally:
+        subprocess.run(["git", "-C", str(h), "worktree", "remove", "--force", str(tmp)], capture_output=True)
 
 
 def _merge_upstream(h: Path, tmp: Path, ident: list[str], base: str = "main",

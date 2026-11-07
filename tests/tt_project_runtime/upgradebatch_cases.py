@@ -344,3 +344,76 @@ def test_an_unlanded_merge_is_retried_by_the_daemon_once_the_projects_own_files_
     assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1], tids
     p.db.update_task(tids[1], status="failed")
     assert release.hold_reason(p, d) == "already tried for this release" and not restarts
+
+
+@pytest.mark.parametrize("argv", [["--auto"], []])
+def test_a_merge_task_the_project_cancelled_does_not_hold_off_the_next_one(env, monkeypatch, argv):
+    """A project's coordinator cancelled its template-merge task, and that task still counted as the
+    window's one task for 6 h: the project stayed behind. A task the project cancelled is left out of the
+    window. No window holds a merge off any more: a cancelled task merged nothing, so it never does."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    if argv:
+        argv = argv + ["--project-dir", str(p.base)]
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo", *argv])
+    first = _harness_tasks(p)[0]
+    p.db.update_task(first, status="cancelled", blocked_reason="cancelled by the coordinator: spending order")
+    _next_release(env)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", *argv])
+    tids = _harness_tasks(p)
+    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1]
+    assert not restarts
+
+
+def _cancelled_resolution(p, text):
+    """The project's merge task merged `upstream` in its own detached worktree, resolved the conflict
+    with `text`, committed, and was cancelled before its `--apply`. Returns the commit."""
+    tid = _harness_tasks(p)[-1]
+    tmp = p.root / "merge-tmp"
+    _git_out(p.harness, "worktree", "add", "-q", "--detach", str(tmp), "HEAD")
+    subprocess.run(["git", "-C", str(tmp), "merge", "upstream"], capture_output=True)
+    (tmp / "prompts" / "kind-harness.md").write_text(text)
+    ident = ["-c", "user.name=t", "-c", "user.email=t@t"]
+    _git_out(tmp, "add", "-A")
+    _git_out(tmp, *ident, "commit", "-qm", "merge upstream")
+    p.db.update_task(tid, status="cancelled", blocked_reason="cancelled by the coordinator")
+    return _git_out(tmp, "rev-parse", "HEAD").strip()
+
+
+@pytest.mark.parametrize("case", ["clean", "conflict"])
+def test_a_host_upgrade_finishes_a_cancelled_tasks_committed_merge_model_free(env, monkeypatch, case):
+    """A cancelled merge task left its resolution committed in its worktree, and the project stayed behind
+    until someone merged it by hand. A host-side `ttp upgrade` now merges that commit with the current
+    template and main, checks it compiles and imports, and applies it with no task. A resolution that
+    conflicts with the newer template still queues a task, and main is left as it was."""
+    from ttp import cli
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    with pytest.raises(SystemExit):
+        cli.main(["upgrade", "demo"])
+    resolved = "# Harness task, both ways\n"
+    sha = _cancelled_resolution(p, resolved)
+    (p.harness / "charter-note.md").write_text("main moved meanwhile\n")    # main must be merged too
+    _git_out(p.harness, "add", "-A")
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "charter note")
+    head = _git_out(p.harness, "rev-parse", "HEAD").strip()
+    if case == "conflict":      # the newer template changes the same lines again
+        _install_template(env, {"kind-harness.md": "# Harness task, upstream's newer way\n"})
+    _next_release(env)
+    newest = cli._runtime_version(env["home"] / "lib" / "current" / "runtime")
+    if case == "clean":
+        cli.main(["upgrade", "demo"])
+        h = p.harness
+        assert restarts == [1] and len(_harness_tasks(p)) == 1, "applied with no new task"
+        assert (h / "prompts" / "kind-harness.md").read_text() == resolved
+        assert cli._runtime_version(h / "runtime") == newest and (h / "charter-note.md").exists()
+        for c in (sha, head):
+            assert subprocess.run(["git", "-C", str(h), "merge-base", "--is-ancestor", c, "HEAD"]).returncode == 0
+        assert not _git_out(h, "status", "--porcelain")
+        return
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo"])
+    assert e.value.code == 75 and len(_harness_tasks(p)) == 2 and not restarts
+    assert _git_out(p.harness, "rev-parse", "HEAD").strip() == head
+    assert not (p.harness / ".git" / "MERGE_HEAD").exists()
