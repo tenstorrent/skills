@@ -10600,3 +10600,112 @@ def test_session_coordinator_may_run_queue_commands_with_quoted_reasons_and_read
     assert coordtools.queue_refusal("ttp checks park 5 --reason='a b' --task=6 --json") is None
     rules = coordtools._rules("demo")
     assert "Bash(ttp checks park *)" in rules and "Bash(ttp checks queue)" in rules
+
+
+def test_a_preempted_checks_run_resumes_its_pytest_check_from_the_files_it_passed(env, tmp_path, monkeypatch, capsys):
+    """#7218: a routine `ttp checks` run preempted mid-pytest queues again and its rerun skips the test files
+    that passed before the preemption on the same tree and env (pushpass.resume_env, ttp_pytest_resume); the
+    file cut short and the rest run, and the run passes as a full one."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.delenv(checkcap.RESUME_ENV, raising=False)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+    ran, mark = tmp_path / "ran.txt", tmp_path / "preempted-once"
+    req = checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    suite = repo / "suite"
+    suite.mkdir()
+    for name in ("a", "b"):
+        (suite / f"test_{name}.py").write_text(f"def test_{name}():\n    open({str(ran)!r}, 'a').write('{name}\\n')\n")
+    (suite / "test_c.py").write_text(
+        "import json, os, time\n"
+        "def test_c():\n"
+        f"    open({str(ran)!r}, 'a').write('c\\n')\n"
+        f"    if os.path.exists({str(mark)!r}):\n        return\n"
+        f"    open({str(mark)!r}, 'w').close()\n"
+        f"    open({str(req)!r}, 'w').write(json.dumps({{'by': 'urgent u', 'task': '77', 'at': time.time() + 1}}))\n"
+        "    time.sleep(60)\n")
+    subprocess.run([*git, "add", "suite"], check=True)
+    subprocess.run([*git, "commit", "-qm", "suite"], check=True)
+    t0 = time.time()
+    cli.main(["checks", "--", "python3", "-m", "pytest", "-q", "-p", "no:cacheprovider", "suite"])
+    out = capsys.readouterr().out
+    assert time.time() - t0 < 50, "its command ended once asked"
+    assert "preempted by urgent #77" in out, out
+    after = out.rsplit("preempted by", 1)[1]
+    assert "resuming" in after and "2 test file(s) passed" in after, after
+    assert "passed" in after.rsplit("resuming", 1)[1], "the resumed run ran to its pass"
+    assert ran.read_text().split() == ["a", "b", "c", "c"], "only the file cut short ran again"
+    assert checkcap.RESUME_ENV in checkcap.RUN_ONLY_ENV, "a nested `ttp checks` in a check never resumes"
+    assert not req.exists()
+
+
+def test_a_checks_resume_record_is_kept_only_for_a_preempted_rerun_on_the_same_tree_and_env(env, tmp_path, monkeypatch):
+    """#7218: a check's resume record (cli._checks_resume) is keyed on the tree, the command and its env, so a
+    changed tree or env skips nothing; any run but a preempted run's rerun starts it empty; a check that cannot
+    resume (not one plain local pytest run, or under pytest-xdist) gets none."""
+    from ttp import checkcap, cli
+    p = make(env)
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    top, c = tmp_path, "python3 -m pytest -q suite"
+    run_env = {k: v for k, v in os.environ.items() if k not in ("PYTEST_ADDOPTS", "PYTHONPATH")}
+
+    def record(tree, e=run_env):
+        vars_, _ = cli._checks_resume(p, top, tree, c, e)
+        return Path(vars_["TTP_PYTEST_RESUME"])
+
+    monkeypatch.setenv(checkcap.RESUME_ENV, "1")
+    record("t1").write_text("suite/test_a.py\nsuite/test_b.py\n")
+    assert cli._checks_resume(p, top, "t1", c, run_env)[1] == 2, "the preempted rerun skips its passed files"
+    assert cli._checks_resume(p, top, "t2", c, run_env)[1] == 0, "another tree skips nothing"
+    other = {**run_env, "PYTEST_PLUGINS": "some_plugin"}
+    assert record("t1", other) != record("t1"), "another env keys another record"
+    assert cli._checks_resume(p, top, "t1", c, other)[1] == 0, "another env skips nothing"
+    monkeypatch.delenv(checkcap.RESUME_ENV)
+    assert cli._checks_resume(p, top, "t1", c, run_env)[1] == 0, "a run not preempted starts afresh"
+    monkeypatch.setenv(checkcap.RESUME_ENV, "1")
+    assert cli._checks_resume(p, top, "t1", c, run_env)[1] == 0, "its record was emptied"
+    for cannot in ("sh -c 'pytest -q'", "pytest -q a.py && pytest -q b.py", f"{c} -n 4", f"{c} -nauto",
+                   f"{c} --numprocesses=2", f"{c} --dist load"):
+        assert cli._checks_resume(p, top, "t1", cannot, run_env) == ({}, 0), cannot
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-n 3")
+    assert not cli._checks_resumes(c), "xdist from PYTEST_ADDOPTS turns the resume plugin off"
+
+
+def test_a_checks_run_that_cannot_resume_is_never_preempted_past_90_percent(env, tmp_path, monkeypatch):
+    """#7218: a run whose checks cannot resume from their passed files labels its slot with its log
+    (cli._checks_progress); preempt never asks it once the log's last pytest `[ NN%]` is SHIELD_PCT or more,
+    and asks the other run instead, or nobody. A run that can resume carries no log and is asked as before."""
+    from ttp import checkcap, cli
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    monkeypatch.delenv("PYTEST_ADDOPTS", raising=False)
+    log = tmp_path / "checks.log"
+    with open(log, "w") as out:
+        assert cli._checks_progress(out, ["sh -c 'pytest -q'", "python3 -m pytest -q"]) == str(log)
+        assert cli._checks_progress(out, ["python3 -m pytest -q -n 4"]) == str(log)
+        assert cli._checks_progress(out, ["python3 -m pytest -q"]) == "", "it resumes: no shield"
+    log.write_text("$ pytest -q\n........ [ 50%]\n........ [ 91%]\n")
+    late = checkcap.acquire("late run", project_name="other", priority=5, preemptible=True, progress=str(log))
+    early = checkcap.acquire("early run", project_name="other", priority=2, preemptible=True)
+
+    def ask():
+        try:
+            return checkcap.preempt("urgent", checkcap.all_paths(2), "mine")
+        finally:
+            for f in checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json"):
+                f.unlink()
+    try:
+        assert ask() == "early run", "the lower-priority run is past 90% and cannot resume: the other is asked"
+        early.close()
+        assert ask() == "", "nobody else: it is still not asked"
+        log.write_text("$ pytest -q\n........ [ 89%]\n")
+        assert ask() == "late run", "below 90% it is asked as before"
+    finally:
+        early.close()
+        late.close()

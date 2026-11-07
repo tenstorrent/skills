@@ -192,10 +192,13 @@ HANDOVER_S = 3.0   # a parked asker that still cannot start this long after the 
 FREEING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("checkcap_freeing", default=None)
 RERANK_ENV = "TTP_CHECKS_RERANKED"   # these waiting checks re-executed once as urgent (reranked)
 RERANK_S = 30.0   # a waiting routine run reads its task's priority again at most this often (reranked)
+# A preempted run's rerun resumes each plain local pytest check from the files it passed (cli._checks_resume).
+RESUME_ENV = "TTP_CHECKS_RESUME"
+SHIELD_PCT = 90   # a run that cannot resume is never asked once its log's last pytest `[ NN%]` is this far (preempt)
 # What only this `ttp checks` run reads (its own re-queue, re-execution and label): never passed to the check
 # commands it starts (push.check_env), so a `ttp checks` nested in them is not labelled preempted nor kept from
 # its own rerank or re-execution.
-RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV)
+RUN_ONLY_ENV = (REEXEC_ENV, PREEMPT_ASKED_ENV, PREEMPTED_ENV, RERANK_ENV, RESUME_ENV)
 
 
 def slot_dir() -> Path:
@@ -1077,7 +1080,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None,
             startable: Callable[[], bool] | None = None,
             parks: Callable[[bool], None] | None = None, urgent: bool = False,
-            preemptible: bool = False, small: bool = False) -> Slot | None:
+            preemptible: bool = False, small: bool = False, progress: str = "") -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -1111,13 +1114,16 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     `preemptible`: the caller stops its checks when asked (preempted), so its slot's label says it may be
     asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`.
     `small` (is_small): its queue and PARKED tickets mark a short run (locks.SMALL_TICKET), which goes first
-    among its project's waiters at its priority; the cap and every other rule hold it as any run."""
+    among its project's waiters at its priority; the cap and every other rule hold it as any run.
+    `progress`: the log of a preemptible run that cannot resume from its passed files, so preempt never asks
+    it once it is past SHIELD_PCT."""
     n = limit()
     was_preempted = bool(os.environ.get(PREEMPTED_ENV))   # preempted once: queues at its place, asked again last
     label = {"priority": priority, "checks_project": project_name, "owed": bool(owns),
-             **({"preemptible": True} if preemptible else {}), **({"preempted": True} if was_preempted else {})}
+             **({"preemptible": True} if preemptible else {}), **({"preempted": True} if was_preempted else {}),
+             **({"progress_log": progress} if preemptible and progress else {})}
     again = {"holder": holder, "what": what, "project_name": project_name, "priority": priority, "owns": owns,
-             "cap": cap, "preemptible": preemptible}
+             "cap": cap, "preemptible": preemptible, "progress": progress}
     if not n or os.environ.get(HELD_ENV):
         return Slot()
     since = time.time() if since is None else since
@@ -1346,7 +1352,10 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
     an owed run never waits behind urgent work that owes nothing. With `startable` (the asker waits for its test slots) only a run whose stop lets it start:
     `startable()` true with that run's test slots counted free (FREEING), else nobody is asked. With `claim`
     the slot it frees is the asker's (claims): no other waiter takes it while the claim lives, and the request
-    lapses with it (preempted). Returns the holder asked, or ""."""
+    lapses with it (preempted). Never a run whose label names a progress log (acquire's `progress`: it cannot
+    resume from its passed files) once that log's last pytest `[ NN%]` is SHIELD_PCT or more: a restart from
+    zero there loses nearly all its work. Returns the holder asked, or ""."""
+    from . import checkwall
     found = []
     for path in every:
         if not locks.held_labels([path]):
@@ -1356,6 +1365,8 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
         except (OSError, ValueError):
             continue
         if not isinstance(h, dict) or not h.get("preemptible") or h.get("urgent"):
+            continue
+        if (log := h.get("progress_log")) and (checkwall._percent(log, 0) or 0) >= SHIELD_PCT:
             continue
         band = is_urgent(h.get("priority"))
         if band and not (owed and h.get("owed") is False):

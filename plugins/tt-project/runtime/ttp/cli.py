@@ -3079,6 +3079,47 @@ def _recorded_pass(p: Project | None, tree: str, cmds: list, purpose: str = "can
     return None
 
 
+CHECKS_RESUME_DIR = "checks_resume"   # under the project's state: a `ttp checks` check's passed test files
+
+
+def _checks_resumes(c) -> bool:
+    """Whether check `c` resumes from its passed files after a preemption (_checks_resume): one plain local
+    pytest run (pushpass.resumable) with no pytest-xdist option in it or PYTEST_ADDOPTS (the resume plugin
+    is off under xdist)."""
+    import shlex
+    from . import push, pushpass, testslots
+    if not pushpass.resumable(c) or push.remote_host(c) or getattr(c, "slurm", None):
+        return False
+    try:
+        words = shlex.split(f"{c} {os.environ.get('PYTEST_ADDOPTS', '')}")
+    except ValueError:
+        return False
+    return not any(w in testslots.XDIST_OPTS or w.startswith(("--numprocesses=", "--dist=", "--maxprocesses="))
+                   or w.startswith("-n") and not w.startswith("--") for w in words)
+
+
+def _checks_resume(p: Project | None, top: str | Path, tree: str, c, run_env: dict) -> tuple[dict, int]:
+    """(the variables that load the resume plugin for check `c`, how many of its test files it skips). Its
+    record (pushpass.resume_env) is keyed on the tree, the command and its env as a pass records it
+    (pushpass.check_envs), so a changed tree or env starts afresh. Only a preempted run's rerun
+    (checkcap.RESUME_ENV) skips the files passed there; any other run starts the record empty, so a failed
+    or cut run's rerun runs everything. ({}, 0) for a check that cannot resume (_checks_resumes)."""
+    from . import checkcap, pushpass
+    if not p or not tree or not _checks_resumes(c):
+        return {}, 0
+    try:
+        eid = pushpass.check_envs(Path(top), [c], run_env)[0]
+    except (OSError, ValueError, TypeError):
+        return {}, 0
+    path = p.state / CHECKS_RESUME_DIR / f"{pushpass.key(tree, str(c), eid)}.txt"
+    if not os.environ.get(checkcap.RESUME_ENV):
+        path.unlink(missing_ok=True)
+    try:
+        return pushpass.resume_env(path, run_env), len(pushpass.resumed(path))
+    except OSError:
+        return {}, 0
+
+
 def _suite_pass(p: Project | None, tree: str, cmd, purpose: str, env: str | None) -> dict | None:
     """The suite pass of the one command `cmd` on `tree` for `purpose` under its environment `env`
     (pushpass.check_envs), or None: recorded once every check of a call passed, before its rerun of the
@@ -3996,6 +4037,14 @@ def cmd_checks(a) -> None:
                        "PWD": cwd, **({checkreap.MARKER: reap_tok} if reap_tok else {}),
                        **({pooladmit.WALL_ENV: f"{ran_since:.0f}:{wall:.0f}"} if deadline else {})}
                 judge_env = dict(env)   # a rerun of the failing tests records no suite durations
+                # A plain local pytest run records the files it passed: a preempted run's rerun skips them.
+                resume_vars, resumed_files = _checks_resume(p, top, tree, c, run_env)
+                env |= resume_vars
+                if resumed_files:
+                    line = (f"resuming {c}: {resumed_files} test file(s) passed on tree {tree[:12]} before the preemption; "
+                            "running the rest")
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
                 if pushpass.resumable(c) and not push.remote_host(c):   # one plain local pytest run
                     env |= slowtests.env(Path(run_dir) / slowtests.FILE, env)
                 def said(line: str) -> None:   # a script it runs was rewritten as it ran: once more
@@ -4196,6 +4245,7 @@ def cmd_checks(a) -> None:
             out.flush()
             print(f"ttp checks: {said}", flush=True)
             os.environ[checkcap.PREEMPTED_ENV] = preempted_by
+            os.environ[checkcap.RESUME_ENV] = "1"   # its plain pytest checks resume from their passed files
             try:   # its task's notes: the run is told, and its own retry (this rerun) goes on
                 durable_append(Path(run_dir) / "progress.md", f"{timefmt.clock()} checks: {said}\n")
             except OSError:
@@ -5274,7 +5324,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
                                     urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),
-                                    small=checkcap.is_small(run_cost))
+                                    small=checkcap.is_small(run_cost), progress=_checks_progress(out, cmds))
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
@@ -5624,6 +5674,13 @@ _CHECK_PREEMPT: dict = {"since": None}
 
 # The running checks' slot while their commands may give it up and take it back (checkcap.serve_yield).
 _CHECK_YIELD: dict = {"slot": None}
+
+
+def _checks_progress(out, cmds) -> str:
+    """The run's log, for preempt to read how far it is, when one of `cmds` cannot resume from its passed
+    files after a preemption (_checks_resumes); "" when every one can."""
+    name = getattr(out, "name", "")
+    return name if isinstance(name, str) and not all(_checks_resumes(c) for c in cmds or []) else ""
 
 
 def _checks_preempt_stop() -> None:
