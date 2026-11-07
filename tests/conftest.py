@@ -975,6 +975,13 @@ def _reap_test_processes(request):
 
 
 @pytest.fixture
+def tmp_processes_in():
+    """The per-test teardown's finder (processes_in), for a test whose processes end on their own a
+    little after it (a stop's grace) to wait for them."""
+    return processes_in
+
+
+@pytest.fixture
 def leaked_tmp_processes():
     """The session guard's finder (leaked_processes), for tests of the guard itself."""
     return leaked_processes

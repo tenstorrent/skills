@@ -170,9 +170,11 @@ def _rc_gone(pid, within=10.0):
     return False
 
 
-def test_a_stopped_remote_check_stops_its_command_on_the_host(tmp_path):
+def test_a_stopped_remote_check_stops_its_command_on_the_host(tmp_path, tmp_processes_in):
     """SIGTERM to the local side (a timeout, a `ttp checks` stop, a queue stop) stops the command where
-    it runs (ssh without a tty signals nothing) and removes its temp dir."""
+    it runs (ssh without a tty signals nothing) and removes its temp dir; the host's stop watcher (its
+    TERM-then-KILL grace sleep) ends on its own within that grace, leaving nothing running there."""
+    from ttp import remotecheck
     repo = _rc_repo(tmp_path)
     started, marker = tmp_path / "started", tmp_path / "marker"
     proc = _rc_run(tmp_path, repo, f"sleep 30 & echo $! > {started}.tmp; mv {started}.tmp {started}; wait $!; "
@@ -193,6 +195,10 @@ def test_a_stopped_remote_check_stops_its_command_on_the_host(tmp_path):
     assert _rc_gone(sleeper), "the command's process group was stopped"
     time.sleep(0.3)
     assert not marker.exists() and _rc_left(tmp_path) == []
+    end = time.time() + remotecheck.STOP_GRACE_S + 10
+    while (left := tmp_processes_in(tmp_path)) and time.time() < end:
+        time.sleep(0.1)
+    assert not left, left
 
 
 def test_a_remote_checks_command_starts_with_ctrl_c_and_quit_at_their_default(tmp_path):
