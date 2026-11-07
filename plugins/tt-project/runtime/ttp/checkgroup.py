@@ -25,8 +25,17 @@ POLL_S = 1.0   # how soon a dead parent is noticed where the kernel does not say
 PR_SET_PDEATHSIG = 1
 
 
+_proc: subprocess.Popen | None = None
+
+
 def _end_group(*_) -> None:
-    os.killpg(0, signal.SIGKILL)
+    """Kill the group this script leads; started outside a group of its own (not as push starts it),
+    kill only the command and itself, never a group it shares with others."""
+    if os.getpgrp() == os.getpid():
+        os.killpg(0, signal.SIGKILL)
+    if _proc is not None and _proc.poll() is None:
+        _proc.kill()
+    os._exit(128 + signal.SIGKILL)
 
 
 def _on_parent_death() -> None:
@@ -47,8 +56,9 @@ def main(argv: list[str]) -> int:
     _on_parent_death()
     if os.getppid() != parent:   # it died before the hook was set
         _end_group()
+    global _proc
     try:
-        proc = subprocess.Popen(argv[2:], close_fds=False)   # the check's inherited fds (checkdirs) go on
+        _proc = proc = subprocess.Popen(argv[2:], close_fds=False)   # the check's inherited fds (checkdirs) go on
     except OSError as e:
         print(f"checkgroup: could not start {argv[2]}: {e}", file=sys.stderr)
         return 127

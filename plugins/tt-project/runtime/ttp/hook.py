@@ -1657,8 +1657,11 @@ def _log_refusal(cmd: str, kind: str, **extra: str) -> None:
 # that make a call one (None: any call).
 DEVICE_TOOLS = {"tt-smi": re.compile(r"-r[\d,]*|--reset(?:=.*)?|-{1,2}glx_reset\w*"), "tt-flash": None,
                 "tt-topology": None, "ipmitool": re.compile(r"power|reset")}
-# Programs that only list or stat a device node path, never open the device
-NODE_LISTERS = {"ls", "stat", "test", "[", "readlink", "realpath", "lsof", "fuser", "echo", "printf"}
+# Programs that only list, stat or search for a device node path (a word naming it is a pattern or a
+# path to walk), never open the device
+NODE_LISTERS = {"ls", "dir", "vdir", "exa", "eza", "tree", "stat", "test", "[", "readlink", "realpath", "lsof",
+                "fuser", "echo", "printf", "grep", "egrep", "fgrep", "rg", "ag", "ack", "find", "fd", "fdfind",
+                "locate", "git"}
 DECLARE = {"export", "unset", "declare", "typeset", "readonly", "local"}
 
 
@@ -1696,7 +1699,8 @@ def _device_use(commands: str, nodes: list[str], depth: int = 0) -> tuple[str, s
         if name in DEVICE_TOOLS and (DEVICE_TOOLS[name] is None
                                      or any(DEVICE_TOOLS[name].fullmatch(w) for w in argv[1:])):
             return shown, f"runs the device tool {name}"
-        if name not in NODE_LISTERS and any(w == p or w.startswith(p.rstrip("/") + "/") for w in argv for p in nodes):
+        named = [v for w in argv for v in (w, w.partition("=")[2]) if v]   # `if=<node>`, `--file=<node>`
+        if name not in NODE_LISTERS and any(v == p or v.startswith(p.rstrip("/") + "/") for v in named for p in nodes):
             return shown, "opens a device node"
         envs = [i for i, w in enumerate(pre) if os.path.basename(w) == "env"]
         declared = name in DECLARE and any(re.fullmatch(rf"(?:{mask})(?:\+?=.*)?", w) for w in argv[1:])

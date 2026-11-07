@@ -398,7 +398,8 @@ def _device_hook(monkeypatch, tmp_path, device_host=True, no_device="1"):
     "tt-smi -r 0", "sudo tt-smi -glx_reset", "tt-smi --reset=0,1", "ttp sandbox -- tt-smi -r",
     "ttp clip -- tt-flash --fw-tar fw.tar", "bash -c 'tt-topology -l mesh'", "ipmitool chassis power cycle",
     "ttp lock build -- tt-smi -r",
-    "cat {dev}/0", "python3 -c 'open(1)' {dev}/0", "echo x > {dev}/0", "TT_VISIBLE_DEVICES=0 pytest -q",
+    "cat {dev}/0", "dd if={dev}/0 of=x bs=1 count=1", "head -c1 {dev}/0", "cp {dev}/0 x",
+    "python3 -c 'open(1)' {dev}/0", "echo x > {dev}/0", "TT_VISIBLE_DEVICES=0 pytest -q",
     "unset TT_VISIBLE_DEVICES; pytest", "export TT_VISIBLE_DEVICES=0", "env -u TT_VISIBLE_DEVICES pytest",
     "env -i PATH=$PATH pytest", "sh -c 'TT_VISIBLE_DEVICES=1 ./run'",
 ])
@@ -415,7 +416,8 @@ def test_a_no_device_run_is_refused_device_commands_outside_a_device_lock(cmd, t
     "ttp lock box-device -- tt-smi -r 0", "ttp lock box-device -- sudo tt-smi -glx_reset",
     "ttp devq submit -- tt-smi -r", "ttp lock box-device -- cat {dev}/0",
     "ls -l {dev}/0", "stat {dev}", "pytest -q tests/x.py", "ttp clip -- ttp sandbox -- pytest -q", "tt-smi -s",
-    "TTP_NO_DEVICE=0 pytest",
+    "TTP_NO_DEVICE=0 pytest", "grep -rn {dev} src", "egrep -r {dev}/0 .", "rg {dev}", "ag {dev} src",
+    "find {dev} -type c", "fd . {dev}", "git log -- {dev}", "git grep -n {dev}", "ls -la {dev}/", "tree {dev}",
 ])
 def test_a_no_device_run_keeps_test_runs_listings_and_locked_device_commands(cmd, tmp_path, monkeypatch):
     call = _device_hook(monkeypatch, tmp_path)
@@ -501,6 +503,23 @@ def test_ttp_sandbox_and_clip_run_pytest_without_n_where_xdist_is_missing(tmp_pa
         assert ("dropped -n 4" in r.stdout + r.stderr) is (rc == 3), (r.stdout, r.stderr)
 
 
+def _gone(pid: int) -> bool:
+    """The process ended: no such pid, or a zombie waiting for its reaper. It can vanish between any two
+    reads, so every failed read means gone."""
+    try:
+        os.kill(pid, 0)
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
+    except OSError:   # ProcessLookupError, FileNotFoundError
+        return True
+
+
+def _kill(pid: int) -> None:
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except OSError:
+        pass
+
+
 def test_a_check_run_without_a_sandbox_ends_the_processes_it_left_behind(tmp_path, monkeypatch):
     """No PID namespace reaps a check by default: the check runs in a process group of its own, and
     whatever of it is still alive once it ends, passed or failed, is killed with that group."""
@@ -514,17 +533,25 @@ def test_a_check_run_without_a_sandbox_ends_the_processes_it_left_behind(tmp_pat
         assert push._run_one("bash check.sh", tmp_path, dict(env), lambda m: None) == want
         pid = int(pidfile.read_text())
         for _ in range(100):
-            try:
-                os.kill(pid, 0)
-            except ProcessLookupError:
+            if _gone(pid):
                 break
-            stat = Path(f"/proc/{pid}/stat")
-            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
-                break   # killed, waiting for its reaper
             time.sleep(0.05)
         else:
-            os.kill(pid, signal.SIGKILL)
+            _kill(pid)
             pytest.fail(f"the check's leftover process {pid} outlived it (exit {rc})")
+
+
+def test_checkgroup_started_outside_a_group_of_its_own_kills_only_what_it_started():
+    """checkgroup kills its whole group only when it leads it: run in its caller's group (not as push
+    starts it), a parent gone ends the command and itself, never the caller's group."""
+    from ttp import push
+    driver = ("import subprocess, sys\n"   # the group leader: checkgroup runs in its group, its parent is not pid 1
+              "r = subprocess.run([*sys.argv[1:4], '1', '--', 'sleep', '60'], timeout=60)\n"
+              "print('caller alive', r.returncode)\n")
+    r = subprocess.run([sys.executable, "-c", driver, *push.CHECK_GROUP], start_new_session=True,
+                       capture_output=True, text=True, timeout=90)
+    assert r.returncode == 0 and r.stdout.strip() == f"caller alive {128 + signal.SIGKILL}", (r.returncode, r.stdout,
+                                                                                              r.stderr)
 
 
 def test_a_check_whose_push_is_killed_outright_ends_with_it(tmp_path):
@@ -546,19 +573,13 @@ def test_a_check_whose_push_is_killed_outright_ends_with_it(tmp_path):
         pusher.wait()
         deadline = time.time() + 15
         while time.time() < deadline:
-            try:
-                os.kill(left, 0)
-            except ProcessLookupError:
-                break
-            stat = Path(f"/proc/{left}/stat")
-            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+            if _gone(left):
                 break
             time.sleep(0.1)
         else:
-            os.kill(left, signal.SIGKILL)
+            _kill(left)
             pytest.fail(f"the check's process {left} outlived its killed push")
     finally:
-        try:
+        if pusher.poll() is None:   # once reaped, its pid (and group id) may be another process's
             os.killpg(pusher.pid, signal.SIGKILL)
-        except OSError:
-            pass
+            pusher.wait()
