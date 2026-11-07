@@ -18,7 +18,11 @@ refuses any create, change, move, chmod or delete it can read under a protected 
   known_hosts); interpreter code (python, perl, node, ruby ...: one-liners, heredocs, the script files a
   command runs) that writes one: Python's write calls by their target, so reading one passes, other code
   (or Python too dynamic to follow) when it names one and writes anything; words of the line outside the
-  code count only when the code reads its input; the same inside `sh -c` and shell scripts.
+  code count only when the code reads its input; the same inside `sh -c`, shell scripts and command
+  substitutions ($(...) and backticks, also inside double quotes).
+The text of a `ttp note|notify|say` message is data: a path it only names is no write, and it is left out
+of the interpreter-code scan of the line; a command substitution in it runs, so it is read like any other,
+and one naming a protected path is refused even to read: what it prints is sent to others.
 Words are read after ~, $HOME, ${HOME}, $XDG_CONFIG_HOME and $GH_CONFIG_DIR are expanded with the run's
 environment and symlinks resolved, and the account's own home counts besides HOME. Reads pass as before.
 Text ssh runs on another host is read too: its quoted remote command, a file or heredoc fed to its stdin
@@ -144,6 +148,11 @@ WHY = ("a run never creates, changes, moves, chmods or deletes anything under th
        "({hit} is one; guards.protected_paths lists them): a login a run overwrote is gone for every project on "
        "the host. Read it as before, test against a scratch copy under `mktemp -d` named by another variable "
        "(H=$(mktemp -d); ... \"$H/.ssh/...\"), and leave logins and keys to the user")
+# `ttp note|notify|say`: their message words are sent, not run
+MESSAGE_CMDS = {"note", "notify", "say"}
+LEAK_WHY = ("a ttp message must not carry a credential: a command substitution in its text runs, and what it "
+            "prints from the account's credential folders ({hit} is one) is sent to others. Describe the file "
+            "in words, or name its path as plain text")
 
 
 def paths(cfg: dict | None = None) -> list[str]:
@@ -572,6 +581,14 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, scrip
                 return h
     if "*** Begin Patch" in cmd and (h := patch_refusal(cmd, ctx)):
         return h
+    for s, e in _message_pieces(commands):   # a substitution in a ttp message: what it prints is sent
+        for body in _substitutions(commands[s:e]):
+            if h := _names(_blank_messages(hook._split(body)[1]), ctx):
+                return _Leak(h)
+    if depth < 2:
+        for body in _substitutions(commands):   # $(...) and backticks run, also inside double quotes
+            if h := shell_refusal(body, env, cwd, rts, depth + 1):
+                return h
     segments = hook._all_segments(commands)
     prefixed = {tuple(hook._strip_prefix(raw)): _assigned(raw, env) for raw in hook._segments(commands, strip=False)}
     for argv in segments:
@@ -598,7 +615,7 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, scrip
         # so does every folder when the line changes directory first (cd, pushd, env -C)
         inline = [a[i + 1] for a in segments if INTERPRETER_RE.match(os.path.basename(a[0]))
                   for i in range(1, len(a) - 1) if a[i] in ("-c", "-e", "-E", "--eval", "-p", "--print")]
-        if h := next((h for c in [scan, *inline] if (h := _code_refusal(c, ctx if cd else dctx, depth))), None):
+        if h := next((h for c in [_blank_messages(scan), *inline] if (h := _code_refusal(c, ctx if cd else dctx, depth))), None):
             return h
         # Each -c/-e code as the interpreter gets it (its string literals unquoted), and the heredocs it
         # reads on stdin; the line's other words are data unless the code reads its input. An interpreter
@@ -662,7 +679,8 @@ def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
             h, opts = _ssh_key(ssh, ctx) if ssh[:1] == ["ssh"] else (None, False)
             ok = ok and opts and v in credguard.ssh_commands(raw) and not any(_names(a, ctx) for a in argv[1:])
         else:
-            h, ok = None, name in KEY_SAFE and not keys
+            msg = name == "ttp" and next((a for a in argv[1:] if not a.startswith("-")), "") in MESSAGE_CMDS
+            h, ok = None, (name in KEY_SAFE or msg) and not keys
         hit, bad = hit or h, bad or not ok
     if not hit:
         return None
@@ -832,6 +850,85 @@ def _ssh_remote(args: list[str]) -> list[str] | None:
     return args[i + 1:] if i < len(args) else None
 
 
+class _Leak(str):
+    """A protected path a ttp message's command substitution names (refused with LEAK_WHY)."""
+
+
+# What can hand a message's words to code elsewhere in the line: `$_`, the running command, history, a
+# function or alias that takes over `ttp`
+MESSAGE_REUSE_RE = re.compile(r"\$\{?_\b|\bBASH_COMMAND\b|\bhistory\b|\bfc\b|\balias\b|\bttp\s*\(|\bfunction\s+ttp\b")
+
+
+def _message_pieces(text: str) -> list[tuple[int, int]]:
+    """Spans of the top-level `ttp note|notify|say ...` commands in `text`: not one piped into another
+    command or run with its own PATH."""
+    from . import hook
+    flags, out, start = hook._quoting(text), [], 0
+    for i, c in enumerate(text + ";"):
+        if i < len(text) and (flags[i][0] or flags[i][1] or c not in ";&|\n" or text[i - 1:i] in ("<", ">")
+                              or text[i + 1:i + 2] == ">"):
+            continue
+        raw = next(iter(hook._segments(text[start:i], strip=False)), [])
+        argv = hook._strip_prefix(raw) if raw else []
+        sub = next((a for a in argv[1:] if not a.startswith("-")), "")
+        piped = c == "|" and "|" not in (text[i - 1:i], text[i + 1:i + 2])
+        if argv and os.path.basename(argv[0]) == "ttp" and sub in MESSAGE_CMDS and not piped and not any(
+                w.startswith("PATH=") for w in raw):
+            out.append((start, i))
+        start = i + 1
+    return out
+
+
+def _substitutions(text: str) -> list[str]:
+    """The bodies of the command substitutions in `text`, $(...) and backticks, outside single quotes
+    (inside double quotes they run too); $((...)) is arithmetic."""
+    out, i, q = [], 0, ""
+    while i < len(text):
+        c = text[i]
+        if q == "'":
+            q = "" if c == "'" else q
+        elif c == "\\":
+            i += 1
+        elif c == "'" and not q:
+            q = "'"
+        elif c == '"':
+            q = "" if q else '"'
+        elif c == "`":
+            j = i + 1
+            while j < len(text) and text[j] != "`":
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i + 1:j])
+            i = j
+        elif text.startswith("$(", i) and not text.startswith("$((", i):
+            depth, j, iq = 1, i + 2, ""
+            while j < len(text) and depth:
+                d = text[j]
+                if iq:
+                    iq = "" if d == iq else iq
+                elif d in "'\"":
+                    iq = d
+                elif d == "\\":
+                    j += 1
+                else:
+                    depth += (d == "(") - (d == ")")
+                j += 1
+            out.append(text[i + 2:j - 1] if not depth else text[i + 2:])
+            i = j - 1
+        i += 1
+    return out
+
+
+def _blank_messages(text: str) -> str:
+    """`text` with each ttp message command's words after the subcommand blanked: they are data, sent and
+    not run (its substitutions are read on their own). Unchanged when something in the rest of the line can
+    hand the words to code."""
+    spans = _message_pieces(text)
+    out = text
+    for s, e in reversed(spans):
+        out = out[:s] + " ttp note '' " + out[e:]
+    return text if spans and MESSAGE_REUSE_RE.search(out) else out
+
+
 def _assigned(raw: list[str], env) -> dict:
     """`env` with the NAME=value words before a command (also after `env`)."""
     out = dict(env)
@@ -877,6 +974,8 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
         from . import credguard
         return (f"{credguard.WHY}, and never writes under the account's credential folders ({hit} is named "
                 f"outside a plain ssh key use). {KEY_ROUTE}")
+    if isinstance(hit, _Leak):
+        return LEAK_WHY.format(hit=hit)
     # A key used as an ssh or git identity: name the route that passes
     route = re.search(r"(?<![\w./-])(?:ssh|scp|sftp)(?![\w.-])|GIT_SSH_COMMAND", json.dumps(payload.get("tool_input") or {}))
     return WHY.format(hit=hit) + (". " + KEY_ROUTE if route else "")

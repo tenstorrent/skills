@@ -257,6 +257,62 @@ def test_pathguard_lets_ssh_read_its_own_config_and_host_lists_by_option(cred_ho
         assert pathguard_why(_pg_bash(cmd, cred_home.work)) is None, cmd
 
 
+# A ttp message's text only names a path: it passes, also with an interpreter elsewhere in the line
+PG_MESSAGE_ALLOWED = [
+    'ttp note "the owner\'s ssh sessions rewrote ~/.config/gh/hosts.yml, then chmod 600 it"',
+    'ttp note "~/.config/gh/hosts.yml changed" && python3 -c \'open("/tmp/x", "w").write("1")\'',
+    'python3 -c "print(1)" > /tmp/o; ttp notify --severity low "a write to $HOME/.ssh/config, not by a run"',
+    "ttp say 'python3 -c \"open(~/.netrc, w)\" was refused' && perl -e 'print 1' > /tmp/o",
+    'ttp lock res -- ttp note --to other "~/.ssh/id_ed25519 lost" 2>&1 && node -e "1" > /tmp/o',
+    'ttp note "~/.ssh/k works" && ssh -i ~/.ssh/k host true',
+    'ttp note "$(date): ~/.config/gh/hosts.yml changed (cost $((1+2)))"',
+    "ttp note \"$(cat <<'EOF'\n~/.config/gh/hosts.yml changed by the owner\nEOF\n)\"",
+    "ttp note 'literal $(cat ~/.config/gh/hosts.yml) and `rm ~/.ssh/k` in single quotes'",
+    'ttp note "upstream: pathguard refused `ttp note \\"~/.config/gh/hosts.yml\\"`"',
+]
+# What runs in or around one is still read: a command substitution (also in double quotes) that writes,
+# code that gets the message's words, and one whose output a message would send
+PG_MESSAGE_WRITES = [
+    'ttp note "$(rm ~/.config/gh/hosts.yml)"', 'ttp note "`rm ~/.ssh/k`"', 'echo "$(rm ~/.netrc)"',
+    'x="`echo x > ~/.ssh/config`"', 'ttp note "$(echo x > ~/.config/gh/hosts.yml)"',
+    "ttp note \"$(python3 -c 'open(\\\"$HOME/.ssh/config\\\", \\\"w\\\")')\"",
+    'ttp note "x" && python3 -c "open(\'$HOME/.ssh/config\', \'w\')"',
+    'ttp note "~/.ssh/config"; python3 -c "import sys; open(sys.argv[1], \'w\')" "$_"',
+    'ttp note "~/.ssh/config" | python3 -c "import sys; open(sys.stdin.read(), \'w\')"',
+    'ttp(){ python3 -c "$2"; }; ttp note "open(\'$HOME/.ssh/config\', \'w\')"',
+    'PATH=/tmp/b:$PATH ttp note "open(\'$HOME/.ssh/config\', \'w\')"; python3 -c 1',
+]
+PG_MESSAGE_LEAKS = [
+    'ttp note "$(cat ~/.config/gh/hosts.yml)"', 'ttp notify "`cat ~/.ssh/id_rsa`"', 'ttp say "$(<~/.netrc)"',
+    'ttp note --to other "token: $(grep oauth $GH_CONFIG_DIR/hosts.yml)"',
+    'eval \'ttp note "$(cat ~/.ssh/config)"\'',
+]
+
+
+@pytest.mark.parametrize("cmd", PG_MESSAGE_ALLOWED)
+def test_pathguard_lets_message_text_that_names_a_path_pass(cred_home, cmd):
+    from ttp import hook
+    assert pathguard_why(_pg_bash(cmd, cred_home.work)) is None, cmd
+    out, _ = hook.pre_tool_use(_pg_bash(cmd, cred_home.work))
+    assert "credential" not in str(out), cmd
+
+
+@pytest.mark.parametrize("cmd", PG_MESSAGE_WRITES)
+def test_pathguard_reads_what_runs_in_or_around_a_message(cred_home, cmd):
+    assert "credential folders" in (pathguard_why(_pg_bash(cmd, cred_home.work)) or ""), cmd
+
+
+@pytest.mark.parametrize("cmd", PG_MESSAGE_LEAKS)
+def test_pathguard_refuses_a_message_that_would_send_a_credential(cred_home, cmd):
+    from ttp import hook
+    assert "must not carry a credential" in (pathguard_why(_pg_bash(cmd, cred_home.work)) or ""), cmd
+    out, _ = hook.pre_tool_use(_pg_bash(cmd, cred_home.work))
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
+    # the same read outside a message passes as before; a plain write does not
+    assert pathguard_why(_pg_bash("cat ~/.config/gh/hosts.yml", cred_home.work)) is None
+    assert pathguard_why(_pg_bash("cat x > ~/.config/gh/hosts.yml", cred_home.work))
+
+
 def pathguard_why(payload, cfg=None):
     from ttp import pathguard
     return pathguard.refusal(payload, cfg=cfg or {})
