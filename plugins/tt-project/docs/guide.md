@@ -57,7 +57,10 @@ sent. A failure to read replies is reported on stderr and never stops the messag
   after real progress (`budget.resume_lost`, default $0.50 or 10 min; `false` turns resumes off).
   After a reboot the daemon also starts again, once per boot and model-free, a task's own detached
   `ttp checks` and a review's precheck (only while that review is open), on the same head and at
-  their old place in the host's checks queue. The Host line counts runs cut short as resumed
+  their old place in the host's checks queue. A task deferred since its hand-off (`start_when`,
+  `start_after`) gets nothing restarted; its start gate decides. A resumable `ttp detach` job is
+  relaunched even after a probe marked it lost to the reboot, or when the wait is `survives_reboot`;
+  each relaunch not made says why in daemon.log. The Host line counts runs cut short as resumed
   (restarted, with or without their work) or not restarted.
   A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. So is,
   at once, a task whose run or detached job held a `ttp lock` resource of this host (a device, a

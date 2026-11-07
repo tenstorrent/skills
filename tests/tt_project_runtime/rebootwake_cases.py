@@ -362,3 +362,60 @@ def test_a_run_whose_process_died_restarts_once_free_then_counts(env, tmp_path, 
     assert d._resumable(t, "fake")["cause"] == "crash"
     _lost_with_session(p, d, tmp_path, tid, name="b", session="s", boot=None)
     assert p.db.task(tid)["attempts"] == 1
+
+
+def test_a_deferred_tasks_killed_checks_and_jobs_are_not_relaunched(env, tmp_path, monkeypatch):
+    # A task deferred after its hand-off (start_when) waits on its start gate: the checks and resumable
+    # jobs the reboot killed are not started for it (no host checks slot taken), and it is not woken.
+    from ttp.daemon import Daemon
+    p = make(env)
+    chk = p.db.add_task("checks", "s", kind="code", tier="light", origin="user")
+    _checks_killed_by_reboot(p, tmp_path, chk)
+    job = p.db.add_task("job", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, job)
+    for tid in (chk, job):
+        p.db.update_task(tid, labels=json.dumps(["start_when:test -e /nonexistent/gate"]))
+    d = Daemon(p.base)
+    d.boot, d.boot_at = "a-later-boot", time.time() - 300
+    starts = _record_starts(monkeypatch, d)
+    d.wake_after_reboot()
+    assert starts == [] and not _relaunches(p, chk)
+    assert not _job_relaunches(p, job) and counter.read_text().split() == ["run"]
+    for tid in (chk, job):
+        assert not _woken(p, tid) and p.db.task(tid)["not_before"], dict(p.db.task(tid))
+    assert "deferred" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_resumable_job_a_probe_marked_lost_to_the_reboot_is_relaunched(env, tmp_path):
+    # A probe or status read marked the job .lost with the reboot as its reason before the daemon's boot
+    # pass ran (or with a clock that puts it before boot_at): still the reboot's cut, so it relaunches.
+    from ttp import detach
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    lost = detach.lost(rc)
+    lost.write_text("the driver died with the host reboot: the host restarted while it ran (its boot id changed)")
+    os.utime(lost, (time.time() - 3600, time.time() - 3600))
+    _boot_daemon(p)
+    assert not _woken(p, tid) and len(_job_relaunches(p, tid)) == 1
+    assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
+
+
+def test_a_survives_reboot_wait_still_relaunches_its_local_resumable_job(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, counter = _resumable_job_cut_by_reboot(p, tmp_path, tid)
+    prev = json.loads(p.db.task(tid)["result"])
+    p.db.update_task(tid, result=json.dumps({**prev, "survives_reboot": True}))
+    _boot_daemon(p)
+    assert not _woken(p, tid) and len(_job_relaunches(p, tid)) == 1
+    assert _wait_for_path(rc) and counter.read_text().split() == ["run", "run"]
+
+
+def test_each_skipped_job_relaunch_says_why_in_the_daemon_log(env, tmp_path):
+    p = make(env)
+    tid = p.db.add_task("plain", "s", kind="work", tier="light", origin="user")
+    _resumable_job_cut_by_reboot(p, tmp_path, tid, resumable=False)
+    _boot_daemon(p)
+    text = (p.logs / "daemon.log").read_text()
+    assert f"task {tid}: detached jobs job not relaunched: detached job job is not resumable" in text, text[-2000:]

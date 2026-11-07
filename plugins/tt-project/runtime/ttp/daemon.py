@@ -12236,12 +12236,21 @@ class Daemon:
             since = since if isinstance(since, (int, float)) else t["updated"]
             if not since or since >= self.boot_at:
                 continue
+            if (dfr := deferral(t)).get("when") or (dfr.get("after") or 0) > time.time():
+                # Deferred on purpose since its hand-off (start_when, start_after): its start gate decides
+                # when it runs, so nothing the reboot killed is started for it, and it is not woken.
+                log(self.p, f"task {t['id']}: deferred (start_when or start_after); the work the reboot cut "
+                            "short is not relaunched and the task is not woken")
+                continue
             if held := self._held_at_reboot(t["id"], earlier):
                 # A detached job of its own held a device or machine when the host went down abruptly:
                 # neither relaunched nor woken, whatever its retry_when says. The coordinator decides.
                 self._block_after_reboot(t, prev, held_at_reboot_reason(held))
                 continue
             if prev.get("survives_reboot") is True:
+                # Its probe outlives the reboot (a remote job), but a local resumable job it also
+                # waits on died with the host: start that again; the task stays asleep either way.
+                self._relaunch_jobs(t, prev)
                 continue
             asleep, relaunched = self._relaunch_checks(t, prev)
             cut = False
@@ -12382,6 +12391,16 @@ class Daemon:
         log(self.p, f"task {tid}: the reboot killed its checks; started them again on {head[:12]} ({out})")
         return True, 0
 
+    def _lost_before_boot(self, rc: Path) -> bool:
+        """Whether detached job rc was found lost on an earlier boot (its <name>.lost predates this one).
+        A .lost saying the host reboot ended it is never that: the reboot cut it short, whenever a probe
+        or status read marked it, so it stays resumable."""
+        lost = detach.lost(rc)
+        try:
+            return lost.stat().st_mtime < (self.boot_at or 0) and "host reboot" not in lost.read_text()
+        except OSError:
+            return False
+
     def _relaunch_jobs(self, t: dict, prev: dict) -> tuple[bool, bool]:
         """A task waiting on local detached jobs (`ttp detach --check <rc...>` in its retry_when, alone
         or in a compound probe: rebootwait.local_jobs) that all
@@ -12398,10 +12417,17 @@ class Daemon:
         Relaunches after such reboots count toward max_reboot_losses too (_job_relaunch_boots)."""
         tid = t["id"]
         rcs = rebootwait.local_jobs(str(prev.get("retry_when") or ""))
+        if not rcs:
+            return False, False
         dirs = {r["dir"] for r in self.p.db.q("SELECT dir FROM runs WHERE task=? AND dir IS NOT NULL", (tid,))}
-        if not rcs or any(str(rc.parent) not in dirs for rc in rcs):
+
+        def skip(why: str) -> None:   # every decision on a task's jobs is in daemon.log
+            log(self.p, f"task {tid}: detached jobs {', '.join(rc.stem for rc in rcs)} not relaunched: {why}")
+        if mine := [str(rc) for rc in rcs if str(rc.parent) not in dirs]:
+            skip(f"{', '.join(mine)} is not in a run folder of its own")
             return False, False   # not only its own runs' jobs: not ours to start
-        if rebootwait.transient_besides_jobs(str(prev.get("retry_when") or ""), (str(self.p.runs),)):
+        if what := rebootwait.transient_besides_jobs(str(prev.get("retry_when") or ""), (str(self.p.runs),)):
+            skip(f"its retry_when also checks {what}, which the reboot ended")
             return False, False   # the probe also checks what the reboot ended: it wakes, never sleeps on
         todo, done, cut = [], [], False
         cap = int(self.cfg["budget"].get("max_job_relaunches", detach.RELAUNCH_CAP))
@@ -12426,9 +12452,11 @@ class Daemon:
                 continue
             if rc.exists():
                 continue
-            lost = detach.lost(rc)
-            if m is None or m.get("stopped") or lost.exists() and lost.stat().st_mtime < (self.boot_at or 0):
-                wake(f"detached job {rc.stem} is not resumable, was stopped or was lost before this boot")
+            if m is None or m.get("stopped") or self._lost_before_boot(rc):
+                why = (f"detached job {rc.stem} " + ("is not resumable" if m is None else "was stopped on purpose"
+                       if m.get("stopped") else "was lost before this boot"))
+                skip(why)
+                wake(why)
                 return False, cut
             loss = self._abrupt_cut(m.get("boot"))
             cut = cut or loss
@@ -12442,6 +12470,7 @@ class Daemon:
                 return False, cut
             todo.append((rc, n, loss))
         if not todo and not done:
+            skip("each ended before the reboot")
             return False, False   # all ended before the reboot: woken as before
         limit = int(self.cfg["budget"].get("max_reboot_losses", 3))
         if todo and cut and (k := self._reboot_losses(tid) + _reboot_wakes(t) + self._job_relaunch_boots(tid)) + 1 >= limit:
