@@ -138,6 +138,7 @@ from . import wakecost
 from . import spans
 from . import coordtools
 from . import pointers
+from . import settlehook
 from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -591,6 +592,8 @@ USER_SETTABLE = {
     # The median cost of the last 5 session wakes at which one alarm goes out and the session shrinks
     # itself in place (wakecost.py): dollars, 0 or off for no check.
     "coordinator.wake_cost_alarm_usd": lambda v: wakecost.threshold_of(v),
+    # The project's own model-free settle hook for routine event batches (settlehook.py): "" is off.
+    "coordinator.settle_cmd": settlehook.cmd_of,
 }
 
 

@@ -54,6 +54,7 @@ from . import runcap
 from . import runclass
 from . import configwho
 from . import integrate
+from . import settlehook
 from . import sidefx
 from . import looks
 from . import machinecap
@@ -11649,6 +11650,13 @@ class Daemon:
                 return
             if not msgs and not rerun and not urgent and self._event_hold(own, now):
                 return
+        if evs and not msgs and not rerun and settlehook.command(self.cfg):
+            # The project's own hook settles routine events model-free (settlehook.py).
+            evs, hold = self._settle_hook(evs, now)
+            if hold:
+                return
+            if not [e for e in evs if not pagesev.rides_along(e)]:
+                return
         if not msgs and not rerun and not fire:
             try:
                 # Every open task held by what no turn lifts, and nothing new since the last turn: a
@@ -11849,6 +11857,41 @@ class Daemon:
         if all(self._plain_done(e) for e in evs):
             return True   # a plain hand-off leaves the turn nothing to queue: it waits for company
         return busy + self._runnable_count(now) >= slots
+
+    def _settle_hook(self, evs: list[dict], now: float) -> tuple[list[dict], bool]:
+        """Run coordinator.settle_cmd on a routine batch (settlehook.py): (the events left, whether to
+        wait for the hook's answer). A fault settles nothing and raises one low, deduplicated observation."""
+        db = self.p.db
+        tried = self.__dict__.setdefault("_settle_tried", {})
+        run = getattr(self, "_settle_run", None)
+        try:
+            if run is None:
+                cands = settlehook.candidates(db, evs, tried)
+                if not cands:
+                    return evs, False
+                self._settle_run = settlehook.Run(settlehook.command(self.cfg), str(self.p.root), cands)
+                return evs, True
+            if not run.done:   # wait for it while nothing else in the batch needs a turn
+                return evs, settlehook.candidates(db, evs) is not None
+            self._settle_run = None
+            for i in run.ids:
+                tried[i] = now
+            while len(tried) > settlehook.TRIED_MAX:
+                tried.pop(next(iter(tried)))
+            if run.fault:
+                settlehook.fault(db, run.fault, now)
+                log(self.p, f"settle hook: events {sorted(run.ids)}: {run.fault}; none settled")
+                self.observe(settlehook.FAULT_SOURCE, settlehook.fault_text(run.fault), "low",
+                             key=settlehook.FAULT_KEY, pin=True)
+                return evs, False
+            done = settlehook.apply(db, run, now)
+            if done:
+                log(self.p, "settle hook settled " + "; ".join(f"event {i}: {run.settle[i]}" for i in done))
+            return [e for e in evs if e["id"] not in done], False
+        except Exception:   # the hook only saves turns: a failure runs the turn
+            self._settle_run = None
+            log(self.p, "settle hook failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
+            return evs, False
 
     def _event_hold(self, evs: list[dict], now: float) -> bool:
         """Routine event-only batches wait until coordinator.event_hold_s after the last turn ended, so

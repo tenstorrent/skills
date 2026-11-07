@@ -247,6 +247,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # turn, is settled without a model run; one runs once the last turn started
                     # quiet_held_max_s ago (0: no limit; quietgate.py; quiet_held false: off).
                     "quiet_held": True, "quiet_held_kinds": ["idle_capacity"], "quiet_held_max_s": 86400,
+                    # A command run on a batch of only routine events (task_done, upstream_note,
+                    # observation) that may settle them without a model; "" is off (settlehook.py).
+                    "settle_cmd": "",
                     # No worker run started for this long while dispatch would start a queued task:
                     # one high observation per stall lists those tasks (Daemon.check_stall; 0: off).
                     "stall_wake_h": 3,

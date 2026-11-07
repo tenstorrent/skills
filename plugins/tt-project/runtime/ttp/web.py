@@ -20,7 +20,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, redact, release, responsibilities, route, selfwatch, sweep, timefmt, urgent, waits
 from . import schedule as sched
-from . import pauseends, selfreview, spendproj, startgate, sweepskip, timefmt, topup, trend, upstream
+from . import pauseends, selfreview, settlehook, spendproj, startgate, sweepskip, timefmt, topup, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      SLACK_ERROR_KEY, WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -827,7 +827,7 @@ def state_payload(p: Project, db: DB) -> dict:
         "notify": notify_state(p, db),
         "secrets": secrets_state(),
         "feed": sorted(alerts.feed(db, now) + uncommitted_feed(db) + startgate.feed(db, warn_s, now)
-                       + sweepskip.feed(db, now, tz) + slots_feed(now, p), key=lambda m: -float(m["ts"] or 0)),
+                       + sweepskip.feed(db, now, tz) + settlehook.feed(db, now) + slots_feed(now, p), key=lambda m: -float(m["ts"] or 0)),
         "offline_help": offline_help(p.name),
         "budget": bud.history(db),
         "coordinator": db.kv("last_coordinator_summary", {}),

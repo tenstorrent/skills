@@ -13,7 +13,8 @@ the project could have saved. Model-free; the review grades it.
 - coordinator turns that decided nothing (no action but `noop`), and idle and
   starve wakes (woken by the idle or idle-slot timer alone, with no message or event), with their cost,
   and turns the daemon skipped as repeats of one that decided nothing (turngate.py) or as quiet while
-  every open task was held (quietgate.py), with the saving, and per wait the wait_stale
+  every open task was held (quietgate.py), with the saving, events the project's settle hook settled
+  (settlehook.py, coordinator.settle_cmd) with their top reasons and its faults, and per wait the wait_stale
   turns skipped as unchanged since a turn that decided nothing on it (stalegate.py); blocker sweeps the model ran and those
   skipped model-free (sweepskip.py), with the saving;
 - code runs with no code change: code tasks done after a worker run with no review, PR or published
@@ -56,7 +57,7 @@ import statistics
 import time
 from typing import Any
 
-from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, dailyspend, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, gatetime, obligations, outscan, plainreply, planuse, quietgate, relay, replan, reviewstats, route, rulecite, schedule, settlehook, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -608,6 +609,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     quiet = quietgate.skipped(db, since)
     if quiet["n"]:
         out.append(f"coordinator turns skipped ({quietgate.QUIET}): {quiet['n']}, ~${quiet['usd']:.2f} saved")
+    if settled := settlehook.audit_line(db, since):
+        out.append(settled)
     sweeps = sweepskip.counts(db, since, now)
     if sweeps["model"] or sweeps["skipped"]:
         out.append(f"blocker sweeps: {sweeps['model']} by the model, {sweeps['skipped']} skipped model-free "
@@ -725,7 +728,7 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "retried_tasks": retried_tasks(db, since), "continued_tasks": continued_tasks(db, since),
             "review_fix_tasks": continued_tasks(db, since, fixes=True),
             "coordinator_turns": coordinator_turns(db, since),
-            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "sweeps": sweepskip.counts(db, since, now),
+            "coordinator_cache": budget.coordinator_cache(db, now, window_s)["window"], "turns_skipped": turngate.skipped(db, since), "turns_quiet": quietgate.skipped(db, since), "settle_hook": settlehook.summary(db, since), "sweeps": sweepskip.counts(db, since, now),
             "finished": done, "per_outcome": per_outcome(done, unpriced), "cost_bases": cost_bases(db, done),
             "plan_usage": planuse.summary(db, since, now, p.config() if p is not None else None),
             "no_change_code": no_change_code(db, since), "stuck": stuck_long(db, now, blocked_h), "review_loops": review_loops(db, since),
