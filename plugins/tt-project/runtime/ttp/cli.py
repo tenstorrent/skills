@@ -36,7 +36,7 @@ from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox, redact
 from .devq import unmask_devices
-from . import chatgone, checkwait, runnerenv, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
+from . import chatgone, checkwait, hoststate, runnerenv, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -5730,6 +5730,7 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
             raise SystemExit(_CHECK_STOP["stopped"])
+        guard = hoststate.Guard(kw.get("env"))   # the real crontab and units, compared after the check
         proc = _check_popen(argv, start_new_session=group, **kw)
         if group and record is not None:
             record.group(proc.pid)
@@ -5739,7 +5740,13 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
         rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s, stop=_checks_running_stop(proc, kw.get("stdout")),
                             extend=extend)
         _reap_check(proc, group, kw)
-        return rc
+        changed, said = guard.end()
+        if said and (out := kw.get("stdout")) is not None and hasattr(out, "write"):
+            out.write("".join(f"{line}\n" for line in said))
+            out.flush()
+        for line in said:
+            print(f"ttp checks: {line}", flush=True)
+        return 1 if changed and rc == 0 else rc
     except BaseException:
         _CHECK_STOP["defer"] = True
         try:

@@ -206,30 +206,43 @@ def run(argv: list[str]) -> int:
     turned one on. A SIGTERM or SIGHUP to this process (a `timeout`, a closed terminal) ends the whole namespace. A pytest run's xdist
     options are dropped where xdist is not installed (testslots.drop_xdist). The command gets the
     account's leak-pattern file by path (leakfile), as checks do."""
-    from . import leakfile, testslots
-    env = leakfile.with_path(dict(os.environ))
+    from . import hoststate, leakfile, testslots
+    # The host's real crontab, systemd user units and power state are out of its reach (hoststate)
+    run_dir = os.environ.get("TTP_RUN_DIR")
+    env = hoststate.fake_env(leakfile.with_path(dict(os.environ)),
+                             Path(run_dir) / "hoststate" if run_dir and os.path.isdir(run_dir) else None)
+    temp = not os.environ.get(hoststate.MARKER) and not (run_dir and os.path.isdir(run_dir))
     argv, dropped = testslots.drop_xdist(argv)
     if dropped:
         print(f"ttp sandbox: {dropped}", file=sys.stderr, flush=True)
     wrapped = wrap(argv)
-    if wrapped == list(argv):
-        if line := notice():
-            print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
-        try:
-            os.execvpe(argv[0], argv, env)
-        except OSError as e:
-            print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
-            return 127 if isinstance(e, FileNotFoundError) else 126
-    proc = subprocess.Popen(wrapped, env=env)
+    plain = wrapped == list(argv)
+    if plain and (line := notice()):
+        print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
+    guard = hoststate.Guard(env)
+    try:
+        proc = subprocess.Popen(wrapped, env=env)
+    except OSError as e:
+        print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
+        if temp and env.get(hoststate.MARKER):
+            shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
+        return 127 if isinstance(e, FileNotFoundError) else 126
 
     def end(*_):
         try:
-            proc.kill()   # unshare --kill-child / bwrap --die-with-parent: the namespace goes with it
+            # unshare --kill-child / bwrap --die-with-parent: the namespace goes with it
+            proc.send_signal(signal.SIGTERM) if plain else proc.kill()
         except OSError:
             pass
 
     signal.signal(signal.SIGTERM, end)
     signal.signal(signal.SIGHUP, end)
-    signal.signal(signal.SIGINT, signal.SIG_IGN)   # a terminal's Ctrl-C reaches the sandbox init, which passes it on
+    signal.signal(signal.SIGINT, signal.SIG_IGN)   # a terminal's Ctrl-C reaches the command (or the sandbox init)
     rc = proc.wait()
-    return rc if rc >= 0 else 128 - rc
+    changed, said = guard.end()
+    for line in said:
+        print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
+    if temp and env.get(hoststate.MARKER):
+        shutil.rmtree(env[hoststate.MARKER], ignore_errors=True)
+    rc = rc if rc >= 0 else 128 - rc
+    return 1 if changed and rc == 0 else rc

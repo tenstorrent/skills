@@ -57,7 +57,7 @@ from . import (checkcap, checkdirs, cleantree, conflictfix, cyclenotice, envfaul
                scriptwatch, setupfault, syntaxfault, testslots, workerloss, urgent,
                sharedchecks, slowtests, suitecost, verdictcarry, worktree)
 from .project import Project, command_env, durable_write, write_json
-from . import gitmemo
+from . import gitmemo, hoststate
 
 WORKTREE = "push"             # the batch's own checkout under the project's worktrees (never t<id>)
 AFTER_PUSH = "after_push-"    # + batch id: the temporary checkout after_push runs in
@@ -238,6 +238,7 @@ def _stream(cmd: str | list[str], cwd: Path, env: dict | None = None, timeout: f
 
 def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bool, pass_fds: tuple,
               collect: workerloss.Collector | None) -> tuple[int | None, str, bool]:
+    guard = hoststate.Guard(env) if env and env.get(hoststate.MARKER) else None   # a check: compare the host after
     proc = subprocess.Popen(cmd, shell=isinstance(cmd, str), cwd=str(cwd), env=env, stdin=subprocess.DEVNULL,
                             stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=group, pass_fds=pass_fds)
     tail: deque[str] = deque(maxlen=push.LOG_TAIL)
@@ -270,7 +271,14 @@ def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bo
         timed_out = True
         _kill(proc)
     reader.join(timeout=10)      # a child that left the group may keep the pipe open; do not wait on it
-    return proc.returncode, "\n".join([*over, *tail]), timed_out
+    rc = proc.returncode
+    if guard is not None:
+        changed, said = guard.end()
+        for line in said:
+            tail.append(line)
+            print(line, flush=True)
+        rc = 1 if changed and rc == 0 else rc
+    return rc, "\n".join([*over, *tail]), timed_out
 
 
 def _registered(repo: Path, wt: Path) -> bool:

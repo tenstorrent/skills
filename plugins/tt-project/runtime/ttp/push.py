@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -1008,9 +1008,10 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     if pp := check_pythonpath(os.environ):
         env["PYTHONPATH"] = pp
     env = leakfile.with_path(env)   # the account's leak-pattern file, by path, for a check's temp HOME
-    return runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
-                                                "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}),
-                           lock or check_lock)
+    env = runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
+                                               "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}),
+                          lock or check_lock)
+    return hoststate.fake_env(env, Path(output) / "hoststate" if output else None)   # host-state stand-ins first on PATH
 
 
 def short_branch(ref: str) -> str:
@@ -4222,6 +4223,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         # A landing's check (to the push branch, or `ttp land`) runs under a landing mark: a `ttp lock`
         # in it goes ahead of non-landing waiters (landmark.py). No other check inherits one.
         mark = landmark.hold() if env.get("TTP_PUSH_MODE") == "target" else None
+        guard = hoststate.Guard(env)   # the real crontab and units, compared after the check
         try:
             # own session: its group is ended once it ends (_end_group), or by checkgroup if this push dies first
             proc = subprocess.Popen([*CHECK_GROUP, str(os.getpid()), "--",
@@ -4240,7 +4242,11 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         reader = threading.Thread(target=_copy_out, args=(proc.stdout, collect), daemon=True)
         reader.start()
         try:
-            return _timed_wait(proc, waits, cmd, say)
+            rc = _timed_wait(proc, waits, cmd, say)
+            changed, said = guard.end()
+            for line in said:
+                say(line)
+            return CHECKS_FAILED if changed and rc == 0 else rc
         except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
             proc.kill()
             proc.wait()

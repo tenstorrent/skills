@@ -29,7 +29,7 @@ from pathlib import Path
 
 from . import poll_s
 from .project import Project, durable_write, open_append_or_null, tree_writes
-from . import gitmemo
+from . import gitmemo, hoststate
 
 
 def unit_name(p: Project) -> str:
@@ -56,7 +56,7 @@ def _agent(p: Project, watchdog: bool = False) -> Path:
 
 
 def _unit(p: Project) -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / f"{unit_name(p)}.service"
+    return hoststate.unit_dir() / f"{unit_name(p)}.service"   # a test run's fake under its marker
 
 
 def _env(p: Project) -> dict:
@@ -66,7 +66,7 @@ def _env(p: Project) -> dict:
 
 
 def _run(*argv: str) -> subprocess.CompletedProcess:
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
+    return subprocess.run(hoststate.argv(argv), capture_output=True, text=True, timeout=60)
 
 
 def install(p: Project) -> str:
@@ -145,7 +145,7 @@ def plan() -> str:
 
 
 def _watchdog_unit(p: Project, ext: str) -> Path:
-    return Path.home() / ".config" / "systemd" / "user" / f"{unit_name(p)}-watchdog.{ext}"
+    return hoststate.unit_dir() / f"{unit_name(p)}-watchdog.{ext}"
 
 
 def backstop_s(p: Project) -> int:
@@ -287,7 +287,7 @@ def _install_cron(p: Project) -> str:
     tag = f"{CRON_TAG}{p.base}"
     keep = [ln for ln in cur.splitlines() if tag not in ln]
     keep += _cron_lines(p)
-    r = subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n", text=True, capture_output=True)
+    r = subprocess.run(hoststate.argv(["crontab", "-"]), input="\n".join(keep) + "\n", text=True, capture_output=True)
     if r.returncode != 0:
         return CRON_FAILED + ": " + r.stderr.strip()[:200]
     # The daemon refuses to start twice (lock file), so the 5-minute entry is a no-op while it runs.
@@ -335,7 +335,7 @@ def uninstall(p: Project) -> str:
         tag = f"{CRON_TAG}{p.base}"
         if tag in cur:
             keep = [ln for ln in cur.splitlines() if tag not in ln]
-            subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n", text=True)
+            subprocess.run(hoststate.argv(["crontab", "-"]), input="\n".join(keep) + "\n", text=True)
             done.append("cron")
     return ", ".join(done) or "nothing installed"
 
@@ -398,7 +398,7 @@ def refresh(p: Project) -> None:
         if tag in cur and "ttp.watchdog" not in "".join(ln for ln in cur.splitlines() if tag in ln):
             keep = [ln for ln in cur.splitlines() if tag not in ln]
             keep += _cron_lines(p)
-            subprocess.run(["crontab", "-"], input="\n".join(keep) + "\n", text=True, capture_output=True)
+            subprocess.run(hoststate.argv(["crontab", "-"]), input="\n".join(keep) + "\n", text=True, capture_output=True)
     _WATCHDOG_SEEN.pop(str(p.base), None)
 
 

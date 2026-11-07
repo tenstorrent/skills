@@ -23,7 +23,7 @@ import sys
 from pathlib import Path
 from typing import Callable
 
-from . import project, shortcut
+from . import hoststate, project, shortcut
 from .daemon import _is_daemon, _read_pid
 from .providers.claude import claude_config_dir
 from .service import CRON_TAG
@@ -37,11 +37,11 @@ Action = tuple[str, Callable[[], str]]   # what it does, and the step (returns a
 
 
 def _run(*argv: str) -> subprocess.CompletedProcess:
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
+    return subprocess.run(hoststate.argv(argv), capture_output=True, text=True, timeout=60)
 
 
 def _unit_dir() -> Path:
-    return Path.home() / ".config" / "systemd" / "user"
+    return hoststate.unit_dir()   # a test run's fake under its marker
 
 
 def _agent_dir() -> Path:
@@ -111,7 +111,7 @@ def _drop_cron_lines() -> str:
     keep = [ln for ln in lines if cron_line_base(ln) is None]
     if len(keep) == len(lines):
         return ""
-    r = subprocess.run(["crontab", "-"], input="".join(keep), text=True, capture_output=True, timeout=60)
+    r = subprocess.run(hoststate.argv(["crontab", "-"]), input="".join(keep), text=True, capture_output=True, timeout=60)
     return "" if r.returncode == 0 else f"crontab: {r.stderr.strip()[:200]}"
 
 

@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: a test run the harness starts can no longer change the host's real crontab, systemd user units or power state. `ttp checks`, the push queue, `ttp land`, `ttp sandbox` and the plugin's own test sessions put stand-ins first on PATH for crontab, systemctl, loginctl, at, atq, atrm, batch, reboot, shutdown, poweroff, halt, ipmitool and tt-smi resets: writes go to a per-run fake store and are listed after the run, reads are served from it or by the real command. The marker `TTP_HOSTSTATE_FAKE` makes the harness's own installers write their units and crontab lines to that store while HOME is the real home. The real crontab and `~/.config/systemd/user` are snapshotted before and after each run: a change the stand-ins missed (a call by absolute path, a unit file written directly) fails the run naming it, is put back, and is recorded in the machine change ledger as a test change that closes itself. No sandbox or namespace is used. Not covered: a unit started (not enabled) by absolute path, and macOS launchd.

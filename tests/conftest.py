@@ -227,6 +227,38 @@ _checks_python_env()
 _HERE = Path(__file__).resolve().parent
 _RUNTIME = next((d / "plugins" / "tt-project" / "runtime" for d in (_HERE.parent, _HERE)
                  if (d / "plugins" / "tt-project" / "runtime" / "ttp" / "credwatch.py").is_file()), None)
+
+def _load_hoststate():
+    """The plugin's hoststate module, loaded by path (the session imports no ttp package of its own)."""
+    import importlib.util
+    if _RUNTIME is None:
+        return None
+    spec = importlib.util.spec_from_file_location("_ttp_hoststate", _RUNTIME / "ttp" / "hoststate.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _host_guard():
+    """Every test, and every process it starts, finds the host-state stand-ins first on PATH (crontab,
+    systemctl, loginctl, at, reboot, shutdown, poweroff, halt, ipmitool, tt-smi: hoststate.py), so a
+    test's call by name never changes the account's real crontab, systemd units or power state. A run
+    under `ttp checks` or `ttp sandbox` keeps their store; else a temp one goes at exit. The session
+    also compares the real crontab and user units before and after (pytest_sessionfinish)."""
+    import atexit
+    import shutil
+    hs = _load_hoststate()
+    if hs is None:
+        return None
+    inherited = bool(os.environ.get(hs.MARKER))
+    os.environ.update(hs.fake_env(dict(os.environ)))
+    if not inherited:
+        atexit.register(shutil.rmtree, os.environ[hs.MARKER], True)
+    return hs
+
+
+_HOSTSTATE = _host_guard()
+
 _CRED_SCRIPT = ("import json, sys\nsys.path.insert(0, sys.argv[1])\nfrom ttp import credwatch\n"
                 "before = json.load(sys.stdin)\nnow = credwatch.snapshot()\n"
                 "print(json.dumps(now if before is None else credwatch.changes(before, now)))\n")
@@ -886,13 +918,38 @@ def pytest_sessionstart(session):
         session.config._ttp_outside = _outside_snapshot(session.config)
         creds = session.config._ttp_creds = credential_marks()
         session.config._ttp_secret = folder_marks(secret_folders())
+        session.config._ttp_host = _HOSTSTATE.Guard() if _HOSTSTATE else None
         recorder = getattr(sys.modules.get("_ttp_suite_writes"), "recorder", None)
         if recorder:   # the providers' login files and gh's folder, wherever the account's env puts them
             recorder.watch(list((creds or {}).get("kinds") or ()) + secret_folders())
             Path(_WRITE_LOG + ".watch").write_text("".join(p + "\n" for p in recorder.watched))
 
 
+def _ledger_record(what: str) -> str:
+    """hoststate.record in a child with the account's real HOME: the session's own HOME is a temp one."""
+    script = "import sys\nsys.path.insert(0, sys.argv[1])\nfrom ttp import hoststate\nprint(hoststate.record(sys.argv[2]))"
+    try:
+        r = subprocess.run([sys.executable, "-c", script, str(_RUNTIME), what], capture_output=True, text=True,
+                           timeout=60, env={**os.environ, "HOME": REAL_HOME})
+        return r.stdout.strip() or f"not recorded in the machine change ledger: {r.stderr.strip()[-200:]}"
+    except (OSError, subprocess.SubprocessError) as e:
+        return f"not recorded in the machine change ledger: {e}"
+
+
+def host_state_lines(guard) -> tuple[bool, list[str]]:
+    """The session's host-state verdict (hoststate.Guard.end), its ledger record made with the real HOME."""
+    if guard is None:
+        return False, []
+    _HOSTSTATE.record = _ledger_record
+    return guard.end()
+
+
 def pytest_sessionfinish(session, exitstatus):
+    changed, said = host_state_lines(getattr(session.config, "_ttp_host", None))
+    if said:
+        _report(session, said, red=changed)
+    if changed:
+        session.exitstatus = pytest.ExitCode.TESTS_FAILED
     before = getattr(session.config, "_ttp_outside", None)
     recorded = recorded_writes(_WRITE_LOG) if _WRITE_LOG and os.path.exists(_WRITE_LOG) else None
     written, other = written_outside(before, _outside_snapshot(session.config), recorded) if before else ([], [])
