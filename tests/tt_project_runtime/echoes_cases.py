@@ -491,7 +491,8 @@ def test_a_superseded_entry_naming_a_current_cited_restriction_never_orders_its_
     hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
     assert {"charter:Restrictions", f"task:{spec}:spec", f"task:{pool}:spec", f"file:{rel}",
             f"memory:{fact.stem}"} <= set(hits), hits
-    assert all(h["class"] == "advisory" and "current Restrictions item" in h["why"] for h in hits.values()), hits
+    assert all(h["class"] == "advisory" and h["why"].startswith("still stated by Restrictions ")
+               for h in hits.values()), hits
     assert echoes.digest_lines(p) == []
     # The retired decision's own wording, copied into a task spec, is still a fix order.
     copy = p.db.add_task("copy", "Run the `quiet-gate` check, then use the `spare-pool hosts` for each service "
@@ -514,6 +515,60 @@ def test_a_cited_restriction_name_never_shields_a_users_own_retirement_or_an_uns
     spec = p.db.add_task("lanes", "Send jobs down the drain-lane and the bulk-lane.")
     got = {h["phrase"]: h["class"] for h in echoes.scan(p) if h["label"] == f"task #{spec} spec"}
     assert got == {"drain-lane": "directive", "bulk-lane": "directive"}, got
+
+
+
+def test_a_phrase_only_retired_entries_held_stays_a_fix_order_and_one_still_stated_is_advisory_naming_who(env):
+    """A memory entry's retirement: a copy of a phrase no current text states is a fix order; the same phrase
+    stated by a cited Restrictions item or held whole by a live memory entry (another than the copy's own)
+    is advisory and names it."""
+    from ttp import echoes
+    p = make(env)
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Keep the hosts tidy (user msg #1).\n"
+                              "- Always drain the `amber-queue` before a rollout (user msg #2).\n")
+    live = p.add_memory("Push changes through the `teal-hopper` lane (user msg #3).", kind="decision")
+    echoes.record(p.db, "memory [old] withdrawn", "Push changes through the `teal-hopper` lane. "
+                  "Drain the `amber-queue` and the `violet-sieve` first.", kind=echoes.WITHDRAWN)
+    spec = p.db.add_task("roll", "Push via the teal-hopper lane.")
+    sieve = p.db.add_task("sieve", "Run the violet-sieve now.")
+    queue = p.db.add_task("queue", "Drain the amber-queue now.")
+
+    def got():
+        return {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    hits = got()
+    # (1) only the retired entry holds it: a fix order.
+    assert hits[f"task:{sieve}:spec"]["class"] == "directive", hits
+    # (3) a cited Restrictions item states it: advisory, naming the item.
+    h = hits[f"task:{queue}:spec"]
+    assert h["class"] == "advisory" and h["why"] == ("still stated by Restrictions item 2 ('Always drain the "
+                                                      "`amber-queue` before a...'): no action"), h
+    # (2) a live entry holds it whole: advisory, naming that entry; the entry's own copy keeps its class.
+    h = hits[f"task:{spec}:spec"]
+    assert h["class"] == "advisory" and h["why"] == f"still stated by memory [{live.stem}]: no action", h
+    assert hits[f"memory:{live.stem}"]["class"] == "directive", hits
+    now = p.add_memory("The violet-sieve step is current again (user msg #9).", kind="decision")
+    hits = got()
+    h = hits[f"task:{sieve}:spec"]
+    assert h["class"] == "advisory" and h["why"] == f"still stated by memory [{now.stem}]: no action", h
+    data = echoes.export(p)
+    assert {m["key"]: m["action"] for m in data["matches"]}[f"task:{sieve}:spec"] == "none", data
+
+
+def test_a_task_about_the_echo_detector_quoting_its_matches_is_advisory_and_another_task_is_not(env):
+    from ttp import echoes
+    p = make(env)
+    echoes.record(p.db, "memory [old] withdrawn", "Route builds through the `copper-funnel` host pool.",
+                  kind=echoes.WITHDRAWN)
+    meta = p.db.add_task("code: ttp echoes misses a case", "Fix the detector: it flags `copper-funnel` here.")
+    body = p.db.add_task("look", "Goal: the echo detector lists copper-funnel in a spec; make it quieter.")
+    plain = p.db.add_task("build", "Route builds through the copper-funnel pool.")
+    late = p.db.add_task("late", "Route builds through the copper-funnel pool. " + "x " * 200 + "then ttp echoes.")
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    for t in (meta, body):
+        h = hits[f"task:{t}:spec"]
+        assert h["class"] == "advisory" and "echo detector" in h["why"], h
+    # A task merely naming it deep in its spec, or not at all, keeps the fix order.
+    assert hits[f"task:{plain}:spec"]["class"] == "directive" and hits[f"task:{late}:spec"]["class"] == "directive"
 
 
 def _old_said(p, text, age=3600):
@@ -587,7 +642,7 @@ def test_a_user_withdrawal_quoting_a_current_restriction_heading_flags_only_the_
     assert hits[ident]["class"] == "directive" and hits[ident]["phrase"] == "assert_pool_free", hits[ident]
     advisory = quotes | {f"task:{body}:spec"}
     assert advisory <= set(hits), hits
-    assert all(hits[k]["class"] == "advisory" and "current Restrictions item" in hits[k]["why"]
+    assert all(hits[k]["class"] == "advisory" and hits[k]["why"].startswith("still stated by Restrictions ")
                for k in advisory), hits
     assert echoes.digest_lines(p)[0] == echoes.RETIRED_HEADER
     # Not a quote: other words between the heading's, or the words reordered.
@@ -620,7 +675,7 @@ def test_a_phrase_a_live_memory_entry_states_whole_is_advisory_never_a_fix_order
     retired = p.db.add_task("retired", "Then call roll-back-fast on failure.")
     hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
     assert hits[f"task:{both}:spec"]["class"] == "advisory", hits
-    assert hits[f"task:{both}:spec"]["why"] == "a live memory entry states it: no action"
+    assert hits[f"task:{both}:spec"]["why"].startswith("still stated by memory ["), hits
     assert hits[f"task:{retired}:spec"]["class"] == "directive", hits
     assert hits[f"task:{retired}:spec"]["phrase"] == "roll-back-fast"
     assert hits[f"memory:{fact.stem}"]["class"] == "directive", hits   # the live entry's own stale copy
@@ -1190,7 +1245,7 @@ def test_a_charter_retirements_phrase_a_current_item_or_a_later_memory_entry_sta
     reworded = p.db.add_task("reworded", "Use queue-flush-slow on the archive.")
     hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
     assert hits[f"task:{stated}:spec"]["class"] == "advisory", hits
-    assert hits[f"task:{stated}:spec"]["why"] == "a current Restrictions item with its source states it: no action"
+    assert hits[f"task:{stated}:spec"]["why"].startswith("still stated by Restrictions item 2 ("), hits
     assert hits[f"task:{reworded}:spec"]["class"] == "advisory", hits
     assert f"memory:{later.stem}" not in {k for k, h in hits.items() if h["class"] == "directive"}
     # Without the later entry, the older memory copy and the task are fix orders again.

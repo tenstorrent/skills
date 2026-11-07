@@ -19,8 +19,9 @@ after it was first shown is marked. An audit record that only preserves an old a
 historical in HISTORICAL_INDEX (its path, sha256 and the retirement's id): while its bytes still hash
 to that value and the retirement is live, that retirement's hit on it is counted, not listed; any
 mismatch lists it as before. Binding places (prompts, harness tools, skills, agent instructions,
-executables) are never historical. Accepted gap: a task whose spec quotes the retired rule in order
-to remove it is listed too.
+executables) are never historical. A task whose subject is the detector itself (`ttp echoes` or the echo
+detector named in its title or spec opening: _about_echoes) quotes matches only to discuss them: its hit is
+advisory. Accepted gap: any other task whose spec quotes the retired rule in order to remove it is listed too.
 
 Each retirement has a KIND: WITHDRAWN (the user withdrew or replaced a governing instruction: a
 charter_update `quote` or `replaces`, a user Correction, a memory change whose `why` cites the user's
@@ -36,8 +37,8 @@ the user, with `over` or not: restriction_source.drops_unsourced) is advisory wh
 that rule still binds, so its copies are right. Likewise a memory entry's retirement (superseded or withdrawn)
 never retires a phrase a current Restrictions item with its source (a user cite, origin: Brief or harness gate)
 or its heading states (_states: holds it whole, or as one run of its words apart from naming words and cites,
-such as 'the X restriction' or a heading quoted with its item): a hit on it is advisory (_current), wherever it
-stands. So is a phrase a live memory entry holds whole (_live_holds): its superseder anywhere, itself included,
+such as 'the X restriction' or a heading quoted with its item): a hit on it is advisory, its `why` naming the item
+(_current: "Restrictions item N (...)"), wherever it stands. So is a phrase a live memory entry holds whole (_live_holds): its superseder anywhere, itself included,
 or another entry anywhere but in that entry itself (an older copy of current words). One only part of it holds,
 or only the retired entry, keeps its class, and so does a live entry's own copy of words the user withdrew,
 unless it is the superseder (that copy is the one to fix). Accepted gap: while such a stale live copy stands,
@@ -615,13 +616,22 @@ def _live_holds(live: dict[str, str], ph: str, rec: dict) -> set[str]:
     return {"*"} if m and f"memory:{m.group(1)}" in keys else keys
 
 
-def _current(charter: str, recorded: set[str] | frozenset = frozenset()) -> list[str]:
-    """The flattened text of each current Restrictions item that binds (restriction_source.sourced: a user
-    cite, the Brief or a harness gate, its own or its sub-heading's), with the heading (section or
-    sub-heading) it stands under, alone and followed by the item. `recorded`: restriction_source.recorded_items."""
+def _holder(live: dict[str, str], keys: set[str], rec: dict, key: str) -> str:
+    """The name of the live memory entry (`keys`, _live_holds) that makes a hit at place `key` current."""
+    m = re.search(r"superseded by \[([^\]]+)\]", rec.get("source") or "")
+    names = sorted(k[7:] for k in keys - {key} if k.startswith("memory:"))
+    return m.group(1) if "*" in keys and m else (names or ["?"])[0]
+
+
+def _current(charter: str, recorded: set[str] | frozenset = frozenset()) -> list[tuple[str, str]]:
+    """(who, flattened text) of each current Restrictions item that binds (restriction_source.sourced: a
+    user cite, the Brief or a harness gate, its own or its sub-heading's), with the heading (section or
+    sub-heading) it stands under, alone and followed by the item (`recorded`: restriction_source.recorded_items).
+    `who` names it: "Restrictions item N ('its first words')", N counting the Restrictions sections' items from 1, or "Restrictions heading '...'"."""
     from .prompts import charter_sections
     from .restriction_source import sourced, split_items
-    out: list[str] = []
+    out: dict[str, str] = {}
+    n = 0
     for head, body in charter_sections(charter):
         name = head[3:].strip()
         if not name.lower().startswith("restriction"):
@@ -633,10 +643,15 @@ def _current(charter: str, recorded: set[str] | frozenset = frozenset()) -> list
                 name = text.lstrip("#").strip()
                 cited = sourced(name, recorded)   # a cite on the sub-heading itself covers its items
                 if cited:
-                    out.append(_flat(name))
-            elif cited or sourced(text, recorded):
-                out += [_flat(text), _flat(name), _flat(f"{name} {text}")]
-    return list(dict.fromkeys(out))
+                    out.setdefault(_flat(name), f"Restrictions heading '{name[:60]}'")
+                continue
+            n += 1
+            if cited or sourced(text, recorded):
+                words = text.lstrip("-*+ ").split()
+                who = f"Restrictions item {n} ('{' '.join(words[:6])}{'...' if len(words) > 6 else ''}')"
+                for u in (_flat(text), _flat(name), _flat(f"{name} {text}")):
+                    out.setdefault(u, who)
+    return [(who, u) for u, who in out.items()]
 
 
 _WORD = re.compile(r"\w+(?:[-.']\w+)*")
@@ -645,28 +660,53 @@ _NAMING = {"a", "an", "the", "of", "in", "on", "and", "or", "to", "for", "per", 
 _CITE = re.compile(r"\([^()]*(?:\b(?:user|msgs?|origin|relayer)\b|#\d)[^()]*\)")   # '(user msg #4)', '(origin: Brief)'
 
 
-def _states(units: list[str], ph: str) -> bool:
-    """Whether a current cited Restrictions item or its heading (`units`, _current) states phrase `ph`: holds
-    it whole, or holds its words as one run once the words that only name an item (_NAMING: 'the X
-    restriction') and cites (_CITE) are left out, such as a heading quoted with its item: two words
-    or more, or the unit's whole wording. Never a reordering or a run with other words between."""
-    for u in units:
-        i = u.find(ph)
-        while i >= 0:
-            if not _inside(u, i, ph):
-                return True
-            i = u.find(ph, i + 1)
+def _says(flat: str, ph: str) -> bool:
+    """Whether flattened text `flat` holds phrase `ph` as a whole (not inside a longer word or name)."""
+    i = flat.find(ph)
+    while i >= 0:
+        if not _inside(flat, i, ph):
+            return True
+        i = flat.find(ph, i + 1)
+    return False
+
+
+def _states(units: list[tuple[str, str]], ph: str) -> str:
+    """The current cited Restrictions item or heading (`units`, _current) that states phrase `ph`, by its
+    name ("" when none): one holding it whole, or holding its words as one run once the words that only
+    name an item (_NAMING: 'the X restriction') and cites (_CITE) are left out, such as a heading quoted
+    with its item: two words or more, or the unit's whole wording. Never a reordering or a run with other
+    words between."""
+    for who, u in units:
+        if _says(u, ph):
+            return who
 
     def run(text: str) -> list[str]:
         return [w for w in _WORD.findall(_CITE.sub(" ", text)) if w not in _NAMING]
 
     words = run(ph)
     n = len(words)
-    for u in units if words else ():
+    for who, u in units if words else ():
         held = run(u)
         if held == words or n >= 2 and any(held[i:i + n] == words for i in range(len(held) - n + 1)):
-            return True
-    return False
+            return who
+    return ""
+
+
+# A task whose subject is the echo detector itself (its title or spec opening names it): it quotes
+# matches only to discuss them.
+_ABOUT_ECHOES = re.compile(r"\bttp echoes\b|\becho(?:es)? detector\b|\bretired[- ]rule echo", re.I)
+ABOUT_CHARS = 300                    # the spec's opening read for its subject
+
+
+def _about_echoes(p, keys: list[str]) -> set[str]:
+    """The task spec places (`keys`, task:<id>:spec) whose task is about the echo detector (_ABOUT_ECHOES
+    in its title or the first ABOUT_CHARS of its spec)."""
+    ids = [int(k.split(":")[1]) for k in keys if re.fullmatch(r"task:\d+:spec", k)]
+    if not ids:
+        return set()
+    rows = p.db.q(f"SELECT id, title, spec FROM tasks WHERE id IN ({','.join('?' * len(ids))})", ids)
+    return {f"task:{r['id']}:spec" for r in rows
+            if _ABOUT_ECHOES.search(r["title"] or "") or _ABOUT_ECHOES.search((r["spec"] or "")[:ABOUT_CHARS])}
 
 
 # A cite of user messages: "user msg #4", "user messages #4, #5", "msg #4/#6" (the numbers, _msgs).
@@ -725,6 +765,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
     live = {key[7:]: flat for key, _, _, flat in where if key.startswith("memory:")}
     born = {e["name"]: _stamp_ts(e.get("created") or "") for e in p._memory_entries()}
     cited = _msgs(" ".join(live.values()) + " " + charter)   # messages live memory or the charter still cites
+    about = _about_echoes(p, [key for key, *_ in where])
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
         kept = _superseders(rec, recs, live)
@@ -741,7 +782,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
         # a charter one, what a current cited Restrictions item or a memory entry written after it states.
         mem = bool(_MEMORY_RETIRED.match(rec.get("source") or ""))
         chart = not mem and (rec.get("source") or "").lower().startswith("charter ")
-        stated_now = {ph for ph in own if _states(units, ph)} if mem or chart else set()
+        stated_now = {ph: who for ph in own if (who := _states(units, ph))} if mem or chart else {}
         later = {n: flat for n, flat in live.items() if born.get(n, 0) > rec.get("at", 0)}
         held = ({ph: _live_holds(live, ph, rec) for ph in own if ph not in stated_now} if mem else
                 {ph: {"*"} if any(_hit({}, flat, [ph]) for flat in later.values()) else set()
@@ -749,7 +790,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
         # A phrase that only cites user messages (a citation header) is current while live memory or the
         # charter still cites every one of them: the rule that came from them lives on in another wording.
         cites = {ph for ph in own if (mem or chart) and _cite_only(ph) and _msgs(ph) <= cited}
-        cur = stated_now | cites | {ph for ph, keys in held.items() if keys}
+        cur = set(stated_now) | cites | {ph for ph, keys in held.items() if keys}
         own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         mine = _own_decision(rec)
@@ -763,10 +804,12 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
                 why = (f"still stated in {stated}: no action" if stated else
-                       "a current Restrictions item with its source states it: no action" if ph in stated_now else
-                       "a live memory entry states it: no action" if held.get(ph, set()) - {key} else
+                       f"still stated by {stated_now[ph]}: no action" if ph in stated_now else
+                       f"still stated by memory [{_holder(live, held[ph], rec, key)}]: no action"
+                       if held.get(ph, set()) - {key} else
                        "it only cites user messages live memory or the charter still cites: no action"
                        if ph in cites else
+                       "a task about the echo detector, quoting its matches: no action" if key in about else
                        "a coordinator's own decision retired, no user rule withdrawn: no action" if mine else
                        "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED

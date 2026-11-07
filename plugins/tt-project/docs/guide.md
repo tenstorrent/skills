@@ -747,7 +747,8 @@ coordinator with that evidence.
   event, wake, hold or model call of its own. An audit record that only preserves an old assertion is
   declared historical in `harness/echo_historical.json` (its path, sha256 and the retirement's id): while
   its bytes still match, that hit is counted, not listed; any mismatch lists it again. A task whose spec quotes the old rule to remove it is
-  listed too. Only a rule the user withdrew (a charter `quote` or `replaces`, a Correction,
+  listed too, unless its subject is the echo detector itself (advisory). A memory entry's retirement yields to a current cited
+  Restrictions item or a user-cited memory entry written since that still states the phrase: advisory, `why` naming it. Only a rule the user withdrew (a charter `quote` or `replaces`, a Correction,
   a memory change whose `why` cites the user's words, or one on the user's turn that cites or quotes
   their new words or whose message names the old rule, including a `memory_forget`; a dedupe on the
   user's turn is not one)
