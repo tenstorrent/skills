@@ -18,7 +18,11 @@ def _oh_run(p, tid, env, name="r1", status="running"):
 
 
 def _oh_sent(p, chat="c1"):
-    return [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND chat=? ORDER BY id", (chat,))]
+    """The replies sent to `chat`, without claimcheck's marks: these tests judge onhost.guard alone."""
+    from ttp import claimcheck
+    drop = re.compile(rf" {re.escape(claimcheck.UNVERIFIED)}|{re.escape(claimcheck.FALSE_MARK)} \([^)]*\): ")
+    return [drop.sub("", m["text"])
+            for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND chat=? ORDER BY id", (chat,))]
 
 
 def test_a_claim_about_a_queued_host_task_is_sent_marked_with_the_honest_status(env):
