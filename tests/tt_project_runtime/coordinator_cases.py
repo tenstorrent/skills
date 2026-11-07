@@ -23052,3 +23052,27 @@ def test_task_update_spec_without_an_exact_edit_line_is_appended_as_before(env, 
     assert p.db.task(tid)["spec"] == _STEPS_SPEC + "\n\n## Update\n" + upd
     assert upd in steer.read_text() and coord.WHOLE_SPEC_REPLACED not in steer.read_text()
     assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []
+
+
+@pytest.mark.parametrize("how", ["retire", "replace"])
+def test_a_retired_quotation_leaves_the_readback_and_the_worker_prompt(env, capsys, monkeypatch, how):
+    # Witness: a task's readback kept its older broad quotation after a later explicit replacement retired it,
+    # so a worker (and an active-rule check) kept seeing it. After `retire:` or `replace:` neither shows it.
+    p = make(env)
+    from ttp import cli, prompts
+    from ttp import coordinator as coord
+    broad = 'In the user\'s words: "re-run every benchmark on every board before each push"'
+    tid = p.db.add_task("bench", _STEPS_SPEC + "\n\n## Update\n" + broad, kind="work")
+    upd = ('retire: "' + broad + '"\nBenchmark only the changed model.' if how == "retire"
+           else "replace:\nGoal: benchmark only the changed model.")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    capsys.readouterr()
+    cli.main(["task", "show", str(tid)])
+    readback = capsys.readouterr().out
+    prompt = prompts.worker_task(p, p.db.task(tid), str(p.root), None)
+    for text in (readback, prompt):
+        assert "every benchmark on every board" not in text and "only the changed model" in text
+        assert "never push to main" in text
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert broad in json.loads(ev["data"])["old"]
