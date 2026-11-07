@@ -58,3 +58,4 @@
 +360: a missed promise or order changes approach, never only its time; due moves past due need a plan change (replan.py, #6664)
 +237: a qwait queue-wait must-act item: queue its fix or name the rule that holds it (#6665)
 +225: the untrusted-text rule names the per-turn provenance delimiters around event and relayer text (spans.py)
++140: quote STATE's spend projection, never one that ignores the cap's reset (user msg #1991)
