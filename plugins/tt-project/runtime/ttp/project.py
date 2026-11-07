@@ -725,7 +725,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # test_project_max, done_holder_flag_s, done_holder_grace_s: the checks lanes (checklane);
         # test_project_slots: the project's test-worker budget (testslots.project_max); test_project_workers:
         # its ceiling on test workers over all its suites (testslots.project_workers); test_run_max: one
-        # suite's most workers, only lowering the account's (testslots.sizes);
+        # suite's most workers, only lowering the account's (testslots.sizes); test_run_min: a full run's
+        # fewest workers (testslots.run_min);
         # stall_s: a running check's log silence that makes it stalled (checkstall.stall_s);
         # push_load_wait_s: push checks' longest wait under the load guard (testslots.push_load_wait_s).
         # wrap_needs_device: false says the commands behind wrap_cmd need no device, so they may spill (checkspill).
@@ -736,7 +737,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
         return {"nice", "python_lock", "ionice", "wall_cap_s", "wrap_cmd", "wrap_lane", "wrap_needs_device", "spill_wrap_cmd",
                 "spill_beside_device", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
-                "test_project_workers", "test_run_max",
+                "test_project_workers", "test_run_max", "test_run_min",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s"}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
@@ -2949,7 +2950,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
                 "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
-                           "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
+                           "test_run_min", "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
                            "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s", "small_tests",
                            "push_load_wait_s",

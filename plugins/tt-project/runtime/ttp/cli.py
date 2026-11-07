@@ -6649,7 +6649,8 @@ def cmd_clip(a) -> None:
     run's failures, else the head and tail, plus the file's path. Exits with the command's code.
     Inside a run the file goes in the run's folder (out/), else in a temporary one. A build (make, ninja,
     cmake --build) first takes this run's share of the host's build slots (testslots.BUILDS) and runs
-    with that many jobs, at a lower priority; none free within CLIP_WAIT_S: one job."""
+    with that many jobs, at a lower priority; none free within CLIP_WAIT_S: one job. A worker's pytest
+    run asking more than one worker takes them from the host's test pool (testslots.direct)."""
     from . import testslots, trim
     cmd = a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd
     if not cmd:
@@ -6659,11 +6660,12 @@ def cmd_clip(a) -> None:
         if dropped:
             print(f"ttp clip: {dropped}", flush=True)
     line, env, grant, argv = shlex.join(cmd) if len(cmd) > 1 else cmd[0], None, None, None
+
+    def tell(msg: str) -> None:
+        print(f"ttp clip: {msg}", flush=True)
+    who = f"ttp clip (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()}): {line[:80]}"
     if testslots.builds(line):
-        def tell(msg: str) -> None:
-            print(f"ttp clip: {msg}", flush=True)
-        grant = testslots.acquire(f"ttp clip (task #{os.environ.get('TTP_TASK') or '?'}, pid {os.getpid()}): "
-                                  f"{line[:80]}", tell, testslots.CLIP_WAIT_S, kind=testslots.BUILDS)
+        grant = testslots.acquire(who, tell, testslots.CLIP_WAIT_S, kind=testslots.BUILDS)
         if grant is None:
             tell(f"no host build slot free after {testslots.CLIP_WAIT_S:.0f} s: building with 1 job")
             grant = testslots.Grant(1, kind=testslots.BUILDS)
@@ -6672,6 +6674,11 @@ def cmd_clip(a) -> None:
                 tell(f"build jobs capped at -j {grant.k} (this run's share of the host's build slots): {capped}")
             line, env = capped, {**os.environ, **grant.env()}
             argv = testslots.low_priority(["/bin/sh", "-c", line])
+    elif (grant := testslots.direct(line, who, tell)) is not None:   # held by the tests too: free when they end
+        if (capped := testslots.clamp(line, grant.k)) != line:
+            tell(f"pytest workers lowered to -n {grant.k} (this run's host test slots): {capped}")
+        line, env = capped, {**os.environ, **grant.env()}
+        argv = testslots.low_priority(["/bin/sh", "-c", line])
     run_dir = os.environ.get("TTP_RUN_DIR")
     folder = Path(run_dir) / "out" if run_dir else Path(tempfile.mkdtemp(prefix="ttp-clip-"))
     folder.mkdir(parents=True, exist_ok=True)
@@ -6680,7 +6687,7 @@ def cmd_clip(a) -> None:
     try:
         with open(log, "w") as out:
             rc = subprocess.run(argv or line, shell=argv is None, stdout=out, stderr=subprocess.STDOUT,
-                                env=env).returncode
+                                env=env, pass_fds=grant.fds() if grant and grant.kind is testslots.TESTS else ()).returncode
     finally:
         if grant is not None:
             grant.close()

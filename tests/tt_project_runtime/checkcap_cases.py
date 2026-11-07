@@ -830,7 +830,7 @@ def test_checks_log_records_each_check_commands_wall_clock_seconds_and_exit(env,
 
 # Host-wide test-worker slots (testslots) --------------------------------------------------------
 _SLOT_HOLDER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import testslots
 g = testslots.acquire("holder " + sys.argv[1])
@@ -903,7 +903,7 @@ def test_test_slots_project_config_can_only_lower_the_host_limits(env, monkeypat
     assert testslots.sizes({"checks": {"test_pool": 0}}) == (16, 8), "a project cannot turn the host's pool off"
     got = testslots.worker_env({"checks": {"test_run_max": 3}})
     assert {k: got[k] for k in ("PYTEST_XDIST_AUTO_NUM_WORKERS", "TTP_TEST_SLOTS")} == {
-        "PYTEST_XDIST_AUTO_NUM_WORKERS": "3", "TTP_TEST_SLOTS": "3"}
+        "PYTEST_XDIST_AUTO_NUM_WORKERS": "1", "TTP_TEST_SLOTS": "3"}, "a bare -n auto: one worker; more through clip or sandbox"
     assert got["CMAKE_BUILD_PARALLEL_LEVEL"] == "8", "the build pool keeps its own limits"
 
 
@@ -1432,12 +1432,161 @@ def test_a_pytest_n_above_the_budget_is_lowered_with_a_line_saying_so_and_refuse
     assert "lowered to -n 3" in r.stderr and r.returncode == 0
     monkeypatch.setenv("TTP_TEST_SLOTS", "4")
     assert "budget of 4" in hook.too_many_workers("python3 -m pytest -n 16 tests/a.py")
-    assert hook.too_many_workers("pytest -n 4 tests/a.py") is None
-    assert hook.too_many_workers("pytest -n auto tests/a.py") is None
+    assert hook.too_many_workers("ttp clip -- ttp sandbox -- pytest -n 4 tests/a.py") is None
+    assert hook.too_many_workers("pytest -n auto tests/a.py") is None, "a bare -n auto starts one worker"
     assert hook.too_many_workers("ttp checks -- 'pytest -n 16 tests/a.py'") is None, "ttp checks lowers it"
     assert hook.too_many_workers("head -n 50 f && sort -n 99 g") is None
     monkeypatch.delenv("TTP_TEST_SLOTS")
     assert hook.too_many_workers("pytest -n 64 tests") is None, "outside a worker run: no budget"
+
+
+@pytest.mark.parametrize("cmd", ["pytest -n 4 tests/a.py", "cd x && python3 -m pytest -n4 tests",
+                                 "ttp detach t -- pytest --numprocesses=3 tests", "ttp clip -- true; pytest -n 2 t"])
+def test_a_workers_pytest_n_outside_clip_or_sandbox_is_refused_as_it_holds_no_host_test_slots(env, monkeypatch, cmd):
+    from ttp import hook, testslots
+    monkeypatch.setenv("TTP_TEST_SLOTS", "4")
+    assert "holds none of this shared host's test slots" in (hook.too_many_workers(cmd) or "")
+    for ok in ("pytest tests/a.py", "pytest -n 1 tests", "pytest -n 0 t", "ttp sandbox -- pytest -n 4 t",
+               "ttp clip -- pytest -n 4 t", "ttp detach t -- ttp clip -- pytest -n 4 t"):
+        assert hook.too_many_workers(ok) is None, ok
+    monkeypatch.setenv(testslots.HELD_ENV, "4")
+    assert hook.too_many_workers(cmd) is None, "inside a run that holds slots (a check) it runs on them"
+
+
+def test_asked_reads_a_pytest_runs_worker_count(env):
+    from ttp import testslots
+    a = testslots.asked
+    assert a("pytest -n 8 t", 4) == 8 and a("python3 -m pytest -n6 t", 4) == 6
+    assert a("pytest --numprocesses=3 t", 4) == 3 and a("pytest --numprocesses 5 t", 4) == 5
+    assert a("pytest -n auto t", 4) == 4 and a("pytest -n logical t", 4) == 4
+    assert a("pytest t", 4) == 1 and a("pytest -n 0 t", 4) == 1
+    assert a("nice -n 19 pytest t", 4) == 1, "a -n before the pytest word is not its"
+    assert a("pytest t -- -n 9", 4) == 1, "nor one after --"
+    assert a("head -n 50 f", 4) is None and a("make -j 8", 4) is None
+
+
+def _direct_env(monkeypatch, pool=4, share=4):
+    monkeypatch.setenv("TTP_TEST_POOL", str(pool))
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", str(pool))
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")
+    monkeypatch.setenv("TTP_TEST_SLOTS", str(share))
+    for v in ("TTP_TEST_SLOTS_HELD", "TTP_CHECKS_SLOT", "TTP_PROJECT"):
+        monkeypatch.delenv(v, raising=False)
+
+
+def test_a_workers_own_pytest_takes_host_test_slots_and_shrinks_to_what_is_free(env, monkeypatch):
+    from ttp import locks, testslots
+    _direct_env(monkeypatch)
+    other = testslots.acquire("a ttp checks run", most=3)
+    told: list = []
+    try:
+        assert other.k == 3
+        g = testslots.direct("pytest -n 8 tests", "worker pytest", told.append)
+        assert g is not None and g.k == 1 and len(g.files) == 1, "one slot left: it starts with one"
+        assert g.env()[testslots.XDIST_ENV] == "1" and testslots.clamp("pytest -n 8 tests", g.k) == "pytest -n 1 tests"
+        assert all(os.get_inheritable(fd) for fd in g.fds()), "the test process keeps them past an exec"
+        assert len(locks.held_labels(testslots.paths(4))) == 4
+        g.close()
+        assert testslots.direct("pytest tests", "serial", told.append) is None, "a one-process run takes none"
+        assert testslots.direct("make -j 4", "build", told.append) is None
+        monkeypatch.setenv(testslots.HELD_ENV, "2")
+        assert testslots.direct("pytest -n 8 tests", "nested", told.append) is None, "a check's own runs use its grant"
+    finally:
+        other.close()
+    monkeypatch.delenv(testslots.HELD_ENV)
+    g = testslots.direct("pytest -n 8 tests", "worker pytest", told.append)
+    assert g.k == 4, "at most its share (TTP_TEST_SLOTS), never the -n it asked"
+    g.close()
+    monkeypatch.delenv("TTP_TEST_SLOTS")
+    assert testslots.direct("pytest -n 8 tests", "no worker", told.append) is None, "outside a worker run: as before"
+
+
+def test_a_workers_own_pytest_waits_for_a_full_pool_then_runs_on_one_worker(env, monkeypatch):
+    import threading
+    from ttp import testslots
+    _direct_env(monkeypatch, pool=2, share=2)
+    full = testslots.acquire("a ttp checks run", most=2)
+    got, told = [], []
+    monkeypatch.setattr(testslots, "DIRECT_WAIT_S", 30.0)
+    t = threading.Thread(target=lambda: got.append(testslots.direct("pytest -n 2 t", "waiter", told.append)))
+    t.start()
+    try:
+        assert _wait_for(lambda: any("waiting for a host-wide test slot" in m for m in told)), told
+        assert not got, "a full pool: it waits"
+    finally:
+        full.close()
+    t.join(30)
+    assert got and got[0].k == 2 and got[0].files, "the freed slots go to the waiter"
+    got[0].close()
+    full = testslots.acquire("a ttp checks run", most=2)
+    monkeypatch.setattr(testslots, "DIRECT_WAIT_S", 0.2)
+    try:
+        g = testslots.direct("pytest -n 2 t", "waiter", told.append)
+        assert g.k == 1 and not g.files and "running on 1 test worker" in told[-1], "bounded: then one worker, no slot"
+    finally:
+        full.close()
+
+
+_FAKE_PYTEST = """#!{python}
+import json, os, sys, time
+from pathlib import Path
+out = Path(os.environ["FAKE_OUT"])
+Path(f"{{out}}.tmp").write_text(json.dumps([" ".join(sys.argv[1:]), os.environ.get("PYTEST_XDIST_AUTO_NUM_WORKERS", "")]))
+os.replace(f"{{out}}.tmp", out)
+while not Path(os.environ["FAKE_STOP"]).exists():
+    time.sleep(0.05)
+"""
+
+
+@pytest.mark.parametrize("wrapper", [["sandbox", "--"], ["clip", "--"]])
+def test_a_workers_own_pytest_holds_its_slots_until_the_test_process_ends_or_is_killed(env, tmp_path, monkeypatch, wrapper):
+    import signal
+    from ttp import locks, testslots
+    _direct_env(monkeypatch, pool=4, share=3)
+    bin_dir, xdist = tmp_path / "bin", tmp_path / "site" / "xdist"
+    bin_dir.mkdir()
+    xdist.mkdir(parents=True)
+    (xdist / "__init__.py").write_text("")   # drop_xdist keeps -n: the fake's interpreter finds xdist
+    fake = bin_dir / "pytest"
+    fake.write_text(_FAKE_PYTEST.format(python=sys.executable))
+    fake.chmod(0o755)
+    out, stop = tmp_path / "fake-pytest.txt", tmp_path / "stop"
+    run_env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "FAKE_OUT": str(out), "FAKE_STOP": str(stop),
+               "PYTHONPATH": f"{RUNTIME}:{tmp_path / 'site'}", "TTP_RUN_DIR": str(tmp_path)}
+    held = lambda: len(locks.held_labels(testslots.paths(4)))  # noqa: E731
+    for end in ("exit", "kill"):
+        for f in (out, stop):
+            f.unlink(missing_ok=True)
+        proc = subprocess.Popen([sys.executable, "-m", "ttp", *wrapper, "pytest", "-n", "8", "tests"], env=run_env,
+                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=True)
+        try:
+            if not _wait_for(lambda: out.exists() or proc.poll() is not None) \
+                    or proc.poll() is not None:
+                proc.kill()
+                raise AssertionError(proc.communicate()[0])
+            assert json.loads(out.read_text()) == ["-n 3 tests", "3"], "-n lowered to its grant, -n auto's variable set to it"
+            assert held() == 3, "the test process holds its slots"
+            if end == "kill":
+                os.killpg(proc.pid, signal.SIGKILL)   # the wrapper and the tests die at once: nothing cleans up
+            else:
+                stop.write_text("")
+            proc.wait(30)
+            assert _wait_for(lambda: held() == 0, 10), f"{end}: its slots are free again"
+        finally:
+            stop.write_text("")
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait(10)
+
+
+def test_config_takes_checks_test_run_min_per_project_and_account(env, monkeypatch):
+    from ttp import cli, testslots
+    p = make(env)
+    monkeypatch.delenv("TTP_TEST_RUN_MIN", raising=False)
+    cli.main(["config", "--account", "checks.test_run_min", "3"])
+    assert testslots.run_min({}, 8) == 3
+    cli.main(["config", p.name, "checks.test_run_min", "5"])
+    assert testslots.run_min(p.config(), 8) == 5, "the project's wins"
 
 
 def _build_share(monkeypatch, k):
@@ -2243,7 +2392,7 @@ def test_suite_slot_wait_line_of_ttp_checks_names_this_run_s_priority_and_rank(e
 
 
 _SUITE_RUNNER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import checkcap, locks, testslots
 if sys.argv[3] == "hold":
@@ -5136,7 +5285,7 @@ def test_a_drained_checks_queue_ends_its_incident_and_a_new_queue_wakes_afresh(e
 
 
 _RUN_HOLDER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import checklane, cli
 from ttp.project import Project
@@ -5362,7 +5511,7 @@ def test_a_lane_held_by_a_finished_task_s_check_is_flagged_then_only_its_own_che
 
 # A review precheck as `ttp checks --detach` holds its lane: cli._checks_slot under Daemon._start_checks' env.
 _PRECHECK_HOLDER = """
-import os, sys, time
+import json, os, sys, time
 from pathlib import Path
 from ttp import checklane, cli
 from ttp.project import Project

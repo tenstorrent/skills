@@ -1572,16 +1572,25 @@ def _check_runs() -> list[tuple[str, set[str], set[tuple[str, str]]]]:
 
 def too_many_workers(cmd: str) -> str | None:
     """Why `cmd` is refused when a pytest in it asks for more workers (`-n N`) than the run's test-worker
-    budget (TTP_TEST_SLOTS, which the daemon gives worker runs: testslots.worker_env), else None."""
+    budget (TTP_TEST_SLOTS, which the daemon gives worker runs: testslots.worker_env), or for more than
+    one outside `ttp clip` / `ttp sandbox`, which take them from the host's test pool (testslots.direct)
+    unless the run already holds slots; else None."""
     from . import testslots
     try:
         k = int(os.environ.get(testslots.SLOTS_ENV) or 0)
     except ValueError:
         return None
-    if re.search(r"\bttp\s+checks\b", cmd) or not (big := testslots.over(cmd, k)):
+    if not k or re.search(r"\bttp\s+checks\b", cmd):
         return None   # `ttp checks` lowers it itself
-    return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
-            f"Use -n {k} or fewer, or `-n auto` (it reads {testslots.XDIST_ENV}={k})")
+    how = (f"`ttp clip -- ttp sandbox -- <pytest ...>`, which takes up to {k} test workers from the host's "
+           f"test slots (fewer, or a short wait, while other runs hold them)")
+    if big := testslots.over(cmd, k):
+        return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
+                f"Use -n {k} or fewer (or `-n auto`) through {how}")
+    if not os.environ.get(testslots.HELD_ENV) and (bare := testslots.unpooled(cmd)):
+        return (f"pytest -n {max(bare)} outside `ttp clip` or `ttp sandbox` holds none of this shared host's "
+                f"test slots. Run it as {how}, or with no -n")
+    return None
 
 
 def build_share() -> int:
