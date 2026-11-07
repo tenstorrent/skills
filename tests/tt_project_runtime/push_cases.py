@@ -20157,3 +20157,44 @@ def test_precheck_hold_skips_an_urgent_review(tmp_path, monkeypatch):
     assert daemon.precheck_holds(tmp_path, task, 1001.0), "a routine review waits"
     assert not daemon.precheck_holds(tmp_path, dict(task, priority=1), 1001.0)
     assert not daemon.precheck_holds(tmp_path, dict(task, spec="urgent: landing"), 1001.0)
+
+
+def test_a_takeover_that_defers_to_a_live_merge_task_waits_for_it_then_reports_it_stuck(env, tmp_path, monkeypatch):
+    """Every takeover try exited 75 (deferred) while a live merge task held the merge, and deploy gave up
+    after 3 quick tries. Now a try that defers to a live owner waits for it and spends no try; once the
+    owner ends the next try runs; an owner that holds it past OWNER_WAIT_S is reported stuck, once."""
+    from ttp import deploy, overview, release
+    p = make(env)
+    _deploy_lib('0.5.0')
+    _, db = _deploy_project(tmp_path, 'alpha', '0.4.9')
+    tid = db.add_task(release.UPGRADE_TASK_TITLE, 'merge', kind='harness')
+    db.update_task(tid, status='waiting')
+    now = time.time()
+    report = overview.deployed(names=['alpha'])
+    report['projects'][0]['takeover_at'] = now + 1
+    deploy.record(p, report, now)
+    due = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0']['due']
+    launched = []
+    def launch(p, name, task):
+        launched.append((name, task))
+        return subprocess.Popen([sys.executable, "-c", "raise SystemExit(75)"])
+    monkeypatch.setattr(deploy, "launch_takeover", launch)
+    pages, page = _deploy_pager(p)
+    t = due + 1
+    for _ in range(12):     # an hour of probes: one try, then waiting on the live task
+        deploy.tick(p, page, t)
+        for child in deploy._children.values():
+            child.wait()
+        t += deploy.TAKEOVER_SETTLE_S
+    rec, tk = p.db.kv(deploy.CHECKS)['deploy:alpha:0.5.0'], p.db.kv(deploy.TAKEOVERS)['alpha']
+    assert launched == [('alpha', tid)] and not pages and tk['tries'] == 1 and tk['rc'] == 'exit 75'
+    assert rec['outcome'] == 'pending' and not rec.get('closed')
+    tk['owner_wait'] = t - deploy.OWNER_WAIT_S - 1     # the owner held it all that while
+    p.db.set_kv(deploy.TAKEOVERS, {'alpha': tk})
+    for i in range(3):
+        deploy.tick(p, page, t + i * deploy.PROBE_S)
+    assert len(pages) == 1 and 'stuck owner' in pages[0][1] and f'harness task #{tid}' in pages[0][1]
+    assert launched == [('alpha', tid)]
+    db.update_task(tid, status='cancelled')     # the owner ended without landing it: the takeover goes on
+    deploy.tick(p, page, t + 4 * deploy.PROBE_S)
+    assert len(launched) == 2, "the wait spent no try"
