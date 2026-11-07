@@ -3,13 +3,16 @@
 # collects these tests under its name. Add new leftoverchecks tests here.
 from __future__ import annotations
 
-# A stand-in `ttp checks` run: holds a checks slot and a queue ticket under the slot folder, then sleeps.
+# A stand-in `ttp checks` run: holds a checks slot and a queue ticket under the slot folder, and each
+# LC_EXTRA path ("{pid}" filled in), then sleeps.
 _LC_FAKE = """
 import fcntl, os, sys, time
 slots = os.environ["LC_SLOTS"]
 os.makedirs(os.path.join(slots, "checks.queue"), exist_ok=True)
 held = []
-for name in ("checks.%s.lock" % os.environ["LC_SLOT"], os.path.join("checks.queue", "%017.6f-%d" % (time.time(), os.getpid()))):
+extra = [x.replace("{pid}", str(os.getpid())) for x in os.environ.get("LC_EXTRA", "").split(os.pathsep) if x]
+for name in ("checks.%s.lock" % os.environ["LC_SLOT"], os.path.join("checks.queue", "%017.6f-%d" % (time.time(), os.getpid())), *extra):
+    os.makedirs(os.path.dirname(os.path.join(slots, name)), exist_ok=True)
     f = open(os.path.join(slots, name), "a+")
     fcntl.flock(f, fcntl.LOCK_EX)
     held.append(f)
@@ -158,3 +161,42 @@ def test_live_identityless_and_other_users_checks_runs_are_never_reaped(env, tmp
         assert leftoverchecks.find(p) == [], "another user's processes are never read"
     finally:
         _lc_end(running, bare, locker)
+
+
+def test_a_slot_holder_with_its_own_lifetime_locks_is_reaped_but_one_holding_a_ttp_lock_slot_is_not(env, tmp_path, monkeypatch):
+    """A real slot-holding `ttp checks` also holds its clean checkout's lock (cleantree.PREFIX/LOCK), its
+    detached supervisor's check-runs lock (checkdirs.LOCK) and its log's .lock: none of them is a `ttp
+    lock` slot, so with its folder deleted it is reaped. One holding a file in the project's lock folder
+    is kept."""
+    from ttp import checkdirs, cleantree, leftoverchecks
+    p = make(env)
+    own = [tmp_path / "shm" / f"{cleantree.PREFIX}{{pid}}-x" / cleantree.LOCK,
+           p.state / checkdirs.FOLDER / checkdirs.LOCK,
+           p.state / checkdirs.FOLDER / "abc" / checkdirs.LOCK,
+           tmp_path / "runlogs" / "checks.log.lock"]
+    a_cwd, b_cwd = tmp_path / "a-work", tmp_path / "b-work"
+    a, _ = _lc_spawn(tmp_path, monkeypatch, {"LC_EXTRA": os.pathsep.join(map(str, own))}, name="a", cwd=a_cwd)
+    b, _ = _lc_spawn(tmp_path, monkeypatch, {"LC_EXTRA": str(p.state / "locks" / "suite.0.lock")}, name="b", cwd=b_cwd)
+    try:
+        held = leftoverchecks._fds(a.pid)
+        assert any(f.endswith(f"{cleantree.PREFIX}{a.pid}-x/{cleantree.LOCK}") for f in held), held
+        shutil.rmtree(a_cwd)
+        shutil.rmtree(b_cwd)
+        found = {f["pid"]: f["why"] for f in leftoverchecks.find(p)}
+        assert found == {a.pid: "its working folder is deleted"}, found
+    finally:
+        _lc_end(a, b)
+
+
+def test_ttp_checks_reap_logs_each_stop_to_the_project_log_but_a_dry_run_does_not(env, monkeypatch, capsys):
+    from ttp import cli, leftoverchecks
+    p = make(env)
+    monkeypatch.setattr(cli, "here", lambda: p)
+    monkeypatch.setattr(leftoverchecks, "reap", lambda p, dry_run=False: [{"text": f"reap line dry={dry_run}"}])
+    for args in (["checks", "--reap", "--dry-run"], ["checks", "--reap"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(args)
+        assert e.value.code == 0
+    assert capsys.readouterr().out.splitlines() == ["reap line dry=True", "reap line dry=False"]
+    text = (p.logs / "daemon.log").read_text() if (p.logs / "daemon.log").exists() else ""
+    assert "reap line dry=False" in text and "dry=True" not in text

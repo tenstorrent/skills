@@ -3430,8 +3430,11 @@ def cmd_checks(a) -> None:
         p = here()
         if not p:
             die("ttp checks --reap: no project found")
+        from .daemon import log as daemon_log
         for r in leftoverchecks.reap(p, dry_run=a.dry_run):
             print(r["text"])
+            if not a.dry_run:
+                daemon_log(p, r["text"])   # as the daemon's pass logs it
         sys.exit(0)
     if getattr(a, "settle", None):
         sys.exit(_checks_settle(Path(a.settle), a.head))

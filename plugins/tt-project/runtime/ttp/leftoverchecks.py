@@ -11,8 +11,8 @@ guard rightly refuses to stop a process that is not its own, so the daemon's che
 A process is a leftover (find) only when all of these hold:
 - it is this OS user's, on Linux, and its command line is a `ttp checks` run;
 - it has a file under the checks slot folder open (checkcap.slot_dir: a slot, lane or queue ticket);
-- it names no other project (procowner.foreign_env) and holds no other `ttp lock` slot (an open *.lock
-  file outside that folder);
+- it names no other project (procowner.foreign_env) and holds no other `ttp lock` slot (held_lock: an open
+  file in the project's or a shared resource's lock folder);
 - neither it nor an ancestor is the caller, the project's daemon or one of its running workers
   (leftoverstop._guarded), and it is not a `ttp detach` job's or a device user (leftoverstop._untouchable);
 - its task, when it is this project's, is finished; its TTP_RUN_DIR, when set, is not a live run (the
@@ -97,6 +97,16 @@ def _cwd_gone(pid: int) -> bool:
     return cwd.endswith(" (deleted)") or not os.path.isdir(cwd)
 
 
+def held_lock(p, pid: int, slots: Path) -> bool:
+    """Whether `pid` has a file open in a `ttp lock` folder (the project's or a shared resource's,
+    jobstop.lock_dirs), the checks slot folder aside. Its own lifetime locks (a clean checkout's
+    cleantree.LOCK, check-runs' checkdirs.LOCK, its logs' .lock files) live elsewhere and do not count."""
+    from . import jobstop
+    root = os.path.realpath(slots)
+    dirs = [d for d in (os.path.realpath(x) for x in jobstop.lock_dirs(p)) if d != root]
+    return any(f.startswith(d + os.sep) and not f.startswith(root + os.sep) for f in _fds(pid) for d in dirs)
+
+
 def judge(p, pid: int, slots: Path, guarded: set[int], env: dict) -> tuple[str, str]:
     """("leftover" | "keep", why) for this user's `ttp checks` process `pid` that has a file under `slots` open."""
     from . import leftoverstop
@@ -104,8 +114,7 @@ def judge(p, pid: int, slots: Path, guarded: set[int], env: dict) -> tuple[str, 
         return "keep", "another project's"
     if why := leftoverstop._untouchable(p, pid, env):
         return "keep", why
-    root = os.path.realpath(slots)
-    if any(f.endswith(".lock") and not f.startswith(root + os.sep) for f in _fds(pid)):
+    if held_lock(p, pid, slots):
         return "keep", "it holds a ttp lock"
     a, seen = pid, set()
     while a > 1 and a not in seen:
