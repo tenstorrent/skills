@@ -1216,6 +1216,7 @@ def main(argv: list[str], own_dir: str) -> int:
         why = f"refused: the leak scan failed ({type(e).__name__}); nothing was sent"
     if why:
         print(f"gh (tt-project): {why}", file=sys.stderr)
+        outscan.record("gh", why)
         return 1
     db, allowed, seen = None, set(), []
     try:

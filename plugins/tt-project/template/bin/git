@@ -3,7 +3,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # git for tt-project runs: the real git further down PATH. Inside a run (TTP_TASK set), a call naming
 # `push` goes through ttp/gitguard.py first, which keeps a code task off the push branch while
-# delivery.code_tasks_may_push is off and scans what the push sends for leaks (ttp/outscan.py).
+# delivery.code_tasks_may_push is off and scans what the push sends for leaks (ttp/outscan.py). So
+# does a call whose subcommand is no common builtin: gitguard resolves a git alias (`git -c alias.p=push
+# p`) and refuses send-pack. Aliases never shadow a builtin, so the listed ones go straight to git.
 # In a coordinator run (TTP_ROLE=coordinator, or full tools) every push goes there too and is
 # refused; a guard that fails to load refuses it as well. Every other call execs the real git at once.
 # The real git is the first git on PATH that is no tt-project git wrapper: another project's
@@ -33,7 +35,31 @@ fi
 coord=
 [ "${TTP_ROLE:-}" = coordinator ] || [ "${TTP_COORD_FULL_TOOLS:-}" = 1 ] && coord=1
 if [ -n "${TTP_TASK:-}" ] || [ -n "$coord" ]; then
-    case " $* " in
+    sub=
+    skip=
+    for a in "$@"; do
+        if [ -n "$skip" ]; then
+            skip=
+            continue
+        fi
+        case $a in
+        -C|-c|--git-dir|--work-tree|--namespace|--super-prefix|--config-env) skip=1 ;;
+        -*) ;;
+        *) sub=$a; break ;;
+        esac
+    done
+    case $sub in
+    ''|add|am|annotate|apply|archive|bisect|blame|branch|bundle|cat-file|check-attr|check-ignore|\
+    check-mailmap|check-ref-format|checkout|checkout-index|cherry|cherry-pick|clean|clone|column|commit|\
+    commit-graph|commit-tree|config|count-objects|credential|describe|diff|diff-files|diff-index|diff-tree|\
+    fetch|for-each-ref|format-patch|fsck|gc|grep|hash-object|help|init|interpret-trailers|log|ls-files|\
+    ls-remote|ls-tree|merge|merge-base|merge-file|merge-tree|mktree|mv|name-rev|notes|pack-refs|patch-id|\
+    prune|pull|range-diff|read-tree|rebase|reflog|remote|repack|replace|reset|restore|rev-list|rev-parse|\
+    revert|rm|shortlog|show|show-branch|show-ref|sparse-checkout|stash|status|stripspace|submodule|switch|\
+    symbolic-ref|tag|update-index|update-ref|var|verify-commit|verify-tag|version|worktree|write-tree) ;;
+    *) sub=" push " ;;
+    esac
+    case " $* $sub " in
     *" push "*)
         [ -x "${TTP_PYTHON:-}" ] || TTP_PYTHON=python3
         rt=${0%/*}/../runtime                                # a harness's bin/

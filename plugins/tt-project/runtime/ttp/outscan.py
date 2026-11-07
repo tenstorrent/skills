@@ -15,11 +15,15 @@ It covers a run's outward writes (TTP_TASK set):
   files, and stdin wherever gh reads it: '-' or a stdin path, gist create, variable and secret set,
   workflow run --json and the key and alias imports when their flags leave stdin as the input, and an
   extension or shell alias once its stdin shows data or EOF within PROBE_STDIN_S (see gh_stdin); not
-  auth login or codespace ssh, see STDIN_UNSCANNED);
+  auth login or codespace ssh, see STDIN_UNSCANNED), and to their end the assets `gh release upload`
+  and `gh release create` send;
 - `ttp note --to` / `--reply` and `ttp notify`;
 - every `git push` through the run's bin/git: its pre-push hook (gitguard.HOOK) runs pre_push(), which
-  scans the commit messages and added lines (and their paths) of every commit the push sends and the
-  messages of the annotated tags it sends; never what the remote already has (`git ls-remote`).
+  scans the commit messages and added lines (and their paths) of every commit the push sends, root
+  commits included, and the messages of the annotated tags it sends; never what the remote already has
+  (`git ls-remote`). A ref to a blob or a tree is refused. A git alias for push goes there too, and
+  `git send-pack` is refused (gitguard.resolve).
+Each refusal is recorded (record(): its route and line, never a value); `ttp audit` counts them.
 A daemon's chat post (slack.Slack._body) cannot be refused without losing the message: stored values
 are masked there already (redact.scrub) and credential shapes are masked by mask_shapes().
 
@@ -115,6 +119,38 @@ def problem(what: str, *texts: str, p=None) -> str | None:
     return None
 
 
+REFUSED_KIND = "outscan_refused"   # events: one per refusal, {route, task}; `ttp audit` counts them
+
+
+def record(route: str, why: str, p=None) -> None:
+    """Record a refusal on `route` ("gh", "git push", "ttp note --to", "ttp notify") in the project's
+    events. `why` is the refusal line, which names a class and never a value. Best effort: a fault here
+    never turns a refusal into a send."""
+    try:
+        p = _project() if p is None else p
+        if p is None:
+            return
+        import json
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+               (time.time(), "run", REFUSED_KIND, "low", why[:500],
+                json.dumps({"route": route, "task": os.environ.get("TTP_TASK", "")}), "handled"))
+    except Exception:
+        pass
+
+
+def refusal_counts(db, since: float) -> dict[str, int]:
+    """{route: refusals} since `since`."""
+    import json
+    out: dict[str, int] = {}
+    for r in db.q("SELECT data FROM events WHERE kind=? AND ts>=?", (REFUSED_KIND, since)):
+        try:
+            route = str(json.loads(r["data"] or "{}").get("route") or "?")
+        except (ValueError, AttributeError):
+            route = "?"
+        out[route] = out.get(route, 0) + 1
+    return dict(sorted(out.items()))
+
+
 def mask_shapes(text: str) -> str:
     """`text` with each credential shape replaced by `[redacted:<shape>]` (for posts that must still go)."""
     if not isinstance(text, str) or not _ANY_SHAPE.search(text):
@@ -140,6 +176,38 @@ def _gh_files(args: list[str]) -> list[str]:
         files += _positionals(args[2:], ("-d", "--desc", "-f", "--filename", "-a", "--add"))
         files += _opts(args[2:], ("-a", "--add"))
     return files
+
+
+# `gh release create` and `upload` options that take the next word as their value
+RELEASE_VALUES = ("-n", "--notes", "-F", "--notes-file", "-t", "--title", "--target", "--discussion-category",
+                  "--notes-start-tag", "-R", "--repo")
+
+
+def _gh_assets(args: list[str]) -> list[str]:
+    """The asset files `gh release upload|create <tag> <file>[#label]...` sends."""
+    if args[:2] not in (["release", "upload"], ["release", "create"]):
+        return []
+    from .prguard import _positionals
+    return [a.split("#", 1)[0] for a in _positionals(args[2:], RELEASE_VALUES)[1:]]
+
+
+ASSET_CHUNK = 8 << 20   # an asset is scanned in chunks this size, each overlapping the last by ASSET_OVERLAP
+ASSET_OVERLAP = 4096
+
+
+def _asset_leak(path: str, hit: Callable[[str], str | None]) -> str | None:
+    """The class of the first leak in the file at `path`, read to its end; None when clean or unreadable
+    (gh fails on it too, sending nothing)."""
+    try:
+        with open(path, "rb") as f:
+            tail = b""
+            while chunk := f.read(ASSET_CHUNK):
+                if cls := hit((tail + chunk).decode("utf-8", "replace")):
+                    return cls
+                tail = chunk[-ASSET_OVERLAP:]
+    except OSError:
+        return None
+    return None
 
 
 def gh_resolve(args: list[str], real: str | None) -> tuple[list[str], str]:
@@ -277,13 +345,21 @@ def gh_problem(args: list[str], stdin_text: str | None, real: str | None = None)
     resolved, shell = gh_resolve(args, real)
     texts = [" ".join(args), " ".join(resolved), shell, stdin_text or ""]
     texts += [_read(f) for f in ([] if shell else _gh_files(resolved)) if f not in STDIN_PATHS]
-    hit = matcher()
+    try:
+        hit = matcher(_project())   # its forbidden-data patterns too, for the assets
+    except ValueError as e:
+        return f"refused: gh refused: {e}; nothing was sent"
     words = []   # the command words only: an alias's or extension's second word may be the payload
     for w in args[:2]:
         if not re.fullmatch(r"[a-z][a-z-]{0,30}", w) or hit(w):
             break
         words.append(w)
-    why = problem(" ".join(["gh", *words]), *texts)
+    what = " ".join(["gh", *words])
+    why = problem(what, *texts)
+    for f in ([] if why or shell else _gh_assets(resolved)):
+        if cls := _asset_leak(f, hit):
+            why = refusal(what, cls, f"the file {os.path.basename(f)}")
+            break
     return why and f"refused: {why}"
 
 
@@ -293,8 +369,13 @@ def gh_problem(args: list[str], stdin_text: str | None, real: str | None = None)
 LS_REMOTE_S = 120   # listing the refs of the remote a push goes to
 
 
+# What a push sends, never a replace ref's stand-in (pack-objects ignores replace refs; git log would not)
+_GIT_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
+
+
 def _git(*args: str, **kw) -> subprocess.CompletedProcess:
-    return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace", timeout=60, **kw)
+    return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace", timeout=60,
+                          env={**os.environ, **_GIT_ENV}, **kw)
 
 
 def _remote_has(url: str) -> dict[str, str]:
@@ -302,7 +383,7 @@ def _remote_has(url: str) -> dict[str, str]:
     repository has: what a push never sends again. Read from the remote itself, not from
     remote-tracking refs a run can set to anything. Raises ValueError when it cannot be listed."""
     r = subprocess.run(["git", "ls-remote", url], capture_output=True, text=True, errors="replace",
-                       timeout=LS_REMOTE_S, stdin=subprocess.DEVNULL)
+                       timeout=LS_REMOTE_S, stdin=subprocess.DEVNULL, env={**os.environ, **_GIT_ENV})
     if r.returncode:
         raise ValueError(f"could not list what the remote has (git ls-remote exited {r.returncode})")
     shas = {w[0] for line in r.stdout.splitlines() if (w := line.split())}
@@ -315,8 +396,9 @@ def _remote_has(url: str) -> dict[str, str]:
 def push_problem(lines: list[str], url: str, p=None) -> str | None:
     """Why the push whose pre-push input is `lines` (`<local ref> <sha> <remote ref> <sha>`), going to
     `url`, must not run: a commit message, an added line or a file path of a commit it sends, or the
-    message of an annotated tag it sends, holds a leak. Run in the repository. Raises ValueError when
-    what it sends cannot be read."""
+    message of an annotated tag it sends, holds a leak, or a ref it updates would send a blob or a tree
+    (which this scan does not read). Run in the repository. Raises ValueError when what it sends cannot
+    be read."""
     hit = matcher(p)
     has = _remote_has(url)
     tips = []
@@ -332,8 +414,13 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
             if cls := hit(body):
                 return refusal("git push", cls, f"the tag {parts[2].removeprefix('refs/tags/')} (its message)")
             obj = body.split()[1]   # "object <sha>"
-        if _git("rev-parse", "--verify", "-q", f"{obj}^{{commit}}").returncode == 0:
-            tips.append(obj)
+        if obj in has:
+            continue
+        kind = _git("cat-file", "-t", obj).stdout.strip()
+        if kind != "commit":
+            return (f"git push refused: {parts[2]} would send a {kind or 'unreadable'} object, which the leak "
+                    "scan does not read; push commits and tags only; nothing was sent")
+        tips.append(obj)
     if not tips:
         return None
     with tempfile.TemporaryFile("w+") as revs:
@@ -342,10 +429,12 @@ def push_problem(lines: list[str], url: str, p=None) -> str | None:
         revs.flush()
         revs.seek(0)
         # %B stops at a NUL, so no message can forge the \0 lines; --cc shows what a merge adds itself
-        proc = subprocess.Popen(["git", "log", "--stdin", "-p", "--cc", "--text", "--no-renames", "--no-color",
-                                 "--no-ext-diff", "--no-textconv", "--format=%x00commit %h%n%B%n%x00end"],
+        # --root: a root commit's lines too, whatever log.showRoot says
+        proc = subprocess.Popen(["git", "log", "--stdin", "-p", "--root", "--cc", "--text", "--no-renames",
+                                 "--no-color", "--no-ext-diff", "--no-textconv",
+                                 "--format=%x00commit %h%n%B%n%x00end"],
                                 stdin=revs, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
-                                text=True, errors="replace")
+                                text=True, errors="replace", env={**os.environ, **_GIT_ENV})
         commit, path, state, cls = "", "", "", None
         try:
             for out in proc.stdout:
@@ -391,5 +480,6 @@ def pre_push(argv: list[str]) -> int:
         why = f"git push refused: {e}; nothing was sent"
     if why:
         print(f"tt-project: {why}", file=sys.stderr)
+        record("git push", why)
         return 1
     return 0

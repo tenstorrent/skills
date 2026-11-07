@@ -16,6 +16,11 @@ own: a push that would send a stored secret, a credential shape or a forbidden-d
 commit message, an added line or a tag message, is refused (outscan.py). A fault setting the scan up
 refuses the push; a fault reading the push branch guard's project skips only that guard.
 
+The wrapper also hands over a call whose subcommand is no common builtin (bin/git lists them): an
+alias is expanded the way git does (resolve), so `git -c alias.p=push p` is guarded as `git push`.
+In a run, `git send-pack` and `git http-push` (which run no pre-push hook) and a shell alias naming
+either or push (its git is git's own, past the wrapper) are refused (bypass_refusal).
+
 With delivery.never_force on, a run's push that forces in any form (--force, -f, --force-with-lease,
 --force-if-includes, a `+refspec`) is refused before git runs (forced, never_force_refusal), except a
 forward move of a delivery.channel_tags tag under a fresh lease (channeltag.py, `ttp push --move-tag`).
@@ -23,6 +28,8 @@ forward move of a delivery.channel_tags tag under a fresh lease (channeltag.py, 
 from __future__ import annotations
 
 import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -32,6 +39,9 @@ VALUE_OPTS = {"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--super-pr
 # `git push` options that take the next word as their value (or `--opt=value`)
 PUSH_VALUE_OPTS = {"--push-option", "--receive-pack", "--exec", "--repo"}
 FORCE_OPTS = ("--force", "--force-with-lease", "--force-if-includes")
+# git commands that send objects without `git push`'s pre-push hook: a run never runs them
+HOOKLESS_PUSH = ("send-pack", "http-push")
+ALIAS_DEPTH = 10
 HOOK = """#!/bin/sh
 # tt-project: a run's pre-push hook (ttp/gitguard.py). Refuses a push to the push branch from a code
 # task's run and a push that sends a leak (ttp/outscan.py), then runs the repository's own pre-push.
@@ -69,6 +79,52 @@ def split(args: list[str]) -> tuple[list[str], str, list[str]]:
         else:
             return args[:i], a, args[i + 1:]
     return args, "", []
+
+
+def _git_commands(real: str, globals_: list[str]) -> set[str]:
+    """Every command git runs before it looks for an alias: builtins, git-* in its exec path and on PATH."""
+    out = subprocess.run([real, *globals_, "--list-cmds=builtins,main,others"], capture_output=True, text=True,
+                         timeout=30, stdin=subprocess.DEVNULL)
+    return set(out.stdout.split()) if out.returncode == 0 else set()
+
+
+def resolve(real: str, args: list[str]) -> tuple[list[str], str]:
+    """`git <args>` with its alias expanded as git expands it (also chained, also one given with -c or
+    starting with global options), and the text of a shell alias (`!...`) it ends on, else ""."""
+    commands, seen = None, set()
+    for _ in range(ALIAS_DEPTH):
+        globals_, sub, rest = split(args)
+        if not sub or sub in seen or sub == "push" or sub in HOOKLESS_PUSH:   # builtins: no alias
+            break
+        if commands is None:
+            commands = _git_commands(real, globals_)
+        if sub in commands:
+            break
+        seen.add(sub)
+        out = subprocess.run([real, *globals_, "config", "--get", f"alias.{sub}"], capture_output=True,
+                             text=True, timeout=30, stdin=subprocess.DEVNULL)
+        if out.returncode != 0:
+            break
+        expansion = out.stdout.rstrip("\n")
+        if expansion.startswith("!"):
+            return args, expansion
+        try:
+            args = [*globals_, *shlex.split(expansion), *rest]
+        except ValueError:   # git refuses the alias too
+            break
+    return args, ""
+
+
+def bypass_refusal(args: list[str], shell: str) -> str:
+    """Why `git <args>` (resolved; `shell` the shell alias it ends on) must not run in a run, else ""."""
+    _, sub, rest = split(args)
+    if sub in HOOKLESS_PUSH:
+        return (f"git {sub} sends objects with no pre-push hook, so with neither the run's leak scan nor its "
+                "push guard: push with `git push`")
+    if shell and re.search(r"\b(?:push|send-pack|http-push)\b", " ".join([shell, *rest])):
+        return (f"git {sub} is a shell alias that pushes: its git is git's own, past the run's leak scan and "
+                "push guard; run the `git push` itself")
+    return ""
 
 
 def forced(rest: list[str]) -> str:
@@ -212,14 +268,27 @@ def command(real: str, args: list[str], env: dict) -> tuple[list[str], dict]:
 def main(argv: list[str]) -> int:
     """argv: the real git, then the arguments `git` was called with."""
     real, args = argv[0], argv[1:]
-    try:   # a coordinator run pushes nothing, however the command was built (coordtools.py)
-        from . import coordtools
-        if coordtools.coordinator_run() and split(args)[1] == "push":
+    try:
+        resolved, shell = resolve(real, args)
+    except Exception as e:   # the wrapper hands over only a run's calls: fails closed, as the leak scan does
+        print(f"tt-project: git {split(args)[1]} refused: its alias could not be resolved ({type(e).__name__})",
+              file=sys.stderr)
+        return 1
+    if split(resolved)[1] == "push" or bypass_refusal(resolved, shell):
+        try:   # a coordinator run pushes nothing, however the command was built (coordtools.py)
+            from . import coordtools
+            coord = coordtools.coordinator_run()
+        except Exception:
+            print("tt-project: the coordinator push check failed: no push", file=sys.stderr)
+            return 1
+        if coord:
             print(f"tt-project: {coordtools.PUSH_REFUSAL}", file=sys.stderr)
             return 1
-    except Exception:
-        print("tt-project: the coordinator push check failed: no push", file=sys.stderr)
+    if os.environ.get("TTP_TASK") and (why := bypass_refusal(resolved, shell)):
+        print(f"tt-project: {why}", file=sys.stderr)
         return 1
+    if split(resolved)[1] == "push":
+        args = resolved
     try:
         why = never_force_refusal(args, dict(os.environ), real)
     except Exception:   # a fault reading the project never stops git

@@ -656,7 +656,7 @@ def git_push_bypass(segments: list[list[str]]) -> str | None:
     is refused in a run: it would skip the push branch guard and the leak scan; else None."""
     from . import gitguard
     pushes = [s for s in segments if os.path.basename(s[0]) == "git" and "/" in s[0]
-              and gitguard.split(s[1:])[1] == "push"]
+              and gitguard.split(s[1:])[1] in ("push", *gitguard.HOOKLESS_PUSH)]
     if not pushes:
         return None
     try:

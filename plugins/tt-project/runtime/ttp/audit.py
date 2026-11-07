@@ -40,6 +40,8 @@ the project could have saved. Model-free; the review grades it.
   and the failures it caught before detaching (each a worker wake saved).
 - context gaps: what workers' hand-offs (`context_gaps`) said they needed and their spec and context
   block (ctxblock) lacked, counted per task.
+- the outward leak scan's refusals (outscan.record), counted by route: gh, git push, ttp note --to,
+  ttp notify.
 
 An empty day is one line, NOTHING. `ttp audit` prints the same lines, or `report` as JSON. It reads
 only the project's own database and harness files."""
@@ -49,7 +51,7 @@ import json
 import time
 from typing import Any
 
-from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, obligations, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
+from . import budget, chaincap, checkprestage, coordfix, coordmodel, correction, ends, gatejudge, obligations, outscan, plainreply, quietgate, relay, replan, reviewstats, route, rulecite, schedule, sharedchecks, stalegate, suitecost, sweepskip, timefmt, turngate, unblock, upstream
 from .db import DB, continues_id, load_result
 from .project import Project
 
@@ -609,6 +611,9 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     from . import lockreap
     if n := lockreap.released_count(db, since):
         out.append(f"stale locks released (holder dead): {n}")
+    if leaks := outscan.refusal_counts(db, since):
+        out.append(f"leak scan refusals: {sum(leaks.values())} ("
+                   + ", ".join(f"{route} {n}" for route, n in leaks.items()) + ")")
     races = mount_races(db, since)
     if races["hit"]:
         out.append(f"sandbox mount races: {races['hit']} of {races['runs']} Claude runs "
@@ -665,4 +670,5 @@ def report(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked
             "repeated_instructions": correction.repeat_summary(db, since), "mount_races": mount_races(db, since),
             "context_gaps": context_gaps(db, since), "coordinator_fixes": coordfix.entries(db, since, now),
             "approval_to_landed": pushq.landing_times(db, since),
+            "outscan_refusals": outscan.refusal_counts(db, since),
             **({"rule_cites": rulecite.metric(p, now, window_s)} if p is not None else {})}

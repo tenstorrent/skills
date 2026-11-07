@@ -2344,9 +2344,10 @@ def cmd_notify(a) -> None:
     text = a.text.strip()
     if not text:
         die("empty notify")
-    from .outscan import problem
+    from .outscan import problem, record
     why = problem("ttp notify", text, getattr(a, "check", None) or "", getattr(a, "do", None) or "")
     if why:
+        record("ttp notify", why)
         die(why, 2)
     step = {}
     if getattr(a, "step", None):
@@ -2422,9 +2423,10 @@ def _note_to(a, run_dir: str) -> None:
     me = Project(base) if base else None
     if not me or not me.exists():
         die("ttp note --to: this run has no project (TTP_PROJECT)")
-    from .outscan import problem
+    from .outscan import problem, record
     why = problem("ttp note --to", getattr(a, "sent_text", a.text), p=me)
     if why:
+        record("ttp note --to", why, me)
         die(why, 2)
     at = back = None
     routed = bool(getattr(a, "reply", None)) or "@" in a.to

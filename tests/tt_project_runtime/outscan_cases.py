@@ -356,3 +356,139 @@ def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusin
     monkeypatch.setattr(sys, "stdin", io.StringIO(f"refs/heads/clean {head} refs/heads/clean {'0' * 40}\n"))
     assert outscan.pre_push(["gone", str(tmp_path / "missing.git")]) == 1
     assert "could not list what the remote has" in capsys.readouterr().err
+
+
+def _wrapped_git(repo, tmp_path, *args):
+    """`git <args>` in `repo` in a run, through the harness's git wrapper (as _push_run's push does)."""
+    env = {**os.environ, "TTP_PYTHON": sys.executable, "TTP_RUN_DIR": str(tmp_path / "run")}
+    return subprocess.run([str(RUNTIME.parent / "template" / "bin" / "git"), *args], cwd=repo, env=env,
+                          capture_output=True, text=True, timeout=60)
+
+
+def test_runs_git_push_scans_a_root_commit_and_the_objects_a_replace_ref_hides(env, tmp_path, monkeypatch):
+    """log.showRoot=false (the repository's or the user's config) would leave a root commit's added lines
+    out of `git log -p`, and a replace ref would show the scan other content than the push sends."""
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    _git_out(repo, "config", "log.showRoot", "false")
+    _git_out(repo, "checkout", "-q", "--orphan", "fresh")
+    _git_out(repo, "rm", "-rqf", ".")
+    _commit(repo, "root.txt", f"token {_OUT_SHAPE}\n")
+    sha = _git_out(repo, "rev-parse", "--short", "HEAD")
+    out = push("origin", "fresh")
+    assert out.returncode != 0 and f"commit {sha} (root.txt)" in out.stderr, out.stderr
+    assert "GitHub token shape" in out.stderr and _OUT_SHAPE not in out.stderr
+    # A replace ref swaps the leaky commit for a clean one in what git log shows; the push sends the original.
+    _git_out(repo, "checkout", "-q", "-B", "hidden", "main")
+    _commit(repo, "h.txt", f"key {_OUT_SECRET}\n")
+    leaky = _git_out(repo, "rev-parse", "HEAD")
+    _git_out(repo, "checkout", "-q", "-B", "decoy", "main")
+    _commit(repo, "h.txt", "clean\n")
+    _git_out(repo, "replace", leaky, _git_out(repo, "rev-parse", "HEAD"))
+    out = push("origin", "hidden")
+    assert out.returncode != 0 and "(h.txt)" in out.stderr and "stored secret" in out.stderr, out.stderr
+    assert "refs/heads/fresh" not in _remote_refs(repo) and "refs/heads/hidden" not in _remote_refs(repo)
+
+
+def test_runs_git_push_refuses_a_ref_to_a_blob_or_a_tree(env, tmp_path, monkeypatch):
+    """A ref whose new object is a blob or a tree (also behind an annotated tag) is not read by the commit
+    scan: a run's push of one is refused, naming the ref and the object's type, never its content."""
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    (repo / "loose.txt").write_text(f"token {_OUT_SHAPE}\n")
+    blob = _git_out(repo, "hash-object", "-w", "loose.txt")
+    tree = _git_out(repo, "rev-parse", "HEAD^{tree}")
+    _git_out(repo, "tag", "-a", "blobtag", "-m", "a blob", blob)
+    for spec, ref, kind in ((f"{blob}:refs/tags/x", "refs/tags/x", "blob"), (f"{tree}:refs/tags/y", "refs/tags/y", "tree"),
+                            ("blobtag", "refs/tags/blobtag", "blob")):
+        out = push("origin", spec)
+        assert out.returncode != 0 and "git push refused" in out.stderr, (spec, out.stderr)
+        assert f"{ref} would send a {kind}" in out.stderr and "nothing was sent" in out.stderr, (spec, out.stderr)
+        assert _OUT_SHAPE not in out.stderr
+    assert "refs/tags/" not in _remote_refs(repo)
+
+
+def test_runs_git_aliases_and_send_pack_go_through_the_push_guard(env, tmp_path, monkeypatch):
+    """A git alias for push (given with -c, in the config, chained, or with its own global options) is
+    resolved the way git does and scanned like `git push`; a shell alias that pushes and `git send-pack`
+    (which runs no pre-push hook) are refused in a run. An alias never shadows a builtin, so neither here."""
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-B", "work", "main")
+    _commit(repo, "a.txt", f"token {_OUT_SHAPE}\n")
+    sha = _git_out(repo, "rev-parse", "--short", "HEAD")
+    _git_out(repo, "config", "alias.pp", "push")
+    _git_out(repo, "config", "alias.first", "second")
+    _git_out(repo, "config", "alias.second", "push -q")
+    _git_out(repo, "config", "alias.opt", "-c color.ui=never push")
+    _git_out(repo, "config", "alias.shp", "!git push")
+    url = str(tmp_path / "leak-origin.git")
+    for args in (["-c", "alias.p=push", "p", "origin", "work"], ["pp", "origin", "work"], ["first", "origin", "work"],
+                 ["-C", str(repo), "opt", "origin", "work"], ["-c", "alias.P=pp", "P", "origin", "work"]):
+        out = _wrapped_git(repo, tmp_path, *args)
+        assert out.returncode != 0 and f"commit {sha} (a.txt)" in out.stderr, (args, out.stderr)
+    _git_out(repo, "config", "alias.run", "!git")
+    for args, why in ((["shp", "origin", "work"], "shell alias"), (["send-pack", url, "work"], "send-pack"),
+                      (["run", "push", "origin", "work"], "shell alias"),
+                      (["-c", "alias.sp=send-pack", "sp", url, "work"], "send-pack")):
+        out = _wrapped_git(repo, tmp_path, *args)
+        assert out.returncode != 0 and why in out.stderr and "tt-project" in out.stderr, (args, out.stderr)
+    assert "refs/heads/work" not in _remote_refs(repo)
+    # Clean through an alias goes; aliases to other commands and a builtin's name run as git runs them.
+    _git_out(repo, "checkout", "-q", "-B", "tidy", "main")
+    _commit(repo, "b.txt", "clean\n")
+    assert _wrapped_git(repo, tmp_path, "pp", "-q", "origin", "tidy").returncode == 0
+    assert "refs/heads/tidy" in _remote_refs(repo)
+    out = _wrapped_git(repo, tmp_path, "-c", "alias.st=status --short", "st")
+    assert out.returncode == 0 and "On branch" not in out.stdout, out.stderr
+    out = _wrapped_git(repo, tmp_path, "-c", "alias.status=push origin work", "status")
+    assert out.returncode == 0 and "On branch tidy" in out.stdout and "refs/heads/work" not in _remote_refs(repo)
+    # Outside a run every call goes straight to git, aliases included.
+    monkeypatch.delenv("TTP_TASK")
+    out = _wrapped_git(repo, tmp_path, "-c", "alias.sp=send-pack", "sp", "--help")
+    assert "tt-project" not in out.stderr
+    from ttp import hook
+    monkeypatch.setenv("TTP_TASK", "57")
+    assert "skips" in hook.git_push_bypass([["/usr/bin/git", "send-pack", url, "work"]])
+
+
+def test_runs_gh_release_assets_are_scanned_to_their_end(env, tmp_path, monkeypatch):
+    """The files `gh release upload` and `gh release create` send (an optional #label after each) are
+    scanned with the same classes, to their end however large; the refusal names the file, not the value."""
+    from ttp import outscan
+    p = _outscan_project(env, monkeypatch)
+    small, big = tmp_path / "notes.txt", tmp_path / "asset.bin"
+    with open(big, "wb") as f:   # the leak sits past MAX_FILE_BYTES
+        f.write(b"\0" * (outscan.MAX_FILE_BYTES + 100) + f"key {_OUT_SECRET}".encode())
+    for leak in (_OUT_SHAPE, "serial " + _OUT_FORBIDDEN):
+        small.write_text(f"x {leak}\n")
+        for args in (["release", "upload", "v1", str(small)], ["release", "upload", "v1", f"{small}#Notes"],
+                     ["release", "create", "v1", "--notes", "n [authored by AI]", "-t", "t", str(small)]):
+            (tmp_path / "gh.log").write_text("")
+            r = _gh_main(p, tmp_path, args)
+            err = r.stderr.decode()
+            assert r.returncode == 1 and "notes.txt" in err and "nothing was sent" in err, (args, err)
+            assert leak not in err and (tmp_path / "gh.log").read_text() == "", args
+    r = _gh_main(p, tmp_path, ["release", "upload", "v1", "--clobber", str(big)])
+    assert r.returncode == 1 and "stored secret" in r.stderr.decode() and "asset.bin" in r.stderr.decode()
+    small.write_text("all green\n")
+    r = _gh_main(p, tmp_path, ["release", "upload", "v1", str(small)])
+    assert "holds" not in r.stderr.decode(), r.stderr
+
+
+def test_audit_counts_the_leak_scan_refusals_by_route(env, tmp_path, monkeypatch, capsys):
+    """Each refusal (gh, ttp note --to, ttp notify, git push) is recorded without its value, and
+    `ttp audit` counts them by route."""
+    from ttp import audit, cli
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-B", "work", "main")
+    _commit(repo, "a.txt", f"token {_OUT_SHAPE}\n")
+    assert push("origin", "work").returncode != 0
+    assert _gh_main(p, tmp_path, ["pr", "comment", "7", "-b", _OUT_SHAPE]).returncode == 1
+    _note_run(env, monkeypatch, p)
+    assert _note(cli, "--to", "second", f"fyi {_OUT_SECRET}") == 2
+    with pytest.raises(SystemExit):
+        cli.main(["notify", f"fyi {_OUT_SECRET}"])
+    capsys.readouterr()
+    rows = p.db.q("SELECT text, data FROM events WHERE kind='outscan_refused'")
+    assert len(rows) == 4 and not any(v in r["text"] + r["data"] for r in rows for v in (_OUT_SHAPE, _OUT_SECRET))
+    line = next(x for x in audit.lines(p.db, p=p) if x.startswith("leak scan refusals"))
+    assert line == "leak scan refusals: 4 (gh 1, git push 1, ttp note --to 1, ttp notify 1)", line
+    assert audit.report(p.db, p=p)["outscan_refusals"] == {"gh": 1, "git push": 1, "ttp note --to": 1, "ttp notify": 1}
