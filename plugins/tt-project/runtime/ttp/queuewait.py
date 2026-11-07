@@ -5,10 +5,12 @@
 Model-free, each minute (Daemon.check_queue_waits): collect() finds every task of the project waiting on a
 queue, cap or admission: a host-wide checks slot (checkcap.state, queued or parked) or its own detached checks
 it polls while queued (`ttp checks --result`, or a reason saying so), the push queue (`ttp push`), worker capacity (the next ready
-task, never started while every worker slot is taken), a device or other `ttp lock` resource, an outside batch pool
-(`ttp pool-wait`, Slurm) or CPU admission (a reason naming admission and CPU or load). Each task and queue
+task dispatch holds only because its provider's live worker runs fill every slot it may take; a review held by
+its daemon pre-checks waiting for a host slot is a checks wait), a device or other `ttp lock` resource, an outside
+batch pool (`ttp pool-wait`, Slurm) or CPU admission (a reason naming admission and CPU or load). Each task and queue
 waiting past the threshold raises one must-act event (KIND, mustact.py): the queue, its cap and occupancy,
-who holds and waits for each place, the wait so far, and options() computed from config and host state,
+who holds and waits for each place (rewritten each scan while the item is unread, so it names the holders of
+the moment it is read), the wait so far, and options() computed from config and host state,
 leaving out every route a user pause, a cap the user set or missing config forbids. Restrictions still bind.
 A wait whose cause an open task already owns (an active throughput-class mute's owner, or the fix task an earlier
 item on the same queue was acted on with) folds into it: one act per queue cause, not per waiting task.
@@ -75,8 +77,15 @@ def _task_of(label: str, project: str) -> int | None:
     return int(m[1]) if m else None
 
 
-def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | None = None) -> list[dict]:
-    """The project's queue waits now: {task, queue, res, since, cap, running, queued}, one per task and queue."""
+def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | None = None,
+            hold=None) -> list[dict]:
+    """The project's queue waits now: {task, queue, res, since, cap, running, queued}, one per task and queue.
+    `hold(task)` is dispatch's own reason a ready task does not start (Daemon._queue_hold): None (it starts),
+    {"queue": "workers", "cap", "provider", "why"} (its provider's live worker runs fill every slot it may
+    take), {"queue": "checks", "since"} (a review's daemon pre-checks wait for a host checks slot) or any
+    other hold (a pause, a lock, the spend gate: their own alarms name those). Only the first ready task
+    held by full slots raises a workers wait; a task parked on its own checks or a detached wait runs no
+    worker and never counts as a slot holder."""
     from .db import TERMINAL_TASK_STATES, load_result
     db, name, out = p.db, p.name, {}
     host = host or {}
@@ -106,17 +115,31 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
         if got and not (got[0] == "checks" and t["id"] in busy):
             add(t["id"], got[0], got[1], prev["waiting_since"],
                 checks if got[0] == "checks" else _holders(db, p, got[0], got[1], cfg))
-    cap = int((cfg.get("budget") or {}).get("max_parallel_workers", 6) or 0)
-    run = db.q("SELECT r.task, t.priority FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role!='coordinator' "
-               "AND r.status='running'")
-    if cap and len(run) >= cap:
-        info = {"cap": cap, "running": [f"{name} task #{r['task']} (priority {r['priority']})" for r in run],
-                "queued": []}
-        for t in db.ready_tasks()[:1]:   # the head of the line: more capacity unblocks every one behind it
+    for t in db.ready_tasks():
+        got = hold(t) if hold else _config_hold(db, cfg)
+        if got is None:
+            break   # dispatch starts it: no ready task behind it waits on a slot
+        if got.get("queue") == "checks":   # a review held by its daemon pre-checks waiting for a host slot
+            add(t["id"], "checks", "", got.get("since"), checks)
+        elif got.get("queue") == "workers":   # the head of the line: more capacity unblocks every one behind it
+            prov = got.get("provider")
+            run = db.q("SELECT r.task, t.priority FROM runs r JOIN tasks t ON t.id=r.task WHERE r.role!='coordinator' "
+                       "AND r.status='running'" + (" AND r.provider=?" if prov else ""), (prov,) if prov else ())
             last = db.one("SELECT MAX(ended) e FROM runs WHERE task=?", (t["id"],))
             add(t["id"], "workers", "", max(float(t["created"] or now), float((last or {}).get("e") or 0),
-                                            float(t["not_before"] or 0)), info)
+                                            float(t["not_before"] or 0)),
+                {"cap": got.get("cap"), "cap_why": got.get("why") or "", "queued": [],
+                 "running": [f"{name} task #{r['task']} (priority {r['priority']})" for r in run]})
+            break
     return list(out.values())
+
+
+def _config_hold(db, cfg: dict) -> dict | None:
+    """Without the daemon's dispatch check (Daemon._queue_hold): dispatch's own rule with no budget gate, every
+    live worker run against budget.max_parallel_workers. None: a slot is free."""
+    cap = int((cfg.get("budget") or {}).get("max_parallel_workers", 6) or 0)
+    n = db.one("SELECT COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running'")["n"]
+    return {"queue": "workers", "cap": cap} if cap and n >= cap else None
 
 
 def _holders(db, p, queue: str, res: str, cfg: dict) -> dict:
@@ -186,7 +209,9 @@ def options(db, w: dict, cfg: dict, paused: dict, device: set | None = None, cor
     if q == "workers":
         cap = int(w.get("cap") or 0)
         top = max(1, cores // 4) if cores else 0
-        if not user_set("budget.max_parallel_workers") and cap and cap < top:
+        conf = int((cfg.get("budget") or {}).get("max_parallel_workers", 6) or 0)
+        # slots a budget gate or the urgent reserve cut below the setting (cap_why) rise with no config raise
+        if not user_set("budget.max_parallel_workers") and cap and cap == conf and cap < top and not w.get("cap_why"):
             out.append(f"raise budget.max_parallel_workers from {cap} to {cap + 1} (host limit {top}): config_set")
         out.append("cut the stale queued tail: cancel queued tasks a newer order superseded")
     if q in ("device", "lock"):
@@ -210,21 +235,22 @@ def text(w: dict, opts: list[str], now: float, note: str = "") -> str:
     some = lambda xs: "; ".join(xs[:4]) + ("; ..." if len(xs) > 4 else "") or "none seen"   # noqa: E731
     head = (f"{key(w)}: #{w['task']} has waited {(now - w['since']) / 60:.0f} min on the "
             f"{NAMES.get(w['queue'], w['queue'])}{' ' + w['res'] if w.get('res') else ''}: {len(run)} running"
-            f" (cap {cap if cap else 'unknown'}), {len(que)} queued. Holding: {some(run)}. Waiting: {some(que)}."
-            + (f" {note}" if note else ""))
+            f" (cap {cap if cap else 'unknown'}{', ' + w['cap_why'] if w.get('cap_why') else ''}), {len(que)} queued."
+            f" Holding: {some(run)}. Waiting: {some(que)}." + (f" {note}" if note else ""))
     if not opts:
         return head + " No option is open to the project (a user pause or a cap the user set holds it): the user is told."
     return head + " Options: " + " | ".join(f"({i}) {o}" for i, o in enumerate(opts, 1))
 
 
 def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, device: set | None = None,
-         cores: int = 0) -> list[str]:
-    """Raise, re-raise and clear queue-wait items; returns the fingerprints raised."""
+         cores: int = 0, hold=None) -> list[str]:
+    """Raise, re-raise and clear queue-wait items; returns the fingerprints raised. `hold`: collect's."""
     now = time.time() if now is None else now
     db, thr = p.db, threshold_s(cfg)
     if thr <= 0:
         return []
-    waits = sorted((w for w in collect(p, cfg, now, host, device) if now - w["since"] >= thr), key=lambda w: w["since"])
+    waits = sorted((w for w in collect(p, cfg, now, host, device, hold) if now - w["since"] >= thr),
+                   key=lambda w: w["since"])
     paused = db.paused_resources()
     raised, live, spill = [], set(), None
     st = db.kv(KV) or {}
@@ -237,13 +263,16 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         if rec.get("acted"):
             continue
         k, mark = key(w), int((now - w["since"]) // thr)
-        if db.one("SELECT id FROM events WHERE kind=? AND status='queued' AND data LIKE ?", (KIND, f'%"key": "{k}"%')):
-            continue
         if spill is None and w["queue"] in ("checks", "cpu", "pool"):
             spill = spill_ready(p, cfg)   # once a scan, only when a wait could spill
         sp = spill if w["queue"] in ("checks", "cpu", "pool") else None
         opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores, sp)
         msg = text(w, opts, now, spill_note(sp))
+        if ev := db.one("SELECT id, text FROM events WHERE kind=? AND status='queued' AND data LIKE ?",
+                        (KIND, f'%"key": "{k}"%')):
+            if ev["text"] != msg[:4000]:   # still unread: the holders, occupancy and options of this scan, not
+                db.x("UPDATE events SET text=? WHERE id=?", (msg[:4000], ev["id"]))   # the raise's
+            continue
         if _cause_owner(db, st, w, now) is not None:
             continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep}}

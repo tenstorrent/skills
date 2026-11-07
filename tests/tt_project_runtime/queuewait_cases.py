@@ -42,7 +42,7 @@ def test_queue_wait_fires_on_a_full_checks_queue_with_options_then_clears(env):
     ev = _qw_events(p)[0]
     assert ev["kind"] in mustact.KINDS and ev["severity"] == "high" and ev["task"] == 7
     t = ev["text"]
-    assert "qwait-7-checks" in t and "40 min" in t and "4 running (cap 4), 20 queued" in t, t
+    assert "qwait-7-checks" in t and "41 min" in t and "4 running (cap 4), 20 queued" in t, t   # as of the rescan
     assert "other task #90" in t and "raise the host-wide checks cap from 4 to 6 (host limit 8)" in t, t
     assert "spill" not in t   # no check host is listed: no spill route
     assert "qwait-7-checks" in mustact.block(p.db, [ev["id"]])
@@ -332,3 +332,85 @@ def test_queue_wait_offers_a_spill_host_only_when_it_can_take_checks_now(env):
     w = {"task": 7, "queue": "checks", "since": now - 2400}
     assert not any("spill to" in o for o in queuewait.options(p.db, w, cfg, {})), "never offered unchecked"
     assert any("spill to" in o for o in queuewait.options(p.db, w, cfg, {}, spill=queuewait.spill_ready(p, cfg)))
+
+
+def test_queue_wait_workers_counts_dispatch_live_slots_and_names_the_precheck_gate(env, monkeypatch):
+    """#6939's false item: tasks still 'running' while parked on their own checks and another provider's live
+    runs outnumber the cap, yet dispatch has a free slot on the waiting task's provider: no workers item. A
+    review held by its daemon pre-checks waiting for a host slot raises a checks item, never a workers one.
+    Only once the provider's own live runs fill its slots does the head of the line raise a workers item,
+    naming those runs alone and no 'raise max_parallel_workers' when the cap is a budget gate's cut."""
+    from ttp import daemon as dm, queuewait
+    from ttp.cli import CHECKS_SLOT_WAIT
+    p = make(env)
+    p.set_config("budget.max_parallel_workers", 2)
+    d = dm.Daemon(p.base)
+    d.cfg = p.config()
+    core, now = d.cfg.get("core_provider", "claude"), time.time()
+    other = "codex" if core != "codex" else "claude"
+    for i in range(4):   # parked on their own checks: status running, no live worker run
+        p.db.update_task(p.db.add_task(f"parked {i}", "s", kind="code"), status="running")
+    for i in range(3):   # another provider's live runs: its own slots
+        t = p.db.add_task(f"other {i}", "s", kind="code", provider=other)
+        p.db.update_task(t, status="running")
+        p.db.x("INSERT INTO runs(task,role,started,status,provider) VALUES(?,?,?,'running',?)",
+               (t, "worker", now - 3600, other))
+    live = p.db.add_task("live", "s", kind="code")
+    p.db.update_task(live, status="running")
+    p.db.x("INSERT INTO runs(task,role,started,status,provider) VALUES(?,?,?,'running',?)",
+           (live, "worker", now - 3600, core))
+    code = p.db.add_task("c", "s", kind="code")
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (code,))
+    out = p.state / dm.PRECHECKS_DIR / f"t{code}-ab12cd34ef56"
+    out.mkdir(parents=True)
+    (out / CHECKS_SLOT_WAIT).write_text(json.dumps({"since": now - 50 * 60, "pid": 1}))
+    rev = p.db.add_task("review", "r", kind="review", priority=1, labels=[dm.PRECHECK_LABEL + out.name])
+    ready = p.db.add_task("ready", "s", kind="code")
+    p.db.x("UPDATE tasks SET created=? WHERE id IN (?,?)", (now - 50 * 60, rev, ready))
+    monkeypatch.setattr(d, "_precheck_holds", lambda t, now: t["id"] == rev)
+    cfg = {**QW_CFG, "budget": {"max_parallel_workers": 2}}
+    got = {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, {}, hold=d._queue_hold(now))}
+    assert got == {(rev, "checks")}, got   # 1 live run of 2 on its provider: dispatch starts `ready`
+    assert {(w["task"], w["queue"]) for w in queuewait.collect(p, cfg, now, {})} == {(rev, "workers")}, \
+        "the plain count (4 runs on two providers against 2) is the false item the hold removes"
+    full = p.db.add_task("full", "s", kind="code")
+    p.db.update_task(full, status="running")
+    p.db.x("INSERT INTO runs(task,role,started,status,provider) VALUES(?,?,?,'running',?)",
+           (full, "worker", now - 60, core))
+    w = {x["queue"]: x for x in queuewait.collect(p, cfg, now, {}, hold=d._queue_hold(now))}
+    assert set(w) == {"checks", "workers"} and w["workers"]["task"] == ready and w["workers"]["cap"] == 2, w
+    assert sorted(w["workers"]["running"]) == sorted(f"{p.name} task #{t} (priority 3)" for t in (live, full)), w
+    assert queuewait.options(p.db, {**w["workers"], "cap_why": "4 configured; the budget gate allows 2"},
+                             {"budget": {"max_parallel_workers": 4}}, {}, cores=64)[0].startswith("cut the stale")
+    opts = queuewait.options(p.db, w["workers"], cfg, {}, cores=64)
+    assert "raise budget.max_parallel_workers from 2 to 3" in opts[0], opts
+    import dataclasses
+    from ttp import budget as bud
+    gate = bud.evaluate(p.db, d.cfg, core, bud.plan_windows(p.db))
+    monkeypatch.setitem(d.gates, core, dataclasses.replace(gate, allow_new_work=False))
+    got = {(x["task"], x["queue"]) for x in queuewait.collect(p, cfg, now, {}, hold=d._queue_hold(now))}
+    assert got == {(rev, "checks")}, f"the spend gate holds it, not the slots: {got}"
+    monkeypatch.setitem(d.gates, core, gate)
+    from ttp import checkcap
+    monkeypatch.setattr(checkcap, "state", lambda: {"limit": 4, "running": [], "queued": [], "parked": []})
+    d.cfg.setdefault("coordinator", {})["queue_wait_escalate_min"] = 30
+    d.check_queue_waits(every_s=0)   # the daemon's own scan passes its dispatch hold
+    assert {(e["task"], json.loads(e["data"])["must_act"]["key"]) for e in _qw_events(p)} == \
+        {(rev, f"qwait-{rev}-checks"), (ready, f"qwait-{ready}-workers")}
+
+
+def test_queue_wait_item_shows_the_holders_when_read_not_when_raised(env):
+    """#6957: an item raised before a slot changes hands is rewritten while unread, so a later read names the
+    new holder and occupancy, not the one that let go; an acted item's wait ending still settles it."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    host = _qw_host(p, now, now - 40 * 60)
+    assert len(queuewait.scan(p, QW_CFG, now, host, cores=64)) == 1
+    assert "other task #90" in _qw_events(p, "queued")[0]["text"]
+    later = {**host, "running": ["other task #500 (run 9)"]}
+    assert queuewait.scan(p, QW_CFG, now + 120, later, cores=64) == []   # no new item: the open one is rewritten
+    evs = _qw_events(p)
+    assert len(evs) == 1 and evs[0]["status"] == "queued", evs
+    t = evs[0]["text"]
+    assert "other task #500" in t and "other task #90" not in t and "1 running (cap 4)" in t and "42 min" in t, t

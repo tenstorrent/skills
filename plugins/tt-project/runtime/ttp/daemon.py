@@ -8649,8 +8649,47 @@ class Daemon:
         except (OSError, checkcap.Unavailable) as e:   # no host checks view: the task-level waits still count
             log(self.p, f"queue waits: no host checks state ({type(e).__name__}: {e})")
             host = {}
-        for fp in queuewait.scan(self.p, self.cfg, now, host, locks.device_locks(self.cfg), os.cpu_count() or 0):
+        for fp in queuewait.scan(self.p, self.cfg, now, host, locks.device_locks(self.cfg), os.cpu_count() or 0,
+                                 self._queue_hold(now)):
             log(self.p, f"queue wait raised: {fp}")
+
+    def _queue_hold(self, now: float):
+        """queuewait.collect's `hold`: dispatch's own reason (_start_hold) a ready task does not start now, so
+        a workers wait counts only the live worker runs of the provider dispatch checked, against the slots
+        it may take there, and a review held by its pre-checks waits on the host checks queue."""
+        db, core = self.p.db, self.cfg.get("core_provider", "claude")
+        busy = {r["provider"]: r["n"] for r in db.q(
+            "SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' GROUP BY provider")}
+        ctx = {"now": now, "paused": db.paused_resources(), "busy": busy, "committed": None, "logged_out": {}}
+
+        def hold(t: dict) -> dict | None:
+            prov = t["provider"] or core
+            if prov not in ctx["logged_out"]:
+                ctx["logged_out"][prov] = self._logged_out(prov)
+            try:
+                why = self._start_hold(t, prov, ctx)
+            except Exception:   # an unreadable hold raises no workers item; the scan's other waits still count
+                log(self.p, f"queue waits: no dispatch hold for #{t['id']}: " + traceback.format_exc()[-800:])
+                return {"queue": "unknown"}
+            if why is None:
+                return None
+            if why == "gate" and t["id"] in ctx["full"]:
+                return {"queue": "workers", "cap": ctx["full"][t["id"]], "why": ctx["full_why"].get(t["id"], ""),
+                        "provider": ctx.get("slot", {}).get(t["id"], prov)}
+            if why == "held" and self._precheck_holds(t, now):
+                return {"queue": "checks", "since": self._precheck_wait_since(t)}
+            return {"queue": why}
+        return hold
+
+    def _precheck_wait_since(self, task: dict) -> float | None:
+        """When the checks _precheck_holds waits for began waiting for a host checks slot; None while they run."""
+        from .cli import CHECKS_SLOT_WAIT
+        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
+        try:
+            since = json.loads((self.p.state / PRECHECKS_DIR / name / CHECKS_SLOT_WAIT).read_text()).get("since")
+        except (OSError, ValueError, AttributeError):
+            return None
+        return float(since) if isinstance(since, (int, float)) and name else None
 
     def check_cap_wait(self, every_s: float = 60) -> None:
         """Model-free cap wait (loadcaps): a ready device task held only by device.max_tasks for
