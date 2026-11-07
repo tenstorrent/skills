@@ -2239,13 +2239,15 @@ session and stateless coordinators on every provider.
   its approval at each of the other's landings; a failed check fails the
   review and wakes the coordinator. The batch finds the first change that fails by checking
   prefixes, pushes the ones before it, and checks the ones after it once more without it, pushing
-  them too when they pass. A failed pytest check first reruns only its failing tests once at the
-  same head (at most 10, each once per batch, within `push_rerun_s`, default 600): when they pass
-  the failure was flaky, the batch goes on and the coordinator is told once per test so a
-  deterministic fix gets queued; a test that fails twice never passes. A check that did not exit 1,
-  or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. When the first change is
-  blamed, its failing tests are rerun once on the tip alone: failing there too, the tip is reported
-  broken instead of the change. Keys, all under `delivery`: `push_batch_s` (default 300: with
+  them too when they pass. A failed pytest check is judged as `ttp checks` judges one: its failing
+  tests (at most 10) not yet judged at that head rerun once there, within `push_rerun_s` (default
+  600), and those failing again rerun on the tip alone, on the same host, up to 3 times. A test that
+  passes on its rerun is flaky (quarantined), one that fails on the tip too is pre-existing, and a
+  quarantined test the batch does not touch is excused at once: when none is new the check passes,
+  the batch goes on and the coordinator is told once per test so a fix gets queued. A check that did
+  not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. The
+  search runs only the new failing tests at each prefix and the full suite once, at the prefix they
+  pass on. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
   oldest approval waited this long; 0 = at once), `push_batch_max`
   (default 8: start at once with this many; also the most one batch takes, except that after a

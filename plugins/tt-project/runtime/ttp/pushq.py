@@ -364,10 +364,12 @@ def _flaky_told(db, st: dict, b, m: dict, now: float) -> None:
     if new:
         told.update({i: now for i in new})
         tips = sorted({_short(str(f.get("tip") or "")) for f in pre if set(map(str, f.get("ids") or [])) & set(new)})
-        entries = sorted({str(f.get("entry")) for f in pre if set(map(str, f.get("ids") or [])) & set(new)})
+        entries = sorted({str(f.get("entry")) for f in pre if set(map(str, f.get("ids") or [])) & set(new)
+                          and f.get("entry") is not None})
+        with_ = f"entr{'y' if len(entries) == 1 else 'ies'} {', '.join(entries)}" if entries else "the batch"
         _event(db, None, FLAKY_EVENT,
                f"test{'s' if len(new) > 1 else ''} failing on the push branch itself in push batch {b['id']}: "
-               f"{', '.join(new)} failed with entr{'y' if len(entries) == 1 else 'ies'} {', '.join(entries)} and "
+               f"{', '.join(new)} failed with {with_} and "
                f"again on a rerun on the tip ({', '.join(tips)}) alone: pre-existing (flaky or already failing), "
                f"so no entry was sent back for {'them' if len(new) > 1 else 'it'}. Queue a fix that makes "
                f"{'them' if len(new) > 1 else 'it'} pass reliably.", queued=True)

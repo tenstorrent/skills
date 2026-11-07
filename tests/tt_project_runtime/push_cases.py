@@ -14747,7 +14747,7 @@ _FLAKY_CHECK = "python3 -m pytest -q tests"
 def _rerun_stub(monkeypatch, tip, plan, fail_out=None):
     """batch._stream stubbed as the check runner, no real test run: `plan(where, selected)` gives the exit
     code at the tip ("tip") or another head ("head"), `selected` the rerun's TTP_PYTEST_SELECT (None for
-    the full check). A failure prints pytest's lines for _FLAKY_ID (`fail_out`: these lines instead).
+    the full check); a plan of three arguments also gets the checked worktree. A failure prints pytest's lines for _FLAKY_ID (`fail_out`: these lines instead).
     Returns the calls (where, selected)."""
     from ttp import batch
     calls = []
@@ -14756,7 +14756,7 @@ def _rerun_stub(monkeypatch, tip, plan, fail_out=None):
         head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
         where, selected = "tip" if head == tip else "head", (env or {}).get("TTP_PYTEST_SELECT")
         calls.append((where, selected))
-        rc = plan(where, selected)
+        rc = plan(where, selected, Path(cwd)) if plan.__code__.co_argcount == 3 else plan(where, selected)
         out = (f"F...\nFAILED {_FLAKY_ID} - AssertionError: took too long\n1 failed, 3 passed in 0.50s"
                if rc == 1 else "....\n4 passed in 0.50s") if fail_out is None or rc == 0 else fail_out
         return rc, out, False
@@ -14814,25 +14814,49 @@ def test_a_push_batch_never_reruns_a_check_pytest_stopped_early_or_that_did_not_
     assert _git_out(origin, "rev-parse", "proj") == tip
 
 
-def test_a_push_batch_reports_the_tip_broken_when_the_failing_tests_fail_on_the_tip_alone_too(env, monkeypatch):
-    """The failing test fails again on its rerun at the head and on its one rerun on the tip without the
-    batch: the tip is broken (tip_failed), not the change, and the tip is not checked alone in full."""
+_SEL = "^(?:test_waits_on_a_clock)$"
+
+
+def test_a_push_batch_pushes_past_a_failing_test_that_fails_on_the_tip_alone_too(env, monkeypatch):
+    """Cell base_fail_ignored: the failing test fails again on its rerun at the head and on its rerun on
+    the tip (the base, same host), as `ttp checks` judges one: pre-existing, so it neither fails the tip nor
+    blocks the batch. The entry goes, the marker reports the test as pre-existing (no entry blamed), the tip
+    is not checked alone in full, and the coordinator is told it failed with the batch."""
+    from ttp import gatejudge, pushpass, pushq
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
     calls = _rerun_stub(monkeypatch, tip, lambda where, sel: 1)
     rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
-    assert m["outcome"] == "tip_failed" and _statuses(m) == ["requeued"] and rc != 0, m
-    assert m["tip_check"]["cmd"] == _FLAKY_CHECK and _FLAKY_ID in m["tip_check"]["tail"]
-    assert "fails its checks on its own" in m["message"] and not m.get("flaky_tests")
-    sel = "^(?:test_waits_on_a_clock)$"
-    assert calls == [("head", None), ("head", sel), ("tip", sel)], calls
-    assert _git_out(origin, "rev-parse", "proj") == tip
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert calls == [("head", None), ("head", _SEL), ("tip", _SEL)], calls
+    [pre] = m["pre_existing"]
+    assert pre["ids"] == [_FLAKY_ID] and pre["tip"] == tip and pre["entry"] is None and pre["cmd"] == _FLAKY_CHECK
+    assert (pre["runs"], m["checks"]["tip_reruns"]) == (1, 1) and not m.get("flaky_tests")
+    assert gatejudge.saved_base(p.state, gatejudge.host(), tip, [_FLAKY_ID], time.time()) == {_FLAKY_ID: True}
+    assert not pushpass.passed(p, pushpass.tree_of(p.root, m["pushed_sha"]), _FLAKY_CHECK,
+                               pushpass.env_id(p.root, _FLAKY_CHECK, {}, tip)), "an excused failure is not the tree's pass"
+    pushq._flaky_told(p.db, {}, {"id": "b1"}, m, time.time())
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=?", (pushq.FLAKY_EVENT,))
+    assert "failed with the batch" in ev["text"] and "pre-existing" in ev["text"] and tip[:7] in ev["text"], ev["text"]
+
+
+def test_a_push_batch_pushes_past_a_failing_test_that_fails_on_a_later_tip_rerun(env, monkeypatch):
+    """The failing test passes on its first rerun on the tip and fails on the second: pre-existing, as one
+    failing base run makes it. The entry goes; the tip reruns stop at that failure."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _rerun_stub(monkeypatch, tip, _seq_plan([1], [0, 1]))
+    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert calls.count(("tip", _SEL)) == 2 and m["checks"]["tip_reruns"] == 2, calls
+    assert m["pre_existing"][0]["runs"] == 2
+    assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"] != tip
 
 
 def test_a_push_batch_blames_the_change_when_its_failing_test_fails_twice_on_it_and_passes_on_the_tip(env, monkeypatch):
-    """A test that fails on both runs at the heads never passes, and one that passes on every rerun on the
-    tip alone is the change's own failure: today's check_failed. Each test is rerun at most once per batch
-    at a head and once in TIP_RERUNS runs on the tip, however many prefixes the search checks."""
+    """A test that fails on both runs at the heads and passes on every rerun on the tip alone is the
+    change's own failure: today's check_failed. The tip reruns happen once per batch (TIP_RERUNS runs):
+    later judgements read the base result saved for the tip on this host."""
     from ttp import batch
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
@@ -14840,12 +14864,11 @@ def test_a_push_batch_blames_the_change_when_its_failing_test_fails_twice_on_it_
     heads = [_entry(repo, n, {f"{n}.txt": f"{n}\n"}) for n in ("e1", "e2")]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert _statuses(m) == ["check_failed", "requeued"] and m["outcome"] != "tip_failed", m
-    assert not m.get("flaky_tests") and m["checks"]["flaky"] is False and m["checks"]["reruns"] == 1 + batch.TIP_RERUNS
-    assert m["checks"]["tip_reruns"] == batch.TIP_RERUNS and not m.get("pre_existing")
-    sel = "^(?:test_waits_on_a_clock)$"
-    assert [c for c in calls if c[1] == sel] == [("head", sel)] + [("tip", sel)] * batch.TIP_RERUNS, calls
+    assert not m.get("flaky_tests") and m["checks"]["flaky"] is False and not m.get("pre_existing")
+    assert m["checks"]["tip_reruns"] == batch.TIP_RERUNS
+    assert calls.count(("tip", _SEL)) == batch.TIP_RERUNS, calls
     assert ("tip", None) not in calls, "the tip is not checked alone in full"
-    assert calls.count(("head", None)) == 3, "full head, prefix 1, and the entry after it: no further reruns"
+    assert calls.count(("head", None)) == 2, "the full head and the rescue of entry 2; prefix 1 ran only the test"
     assert _git_out(origin, "rev-parse", "proj") == tip
 
 
@@ -14860,58 +14883,135 @@ def _seq_plan(head_full, tip_sel):
     return plan
 
 
-def test_a_push_batch_does_not_send_back_a_later_entry_whose_failing_test_fails_on_the_tip_now_and_then(env, monkeypatch, capsys):
-    """A test already on the tip fails now and then: the full head fails on it, prefix 1 passes by
-    chance, the full head fails again. Before entry 2 is blamed its failing test reruns on the tip alone;
-    it fails there on the 2nd rerun: pre-existing. Entry 1 (which passed) goes, entry 2 is requeued, not
-    sent back; the marker and the batch log record it and the reruns, and the coordinator is told once."""
+def test_a_push_batch_pushes_both_entries_when_their_failing_test_fails_on_the_tip_now_and_then(env, monkeypatch, capsys):
+    """A test already on the tip fails now and then: the full head fails on it, again on its rerun there,
+    and on the 2nd rerun on the tip: pre-existing. Nothing is sent back or split: both entries go, the
+    marker and the batch log record it and the reruns, and the coordinator is told once."""
     from ttp import batch, pushq
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
-    calls = _rerun_stub(monkeypatch, tip, _seq_plan([1, 0, 1], [0, 1]))
+    calls = _rerun_stub(monkeypatch, tip, _seq_plan([1], [0, 1]))
     heads = [_entry(repo, n, {f"{n}.txt": f"{n}\n"}) for n in ("e1", "e2")]
-    marker = _batch_marker(p, heads)
-    rc, m = _run_batch(p, marker, monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "requeued"], m
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+    assert [c for c in calls if c[1] in (None, _SEL)] == [("head", None), ("head", _SEL), ("tip", _SEL), ("tip", _SEL)], calls
     [pre] = m["pre_existing"]
-    assert pre["ids"] == [_FLAKY_ID] and pre["tip"] == tip and pre["entry"] == 2 and pre["cmd"] == _FLAKY_CHECK
+    assert pre["ids"] == [_FLAKY_ID] and pre["tip"] == tip and pre["cmd"] == _FLAKY_CHECK
     assert (pre["runs"], pre["of"]) == (2, batch.TIP_RERUNS) and m["checks"]["tip_reruns"] == 2
-    sel = "^(?:test_waits_on_a_clock)$"
-    assert calls.count(("tip", sel)) == 2, "it stops at the first failing rerun on the tip"
-    assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"] != tip
     out = capsys.readouterr()
     log = out.out + out.err
-    assert "failed on the tip" in log and "rerun 2 of 3" in log and "entry 2 is not sent back" in log, log
+    assert "pre-existing on the base" in log and "none of the failing tests is new" in log, log
     pushq._flaky_told(p.db, {}, {"id": "b1"}, m, time.time())
     [ev] = p.db.q("SELECT * FROM events WHERE kind=?", (pushq.FLAKY_EVENT,))
     assert _FLAKY_ID in ev["text"] and "pre-existing" in ev["text"] and tip[:7] in ev["text"], ev["text"]
 
 
-def test_a_push_batch_reports_the_tip_broken_when_entry_1s_failing_test_fails_on_a_later_tip_rerun(env, monkeypatch):
-    """Entry 1 fails on a test that passes on its first rerun on the tip and fails on the second: the
-    tip's own failure (tip_failed), not entry 1's; it is requeued, not sent back."""
-    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
-    tip = _git_out(origin, "rev-parse", "proj")
-    calls = _rerun_stub(monkeypatch, tip, _seq_plan([1], [0, 1]))
-    rc, m = _run_batch(p, _batch_marker(p, [_entry(repo, "e1", {"f1.txt": "1\n"})]), monkeypatch)
-    assert m["outcome"] == "tip_failed" and _statuses(m) == ["requeued"] and rc != 0, m
-    assert calls.count(("tip", "^(?:test_waits_on_a_clock)$")) == 2 and m["checks"]["tip_reruns"] == 2, calls
-    assert _git_out(origin, "rev-parse", "proj") == tip
-
-
 def test_a_push_batch_still_sends_back_a_later_entry_whose_failing_test_passes_on_the_tip_every_rerun(env, monkeypatch):
-    """Prefix 1 passes and the full head fails twice on a test that passes on all TIP_RERUNS reruns on the
-    tip alone: entry 2's own failure. It is sent back (check_failed) as before; entry 1 goes."""
+    """The full head fails on a test that fails again at that head and passes on all TIP_RERUNS reruns on
+    the tip alone: new. The split probe of prefix 1 runs only that test and it passes; prefix 1 then
+    passes in full. Entry 2's own failure: it is sent back (check_failed); entry 1 goes."""
     from ttp import batch
     p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
     tip = _git_out(origin, "rev-parse", "proj")
-    calls = _rerun_stub(monkeypatch, tip, _seq_plan([1, 0, 1], []))
+    calls = _rerun_stub(monkeypatch, tip, lambda where, sel, tree: int((tree / "e2.txt").exists()))
     heads = [_entry(repo, n, {f"{n}.txt": f"{n}\n"}) for n in ("e1", "e2")]
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed"], m
     assert not m.get("pre_existing") and m["checks"]["tip_reruns"] == batch.TIP_RERUNS
-    assert calls.count(("tip", "^(?:test_waits_on_a_clock)$")) == batch.TIP_RERUNS, calls
+    assert calls.count(("tip", _SEL)) == batch.TIP_RERUNS, calls
     assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"] != tip
+
+
+_NEW_ID = "tests/test_b.py::test_breaks_with_its_entry"
+
+
+def _ids_stub(monkeypatch, tip, failing):
+    """batch._stream stubbed as a check of the two tests _FLAKY_ID and _NEW_ID: `failing(tree, selected)`
+    names the ids failing in worktree `tree` (selected: the run's TTP_PYTEST_SELECT, None for the full
+    check). Only the selected ids run: exit 1 with pytest's lines for those failing, 5 when none is
+    selected, else 0. Returns the calls (where, selected, the entries' files in the tree)."""
+    from ttp import batch
+    calls = []
+
+    def fake(cmd, cwd, env=None, timeout=None, group=False, pass_fds=(), collect=None, urgent_mark=False):
+        tree = pathlib.Path(cwd)
+        head = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(cwd), capture_output=True, text=True).stdout.strip()
+        sel = (env or {}).get("TTP_PYTEST_SELECT")
+        calls.append(("tip" if head == tip else "head", sel, sorted(f.stem for f in tree.glob("e*.txt"))))
+        run = [i for i in (_FLAKY_ID, _NEW_ID) if sel is None or re.match(sel, i.rpartition("::")[2])]
+        bad = [i for i in (_FLAKY_ID, _NEW_ID) if i in run and i in failing(tree, sel)]
+        if not run:
+            return 5, "no tests ran in 0.01s", False
+        if not bad:
+            return 0, f"{'.' * len(run)}\n{len(run)} passed in 0.50s", False
+        return 1, ("F" * len(bad) + "\n" + "".join(f"FAILED {i} - AssertionError: broken\n" for i in bad)
+                   + f"{len(bad)} failed, {len(run) - len(bad)} passed in 0.50s"), False
+
+    monkeypatch.setattr(batch, "_stream", fake)
+    return calls
+
+
+def _entries(repo, n):
+    return [_entry(repo, f"e{k}", {f"e{k}.txt": f"{k}\n"}) for k in range(1, n + 1)]
+
+
+def test_a_push_batch_split_runs_only_the_new_failing_tests_at_the_prefix_heads(env, monkeypatch):
+    """Cell split_failing_ids_only: entry 3 of 4 breaks one test. The search probes the prefixes with
+    only that test, never their whole suite: the full suite runs at the full head, at the prefix the
+    probes passed (once, before it is pushed) and at the entry after the blamed one (its rescue)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_NEW_ID} if (tree / "e3.txt").exists() else set())
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 4)), monkeypatch)
+    assert _statuses(m) == ["pushed", "pushed", "check_failed", "pushed"], m
+    sel = "^(?:test_breaks_with_its_entry)$"
+    full = [c[2] for c in calls if c[1] is None]
+    assert full == [["e1", "e2", "e3", "e4"], ["e1", "e2"], ["e1", "e2", "e4"]], calls
+    probes = [c[2] for c in calls if c[1] == sel and c[0] == "head"]
+    assert ["e1", "e2"] in probes and ["e1", "e2", "e3"] in probes, calls
+    assert m["checks"]["id_probes"] == 2 and not m.get("pre_existing") and not m.get("flaky_tests")
+
+
+def test_a_push_batch_lands_the_passing_entries_when_the_tip_fails_a_test_too(env, monkeypatch):
+    """Cells base_fail_ignored and passing_entries_land: the tip fails _FLAKY_ID on its own, and entry 2
+    of 3 breaks _NEW_ID too. _FLAKY_ID is pre-existing at every head, never the tip's failure (no
+    tip_failed) and never blamed on an entry; only entry 2 is sent back, entries 1 and 3 land."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip,
+                      lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e2.txt").exists() else set()))
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 3)), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "check_failed", "pushed"], m
+    pushed = _git_out(origin, "show", "--name-only", "--format=", f"{tip}..proj").split()
+    assert "e1.txt" in pushed and "e3.txt" in pushed and "e2.txt" not in pushed, pushed
+    assert {i for f in m["pre_existing"] for i in f["ids"]} == {_FLAKY_ID}, m["pre_existing"]
+    assert ("tip", None, []) not in calls, "the tip is not checked alone in full"
+
+
+def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, monkeypatch):
+    """Cell flaky_rerun_all: _FLAKY_ID fails in every full check and passes when rerun; entry 2 breaks
+    _NEW_ID; entry 1 edits _FLAKY_ID's file, so its quarantine does not excuse it in this batch. At each
+    head every failing test not yet judged there is rerun, so prefix 1 passes once its _FLAKY_ID is rerun
+    (before, one test rerun anywhere in the batch stopped every later rerun). The flaky test is
+    quarantined; a later batch that does not touch it is excused at once, with no rerun."""
+    from ttp import gatejudge
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip, lambda tree, sel: ({_FLAKY_ID} if sel is None else set())
+                      | ({_NEW_ID} if (tree / "e2.txt").exists() else set()))
+    heads = [_entry(repo, "e1", {"e1.txt": "1\n", "tests/test_a.py": "# edited\n"}),
+             _entry(repo, "e2", {"e2.txt": "2\n"})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert _statuses(m) == ["pushed", "check_failed"], m
+    both = gatejudge.select_rx([_FLAKY_ID, _NEW_ID])
+    assert ("head", both, ["e1", "e2"]) in calls, "both failing tests rerun together at the full head"
+    assert ("head", _SEL, ["e1"]) in calls, "prefix 1's failing test reruns there too"
+    assert [f["ids"] for f in m["flaky_tests"]] == [[_FLAKY_ID], [_FLAKY_ID]], m["flaky_tests"]
+    assert _FLAKY_ID in gatejudge.active(p.state, time.time())
+    calls.clear()
+    rc, m2 = _run_batch(p, _batch_marker(p, [_entry(repo, "e3", {"e3.txt": "3\n"})], bid="b2"), monkeypatch)
+    assert m2["outcome"] == "pushed" and _statuses(m2) == ["pushed"], m2
+    assert [c[1] for c in calls] == [None], "a quarantined test the batch does not touch is not rerun"
 
 
 def test_stray_running_batch_file_is_closed_at_daemon_start_and_a_live_one_is_left(env, monkeypatch):
