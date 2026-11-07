@@ -1610,6 +1610,8 @@ def test_a_model_left_out_of_the_served_list_is_ranked_and_an_empty_ranking_chan
     prov, _, note = _route_dispatch(p, d, monkeypatch, title="unlisted")
     assert prov == "chat" and note[route.KEY]["model"] == "rank-b"
     assert note[route.KEY][modelrank.KEY] == {"from": _RT_MODEL, "why": "not listed"}
+    # A model pick to another provider is never ranked against the chat endpoint's list.
+    assert modelrank.KEY not in d._route_entry({"id": None, "kind": "work"}, "light", "codex", "gpt-x", time.time())
     # Nothing ranked is served: the tier's own model, as before (a refusal then holds it as usual).
     route.write_served(p.state, "chat", True, "HTTP 200", ["other"], time.time())
     assert _route_dispatch(p, d, monkeypatch, title="none served")[2][route.KEY]["model"] == _RT_MODEL
