@@ -2921,8 +2921,10 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
                            "slurm_overflow"}}   # a Slurm cluster the pool's overflow runs on (slurmcheck)
-# Account keys a run may only clear (ttp config --account refuses setting them inside a run).
+# Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
+# ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 ACCOUNT_USER_ONLY = {"checks.spill_hosts", "checks.slurm_overflow"}
+ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}}
 # Host-wide account keys the runtime reads only from the account settings: a project's own copy would
 # show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
 HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",

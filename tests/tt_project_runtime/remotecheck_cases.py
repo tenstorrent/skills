@@ -1660,7 +1660,8 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
 
 # The account's Slurm overflow (slurmcheck): fake sbatch, squeue, sacct and scancel run through the fake
 # ssh. FAKE_SLURM=<dir> holds their logs and job states; FAKE_SLURM_MODE: run (the job runs at once and
-# completes), hold (it stays RUNNING until scancel), refuse (sbatch exits 1), nodefail1 (the first job
+# completes), hold (it stays RUNNING until scancel), refuse (sbatch exits 1), startfail (every job ends
+# FAILED, exit code 1:0, without running or output), nodefail1 (the first job
 # ends NODE_FAIL without running, later ones run).
 _SLURM_FAKES = {
     "sbatch": r'''#!/bin/sh
@@ -1670,6 +1671,7 @@ echo "$*" >> "$d/sbatch.log"
 n=$(( $(cat "$d/next" 2>/dev/null || echo 100) + 1 )); echo $n > "$d/next"
 out= ; dir= ; for a in "$@"; do case "$a" in --output=*) out=${a#--output=};; --chdir=*) dir=${a#--chdir=};; esac; script=$a; done
 if [ "$FAKE_SLURM_MODE" = hold ]; then echo RUNNING > "$d/state.$n"
+elif [ "$FAKE_SLURM_MODE" = startfail ]; then echo FAILED > "$d/state.$n"; echo "1:0" > "$d/code.$n"
 elif [ "$FAKE_SLURM_MODE" = nodefail1 ] && [ ! -e "$d/failed" ]; then touch "$d/failed"; echo NODE_FAIL > "$d/state.$n"
 else (cd "$dir" && sh "$script" > "$out" 2>&1); echo COMPLETED > "$d/state.$n"
 fi
@@ -1682,7 +1684,7 @@ case "$s" in PENDING|RUNNING) echo "$s";; esac
 ''',
     "sacct": r'''#!/bin/sh
 for a in "$@"; do [ "$prev" = -j ] && j=$a; prev=$a; done
-echo "$(cat "$FAKE_SLURM/state.$j" 2>/dev/null)|0:0"
+echo "$(cat "$FAKE_SLURM/state.$j" 2>/dev/null)|$(cat "$FAKE_SLURM/code.$j" 2>/dev/null || echo 0:0)|"
 ''',
     "scancel": r'''#!/bin/sh
 echo "$1" >> "$FAKE_SLURM/scancel.log"
@@ -1749,6 +1751,115 @@ def test_slurm_overflow_is_off_by_default_validated_and_only_the_user_sets_it(en
     assert slurmcheck.enabled({"delivery": {"checks_spill_hosts": []}}) is None, "an own [] keeps runs here"
     cli.main(["config", "--account", slurmcheck.KEY, ""])
     assert slurmcheck.settings() is None and "slurm_overflow" not in (project.load_account_settings().get("checks") or {})
+
+
+def test_a_run_may_clear_the_slurm_overflow_to_off_logged_but_sets_no_user_only_key(env, capsys, monkeypatch):
+    """In a run, `ttp config --account checks.slurm_overflow {}` (its off value) is a clear: it only reduces
+    reach, so it is taken and logged with the run, task, old and new values; a value that is not off, and
+    every other user-only key (spend caps, the write fence), still exit 2. Outside a run nothing changed."""
+    from ttp import accountset, cli, project, slurmcheck
+    value = {"host": "cluster-login", "partition": "cpu"}
+    cli.main(["config", "--account", slurmcheck.KEY, json.dumps(value)])
+    assert accountset.last(slurmcheck.KEY)["by"] == "user" and accountset.last(slurmcheck.KEY)["new"] == value
+    capsys.readouterr()
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    monkeypatch.setenv("TTP_TASK_ID", "42")
+    for bad in ('{"host": "other", "partition": "cpu"}', "[]", "null", "0"):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["config", "--account", slurmcheck.KEY, bad])
+        assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err, bad
+    for key, v in (("budget.global_daily_usd", ""), ("budget.global_daily_usd", "5"), ("budget.daily_usd", ""),
+                   ("providers.claude.write_fence", ""), ("providers.claude.write_fence", "off")):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["config", "--account", key, v])
+        assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err, key
+    assert slurmcheck.settings()["host"] == "cluster-login", "nothing a refused call changed"
+    cli.main(["config", "--account", slurmcheck.KEY, "{ }"])
+    out = capsys.readouterr().out
+    assert slurmcheck.settings() is None and "was" in out and "cluster-login" in out and "undo:" in out, out
+    rec = accountset.last(slurmcheck.KEY)
+    assert rec["new"] == {} and rec["old"] == value and rec["by"] == "worker", rec
+    assert str(rec["task"]) == "42" and str(rec["run"]) == "7" and rec["ts"] and "cluster-login" in rec["undo"], rec
+    # Outside a run: the user sets and clears it as before.
+    monkeypatch.delenv("TTP_RUN_ID")
+    monkeypatch.delenv("TTP_TASK_ID")
+    cli.main(["config", "--account", slurmcheck.KEY, json.dumps(value)])
+    assert slurmcheck.settings()["host"] == "cluster-login" and accountset.last(slurmcheck.KEY)["by"] == "user"
+    cli.main(["config", "--account", "budget.global_daily_usd", "5"])
+    assert project.load_account_settings()["budget"]["global_daily_usd"] in (5, 5.0, "5")
+
+
+def test_the_slurm_breaker_trips_after_three_start_deaths_in_a_row_and_only_the_user_re_arms_it(env, capsys, monkeypatch):
+    from ttp import cli, project, slurmcheck
+    project.set_account_setting(slurmcheck.KEY, dict(_SLURM_SET))
+    died = lambda n: {"job": str(n), "state": "FAILED", "code": "1:0", "elapsed_s": 0}
+    assert slurmcheck._breaker(died(1)) is None and slurmcheck._breaker(died(2)) is None
+    assert slurmcheck._breaker(None) is None, "a job that ran resets the count"
+    assert slurmcheck._breaker(died(3)) is None and slurmcheck._breaker(died(4)) is None and not slurmcheck.tripped()
+    trip = slurmcheck._breaker(died(5))
+    assert trip and trip["count"] == 3 and [j["job"] for j in trip["jobs"]] == ["3", "4", "5"], trip
+    assert slurmcheck.tripped()["tripped"] and "job 5 FAILED, exit code 1:0" in slurmcheck.trip_why(trip)
+    assert slurmcheck._breaker(None) is None and slurmcheck.tripped(), "a late job's end re-arms nothing"
+    told = []
+    assert slurmcheck.pick(None, {}, told.append) is None and "paused itself" in told[-1], told
+    assert "paused itself" in slurmcheck.paused_line() and "re-arms it" in slurmcheck.paused_line()
+    assert slurmcheck.alert_due("a") and slurmcheck.alert_due("a") is None and slurmcheck.alert_due("b") is None
+    # The user setting the same value again re-arms it (its log line is newer than the trip).
+    time.sleep(0.01)
+    cli.main(["config", "--account", slurmcheck.KEY, json.dumps(_SLURM_SET)])
+    assert slurmcheck.tripped() is None and slurmcheck.paused_line() == ""
+    assert slurmcheck._breaker(died(6)) is None and slurmcheck._breaker(died(7)) is None
+    assert slurmcheck._breaker(died(8)), "counted afresh"
+    # A changed value re-arms it too.
+    project.set_account_setting(slurmcheck.KEY, {**_SLURM_SET, "max_jobs": 1})
+    assert slurmcheck.tripped() is None and slurmcheck._breaker(died(9)) is None
+
+
+def test_overflow_jobs_dying_at_start_pause_it_with_one_alert_and_the_runs_stay_local_never_failed(
+        env, tmp_path, monkeypatch, capsys):
+    """startfail: every job ends FAILED with no output. The first run's job and its one resubmit die (2),
+    the run's checks run again here and pass; the second run's job is the third death: the overflow trips,
+    that run passes here too; the third run submits nothing. One alert, in ttp status, cleared on re-arm."""
+    import threading
+    from ttp import alerts, cli, project, slurmcheck
+    from ttp.daemon import Daemon
+    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, ["down"])
+    monkeypatch.setenv("FAKE_SLURM_MODE", "startfail")
+    sbatches = []
+    for n in range(3):
+        lane = _spill_lane(p, repo)
+        threading.Timer(1.5, lane.close).start()
+        cli.main(["checks", "--fresh"])
+        rec = json.loads((run / "checks.json").read_text())
+        text = (run / "checks.log").read_text()
+        assert rec["passed"] is True and "spilled_to" not in rec, (n, rec, text)
+        sbatches.append(len((d / "sbatch.log").read_text().splitlines()))
+        if n == 1:
+            assert "paused itself" in text and "running them again on this machine" in text, text
+        if n == 2:
+            assert "paused itself" in text, text
+    assert sbatches == [2, 3, 3], sbatches
+    trip = slurmcheck.tripped()
+    assert trip and trip["count"] == 3 and [j["state"] for j in trip["jobs"]] == ["FAILED"] * 3, trip
+    assert all(j["code"] == "1:0" for j in trip["jobs"]) and trip["jobs"][-1]["job"] == "103", trip
+    dm = Daemon(p.base)
+    for _ in range(3):
+        dm.alert_slurm_paused()
+    (msg,) = p.db.q("SELECT * FROM messages WHERE ref=?", (slurmcheck.ALERT_KEY,))
+    assert msg["severity"] == "normal" and "paused itself" in msg["text"] and "local queue" in msg["text"], msg
+    assert alerts.tracked("alert", "normal", slurmcheck.ALERT_KEY) and not alerts.sweep(p.db)
+    capsys.readouterr()
+    cli.main(["status"])
+    cli.main(["checks", "status"])
+    out = capsys.readouterr().out
+    assert out.count("Slurm checks overflow paused itself") == 2 and "runs stay on the local queue" in out, out
+    cli.main(["checks", "status", "--json"])
+    assert json.loads(capsys.readouterr().out)["slurm_paused"]["count"] == 3
+    project.set_account_setting(slurmcheck.KEY, {**slurmcheck.settings(), "max_jobs": 1})   # the user's new value
+    (ep,) = alerts.sweep(p.db)
+    assert ep["key"] == slurmcheck.ALERT_KEY and slurmcheck.tripped() is None
+    dm.alert_slurm_paused()
+    assert len(p.db.q("SELECT id FROM messages WHERE ref=? AND kind='alert'", (slurmcheck.ALERT_KEY,))) == 1
 
 
 def test_a_slurm_job_runs_the_check_on_a_copy_of_head_as_one_cpu_job_with_its_time_and_is_logged(env, tmp_path):

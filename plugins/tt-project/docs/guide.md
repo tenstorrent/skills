@@ -1818,7 +1818,8 @@ session and stateless coordinators on every provider.
   `checks.slurm_overflow` (account-level, unset by default: nothing changes) sends a run that no pool host can take
   (each paused, busy with a device job, full or unreachable, or no pool at all) to a Slurm cluster instead of
   waiting here: `ttp config --account checks.slurm_overflow '{"host": "<cluster-login>", "partition":
-  "<cpu-partition>", "workdir": "~/ttp-checks"}'` (only the user sets it, a run may only clear it with `""`).
+  "<cpu-partition>", "workdir": "~/ttp-checks"}'` (only the user sets it; a run may only clear it, with `""` or
+  `{}`, and each change is logged in `account-settings.jsonl` under the account folder with who made it and the undo).
   `host` is the submit host's ssh alias, `partition` a CPU partition, `workdir` a folder on the cluster's shared
   file system; `max_jobs` (2) caps this machine's jobs there at once, `--time` is the run's median wall time plus
   `margin_s` (600), at most `max_time_s` (7200, also its value before a median exists), and a job pending past
@@ -1833,7 +1834,13 @@ session and stateless coordinators on every provider.
   ends at its time limit. Every job (id, project, task, check, submit, start and end times, state, exit code) is
   logged in `check-slots/slurm/jobs.jsonl` under the account folder; `ttp status`, `ttp checks status` and
   `checks.json` (`spilled_to`, the submit host) show running ones like a spill host's. A project's own
-  `delivery.checks_spill_hosts: []` keeps its runs here, overflow included.
+  `delivery.checks_spill_hosts: []` keeps its runs here, overflow included. After 3 jobs in a row die at start
+  (Slurm ends them, not completed, within 30 s of their start and with no output; a job that completes or gives
+  output resets the count), the overflow pauses itself: it submits no more jobs, records the trip (when, how
+  many, the last job ids with their state and exit code) in `check-slots/slurm/breaker.json`, and one daemon
+  raises one `slurm-paused` alert. Runs that would overflow stay in the local queue in their place; a run whose
+  job died at start runs again here, whose result counts. Only setting `checks.slurm_overflow` again (or
+  clearing it) re-arms it and clears the alert; `ttp status` and `ttp checks status` show the pause in one line.
   `ttp checks status` (also `--slot-status`, `--json`) prints each repository's lane holders (pid, task, run,
   age, alive or dead, what it checks and whether its task has finished) and its waiters in queue order, the next
   one marked; it is read only and never queues. Every lane group has a name (its repository or wrapper lock, else the project

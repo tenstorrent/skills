@@ -1822,7 +1822,8 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.check_chats, self.probe_mcp):
+                     self.check_linger, self.check_notifier, self.alert_slurm_paused, self.check_chats,
+                     self.probe_mcp):
             if step in lease_off:
                 continue
             self._run_step(step)
@@ -3820,6 +3821,13 @@ class Daemon:
             self.alert(notifier.ALERT_KEY, f"Desktop notifications on {hostname()} fail since {since} "
                        f"({bad.get('backend')}: {str(bad.get('error'))[:160]}). Alerts still reach this chat and "
                        f"the web app. `ttp notifier test` on {hostname()} shows the fix.", severity="normal")
+
+    def alert_slurm_paused(self) -> None:
+        """One alert per trip of the Slurm checks overflow's start-failure breaker (slurmcheck.alert_due: the
+        first project daemon to see the trip sends it); it clears once the user sets checks.slurm_overflow again."""
+        from . import slurmcheck
+        if b := slurmcheck.alert_due(self.p.name):
+            self.alert(slurmcheck.ALERT_KEY, slurmcheck.alert_text(b), severity="normal")
 
     def check_chats(self) -> None:
         """One low status line per relay chat that stopped reading with no listener running (chatgone)."""

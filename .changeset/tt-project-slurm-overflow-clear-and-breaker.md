@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: inside a run, `ttp config --account checks.slurm_overflow '{}'` (its off value) is now taken as a clear, as `""` was: it only reduces reach. Every change of the account's spill pool or Slurm overflow is logged in `account-settings.jsonl` with who made it (run and task id), the old and new values and the undo, and the command prints what changed. Any other value, and every other user-only key (spend caps, the write fence), is still refused inside a run. The Slurm overflow now pauses itself after 3 jobs in a row die at start (not completed within 30 s, no output): it submits no more jobs, records the trip in `check-slots/slurm/breaker.json`, raises one `slurm-paused` alert, and `ttp status` and `ttp checks status` show it in one line. Runs stay on the local queue in their place, and a run whose job died at start runs again locally and never counts as failed. Only setting `checks.slurm_overflow` again (or clearing it) re-arms it and clears the alert. A job that completes or gives output resets the count.

@@ -3,8 +3,8 @@
 """Checks that overflow from the account's test pool to a Slurm cluster: account `checks.slurm_overflow`.
 
 Unset (the default), nothing changes. Set (`ttp config --account checks.slurm_overflow '{"host":
-"<cluster-login>", "partition": "<cpu-partition>", "workdir": "~/ttp-checks"}'`, which a run may only
-clear), a `ttp checks` run that may spill (checkspill.spillable) and whose bounded wait here ended with no
+"<cluster-login>", "partition": "<cpu-partition>", "workdir": "~/ttp-checks"}'`; only the user sets it,
+and a run may only clear it, removing it ('') or setting it off ({}), logged: cli._log_account_change), a `ttp checks` run that may spill (checkspill.spillable) and whose bounded wait here ended with no
 pool host able to take it (each paused, busy with a device job, at its cap or unreachable; or no pool
 at all) is sent to the cluster as one CPU-only batch job per check, instead of waiting on here. A
 project whose own delivery.checks_spill_hosts is [] keeps its runs here, the overflow too.
@@ -32,6 +32,13 @@ after LOST_S. A job that ends for the cluster's reasons (never started within ma
 fault, preempted, cancelled by others, the node unable to unpack the tree) is submitted again once;
 then, and for a job past its time limit, the check exits remotecheck.FAULT_RC: as for a spill host,
 a run that did not pass there runs again here, in its place in the queue, and only that verdict counts.
+
+Start-failure breaker: a job that dies at start (Slurm ends it, not completed, within START_FAIL_S of its
+start and with no output) counts; TRIP_AFTER in a row trip the overflow (BREAKER: when, how many, the last
+jobs' ids, states and exit codes). Tripped, it submits no job: pick() keeps runs waiting here in their place
+and a job's run that would resubmit faults instead, so the check runs again here and only that verdict counts.
+One daemon alerts it once (alert_due, ALERT_KEY), and it clears once the user sets the key again (or clears
+it): only that re-arms it, never a timer. A job that completes or gives output resets the count.
 
 Every job is logged in JOBS_LOG (job id, project, task, check, submit, start and end times, state, exit
 code) beside the spill pool's claims, and `ttp status` shows the running ones (status_lines)."""
@@ -71,6 +78,10 @@ WANT_TTL_S = 600.0   # a waiter's ticket not renewed this long is gone (its run 
 CLUSTER_STATES = {"NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "CANCELLED", "REVOKED", "DEADLINE", "FAILED",
                   "OUT_OF_MEMORY", "SPECIAL_EXIT", "STOPPED", "SUSPENDED"}
 _ACTIVE = {"PENDING", "RUNNING", "CONFIGURING", "COMPLETING", "REQUEUED", "RESIZING", "SUSPENDED", "STAGE_OUT"}
+START_FAIL_S = 30   # a job Slurm ends, not completed, this soon after it started and with no output: died at start
+TRIP_AFTER = 3     # that many in a row pause the overflow (tripped) until the user sets the key again
+BREAKER = "breaker.json"   # in slurm_dir(): the start-failure count and the trip (_breaker)
+ALERT_KEY = "slurm-paused"   # the trip's alert condition (alerts.holds: while tripped() holds)
 _BOOT = "import sys; sys.path.insert(0, sys.argv[1]); from ttp.slurmcheck import main; sys.exit(main(sys.argv[2:]))"
 
 
@@ -309,6 +320,10 @@ def pick(p, cfg: dict, tell, what: str = "", prio: int | None = None, arrived: f
     s = enabled(cfg)
     if s is None:
         return None
+    if trip := tripped():
+        tell(f"no pool host could take the checks and the Slurm overflow ({s['host']}) paused itself: "
+             f"{trip_why(trip)}; waiting here")
+        return None
     arrived = time.time() if arrived is None else arrived
     reap()
     want(prio, arrived, p.name)
@@ -362,6 +377,101 @@ def status_lines(project_name: str, now: float | None = None) -> list[str]:
     return out
 
 
+def _raw() -> Any:
+    from . import project
+    return (project.load_account_settings().get("checks") or {}).get("slurm_overflow")
+
+
+def _digest(v: Any) -> str:
+    return json.dumps(v, sort_keys=True)
+
+
+def _set_since(key_ts: float) -> bool:
+    """Whether the key was set (or cleared) again after `key_ts`, by the account settings log."""
+    from . import accountset
+    rec = accountset.last(KEY)
+    return bool(rec) and float(rec.get("ts") or 0) > key_ts
+
+
+def _armed(b: dict) -> bool:
+    """Whether breaker record `b` is stale: the key's value changed, or it was set again, since it began."""
+    return _digest(_raw()) != b.get("value") or _set_since(float(b.get("since") or 0))
+
+
+def tripped() -> dict | None:
+    """The trip record while the overflow paused itself (TRIP_AFTER jobs in a row died at start) and the
+    user has not set checks.slurm_overflow again since; else None."""
+    b = _read(slurm_dir() / BREAKER)
+    return b if b.get("tripped") and not _armed(b) else None
+
+
+def trip_why(b: dict) -> str:
+    last = (b.get("jobs") or [{}])[-1]
+    return (f"its last {b.get('count')} jobs ended at start with no output (last: job {last.get('job') or '?'} "
+            f"{last.get('state') or '?'}, exit code {last.get('code') or '?'}, {last.get('elapsed_s', '?')} s)")
+
+
+def _breaker(start_fail: dict | None, now: float | None = None) -> dict | None:
+    """Count one overflow job's end: `start_fail` (the job's id, state, exit code, elapsed seconds) for a job
+    that died at start, None for one that ran (completed, or gave output). Returns the record when this
+    end tripped the overflow (the caller tells it), else None. A record from before the key's last
+    change starts over: the user's setting it again re-arms the overflow."""
+    from .project import write_json
+    now = time.time() if now is None else now
+    d = slurm_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    with open(d / (BREAKER + ".lock"), "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        b = _read(d / BREAKER)
+        if not b or _armed(b):
+            b = {"since": now, "value": _digest(_raw()), "count": 0, "jobs": []}
+        if b.get("tripped"):
+            return None   # paused: only the user's setting re-arms it, never a job that still ended
+        if start_fail is None:
+            if b["count"]:
+                b.update(count=0, jobs=[])
+                write_json(d / BREAKER, b)
+            return None
+        b["count"] += 1
+        b["jobs"] = [*b.get("jobs", []), {**start_fail, "end": now}][-TRIP_AFTER:]
+        if b["count"] >= TRIP_AFTER:
+            b["tripped"] = now
+        write_json(d / BREAKER, b)
+        return b if b.get("tripped") else None
+
+
+def alert_due(project_name: str) -> dict | None:
+    """The trip record for the one project that alerts it (the first daemon to ask), once per trip."""
+    from .project import write_json
+    d = slurm_dir()
+    if not (d / BREAKER).exists():
+        return None
+    with open(d / (BREAKER + ".lock"), "a") as lk:
+        fcntl.flock(lk, fcntl.LOCK_EX)
+        b = tripped()
+        if not b or b.get("alerted"):
+            return None
+        b["alerted"] = project_name
+        write_json(d / BREAKER, b)
+        return b
+
+
+def alert_text(b: dict) -> str:
+    return (f"The Slurm checks overflow ({KEY}) paused itself: {trip_why(b)}. It submits no more jobs; "
+            "check runs wait on the local queue in their place, and none counts as a failed check. Find why "
+            f"the jobs die (`sacct -j <job>` on the cluster), then set {KEY} again to re-arm it, or clear it.")
+
+
+def paused_line(now: float | None = None) -> str:
+    """One status line while the overflow paused itself, else ""."""
+    if not (b := tripped()):
+        return ""
+    now = time.time() if now is None else now
+    mins = max(0, int((now - float(b["tripped"])) // 60))
+    return (f"Slurm checks overflow paused itself {mins} min ago: {trip_why(b)}; runs stay on the local queue; "
+            f"setting {KEY} again re-arms it")
+
+
 def argv(cmd: str, s: dict, env: dict | None = None, commit: str = "", minutes: int = 0) -> list[str]:
     """The local command that runs check `cmd` as one job on the cluster (main)."""
     return [sys.executable, "-c", _BOOT, str(Path(__file__).resolve().parents[1]),
@@ -401,15 +511,27 @@ def _stop(_sig, _frame) -> None:
     raise _Stop()
 
 
-def _sacct(host: str, job: str) -> tuple[str, str]:
-    """(state, exit code) of a finished job; ("", "") when sacct does not know it (yet)."""
+def _sacct(host: str, job: str) -> tuple[str, str, int | None]:
+    """(state, exit code, elapsed seconds or None) of a finished job; ("", "", None) when sacct does not
+    know it (yet)."""
     try:
-        r = _ssh(host, f"sacct -n -X -P -j {shlex.quote(job)} -o State,ExitCode", CALL_TIMEOUT_S)
+        r = _ssh(host, f"sacct -n -X -P -j {shlex.quote(job)} -o State,ExitCode,ElapsedRaw", CALL_TIMEOUT_S)
     except (OSError, subprocess.SubprocessError):
-        return "", ""
+        return "", "", None
     line = (r.stdout.decode(errors="replace").strip().splitlines() or [""])[0]
-    state, _, code = line.partition("|")
-    return (state.split() or [""])[0].upper(), code.strip()
+    state, code, elapsed = (line.split("|") + ["", ""])[:3]
+    return (state.split() or [""])[0].upper(), code.strip(), int(elapsed) if elapsed.strip().isdigit() else None
+
+
+def _start_fail(job: str, state: str, why: str, seen: dict) -> dict | None:
+    """The job's record when it died at start (Slurm ended it, not completed, within START_FAIL_S of its
+    start, with no output), else None. A job cancelled here for pending too long did not start: neither."""
+    if not why.startswith("cluster") or state in ("COMPLETED", "PENDING") or seen.get("out_bytes"):
+        return None
+    elapsed = seen.get("elapsed_s")
+    if elapsed is not None and elapsed >= START_FAIL_S:
+        return None
+    return {"job": job, "state": state, "code": seen.get("code") or "", "elapsed_s": elapsed if elapsed is not None else 0}
 
 
 def main(args: list[str]) -> int:
@@ -436,6 +558,8 @@ def main(args: list[str]) -> int:
     host = s["host"]
     if why := remotecheck.paused(host):
         return _fault(host, why)
+    if trip := tripped():
+        return _fault(host, f"the Slurm overflow paused itself: {trip_why(trip)}")
     top = remotecheck._git("rev-parse", "--show-toplevel")
     head = "" if commit.startswith("-") else remotecheck._git("rev-parse", "--verify", "-q", f"{commit or 'HEAD'}^{{commit}}")
     if not top or not head:
@@ -506,15 +630,21 @@ def main(args: list[str]) -> int:
             note(job=job, state="PENDING", submit=submitted, attempt=attempt)
             _say(f"checking {head[:12]} as Slurm job {job} on {host} (partition {s['partition']}, "
                  f"--time={minutes} min) in {tmp}")
-            rc, state, why = _follow(host, q, job, s, poll, submitted, note)
+            rc, state, why, seen = _follow(host, q, job, s, poll, submitted, note)
             active = False
             log_job({**rec, "end": time.time(), "state": state, **({"rc": rc} if rc is not None else {})})
+            died = _start_fail(job, state, why, seen) if rc is None else None
+            if (died or rc is not None or seen.get("out_bytes") or state in ("COMPLETED", "TIMEOUT")) and (
+                    trip := _breaker(died)):
+                _say(f"the Slurm overflow paused itself: {trip_why(trip)}; no more jobs go there until "
+                     f"{KEY} is set again")
+                return _fault(host, f"job {job}: {why}; the overflow paused itself")
             if rc is not None:
                 if rc == remotecheck.FAULT_RC:
                     _say(f"the command exited {remotecheck.FAULT_RC}; reported as 1")
                     return 1
                 return rc
-            if why.startswith("cluster") and attempt == 1:
+            if why.startswith("cluster") and attempt == 1 and not tripped():
                 _say(f"job {job} ended for the cluster's reasons ({why}): submitting it again once; "
                      "this is no test failure")
                 rec.pop("start", None)
@@ -540,9 +670,10 @@ def main(args: list[str]) -> int:
                 _say(f"could not remove {tmp} on {host}")
 
 
-def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float, note) -> tuple[int | None, str, str]:
+def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float, note) -> tuple[int | None, str, str, dict]:
     """Wait for `job`, streaming its output: (the command's exit code or None, final state, why it did
-    not report one: "cluster: ..." for an end the cluster caused, else the reason)."""
+    not report one: "cluster: ..." for an end the cluster caused, else the reason, what was seen of it:
+    out_bytes, and for an end sacct read its exit code and elapsed_s)."""
     mark = f"ttp-slurm:{secrets.token_hex(6)}"
     sent, last_ok, gone, started = 0, time.time(), 0, None
     out = sys.stdout.buffer
@@ -558,7 +689,7 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
         parts = head_line.decode(errors="replace").split("|")
         if got is None or got.returncode != 0 or parts[0] != mark:
             if time.time() - last_ok > LOST_S:
-                return None, "UNKNOWN", f"the submit host stopped answering for {LOST_S:g} s; the job ends at its time limit"
+                return None, "UNKNOWN", f"the submit host stopped answering for {LOST_S:g} s; the job ends at its time limit", {"out_bytes": sent}
             time.sleep(poll)
             continue
         last_ok = time.time()
@@ -573,21 +704,24 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
         if rc.isdigit():
             if state in _ACTIVE:   # the script wrote its code: the job is ending
                 time.sleep(min(poll, 2))
-            return int(rc), "COMPLETED", ""
+            return int(rc), "COMPLETED", "", {"out_bytes": sent}
         if state in _ACTIVE:
             gone = 0
             if state == "PENDING" and started is None and time.time() - submitted > s["max_pending_s"]:
                 scancel(host, job)
-                return None, "PENDING", f"cluster: it did not start within {s['max_pending_s']} s"
+                return None, "PENDING", f"cluster: it did not start within {s['max_pending_s']} s", {"out_bytes": sent}
             time.sleep(poll)
             continue
-        final, code = _sacct(host, job)
+        final, code, elapsed = _sacct(host, job)
+        if elapsed is None and started is not None:   # sacct gave none: from when it was seen running
+            elapsed = round(time.time() - started)
+        seen = {"out_bytes": sent, "code": code, "elapsed_s": elapsed}
         if final in _ACTIVE or (not final and gone < 2):
             gone += 1
             time.sleep(poll)
             continue
         if rc == "fault":
-            return None, final or "FAILED", "cluster: the node could not set up the tree"
+            return None, final or "FAILED", "cluster: the node could not set up the tree", seen
         if final == "TIMEOUT":
-            return None, final, "it ran past its time limit"
-        return None, final or "UNKNOWN", f"cluster: it ended {final or 'unseen'} ({code or 'no exit code'}) before the command reported one"
+            return None, final, "it ran past its time limit", seen
+        return None, final or "UNKNOWN", f"cluster: it ended {final or 'unseen'} ({code or 'no exit code'}) before the command reported one", seen

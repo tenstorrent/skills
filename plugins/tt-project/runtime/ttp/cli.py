@@ -1643,6 +1643,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
         lines.extend(checklane.lane_lines(p.name, p.config(), now))
     lines.extend(checklane.long_wait_lines(p.name, p.config(), now))
     lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
+    if paused := slurmcheck.paused_line(now):   # the Slurm overflow's start-failure breaker: always shown
+        lines.append(paused)
     from . import gatejudge   # tests the gate quarantined as flaky (no release check counts them passed)
     lines.extend(gatejudge.status_lines(p.state, now, lambda ts: at(ts, now, tz)))
     if verbose:
@@ -4731,13 +4733,15 @@ def _checks_lane_status(as_json: bool) -> int:
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
                           "spilled": checkspill.holders(p.name),
                           "slurm_overflow": slurmcheck.holders(p.name),
+                          "slurm_paused": slurmcheck.tripped(),
                           "hosts": {**load, "overloaded": hostload.overloaded(load)},
                           "disk": disk,
                           "followers": [x.strip() for x in followers]},
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.status_lines(p.name), *slurmcheck.status_lines(p.name)]:
+        for line in [*checkspill.status_lines(p.name), *slurmcheck.status_lines(p.name),
+                     *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")
         print("\n".join(f"  {line}" for line in hostload.lines(s=load)))
@@ -9759,12 +9763,39 @@ def cmd_account_config(key: str, value: str | None) -> None:
             bad = [str(e)]
     if bad:
         die(bad[0])
+    from . import accountset
+    old = accountset.current(key)
     try:
         set_account_setting(key, None if val == "" else val)
     except ValueError as e:
         die(str(e))
-    print(f"{key} = {json.dumps(val)} (account-level, every project on this machine)" if val != ""
-          else f"{key} removed (account-level); the default applies")
+    was = f"; was {json.dumps(old)}" if key in ACCOUNT_USER_ONLY else ""
+    print(f"{key} = {json.dumps(val)} (account-level, every project on this machine{was})" if val != ""
+          else f"{key} removed (account-level{was}); the default applies")
+    if key in ACCOUNT_USER_ONLY:   # who changed the account's pool or overflow, when (and slurmcheck's re-arm)
+        _log_account_change(key, old, None if val == "" else val)
+
+
+def _account_off(key: str, value: str) -> bool:
+    """Whether `value` (the command's text) sets user-only account `key` to its declared off value."""
+    from .project import ACCOUNT_OFF_VALUE
+    try:
+        return key in ACCOUNT_OFF_VALUE and json.loads(value) == ACCOUNT_OFF_VALUE[key]
+    except ValueError:
+        return False
+
+
+def _log_account_change(key: str, old, new) -> None:
+    """One line in the account settings log (accountset.LOG): when, the key, old and new values, who and the undo."""
+    from . import accountset, configwho
+    undo = f"ttp config --account {key} " + (shlex.quote(json.dumps(old)) if old is not None else "''")
+    rec = {"ts": round(time.time(), 3), "key": key, "old": old, "new": new, "undo": undo, **configwho.from_env()}
+    try:
+        durable_append(accountset.log_path(), json.dumps(rec, sort_keys=True) + "\n")
+    except OSError as e:
+        print(f"ttp config: the change was made but not logged in {accountset.log_path()}: {e}", file=sys.stderr)
+        return
+    print(f"logged in {accountset.log_path()}; undo: {undo}")
 
 
 def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
@@ -9842,8 +9873,9 @@ def cmd_config(a) -> None:
         if run and a.key is not None and a.name in NEEDS_USER:
             # A run can be steered by text it reads; spend caps change only on the user's word.
             _refuse_user_only_in_run(a.name)
-        if run and a.key not in (None, "", "[]") and a.name in ACCOUNT_USER_ONLY:
-            # The account's spill pool sends every project's code to those machines: only clearing it is a run's.
+        if run and a.key not in (None, "") and a.name in ACCOUNT_USER_ONLY and not _account_off(a.name, a.key):
+            # The account's spill pool and Slurm overflow send every project's code to those machines: only
+            # clearing them (removing, or their off value) is a run's.
             _refuse_user_only_in_run(a.name)
         from . import accountset
         if a.name in accountset.KEYS and a.key is not None:

@@ -90,6 +90,7 @@ CLEARED_TEXT = {
     "daemon-hang": "The daemon completes its ticks again after its watchdog restart.",
     "paused": "The project is no longer paused; new runs start again.",
     "user-step": "The user step {arg} (task:step) is no longer needed: its task ended.",
+    "slurm-paused": "The Slurm checks overflow is re-armed: checks.slurm_overflow was set again or cleared.",
     "fleethold": "A machine hold past its expected end was lifted or extended, or no task here waits on it.",
     "coord-budget": "No coordinator item is parked over its per-turn budget any more.",
     "linger-off": "Linger is on again: the daemon starts at boot without a login.",
@@ -103,9 +104,10 @@ CLEARED_TEXT = {
 # linger-off: the systemd service would not start at boot without a login (downtime.py).
 # notifier: this machine's desktop notifications fail (notifier.py; a system setting or a missing tool).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
-USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step")   # paused: a long project pause (projpause); user-step: userstep.py
+USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
+                 "slurm-paused")   # slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
-                    "linger-off": "low", "notifier": "low", "user-step": "low"}
+                    "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
 # run reports them, or it turns out billed by use.
@@ -212,6 +214,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
         # One reopened after the relay is a new stretch, told by a relay of its own.
         return bool(ids) and bool(db.one(f"SELECT id FROM issues WHERE status='open' AND COALESCE(opened,first_seen)<=? "
                                          f"AND id IN ({','.join('?' * len(ids))}) LIMIT 1", [since, *ids]))
+    if key == "slurm-paused":   # until the user sets checks.slurm_overflow again (slurmcheck.tripped)
+        from . import slurmcheck
+        return slurmcheck.tripped() is not None
     if kind == "user-step":   # one standing item per task and user-only step (userstep.py)
         from . import userstep
         return userstep.holds(db, arg)
@@ -339,7 +344,7 @@ def _checkable(key: str) -> bool:
                                          "push_rejected", "after_push_failed", "push_queue_dying", "push_not_landing", "push_tip_failing", "push_script_torn", "push_setup_fault",
                                          "push_scope", "heal",
                                          "heal-hold", "machine", "machine-change", "network", "deploy", "deploy-behind", "deploy-pending", "redeploy", "daemon-hang", "paused", "fleethold",
-                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step")
+                                         "coord-budget", "account-mismatch", "linger-off", "tick-step", "pause-gone", "notifier", "chat-silent", "user-step", "slurm-paused")
 
 
 def _since(ep: dict) -> float:
