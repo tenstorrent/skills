@@ -1590,7 +1590,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     count = slots if callable(slots) else (lambda _held, n=max(1, int(slots or 1)): n)
     base = suite_base(project_name, repo)
     extra_lanes = lane_paths(project_name, 1, repo, overflow=True)
-    task = os.environ.get("TTP_TASK") or ""
+    task = str(checkcap._task_run()[0] or "")   # TTP_TASK, else the adopted one (checkcap.adopt_identity)
     label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
     ns = locks._pid_ns()
     text = ((f"task #{task} {label}" if task.isdigit() else label) + (f" [check {check}]" if check else "")

@@ -883,11 +883,7 @@ def _stalled(rec: dict, now: float, cfg: dict | None = None) -> str:
 
 
 def _ticket_task(t: Path) -> str:
-    try:
-        m = re.search(r"task #(\d+)", t.read_text())
-    except OSError:
-        return ""
-    return m.group(1) if m else ""
+    return locks.ticket_task(t)
 
 
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
@@ -1142,7 +1138,7 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
         for r in recs[base]:
             t = holder_times(r, now)
             running = t["running_s"]
-            lanes.append({"task": str(r.get("task") or ""), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
+            lanes.append({"task": _holder_task(r), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
                           "priority": r.get("priority"), "age_s": t["held_s"], "queued_s": t["queued_s"],
                           "alive": r.get("alive"), "children": t["children"],
                           "running_s": running, "cap_s": float(r.get("cap_s") or 0),
@@ -1174,6 +1170,12 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
                         "kind": "wrapper lock" if key.startswith("w") else "repository" if key else "project",
                         "lanes": lanes, "waiters": waiters})
     return out
+
+
+def _holder_task(rec: dict) -> str:
+    """The task a lane holder runs for: its "task" field, else its run record's task_id (locks.run_ids)."""
+    task = str(rec.get("task") or rec.get("task_id") or "")
+    return task if task.isdigit() else ""
 
 
 def _why(text) -> str:

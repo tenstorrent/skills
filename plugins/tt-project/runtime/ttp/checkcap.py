@@ -850,7 +850,7 @@ def upgraded(init: Path | None = None, now: float | None = None, settle: float |
     return new if now - _SEEN["since"] >= (UPGRADE_SETTLE_S if settle is None else settle) else ""
 
 
-_IDENT: dict = {}   # adopt_identity(): the project run a `ttp checks` with no TTP_TASK was started under
+_IDENT: dict = locks.IDENTITY   # adopt_identity() (shared with locks: queue tickets record it): the project run a `ttp checks` with no TTP_TASK was started under
 
 
 def inherited(pid: int, base: Path | None = None, depth: int = INHERIT_DEPTH) -> dict:

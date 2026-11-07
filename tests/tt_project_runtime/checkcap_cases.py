@@ -10919,3 +10919,37 @@ def test_detached_checks_keep_the_identity_their_parent_adopted(env, monkeypatch
     assert checkcap.adopt_identity() == {}
     monkeypatch.setenv(checkcap.ADOPTED_ENV, "not json")
     assert checkcap.adopt_identity() == {}
+
+
+def test_a_lane_waiter_is_named_by_the_task_in_its_run_record(env, tmp_path, monkeypatch):
+    # A detached candidate run started by a task: its lane ticket's record (locks.waiter_ids) names the task,
+    # so the wait event and the lane status name it even when the ticket's text does not; a run with no task
+    # in its record still reads "no task". An adopted identity (checkcap.adopt_identity) is recorded too.
+    from ttp import checkcap, checklane, locks, testslots
+    p = make(env)
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, p.name, _LANE_REPO)
+    base = testslots.suite_base(p.name, _LANE_REPO)
+    now = time.time()
+    monkeypatch.setenv("TTP_TASK", "71")
+    monkeypatch.setenv("TTP_RUN_ID", "501")
+    tasked = locks.enqueue(checkcap.slot_dir(), base, f"{p.name}: full checks (run 501, pid 1)", now - 900, priority=2)
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.delenv("TTP_RUN_ID")
+    bare = locks.enqueue(checkcap.slot_dir(), base, f"{p.name}: full checks (pid 2)", now - 800, priority=2)
+    monkeypatch.setattr(locks, "IDENTITY", {"task": "73", "run": "502"})
+    adopted = locks.enqueue(checkcap.slot_dir(), base, f"{p.name}: full checks (pid 3)", now - 700, priority=2)
+    try:
+        assert [locks.ticket_task(t) for t in (tasked, bare, adopted)] == ["71", "", "73"]
+        texts = [e["text"] for e in checklane.wait_events(p.name, {"checks": {"wait_event_s": 600}}, now)]
+        assert any(t.startswith("Checks lane wait: #71 has waited") for t in texts), texts
+        assert any(t.startswith("Checks lane wait: #73 has waited") for t in texts), texts
+        assert any(t.startswith("Checks lane wait: a run with no task has waited") for t in texts), texts
+        waiters = [w["task"] for r in checklane.lane_status(p.name, now) for w in r["waiters"]]
+        assert sorted(waiters) == ["", "71", "73"], waiters
+        assert checklane._who({"task": "", "pid": 2}) == "no task pid 2"
+        assert checklane._holder_task({"task_id": "74"}) == "74" and checklane._holder_task({"task_id": "x"}) == ""
+    finally:
+        for t in (tasked, bare, adopted):
+            locks.dequeue(t)
+        _stop(holder)

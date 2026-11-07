@@ -1199,7 +1199,42 @@ def _ticket_owner(env=None) -> dict:
     out = _owner(os.getpid())
     if (run := _waits_for_run(env)):
         out["run_dir"] = run
+    try:   # the waiter's task and project only label it; an unreadable registry never fails a ticket
+        out |= waiter_ids(env)
+    except Exception:
+        pass
     return out
+
+
+IDENTITY: dict = {}   # the task, run and project root a process with no TTP_TASK adopted (checkcap.adopt_identity)
+
+
+def waiter_ids(env=None) -> dict:
+    """The task, run and project a waiter queues for, for its ticket's record (ticket_task): run_ids, else the
+    adopted IDENTITY's task and run (a `ttp checks` with no TTP_TASK started under a project run)."""
+    env = os.environ if env is None else env
+    out = run_ids(env)
+    if not str(env.get("TTP_TASK") or "").isdigit() and str(IDENTITY.get("task") or "").isdigit():
+        out = {**out, "task_id": IDENTITY["task"], **({"run_id": IDENTITY["run"]} if IDENTITY.get("run") else {})}
+    return out
+
+
+_TASK_RE = re.compile(r"task #(\d+)")
+
+
+def ticket_task(ticket: Path) -> str:
+    """The task a queue ticket waits for: its text's "task #N", else its record's task_id (waiter_ids); ""
+    when neither names one."""
+    try:
+        if m := _TASK_RE.search(ticket.read_text()):
+            return m.group(1)
+    except OSError:
+        return ""
+    try:
+        task = str(json.loads(_owner_file(ticket).read_text()).get("task_id") or "")
+    except (OSError, ValueError, AttributeError):
+        return ""
+    return task if task.isdigit() else ""
 
 
 def _waits_for_run(env=None) -> str:
