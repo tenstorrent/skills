@@ -20,6 +20,7 @@ A plain shell string, a non-list, or any entry `ttp host-run` would refuse (empt
 
 Only off from chat: `providers.<p>.write_fence` and `sandbox.checks`, which turn namespace sandboxing on, are user-only.
 `config_set` (in a turn carrying a user message too) and `ttp config` inside any run refuse true and accept false or `''`; only the user's own word (`ttp config` in their own shell, or the web settings page) turns one on.
+`restrictions.no_internet` also turns sandboxing on (Codex, Cursor) and is a Restriction: `config_set` cannot set it and `ttp config` inside a run refuses it on or off.
 
 Never from chat: any `providers.<p>.base_url`.
 Worker runs carry internal code, so the bridge sends them only to the base URL saved with the endpoint's key; leave `base_url` unset.

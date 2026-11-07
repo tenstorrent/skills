@@ -1701,6 +1701,9 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
 # config_set refuse the on value, also in a turn carrying a user message; false or unset is anyone's.
 SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS} | {"sandbox.checks"}
 NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
+# restrictions.no_internet also turns sandboxing on (Codex workspace-write and read-only, Cursor --sandbox) and
+# is a Restriction: a run changes it in neither direction, as clearing it loosens one (not SAFE_WHEN_OFF).
+NEEDS_USER["restrictions.no_internet"] = "restriction"
 
 
 def sandbox_on(value) -> bool:

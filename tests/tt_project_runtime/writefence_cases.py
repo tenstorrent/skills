@@ -782,6 +782,40 @@ def test_the_coordinator_never_turns_the_worker_sandbox_on_and_may_turn_it_off(e
     assert "providers.claude.write_fence: accepted as false" in capsys.readouterr().out
 
 
+@pytest.mark.parametrize("var", ["TTP_RUN_ID", "TTP_RUN_DIR", "TTP_NOTE_RUN_DIR"])
+@pytest.mark.parametrize("start,argv_tail", [
+    (None, ["restrictions.no_internet", "true"]),                      # turns Codex's and Cursor's sandbox on
+    (None, ["restrictions", json.dumps({"no_internet": True})]),       # through the parent key
+    (True, ["restrictions.no_internet", "false"]),                     # clearing it loosens a Restriction
+    (True, ["restrictions.no_internet", ""]),                          # unset, the same
+    (True, ["restrictions", json.dumps({})]),                          # dropped through the parent key
+])
+def test_a_run_cannot_change_restrictions_no_internet(env, capsys, monkeypatch, var, start, argv_tail):
+    """restrictions.no_internet turns sandboxing on (Codex workspace-write and read-only, Cursor --sandbox) and is
+    a Restriction: a run's `ttp config` refuses it in both directions, directly or through `restrictions`, and
+    the coordinator's config_set refuses it; the user's own `ttp config`, outside a run, sets it."""
+    from ttp import cli, coordinator as coord
+    from ttp.providers import fence_on, get_provider
+    p = make(env)
+    if start is not None:
+        p.set_config("restrictions.no_internet", start)
+    before = p.raw_config()
+    monkeypatch.setenv(var, "7")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "demo", *argv_tail])
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and "only the user may change" in err and "restrictions.no_internet" in err, err
+    assert p.raw_config() == before
+    monkeypatch.delenv(var)
+    for user_turn in (False, True):
+        out = coord.apply(p, [{"type": "config_set", "key": "restrictions.no_internet", "value": not start}],
+                          user_turn=user_turn)
+        assert out and p.raw_config() == before, out
+    cli.main(["config", "demo", "restrictions.no_internet", "true"])  # the user's own terminal
+    cfg = p.config()
+    assert get_provider("codex").fenced(fence_on(cfg, "codex"), cfg["restrictions"])
+
+
 def _launch_role(env, p, provider, role, cwd, monkeypatch):
     """run.json of a `role` run the daemon starts with `provider` (a stand-in agent), and the daemon log."""
     from ttp import coordinator as coord, providers

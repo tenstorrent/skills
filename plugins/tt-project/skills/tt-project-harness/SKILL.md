@@ -275,7 +275,9 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   user-only: only the user's own word turns one on (`ttp config` in their own shell, or the web
   settings page). `ttp config` inside any run, a worker's or a coordinator's, and every coordinator
   `config_set` refuse the on value, in a turn carrying a user message too; the off value (false, or
-  `''` to unset) anyone may write. A user's
+  `''` to unset) anyone may write. `restrictions.no_internet` also turns Codex's and Cursor's
+  sandbox on and is a Restriction: a run's `ttp config` refuses it on or off, and `config_set`
+  cannot set it. A user's
   harness-wide order (such as unsandboxed runs) applies to every project; a project never opts out
   on its own judgement: it records the workaround it relied on instead.
 - A fenced Claude worker's (write_fence true) `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox
