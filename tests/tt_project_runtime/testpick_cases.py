@@ -351,6 +351,40 @@ def test_a_nested_pytest_a_targeted_test_starts_runs_its_own_tests(tmp_path, wor
     assert r.returncode == 0 and ran == ["test_outer"], r.stdout[-3000:] + r.stderr[-2000:]
 
 
+_NESTED_OUTER_INHERITED = """import os, subprocess, sys, pathlib
+
+
+def test_outer():
+    inner = pathlib.Path(__file__).parent / "inner"
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(inner),
+                        str(inner)], cwd=inner, env=dict(os.environ), capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "1 passed" in r.stdout, r.stdout + r.stderr
+"""
+
+
+@pytest.mark.parametrize("form", ["-p ttp_pytest_rerun", "-pttp_pytest_rerun"])
+def test_a_nested_pytest_an_added_tests_rerun_test_starts_runs_its_own_tests(tmp_path, form):
+    """The added-tests rerun of a targeted `ttp checks` loads the rerun and the select plugin from the same
+    folder: the select plugin keeps that folder on PYTHONPATH while PYTEST_ADDOPTS still loads another plugin
+    from it, so a pytest a test starts with the inherited environment imports it and runs its own tests."""
+    from ttp import addedtests, pushpass
+    t = tmp_path / "proj"
+    (t / "tests" / "inner").mkdir(parents=True)
+    (t / "tests" / "inner" / "test_inner.py").write_text("def test_inner():\n    pass\n")
+    (t / "tests" / "test_outer.py").write_text(_NESTED_OUTER_INHERITED)
+    (t / "tests" / "test_other.py").write_text("def test_other():\n    pass\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_PYTEST_", "PYTEST_XDIST"))}
+    env.update({"PYTHONPATH": os.pathsep.join([str(pushpass.PLUGIN_DIR)] * 2),
+                "PYTEST_ADDOPTS": f"{form} -p {pushpass.SELECT_PLUGIN}",
+                addedtests.ENV: json.dumps({"root": str(t), "tests": [["tests/test_outer.py", "test_outer"]],
+                                            "rounds": 1}),
+                "TTP_PYTEST_SELECT_FILES": "tests/test_outer.py\n", "PWD": str(t)})
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(t),
+                        "tests/test_outer.py", "tests/test_other.py", "-rA"],
+                       cwd=t, env=env, capture_output=True, text=True, timeout=300)
+    ran = sorted(re.findall(r"^PASSED \S+::(\w+)", r.stdout, re.M))
+    assert r.returncode == 0 and ran == ["test_outer"], r.stdout[-3000:] + r.stderr[-2000:]
+
 
 @pytest.mark.parametrize("path", ["gate_rerun", "cap_probe"])
 def test_a_push_batch_gate_rerun_or_cap_probe_leaves_no_select_setting_in_a_nested_pytest(tmp_path, path):

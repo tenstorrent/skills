@@ -14,7 +14,7 @@ file executes, or a test file), `path::name` the test function `name` of test fi
 combine (a test must pass each one set). A run that keeps none exits 5, pytest's "no tests" status.
 It acts only in the pytest process it was loaded into and its xdist workers: it takes its load, its
 TTP_PYTEST_SELECT* settings and its folder on PYTHONPATH out of the environment, so a pytest a test
-starts runs without it. An xdist controller, which runs no test, keeps them: its workers, started after
+starts runs without it. The folder stays while PYTEST_ADDOPTS still loads another plugin from it. An xdist controller, which runs no test, keeps them: its workers, started after
 it loads, load the plugin from the environment they inherit and get the settings from the controller."""
 from __future__ import annotations
 
@@ -44,12 +44,20 @@ def _strip_env() -> None:
         os.environ.pop("PYTEST_ADDOPTS", None)
     here = os.path.dirname(os.path.realpath(__file__))
     pp = os.environ.get("PYTHONPATH")
-    if pp is not None:
+    if pp is not None and not _loads_from(kept, here):
         rest = [e for e in pp.split(os.pathsep) if not e or os.path.realpath(e) != here]
         if any(rest):
             os.environ["PYTHONPATH"] = os.pathsep.join(rest)
         else:
             os.environ.pop("PYTHONPATH", None)
+
+
+def _loads_from(words: list, folder: str) -> bool:
+    """PYTEST_ADDOPTS `words` still load another plugin from `folder` (`-p name` or `-pname`), as the
+    added-tests rerun's ttp_pytest_rerun does: a pytest a test starts imports it from there."""
+    names = [words[i + 1] for i, w in enumerate(words[:-1]) if w == "-p"]
+    names += [w[2:] for w in words if w.startswith("-p") and len(w) > 2]
+    return any(n.isidentifier() and os.path.isfile(os.path.join(folder, n + ".py")) for n in names)
 
 
 def _controller(config) -> bool:
