@@ -17,6 +17,7 @@ from __future__ import annotations
 import inspect
 import os
 import re
+from pathlib import Path
 
 ENV = "TTP_PYTEST_SELECT"
 IDS_ENV = "TTP_PYTEST_SELECT_IDS"
@@ -34,14 +35,13 @@ def pytest_collection_modifyitems(config, items):
             (tests.add((p, name)) if name else paths.add(p))
     rx = re.compile(pattern) if pattern else None
     want = {i.strip() for i in (ids or "").splitlines() if i.strip()}
-    rel = getattr(config, "cwd_relative_nodeid", lambda n: n)
 
     def keep(item) -> bool:
         if rx is not None and not rx.search(item.nodeid.rpartition("::")[2]):
             return False
         if files is not None and not _in_files(item, paths, tests):
             return False
-        return ids is None or item.nodeid in want or rel(item.nodeid) in want
+        return ids is None or item.nodeid in want or _cwd_relative(config, item.nodeid) in want
     gone = [i for i in items if not keep(i)]
     if gone:
         items[:] = [i for i in items if keep(i)]
@@ -63,3 +63,16 @@ def _in_files(item, paths: set, tests: set) -> bool:
     name = getattr(item, "originalname", None) or item.name.partition("[")[0]
     return any(_ends(code, p) or _ends(where, p) for p in paths) \
         or any(n == name and _ends(where, p) for p, n in tests)
+
+
+def _cwd_relative(config, nodeid: str) -> str:
+    """`nodeid` relative to the current directory, as pytest's summary prints it. Computed here, not by
+    config.cwd_relative_nodeid: pytest 9 takes a node id object there, not the item's string."""
+    try:
+        root, here = Path(config.rootpath), Path(config.invocation_params.dir)
+    except (AttributeError, TypeError):
+        return nodeid
+    if root == here:
+        return nodeid
+    path, sep, rest = nodeid.partition("::")
+    return Path(os.path.relpath(root / path, here)).as_posix() + sep + rest
