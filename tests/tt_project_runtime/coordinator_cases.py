@@ -13105,6 +13105,39 @@ def test_task_add_naming_a_finished_tasks_branch_carries_it_only_with_a_pr_branc
 
 
 
+def test_task_add_naming_a_live_tasks_branch_without_a_pr_branch_line_says_it_delivers_nothing_there(env):
+    """A reported case, replayed: a work task whose spec said to push a queued code task's branch
+    (ttp/t<id>-...) got no label and no word that it would not deliver there, so its push was refused
+    later. task_add now notes that the live task still owns the branch and that only a `pr_branch:`
+    line delivers there. A spec with that line, or a rebase title, gets no such note."""
+    p = make(env)
+    from ttp import coordinator as coord
+
+    def labels(title):
+        return json.loads(p.db.one("SELECT labels FROM tasks WHERE title=?", (title,))["labels"])
+
+    def owned_notes(new):
+        return [n for n in p.db.kv(coord.NOTES_KEY) or [] if f"#{new} names #{src}'s branch" in n]
+
+    src = p.db.add_task("Fold the peak", "s", kind="code")   # queued, never started
+    b = f"ttp/t{src}-fold-the-peak"
+    assert coord.apply(p, [{"type": "task_add", "title": "Push the fold", "kind": "work",
+                            "spec": f"Fast-forward {b} to the tested commit and push the branch."}]) == []
+    new = p.db.one("SELECT id FROM tasks WHERE title='Push the fold'")["id"]
+    assert not [x for x in labels("Push the fold") if x.startswith(("pr_branch:", "continues:", "rebases:"))]
+    got = owned_notes(new)
+    assert len(got) == 1 and f"`pr_branch: {b}`" in got[0] and f"#{src} (queued) still owns it" in got[0], got
+    p.db.update_task(src, status="running", branch=b)
+    assert coord.apply(p, [{"type": "task_add", "title": "Push it now", "kind": "work",
+                            "spec": f"Push {b}."}]) == []
+    assert owned_notes(p.db.one("SELECT id FROM tasks WHERE title='Push it now'")["id"])
+    for title, spec in (("Push the fold, carried", f"pr_branch: {b}\nFast-forward it and push."),
+                        ("Rebase the fold", f"Rebase {b} onto the tip.")):
+        assert coord.apply(p, [{"type": "task_add", "title": title, "kind": "work", "spec": spec}]) == []
+        assert not owned_notes(p.db.one("SELECT id FROM tasks WHERE title=?", (title,))["id"]), title
+    assert f"pr_branch:{b}" in labels("Push the fold, carried")
+
+
 def test_a_pr_branch_line_labels_its_first_token_with_text_after_it(env):
     """A spec's `pr_branch:` line (the marker starts the line, a list bullet aside) labels the task with
     the branch right after it, backticks or quotes aside, even with more text on the same line, and

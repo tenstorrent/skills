@@ -12789,6 +12789,56 @@ def test_own_push_existing_only_refusal_of_another_tasks_branch_names_the_own_br
     assert _git_out(origin, "rev-parse", mine) == _git_out(repo, "rev-parse", "HEAD")
 
 
+def test_own_push_refusals_of_a_work_task_name_the_pr_branch_route(env, monkeypatch, capsys):
+    """A reported case, replayed: a work task told to push another task's ttp/t<id>-... branch was
+    refused by `ttp push --own` with text naming no route (only the push queue, or 'only this task's own
+    branch'). Each refusal now names the supported one: hand off blocked, and the coordinator adds a
+    task whose spec has a `pr_branch: <branch>` line. With that line, --own still fast-forwards the
+    existing branch; no branch is created on the way."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.own_push", None)
+    first = p.db.add_task("Fold the peak", "s", kind="code")
+    theirs = f"ttp/t{first}-fold-the-peak"
+    p.db.update_task(first, status="running", branch=theirs)
+    w = p.db.add_task("Push the fold", f"Fast-forward {theirs} to the tested commit and push the branch.",
+                     kind="work")
+    mine = f"ttp/t{w}-push-the-fold"
+    p.db.update_task(w, status="running", branch=mine)
+    heads = lambda: _git_out(origin, "for-each-ref", "--format=%(refname:short)", "refs/heads").split()
+    monkeypatch.setenv("TTP_TASK", str(w))
+    # (a) On its own branch, which the remote lacks: the spec's branch is named with its route.
+    _git_out(repo, "checkout", "-q", "-b", mine)
+    _commit(repo, "fold.txt", "fold\n")
+    capsys.readouterr()
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "not creating it" in err and "work task creates no branch" in err and f"`pr_branch: {theirs}`" in err \
+        and "no 'rebase'" in err, err
+    # (b) No branch named: the route in general terms.
+    p.db.update_task(w, spec="Push the tested commit.")
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "work task creates no branch" in err and "`pr_branch: <branch>`" in err, err
+    # (c) The other task's branch checked out, not carried: refused, naming the route.
+    _git_out(repo, "checkout", "-q", "-B", theirs)
+    assert _ttp("push", "--own") == 2
+    err = capsys.readouterr().err
+    assert "publishes only this task's own branch" in err and f"#{first}'s branch" in err \
+        and f"`pr_branch: {theirs}`" in err, err
+    assert heads() == ["proj"]
+    # (d) No regression: a work task with a `pr_branch:` line naming the existing remote branch
+    # fast-forwards it with --own.
+    _git_out(repo, "push", "-q", "origin", f"HEAD~1:refs/heads/{theirs}")
+    carrier = p.db.add_task("Push the fold, carried", f"pr_branch: {theirs}\nFast-forward it.", kind="work",
+                           labels=[f"pr_branch:{theirs}"])
+    p.db.update_task(first, status="done")
+    p.db.update_task(carrier, status="running", branch=theirs)
+    monkeypatch.setenv("TTP_TASK", str(carrier))
+    assert _ttp("push", "--own") == 0, capsys.readouterr().err
+    assert _git_out(origin, "rev-parse", theirs) == _git_out(repo, "rev-parse", "HEAD")
+    assert sorted(heads()) == sorted(["proj", theirs])
+
+
 def test_push_own_reuses_a_ttp_checks_pass_only_on_the_same_tree_commands_and_env(env, monkeypatch, tmp_path, capsys):
     """`ttp push --own` runs again no check `ttp checks` recorded passing on exactly HEAD's tree with the
     same commands (or more that start with them) and environment, and says it reused that pass. A

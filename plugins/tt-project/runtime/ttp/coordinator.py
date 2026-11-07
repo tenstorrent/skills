@@ -2826,6 +2826,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     except ValueError:
                         old = None
                 taken = bool(carried and old and old["id"] == carried[0]["id"])
+                # A live task's branch the spec merely names stays that task's: nothing delivers there.
+                owned = None if review or given or followup or pub or REBASE_TITLE.search(title) \
+                    else _named_branch(db, spec_text, live=True)
                 onto = pub["branch"] if pub else given.group("branch") if given else ""
                 # A rebase of that branch cannot fast-forward it: it works on its own branch and delivers
                 # there (delivery.rebase_replace new_branch), or `ttp push --own` replaces that branch
@@ -2973,6 +2976,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     notes.append(f"task_add: #{new_id} names #{carried[0]['id']}'s branch {carried[1]} but carries "
                                  f"no branch: only a `pr_branch: {carried[1]}` line in its spec makes it deliver "
                                  f"onto another task's branch")
+                if owned and not (old and old["id"] == owned[0]["id"]):
+                    notes.append(f"task_add: #{new_id} names #{owned[0]['id']}'s branch {owned[1]} but carries no "
+                                 f"branch: #{owned[0]['id']} ({owned[0]['status']}) still owns it, and only a "
+                                 f"`pr_branch: {owned[1]}` line in #{new_id}'s spec makes it deliver there")
                 if worktree.NO_PR_BRANCH in labels:
                     why = (" (never published)" if unpublished else f" (#{foreign}'s branch, and no `pr_branch: "
                            f"{inherited}` line names it)" if foreign is not None else "")
@@ -4418,7 +4425,7 @@ def _failed_latest_review(db, task: dict) -> dict | None:
 # it. A mention in running prose ("the spec's pr_branch: line") is no such line. Known gap, accepted:
 # a line such as `pr_branch: use that branch` labels a bogus branch ("use"); `ttp push --own` refuses
 # one that exists nowhere and on_carried sends the task back to its own branch.
-NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")
+NAMED_BRANCH = push.NAMED_BRANCH
 REBASE_TITLE = re.compile(r"\brebas(?:e|es|ed|ing)\b", re.I)   # a task whose work is a rebase of its branch
 SPEC_PR_BRANCH = worktree.SPEC_PR_BRANCH
 
@@ -4439,13 +4446,14 @@ def _lands_on_push_branch(cfg: dict, spec: str, branch: str) -> bool:
         any(names_branch(spec, r) for r in {ref, ref.partition("/")[2]} if r)
 
 
-def _named_branch(db, spec: str) -> tuple[dict, str] | None:
+def _named_branch(db, spec: str, live: bool = False) -> tuple[dict, str] | None:
     """(task, branch) when `spec` names the work branch of one finished task (done, failed or
-    cancelled; a live one still owns it); None when it names none, or branches of several tasks."""
+    cancelled; a live one still owns it), or with `live` of one unfinished task; None when it names
+    none, or branches of several tasks."""
     found: dict[int, tuple[dict, str]] = {}
     for m in NAMED_BRANCH.finditer(spec):
         t = db.task(int(m.group(1)))
-        if t and t["status"] in ("done", "failed", "cancelled") \
+        if t and (t["status"] in ("done", "failed", "cancelled")) != live \
                 and m.group(0) == (t["branch"] or f"ttp/t{t['id']}-{worktree.slug(t['title'])}"):
             found[t["id"]] = (t, m.group(0))
     return next(iter(found.values())) if len(found) == 1 else None

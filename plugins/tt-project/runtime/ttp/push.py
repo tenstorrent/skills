@@ -74,6 +74,7 @@ BUMP_TRAILER = "Ttp-Version-Bump"   # marks the bump commit ttp push made, so a 
 VERSION_RE = re.compile(r"""(version(?:__)?["']?\s*[:=]\s*["'])(\d+)\.(\d+)\.(\d+)(["'])""", re.I)
 PROTECTED = {"HEAD", "main", "master"}
 OWN_BRANCH = re.compile(r"ttp/t(\d+)-\S+")   # a task's own branch, as worktree.ensure names it
+NAMED_BRANCH = re.compile(r"(?<![\w/.-])ttp/t(\d+)-[\w./-]*[\w-]")   # such a branch named in prose
 NOTES_BRANCH = re.compile(r"ttp/t(\d+)-(?:\S+-)?notes")   # a task's notes branch: ttp/t<id>-notes, ...-notes
 NO_CHECKS = ("set delivery.push_checks to the commands that must pass on the exact commit before it "
              "is pushed (a list, or one per line, e.g. the repository's test suite); the coordinator "
@@ -2002,7 +2003,9 @@ def own_target(p: Project, repo: Path) -> tuple[str, str]:
                              f"not publishing")
         branch = onto
     elif m and task and m.group(1) != task and not _carries(p, task, m.group(1), branch):
-        raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}")
+        raise ValueError(f"--own publishes only this task's own branch (ttp/t{task}-...), not {branch}, task "
+                         f"#{m.group(1)}'s branch, which this task does not carry: not pushing. If the work "
+                         f"must go onto {branch}, {pr_branch_route(branch)}")
     d = p.config().get("delivery") or {}
     remote, shared = target(p, repo) if str(d.get("push_branch") or "").strip() else ("origin", "")
     if configured := own_push_remote(d, repo):
@@ -2546,7 +2549,7 @@ def own_gate(p: Project, repo: Path, remote: str, branch: str) -> None:
         raise ValueError(f"{remote} has no branch {branch}, and this project lets `ttp push --own` publish "
                          f"only onto a branch the remote already has ({setting}): not "
                          f"creating it. Never create it another way (no `git push`): "
-                         f"{own_route(p, cfg, branch) or own_landing(cfg)}")
+                         f"{own_route(p, cfg, branch) or work_route(p, branch) or own_landing(cfg)}")
 
 
 def own_route(p: Project, cfg: dict, branch: str) -> str:
@@ -2560,6 +2563,33 @@ def own_route(p: Project, cfg: dict, branch: str) -> str:
     return (f"deliver on this task's own branch instead, which may be created: commit on {own} (`git switch "
             f"-c {own}` if it is not checked out), run `ttp push --own-branch --detach` and open the PR "
             f"from {own}")
+
+
+def pr_branch_route(branch: str) -> str:
+    """How work gets onto another task's existing `branch`: only a task whose spec has a `pr_branch:`
+    line naming it publishes a fast-forward there with `ttp push --own`."""
+    return (f"hand off blocked naming {branch}: the coordinator then adds a task whose spec has the line "
+            f"`pr_branch: {branch}` and whose title has no 'rebase' (that would deliver on a new branch), "
+            f"and that task's `ttp push --own` fast-forwards the existing branch (task_update cannot set a "
+            f"running task's pr_branch)")
+
+
+def work_route(p: Project, branch: str) -> str:
+    """The route a running task that is neither a code task nor a review, refused publishing `branch`
+    the remote lacks, has, or "": it creates no branch, but a task with a `pr_branch:` line can deliver
+    onto the one other task's branch its spec names (or any existing branch)."""
+    task = os.environ.get("TTP_TASK")
+    t = _task_row(p, task) if task else None
+    if not t or (kind := str(t.get("kind") or "work")) in ("code", "review"):
+        return ""
+    named = {m.group(0) for m in NAMED_BRANCH.finditer(str(t.get("spec") or ""))
+             if m.group(1) != task and m.group(0) != branch}
+    if len(named) == 1:
+        onto = named.pop()
+        return f"a {kind} task creates no branch. If its work must go onto {onto}, which its spec names, " \
+               f"{pr_branch_route(onto)}"
+    return f"a {kind} task creates no branch. If its work must go onto another task's existing branch, " \
+           f"{pr_branch_route('<branch>')}"
 
 
 def own_pr_branch(p: Project, cfg: dict, branch: str) -> bool:
