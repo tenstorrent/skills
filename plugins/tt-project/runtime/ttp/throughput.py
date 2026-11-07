@@ -54,7 +54,9 @@ to its first run, or to now for one still queued:
   none held by the project's own limits the lane names that `holder` instead of a checks setting, and
   plan() reports it as information only: no raise, no task; a set test-worker budget,
   checks.test_project_slots, that admits fewer full runs at once than both checks limits is the lane's
-  limit instead, reported, never raised), own_job (its own detached job or checks,
+  limit instead, reported, never raised, naming the setting that binds it (`budget_from`,
+  testslots.project_max_from: the account's, its environment variable, the host's per-project worker
+  ceiling or pool, or the project's own)), own_job (its own detached job or checks,
   or a retry_when on its own driver: no limit), the resource rule above only with a dispatch hold recorded
   in the wait, a deferral or provider hold, else retry_wait (its own retry
   condition, then a slot, not told apart: no limit, never counted against worker slots).
@@ -709,17 +711,30 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
             set_ = testslots._number(_cfg(cfg, f"checks.{key}", None)) or testslots._setting(env, key)
             budget = testslots.project_max(cfg, s) if s and set_ else 0
             fits = budget // testslots.run_min(cfg, s[1]) if budget else 0
+            src = testslots.project_max_from(cfg, s) if budget else ""
         except Exception:
             budget = fits = 0
         if budget and fits < min(lanes_n, cap_n):
-            ck_lane.update(limit_key=f"checks.{key}", limit=budget, budget_runs=max(1, fits))
+            # Name the setting that binds (testslots.project_max_from): a raise of any other changes nothing.
+            mine = testslots._number(_cfg(cfg, f"checks.{key}", None))
+            fix = {
+                "account": (f", the account's setting{f': its own {mine} only lowers it' if mine else ''}",
+                            f"raise or unset the account's (ttp config --account checks.{key}; it holds every "
+                            "project on this host; unset, it follows the host's spare cores)"),
+                "env": (f", set by {env}", f"raise or unset {env} in the daemon's environment"),
+                "workers": (f", held by the host's per-project worker ceiling {budget}",
+                            "the per-project worker ceiling follows the host's load (checks.test_project_workers "
+                            f"only lowers it): raising checks.{key} changes nothing; cut the host's other load"),
+                "pool": (f", held by the host's test pool {s[0]}", f"raise checks.test_pool, not checks.{key}"),
+            }.get(src, ("", f"raise or unset checks.{key} (unset, it follows the host's spare cores)"))
+            ck_lane.update(limit_key=f"checks.{key}", limit=budget, budget_runs=max(1, fits), budget_from=src)
             ck_lane["limits"][f"checks.{key}"] = budget
             ck_lane["note"] = (
-                f"the project's test-worker budget (checks.{key} {budget}) admits only {max(1, fits)} full run(s) "
-                f"at once (each starts with at least checks.test_run_min {testslots.run_min(cfg, s[1])} workers), "
-                f"fewer than checks.slots {lanes_n} and checks.test_project_max {cap_n}: it holds the lane, so "
-                f"raising those changes nothing; raise or unset checks.{key} (unset, it follows the host's spare "
-                "cores); " + ck_lane["note"])
+                f"the project's test-worker budget (checks.{key} {budget}{fix[0]}) admits only {max(1, fits)} "
+                f"full run(s) at once (each starts with at least checks.test_run_min "
+                f"{testslots.run_min(cfg, s[1])} workers), fewer than checks.slots {lanes_n} and "
+                f"checks.test_project_max {cap_n}: it holds the lane, so raising those changes nothing; "
+                f"{fix[1]}; " + ck_lane["note"])
     peak = _peak(spans, t0, now)
     out = []
     for ln in lanes.values():

@@ -456,6 +456,35 @@ def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind:
     return top
 
 
+def project_max_from(cfg: dict | None = None, s: tuple[int, int] | None = None,
+                     project_name: str | None = None) -> str:
+    """Which setting sets project_max() for tests, as project_max applies them: "workers" (project_workers:
+    the host's per-project ceiling), "pool" (the pool, checks.test_pool), "project" (its own
+    checks.test_project_slots), "env" (TTP_TEST_PROJECT_SLOTS), "account" (the account's, which a project's
+    own one only lowers), "run" (one run's grant, the floor) or "" (none set: the project cap's default)."""
+    s = s or sizes(cfg) or (0, 0)
+    if not s[0]:
+        return ""
+    env, key = TESTS.setting(TESTS.budget)
+    mine = _number(_section(cfg, "checks").get(key))
+    upper = _number(os.environ.get(env)) if os.environ.get(env) not in (None, "") else None
+    acct = _number((project.load_account_settings().get("checks") or {}).get(key))
+    top = upper or acct or mine
+    src = "env" if upper else "account" if acct else "project" if mine else ""
+    if mine and top and mine < top:
+        top, src = mine, "project"
+    if not top:
+        from . import checklane
+        top = max(1, checklane.project_cap(cfg)) * s[1]
+    w = project_workers(cfg, project_name=project_name)
+    bounded = max(s[1], min(top, s[0]))
+    if w and w < bounded:
+        return "workers"
+    if top < s[1]:
+        return "run"
+    return "pool" if s[0] < top else src
+
+
 def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
     """One project's budget slots; none for no project (its runs only count against the pool)."""
     return (locks.slot_paths(checkcap.slot_dir(), f"{kind.own}.{locks.group_id(project_name)}", n)

@@ -1237,20 +1237,26 @@ def test_throughput_a_checks_wait_counts_against_the_limit_its_event_names_cap_h
 
 
 @pytest.mark.parametrize("budget,where,holds", [(8, "project", True), (8, "env", True), (24, "project", False),
-                                                (None, None, False)])
+                                                (None, None, False), (8, "account", True),
+                                                (8, "account_over", True), (8, "workers", True)])
 def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budget(env, monkeypatch, tmp_path,
                                                                                    budget, where, holds):
     """Task #5710: a set test-worker budget (checks.test_project_slots 8) with full runs of at least 4 workers
     (checks.test_run_min, half of a run's 8) admits 2 runs at once, fewer than checks.slots 3 and the cap 4,
     so it held the lane: the lane names it and says raising checks.slots changes nothing. One that fits as
-    many runs as both limits (24), or none set (the default follows the host's spare cores), keeps checks.slots."""
-    from ttp import checkcap, slowcomplaint, testslots, throughput
+    many runs as both limits (24), or none set (the default follows the host's spare cores), keeps checks.slots.
+    Task #7176: the lane names where the binding budget comes from (budget_from): the account's 8 holds a
+    project whose own 32 only lowers it, so it names the account setting, never raising the project's; the
+    host's per-project worker ceiling (testslots.project_workers, 8 here) under a project budget of 32 is named
+    as that ceiling, not as checks.test_project_slots."""
+    from ttp import checkcap, project as pj, slowcomplaint, testslots, throughput
     from ttp.daemon import Daemon
     monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     for k in ("POOL", "RUN_MAX", "RUN_MIN", "PROJECT_SLOTS", "PROJECT_WORKERS"):
         monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
-    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: 32)
+    workers = 8 if where == "workers" else 32
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: workers)
     p = make(env)
     d, now = Daemon(p.base), time.time()
     p.set_config("checks.test_project_max", 4)
@@ -1259,6 +1265,12 @@ def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budg
         p.set_config("checks.test_project_slots", budget)
     elif where == "env":
         monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", str(budget))
+    elif where in ("account", "account_over"):
+        pj.set_account_setting("checks.test_project_slots", budget)
+        if where == "account_over":
+            p.set_config("checks.test_project_slots", 32)
+    elif where == "workers":
+        p.set_config("checks.test_project_slots", 32)
     for i, w0 in enumerate((now - 5 * 3600, now - 3 * 3600)):
         t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"budget wait {i}", w0, 2400)
         _tp_checks_run(p, monkeypatch, w0 - 60, 2500)   # one run at a time: the budget, not the lanes
@@ -1272,8 +1284,21 @@ def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budg
         return
     assert (ck["limit_key"], ck["limit"], ck["budget_runs"]) == ("checks.test_project_slots", 8, 2), ck
     assert ck["limits"]["checks.test_project_slots"] == 8, ck
-    assert ck["note"].startswith("the project's test-worker budget (checks.test_project_slots 8) admits only 2 "
-                                 "full run(s)") and "raising those changes nothing" in ck["note"], ck["note"]
+    assert ck["note"].startswith("the project's test-worker budget (checks.test_project_slots 8") \
+        and "admits only 2 full run(s)" in ck["note"] and "raising those changes nothing" in ck["note"], ck["note"]
+    src = {"account_over": "account"}.get(where, where)
+    assert ck["budget_from"] == src, ck
+    if src == "account":
+        assert "ttp config --account checks.test_project_slots" in ck["note"], ck["note"]
+        assert "the account's setting" in ck["note"] and "raise or unset checks." not in ck["note"], ck["note"]
+        assert ("its own 32 only lowers it" in ck["note"]) == (where == "account_over"), ck["note"]
+    elif src == "workers":
+        assert "per-project worker ceiling" in ck["note"] and "checks.test_project_workers" in ck["note"], ck["note"]
+        assert "raise or unset checks.test_project_slots" not in ck["note"], ck["note"]
+    elif src == "env":
+        assert "TTP_TEST_PROJECT_SLOTS" in ck["note"], ck["note"]
+    else:
+        assert "raise or unset checks.test_project_slots (unset, it follows" in ck["note"], ck["note"]
     _, kept = throughput.plan(p.db, p.config(), rep)
     (k,) = [k for k in kept if k["lane"] == "checks_slots"]
     assert k["key"] == "checks.test_project_slots" and not k.get("info"), k
