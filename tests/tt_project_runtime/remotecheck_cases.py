@@ -1850,10 +1850,14 @@ def test_overflow_jobs_dying_at_start_pause_it_with_one_alert_and_the_runs_stay_
     assert alerts.tracked("alert", "normal", slurmcheck.ALERT_KEY) and not alerts.sweep(p.db)
     capsys.readouterr()
     cli.main(["status"])
-    cli.main(["checks", "status"])
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "status"])
+    assert e.value.code == 0
     out = capsys.readouterr().out
     assert out.count("Slurm checks overflow paused itself") == 2 and "runs stay on the local queue" in out, out
-    cli.main(["checks", "status", "--json"])
+    with pytest.raises(SystemExit) as e:
+        cli.main(["checks", "status", "--json"])
+    assert e.value.code == 0
     assert json.loads(capsys.readouterr().out)["slurm_paused"]["count"] == 3
     project.set_account_setting(slurmcheck.KEY, {**slurmcheck.settings(), "max_jobs": 1})   # the user's new value
     (ep,) = alerts.sweep(p.db)
