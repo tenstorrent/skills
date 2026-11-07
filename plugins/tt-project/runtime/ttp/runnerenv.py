@@ -24,12 +24,14 @@ import os
 import platform
 import re
 import secrets
+import shlex
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
 LOCK = Path(__file__).with_name("checks-python.lock")
+LOCK_ENV = "TTP_CHECKS_PYTHON_LOCK"   # in a check's env (apply): the lock, for a check run on another host
 INFO = "ttp-env.json"   # in an env: its key, lock hash and versions (describe)
 BUILD_TIMEOUT_S = 900
 _ready: dict[str, dict] = {}   # key -> info, for this process
@@ -158,7 +160,23 @@ def apply(env: dict, lock: Path | None = None) -> dict:
     info = ensure(lock)
     out = {k: v for k, v in env.items() if k != "PIP_USER"}
     out["PATH"] = os.pathsep.join([str(Path(info["path"]) / "bin"), *([env["PATH"]] if env.get("PATH") else [])])
-    return {**out, "PYTHONNOUSERSITE": "1", "TTP_CHECKS_PYTHON_ENV": info["key"]}
+    return {**out, "PYTHONNOUSERSITE": "1", "TTP_CHECKS_PYTHON_ENV": info["key"],
+            LOCK_ENV: str(Path(lock or LOCK).resolve())}
+
+
+def remote_lines(lock: Path | str | None, where: str, fail: str) -> str:
+    """Shell lines for another host (remotecheck, slurmcheck): write this file and `lock` into folder
+    `where` there, make or reuse the pinned env from them with that host's python3 (as ensure does
+    here, under its TTP_HOME), and put it in force as apply does. Where it cannot be made, they print
+    why and run `fail`: the check never runs with that host's user site. OSError when a file cannot be read."""
+    lock = Path(lock or LOCK)
+    out, w = f"mkdir -p {shlex.quote(where)}\n", shlex.quote(where)
+    for name, text in (("runnerenv.py", Path(__file__).read_text()), ("checks-python.lock", lock.read_text())):
+        end = f"TTP_ENV_{secrets.token_hex(8)}"
+        out += f"cat > {w}/{name} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
+    return (out + f'ttp_env=$(python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
+            f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
+            'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1\nunset PIP_USER\n')
 
 
 def _name(s: str) -> str:
@@ -199,3 +217,11 @@ def describe(info: dict) -> str:
     """One line naming the env, for the checks output and record."""
     return (f"python env {info['key']} (python {info.get('python', '?')}, pytest {info.get('pytest', '?')}, "
             f"lock {str(info.get('lock_sha256', ''))[:12]} from {info.get('lock', '?')})")
+
+
+if __name__ == "__main__":   # on another host (remote_lines): print the env's folder, made first when missing
+    try:
+        print(ensure(Path(sys.argv[1]))["path"])
+    except Unavailable as e:
+        print(f"ttp: {e}", file=sys.stderr)
+        sys.exit(1)

@@ -203,3 +203,37 @@ def test_ttp_checks_freeze_lock_pins_the_user_sites_packages_the_lock_does_not_n
     assert "Some_Pkg==1.2.3" in lines and "pytest==8.4.2" in lines and "pytest==99.0" not in lines
     assert "--hash" not in out.read_text() and "Some_Pkg==1.2.3" in capsys.readouterr().out
     assert not (run / "checks.json").exists(), "it runs no check"
+
+
+def test_a_remote_check_runs_in_the_hosts_pinned_env_and_never_without_it(tmp_path):
+    # A check on another host (delivery.checks_host, a spill host) makes the pinned env there from the
+    # same lock and runs with the user site off; where it cannot be made the check does not run and
+    # it is that host's fault (FAULT_RC), so the run goes again elsewhere.
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    seen = tmp_path / "seen"
+    cmd = f'printf "%s|%s|%s" "$PYTHONNOUSERSITE" "${{PIP_USER-unset}}" "${{PATH%%:*}}" > {seen}'
+    rc, said = _rc_run(tmp_path, repo, cmd, PIP_USER="1")
+    assert rc == 0, said
+    assert seen.read_text() == f"1|unset|{os.environ['TTP_TEST_CHECKS_PYTHON_ENV']}/bin"
+    assert "TTP_ENV_" not in said and _rc_left(tmp_path) == []
+    seen.unlink()
+    rc, said = _rc_run(tmp_path, repo, cmd, TTP_TEST_CHECKS_PYTHON_ENV=str(tmp_path / "none"))
+    assert rc == remotecheck.FAULT_RC and not seen.exists(), said
+    assert "pinned Python env could not be made there" in said and _rc_left(tmp_path) == []
+
+
+def test_a_slurm_check_job_runs_in_the_nodes_pinned_env_and_is_a_fault_without_it(tmp_path):
+    from ttp import slurmcheck
+    repo = _rc_repo(tmp_path)
+    seen = tmp_path / "seen"
+    cmd = f'printf "%s|%s" "$PYTHONNOUSERSITE" "${{PATH%%:*}}" > {seen}'
+    for name, stand_in, rc in (("ok", os.environ["TTP_TEST_CHECKS_PYTHON_ENV"], "0"), ("bad", str(tmp_path / "none"), "fault")):
+        q = tmp_path / name
+        q.mkdir()
+        subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", "-o", str(q / "tree.tar"), "HEAD"], check=True)
+        (q / "job.sh").write_text(slurmcheck.job_script(shlex.quote(str(q)), "", cmd))
+        subprocess.run(["sh", str(q / "job.sh")], cwd=q, env={**os.environ, "TTP_TEST_CHECKS_PYTHON_ENV": stand_in},
+                       capture_output=True, timeout=120)
+        assert (q / "rc").read_text().strip() == rc
+    assert seen.read_text() == f"1|{os.environ['TTP_TEST_CHECKS_PYTHON_ENV']}/bin"
