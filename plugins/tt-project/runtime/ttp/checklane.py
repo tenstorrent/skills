@@ -67,8 +67,9 @@ WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events). Only one o
 per queue incident (wait_wake: from the first waiter past the threshold until none is); the incident wakes it
 again only when a decision is due: its longest waiter past `checks.wait_escalate_s` (default WAIT_ESCALATE_S,
 then once per as long again; 0: never), a holder running `checks.wait_hang_factor` (default WAIT_HANG_FACTOR;
-0: never) times the recent median checks run (a likely hang), or a holder whose task has ended (no owner
-to fix it).
+0: never) times the recent median checks run (a likely hang when its checks log has stopped growing for
+checkwall.SILENT_S, or names none; else "slow", with the host's load), or a holder whose task has ended (no
+owner to fix it).
 """
 from __future__ import annotations
 
@@ -875,9 +876,10 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     when they do not, and the queue incident to keep). An incident opens with the first waiter past
     checks.wait_event_s (reason "new") and closes once no waiter is past it (None). Within it, a wake again
     only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
-    (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, once per
-    holder) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
-    only once no review reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
+    (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, whose output
+    stopped growing: printing(); once per holder), "slow" (the same, still printing; once per holder) and
+    "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck only once no review
+    reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
     if not events:
         return [], None
     inc = json.loads(json.dumps(incident)) if isinstance(incident, dict) else {}   # never the caller's lists
@@ -894,9 +896,10 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     factor = wait_hang_factor(cfg)
     # A holder still waiting for a later gate (testslots.lane_waits) is not hung: its clock starts once
     # it has its test slots (granted_at), or with its commands (run_since).
-    for name, test in (("hang", lambda h: factor > 0 and median_s and median_s > 0 and not h.get("waits")
-                        and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now)
-                        > factor * median_s),
+    over = (lambda h: factor > 0 and median_s and median_s > 0 and not h.get("waits")
+            and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now) > factor * median_s)
+    for name, test in (("hang", lambda h: over(h) and not printing(h, now, cfg)),
+                       ("slow", lambda h: over(h) and printing(h, now, cfg)),
                        ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h)))):
         seen = list(inc.get(name) or [])
         for k, h in holders.items():
@@ -908,14 +911,30 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     return why, inc
 
 
+def printing(h: dict, now: float, cfg: dict | None = None) -> bool:
+    """Whether lane holder `h` is running its commands and its checks log grew within checkwall.SILENT_S
+    (checkstall.view): slow, not hung. A holder naming no log has nothing to show it working."""
+    from . import checkstall, checkwall
+    v = checkstall.view(h, now, cfg)
+    return v is not None and v["log_idle_s"] < checkwall.SILENT_S
+
+
+def host_load() -> str:
+    """"92 on 64 cores": this host's 1-minute load and its cores, for a slow holder's line ("unknown")."""
+    from . import hostload
+    ld = hostload.loads()
+    return f"{ld[0]:.0f} on {checkcap.cores()} cores" if ld else "unknown"
+
+
 def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, now: float,
-              median_s: float | None = None) -> str:
+              median_s: float | None = None, load=host_load) -> str:
     """The waking `checks_slot_wait` event's text: the reasons, then the longest waiter's own event text."""
     head = max(events, key=lambda e: float(e.get("waited_s") or 0))
+    over = f"a holder has run over {wait_hang_factor(cfg):g}x the recent median checks run ({mins(median_s or 0)})"
     say = {"new": f"a checks queue incident started ({len(events)} waiting past {mins(wait_event_s(cfg))})",
            "escalate": f"its longest wait passed {mins(wait_escalate_s(cfg))}",
-           "hang": (f"a holder has run over {wait_hang_factor(cfg):g}x the recent median checks run "
-                    f"({mins(median_s or 0)}): a likely hang"),
+           "hang": f"{over} and its output stopped growing: a likely hang",
+           "slow": f"{over} and is still printing results: slow (host load {load() if 'slow' in why else ''})",
            "ownerless": "a holder's task has ended: nobody owns its fix"}
     return (f"Checks queue: {'; '.join(say[w] for w in why)}. {head['text']} Further waiters of this "
             f"incident (open {mins(now - float(inc['start']))}) show in the digest's `checks slot wait:` "

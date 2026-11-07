@@ -3475,6 +3475,7 @@ def cmd_checks(a) -> None:
     executed, selected, rerun = [], [], None
     run_envs, run_parts, reused = None, None, []   # each check's environment; those a suite pass spared (_suite_pass)
     timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
+    wall_ext = None   # its extension room (checkwall.Extension)
     ran_cpu = 0.0   # the CPU its children had used when its commands started (checkcap.record_cost)
     spilled = None   # the spill host's claim when the checks run there (checkspill)
     worker_loss = None   # test workers lost again on the rerun: an infrastructure fault (workerloss)
@@ -3758,6 +3759,7 @@ def cmd_checks(a) -> None:
                 wall, wall_how = checkwall.cap(p)
                 ran_since, ran_cpu = time.time(), checkcap.child_cpu_s()
                 deadline = ran_since + wall if wall > 0 else None
+                wall_ext = checkwall.Extension(wall)   # a run still progressing at the cap runs on (Extension)
                 testslots.suite_running(getattr(slot, "suite", None), wall, str(log))
                 if p and (last := checkwall.last_timeout(p.state, os.environ.get("TTP_TASK"))):
                     said_last = (f"this task's last checks run (run {last.get('run') or '?'} on "
@@ -3804,14 +3806,37 @@ def cmd_checks(a) -> None:
                     check_start = out.tell()
                 began = time.monotonic()
                 loss_reruns = torn_reruns = setup_reruns = 0
+                took = [0.0]
+
+                def run_once():   # one run of the check; the run's deadline moves by any cap extension
+                    nonlocal deadline
+                    t0 = time.monotonic()
+                    try:
+                        return _run_check(_low_priority(push.check_argv(c, cwd, env, commit=head)), group, record=reap_rec, cwd=cwd,
+                                          stdout=out,
+                                          stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
+                                          silent_s=checkwall.silent_limit(c), extend=wall_ext,
+                                          pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ())
+                    finally:
+                        took[0] = time.monotonic() - t0
+                        if deadline is not None:
+                            deadline = ran_since + wall + (wall_ext.granted if wall_ext else 0.0)
+
+                def rerun_fits() -> bool:   # a rerun that cannot end before the cap only holds the lane
+                    left = checkwall.deadline_left(deadline)
+                    if left is None or took[0] <= left:
+                        return True
+                    line = (f"{scriptwatch.LABEL} skipped: the run took {checkwall.span(took[0])} and only "
+                            f"{checkwall.span(left)} is left before the wall-time cap; its result stands")
+                    print(f"ttp checks: {line}", flush=True)
+                    out.write(f"ttp checks: {line}\n")
+                    out.flush()
+                    return False
+
                 try:
                     while True:
-                        rc = scriptwatch.rerun(
-                            lambda: _run_check(_low_priority(push.check_argv(c, cwd, env, commit=head)), group, record=reap_rec, cwd=cwd,
-                                               stdout=out,
-                                               stderr=subprocess.STDOUT, env=env, timeout=checkwall.deadline_left(deadline),
-                                               silent_s=checkwall.silent_limit(c), pass_fds=(a.tmp_fd,) if group and getattr(a, "tmp_fd", None) is not None else ()),
-                            bool, None if push.remote_host(c) else str(c), cwd, env, said)
+                        rc = scriptwatch.rerun(run_once, bool, None if push.remote_host(c) else str(c), cwd, env, said,
+                                               again=rerun_fits)
                         # The wrapper's lock refused it as paused: it and the other wrapped commands run on
                         # checks.fallback_lane once, never on the paused resource (a paused fallback waits).
                         if (rc == 75 and fallback[0] and not fallback[2] and not fell_back and str(c) in wrapped
@@ -3857,9 +3882,11 @@ def cmd_checks(a) -> None:
                 except subprocess.TimeoutExpired:
                     # Past the wall-time cap: _run_check ended its group and what it left; never a pass.
                     passed, failed, rc = False, c, checkwall.RC
-                    timed_out = {"check": str(c), "cap_s": wall, "how": wall_how, "head": head,
+                    ext_s = wall_ext.granted if wall_ext else 0.0
+                    how = wall_how + (f", extended by {checkwall.span(ext_s)}" if ext_s else "")
+                    timed_out = {"check": str(c), "cap_s": wall + ext_s, "how": how, "head": head,
                                  "run": os.environ.get("TTP_RUN_ID") or "?"}
-                    out.write(f"ttp checks: {checkwall.said(str(c), wall, wall_how, head)}\n")
+                    out.write(f"ttp checks: {checkwall.said(str(c), wall + ext_s, how, head)}\n")
                     out.write(_check_took(c, rc, began))
                     break
                 if rc != 0:
@@ -5505,14 +5532,15 @@ def _check_took(c, rc: int, began: float) -> str:
 
 
 def _run_check(argv: list, group: bool, record=None, timeout: float | None = None, silent_s: float = 0,
-               **kw) -> int:
+               extend=None, **kw) -> int:
     """Run one check command to its exit code. In its own group (`group`) a stop always ends it:
     a stop during Popen would otherwise leave the started command running. Once its exit code is
     known, and when it is stopped or fails, every process it left (checkreap: tied by the run's
     token in its environment, or by its group and a working directory in its tree) is ended too;
     the check log says how many. `record` (checkreap.Record) learns the check's group. Past `timeout`
-    seconds it is ended and subprocess.TimeoutExpired raised; once its `stdout` file has not grown for
-    `silent_s` seconds (0: never), it is ended and checkwall.Silent raised (checkwall.wait)."""
+    seconds it is ended and subprocess.TimeoutExpired raised, unless `extend` (checkwall.Extension) grants
+    more; once its `stdout` file has not grown for `silent_s` seconds (0: never), it is ended and
+    checkwall.Silent raised (checkwall.wait)."""
     from . import checkwall
     proc = None
     if (slot := _CHECK_YIELD["slot"]) is not None:   # a slot a yield gave up: held again before more work
@@ -5527,7 +5555,8 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
         _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:
             raise SystemExit(_CHECK_STOP["pending"])
-        rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s, stop=_checks_running_stop(proc, kw.get("stdout")))
+        rc = checkwall.wait(proc, kw.get("stdout"), timeout, silent_s, stop=_checks_running_stop(proc, kw.get("stdout")),
+                            extend=extend)
         _reap_check(proc, group, kw)
         return rc
     except BaseException:

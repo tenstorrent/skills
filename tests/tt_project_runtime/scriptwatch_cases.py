@@ -176,6 +176,41 @@ def test_ttp_checks_reruns_a_check_whose_script_was_rewritten_mid_run_and_labels
     assert not json.loads((run / "checks.json").read_text())["passed"]
 
 
+def test_ttp_checks_skips_a_script_changed_rerun_that_cannot_end_before_the_wall_cap_and_keeps_the_result(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkwall, cli, scriptwatch
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    # Its first run appends to itself (a content change, no syntax error), takes a second and fails.
+    (repo / "check.sh").write_text('#!/bin/bash\necho x >> "$0.runs"\n'
+                                   'if [ ! -e "$0.ran" ]; then : > "$0.ran"; echo "# edited" >> "$0"; sleep 1; exit 1; fi\n')
+    (repo / ".gitignore").write_text("*.ran\n*.runs\n")
+    subprocess.run([*git, "add", "check.sh", ".gitignore"], check=True)
+    subprocess.run([*git, "commit", "-qm", "check"], check=True)
+    p.set_config("delivery.push_checks", [{"run": "bash check.sh", "cwd": "authoring"}])
+    monkeypatch.setenv(checkwall.ENV, "3600")
+    real, asked = checkwall.deadline_left, []
+    def left(deadline):   # the run itself under the real cap; the rerun asks with half a second left
+        asked.append(deadline)
+        return real(deadline) if len(asked) == 1 else 0.5
+    monkeypatch.setattr(checkwall, "deadline_left", left)
+    with pytest.raises(SystemExit):
+        cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert re.search(rf"{re.escape(scriptwatch.LABEL)} skipped: the run took \d+ s and only 0 s is left before the "
+                     r"wall-time cap; its result stands", out), out
+    assert _runs(repo / "check.sh") == 1 and asked[0] is not None, "no rerun started"
+    assert f"{scriptwatch.LABEL} skipped" in (run / "checks.log").read_text()
+    assert not json.loads((run / "checks.json").read_text())["passed"], "the run's own result stands"
+    # With the time to fit it, the rerun runs and its pass counts.
+    (repo / "check.sh.ran").unlink()
+    subprocess.run([*git, "checkout", "-q", "check.sh"], check=True)
+    monkeypatch.setattr(checkwall, "deadline_left", real)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert f"{scriptwatch.LABEL}: content changed in check.sh" in out and "skipped" not in out, out
+    assert _runs(repo / "check.sh") == 3 and json.loads((run / "checks.json").read_text())["passed"]
+
+
 def _push_check(path, edit, exit_code=0):
     """A push check script whose first run runs `edit` (shell, with $0 the script) and exits `exit_code`;
     later runs exit 0. Each run appends a line to <path>.runs."""

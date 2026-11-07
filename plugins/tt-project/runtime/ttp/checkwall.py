@@ -21,11 +21,20 @@ timeout with "silent_s" (wait, said_silent). A check that is silent longer by de
 Any line counts as output: a check that waits for a lane, lock or slot is not hung as long as it says so
 (a line at least every few minutes). The plugin's own waits do (`ttp lock`, the checks lanes and slots,
 the test-worker pool: each tells at least every 5 min); a project's own wrapper that queues must too.
+
+A slow run is not a hung one (Extension): a command still printing at the cap (its output grew within its
+silence limit) whose progress (pytest's `[ NN%]` lines, at their rate over the last RATE_WINDOW_S) projects
+a finish within the room left runs on to that projection (times EXTEND_SLACK), and is looked at again
+there. The room is at most EXTEND_FRAC of the cap for the whole run, and the run never passes CEILING_S
+from its start (a cap at or above CEILING_S is never extended). Each extension is a line in the run log.
+A command that went silent, shows no progress or would not finish in the room is stopped at the cap as
+before.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import subprocess
 import time
 from pathlib import Path
@@ -49,6 +58,12 @@ RC = 124   # a timed-out check's exit code in the log and records (as timeout(1)
 SILENT_S = 600.0   # a command whose output has not grown this long is a hang (Check.silent_s; 0: off)
 POLL_S = 5.0       # how often wait() looks at the output's size
 clock = time.monotonic   # wait()'s clock; tests swap in a test clock
+EXTEND_FRAC = 0.5      # a run's cap is extended by at most half of it in all (Extension)
+EXTEND_SLACK = 1.25    # an extension is the projected time left times this
+EXTEND_MIN_S = 120.0   # and at least this (a run at 100% still writes its summary)
+RATE_WINDOW_S = 900.0  # progress is measured over this much of the run before the cap and after
+TAIL_BYTES = 8192      # how much of the output's end is read for the last `[ NN%]`
+_PERCENT = re.compile(rb"\[\s*(\d{1,3})%\]")
 
 
 def _number(v) -> float | None:
@@ -149,12 +164,61 @@ def silent_limit(check) -> float:
     return SILENT_S if v is None else float(v)
 
 
-def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, stop=None) -> int:
-    """`proc`'s exit code. subprocess.TimeoutExpired past `timeout` seconds; Silent once the file `out`
-    (its output) has not grown for `silent_s` seconds (0, or an `out` with no file, watches nothing).
+class Extension:
+    """The wall-cap extension room of one `ttp checks` run with cap `cap_s`: at most EXTEND_FRAC of it, and
+    never past CEILING_S from the run's start. `granted` is what wait() gave so far (the run's deadline
+    moves by it)."""
+
+    def __init__(self, cap_s: float):
+        cap_s = float(cap_s or 0)
+        self.cap_s, self.granted = cap_s, 0.0
+        self.room = max(0.0, min(EXTEND_FRAC * cap_s, CEILING_S - cap_s)) if cap_s > 0 else 0.0
+
+    def grant(self, samples: list, quiet_s: float, silent_s: float) -> tuple[float, str]:
+        """(seconds to add, the run log's line; 0 and why not) at the cap, from `samples` ((clock, percent)
+        readings, oldest first) and `quiet_s`, how long the output has not grown."""
+        limit = silent_s if silent_s > 0 else SILENT_S
+        left = self.room - self.granted
+        if quiet_s >= limit:
+            return 0.0, f"no output for {span(quiet_s)}"
+        if left <= 0:
+            return 0.0, (f"no extension room left (at most {EXTEND_FRAC:g}x the cap, never past "
+                         f"{_mins(CEILING_S)} in all)")
+        if not samples:
+            return 0.0, "no progress line ([ NN%]) in its output"
+        (t0, p0), (t1, p1) = samples[0], samples[-1]
+        if p1 <= p0 or t1 <= t0:
+            return 0.0, f"no progress over the last {span(max(0.0, t1 - t0))} (at {p1}%)"
+        need = max(EXTEND_MIN_S, EXTEND_SLACK * (100 - p1) * (t1 - t0) / (p1 - p0))
+        if need > left:
+            return 0.0, (f"at {p1}%, its rate needs about {_mins(need)} more, over the {_mins(left)} of "
+                         f"extension room left")
+        self.granted += need
+        return need, (f"wall-time cap extended by {_mins(need)}: output still growing, at {p1}% (from {p0}% "
+                      f"{span(t1 - t0)} before); {_mins(self.room - self.granted)} of extension room left, "
+                      f"never past {_mins(min(self.cap_s + self.room, CEILING_S))} in all")
+
+
+def _percent(path, base: int) -> int | None:
+    """The last pytest `[ NN%]` in the file `path` past offset `base` (its tail only), or None."""
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, os.SEEK_END)
+            f.seek(max(base, f.tell() - TAIL_BYTES))
+            got = _PERCENT.findall(f.read(TAIL_BYTES))
+    except (OSError, TypeError, ValueError):
+        return None
+    return min(100, int(got[-1])) if got else None
+
+
+def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, stop=None,
+         extend: Extension | None = None) -> int:
+    """`proc`'s exit code. subprocess.TimeoutExpired past `timeout` seconds, unless `extend` grants more
+    (Extension.grant: still printing and progressing; said in `out`); Silent once the file `out` (its
+    output) has not grown for `silent_s` seconds (0, or an `out` with no file, watches nothing).
     `stop()`, called every POLL_S while it runs, may raise to end the wait (checkcap.Preempted)."""
     try:
-        fd = out.fileno() if silent_s > 0 and out is not None else None
+        fd = out.fileno() if out is not None and (silent_s > 0 or extend is not None) else None
     except (AttributeError, OSError, ValueError):
         fd = None
     if fd is None and stop is None:
@@ -169,6 +233,7 @@ def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, st
     start = clock()
     end = None if timeout is None else start + timeout
     last, quiet_since = size(), start
+    base, samples = max(0, last), []
     while True:
         step = POLL_S if end is None else max(0.01, min(POLL_S, end - clock()))
         try:
@@ -176,15 +241,29 @@ def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, st
         except subprocess.TimeoutExpired:
             pass
         now = clock()
+        if fd is not None and (grown := size()) != last:
+            last, quiet_since = grown, now
+        if extend is not None and fd is not None and end is not None and now >= end - RATE_WINDOW_S:
+            if (pct := _percent(getattr(out, "name", None), base)) is not None:
+                samples.append((now, pct))
+                samples = [x for x in samples if now - x[0] <= RATE_WINDOW_S] or samples[-1:]
         if end is not None and now >= end:
-            raise subprocess.TimeoutExpired(proc.args, timeout)
+            more, why = extend.grant(samples, now - quiet_since, silent_s) if extend is not None and fd is not None \
+                else (0.0, "")
+            if why:
+                try:
+                    out.write(f"ttp checks: {why if more else f'wall-time cap not extended: {why}'}\n")
+                    out.flush()
+                except (OSError, ValueError):
+                    pass
+            if not more:
+                raise subprocess.TimeoutExpired(proc.args, timeout)
+            end = now + more
+            last = size()
+            continue
         if stop is not None:
             stop()
-        if fd is None:
-            continue
-        if (grown := size()) != last:
-            last, quiet_since = grown, now
-        elif now - quiet_since >= silent_s:
+        if fd is not None and silent_s > 0 and now - quiet_since >= silent_s:
             raise Silent(proc.args, silent_s)
 
 

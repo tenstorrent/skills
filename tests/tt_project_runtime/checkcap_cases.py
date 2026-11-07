@@ -2285,6 +2285,131 @@ def test_checks_watchdog_stops_a_silent_command_at_its_limit_on_a_test_clock(tmp
     assert push._form_problem({"run": "true", "silent_s": 0}) is None
 
 
+class _ProgressProc:
+    """A stand-in pytest run for checkwall.wait: each wait() is one poll, printing a `[ NN%]` line with
+    `pct(poll)` (None: prints nothing), exiting 0 once it prints 100% (or at poll `exit_at`)."""
+    args = "stand-in"
+
+    def __init__(self, out, pct, exit_at=None):
+        self.out, self.pct, self.exit_at, self.polls = out, pct, exit_at, 0
+
+    def wait(self, timeout=None):
+        self.polls += 1
+        if (n := self.pct(self.polls)) is not None:
+            self.out.write(f"...........  [{int(n):3d}%]\n")
+            self.out.flush()
+        if (n is not None and n >= 100) or (self.exit_at is not None and self.polls >= self.exit_at):
+            return 0
+        raise subprocess.TimeoutExpired(self.args, timeout)
+
+
+def _test_clock(monkeypatch, step=10.0):
+    from ttp import checkwall
+    now = [0.0]
+    def clock():   # each read is `step` seconds later: two reads per poll
+        now[0] += step
+        return now[0]
+    monkeypatch.setattr(checkwall, "clock", clock)
+    return now
+
+
+def test_wall_cap_extends_a_run_still_progressing_and_stops_a_silent_or_stalled_one_never_past_the_ceiling(
+        tmp_path, monkeypatch):
+    from ttp import checkwall
+    now = _test_clock(monkeypatch)
+    log = tmp_path / "checks.log"
+    with open(log, "a") as out:
+        out.write("[100%] of an earlier command in the same log\n")
+        out.flush()
+        # 1.8% per 20 s poll: at the 1000 s cap it is at 90%, done some 2 min later; extended once, finishes.
+        ext = checkwall.Extension(1000)
+        assert ext.room == 500
+        proc = _ProgressProc(out, lambda n: min(100, 1.8 * n))
+        assert checkwall.wait(proc, out, 1000, 600, extend=ext) == 0 and now[0] > 1000
+        text = log.read_text()
+        assert text.count("wall-time cap extended by") == 1 and "at 90%" in text, text
+        assert 0 < ext.granted <= ext.room
+        # The same run with no extension room: stopped at the cap, as before.
+        now[0] = 0.0
+        with pytest.raises(subprocess.TimeoutExpired):
+            checkwall.wait(_ProgressProc(out, lambda n: min(100, 1.8 * n)), out, 1000, 600)
+        # Silence at the cap (the silence stop is off for this check, 10 min still counts): never extended.
+        now[0] = 0.0
+        quiet = _ProgressProc(out, lambda n: 2 * n if n <= 10 else None)
+        with pytest.raises(subprocess.TimeoutExpired) as e:
+            checkwall.wait(quiet, out, 1000, 0, extend=checkwall.Extension(1000))
+        assert not isinstance(e.value, checkwall.Silent)
+        assert "wall-time cap not extended: no output for 13 min" in log.read_text()
+        # The silence stop still ends a run that went quiet after an extension.
+        now[0] = 0.0
+        stalls = _ProgressProc(out, lambda n: 1.8 * n if n <= 52 else None)
+        with pytest.raises(checkwall.Silent):
+            checkwall.wait(stalls, out, 1000, 240, extend=checkwall.Extension(1000))
+        assert 1040 + 240 <= now[0] <= 1040 + 240 + 40, now
+        # Printing but no longer progressing: extended while its window still rises, then stopped; the
+        # extensions never pass the room.
+        now[0] = 0.0
+        ext = checkwall.Extension(1000)
+        slow = _ProgressProc(out, lambda n: min(99, 1.8 * n))
+        with pytest.raises(subprocess.TimeoutExpired):
+            checkwall.wait(slow, out, 1000, 600, extend=ext)
+        assert 0 < ext.granted <= ext.room and now[0] <= 1000 + ext.room + 40, (ext.granted, now)
+        assert "wall-time cap not extended: at 99%" in log.read_text()
+        # Stuck at one percentage over the whole window while printing: no progress, stopped at the cap.
+        now[0] = 0.0
+        with pytest.raises(subprocess.TimeoutExpired):
+            checkwall.wait(_ProgressProc(out, lambda n: 40), out, 1000, 600, extend=checkwall.Extension(1000))
+        assert "not extended: no progress over the last 15 min (at 40%)" in log.read_text()
+        # Too slow to finish in the room: stopped at the cap, with the reason.
+        now[0] = 0.0
+        with pytest.raises(subprocess.TimeoutExpired):
+            checkwall.wait(_ProgressProc(out, lambda n: 0.5 * n), out, 1000, 600, extend=checkwall.Extension(1000))
+        assert "its rate needs about" in log.read_text()
+        # No progress line at all: stopped at the cap.
+        now[0] = 0.0
+        with open(tmp_path / "plain.log", "a") as plain:
+            plain_proc = _SilenceProc(plain, prints=True)
+            with pytest.raises(subprocess.TimeoutExpired):
+                checkwall.wait(plain_proc, plain, 1000, 600, extend=checkwall.Extension(1000))
+        assert "no progress line" in (tmp_path / "plain.log").read_text()
+    # The ceiling: a cap at it has no room, one near it only up to it, a large one half of itself.
+    assert checkwall.Extension(checkwall.CEILING_S).room == 0 == checkwall.Extension(0).room
+    near = checkwall.Extension(checkwall.CEILING_S - 600)
+    assert near.room == 600
+    for _ in range(50):   # steady progress, grant after grant: never past the ceiling
+        near.grant([(0.0, 10), (100.0, 99)], 0.0, 600)
+    assert near.granted <= near.room and near.cap_s + near.granted <= checkwall.CEILING_S
+    assert checkwall.Extension(3600).room == 1800
+
+
+def test_a_queue_incident_calls_a_holder_still_printing_slow_with_the_host_load_and_a_silent_one_a_likely_hang(
+        tmp_path):
+    from ttp import checklane, checkwall
+    now = time.time()
+    printing, silent = tmp_path / "printing.log", tmp_path / "silent.log"
+    printing.write_text("..... [ 80%]\n")
+    silent.write_text("..... [ 40%]\n")
+    os.utime(silent, (now - checkwall.SILENT_S - 60,) * 2)
+    busy = {"task": "21", "pid": 4242, "run_since": now - 5000, "command": "pytest -q", "log": str(printing)}
+    hung = {"task": "22", "pid": 4243, "run_since": now - 5000, "command": "pytest -q", "log": str(silent)}
+    nolog = {"task": "23", "pid": 4244, "run_since": now - 5000, "command": "make check"}
+    cfg = {"checks": {"wait_hang_factor": 3}}
+    evs = _queue_events(1, holders=[busy])
+    why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 300.0)
+    assert why == ["slow"] and len(inc["slow"]) == 1 and not inc["hang"], (why, inc)
+    text = checklane.wake_text(why, evs, inc, cfg, now, 300.0, load=lambda: "92 on 64 cores")
+    assert "still printing results: slow (host load 92 on 64 cores)" in text and "likely hang" not in text, text
+    assert checklane.wait_wake(evs, inc, cfg, now + 60, 300.0)[0] == [], "once per holder"
+    evs = _queue_events(1, holders=[busy, hung, nolog])
+    why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, now, 300.0)
+    assert why == ["hang", "slow"] and len(inc["hang"]) == 2 and len(inc["slow"]) == 1, (why, inc)
+    text = checklane.wake_text(why, evs, inc, cfg, now, 300.0, load=lambda: "92 on 64 cores")
+    assert "output stopped growing: a likely hang" in text and "slow (host load" in text, text
+    # Not over the factor: neither.
+    assert checklane.wait_wake(evs, {"start": 1.0}, {"checks": {"wait_hang_factor": 100}}, now, 300.0)[0] == []
+    assert checklane.host_load() == "unknown" or " on " in checklane.host_load()
+
+
 def test_ttp_checks_stops_a_check_with_no_output_as_a_timeout_and_spares_one_that_prints(env, tmp_path, monkeypatch, capsys):
     from ttp import checkwall, cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
