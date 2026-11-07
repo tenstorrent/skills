@@ -8365,7 +8365,9 @@ class Daemon:
         that backlog instead, unless it is deadline work, but only while the queue drains: a run of its
         provider (not the coordinator) started within the task's own threshold and after the gate last
         cleared. Free slots with no such start is a stall: the plain alarm, naming the backlog figures.
-        One handled ready_backlog record per episode."""
+        One handled ready_backlog record per episode. A late task with no hold whose provider's spend
+        gate cleared less than unstarted.CLEARED_WAIT_S ago raises nothing until a dispatch pass that
+        began after the clear has run: that pass, not a coordinator turn, starts it."""
         now = time.time()
         last = getattr(self, "_unstarted_checked", 0.0)
         if now - last < every_s:
@@ -8391,6 +8393,7 @@ class Daemon:
         self._unstarted_seen, self._unstarted_held, self._unstarted_ready = {}, set(), {t["id"] for t in ready}
         kick = []   # urgent tasks past READY_P1_S that dispatch would start now
         backlog, drained = self._ready_backlog(ready, busy, core, now), {}
+        gate_recs = db.kv_dict(unstarted.BACKLOG_KV)[0]   # when each provider's spend gate last cleared
         starts = {r["provider"] or core: r["s"] for r in db.q(
             "SELECT provider, MAX(started) s FROM runs WHERE role!='coordinator' AND started>=? GROUP BY provider",
             (now - max(unstarted.READY_S, unstarted.READY_P1_S),))} if backlog else {}
@@ -8438,6 +8441,11 @@ class Daemon:
                 continue
             if late and why is None and prio <= 1:
                 kick.append(tid)
+            rec = gate_recs.get(prov)
+            cleared = float(rec.get("cleared") or 0) if isinstance(rec, dict) else 0.0
+            if late and why is None and now - cleared < unstarted.CLEARED_WAIT_S \
+                    and getattr(self, "_dispatch_pass_at", 0.0) < cleared:
+                continue   # the spend gate that held it just cleared: one dispatch pass starts it first
             if not late or db.one("SELECT 1 FROM events WHERE fingerprint IN (?,?,?) OR (kind=? AND task=? AND status='queued')",
                               (fp, f"slot_wait:{tid}:{(ran or {}).get('id') or 0}",
                                f"urgent_start:{tid}:{(ran or {}).get('id') or 0}", unstarted.ANNOUNCED_KIND, tid)):
@@ -9582,6 +9590,17 @@ class Daemon:
         gate = self.gates.get(self.cfg.get("core_provider", "claude"))
         if gate and gate.level == "red" and not msgs:
             return
+        # The coordinator turn guard (budget.evaluate: Gate.coord_hold) spaces out self-started turns:
+        # none before its cool-down ends, then one turn takes everything queued meanwhile. A user message
+        # or a must-act item wakes it at once; worker dispatch is not held by it.
+        hold = (getattr(gate, "coord_hold", None) or {}) if gate else {}
+        if hold and not msgs and now < float(hold.get("until") or 0) \
+                and not any(e["kind"] in mustact.KINDS for e in evs):
+            if getattr(self, "_coord_hold_logged", None) != hold.get("until"):
+                self._coord_hold_logged = hold.get("until")
+                log(self.p, f"coordinator turn held {(float(hold['until']) - now) / 60:.0f} min by the turn guard "
+                            f"({hold['reasons'][0][:160]}); what queues meanwhile goes in one turn")
+            return
         lim = self._provider_pause(self.cfg.get("core_provider", "claude"))
         if lim and lim.get("until", 0) > now:
             return   # provider paused (logged out or at its limit); the pause expiry is the retry
@@ -9740,7 +9759,7 @@ class Daemon:
 
     # workers ----------------------------------------------------------------------------------------
     def dispatch(self) -> None:
-        db = self.p.db
+        db, began = self.p.db, time.time()
         running = db.q("SELECT provider, COUNT(*) n FROM runs WHERE role!='coordinator' AND status='running' "
                        "GROUP BY provider")
         busy = {r["provider"]: r["n"] for r in running}
@@ -9752,6 +9771,7 @@ class Daemon:
             self._slot_resv_pass = {}
         try:
             self._dispatch(busy)
+            self._dispatch_pass_at = began   # check_unstarted: a pass that began after a gate cleared
         finally:
             self._slot_resv_pass = None
 

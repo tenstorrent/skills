@@ -1628,6 +1628,9 @@ def status_text(p: Project, verbose: bool = False) -> str:
         coord += f" · next idle check {at(c['idle_wake'], now, tz)}"
     elif c["idle_held"]:
         coord += f" · idle check {c['idle_held']}"
+    hold = ((db.kv("gates") or {}).get(p.config().get("core_provider", "claude")) or {}).get("coord_hold") or {}
+    if float(hold.get("until") or 0) > now:
+        coord += " · " + budget.coord_hold_words(hold, at(hold["until"], now, tz))
     lines.append(coord)
     if verbose:
         lines.append(coordmodel.line(p.config(), db, p))

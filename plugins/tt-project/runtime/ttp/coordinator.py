@@ -1291,6 +1291,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(f"- {prov}: {g['level']} ({'; '.join(g['reasons']) or 'ok'}) · {money} · max_tier={g['max_tier']} "
                      f"max_parallel={g['max_parallel']} optional_work={'yes' if g['allow_optional'] else 'no'}"
                      + (f" · {bud.lane_words(g['lane'])}" if (g.get("lane") or {}).get("max_parallel") else "")
+                     + (" · " + bud.coord_hold_words(g["coord_hold"], "in %.0f min" % ((float(g["coord_hold"]["until"]) - now) / 60))
+                        if float((g.get("coord_hold") or {}).get("until") or 0) > now else "")
                      + (f" · unblock path: {path}" if path else ""))
     # Once, not per provider: the caps bound every usage-billed provider's spend together.
     lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now, home))

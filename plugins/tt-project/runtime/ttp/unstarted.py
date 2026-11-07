@@ -45,6 +45,7 @@ READY_URGENT_S = 60     # a fresh `urgent:` line or an obligation owner: its slo
 BACKLOG_KIND = "ready_backlog"
 BACKLOG_S = 3600        # a spend gate that stopped new work this recently still explains the queue it left
 BACKLOG_KV = "ready_backlog"   # kv: {provider: {"stopped": bool, "why": str, "cleared": ts, "since": ts}}
+CLEARED_WAIT_S = 300    # a task the spend gate held until this recently waits for one dispatch pass first
 DEFER_S = 600           # task_update adding spec to a task deferred further than this gets the nudge
 MAX_AGE_S = 86400
 READY_TITLE = re.compile(r"(?i)^\s*ready\s*:\s*")   # a hand-off follow-up whose inputs are ready now

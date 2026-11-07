@@ -18,9 +18,9 @@ it under the dollar caps whatever windows it reports; `plan` with no windows to 
 meter) is regime "plan": no dollar cap holds it and its spend is plan spend, not billed.
 A runaway check (a loop: wasted runs, a coordinator spinning, spend far above this project's own
 norm) overrides both. On plan windows its dollars are virtual, so it counts wasted runs and
-coordinator turns there. Its coordinator signals (self-started turns) defer those turns and hold
-routine work only: urgent and user-ordered tasks keep starting under the rest of the gate (Gate.lane,
-for_task), so the dollar caps and every other red still hold them.
+coordinator turns there. Its coordinator signals (self-started turns) throttle the coordinator
+only (Gate.coord_hold): its self-started turns wait out a cool-down and run as one wake, while worker
+runs keep starting under the rest of the gate, so the dollar caps and every other red still hold them.
 """
 from __future__ import annotations
 
@@ -91,9 +91,13 @@ class Gate:
     allow_new_work: bool = True # anything but replies to a user's direct message
     numbers: dict[str, Any] = field(default_factory=dict)
     cause: str = ""             # the reason that set the current level (slot_words)
-    # Set when only the coordinator turn guard made the gate red: what urgent and user-ordered tasks
-    # still start under (max_parallel, max_tier, allow_optional); for_task applies it. Empty otherwise.
+    # Set by a gate saved by an older runtime, whose coordinator turn guard made the gate red: what urgent
+    # and user-ordered tasks still start under; for_task applies it. evaluate() no longer sets it.
     lane: dict = field(default_factory=dict)
+    # Set while the coordinator turn guard is tripped: {"reasons": [...], "until": ts}. The daemon runs no
+    # self-started coordinator turn before `until` (user messages and must-act items excepted); worker
+    # runs are not held by it. Empty otherwise.
+    coord_hold: dict = field(default_factory=dict)
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -374,7 +378,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     g.numbers["billing"] = "plan" if virtual else "usage"
     hour_ago = now - HOUR
     last_h = spent_last_hour(db, provider, now)
-    runs_h = db.q("SELECT role, status, cost_usd, note FROM runs WHERE provider=? AND ended>=?", (provider, hour_ago))
+    runs_h = db.q("SELECT role, status, cost_usd, note, ended FROM runs WHERE provider=? AND ended>=?",
+                  (provider, hour_ago))
     # A run stopped on purpose (a cancel, a pause, a redirect) is a decision, not waste.
     waste = sum(float(r["cost_usd"] or 0) for r in runs_h if wasted(r))
     coord_h = [r for r in runs_h if r["role"] == "coordinator"]
@@ -417,7 +422,8 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                          f"(limit ${waste_cap:.0f}); resumes automatically as the hour rolls over")
     selfs = [r for r in coord_h if not user_turn(r)]
     same = repeated_turns(selfs)
-    coord_red: list[str] = []   # the coordinator turn signals: applied after the level, see below
+    coord_red: list[str] = []   # the coordinator turn signals: they throttle the coordinator, see below
+    resume = [now]              # when each tripped coordinator signal is back under its limit
     g.numbers.update({"coordinator_turns_1h": len(selfs), "coordinator_repeats_1h": same})
     if virtual:
         # Below coordinator.max_turns_per_hour, which stops self-started turns by itself: a guard at
@@ -428,14 +434,17 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
         if len(selfs) > turn_cap:
             coord_red.append(f"runaway guard: {len(selfs)} self-started coordinator turns in the last hour "
                              f"(limit {turn_cap}; turns for user messages not counted)")
+            resume.append(rolls_under(selfs, lambda rs: len(rs) > turn_cap, now))
         if same >= repeat_cap:
             coord_red.append(f"runaway guard: {same} self-started coordinator turns in the last hour met the "
                              f"same evidence (limit {repeat_cap - 1}); resumes automatically as the hour rolls over")
+            resume.append(rolls_under(selfs, lambda rs: repeated_turns(rs) >= repeat_cap, now))
     else:
         shares += [_share(thrash, thrash_cap), _share(last_h, ceiling)]
     if not virtual and thrash > thrash_cap:
         coord_red.append(f"runaway guard: coordinator spent ${thrash:.2f} on self-started turns in the last hour "
                          f"(limit ${thrash_cap:.0f}; turns for user messages not counted)")
+        resume.append(rolls_under(selfs, lambda rs: sum(float(r["cost_usd"] or 0) for r in rs) > thrash_cap, now))
     if last_h > ceiling and not virtual:
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")
@@ -452,16 +461,34 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     elif g.level == "red":
         g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
     if coord_red:
-        # The coordinator turn guard defers self-started coordinator turns (the daemon runs none while
-        # red, turns for user messages excepted) and holds routine work. It is no dollar cap: urgent and
-        # user-ordered tasks keep starting under what the rest of the gate allows (for_task), and under
-        # nothing when a dollar cap or another red already stops new work.
-        if g.allow_new_work and g.max_parallel > 0:
-            g.lane = {"max_parallel": g.max_parallel, "max_tier": g.max_tier, "allow_optional": g.allow_optional}
-        for reason in coord_red:
-            _raise(g, "red", reason + ("; urgent and user-ordered tasks still start" if g.lane else ""))
-        g.max_tier, g.max_parallel, g.allow_optional, g.allow_new_work = "light", 0, False, False
+        # The coordinator turn guard throttles the coordinator, not worker dispatch: only coordinator turns
+        # spent it, and worker runs stay under their per-task budgets, the dollar caps and the waste and
+        # total signals above (their red still stops new work). The daemon runs no self-started coordinator
+        # turn before `until`, when the trailing hour is back under every tripped limit, and then gathers
+        # what queued meanwhile into one wake (Daemon.maybe_coordinate); user messages and must-act items
+        # still wake it at once. That turn's own spend re-trips the guard while the rate stays high, so
+        # the turns are spaced to the limit, never stopped.
+        # Kept out of g.reasons, which name what holds new work (hold_clears, failover, alerts).
+        g.coord_hold = {"reasons": coord_red, "until": round(max(resume), 1)}
     return g
+
+
+def rolls_under(runs: list, over, now: float | None = None) -> float:
+    """When `over(runs)` stops holding as each of `runs` (rows with `ended`) leaves the trailing hour,
+    oldest first: the hour after the newest run that must leave; `now` (or the time) if none must."""
+    rest = sorted(runs, key=lambda r: float(r["ended"] or 0))
+    at = time.time() if now is None else now
+    while rest and over(rest):
+        at = float(rest.pop(0)["ended"] or 0) + HOUR
+    return at
+
+
+def coord_hold_words(hold: dict | None, when: str) -> str:
+    """Gate.coord_hold in words for status lines ('' when not tripped); `when` is its `until` as shown."""
+    if not (hold or {}).get("reasons"):
+        return ""
+    return (f"self-started coordinator turns spaced out to {when} by the turn guard ({hold['reasons'][0][:140]}); "
+            f"user messages and must-act items still wake it, worker runs keep starting")
 
 
 def _share(value: float, limit: float) -> float:
