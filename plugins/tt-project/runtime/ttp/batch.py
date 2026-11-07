@@ -3441,7 +3441,7 @@ def _notice_hold(p: Project) -> str:
     """The line of a power cycle of this host a device broker announced, or "" (cyclenotice.py)."""
     if not push.after_set(p):
         return ""
-    h = cyclenotice.held(cyclenotice.project_paths(p))
+    h = cyclenotice.project_held(p)
     return cyclenotice.line(h, p) if h else ""
 
 

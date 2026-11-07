@@ -23006,7 +23006,9 @@ def test_a_clean_stop_makes_the_next_boot_orderly_and_a_crash_abrupt(env, tmp_pa
     assert p.db.kv("boot_prev")["shutdown"] == how
     assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rids[0],))["note"])["shutdown"] == how
     ev = p.db.q("SELECT text, data FROM events WHERE source='host' AND kind='boot'")
-    assert len(ev) == 1 and ev[0]["text"] == (f"the host rebooted ({how}); 1 run(s) cut short; "
+    from ttp import timefmt
+    back = timefmt.short(float(json.loads(ev[0]["data"])["boot_time"]), p)
+    assert len(ev) == 1 and ev[0]["text"] == (f"the host rebooted ({how}); back up at {back}; 1 run(s) cut short; "
                                               f"initiator: unknown (journal not readable: journalctl did not answer, missing or timed out)"), ev
     assert json.loads(ev[0]["data"])["shutdown"] == how
     note = _reboot_notices(p)

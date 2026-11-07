@@ -3883,6 +3883,7 @@ def cmd_checks(a) -> None:
         print(f"ttp checks: not started, {hostcycle.hold_line(cyc, p)}. Commit and hand off `waiting` with a "
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
+    _cycle_notice_busy("ttp checks", p)
     purpose = getattr(a, "purpose", None) or "candidate"
     if a.full and purpose == "candidate" and not getattr(a, "release", False):
         from . import testpick   # a release run (the release cut's required suite) always runs in full
@@ -8696,6 +8697,7 @@ def cmd_detach(a) -> None:
             "(name: letters, digits, . _ -)")
     if not run_dir:
         die("ttp detach only works inside a tt-project run")
+    _cycle_notice_busy("ttp detach", Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else None)
     rd = Path(run_dir).resolve()
     rc, logf = rd / f"{a.name}.rc", rd / f"{a.name}.log"
     if any(f.exists() for f in (rc, logf, detach.queued(rc), detach.lost(rc))):
@@ -11884,6 +11886,21 @@ def cmd_uninstall(a) -> None:
     print("left in place (remove by hand if you want them gone):")
     for ln in uninstall.leftovers(bin_dir):
         print(f"  {ln}")
+
+
+def _cycle_notice_busy(what: str, p: Project | None) -> None:
+    """Exit 75 when a power cycle of this host is announced (cyclenotice.project_held): a long job started
+    now would be cut by it. Hand off `waiting` on a time check; it starts once the announcement clears."""
+    from . import cyclenotice
+    try:
+        h = cyclenotice.project_held(p) if p is not None and p.exists() else None
+    except Exception:
+        return
+    if h:
+        print(f"{what}: not started, {cyclenotice.line(h, p)}. Commit and hand off `waiting` with retry_when "
+              f"'test \"$(date +%s)\" -ge {int(time.time()) + 600}' and start it once the cycle is over",
+              file=sys.stderr)
+        sys.exit(cyclenotice.BUSY)
 
 
 def cyclenotice_paths(p: Project) -> list[str]:

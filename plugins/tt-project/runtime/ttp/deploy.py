@@ -361,7 +361,7 @@ def _takeover(p, rec: dict, outcome: str, kind: str, reason: str, t: dict, now: 
     if not start:
         return "pending", "", f"host-side takeover due now; {reason}"
     from . import cyclenotice
-    if p is not None and (h := cyclenotice.held(cyclenotice.project_paths(p))):   # busy: no try spent
+    if p is not None and (h := cyclenotice.project_held(p)):   # busy: no try spent
         return "pending", "", f"host-side takeover held: {cyclenotice.line(h, p)}; {reason}"
     try:
         child = launch_takeover(p, rec["name"], _owner_task(rec))

@@ -70,6 +70,7 @@ from .worktree import FORK_POINT_REF, fix_branches, named_refs
 
 REF_PREFIX = "refs/ttp/push/"   # + row id: pins the approved commit until its row is settled
 KV = "push_queue"               # kv: {"backoff_until", "deaths", "bad_tip": {"tip", "fails", "tried", "at", ...}, "tips_told"}
+CYCLE_SAID_KEY = "push_queue_cycle_said"   # kv: the announced power cycle a held batch start was logged for
 DEFAULT_BATCH_S = 300           # delivery.push_batch_s: the oldest approval waits at most this long for running reviews
 DEFAULT_BATCH_MAX = 8           # delivery.push_batch_max: start at once with this many (no longer a batch's most: one train takes every approval)
 DEFAULT_MIN_GAP_S = 1800        # delivery.push_min_gap_s: after a batch that did not end clean, the least time to the next start
@@ -1872,6 +1873,13 @@ def schedule(p: Project, cfg: dict | None = None, log: Callable[[str], None] = l
     rows, why = due(p, cfg=cfg)
     if not rows:
         return None
+    if held := _cycle_held(p, cfg):   # its checks would be cut: the batch starts once the cycle is over
+        if db.kv(CYCLE_SAID_KEY) != held:
+            db.set_kv(CYCLE_SAID_KEY, held)
+            log(f"push queue: no new batch starts: {held}")
+        return None
+    if db.kv(CYCLE_SAID_KEY):
+        db.set_kv(CYCLE_SAID_KEY, None)
     bid = start(p, rows, name)
     if bid:
         log(f"push queue: started {bid} with {len(rows)} approval{'s' if len(rows) > 1 else ''} ({why})")
@@ -2786,7 +2794,7 @@ def _after_push_set(p: Project, cfg: dict | None) -> bool:
 
 def _cycle_held(p: Project, cfg: dict | None) -> str:
     """The line of a power cycle of this host a device broker announced, or "" (cyclenotice.py)."""
-    h = cyclenotice.held(cyclenotice.paths(cfg) if cfg else cyclenotice.project_paths(p))
+    h = cyclenotice.project_held(p, cfg)
     return cyclenotice.line(h, p) if h else ""
 
 

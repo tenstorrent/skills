@@ -19,13 +19,23 @@ The paths come from the project's `upgrade.cycle_notices` (a list; [] turns the 
 not exist holds nothing, so a host without a broker is unaffected. A notice holds only in a hold state.
 A file that is present but unreadable or not such an object holds only MALFORMED_FRESH_S after its last
 write, and a well-formed one only VALID_FRESH_S after its `updated_at` (or its last write, if later): a
-stale file left by a broker that died never holds maintenance forever. `ttp upgrade --ignore-cycle-notice`
+stale file left by a broker that died never holds maintenance forever.
+
+Probe announcements. A broker's health probe or status command may say a cycle is coming before (or
+without) a notice file, e.g. 'next: power cycle ...'. The project's heal checks (heal.py) keep their last
+output; project_held also holds while one that watches this host (no `machine` or `host`, or one naming
+this host) printed a line matching `upgrade.cycle_patterns` (regexes, case-insensitive; default
+DEFAULT_PATTERNS, [] turns it off) within PROBE_FRESH_S of its last run. `upgrade.cycle_checks` names
+the checks to read (default: every local one). It clears as soon as the check's next output no longer
+matches. While either source holds, besides the maintenance above, the push queue starts no new batch
+(its checks would be cut), `ttp checks` starts none and `ttp detach` starts no local job (each exits 75). `ttp upgrade --ignore-cycle-notice`
 (and `ttp setup --ignore-cycle-notice`) proceeds anyway, with a warning.
 """
 from __future__ import annotations
 
 import json
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -36,6 +46,10 @@ HOLD_STATES = ("possible", "requested")
 MALFORMED_FRESH_S = 600      # a half-written or garbled notice: a broker rewrites it within seconds
 VALID_FRESH_S = 6 * 3600     # a notice no broker refreshed in this long is a leftover
 BUSY = 75                    # the exit code of a held `ttp upgrade` or `ttp setup` (as `ttp lock`'s busy)
+# A pending cycle in the generic words a probe uses; site-specific wording goes in upgrade.cycle_patterns.
+DEFAULT_PATTERNS = (r"\bnext:\s*power[ -]?cycle\b",
+                    r"\bpower[ -]?cycle\b[^\n]{0,40}\b(?:pending|requested|scheduled|imminent)\b")
+PROBE_FRESH_S = 900          # a probe output older than this says nothing about now
 TEST_ENV = "TTP_TEST_CYCLE_NOTICES"   # tests: the default paths (os.pathsep-separated), never the real one
 
 
@@ -140,4 +154,70 @@ def line(h: dict, where=None) -> str:
     else:
         at = str(e) if e else "not given"
     return (f"a power cycle of this host is pending (state {h['state']}, reason: {h['reason']}, "
-            f"earliest cycle at {at}; notice {h['path']})")
+            f"earliest cycle at {at}; {'' if h['path'].startswith('heal check ') else 'notice '}{h['path']})")
+
+
+def patterns(cfg: dict | None) -> list[re.Pattern]:
+    """upgrade.cycle_patterns compiled (an invalid one is skipped), else DEFAULT_PATTERNS."""
+    v = ((cfg or {}).get("upgrade") or {}).get("cycle_patterns") if isinstance(cfg, dict) else None
+    if isinstance(v, str):
+        v = [v]
+    out = []
+    for x in v if isinstance(v, list) else DEFAULT_PATTERNS:
+        try:
+            out.append(re.compile(str(x), re.I))
+        except re.error:
+            continue
+    return out
+
+
+def _local(spec: dict) -> bool:
+    """Whether a heal check watches this host: it names no other machine or ssh host."""
+    from . import machines
+    from .project import hostname
+    names = [str(spec.get(k)).strip().lower() for k in ("machine", "host") if spec.get(k)]
+    if not names:
+        return True
+    me = {hostname().lower()}
+    try:
+        if h := machines.here():
+            me |= {h[0].lower(), str(h[1].get("hostname") or "").lower()}
+    except Exception:
+        pass
+    return all(n in me for n in names)
+
+
+def probe_held(p, cfg: dict | None = None, now: float | None = None) -> dict | None:
+    """A hold (as read() returns) from a heal check whose fresh last output announces a cycle, or None."""
+    from . import heal
+    now = time.time() if now is None else now
+    cfg = p.config() if cfg is None else cfg
+    pats = patterns(cfg)
+    names = ((cfg or {}).get("upgrade") or {}).get("cycle_checks")
+    if not pats:
+        return None
+    for r, spec in heal.checks(p.db):
+        if isinstance(names, list) and r["name"] not in names or names is None and not _local(spec):
+            continue
+        st = heal.state(p.db, r["name"])
+        if now - float(st.get("last_check") or 0) >= PROBE_FRESH_S:
+            continue
+        for ln in str(st.get("last_out") or "").splitlines():
+            if any(x.search(ln) for x in pats):
+                return {"path": f"heal check {r['name']}", "state": "announced", "reason": " ".join(ln.split())[:200],
+                        "earliest": None, "malformed": False}
+    return None
+
+
+def project_held(p, cfg: dict | None = None, now: float | None = None) -> dict | None:
+    """A notice file (held) or a probe announcement (probe_held) of a cycle of this host, or None."""
+    try:
+        cfg = p.config() if cfg is None else cfg
+    except Exception:
+        cfg = {}
+    if h := held(paths(cfg) if cfg else project_paths(p), now):
+        return h
+    try:
+        return probe_held(p, cfg, now)
+    except Exception:       # an unreadable heal state never holds work
+        return None

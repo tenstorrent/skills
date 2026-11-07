@@ -4927,6 +4927,9 @@ class Daemon:
             # A planned cycle already names its planner: only the journal adds to it there.
             by = f"initiator: {started.get('text') or 'unknown'}" \
                 if started and (not cycle or started.get("source") == "journal") else ""
+            if started and started.get("kernel"):
+                by += ("; " if by else "") + f"kernel fault before it: {started['kernel']}"
+            back = timefmt.short(min(booted or now, now), self.p)
             data = {"boot": self.boot, "boot_time": booted, "prev_boot": prev.get("prev_boot"), "shutdown": shutdown,
                     "initiator": started,
                     "planned": {"reason": str(cycle.get("reason") or "")[:300], "record": cycle["path"],
@@ -4937,7 +4940,8 @@ class Daemon:
             # A record, not news: the coordinator sees it in its digest, not as a new event.
             db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,data,status) VALUES(?,?,?,?,?,?,?,?)",
                  (min(booted or now, now), "host", "boot", f"boot:{self.boot}", "normal",
-                  f"the host rebooted ({how}); {len(lost)} run(s) cut short" + (f"; {by}" if by else ""),
+                  f"the host rebooted ({how}); back up at {back}; {len(lost)} run(s) cut short"
+                  + (f"; {by}" if by else ""),
                   json.dumps(data), "record"))
             if not lost:
                 return

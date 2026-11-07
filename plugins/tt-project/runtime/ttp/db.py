@@ -1341,10 +1341,12 @@ def unplanned_abrupt(boot: dict) -> bool:
 
 
 def host_line(boots: list[dict], where=None) -> str:
-    """'host: N reboots in 24 h (K planned: by <project>) (last HH:MM <zone>), M runs cut short: R resumed
-    (K with work kept, $B), L not restarted, $A of work lost' for the boots of the last day, as DB.boots
-    returns them, in the home zone `where`; '' when there were none. A run a later run resumed kept its
-    work; one a later run of its task followed was restarted."""
+    """'host: N reboots in 24 h (K planned: by <project>) (last HH:MM <zone>: <cause>), M runs cut short:
+    R resumed (K with work kept, $B), L not restarted, $A of work lost' for the boots of the last day, as
+    DB.boots returns them, in the home zone `where`; '' when there were none. A run a later run resumed
+    kept its work; one a later run of its task followed was restarted. The cause is what the last boot's
+    record read from the journal (initiator.find: who or what started it, and a kernel fault before it),
+    so a reboot is not blamed on the work that ran."""
     if not boots:
         return ""
     runs = [x for b in boots for x in b.get("lost") or [] if isinstance(x, dict)]
@@ -1358,6 +1360,11 @@ def host_line(boots: list[dict], where=None) -> str:
                  if isinstance(b["planned"], dict) and re.fullmatch(r"[\w.-]+", str(b["planned"].get("project") or ""))})
     from .timefmt import short
     last = short(float(boots[-1]["ts"]), where)
+    ini = boots[-1].get("initiator") if isinstance(boots[-1].get("initiator"), dict) else {}
+    cause = "; ".join(str(x)[:160] for x in (ini.get("text"), ini.get("kernel") and f"kernel: {ini['kernel']}")
+                      if x and x != "unknown")
+    if cause:
+        last += f": {cause}"
     n = len(runs)
     return (f"host: {len(boots)} reboot{'' if len(boots) == 1 else 's'} in 24 h"
             + (f" ({len(planned)} planned" + (f": by {', '.join(by)}" if by else "") + ")" if planned else "")

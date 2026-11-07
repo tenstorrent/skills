@@ -857,7 +857,7 @@ def _initiator_reboot(p, tmp_path, monkeypatch, journal, last_heartbeat_ago=600)
     d = Daemon(p.base)
     d.tick()
     d.tick()
-    assert set(calls) <= {"boot-0"} and 1 <= len(calls) <= 3, "the journal is read once per boot (markers, " \
+    assert set(calls) <= {"boot-0"} and 1 <= len(calls) <= 4, "the journal is read once per boot (markers, kernel, " \
         "commands, then the window before the marker), for the boot that ended"
     (n,) = _reboot_notices(p)
     ev = p.db.one("SELECT text, data FROM events WHERE source='host' AND kind='boot' ORDER BY id DESC LIMIT 1")
@@ -1336,3 +1336,49 @@ def test_a_reboot_after_a_shutdown_record_requeues_the_cut_short_run_that_held_a
     else:
         assert t["status"] == "blocked", dict(t)
         assert t["blocked_reason"].startswith("the host rebooted abruptly while this task held board"), t
+
+
+# A kernel fault before the reboot (initiator.kernel_fault): fixture journal text only.
+@pytest.mark.parametrize("line,label", [
+    ("Oct 25 21:59:30 testhost kernel: Kernel panic - not syncing: Fatal exception", "kernel panic"),
+    ("Oct 25 21:59:30 testhost kernel: Out of memory: Killed process 4242 (python3)", "out of memory"),
+    ("Oct 25 21:59:30 testhost systemd-oomd[90]: Killed /user.slice/x.scope due to memory pressure", "out of memory"),
+    ("Oct 25 21:59:30 testhost kernel: mce: [Hardware Error]: Machine check events logged", "machine check"),
+    ("Oct 25 21:59:30 testhost kernel: watchdog: BUG: soft lockup - CPU#3 stuck for 22s!", "lockup"),
+    ("Oct 25 21:59:30 testhost kernel: watchdog: watchdog0: watchdog did not stop!", ""),   # a normal shutdown
+    ("Oct 25 21:59:30 testhost systemd[1]: Started Shutdown watchdog.", ""),        # not the kernel's own line
+    ("Oct 25 21:59:30 testhost example-app[7]: Out of memory: Killed process 1", ""),   # an app quoting it
+])
+def test_the_kernel_fault_read_names_only_the_kernels_own_fault_lines(line, label):
+    from ttp import initiator
+    got = initiator.kernel_fault(line + "\n")
+    assert got.startswith(label + ": ") if label else got == "", got
+
+
+def test_the_kernel_read_selects_kernel_and_oomd_lines_of_the_ended_boot(env, monkeypatch):
+    from ttp import initiator
+    p = make(env)
+    oom = json.dumps({"__REALTIME_TIMESTAMP": str(int((_T0 - 40) * 1e6)), "_TRANSPORT": "kernel",
+                      "SYSLOG_IDENTIFIER": "kernel", "MESSAGE": "Out of memory: Killed process 4242 (python3)"})
+    quoted = _j(-20, "Out of memory: Killed process 1", "example.service", "example-app")
+    text = "\n".join([oom, quoted, *_CYCLE.splitlines()]) + "\n"
+    monkeypatch.setattr(initiator, "run_journal", lambda boot, extra=(), sudo=False: _journalctl(text, extra))
+    got = initiator.find(p, "boot-0", _T0 + 60, _T0 - 60)
+    assert got["source"] == "journal" and got["kernel"] == "out of memory: Out of memory: Killed process 4242 (python3)"
+
+
+def test_the_reboot_record_and_host_line_say_when_in_the_home_zone_and_why(env, tmp_path, monkeypatch):
+    from ttp import db as dbm
+    from ttp import timefmt
+    p = make(env)
+    p.set_config(timefmt.KEY, "America/Los_Angeles")
+    oom = "Oct 25 21:59:30 testhost kernel: Out of memory: Killed process 4242 (python3)\n"
+    feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, oom + _SUDO_REBOOT, ""))
+    assert got["kernel"].startswith("out of memory: ") and "someuser ran `reboot`" in got["text"], got
+    boot = p.db.boots(0)[-1]
+    back = timefmt.short(float(boot["boot_time"]), p)
+    assert back.endswith(("PST", "PDT")), back
+    assert f"; back up at {back}; " in record and "kernel fault before it: out of memory" in record, record
+    assert "Kernel fault before it: out of memory" in feed or "kernel fault before it: out of memory" in feed, feed
+    line = dbm.host_line(p.db.boots(0), p)
+    assert f"(last {back}: someuser ran `reboot` via sudo (journal); kernel: out of memory: " in line, line
