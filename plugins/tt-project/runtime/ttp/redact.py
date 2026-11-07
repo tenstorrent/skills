@@ -46,10 +46,14 @@ _KEY_BODY = r"(?:[A-Za-z0-9+/=:,.()\- \t\r\n]|\\+[nrt/]|\\+u[0-9a-fA-F]{4})"
 _ESC_BODY = r"(?:[A-Za-z0-9+/=:,.()\- \t]|\\+[nrt/]|\\+u[0-9a-fA-F]{4})"
 _ESC_CUT = rf"{_ESC_BODY}*?\\+n{_ESC_BODY}*(?!{_ESC_BODY})"
 # Cut off in raw text: base64 on the BEGIN line, then each line that looks like a key line: base64 (a
-# partial one when cut mid-line: 16 or more of it) or a header (Name: value). Prose stops it.
+# partial one when cut mid-line: 16 or more of it) or a header (Name: value), after a line number as
+# `cat -n` or a file viewer prints it, if any; blank lines only before another key line. Prose stops it.
+# Each line matches one way only (spaces never split between two parts), so a failing line costs linear time.
 _B64 = r"[A-Za-z0-9+/=]"
-_RAW_LINE = rf"[ \t]*(?:{_B64}+[ \t]*(?=\r?\n|\Z)|{_B64}{{16,}}|[A-Za-z][A-Za-z0-9-]*:[ \t][^\r\n\"'`\\]*)"
-_RAW_CUT = rf"(?:[ \t]+{_B64}{{16,}})*(?:(?:[ \t]*\r?\n)+{_RAW_LINE})*"
+_LINE_START = r"\r?\n[ \t]*(?:[0-9]+(?:\t|\u2192)[ \t]*)?"
+_RAW_BLANK = rf"{_LINE_START}(?=\r?\n)"
+_RAW_LINE = rf"{_LINE_START}(?:{_B64}+[ \t]*(?=\r?\n|\Z)|{_B64}{{16,}}|[A-Za-z][A-Za-z0-9-]*:[ \t][^\r\n\"'`\\]*)"
+_RAW_CUT = rf"(?:[ \t]+{_B64}{{16,}})*(?:[ \t]+(?=\r?\n))?(?:(?:{_RAW_BLANK})*{_RAW_LINE})*"
 _KEY_RE = (rf"-{{4,5}} ?BEGIN {_KEY_TYPE} ?-{{4,5}}"
            rf"(?:{_KEY_BODY}*?-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}|{_ESC_CUT}|{_RAW_CUT})")
 KEY_RE = re.compile(_KEY_RE)

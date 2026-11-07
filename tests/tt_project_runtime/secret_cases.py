@@ -1411,6 +1411,14 @@ def test_prose_after_a_lone_key_marker_line_survives_and_a_cut_block_is_still_ma
         out = redact.scrub("x " + block[:cut] + tail)
         assert _no_key(out, lines) and not _key_piece(out, lines) and "DEK-Info" not in out, out
         assert out.endswith(tail.lstrip(".")) if tail else out == "x " + redact.KEY_MASK, out
+    for sep in ("\t", "\u2192"):   # numbered lines (`cat -n`, a file viewer), cut before the END line
+        numbered = "".join(f"{i + 1:6}{sep}{ln}\n" for i, ln in enumerate(block.splitlines()[:6]))
+        out = redact.scrub(numbered + prose)
+        assert out.endswith("\n" + prose) and not _key_piece(out, lines), out
+    t0 = time.monotonic()   # space-only lines match one way: no backtracking blow-up before prose
+    for filler in ("\n   ", "\n  7\t  ", "\nAAAA   \n   "):
+        assert redact.scrub(begin + filler * 3000 + "\nx y").endswith("\nx y")
+    assert time.monotonic() - t0 < 5
     squashed = begin + " " + " ".join(lines[:4]) + "\n" + prose   # one line, cut before its END
     out = redact.scrub(squashed)
     assert out == redact.KEY_MASK + "\n" + prose and not _key_piece(out, lines)
@@ -1438,12 +1446,13 @@ def test_scrub_run_leaves_a_live_detached_jobs_log_whole_and_masks_it_once_the_j
     with open(log, "w") as w:   # as the job wrapper's `>"$log"`: one open file, its own offset
         w.write("line 0\n" + block)
         w.flush()
-        assert redact.scrub_run(run) == 1   # stderr.log only
+        masked = redact.scrub_run(run)
         for i in range(1, 50):
             w.write(f"line {i}\n")
             w.flush()
     text = log.read_text()
     assert all(f"line {i}\n" in text for i in range(50)), text[-200:]
+    assert masked == 1   # stderr.log only
     assert _masked((run / "stderr.log").read_text())
     rc = run / f"{name}.rc"
     if name == "job":   # the daemon's sweep closes the job's record once it ended: its log is masked then
