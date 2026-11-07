@@ -339,7 +339,9 @@ def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 70.0 and g.level == "yellow", (g.numbers, g.reasons)
     line = budget_line(p.db, now, "claude", g.as_dict())
-    assert line == "24h $70.00 this project, $70.00 of $200 global", "the old plan's spend was never billed: " + line
+    assert line.startswith("24h $70.00 this project, $70.00 of $200 global; at $"), \
+        "the old plan's spend was never billed: " + line
+    assert line.endswith("/h: reset time unknown (rolling 24 h), no projection"), line
     # a run that started earlier under the plan account does not bring its windows back
     _run(p, "acct-a | plan", now - 7300)
     assert bud.plan_windows(p.db, now) == []
@@ -361,11 +363,15 @@ def test_account_switch_mid_window_counts_only_billed_spend(env):
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 15.0 and g.numbers["spent_7d"] == 15.0, g.numbers
     assert g.level == "green" and g.allow_new_work, (g.level, g.reasons)
-    assert budget_line(p.db, now, "claude", g.as_dict()) == "24h $15.00 this project, $15.00 of $200 global"
+    line = budget_line(p.db, now, "claude", g.as_dict())
+    assert line.startswith("24h $15.00 this project, $15.00 of $200 global; at $"), line
+    assert line.endswith("/h: reset time unknown (rolling 24 h), no projection"), line
     assert budget_line(p.db, now, "claude") == "24h $15.00 actual"
     _login(env, "acct-c", "billed")   # the global total is the machine's own login's: another one spent nothing
     other = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
-    assert budget_line(p.db, now, "claude", other.as_dict()) == "24h $15.00 this project, $0.00 of $200 global"
+    line = budget_line(p.db, now, "claude", other.as_dict())
+    assert line.startswith("24h $15.00 this project, $0.00 of $200 global; "), line
+    assert "reaches the cap" not in line, "a rolling 24 h cap has no reset to project against: " + line
     _login(env, "acct-b", "billed")
     # B's run still going counts; a run that started under A before the switch does not
     _run(p, "acct-b | billed", now - 300, None, 2.5)
