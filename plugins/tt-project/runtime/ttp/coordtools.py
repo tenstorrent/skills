@@ -20,7 +20,7 @@ charter, memory, project.json or state database (Edit/Write deny rules and the h
 the action or command that applies the same checks), no raw `git push` and no landing `ttp push` (a
 --land, --own, --detach or --move-tag push, or a plain one: code goes to a worker task, its review and
 the push queue; a channel tag moves only in a release cut task after its candidate checks; `ttp push
---queue`, `--result` and `--free` stay), and no foreground command past coordinator.session.tool_timeout_s
+--queue`, `--result`, `--free` and `--cancel` stay), and no foreground command past coordinator.session.tool_timeout_s
 (TOOL_TIMEOUT_S; the CLI's own Bash timeout is set to it too): longer work goes to `ttp detach` or a
 worker. Every call that is not a read (Bash off the read-only list, Edit, Write) is logged with its
 exit to the run's AUDIT file and its progress.md, which the web app shows (post_tool_use). The Bash
@@ -86,8 +86,9 @@ _TIME_PROBE = re.compile(r'test "\$\(date \+%s\)" -ge \d+')
 _QUOTED = re.compile(r"'[^']*'|\"[^\"$`\\!]*\"")
 FULL_ENV = "TTP_COORD_FULL_TOOLS"   # "1": the hook applies full_refusal, not the read-only list
 ROLE_ENV = "TTP_ROLE"   # the run's role, set for every run (daemon.start_run): "coordinator" in a coordinator's
-# `ttp push` forms that land or move nothing (cli.cmd_push): the only ones a coordinator may run
-PUSH_READS = (("--queue",), ("--free",), ("--result", "*"), ("--result", "*", "--pushed"), ("--help",), ("-h",))
+# `ttp push` forms that land or move nothing (cli.cmd_push; `--cancel` only stops one): the only ones a coordinator may run
+PUSH_READS = (("--queue",), ("--free",), ("--result", "*"), ("--result", "*", "--pushed"), ("--cancel", "*"),
+              ("--help",), ("-h",))
 PUSH_REFUSAL = ("a coordinator lands nothing and moves no tag: code changes go on a work branch through a worker "
                 "task, its review and the push queue (the review lands them), and a channel tag moves only in a "
                 "release cut task once its candidate checks pass. Queue a task (`ttp task <project> add ...`)")
@@ -380,7 +381,7 @@ def _pushes(cmd: str) -> bool:
 
 def _lands(cmd: str) -> bool:
     """Whether `cmd` runs a `ttp push` that may land or move a tag (any but PUSH_READS)."""
-    return _runs(cmd, _ttp_push, r"\bttp\s+push\b(?!\s+--(?:queue|free|result)\b)")
+    return _runs(cmd, _ttp_push, r"\bttp\s+push\b(?!\s+--(?:queue|free|result|cancel)\b)")
 
 
 def full_refusal(tool: str, args: dict, cwd: str) -> str | None:

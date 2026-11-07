@@ -3082,7 +3082,9 @@ def cmd_push(a) -> None:
     rebase or bump, never the push branch or a shared one; with no push branch set, that is also the
     default once the branch is on the remote. `--own-branch` publishes the task's own branch even when
     it carries a pr_branch. Inside a run, a plain push of the task's own branch onto the push branch is
-    refused unless its spec asks it to land or `--land` says so. Inside a run, a worktree on another task's branch is
+    refused unless its spec asks it to land or `--land` says so; where delivery wants a review before
+    each push, `--land` lands only a head a passed review accepted (push.unreviewed_landing). `--cancel <marker>`
+    stops a detached push the calling task queued (the coordinator: any) before it lands. Inside a run, a worktree on another task's branch is
     refused (push.resolve), and so is publishing onto another task's branch the task only inherited. `--queue` lists the push queue
     (`delivery.push_queue`). `--move-tag <tag> <commit>` moves a delivery.channel_tags tag forward
     (channeltag.move). Exit codes are in `push.py`."""
@@ -3090,7 +3092,7 @@ def cmd_push(a) -> None:
     if a.result:
         sys.exit(push.result(Path(a.result), pushed_only=a.pushed))
     from . import coordtools
-    if coordtools.coordinator_run() and not (a.queue or a.stop or (a.free and not a.move_tag)):
+    if coordtools.coordinator_run() and not (a.queue or a.stop or a.cancel or (a.free and not a.move_tag)):
         die(f"ttp push: {coordtools.PUSH_REFUSAL}")   # also past the hook's text check (coordtools.py)
     if a.own_branch:   # read by push.own_target, also in the detached process (inherited, or QUEUE_ENV)
         a.own = True
@@ -3110,6 +3112,8 @@ def cmd_push(a) -> None:
         return
     if a.stop:
         sys.exit(push.stop_own(p, Path(a.stop)))
+    if a.cancel:
+        sys.exit(push.cancel(p, Path(a.cancel)))
     if a.move_tag:
         from . import channeltag
         sys.exit(channeltag.move(p, Path.cwd(), *a.move_tag, say=lambda s: print(s, file=sys.stderr)))
@@ -13989,6 +13993,9 @@ def main(argv: list[str] | None = None) -> None:
                    help="end this task's own detached push (its marker) while it waits for its turn or runs its "
                         "checks, and remove its marker, so the push train can take its head; never one in its "
                         "git push (exit 1), another task's or project's (exit 2); 0 once stopped or already ended")
+    s.add_argument("--cancel", metavar="MARKER",
+                   help="push nothing new: stop the detached push of MARKER (queued or running, its checks too) "
+                        "before it lands; only the task that queued it, or the project's coordinator")
     s.add_argument("--pushed", action="store_true",
                    help="with --result: exit 0 only if the push landed, 1 while it runs, 3 if it finished "
                         "without pushing (for an on_pass_cmd; no grep needed)")

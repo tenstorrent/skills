@@ -2879,6 +2879,18 @@ session and stateless coordinators on every provider.
   whether it died at startup, in a reboot or later, instead of waiting. From a sandbox that runs
   each command in a PID namespace of its own (Codex on Linux), which kills a background process
   when the command ends, the push is queued and the daemon starts it; the probe exits 1 meanwhile.
+- `ttp push --cancel <marker>` stops a detached push before it lands: a queued one is never
+  started, and a running one has its process group (the push, its checks and git) ended, TERM then
+  KILL, which frees its run lock, check slots and check scratch. The marker then reads `cancelled`,
+  the push log and the run's notes say who cancelled it, and `--result` reports it not pushed. Only
+  the task that queued the push may cancel it (the project's coordinator may cancel any push of its
+  project); another task's push is refused (exit 2). Exit 1 when it had already pushed.
+- Inside a run, `ttp push --land` lands the task's own branch though its spec has no landing step,
+  and skips the guard that wants `ttp checks` passed on HEAD. It never skips a review: when delivery
+  wants one before each push (`delivery.review_before_pr`, on by default), it lands only a commit a
+  passed review accepted for that task (the review marker), exactly HEAD. A review of an older head
+  does not cover a newer one; without one the push is refused (exit 2), naming the missing review.
+  With `delivery.review_before_pr` off, `--land` lands as before.
 - `delivery.version_bump` lets `ttp push` own the version bump, so parallel reviews never race for
   one version: `{"files": [...], "changeset_dir": ".changeset"}` (optional `package`, and `paths`,
   default the folder the files share). After each rebase, when the change touches `paths`, it

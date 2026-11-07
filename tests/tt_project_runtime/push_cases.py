@@ -1321,6 +1321,7 @@ def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    p.set_config("delivery.review_before_pr", False)   # no review step: --land needs no review (unreviewed_landing)
     shared = _git_out(origin, "rev-parse", "proj")
     own_only = p.db.add_task("fix", kind="code", spec="Fix it. Push only your own ttp/* branch; never open PRs.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{own_only}-fix")
@@ -1394,6 +1395,7 @@ def test_a_code_workers_plain_push_lands_only_tested_work_unless_land_overrides_
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    p.set_config("delivery.review_before_pr", False)   # no review step: --land needs no review (unreviewed_landing)
     shared = _git_out(origin, "rev-parse", "proj")
     tid = p.db.add_task("fix", kind="code", spec="Fix it, then land it with `ttp push`.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-fix")
@@ -8088,6 +8090,7 @@ def test_a_code_task_whose_title_ends_in_notes_still_delivers_its_own_branch_as_
     from ttp import push, worktree
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    p.set_config("delivery.review_before_pr", False)   # no review step: --land needs no review (unreviewed_landing)
     _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
     for labels in ([], ["pr_branch:feature/x"]):
         tid = p.db.add_task("Update release notes", "s", kind="code", labels=labels)
@@ -20743,3 +20746,127 @@ def test_a_code_hand_off_passes_when_it_declares_the_landing_or_the_carried_comm
     assert not pushq.carried(s.p, s.p.db.task(d), _git_out(s.repo, "rev-parse", s.p.db.task(d)["branch"])).get(y)
     t = _carry_hand_off(env, s, d)
     assert t["status"] == "done" and carryback.KEY not in json.loads(t["result"]), dict(t)
+
+
+def test_land_needs_a_passed_review_of_exactly_head_where_delivery_wants_review(env, monkeypatch, capsys):
+    # Replays the upstream note: on a project whose delivery wants a review before each push, a worker's
+    # `ttp push --land --detach` ran only the checks and landed. `--land` overrides the landing step and
+    # the checks guard, never the review: it lands only the exact head a passed review accepted.
+    from ttp import push, verified
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
+    shared = _git_out(origin, "rev-parse", "proj")
+    tid = p.db.add_task("fix", kind="code", spec="Fix it.")
+    _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-fix")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    for args in (["push", "--land"], ["push", "--land", "--detach"]):
+        assert _ttp(*args) == 2, args
+        err = capsys.readouterr().err
+        assert "needs a passed review of this exact commit" in err and "delivery.review_before_pr" in err, err
+        monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
+    assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
+    # A passed review records the head it accepted (daemon._mark_verified): that exact head may land.
+    old = _git_out(repo, "rev-parse", "HEAD")
+    review = p.db.add_task(f"Review #{tid}", kind="review", depends_on=[tid])
+    verified.record(p.db, tid, "review", old, review=review)
+    monkeypatch.setenv(push.LAND_ENV, "1")
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    # A commit after the review is not covered by it; the refusal names the head the review accepted.
+    _commit(repo, "more.txt", "more\n")
+    head = _git_out(repo, "rev-parse", "HEAD")
+    with pytest.raises(ValueError, match=f"#{review}\\) accepted {old[:10]}, not this commit"):
+        push.resolve(p, repo)
+    # Another task's review of this very commit does not cover this task's landing.
+    other = p.db.add_task("other", kind="code")
+    verified.record(p.db, other, "review", head, review=review)
+    with pytest.raises(ValueError, match="needs a passed review"):
+        push.resolve(p, repo)
+    # With no review step the project lands as before.
+    p.set_config("delivery.review_before_pr", False)
+    assert push.resolve(p, repo) == ("origin", "proj", False)
+    p.set_config("delivery.review_before_pr", True)
+    # Reviewed at this head, `ttp push --land` lands it.
+    verified.record(p.db, tid, "review", head, review=review)
+    monkeypatch.delenv(push.LAND_ENV)
+    assert _ttp("push", "--land") == 0 and _git_out(origin, "rev-parse", "proj") == head
+    monkeypatch.delenv(push.LAND_ENV, raising=False)
+
+
+def test_push_cancel_stops_the_tasks_own_running_push_and_lands_nothing(env, monkeypatch, capsys):
+    # Replays the upstream note: a worker that started `ttp push --land --detach` could not stop it (the
+    # kill hook refuses the push's process group). `ttp push --cancel <marker>` ends the push and its
+    # checks, frees the branch and lands nothing; another task's cancel is refused.
+    started = env["tmp"] / "started"
+    p, repo, origin, _ = _push_setup(env, monkeypatch, [f"touch {started}; sleep 120"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    mine, theirs = p.db.add_task("mine", kind="work"), p.db.add_task("theirs", kind="work")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(mine))
+    monkeypatch.setenv("TTP_RUN_ID", "1")
+    rc, marker, probe = _detach(capsys)
+    assert rc == 0 and marker
+    pid = json.loads(marker.read_text())["pid"]
+    try:
+        deadline = time.time() + 30
+        while not started.exists() and time.time() < deadline:
+            time.sleep(0.05)
+        assert started.exists() and _probe(p, probe).returncode == 1
+        monkeypatch.setenv("TTP_TASK", str(theirs))
+        assert _ttp("push", "--cancel", str(marker)) == 2
+        assert f"queued by task #{mine}, not by task #{theirs}" in capsys.readouterr().err
+        assert json.loads(marker.read_text())["status"] == "running"
+        from ttp import push
+        assert push._group_alive(pid)   # still running
+        monkeypatch.setenv("TTP_TASK", str(mine))
+        assert _ttp("push", "--cancel", str(marker)) == 0
+        assert "nothing landed" in capsys.readouterr().out
+        from ttp import push
+        assert not push._group_alive(pid)   # the push and its check are gone (a zombie left unreaped is not alive)
+    finally:
+        try:
+            os.killpg(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    m = json.loads(marker.read_text())
+    assert m["status"] == "cancelled" and m["reason"] == f"cancelled by task #{mine}" and not m.get("sha")
+    assert _ttp("push", "--free") == 0 and _git_out(origin, "rev-parse", "proj") == shared
+    r = _probe(p, probe)
+    assert r.returncode == 0 and f"not pushed (cancelled by task #{mine})" in r.stdout, r
+    assert _probe(p, probe + " --pushed").returncode == 3
+    # Cancelling it again says it already ended.
+    assert _ttp("push", "--cancel", str(marker)) == 0 and "already ended" in capsys.readouterr().out
+
+
+def test_push_cancel_of_a_queued_push_keeps_the_daemon_from_starting_it(env, monkeypatch, capsys):
+    from ttp import push
+    p, repo, origin, _ = _push_setup(env, monkeypatch, ["true"])
+    shared = _git_out(origin, "rev-parse", "proj")
+    mine, theirs = p.db.add_task("mine", kind="work"), p.db.add_task("theirs", kind="work")
+    _commit(repo, "mine.txt", "mine\n")
+    monkeypatch.setenv("TTP_TASK", str(mine))
+    monkeypatch.setenv("TTP_RUN_ID", "1")
+    monkeypatch.setenv("TTP_PIDNS", "pid:[1]")   # the run's namespace, not this one: queued for the daemon
+    rc, marker, _ = _detach(capsys)
+    monkeypatch.delenv("TTP_PIDNS")
+    assert rc == 0 and json.loads(marker.read_text())["status"] == "queued"
+    # Refused: another task, a marker outside this project's pushes, the push queue's batch process.
+    monkeypatch.setenv("TTP_TASK", str(theirs))
+    assert _ttp("push", "--cancel", str(marker)) == 2 and "a task cancels only its own pushes" in capsys.readouterr().err
+    stray = env["tmp"] / "stray.json"
+    stray.write_text(json.dumps({**json.loads(marker.read_text()), "task": str(theirs)}))
+    assert _ttp("push", "--cancel", str(stray)) == 2 and "not a detached push of this project" in capsys.readouterr().err
+    batch = marker.parent / "batch-x.json"
+    batch.write_text(json.dumps({"kind": "batch", "task": str(theirs)}))
+    assert _ttp("push", "--cancel", str(batch)) == 2 and "batch process" in capsys.readouterr().err
+    assert _ttp("push", "--cancel", str(env["tmp"] / "none.json")) == 2
+    # The project's coordinator may cancel any push of its project.
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.setenv("TTP_ROLE", "coordinator")
+    assert _ttp("push", "--cancel", str(marker)) == 0 and "nothing landed" in capsys.readouterr().out
+    monkeypatch.delenv("TTP_ROLE")
+    m = json.loads(marker.read_text())
+    assert m["status"] == "cancelled" and m["reason"] == "cancelled by the coordinator"
+    push.tend(p)   # the daemon's tick never starts it
+    assert json.loads(marker.read_text())["status"] == "cancelled"
+    assert _ttp("push", "--free") == 0 and _git_out(origin, "rev-parse", "proj") == shared

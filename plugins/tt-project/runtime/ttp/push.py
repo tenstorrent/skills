@@ -46,7 +46,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote
 
 from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
-               sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
+               sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
 from .project import (Project, code_tasks_may_push, durable_append, durable_write, git_fsync_env, hostname,
@@ -2785,6 +2785,8 @@ def _resolve(p: Project, repo: Path, own: bool = False) -> tuple[str, str, bool]
         raise ValueError(why)
     if m and task and m.group(1) == task:
         if os.environ.get(LAND_ENV):
+            if why := unreviewed_landing(p, repo, task, d):
+                raise ValueError(why)
             say = (f"ttp push: --land: task #{task} lands its own branch {branch} on {remote}/{push_to} "
                    f"(explicit override of the landing guard)")
             print(say, file=sys.stderr)
@@ -2815,6 +2817,40 @@ def code_run_landing(p: Project, task: str, upstream: str, d: dict) -> str:
     return (f"task #{task} is a code task and delivery.code_tasks_may_push is off: code tasks never push to "
             f"{upstream}, whatever the spec says, and `--land` does not change that. Commit, run `ttp checks` "
             f"and hand off; the review lands the change.{own}")
+
+
+def review_required(d: dict) -> bool:
+    """Whether delivery `d` wants an independent review before each push: delivery.review_before_pr,
+    on unless set off."""
+    return bool(d.get("review_before_pr", True))
+
+
+def unreviewed_landing(p: Project, repo: Path, task: str, d: dict) -> str:
+    """Why `ttp push --land` must not land task `task`'s HEAD, or "": where delivery wants a review
+    before each push (review_required), `--land` overrides only the landing step and the checks guard, never the review.
+    It lands only a head a passed review accepted: the `review` marker a passing review records for the
+    task or its lineage (verified.py) names exactly this commit. A review of an older head does not
+    cover a newer one. A review task's own run is the review and is not gated."""
+    if not review_required(d):
+        return ""
+    try:
+        t = p.db.task(int(task))
+    except (ValueError, TypeError):
+        return ""
+    if not t or t.get("kind") == "review":
+        return ""
+    head = _git(repo, "rev-parse", "HEAD").stdout.strip()
+    for i in verified.lineage(p.db, t, include_self=True):
+        m = verified.own(p.db, i, "review")
+        if m and head and m.get("sha") == head:
+            return ""
+    m = verified.inherited(p.db, t, "review", include_self=True)
+    older = (f" The last passed review (#{m.get('review')}) accepted {str(m.get('sha'))[:10]}, not this "
+             f"commit; a review of an older head does not cover a newer one." if m else "")
+    return (f"task #{task}: `--land` needs a passed review of this exact commit ({head[:10]}), because this "
+            f"project's delivery wants a review before each push (delivery.review_before_pr), and no "
+            f"passed review covers it.{older} Commit, run `ttp checks` and "
+            f"hand off; the review lands the change")
 
 
 def untested_landing(p: Project, repo: Path, task: str, d: dict) -> str:
@@ -5419,7 +5455,7 @@ def _requeue(marker: Path, m: dict) -> bool:
     """Queue again, for the daemon to start (_tend_one), the push of `marker` that a host reboot cut
     short, while its retries last. True when it is queued (or another process is handling it right now:
     its run lock is taken), False to record it as failed."""
-    if not (_rebooted(m) and _restartable(m)):
+    if m.get("cancel_requested") or not (_rebooted(m) and _restartable(m)):
         return False
     if len(_retries(m)) >= retries_of(m.get("retry_max")):
         return False
@@ -5595,6 +5631,143 @@ def result(marker: Path, pushed_only: bool = False) -> int:
         if tail:
             print(tail)
         return NOT_PUSHED if pushed_only else 0
+    return 0
+
+
+CANCEL_GRACE_S = 30   # `--cancel`: how long the push's group has after SIGTERM before SIGKILL
+CANCEL_KILL_S = 10    # and after SIGKILL, before the cancel reports it still running
+
+
+def _cancel_refusal(p: Project, marker: Path, m: dict) -> str:
+    """Why this process may not cancel the detached push of `marker`, or "": only the task that queued
+    it, this project's coordinator, or a person outside any run, and only a single push of this project
+    (never the push queue's batch process: its entries are cancelled with their tasks)."""
+    if marker.resolve().parent != (p.state / DETACHED).resolve():
+        return f"{marker} is not a detached push of this project"
+    if m.get("kind") == "batch":
+        return "that is the push queue's batch process; cancel the task whose entry it carries instead"
+    from . import coordtools
+    if coordtools.coordinator_run():
+        return ""
+    me, owner = os.environ.get("TTP_TASK") or "", str(m.get("task") or "")
+    if not me and not os.environ.get("TTP_RUN_ID"):
+        return ""
+    if me and me == owner:
+        return ""
+    return (f"that push was queued by {f'task #{owner}' if owner else 'no task'}, not by task #{me or '?'}: "
+            f"a task cancels only its own pushes (the project's coordinator may cancel any)")
+
+
+def _group_alive(pid: int) -> bool:
+    """Whether process group `pid` has a live member. A zombie (ended, its parent has not reaped it yet:
+    the daemon or launcher that started the push) is not one; it is read from /proc where there is one."""
+    proc = Path("/proc")
+    if proc.is_dir():
+        for d in proc.iterdir():
+            if not d.name.isdigit():
+                continue
+            try:
+                stat = (d / "stat").read_text()
+            except OSError:
+                continue
+            fields = stat[stat.rfind(")") + 2:].split()
+            if len(fields) > 2 and fields[2] == str(pid) and fields[0] not in ("Z", "X"):
+                return True
+        return False
+    try:
+        os.killpg(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _end_group(marker: Path, pid: int, say: Callable[[str], None]) -> bool:
+    """Stop the push process `pid` of `marker` and every process of its group (its checks, git), TERM
+    then KILL: it was started as its own session (_start), so its pid is the group id. True once the
+    group is gone and the run lock is free."""
+    for sig, wait in ((signal.SIGTERM, CANCEL_GRACE_S), (signal.SIGKILL, CANCEL_KILL_S)):
+        try:
+            os.killpg(pid, sig)
+        except ProcessLookupError:
+            pass
+        except PermissionError as e:
+            say(f"ttp push: cannot signal process group {pid}: {e}")
+            return False
+        end = time.time() + wait
+        while time.time() < end:
+            if not _group_alive(pid) and locks.any_free([_run_lock(marker)]):
+                return True
+            time.sleep(0.2)
+    return not _group_alive(pid) and locks.any_free([_run_lock(marker)])
+
+
+def cancel(p: Project, marker: Path) -> int:
+    """`ttp push --cancel <marker>`: stop the detached push of `marker` before it lands. A queued one is
+    marked cancelled under its run lock, so the daemon never starts it; a running one has its process
+    group (the push, its checks and git) ended, TERM then KILL, which lets go of the run lock, the
+    check slots and the check scratch it held. The marker then reads `cancelled`, the run's notes and
+    the push's log record who cancelled it, and nothing lands. 0 when cancelled or already ended without
+    pushing, 1 when it pushed before the cancel took effect (or could not be stopped), REFUSED for a
+    missing marker or a push the caller may not cancel (_cancel_refusal)."""
+    marker = Path(marker)
+    m = _read(marker)
+    if not m:
+        print(f"ttp push: no detached push marker at {marker}", file=sys.stderr)
+        return REFUSED
+    if why := _cancel_refusal(p, marker, m):
+        print(f"ttp push: --cancel refused: {why}", file=sys.stderr)
+        return REFUSED
+    from . import coordtools
+    me = os.environ.get("TTP_TASK")
+    by = "the coordinator" if coordtools.coordinator_run() else f"task #{me}" if me else "hand"
+    say = lambda s: print(s, file=sys.stderr)   # noqa: E731
+    did = False
+    lock = locks.try_take([_run_lock(marker)], f"detached push {m.get('id')}", "ttp push --cancel")
+    if lock is not None:   # queued, or its process is gone: nothing runs it now, and nothing starts it
+        with lock:
+            m = _read(marker)
+            if m.get("status") in ("queued", "running"):
+                m.update(status="cancelled", exit=None, ended=time.time(), reason=f"cancelled by {by}")
+                write_json(marker, m)
+                did = True
+        _forget_lock(marker)
+    else:
+        m = _read(marker)
+        pid = m.get("pid")
+        if m.get("status") == "running" and isinstance(pid, int) and pid > 1:
+            did = True
+            m["cancel_requested"] = by   # a reboot's requeue (_requeue) never starts it again
+            write_json(marker, m)
+            say(f"ttp push: stopping the push process group {pid} (TERM, then KILL after {CANCEL_GRACE_S} s)")
+            if not _end_group(marker, pid, say):
+                say(f"ttp push: the push of {marker.name} is still running; it was not cancelled")
+                return 1
+        m = _read(marker)
+        if did and m.get("status") in ("queued", "running", "failed") and not m.get("sha"):
+            m.update(status="cancelled", ended=m.get("ended") or time.time(), reason=f"cancelled by {by}")
+            write_json(marker, m)
+        _forget_lock(marker)
+    m = _read(marker)
+    if out := m.get("check_run_dir"):
+        try:   # a group ended by KILL never let go of its check scratch itself
+            checkdirs.finish(checkdirs.restore(p.state, out))
+        except (OSError, ValueError):
+            pass
+    if m.get("status") == "pushed":
+        say(f"ttp push: too late to cancel: it pushed {m.get('sha')} to {m.get('target')}")
+        return 1
+    text = f"ttp push: cancelled the push {marker.name} of {m.get('target') or 'no target'} ({by}); nothing landed"
+    if not did or m.get("status") != "cancelled":
+        text = f"ttp push: the push {marker.name} had already ended ({m.get('status')}); nothing to cancel"
+    else:
+        try:
+            _log_line(Path(m["log"]), text)
+        except (KeyError, OSError):
+            pass
+        run_note(text)
+    print(text)
     return 0
 
 
