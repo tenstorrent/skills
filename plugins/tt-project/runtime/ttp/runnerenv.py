@@ -53,9 +53,16 @@ def root() -> Path:
 
 
 def _base_python() -> str:
-    """The interpreter envs are made from: this one's base (a venv's own python makes no venv of the system)."""
-    base = Path(getattr(sys, "_base_executable", "") or sys.executable)
-    return str(base if base.exists() else Path(sys.executable))
+    """The interpreter envs are made from: this one's base outside any venv (a venv's python would see
+    that venv's packages; before 3.11 sys._base_executable names it inside a venv)."""
+    if sys.prefix == sys.base_prefix:
+        return sys.executable
+    v = sys.version_info
+    for c in (getattr(sys, "_base_executable", ""), Path(sys.base_prefix) / "bin" / f"python{v.major}.{v.minor}",
+              Path(sys.base_prefix) / "bin" / "python3", os.path.realpath(sys.executable)):
+        if c and Path(c).exists() and not Path(os.path.abspath(c)).is_relative_to(os.path.abspath(sys.prefix)):
+            return str(c)
+    return sys.executable
 
 
 def key_of(text: bytes, base: str) -> str:
