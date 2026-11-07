@@ -1879,18 +1879,29 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
 # ssh. FAKE_SLURM=<dir> holds their logs and job states; FAKE_SLURM_MODE: run (the job runs at once and
 # completes), hold (it stays RUNNING until scancel), refuse (sbatch exits 1), startfail (every job ends
 # FAILED, exit code 1:0, without running or output), nodefail1 (the first job
-# ends NODE_FAIL without running, later ones run).
+# ends NODE_FAIL without running, later ones run), localdisk (the workdir is on the submit host's own
+# disk: the node cannot read it, so the probe exits 3 and a job fails at once), probehide (the node's
+# probe answer never shows on the submit host). Probe jobs (--job-name=ttp-probe) log to probe.log
+# with ids from 901. FAKE_SLURM_NOACCT=1: sacct answers nothing (no accounting), scontrol does.
+# FAKE_SLURM_RC_LAG=<s>: a job's rc file shows that long after the job ended (NFS).
 _SLURM_FAKES = {
     "sbatch": r'''#!/bin/sh
 d=$FAKE_SLURM
-echo "$*" >> "$d/sbatch.log"
+case "$*" in *--job-name=ttp-probe*) probe=1; log=probe.log; first=900;; *) probe=; log=sbatch.log; first=100;; esac
+echo "$*" >> "$d/$log"
 [ "$FAKE_SLURM_MODE" = refuse ] && { echo "sbatch: error: invalid partition specified" >&2; exit 1; }
-n=$(( $(cat "$d/next" 2>/dev/null || echo 100) + 1 )); echo $n > "$d/next"
+n=$(( $(cat "$d/next$probe" 2>/dev/null || echo $first) + 1 )); echo $n > "$d/next$probe"
 out= ; dir= ; for a in "$@"; do case "$a" in --output=*) out=${a#--output=};; --chdir=*) dir=${a#--chdir=};; esac; script=$a; done
-if [ "$FAKE_SLURM_MODE" = hold ]; then echo RUNNING > "$d/state.$n"
+if [ "$FAKE_SLURM_MODE" = localdisk ]; then echo FAILED > "$d/state.$n"; [ -n "$probe" ] && echo 3:0 > "$d/code.$n"
+elif [ -n "$probe" ]; then (cd "$dir" && sh "$script" > "$out" 2>&1); echo COMPLETED > "$d/state.$n"
+  [ "$FAKE_SLURM_MODE" = probehide ] && rm -f "$(dirname "$script")/probe.out"
+elif [ "$FAKE_SLURM_MODE" = hold ]; then echo RUNNING > "$d/state.$n"
 elif [ "$FAKE_SLURM_MODE" = startfail ]; then echo FAILED > "$d/state.$n"; echo "1:0" > "$d/code.$n"
 elif [ "$FAKE_SLURM_MODE" = nodefail1 ] && [ ! -e "$d/failed" ]; then touch "$d/failed"; echo NODE_FAIL > "$d/state.$n"
 else (cd "$dir" && sh "$script" > "$out" 2>&1); echo COMPLETED > "$d/state.$n"
+  if [ -n "$FAKE_SLURM_RC_LAG" ] && [ -e "$dir/rc" ]; then
+    mv "$dir/rc" "$dir/rc.late"; (sleep "$FAKE_SLURM_RC_LAG"; mv "$dir/rc.late" "$dir/rc") </dev/null >/dev/null 2>&1 &
+  fi
 fi
 echo "$n"
 ''',
@@ -1900,8 +1911,15 @@ s=$(cat "$FAKE_SLURM/state.$j" 2>/dev/null)
 case "$s" in PENDING|RUNNING) echo "$s";; esac
 ''',
     "sacct": r'''#!/bin/sh
+[ -n "$FAKE_SLURM_NOACCT" ] && { echo "sacct: error: Slurm accounting storage is disabled" >&2; exit 1; }
 for a in "$@"; do [ "$prev" = -j ] && j=$a; prev=$a; done
 echo "$(cat "$FAKE_SLURM/state.$j" 2>/dev/null)|$(cat "$FAKE_SLURM/code.$j" 2>/dev/null || echo 0:0)|"
+''',
+    "scontrol": r'''#!/bin/sh
+echo "$*" >> "$FAKE_SLURM/scontrol.log"
+s=$(cat "$FAKE_SLURM/state.$3" 2>/dev/null) || { echo "slurm_load_jobs error: Invalid job id specified" >&2; exit 1; }
+printf 'JobId=%s JobName=ttp-check\n   JobState=%s Reason=None Dependency=(null)\n   ExitCode=%s\n' "$3" "$s" \
+  "$(cat "$FAKE_SLURM/code.$3" 2>/dev/null || echo 0:0)"
 ''',
     "scancel": r'''#!/bin/sh
 echo "$1" >> "$FAKE_SLURM/scancel.log"
@@ -1929,9 +1947,9 @@ def _slurm_fakes(tmp_path, monkeypatch=None, mode="run"):
 _SLURM_SET = {"host": "cluster-login", "partition": "cpu-part", "max_time_s": 1800}
 
 
-def _slurm_run(tmp_path, repo, cmd, fake, wait=True, minutes=0):
+def _slurm_run(tmp_path, repo, cmd, fake, wait=True, minutes=0, **more):
     from ttp import slurmcheck
-    s = slurmcheck.settings_of({**_SLURM_SET, "workdir": str(tmp_path / "remote")})
+    s = slurmcheck.settings_of({**_SLURM_SET, "workdir": str(tmp_path / "remote"), **more})
     proc = subprocess.Popen(slurmcheck.argv(cmd, s, {"GREETING": "hi"}, "", minutes), cwd=repo,
                             env={**os.environ, **fake}, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
     if not wait:
@@ -1946,7 +1964,7 @@ def test_slurm_overflow_is_off_by_default_validated_and_only_the_user_sets_it(en
     assert slurmcheck.pick(None, {}, pytest.fail) is None, "unset: nothing is tried"
     s = slurmcheck.settings_of({"host": "cluster-login", "partition": "cpu"})
     assert s == {"host": "cluster-login", "partition": "cpu", "workdir": slurmcheck.DEFAULT_WORKDIR,
-                 "max_jobs": 2, "margin_s": 600, "max_time_s": 7200, "max_pending_s": 1800}
+                 "max_jobs": 2, "margin_s": 600, "max_time_s": 7200, "max_pending_s": 1800, "rc_grace_s": 90}
     for bad in ("cluster-login", {"host": "a b", "partition": "cpu"}, {"host": "h", "partition": "c p"},
                 {"host": "h", "partition": "cpu", "workdir": "rel/dir"}, {"host": "h", "partition": "cpu", "workdir": "/a/../b"},
                 {"host": "h", "partition": "cpu", "max_jobs": 0}, {"host": "h", "partition": "cpu", "gres": "x"}):
@@ -2189,7 +2207,8 @@ def test_a_stopped_slurm_check_cancels_its_job_and_leaves_nothing(env, tmp_path)
     fake, d = _slurm_fakes(tmp_path, mode="hold")
     proc = _slurm_run(tmp_path, repo, "sleep 60", fake, wait=False)
     deadline = time.time() + 30
-    while not list(slurmcheck.slurm_dir().glob("job.*.json")) and time.time() < deadline:
+    while time.time() < deadline and not any(  # past the workdir probe's job: the check's own is sent
+            slurmcheck._read(f).get("job") == "101" for f in slurmcheck.slurm_dir().glob("job.*.json")):
         time.sleep(0.1)
     assert (d / "sbatch.log").exists()
     proc.send_signal(signal.SIGTERM)
@@ -2210,6 +2229,94 @@ def test_a_slurm_job_whose_run_died_is_cancelled_by_the_next_pick(env, tmp_path,
         {"pid": dead.pid, "job": "55", "host": "cluster-login", "project": "x"}))
     assert slurmcheck.reap() == ["55"] and (d / "scancel.log").read_text().split() == ["55"]
     assert slurmcheck.jobs()[-1]["state"] == "ORPHANED"
+
+
+def test_a_slurm_job_on_a_cluster_without_accounting_reads_scontrol_and_waits_out_a_late_rc_file(env, tmp_path):
+    # No accounting (sacct answers nothing): the job's state comes from scontrol, and an rc file that
+    # shows late (NFS) is still read within rc_grace_s; only past it is the job a cluster end.
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    fake, d = _slurm_fakes(tmp_path)
+    fake = {**fake, "FAKE_SLURM_NOACCT": "1", "FAKE_SLURM_RC_LAG": "1"}
+    rc, out = _slurm_run(tmp_path, repo, "exit 5", fake, rc_grace_s=30)
+    assert rc == 5 and "submitting it again" not in out, out
+    assert "show job 101" in (d / "scontrol.log").read_text()
+    assert len((d / "sbatch.log").read_text().splitlines()) == 1
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_RC_LAG": "5"}, rc_grace_s=1)
+    assert rc == remotecheck.FAULT_RC and "submitting it again once" in out and "ended COMPLETED" in out, out
+    assert len((d / "sbatch.log").read_text().splitlines()) == 3
+    # A node fault scontrol names is a cluster end at once, never waited out: sent again once, then it runs.
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_MODE": "nodefail1", "FAKE_SLURM_RC_LAG": ""},
+                         rc_grace_s=600)
+    assert rc == 0 and "(cluster: it ended NODE_FAIL" in out and "ran" in out, out
+
+
+def test_a_workdir_the_nodes_cannot_see_is_found_by_one_probe_job_before_any_check_job(env, tmp_path, monkeypatch, capsys):
+    # The workdir on the submit host's own disk: one tiny probe job finds it before any check job is
+    # sent; the run goes on here, the overflow is marked unusable with why (status, slot status, pick),
+    # and the verdict is kept per (host, partition, workdir): new settings probe again.
+    import threading
+    from types import SimpleNamespace
+    from ttp import cli, remotecheck, slurmcheck
+    p, repo, run, d, log, cmd = _slurm_overflow_setup(env, tmp_path, monkeypatch, ["down"])
+    monkeypatch.setenv("FAKE_SLURM_MODE", "localdisk")
+    lane = _spill_lane(p, repo)
+    threading.Timer(1.5, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec, text = json.loads((run / "checks.json").read_text()), (run / "checks.log").read_text()
+    assert rec["passed"] is True and "/ttp-check." not in log.read_text(), (rec, text)
+    assert "not readable on the compute node" in text and "running them again on this machine" in text, text
+    assert len((d / "probe.log").read_text().splitlines()) == 1 and not (d / "sbatch.log").exists()
+    assert "--partition=cpu-part --time=1 " in (d / "probe.log").read_text()
+    told = []
+    assert slurmcheck.pick(SimpleNamespace(name=p.name), {}, told.append) is None
+    assert "its workdir probe failed" in told[-1] and "waiting here" in told[-1], told
+    capsys.readouterr()
+    with pytest.raises(SystemExit):
+        cli.main(["checks", "--slot-status"])
+    assert "is unusable: its workdir probe failed" in capsys.readouterr().out
+    lines = slurmcheck.probe_lines()
+    assert len(lines) == 1 and "is unusable" in lines[0] and "not readable on the compute node" in lines[0]
+    s = slurmcheck.settings()
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {"FAKE_SLURM_MODE": "localdisk"}, workdir=s["workdir"])
+    assert rc == remotecheck.FAULT_RC and "the Slurm overflow is unusable" in out, out
+    assert len((d / "probe.log").read_text().splitlines()) == 1, "a kept failure sends no probe again"
+    # A shared workdir (new settings): probed once, then every job goes without a probe.
+    shared = s["workdir"] + "/shared"
+    for _ in (1, 2):
+        rc, out = _slurm_run(tmp_path, repo, "echo ran", {"FAKE_SLURM_MODE": "run"}, workdir=shared)
+        assert rc == 0 and "ran" in out, out
+    assert len((d / "probe.log").read_text().splitlines()) == 2 and len((d / "sbatch.log").read_text().splitlines()) == 2
+    # The node's answer never showing on the submit host fails the probe too, once rc_grace_s passed.
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {"FAKE_SLURM_MODE": "probehide"}, workdir=s["workdir"] + "/hidden",
+                         rc_grace_s=1)
+    assert rc == remotecheck.FAULT_RC and "did not show on cluster-login" in out, out
+    assert len((d / "sbatch.log").read_text().splitlines()) == 2 and _rc_left(tmp_path) == []
+
+
+def test_a_slurm_job_makes_its_pinned_env_under_the_shared_workdir_and_no_env_is_an_environment_fault(env, tmp_path):
+    # The node makes (or reuses, by the lock's hash: runnerenv.ensure) the checks' pinned env under the
+    # workdir, so one build serves every job on the shared file system; the check runs with its bin
+    # first, the user site off and pip kept to a virtualenv. An env that cannot be made ends the job
+    # with its reason: an environment fault (the run goes again here), never sent again as a cluster end.
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    fake, d = _slurm_fakes(tmp_path)
+    shim = tmp_path / "shim"
+    shim.mkdir()
+    (shim / "python3").write_text('#!/bin/sh\necho "$TTP_HOME" >> "$FAKE_SLURM/maker.log"\n'
+                                  'mkdir -p "$TTP_HOME/checks-env/k/bin" && echo "$TTP_HOME/checks-env/k"\n')
+    (shim / "python3").chmod(0o755)
+    seen, work = tmp_path / "seen", tmp_path / "remote"
+    cmd = f'printf "%s|%s|%s" "${{PATH%%:*}}" "$PYTHONNOUSERSITE" "$PIP_REQUIRE_VIRTUALENV" > {seen}'
+    rc, out = _slurm_run(tmp_path, repo, cmd, {**fake, "PATH": f"{shim}{os.pathsep}{fake['PATH']}"})
+    assert rc == 0, out
+    assert seen.read_text() == f"{work}/checks-env/k/bin|1|1"
+    assert (d / "maker.log").read_text().split() == [str(work)]
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "TTP_TEST_CHECKS_PYTHON_ENV": str(tmp_path / "none")})
+    assert rc == remotecheck.FAULT_RC and remotecheck.SIG in out and "submitting it again" not in out, out
+    assert "pinned Python env could not be made on the node" in out and "\nran" not in out, out
+    assert len((d / "sbatch.log").read_text().splitlines()) == 2 and _rc_left(tmp_path) == []
 
 
 def _slurm_overflow_setup(env, tmp_path, monkeypatch, pool, host="cluster-login", **more):

@@ -242,17 +242,18 @@ def apply(env: dict, lock: Path | None = None) -> dict:
             LOCK_ENV: str(Path(lock or LOCK).resolve())}
 
 
-def remote_lines(lock: Path | str | None, where: str, fail: str) -> str:
+def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "") -> str:
     """Shell lines for another host (remotecheck, slurmcheck): write this file and `lock` into folder
     `where` there, make or reuse the pinned env from them with that host's python3 (as ensure does
-    here, under its TTP_HOME), and put it in force as apply does. Where it cannot be made, they print
-    why and run `fail`: the check never runs with that host's user site. OSError when a file cannot be read."""
+    here, under its TTP_HOME, or `home`, a shell word, when given), and put it in force as apply does.
+    Where it cannot be made, they print why and run `fail`: the check never runs with that host's user
+    site. OSError when a file cannot be read."""
     lock = Path(lock or LOCK)
     out, w = f"mkdir -p {shlex.quote(where)}\n", shlex.quote(where)
     for name, text in (("runnerenv.py", Path(__file__).read_text()), ("checks-python.lock", lock.read_text())):
         end = f"TTP_ENV_{secrets.token_hex(8)}"
         out += f"cat > {w}/{name} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
-    return (out + f'ttp_env=$(python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
+    return (out + f'ttp_env=$({f"TTP_HOME={home} " if home else ""}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
             f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
             'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1\nunset PIP_USER\n')
 

@@ -1978,8 +1978,15 @@ session and stateless coordinators on every provider.
   file system; `max_jobs` (2) caps this machine's jobs there at once, `--time` is the run's median wall time plus
   `margin_s` (600), at most `max_time_s` (7200, also its value before a median exists), and a job pending past
   `max_pending_s` (1800) is cancelled. Each check is one batch job (`--nodes=1 --ntasks=1`, no GRES) on a copy
-  of the commit, copied as for a spill host; the submit host only runs sbatch, squeue, sacct and scancel and
-  serves the job's output and exit code. A run with a spill wrapper (`spill_wrap_cmd`) never overflows: the
+  of the commit, copied as for a spill host; the submit host only runs sbatch, squeue, sacct (`scontrol show job`
+  when the cluster keeps no accounting) and scancel and serves the job's output and exit code. A job's exit-code
+  file may show late on the submit host (NFS): it counts as missing only `rc_grace_s` (90) after the job left the
+  queue. Before the first job on a (host, partition, workdir) one tiny probe job checks that a marker written from
+  the submit host under `workdir` is readable on the node and that the node's answer shows back; a failure (a
+  `workdir` on a disk only the submit host sees) marks the overflow unusable, with why, in `ttp status` and
+  `ttp checks --slot-status`, and no check job goes there until the settings change or 6 h pass. On the node the
+  job makes the checks' pinned Python env under `workdir` once per lock hash and runs the check in it
+  (PYTHONNOUSERSITE=1, PIP_REQUIRE_VIRTUALENV=1); an env that cannot be made is an environment fault. A run with a spill wrapper (`spill_wrap_cmd`) never overflows: the
   batch job runs none. Urgent runs take a free job slot first. A cluster ssh does not reach
   keeps the run waiting here; one whose sbatch refuses the job, or a job that ends for a cluster reason twice
   (it is submitted again once: never started, node fault, preempted), is an environment fault and the run runs

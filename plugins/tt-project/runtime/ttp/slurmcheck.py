@@ -13,7 +13,21 @@ Fields: `host` the ssh alias of the cluster's submit host; `partition` a CPU par
 folder on the cluster's shared file system (absolute, or under ~ or $HOME; default DEFAULT_WORKDIR);
 `max_jobs` this machine's overflow jobs at once (default 2); `margin_s` added to the run's median wall
 time for `--time` (default 600); `max_time_s` the cap of `--time` (default 7200), also its value before
-a passing run's time is known; `max_pending_s` how long a job may wait to start (default 1800).
+a passing run's time is known; `max_pending_s` how long a job may wait to start (default 1800); `rc_grace_s` how long a job's exit-code
+file may stay unseen after the job left the queue before the job counts as ended without one (default 90:
+NFS caches a file's attributes for up to a minute).
+
+Before its first job on a (host, partition, workdir) a run sends one tiny probe job there (probe): a
+marker written from the submit host under `workdir` must be readable on the compute node, and the
+node's answer written there must show on the submit host. Its verdict is kept in PROBE_FILE. A pass
+stands until the settings change; a failure (`workdir` on a disk only the submit host sees, say) marks
+the overflow unusable, with why in `ttp status` and `ttp checks --slot-status` (probe_lines): no check
+job goes there and runs keep their place here, until the settings change or PROBE_RETRY_S passes.
+
+On the node the job makes or reuses the checks' pinned Python env (runnerenv, from the run's lock)
+under `workdir`, keyed by the lock's hash, so it is built once for every job on the shared file system;
+it runs the check with that env's bin first on PATH, PYTHONNOUSERSITE=1 and PIP_REQUIRE_VIRTUALENV=1.
+An env that cannot be made ends the job with its reason and the run as an environment fault.
 
 Order: a run takes an overflow slot only when no live overflow waiter of this machine ranks before it,
 by the checks queue's rank (checkcap.task_rank: task priority, an urgent or obligation run first; then
@@ -22,7 +36,7 @@ skipped and the run keeps its place in the queue here, never failed.
 
 A job (main, run by push.check_argv in the run's place): the commit is copied as remotecheck copies it
 (`git archive` over ssh), here into a tar file in a fresh ttp-check.* folder under `workdir`, with the
-job script beside it; on the submit host only sbatch, squeue, sacct and scancel run, and the result
+job script beside it; on the submit host only sbatch, squeue, sacct (scontrol when the cluster keeps no accounting) and scancel run, and the result
 files (its output, its exit code) are read. The job itself, on a compute node, unpacks the tree into a
 git checkout and runs the command. `sbatch --partition <partition> --time <minutes> --nodes 1 --ntasks 1`,
 no device or GRES request. Its output streams back as it grows. A stop of the run (a stop, a timeout,
@@ -62,7 +76,7 @@ from . import remotecheck, runnerenv
 
 KEY = "checks.slurm_overflow"
 DEFAULT_WORKDIR = "~/ttp-checks"
-DEFAULTS = {"max_jobs": 2, "margin_s": 600, "max_time_s": 7200, "max_pending_s": 1800}
+DEFAULTS = {"max_jobs": 2, "margin_s": 600, "max_time_s": 7200, "max_pending_s": 1800, "rc_grace_s": 90}
 _FIELDS = {"host", "partition", "workdir", *DEFAULTS}
 _PARTITION = re.compile(r"[A-Za-z0-9_.,-]{1,128}")
 _WORKDIR = re.compile(r"(/|~/|\$HOME/)[A-Za-z0-9_./-]*|~|\$HOME")
@@ -74,6 +88,9 @@ SCANCEL_TIMEOUT_S = 4   # a stopped check is killed 5 s after its TERM (cli._end
 POLL_S = 15.0
 POLL_ENV = "TTP_SLURM_POLL_S"   # tests poll faster
 LOST_S = 600.0   # the submit host unanswered this long mid-job: the run gives up (the job ends at its limit)
+PROBE_FILE = "probe.json"   # the workdir probe's verdict per (host, partition, workdir)
+PROBE_RETRY_S = 6 * 3600.0   # a failed probe is tried again after this long, or at once on new settings
+NO_ENV = "noenv"   # the rc file's word when the node could not make the checks' pinned Python env
 WANT_TTL_S = 600.0   # a waiter's ticket not renewed this long is gone (its run took a slot here or died)
 CLUSTER_STATES = {"NODE_FAIL", "PREEMPTED", "BOOT_FAIL", "CANCELLED", "REVOKED", "DEADLINE", "FAILED",
                   "OUT_OF_MEMORY", "SPECIAL_EXIT", "STOPPED", "SUSPENDED"}
@@ -337,7 +354,7 @@ def pick(p, cfg: dict, tell, what: str = "", prio: int | None = None, arrived: f
         tell(f"no pool host could take the checks and the Slurm overflow ({s['host']}) runs its "
              f"{s['max_jobs']} job(s) already: waiting here")
         return None
-    if why := remotecheck.paused(s["host"]) or reachable(s["host"]):
+    if why := remotecheck.paused(s["host"]) or probe_failed(s) or reachable(s["host"]):
         got.close()
         tell(f"no pool host could take the checks and the Slurm overflow ({s['host']}) cannot now: {why}; "
              "waiting here")
@@ -346,6 +363,46 @@ def pick(p, cfg: dict, tell, what: str = "", prio: int | None = None, arrived: f
     tell(f"no pool host could take the checks: overflowing to Slurm cluster {s['host']} (partition "
          f"{s['partition']}, {KEY}); each check runs there as one batch job on a copy of the commit")
     return got
+
+
+def _probe_key(s: dict) -> str:
+    return f"{s['host']}|{s['partition']}|{s['workdir']}"
+
+
+def probe_state(s: dict) -> dict:
+    """The last workdir probe's verdict for these settings: {ok, why, at}, or {} when none ran."""
+    r = _read(slurm_dir() / PROBE_FILE).get(_probe_key(s))
+    return r if isinstance(r, dict) else {}
+
+
+def probe_failed(s: dict, now: float | None = None) -> str:
+    """Why the overflow is unusable when the last probe for these settings failed within PROBE_RETRY_S, else ""."""
+    r = probe_state(s)
+    now = time.time() if now is None else now
+    if r.get("ok") is False and now - float(r.get("at") or 0) < PROBE_RETRY_S:
+        return f"its workdir probe failed: {r.get('why') or 'no reason kept'}"
+    return ""
+
+
+def _probe_save(s: dict, ok: bool, why: str) -> None:
+    from .project import write_json
+    f = slurm_dir() / PROBE_FILE
+    all_ = _read(f)
+    all_[_probe_key(s)] = {"ok": ok, "why": why, "at": time.time()}
+    try:
+        write_json(f, all_)
+    except OSError:
+        pass
+
+
+def probe_lines(now: float | None = None) -> list[str]:
+    """`ttp status` and `ttp checks --slot-status` lines: the overflow marked unusable by its probe."""
+    s = settings()
+    if not s or not (why := probe_failed(s, now)):
+        return []
+    left = max(1, int((float(probe_state(s).get("at") or 0) + PROBE_RETRY_S - (now or time.time())) // 60))
+    return [f"Slurm overflow {s['host']} (partition {s['partition']}, workdir {s['workdir']}) is unusable: {why}; "
+            f"no check goes there until {KEY} changes or in {left} min it is probed again"]
 
 
 def holders(project_name: str | None = None) -> list[dict]:
@@ -483,10 +540,11 @@ def argv(cmd: str, s: dict, env: dict | None = None, commit: str = "", minutes: 
             *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []), "--", cmd]
 
 
-def job_script(q: str, exports_: str, cmd: str, lock: str | None = None) -> str:
+def job_script(q: str, exports_: str, cmd: str, lock: str | None = None, home: str = "") -> str:
     """The batch script, run on a compute node in folder `q`: unpack the tree into a git checkout, put
-    the checks' pinned Python env made from `lock` (default runnerenv.LOCK) in force, run the command,
-    leave its exit code in `rc` ("fault" when the node could not set the tree or the env up)."""
+    the checks' pinned Python env made from `lock` (default runnerenv.LOCK) under `home` (a shell word:
+    the shared workdir; default the node's TTP_HOME) in force, run the command, leave its exit code in
+    `rc` ("fault" when the node could not set the tree up, NO_ENV when it could not make the env)."""
     return ("#!/bin/sh\nrc=fault\n"
             f"trap 'printf \"%s\\n\" \"$rc\" > {q}/rc.part && mv -f {q}/rc.part {q}/rc' EXIT\n"
             f"cd {q} || exit 1\nrm -rf src && mkdir src && tar -xf tree.tar -C src && cd src && "
@@ -494,7 +552,8 @@ def job_script(q: str, exports_: str, cmd: str, lock: str | None = None) -> str:
             "git -c user.name=ttp -c user.email=ttp@localhost -c commit.gpgsign=false commit -q --no-verify "
             "--allow-empty -m 'ttp check' || exit 1\n"
             # The pinned Python env (runnerenv), made on the node: none is a fault there, as an unpacking one is.
-            f"{exports_}{runnerenv.remote_lines(lock, '../ttp-env', 'exit 1')}rc=killed\n"
+            f"{exports_}{runnerenv.remote_lines(lock, '../ttp-env', f'rc={NO_ENV}; exit 1', home)}"
+            "export PIP_REQUIRE_VIRTUALENV=1\nrc=killed\n"
             f"if command -v bash >/dev/null 2>&1; then bash -e -o pipefail -c {shlex.quote(cmd)} </dev/null; "
             f"else sh -e -c {shlex.quote(cmd)} </dev/null; fi\nrc=$?\nexit 0\n")
 
@@ -538,6 +597,95 @@ def _start_fail(job: str, state: str, why: str, seen: dict) -> dict | None:
     if elapsed is not None and elapsed >= START_FAIL_S:
         return None
     return {"job": job, "state": state, "code": seen.get("code") or "", "elapsed_s": elapsed if elapsed is not None else 0}
+
+
+def _scontrol(host: str, job: str) -> tuple[str, str]:
+    """(state, exit code) from `scontrol show job`, for a cluster without accounting (it knows a job
+    for a while after its end); ("", "") when it does not know it."""
+    try:
+        r = _ssh(host, f"scontrol show job {shlex.quote(job)}", CALL_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    text = r.stdout.decode(errors="replace")
+    state, code = re.search(r"\bJobState=(\S+)", text), re.search(r"\bExitCode=(\S+)", text)
+    return (state.group(1).upper() if state else ""), (code.group(1) if code else "")
+
+
+def _final(host: str, job: str) -> tuple[str, str, int | None]:
+    """(state, exit code, elapsed seconds or None) of a job out of the queue: sacct's when it answers,
+    else scontrol's (no elapsed)."""
+    state, code, elapsed = _sacct(host, job)
+    return (state, code, elapsed) if state else (*_scontrol(host, job), None)
+
+
+def _probe(host: str, s: dict, q: str, poll: float, note) -> tuple[bool | None, str]:
+    """Send one tiny job checking that the compute node reads a marker written here under the workdir
+    (folder `q` in it) and that its answer shows here: (True, ""), (False, why) when the workdir is not
+    shared, or (None, why) when the probe could not tell (the cluster busy, ssh lost)."""
+    token, w = secrets.token_hex(8), s["workdir"]
+    script = (f"#!/bin/sh\n[ \"$(cat {q}/probe.in 2>/dev/null)\" = {token} ] || exit 3\n"
+              f"printf '%s\\n' {token} > {q}/probe.part && mv -f {q}/probe.part {q}/probe.out || exit 4\n")
+    try:
+        put = _ssh(host, f"printf '%s\\n' {token} > {q}/probe.in && cat > {q}/probe.sh", CALL_TIMEOUT_S, script.encode())
+        sub = _ssh(host, f"sbatch --parsable --job-name=ttp-probe --partition={shlex.quote(s['partition'])} --time=1 "
+                         f"--nodes=1 --ntasks=1 --output=/dev/null --chdir=/tmp {q}/probe.sh", CALL_TIMEOUT_S) \
+            if put.returncode == 0 else put
+    except subprocess.TimeoutExpired:
+        return None, "ssh timed out sending the probe job"
+    job = (sub.stdout.decode(errors="replace").strip().splitlines() or [""])[-1].split(";")[0].strip()
+    if sub.returncode != 0 or not job.isdigit():
+        err = (sub.stderr.decode(errors="replace").strip().splitlines() or [f"exit {sub.returncode}"])[-1]
+        return None, f"sbatch refused the job (the workdir probe): {err[:200]}"
+    note(job=job, state="PROBE")   # a run that dies here: the next pick cancels it (reap)
+    submitted = last_ok = time.time()
+    left, mark, jq = None, f"ttp-probe:{secrets.token_hex(6)}", shlex.quote(job)
+    try:
+        while True:
+            try:
+                got = _ssh(host, f"s=$(squeue -h -j {jq} -o %T 2>/dev/null | head -n 1); o=$(head -n 1 {q}/probe.out "
+                                 f"2>/dev/null); printf '%s|%s|%s\\n' {mark} \"$s\" \"$o\"", CALL_TIMEOUT_S)
+                parts = got.stdout.decode(errors="replace").strip().split("|") if got.returncode == 0 else []
+            except (OSError, subprocess.SubprocessError):
+                parts = []
+            now = time.time()
+            if len(parts) < 3 or parts[0] != mark:
+                if now - last_ok > LOST_S:
+                    return None, f"the submit host stopped answering for {LOST_S:g} s"
+                time.sleep(poll)
+                continue
+            last_ok, state = now, parts[1].strip().upper()
+            if parts[2].strip() == token:
+                return True, ""
+            if state in _ACTIVE:
+                left = None
+                if state == "PENDING" and now - submitted > s["max_pending_s"]:
+                    scancel(host, job)
+                    return None, f"the probe job did not start within {s['max_pending_s']} s"
+                time.sleep(poll)
+                continue
+            left = left or now
+            final, code, _ = _final(host, job)
+            if final in _ACTIVE:
+                time.sleep(poll)
+                continue
+            if code.split(":")[0] == "3":
+                return False, (f"a marker written on {host} under {w} is not readable on the compute node: {w} is "
+                               f"on a disk only {host} sees, not the cluster's shared file system; set {KEY} "
+                               "workdir to a shared folder")
+            if code.split(":")[0] == "4":
+                return False, f"the compute node cannot write under {w}"
+            if final == "TIMEOUT" or final in CLUSTER_STATES - {"FAILED"}:
+                return None, f"the probe job ended {final}"
+            if now - left < s["rc_grace_s"]:
+                time.sleep(poll)
+                continue
+            return False, (f"the compute node's answer under {w} did not show on {host} within {s['rc_grace_s']} s "
+                           f"of the probe job's end ({final or 'state unknown'}): {w} is not shared with the node")
+    except _Stop:
+        scancel(host, job)
+        raise
+    finally:
+        note(job="", state="")
 
 
 def main(args: list[str]) -> int:
@@ -612,13 +760,27 @@ def main(args: list[str]) -> int:
             tmp = ""
             return _fault(host, f"cannot make a folder in {w} there (ssh exit {made.returncode})")
         q = shlex.quote(tmp)
+        if not probe_state(s).get("ok"):   # the workdir must be shared with the nodes before any real job
+            slurm_dir().mkdir(parents=True, exist_ok=True)
+            with open(slurm_dir() / ".probe.lock", "a") as fh:
+                fcntl.flock(fh, fcntl.LOCK_EX)   # one probe at a time; a waiter takes its verdict
+                if why := probe_failed(s):
+                    return _fault(host, f"the Slurm overflow is unusable: {why}")
+                if not probe_state(s).get("ok"):
+                    _say(f"probing that {w} on {host} is shared with partition {s['partition']}'s nodes (one tiny job)")
+                    ok, why = _probe(host, s, q, poll, note)
+                    if ok is None:
+                        return _fault(host, f"the workdir probe could not tell whether {w} is shared: {why}")
+                    _probe_save(s, ok, why)
+                    if not ok:
+                        return _fault(host, f"the workdir probe failed, so no check job is sent there: {why}")
         archive = subprocess.run(["git", "-C", top, "archive", "--format=tar", head], capture_output=True)
         if archive.returncode != 0:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
         try:
             script = job_script(q, remotecheck.exports(env) + remotecheck.shipped(py, literal), cmd,
-                                os.environ.get(runnerenv.LOCK_ENV)).encode()
+                                os.environ.get(runnerenv.LOCK_ENV), shlex.quote(os.path.dirname(tmp))).encode()
         except OSError as e:
             _say(f"cannot read the checks' Python lock or a file to copy there: {e}")
             return 2
@@ -690,7 +852,7 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
     not report one: "cluster: ..." for an end the cluster caused, else the reason, what was seen of it:
     out_bytes, and for an end sacct read its exit code and elapsed_s)."""
     mark = f"ttp-slurm:{secrets.token_hex(6)}"
-    sent, last_ok, gone, started = 0, time.time(), 0, None
+    sent, last_ok, left, started = 0, time.time(), None, None
     out = sys.stdout.buffer
     jq = shlex.quote(job)
     while True:
@@ -721,22 +883,28 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
                 time.sleep(min(poll, 2))
             return int(rc), "COMPLETED", "", {"out_bytes": sent}
         if state in _ACTIVE:
-            gone = 0
+            left = None
             if state == "PENDING" and started is None and time.time() - submitted > s["max_pending_s"]:
                 scancel(host, job)
                 return None, "PENDING", f"cluster: it did not start within {s['max_pending_s']} s", {"out_bytes": sent}
             time.sleep(poll)
             continue
-        final, code, elapsed = _sacct(host, job)
+        left = left or time.time()
+        final, code, elapsed = _final(host, job)
         if elapsed is None and started is not None:   # sacct gave none: from when it was seen running
             elapsed = round(time.time() - started)
         seen = {"out_bytes": sent, "code": code, "elapsed_s": elapsed}
-        if final in _ACTIVE or (not final and gone < 2):
-            gone += 1
+        if final in _ACTIVE:
             time.sleep(poll)
             continue
+        if rc == NO_ENV:
+            return None, final or "FAILED", ("the checks' pinned Python env could not be made on the node (why is "
+                                             "above), so the check did not run"), seen
         if rc == "fault":
             return None, final or "FAILED", "cluster: the node could not set up the tree", seen
         if final == "TIMEOUT":
             return None, final, "it ran past its time limit", seen
+        if not rc and final in ("", "COMPLETED") and time.time() - left < s["rc_grace_s"]:
+            time.sleep(poll)   # NFS: the rc file the node wrote may show here late
+            continue
         return None, final or "UNKNOWN", f"cluster: it ended {final or 'unseen'} ({code or 'no exit code'}) before the command reported one", seen

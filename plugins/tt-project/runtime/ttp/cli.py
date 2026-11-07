@@ -1647,6 +1647,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.extend(checkspill.skip_lines(now))   # a spill host kept off for a device job: always shown
     if paused := slurmcheck.paused_line(now):   # the Slurm overflow's start-failure breaker: always shown
         lines.append(paused)
+    lines.extend(slurmcheck.probe_lines(now))   # the Slurm overflow unusable (its workdir probe): always shown
     from . import gatejudge   # tests the gate quarantined as flaky (no release check counts them passed)
     lines.extend(gatejudge.status_lines(p.state, now, lambda ts: at(ts, now, tz),
                                         gatejudge.not_found(p, gatejudge.active(p.state, now))))
@@ -4900,7 +4901,7 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
-        for line in [*checkspill.status_lines(p.name), *slurmcheck.status_lines(p.name),
+        for line in [*checkspill.status_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")
         print("check runs per host:")

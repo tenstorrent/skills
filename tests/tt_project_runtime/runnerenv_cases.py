@@ -287,7 +287,7 @@ def test_a_slurm_check_job_runs_in_the_nodes_pinned_env_and_is_a_fault_without_i
     repo = _rc_repo(tmp_path)
     seen = tmp_path / "seen"
     cmd = f'printf "%s|%s" "$PYTHONNOUSERSITE" "${{PATH%%:*}}" > {seen}'
-    for name, stand_in, rc in (("ok", os.environ["TTP_TEST_CHECKS_PYTHON_ENV"], "0"), ("bad", str(tmp_path / "none"), "fault")):
+    for name, stand_in, rc in (("ok", os.environ["TTP_TEST_CHECKS_PYTHON_ENV"], "0"), ("bad", str(tmp_path / "none"), slurmcheck.NO_ENV)):
         q = tmp_path / name
         q.mkdir()
         subprocess.run(["git", "-C", str(repo), "archive", "--format=tar", "-o", str(q / "tree.tar"), "HEAD"], check=True)
