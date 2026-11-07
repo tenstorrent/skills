@@ -17,6 +17,9 @@ def _fake_host(tmp_path, monkeypatch, tab: str | None = None):
     cron.chmod(0o755)
     if tab is not None:
         tabf.write_text(tab)
+    # Its own fake store: the session's is shared by every test worker, whose crontab -r would race this one
+    monkeypatch.delenv(hoststate.MARKER, raising=False)
+    monkeypatch.delenv("TTP_RUN_DIR", raising=False)
     monkeypatch.setattr(hoststate, "_real_dir", lambda: units)
     monkeypatch.setattr(hoststate, "_real", lambda name: str(cron) if name == "crontab" else None)
     return cron, tabf, units
@@ -37,6 +40,7 @@ def test_shimmed_crontab_systemctl_and_reboot_under_ttp_checks_leave_the_host_un
     _, tabf, units = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
     env = push.check_env("checks", run_dir=str(tmp_path / "run"))
     assert env.get(hoststate.MARKER) and env["PATH"].split(os.pathsep)[0].endswith("bin")
+    assert env[hoststate.MARKER].startswith(str(tmp_path)), "its own store, not the session's shared one"
     log = tmp_path / "checks.log"
     script = ("echo '@reboot evil' | crontab - && crontab -l | grep -q evil && "
               "systemctl --user enable evil.service && systemctl --user is-enabled evil.service && "
@@ -105,6 +109,35 @@ def test_ttp_sandbox_fails_a_command_that_changed_the_host_and_restores_it(tmp_p
             signal.signal(s, h)
     assert tabf.read_text() == "a\n"
     assert "host guard: FAILED" in capsys.readouterr().err
+
+
+def test_sudo_running_a_host_write_under_ttp_checks_is_refused_and_reported_and_other_sudo_calls_pass(
+        tmp_path, monkeypatch):
+    # sudo resets PATH (secure_path): the stand-ins never see what it runs, so the sudo stand-in refuses
+    from ttp import cli, push
+    _fake_host(tmp_path, monkeypatch)
+    real, seen = tmp_path / "realsudo", tmp_path / "sudo-ran"
+    real.mkdir()
+    (real / "sudo").write_text(f"#!/bin/sh\necho \"$*\" >> {shlex.quote(str(seen))}\n")
+    (real / "sudo").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{real}{os.pathsep}{os.environ['PATH']}")
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    refused = ["sudo -n systemctl enable evil.service", "sudo -n -u root -- env A=1 reboot",
+               "sudo -nE crontab -", "sudo install -m 644 x /etc/systemd/system/evil.service",
+               "sudo sh -c 'true && systemctl --user daemon-reload'", "sudo -n timeout 5 shutdown -h now",
+               "sudo -n loginctl enable-linger", "sudo tt-smi -glx_reset", "sudo /usr/sbin/poweroff",
+               "sudo tee /var/spool/cron/crontabs/x", "sudo sudo -n halt"]
+    allowed = ["sudo -n systemctl status x", "sudo -n crontab -l", "sudo -n true", "sudo -l"]
+    script = "; ".join(f"{c} < /dev/null; echo \"rc=$?\"" for c in refused + allowed)
+    log = tmp_path / "checks.log"
+    with open(log, "w") as out:
+        rc = cli._run_check(["sh", "-c", script], True, cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+    text = log.read_text()
+    assert rc == 0, text
+    assert text.count("rc=1") == len(refused) and text.count("sudo: refused in a test run") == len(refused), text
+    assert seen.read_text().splitlines() == [c[len("sudo "):] for c in allowed], "only the reads reached sudo"
+    said = text[text.index("host guard: these calls went to the run's fake store"):]
+    assert "sudo -n systemctl enable evil.service" in said and "sudo -n crontab -l" not in said, said
 
 
 def test_a_host_restore_keeps_a_concurrent_unrelated_crontab_line(tmp_path, monkeypatch):

@@ -1,13 +1,15 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
 """The stand-in a test run's PATH finds for crontab, systemctl, loginctl, at, atq, atrm, batch, reboot,
-shutdown, poweroff, halt, ipmitool and tt-smi (hoststate.py writes one small sh script per name).
+shutdown, poweroff, halt, ipmitool, tt-smi and sudo (hoststate.py writes one small sh script per name).
 
 Usage: `python3 -I hostshim.py <store> <name> [args...]`. A write (a new crontab, an enabled or
 started unit, an at job, a power command, a device or BMC reset) changes only the fake store and is
 recorded in <store>/calls.jsonl; a read is served from the store where it holds the answer, else
-passed to the real command (found on PATH without this folder). Standard library only: it runs
-isolated, outside the ttp package."""
+passed to the real command (found on PATH without this folder). sudo running one of these as a
+write (or init, telinit, systemd-run), or a file command naming a systemd unit folder or the cron
+spool, is refused with exit 1 and recorded: sudo resets PATH (secure_path), so the command it runs
+would be the real one. Standard library only: it runs isolated, outside the ttp package."""
 import json
 import os
 import shutil
@@ -24,6 +26,94 @@ IPMI_WRITES = {"on", "off", "cycle", "reset", "soft", "bootdev", "raw", "cold", 
                "delete", "identify", "diag", "bootparam", "activate"}
 TTSMI_RESETS = ("-r", "--reset", "-glx_reset", "--glx_reset", "-glx_reset_auto", "--glx_reset_auto",
                 "-glx_reset_tray", "--glx_reset_tray")
+
+SUDO_ARG = set("ugpCDrtTUh")   # sudo's short options that take a value
+SUDO_LONG_ARG = {"--user", "--group", "--prompt", "--close-from", "--chdir", "--role", "--type", "--other-user",
+                 "--host", "--command-timeout", "--chroot"}
+SUDO_ALWAYS = POWER | {"init", "telinit", "systemd-run", "batch", "atrm"}
+FILE_CMDS = {"install", "cp", "mv", "ln", "tee", "rm", "rsync", "dd", "chmod", "chown", "touch", "mkdir"}
+HOST_PATHS = ("/systemd/", "/var/spool/cron", "/etc/cron")
+SHELLS = {"sh", "bash", "dash", "zsh", "ksh"}
+
+
+def _sudo_command(args):
+    """The command a sudo call runs: its options, VAR=value words and wrappers (env, nohup, nice,
+    timeout, command) dropped."""
+    i = 0
+    while i < len(args) and args[i].startswith("-") and args[i] != "-":
+        a, i = args[i], i + 1
+        if a == "--":
+            break
+        if a.startswith("--"):
+            i += a in SUDO_LONG_ARG
+            continue
+        for j, c in enumerate(a[1:], 1):
+            if c in SUDO_ARG:
+                i += j == len(a) - 1   # -u root takes the next word, -uroot does not
+                break
+    cmd = args[i:]
+    while cmd:
+        base = os.path.basename(cmd[0])
+        if "=" in cmd[0] and cmd[0].split("=")[0].isidentifier():
+            cmd = cmd[1:]
+        elif base in ("env", "nohup", "command", "nice", "timeout"):
+            cmd = cmd[1:]
+            while cmd and cmd[0].startswith("-"):
+                takes = (base == "env" and cmd[0] in ("-u", "-C", "-S")) or (base == "nice" and cmd[0] == "-n") \
+                    or (base == "timeout" and cmd[0] in ("-s", "-k"))
+                cmd = cmd[2:] if takes else cmd[1:]
+            if base == "timeout" and cmd:
+                cmd = cmd[1:]   # its duration
+        else:
+            break
+    return cmd
+
+
+def _writes(base, args):
+    """Whether `base args` (a guarded command) changes the host, as its stand-in would judge it."""
+    words = [a for a in args if not a.startswith("-")]
+    if base == "crontab":
+        return "-l" not in args
+    if base == "systemctl":
+        return bool(words) and words[0] not in SYSTEMCTL_READS
+    if base == "loginctl":
+        return bool(words) and words[0].startswith(LOGINCTL_WRITES)
+    if base == "at":
+        return "-l" not in args
+    if base == "ipmitool":
+        return bool(IPMI_WRITES & {a.lower() for a in args})
+    if base == "tt-smi":
+        return any(a.split("=")[0] in TTSMI_RESETS for a in args)
+    return base in SUDO_ALWAYS
+
+
+def _sudo_refused(cmd):
+    """Why sudo must not run `cmd` in a test run, or None."""
+    if not cmd:
+        return None
+    base = os.path.basename(cmd[0])
+    if base == "sudo":
+        return _sudo_refused(_sudo_command(cmd[1:]))
+    if _writes(base, cmd[1:]):
+        return f"{base} would change the real host"
+    if base in FILE_CMDS and any(h in a for a in cmd[1:] for h in HOST_PATHS):
+        return f"{base} names a systemd unit folder or the cron spool"
+    if base in SHELLS and "-c" in cmd[1:-1]:
+        script = cmd[cmd.index("-c") + 1]
+        for part in script.replace("&&", ";").replace("||", ";").replace("|", ";").replace("\n", ";").split(";"):
+            if why := _sudo_refused(_sudo_command(["--", *part.split()])):
+                return why
+    return None
+
+
+def sudo(store, args):
+    if why := _sudo_refused(_sudo_command(args)):
+        _log(store, "sudo", args, True)
+        print(f"sudo: refused in a test run: {why} (sudo resets PATH, so no stand-in would catch it; "
+              "recorded in a fake store)", file=sys.stderr)
+        return 1
+    _log(store, "sudo", args, False)
+    return _real(store, "sudo", args)
 
 
 def _log(store, name, args, write):
@@ -151,6 +241,8 @@ def main(argv):
         return loginctl(store, args)
     if name in ("at", "atq", "atrm", "batch"):
         return at(store, name, args)
+    if name == "sudo":
+        return sudo(store, args)
     if name in POWER:
         _log(store, name, args, True)
         print(f"{name}: not run in a test run (recorded in a fake store)", file=sys.stderr)

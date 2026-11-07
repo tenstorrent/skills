@@ -8,7 +8,9 @@ plugin's own test sessions (tests/conftest.py) get three things, with no namespa
 - Stand-ins first on PATH (hostshim.py) for crontab, systemctl, loginctl, at, atq, atrm, batch,
   reboot, shutdown, poweroff, halt, ipmitool and tt-smi. A write goes to a per-run fake store and is
   recorded there; a read is served from it, or by the real command where the store has no answer.
-  The writes are listed after the run, which they do not fail.
+  The writes are listed after the run, which they do not fail. A sudo stand-in refuses (exit 1, also
+  listed) sudo running one of those as a write, or a copy into a systemd unit folder or the cron
+  spool: sudo resets PATH, so the stand-ins would never see it. Other sudo calls go to the real sudo.
 - The marker TTP_HOSTSTATE_FAKE naming that store. The harness's own installers (service.py,
   uninstall.py) honour it while HOME is the account's real home: their units go to
   <store>/systemd/user and their crontab, systemctl and loginctl calls to the stand-ins.
@@ -38,7 +40,7 @@ from pathlib import Path
 
 MARKER = "TTP_HOSTSTATE_FAKE"
 NAMES = ("crontab", "systemctl", "loginctl", "at", "atq", "atrm", "batch", "reboot", "shutdown",
-         "poweroff", "halt", "ipmitool", "tt-smi")
+         "poweroff", "halt", "ipmitool", "tt-smi", "sudo")
 SHIMS = ".ttp-shims"   # in each stand-in folder, so a nested run and the stand-ins skip every such folder
 OWN_CRON = "# tt-project:"
 OWN_UNIT = "tt-project-"
