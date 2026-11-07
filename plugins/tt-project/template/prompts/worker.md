@@ -49,9 +49,8 @@
   message". A deadline: `ttp hours --check --for <seconds they need>` plus `--present 10` if under 10
   min; exit 1: never start or send it on a timer, wait on that check.
 - Make durable progress early (commit, or write to the output folder): a killed run keeps what's on disk.
-- Run builds as `ttp clip -- <command>` (failures or head and tail, and the log's path), test suites
-  and other untrusted test code as `ttp clip -- ttp sandbox -- <command>`. Cap pytest -n at
-  $TTP_TEST_SLOTS, only with xdist.
+- Run builds and test suites as `ttp clip -- <command>` (failures or head and tail, and the log's
+  path). Cap pytest -n at $TTP_TEST_SLOTS, only with xdist.
 - Read files narrowly: `grep -n` first, then only the ranges you need (`sed -n 'a,bp'`, or Read with
   offset and limit). Do not re-read a range: later calls pay it again.
 <!-- ttp:if harness -->

@@ -562,9 +562,9 @@ only in the feed and never under "needs you".
   check covers it. Any raw `git push` and any `ttp push` that lands or moves a tag is denied, by the hook and again
   at run time by `ttp push` and the harness's `git` wrapper: code goes through a work branch, a
   worker task, review and the push queue, and a channel tag moves only in a release cut task. A
-  coordinator run holds no device (`TTP_NO_DEVICE=1`), so the worker device-run rule binds it: a
-  device test run outside `ttp sandbox` is denied with the sandboxed form as its hint, never
-  rewritten as a worker's is, since heavy device work goes to a worker task. A
+  coordinator run holds no device (`TTP_NO_DEVICE=1`), so the worker device-command refusals bind
+  it: a reset, flash or power tool, a device node path or a change to the device mask outside a
+  device `ttp lock` or `ttp devq` is denied, since heavy device work goes to a worker task. A
   foreground command stops at `tool_timeout_s` (300, at most 600); a longer or background one is
   denied with a pointer to `ttp detach` or a worker task. Each mutating call (the command or file,
   its exit code) goes to the run's `tool-audit.jsonl` and `progress.md`, which the web run view

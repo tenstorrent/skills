@@ -293,6 +293,7 @@ def test_the_tool_hook_sees_the_command_inside_ttp_sandbox():
 def _sandbox_with(monkeypatch, tool):
     """A live sandbox that uses only `tool` (unshare or bwrap); skips where that one does not work."""
     from ttp import sandbox
+    monkeypatch.setenv(sandbox.ENV, "1")   # the project opted in
     monkeypatch.setattr(sandbox, "_STATE", {})
     monkeypatch.setattr(sandbox, "inside", lambda: False)
     which = shutil.which
@@ -351,9 +352,13 @@ def test_a_sandbox_nested_in_one_that_left_the_nodes_visible_hides_them(tmp_path
     monkeypatch.setattr(sandbox, "status", lambda: (["unshare", "--user"], ""))
     monkeypatch.setenv("TTP_NO_DEVICE", "0")
     assert sandbox.wrap(["true"]) == ["true"]
-    # A check's own environment decides (push.check_argv passes it), not the caller's.
+    # A check's own environment decides (push.check_argv passes it), not the caller's; only where the
+    # project opted in (sandbox.checks), never by default.
     from ttp import push
-    assert "--keep-caps" in push.check_argv("true", env={**os.environ, "TTP_NO_DEVICE": "1"})
+    clean = {k: v for k, v in os.environ.items() if k != sandbox.ENV}
+    assert "--keep-caps" not in push.check_argv("true", env={**clean, "TTP_NO_DEVICE": "1"})
+    assert "--keep-caps" in push.check_argv("true", env={**clean, "TTP_NO_DEVICE": "1", sandbox.ENV: "1"})
+    monkeypatch.setenv(sandbox.ENV, "1")
     monkeypatch.setenv("TTP_NO_DEVICE", "1")
     argv = sandbox.wrap(["true"])
     assert argv[:2] == ["unshare", "--keep-caps"] and f"--hide={tmp_path / 'devdir'}" in argv
@@ -370,20 +375,18 @@ def test_sudo_fails_inside_the_sandbox(monkeypatch):
     assert r.returncode != 0, r.stderr
 
 
-def _device_hook(monkeypatch, tmp_path, device_host=True, works=True, no_device="1", rewrite=False):
-    from ttp import hook, machines, sandbox
+def _device_hook(monkeypatch, tmp_path, device_host=True, no_device="1"):
+    from ttp import hook, machines
     monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
-    if rewrite:
-        monkeypatch.setenv(hook.HOOK_REWRITE, "1")
-    else:
-        monkeypatch.delenv(hook.HOOK_REWRITE, raising=False)
     monkeypatch.delenv("TTP_PROJECT", raising=False)
     if no_device is None:
         monkeypatch.delenv("TTP_NO_DEVICE", raising=False)
     else:
         monkeypatch.setenv("TTP_NO_DEVICE", no_device)
+    (tmp_path / "devdir").mkdir(exist_ok=True)
+    (tmp_path / "devdir" / "0").write_text("")
+    monkeypatch.setenv("TTP_DEVICE_NODES", str(tmp_path / "devdir"))
     monkeypatch.setattr(machines, "device_host", lambda known=None: device_host)
-    monkeypatch.setattr(sandbox, "status", lambda: (["unshare"], "") if works else (None, "no unshare"))
 
     def call(cmd):
         out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd}, "cwd": str(tmp_path)})
@@ -391,221 +394,63 @@ def _device_hook(monkeypatch, tmp_path, device_host=True, works=True, no_device=
     return call
 
 
-@pytest.mark.parametrize("cmd, shown", [
-    ("pytest -q tests/x.py", "ttp clip -- ttp sandbox -- pytest -q tests/x.py"),
-    ("python3 -m pytest -k 'a and b'", "ttp clip -- ttp sandbox -- python3 -m pytest -k 'a and b'"),
-    ("ttp clip -- python -m pytest", "ttp clip -- ttp sandbox -- python -m pytest"),
-    ("PYTHONPATH=$PWD timeout 600 ctest --test-dir build", "PYTHONPATH=$PWD timeout 600 ttp clip -- ttp sandbox -- ctest"),
-    ("cd x && ttp detach t -- pytest", "ttp detach t -- ttp sandbox -- pytest"),
-    ("ttp sandbox -- true; pytest", "ttp clip -- ttp sandbox -- pytest"),
-    ("bash -lc 'pytest -q'", "ttp clip -- ttp sandbox -- pytest -q"),
-    ("ttp lock build -- pytest", "ttp lock build -- ttp sandbox -- pytest"),
-    ("uv run pytest -q", "uv run ttp clip -- ttp sandbox -- pytest -q"),
+@pytest.mark.parametrize("cmd", [
+    "tt-smi -r 0", "sudo tt-smi -glx_reset", "tt-smi --reset=0,1", "ttp sandbox -- tt-smi -r",
+    "ttp clip -- tt-flash --fw-tar fw.tar", "bash -c 'tt-topology -l mesh'", "ipmitool chassis power cycle",
+    "ttp lock build -- tt-smi -r",
+    "cat {dev}/0", "python3 -c 'open(1)' {dev}/0", "echo x > {dev}/0", "TT_VISIBLE_DEVICES=0 pytest -q",
+    "unset TT_VISIBLE_DEVICES; pytest", "export TT_VISIBLE_DEVICES=0", "env -u TT_VISIBLE_DEVICES pytest",
+    "env -i PATH=$PATH pytest", "sh -c 'TT_VISIBLE_DEVICES=1 ./run'",
 ])
-def test_the_hook_refuses_a_no_device_test_run_outside_the_sandbox_on_a_device_host(cmd, shown, tmp_path, monkeypatch):
-    out = _device_hook(monkeypatch, tmp_path)(cmd)
+def test_a_no_device_run_is_refused_device_commands_outside_a_device_lock(cmd, tmp_path, monkeypatch):
+    call = _device_hook(monkeypatch, tmp_path)
+    out = call(cmd.replace("{dev}", str(tmp_path / "devdir")))
     why = out["hookSpecificOutput"]["permissionDecisionReason"]
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "TTP_NO_DEVICE=1" in why
-    assert shown in why, why
-
-
-@pytest.mark.parametrize("cmd", ["TTP_NO_DEVICE=0 ttp clip -- ttp sandbox -- pytest",
-                                 "env -i PATH=$PATH ttp sandbox -- pytest", "unset TTP_NO_DEVICE; ttp sandbox -- pytest",
-                                 "env -u TTP_NO_DEVICE ttp sandbox -- ctest"])
-def test_the_hook_refuses_a_sandboxed_test_run_that_drops_ttp_no_device(cmd, tmp_path, monkeypatch):
-    out = _device_hook(monkeypatch, tmp_path)(cmd)
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "leave TTP_NO_DEVICE" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "TTP_NO_DEVICE=1" in why, why
+    assert "ttp lock <device> -- <cmd>" in why and "held or paused" in why
+    assert '"kind": "no_device"' in (tmp_path / "refusals.jsonl").read_text()
 
 
 @pytest.mark.parametrize("cmd", [
-    "ttp clip -- ttp sandbox -- python3 -m pytest -q tests/x.py",
-    "ttp sandbox -- ctest",
-    "ttp sandbox -- bash -c 'pytest'",
-    "TTP_NO_DEVICE=1 ttp sandbox -- pytest",
-    "ttp lock box-device -- pytest -q",
-    "ttp devq submit box --id a -- pytest -q",
-    "git status; ls",
-    "grep -n pytest notes.txt",
+    "ttp lock box-device -- tt-smi -r 0", "ttp lock box-device -- sudo tt-smi -glx_reset",
+    "ttp devq submit -- tt-smi -r", "ttp lock box-device -- cat {dev}/0",
+    "ls -l {dev}/0", "stat {dev}", "pytest -q tests/x.py", "ttp clip -- ttp sandbox -- pytest -q", "tt-smi -s",
+    "TTP_NO_DEVICE=0 pytest",
 ])
-def test_the_hook_allows_sandboxed_device_and_non_test_runs(cmd, tmp_path, monkeypatch):
-    assert _device_hook(monkeypatch, tmp_path)(cmd) is None
+def test_a_no_device_run_keeps_test_runs_listings_and_locked_device_commands(cmd, tmp_path, monkeypatch):
+    call = _device_hook(monkeypatch, tmp_path)
+    out = call(cmd.replace("{dev}", str(tmp_path / "devdir")))
+    assert "permissionDecision" not in ((out or {}).get("hookSpecificOutput") or {}), out
 
 
-@pytest.mark.parametrize("kw", [{"no_device": "0"}, {"no_device": None}, {"device_host": False}])
-def test_the_hook_allows_test_runs_of_device_runs_and_on_other_hosts(kw, tmp_path, monkeypatch):
-    assert _device_hook(monkeypatch, tmp_path, **kw)("pytest -q") is None
+@pytest.mark.parametrize("device_host, no_device", [(True, None), (True, "0"), (False, "1")])
+def test_device_commands_pass_where_the_run_holds_a_device_or_the_host_has_none(device_host, no_device,
+                                                                                tmp_path, monkeypatch):
+    call = _device_hook(monkeypatch, tmp_path, device_host=device_host, no_device=no_device)
+    out = call("tt-smi -r 0")
+    assert "permissionDecision" not in ((out or {}).get("hookSpecificOutput") or {}), out
 
 
-@pytest.mark.parametrize("cmd, new", [
-    ("pytest -q tests/x.py", "ttp clip -- ttp sandbox -- pytest -q tests/x.py"),
-    ("cd x && python3 - <<'EOF'\nopen('a', 'w').write('b; pytest')\nEOF\npytest -q tests/a.py",
-     "cd x && python3 - <<'EOF'\nopen('a', 'w').write('b; pytest')\nEOF\nttp clip -- ttp sandbox -- pytest -q tests/a.py"),
-    ("cd x && python3 - <<EOF && python3 -m pytest -q -k 'a or b'\nimport a; a.b()\nEOF",
-     "cd x && python3 - <<EOF && ttp clip -- ttp sandbox -- python3 -m pytest -q -k 'a or b'\nimport a; a.b()\nEOF"),
-    ('PYTHONPATH="$PWD" timeout 600 ctest --test-dir "$B"', 'PYTHONPATH="$PWD" timeout 600 ttp clip -- ttp sandbox -- ctest --test-dir "$B"'),
-    ("ttp clip -- python -m pytest", "ttp clip -- ttp sandbox -- python -m pytest"),
-    ("git add -A; uv run pytest -q  # focused", "git add -A; uv run ttp clip -- ttp sandbox -- pytest -q  # focused"),
-    ("make ||\n  pytest -q;\n", "make ||\n  ttp clip -- ttp sandbox -- pytest -q;\n"),
-    ("ttp sandbox -- true; pytest", "ttp sandbox -- true; ttp clip -- ttp sandbox -- pytest"),
-    ("pytest -q 2>&1 | tail -5", "ttp clip -- ttp sandbox -- pytest -q 2>&1 | tail -5"),
-    ("pytest -q > out.txt", "ttp clip -- ttp sandbox -- pytest -q > out.txt"),
-    ("pytest -q && git status", "ttp clip -- ttp sandbox -- pytest -q && git status"),
-    ("pytest a; pytest b", "ttp clip -- ttp sandbox -- pytest a; ttp clip -- ttp sandbox -- pytest b"),
-    ("(cd x && pytest)", "(cd x && ttp clip -- ttp sandbox -- pytest)"),
-    ("echo $(\npytest)", "echo $(\nttp clip -- ttp sandbox -- pytest)"),
-    ("for f in a b; do pytest $f; done", "for f in a b; do ttp clip -- ttp sandbox -- pytest $f; done"),
-    ("pytest -q &", "ttp clip -- ttp sandbox -- pytest -q &"),
-    ("pytest -q |& tee log", "ttp clip -- ttp sandbox -- pytest -q |& tee log"),
-    ("ttp clip -- pytest -q 2>&1 | grep -E 'passed|failed'", "ttp clip -- ttp sandbox -- pytest -q 2>&1 | grep -E 'passed|failed'"),
-])
-def test_the_hook_rewrites_a_trailing_no_device_test_run_into_the_sandbox(cmd, new, tmp_path, monkeypatch):
-    from ttp import hook
-    call = _device_hook(monkeypatch, tmp_path, rewrite=True)
-    out, _ = hook.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": cmd, "description": "d", "timeout": 9},
-                                "cwd": str(tmp_path)})
-    o = out["hookSpecificOutput"]
-    assert o["permissionDecision"] == "allow" and o["updatedInput"] == {"command": new, "description": "d", "timeout": 9}
-    assert "ran in `ttp sandbox`" in o["additionalContext"] and "\n" not in o["additionalContext"]
-    rows = [json.loads(x) for x in (tmp_path / hook.REFUSALS_FILE).read_text().splitlines()]
-    assert [(r["kind"], r["command"], r["rewritten"]) for r in rows] == [("rewrite", cmd, new)]
-    assert call(new) is None   # the rewritten command passes as it is
-
-
-@pytest.mark.parametrize("cmd", [
-    "bash -lc 'pytest -q'", "sh -c 'cd x && pytest'", "ls tests | xargs pytest", "sudo pytest", "a | pytest",
-    "a |\npytest", "case a in a) pytest;; esac", "f() { pytest; }", "$((pytest))", "pytest - <<EOF\nx\nEOF",
-    "pytest -q < args.txt", "pytest -q \\\n  tests/x.py", "'pytest' -q", "cat <<EOF; pytest -q\nx\n",
-    "bash <<EOF\npytest -q\nEOF", "pytest a; bash -c 'pytest b'",
-    "python3 - <<'EOF'\nimport pytest\npytest.main(['-q', 'tests'])\nEOF",
-    "cd x && python3 - <<EOF\nimport subprocess, sys\nsubprocess.run([sys.executable, '-m', 'pytest', '-q'])\nEOF",
-    "python3 - <<'EOF'\nimport os\nos.system('pytest -q')\nEOF",
-    "xargs -a list.txt pytest -q", "xargs --arg-file=list.txt pytest", "xargs --arg-file list.txt pytest",
-    "xargs -alist.txt pytest", "xargs -0 -a list.txt -P 4 pytest", "xargs -ra list.txt pytest", "xargs -a l -- pytest",
-    "xargs -I {} pytest {} < list.txt", "cd x && xargs -n 1 -a list.txt timeout 60 python3 -m pytest -q",
-    "python3 -c 'import pytest; pytest.main([\"-q\", \"tests\"])'",
-    "python -c \"import subprocess, sys; subprocess.run([sys.executable, '-m', 'pytest', '-q'])\"",
-    "python3 -Ic 'import os; os.system(\"pytest -q\")'", "python3 -W ignore -Bc'import pytest;pytest.main()'",
-    "cd x && uv run python3 -c 'import pytest; raise SystemExit(pytest.main())' 2>&1 | tail -3",
-    "bash -c \"python3 -c 'import pytest; pytest.main()'\"",
-])
-def test_the_hook_refuses_a_no_device_test_run_it_cannot_rewrite_alone(cmd, tmp_path, monkeypatch):
-    from ttp import hook
-    out = _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd)
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny" and "updatedInput" not in out["hookSpecificOutput"]
-    assert [json.loads(x)["kind"] for x in (tmp_path / hook.REFUSALS_FILE).read_text().splitlines()] == ["no_device"]
-
-
-@pytest.mark.parametrize("cmd", [
-    "python3 -c 'import json, sys; print(json.load(sys.stdin)[\"pytest\"])' < a.json",
-    "python3 -c 'print(\"pytest.main([])\")'", "python3 -c 'import pytest; print(pytest.__version__)'",
-    "python3 -m json.tool a.json", "xargs -a list.txt grep -l pytest", "xargs -I {} echo pytest {}",
-    "ttp clip -- ttp sandbox -- python3 -c 'import pytest; pytest.main()'",
-])
-def test_the_hook_allows_python_c_and_xargs_runs_that_run_no_test(cmd, tmp_path, monkeypatch):
-    from ttp import hook
-    assert _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd) is None
-    assert not (tmp_path / hook.REFUSALS_FILE).exists()
-
-
-@pytest.mark.parametrize("cmd", ["TTP_NO_DEVICE=0 pytest -q", "env -i PATH=$PATH pytest", "unset TTP_NO_DEVICE; pytest",
-                                 "env -u TTP_NO_DEVICE ctest", "TTP_NO_DEVICE= ttp sandbox -- pytest"])
-def test_the_hook_never_rewrites_a_test_run_that_changes_ttp_no_device(cmd, tmp_path, monkeypatch):
-    out = _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd)
-    assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-    assert "leave TTP_NO_DEVICE" in out["hookSpecificOutput"]["permissionDecisionReason"]
-
-
-# The shapes of logged no-device refusals, with placeholders: edit scripts fed to python or cat on stdin
-EDIT_SCRIPTS = [
-    "cd w/t1; sed -i 's/a/b/' tests/a_cases.py; python3 - <<'EOF'\nimport pathlib\nf = pathlib.Path('tests/b_cases.py')\n"
-    "s = f.read_text().replace('pytest.main', 'pytest.main()')\nf.write_text(s)\nEOF",
-    "cp tests/test_a.py $TMPDIR/a.bak && python3 - <<'EOF'\np = 'tests/test_a.py'; s = open(p).read()\n"
-    "s = s.replace('a', 'run pytest -q')\nopen(p, 'w').write(s)\nEOF",
-    "python3 - <<'EOF'\np = 'tests/a_cases.py'\ns = open(p).read()\nold = '''    x = 1\n'''\n"
-    "new = '''    r = subprocess.run([sys.executable, \"-m\", \"pytest\", \"-q\", str(f)])\n'''\n"
-    "assert old in s; s = s.replace(old, new)\nopen(p, 'w').write(s)\nEOF",
-    "cat >> tests/a_cases.py <<'EOF'\n\ndef test_x():\n    subprocess.run(['pytest', '-q'])\n    pytest.main(['x'])\nEOF",
-    "python3 - <<EOF\nimport pytest  # pytest.main(['-q']) only in a comment\nprint('ok')\nEOF",
-]
-TEST_RUNS = [
-    "cd w/t2; PYTHONPATH=$PWD timeout 300 python3 -m pytest --rootdir=. -q tests/test_a.py -k \"a or b\" -p no:randomly 2>&1 | tail -5",
-    "cd w/t3; cat x.rc; tail -3 x.log; python3 -m pytest -q tests -k name 2>&1 | tail -3",
-    "PYTHONPATH=$PWD/r:. python3 -m pytest -q tests/a_cases.py -k \"b\" 2>&1 | tail -3",
-    "cd w/t4 && PYTHONPATH=$PWD timeout 600 python3 -m pytest -q -x tests/test_a.py -k \"a\" 2>&1 | tail -20",
-    "python3 - <<'EOF'\np = 'tests/a_cases.py'\nopen(p, 'a').write('x')\nEOF\nmv a.tmp tests/a_cases.py\n"
-    "PYTHONPATH=$PWD timeout 600 python3 -m pytest -q tests/test_a.py -k \"a or b\" 2>&1 | tail -15",
-    "git status --short | head; for i in 1 2 3; do PYTHONPATH=$PWD timeout 200 python3 -m pytest -q tests/test_a.py -k t 2>&1 | tail -1; done",
-    "ls tests | head; (ttp clip -- python3 -m pytest -q -x tests/test_a.py -k \"a or b\" 2>&1 | tail -8); claude plugin validate p --strict",
-    "export OUT=$TMPDIR/m.txt && time (PYTHONPATH=$PWD timeout 600 python3 -m pytest -q tests/test_a.py 2>&1 | tail -5) && cat $OUT",
-    "cd w/t5; python3 -m pytest -q tests/test_a.py -k 'a or b' 2>&1 | tail -3; git rev-parse HEAD",
-    "ctest --test-dir build -R unit 2>&1 | tail -20 && echo done",
-    "measure() { pytest -q tests/test_a.py 2>&1 | grep -E 'passed|failed'; }\nmeasure",
-]
-
-
-@pytest.mark.parametrize("cmd", EDIT_SCRIPTS)
-def test_the_hook_allows_heredoc_edit_scripts_that_run_no_test(cmd, tmp_path, monkeypatch):
-    from ttp import hook
-    assert _device_hook(monkeypatch, tmp_path, rewrite=True)(cmd) is None
-    assert not (tmp_path / hook.REFUSALS_FILE).exists()
-
-
-def test_the_hook_rewrites_most_logged_test_run_shapes_and_none_runs_outside_the_sandbox(tmp_path, monkeypatch):
-    from ttp import hook
-    call = _device_hook(monkeypatch, tmp_path, rewrite=True)
-    kinds = []
-    for cmd in TEST_RUNS:
-        o = call(cmd)["hookSpecificOutput"]
-        if "updatedInput" in o:
-            new = o["updatedInput"]["command"]
-            assert not hook._unsandboxed_test(hook._split(new)[0], True) and call(new) is None, new
-            kinds.append("rewrite")
-        else:
-            assert o["permissionDecision"] == "deny", cmd
-            kinds.append("deny")
-    assert kinds.count("rewrite") >= 0.9 * len(TEST_RUNS), list(zip(kinds, TEST_RUNS))
-    assert kinds[-1] == "deny"   # a test run inside a function body is not rewritten
-
-
-def test_a_fault_in_the_rewrite_refuses_the_call(tmp_path, monkeypatch):
-    from ttp import hook
-    call = _device_hook(monkeypatch, tmp_path, rewrite=True)
-    monkeypatch.setattr(hook, "_sandboxed", lambda *a: 1 / 0)
-    assert call("pytest -q")["hookSpecificOutput"]["permissionDecision"] == "deny"
-
-
-def test_the_hook_refuses_instead_of_rewriting_without_a_cli_that_applies_updated_input(tmp_path, monkeypatch):
-    for value in (None, "0"):
-        call = _device_hook(monkeypatch, tmp_path)
-        if value:
-            monkeypatch.setenv("TTP_HOOK_REWRITE", value)
-        out = call("cd x && pytest -q")
-        assert out["hookSpecificOutput"]["permissionDecision"] == "deny"
-        assert "cd x && ttp clip -- ttp sandbox -- pytest -q" not in out["hookSpecificOutput"]["permissionDecisionReason"]
-    assert _device_hook(monkeypatch, tmp_path, rewrite=True)("ttp clip -- ttp sandbox -- pytest -q") is None
-
-
-@pytest.mark.parametrize("version, on", [("2.1.296 (Claude Code)", True), ("2.0.10 (Claude Code)", True),
-                                         ("2.0.9 (Claude Code)", False), ("1.9.99", False), ("", False)])
-def test_claude_workers_get_hook_rewrites_only_from_a_cli_that_applies_updated_input(version, on, monkeypatch):
-    from ttp.hook import HOOK_REWRITE
-    from ttp.providers import base, get_provider
-    prov = get_provider("claude")
-    monkeypatch.setattr(type(prov), "binary", lambda self: "/x/claude")
-    monkeypatch.setattr(type(prov), "supports", lambda self, flag: False)
-    monkeypatch.setitem(base._CLI_OUTPUT, ("/x/claude", "--version"), version)
-    kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None, restrictions={})
-    assert (prov.build(read_only=False, **kw)[1].get(HOOK_REWRITE) == "1") is on
-    assert HOOK_REWRITE not in prov.build(read_only=True, **kw)[1]
-
-
-def test_the_hook_gives_one_notice_where_no_sandbox_works(tmp_path, monkeypatch):
-    call = _device_hook(monkeypatch, tmp_path, works=False)
-    out = call("pytest -q")
-    assert "permissionDecision" not in out["hookSpecificOutput"]
-    assert "no process sandbox works here (no unshare)" in out["hookSpecificOutput"]["additionalContext"]
-    assert call("pytest -q") is None
+def test_no_default_path_wraps_a_command_in_a_namespace(tmp_path, monkeypatch):
+    """The default worker or coordinator run, `ttp checks`, push checks and `ttp sandbox` start no
+    bwrap or unshare, even with TTP_NO_DEVICE=1 on a device host whose nodes exist."""
+    from ttp import machines, push, sandbox
+    (tmp_path / "devdir").mkdir()
+    (tmp_path / "devdir" / "0").write_text("")
+    monkeypatch.setenv("TTP_DEVICE_NODES", str(tmp_path / "devdir"))
+    monkeypatch.setenv("TTP_NO_DEVICE", "1")
+    monkeypatch.delenv(sandbox.ENV, raising=False)
+    monkeypatch.setattr(machines, "device_host", lambda known=None: True)
+    clean = {k: v for k, v in os.environ.items() if k != sandbox.ENV}
+    assert sandbox.wrap(["pytest", "-q"]) == ["pytest", "-q"]
+    argv = push.check_argv("pytest -q", env=clean, isolate=False)
+    assert not {"bwrap", "unshare"} & {os.path.basename(w) for w in argv}, argv
+    runtime = pathlib.Path(__import__("ttp").__file__).resolve().parent.parent
+    r = subprocess.run([sys.executable, "-m", "ttp", "sandbox", "--", "sh", "-c", f'ls {tmp_path / "devdir"}; echo $$'],
+                       env={**clean, "PYTHONPATH": str(runtime)}, capture_output=True, text=True, timeout=60)
+    assert r.returncode == 0 and r.stdout.split()[0] == "0", r.stdout + r.stderr   # same view, no namespace
+    assert r.stdout.split()[1] != "1", r.stdout
+    assert "sandbox" not in r.stderr, r.stderr
 
 
 def _fake_xdist_python(tmp_path, xdist_rc: int):

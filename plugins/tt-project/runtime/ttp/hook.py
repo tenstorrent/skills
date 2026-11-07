@@ -72,11 +72,11 @@ A Bash call that would print more than WIDE_READ_LINES lines of one file (sed -n
 cat of a large file) gets a reminder to grep first and read narrow ranges, as added context; it is
 never denied (wide_read). `ttp stats --tools` shows how much of the runs' tool output is file reads.
 
-A run that holds no device (TTP_NO_DEVICE=1) on a machine tagged `device` is refused pytest and ctest
-runs outside `ttp sandbox`, which hides the device nodes; a device `ttp lock` or `ttp devq` passes,
-and where no sandbox works it gets one notice instead (device_test_run). Where the CLI applies a hook's
-`updatedInput` (HOOK_REWRITE) and each test run stands as a top-level simple command (after `cd x;` or
-`&&`, under assignments and wrappers, or first in a pipeline), the call is rewritten into the sandbox instead, with one line of added context, and logged to refusals.jsonl.
+A run that holds no device (TTP_NO_DEVICE=1) on a machine tagged `device` is refused device work: a
+reset, flash or power tool, a device node path, or a change to the device mask (TT_VISIBLE_DEVICES,
+`env -i`), also through wrappers and `sh -c`; a device `ttp lock` (refused itself on a held or paused
+device) or `ttp devq` passes (device_command). Nothing runs in a namespace sandbox: tests run as they
+are, with the device mask set. Each refusal is logged to refusals.jsonl.
 
 Otherwise it fails open: any error prints nothing, and the run goes on unchanged.
 """
@@ -87,7 +87,6 @@ import json
 import os
 import posixpath
 import re
-import shlex
 import subprocess
 import sys
 import time
@@ -1178,18 +1177,14 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = too_many_workers(cmd)
     if not why:
         why = too_many_build_jobs(cmd)
-    hint = rewrite = None
     if not why:
-        why, hint, rewrite = device_test_run(commands, cmd)
+        why = device_command(commands, cmd)
     if not why:
         why = local_guard(payload)
     if not why:
         cwd = str(payload.get("cwd") or os.getcwd())
-        hint = "\n\n".join(h for h in (hint, fenced_script(segments, commands, cwd), wide_read(commands, cwd)) if h)
+        hint = "\n\n".join(h for h in (fenced_script(segments, commands, cwd), wide_read(commands, cwd)) if h)
         out = {"hookEventName": "PreToolUse", **({"additionalContext": hint} if hint else {})}
-        if rewrite:
-            # The whole input goes back: the CLI replaces it, and drops what it does not know.
-            out.update(permissionDecision="allow", updatedInput={**payload["tool_input"], "command": rewrite})
         return ({"hookSpecificOutput": out} if len(out) > 1 else None), None
     return _deny(why), None
 
@@ -1657,15 +1652,14 @@ def _log_refusal(cmd: str, kind: str, **extra: str) -> None:
         pass
 
 
-DEVICE_NOTICE_FILE = "device-sandbox.notice"   # in the run dir: the no-sandbox notice was given
-# Set to 1 by a provider whose CLI applies a PreToolUse hook's `updatedInput` to a Bash call: a no-device
-# test run is then rewritten into `ttp sandbox` instead of refused (the refusal costs the worker a call).
-HOOK_REWRITE = "TTP_HOOK_REWRITE"
-# Words before a test command that keep their meaning with `ttp clip -- ttp sandbox --` after them
-# (sudo would run ttp as root, with root's PATH)
-REWRITE_NOT_AFTER = {"sudo", "xargs"}
-ENV_RUNNERS = {"uv", "poetry", "pipenv", "pdm", "hatch"}   # `<runner> run <cmd>` runs <cmd>
-SAFE_WORD_RE = re.compile(r"[\w@%+=:,./$~-]+")
+# Device commands a run that holds no device (TTP_NO_DEVICE=1) is refused outside a device `ttp lock` or
+# `ttp devq` (device_command): reset, flash and power tools by program name, each with the argument words
+# that make a call one (None: any call).
+DEVICE_TOOLS = {"tt-smi": re.compile(r"-r[\d,]*|--reset(?:=.*)?|-{1,2}glx_reset\w*"), "tt-flash": None,
+                "tt-topology": None, "ipmitool": re.compile(r"power|reset")}
+# Programs that only list or stat a device node path, never open the device
+NODE_LISTERS = {"ls", "stat", "test", "[", "readlink", "realpath", "lsof", "fuser", "echo", "printf"}
+DECLARE = {"export", "unset", "declare", "typeset", "readonly", "local"}
 
 
 def _device_lock(words: list[str]) -> bool:
@@ -1683,247 +1677,65 @@ def _device_lock(words: list[str]) -> bool:
         return False
 
 
-def _unsandboxed_test(commands: str, kept: bool, depth: int = 0) -> tuple[list[str], int, bool] | None:
-    """(the simple command, where its test command starts, whether a ttp wrapper is before it) for
-    the first pytest or ctest run in `commands` (or in a `sh -c` string there, or `python -c` code
-    that runs pytest, _runs_pytest) that neither `ttp
-    sandbox` (when `kept`: the command keeps TTP_NO_DEVICE, which tells it to hide the devices) nor a
-    sanctioned way to a device (a device `ttp lock`, `ttp devq`) wraps; None when there is none."""
+def _device_use(commands: str, nodes: list[str], depth: int = 0) -> tuple[str, str] | None:
+    """(the command, what makes it device work) for the first simple command of `commands` (or of a
+    `sh -c` string there) that resets, flashes or power-cycles a device (DEVICE_TOOLS), names a device
+    node (`nodes`) or changes or drops the device mask (machines.DEVICE_MASK, `env -i`), outside a
+    device `ttp lock` or `ttp devq`; None when there is none."""
+    from .machines import DEVICE_MASK
+    mask = "|".join(map(re.escape, DEVICE_MASK))
+    locked = False
     for raw in _segments(commands, strip=False):
         wrappers: list[list[str]] = []
         argv = _strip_prefix(raw, wrappers)
-        if not argv or any((w[:1] == ["sandbox"] and kept) or (w[:1] == ["lock"] and _device_lock(w))
-                           for w in wrappers):
+        if any(w[:1] == ["lock"] and _device_lock(w) for w in wrappers) or argv[:2] == ["ttp", "devq"]:
+            locked = True
             continue
-        if os.path.basename(argv[0]) in ENV_RUNNERS and argv[1:2] == ["run"]:   # uv run [opts] pytest
-            argv = next((argv[i:] for i in range(2, len(argv)) if not argv[i].startswith("-")), [])
-            if not argv:
-                continue
-        name = os.path.basename(argv[0])
-        if _pytest_args(argv) is not None or name == "ctest" or _runs_pytest(_inline_code(argv) or ""):
-            return raw, len(raw) - len(argv), bool(wrappers)
+        shown, pre = " ".join(raw)[:120], raw[:len(raw) - len(argv)]
+        name = os.path.basename(argv[0]) if argv else ""
+        if name in DEVICE_TOOLS and (DEVICE_TOOLS[name] is None
+                                     or any(DEVICE_TOOLS[name].fullmatch(w) for w in argv[1:])):
+            return shown, f"runs the device tool {name}"
+        if name not in NODE_LISTERS and any(w == p or w.startswith(p.rstrip("/") + "/") for w in argv for p in nodes):
+            return shown, "opens a device node"
+        envs = [i for i, w in enumerate(pre) if os.path.basename(w) == "env"]
+        declared = name in DECLARE and any(re.fullmatch(rf"(?:{mask})(?:\+?=.*)?", w) for w in argv[1:])
+        if mask and (declared or any(re.fullmatch(rf"(?:{mask})\+?=.*|--unset=(?:{mask})", w) for w in pre)
+                     or any(a in ("-u", "--unset") and b in DEVICE_MASK for a, b in zip(pre, pre[1:]))):
+            return shown, "changes the device mask (" + ", ".join(DEVICE_MASK) + ")"
+        if envs and any(re.fullmatch(r"-[\w]*i\w*|--ignore-environment|-", w) for w in pre[envs[0] + 1:]):
+            return shown, "drops the device mask with the rest of the environment"
         if name in SHELLS and depth < 3:
             inner = next((argv[i + 1] for i, a in enumerate(argv[1:-1], 1) if re.fullmatch(r"-[a-z]*c[a-z]*", a)), None)
-            if inner and (hit := _unsandboxed_test(inner, kept, depth + 1)):
+            if inner and (hit := _device_use(inner, nodes, depth + 1)):
                 return hit
+    if not locked and (m := next((m for p in nodes if (m := re.search(rf"[<>]&?\s*{re.escape(p)}(?![\w.-])", commands))), None)):
+        return m[0], "redirects to or from a device node"
     return None
 
 
-# What may stand before a simple command the rewrite wraps (spaces taken out): the start, `;`, `&&`, `||`,
-# `&` or new lines, then at most one `(` (a subshell or `$(`). Not a pipe (the test would read its stdin
-# through the wrappers), `;;` or `)` (a case pattern), nor `((` (arithmetic).
-REWRITE_BEFORE_RE = re.compile(r"(?:;|&&|\|\||&)?\n*(?:\(\n*)?")
-# A python script on stdin that runs pytest itself: pytest.main, or pytest through subprocess or os
-STDIN_PYTEST_RE = re.compile(r"\bpytest\.(?:main|console_main)\s*\(|\b(?:subprocess\.(?:run|call|check_call|check_output"
-                             r"|Popen)|os\.(?:system|popen|exec\w*|spawn\w*))\s*\([^)]*?\bpytest\b")
-
-
-def _top_pieces(text: str, flags: list[tuple[bool, int]]) -> list[tuple[int, int, str, str]]:
-    """(start, end, what stands before, what stands after) of each piece of `text` between unquoted
-    `;`, `&`, `|`, `(`, `)` and new lines; the `&` of a redirect (`2>&1`, `&>f`) and the `|` of `>|`
-    are not separators. Spaces and tabs are taken out of the separators."""
-    seps, i = [], 0
-    while i < len(text):
-        j = i
-        while j < len(text) and (not flags[j][0] and text[j] in ";&|()\n" and not (
-                text[j] == "&" and (text[j - 1:j] in ("<", ">") or text[j + 1:j + 2] == ">")
-                or text[j] == "|" and text[j - 1:j] == ">") or j > i and text[j] in " \t"):
-            j += 1
-        if j > i:
-            seps.append((i, j))
-            i = j
-        else:
-            i += 1
-    out, at, before = [], 0, ""
-    for s, e in seps + [(len(text), len(text))]:
-        sep = re.sub(r"[ \t]", "", text[s:e])
-        if s > at:
-            out.append((at, s, before, sep))
-        at, before = e, sep
-    return out
-
-
-def _sandboxed_at(cmd: str, raw: list[str], k: int, wrapped: bool) -> str | None:
-    """`cmd` with `ttp clip -- ttp sandbox --` (`ttp sandbox --` when a ttp wrapper is there) put just
-    before the test command `raw[k:]`, when `raw` stands as a simple command after what
-    REWRITE_BEFORE_RE allows (so never fed by a pipe), with no stdin redirect of its own; else None.
-    A pipe after it (the first member of a pipeline), `&`, `)` and loop words keep their meaning. Only those characters
-    are added: every other byte, redirections, the pipe's tail and heredoc bodies too, stays as written."""
-    if REWRITE_NOT_AFTER & {os.path.basename(w) for w in raw[:k]} or _inline_code(raw[k:]) is not None:
-        return None   # `python -c` code that runs pytest is refused, as a script on stdin is
-    lines, pending, at = [], [], 0     # (offset in cmd, text) of each line the shell reads as commands
-    for line in cmd.split("\n"):
-        start, at = at, at + len(line) + 1
-        if pending:
-            delim, dash = pending[0]
-            if (line.lstrip("\t") if dash else line) == delim:
-                pending.pop(0)
-            continue
-        lines.append((start, line))
-        flags = _quoting(line) if "<<" in line else []
-        pending += [(m[3], m[1] == "-") for m in HEREDOC_RE.finditer(line) if not flags[m.start()][0]]
-    if pending:
-        return None
-    text = "\n".join(line for _, line in lines)
-    flags = _quoting(text)
-    for cut, end, before, after in _top_pieces(text, flags):
-        seg = text[cut:end]
-        if _segments(seg, strip=False) != [raw]:
-            continue
-        if not REWRITE_BEFORE_RE.fullmatch(before) or ";;" in after \
-                or any(c == "<" and not q for c, (q, _) in zip(seg, flags[cut:end])):
-            return None
-        pos = None
-        for i in range(len(seg)):   # where the test command's first word starts
-            if seg[i].isspace() or flags[cut + i][0] or i and not (seg[i - 1].isspace() and not flags[cut + i - 1][0]):
-                continue
-            if _segments(seg[:i], strip=False) == ([raw[:k]] if k else []):
-                pos = cut + i
-                break
-        if pos is None:
-            return None
-        base = 0
-        for start, line in lines:   # back from `text` to `cmd`, past the heredoc bodies
-            if pos <= base + len(line):
-                off = start + pos - base
-                return cmd[:off] + ("" if wrapped else "ttp clip -- ") + "ttp sandbox -- " + cmd[off:]
-            base += len(line) + 1
-        return None
-    return None
-
-
-def _sandboxed(cmd: str) -> str | None:
-    """`cmd` with each pytest or ctest run outside `ttp sandbox` wrapped into it (_sandboxed_at), or
-    None when one of them cannot be."""
-    for _ in range(16):
-        hit = _unsandboxed_test(_split(cmd)[0], True)
-        if not hit:
-            return cmd
-        cmd = _sandboxed_at(cmd, *hit)
-        if cmd is None:
-            return None
-    return None
-
-
-def _runs_pytest(code: str) -> bool:
-    """Whether python `code` calls pytest (STDIN_PYTEST_RE) outside its string literals: an edit script
-    that writes such a call into a test file does not run it. Code that does not tokenize is matched whole."""
-    import io
-    import tokenize
-    hits = [m.start() for m in STDIN_PYTEST_RE.finditer(code)]
-    if not hits:
-        return False
-    starts = [0]
-    for line in code.splitlines(keepends=True):
-        starts.append(starts[-1] + len(line))
-    strings = []
-    try:
-        for t in tokenize.generate_tokens(io.StringIO(code).readline):
-            if tokenize.tok_name[t.type] in ("STRING", "FSTRING_MIDDLE", "COMMENT"):
-                strings.append((starts[t.start[0] - 1] + t.start[1], starts[t.end[0] - 1] + t.end[1]))
-    except (tokenize.TokenError, SyntaxError, IndexError):
-        return True
-    return any(not any(a <= h < b for a, b in strings) for h in hits)
-
-
-def _stdin_pytest(cmd: str) -> bool:
-    """Whether a python reading its script from a heredoc outside `ttp sandbox` runs pytest in it
-    (STDIN_PYTEST_RE); other heredoc bodies, edit scripts too, are data here."""
-    lines, bodies, pending = [], [], []
-    for line in cmd.replace("\\\n", " ").split("\n"):
-        if pending:
-            delim, dash, n = pending[0]
-            if (line.lstrip("\t") if dash else line) == delim:
-                pending.pop(0)
-            else:
-                bodies[n][2].append(line)
-            continue
-        lines.append(line)
-        flags = _quoting(line) if "<<" in line else []
-        for m in HEREDOC_RE.finditer(line):
-            if not flags[m.start()][0]:
-                pending.append((m[3], m[1] == "-", len(bodies)))
-                bodies.append((line, m.start(), []))
-    for line, pos, body in bodies:
-        if not _runs_pytest("\n".join(body)):
-            continue
-        wrappers: list[list[str]] = []
-        for raw in _segments(_piece_at(line, pos)[0], strip=False):
-            argv = _strip_prefix(raw, wrappers)
-            if argv and os.path.basename(argv[0]).startswith("python") and _interpreter_args(argv) == "-" \
-                    and not any(w[:1] == ["sandbox"] or (w[:1] == ["lock"] and _device_lock(w)) for w in wrappers):
-                return True
-    return False
-
-
-# A command that changes or drops TTP_NO_DEVICE (`TTP_NO_DEVICE=0`, `unset`, `env -u`, `env -i`):
-# a `ttp sandbox` in it may not hide the devices.
-NO_DEVICE_CHANGE_RE = re.compile(r"TTP_NO_DEVICE(?![\w=])|TTP_NO_DEVICE=(?![\"']?1\b)|"
-                                 r"\benv\s+(?:-\w*i\b|--ignore-environment\b|-\s)")
-
-
-def device_test_run(commands: str, cmd: str = "") -> tuple[str | None, str | None, str | None]:
-    """(why the call is refused, a notice, the command to run instead) for a test run outside `ttp
-    sandbox` by a run that holds no device (TTP_NO_DEVICE=1) on a machine tagged `device`.
-    TT_VISIBLE_DEVICES only asks: a raw open or reset code still reaches the devices, while `ttp
-    sandbox` hides their nodes, and so is a python script on stdin that runs pytest (_stdin_pytest).
-    Where the provider set HOOK_REWRITE and each test run stands as a top-level simple command of
-    `cmd` (or first in a pipeline), they are rewritten into the sandbox (_sandboxed); a command
-    that changes TTP_NO_DEVICE is still refused. Where no sandbox works the call goes on with one notice
-    per run. It guards against accidents, not a determined bypass, and only refuses new calls; it
-    never signals a running process."""
+def device_command(commands: str, cmd: str = "") -> str | None:
+    """Why the call is refused: a run that holds no device (TTP_NO_DEVICE=1) on a machine tagged `device`
+    runs device work (_device_use) outside a device `ttp lock` (which itself refuses a held or paused
+    device) or `ttp devq`. Nothing runs in a namespace: this refusal and the TT_VISIBLE_DEVICES mask are
+    the device safety. It guards against accidents, not a determined bypass (a script file or inline
+    code is not read), and only refuses new calls. A project adds its own refusals in guards.local."""
     if os.environ.get("TTP_NO_DEVICE", "").strip() != "1":
-        return None, None, None
-    hit = _unsandboxed_test(commands, not NO_DEVICE_CHANGE_RE.search(commands))
-    stdin = bool(cmd) and _stdin_pytest(cmd)
-    if not hit and not stdin:
-        return None, None, None
-    from . import machines, sandbox
+        return None
+    from . import machines
     try:
         if not machines.device_host():
-            return None, None, None
+            return None
+        hit = _device_use(commands, machines.device_nodes())
     except Exception:
-        return None, None, None
-    pre, why = sandbox.status()
-    if pre:
-        lead = "this run holds no device (TTP_NO_DEVICE=1) on a device host"
-        tail = "Tests that need a device go through the device broker, `ttp lock <device> --` or `ttp devq`"
-        if stdin:
-            _log_refusal(cmd, kind="no_device")
-            return (f"{lead}, and a python script read from stdin runs pytest outside `ttp sandbox`. Write the "
-                    f"script to a file and run it as `ttp clip -- ttp sandbox -- python3 <file>`: the sandbox "
-                    f"hides the device nodes. {tail}"), None, None
-        raw, k, wrapped = hit
-        if "sandbox" in raw[:k] or NO_DEVICE_CHANGE_RE.search(commands):
-            _log_refusal(cmd or commands, kind="no_device")
-            return (f"{lead}, and `ttp sandbox` hides the device nodes only while TTP_NO_DEVICE=1 reaches it: "
-                    f"leave TTP_NO_DEVICE and the environment as they are (no `TTP_NO_DEVICE=`, `unset`, "
-                    f"`env -u` or `env -i`). {tail}"), None, None
-        try:   # a fault here refuses the call, as before: the hook fails open
-            new = _sandboxed(cmd) if os.environ.get(HOOK_REWRITE) == "1" else None
-        except Exception:
-            new = None
-        if new:
-            _log_refusal(cmd, kind="rewrite", rewritten=new)
-            test = " ".join(raw[k:])[:120]
-            return None, (f"tt-project: `{test}` ran in `ttp sandbox` ({lead}; the sandbox hides the device "
-                          f"nodes). Run tests as `ttp clip -- ttp sandbox -- <cmd>` yourself"), new
-        words = [*raw[:k], *([] if wrapped else ["ttp", "clip", "--"]), "ttp", "sandbox", "--", *raw[k:]]
+        return None
+    if not hit:
+        return None
+    if os.environ.get("TTP_RUN_DIR"):
         _log_refusal(cmd or commands, kind="no_device")
-        shown = " ".join(w if SAFE_WORD_RE.fullmatch(w) else shlex.quote(w) for w in words)
-        return (f"{lead}, and a test run outside `ttp sandbox` can still open or reset the devices "
-                f"(TT_VISIBLE_DEVICES only asks). Run it as `{shown}`: the sandbox hides the device nodes. "
-                f"{tail}"), None, None
-    mark = Path(os.environ["TTP_RUN_DIR"]) / DEVICE_NOTICE_FILE
-    if mark.exists():
-        return None, None, None
-    try:
-        mark.write_text(why + "\n")
-    except OSError:
-        pass
-    return None, (f"tt-project: this run holds no device (TTP_NO_DEVICE=1) on a device host, but no process "
-                  f"sandbox works here ({why}), so test runs can open the device nodes. Open a device only "
-                  f"through the device broker, `ttp lock <device> --` or `ttp devq`"), None
+    return (f"this run holds no device (TTP_NO_DEVICE=1) on a device host, and `{hit[0]}` {hit[1]}. Device work "
+            f"goes through the device broker: `ttp lock <device> -- <cmd>` (refused while the device is held "
+            f"or paused) or `ttp devq`")
 
 
 # Claude Code's Bash sandbox (bwrap) binds each fenced path that exists when the command starts; one

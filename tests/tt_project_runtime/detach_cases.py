@@ -2750,28 +2750,27 @@ def test_a_checks_queued_job_ends_at_its_bound_or_once_its_owner_marker_is_gone(
     assert not list((p.state / detach.BOUND).glob("*.json"))
 
 
-def test_a_cpu_only_checks_queued_job_sees_no_device_nodes(env, tmp_path, monkeypatch):
-    """A check that holds no device (TTP_NO_DEVICE=1) queues a job: the daemon starts it in the sandbox that
-    hides the device nodes, as the check's own commands were."""
+def test_a_cpu_only_checks_queued_job_starts_in_no_namespace(env, tmp_path, monkeypatch):
+    """A check that holds no device (TTP_NO_DEVICE=1) queues a job: the daemon starts it as it is, in no
+    namespace (it sees what the host sees), with the check's TTP_NO_DEVICE and device mask kept."""
     from ttp import detach, locks, sandbox
-    if sandbox.status()[0] is None:
-        pytest.skip("no process sandbox works on this host")
     dev = tmp_path / "dev-tt"
     dev.mkdir()
     (dev / "0").write_text("")
     monkeypatch.setenv("TTP_DEVICE_NODES", str(dev))
     p = make(env)
     report = _check_report(p)
-    out, rc = tmp_path / "seen", report / "hidden.rc"
-    detach.enqueue(p.state, rc, report / "hidden.log", ["sh", "-c", f"ls -A {shlex.quote(str(dev))} >{shlex.quote(str(out))}"],
-                   str(tmp_path), {**os.environ, "TTP_NO_DEVICE": "1"}, bound=detach.check_bound(None))
+    out, rc = tmp_path / "seen", report / "plain.rc"
+    job = f"ls -A {shlex.quote(str(dev))} >{shlex.quote(str(out))}; echo \"$TTP_NO_DEVICE:$TT_VISIBLE_DEVICES:\" >>{shlex.quote(str(out))}"
+    e = {k: v for k, v in os.environ.items() if k != sandbox.ENV}
+    detach.enqueue(p.state, rc, report / "plain.log", ["sh", "-c", job], str(tmp_path),
+                   {**e, "TTP_NO_DEVICE": "1", "TT_VISIBLE_DEVICES": ""}, bound=detach.check_bound(None))
     detach.tend(p)
-    # A sandboxed start on a loaded host can take longer than a fixed 20 s: wait while the job holds its
-    # lock (the wrapper writes the rc before it lets go), bounded only against a hang.
+    # A start on a loaded host can take longer than a fixed 20 s: wait while the job holds its lock (the
+    # wrapper writes the rc before it lets go), bounded only against a hang.
     assert _wait_for(lambda: rc.exists() or locks.any_free([locks.job_lock(rc)]), timeout=300)
-    assert rc.exists() and rc.read_text().strip() == "0", (report / "hidden.log").read_text()
-    assert out.read_text() == ""
-    assert (dev / "0").exists()
+    assert rc.exists() and rc.read_text().strip() == "0", (report / "plain.log").read_text()
+    assert out.read_text().splitlines() == ["0", "1::"]
 
 
 def test_a_detach_in_a_private_pid_namespace_is_queued_and_records_the_host_pid(env, tmp_path):

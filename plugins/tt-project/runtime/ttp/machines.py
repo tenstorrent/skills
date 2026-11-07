@@ -51,7 +51,7 @@ DIGEST_MACHINES = 20        # machines the digest lists at most
 TROUBLE_AT = 2              # failures in 24 h that put a resource in trouble
 WAITS_AT = 6                # or this many waits on it (it may be down, not busy)
 BAD_RUNS = ("failed", "lost", "timeout", "stalled")
-# The device driver's nodes: `ttp sandbox` hides them from a run that holds no device (sandbox.py).
+# The device driver's nodes: a run that holds no device is refused commands naming them (hook.device_command).
 DEVICE_NODES = ("/dev/tenstorrent",)
 SSH_CHECK_S = 5             # route_problem's ssh -G and name lookup, each
 

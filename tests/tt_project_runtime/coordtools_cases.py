@@ -800,7 +800,7 @@ def test_the_git_wrapper_refuses_a_coordinators_push_however_it_is_built(tmp_pat
 
 
 def test_a_coordinator_run_holds_no_device_and_the_device_rule_binds_it(env, tmp_path, monkeypatch):
-    from ttp import coordtools, machines, sandbox
+    from ttp import coordtools, machines
     _, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
     run = max((d for d in p.runs.iterdir() if d.name.isdigit()), key=lambda d: int(d.name))
     run_env = json.loads((run / "run.json").read_text())["env"]
@@ -813,25 +813,17 @@ def test_a_coordinator_run_holds_no_device_and_the_device_rule_binds_it(env, tmp
         time.sleep(0.05)
     _full_env(tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_NO_DEVICE", run_env["TTP_NO_DEVICE"])
-    monkeypatch.delenv("TTP_HOOK_REWRITE", raising=False)
     monkeypatch.setattr(machines, "device_host", lambda *a, **k: True)
-    monkeypatch.setattr(sandbox, "status", lambda: (["/sb/unshare", "--pid"], ""))
-    assert _decide(tmp_path, "Bash", command="pytest tests/x.py") == "deny"
-    assert _decide(tmp_path, "Bash", command="ttp clip -- ttp sandbox -- pytest tests/x.py") == "allow"
-    # Kept by decision: the session sets no HOOK_REWRITE, so the test run is denied with the sandboxed
-    # form as its hint, never rewritten (heavy device work goes to a worker).
-    from ttp import hook
-    from ttp.providers import claude
-    monkeypatch.setattr(claude.Claude, "hook_rewrites", lambda self: True)   # a CLI that could apply one
-    argv, _, _, p = _coord_argv(env, monkeypatch, {"mode": "on"})
-    run = max((d for d in p.runs.iterdir() if d.name.isdigit()), key=lambda d: int(d.name))
-    assert hook.HOOK_REWRITE not in _coord_settings(argv)["env"]
-    assert hook.HOOK_REWRITE not in json.loads((run / "run.json").read_text())["env"]
-    out, _ = coordtools.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "pytest tests/x.py"},
+    # No namespace: a test run goes as it is (the TT_VISIBLE_DEVICES mask hides the devices), a device
+    # command is refused outside a device lock and runs inside one.
+    assert _decide(tmp_path, "Bash", command="pytest tests/x.py") == "allow"
+    assert _decide(tmp_path, "Bash", command="tt-smi -r 0") == "deny"
+    assert _decide(tmp_path, "Bash", command="ttp lock box-device -- tt-smi -r 0") == "allow"
+    out, _ = coordtools.pre_tool_use({"tool_name": "Bash", "tool_input": {"command": "sudo tt-smi -glx_reset"},
                                       "cwd": str(tmp_path)})
     spec = out["hookSpecificOutput"]
     assert spec["permissionDecision"] == "deny" and "updatedInput" not in spec
-    assert "`ttp clip -- ttp sandbox -- pytest tests/x.py`" in spec["permissionDecisionReason"]
+    assert "ttp lock <device> -- <cmd>" in spec["permissionDecisionReason"]
 
 
 def _bash_guard_project(env, tmp_path, monkeypatch):
