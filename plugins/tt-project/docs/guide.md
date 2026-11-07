@@ -1120,7 +1120,19 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    cool-down, but that tier's route holds, with one normal notice naming the provider, tier and model,
    until `providers.chat.tiers.<tier>.model` changes or the daemon's model-free /models check (at
    most hourly while a tier routes) lists the model again. That check stores only the served ids and
-   its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold. Routed runs take worker slots under the `chat` gate (its
+   its time in the project state folder; `ttp status` and `ttp doctor` show them and any hold.
+   To keep work on the endpoint instead, set `providers.chat.model_ranking` to its model ids, smartest
+   first (for example by a public intelligence ranking you trust; empty by default, and nothing changes
+   without it). A routed start whose model is down, held as above or left out of the last good /models
+   check, then runs the highest-ranked model that check lists and that no run was refused, at the
+   tier's effort; its run's `route` record names the model it stands in for (`model_rank`). A stand-in
+   that is refused too is skipped for a day and the next one runs. A task's own model pin on `chat`
+   is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
+   model is served again. Each switch is one low alert; once the model is served again (the hold ends
+   or the check lists it) the next start runs it. With no ranked model served, or the whole endpoint
+   cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
+   Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start
+   work). Routed runs take worker slots under the `chat` gate (its
    `max_parallel`), not the core provider's; when `chat` has no free slot the run starts on the core
    provider instead, under its gate, with the reason `busy`. An answer that is not JSON is an
    endpoint fault too (`malformed`). A routed run that ends without a hand-off on its own (it timed
