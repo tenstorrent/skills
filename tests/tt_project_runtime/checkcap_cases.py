@@ -10823,19 +10823,24 @@ def test_checks_with_no_project_queue_behind_every_project_waiter(env, monkeypat
 
 
 def test_checks_with_no_project_hold_at_most_bare_slots_at_once(env, monkeypatch):
-    from ttp import checkcap
+    from ttp import checkcap, locks
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "3")
     first = checkcap.acquire(checkcap.label(None, "w"))
     try:
         assert first.f is not None
-        assert checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=0.2) is None, "one run with no project at once"
-        mine = checkcap.acquire(checkcap.label("pa", "w"), project_name="pa", max_wait_s=5)
-        assert mine is not None and mine.f is not None, "a project's run takes a free slot"
-        mine.close()
-        monkeypatch.setenv(checkcap.BARE_SLOTS_ENV, "2")
-        second = checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=5)
-        assert second is not None and second.f is not None
-        second.close()
+        alone = checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=5)
+        assert alone is not None and alone.f is not None, "with no project's run waiting the cap does not bind"
+        alone.close()
+        waiter = locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, "pa task #1 w", group="pa")
+        try:
+            assert checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=0.2) is None, \
+                "one run with no project at once while a project's run waits"
+            monkeypatch.setenv(checkcap.BARE_SLOTS_ENV, "2")
+            second = checkcap.acquire(checkcap.label(None, "w2"), max_wait_s=5)
+            assert second is not None and second.f is not None, "checks.bare_slots raises the cap"
+            second.close()
+        finally:
+            locks.dequeue(waiter)
     finally:
         first.close()
 

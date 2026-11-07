@@ -535,7 +535,7 @@ def order() -> dict:
 
 def bare_slots() -> int:
     """Host-wide slots runs with no project hold at once: TTP_CHECKS_BARE_SLOTS, else the account's
-    checks.bare_slots, else BARE_SLOTS; at least 1 (they still run once no project waits)."""
+    checks.bare_slots, else BARE_SLOTS; at least 1. The cap binds only while a project's run waits (_take)."""
     for v in (os.environ.get(BARE_SLOTS_ENV), (project.load_account_settings().get("checks") or {}).get("bare_slots")):
         if v not in (None, "") and (n := _number(v)) is not None:
             return max(n, 1)
@@ -545,6 +545,11 @@ def bare_slots() -> int:
 def _bare_held(every: list[Path]) -> int:
     """Slots among `every` held now by a run with no project (its label's checks_project empty)."""
     return sum(1 for r in locks.holder_records(every) if "checks_project" in r and not r["checks_project"])
+
+
+def _project_waits() -> bool:
+    """A run of some project waits in the host-wide queue (its ticket has a group)."""
+    return any(locks.ticket_group(t) for t in locks.queued(slot_dir(), RESOURCE))
 
 
 def aged_before(now: float | None = None) -> float:
@@ -1889,7 +1894,8 @@ def _take(n: int, ps: list[Path], every: list[Path], holder: str, what: str, sam
     if room <= 0 or cores_short(every) or diskgate.saturated():
         return None
     if label is not None and "checks_project" in label and not label["checks_project"] \
-            and _bare_held(every) >= bare_slots():   # a run with no project: at most bare_slots() at once
+            and _bare_held(every) >= bare_slots() and _project_waits():
+        # a run with no project: at most bare_slots() at once while a project's run waits
         return None
     f = locks.try_take(ps, holder, what, key=same, extra=label)
     if f is None and (x := extra(n)):

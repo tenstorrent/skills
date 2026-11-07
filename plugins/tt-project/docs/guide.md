@@ -1917,7 +1917,11 @@ session and stateless coordinators on every provider.
   place and waits; running checks and the push branch's checks (its priority slot) go on. `ttp checks --slot-status` shows the values
   and the reason. A set cap wins: `ttp config
   --account checks.host_max N` (0 turns the cap off) or `TTP_CHECKS_HOST_MAX`; it is one value for every
-  project (a project's own copy is ignored and `ttp config checks.host_max` shows the account's). While
+  project (a project's own copy is ignored and `ttp config checks.host_max` shows the account's). A run with
+  no task takes the task and project of the project run it was started under; one with none queues behind
+  every project's waiter and, while one waits, such runs hold at most `checks.bare_slots` slots (default 1).
+  `ttp checks status` flags a holder that has held its slot `checks.idle_hold_s` (default 600) with no test
+  using CPU and names `ttp checks-yield`; it stops nothing. While
   the 1-minute load average is under half the cores, up to `checks.load_extra` more slots open (default 2,
   0 turns them off); check commands (`ttp checks`, push checks, pool shards, and on a remote or spill check host too, where it has the tools) run under `nice -n 19`/`ionice -c3` (idle IO), while the daemon, coordinator and workers keep their normal priority; `checks.nice` false, per project (`ttp config <project> checks.nice false`) or account, runs them at normal priority (`checks.nice` N, 0-19, sets the level; `checks.ionice` `idle` or `best-effort[:0-7]`; both per project or account). Each check
   run also takes test-worker slots from a host pool shared by all projects (testslots: default half the cores, at
