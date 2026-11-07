@@ -17,11 +17,11 @@ database), nothing uncommitted is left in them and no detached job or `ttp push`
 daemon's own uncommitted memory writes there are committed first (_commit_memory). A merge that
 conflicts, or that git refuses over uncommitted changes there, is undone and kept for the next
 pass (sweep), and reported to the coordinator once per branch head (a refusal only while no harness
-run works in the checkout). Before it merges, an uncommitted copy in the checkout of a file the branch
-changed is set aside when it equals one of the branch's versions of that file since the merge base,
-and only when every such copy does and no other staged change makes git refuse (_settle): backed up under state/harness-land-backups/, put back to HEAD, then the merge writes the
-branch's version; every other uncommitted file is left alone. A conflict is merged again only once its branch head or the harness HEAD
-moved: each try briefly leaves MERGE_HEAD in the live checkout, in the way of `ttp upgrade`. A merge
+run works in the checkout). The merge is made aside and the checkout only moves forward to it: the
+ref first, then git updates the files that still match the old HEAD (_fast_forward). An uncommitted
+copy there of a file the merge changes lands as it is only when it already holds the merged content
+(staged, never rewritten); any other stops the land, named, and every uncommitted file is left alone.
+A conflict is merged again only once its branch head or the harness HEAD moved. A merge
 that changed runtime/ asks the daemon to restart, as `ttp restart` would."""
 from __future__ import annotations
 
@@ -40,7 +40,6 @@ IDENT = ["-c", "user.name=tt-project", "-c", "user.email=tt-project@localhost"]
 REPORTED_KEY = "harness_merge_reported"   # kv: task id -> the branch head a conflict was reported for
 CONFLICT_KEY = "harness_merge_conflicted"  # kv: task id -> [branch head, harness HEAD, "conflict"|"refused"] last seen
 MERGE_MSG = "tt-project: land harness task"   # the start of land's merge message (MERGE_MSG mid-merge)
-BACKUP_DIR = "harness-land-backups"   # state/<it>/<date>-t<id>/: the checkout's copies a land set aside
 SHA_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
 TASK_BRANCH_RE = re.compile(r"ttp/harness-t\d+")   # a harness task's own branch
 
@@ -193,26 +192,13 @@ def land(p: Project, tid: int, other: str = "") -> str:
             last = (p.db.kv(CONFLICT_KEY, {}) or {}).get(str(tid))
             if last == pair + ["conflict"]:
                 return "conflict-known"     # the same two commits conflict again: no merge until one moves
-            from .upjournal import _differs, _put_back, _touched
-            settled, backup = [], None
             # Merged aside, never in the checkout: a merge there that conflicts needs `merge --abort`
             # (a reset), which takes back what runs working in the checkout staged meanwhile.
             r, merged, conflicted = _merge_aside(p, tid, b, before)
             if merged:
-                settled, backup = _settle(p, tid, b)
-                touched = _touched(p.harness, before, merged)
-                clean = [f for f in touched if f not in _differs(p.harness, touched)]
-                with tree_writes(p.harness):   # a fast-forward: other files and staged changes stay
-                    r = _git(p.harness, "merge", "--ff-only", "-q", merged, timeout=120)
-                if r.returncode != 0 and _git(p.harness, "rev-parse", "HEAD").stdout.strip() == before:
-                    # git refused only after writing them (the template guard on main refuses a branch that
-                    # holds a template merge): left there, they fail `ttp upgrade --apply`'s fast-forward
-                    _put_back(p.harness, clean)
-                    _restore(p, settled, backup)   # not landed: the checkout keeps its copies as they were
+                r = _fast_forward(p, tid, before, merged)
         if r.returncode != 0:
             said = (r.stdout + r.stderr).strip()
-            if settled:
-                said += f" (land set aside and put back {', '.join(settled)}; backup in {backup})"
             # a refusal over files another live run is editing passes when it commits; else it needs a hand
             if conflicted or ("would be overwritten" in said and not checkout_busy(p, tid)):
                 # a refusal leaves no MERGE_HEAD and passes once the checkout's changes go: tried each pass
@@ -276,80 +262,71 @@ def _drop_aside(p: Project, aside: Path) -> None:
     _git(p.harness, "worktree", "prune")
 
 
-def _settle(p: Project, tid: int, b: str) -> tuple[list[str], Path | None]:
-    """Set aside the checkout's uncommitted copies (changed or untracked) of files branch `b` changed
-    since its merge base whose content equals one of the branch's versions there (its head's or an
-    earlier one): git would refuse the merge over them though they hold nothing the branch lacks. Only
-    when every such copy qualifies (none a deletion, a symlink, other content or a staged entry that
-    differs from both HEAD and the working copy) and no other staged change blocks a merge that is not a
-    fast-forward, else none: git refuses as before. Each is copied to a
-    dated backup folder under the state, then put back to HEAD (an untracked one removed). Every other uncommitted file is left alone, and nothing while another harness run works
-    in the checkout (its edits are its own). Returns the files and the backup folder."""
-    if checkout_busy(p, tid):
-        return [], None
-    base = _git(p.harness, "merge-base", "HEAD", b).stdout.strip()
-    if not base:
-        return [], None
-    versions: dict[str, set[str]] = {}
-    out = _git(p.harness, "log", "-z", "--raw", "--no-abbrev", "--no-renames", "--format=", f"{base}..{b}")
-    words = [w.strip("\n") for w in out.stdout.split("\0")] if out.returncode == 0 else []
-    for meta, f in zip(words, words[1:]):
-        if meta.startswith(":") and len(meta.split()) >= 5 and set(meta.split()[3]) != {"0"}:
-            versions.setdefault(f, set()).add(meta.split()[3])   # the blob a branch commit left at f
-    if not versions:
-        return [], None
-    st = _git(p.harness, "--literal-pathspecs", "status", "--porcelain", "-z", "--no-renames",
-              "--untracked-files=all", "--", *sorted(versions))
-    if st.returncode != 0:
-        return [], None
-    # all or nothing: one copy that cannot go keeps git refusing, so setting the rest aside on every
-    # retry would only churn the checkout and the backups
-    moves = set(_git(p.harness, "diff", "-z", "--name-only", "--no-renames", "HEAD", b).stdout.split("\0"))
-    settled = []
-    for e in st.stdout.split("\0"):
-        if len(e) < 4 or e[3:] not in moves:
-            continue   # a file the merge leaves as HEAD has it: never in git's way
-        xy, f = e[:2], e[3:]
-        fp = p.harness / f
-        if (f not in versions or "D" in xy or xy[0] not in " ?" and xy[1] != " "
-                or fp.is_symlink() or not fp.is_file()):
-            return [], None   # a deletion, or staged content the backup of the working copy would lose
-        blob = _git(p.harness, "--literal-pathspecs", "hash-object", "--", f).stdout.strip()
-        if blob not in versions[f]:
-            return [], None
-        settled.append(f)
-    if not settled:
-        return [], None
-    staged = set(_git(p.harness, "diff", "--cached", "--name-only", "-z", "--no-renames", "HEAD").stdout.split("\0"))
-    if (staged - set(settled) - {""}
-            and _git(p.harness, "merge-base", "--is-ancestor", "HEAD", b).returncode != 0):
-        return [], None   # git refuses a non-fast-forward merge over any staged change, wherever it is
-    backup = p.state / BACKUP_DIR / f"{time.strftime('%Y-%m-%d-%H%M%S')}-t{int(tid)}"
-    for f in settled:
-        src = p.harness / f
-        durable_write(backup / f, src.read_bytes(), mode=src.stat().st_mode & 0o777)
-    with tree_writes(p.harness):   # back to HEAD's version, an untracked one removed (names taken literally)
-        for f in settled:
-            if _git(p.harness, "cat-file", "-e", f"HEAD:{f}").returncode == 0:
-                _git(p.harness, "--literal-pathspecs", "checkout", "HEAD", "--", f)
-            else:
-                _git(p.harness, "--literal-pathspecs", "rm", "-q", "--cached", "--ignore-unmatch", "--", f)
-                (p.harness / f).unlink(missing_ok=True)
-    from .daemon import log
-    log(p, f"harness worktree of task {tid}: set aside {len(settled)} uncommitted cop"
-           f"{'y' if len(settled) == 1 else 'ies'} equal to branch {b}'s content ({', '.join(settled)}); "
-           f"backup in {backup}")
-    return settled, backup
-
-
-def _restore(p: Project, settled: list[str], backup: Path | None) -> None:
-    """Put the copies _settle set aside back into the checkout (the merge did not land); the backup stays."""
-    if not settled or backup is None:
-        return
-    with tree_writes(p.harness):
-        for f in settled:
-            src = backup / f
-            durable_write(p.harness / f, src.read_bytes(), mode=src.stat().st_mode & 0o777)
+def _fast_forward(p: Project, tid: int, before: str, merged: str) -> subprocess.CompletedProcess:
+    """Move the harness checkout from `before` to its descendant `merged` without writing over anything
+    uncommitted there: never `checkout --`, reset, stash or merge --abort. The ref moves first (a refusal,
+    such as the template guard's, then leaves every file as it was), then git's two-tree read-tree updates
+    only files that still match `before` and refuses over any other. An uncommitted copy of a file the
+    merge changes lands as it is only when it already holds the merged content (its index entry, or its
+    working copy over an index entry still at `before`'s): that one is staged, never rewritten, and only
+    while no other harness run works in the checkout (its copies are its own). Any other such copy stops
+    the land and is named; a refusal after staging takes the staging back. Returns git's answer."""
+    h = p.harness
+    raw = _git(h, "diff", "-z", "--raw", "--no-renames", "--no-abbrev", before, merged)
+    words = raw.stdout.split("\0")
+    ends: dict[str, tuple] = {}   # path -> (before's (mode, blob) or None, merged's)
+    for meta, f in zip(words[0::2], words[1::2]):
+        m = meta.lstrip(":").split()
+        if raw.returncode == 0 and len(m) >= 5:
+            ends[f] = (None if set(m[2]) == {"0"} else (m[0], m[2]), None if set(m[3]) == {"0"} else (m[1], m[3]))
+    index: dict[str, tuple] = {}
+    for e in _git(h, "ls-files", "-s", "-z").stdout.split("\0"):
+        meta, _, f = e.partition("\t")
+        if f in ends:
+            mode, blob, stage = meta.split()
+            index[f] = (mode, blob) if stage == "0" and f not in index else ("conflicted", "")
+    unstaged = set(_git(h, "diff", "-z", "--name-only", "--no-renames").stdout.split("\0"))
+    stage, keep = [], []
+    for f, (old, new) in sorted(ends.items()):
+        cur, fp = index.get(f), h / f
+        if cur == old and f not in unstaged and not (cur is None and os.path.lexists(fp)):
+            continue   # as `before` has it: git updates it
+        if cur == new or new is None and cur in (old, None) and not os.path.lexists(fp):
+            continue   # already the merged content staged (any further edit stays), or already deleted
+        if (new is not None and cur in (old, None) and not fp.is_symlink() and fp.is_file()
+                and _git(h, "hash-object", "--", f).stdout.strip() == new[1]):
+            stage.append((f, cur))
+            continue
+        keep.append(f)
+    if keep or stage and checkout_busy(p, tid):
+        return subprocess.CompletedProcess([], 1, "", "Your local changes to the following files would be "
+                                           "overwritten by merge (land left them as they are):\n\t"
+                                           + "\n\t".join(keep or [f for f, _ in stage]))
+    with tree_writes(h):
+        for f, _ in stage:
+            _git(h, "update-index", "--add", "--", f)
+        r = _git(h, "read-tree", "-m", "-u", "-n", before, merged, timeout=120)   # would git refuse?
+        if r.returncode != 0:
+            r.stderr = ("Your local changes would be overwritten by merge (land left them as they are): "
+                        + r.stderr)
+        else:
+            r = _git(h, "update-ref", "-m", f"merge {merged}: Fast-forward", "HEAD", merged, before)
+            if r.returncode == 0:
+                r = _git(h, "read-tree", "-m", "-u", before, merged, timeout=120)
+                if r.returncode != 0:   # refused meanwhile: the ref goes back, the files were not written
+                    _git(h, "update-ref", "-m", "land refused: back", "HEAD", before, merged)
+        if r.returncode != 0:
+            for f, cur in stage:
+                if cur is None:
+                    _git(h, "update-index", "--force-remove", "--", f)
+                else:
+                    _git(h, "update-index", "--cacheinfo", f"{cur[0]},{cur[1]},{f}")
+    if stage and r.returncode == 0:
+        from .daemon import log
+        log(p, f"harness worktree of task {tid}: landed with {len(stage)} uncommitted cop"
+               f"{'y' if len(stage) == 1 else 'ies'} that already held the merged content, left as "
+               f"they were ({', '.join(f for f, _ in stage)})")
+    return r
 
 
 def _commit_memory(p: Project, tid: int) -> None:

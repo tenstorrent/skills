@@ -300,13 +300,13 @@ only in the feed and never under "needs you".
   whose branch still holds unmerged commits, or a branch that does not fast-forward),
   with `TTP_HARNESS_LANDING_WHY` saying what the worker can do. A harness-landed check should fail only
   on `refused`: a worker's sandbox cannot write the harness checkout, so it can never merge there itself.
-  Before that merge, an uncommitted copy in the harness checkout (changed or untracked) of a file the
-  branch changed, equal to the branch's head version or an earlier one since the merge base, is backed
-  up to `state/harness-land-backups/<date>-t<id>/` and put back so git does not refuse; any other
-  uncommitted file is left alone, and a merge still refused puts the copies back and names them.
-  This happens only when it clears every such copy: one that differs, a deletion, or staged content
-  unlike its working copy, or (for a merge that is not a fast-forward) any other staged change, means
-  none is set aside and git refuses as before, once per pass.
+  The merge is made in a scratch worktree; the harness checkout then only moves forward to it, the
+  ref first (a refusal, such as the template guard's, writes no file), and git updates only files that
+  still match the old HEAD. Land never runs `checkout --`, reset, stash or merge --abort there. An
+  uncommitted copy (changed, staged or untracked) of a file the merge changes lands as it is only when
+  it already holds the merged content: it is staged, never rewritten. Any other such copy (other
+  content, an earlier branch version, a deletion, a symlink) stops the land and is named once per
+  branch head; every uncommitted file is left alone.
 - A task that has ended (done, failed, cancelled, exhausted) can still leave processes behind. Its own
   ones are those of your user whose environment carries this project's `TTP_PROJECT`, the task's
   `TTP_TASK` and a `TTP_RUN_DIR` of one of its recorded runs. When such processes are the only ones with a
