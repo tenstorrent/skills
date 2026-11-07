@@ -7914,6 +7914,11 @@ class Daemon:
         if run := schedrun.current():   # what `ttp schedules <p> run` prints (schednow)
             run.rc, run.stdout = out.returncode, text
         ok = out.returncode in (0, 1)
+        # A crash at a normal exit code reports nothing either: no stdout, and exit 1 with stderr or a
+        # traceback at exit 0. It is a failed run, not a clean one: its issues, receipts and mutes stand.
+        own = (out.stderr or "")[len(getattr(out, "rerun_note", "") or ""):].strip()
+        if ok and not text and own and (out.returncode == 1 or "Traceback (most recent call last)" in own):
+            ok = False
         failed = not ok and not text   # the daemon reports the failure itself
         if failed:
             text = f"watcher command failed rc={out.returncode}: {output_tail(out.stderr) or '(no stderr)'}"
@@ -7969,6 +7974,8 @@ class Daemon:
             scr.settle_mutes(self.p.db, source, started)   # muted conditions it no longer reported cleared
         # Error lines are not observations: a run of only errors is a check that could not run, a failing
         # status (schedule.failing) in the list, ttp status and the web app.
+        if failed:   # its stderr tail in `ttp schedules`
+            return f"error: watcher command failed rc={out.returncode}: {output_tail(out.stderr, 240) or '(no stderr)'}"
         if n and errs == n:
             return f"error ({n} lines: check could not run)"
         return f"ok ({n - errs} observations, {errs} errors)" if errs else f"ok ({n} observations)"
@@ -14064,12 +14071,42 @@ class Daemon:
                 cur = {**cur, "since": None}   # the wait ended or started over: decided
             stalegate.record(db, str(d.get("wait")), seen, cur, run)
 
+    def _stale_ended(self, d: dict, task: dict | None, now: float) -> str | None:
+        """Why the wait a queued wait_stale event (`d`) asked about is over, so no turn can act on it: its
+        task is gone or left the queue, handed off anew, was woken, had its probe changed or passed; else None."""
+        if not task:
+            return "its task is gone"
+        if task["status"] != "queued":
+            return f"its task is {task['status']}"
+        prev = load_result(task["result"])
+        probe = str(prev.get("retry_when") or "")
+        if prev.get("status") != "waiting" or not probe.strip():
+            return "its task no longer waits on a probe"
+        if stalegate.wait_key(task["id"], prev.get("waiting_since") or 0) != d.get("wait"):
+            return "its task handed off a new wait"
+        if prev.get("woke"):
+            return f"its task was woken: {str(prev['woke'])[:200]}"
+        seen = d.get("snap") if isinstance(d.get("snap"), dict) else {}
+        if "probe" in seen and probe.strip() != str(seen["probe"] or "").strip():
+            return "its probe was changed"
+        rc, at, by = self._probe_rc.get(task["id"], (None, 0.0, ""))
+        if rc == 0 and by == probe and at >= float(prev.get("waiting_since") or 0):
+            return "its probe passed"
+        return None
+
     def _stale_queued(self, queued: list[dict], now: float) -> list[dict]:
-        """Queued wait_stale events the gate settles without a turn (stalegate.py) are handled here."""
+        """Queued wait_stale events the gate settles without a turn (stalegate.py) are handled here, and so
+        are those whose wait ended since they were raised (_stale_ended), with the reason in their data."""
         db, keep = self.p.db, []
         for e in queued:
             d = stalegate.event_data(e.get("data")).get("wait_stale") if e["kind"] == "wait_stale" else None
             task = db.task(e["task"]) if d and e["task"] else None
+            if d and (ended := self._stale_ended(d, task, now)):
+                data = {**stalegate.event_data(e.get("data")), "settled": {"why": ended, "ts": now}}
+                db.x("UPDATE events SET status='handled', data=? WHERE id=? AND status='queued'",
+                     (json.dumps(data), e["id"]))
+                log(self.p, f"wait_stale event {e['id']} settled without a turn: the wait ended ({ended})")
+                continue
             if task and task["status"] == "queued":
                 prev = load_result(task["result"])
                 wait, cur, fresh = self._stale_snap(task, prev, now)
