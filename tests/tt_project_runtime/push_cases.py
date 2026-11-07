@@ -16964,6 +16964,79 @@ def test_a_push_batch_carries_a_pass_onto_a_tip_that_moved_only_in_ignored_paths
         assert len(runs) == 2 and "carried" not in m["checks"]
 
 
+def _task_pass(p, repo, cmds, targeted=False, suite=False):
+    """Record a task's own `ttp checks` pass of `cmds` on HEAD as cli._record_pass does after a run: per
+    command its check_env_parts, and the head and its merge base with the push target. `targeted`: the
+    run was testpick's narrowed one (the check with a test-selecting env); `suite`: one command's suite pass."""
+    from ttp import cli, push, pushpass, testpick
+    cmds = push.check_list(cmds)
+    if targeted:
+        cmds = [push.Check(str(c)) for c in cmds]
+        for c in cmds:
+            c.env, c.targeted = ((testpick.FILES_ENV, "tests/test_a.py"),), True
+    (run := repo.parent / "task-run").mkdir(exist_ok=True)
+    run_env = push.check_env("checks", run_dir=str(run))
+    parts = pushpass.check_env_parts(repo, cmds, run_env)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    cli._record_pass(p, pushpass.tree_of(repo, "HEAD"), cmds, "candidate", "", [pushpass.digest(x) for x in parts],
+                     parts, suite=suite, at=None if suite else cli._carry_ref(repo, head, "origin/proj"))
+
+
+@pytest.mark.parametrize("case", ["same", "covered_upstream", "ignored_upstream", "targeted", "suite", "other_cmds"])
+def test_a_push_batch_carries_a_tasks_own_full_checks_pass_of_the_same_change(env, monkeypatch, capsys, case):
+    """A task's own full `ttp checks` pass of the push checks on its head carries to the batch's head of that
+    change (the batch's version bump aside) when its patch is the same and the upstream delta misses what the
+    check covers: the check does not run again and the marker says so. A delta in a covered path, a targeted
+    run, a single command's suite pass or a pass of other commands runs it."""
+    log = env["tmp"] / "checked"
+    check = {"run": f"git rev-parse HEAD >> {log}", "ignore_paths": ["docs/**"]}
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [check])
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    cmds = [check] if case != "other_cmds" else [check, "true"]
+    monkeypatch.setenv("TTP_RUN_ID", "41")
+    _task_pass(p, repo, cmds[1:] if case == "other_cmds" else cmds, targeted=case == "targeted", suite=case == "suite")
+    if case in ("covered_upstream", "ignored_upstream"):
+        (other / "docs").mkdir(exist_ok=True)
+        _commit(other, "docs/late.md" if case == "ignored_upstream" else "src.txt", "x\n")
+        _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    out = capsys.readouterr().out
+    ran = log.read_text().split() if log.exists() else []
+    if case in ("same", "ignored_upstream"):
+        assert ran == [], out
+        [line] = m["checks"]["carried"]
+        delta = "docs/late.md" if case == "ignored_upstream" else "nothing"
+        assert line.startswith(f"verdict carried from {heads[0][:10]}; upstream delta touched only: {delta} "
+                               "(the task's own ttp checks run 41)"), line
+        assert line in out
+    else:
+        assert len(ran) == 1 and not m["checks"].get("carried"), out
+
+
+def test_a_batch_judges_a_task_pass_without_its_own_version_bump_only(tmp_path):
+    """_bump_only: the replayed head under the batch's bump when the bump touched only the version files and
+    changesets; None when it changed anything else; the head itself when the batch made no bump."""
+    from ttp import batch
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    def commit(path, text):
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+        _git_out(repo, "add", "-A")
+        _git_out(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", path)
+        return _git_out(repo, "rev-parse", "HEAD")
+    under = commit("a.txt", "a\n")
+    commit("v.json", "1\n")
+    clean = commit(".changeset/x.md", "x\n")
+    dirty = commit("src.py", "y\n")
+    b = batch.Batch.__new__(batch.Batch)
+    b.wt, b.cfg = repo, {"files": ["v.json"], "changeset_dir": ".changeset"}
+    b.unbumped = {clean: under, dirty: under}
+    assert b._bump_only(clean) == under
+    assert b._bump_only(dirty) is None
+    assert b._bump_only(under) == under
+
 def test_the_coordinator_and_guide_state_the_verdict_carry_rule_without_a_user_step():
     import re
     root = Path(__file__).resolve().parents[1] / "plugins" / "tt-project"

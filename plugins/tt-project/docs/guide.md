@@ -1641,8 +1641,11 @@ session and stateless coordinators on every provider.
   queue batch marker) say `verdict carried from <sha>; upstream delta touched only: <paths>`. A
   delta touching a covered path reruns the check as usual. `ignore_paths` only decides this reuse:
   it never narrows what a check covers or whether it runs on a fresh head, so setting it is not a
-  rescoping and a coordinator may set it itself. Only passes the push or the push queue made carry,
-  never passes recorded by `ttp checks`.
+  rescoping and a coordinator may set it itself. Passes the push or the push queue made carry; of
+  the passes `ttp checks` records, only a task's own full candidate run of the push checks carries,
+  to that change's head in a push queue batch (judged without the batch's own version bump, which
+  touches only the version files and a changeset), with `(the task's own ttp checks run <id>)`
+  added to the line. A targeted run, a single command's pass or a batch of several changes does not.
 - Config warnings flag checks that pin a full commit SHA, use an absolute temporary environment,
   or name a target missing from the branch tip without `if_exists`. Declare applicability with
   `if_exists`/`if_changed` and retain coverage for the code the check protects. Warnings do not skip

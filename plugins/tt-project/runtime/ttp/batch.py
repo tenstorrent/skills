@@ -8,8 +8,10 @@ replays the entries in order onto the target's tip in a worktree of its own (`wo
 settles the conflicts that need no judgment: version lines, both sides adding different lines at
 one spot, and both sides changing different lines that git calls a conflict only because they are
 adjacent. The marker counts the entries that conflicted, were settled and were sent back. It bumps the version once for all entries, runs the push checks once on the result and
-pushes it without force. It always runs them itself and never reads the passes `ttp checks` records;
-it skips only a check a batch recorded passing on the same tree, command and environment (pushpass). When the checks fail, a binary search over prefixes finds the first failing
+pushes it without force. It always runs them itself; it skips only a check a batch recorded passing on the
+same tree, command and environment (pushpass), one carried from another tip, or a task's own full `ttp checks`
+pass of the push checks on the same change (pushpass.task_carriable) where the patch is unchanged and nothing the
+check covers moved besides the batch's version bump (_task_carried). When the checks fail, a binary search over prefixes finds the first failing
 entry, and the passing prefix is pushed. A failed check is judged as `ttp checks` judges one
 (gatejudge): its failing pytest ids not yet judged at that head are rerun once there, those failing
 again on the tip alone (the base, this host) up to TIP_RERUNS times; a base result saved for the tip
@@ -1455,6 +1457,7 @@ class Batch:
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
         self._settling: tuple[list[str], set, list] = ([], set(), [])   # files, kinds and doc merges of the replay running
         self.rescued: dict[int, str] = {}      # entry index -> its head, replayed again without a blamed entry
+        self.unbumped: dict[str, str] = {}     # a head with this batch's version bump -> the replayed head under it
         self.held: dict[int, dict] = {}        # entry index -> the token scope a refused push needs for it
         self.scopes: list[dict] = []           # those refusals: scope, files, entry ids, check (scopehold)
         self.retried = False                   # this round checked the entries after a blamed one (_rescue)
@@ -2107,7 +2110,9 @@ class Batch:
             raise Refused(f"delivery.version_bump: the bump commit failed ({_last(r.stderr, 3)}); not pushing")
         say(f"bumped {package or 'the version'} to {new} for {k} entr{'y' if k == 1 else 'ies'}"
             + (" with a batch changeset" if wrote else ""))
-        return _git(self.wt, "rev-parse", "HEAD").stdout.strip()
+        bumped = _git(self.wt, "rev-parse", "HEAD").stdout.strip()
+        self.unbumped[bumped] = h
+        return bumped
 
     def _version(self, head: str) -> str | None:
         if not self.cfg:
@@ -2165,14 +2170,14 @@ class Batch:
         self.checks["runs"] += 1
         env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
         tree, run = pushpass.tree_of(self.wt, head), []
-        for cmd in todo:
+        for n, cmd in enumerate(todo):
             parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
             eid = pushpass.digest(parts)
             if hit := pushpass.passed(self.p, tree, str(cmd), eid):
                 say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
                 self.checks["reused"] = self.checks.get("reused", 0) + 1
                 self._passed(cmd)
-            elif carried := self._carried(head, cmd, parts):
+            elif carried := self._carried(head, cmd, parts) or self._task_carried(head, cmd, parts, todo[:n], env):
                 say(f"{carried}: {cmd}")
                 self.checks.setdefault("carried", []).append(f"{carried}: {cmd}")
                 self._passed(cmd)
@@ -2291,6 +2296,36 @@ class Batch:
             delta = verdictcarry.carry(self.wt, cmd, e["tip"], e["head"], self.tip or "", head, exclude)
             if delta is not None:
                 return verdictcarry.line(e["head"], delta)
+        return ""
+
+    def _bump_only(self, head: str) -> str | None:
+        """The replayed head under `head` when `head` is it plus this batch's own version bump (_head)
+        touching only delivery.version_bump's files and changesets, or `head` itself with no such bump;
+        None when the bump commit changed anything else or cannot be read."""
+        under = self.unbumped.get(head)
+        if under is None:
+            return head
+        names = verdictcarry._names(self.wt, under, head)
+        if names is None or not self.cfg:
+            return None
+        own = {*(self.cfg.get("files") or ()), *([self.cfg["changeset_file"]] if self.cfg.get("changeset_file") else [])}
+        csdir = (self.cfg.get("changeset_dir") or "").strip("/")
+        return under if all(f in own or (csdir and f.startswith(csdir + "/")) for f in names) else None
+
+    def _task_carried(self, head: str, cmd, parts: dict, before: list, env: dict) -> str:
+        """The record line of a full pass of `cmd` a task's own `ttp checks` recorded (pushpass.task_carriable:
+        the same push checks in order, never a targeted run or a single command's suite pass) that carries
+        to `head` under verdictcarry's rule, or "". It is judged on the replayed head under this batch's
+        version bump (_bump_only): the bump is the batch's own mechanical edit of the version files and a
+        changeset, so the change's patch must match the one that passed and the upstream delta must miss
+        what the check covers; a batch of several entries has another patch than any one task's."""
+        if cmd == STALE or not (under := self._bump_only(head)):
+            return ""
+        exclude = push.exclude_list(self.d.get("push_exclude_paths"))
+        for e in pushpass.task_carriable(self.p, self.wt, [*before, cmd], parts, env)[:CARRY_TRIES]:
+            delta = verdictcarry.carry(self.wt, cmd, e["tip"], e["head"], self.tip or "", under, exclude)
+            if delta is not None:
+                return f"{verdictcarry.line(e['head'], delta)} (the task's own ttp checks run {e.get('run') or '?'})"
         return ""
 
     def _rerun_ids(self, cmd, rc: int | None, tail: str) -> list[str]:

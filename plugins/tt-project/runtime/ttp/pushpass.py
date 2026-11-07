@@ -7,8 +7,9 @@ A pass is keyed on the tree of the checked head, the exact check command and env
 interpreters and venv the check would use (by content, version and installed packages, not by where
 they live) and the tip it was checked against, so another worktree of the same tree reuses it. Only
 passes are recorded: a failure, a check skipped by if_exists or if_changed and one never run leave nothing. The
-batch reads only what a batch recorded here, never the passes `ttp checks` records; it trusts the
-project's state as it trusts its own markers there, which name the heads it pushes. The store keeps
+batch trusts the project's state as it trusts its own markers there, which name the heads it pushes. Of
+the passes `ttp checks` records it reads only a task's full candidate run of the push checks
+(task_carriable), and only to carry it to that change's own head in the batch under verdictcarry's rule. The store keeps
 the newest MAX entries younger than MAX_AGE_S. A pass also keeps the head and tip it was checked on,
 so the same change rebased onto a newer tip can carry it (carriable, verdictcarry) when the rebase
 changed nothing the check covers; such a carried pass is recorded for the new tree marked "carried"
@@ -312,6 +313,36 @@ def carriable(p: Project, cmd: str, parts: dict) -> list[dict]:
         old = e.get("parts")
         if e.get("cmd") == cmd and e.get("head") and e.get("tip") and isinstance(old, dict) \
                 and {k: v for k, v in old.items() if k != "tip"} == new:
+            out.append(e)
+    return out
+
+
+TASK_STORE = "check_passes.json"   # cli.CHECK_PASSES: the passes `ttp checks` records
+
+
+def task_carriable(p: Project, wt: Path, cmds: list, parts: dict, env: dict) -> list[dict]:
+    """The passes a task's own `ttp checks` recorded (TASK_STORE), newest first, that verdictcarry may carry
+    to the last of `cmds` (the batch's applicable push checks up to it, in order): a candidate run on a
+    known head and tip whose commands began with exactly `cmds` (or with that check alone), and whose
+    environment for it was the batch's, `parts` (env_parts) plus CHECK_ENV_VARS as `env` sets them, in
+    every part but the tip. A targeted run (testpick: the check with a test-selecting env) or a reduced
+    one records other commands, and a suite pass of one command keeps no head: neither carries. Its
+    "tip" is the merge base of that head with the push target, so the upstream delta is from there."""
+    from .cli import _commands_hash
+    if not cmds:
+        return []
+    roots = _roots(wt)
+    new = part_digests({**parts, "vars": {k: _local(env.get(k, ""), roots) for k in CHECK_ENV_VARS}})
+    new.pop("tip", None)
+    keys = {_commands_hash(cmds): len(cmds) - 1, _commands_hash(cmds[-1:]): 0}
+    out = []
+    for e in reversed(_fresh(_load(p.state / TASK_STORE), time.time())):
+        if e.get("suite") or e.get("purpose", "candidate") != "candidate" or not (e.get("head") and e.get("tip")):
+            continue
+        at = next((keys[k] for k in (e.get("commands"), *(e.get("prefixes") or ())) if k in keys), None)
+        got = e.get("env_parts")
+        old = got[at] if at is not None and isinstance(got, list) and at < len(got) else None
+        if isinstance(old, dict) and {k: v for k, v in old.items() if k != "tip"} == new:
             out.append(e)
     return out
 
