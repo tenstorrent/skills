@@ -378,6 +378,8 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
     import importlib.util
     from ttp import cellenv
     monkeypatch.setenv("PIP_USER", "1")
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-p ttp_no_such_plugin")
+    monkeypatch.setenv("PYTEST_PLUGINS", "ttp_no_such_plugin")
     one, two = cellenv.make(tmp_path / "c1" / "venv"), cellenv.make(tmp_path / "c2" / "venv", seed=())
     assert one != two and (one / "pyvenv.cfg").is_file() and (two / "pyvenv.cfg").is_file()
     with pytest.raises(cellenv.Unavailable, match="never reused"):
@@ -386,6 +388,7 @@ def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_
         env = cellenv.env(venv, dict(os.environ))
         assert env["PATH"].split(os.pathsep)[0] == str(venv / "bin") and env["VIRTUAL_ENV"] == str(venv)
         assert env["PYTHONNOUSERSITE"] == "1" and env["PIP_REQUIRE_VIRTUALENV"] == "1" and "PIP_USER" not in env
+        assert "PYTEST_ADDOPTS" not in env and "PYTEST_PLUGINS" not in env
         assert pathlib.Path(env["PYTHONUSERBASE"]).parent == venv.parent
         r = subprocess.run(["python3", "-c", "import site, sys; print(sys.prefix, site.ENABLE_USER_SITE)"],
                            env=env, capture_output=True, text=True, timeout=60)
@@ -411,6 +414,8 @@ def test_bench_run_agent_and_grade_of_each_cell_run_in_venvs_of_their_own(env, t
     arms = {"opus": {"provider": "claude", "model": "m-one", "effort": "medium"},
             "glm": {"provider": "chat", "model": "m-two", "effort": "max"}}
     monkeypatch.setenv("PIP_USER", "1")
+    # A pytest that starts the run (ttp checks reruns added tests with `-p <plugin>`) hands the grade none of its own.
+    monkeypatch.setenv("PYTEST_ADDOPTS", "-p ttp_no_such_plugin")
     monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX + " && python3 -c 'import os, sys; print(\"PREFIX=\" + sys.prefix)'"
                        " > cellenv.txt && env >> cellenv.txt")
     show = "echo VENV=$VIRTUAL_ENV NUS=$PYTHONNOUSERSITE REQ=$PIP_REQUIRE_VIRTUALENV USER=${PIP_USER-unset}"

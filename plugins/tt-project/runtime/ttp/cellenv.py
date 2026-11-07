@@ -10,7 +10,8 @@ installed, with what they require (pytest by default): the cell gets today's cop
 path into the user site. env() gives the environment every process of the cell runs with: the
 venv's bin first on PATH, VIRTUAL_ENV set, PYTHONNOUSERSITE=1 (the user site never loads),
 PIP_REQUIRE_VIRTUALENV=1 (pip refuses to run outside a venv), PYTHONUSERBASE in the cell's folder
-(a `--user` install that gets past both lands there) and PIP_USER, PYTHONHOME and PYTHONPATH unset."""
+(a `--user` install that gets past both lands there) and PIP_USER, PYTHONHOME, PYTHONPATH,
+PYTEST_ADDOPTS and PYTEST_PLUGINS unset."""
 from __future__ import annotations
 
 import os
@@ -22,7 +23,9 @@ from importlib import metadata
 from pathlib import Path
 
 SEED = ("pytest",)
-DROP = ("PIP_USER", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV")
+# PYTEST_ADDOPTS and PYTEST_PLUGINS: a cell's pytest runs as on its own, never with the options or
+# plugins (and their import paths) of a pytest that started the run.
+DROP = ("PIP_USER", "PYTHONHOME", "PYTHONPATH", "VIRTUAL_ENV", "PYTEST_ADDOPTS", "PYTEST_PLUGINS")
 
 
 class Unavailable(RuntimeError):
