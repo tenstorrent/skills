@@ -7,9 +7,11 @@ from `processes` in /proc/stat, available memory, free disk under the project) a
 process tree: every process whose environment marks it as this project's (procowner.owns_env: its
 TTP_PROJECT, else its TTP_RUN_DIR) and the daemon with its own children. They are grouped by run
 (TTP_RUN_ID, with TTP_TASK_ID) and counted: processes, spawn rate, CPU cores used and memory (RSS).
-A run's spawn rate is the host's fork rate times the run's share of the new processes seen since the
-last sample (at least the new ones seen per second): a fork storm's short-lived processes are counted
-even when few of them live at a sample.
+A run's spawn rate is the new processes of its own seen per second since the last sample. Only when
+that alone reaches SPAWN_SEEN of the spawn limit is the run also given its share of the host's fork
+rate (from /proc/stat, which counts every process and thread any user creates), so a storm's
+short-lived processes count once the run is seen forking, and a storm the watch does not see the run
+make is never put on it.
 A run runs away when, at every sample for WINDOW_S, one limit holds: its spawn rate is at or above
 SPAWN_S, its processes at or above PROCS, or the host's load is at least LOAD_X times its cores while
 the run uses at least LOAD_SHARE of them. Then the daemon (act()) asks the run's supervisor to stop,
@@ -42,6 +44,7 @@ EVERY_S = 30.0
 BREACH_EVERY_S = 10.0   # sampled faster while a limit holds, so a runaway is stopped near WINDOW_S
 WINDOW_S = 60.0
 SPAWN_S = 1000.0        # new processes per second from one run
+SPAWN_SEEN = 0.1        # host forks are shared out to a run only while its own seen ones reach this share of SPAWN_S
 PROCS = 3000            # live processes of one run
 LOAD_X = 2.0            # host load over its cores ...
 LOAD_SHARE = 0.5        # ... while the run uses this share of them
@@ -166,7 +169,8 @@ class Watch:
             r["new"] += (pid, start) not in old if self.last else 0
         for r in runs.values():
             seen_s = r["new"] / dt
-            r["spawn_s"] = round(max(seen_s, (forks_s or 0) * r["new"] / new_all) if new_all else seen_s, 1)
+            backed = new_all and s["spawn_s"] and seen_s >= SPAWN_SEEN * s["spawn_s"]
+            r["spawn_s"] = round(max(seen_s, (forks_s or 0) * r["new"] / new_all) if backed else seen_s, 1)
             r["cpu"] = round(max(0, r["ticks"]) / TICK / dt, 2)
             r["why"] = _past(r, h, s) if r["run"] != "daemon" else ""
         self.last = {"ts": now, "forks": h["forks"], "procs": {(pid, v[5]): v[6] for pid, v in procs.items()}}

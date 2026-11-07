@@ -5,8 +5,10 @@ Each daemon runs `Daemon.check_self_watch` (runtime `selfwatch.py`) about every 
 - Host: load average against its cores, processes created per second (`processes` in /proc/stat),
   available memory and free disk under the project.
 - Own tree: every process whose environment carries this project's `TTP_PROJECT` (or a `TTP_RUN_DIR`
-  inside it), and the daemon with its children, grouped by `TTP_RUN_ID`: processes, spawn rate (the
-  host's fork rate times the run's share of new processes), CPU cores and RSS.
+  inside it), and the daemon with its children, grouped by `TTP_RUN_ID`: processes, spawn rate (its own
+  new processes seen per second; only once that reaches a tenth of `spawn_s` is it also given its share of
+  the host's fork rate, so host churn the watch does not see the run make is never put on it), CPU cores
+  and RSS.
 
 A run past a limit at every sample for `selfwatch.window_s` (60 s) is a runaway:
 

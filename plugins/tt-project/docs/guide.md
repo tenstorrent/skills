@@ -2607,7 +2607,8 @@ the pick order, so it takes the first starts. A resumed resource ramps only its 
   (selfwatch.py) does, for the project's own runs only: about every 30 s (`selfwatch.every_s`) each daemon samples
   the host's load against its cores, processes created per second, available memory and free disk, and its own
   process tree (every process whose TTP_PROJECT or TTP_RUN_DIR is this project's, and the daemon's children),
-  per run: processes, spawn rate, CPU cores and RSS. A run past a limit at every sample for `selfwatch.window_s`
+  per run: processes, spawn rate (its own new processes seen per second, plus its share of the host's fork rate
+  only once those reach a tenth of the limit), CPU cores and RSS. A run past a limit at every sample for `selfwatch.window_s`
   (60 s): `selfwatch.spawn_s` (1000 new processes/s), `selfwatch.procs` (3000 processes), or host load at
   `selfwatch.load_x` (2) times its cores while the run uses `selfwatch.load_share` (half) of them, is stopped: its
   supervisor is asked to stop, its own process groups get TERM and after `selfwatch.grace_s` (5 s) KILL (a group

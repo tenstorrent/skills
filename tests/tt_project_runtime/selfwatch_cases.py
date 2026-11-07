@@ -22,9 +22,11 @@ def _sw_proc(root, forks, procs, load="2.0", mem_kb=64 * 2**20):
             (d / "environ").write_bytes(b"\0".join(f"{k}={v}".encode() for k, v in env.items()) + b"\0")
 
 
-def _sw_world(tmp_path, n_own):
+def _sw_world(tmp_path, n_own, n_other=None):
     """This project's run 7 (task 42) with n_own processes in its own group 500, one of its processes in
-    group 950 beside another user's, another project's busy group 900 and the daemon (pid 100)."""
+    group 950 beside another user's, another project's busy group 900 and the daemon (pid 100); the
+    other project and the other user have n_other processes each (default n_own)."""
+    n_other = n_own if n_other is None else n_other
     base = tmp_path / "proj" / "tt-project"
     other = tmp_path / "other" / "tt-project"
     base.mkdir(parents=True, exist_ok=True)
@@ -33,14 +35,14 @@ def _sw_world(tmp_path, n_own):
     procs = {100: (1, 100, 50, {"PATH": "/bin"}), 101: (100, 100, 5, {"PATH": "/bin"}),
              500: (1, 500, 10, mine), 950: (1, 950, 10, None), 951: (950, 950, 10, mine)}
     procs.update({1000 + i: (500, 500, 10, mine) for i in range(n_own)})
-    procs.update({5000 + i: (1, 900, 10, {"TTP_PROJECT": str(other), "TTP_RUN_ID": "7"}) for i in range(n_own)})
-    procs.update({8000 + i: (950, 950, 10, None) for i in range(n_own)})
+    procs.update({5000 + i: (1, 900, 10, {"TTP_PROJECT": str(other), "TTP_RUN_ID": "7"}) for i in range(n_other)})
+    procs.update({8000 + i: (950, 950, 10, None) for i in range(n_other)})
     return base, procs
 
 
 def test_selfwatch_stops_its_own_runaway_run_after_the_window_and_leaves_other_processes_alone(tmp_path):
     from ttp import selfwatch
-    s = {**selfwatch.DEFAULTS, "procs": 0, "load_x": 0}
+    s = {**selfwatch.DEFAULTS, "spawn_s": 100.0, "procs": 0, "load_x": 0}
     root = tmp_path / "proc"
     base, procs = _sw_world(tmp_path, 3)
     _sw_proc(root, 1000, procs)
@@ -48,8 +50,10 @@ def test_selfwatch_stops_its_own_runaway_run_after_the_window_and_leaves_other_p
     first = w.step(s, 0.0)
     assert first["sampled"] and first["runaway"] == [] and first["host"]["forks_s"] is None, "no rate before two samples"
     assert first["tree"]["procs"] == 2 + 5 and first["tree"]["runs"] == 1, first["tree"]   # daemon 2 + run 7 (500, 951 and 3)
-    for t, n in ((30.0, 40), (60.0, 80), (90.0, 120)):
-        base, procs = _sw_world(tmp_path, n)
+    # Run 7 itself storms (about 13 new processes of its own seen per second, past a tenth of the
+    # limit), while another project's and another user's groups grow too.
+    for t, n in ((30.0, 400), (60.0, 800), (90.0, 1200)):
+        base, procs = _sw_world(tmp_path, n, n // 10)
         _sw_proc(root, 1000 + int(t) * 3400, procs, load="158")
         snap = w.step(s, t)
         assert snap["host"]["forks_s"] == 3400.0
@@ -58,7 +62,7 @@ def test_selfwatch_stops_its_own_runaway_run_after_the_window_and_leaves_other_p
             assert snap["runaway"] == [], "past the limit since 30 s: not before the window"
     r = snap["runaway"][0]
     assert r["run"] == "7" and r["task"] == "42" and r["spawn_s"] >= selfwatch.SPAWN_S and "processes/s" in r["why"]
-    assert r["procs"] == 122 and r["spawn_s"] < 3400, "only its share of the host's forks counts"
+    assert r["procs"] == 1202 and r["spawn_s"] < 3400, "only its share of the host's forks counts"
     sent = []
     done = selfwatch.stop(w, r, 0.0, kill=lambda t, sig, group: sent.append((t, sig, group)), sleep=lambda _s: None)
     import signal as _sig
@@ -139,3 +143,23 @@ def test_the_daemon_stops_its_own_runaway_marks_the_task_and_notifies_once(env, 
     snap = p.db.kv(selfwatch.KV)
     assert snap["stopped"]["run"] == "7" and "runaway" not in snap
     assert "stopped runaway run 7 (task #42)" in state_payload(p, p.db)["selfwatch"]
+
+
+def test_selfwatch_never_puts_a_storm_it_does_not_see_its_run_make_on_that_run(tmp_path):
+    """Review #7224: a host fork storm too short-lived to be seen (another user's, or thread churn) while
+    a run of this project starts one process per sample: the host rate is not shared out to the run."""
+    from ttp import selfwatch
+    s = dict(selfwatch.DEFAULTS)
+    root = tmp_path / "proc"
+    base, procs = _sw_world(tmp_path, 0)
+    _sw_proc(root, 0, procs)
+    w = selfwatch.Watch(base, proc=root, daemon_pid=100, cores=64)
+    w.step(s, 0.0)
+    for k in range(1, 13):
+        base, procs = _sw_world(tmp_path, k, 0)
+        _sw_proc(root, k * 30000, procs)
+        snap = w.step(s, k * 10.0)
+        assert snap["host"]["forks_s"] == 3000.0
+        assert not snap["breach"] and snap["runaway"] == [], (k, snap["breach"])
+        assert snap["tree"]["spawn_s"] < 1 and snap["foreign_churn"], snap["tree"]
+    assert "not from this project's processes" in selfwatch.line(snap, 120.0)
