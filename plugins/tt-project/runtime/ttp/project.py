@@ -902,13 +902,16 @@ def _without_bad_sections(raw: dict) -> dict:
     return out
 
 
-# Keys the runtime no longer reads and refuses to set, with why.
+# Keys an older plugin version read and this one no longer does, with why each went. `ttp config` refuses
+# to set them (unknown_key_hint); `ttp upgrade` drops them from project.json (cli._drop_retired_keys), and
+# `ttp config NAME KEY ''` removes any unknown key present.
 RETIRED_KEYS = {
     "coordinator.session.mode": "the coordinator session is always on, with no off switch",
     "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
     "budget.hourly_coordinator_usd": "the coordinator's hourly dollar guard is gone: the dollar caps are the cost limits",
     "upgrade.merge_retry_h": "a conflicting upgrade queues its merge task at once, never on a timer",
     "upgrade.task_every_h": "a conflicting upgrade queues its merge task at once, never on a timer",
+    "coordinator.unblock_effort": "every coordinator runs at one effort level, coordinator.effort",
 }
 
 

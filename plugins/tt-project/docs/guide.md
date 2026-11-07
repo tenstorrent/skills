@@ -243,7 +243,10 @@ coordinator with that evidence.
   `ranking_every_s` and `ranking_key_file` (see the chat provider's model ranking below).
   `ttp config --account KEY` reads one; an
   empty value removes it. The same holds for a project's own keys: `ttp config <name> KEY ''` removes KEY
-  from `project.json`, so its default applies again, and a key whose default is a list or an object
+  from `project.json`, so its default applies again (it prints the value it removed and records the removal
+  in provenance, `--why`; a key the plugin no longer knows is removed too when `project.json` holds it, while
+  a value for one, or removing one not there, is refused as unknown or retired; `ttp upgrade` drops the keys the
+  plugin retired, such as `coordinator.unblock_effort`, by itself), and a key whose default is a list or an object
   refuses a value of another type without writing it, except the plain forms its reader takes
   (`budget.compact_window_tokens` and `budget.split_reread_tokens`: one non-negative number for every tier;
   `budget.resume_lost` and `waiting.wake_gate`: `false`, off; `coordinator.conclusion_floor`: a string such

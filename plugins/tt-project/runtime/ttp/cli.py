@@ -10908,8 +10908,8 @@ def cmd_config(a) -> None:
         val = a.value
     from .project import unknown_key_hint
     hint = unknown_key_hint(a.key)
-    if hint:
-        die(hint)
+    if hint and not (a.value == "" and _config_has(p.raw_config(), a.key)):
+        die(hint)   # an unknown key present in project.json (one a plugin retired) can still be removed
     if a.value == "":
         return _config_remove(p, a.key, run)
     if a.key == "runner.pin_verify":
@@ -10996,6 +10996,7 @@ def _config_remove(p, key: str, run) -> None:
             "the user or the coordinator, never by a worker: name the exact command in your hand-off")
     if run and (k := _user_only_change(p.raw_config(), key, None, p)):
         _refuse_user_only_in_run(k)
+    was = configwho.at(p.raw_config(), key)
     try:
         removed = p.unset_config(key, by=configwho.from_env())
     except (RuntimeError, configwho.Protected) as e:   # project.json unreadable; a value its owner set
@@ -11003,7 +11004,7 @@ def _config_remove(p, key: str, run) -> None:
     node = p.config()
     for part in key.split("."):
         node = node.get(part) if isinstance(node, dict) else None
-    print(f"{key} {'removed' if removed else 'was not set'}; now {json.dumps(node)}")
+    print(f"{key} {f'removed (was {json.dumps(was)[:200]})' if removed else 'was not set'}; now {json.dumps(node)}")
 
 
 def cmd_config_why(words: list[str], key: str) -> None:
@@ -11915,6 +11916,8 @@ def _upgrade(p: Project, auto: bool = False, explicit: bool = False, took_over: 
         print(ttl_note)
     if caps_note := _migrate_load_caps(p):
         print(caps_note)
+    for line in _drop_retired_keys(p):
+        print(line)
     print("harness up to date with the installed template; restarting the daemon")
     from . import service
     upjournal.step(p, "restarting")
@@ -12014,6 +12017,32 @@ def _migrate_load_caps(p: Project) -> str:
     except Exception:
         return ""
     return "upgrade note: defaults now sized to the project's load: " + "; ".join(done)
+
+
+def _drop_retired_keys(p: Project) -> list[str]:
+    """Each project.RETIRED_KEYS key project.json still holds is removed and recorded in config provenance;
+    no other key is touched and a second run changes nothing. One note line per key removed."""
+    from .project import RETIRED_KEYS
+    out = []
+    try:
+        raw = p.raw_config()
+        if p.config_status == "unavailable":
+            return []
+        for key, why in RETIRED_KEYS.items():
+            if not _config_has(raw, key):
+                continue
+            if p.unset_config(key, by={"by": "default", "via": "upgrade: retired key"}):
+                out.append(f"upgrade note: removed {key} from project.json, a key this plugin no longer reads ({why})")
+            raw = p.raw_config()
+    except Exception:
+        return out
+    return out
+
+
+def _config_has(raw: dict, key: str) -> bool:
+    """Whether dotted `key` is in project.json `raw` (at any value, null too)."""
+    from . import configwho
+    return configwho.at(raw, key) is not configwho._ABSENT
 
 
 def _running_harness_start(p: Project) -> tuple[float, int] | None:
