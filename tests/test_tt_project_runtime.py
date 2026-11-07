@@ -5708,7 +5708,7 @@ def test_claude_runs_cannot_start_background_tasks_that_die_at_exit(env):
     assert "setsid nohup" in prompt
 
 
-def test_worker_and_reviewer_context_is_compacted_per_tier_but_not_the_coordinators(env):
+def test_worker_and_reviewer_context_is_compacted_per_tier_and_the_coordinators_at_its_session_limit(env):
     p = make(env)
     from ttp.daemon import Daemon
     d = Daemon(p.base)
@@ -5726,7 +5726,8 @@ def test_worker_and_reviewer_context_is_compacted_per_tier_but_not_the_coordinat
         assert run_env("reviewer", tier)["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == tokens
     crid = d.start_run("coordinator", "decide", "claude", "light", str(p.base), read_only=True)
     (p.runs / str(crid) / "STOP").touch()
-    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in json.loads((p.runs / str(crid) / "run.json").read_text())["env"]
+    # The coordinator's session compacts in place at its own limit (coordsession.limit, user msg #2043).
+    assert int(json.loads((p.runs / str(crid) / "run.json").read_text())["env"]["CLAUDE_CODE_AUTO_COMPACT_WINDOW"]) >= 100000
     # 0 turns it off, per tier or for every tier.
     p.set_config("budget.compact_window_tokens", {"light": 0, "standard": 150000, "deep": 200000})
     d.cfg = p.config()
@@ -24890,10 +24891,11 @@ def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, 
     assert overrides(argv)["model_auto_compact_token_limit"] == 100000
     assert prompt == "PROMPT-MARKER", "the system text still leads the prompt"
     assert argv[-3:] == ["resume", THREAD, "-"], "options after the resume subcommand"
-    # The coordinator's system text goes the same way; it has no compact window.
+    # The coordinator's system text goes the same way; its session compacts in place at its own limit
+    # (coordsession.limit, user msg #2043), not at a tier's window.
     argv, prompt = start("coordinator", system=system, read_only=True)
     assert overrides(argv)["developer_instructions"] == system and _unmoded(prompt) == "PROMPT-MARKER"
-    assert "model_auto_compact_token_limit" not in overrides(argv) and argv[-1] == "-"
+    assert overrides(argv)["model_auto_compact_token_limit"] >= 100000 and argv[-1] == "-"
     # Text too long for one argument leads the prompt, as before.
     big = "x" * 200_000
     argv, prompt = start("worker", append_system=big)
@@ -33208,6 +33210,7 @@ def test_claude_workers_keep_long_command_output_in_a_file(env):
 def test_a_review_past_the_split_line_is_told_to_finish_its_verdict_not_to_hand_off_done(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
+    p.set_config("budget.split_reread_tokens", {"light": 2_000_000, "standard": 4_000_000, "deep": 8_000_000})
     tid = p.db.add_task("review it", "spec", kind="review", tier="standard", origin="user")
     run_dir = tmp_path / "run"
     run_dir.mkdir()

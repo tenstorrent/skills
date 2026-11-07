@@ -143,9 +143,9 @@ def coordinator_role(p: Project) -> str:
 
 def coordinator_session_role(p: Project, tools: tuple[str, str] = ("full", "")) -> str:
     """The persistent session's role (coordinator.md, then prompts/coordinator-session.md: how wakes
-    continue one session and the rollover handover), under the coordinator role's size budget. It
+    continue one session and compact it in place), under the coordinator role's size budget. It
     always carries the order ledger's rules: the first open order or the last closed one would
-    otherwise change the prompt and start a new session without a handover. Its Tools section names
+    otherwise change the prompt and start a new session. Its Tools section names
     only the wake's real tools (session_tools): `tools` is (full, read or none, why)."""
     from .coordtools import tools_mode
     state, why = tools

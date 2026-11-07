@@ -3014,7 +3014,7 @@ class Daemon:
                 session_ttl_at = now = time.time()
                 cache_ttl, ttl_why = cachettl.choose_session(
                     self.p.db.kv(coordsession.KEY), session_mode, now, warm_min,
-                    lambda: cachettl.signals(self.p.db, now), handover=why == "handover")
+                    lambda: cachettl.signals(self.p.db, now))
             elif prov.cache_env("1h"):
                 cache_fp = cachettl.fingerprint(system, context, schema, model, effort,
                                                 cachettl.cli_stamp(prov.binary()))
@@ -3057,25 +3057,37 @@ class Daemon:
                 except Exception as e:   # today's digest, unacknowledged: the next session wake sends it whole
                     ack, sent_why = None, f"digest failed: {type(e).__name__}: {e}"[:200]
                     log(self.p, f"coordinator session {sent_why}")
+            restoring = session_mode == "resume" and bool((state or {}).get("restore"))
             if session_mode in ("new", "resume") and session_prompt:
                 system, context = session_prompt["system"], session_prompt["context"]
-                try:   # the rollover handover (coordsession.py): no order, promise or decision is lost
-                    if session_mode == "new":
+                try:   # a new or compacted session's pinned record (coordsession.py): no order, promise or decision is lost
+                    if session_mode == "new" or restoring:
                         from .relay import agent_orders
-                        prompt = (coordsession.seed(self.p, state, why, session_prompt.get("cached") or "",
-                                                    agent=agent_orders(self.cfg)) + "\n\n" + prompt)
+                        lead = (coordsession.seed(self.p, state, why, session_prompt.get("cached") or "",
+                                                  agent=agent_orders(self.cfg))
+                                if session_mode == "new" else
+                                coordsession.restore(self.p, state, session_prompt.get("cached") or "",
+                                                     agent=agent_orders(self.cfg)))
+                        prompt = lead + "\n\n" + prompt
                         pending = {k: v[0] for k, v in coordsession.memory_view(self.p).items()}
                     else:   # memory recorded since the last wake, though a re-render emptied the digest's deltas
                         changed, pending = coordsession.resume_memory(self.p, state, prompt)
                         prompt = f"{changed}\n\n{prompt}" if changed else prompt
-                        if (state or {}).get("compacted"):   # the summary carries no user order
-                            prompt = coordsession.compacted_block(self.p) + "\n\n" + prompt
                     self.p.db.set_kv(coordsession.KEY, {**(state or {}), "pending": pending})   # record() keeps it once ok
-                    if why == "handover":
-                        prompt = prompt + "\n\n" + coordsession.handover_ask(state)
+                    if why == "compact" and not coordsession.agent_compacts(prov):   # the harness-supplied summary
+                        prompt = prompt + "\n\n" + coordsession.compact_ask(state)
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
             prompt = self._wake_mode_line(session_mode, why, True, prompt)   # before the seed cap counts it
+            compact_at = 0   # the agent's own compaction switch, at the size the session compacts at
+            if session_mode in ("new", "resume"):   # never below this wake's own prompt, whatever the state knows
+                fixed = sum(len(t or "") for t in (system, context, append_system, prompt)) // CHARS_PER_TOKEN \
+                    + TOOL_ALLOWANCE_TOKENS
+                src = (state or {}) if session_mode == "resume" else {}
+                compact_at = int(coordsession.limit(
+                    self.cfg, {**src, "base_tokens": max(int(src.get("base_tokens") or 0), fixed)}, model) or 0)
+                env = {**env, **prov.compact_env(compact_at)}
+                argv = _before_stdin(argv, prov.compact_args(compact_at))
             seed_usd = None
             if session_mode == "new" and budget_usd is not None and prov.caps_budget:
                 try:   # the seed rides on this wake: its cap covers it, within the dollar caps (seedcap.py)
@@ -3096,6 +3108,8 @@ class Daemon:
                 **({"seed_usd": seed_usd, "seed_basis": seed_basis} if seed_usd is not None else {}),
                 **({"error": str((state or {}).get("fail_error") or "")}   # the failed resume this reruns
                    if session_mode == "stateless" and (state or {}).get("rerun") else {}),
+                **({"restore": True} if restoring else {}),
+                **({"compact_at": compact_at} if compact_at else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
         elif role == "coordinator" and not resume and prov.cache_key_per_session:
             try:   # the agent's cache follows its session: continue the last turn's while warm
@@ -5013,12 +5027,13 @@ class Daemon:
 
     def _coord_session_end(self, r: dict, usage, session: dict, ok: bool, out: dict | None = None,
                           actions=None) -> bool:
-        """Saves the persistent session (coordsession.py) after a coordinator wake, and the wake's
-        `session_note` (its rollover handover) as state/coord-session/<session id>.md. True for a resumed
+        """Saves the persistent session (coordsession.py) after a coordinator wake, with any compaction
+        the agent made in it, and the wake's `session_note` (a compaction's summary) as
+        state/coord-session/<session id>.md. True for a resumed
         wake that failed: nothing of it is applied and the next wake reruns its batch stateless at
         once, with no backoff; repeated failures pause the mode and raise an issue. A wake that asked
         for the whole digest, or whose session compacted its history, leaves no digest acknowledged; a
-        compacted one also marks kv KEY `compacted`, so the next wake leads with compacted_block."""
+        compacted one is recorded (coordsession.record), so the next wake leads with restore()."""
         db, now = self.p.db, time.time()
         try:
             ctx = self._session_context(r, usage) if session.get("mode") in ("new", "resume") else None
@@ -5044,9 +5059,17 @@ class Daemon:
                 sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
                 from .relay import agent_orders
                 if path := coordsession.save_note(self.p, sid, out.get("session_note"), agent_orders(self.cfg)):
-                    log(self.p, f"coordinator run {r['id']}: session handover saved to {path}")
-            state = coordsession.record(state, usage, r.get("session_id") or "", session, ok, now)
-            db.set_kv(coordsession.KEY, {**state, "compacted": True} if compacted else state)
+                    log(self.p, f"coordinator run {r['id']}: session note saved to {path}")
+            compaction = None
+            if session.get("mode") in ("new", "resume"):
+                pre = self._compaction(r)
+                compaction = pre if pre is not None else {"pre_tokens": 0} if (ctx or {}).get("compacted") else None
+            state = coordsession.record(state, usage, r.get("session_id") or "", session, ok, now, compaction)
+            if ok and (state.get("compactions") or [{}])[-1].get("at") == now:
+                c = state["compactions"][-1]
+                log(self.p, f"coordinator run {r['id']}: session {c['session'][:8]} compacted in place "
+                            f"({c['how']}): {c['before']} -> {c['after']} tokens")
+            db.set_kv(coordsession.KEY, state)
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         return False
@@ -5072,6 +5095,23 @@ class Daemon:
             got = tel.setdefault("cache_telemetry", {})
             got.update({k: int(ctx[k]) for k in ("first_context", "last_context") if ctx.get(k)})
         return ctx
+
+    def _compaction(self, r: dict) -> dict | None:
+        """{"pre_tokens": the size before} when the run's agent compacted its session (Claude's
+        stream-json `compact_boundary` and its compact_metadata; 0: not given), else None."""
+        try:
+            with open(self._run_dir(r) / "output.jsonl", "rb") as f:
+                lines = [line for line in f if b'"compact_boundary"' in line]
+        except OSError:
+            return None
+        if not lines:
+            return None
+        try:
+            meta = json.loads(lines[0]).get("compact_metadata") or {}
+            pre = meta.get("pre_tokens") or meta.get("preTokens")
+        except (ValueError, AttributeError):
+            pre = None
+        return {"pre_tokens": pre if isinstance(pre, int) and not isinstance(pre, bool) and pre > 0 else 0}
 
     def _compacted(self, r: dict) -> bool:
         """The agent compacted the run's session history (Claude's stream-json `compact_boundary`)."""
