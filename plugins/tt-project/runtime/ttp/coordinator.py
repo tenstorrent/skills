@@ -124,6 +124,7 @@ from . import claimcheck
 from . import coordsession
 from . import spans
 from . import coordtools
+from . import pointers
 from . import ctxblock
 from . import overlap as file_overlap   # apply() has a local `overlap`
 from . import screen as scr
@@ -2635,9 +2636,13 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             if t == "reply":
                 if why := msgparts.too_long(a["text"], "reply"):
                     raise ValueError(why)
+                chat = a.get("chat") or default_chat
+                if why := pointers.refused(a["text"], "reply", pointers.later_parts(a["text"], [
+                        str(b.get("text") or "") for _, b in order[k + 1:]
+                        if (b or {}).get("type") == "reply" and (b.get("chat") or default_chat) == chat])):
+                    raise ValueError(why)
                 if a.get("claims"):
                     obligations.check_claims(a["claims"], p)
-                chat = a.get("chat") or default_chat
                 cites = turnrules.check_cites(db, a, chat)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
@@ -3441,6 +3446,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     raise ValueError(f"notify rejected: {why}")
                 if why := msgparts.too_long(a["text"], "notify"):
+                    raise ValueError(why)
+                if why := pointers.refused(a["text"], "notify", pointers.later_parts(a["text"], [
+                        str(b.get("text") or "") for _, b in order[k + 1:] if (b or {}).get("type") == "notify"])):
                     raise ValueError(why)
                 if a.get("claims"):
                     obligations.check_claims(a["claims"], p)
