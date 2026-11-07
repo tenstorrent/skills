@@ -11,8 +11,8 @@ paths in coordinator.echo_paths) and lists the hits under RETIRED_HEADER, which 
 instruction; memory entries that hit are also named on one line for memory_forget, so they do not pile up. It is a notice only: no event, wake, hold or model call. Not searched: the replacing
 text itself (its entry, or its words wherever they stand), the charter's Brief (the user's verbatim words,
 never an echo), the archives (memory/archive, the charter history), and harness files the project never edited (equal to the harness's `upstream` snapshot or the
-plugin template): only a project-tuned copy can be fixed. A phrase the replacing text keeps is no phrase of the
-retired rule, nor is plugin vocabulary (one identifier or `ttp <command>` name found in the runtime source or an
+plugin template): only a project-tuned copy can be fixed. A phrase the replacing text keeps, or a live entry
+superseding the retired one (directly or down its chain) still carries, is no phrase of the retired rule, nor is plugin vocabulary (one identifier or `ttp <command>` name found in the runtime source or an
 unedited template file, such as `start_when` or `ttp list`; never the plugin's prose, nor a Correction's
 wrong part): alone it matches unrelated text. A hit still there a turn
 after it was first shown is marked. An audit record that only preserves an old assertion is declared
@@ -563,6 +563,29 @@ def _unsourced(rec: dict) -> bool:
 
 
 _MEMORY_RETIRED = re.compile(r"memory \[[^\]]+\] (?:superseded by \[|withdrawn$)")
+_SUPERSEDED = re.compile(r"memory \[([^\]]+)\] superseded by \[([^\]]+)\]")
+
+
+def _superseders(rec: dict, recs: list[dict], live: dict[str, str]) -> str:
+    """The flattened text of the live entries superseding the memory entry `rec` retired (its source's
+    'superseded by [B]', and B's own superseders while B is retired too, from `recs`), '' when none is live:
+    a phrase one of them still carries is the current rule's, not a retired one."""
+    m = _SUPERSEDED.match(rec.get("source") or "")
+    later: dict[str, list[str]] = {}
+    for r in recs:
+        if n := _SUPERSEDED.match(r.get("source") or ""):
+            later.setdefault(n.group(1), []).append(n.group(2))
+    todo, seen, out = [m.group(2)] if m else [], set(), []
+    while todo:
+        name = todo.pop()
+        if name in seen:
+            continue
+        seen.add(name)
+        if name in live:
+            out.append(live[name])
+        else:
+            todo += later.get(name, [])
+    return " ".join(out)
 
 
 def _current(charter: str) -> list[str]:
@@ -651,9 +674,12 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
     except OSError:
         charter = ""
     units = _current(charter)
+    live = {key[7:]: flat for key, _, _, flat in where if key.startswith("memory:")}
     out, seen = [], set()
     for rec in sorted(recs, key=lambda r: -r.get("at", 0)):
-        own = [ph for ph in rec.get("phrases") or [] if rec.get("negated") or not _generic(ph, vocab)]
+        kept = _superseders(rec, recs, live)
+        own = [ph for ph in rec.get("phrases") or [] if (rec.get("negated") or not _generic(ph, vocab))
+               and ph not in kept]
         if not own:
             continue
         stated = ""
