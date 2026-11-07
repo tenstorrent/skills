@@ -150,14 +150,15 @@ def test_runs_gh_scans_kept_stdin_aliases_and_field_files(env, tmp_path, monkeyp
             err = r.stderr.decode()
             assert r.returncode == 1 and "refused" in err and "nothing was sent" in err, (args, err)
             assert leak not in err and log.read_text() == "", args
+    clean = "status: all green [authored by AI]"   # tagged: the AI-tag guard also checks the post alias's comment
     for route in routes:
-        args, data = route("status: all green")
+        args, data = route(clean)
         log.write_text("")
         r = _gh_main(p, tmp_path, args, data, fake=fake)
         assert r.returncode == 0 and "refused" not in r.stderr.decode(), (args, r.stderr)
         assert log.read_text().count("\n") == 1, args
         if data:
-            assert "<status: all green>" in log.read_text(), args   # read once, passed on to gh
+            assert f"<{clean}>" in log.read_text(), args   # read once, passed on to gh
     # One `gh alias list` per call, though both the scan and the draft guard expand the alias.
     (tmp_path / "gh.log.aliases").write_text("")
     _gh_main(p, tmp_path, ["put"], b"fine", fake=fake)
