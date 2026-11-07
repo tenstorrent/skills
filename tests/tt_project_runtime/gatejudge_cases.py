@@ -191,11 +191,43 @@ def test_the_select_plugin_matches_a_cwd_relative_id_without_config_cwd_relative
     monkeypatch.delenv("TTP_PYTEST_SELECT", raising=False)
     monkeypatch.delenv("TTP_PYTEST_SELECT_FILES", raising=False)
     monkeypatch.setenv("TTP_PYTEST_SELECT_IDS", "test_b.py::test_x\n")
+    sel.pytest_configure(config)
     sel.pytest_collection_modifyitems(config, items)
     assert [i.nodeid for i in items] == ["tests/test_b.py::test_x"]
     # Run from the root dir, the id is unchanged.
     config.invocation_params.dir = root
     assert sel._cwd_relative(config, "tests/test_b.py::test_x") == "tests/test_b.py::test_x"
+
+def test_gate_rerun_selection_stays_in_its_own_pytest_run(tmp_path):
+    # A rerun failing test that starts its own pytest (with the inherited environment) once had all of
+    # that inner run's tests deselected (exit 5): the selection acts only in the run it was given to,
+    # its xdist workers included (they report no deselected count), and the inner run gets no variables.
+    import importlib.util
+    from ttp import gatejudge
+    proj = tmp_path / "proj"
+    (proj / "tests").mkdir(parents=True)
+    (proj / "pytest.ini").write_text("[pytest]\n")
+    (proj / "inner").mkdir()
+    (proj / "inner" / "test_inner.py").write_text(
+        "import pytest\n@pytest.mark.parametrize('i', range(3))\ndef test_i(i):\n    pass\n")
+    (proj / "tests" / "test_outer.py").write_text(
+        "import os, subprocess, sys\n"
+        "def test_starts_pytest():\n"
+        "    assert not [k for k in os.environ if k.startswith('TTP_PYTEST_SELECT')]\n"
+        "    r = subprocess.run([sys.executable, '-m', 'pytest', '-q', '-p', 'no:cacheprovider', 'inner'],\n"
+        "                       capture_output=True, text=True, timeout=120)\n"
+        "    assert r.returncode == 0 and '3 passed' in r.stdout, r.stdout + r.stderr\n"
+        "def test_other():\n    pass\n")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "TTP_PYTEST_"))}
+    env = {**clean, **gatejudge.select_env(["tests/test_outer.py::test_starts_pytest"], clean)}
+    xdist = [["-n", "2"]] if importlib.util.find_spec("xdist") else []
+    for extra in [[], ["-p", "no:xdist"], *xdist]:
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", f"--rootdir={proj}",
+                            *extra, "tests"], cwd=str(proj), env=env, capture_output=True, text=True, timeout=180)
+        out = r.stdout + r.stderr
+        assert r.returncode == 0 and gatejudge._ran(out) == (1, 0), (extra, out)
+        assert "-n" in extra or "1 deselected" in out, (extra, out)
+
 
 def test_gate_judge_uses_a_saved_base_result_only_from_the_same_host(tmp_path):
     from ttp import gatejudge

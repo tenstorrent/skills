@@ -11,7 +11,10 @@ prints them; set but empty: none), so a same-named test in another file never ru
 TTP_PYTEST_SELECT_FILES, one entry per line (testpick, a task's targeted `ttp checks`), keeps only the
 tests matching an entry: a path keeps the tests defined in that file (a case file an aggregator test
 file executes, or a test file), `path::name` the test function `name` of test file `path`. The filters
-combine (a test must pass each one set). A run that keeps none exits 5, pytest's "no tests" status."""
+combine (a test must pass each one set). A run that keeps none exits 5, pytest's "no tests" status.
+It acts only in the pytest run it was loaded into: it takes its TTP_PYTEST_SELECT* variables out of
+the environment, so a pytest a test starts runs all its own tests; xdist workers get them from their
+controller."""
 from __future__ import annotations
 
 import inspect
@@ -19,13 +22,33 @@ import os
 import re
 from pathlib import Path
 
+import pytest
+
 ENV = "TTP_PYTEST_SELECT"
 IDS_ENV = "TTP_PYTEST_SELECT_IDS"
 FILES_ENV = "TTP_PYTEST_SELECT_FILES"
+NAME = "ttp_pytest_select"
+
+
+def _strip_env() -> dict:
+    """The TTP_PYTEST_SELECT* variables, taken out of the environment children inherit. The plugin's load
+    (PYTEST_ADDOPTS) stays: an xdist worker loads it from there, and a load with no variables keeps all."""
+    return {k: os.environ.pop(k) for k in [k for k in os.environ if k.startswith(ENV)]}
+
+
+def pytest_configure(config):
+    given = getattr(config, "workerinput", None)
+    config._ttp_select_env = dict(given.get(NAME) or {}) if given is not None else _strip_env()
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_configure_node(node):
+    node.workerinput[NAME] = node.config._ttp_select_env
 
 
 def pytest_collection_modifyitems(config, items):
-    pattern, ids, files = os.environ.get(ENV), os.environ.get(IDS_ENV), os.environ.get(FILES_ENV)
+    env = getattr(config, "_ttp_select_env", {})
+    pattern, ids, files = env.get(ENV), env.get(IDS_ENV), env.get(FILES_ENV)
     if not pattern and ids is None and files is None:
         return
     paths, tests = set(), set()
