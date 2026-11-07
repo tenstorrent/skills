@@ -15,7 +15,9 @@ held-out test content (leaks); the bench and results folders, the source reposit
 and worktrees, the project's state folder and the providers' plugin caches and saved transcripts
 (hidden_paths) are denied to the agent's reads. After it, the transcript is audited for those paths,
 the landed commit and history or forge commands (audit): a flagged cell fails. Then the held-out files are copied in and the held-out
-tests run (the grade). Each cell appends one row to <out>/results.jsonl: cost, tokens, wall time,
+tests run (the grade). The agent and the grade each run in a fresh venv in the cell's folder (cellenv:
+the user site off, pip refused outside a venv), so no cell installs into or imports from ~/.local
+and nothing the agent installed runs the held-out tests. Each cell appends one row to <out>/results.jsonl: cost, tokens, wall time,
 hand-off status, the grade and the sha256 of its transcript and diff; its files go to <out>/cells.
 A rerun with the same plan skips the cells already recorded. `dry_run` swaps every arm's provider
 for the fake agent: no model call, no spend."""
@@ -34,7 +36,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import bench, gitmemo
+from . import bench, cellenv, gitmemo
 from .project import durable_write, open_append
 
 PROMPT = ("You are working in the git repository in your current directory. Do the task below there: make "
@@ -240,8 +242,10 @@ def audit(transcript: str, task: dict, hidden: list[Path], secret: dict | None =
     return out
 
 
-def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float) -> tuple[bool, str]:
-    """Copy the held-out files over the candidate's and run the held-out tests: (passed, log tail)."""
+def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float,
+          env: dict | None = None) -> tuple[bool, str]:
+    """Copy the held-out files over the candidate's and run the held-out tests with `env` (the cell's
+    grading venv): (passed, log tail)."""
     for path in task["heldout"]:
         dest = ws / path
         if dest.is_symlink() or dest.is_dir():
@@ -250,7 +254,7 @@ def grade(ws: Path, bench_dir: Path, task: dict, test_cmd: str, timeout_s: float
         shutil.copyfile(bench_dir / str(task["task"]) / "heldout" / path, dest)
     try:
         r = subprocess.run([*shlex.split(test_cmd), *task["tests"]], cwd=ws, capture_output=True, text=True,
-                           timeout=timeout_s, stdin=subprocess.DEVNULL)
+                           timeout=timeout_s, stdin=subprocess.DEVNULL, env=env)
     except subprocess.TimeoutExpired:
         return False, f"the held-out tests ran past {timeout_s:.0f} s"
     return r.returncode == 0, (r.stdout + r.stderr)[-4000:]
@@ -285,6 +289,10 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         if problems := leaks(ws, task):
             return {**row, "outcome": "isolation_failed", "passed": False, "why": problems}
         start = bench._git(ws, "rev-parse", "HEAD").stdout.strip()
+        try:   # the agent and all it starts run in the cell's own venv, the user site off
+            cell_env = cellenv.env(cellenv.make(tmp / "venv", opts.get("cell_packages", cellenv.SEED)), _clean_env())
+        except cellenv.Unavailable as e:
+            return {**row, "outcome": "isolation_failed", "passed": False, "why": [str(e)[:500]]}
         run.mkdir()
         durable_write(run / "prompt.md", PROMPT.format(spec=task["spec"]))
         provider = "fake" if opts.get("dry_run") else arm["provider"]
@@ -305,7 +313,7 @@ def run_cell(bench_dir: Path, out: Path, task: dict, cell: dict, arm: dict, opts
         began = time.time()
         try:
             with open(run / "runner.log", "wb") as log:
-                subprocess.run([*_boot("ttp.runner"), str(run)], cwd=str(run), env=_clean_env(),
+                subprocess.run([*_boot("ttp.runner"), str(run)], cwd=str(run), env=cell_env,
                                stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL,
                                timeout=opts["timeout_s"] + 300)
         except subprocess.TimeoutExpired:   # the supervisor itself hung: its watchdog ends the agent
@@ -352,8 +360,12 @@ def _finish(row: dict, bench_dir: Path, task: dict, ws: Path, run: Path, keep: P
     row["diff_sha256"] = _sha(diff)
     flags = audit(transcript.decode(errors="replace"), task, hidden,
                   secret_lines(bench_dir, task), diff.decode(errors="replace"), session_dirs(ws))
-    passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"]) if not flags \
-        else (False, "not graded: flagged by the cheat audit")
+    if flags:
+        passed, log_tail = False, "not graded: flagged by the cheat audit"
+    else:   # a fresh venv: nothing the agent installed into its own runs the held-out tests
+        venv = cellenv.make(run.parent / "grade-venv", opts.get("cell_packages", cellenv.SEED))
+        passed, log_tail = grade(ws, bench_dir, task, opts["test_cmd"], opts["test_timeout_s"],
+                                 cellenv.env(venv, _clean_env()))
     row.update(passed=passed, flagged=flags, outcome="flagged" if flags else "pass" if passed else "fail")
     keep.mkdir(parents=True, exist_ok=True)
     for name in ("output.jsonl", "exit.json", "result.json", "run.json", "runner.log", "stderr.log"):

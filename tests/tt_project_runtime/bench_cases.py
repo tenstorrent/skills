@@ -151,7 +151,7 @@ _BENCH_FIX = ("printf 'def old():\\n    return 1\\n\\n\\ndef new():\\n    return
 
 def _bench_opts(tmp_path, **kw):
     return {"timeout_s": 120, "stall_s": 120, "budget_usd": 1.0, "test_timeout_s": 120,
-            "test_cmd": f"{sys.executable} -m pytest -q -p no:cacheprovider", "dry_run": True, **kw}
+            "test_cmd": "python3 -m pytest -q -p no:cacheprovider", "dry_run": True, **kw}
 
 
 def test_bench_run_dry_run_runs_every_cell_alike_in_a_seeded_order_and_grades_on_the_held_out_tests(env, tmp_path, monkeypatch):
@@ -371,3 +371,61 @@ def test_bench_audit_and_deny_rules_leave_a_claude_cell_its_own_session_folder(e
     for want in (f"{old}*", f"{old}*/**", str(earlier), f"{earlier}/**", str(repo.resolve()), f"{repo.resolve()}/**"):
         assert want in rules, want
     shutil.rmtree(ws.parent)
+
+
+def test_bench_cells_get_venvs_of_their_own_with_the_user_site_off_and_pip_user_refused(tmp_path, monkeypatch):
+    # #7076: a cell ran `pip install --user` and changed the shared user site under every project.
+    import importlib.util
+    from ttp import cellenv
+    monkeypatch.setenv("PIP_USER", "1")
+    one, two = cellenv.make(tmp_path / "c1" / "venv"), cellenv.make(tmp_path / "c2" / "venv", seed=())
+    assert one != two and (one / "pyvenv.cfg").is_file() and (two / "pyvenv.cfg").is_file()
+    with pytest.raises(cellenv.Unavailable, match="never reused"):
+        cellenv.make(one)
+    for venv in (one, two):
+        env = cellenv.env(venv, dict(os.environ))
+        assert env["PATH"].split(os.pathsep)[0] == str(venv / "bin") and env["VIRTUAL_ENV"] == str(venv)
+        assert env["PYTHONNOUSERSITE"] == "1" and env["PIP_REQUIRE_VIRTUALENV"] == "1" and "PIP_USER" not in env
+        assert pathlib.Path(env["PYTHONUSERBASE"]).parent == venv.parent
+        r = subprocess.run(["python3", "-c", "import site, sys; print(sys.prefix, site.ENABLE_USER_SITE)"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        assert r.stdout.split() == [str(venv), "False"], r
+        # No network: pip refuses `--user` before it looks for a package.
+        r = subprocess.run(["python3", "-m", "pip", "install", "--user", "--no-index", "nopkg"], env=env,
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode and re.search(r"--user|virtualenv", r.stderr), r
+        assert not pathlib.Path(env["PYTHONUSERBASE"]).exists()
+    # The default seed: pytest is the venv's own copy, not a path into the user site.
+    r = subprocess.run(["python3", "-c", "import pytest; print(pytest.__file__)"], env=cellenv.env(one, dict(os.environ)),
+                       capture_output=True, text=True, timeout=60)
+    assert pathlib.Path(r.stdout.strip()).is_relative_to(one), r
+    if importlib.util.find_spec("pip"):   # an interpreter outside the cell's venv: pip wants one
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "--user", "--no-index", "nopkg"],
+                           env=cellenv.env(two, dict(os.environ)), capture_output=True, text=True, timeout=120)
+        assert r.returncode and re.search(r"--user|virtualenv", r.stderr), r
+
+
+def test_bench_run_agent_and_grade_of_each_cell_run_in_venvs_of_their_own(env, tmp_path, monkeypatch):
+    from ttp import benchrun
+    p, tid, task = _bench_built(env, tmp_path)
+    arms = {"opus": {"provider": "claude", "model": "m-one", "effort": "medium"},
+            "glm": {"provider": "chat", "model": "m-two", "effort": "max"}}
+    monkeypatch.setenv("PIP_USER", "1")
+    monkeypatch.setenv("TTP_FAKE_SHELL", _BENCH_FIX + " && python3 -c 'import os, sys; print(\"PREFIX=\" + sys.prefix)'"
+                       " > cellenv.txt && env >> cellenv.txt")
+    show = "echo VENV=$VIRTUAL_ENV NUS=$PYTHONNOUSERSITE REQ=$PIP_REQUIRE_VIRTUALENV USER=${PIP_USER-unset}"
+    opts = _bench_opts(tmp_path, test_cmd=f"sh -c '{show}; exec python3 -m pytest -q -p no:cacheprovider \"$@\"' sh")
+    rows = benchrun.run(tmp_path / "bench", tmp_path / "h2h", arms, 1, 7, opts, p.config())
+    assert [r["outcome"] for r in rows] == ["pass", "pass"], rows
+    agents, grades = set(), set()
+    for arm in arms:
+        cell = tmp_path / "h2h" / "cells" / f"{tid}-r1-{arm}"
+        seen = dict(line[1:].split("=", 1) for line in (cell / "diff.patch").read_text().splitlines()
+                    if re.match(r"\+(PREFIX|VIRTUAL_ENV|PYTHONNOUSERSITE|PIP_REQUIRE_VIRTUALENV|PIP_USER|PATH)=", line))
+        assert seen["PREFIX"] == seen["VIRTUAL_ENV"] and seen["PATH"].split(os.pathsep)[0] == seen["VIRTUAL_ENV"] + "/bin"
+        assert seen["PYTHONNOUSERSITE"] == "1" and seen["PIP_REQUIRE_VIRTUALENV"] == "1" and "PIP_USER" not in seen
+        agents.add(seen["VIRTUAL_ENV"])
+        shown = re.search(r"VENV=(\S+) NUS=1 REQ=1 USER=unset", (cell / "tests.log").read_text())
+        assert shown, (cell / "tests.log").read_text()
+        grades.add(shown[1])
+    assert len(agents | grades) == 4, "each cell's agent and grade get a venv of their own"

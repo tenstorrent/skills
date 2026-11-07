@@ -1061,7 +1061,14 @@ cells, and naming any other one is flagged. A cell whose runner hangs keeps its 
 harness runtime. A transcript that names a denied path or the landed commit, or runs history or
 forge commands (`git fetch`, `git log --all`, `gh api`), flags the cell as failed. Otherwise the
 held-out files are copied in and the held-out tests run (`--test-cmd`, default `python3 -m pytest`;
-wrap it in `ttp sandbox --` to run candidate code sandboxed). Each cell appends a row to
+wrap it in `ttp sandbox --` to run candidate code sandboxed). The agent, with everything it starts,
+and then the grade each run in a fresh virtualenv in the cell's own temporary folder, never shared
+between cells: its bin first on `PATH`, `VIRTUAL_ENV` set, `PYTHONNOUSERSITE=1` and
+`PIP_REQUIRE_VIRTUALENV=1`, `PIP_USER` unset and `PYTHONUSERBASE` in the cell. So no cell installs
+into or imports from the user site (`~/.local`) the host's other projects share, and nothing the agent
+installed runs the held-out tests. Each venv sees the OS's packages and gets a copy of the harness's
+installed pytest and what it requires. A cell whose agent venv cannot be built runs no agent and is
+recorded `isolation_failed`. Each cell appends a row to
 `results.jsonl` (cost, tokens, wall time, hand-off status, pass or fail, flags, and the sha256 of its
 transcript and diff) and keeps its transcript, diff and test log under `cells/`; a rerun into the same
 folder skips recorded cells and refuses a different plan. A cell whose hand-off is not a JSON
