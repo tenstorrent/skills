@@ -2351,12 +2351,13 @@ def test_idle_slot_wake_backs_off_to_long_waits_while_every_queued_task_is_gated
 
 
 
-def test_a_worker_that_rereads_too_much_context_is_told_once_to_split(env, tmp_path):
+def test_a_worker_that_rereads_too_much_context_is_told_once_to_split_where_a_project_sets_the_line(env, tmp_path):
     p = make(env)
     from ttp.daemon import Daemon
     from ttp.project import DEFAULT_CONFIG
-    assert DEFAULT_CONFIG["budget"]["split_reread_tokens"] == {"light": 2_000_000, "standard": 4_000_000,
-                                                               "deep": 8_000_000}
+    # Off by default (user msg #2043): a worker compacts its context in place instead of ending its run.
+    assert DEFAULT_CONFIG["budget"]["split_reread_tokens"] == {"light": 0, "standard": 0, "deep": 0}
+    p.set_config("budget.split_reread_tokens", {"light": 2_000_000, "standard": 4_000_000, "deep": 8_000_000})
     tid = p.db.add_task("long one", "spec", kind="code", tier="standard", origin="user")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
