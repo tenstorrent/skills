@@ -328,6 +328,29 @@ def test_a_nested_pytest_a_targeted_test_starts_runs_its_own_tests(tmp_path, wor
     assert r.returncode == 0 and ran == ["test_outer"], r.stdout[-3000:] + r.stderr[-2000:]
 
 
+
+@pytest.mark.parametrize("path", ["gate_rerun", "cap_probe"])
+def test_a_push_batch_gate_rerun_or_cap_probe_leaves_no_select_setting_in_a_nested_pytest(tmp_path, path):
+    """A push batch's failing-test rerun (gatejudge.select_env) and cap probe (pushpass.select_env) load the
+    select plugin too: it selects only their tests, and a pytest such a test starts gets none of its setting,
+    so a real failure there is never masked as one on both head and tip."""
+    from ttp import gatejudge, pushpass
+    t = tmp_path / "proj"
+    (t / "tests" / "inner").mkdir(parents=True)
+    (t / "tests" / "inner" / "test_inner.py").write_text("def test_inner():\n    pass\n")
+    (t / "tests" / "test_outer.py").write_text(_NESTED_OUTER.replace("PLUGIN_DIR", repr(str(pushpass.PLUGIN_DIR))))
+    (t / "tests" / "test_other.py").write_text("def test_other():\n    pass\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_PYTEST_", "PYTEST_XDIST"))}
+    env.pop("PYTEST_ADDOPTS", None)
+    sel = (gatejudge.select_env(["tests/test_outer.py::test_outer"], env) if path == "gate_rerun"
+           else pushpass.select_env("^test_outer$", env))
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(t),
+                        "tests/test_outer.py", "tests/test_other.py", "-rA"],
+                       cwd=t, env={**env, **sel}, capture_output=True, text=True, timeout=300)
+    ran = sorted(re.findall(r"^PASSED \S+::(\w+)", r.stdout, re.M))
+    assert r.returncode == 0 and ran == ["test_outer"], r.stdout[-3000:] + r.stderr[-2000:]
+
+
 def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite():
     import ttp
     root = pathlib.Path(ttp.__file__).parent
