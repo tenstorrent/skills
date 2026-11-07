@@ -249,7 +249,47 @@ def test_onhost_claims_tell_claims_from_plans():
         assert onhost.claims(s), s
     for s in ("Queued #4; a worker starts it when the lock is free.", "It will be stopped once the run ends.",
               "Waiting for the lock.", "The runs are not started yet.", "Once it is started I'll report.",
-              "I'll power cycle it after the queue drains.", "Nothing changes for now.",
+              "I'll power cycle it after the queue drains.", "Nothing changes for now.", "Once it's done I'll report.",
               f"{onhost.MARK} power cycling it now."):
         assert not onhost.claims(s), s
 
+
+
+# The shape of a reply that marked plain facts as plans: past and present facts about other work around one
+# line about the work the same batch queues (user msg #1924).
+_OH_FACTS = ("The cut passed its review and is in the current push batch (24 changes, started 16:42 PST).",
+             "That batch failed its first two check passes and is now working out which change broke them, "
+             "so there is no landing time yet.",
+             "Also, the chat provider stopped serving the model (alert at about 17:10 PST).")
+_OH_FREE = {"type": "task_add", "title": "free the check slots held by stale runs", "spec": "s",
+            "resources": ["box1"], "reply_chat": "c1"}
+
+
+def test_facts_beside_a_newly_queued_host_task_are_not_marked_as_planned(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    plan = "I'm changing the rerun to use the model the provider serves now and to name that model in the results."
+    text = " ".join(["Correction on the rerun: it has not started yet.", *_OH_FACTS[:2],
+                     "The rerun starts on its own once the cut lands.", _OH_FACTS[2], plan])
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}, dict(_OH_FREE)], turn=1)
+    (got,) = _oh_sent(p)
+    assert got.count(onhost.MARK) == 1 and f"{onhost.MARK} {plan}" in got, got
+    for fact in _OH_FACTS:
+        assert f"{onhost.MARK} {fact}" not in got and fact in got, got
+    assert "new task 'free the check slots held by stale runs': queued for a worker" in got, got
+    # Facts and an honest line about the queued task alone: sent as written.
+    text = " ".join([*_OH_FACTS, "Queued a task to free the stale check slots; a worker starts it when box1 is free."])
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}, dict(_OH_FREE)], turn=2)
+    assert _oh_sent(p)[-1] == text
+
+
+def test_a_premature_claim_beside_facts_is_still_marked(env):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    for turn, claim in enumerate(("The slot cleanup is running now.", "It's done.", "Freeing the check slots now.",
+                                  "The job finished.", "This is running now."), 1):
+        text = f"{_OH_FACTS[0]} {claim}"
+        coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}, dict(_OH_FREE)], turn=turn)
+        got = _oh_sent(p)[-1]
+        assert got.startswith(f"{_OH_FACTS[0]} {onhost.MARK} {claim}"), got
+        assert "new task 'free the check slots held by stale runs': queued for a worker" in got, got

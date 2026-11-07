@@ -23,8 +23,11 @@ guard() checks a coordinator reply or notify before it is posted. Its scope is t
 names (#id), the reply's backing tasks (open tasks answering its chat, its `owners`) and host tasks this
 batch adds or updates. When one of them has not started on its host (or was stopped while its jobs
 still run) and a sentence claims an action is under way or done ('now', '...ing it', 'started',
-'stopped', 'only X runs'), that sentence is kept but marked planned, not started, and the honest status
-of each such task is appended. Nothing else in the message changes and it is posted at once: a rewrite
+'stopped', 'only X runs') about it, that sentence is kept but marked planned, not started, and the honest
+status of each such task is appended. A claim is about a task when it names its #id or resource, or, when
+the reply speaks for one unstarted task, when its subject is that work: the speaker ('I'm ...'), a pronoun
+('it is ...'), none ('Resetting the board') or a noun phrase sharing a word with its title. A sentence whose
+subject is something else ('The review passed ...', 'That batch is now ...') states a fact and stays as written. Nothing else in the message changes and it is posted at once: a rewrite
 in place keeps every word (goal 1) and the user never reads the claim as a fact."""
 from __future__ import annotations
 
@@ -44,7 +47,7 @@ _RUNS = re.compile(r"(?i)\b(?:runs|running|under ?way|in progress|happening|goin
 _ONLY = re.compile(r"(?i)\bonly\b[^.!?\n]{0,80}?\b(?:runs|run|is running|are running|remains?|is left)\b")
 _DONE = re.compile(r"(?i)\b(?:started|stopped|killed|cancell?ed|halted|terminated|ended|aborted|power[- ]?cycled|"
                    r"rebooted|restarted|reset (?:it|them|the)|(?:is|are|was|were) (?:done|finished|complete)|"
-                   r"finished|completed)\b")
+                   r"\w+['’]s (?:done|finished|complete)|finished|completed)\b")
 # Words before a done-verb that make it a plan, a condition or a negation, not a claim.
 _HEDGE = re.compile(r"(?i)(?:\b(?:will|to be|to get|not|never|once|until|when|after|if|before|unless|gets?|be)|n't)\s+"
                     r"(?:\w+\s+){0,2}$")
@@ -355,6 +358,41 @@ def _names(sentence: str, task: dict) -> bool:
     return False
 
 
+# Openings before a sentence's subject: list marks, numbering, a short 'Label:' and linking words.
+_LEAD = re.compile(r"(?i)^\s*(?:[-*>\u2022]+\s*|\(?\d{1,3}[.)]\s*|[\w .'-]{1,30}:\s+|(?:also|so|and|but|then|"
+                   r"meanwhile|plus|ok|okay)\b,?\s+)*")
+_DET = {"the", "a", "an", "that", "this", "these", "those", "its", "their", "his", "her", "each", "every", "both",
+        "some", "another", "one", "all", "any", "no"}
+_AUX = {"is", "are", "was", "were", "be", "been", "has", "have", "had", "will", "would", "can", "could", "may", "might",
+        "should", "must", "do", "does", "did", "isn't", "aren't", "wasn't", "weren't", "hasn't", "haven't", "hadn't",
+        "won't", "didn't", "doesn't", "ran", "runs", "got", "gets", "now", "only"}
+# Nouns that name a reply's own work whatever its title says.
+_WORK = {"task", "job", "jobs", "run", "work", "step"}
+_STOP = {"with", "from", "into", "onto", "over", "this", "that", "these", "those", "their", "them", "then", "than",
+         "when", "what", "which", "while", "for", "and", "the", "new", "task", "work", "code"}
+
+
+def _subject_is(sentence: str, task: dict) -> bool:
+    """Whether a claim sentence that names no #id or resource speaks of `task`, the reply's one unstarted task:
+    its subject is the speaker, a pronoun or none (it opens with the verb), or a noun phrase ('the reset') that
+    names that work (a word of its title, or 'the job'). Any other noun phrase ('The review passed', 'That batch
+    is now ...', 'the provider stopped ...') is the subject of a fact about other things."""
+    words = re.findall(r"[\w'\u2019.-]+", _LEAD.sub("", sentence.strip(), count=1))[:6]
+    words = [w.lower().replace("\u2019", "'").strip(".") for w in words]
+    if not words or words[0] not in _DET or len(words) < 2:
+        return True
+    if words[0] in {"this", "that", "these", "those"} and (words[1] in _AUX or re.search(r"(?:ing|ed)$", words[1])):
+        return True   # 'This is running', 'That started': a pronoun, not a determiner
+    np = []
+    for w in words[1:]:
+        if w in _AUX or (len(w) > 4 and re.search(r"(?:ing|ed)$", w)):
+            break
+        np.append(w)
+    stem = lambda w: re.sub(r"(?:ing|ed|es|s)$", "", w)[:5]   # noqa: E731  slots/slot, cycling/cycle
+    title = {stem(w) for w in re.findall(r"[a-z][a-z0-9]{3,}", str(task.get("title") or "").lower()) if w not in _STOP}
+    return any(w in _WORK or (len(w) > 3 and w not in _STOP and stem(w) in title) for w in np)
+
+
 def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[str, list[str]]:
     """(text to post, notes for the coordinator). Unchanged unless a covered task has not started on its
     host (or was stopped with jobs still running) and a sentence claims an action is under way or done."""
@@ -391,9 +429,11 @@ def guard(p, text: str, tasks: list[dict], now: float | None = None) -> tuple[st
     for k in hits:
         named = {int(x) for x in re.findall(r"#(\d{1,9})\b", parts[k])}
         # A sentence is about an unstarted task when it names its #id; naming no #id, when it names that
-        # task's resource or the reply speaks for exactly one unstarted task (a chat's other open tasks do
-        # not count). Any other claim sentence is left as written: it may be about other, finished work.
-        if (named & ids) if named else (len(direct) == 1 or any(_names(parts[k], t) for t, _ in waiting)):
+        # task's resource, or the reply speaks for exactly one unstarted task (a chat's other open tasks do
+        # not count) and the sentence's subject is that work (_subject_is). Any other claim sentence is left
+        # as written: it states a fact about other work.
+        if (named & ids) if named else (any(_names(parts[k], t) for t, _ in waiting)
+                                        or len(direct) == 1 and _subject_is(parts[k], direct[0])):
             parts[k] = f"{MARK} {parts[k].strip()}"
             marked += 1
     if not marked:
