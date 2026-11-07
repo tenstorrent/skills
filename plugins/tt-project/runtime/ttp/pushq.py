@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from . import (   # one name per line: two changes adding names merge without a conflict
+    checkcap,
     checkdirs,
     batch,
     conflictfix,
@@ -1703,6 +1704,7 @@ def _spawn(p: Project, bid: str, marker: Path, lock) -> subprocess.Popen:
     try:
         env = _child_env(p, str(output))
         env["TTP_BATCH_LOCK_FD"] = str(lock.fileno())
+        env[checkcap.BATCH_ENV] = bid   # its checks' slots and wait logs name the batch (checkcap.batch_of)
         env["TTP_CHECKS_TMP_FD"] = str(guard.fileno())
         with open(marker.with_suffix(".log"), "ab") as out:
             child = subprocess.Popen(batch_argv(marker), cwd=str(p.root), env=env, stdin=subprocess.PIPE,

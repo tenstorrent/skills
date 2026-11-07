@@ -5569,6 +5569,7 @@ def _checks_lane_status(as_json: bool) -> int:
     followers = checkjoin.status_lines(p.state)
     holders = checkcap.holder_activity()   # whether each host-wide slot holder runs tests now
     slots, parked = checkcap.slot_holders(), checkcap.parked_order()   # who holds each host slot (live), who is parked
+    push_rows = checkcap.push_rows()   # push batches' checks host-wide: no task by design, named by batch id
     disk = diskgate.reading()   # new local runs held while the disk is saturated: why, with the values   # joined or superseded waiters: they run no suite of their own
     load = hostload.snapshot(p.config())
     names = {"": p.root.name, **({here_repo: testslots.repo_name(top) or here_repo} if here_repo else {})}
@@ -5576,7 +5577,7 @@ def _checks_lane_status(as_json: bool) -> int:
         print(json.dumps({"project": p.name, "slots": checklane.slots(p.config()),
                           "project_max": checklane.project_cap(p.config()), "this_repo": here_repo,
                           "repos": checklane.lane_status(p.name, cfg=p.config(), names=names, db=p.db),
-                          "spilled": checkspill.holders(p.name),
+                          "spilled": checkspill.holders(p.name), "push": push_rows,
                           "no_spill_hosts": checkspill.no_spill(),
                           "here": checkspill.here_records(p.name),
                           "slurm_overflow": slurmcheck.holders(p.name),
@@ -5589,6 +5590,9 @@ def _checks_lane_status(as_json: bool) -> int:
                          indent=2))
     else:
         print(checklane.status_text(p.name, p.config(), here_repo, names=names, db=p.db))
+        if push_rows:
+            print("push checks host-wide (push priority slot, or an ordinary turn after it stayed held):")
+            print("\n".join(f"  {line}" for line in checkcap.push_lines(rows=push_rows)))
         for line in [*checkspill.no_spill_lines(), *checkspill.status_lines(p.name), *checkspill.exclude_lines(p.config()), *checkspill.pick_lines(p.name), *checkspill.here_lines(p.name), *checkspill.limit_lines(p.name), *slurmcheck.probe_lines(), *slurmcheck.status_lines(p.name),
                      *filter(None, [slurmcheck.paused_line()])]:
             print(f"  {line}")

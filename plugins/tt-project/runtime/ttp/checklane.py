@@ -890,7 +890,8 @@ def holder_text(rec: dict, now: float, cfg: dict | None = None) -> str:
     """"#12 'pytest -q' queued 3 h 0 min, running 14 min, 4 child processes alive" for a waiter's line:
     the holder's queue age and its run time from the pytest start shown apart (holder_times), so a holder
     whose check sat queued for hours does not read as a frozen 'running 0 min'."""
-    who = f"#{rec['task']}" if rec.get("task") else str(rec.get("holder") or "a run")
+    who = (f"#{rec['task']}" if rec.get("task") else f"push batch {rec['batch']}" if rec.get("batch")
+           else str(rec.get("holder") or "a run"))
     cmd = str(rec.get("command") or "").strip()
     t = holder_times(rec, now)
     run = (f"running {mins(t['running_s'])}" if t["running_s"] is not None
@@ -906,6 +907,14 @@ def _stalled(rec: dict, now: float, cfg: dict | None = None) -> str:
     from . import checkstall
     v = checkstall.view(rec, now, cfg)
     return f", {checkstall.text(v)}" if v and v["stalled"] else ""
+
+
+def _ticket_batch(t: Path) -> str:
+    """The push batch a lane ticket names (testslots.suite_hold writes "push batch <id> ..."), "" for none."""
+    try:
+        return "" if _ticket_task(t) else checkcap.batch_of(t.read_text())
+    except OSError:
+        return ""
 
 
 def _ticket_task(t: Path) -> str:
@@ -1039,8 +1048,9 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
-                    who, since = waiter(t), locks._arrival(t)
-                    out.append({"task": who["task"], "run": who["run"], "who": waiter_text(who, since, cfg, now),
+                    who, since, batch = waiter(t), locks._arrival(t), _ticket_batch(t)   # a batch the ticket names wins
+                    out.append({"task": "" if batch else who["task"], "batch": batch, "run": who["run"],
+                                "who": checkcap.owner("", batch) if batch else waiter_text(who, since, cfg, now),
                                 "waiter": who, "waited_s": waited, "since": since,
                                 "position": i + 1, "of": len(q), "lane": labels[key], "waits_on": on[i],
                                 "holders": lane_recs if on[i] == labels[key] else all_recs,
@@ -1280,7 +1290,9 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
         for r in recs[base]:
             t = holder_times(r, now)
             running = t["running_s"]
-            lanes.append({"task": _holder_task(r), "run": _run_of(r.get("holder")), "pid": r.get("pid"),
+            task = _holder_task(r)
+            lanes.append({"task": task, "batch": "" if task else str(r.get("batch") or ""),
+                          "run": _run_of(r.get("holder")), "pid": r.get("pid"),
                           "priority": r.get("priority"), "age_s": t["held_s"], "queued_s": t["queued_s"],
                           "alive": r.get("alive"), "children": t["children"],
                           "running_s": running, "cap_s": float(r.get("cap_s") or 0),
@@ -1297,8 +1309,8 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
         for i, t in enumerate(q):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
             prio = locks.ticket_priority(t)
-            who = waiter(t)
-            waiters.append({"position": i + 1, "task": who["task"], "run": who["run"],
+            who, batch = waiter(t), _ticket_batch(t)   # a batch the ticket names wins over a task its process suggests
+            waiters.append({"position": i + 1, "task": "" if batch else who["task"], "batch": batch, "run": who["run"],
                             "pid": int(m.group(1)) if m else None,
                             "priority": None if prio == float("inf") else prio,
                             "rank": testslots.suite_priority(t, now, age), "label": testslots.rank_text(t, now, age),
@@ -1335,7 +1347,8 @@ def _task_state(db, rec: dict) -> dict:
 
 
 def _who(x: dict) -> str:
-    return " ".join(w for w in ((f"#{x['task']}" if x.get("task") else "no task"),
+    return " ".join(w for w in ((f"#{x['task']}" if x.get("task") else f"push batch {x['batch']}" if x.get("batch")
+                                 else "no task"),
                                 (f"run {x['run']}" if x.get("run") else ""),
                                 (f"pid {x['pid']}" if x.get("pid") else "")) if w)
 
@@ -1360,7 +1373,8 @@ def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = N
     for r in got:
         parts = []
         for h in r["lanes"]:
-            who = (f"#{h['task']}" if h["task"] else "a run") + (f" p{h['priority']}" if h["priority"] is not None else "")
+            who = (checkcap.owner(h["task"], h["batch"]) if h["task"] or h["batch"] else "a run") \
+                + (f" p{h['priority']}" if h["priority"] is not None else "")
             kids = _kids(h["children"], h["running_s"] is not None)
             if h["running_s"] is not None:
                 parts.append(f"{who} queued {mins(h['queued_s'])}, running {mins(h['running_s'])}"
@@ -1370,7 +1384,7 @@ def lane_lines(project_name: str, cfg: dict | None = None, now: float | None = N
                              f"waits on {h['waits_on']}, {kids}")
         held = []
         for w in r["waiters"]:
-            who = f"#{w['task']}" if w["task"] else "a run"
+            who = checkcap.owner(w["task"], w["batch"]) if w["task"] or w["batch"] else "a run"
             held.append(f"{who} {w['label']} {mins(w['waited_s'])}, waits on {w['waits_on']}")
         rule = _rule(r, cfg)
         line = f"checks lane {r['label']}" + (f" ({rule})" if rule else "") + ": " + ("; ".join(parts) or "no holder")

@@ -12755,3 +12755,145 @@ def test_a_failed_tasks_waiting_checks_drop_themselves_and_their_result_says_why
         results.append(capsys.readouterr().out)
         assert f"dropped: task #{tid} ended (failed)" in results[-1], (by, results[-1])
         assert "lost" not in results[-1]
+
+
+# A push batch's checks have no task by design (slot "push", or an ordinary turn after it): every wait
+# and holder line names them "push batch <id>"; only a run with neither a task nor a batch has no owner.
+# Their labels come from the writers the batch process uses: checkcap.label(name, "push batch <id>")
+# (batch.Batch._slot) and testslots.suite_hold, under checkcap.BATCH_ENV as pushq._spawn sets it.
+
+_BATCH_ID = "batch-20260101-000000-4242"   # synthetic
+
+
+def _push_status(capsys):
+    assert _ttp("checks", "--slot-status") == 0
+    text = capsys.readouterr().out
+    assert _ttp("checks", "--slot-status", "--json") == 0
+    return text, json.loads(capsys.readouterr().out)
+
+
+def test_a_push_batch_waiter_shows_as_push_batch_id_in_the_wait_event_and_slot_status(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, checklane, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv(checkcap.PRIORITY_WAIT_ENV, "0.3")
+    key = testslots.repo_key(repo)
+    holder = _lane_holder(tmp_path, p.name, key)   # task #12 holds the lane
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    monkeypatch.setenv(checkcap.BATCH_ENV, _BATCH_ID)
+    seen = {}
+
+    def lane_wait(_line):   # told at once, with its ticket queued for 1000 s
+        if not seen:
+            seen["events"] = checklane.wait_events(p.name, {})
+            seen["lines"] = checklane.long_wait_lines(p.name, {})
+            seen["status"] = checklane.status_text(p.name, {})
+            seen["lane"] = checklane.lane_status(p.name)
+    try:
+        assert testslots.suite_hold(p.name, repo=key, wait_s=0.3, since=time.time() - 1000, tell=lane_wait) is None
+    finally:
+        _stop(holder)
+    (ev,) = seen["events"]
+    assert ev["text"].startswith(f"Checks lane wait: push batch {_BATCH_ID} has waited 16 min"), ev
+    assert ev["task"] is None and "no task" not in ev["text"], ev
+    assert f"push batch {_BATCH_ID} has waited" in seen["lines"][0], seen["lines"]
+    assert f"waiter 1 (next): push batch {_BATCH_ID}" in seen["status"], seen["status"]
+    assert seen["lane"][0]["waiters"][0]["batch"] == _BATCH_ID and seen["lane"][0]["waiters"][0]["task"] == ""
+    # The push priority slot: another push holds it, so the batch waits for it and slot-status lists it.
+    monkeypatch.setenv(checkcap.BATCH_ENV, "batch-20260101-000000-1")
+    other = checkcap.acquire_priority("git@example:org/repo#main", checkcap.label(p.name, "push batch batch-20260101-000000-1"))
+    monkeypatch.setenv(checkcap.BATCH_ENV, _BATCH_ID)
+    got = {}
+
+    def told(_line):
+        if not got and "waiting for the push priority slot" in _line:
+            got["status"] = _push_status(capsys)
+    try:
+        slot = checkcap.acquire_priority("git@example:org/repo#main", checkcap.label(p.name, f"push batch {_BATCH_ID}"),
+                                         "push checks", told, fallback=lambda: checkcap.Slot())
+        slot.close()
+    finally:
+        other.close()
+    text, js = got["status"]
+    assert f"waiter (push slot): push batch {_BATCH_ID} of {p.name}" in text, text
+    assert f"holder (push slot): push batch batch-20260101-000000-1 of {p.name}" in text, text
+    rows = {r["batch"]: r for r in js["push"]}
+    assert rows[_BATCH_ID]["slot"] == "push" and rows[_BATCH_ID]["state"] == "waiting", rows
+    assert rows[_BATCH_ID]["project"] == p.name
+    assert checkcap.push_rows() == [], "the waiter's ticket goes with its wait"
+
+
+def test_a_push_batch_holder_shows_as_push_batch_id_in_the_wait_event_and_slot_status(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, checklane, locks, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    key = testslots.repo_key(repo)
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    monkeypatch.setenv(checkcap.BATCH_ENV, _BATCH_ID)
+    push = checkcap.acquire_priority("git@example:org/repo#main", checkcap.label(p.name, f"push batch {_BATCH_ID}"),
+                                     "push checks", state=p.state)
+    lane = testslots.suite_hold(p.name, repo=key, what="pytest -q")
+    monkeypatch.delenv(checkcap.BATCH_ENV)
+    ticket = locks.enqueue(checkcap.slot_dir(), testslots.suite_base(p.name, key),
+                           f"task #13 {p.name}: full checks (run 9, pid 1)", time.time() - 1000, priority=2)
+    try:
+        (ev,) = checklane.wait_events(p.name, {})
+        assert ev["task"] == 13 and f"behind push batch {_BATCH_ID} 'pytest -q'" in ev["text"], ev
+        status = checklane.status_text(p.name, {})
+        assert f"holder: push batch {_BATCH_ID}" in status and "no task" not in status, status
+        assert any(f"push batch {_BATCH_ID} queued" in x for x in checklane.lane_lines(p.name)), checklane.lane_lines(p.name)
+        text, js = _push_status(capsys)
+        assert f"holder (push slot): push batch {_BATCH_ID} of {p.name}" in text, text
+        (row,) = js["push"]
+        assert (row["slot"], row["state"], row["batch"], row["project"]) == ("push", "holding", _BATCH_ID, p.name), row
+        assert js["repos"][0]["lanes"][0]["batch"] == _BATCH_ID
+        (w,) = [r for r in checkcap.wait_records(p.state) if r["slot"] == "push"]
+        assert w["batch"] == _BATCH_ID and w["task"] is None, w
+    finally:
+        locks.dequeue(ticket)
+        lane.close()
+        push.close()
+
+
+def test_a_run_with_neither_a_task_nor_a_push_batch_still_shows_as_having_no_owner(
+        env, tmp_path, monkeypatch, capsys):
+    from ttp import checkcap, checklane, testslots
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    key = testslots.repo_key(repo)
+    holder = _lane_holder(tmp_path, p.name, key)
+    for k in ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", checkcap.BATCH_ENV):   # no run id: "run 41 (no task)" otherwise
+        monkeypatch.delenv(k, raising=False)
+    # nothing in the runner's processes links the waiter to a task
+    monkeypatch.setattr(checklane, "_proc", lambda pid: {"command": "", "cwd": "", "ppid": None, "sid": None, "env": None})
+    seen = {}
+
+    def lane_wait(_line):
+        if not seen:
+            seen["events"] = checklane.wait_events(p.name, {})
+            seen["status"] = checklane.status_text(p.name, {})
+            seen["lane"] = checklane.lane_status(p.name)
+    try:
+        assert testslots.suite_hold(p.name, repo=key, wait_s=0.3, since=time.time() - 1000, tell=lane_wait) is None
+    finally:
+        _stop(holder)
+    (ev,) = seen["events"]
+    assert ev["text"].startswith("Checks lane wait: a run with no task ("), ev
+    assert "push batch" not in ev["text"] and "waiter 1 (next): no task" in seen["status"], seen["status"]
+    assert seen["lane"][0]["waiters"][0]["batch"] == ""
+    # A plain `ttp push` on the priority slot names no batch.
+    push = checkcap.acquire_priority("git@example:org/repo#main", checkcap.label(p.name, "ttp push"), state=p.state)
+    try:
+        text, js = _push_status(capsys)
+        (row,) = js["push"]
+        assert row["batch"] is None and row["slot"] == "push" and "push batch" not in text, (row, text)
+        assert checkcap.owner(None, "") == "a run with no task" and checkcap.batch_of({"holder": "pa ttp push"}) == ""
+        (w,) = [r for r in checkcap.wait_records(p.state) if r["slot"] == "push"]
+        assert "batch" not in w, w
+    finally:
+        push.close()

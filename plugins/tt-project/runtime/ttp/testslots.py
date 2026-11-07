@@ -1686,8 +1686,10 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     task = str(checkcap._task_run()[0] or "")   # TTP_TASK, else the adopted one (checkcap.adopt_identity)
     label = f"{project_name}: full checks ({who + ', ' if who else ''}pid {os.getpid()})"
     ns = locks._pid_ns()
-    text = ((f"task #{task} {label}" if task.isdigit() else label) + (f" [check {check}]" if check else "")
-            + (f" [pidns {ns}]" if ns else ""))   # the ticket names its task for checklane.lane_lines
+    batch = "" if task.isdigit() else checkcap.batch_id()   # a push batch's run: no task, its batch id instead
+    text = ((f"task #{task} {label}" if task.isdigit() else f"push batch {batch} {label}" if batch else label)
+            + (f" [check {check}]" if check else "")
+            + (f" [pidns {ns}]" if ns else ""))   # the ticket names its task (or batch) for checklane.lane_lines
     resource = _suite_resource(project_name, repo)
     try:
         ticket = locks.enqueue(checkcap.slot_dir(), resource, text, since, priority=priority)
@@ -1695,7 +1697,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
         return Grant()   # an unwritable slot directory: the checks slot says so
     arrival = locks._arrival(ticket)
     checklane.remember_name(project_name, repo, name or repo_name)
-    fields = {**({"task": task} if task.isdigit() else {}), **({"priority": priority} if priority is not None else {}),
+    fields = {**({"task": task} if task.isdigit() else {}), **({"batch": batch} if batch else {}),
+              **({"priority": priority} if priority is not None else {}),
               **({"cost": cost} if cost else {}), **({"lock": lock} if lock else {}),
               **({"worktree": str(worktree)} if worktree else {}), **({"granted": False} if pending else {}),
               **({"repo_name": repo_name} if repo_name else {}), **({"running": True} if running and pending and not lock else {}),

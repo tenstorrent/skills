@@ -186,6 +186,8 @@ UPGRADE_SETTLE_S = 10.0   # a newly installed version is adopted once seen this 
 EXTRA_SLOTS = 2   # at most this many slots beyond the cap while the host is lightly loaded (extra())
 PRIORITY_TURNS = locks.URGENT_FIRST   # urgent checks always first (priority_turns(); N > 0 bounds their run)
 PARKED = "checks-parked"   # the queue of runs waiting outside the checks queue for their test slots (acquire)
+PUSH_WAIT = "checks-push-wait"   # who waits for a push priority slot another push holds (acquire_priority): status only
+BATCH_ENV = "TTP_PUSH_BATCH_ID"   # set by a push batch process (pushq._spawn): its batch id, for status and logs
 PRIORITY_WAIT_S = 1800.0   # default checks.push_priority_wait_s: the longest wait behind another priority holder
 PRIORITY_WAIT_ENV = "TTP_CHECKS_PRIORITY_WAIT_S"
 STARVE_S = 3600.0   # default checks.starve_s: a run waiting this long goes before later arrivals at its priority or lower
@@ -1086,6 +1088,71 @@ def label(project_name: str | None, what: str = "") -> str:
     return who + requeued() + (f" {what}" if what else "")
 
 
+def batch_id() -> str:
+    """The push batch this process runs for (BATCH_ENV), "" outside one."""
+    return (os.environ.get(BATCH_ENV) or "").strip()
+
+
+_BATCH = re.compile(r"\bpush batch (\S+)")
+
+
+def batch_of(rec) -> str:
+    """The push batch a slot holder's record (its "batch" field) or a label (label(..., "push batch <id>"),
+    as a batch labels its checks) names, "" for none."""
+    if isinstance(rec, dict):
+        if rec.get("batch"):
+            return str(rec["batch"])
+        rec = rec.get("holder") or ""
+    m = _BATCH.search(str(rec or ""))
+    return m.group(1).rstrip(",;:)") if m else ""
+
+
+def owner(task, batch: str = "") -> str:
+    """Who a checks run is for, in status words: "#<task>", else "push batch <id>" (a push batch's checks
+    have no task by design), else "a run with no task"."""
+    return f"#{task}" if task else f"push batch {batch}" if batch else "a run with no task"
+
+
+def push_rows(now: float | None = None) -> list[dict]:
+    """The push batches' checks host-wide, for `ttp checks --slot-status`: each holder of a push priority
+    slot (slot "push", state "holding"), each waiter for one (PUSH_WAIT, state "waiting") and each push
+    batch waiting for an ordinary turn (slot "queue"), with its batch id (batch_of; None for a push that is
+    not a batch, such as `ttp push`), project, label, pid and age. Read only; unreadable gives none."""
+    now = time.time() if now is None else now
+    out = []
+    try:
+        for r in locks.holder_records(priority_paths()):
+            out.append({"slot": "push", "state": "holding", "batch": batch_of(r) or None,
+                        "project": r.get("project") or _project(str(r.get("holder") or "")),
+                        "label": str(r.get("holder") or ""), "pid": r.get("pid"),
+                        "age_s": round(now - float(r.get("since") or now), 1)})
+        for slot, queue in (("push", PUSH_WAIT), ("queue", RESOURCE), ("queue", PARKED)):
+            for t in locks.queued(slot_dir(), queue):
+                try:
+                    text = t.read_text().strip()
+                except OSError:
+                    continue
+                if slot == "queue" and not batch_of(text):
+                    continue
+                m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
+                out.append({"slot": slot, "state": "waiting", "batch": batch_of(text) or None,
+                            "project": _project(text), "label": text, "pid": int(m.group(1)) if m else None,
+                            "age_s": round(now - locks._arrival(t), 1)})
+    except OSError:
+        return out
+    return out
+
+
+def push_lines(now: float | None = None, rows: list[dict] | None = None) -> list[str]:
+    """push_rows (or `rows`, its answer) as lines for a person."""
+    now = time.time() if now is None else now
+    return [f"{'holder' if r['state'] == 'holding' else 'waiter'} ({r['slot']} slot): "
+            f"{owner(None, r['batch']) if r['batch'] else r['label'] or 'a push'}"
+            + (f" of {r['project']}" if r["project"] and r["batch"] else "")
+            + f", {'held' if r['state'] == 'holding' else 'waited'} {_dur(r['age_s'])}"
+            + (f", pid {r['pid']}" if r["pid"] else "") for r in (push_rows(now) if rows is None else rows)]
+
+
 def requeued() -> str:
     """What label() adds while a preempted run queues again (PREEMPTED_ENV), "" otherwise. The slot it takes
     back is labelled without it (acquire), and its run drops PREEMPTED_ENV once it holds one (cli)."""
@@ -1208,7 +1275,7 @@ def state() -> dict:
 
 def _project(holder: str) -> str:
     """The project a holder label names (label())."""
-    return holder.split(" task #", 1)[0].split(" ttp checks", 1)[0]
+    return holder.split(" task #", 1)[0].split(" ttp checks", 1)[0].split(" push batch ", 1)[0].split(" ttp push", 1)[0]
 
 
 def idle_hold_s() -> float:
@@ -2361,37 +2428,51 @@ def acquire_priority(key: str, holder: str, what: str = "", tell: Callable[[str]
         return Slot()
     path = priority_path(key)
     started, told = time.time(), 0.0
-    while True:
-        beyond = priority_beyond_cap()
-        try:
-            f = locks.try_take([path], holder, what, extra=None if beyond else {"waiting": True})
-            if f and not beyond:
-                told = _priority_turn(f, path, n, tell) or told
-        except OSError as e:
-            raise _unavailable(e) from e
-        if f:
-            if tell:
-                q = len(locks.queued(slot_dir(), RESOURCE))
-                tell(f"push checks took the push priority slot ("
-                     + (f"beyond the host-wide cap of {n}: " if beyond else f"within the host-wide cap of {n}: ")
-                     + f"{len(locks.held_labels(all_paths(n)))} task checks running"
-                     + (f", {q} queued behind" if q else "") + ")"
-                     + (f" after {(time.time() - started) / 60:.1f} min" if told else ""))
-            record_wait(state, project_name, None, started, time.time(), "push")
-            return Slot(f)
-        if fallback is not None and time.time() - started >= (bound := priority_wait_s()):
-            if tell:
-                tell(f"the push priority slot stayed held {bound / 60:g} min by "
-                     f"{_some(locks.held_labels([path])) or 'unknown'} (checks.push_priority_wait_s): taking an "
-                     "ordinary host-wide checks turn instead")
-            slot = fallback()
-            slot.fell_back = True
-            return slot
-        if tell and time.time() - told >= TELL_S:
-            tell(f"waiting for the push priority slot, held by another push to the same branch: "
-                 f"{_some(locks.held_labels([path])) or 'unknown'}")
-            told = time.time()
-        time.sleep(poll_s(POLL_S))
+    tag = {"slot": "push", **({"batch": b} if (b := batch_id()) else {})}
+    ticket = None   # while another push holds the slot: a PUSH_WAIT ticket, so status lists this waiter
+    try:
+        while True:
+            beyond = priority_beyond_cap()
+            try:
+                f = locks.try_take([path], holder, what, extra=tag if beyond else {**tag, "waiting": True})
+                if f and not beyond:
+                    locks.dequeue(ticket)   # it holds the slot now: the holder's label lists it
+                    ticket = None
+                    told = _priority_turn(f, path, n, tell) or told
+            except OSError as e:
+                raise _unavailable(e) from e
+            if f:
+                if tell:
+                    q = len(locks.queued(slot_dir(), RESOURCE))
+                    tell(f"push checks took the push priority slot ("
+                         + (f"beyond the host-wide cap of {n}: " if beyond else f"within the host-wide cap of {n}: ")
+                         + f"{len(locks.held_labels(all_paths(n)))} task checks running"
+                         + (f", {q} queued behind" if q else "") + ")"
+                         + (f" after {(time.time() - started) / 60:.1f} min" if told else ""))
+                record_wait(state, project_name, None, started, time.time(), "push")
+                return Slot(f)
+            if fallback is not None and time.time() - started >= (bound := priority_wait_s()):
+                if tell:
+                    tell(f"the push priority slot stayed held {bound / 60:g} min by "
+                         f"{_some(locks.held_labels([path])) or 'unknown'} (checks.push_priority_wait_s): taking an "
+                         "ordinary host-wide checks turn instead")
+                locks.dequeue(ticket)
+                ticket = None
+                slot = fallback()
+                slot.fell_back = True
+                return slot
+            if ticket is None:
+                try:
+                    ticket = locks.enqueue(slot_dir(), PUSH_WAIT, holder, started)
+                except OSError:
+                    ticket = None   # status only: the wait goes on without it
+            if tell and time.time() - told >= TELL_S:
+                tell(f"waiting for the push priority slot, held by another push to the same branch: "
+                     f"{_some(locks.held_labels([path])) or 'unknown'}")
+                told = time.time()
+            time.sleep(poll_s(POLL_S))
+    finally:
+        locks.dequeue(ticket)
 
 
 def _priority_turn(f, path: Path, n: int, tell: Callable[[str], None] | None = None) -> float:
@@ -2418,7 +2499,7 @@ def _priority_turn(f, path: Path, n: int, tell: Callable[[str], None] | None = N
 
 
 # Each slot taken, logged in the taker's project state as one JSON line: {"project", "task", "run",
-# "priority", "slot": "queue" | "push", "queued_at", "granted_at"} (times in epoch seconds). A slot
+# "priority", "slot": "queue" | "push", "queued_at", "granted_at"; a push batch's also "batch"} (times in epoch seconds). A slot
 # taken at once logs a wait of zero, so the median and p90 describe every checks run, not only the
 # ones that queued. The log is bounded like activity.jsonl: past WAITS_MAX_BYTES it rotates to one
 # old generation, read as well.
@@ -2448,6 +2529,8 @@ def record_wait(state: Path | None, project_name: str | None, priority: int | No
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
            "run": run or None, "priority": priority, "slot": slot,
            "queued_at": round(queued_at, 3), "granted_at": round(granted_at, 3)}
+    if not task.isdigit() and (b := batch_id()):
+        rec["batch"] = b   # a push batch's checks: no task by design, named by its batch id
     if cap is not None:
         rec["cap"] = int(cap)
     if lane_at is not None:
