@@ -347,3 +347,48 @@ def test_an_order_naming_a_resource_keeps_its_resource_steer_and_is_not_told_twi
                             "owners": [ids["order"]], "action_class": "device"}]) == []
     assert (run_dir / "steer.md").read_text() == steer, "the run told of the order on rig got it again"
     assert not (other_dir / "steer.md").exists()
+
+
+def _uo_add(cite_order, p):
+    """A task_add that is a user order on rig (a nonempty note) or a plain one (an empty note)."""
+    act = {"type": "task_add", "title": "power-cycle rig", "spec": "power-cycle rig", "tier": "light",
+           "resources": ["rig"]}
+    if cite_order:
+        act["user_msg"] = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user','power-cycle rig')",
+                                 (time.time() - 60,))
+    return act
+
+
+@pytest.mark.parametrize("cite_order", [False, True])
+def test_task_updates_after_a_task_add_in_one_batch_all_apply_with_or_without_its_user_order_note(env, cite_order):
+    """apply's action-order list is never overwritten by a task_add's user-order note: every later
+    task_update applies, and a hold on `ask:new` still sees the ask_user later in the batch."""
+    from ttp import coordinator as coord
+    p = make(env)
+    ids = [p.db.add_task(f"soak {n}", "spec", kind="work", tier="light", origin="user") for n in range(4)]
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    out = coord.apply(p, [_uo_add(cite_order, p),
+                          *({"type": "task_update", "id": t, "priority": 1} for t in ids[:3]),
+                          {"type": "task_update", "id": ids[3], "status": "blocked", "waits_on": "ask:new"},
+                          {"type": "ask_user", "text": "May I spend $40 on the long run?", "blocking": "spend"}])
+    assert out == [], out
+    assert [p.db.task(t)["priority"] for t in ids[:3]] == [1, 1, 1]
+    aid = p.db.one("SELECT MAX(id) id FROM messages WHERE kind='ask'")["id"]
+    assert p.db.task(ids[3])["status"] == "blocked" and f'"waits:ask:{aid}"' in p.db.task(ids[3])["labels"]
+    notes = p.db.kv(coord.NOTES_KEY, [])
+    assert any("is the latest user order" in n for n in notes) == cite_order, notes
+
+
+@pytest.mark.parametrize("cite_order", [False, True])
+def test_the_started_on_host_check_after_a_task_add_still_sees_the_rest_of_the_batch(env, cite_order):
+    """A reply after a task_add is checked against the batch's later actions: the task it speaks of is
+    cancelled later in the batch, so the claim is sent as written, with no check failure."""
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    text = "Power cycling rig now, nothing else touches it."
+    coord.apply(p, [_uo_add(cite_order, p),
+                    {"type": "reply", "text": text, "chat": "c1"},
+                    {"type": "task_update", "id": 1, "status": "cancelled"}], turn=1)
+    assert p.db.task(1)["title"] == "power-cycle rig" and p.db.task(1)["status"] == "cancelled"
+    assert [m["text"] for m in p.db.q("SELECT text FROM messages WHERE direction='out' AND chat='c1'")] == [text]
+    assert not any("started-on-host check failed" in n for n in p.db.kv(coord.NOTES_KEY, []))

@@ -2566,9 +2566,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if quoted := _quote_heads(p, db, covered, a.get("spec") or ""):
                     a = dict(a, spec=f"{(a.get('spec') or '').rstrip()}\n{quoted}")
                 autos = _auto_reviews(db, covered)
-                started = {n: r for n, r in autos.items() if r["status"] != "queued" or r["attempts"]}
-                if covered and set(started) == covered:
-                    ids = ", ".join(f"#{r['id']}" for r in started.values())
+                under_way = {n: r for n, r in autos.items() if r["status"] != "queued" or r["attempts"]}
+                if covered and set(under_way) == covered:
+                    ids = ", ".join(f"#{r['id']}" for r in under_way.values())
                     raise ValueError(f"duplicate of review {ids} the daemon queued, already under way; send it a "
                                      f"`spec` with task_update to add checks")
                 # A head a review already accepted under the same checks keeps that verdict
@@ -2721,7 +2721,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                          parent=followup["id"] if followup else old["id"] if split else None)
                     batch_tasks[new_id] = a.get("reply_chat") or None
                     new_tasks[i] = new_id
-                    for r in {r["id"]: r for n, r in autos.items() if n not in started}.values():
+                    for r in {r["id"]: r for n, r in autos.items() if n not in under_way}.values():
                         db.update_task(r["id"], status="cancelled", blocked_reason=f"replaced by review #{new_id}")
                         _take_over_dependents(db, r["id"], new_id)
                         notes.append(f"task_add: #{new_id} replaces review #{r['id']} the daemon had queued")
@@ -2737,8 +2737,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         batch_obls.append(oid)
                         notes.append(f"task_add: #{new_id} attached as an owner of obligation {oid}: it carries "
                                      f"an owner's work on")
-                if order := _user_order(p, a, new_id, f"{title}\n{a.get('spec') or ''}", messages):
-                    notes.append(f"task_add: #{new_id} {order}")
+                if uo_note := _user_order(p, a, new_id, f"{title}\n{a.get('spec') or ''}", messages):
+                    notes.append(f"task_add: #{new_id} {uo_note}")
                 try:   # a spec missing its order's words or the earlier findings: a note, never a refusal
                     notes.extend(ctxblock.spec_notes(p, new_id))
                 except Exception as e:
@@ -3026,8 +3026,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if upd.get("spec"):
                     userorder.respec(db, task["id"])
                 if upd.get("status", task["status"]) not in TERMINAL_TASK_STATES \
-                        and (order := _user_order(p, a, task["id"], spec, messages)):
-                    notes.append(f"task_update: #{task['id']} {order}")
+                        and (uo_note := _user_order(p, a, task["id"], spec, messages)):
+                    notes.append(f"task_update: #{task['id']} {uo_note}")
                 if upd.get("priority") is not None and upd["priority"] != task["priority"] \
                         and (moved := chainprio.follow(db, task["id"])):
                     notes.append(f"task_update: #{task['id']} priority {upd['priority']}: its review hops follow ("
@@ -3416,10 +3416,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if replaces:
                         from .prompts import charter_sections
                         secs = charter_sections(p.charter_path.read_text())
-                        i = _charter_replaced(secs, replaces, quiet=True)
-                        replaced = "\n".join(secs[i][1]) if i is not None else ""
-                        if i is not None and " ".join(secs[i][0][3:].split()).lower().startswith("restriction"):
-                            gone = "\n".join(secs[i][1])
+                        si = _charter_replaced(secs, replaces, quiet=True)
+                        replaced = "\n".join(secs[si][1]) if si is not None else ""
+                        if si is not None and " ".join(secs[si][0][3:].split()).lower().startswith("restriction"):
+                            gone = "\n".join(secs[si][1])
                     loose_drop = (restriction_source.drops_unsourced("", body=gone) if gone else
                                   restriction_source.drops_unsourced(p.charter_path.read_text(), quote=quote)
                                   if quote and _DATED.sub("", section).lower().startswith("restriction") else False)

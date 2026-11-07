@@ -251,3 +251,18 @@ def test_replan_order_resent_takes_the_batchs_plan_change(env, monkeypatch):
     assert out == [], out
     pr = ob.get(p.db, oid)["promise"]
     assert pr["due"] == now + 7200 and pr["moves"][-1]["plan"].startswith(f"task_update #{tid} changes")
+
+
+def test_replan_a_review_task_add_earlier_in_the_batch_keeps_the_batch_start_time(env, monkeypatch):
+    """A review task_add's under-way auto reviews never replace the batch's start time, which the due
+    moves compare owners' attach times with: an `obligation` naming an owner after it is judged, never a
+    TypeError out of apply."""
+    from ttp import coordinator as coord
+    p, ob, oid, tid, other, late = _rp_setup(env, monkeypatch)
+    review = {"type": "task_add", "kind": "review", "title": "review the merge", "spec": "review it", "tier": "light"}
+    for owner in (tid, other):
+        out = coord.apply(p, [{**review, "title": f"review the merge for #{owner}"},
+                              {"type": "obligation", "key": oid, "owners": [owner], "due": late + 3600}])
+        assert not any("TypeError" in n for n in out), out
+        assert p.db.one("SELECT id FROM tasks WHERE title=?", (f"review the merge for #{owner}",))
+    assert {tid, other} <= {int(t) for t in ob.get(p.db, oid)["owners"]}

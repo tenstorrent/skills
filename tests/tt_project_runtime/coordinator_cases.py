@@ -1889,6 +1889,22 @@ def test_charter_update_replaces_moves_the_old_section_to_history(env):
     assert p.charter_path.read_text().count("Box A is free to use.") == 1, "a rejected update was written"
 
 
+def test_a_refused_charter_update_with_replaces_marks_its_own_action_refused(env):
+    """The section index `replaces` resolves to never stands in for the action's index: the refused
+    charter_update is the one left out of `applied`, and the batch's other actions stay in it."""
+    p = make(env)
+    from ttp import coordinator as coord
+    p.charter_path.write_text("# demo\n\n## Brief (verbatim from the user)\nKeep it tidy.\n\n"
+                              "## Policies (added 2026-09-01)\nPush every day.\n\n"
+                              "## Restrictions (added 2026-09-02)\nNever touch box A (user msg #1).\n")
+    retire = {"type": "charter_update", "section": "Notes", "text": "Box A is free to use.",
+              "replaces": "Restrictions (added 2026-09-02)"}
+    applied: list = []
+    out = coord.apply(p, [retire, {"type": "noop"}, {"type": "noop"}, {"type": "noop"}], turn=8, applied=applied)
+    assert any("needs the user's word" in n for n in out), out
+    assert applied == [1, 2, 3], applied
+
+
 
 def test_charter_update_merges_into_the_one_existing_section(env):
     p = make(env)
