@@ -12,7 +12,7 @@ US_REFUSED = [
     "env --unset=PIP_USER pip install x", "export PIP_BREAK_SYSTEM_PACKAGES=1", "sudo pip install x",
     "env -i pip install x", "pip --isolated install x", "pip install --isolated x", "bash -lc 'pip install --user x'",
     "sh -c \"cd a && python3 -m pip install --user x\"", "eval pip install --user x",
-    "pip install --target ~/.local/lib/python3.10/site-packages x", "pip install --target=/home/u/.local/lib x",
+    "pip install --target ~/.local/lib/python3.10/site-packages x", "pip install --target=$HOME/.local/lib x",
     "uv pip install --system x", "pip config set global.user true", "pip config set global.require-virtualenv false",
     "python3 setup.py install --user", "easy_install --user x", "ttp clip -- pip install --user x",
     "timeout 60 pip3.10 install --user x", "cd /tmp && pip install -U --user pytest==9.2.0",
