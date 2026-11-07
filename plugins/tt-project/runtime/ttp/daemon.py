@@ -3578,7 +3578,7 @@ class Daemon:
             info = _read_checks_pid(run_dir)
             if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
                 continue
-            if r.get("newer") and self._checks_still_wanted(r, run_dir, info):
+            if r.get("newer") and self._checks_still_wanted(run_dir, info):
                 continue
             why = f"task #{r['task']} moved to run {r['newer']}" if r.get("newer") else \
                 f"task #{r['task']} ended ({r['status']})" if r["status"] else \
@@ -3602,14 +3602,15 @@ class Daemon:
         each with "newer" (the task's latest run): reap_waiting_checks stops their waiting checks unless
         _checks_still_wanted."""
         marks = ",".join("?" * len(TERMINAL_TASK_STATES))
-        return self.p.db.q(
-            "SELECT runs.id, runs.dir, runs.task, tasks.status, (SELECT MAX(n.id) FROM runs n "
-            "WHERE n.task=runs.task AND n.role!='coordinator') AS newer FROM runs JOIN tasks ON tasks.id=runs.task "
-            "WHERE runs.started > ? AND runs.status != 'running' AND runs.role != 'coordinator' "
-            f"AND tasks.status NOT IN ({marks}) AND EXISTS (SELECT 1 FROM runs n WHERE n.task=runs.task "
-            "AND n.id > runs.id AND n.role != 'coordinator')", (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES))
+        since = now - REAP_CHECKS_WINDOW_S
+        return self.p.db.q(   # one pass over the runs (no index on runs.task)
+            "SELECT runs.id, runs.dir, runs.task, tasks.status, m.newer FROM runs JOIN tasks ON tasks.id=runs.task "
+            "JOIN (SELECT task, MAX(id) AS newer FROM runs WHERE started > ? AND role != 'coordinator' "
+            "AND task IS NOT NULL GROUP BY task) m ON m.task=runs.task WHERE runs.started > ? AND m.newer > runs.id "
+            f"AND runs.status != 'running' AND runs.role != 'coordinator' AND tasks.status NOT IN ({marks})",
+            (since, since, *TERMINAL_TASK_STATES))
 
-    def _checks_still_wanted(self, r: dict, run_dir: Path, info: dict) -> str:
+    def _checks_still_wanted(self, run_dir: Path, info: dict) -> str:
         """Why an earlier run's waiting checks (_moved_checks) stay, or "": a live task's recorded wait names
         that run (its retry_when, then, on_pass_cmd or next_step: the task's own hand-off still points at
         them, or another task waits on them), or another run follows them (checkjoin: it joined them, or
