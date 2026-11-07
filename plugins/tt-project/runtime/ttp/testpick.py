@@ -15,7 +15,14 @@ quotes). Any other file runs the units naming its file (or folder) name. The who
 checks runner, a manifest or `__init__.py`, a pytest or package config file, a module-level change of a
 listed file or of a module mapped by functions, any file nothing places, or a selection of most of the
 suite. `delivery.checks_targeted_always` (default ALWAYS) always
-run; `delivery.checks_targeted: false` (or `ttp checks --full`) runs every task's checks in full."""
+run; `delivery.checks_targeted: false` (or `ttp checks --full`) runs every task's checks in full.
+
+With the push queue on (project.push_queue_on), every batch runs the full suite on the merged tree before
+anything is pushed and bisects a failure to the changes at fault, so a task's own checks run in full only
+where the whole suite is affected (HARD: a conftest, test helper or data file, the runner files, a
+manifest, `__init__.py` or config file, a listed file's module-level code, most of the suite). A change
+only the full suite would cover (SOFT: a module's module-level code, the checks runner's functions in a
+module, what no test names) adds the tests it can place, and the scope line names it as left to the batch."""
 from __future__ import annotations
 
 import ast
@@ -163,9 +170,17 @@ def _naming(us: dict[str, str], word: str, module: bool) -> set[str]:
 
 
 def _place(top: Path, base: str, head: str, path: str, us: dict[str, str], listed: list[str],
-           cases: set[str]) -> tuple[set[str], str]:
-    """The units `path` maps to, or (set(), why it runs the whole check)."""
+           cases: set[str], soft: list[str] | None = None) -> tuple[set[str], str]:
+    """The units `path` maps to, or (set(), why it runs the whole check). With `soft` (a push-queue project)
+    a reason only the full suite covers is appended there and the units placed so far are returned."""
     p, name = Path(path), Path(path).name
+
+    def left(got: set[str], why: str) -> tuple[set[str], str]:
+        if soft is None:
+            return set(), why
+        soft.append(why)
+        return got, ""
+
     if path in us:
         return {path}, ""
     if path in listed:   # its changed tests and helpers: the tests using them, and case files naming a helper
@@ -176,7 +191,7 @@ def _place(top: Path, base: str, head: str, path: str, us: dict[str, str], liste
                and any(re.search(rf"^(?:async )?(?:def|class) {re.escape(d)}\b", us[k], re.M) for d in defs)}
         for d in defs - {k.partition("::")[2] for k in got}:
             got |= _naming({k: us[k] for k in cases}, d, False)
-        return (got, "") if got else (set(), f"no test uses what {path} changes")
+        return (got, "") if got else left(set(), f"no test uses what {path} changes")
     if path in cases:
         return set(), ""   # a case file the head deletes: none of its tests remain
     if name in FULL_NAMES:
@@ -190,16 +205,17 @@ def _place(top: Path, base: str, head: str, path: str, us: dict[str, str], liste
         return set(), f"shared test file {path} changed"
     if p.suffix != ".py":   # its file name, else its folder's (a test that globs the folder)
         got = _naming(us, name, False) or (_naming(us, p.parent.name, False) if p.parent.name else set())
-        return (got, "") if got else (set(), f"no test names {path} or its folder")
+        return (got, "") if got else left(set(), f"no test names {path} or its folder")
     got = _naming(us, p.stem, True)
     if not got:
-        return set(), f"no test imports or names {path}"
+        return left(set(), f"no test imports or names {path}")
     if _weight(us, got) < MAX_SHARE * _weight(us, us):
         return got, ""
     defs = changed_defs(top, base, head, path)
     if defs is None:
-        return set(), f"module-level code of {path} changed"
-    if any(RUNNER_DEFS.match(d) for d in defs):
+        return left(set(), f"module-level code of {path} changed")
+    runner = any(RUNNER_DEFS.match(d) for d in defs)
+    if runner and soft is None:
         return set(), f"the checks runner changed ({path})"
     got = set()
     for d in defs:
@@ -207,11 +223,15 @@ def _place(top: Path, base: str, head: str, path: str, us: dict[str, str], liste
         if d.startswith("cmd_"):
             sub = re.escape(d[4:].replace("_", "-"))
             got |= {k for k, t in us.items() if re.search(rf"[\"']{sub}[\"']", t)}
-    return (got, "") if got else (set(), f"no test names what {path} changes")
+    if runner:
+        return left(got, f"the checks runner changed ({path})")
+    return (got, "") if got else left(set(), f"no test names what {path} changes")
 
 
-def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS) -> tuple[list[str], str]:
-    """(selection entries, "") for a narrowed check, else ([], why it runs in full)."""
+def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS,
+         soft: list[str] | None = None) -> tuple[list[str], str]:
+    """(selection entries, "") for a narrowed check, else ([], why it runs in full). With `soft` (a
+    push-queue project) what only the full suite covers is left to the push batch and listed there."""
     if not base:
         return [], "no push target to diff against"
     diff = _git(top, "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}")
@@ -224,13 +244,15 @@ def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS) -> tu
     cases = {k for k in us if k.endswith("_cases.py")}
     chosen: set[str] = set()
     for path in paths:
-        got, why = _place(top, base, head, path, us, files, cases)
+        got, why = _place(top, base, head, path, us, files, cases, soft)
         if why:
             return [], why
         chosen |= got
-    if not chosen:
+    if not chosen and not soft:
         return [], "nothing in the diff maps to a test"
     chosen |= {k for k in us for a in always if k == a or k.startswith(f"{a}::")}
+    if not chosen:
+        return [], "nothing in the diff maps to a test"
     if (share := _weight(us, chosen) / max(1, _weight(us, us))) >= MAX_SHARE:
         return [], f"the diff reaches {share:.0%} of the tests"
     out = sorted(chosen)
@@ -250,11 +272,14 @@ def summary(entries: list[str]) -> str:
 def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | None,
            full: bool = False) -> tuple[list, list[str]]:
     """`todo` with each eligible project pytest check narrowed to its selection, and the scope lines
-    ('<check>: targeted: ...' or '<check>: full: <reason>') to print and record."""
-    from . import push, pushpass
+    ('<check>: targeted: ...' or '<check>: full: <reason>') to print and record. In a push-queue project
+    a targeted line also names what it leaves to the push batch's full run ('; the push batch runs the
+    rest: <reasons>')."""
+    from . import project, push, pushpass
     out, lines = [], []
     own_s = {str(c) for c in own}
     always = tuple(((cfg or {}).get("delivery") or {}).get(ALWAYS_KEY, ALWAYS) or ())
+    queued = project.push_queue_on(cfg or {})
     for c in todo:
         files = test_files(str(c), top) if str(c) in own_s and not getattr(c, "env", ()) \
             and not getattr(c, "host", "") else []
@@ -262,7 +287,8 @@ def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | N
             out.append(c)
             continue
         why = "--full" if full else "" if enabled(cfg) else f"delivery.{KEY} is false"
-        entries, why = ([], why) if why else pick(top, base, head, files, always)
+        soft: list[str] | None = [] if queued else None
+        entries, why = ([], why) if why else pick(top, base, head, files, always, soft)
         if not entries:
             out.append(c)
             lines.append(f"{c}: full: {why}")
@@ -276,5 +302,6 @@ def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | N
         c2.spill = False   # the select plugin's path is this host's
         c2.targeted = True   # a part of the suite: never a verified-through marker
         out.append(c2)
-        lines.append(f"{c}: {summary(entries)}")
+        lines.append(f"{c}: {summary(entries)}"
+                     + (f"; the push batch runs the rest: {'; '.join(dict.fromkeys(soft))}" if soft else ""))
     return out, lines

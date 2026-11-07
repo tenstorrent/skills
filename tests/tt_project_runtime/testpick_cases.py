@@ -113,6 +113,77 @@ def test_targeted_checks_run_in_full_where_the_diff_can_reach_anything(tmp_path,
     assert entries == [] and reason in why, why
 
 
+_PICK_QUEUE = {"delivery": {"push_queue": True, "push_branch": "work-branch"}}
+
+
+@pytest.mark.parametrize("changes, entries, left", [
+    ({"plugins/x/runtime/ttp/nobody.py": "def lonely():\n    return 1\n"},
+     ["tests/test_plugin_catalogue.py::test_cat"], "no test imports or names plugins/x/runtime/ttp/nobody.py"),
+    ({"plugins/x/runtime/ttp/nobody.py": "def lonely():\n    return 1\n",
+      "plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"},
+     ["tests/r/foo_cases.py", "tests/test_plugin_catalogue.py::test_cat"], "no test imports or names"),
+    ({"plugins/x/notes.txt": "x\n"}, ["tests/test_plugin_catalogue.py::test_cat"], "no test names plugins/x/notes.txt"),
+])
+def test_a_push_queue_project_runs_only_the_targeted_tests_and_leaves_the_rest_to_the_batch(tmp_path, changes,
+                                                                                           entries, left):
+    from ttp import push, testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, changes)
+    assert testpick.pick(repo, base, head, _PICK_FILES)[0] == [], "without the push queue it runs in full"
+    soft: list[str] = []
+    assert testpick.pick(repo, base, head, _PICK_FILES, soft=soft) == (entries, "") and left in soft[0]
+    own = push.check_list([_PICK_CMD])
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
+    assert todo[0].targeted and lines[0].startswith(f"{_PICK_CMD}: targeted: ") \
+        and f"; the push batch runs the rest: {soft[0]}" in lines[0], lines
+    # a project without the push queue (or with it set but pushing off) keeps today's full task checks
+    for cfg in (None, {"delivery": {"push_queue": False, "push_branch": "b"}},
+                {"delivery": {"push_queue": True, "push_branch": "b", "push_allowed": False}}):
+        todo, lines = testpick.narrow(repo, base, head, list(own), own, cfg)
+        assert todo == list(own) and lines[0].startswith(f"{_PICK_CMD}: full: "), (cfg, lines)
+
+
+def test_a_push_queue_project_narrows_a_wide_modules_module_level_and_checks_function_changes(tmp_path):
+    from ttp import testpick
+    repo, base = _pick_repo(tmp_path)
+    many = "".join(f"from ttp import bar\n\n\ndef test_b{i}():\n    assert bar.X\n\n\n" for i in range(30))
+    base = _pick_change(repo, base, {"tests/r/other_cases.py": many,
+                                     "tests/r/run_cases.py": "def test_run():\n    assert _checks_run\n"})
+    head = _pick_change(repo, base, {"plugins/x/runtime/ttp/bar.py":
+                                     "X = 2\n\n\ndef bar_one():\n    return 1\n\n\ndef bar_two():\n    return 2\n"})
+    soft: list[str] = []
+    assert testpick.pick(repo, base, head, _PICK_FILES, soft=soft) == (["tests/test_plugin_catalogue.py::test_cat"], "")
+    assert soft == ["module-level code of plugins/x/runtime/ttp/bar.py changed"]
+    head = _pick_change(repo, base, {"plugins/x/runtime/ttp/bar.py": "X = 1\n\n\ndef bar_one():\n    return 1\n\n\n"
+                                     "def bar_two():\n    return 2\n\n\ndef _checks_run():\n    return 3\n"})
+    assert testpick.pick(repo, base, head, _PICK_FILES)[1] == "the checks runner changed (plugins/x/runtime/ttp/bar.py)"
+    soft = []
+    assert testpick.pick(repo, base, head, _PICK_FILES, soft=soft) == (
+        ["tests/r/run_cases.py", "tests/test_plugin_catalogue.py::test_cat"], "")
+    assert soft == ["the checks runner changed (plugins/x/runtime/ttp/bar.py)"]
+
+
+@pytest.mark.parametrize("rel, text, reason", [
+    ("tests/conftest.py", "X = 1\n", "conftest.py"),
+    ("tests/helpers.py", "def shared():\n    return 1\n", "tests/helpers.py"),
+    ("plugins/x/runtime/ttp/push.py", "def run():\n    return 1\n", "checks runner"),
+    ("plugins/x/.claude-plugin/plugin.json", '{"version": "1"}\n', "plugin.json"),
+    ("pyproject.toml", "[tool.pytest]\n", "pyproject.toml"),
+    ("tests/test_r.py", "X = 1\n\n\ndef _h():\n    return 1\n\n\ndef test_top():\n    assert _h()\n\n\n"
+                        "def test_alone():\n    pass\n", "module-level code of tests/test_r.py"),
+    ("tests/r/other_cases.py", "def test_other():\n    pass\n" + "".join(
+        f"\n\ndef test_more_{i}():\n    pass\n" for i in range(40)), "the diff reaches"),
+])
+def test_a_push_queue_project_still_runs_task_checks_in_full_where_the_whole_suite_is_affected(tmp_path, rel, text,
+                                                                                              reason):
+    from ttp import push, testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {rel: text, "plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
+    own = push.check_list([_PICK_CMD])
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
+    assert todo == list(own) and lines[0].startswith(f"{_PICK_CMD}: full: ") and reason in lines[0], lines
+
+
 def test_narrow_records_targeted_or_full_and_keeps_the_full_pass_key_apart(tmp_path):
     from ttp import cli, push, testpick
     repo, base = _pick_repo(tmp_path)

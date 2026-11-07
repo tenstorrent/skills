@@ -2166,7 +2166,14 @@ session and stateless coordinators on every provider.
   A targeted pass counts only for that narrowed run: it never counts as the full check's pass and
   sets no verified-through marker. `ttp push` and the push queue never narrow: every batch runs the
   full required checks. `delivery.checks_targeted: false` (or `ttp checks --full`) restores full
-  runs.
+  runs. With the push queue on, the batch's full run on the merged tree (bisected to the changes at
+  fault when it fails) is the full-suite gate, so a task's own checks run in full only where the
+  whole suite is affected (a conftest, a shared test helper or fixture, the checks runner's own
+  files, a manifest, `__init__.py` or config file, a test file's module-level code, half the suite or
+  more). A change only the full suite covers (a module's module-level code, the checks functions in
+  a module, something no test names) adds the tests it can place, and the scope line ends `; the push
+  batch runs the rest: <reasons>`. Checks already waiting for a slot re-execute on the new runtime
+  and pick their scope again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
   several quoted strings run as one check each (`ttp checks -- 'pytest -q' 'ruff check .'`). An
