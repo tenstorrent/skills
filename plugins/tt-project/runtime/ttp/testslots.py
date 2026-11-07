@@ -1637,9 +1637,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                     # Recount under the guard: a run that took a lane since the count above (and left the
                     # queue) is not free room, so a stale count never admits past the bound.
                     free = min(free, slots - _numbered_held(base, only_running)) if free > 0 else free
-                    if at_once:   # a place that only queues it for its host grants: claim_running bounds running
-                        f = locks.try_take(lanes, label, what, extra=fields)
-                    elif free > 0 and pos < free:
+                    if free > 0 and pos < free:
                         if cap_turn(project_name, cap, ticket, slots, age=age):
                             f = locks.try_take(lanes, label, what, extra=fields)
                         else:
@@ -1663,6 +1661,10 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                         if f is not None and tell:
                             tell("took the project's landing lane: a task-less or landing check never waits "
                                  "behind its task checks (the host-wide cap still applies)")
+                    if f is None and at_once:
+                        # Only after the over-cap and landing lanes: a place that only queues it for its host
+                        # grants, never held behind holders that are only queued too; claim_running bounds running.
+                        f = locks.try_take(lanes, label, what, extra=fields)
                     if f is not None and (cheaper or urgent) and "-x." in os.path.basename(f.name):
                         held_by = "; ".join(checklane.holder_text(r, time.time()) for r in pool[:3])
                         if tell and cheaper:

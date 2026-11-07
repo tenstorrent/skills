@@ -4186,6 +4186,33 @@ def test_urgent_and_p1_runs_reach_the_host_queue_past_lanes_held_by_runs_only_qu
     assert testslots.project_held("pa") == []
 
 
+def test_a_p1_ttp_checks_run_keeps_its_over_cap_lane_past_a_full_project_cap_before_the_at_once_place(
+        env, monkeypatch):
+    """In the ttp checks path (pending, running) the project's cap of 2 is full of running p2 runs. A p1
+    run with headroom still takes the one over-cap lane and may run at once, never a numbered place that
+    claim_running then holds behind the cap (review #7214: the at-once place is only the fallback)."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    twelve = lambda _held: 12   # noqa: E731
+    hold = lambda prio, repo, wt: testslots.suite_hold(   # noqa: E731
+        "pa", repo=repo, slots=twelve, cap=2, wait_s=0, pending=True, running=True, priority=prio,
+        worktree=wt, headroom=lambda: True)
+    runs = [hold(2, _LANE_REPO, "/w/a"), hold(2, _REPO_B, "/w/b")]
+    p1 = None
+    try:
+        assert all(g and g.files for g in runs)
+        assert all(testslots.claim_running(g, "pa", twelve, 2) for g in runs)
+        assert len(testslots.project_held("pa")) == 2
+        p1 = hold(1, "c0ffee000000", "/w/c")
+        assert p1 and p1.files and "-x." in p1.files[0].name, "a p1 takes the over-cap lane, not a numbered place"
+        rec, = locks.holder_records([Path(p1.files[0].name)])
+        assert rec.get("over_cap") is True
+        assert testslots.claim_running(p1, "pa", twelve, 2), "it runs past the full cap at once"
+    finally:
+        for g in runs + [p1]:
+            g and g.close()
+
+
 def locks_held_lanes(project_name: str) -> list:
     from ttp import locks, testslots
     return [x for x in testslots.lane_paths(project_name, repo=None) if locks._slot_labels([x])]
@@ -4203,8 +4230,18 @@ def test_a_waiting_ttp_checks_run_takes_a_raised_checks_slots_without_a_restart(
     p.set_config("checks.slots", 1)
     key = testslots.repo_key(repo)
     hold = testslots.suite_hold(p.name, repo=key, slots=1)   # a running suite holds the one lane
+    told = threading.Event()   # raised only once the run polled and waits, so it never starts on the new count
+    real_hold = testslots.suite_hold
+
+    def hold_told(project_name, tell=None, *a, **k):
+        def tell_(x):
+            "waiting for this project's other full checks" in x and told.set()
+            tell and tell(x)
+        return real_hold(project_name, tell_, *a, **k)
+    monkeypatch.setattr(testslots, "suite_hold", hold_told)
     queued = lambda: locks.queued(checkcap.slot_dir(), testslots._suite_resource(p.name, key))   # noqa: E731
-    raise_it = threading.Thread(target=lambda: _wait_for(queued) and p.set_config("checks.slots", 2))
+    raise_it = threading.Thread(target=lambda: _wait_for(queued) and told.wait(15)
+                                and p.set_config("checks.slots", 2))
     raise_it.start()
     seen = tmp_path / "seen"
     try:
