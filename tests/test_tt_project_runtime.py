@@ -27350,6 +27350,8 @@ DURABLE_EXEMPT = {
     ("runnerenv.py", '.lock", "a") as fh'): "the checks env build's flock guard file, never written",
     ("runnerenv.py", "(new / INFO).write_text("): "inside a new env folder not yet linked in; a torn one is never linked, and a linked env missing its info is rebuilt",
     ("runnerenv.py", "os.replace(tmp, link)"): "moves the env's symlink atomically to a fully built env (no new data); one lost to a crash leaves the old link and the next run rebuilds",
+    ("runnerenv.py", "tmp.write_bytes(r.stdout)"): "a run-dir copy of the checked commit's checks.python_lock, read again from git by each run; never state",
+    ("runnerenv.py", "os.replace(tmp, path)"): "moves that run-dir lock copy into place whole (no new data)",
     ("runnerenv.py", "Path(out).write_text("): "`ttp checks --freeze-lock` writes a lock file the user named and commits; never state",
     ("hostrun.py", 'os.replace(q, folder / f"{rid}.running")'): "claims a queued host-run request (a rename, no new data): one lost to a crash leaves the request queued, and the restarted daemon runs it or drops it once its client gave up",
 }
