@@ -126,7 +126,8 @@ def test_sudo_running_a_host_write_under_ttp_checks_is_refused_and_reported_and_
                "sudo -nE crontab -", "sudo install -m 644 x /etc/systemd/system/evil.service",
                "sudo sh -c 'true && systemctl --user daemon-reload'", "sudo -n timeout 5 shutdown -h now",
                "sudo -n loginctl enable-linger", "sudo tt-smi -glx_reset", "sudo /usr/sbin/poweroff",
-               "sudo tee /var/spool/cron/crontabs/x", "sudo sudo -n halt"]
+               "sudo tee /var/spool/cron/crontabs/x", "sudo sudo -n halt",
+               "sudo -u root bash -lc 'systemctl enable x'", "sudo env -i PATH=/x systemctl enable x"]
     allowed = ["sudo -n systemctl status x", "sudo -n crontab -l", "sudo -n true", "sudo -l"]
     script = "; ".join(f"{c} < /dev/null; echo \"rc=$?\"" for c in refused + allowed)
     log = tmp_path / "checks.log"

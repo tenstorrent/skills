@@ -98,8 +98,9 @@ def _sudo_refused(cmd):
         return f"{base} would change the real host"
     if base in FILE_CMDS and any(h in a for a in cmd[1:] for h in HOST_PATHS):
         return f"{base} names a systemd unit folder or the cron spool"
-    if base in SHELLS and "-c" in cmd[1:-1]:
-        script = cmd[cmd.index("-c") + 1]
+    flags = [i for i, a in enumerate(cmd[1:-1], 1) if a[:1] == "-" and a[1:2] != "-" and "c" in a]
+    if base in SHELLS and flags:   # sh -c, bash -lc
+        script = cmd[flags[0] + 1]
         for part in script.replace("&&", ";").replace("||", ";").replace("|", ";").replace("\n", ";").split(";"):
             if why := _sudo_refused(_sudo_command(["--", *part.split()])):
                 return why
