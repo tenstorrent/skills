@@ -14,7 +14,8 @@ A process is a leftover (find) only when all of these hold:
 - it names no other project (procowner.foreign_env) and holds no other `ttp lock` slot (held_lock: an open
   file in the project's or a shared resource's lock folder);
 - neither it nor an ancestor is the caller, the project's daemon or one of its running workers
-  (leftoverstop._guarded), and it is not a `ttp detach` job's or a device user (leftoverstop._untouchable);
+  (claimants; the caller's other ancestors claim nothing: an orphan lands on a shared subreaper), and it
+  is not a `ttp detach` job's or a device user (leftoverstop._untouchable);
 - its task, when it is this project's, is finished; its TTP_RUN_DIR, when set, is not a live run (the
   folder exists without exit.json); its run row, when this project's, is not running;
 - and at least one reason holds: its working folder is deleted; its TTP_RUN_DIR is gone; its run ended
@@ -175,6 +176,18 @@ def _facts(p, pid: int, slots: Path, env: dict) -> dict:
     return out
 
 
+def claimants(p) -> set[int]:
+    """Who claims a process in its parent chain (judge): the caller, every running worker run and the live
+    daemon. Not the caller's other ancestors: an orphaned leftover is reparented to the nearest child
+    subreaper, which outside a PID namespace (`systemd --user`) is also an ancestor of the daemon and of a
+    CLI caller, so being under one claims nothing. stop's group guard still spares every guarded pid."""
+    from . import leftoverstop
+    out = {os.getpid()} | {int(r["pid"]) for r in p.db.q("SELECT pid FROM runs WHERE status='running' AND pid IS NOT NULL")}
+    if d := leftoverstop._daemon_pid(p):
+        out.add(d)
+    return out
+
+
 def judge(p, pid: int, slots: Path, guarded: set[int], env: dict, facts: dict | None = None) -> tuple[str, str]:
     """("leftover" | "keep", why) for this user's `ttp checks` process `pid` that has a file under `slots` open;
     `facts` (_facts) as read already. ("timeout" | "stuck", why) when the reads of who joined its checks
@@ -187,9 +200,11 @@ def judge(p, pid: int, slots: Path, guarded: set[int], env: dict, facts: dict | 
         return "keep", why
     if facts["held_lock"]:
         return "keep", "it holds a ttp lock"
-    for a in facts["chain"]:
-        if a in guarded:
-            return "keep", f"a live worker run or the caller (pid {a}) claims it"
+    if hits := [a for a in facts["chain"] if a in guarded]:
+        claim = claimants(p)
+        for a in hits:
+            if a in claim:
+                return "keep", f"a live worker run or the caller (pid {a}) claims it"
     own = procowner.owns_env(p.base, env)
     task, run_id = env.get("TTP_TASK") or env.get("TTP_TASK_ID") or "", env.get("TTP_RUN_ID") or ""
     if own and task and run_id and not run_id.isdigit():

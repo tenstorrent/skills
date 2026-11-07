@@ -20,11 +20,27 @@ open(os.environ["LC_READY"], "w").write("held")
 time.sleep(120)
 """
 
+# A child subreaper standing in for `systemd --user`, itself detached (not under the test): it starts the
+# launcher, so the detached stand-in is reparented here when the launcher exits (inside a PID namespace or
+# not), writes its pid to LC_PID, then waits on its orphans.
+_LC_REAPER = """
+import ctypes, os, subprocess, sys, time
+ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0)   # PR_SET_CHILD_SUBREAPER
+pid = subprocess.run(sys.argv[1:], capture_output=True, text=True, check=True).stdout.strip()
+open(os.environ["LC_PID"] + ".tmp", "w").write(pid)
+os.replace(os.environ["LC_PID"] + ".tmp", os.environ["LC_PID"])
+while True:
+    try:
+        os.wait()
+    except ChildProcessError:
+        time.sleep(0.2)
+"""
+
 
 def _lc_spawn(tmp_path, monkeypatch, env_extra, name="run", cwd=None):
     """A process whose command line is `<dir>/ttp checks -- pytest`, holding a checks slot and a ticket
     under the test's checks slot folder; (proc, slot folder)."""
-    from ttp import checkcap, project
+    from ttp import checkcap, jobstop, project
     home = tmp_path / "ttp-home"
     monkeypatch.setattr(project, "HOME_DIR", home)
     slots = checkcap.slot_dir()
@@ -36,27 +52,34 @@ def _lc_spawn(tmp_path, monkeypatch, env_extra, name="run", cwd=None):
     work = cwd or tmp_path / f"{name}-work"
     work.mkdir(parents=True, exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_")}
-    # Started detached, as a nohup'd run is: its launcher exits, so the test (a guarded ancestor) is not its parent.
-    launch = subprocess.run([sys.executable, "-c", "import subprocess,sys\nprint(subprocess.Popen(sys.argv[1:], "
-                             "start_new_session=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, "
-                             "stderr=subprocess.DEVNULL).pid)", sys.executable, str(bindir / "ttp"), "checks", "--",
-                             "pytest"], cwd=work, capture_output=True, text=True, check=True,
+    # Started detached, as a nohup'd run is: its launcher exits, so it lands on the subreaper stand-in, which
+    # the caller's guard holds as an ancestor (as `systemd --user` is of the daemon and a CLI caller).
+    detach = ("import subprocess,sys\nprint(subprocess.Popen(sys.argv[1:], start_new_session=True, "
+              "stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).pid)")
+    pidfile = tmp_path / f"{name}.pid"
+    launch = subprocess.run([sys.executable, "-c", detach, sys.executable, "-c", _LC_REAPER, sys.executable, "-c",
+                             detach, sys.executable, str(bindir / "ttp"), "checks", "--", "pytest"],
+                            cwd=work, capture_output=True, text=True, check=True,
                             env={**env, **env_extra, "LC_SLOTS": str(slots), "LC_READY": str(ready),
-                                 "LC_SLOT": str(len(list(slots.glob("checks.*.lock"))))})
-    proc = _LcProc(int(launch.stdout))
+                                 "LC_PID": str(pidfile), "LC_SLOT": str(len(list(slots.glob("checks.*.lock"))))})
+    reaper = _LcProc(int(launch.stdout))
+    monkeypatch.setattr(jobstop, "_guarded", lambda p, guarded=jobstop._guarded: guarded(p) | {reaper.pid})
     deadline = time.monotonic() + 20
-    while not ready.exists() and time.monotonic() < deadline:
+    while not (ready.exists() and pidfile.exists()) and time.monotonic() < deadline:
         time.sleep(0.02)
-    assert ready.exists(), "the stand-in did not take its slot"
+    if not (ready.exists() and pidfile.exists()):
+        _lc_end(reaper)
+        raise AssertionError("the stand-in did not take its slot")
+    proc = _LcProc(int(pidfile.read_text()), reaper)
     return proc, slots
 
 
 class _LcProc:
     """A detached stand-in, known by pid and start time (not this test's child, so never waited on)."""
 
-    def __init__(self, pid):
+    def __init__(self, pid, reaper=None):
         from ttp import locks
-        self.pid, self.start = pid, locks.start_time(pid)
+        self.pid, self.start, self.reaper = pid, locks.start_time(pid), reaper
 
     def alive(self):
         from ttp import locks
@@ -77,6 +100,8 @@ def _lc_end(*procs):
     for proc in procs:
         if proc.alive():
             os.kill(proc.pid, signal.SIGKILL)
+        if proc.reaper:
+            _lc_end(proc.reaper)
 
 
 def test_a_leftover_checks_run_with_a_deleted_folder_and_ended_run_is_reaped_and_its_slot_freed(env, tmp_path, monkeypatch):
@@ -345,3 +370,23 @@ def test_reading_who_joined_a_done_tasks_checks_times_out_and_does_not_hold_the_
         assert leftoverchecks.judge(p, os.getpid(), slots, set(), env_) == ("leftover", f"its task #{tid} is done")
     finally:
         release.set()
+
+
+def test_only_the_caller_a_running_worker_or_the_daemon_claims_a_checks_run_not_the_callers_other_ancestors(env, tmp_path, monkeypatch):
+    """An orphan lands on the nearest child subreaper, outside a PID namespace `systemd --user`, which is also
+    an ancestor of the daemon and of a CLI caller: a caller's ancestor in its chain claims nothing, while the
+    caller itself, a running worker run and the live daemon still do."""
+    from ttp import leftoverchecks, leftoverstop
+    p = make(env)
+    guarded = leftoverstop._guarded(p)
+    up = os.getppid()
+    assert up in guarded   # the caller's guard holds its ancestors (stop's group guard keeps them)
+    facts = {"untouchable": None, "held_lock": False, "cwd_gone": True, "run_dir_is": False, "ended": None, "began": None}
+    judge = lambda chain: leftoverchecks.judge(p, chain[0], tmp_path, guarded, {}, {**facts, "chain": chain})
+    assert judge([999999, up]) == ("leftover", "its working folder is deleted")
+    assert judge([999999, os.getpid(), up]) == ("keep", f"a live worker run or the caller (pid {os.getpid()}) claims it")
+    monkeypatch.setattr(leftoverstop, "_daemon_pid", lambda p: up)
+    assert judge([999999, up]) == ("keep", f"a live worker run or the caller (pid {up}) claims it")
+    monkeypatch.setattr(leftoverstop, "_daemon_pid", lambda p: None)
+    p.db.x("INSERT INTO runs(role,status,pid) VALUES('worker','running',?)", (up,))
+    assert judge([999999, up]) == ("keep", f"a live worker run or the caller (pid {up}) claims it")
