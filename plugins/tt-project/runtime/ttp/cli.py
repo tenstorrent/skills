@@ -2262,6 +2262,7 @@ def cmd_note(a) -> None:
         die("ttp note: the note's text is required", 2)
     if not run_dir:
         die("ttp note only works inside a tt-project run")
+    a.sent_text = a.text   # the leak scan reads what was asked to be sent, before masking (_note_to)
     a.text = redact.scrub(a.text)   # progress.md and a note's recipients keep no key or secret
     if getattr(a, "reply", None) and a.to:
         die("ttp note: --reply answers the note's sender by its own route; leave out --to", 2)
@@ -2414,7 +2415,7 @@ def _note_to(a, run_dir: str) -> None:
     if not me or not me.exists():
         die("ttp note --to: this run has no project (TTP_PROJECT)")
     from .outscan import problem
-    why = problem("ttp note --to", a.text, p=me)
+    why = problem("ttp note --to", getattr(a, "sent_text", a.text), p=me)
     if why:
         die(why, 2)
     at = back = None
