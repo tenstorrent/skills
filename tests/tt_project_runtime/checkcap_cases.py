@@ -8101,6 +8101,64 @@ def test_an_urgent_parked_run_whose_project_budget_is_full_keeps_no_test_pool_sl
         f.close()
 
 
+def test_an_urgent_parked_run_that_leaves_free_pool_room_untaken_keeps_no_slots_after_untaken_s(env, monkeypatch):
+    """#7029: a parked urgent run of another project the pool's free room fits, still parked UNTAKEN_S later
+    (some hold its lane names no reason for keeps it off), keeps no pool slots, so a routine run starts on
+    them; one the room does not fit, or once the room is gone, starts its count again."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "_ROOM_SINCE", {})
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    clock = [1000.0]
+    monkeypatch.setattr(testslots.time, "time", lambda: clock[0])
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(12)]
+    tickets, lane = _parked_urgent_with_gate("", n=2)
+    try:
+        assert testslots.urgent_parked("pb", need=4, room=4) == 2
+        assert "8 kept for 2 urgent run(s)" in testslots.pool_gate({}, "pb", full=True, priority=3)
+        clock[0] += testslots.UNTAKEN_S
+        assert testslots.urgent_parked("pb", need=4, room=4) == 1, "the oldest one the room fits: dropped"
+        assert testslots.urgent_parked("pb", need=4, room=3) == 2, "no room: every count starts again"
+        assert testslots.urgent_parked("pb", need=4, room=4) == 2
+        clock[0] += testslots.UNTAKEN_S - 1
+        assert testslots.urgent_parked("pb", need=4, room=4) == 2, "not yet"
+        clock[0] += 1
+        assert testslots.urgent_parked("pb", need=4, room=8) == 1, "the room fits the second only from now"
+        clock[0] += testslots.UNTAKEN_S
+        assert testslots.urgent_parked("pb", need=4, room=8) == 0
+    finally:
+        lane.close()
+        for t in tickets:
+            locks.dequeue(t)
+        for f in busy:
+            f.close()
+
+
+def test_upgraded_names_a_runtime_tree_changed_on_disk_without_a_version_bump(env, tmp_path, monkeypatch):
+    """#7029: a waiting detached `ttp checks` re-executes once its runtime's code changes on disk (a fix
+    landing in place, version unchanged), once settled, and never again for the same tree."""
+    import ttp
+    from ttp import checkcap
+    monkeypatch.setattr(checkcap, "_SEEN", {})
+    monkeypatch.setattr(checkcap, "_TREE0", {})
+    monkeypatch.setenv(checkcap.REEXEC_ENV, "")
+    init, mod = tmp_path / "__init__.py", tmp_path / "gate.py"
+    init.write_text(f'__version__ = "{ttp.__version__}"\n')
+    mod.write_text("A = 1\n")
+    assert checkcap.upgraded(init, now=100.0) == "", "the tree it imported"
+    mod.write_text("A = 22\n")
+    os.utime(mod, ns=(1, 1))
+    assert checkcap.upgraded(init, now=200.0) == "", "just changed: other files may still be copying"
+    new = checkcap.upgraded(init, now=200.0 + checkcap.UPGRADE_SETTLE_S)
+    assert new == f"{ttp.__version__}+{checkcap._tree(tmp_path)}", new
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "gate.py").write_text("compiled\n")
+    assert checkcap.upgraded(init, now=300.0) == new, "byte code is not code"
+    monkeypatch.setenv(checkcap.REEXEC_ENV, new)
+    assert checkcap.upgraded(init, now=9999.0, settle=0) == "", "re-executed for it once already: never a loop"
+
+
 def test_a_checks_wait_ends_once_its_task_moves_the_branch_off_the_head_and_never_on_a_detached_head(tmp_path):
     """#5893: cli._HeadMoved (asked by _checks_slot_take's stop) is "" while the branch tip is the head,
     the reason once a new commit moves it, and "" for a wait that began on a detached HEAD."""

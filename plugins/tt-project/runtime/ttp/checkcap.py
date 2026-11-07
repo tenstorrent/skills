@@ -728,19 +728,39 @@ class Reranked(Upgraded):
 _SEEN: dict = {}   # upgraded(): the installed version it last saw differ, and since when
 
 
+def _tree(pkg: Path) -> str:
+    """A fingerprint of the runtime package's code in `pkg` (each .py file's path, size and mtime), "" if
+    unreadable: a fix that lands changes it without a version bump (upgraded)."""
+    try:
+        files = sorted(f for f in pkg.rglob("*.py") if "__pycache__" not in f.parts)
+        return hashlib.sha256("\n".join(f"{f.relative_to(pkg)} {(st := f.stat()).st_size} {st.st_mtime_ns}"
+                                         for f in files).encode()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+_TREE0: dict = {str(Path(__file__).parent): _tree(Path(__file__).parent)}   # the tree this process imported
+
+
 def upgraded(init: Path | None = None, now: float | None = None, settle: float | None = None) -> str:
     """The runtime version now installed where this process imported its code from (`init`: that package's
-    __init__.py), when it differs from the version it runs and has stayed for `settle` seconds
-    (UPGRADE_SETTLE_S), else "". A version it re-executed for already (REEXEC_ENV) is never returned
+    __init__.py), when it differs from the version it runs, or the same version with its code changed on
+    disk since this process imported it (_tree: "<version>+<fingerprint>"), and has stayed for `settle`
+    seconds (UPGRADE_SETTLE_S), else "". A version it re-executed for already (REEXEC_ENV) is never returned
     again, so a re-execution that did not take the new code cannot loop."""
     from . import __file__ as own_init, __version__
     now = time.time() if now is None else now
+    init = Path(init or own_init)
     try:
-        text = Path(init or own_init).read_text(errors="replace")
+        text = init.read_text(errors="replace")
     except OSError:
         return ""
     m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
     new = m.group(1) if m else ""
+    if new and new == __version__:
+        was = _TREE0.setdefault(str(init.parent), _tree(init.parent))
+        if was and (now_tree := _tree(init.parent)) and now_tree != was:
+            new = f"{new}+{now_tree}"
     if not new or new == __version__ or new == os.environ.get(REEXEC_ENV):
         _SEEN.clear()
         return ""

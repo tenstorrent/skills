@@ -1193,7 +1193,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
         return (f"{BUDGET_GATE}{own_free} of {len(own)} free, a run needs {need}"
                 f" (held by {checkcap._some(list(dict.fromkeys(locks.held_labels(own))))})")
     kept = need * urgent_parked(project_name, priority, since, budget=project_max(cfg, (pool, s[1])), need=need,
-                                 run_max=s[1])
+                                 run_max=s[1], room=pool - used)
     if min(s[1], pool - used - kept) < need:
         return (f"the host's test pool: {pool - used} of {pool} free, a run needs {need}"
                 + (f", {kept} kept for {kept // need} urgent run(s) of other projects parked ahead" if kept else ""))
@@ -1201,7 +1201,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
 
 
 def urgent_parked(project_name: str | None, priority: int | None = None, since: float | None = None,
-                  budget: int = 0, need: int = 1, run_max: int = 0) -> int:
+                  budget: int = 0, need: int = 1, run_max: int = 0, room: int | None = None) -> int:
     """How many urgent runs (locks.URGENT_PRIORITY or better) of other projects than `project_name` are parked
     for their test slots now (checkcap.PARKED tickets) ahead of a run at `priority` that arrived at `since`
     (default now): every one for a routine run, else those more urgent, or as urgent and older. A run whose
@@ -1210,7 +1210,9 @@ def urgent_parked(project_name: str | None, priority: int | None = None, since: 
     kept for it, so they would sit idle. One whose lane names no reason, or only the pool, still counts.
     With a `budget` (the account's project_max), each project counts at most the runs of `need` slots its
     free budget could start now (its urgent slots too while only less urgent runs hold it, as pool_gate
-    counts them): one whose budget is full keeps no pool slots."""
+    counts them): one whose budget is full keeps no pool slots. With the pool's free slots (`room`), one
+    the free room fitted (most urgent and oldest first) for UNTAKEN_S keeps none either: some other hold
+    keeps it off them (_untaken)."""
     gid, d = locks.group_id(project_name), checkcap.slot_dir()
     try:
         q = locks.queued(d, checkcap.PARKED)
@@ -1225,9 +1227,28 @@ def urgent_parked(project_name: str | None, priority: int | None = None, since: 
     held = {r.get("pid") for r in locks.holder_records(sorted(d.glob(f"{SUITE}.*.lock")))
             if (g := str(r.get("gate") or "")).startswith((LOAD_GATE, BUDGET_GATE)) or g.endswith(STARVED_GATE)}
     held.discard(None)
-    groups = collections.Counter(locks.ticket_group(t) for t in ahead if ticket_pid(t) not in held)
+    ahead = sorted((t for t in ahead if ticket_pid(t) not in held),
+                   key=lambda t: (locks.ticket_priority(t), locks._arrival(t)))
+    stale = _untaken(ahead[:max(0, room) // max(1, need)]) if room is not None else set()
+    groups = collections.Counter(locks.ticket_group(t) for t in ahead if str(t) not in stale)
     return sum(min(n, _group_free(d, g, budget, run_max) // max(1, need)) if budget and g else n
                for g, n in groups.items())
+
+
+UNTAKEN_S = 300.0   # a parked urgent run that leaves free pool room untaken this long keeps no slots
+_ROOM_SINCE: dict = {}   # _untaken(): each parked ticket this process saw beside free room, and since when
+
+
+def _untaken(tickets: list, now: float | None = None) -> set:
+    """Of `tickets` (the parked runs the pool's free room fits now, most urgent and oldest first), those
+    (paths, as str) this process has seen so for UNTAKEN_S or longer: a run that could start takes free
+    room within a poll, so one that leaves it untaken is held by something else. Room taken or gone
+    starts its count again."""
+    now = time.time() if now is None else now
+    keep = {str(t) for t in tickets}
+    for k in set(_ROOM_SINCE) - keep:
+        del _ROOM_SINCE[k]
+    return {k for k in keep if now - _ROOM_SINCE.setdefault(k, now) >= UNTAKEN_S}
 
 
 def _group_free(d: Path, gid: str, budget: int, run_max: int) -> int:
