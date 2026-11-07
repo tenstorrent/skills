@@ -152,35 +152,46 @@ def test_restarted_detached_checks_keep_the_queue_place_of_the_ones_still_waitin
 
 def test_daemon_asks_only_an_ended_tasks_still_waiting_checks_to_stop_waiting(env, tmp_path):
     from ttp import cli
-    from ttp.daemon import Daemon
+    from ttp.daemon import REAP_CHECKS_WINDOW_S, Daemon
     from ttp.runner import proc_start
     p = make(env)
     proc = subprocess.Popen(["sleep", "60"])
     try:
         started = proc_start(proc.pid)
 
-        def run_of(status, wait_pid=None, start=None, updated=None, waits=True):
+        def run_of(status, wait_pid=None, start=None, updated=None, waits=True, task=True, run_status="ok",
+                   run_started=None):
             tid = p.db.add_task("t", "s", kind="code")
             p.db.x("UPDATE tasks SET status=?, updated=? WHERE id=?", (status, updated or time.time(), tid))
             run_dir = tmp_path / f"run-{tid}"
             run_dir.mkdir()
             p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
-                   (tid, "worker", "fake", time.time(), "ok", str(run_dir)))
+                   (tid if task is True else task, "worker", "fake", run_started or time.time(), run_status,
+                    str(run_dir)))
             (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": proc.pid, "started": start or started}))
             if waits:
                 (run_dir / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"pid": wait_pid or proc.pid}))
             return tid, run_dir
 
         stop = {s: run_of(s) for s in ("done", "failed", "cancelled")}
+        # a task that ended days ago, a task that is gone and an ended run with no task wait for nobody too
+        long_ago, gone, taskless = (run_of("done", updated=time.time() - 2 * 86400), run_of("queued", task=10 ** 6),
+                                    run_of("queued", task=None))
         keep = [run_of("done", waits=False), run_of("done", wait_pid=proc.pid + 100000), run_of("done", start="1"),
-                run_of("running"), run_of("waiting"), run_of("done", updated=time.time() - 2 * 86400)]
+                run_of("running"), run_of("waiting"), run_of("queued", task=None, run_status="running"),
+                run_of("done", run_started=time.time() - REAP_CHECKS_WINDOW_S - 60)]
         d = Daemon(p.base)
         d.reap_waiting_checks(every_s=0)
         for status, (tid, run_dir) in stop.items():
             assert json.loads((run_dir / cli.CHECKS_SLOT_CANCEL).read_text()) == {
                 "pid": proc.pid, "started": started, "why": f"task #{tid} ended ({status})"}
+        whys = {k: json.loads((r / cli.CHECKS_SLOT_CANCEL).read_text())["why"]
+                for k, (_, r) in {"long_ago": long_ago, "gone": gone, "taskless": taskless}.items()}
+        rid = p.db.one("SELECT id FROM runs WHERE task IS NULL AND status='ok'")["id"]
+        assert whys == {"long_ago": f"task #{long_ago[0]} ended (done)", "gone": f"task #{10 ** 6} is gone",
+                        "taskless": f"run {rid} ended and has no task"}, whys
         assert not [r for _, r in keep if (r / cli.CHECKS_SLOT_CANCEL).exists()], \
-            "checks with a slot, another process and live tasks are left alone"
+            "checks with a slot, another process, live tasks, a running taskless run and old runs are left alone"
         path = stop["done"][1] / cli.CHECKS_SLOT_CANCEL
         os.utime(path, (1000, 1000))
         d.reap_waiting_checks(every_s=0)

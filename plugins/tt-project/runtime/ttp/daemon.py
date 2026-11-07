@@ -583,6 +583,7 @@ STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised}
 # left was cut off (a hang the watchdog restarted, a kill): reaped once more lean, then quarantined.
 REAP_KEY = "reaping"
 dbmod.DICT_KV.add(REAP_KEY)
+REAP_CHECKS_WINDOW_S = 7 * 86400   # reap_waiting_checks looks at the runs started this recently
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
 STALL_GAP_S = 600      # checks further apart than this (a paused project): readiness counts again
 STALL_LIST_MAX = 30    # ready tasks listed in one stall observation
@@ -3510,20 +3511,22 @@ class Daemon:
         return min(now, max(max(seen), r["started"] or 0))
 
     def reap_waiting_checks(self, every_s: float = 60.0) -> None:
-        """Stop the detached checks of an ended task's runs (done, failed or changes_needed, cancelled)
-        that still wait for a host-wide checks slot: nobody reads their result any more, and each holds
-        a place other tasks' checks wait behind. A cancel request (cli.CHECKS_SLOT_CANCEL) names the
-        waiter by pid and start time, and only that process honours it, only while it waits: checks
-        that hold a slot already run on to their end. Tasks that ended within the last day only."""
+        """Stop the detached checks that still wait for a host-wide checks slot though nobody will read
+        their result: those of an ended task's runs (done, failed or changes_needed, cancelled, however
+        long ago), of a run whose task is gone, and of an ended run that has no task. Each holds a place
+        other tasks' checks wait behind. A cancel request (cli.CHECKS_SLOT_CANCEL) names the waiter by pid
+        and start time and why, and only that process honours it, only while it waits: checks that hold a
+        slot already run on to their end. Runs started within REAP_CHECKS_WINDOW_S only."""
         now = time.time()
         if now - getattr(self, "_reaped_checks", 0.0) < every_s:
             return
         self._reaped_checks = now
         from .cli import CHECKS_SLOT_CANCEL, CHECKS_SLOT_WAIT, _checks_alive, _read_checks_pid
         marks = ",".join("?" * len(TERMINAL_TASK_STATES))
-        for r in self.p.db.q(f"SELECT runs.id, runs.dir, runs.task, tasks.status FROM runs JOIN tasks ON tasks.id=runs.task "
-                             f"WHERE tasks.status IN ({marks}) AND tasks.updated > ?",
-                             (*TERMINAL_TASK_STATES, now - 86400)):
+        for r in self.p.db.q(f"SELECT runs.id, runs.dir, runs.task, tasks.status FROM runs LEFT JOIN tasks ON tasks.id=runs.task "
+                             f"WHERE runs.started > ? AND (tasks.status IN ({marks}) OR (tasks.id IS NULL AND "
+                             "(runs.task IS NOT NULL OR runs.status != 'running')))",
+                             (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES)):
             run_dir = self._run_dir(r)
             try:
                 wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
@@ -3532,7 +3535,9 @@ class Daemon:
             info = _read_checks_pid(run_dir)
             if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
                 continue
-            req = {"pid": info["pid"], "started": info["started"], "why": f"task #{r['task']} ended ({r['status']})"}
+            why = f"task #{r['task']} ended ({r['status']})" if r["status"] else \
+                f"task #{r['task']} is gone" if r["task"] is not None else f"run {r['id']} ended and has no task"
+            req = {"pid": info["pid"], "started": info["started"], "why": why}
             try:
                 if json.loads((run_dir / CHECKS_SLOT_CANCEL).read_text()) == req:
                     continue
@@ -3541,10 +3546,10 @@ class Daemon:
             try:
                 durable_write(run_dir / CHECKS_SLOT_CANCEL, json.dumps(req))
             except OSError as e:
-                log(self.p, f"run {r['id']}: waiting checks of ended task #{r['task']} not stopped: {e}")
+                log(self.p, f"run {r['id']}: waiting checks not stopped ({why}): {e}")
                 continue
-            log(self.p, f"run {r['id']}: asked the checks of ended task #{r['task']} (pid {info['pid']}) to stop "
-                        "waiting for a host-wide checks slot")
+            log(self.p, f"run {r['id']}: asked its checks (pid {info['pid']}) to stop waiting for a host-wide "
+                        f"checks slot: {why}")
 
     def reap_runs(self) -> None:
         up = self._awake.tick()

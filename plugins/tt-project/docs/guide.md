@@ -1973,6 +1973,8 @@ session and stateless coordinators on every provider.
   is installed (seen for 10 s) re-executes itself with it (same pid, one log line), keeping a lane it
   holds and queueing again for the rest at its arrival and priority; once its commands start it is never
   re-executed. A cancel (`checks-slot.cancel`, a reaped waiter) also ends a wait for test slots.
+  The daemon reaps a waiter nobody will read: one whose task ended (however long ago) or is gone, or
+  whose run ended without a task (runs of the last 7 days); the cancel and the daemon log say why.
 - Shared check failures: a task waiting on its own detached `ttp checks` that failed only on pytest
   ids (the failing command's `FAILED`/`ERROR path::name` lines, complete against pytest's summary)
   that also failed in at least `checks.shared_min_tasks` (default 2) other changes' checks on other
