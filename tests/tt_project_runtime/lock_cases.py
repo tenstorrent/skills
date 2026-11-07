@@ -2402,6 +2402,24 @@ def test_a_landing_mark_left_by_a_dead_holder_is_never_verified_and_is_reaped(en
     assert list(landmark.marks_dir().iterdir()) == []
 
 
+def test_a_live_review_prechecks_landing_mark_is_never_reaped(env, tmp_path):
+    """A mark held by a live daemon review precheck (its run id from daemon.precheck_run_id, its task set, as
+    while its review is open) stays however old: reap() goes by the OS lock only. Once it dies, its mark goes."""
+    from ttp import daemon, landmark
+    out = tmp_path / "prechecks" / "t1-0123456789ab"
+    pre_env = dict(os.environ, TTP_HOME=str(env["home"]), PYTHONPATH=str(RUNTIME),
+                   TTP_RUN_ID=daemon.precheck_run_id(out), TTP_TASK="1")
+    proc, held = _mark_holder(pre_env)
+    try:
+        old = time.time() - landmark.GRACE - 3600
+        os.utime(held, (old, old))
+        assert landmark.reap() == 0 and Path(held).exists(), "held by a live precheck: kept"
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=60)
+    assert landmark.reap() == 1 and not Path(held).exists(), "its holder died: reaped"
+
+
 def test_a_wait_line_names_a_holders_project_from_its_root_not_its_project_field(tmp_path):
     """locks.holder_kind: the project comes from the record's project_root (a lock's tt-project folder or a
     bare root), never from its project field, which may name only the harness folder; a record with no root
