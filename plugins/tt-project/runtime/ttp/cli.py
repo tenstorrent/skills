@@ -2921,6 +2921,75 @@ def _covered_by(c, checks: list, py: str = "", top: str = ""):
                  and _same_run_key(o, py, top) == key), None)
 
 
+_NORECURSE = re.compile(r"\..+|_darcs|build|CVS|dist|node_modules|venv|\{arch\}|.+\.egg")
+
+
+def _pytest_args(key: str) -> list[str] | None:
+    """The words after `pytest` of a _same_run_key that is one plain pytest run, else None."""
+    try:
+        words = shlex.split(key)
+    except ValueError:
+        return None
+    return words[1:] if words and words[0] == "pytest" and "--" not in words else None
+
+
+def _inside(path: str, root: str, top: str) -> bool:
+    """Whether a pytest run given `root` (a directory or file of the worktree `top`) already runs every test
+    of `path` (a file, a directory or a node id) given alone: it lies inside `root`, a file is named as
+    pytest collects it by default (test_*.py, *_test.py) and no top-level config sets python_files, no
+    directory on the way is one pytest skips by default, and no pytest config file between them would
+    become the lone run's own."""
+    from . import push
+    file = path.partition("::")[0]
+    if not file or not root or "::" in root or Path(file).is_absolute() or Path(root).is_absolute():
+        return False
+    f, r = Path(os.path.normpath(file)), Path(os.path.normpath(root))
+    if ".." in f.parts or ".." in r.parts or not (f == r or str(r) == "." or r in f.parents):
+        return False
+    t = Path(top)
+    try:
+        if not (t / f).is_dir():
+            if not (t / f).is_file() or not re.fullmatch(r"test_.*\.py|.*_test\.py", f.name):
+                return False
+            if any((t / n).is_file() and "python_files" in (t / n).read_text(errors="replace")
+                   for n in push.PYTEST_FILES if n.endswith((".ini", ".cfg", ".toml"))):
+                return False
+        below = f.parts if str(r) == "." else f.parts[len(r.parts):]
+        if any(_NORECURSE.fullmatch(w) for w in below):
+            return False
+        d, stop = (t / f if (t / f).is_dir() else (t / f).parent), (t / r if (t / r).is_dir() else (t / r).parent)
+        while d != stop and stop in d.parents:
+            if any((d / n).is_file() for n in push.PYTEST_FILES if n != "conftest.py"):
+                return False
+            d = d.parent
+    except OSError:
+        return False
+    return True
+
+
+def _within(c, checks: list, py: str = "", top: str = ""):
+    """The first of `checks` (unscoped, one plain pytest run of named paths) whose run already runs every
+    test of the extra command `c`: `c` is a plain pytest run with the same options (_same_run_key) and only
+    paths (files, directories or node ids) that lie inside that check's paths (_inside). None otherwise:
+    any other option, a path outside, or a command that is not plain pytest stays."""
+    if not isinstance(c, str) or not top or (mine := _pytest_args(_same_run_key(c, py, top))) is None:
+        return None
+    flags, paths = sorted(w for w in mine if w.startswith("-")), [w for w in mine if not w.startswith("-")]
+    if not paths or not set(flags) <= set(_TOP_FLAGS):
+        return None   # any other option (-k, -m, -p, --ignore ...) may run other tests: it stays
+    for o in checks:
+        if getattr(o, "if_exists", "") or getattr(o, "if_changed", ()) or not _plain_check(o):
+            continue
+        theirs = _pytest_args(_same_run_key(o, py, top))
+        if theirs is None or any("::" in w for w in theirs):
+            continue
+        roots = [w for w in theirs if not w.startswith("-")]
+        if roots and sorted(w for w in theirs if w.startswith("-")) == flags \
+                and all(any(_inside(w, r, top) for r in roots) for w in paths):
+            return o
+    return None
+
+
 def _commands_hash(cmds: list) -> str:
     import hashlib
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
@@ -3185,7 +3254,9 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
     quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
     here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike in
-    the worktree `top`, _same_run_key). One that
+    the worktree `top`, _same_run_key), and so is a plain pytest run of paths inside such a check's
+    (_within: `pytest -q tests/a.py` after `pytest -q tests`), so the run keeps that check set's
+    command hash and can reuse or share its pass. One that
     only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
     it once that check applies)."""
     if not extra:
@@ -3198,7 +3269,7 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
     mine, dropped = [], []
     for c in given:
         key = _same_run_key(c, py, top)
-        (dropped if key in seen else mine).append(c)
+        (dropped if key in seen or _within(c, own, py, top) is not None else mine).append(c)
         seen.add(key)
     return mine, dropped
 
@@ -3434,7 +3505,9 @@ def cmd_checks(a) -> None:
             print(f"ttp checks: {', '.join(map(repr, map(str, remote)))} run on their check host without "
                   f"{push.WRAP_KEY}, which wraps only commands run on this machine")
     for c in dropped:   # each names the project check that runs it, when another spelling
-        cover = _covered_by(c, own, vpy, top)
+        if (cover := _covered_by(c, own, vpy, top)) is None and (inside := _within(c, own, vpy, top)) is not None:
+            print(f"ttp checks: not running {c!r} after `--`: {source} already runs its tests in {str(inside)!r}")
+            continue
         by = ("an earlier command after `--` is the same run" if cover is None else f"{source} already runs it"
               + (f" as {str(cover)!r}" if str(cover) != c else ""))
         print(f"ttp checks: not running {c!r} after `--` again: {by}")
@@ -12560,7 +12633,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check commands after --: one quoted string runs through the shell "
                         "(ttp checks -- 'FOO=1 pytest -q && ruff check'); several quoted strings run as "
                         "one check each (-- 'pytest -q' 'ruff check .'); plain words run as argv "
-                        "(-- pytest -q tests/a.py). One that delivery.push_checks already runs is dropped")
+                        "(-- pytest -q tests/a.py). One that delivery.push_checks already runs is dropped, as is a plain "
+                        "pytest run of paths inside a push_checks pytest path")
     s.set_defaults(fn=cmd_checks)
 
     s = sub.add_parser("stats", help="context re-read (cache-read) tokens per run and per $, by kind and tier")

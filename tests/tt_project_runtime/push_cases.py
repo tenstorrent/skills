@@ -7574,6 +7574,59 @@ def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, t
     assert cli._extra_checks(["pytest", "-q"], scoped) == (["pytest -q"], [])
 
 
+def test_ttp_checks_drops_an_extra_pytest_run_of_paths_inside_a_project_pytest_path(env, tmp_path, monkeypatch, capsys):
+    """An extra plain pytest run of files, directories or node ids inside a project pytest path that runs
+    on every head already ran: it is dropped with a notice, and the run keeps the project's command set
+    (so its pass is the push check's). Other options, other paths, other collection rules or other
+    commands stay."""
+    from ttp import cli, push
+    top = tmp_path / "wt"
+    for f in ("tests/test_a.py", "tests/sub/test_b.py", "tests/helper.py", "tests/build/test_c.py",
+              "tests/cfg/test_d.py", "other/test_e.py"):
+        (top / f).parent.mkdir(parents=True, exist_ok=True)
+        (top / f).write_text("def test_x():\n    pass\n")
+    (top / "tests/cfg/pytest.ini").write_text("[pytest]\n")
+    own = push.check_list(["pytest -q tests"])
+    t = str(top)
+    for c in ("pytest -q tests/test_a.py", "pytest tests/sub", "pytest -q tests/sub/test_b.py::test_x",
+              "python3 -m pytest -q tests/test_a.py tests/sub/test_b.py", "pytest -q ./tests/test_a.py"):
+        assert cli._extra_checks([c], own, "", t) == ([], [c]), c
+    for c in ("pytest -q other/test_e.py", "pytest -q tests/test_a.py other/test_e.py",
+              "pytest -q -k x tests/test_a.py", "pytest -x tests/test_a.py", "pytest -q tests/helper.py",
+              "pytest -q tests/build/test_c.py", "pytest -q tests/cfg/test_d.py", "pytest -q tests/missing_test.py",
+              "pytest -q", "ruff check tests", "pytest -q ../wt/tests/test_a.py", "FOO=1 pytest -q tests/test_a.py"):
+        assert cli._extra_checks([c], own, "", t) == ([c], []), c
+    # Only an unscoped project check, of named paths and the same options, stands for the extra.
+    scoped = push.check_list([{"run": "pytest -q tests", "if_changed": "src/**"}])
+    assert cli._extra_checks(["pytest -q tests/test_a.py"], scoped, "", t) == (["pytest -q tests/test_a.py"], [])
+    for o in ("pytest -q", "pytest -q -k slow tests", "pytest -q tests/test_a.py::test_x"):
+        assert cli._extra_checks(["pytest -q tests/test_a.py"], push.check_list([o]), "", t)[1] == [], o
+    (top / "pytest.ini").write_text("[pytest]\npython_files = check_*.py\n")
+    assert cli._extra_checks(["pytest -q tests/test_a.py"], own, "", t) == (["pytest -q tests/test_a.py"], [])
+    assert cli._extra_checks(["pytest -q tests/sub"], own, "", t) == ([], ["pytest -q tests/sub"])
+
+
+def test_ttp_checks_run_drops_a_subset_pytest_extra_and_keeps_the_push_checks_commands(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("def test_a():\n    pass\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "tests"], check=True)
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q -p no:cacheprovider tests"])
+    cli.main(["checks", "--fresh", "--", "python3 -m pytest -q -p no:cacheprovider tests/test_a.py"])
+    out = capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["commands"] == [
+        "python3 -m pytest -q -p no:cacheprovider tests", "python3 -m pytest -q -p no:cacheprovider tests/test_a.py"]
+    assert "not running" not in out   # -p is another option: kept
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q tests"])
+    cli.main(["checks", "--fresh", "--", "pytest -q tests/test_a.py"])
+    out = capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["commands"] == ["python3 -m pytest -q tests"]
+    assert "not running 'pytest -q tests/test_a.py' after `--`: delivery.push_checks already runs its tests in " \
+           "'python3 -m pytest -q tests'" in out
+
+
 
 def _arg_logging_wrapper(path, log, rc=None):
     """A stand-in lock wrapper: logs a CALL line and each argument on its own line, then runs its
