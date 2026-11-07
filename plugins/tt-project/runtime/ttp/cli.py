@@ -5262,7 +5262,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             raise checksqueue.Parked()
         if restart and (new := checkcap.upgraded()):
             raise checkcap.Upgraded(new)
-        if restart and (rank := checkcap.reranked(p, prio)) is not None:   # its task turned urgent: queue as urgent
+        if restart and (rank := checkcap.reranked(p, prio)) is not None:   # its task's priority changed: queue at it
             raise checkcap.Reranked(str(rank))
         return (yielder() if yielder else "") or ""
 
@@ -5446,8 +5446,8 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     granted (`slot`, checkcap.keep_slot: no other waiter takes it in between) and queues again for the
     rest at its arrival time `arrived` and its task's priority `prio`, so it keeps its place. Called only
     while it waits, holding nothing else; returns only when the exec failed, with the lanes and the slot
-    let go (freed as a dead holder's are). With `rerank` (checkcap.Reranked) its task turned urgent (`new` is
-    its new priority): the same runtime re-executes once (RERANK_ENV) and reads that priority at its start."""
+    let go (freed as a dead holder's are). With `rerank` (checkcap.Reranked) its task's priority changed (`new`
+    is the new one): the same runtime re-executes (RERANK_ENV: once per priority) and reads it at its start."""
     from . import checkcap, checkspill, testslots
     if arrived is not None:
         os.environ[checkcap.ARRIVED_ENV] = repr(arrived)
@@ -5466,8 +5466,9 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
     elif slot is not None:   # no lane to keep it with: the new process queues for both
         slot.close()
         slot = None
-    tell((f"its task turned urgent (priority {new}) while these checks waited at priority "
-          f"{prio if prio is not None else '-'}: re-executing to queue as urgent " if rerank else
+    tell((f"its task {'turned urgent' if checkcap.is_urgent(int(new)) else 'changed priority'} (priority {new}) while "
+          f"these checks waited at priority {prio if prio is not None else '-'}: re-executing "
+          if rerank else
           f"runtime {__version__} was upgraded to {new} while these checks waited: re-executing with it ")
          + f"(same pid{', keeping its checks lane' if os.environ.get(testslots.LANE_ENV) else ''}"
          f"{' and its host-wide checks slot' if os.environ.get(checkcap.KEPT_ENV) else ''}), "
@@ -5490,7 +5491,7 @@ def _checks_reexec(new: str, arrived: float | None, prio, spill: bool, tell, out
         if slot is not None:
             slot.close()
         tell(f"could not re-execute with runtime {new} ({e.strerror or e}): waiting on with {__version__}")
-        # (a failed rank re-execution keeps RERANK_ENV: it is not tried again, the run waits on at its priority)
+        # (a failed rank re-execution keeps RERANK_ENV: that priority is not tried again, the run waits on at its own)
 
 
 def _checks_tip_ref(p: Project | None, top: Path) -> str:

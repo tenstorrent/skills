@@ -51,11 +51,10 @@ first), so it starts within a bound. A run parked outside the queue for its
 test slots (acquire's `startable`) holds a PARKED ticket meanwhile, so the wait is visible: once it has
 waited that long, later runs of its project at its priority or lower leave it their project's next free test
 slots, more urgent ones after aged_turns() of them started (testslots.pool_room, starved_ahead; push checks
-count as least urgent, priority 0 is never held by a less urgent run, and a less urgent task run leaves its
-project's next free test slots to the project's parked priority-0 runs, whatever their arrival: owed_ahead). An urgent run (locks.URGENT_PRIORITY or
-better) leaves less urgent aged runs one shared turn per aged_turns() urgent starts since its project's last
-routine start, and then only to the oldest of them (_routine_turn), so a routine backlog never holds it longer
-while it still starts one run per N urgent ones. Push checks run on their branch's reserved test lane alone
+count as least urgent, and a less urgent task run leaves its project's next free test slots to the project's
+parked priority-0 runs, whatever their arrival: owed_ahead). An owed or urgent run (locks.URGENT_PRIORITY or
+better) is never held by a less urgent one, however long that one waited (unless checks.priority_turns is 0:
+no urgent precedence). Push checks run on their branch's reserved test lane alone
 while any run waits for test slots (testslots.acquire), so a stream of pushes never holds them all.
 
 An urgent run (priority locks.URGENT_PRIORITY or better: an obligation owner, a user-ordered or `urgent:` task)
@@ -84,8 +83,10 @@ open obligation (owed: the slot label's "owed") asks an urgent run that owes not
 so an owed run never waits behind urgent work that owes nothing; an owed holder is never asked. `ttp checks
 --preempt <run>` writes the same request by hand, logged with who asked (ask_preempt). A freed reserved urgent
 slot goes to the urgent waiter that ranks first (URGENT_WAIT tickets: an owed one, then the oldest), not to
-whichever polls first. A routine run whose task turns urgent
-while it waits sees it within RERANK_S (reranked) and re-executes as an urgent run (cli._checks_reexec).
+whichever polls first. A run whose task's priority changes
+while it waits (raised to urgent, or lowered) sees it within RERANK_S (reranked) and re-executes to queue
+again at the new priority, keeping its arrival (cli._checks_reexec), so a queued or parked ticket never
+keeps a priority its task no longer has.
 
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
 slots (TTP_CHECKS_LOAD_EXTRA, default EXTRA_SLOTS; 0 turns it off) open beyond the cap: two below a quarter of the cores, one
@@ -190,8 +191,8 @@ PARKED_CLAIM_S = 60.0   # an asker that asked while parked renews its claim park
 HANDOVER_S = 3.0   # a parked asker that still cannot start this long after the asked run let go drops its claim
 # The run a preempt would stop: testslots counts the test slots it holds as free (preempt's `startable`).
 FREEING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("checkcap_freeing", default=None)
-RERANK_ENV = "TTP_CHECKS_RERANKED"   # these waiting checks re-executed once as urgent (reranked)
-RERANK_S = 30.0   # a waiting routine run reads its task's priority again at most this often (reranked)
+RERANK_ENV = "TTP_CHECKS_RERANKED"   # the priority these waiting checks last re-executed at (reranked)
+RERANK_S = 30.0   # a waiting run reads its task's priority again at most this often (reranked)
 # A preempted run's rerun resumes each plain local pytest check from the files it passed (cli._checks_resume).
 RESUME_ENV = "TTP_CHECKS_RESUME"
 SHIELD_PCT = 90   # a run that cannot resume is never asked once its log's last pytest `[ NN%]` is this far (preempt)
@@ -445,17 +446,20 @@ _RERANK: dict = {"at": 0.0}
 
 
 def reranked(p, prio: int | None, now: float | None = None) -> int | None:
-    """The task's priority read again (task_rank), at most every RERANK_S: the new one once the task of these
-    waiting routine checks (`prio`) turned urgent, else None. Once per run (RERANK_ENV): its re-execution reads
-    the new priority at its start."""
-    if p is None or is_urgent(prio) or os.environ.get(RERANK_ENV):
+    """The task's priority read again (task_rank), at most every RERANK_S: the new one once it differs from
+    the priority these waiting checks queued at (`prio`: raised, lowered, or now none), else None. Once per
+    priority (RERANK_ENV holds the one it last re-executed at, or failed to): its re-execution reads the new
+    priority at its start, and a later change re-ranks it again."""
+    if p is None:
         return None
     now = time.time() if now is None else now
     if now - _RERANK["at"] < RERANK_S:
         return None
     _RERANK["at"] = now
     new = task_rank(p)[0]
-    return new if is_urgent(new) else None
+    if new is None or new == prio or os.environ.get(RERANK_ENV) == str(new):
+        return None
+    return new
 
 
 def urgent_paths() -> list[Path]:
@@ -562,10 +566,10 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     """The other parked runs of `project_name` (PARKED tickets) that have waited starve_s() or longer, arrived
     before the asking run (its own PARKED ticket's arrival, else `since`, else now: a newcomer's) and go before
     it: those at its priority or a more urgent one, and a less urgent one only on its turn (_aged_turn: after
-    aged_turns() more urgent starts), so urgent runs keep their precedence under a backlog. An urgent asking
-    run (locks.URGENT_PRIORITY or better) is held by a less urgent one only on the routine runs' shared turn,
-    and then only by the oldest (_routine_turn). The asking run's priority is its PARKED ticket's, else
-    `priority`; none (push checks) is the least urgent. A priority-0 run is never held by a less urgent one.
+    aged_turns() more urgent starts), so urgent runs keep their precedence under a backlog. An owed or urgent
+    asking run (locks.URGENT_PRIORITY or better) is never held by a less urgent one, unless aged_turns() is 0
+    (checks.priority_turns 0: no urgent precedence). The asking run's priority is its PARKED ticket's, else
+    `priority`; none (push checks) is the least urgent.
     A run of `cost` (checklane.cost) is not held by one at its priority or less urgent whose run costs
     CHEAP_FACTOR times as much (checklane.much_cheaper: a targeted run beside full suites), its run's lane
     label's cost by the run id in its ticket; a short one (is_small: shortest first) is held there only by
@@ -591,7 +595,7 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     out = [t for t in aged if locks.ticket_priority(t) <= rank]
     passed = [t for t in aged if t not in out] if rank > 0 else []
     if passed and rank <= locks.URGENT_PRIORITY:
-        return out + _routine_turn(project_name, passed, now)
+        return out + (passed if aged_turns() <= 0 else [])
     return out + (_aged_turn(project_name, passed, now) if passed else [])
 
 
@@ -614,25 +618,6 @@ def owed_ahead(project_name: str | None, priority: int | None = None) -> list[Pa
     gid = locks.group_id(project_name)
     return [t for t in q if t != mine and locks.ticket_group(t) == gid
             and locks.ticket_priority(t) <= OBLIGATION_PRIORITY]
-
-
-def _routine_turn(project_name: str | None, aged: list[Path], now: float) -> list[Path]:
-    """For an urgent asking run (locks.URGENT_PRIORITY or better): the oldest of `aged` (less urgent PARKED
-    tickets of `project_name` past starve_s()) once the routine runs' shared turn has come: since the oldest
-    aged and since its project last started a routine run (a queue grant above locks.URGENT_PRIORITY),
-    aged_turns() or more urgent runs of the project took a host-wide checks slot. So an urgent run is held
-    by at most one aged routine run per aged_turns() urgent starts however long the routine backlog, and
-    that backlog still starts one run per aged_turns() urgent starts (the bound: a steady urgent stream
-    takes N of every N + 1 turns). aged_turns() 0: they all go first, as _aged_turn."""
-    n = aged_turns()
-    if n <= 0:
-        return aged
-    oldest = min(aged, key=locks._arrival)
-    rows = [(r["ts"], r["priority"]) for r in grant_records(now, now - locks._arrival(oldest))
-            if r.get("project") == project_name and r.get("slot") == "queue"
-            and isinstance(r.get("priority"), int)]
-    start = max([locks._arrival(oldest) + starve_s()] + [ts for ts, pr in rows if pr > locks.URGENT_PRIORITY])
-    return [oldest] if sum(1 for ts, pr in rows if pr <= locks.URGENT_PRIORITY and ts >= start) >= n else []
 
 
 def _ticket_run(t: Path) -> str:
@@ -802,8 +787,8 @@ class Upgraded(Exception):
 
 
 class Reranked(Upgraded):
-    """A waiting detached routine `ttp checks` whose task turned urgent (reranked; the message is its new
-    priority): it re-executes as Upgraded does, with the same runtime, and queues again as an urgent run."""
+    """A waiting detached `ttp checks` whose task's priority changed (reranked; the message is its new
+    priority): it re-executes as Upgraded does, with the same runtime, and queues again at that priority."""
 
 
 _SEEN: dict = {}   # upgraded(): the installed version it last saw differ, and since when

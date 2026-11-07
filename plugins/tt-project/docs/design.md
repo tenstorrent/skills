@@ -32,9 +32,9 @@ The host-wide checks queue (`runtime/ttp/checkcap.py`, ordered by `locks.fair_or
 on their own slots, then urgent runs, then routine ones by project turns. A run waiting past
 `checks.starve_s` goes ahead only of later arrivals at its priority or lower; it passes more urgent ones
 once N of them started meanwhile (`checks.priority_turns`, default 3), so urgency holds under a backlog
-and every run still starts within a bound. A priority-1 run leaves less urgent aged runs of its project
-one shared turn per N urgent starts (counted since the project's last routine start), taken by the oldest,
-so a long routine backlog never holds it longer.
+and every run still starts within a bound. A priority-0 or priority-1 run is never held by a less urgent
+aged run of its project (unless `checks.priority_turns` is 0), and a waiting run whose task's priority
+changes re-queues at the new one, so a stale priority never holds it either.
 
 Detached checks keep durable reports in `state/check-reports/<id>/` and managed scratch in
 `state/check-runs/<id>/checks-tmp`. Only check subprocesses holding the lifetime guard receive

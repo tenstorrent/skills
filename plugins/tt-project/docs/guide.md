@@ -2213,11 +2213,9 @@ session and stateless coordinators on every provider.
   project leave it their next free test slots. More urgent runs keep their precedence under a backlog,
   but once `checks.priority_turns` N of them (default 3 when it is unset; 0 lets the aged run go first)
   started while it waited, the aged run takes the next turn, so it still starts within a bound; priority-0
-  runs are never held by a less urgent one, and a priority-1 run leaves less urgent aged runs of its
-  project one shared turn per N urgent starts since the project's last routine start, taken by the oldest
-  (a long routine backlog holds it for at most that one run). A run at least 4 times cheaper (a targeted
-  run beside full suites) is not held by an aged run of its priority or a less urgent one; a landing's run
-  still is. A short targeted run (fewer than `checks.small_tests` tests, account-level, env
+  and priority-1 runs are never held by a less urgent aged one (unless `checks.priority_turns` is 0). A run
+  at least 4 times cheaper (a targeted run beside full suites) is not held by an aged run of its priority
+  or a less urgent one; a landing's run still is. A short targeted run (fewer than `checks.small_tests` tests, account-level, env
   `TTP_CHECKS_SMALL_TESTS`, default 500, 0 off) goes first among its project's waiters at its priority
   in the queue and is held by no longer parked run of its priority or a less urgent one (a landing's
   still holds it); the cap and every other rule hold it as any run. An urgent run (priority 0 or 1: a task owed to the user,
@@ -2247,9 +2245,9 @@ session and stateless coordinators on every provider.
   the urgent run that has waited longest, never whichever happens to look first. `ttp checks --preempt
   <run>` sends the same request by hand to run `<run>`'s checks, with the asker logged in the host's
   check-slots folder (`preempt-asks.jsonl`); it refuses push checks, owed runs, runs behind a lock and
-  runs on a reserved urgent slot. The freed slot goes to the next waiter in queue order. A routine run whose task
-  turns urgent while it waits notices within 30 s and re-executes once as an urgent run, at the same
-  arrival. `ttp status` shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
+  runs on a reserved urgent slot. The freed slot goes to the next waiter in queue order. A run whose task's
+  priority changes while it waits (raised to urgent or lowered) notices within 30 s and re-executes to
+  queue at the new priority, at the same arrival. `ttp status` shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
   checks use only their branch's reserved test slot. There is no
   separate outage marker: priority 1 is the signal. Accepted gap: while a host mixes runtimes from
   before this, their waiters may disagree on who is next and a slot can sit idle until another frees.

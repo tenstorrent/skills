@@ -1248,9 +1248,9 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     its urgent slots instead (urgent_paths), as acquire takes them. A run of the project parked past
     checkcap.starve_s() that arrived before `since` (this run's arrival; default now) goes first
     (checkcap.starved_ahead), unless this run is more urgent and that one's turn (one per
-    checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's; an urgent run leaves that turn only to the oldest
-    less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A less urgent
-    run leaves them to its project's parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
+    checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's;
+    an owed or urgent run is never held by a less urgent one. A less urgent run leaves them to its project's
+    parked owed (priority-0) runs whatever its wait (checkcap.owed_ahead). A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
     to whichever polls first; one its own gate holds otherwise keeps none. A routine run also leaves `need`
