@@ -8071,6 +8071,36 @@ def test_an_urgent_parked_run_that_could_start_still_gets_the_freed_slot_ahead_o
     for f in busy:
         f.close()
 
+def test_an_urgent_parked_run_whose_project_budget_is_full_keeps_no_test_pool_slots(env, monkeypatch):
+    """#7029: whatever its lane's gate names, a project counts toward the pool reserve at most the urgent runs
+    its free test-worker budget could start now: a full budget keeps no pool slots, so another project's p1
+    run starts on the free ones; urgent slots open while only less urgent runs hold it count as pool_gate's."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    cfg = {"checks": {"test_project_slots": 8}}
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(8)]
+    own = testslots.own_paths("pa", 8)
+    for rank, held, counted in ((1, 8, 0), (1, 4, 1), (3, 8, 2), (1, 0, 2)):
+        holders = [locks.try_take(own, f"pa task #{90 + i} ttp checks", "pytest", extra={"priority": rank})
+                   for i in range(held)]
+        tickets, lane = _parked_urgent_with_gate("", n=3)
+        try:
+            assert testslots.urgent_parked("pb", 1, budget=8, need=4, run_max=8) == counted, (rank, held)
+            assert testslots.urgent_parked("pb", 1) == 3, "without a budget every one counts"
+            why = testslots.pool_gate(cfg, "pb", full=True, priority=1)
+            assert (why == "") == (counted <= 1), (rank, held, why)
+        finally:
+            lane.close()
+            for t in tickets:
+                locks.dequeue(t)
+            for f in holders:
+                f.close()
+    for f in busy:
+        f.close()
+
+
 def test_a_checks_wait_ends_once_its_task_moves_the_branch_off_the_head_and_never_on_a_detached_head(tmp_path):
     """#5893: cli._HeadMoved (asked by _checks_slot_take's stop) is "" while the branch tip is the head,
     the reason once a new commit moves it, and "" for a wait that began on a detached HEAD."""
