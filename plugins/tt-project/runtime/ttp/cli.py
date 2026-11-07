@@ -3501,12 +3501,23 @@ def cmd_checks(a) -> None:
     # Every check, extras too, runs in the project's environment: its venv active (VIRTUAL_ENV, PATH)
     # when this shell has none, as a run has (worktree.project_venv).
     # And in the pinned Python env, the user site off (runnerenv): made first when missing, never skipped.
-    lock = runnerenv.lock_of(cfg, top)
+    # Its lock as committed at `head` (runnerenv.at_commit), never the worktree's edited copy. One that
+    # cannot be made is the host's fault, waited for as a missing runner is, unless `head` changed the lock.
+    lock = None
     try:
+        lock = runnerenv.at_commit(cfg, top, head, run_dir)
         pyenv = runnerenv.ensure(lock)
     except runnerenv.Unavailable as e:
         print(f"ttp checks: not run: {e}", flush=True)
-        sys.exit(1)
+        if lock is None or runnerenv.changed_by(top, cfg, _checks_base(p, Path(top), own), head):
+            sys.exit(1)
+        from . import envfault
+        fault = runnerenv.fault(lock, e)
+        envfault.record(p, fault, os.environ.get("TTP_TASK"))
+        envfault.write_marker(run_dir, fault)
+        print(f"ttp checks: {envfault.line(fault)}. Hand off `waiting`; retry_when: "
+              f"{envfault.retry_when(p, fault)}", file=sys.stderr)
+        sys.exit(75)
     print(f"ttp checks: {runnerenv.describe(pyenv)}", flush=True)
     venv_vars = {}
     if p and not os.environ.get("VIRTUAL_ENV") and (pv := worktree.project_venv(p, top)):

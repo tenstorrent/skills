@@ -13,8 +13,9 @@ where possible; relative to the checkout) when the project sets it, else LOCK be
 (pytest and pytest-xdist). It is built once under TTP_HOME/checks-env, keyed by the lock's content
 and the base interpreter, and reused. A build goes to a fresh folder under a file lock, then the
 key's link moves to it in one rename, so a lock change builds beside the old env and a running
-check never sees one rebuilt under it. A build that fails fails the checks with what to fix: never
-a fallback to the user site."""
+check never sees one rebuilt under it. A build that fails stops the checks with what to fix, never
+a fallback to the user site: a host fault (fault, envfault) the checks wait on, unless the change
+being checked edited the lock itself (changed_by), which then fails it."""
 from __future__ import annotations
 
 import fcntl
@@ -49,6 +50,82 @@ def lock_of(cfg: dict | None, top: str | Path | None = None) -> Path:
         return LOCK
     q = Path(v).expanduser()
     return q if q.is_absolute() else Path(top or ".") / q
+
+
+def at_commit(cfg: dict | None, top: str | Path, head: str, out: str | Path) -> Path:
+    """The lock of a check of commit `head` in checkout `top` (lock_of): a relative checks.python_lock as
+    committed at `head` (written to folder `out`), never the worktree's copy, which an uncommitted edit
+    or a pinned run leaves another commit's. Unavailable when `head` has no such file."""
+    lock = lock_of(cfg, top)
+    try:
+        rel = lock.resolve().relative_to(Path(top).resolve())
+    except ValueError:   # LOCK or an absolute lock outside the checkout: as it is
+        return lock
+    r = subprocess.run(["git", "-C", str(top), "show", f"{head}:{rel.as_posix()}"], capture_output=True)
+    if r.returncode != 0:
+        raise Unavailable(f"checks.python_lock {rel} is not in commit {head[:12]}; commit it or fix checks.python_lock")
+    path = Path(out) / f"checks-python-{hashlib.sha256(r.stdout).hexdigest()[:12]}.lock"
+    if not path.is_file():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{secrets.token_hex(4)}")
+        tmp.write_bytes(r.stdout)
+        os.replace(tmp, path)
+    return path
+
+
+def changed_by(top: str | Path, cfg: dict | None, base: str, head: str) -> bool:
+    """Whether commit `head` changed the checks.python_lock in checkout `top` from `base`: a lock that
+    then fails to install is the head's fault; a lock it did not change is the host's (fault)."""
+    lock = lock_of(cfg, top)
+    try:
+        rel = lock.resolve().relative_to(Path(top).resolve())
+    except ValueError:
+        return False
+    if not base:   # nothing to compare with: the checkout's own file
+        return True
+    r = subprocess.run(["git", "-C", str(top), "diff", "--quiet", base, head, "--", rel.as_posix()],
+                       capture_output=True)
+    return r.returncode == 1
+
+
+FAULT = "env:python-env:"   # an envfault signature: the pinned env cannot be made on this host
+
+
+def fault(lock: Path | None, err: object, cmd: str = "") -> dict:
+    """The envfault fault of the env of `lock` that could not be made: the host's, not the change's,
+    so checks wait for it (envfault.record) and nothing is counted against a change."""
+    lock = Path(lock or LOCK)
+    try:
+        sig = hashlib.sha256(lock.read_bytes()).hexdigest()[:12]
+    except OSError:
+        sig = lock.name
+    return {"kind": "pyenv", "sig": FAULT + sig, "runner": "pinned Python env", "lock": str(lock),
+            "why": str(err)[-600:], "cmd": cmd or "python env"}
+
+
+def ready(lock: Path | None) -> bool:
+    """Whether the env of `lock` is made. When not, starts one build of it in the background (as
+    another host's runs do, __main__) unless one runs, and never waits: a probe (envfault) stays quick."""
+    if test := os.environ.get("TTP_TEST_CHECKS_PYTHON_ENV"):
+        return bool(_read(Path(test)))
+    lock = Path(lock or LOCK)
+    try:
+        key = key_of(lock.read_bytes(), _base_python())
+    except OSError:
+        return False
+    home = root()
+    if key in _ready or _read(home / key):
+        return True
+    try:
+        home.mkdir(parents=True, exist_ok=True)
+        with open(home / f".{key}.lock", "a") as fh:
+            fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)   # held: a build runs already
+        subprocess.Popen([_base_python(), "-I", __file__, str(lock.resolve())], stdin=subprocess.DEVNULL,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
+                         env=_clean(dict(os.environ)))
+    except OSError:
+        pass
+    return False
 
 
 def root() -> Path:

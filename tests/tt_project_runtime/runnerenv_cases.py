@@ -145,25 +145,84 @@ def test_ttp_checks_never_import_a_newer_pytest_from_the_user_site(env, tmp_path
 
 
 def test_ttp_checks_and_the_push_queue_run_nothing_without_the_pinned_env(env, tmp_path, monkeypatch, capsys):
+    # An env the host cannot make is the host's fault, never the change's: nothing runs, ttp checks
+    # waits on an env-fault marker (75), the push queue's batch is held (envfault.Fault), not failed.
     from types import SimpleNamespace
-    from ttp import batch, cli, push
+    from ttp import batch, cli, envfault, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     runnerenv, _ = _fake_base(tmp_path, monkeypatch)
-    (repo / "py.lock").write_text("--no-index\nnosuchpkg==1\n")
-    monkeypatch.setattr(runnerenv, "lock_of", lambda cfg, top=None: repo / "py.lock")
+    bad = tmp_path / "py.lock"   # outside the checkout: no commit changed it
+    bad.write_text("--no-index\nnosuchpkg==1\n")
+    monkeypatch.setattr(runnerenv, "lock_of", lambda cfg, top=None: bad)
+    monkeypatch.setattr(runnerenv, "ready", lambda lock: False)   # no background build here
     ran = tmp_path / "ran"
     with pytest.raises(SystemExit) as ex:
         cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
-    assert ex.value.code == 1 and not ran.exists()
+    assert ex.value.code == 75 and not ran.exists()
     assert "ttp checks: not run:" in capsys.readouterr().out
-    # The push queue: the batch's check reports the env, runs nothing.
+    mark = json.loads((run / envfault.MARKER).read_text())
+    assert mark["kind"] == "pyenv" and mark["sig"].startswith(runnerenv.FAULT) and "nosuchpkg" in mark["why"]
+    assert mark["sig"] in envfault.open_faults(p), "recorded, so `ttp checks --env-ok` waits on it"
+    assert cli._checks_env_ok(p, [mark["sig"]]) == 1
+    # The push queue: the batch's check raises the host fault, runs nothing.
     monkeypatch.setattr(push, "version_guard", lambda d: False)
     monkeypatch.setattr(push, "applicable", lambda *a: (["touch " + str(ran)], []))
     me = SimpleNamespace(checks_at=None, _checkout=lambda h: None, d={}, wt=repo, tip="", checks={"runs": 0},
                          check_run_dir=str(run), branch="b", p=SimpleNamespace(config=lambda: {}))
-    me._check_env = lambda: batch.Batch._check_env(me)
-    got = batch.Batch._check(me, "a" * 40, ["touch " + str(ran)])
+    me._check_env = lambda head="": batch.Batch._check_env(me, head)
+    with pytest.raises(envfault.Fault) as fe:
+        batch.Batch._check(me, "a" * 40, ["touch " + str(ran)])
+    assert fe.value.fault["kind"] == "pyenv" and not ran.exists()
+    # ... and ttp land and ttp push wait (BUSY), not CHECKS_FAILED.
+    said = []
+    assert push.env_wait(None, repo, "", "HEAD", runnerenv.Unavailable("x"), said.append) == push.BUSY
+    assert "environment fault " + runnerenv.FAULT in said[0]
+
+
+def test_a_lock_the_checked_commit_changed_fails_it_when_its_env_cannot_be_made(env, tmp_path, monkeypatch, capsys):
+    # The one exception: a checks.python_lock in the checkout that the change itself edited.
+    from types import SimpleNamespace
+    from ttp import batch, cli, envfault, push
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    runnerenv, _ = _fake_base(tmp_path, monkeypatch)
+    base = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    (repo / "py.lock").write_text("--no-index\nnosuchpkg==1\n")
+    subprocess.run([*git, "add", "py.lock"], check=True)
+    subprocess.run([*git, "commit", "-qm", "lock"], check=True)
+    head = subprocess.run([*git, "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    cfg = {"checks": {"python_lock": "py.lock"}}
+    assert runnerenv.changed_by(repo, cfg, base, head) and not runnerenv.changed_by(repo, cfg, head, head)
+    assert not runnerenv.changed_by(repo, {}, base, head), "the plugin's own lock is never the change's"
+    monkeypatch.setattr(runnerenv, "lock_of", lambda c, top=None: Path(top or ".") / "py.lock")
+    ran = tmp_path / "ran"
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+    assert ex.value.code == 1 and not ran.exists() and not (run / envfault.MARKER).exists()
+    monkeypatch.setattr(push, "version_guard", lambda d: False)
+    monkeypatch.setattr(push, "applicable", lambda *a: (["touch " + str(ran)], []))
+    me = SimpleNamespace(checks_at=None, _checkout=lambda h: None, d={}, wt=repo, tip=base, checks={"runs": 0},
+                         check_run_dir=str(run), branch="b", p=SimpleNamespace(config=lambda: cfg))
+    me._check_env = lambda head="": batch.Batch._check_env(me, head)
+    got = batch.Batch._check(me, head, ["touch " + str(ran)])
     assert got[0] == "python env" and "nosuchpkg" in got[1] and not ran.exists()
+
+
+def test_ttp_checks_builds_the_env_from_the_checked_commits_lock_not_the_worktrees(env, tmp_path, monkeypatch, capsys):
+    # sa44: the worktree's uncommitted lock edit is not the commit's; the env comes from the commit's.
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    runnerenv, _ = _fake_base(tmp_path, monkeypatch)
+    (repo / "py.lock").write_text("# nothing pinned\n")
+    subprocess.run([*git, "add", "py.lock"], check=True)
+    subprocess.run([*git, "commit", "-qm", "lock"], check=True)
+    (repo / "py.lock").write_text("--no-index\nnosuchpkg==1\n")   # uncommitted
+    monkeypatch.setattr(runnerenv, "lock_of", lambda c, top=None: Path(top or ".") / "py.lock")
+    ran = tmp_path / "ran"
+    with pytest.raises(SystemExit):   # the dirty tree is refused, after the env is made from the commit's lock
+        cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+    out = capsys.readouterr().out
+    want = hashlib.sha256(b"# nothing pinned\n").hexdigest()[:12]
+    assert "not run:" not in out and f"lock {want} from {run}/" in out, out
 
 
 def test_runnerenv_base_python_is_outside_any_venv(tmp_path):
@@ -237,3 +296,17 @@ def test_a_slurm_check_job_runs_in_the_nodes_pinned_env_and_is_a_fault_without_i
                        capture_output=True, timeout=120)
         assert (q / "rc").read_text().strip() == rc
     assert seen.read_text() == f"1|{os.environ['TTP_TEST_CHECKS_PYTHON_ENV']}/bin"
+
+
+def test_a_pinned_env_fault_closes_once_its_env_is_made_or_its_lock_is_gone(tmp_path, monkeypatch):
+    from ttp import envfault, runnerenv
+    lock = tmp_path / "py.lock"
+    lock.write_text("# nothing pinned\n")
+    f = runnerenv.fault(lock, "pip failed")
+    assert f["sig"] == runnerenv.FAULT + hashlib.sha256(lock.read_bytes()).hexdigest()[:12]
+    assert "pinned Python env cannot be made" in envfault.line(f)
+    assert envfault._still(f) is None, "the suite's ready stand-in env: made"
+    monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(tmp_path / "none"))
+    assert envfault._still(f) == f, "not made: still open, the probe never waits for a build"
+    lock.unlink()
+    assert envfault._still(f) is None

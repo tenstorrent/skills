@@ -2180,10 +2180,18 @@ class Batch:
         self.steps.go("checks")
         return slot
 
-    def _check_env(self) -> dict:
-        """The env the batch's checks run in (push.check_env), in the project's pinned Python env."""
-        return push.check_env("target", self.tip, self.check_run_dir, self.branch,
-                              lock=push.runnerenv.lock_of(self.p.config(), self.wt))
+    def _check_env(self, head: str = "") -> dict:
+        """The env the batch's checks run in (push.check_env), in the project's pinned Python env. One
+        that cannot be made is the host's fault (envfault.Fault: the batch is held, not failed), unless
+        `head` changed checks.python_lock itself (runnerenv.changed_by): runnerenv.Unavailable then."""
+        cfg = self.p.config()
+        lock = push.runnerenv.lock_of(cfg, self.wt)
+        try:
+            return push.check_env("target", self.tip, self.check_run_dir, self.branch, lock=lock)
+        except push.runnerenv.Unavailable as e:
+            if head and push.runnerenv.changed_by(self.wt, cfg, self.tip or "", head):
+                raise
+            raise envfault.Fault(push.runnerenv.fault(lock, e)) from e
 
     def _check(self, head: str, checks: list[str]) -> tuple[str, str] | None:
         """Check `head` in the worktree: None when it passes, else (command, output tail). The stale
@@ -2218,8 +2226,8 @@ class Batch:
         say(f"checking {head[:10]}")
         self.checks["runs"] += 1
         try:
-            env = self._check_env()
-        except push.runnerenv.Unavailable as e:
+            env = self._check_env(head)
+        except push.runnerenv.Unavailable as e:   # its own checks.python_lock edit
             say(f"{head[:10]}: {e}")
             return "python env", str(e)
         tree, run = pushpass.tree_of(self.wt, head), []
@@ -2524,10 +2532,7 @@ class Batch:
             return None
         say(f"rerunning the {len(ids)} failing test(s) on the tip {tip[:10]} alone, up to {TIP_RERUNS} times: "
             f"{' '.join(ids)}")
-        try:
-            env = self._check_env()
-        except push.runnerenv.Unavailable:
-            return None
+        env = self._check_env()
         self._runners([cmd], env)
         slot = self._slot(tip)
         try:
@@ -2574,7 +2579,7 @@ class Batch:
         if not todo:
             return False
         try:
-            env = self._check_env()
+            env = self._check_env(head)
         except push.runnerenv.Unavailable:
             return False
         self._runners(todo, env)

@@ -899,6 +899,20 @@ def runner_wait(cmds: list, repo: Path, env: dict, say: Callable[[str], None], p
     return BUSY
 
 
+def env_wait(p: Project | None, repo: Path, base: str, head: str, err: Exception, say: Callable[[str], None]) -> int:
+    """The checks' pinned Python env could not be made (`err`, runnerenv.Unavailable): CHECKS_FAILED when
+    `head` changed checks.python_lock in `repo` from `base` itself (runnerenv.changed_by), else BUSY, a
+    host fault recorded and said with its retry_when as runner_wait does: nothing counted against the change."""
+    cfg = p.config() if p else {}
+    if runnerenv.changed_by(repo, cfg, base, head):
+        say(f"{err}; this change edits checks.python_lock; not pushing")
+        return CHECKS_FAILED
+    fault = runnerenv.fault(runnerenv.lock_of(cfg, repo), err)
+    envfault.record(p, fault, os.environ.get("TTP_TASK"))
+    say(f"{envfault.line(fault)}; not pushing. Hand off `waiting`; retry_when: {envfault.retry_when(p, fault)}")
+    return BUSY
+
+
 def check_slot(head: str, say: Callable[[str], None], who: str = "", priority: str = "", proj: Project | None = None):
     """A host-wide checks slot (checkcap) held while the push checks run, so `ttp push --own` counts
     toward the same cap as `ttp checks`. Checks gating a push to the push branch (`ttp push` and the
@@ -4390,8 +4404,8 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
         if checks:
             print(f"ttp push: {runnerenv.describe(runnerenv.ensure(check_lock))}", file=sys.stderr)
     except runnerenv.Unavailable as e:
-        print(f"ttp push: {e}; not pushing", file=sys.stderr)
-        return CHECKS_FAILED
+        tracked = _git(repo, "rev-parse", "--verify", "-q", f"refs/remotes/{remote}/{branch}").stdout.strip()
+        return env_wait(p, repo, tracked, "HEAD", e, lambda m: print(f"ttp push: {m}", file=sys.stderr))
     if own:   # delivery.push_exclude_paths guards the push branch only
         say_target(repo, remote, branch)
         # The docs-only test, if_changed scopes and the project's own checks may all compare with the
