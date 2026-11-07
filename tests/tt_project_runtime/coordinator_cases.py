@@ -22920,3 +22920,51 @@ def test_digest_folds_urgent_check_and_stale_waits_and_slot_wait_incident_wakes(
     slot = [ln for ln in ev.split("\n") if ln.startswith("- [checks_slot_wait")]
     assert len(slot) == 2 and "wake 2 of incident 100" in slot[0] and "the newest of 2 wakes" in slot[0], slot
     assert "wake 1 of" not in ev and "wake 3 of incident 200" in slot[1]
+
+
+_STEPS_SPEC = ("Goal: speed up the loader.\nSteps:\n1. profile it\n2. run the device benchmark\n3. report the commit\n\n"
+               "Restrictions:\n- keep content generic\n- deliver through review\n\nnever push to main\n"
+               "guards: keep the lock on the board")
+
+
+def test_task_update_replace_withdraws_or_rewrites_one_step_and_keeps_the_old_text(env, tmp_path):
+    # Appending could never take a requirement back: `replace` changes one quoted step, records the old
+    # text as a spec_step_replaced event, and tells a running worker which step no longer applies.
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "replace": {"old": "2. run the device benchmark\n"}}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert "device benchmark" not in spec.split("## Update")[0] and "1. profile it\n3. report the commit" in spec
+    assert "Step withdrawn (no longer required): '2. run the device benchmark'" in spec
+    assert "Restrictions:\n- keep content generic" in spec and "never push to main" in spec
+    [ev] = p.db.q("SELECT * FROM events WHERE kind=? AND task=?", (coord.STEP_REPLACED_KIND, tid))
+    assert json.loads(ev["data"]) == {"old": "2. run the device benchmark\n", "new": ""}
+    p.db.update_task(tid, status="running")
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+           (tid, "worker", "fake", time.time(), "running", str(run_dir)))
+    assert coord.apply(p, [{"type": "task_update", "id": tid,
+                            "replace": {"old": "3. report the commit", "new": "3. report the commit and its timing"}}]) == []
+    assert "3. report the commit and its timing" in p.db.task(tid)["spec"].split("## Update")[0]
+    assert "Step replaced (the earlier text no longer applies): '3. report the commit'" in (run_dir / "steer.md").read_text()
+
+
+@pytest.mark.parametrize("old, why", [
+    ("2. run the board benchmark", "0 times"),
+    ("the", "times, not once"),
+    ("- keep content generic", "touches a safety line"),             # a line of a Restrictions block
+    ("Restrictions:", "touches a safety line"),
+    ("never push to main", "touches a safety line"),
+    ("guards: keep the lock", "touches a safety line"),
+    ("3. report the commit\n\nRestrictions:", "touches a safety line"),   # a step reaching into the block
+])
+def test_task_update_replace_is_refused_off_one_exact_step_or_on_a_safety_line(env, old, why):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("loader", _STEPS_SPEC, kind="work")
+    problems = coord.apply(p, [{"type": "task_update", "id": tid, "replace": {"old": old, "new": ""}}])
+    assert problems and why in " ".join(map(str, problems)), problems
+    assert p.db.task(tid)["spec"] == _STEPS_SPEC
+    assert p.db.q("SELECT 1 FROM events WHERE kind=?", (coord.STEP_REPLACED_KIND,)) == []

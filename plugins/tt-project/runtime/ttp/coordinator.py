@@ -244,6 +244,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "heal": HEAL_SCHEMA, "pr_branch": {"type": "string"}, "gate": {"type": ["object", "null"], "properties": {"depends_on": {"type": "array", "items": {"type": "integer"}},
                      "start_when": {"type": "string"}, "why": {"type": "string"}}},
             "wake_now": {"anyOf": [{"type": "boolean"}, {"type": "string", "enum": list(bud.TIER_ORDER)}]},
+            "replace": {"type": "object", "properties": {"old": {"type": "string"}, "new": {"type": "string"}},
+                        "required": ["old"]},
             "owners": {"type": "array", "items": {"type": "integer"}}, "evidence": {"type": "string"},
             "milestone": {"type": "string"}, "promise": {"type": "string"}, "justify": {"type": "string"},
             "delivers": {"type": "array", "items": {"type": "string"}},
@@ -3089,6 +3091,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 elif a.get("text"):
                     # Kept as the reason, a note would outlive the state it described.
                     spec = "\n\n".join(x for x in (spec, a["text"]) if x)
+                base = task["spec"]
+                if a.get("replace") is not None:   # one step replaced or withdrawn; the old text goes to history
+                    base, said = replace_step(task["spec"], a["replace"])
+                    spec = "\n\n".join(x for x in (spec, said) if x)
                 # Last, so the field wins over a `pr_branch:` line of the same update (recorded_pr_branch).
                 spec = "\n\n".join(x for x in (spec, branch_line) if x)
                 if a.get("priority"):
@@ -3121,7 +3127,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"#{task['id']} rejected: {e}") from None
                     if why := cells.problem(spec):
                         raise ValueError(f"#{task['id']} rejected: {why}")
-                    upd["spec"] = task["spec"] + "\n\n## Update\n" + spec
+                    upd["spec"] = base + "\n\n## Update\n" + spec
                     prev = load_result(upd.get("result") or task["result"])
                     if task["status"] != "running" and prev.pop("stale_wakes", None) is not None:
                         # A re-plan: the wait it hands back next is not compared with the old plan's.
@@ -3170,6 +3176,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     if waits or anchors.without(labels) != labels:
                         upd["labels"] = anchors.without(labels) + ([waits] if waits else [])
                 db.update_task(task["id"], **upd)
+                if base != task["spec"]:
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,data,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                         (time.time(), "coordinator", STEP_REPLACED_KIND, "low", f"#{task['id']}: a spec step replaced",
+                          json.dumps({"old": a["replace"]["old"], "new": a["replace"].get("new") or ""}), "handled",
+                          task["id"]))
                 if upd.get("spec"):
                     userorder.respec(db, task["id"])
                 if upd.get("status", task["status"]) not in TERMINAL_TASK_STATES \
@@ -6391,6 +6402,50 @@ def _repair_lift(p: Project, section: str, text: str, end: dict | None, said: st
         return "", str(e)
     return (stored, f"charter_update repaired: the source's words allow it within its scope, so it went in as a "
                     f"scoped exception (`excepts` \"{clip(clause, 160)}\") instead of being refused. " + note), ""
+
+
+# task_update `replace` {old, new}: one step of a task's spec, its exact text found once, becomes `new`
+# ("" withdraws it). Appending alone could never take back a requirement. The old text is kept in a
+# STEP_REPLACED_KIND event (the task's history) and named in the update a running worker reads. A step
+# touching a safety line (a Restrictions, guard, never or no_push line, or a line of a Restrictions block)
+# is refused: those change only through the charter.
+STEP_REPLACED_KIND = "spec_step_replaced"
+_SAFETY_HEAD = re.compile(r"^\s*(?:[-*#>]+\s*)*(?:\*\*)?(?:restrictions?|guards?|binding|never|no_push|safety)\b", re.I)
+
+
+def _safety_lines(spec: str) -> set[int]:
+    """Indexes of the spec's safety lines: one matching _SAFETY_HEAD, and each line after a Restrictions
+    or guards head up to the next blank line."""
+    out, block = set(), False
+    for i, ln in enumerate(spec.split("\n")):
+        if not ln.strip():
+            block = False
+        elif _SAFETY_HEAD.match(ln):
+            out.add(i)
+            block = block or bool(re.match(r"^\s*(?:[-*#>]+\s*)*(?:\*\*)?(?:restrictions?|guards?)\b", ln, re.I))
+        elif block:
+            out.add(i)
+    return out
+
+
+def replace_step(spec: str, rep) -> tuple[str, str]:
+    """(the spec with `rep['old']` replaced by `rep['new']`, the update line saying so); ValueError when
+    `old` is not in the spec exactly once or touches a safety line."""
+    if not isinstance(rep, dict) or not str(rep.get("old") or "").strip():
+        raise ValueError("`replace` is {old: the exact text of one spec step, new: its new text (\"\" withdraws it)}")
+    old, new = str(rep["old"]), str(rep.get("new") or "")
+    if (n := spec.count(old)) != 1:
+        raise ValueError(f"`replace` old text is in the spec {n} times, not once: quote one step exactly")
+    start = spec.index(old)
+    first, last = spec.count("\n", 0, start), spec.count("\n", 0, start + len(old))
+    if hit := sorted(_safety_lines(spec) & set(range(first, last + 1))):
+        line = spec.split("\n")[hit[0]].strip()
+        raise ValueError(f"`replace` touches a safety line ({line[:120]!r}): Restrictions and guards change only "
+                         f"through the charter, never by a task_update")
+    said = (f"Step replaced (the earlier text no longer applies): {' '.join(old.split())[:300]!r} now reads "
+            f"{' '.join(new.split())[:300]!r}" if new.strip() else
+            f"Step withdrawn (no longer required): {' '.join(old.split())[:300]!r}")
+    return spec[:start] + new + spec[start + len(old):], said
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:
