@@ -2889,7 +2889,9 @@ session and stateless coordinators on every provider.
   deploying project's daemon runs the host-side takeover itself, `ttp upgrade <name>
   --take-over-from <task>`, which fences that task even while it still shows activity. It
   tries up to three times, five minutes apart, and the check closes only when that project's
-  own daemon reports the release (output in `logs/takeover.log`). A live daemon
+  own daemon reports the release (output in `logs/takeover.log`). A try that defers (exit 75)
+  while a merge task that is still working holds the merge spends no try: the check waits for
+  that task to end, and reports it as a stuck owner after 6 h. A live daemon
   whose files are already at the release but that has not restarted onto them (or not yet
   ticked on them) is pending too, owned by that daemon, and is re-checked after
   `delivery.deploy_restart_wait_s` (default 900). A daemon that
@@ -3362,7 +3364,11 @@ lines to a template prompt, the upgrade fences them that way itself. Only a real
 the project and upstream rewording the same line, or each adding its own version of one line (the
 same leading key, or most of the text alike), goes to a harness task, queued at once with at most one
 open; a newer release retargets it. One that ended without landing holds off the next only until a
-newer release or an edit to the project's own runtime or template files, never on a timer.
+newer release or an edit to the project's own runtime or template files, never on a timer; one the
+project cancelled holds off nothing. When a cancelled task left its merge committed (in a worktree of
+the harness or on its own branch), a host-side `ttp upgrade <name>` merges that commit with the
+current template and main and applies it with no task, if both merge without a conflict and the
+result compiles and imports; otherwise it queues a task as usual.
 The same conflict deferred past 48 h, or past two harness tasks that ended without landing it,
 reaches the coordinator once as a normal observation, not once per deploy.
 
