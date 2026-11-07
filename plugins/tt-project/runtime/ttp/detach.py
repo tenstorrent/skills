@@ -680,16 +680,19 @@ def close(rc: Path, now: float | None = None) -> dict | None:
     while the job runs or is queued, or when no record names it."""
     rc = Path(rc)
     e = _entry(rc)
+    if e and e.get("status") in CLOSED and e.get("unmasked") and _mask_log(rc):
+        with registry(rc.parent) as jobs:   # closed while a leftover process still held its lock: masked now
+            for j in jobs:
+                if isinstance(j, dict) and j.get("rc") == str(rc):
+                    j.pop("unmasked", None)
+                    e = j
+        return e
     if not e or e.get("status") in CLOSED:
         return e or None
     st, why = state(rc)
     if st not in ("ended", "lost"):
         return None
-    if locks.any_free([locks.job_lock(rc)]):   # no process of the job writes its log any more
-        from . import redact
-        left: list = []   # scrub_run left it while the job ran (live_job_logs); a big one is masked detached
-        redact.scrub_file(rc.with_suffix(".log"), redact.STEP_FILE_BYTES, left)
-        redact.scrub_later(left, rc.with_name("scrub.log"))
+    masked = _mask_log(rc)
     if st == "ended":
         try:
             end = rc.stat().st_mtime
@@ -704,6 +707,8 @@ def close(rc: Path, now: float | None = None) -> dict | None:
         except OSError:
             end = time.time() if now is None else now
         upd = {"status": "died", "exit": None, "ended": end, "why": why}
+    if not masked:   # close_records masks the log once the lock frees
+        upd["unmasked"] = True
     out = None
     with registry(rc.parent) as jobs:
         for j in jobs:
@@ -712,6 +717,18 @@ def close(rc: Path, now: float | None = None) -> dict | None:
                     j.update(upd)
                 out = j
     return out
+
+
+def _mask_log(rc: Path) -> bool:
+    """Mask the log of the job at `rc` once no process of it holds its job lock (scrub_run left it whole
+    while the job ran: live_job_logs); a big one is masked detached (scrub.log). False while one still does."""
+    if not locks.any_free([locks.job_lock(rc)]):
+        return False
+    from . import redact
+    left: list = []
+    redact.scrub_file(rc.with_suffix(".log"), redact.STEP_FILE_BYTES, left)
+    redact.scrub_later(left, rc.with_name("scrub.log"))
+    return True
 
 
 def close_records(p: Project, now: float | None = None) -> int:
@@ -734,9 +751,9 @@ def close_records(p: Project, now: float | None = None) -> int:
         except (OSError, ValueError):
             continue
         for j in jobs if isinstance(jobs, list) else []:
-            if isinstance(j, dict) and j.get("rc") and j.get("status") not in CLOSED:
+            if isinstance(j, dict) and j.get("rc") and (j.get("status") not in CLOSED or j.get("unmasked")):
                 try:
-                    n += bool(close(Path(j["rc"]), now))
+                    n += bool(close(Path(j["rc"]), now)) and j.get("status") not in CLOSED
                 except OSError:
                     continue
     return n

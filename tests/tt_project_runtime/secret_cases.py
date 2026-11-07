@@ -1459,11 +1459,60 @@ def test_scrub_run_leaves_a_live_detached_jobs_log_whole_and_masks_it_once_the_j
         (run / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
         rc.write_text("0\n")
         assert detach.close(rc)["status"] == "ended"
-    else:
-        rc.write_text("0\n")
-        assert redact.scrub_run(run) == 1
+        logs = [log]
+    else:   # review #7153: the detached checks themselves mask checks.log and checks.out as they end
+        import signal
+        import types
+        from ttp import cli
+        (run / cli.CHECKS_OUT).write_text("out 0\n" + block)
+        monkeypatch.setitem(cli._CHECK_STOP, "stopped", None)
+        handlers = {sig: signal.getsignal(sig) for sig in cli._CHECK_STOP_SIGNALS}
+        monkeypatch.setattr(cli, "_checks_released", lambda go, d: True)
+        monkeypatch.setattr(cli, "cmd_checks", lambda _a: [(run / n).open("a").write(f"{n} end\n")
+                                                           for n in ("checks.log", cli.CHECKS_OUT)])
+        monkeypatch.setattr(cli.sys, "stdin", io.TextIOWrapper(io.BytesIO(b"go\n")))
+        monkeypatch.setenv("TTP_CHECK_OUTPUT_DIR", str(run))
+        monkeypatch.delenv("TTP_CHECKS_TMP_FD", raising=False)
+        try:
+            assert cli._checks_child(types.SimpleNamespace(rc=str(rc))) == 0
+        finally:
+            for sig, h in handlers.items():
+                signal.signal(sig, h)
+        assert rc.read_text() == "0\n"
+        logs = [log, run / cli.CHECKS_OUT]
+    for f in logs:
+        text = f.read_text()
+        assert _no_key(text, lines) and _masked(text), f
+    assert "line 49\n" in log.read_text()
+    if name == "checks":
+        assert "checks.log end\n" in log.read_text() and (run / "checks.out").read_text().startswith("out 0\n")
+
+
+def test_close_masks_a_jobs_log_once_a_leftover_process_frees_its_lock(env, monkeypatch):
+    """Review #7153: a job closed while a leftover child still held its job lock kept its log unmasked for good."""
+    import fcntl
+    from ttp import detach, locks, project
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    block, lines = _key_block()
+    p = make(env)
+    run = p.runs / "21"
+    run.mkdir(parents=True)
+    rc, log = run / "job.rc", run / "job.log"
+    (run / "job.started").write_text("1\n")
+    log.write_text("line 0\n" + block + "line 1\n")
+    (run / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+    rc.write_text("0\n")
+    with open(locks.job_lock(rc), "w") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        assert detach.close_records(p) == 1
+        assert block in log.read_text()   # still written to: left whole
+        assert detach.close(rc).get("unmasked") is True
+        fcntl.flock(held, fcntl.LOCK_UN)
+    (p.state / "detach-closed.at").unlink()
+    assert detach.close_records(p) == 0   # closed before: counted once, masked now
     text = log.read_text()
-    assert _no_key(text, lines) and _masked(text) and "line 49\n" in text
+    assert _no_key(text, lines) and _masked(text) and "line 1\n" in text
+    assert "unmasked" not in detach.close(rc)
 
 
 class _TrackedRead:

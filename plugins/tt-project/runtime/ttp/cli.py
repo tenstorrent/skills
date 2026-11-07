@@ -6233,9 +6233,24 @@ def _checks_child(a) -> int:
                 checkdirs.finish(Path(info['check_run_dir']))
             _checks_tmp_cleanup(rc_file.parent)
         if released:
+            _checks_mask_logs(rc_file.parent)
             durable_write(rc_file, f"{code}\n")
         _checks_names_off()
     return code if isinstance(code, int) else 1
+
+
+def _checks_mask_logs(run_dir: Path) -> None:
+    """Mask checks.log and checks.out as the detached checks end, before checks.rc: while they ran,
+    redact.scrub_run left them whole (live_job_logs), and nothing masks them after. A bigger file is masked
+    by a detached job (scrub.log). Nothing of these checks writes either file after this."""
+    from . import redact
+    try:
+        left: list = []
+        for name in ("checks.log", CHECKS_OUT):
+            redact.scrub_file(run_dir / name, left=left)
+        redact.scrub_later(left, run_dir / "scrub.log")
+    except Exception as e:   # checks.rc is still written
+        print(f"ttp checks: masking the logs failed: {e}", file=sys.stderr, flush=True)
 
 
 def _checks_env_ok(p: Project | None, sigs: list | None = None) -> int:
