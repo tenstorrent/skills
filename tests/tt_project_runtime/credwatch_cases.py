@@ -332,7 +332,7 @@ def test_credwatch_a_change_seen_by_overlapping_runs_is_told_once_outside_these_
     assert exit_info["cred_changed"] == [[str(tok), "changed"]]
     second = dict(run, id=_overlap(p, run["started"] - 10, time.time()), task=None, role="worker")
     got = d._cred_verdicts(second, exit_info, pathlib.Path(run["dir"]))
-    assert credwatch.observe(p.db, second, exit_info["cred_changed"], time.time() + 120, got) == 0
+    assert credwatch.observe(p.db, second, exit_info["cred_changed"], time.time() + 120, verdicts=got) == 0
     assert len(p.db.q("SELECT id FROM events WHERE fingerprint LIKE 'credwatch:%'")) == 1
     # Replaced (a new inode) under the same overlap: high, but no run fails for it.
     monkeypatch.setenv("TTP_FAKE_SHELL", f"sleep 0.05; printf 'k\\n' > {shlex.quote(str(tok))}.n && "
