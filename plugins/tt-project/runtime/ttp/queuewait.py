@@ -119,8 +119,9 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
             continue
         got = classify(prev.get("retry_when") or "", t["blocked_reason"] or "", device)
         if got and not (got[0] == "checks" and t["id"] in busy):
-            add(t["id"], got[0], got[1], prev["waiting_since"],
-                checks if got[0] == "checks" else _holders(db, p, got[0], got[1], cfg))
+            info = checks if got[0] == "checks" else _holders(db, p, got[0], got[1], cfg, now)
+            if not info.pop("live", False):   # a push in its turn, alive and in its time limit: a fair wait
+                add(t["id"], got[0], got[1], prev["waiting_since"], info)
     for t in db.ready_tasks():
         got = hold(t) if hold else _config_hold(db, cfg)
         if got is None:
@@ -148,11 +149,13 @@ def _config_hold(db, cfg: dict) -> dict | None:
     return {"queue": "workers", "cap": cap} if cap and n >= cap else None
 
 
-def _holders(db, p, queue: str, res: str, cfg: dict) -> dict:
+def _holders(db, p, queue: str, res: str, cfg: dict, now: float | None = None) -> dict:
     if queue == "push":
         rows = db.q("SELECT task, status FROM push_queue WHERE status IN ('approved','pushing') ORDER BY id")
-        return {"cap": 1, "running": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "pushing"],
-                "queued": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "approved"]}
+        out = {"cap": 1, "running": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "pushing"],
+               "queued": [f"{p.name} task #{r['task']}" for r in rows if r["status"] == "approved"]}
+        _push_turns(p, out, time.time() if now is None else now)
+        return out
     if queue in ("device", "lock") and res:
         from . import locks
         try:
@@ -161,6 +164,42 @@ def _holders(db, p, queue: str, res: str, cfg: dict) -> dict:
             held = []
         return {"cap": None, "running": held, "queued": []}
     return {"cap": None, "running": [], "queued": []}
+
+
+PUSH_HOLD_LIMIT_S = 4 * 3600.0   # push.CHECK_LIMIT_FLOOR_S: a push turn held longer is overdue, not a fair wait
+
+
+def _push_turns(p, out: dict, now: float) -> None:
+    """Add to push occupancy `out` the pushes that never write push_queue (`ttp push`, detached or not):
+    each live holder of a branch push lock as running, with its step and minutes held (`live` while one is
+    within PUSH_HOLD_LIMIT_S, so no wait behind it is raised), and each other running detached push
+    (push.running) as queued, with its last `ttp push:` log line. The lock and markers are what the
+    waiting task's blocked reason reads; a holder whose pid died left the lock free, so it is not counted."""
+    from . import locks, push
+    try:
+        paths = [x for x in sorted((p.state / "locks").glob("push:*.lock")) if not x.name.startswith("push:run-")]
+        recs = locks.holder_records(paths, p)
+    except OSError:
+        recs = []
+    pids = set()
+    for h in recs:
+        if h.get("alive") is False or h.get("stale"):
+            continue
+        pids.add(h.get("pid"))
+        held = max(0.0, now - float(h.get("since") or now))
+        step = f"step {h['step']}, " if h.get("step") else ""
+        out["running"].append(f"{p.name} {h.get('holder') or 'a push'} ({step}held {held / 60:.0f} min)")
+        out["live"] = out.get("live") or held <= PUSH_HOLD_LIMIT_S
+    try:
+        marks = push.running(p)
+    except OSError:
+        marks = []
+    for m in marks:
+        if m.get("status") != "running" or (m.get("pid") is not None and m.get("pid") in pids):
+            continue
+        last = next((x for x in reversed(push._tail(m.get("log"), 40).splitlines()) if x.startswith("ttp push:")), "")
+        out["queued"].append(f"{p.name} {'task #' + str(m['task']) if m.get('task') else 'push'} "
+                             f"(push {m.get('id')}{': ' + last[:160] if last else ''})")
 
 
 def spill_ready(p, cfg: dict) -> tuple[list[str], list[str]]:

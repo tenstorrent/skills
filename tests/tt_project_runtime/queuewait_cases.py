@@ -442,3 +442,56 @@ def test_queue_wait_unchanged_is_raised_again_only_after_repeat_marks_and_carrie
     # The event text is unchanged by the split: item, queue, state and numbered options.
     assert first["text"].startswith(f"{f['item']} on the checks queue: {f['ctx']} Options: (1) "), first["text"]
     assert "has waited 160 min" in last["text"]
+
+
+def test_queue_wait_counts_a_detached_push_lock_holder_and_raises_nothing_while_it_lives(env):
+    """A `ttp push --detach` never writes push_queue: it holds the branch push lock and runs a marker.
+    The push wait counts the lock's live holder (step, minutes held) and the other running markers, and
+    raises nothing while the holder lives within its limit; a dead holder (lock free) or an overdue one
+    still raises, naming who holds it."""
+    from ttp import locks, push, queuewait
+    assert queuewait.PUSH_HOLD_LIMIT_S == push.CHECK_LIMIT_FLOOR_S
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("review", "s", kind="review")
+    p.db.update_task(tid, not_before=now + 600, result=json.dumps(
+        {"status": "waiting", "retry_when": "ttp push --result /r/m", "waiting_since": now - 40 * 60}))
+    assert p.db.q("SELECT id FROM push_queue") == []
+    paths = push.lock_paths(p, "origin", "team/feature")
+    held = []
+    try:
+        f = locks.try_take(paths, "task #41 (run 9)", "ttp push")   # as push.take labels it
+        held.append(f)
+        push.Steps(f).go("checks")
+        folder = p.state / push.DETACHED
+        folder.mkdir(parents=True, exist_ok=True)
+        for rid, task in (("m-holder", 41), ("m-wait", 42)):
+            marker = folder / f"{rid}.json"
+            log = marker.with_suffix(".log")
+            log.write_text(f"ttp push: waiting up to 1831 s for push:origin/team/feature (held by task #41)\n"
+                           if task == 42 else "ttp push: running the checks\n")
+            marker.write_text(json.dumps({"id": rid, "status": "running", "task": task, "log": str(log),
+                                          "target": "origin/team/feature",
+                                          "pid": os.getpid() if task == 41 else 999999}))
+            held.append(locks.try_take([push._run_lock(marker)], f"task #{task}", "ttp push --detach"))
+        info = queuewait._holders(p.db, p, "push", "", QW_CFG, now)
+        assert info.pop("live") is True and len(info["running"]) == 1, info
+        assert "task #41" in info["running"][0] and "step checks" in info["running"][0], info
+        assert len(info["queued"]) == 1 and "task #42" in info["queued"][0] \
+            and "waiting up to 1831 s" in info["queued"][0], info
+        assert [w for w in queuewait.collect(p, QW_CFG, now) if w["queue"] == "push"] == []
+        queuewait.scan(p, QW_CFG, now)
+        assert _qw_events(p) == [], "no wait raised behind a live push in its turn"
+        # Held past its limit: overdue, raised, and the text names the holder.
+        later = now + queuewait.PUSH_HOLD_LIMIT_S + 60
+        queuewait.scan(p, QW_CFG, later)
+        ev = _qw_events(p)
+        assert len(ev) == 1 and "1 running (cap 1)" in ev[0]["text"] and "task #41" in ev[0]["text"] \
+            and "Holding: none seen" not in ev[0]["text"], ev
+    finally:
+        for f in held:
+            f.close()
+    # Its pid gone, the lock is free: nothing holds it, so the wait is raised as before.
+    info = queuewait._holders(p.db, p, "push", "", QW_CFG, now)
+    assert not info.get("live") and info["running"] == [] and info["queued"] == [], info
+    assert [w["task"] for w in queuewait.collect(p, QW_CFG, now) if w["queue"] == "push"] == [tid]
