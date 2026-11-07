@@ -2382,6 +2382,23 @@ def test_wall_cap_extends_a_run_still_progressing_and_stops_a_silent_or_stalled_
     assert checkwall.Extension(3600).room == 1800
 
 
+def test_wall_cap_progress_reads_never_close_the_check_log_the_run_still_writes(tmp_path, monkeypatch):
+    # The checks log is opened by descriptor (open_append: its name is a number); reading its progress at
+    # the cap, extended or stopped, leaves it open for the lines the run writes after.
+    from ttp import checkwall, project
+    _test_clock(monkeypatch)
+    log = tmp_path / "checks.log"
+    with project.open_append_or_null(log) as out:
+        assert isinstance(out.name, int)
+        assert checkwall.wait(_ProgressProc(out, lambda n: min(100, 1.8 * n)), out, 1000, 600,
+                              extend=checkwall.Extension(1000)) == 0
+        with pytest.raises(subprocess.TimeoutExpired):
+            checkwall.wait(_ProgressProc(out, lambda n: None), out, 1000, 600, extend=checkwall.Extension(1000))
+        out.write("after the cap\n")
+    text = log.read_text()
+    assert "wall-time cap extended by" in text and text.endswith("after the cap\n"), text
+
+
 def test_a_queue_incident_calls_a_holder_still_printing_slow_with_the_host_load_and_a_silent_one_a_likely_hang(
         tmp_path):
     from ttp import checklane, checkwall

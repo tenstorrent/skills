@@ -200,14 +200,20 @@ class Extension:
 
 
 def _percent(path, base: int) -> int | None:
-    """The last pytest `[ NN%]` in the file `path` past offset `base` (its tail only), or None."""
+    """The last pytest `[ NN%]` in the file at `path` past offset `base` (its tail only), or None. The
+    file is opened read-only on its own descriptor, closed here; never the output's own descriptor."""
     try:
-        with open(path, "rb") as f:
-            f.seek(0, os.SEEK_END)
-            f.seek(max(base, f.tell() - TAIL_BYTES))
-            got = _PERCENT.findall(f.read(TAIL_BYTES))
+        fd = os.open(path, os.O_RDONLY)
     except (OSError, TypeError, ValueError):
         return None
+    try:
+        end = os.fstat(fd).st_size
+        at = max(base, end - TAIL_BYTES)
+        got = _PERCENT.findall(os.pread(fd, max(0, end - at), at))
+    except (OSError, ValueError):
+        return None
+    finally:
+        os.close(fd)
     return min(100, int(got[-1])) if got else None
 
 
@@ -234,6 +240,8 @@ def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, st
     end = None if timeout is None else start + timeout
     last, quiet_since = size(), start
     base, samples = max(0, last), []
+    name = getattr(out, "name", None)   # a log opened by descriptor (open_append): through /proc (none: no extension)
+    src = name if isinstance(name, (str, bytes, os.PathLike)) else f"/proc/self/fd/{fd}"
     while True:
         step = POLL_S if end is None else max(0.01, min(POLL_S, end - clock()))
         try:
@@ -244,7 +252,7 @@ def wait(proc: subprocess.Popen, out, timeout: float | None, silent_s: float, st
         if fd is not None and (grown := size()) != last:
             last, quiet_since = grown, now
         if extend is not None and fd is not None and end is not None and now >= end - RATE_WINDOW_S:
-            if (pct := _percent(getattr(out, "name", None), base)) is not None:
+            if (pct := _percent(src, base)) is not None:
                 samples.append((now, pct))
                 samples = [x for x in samples if now - x[0] <= RATE_WINDOW_S] or samples[-1:]
         if end is not None and now >= end:
