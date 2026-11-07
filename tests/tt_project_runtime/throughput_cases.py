@@ -552,10 +552,15 @@ def test_speed_complaint_detector_skips_product_speed_wording_unless_it_names_th
     from ttp import slowcomplaint as sc
     for text in ("add a low-latency flag; throughput faster than realtime by generating several videos at a time",
                  "the model should decode faster than real-time", "Can you add a low-latency flag so throughput is realtime?",
-                 "implement a feature to stream frames faster"):
+                 "implement a feature to stream frames faster", "make inference faster"):
         assert not sc.detect(text), text
     for text in ("why is this so slow", "Fix your throughput asap, especially on the most time sensitive tasks!",
-                 "the low-latency flag task is still waiting for hours", "your work on the video feature is so slow"):
+                 "the low-latency flag task is still waiting for hours", "your work on the video feature is so slow",
+                 # Pace and delay words, or a named piece of work, count beside a model, kernel, feature or image.
+                 "still waiting on the kernel fix for hours", "the model bringup is so slow",
+                 "why is the model run taking so long", "why is the feature still not done after hours",
+                 "the image build is stuck", "stuck on the decode bug for hours",
+                 "the inference perf work is too slow, speed up"):
         assert sc.detect(text), text
 
 
