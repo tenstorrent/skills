@@ -8775,7 +8775,7 @@ def test_missing_check_gap_has_one_owner_and_waits_across_three_reviews(env, mon
         assert "checks --gap" in prev["retry_when"] and task["attempts"] == 0
     assert all(p.db.task(t)["status"] == "queued" for t in consumers)
     started = []
-    monkeypatch.setattr(d, "_start_checks", lambda path, out, name, tid, extra: started.append((tid, extra)) or True)
+    monkeypatch.setattr(d, "_start_checks", lambda path, out, name, tid, extra, arrived=None: started.append((tid, extra)) or True)
     d.reconcile_tasks()
     assert not started
     repaired = [command + " --updated-head-cases", "true"] if gap_kind == "selector_missing" else ["true"]
@@ -13473,7 +13473,7 @@ def _review_of_own_checks(env, monkeypatch, record):
     p.set_config("delivery.push_queue", True)
     p.set_config("delivery.push_checks", ["false"])
     started = []
-    monkeypatch.setattr(Daemon, "_start_checks", lambda self, path, out, run_id, tid, extra: started.append(out) or True)
+    monkeypatch.setattr(Daemon, "_start_checks", lambda self, path, out, run_id, tid, extra, arrived=None: started.append(out) or True)
 
     def before(tid, head):
         record(p, tid, head, str(worktree.ensure(p, p.db.task(tid))[0]))

@@ -408,7 +408,7 @@ def test_a_detached_release_check_keeps_release_across_a_daemon_restart(env, mon
     monkeypatch.setattr(worktree, "_git", lambda _p, *args: "a" * 40 if args[0] == "rev-parse" else "")
     d = dmod.Daemon(p.base)
     started = []
-    monkeypatch.setattr(d, "_start_checks", lambda path, out, run_id, tid, extra: started.append(extra) or True)
+    monkeypatch.setattr(d, "_start_checks", lambda path, out, run_id, tid, extra, arrived=None: started.append(extra) or True)
     assert d._restart_checks(1, run_dir, {**info, "worktree": str(env["tmp"])}, "r1") == ""
     assert "--release" in started[0] and started[0][-1] == "true"
     assert d._restart_checks(1, run_dir, {**info, "worktree": str(env["tmp"]), "release": False}, "r1") == ""

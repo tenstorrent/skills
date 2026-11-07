@@ -41,7 +41,7 @@ def _shared_daemon(p, monkeypatch):
     from ttp import daemon as dmod
     d = dmod.Daemon(p.base)
     started = []
-    monkeypatch.setattr(d, "_start_checks", lambda path, out, run_id, tid, argv: started.append((tid, argv)) or True)
+    monkeypatch.setattr(d, "_start_checks", lambda path, out, run_id, tid, argv, arrived=None: started.append((tid, argv)) or True)
     return d, started
 
 
