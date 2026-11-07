@@ -27320,6 +27320,14 @@ DURABLE_EXEMPT = {
     ("runnerenv.py", "os.replace(tmp, path)"): "moves that run-dir lock copy into place whole (no new data)",
     ("runnerenv.py", "Path(out).write_text("): "`ttp checks --freeze-lock` writes a lock file the user named and commits; never state",
     ("hostrun.py", 'os.replace(q, folder / f"{rid}.running")'): "claims a queued host-run request (a rename, no new data): one lost to a crash leaves the request queued, and the restarted daemon runs it or drops it once its client gave up",
+    ("hoststate.py", 'os.replace(str(prog) + ".tmp", prog)'): "a test run's stand-in program in its fake store, a scratch folder rebuilt when missing; never state",
+    ("hoststate.py", 'f.with_suffix(".tmp").write_text('): "a test run's stand-in script in its fake store, rebuilt when missing; never state",
+    ("hoststate.py", 'os.replace(f.with_suffix(".tmp"), f)'): "places that stand-in script atomically; same lifetime as above",
+    ("hoststate.py", "p.write_bytes(was[2])"): "puts back a systemd user unit file a test run changed, byte for byte as the snapshot had it; the user's file, not state",
+    ("hostshim.py", 'with open(tmp, "w") as f'): "a test run's fake unit and at-job store, thrown away with the run; never state",
+    ("hostshim.py", "os.replace(tmp, os.path.join(store, name))"): "places that fake store file atomically; same lifetime as above",
+    ("hostshim.py", 'with open(tab + ".tmp", "w") as f'): "a test run's fake crontab, thrown away with the run; never state",
+    ("hostshim.py", 'os.replace(tab + ".tmp", tab)'): "places that fake crontab atomically; same lifetime as above",
 }
 
 
