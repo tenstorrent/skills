@@ -27248,6 +27248,7 @@ DURABLE_EXEMPT = {
     ("batch.py", "(Path(d) / name).write_bytes(text)"): "git merge-file --diff3's inputs to read a shared doc's conflict hunks (_doc_hunks), in a temporary directory removed after",
     ("batch.py", "open(f, 'w').writelines(keep)"): "the sequence editor of a batch's rebase rewrites git's own todo file of that rebase in the push worktree, which git reads right after; a crash aborts the rebase and the next batch makes the worktree anew",
     ("daemon.py", "runner.log"): "a log",
+    ("redact.py", 'with open(log, "ab") as out:'): "a detached masking job's log (scrub.log), appended to",
     ("daemon.py", "ON_PASS_LOG"): "a log (an on_pass command's output, read only for its tail)",
     ("daemon.py", "pidfile.write_text"): "names a process, which a reboot ends",
     ("live.py", 'os.replace(os.path.join(d, "rc.tmp")'): "the CLI watch's live row's exit code, written fsynced by its detached runner (WATCH_RUNNER, no runtime import); one lost to a crash is reported as a killed run once overdue",
