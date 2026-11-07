@@ -1669,6 +1669,9 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
 # A miss raises one high `claim_failed` event. Overdue promises and orders, late orders and failed
 # claims carry `must_act` in their event data: the coordinator wake they start must act on each
 # (mustact.py).
+# A status claim ("#12 is queued", "#12 has started", `state` set or read from such a line, see
+# claim_state) observes a task's status now: check_claims holds it against the task record at send
+# time and record_claims does not track it as a promise that the task ends done.
 ORDER_LATE_KIND = "order_late"
 ORDER_KIND = "order_overdue"
 CLAIM_KIND = "claim_failed"
@@ -1689,6 +1692,13 @@ CLAIM_WAITING = (75, 255, "timeout", None)
 # Owners the daemon attaches itself (attach_carriers: a review carrying an owner's work on) are hops, not
 # this choice, and are not checked.
 UNFIT_OWNER_KINDS = ("question", "plan", "review")
+# A status claim's `state` and the task statuses that make it true at send time ("started": a run began).
+CLAIM_STATES = {"queued": ("queued",), "running": ("running",), "waiting": ("waiting",),
+                "started": ("running", "waiting", "blocked", "review", "done", "failed")}
+_OBSERVED = re.compile(r"\b(?:is|are|has|have|was|were|been|now|got)\s+(?:(?:still|now|already|just|been)\s+){0,2}"
+                       r"(queued|started|running|waiting)\b|\b(?:in|on) the queue\b", re.I)
+_OUTCOME = re.compile(r"\b(?:done|land(?:s|ed|ing)?|push(?:es|ed)?|finish(?:es|ed)?|complete[sd]?|merged?|fixed|"
+                      r"ready|live|deliver(?:s|ed)?|report(?:s|ed)?|result)\b", re.I)
 ORDER_AUDIT_DAYS = 7
 
 
@@ -1896,6 +1906,21 @@ def _check_order(p, o: dict, now: float, raised: list[str]) -> bool:
     return changed
 
 
+def claim_state(c: dict) -> str | None:
+    """The status a task-backed claim observes (a key of CLAIM_STATES), else None: its `state`, or a
+    claim with no `due` whose text only says the task is queued, started, running or waiting (no outcome,
+    no future or time). A claim that also names an outcome stays a claim that the task ends done."""
+    if c.get("task") in (None, ""):
+        return None
+    if c.get("state") not in (None, ""):
+        return str(c["state"])
+    text = " ".join(str(c.get("text") or "").split())
+    if c.get("due") not in (None, "") or _OUTCOME.search(text) or FUTURE_RE.search(text) or _has_time(text):
+        return None
+    seen = {(m.group(1) or "queued").lower() for m in _OBSERVED.finditer(text)}
+    return seen.pop() if len(seen) == 1 else None
+
+
 def check_claims(claims, p, new_tasks=None) -> None:
     """Static checks of a reply's or notify's `claims` before it is sent; raises on the first bad one.
     `new_tasks`: the action indexes of this batch's task_add actions, when known."""
@@ -1913,6 +1938,14 @@ def check_claims(claims, p, new_tasks=None) -> None:
             raise ValueError(f"claim: no task #{c['task']}")
         if c.get("action") not in (None, "") and new_tasks is not None and int(c["action"]) not in new_tasks:
             raise ValueError(f"claim: action {c['action']} is not a task_add of this batch")
+        if c.get("state") not in (None, "") and (c["state"] not in CLAIM_STATES or c.get("task") in (None, "")):
+            raise ValueError(f"claim `state` is one of {', '.join(CLAIM_STATES)}, with `task`: what its record "
+                             f"shows now")
+        if state := claim_state(c):
+            t = p.db.task(int(c["task"]))
+            if t["status"] not in CLAIM_STATES[state]:
+                raise ValueError(f"claim: #{c['task']} is {t['status']} in its record, not {state} "
+                                 f"({str(c['text'])[:80]}): state its status from the record")
         if c.get("expect") not in (None, ""):
             check_start_when(str(c["expect"]), p)
         if c.get("due") not in (None, ""):
@@ -1928,6 +1961,10 @@ def record_claims(p, sent: list[tuple[int, str | None, list]], new_tasks: dict[i
     todo = []
     for mid, chat, claims in sent:
         for c in claims or []:
+            if state := claim_state(c):   # a status checked at send time (check_claims), not a promise
+                notes.append(f"claim not tracked: #{c['task']} is {state} at send time, a status, not that it "
+                             f"ends done ({str(c['text'])[:80]})")
+                continue
             task = int(c["task"]) if c.get("task") not in (None, "") else None
             if c.get("action") not in (None, ""):
                 task = new_tasks.get(int(c["action"]))

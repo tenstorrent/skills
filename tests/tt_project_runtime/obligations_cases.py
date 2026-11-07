@@ -709,3 +709,45 @@ def test_promise_is_owned_by_the_batch_task_its_words_name_never_a_cancelled_one
     _, open_ = _footer_reply(p, now, "I'll report the soak result here by 17:00 PST.", batch)
     (o2,) = [x for x in open_ if "soak" in x["text"]]
     assert o2["promise"]["tasks"] == [a, b], o2["promise"]
+
+
+def test_a_status_line_is_checked_at_send_and_never_tracked_as_ending_done(env):
+    # "#N is queued" / "has started" / "is waiting" observes the record now; it is no promise that #N ends done.
+    from ttp import obligations as ob
+    p = make(env)
+    tid = p.db.add_task("build it", "spec")
+    for text, extra in [(f"#{tid} is queued", {}), (f"#{tid} is now in the queue", {}),
+                        ("the build", {"state": "queued"})]:
+        c = {"text": text, "task": tid, **extra}
+        ob.check_claims([c], p)
+        out = p.db.post("out", text, chat="c1", kind="reply")
+        [note] = ob.record_claims(p, [(out, "c1", [c])], {})
+        assert note.startswith("claim not tracked") and "a status" in note
+    assert ob.open_promises(p.db) == []
+    for status, text in [("running", f"#{tid} has started"), ("running", f"#{tid} is running"),
+                         ("waiting", f"#{tid} is waiting on its checks"), ("done", f"#{tid} has started")]:
+        p.db.update_task(tid, status=status)
+        ob.check_claims([{"text": text, "task": tid}], p)
+    p.db.update_task(tid, status="queued")
+    for c in [{"text": f"#{tid} has started", "task": tid}, {"text": "it runs", "task": tid, "state": "running"},
+              {"text": f"#{tid} is waiting", "task": tid}]:
+        with pytest.raises(ValueError, match="is queued in its record"):
+            ob.check_claims([c], p)
+    for c in [{"text": "x", "task": tid, "state": "finished"}, {"text": "x", "expect": "true", "state": "queued"}]:
+        with pytest.raises(ValueError, match="claim `state`"):
+            ob.check_claims([c], p)
+
+
+def test_a_claim_that_names_an_outcome_stays_tracked_as_ending_done(env):
+    # A real promise ("I'll report the commit", "is running and lands by 15:00", a due) keeps its tracking.
+    from ttp import obligations as ob
+    p = make(env)
+    tid = p.db.add_task("build it", "spec")
+    for text, extra in [(f"#{tid} is queued and I'll report the commit", {}), (f"#{tid} is running, lands by 15:00", {}),
+                        (f"#{tid} has started", {"due": time.time() + 7200}), (f"#{tid} is done", {}),
+                        (f"#{tid} is queued and #{tid + 1} is running", {})]:
+        c = {"text": text, "task": tid, **extra}
+        assert ob.claim_state(c) is None, text
+        out = p.db.post("out", text, chat="c1", kind="reply")
+        [note] = ob.record_claims(p, [(out, "c1", [c])], {})
+        assert f"#{tid} ends done" in note, (text, note)

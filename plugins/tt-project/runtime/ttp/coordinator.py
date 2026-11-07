@@ -277,7 +277,8 @@ ACTIONS_SCHEMA: dict[str, Any] = {
             "due": {"type": ["number", "string"]}, "start_by": {"type": ["number", "string"]},
             "claims": {"type": "array", "items": {"type": "object", "properties": {
                 "text": {"type": "string"}, "task": {"type": "integer"}, "action": {"type": "integer"},
-                "expect": {"type": "string"}, "due": {"type": ["number", "string"]}}, "required": ["text"]}},
+                "expect": {"type": "string"}, "due": {"type": ["number", "string"]},
+                "state": {"type": "string", "enum": list(obligations.CLAIM_STATES)}}, "required": ["text"]}},
             "no_order": {"type": "string"}, "cites": {"type": "array", "items": {"type": "integer"}},
             "repeat": {"type": "boolean"}},
             "required": ["type"]}},
