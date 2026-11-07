@@ -9601,6 +9601,51 @@ def test_ttp_checks_preempt_asks_a_run_by_hand_and_refuses_owed_push_and_locked_
             h.close()
 
 
+def test_ttp_checks_preempt_finds_a_relaunched_run_by_the_run_slot_status_names(env, tmp_path, monkeypatch, capsys):
+    """#7190 (2): checks the daemon started again after a reboot hold their host-wide slot under the run_id
+    relaunch-t<task>, while `ttp checks --slot-status` names them by their run folder (run 13549).
+    `ttp checks --preempt 13549` finds that slot through the run's lane holder and asks it; a run no lane
+    holder names is still not found, and the run_id still works."""
+    from ttp import checkcap, checklane, cli, testslots
+    p, repo, _, _ = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "5")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    run_dir = p.runs / "13549"
+    run_dir.mkdir(parents=True)
+    monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
+    monkeypatch.setenv("TTP_RUN_ID", "relaunch-t6862")
+    monkeypatch.setenv("TTP_TASK", "6862")
+    lane = testslots.suite_hold(p.name, wait_s=0, who=f"run {run_dir.name}", priority=2,
+                                repo=testslots.repo_key(str(repo)))
+    slot = checkcap.acquire(checkcap.label(p.name), "ttp checks on abc", priority=2, project_name=p.name,
+                            preemptible=True)
+    monkeypatch.setenv("TTP_RUN_ID", "r-asker")
+    monkeypatch.setenv("TTP_TASK", "91")
+
+    def ask(run):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--preempt", run])
+        return e.value.code, capsys.readouterr().out
+
+    try:
+        assert slot.f is not None and lane is not None
+        (row,) = checklane.lane_status(p.name)
+        assert [h["run"] for h in row["lanes"]] == ["13549"], row
+        rc, out = ask("13550")
+        assert rc == 1 and "no checks of run 13550" in out, out
+        rc, out = ask("13549")
+        assert rc == 0 and "task #6862 (run relaunch-t6862)" in out and "asked" in out, out
+        assert checkcap.preempted(slot.since) == "urgent #91"
+        checkcap.clear_preempt()
+        rc, out = ask("relaunch-t6862")
+        assert rc == 0 and checkcap.preempted(slot.since), out
+    finally:
+        checkcap.clear_preempt()
+        slot.close()
+        lane.close()
+
+
 def test_no_preemption_within_the_grace_and_it_counts_from_the_arrival(env, monkeypatch):
     """#6246 (3): an urgent waiter asks nobody while it has waited less than checks.preempt_after_s (default
     PREEMPT_AFTER_S); one that arrived longer ago (a re-execution keeps its arrival) asks at once."""

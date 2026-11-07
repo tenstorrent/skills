@@ -1403,8 +1403,10 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
 PREEMPT_LOG = "preempt-asks.jsonl"   # check-slots/preempt-asks.jsonl: who asked by hand (ask_preempt), one line each
 
 
-def ask_preempt(run: str, by: str) -> tuple[bool, str]:
-    """`ttp checks --preempt <run>`: ask the checks of run `run` (its slot label's run_id) to give up their
+def ask_preempt(run: str, by: str, owners: list[dict] | tuple = ()) -> tuple[bool, str]:
+    """`ttp checks --preempt <run>`: ask the checks of run `run` (its slot label's run_id, or a slot held by
+    one of `owners`: the run's lane holders as `ttp checks --slot-status` names them, checklane.run_owners,
+    which also finds a run the daemon relaunched under another run_id) to give up their
     slot of the cap, with the request preempt() writes (no claim: the freed slot goes to the queue's next
     waiter in its order), and log who asked (PREEMPT_LOG). Refused for push checks (a priority slot, or a push
     turn on the cap), a reserved urgent slot's run, an owed holder (its task owns an open obligation; an urgent
@@ -1412,7 +1414,9 @@ def ask_preempt(run: str, by: str) -> tuple[bool, str]:
     or an older ttp: preemptible). Returns (asked, the line to print)."""
     for path in all_paths() + urgent_paths() + priority_paths():
         h = _read(path)
-        if str(h.get("run_id") or "") != str(run) or not locks.held_labels([path]):
+        if str(h.get("run_id") or "") != str(run) and not any(same_owner(h, o) for o in owners):
+            continue
+        if not locks.held_labels([path]):
             continue
         who = str(h.get("holder") or f"run {run}")
         if path.name.startswith(PRIORITY + ".") or str(h.get("command") or "").startswith("push checks"):

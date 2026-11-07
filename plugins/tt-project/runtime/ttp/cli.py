@@ -3488,9 +3488,10 @@ def cmd_checks(a) -> None:
     if getattr(a, "env_ok", None) is not None:
         sys.exit(_checks_env_ok(here(), a.env_ok))
     if getattr(a, "preempt", None):
-        from . import checkcap
+        from . import checkcap, checklane
         p = here()
-        ok, line = checkcap.ask_preempt(a.preempt, checkcap.label(p.name if p else None, "ttp checks --preempt"))
+        ok, line = checkcap.ask_preempt(a.preempt, checkcap.label(p.name if p else None, "ttp checks --preempt"),
+                                        checklane.run_owners(p.name, a.preempt) if p else ())
         print(f"ttp checks: {line}")
         sys.exit(0 if ok else 1)
     if getattr(a, "freeze_lock", None):

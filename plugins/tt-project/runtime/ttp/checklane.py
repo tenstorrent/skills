@@ -1097,6 +1097,18 @@ def _precheck_of(text) -> str:
     return m.group(1) if m else ""
 
 
+def run_owners(project_name: str, run) -> list[dict]:
+    """The owner fields (checkcap.OWNER_KEYS) of project `project_name`'s lane holders whose run is `run`, as
+    lane_status names it: the run folder's name, also for checks the daemon started again under another
+    run_id (relaunch-t<task>). `ttp checks --preempt` finds that run's host-wide slot by them."""
+    out = []
+    for base in testslots.suite_bases(project_name):
+        for r in locks.holder_records(testslots._lanes_of(base)):
+            if str(run) and _run_of(r.get("holder")) == str(run) and r.get("pid"):
+                out.append({k: r.get(k) for k in checkcap.OWNER_KEYS})
+    return out
+
+
 def _run_of(text: str) -> str:
     m = re.search(r"\brun (\d+)", str(text or ""))
     return m.group(1) if m else ""

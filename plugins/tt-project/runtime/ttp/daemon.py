@@ -12752,8 +12752,10 @@ class Daemon:
         the head they ran on and has no uncommitted changes to tracked files (untracked ones never
         count, as for `ttp checks`), at most once per boot per task and max_reboot_losses times per
         head since the task was last blocked (checks that take the host down are not started forever).
+        Never for a task no longer open or deferred (_no_relaunch): it stays asleep, its checks not
+        started, and runs them when it next starts.
         Returns (asleep, relaunched): asleep when the task stays asleep (relaunched now, or already on
-        this boot, a daemon restart), else it wakes as before; relaunched is the number of relaunches
+        this boot, a daemon restart, or not relaunched as above), else it wakes as before; relaunched is the number of relaunches
         when the cap refused one after an abrupt reboot, which then count as reboot losses, else 0."""
         from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
         db, tid = self.p.db, t["id"]
@@ -12768,6 +12770,11 @@ class Daemon:
             return True, 0   # the durable request will start on this boot, without a model wake
         mine = f"checks_relaunched:{tid}:{self.boot}:"
         if db.one("SELECT id FROM events WHERE fingerprint LIKE ?", (mine + "%",)):
+            return True, 0
+        if why := self._no_relaunch(tid):
+            # Neither started nor woken (a wake would drop a start_after timer): its checks run again when
+            # the task next starts, and until then they hold no checks slot that owed runs wait for.
+            log(self.p, f"task {tid}: the reboot killed its checks, not started again: the task {why}")
             return True, 0
         info = _read_checks_pid(out)
         wt, head, boot, cmd = info.get("worktree"), info.get("head"), info.get("boot"), info.get("cmd")
@@ -12801,6 +12808,20 @@ class Daemon:
             return lost.stat().st_mtime < (self.boot_at or 0) and "host reboot" not in lost.read_text()
         except OSError:
             return False
+
+    def _no_relaunch(self, tid: int) -> str:
+        """Why task tid's checks a reboot killed are not started again, read now: it is no longer open
+        (cancelled, done or any other status but queued) or deferred (start_after still to come, or a
+        start_when not yet met); "" when they may be."""
+        t = self.p.db.task(tid)
+        if not t or t["status"] != "queued":
+            return f"is {t['status'] if t else 'gone'}"
+        d = deferral(t)
+        if d.get("when"):
+            return "is deferred until its start_when passes"
+        if (d.get("after") or 0) > time.time():
+            return "is deferred by start_after"
+        return ""
 
     def _relaunch_jobs(self, t: dict, prev: dict) -> tuple[bool, bool]:
         """A task waiting on local detached jobs (`ttp detach --check <rc...>` in its retry_when, alone
