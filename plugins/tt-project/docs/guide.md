@@ -51,9 +51,14 @@ sent. A failure to read replies is reported on stderr and never stops the messag
   is retried without spending an attempt and is not counted as waste. After a wake, nothing new
   starts until the host has been awake for `budget.wake_settle_s` (default 300 s), so a laptop's
   brief maintenance wakes start nothing. Messages from people are still answered at once.
-  A run a reboot, a sleep or a lost supervisor cut short after real progress
-  (`budget.resume_lost`, default $0.50 or 10 min) continues its agent session in the same
-  working directory with a short prompt, instead of starting over.
+  A run a reboot cut short, or whose process died without a result (a crash), continues its agent
+  session in the same working directory with a short prompt, instead of starting over, and spends
+  no attempt (a second crash in a row counts one). A run a sleep or the network cut short does so
+  after real progress (`budget.resume_lost`, default $0.50 or 10 min; `false` turns resumes off).
+  After a reboot the daemon also starts again, once per boot and model-free, a task's own detached
+  `ttp checks` and a review's precheck (only while that review is open), on the same head and at
+  their old place in the host's checks queue. The Host line counts runs cut short as resumed
+  (restarted, with or without their work) or not restarted.
   A task lost to `budget.max_reboot_losses` abrupt reboots is blocked, as it may cause them. So is,
   at once, a task whose run or detached job held a `ttp lock` resource of this host (a device, a
   machine; not a push lock) when the host went down abruptly: the coordinator requeues it once the

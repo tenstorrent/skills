@@ -3677,7 +3677,7 @@ class Daemon:
                     self._reap(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
                 elif not alive:
                     self._end_orphan(r)
-                    self._reap(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r)})
+                    self._reap(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r), "orphan": True})
                 elif why := self._hung(r, up):
                     self._end_hung(r, why)
                 self._reap_errors.pop(r["id"], None)
@@ -4007,6 +4007,15 @@ class Daemon:
             db.post("out", f"{lead}The host rebooted ({how}; {nth} reboot in 24 h); {len(lost)} run(s) were cut short "
                            f"(${usd:.2f}).{then}{unstable} Runs: {'; '.join(parts)}"[:3000],
                     kind="info", severity=severity, ref=f"reboot:{self.boot}")
+
+    def _crash_restarted(self, r: dict) -> bool:
+        """Whether the task's run before r was itself lost to a crash and restarted free (lost_to_crash)."""
+        prev = self.p.db.one("SELECT note FROM runs WHERE task=? AND id<? AND role!='coordinator' "
+                             "ORDER BY id DESC LIMIT 1", (r["task"], r["id"]))
+        try:
+            return bool(prev) and bool(json.loads(prev["note"] or "{}").get("lost_to_crash"))
+        except (ValueError, TypeError, AttributeError):
+            return False
 
     def _end_orphan(self, r: dict) -> None:
         """A supervisor that died (kill -9, OOM) leaves its agent running with no wall clock, budget
@@ -4754,6 +4763,11 @@ class Daemon:
             # way keeps its session (below), so this comes before the fresh-start fallback.
             note.update(not_waste="sleep", lost_to_sleep=True, slept_s=exit_info.get("slept_s"))
             status = "lost"
+        elif status == "lost" and exit_info.get("orphan") and r["task"] and r["role"] != "coordinator" \
+                and not self._crash_restarted(r):
+            # Its process died without a result on this boot (a crash, an OOM kill): restarted once with
+            # no attempt spent; a restart that dies the same way counts one, so a crash loop still ends.
+            note.update(lost_to_crash=True)   # still a failure to the runaway guard
         elif status == "failed" and _resume_never_started(note, usage) and not refused:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
         if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
@@ -4838,6 +4852,7 @@ class Daemon:
                         log(p, f"run {r['id']}: checking the project root's checkout failed\n" + traceback.format_exc())
                     self._finish_worker(r, usage, status, run_dir, cut_off if status == "ok" else None,
                                         refused=refused, rebooted=bool(note.get("lost_to_reboot")),
+                                        crashed=bool(note.get("lost_to_crash")),
                                         orderly=note.get("shutdown") == "orderly",
                                         slept=bool(note.get("lost_to_sleep") or note.get("lost_to_network")),
                                         held=held, root_wake=root_wake)
@@ -5606,8 +5621,10 @@ class Daemon:
     def _finish_worker(self, r: dict, usage, status: str, run_dir: Path, ended: str | None = None,
                        rebooted: bool = False, slept: bool = False, handoff: dict | None = None,
                        orderly: bool = False, refused: str = "", push_verified: bool = False,
-                       held: str = "", root_wake: dict | None = None) -> None:
-        """`root_wake`: tracked paths the run newly dirtied in the project root (_root_wake): a `done`
+                       held: str = "", root_wake: dict | None = None, crashed: bool = False) -> None:
+        """`crashed`: the run's process died without a result on this boot, its first such loss in a row
+        (finish_run's lost_to_crash): requeued like a run a reboot cut short, no attempt spent.
+        `root_wake`: tracked paths the run newly dirtied in the project root (_root_wake): a `done`
         is sent back once to commit or revert them; else check_root_checkout reports them.
         `handoff` stands in for the run's result.json: the `on_pass` its checks earned (_probe_passed).
         `held`: why the run's runtime changes did not load (runtimeload.check): its hand-off is not judged.
@@ -5891,7 +5908,7 @@ class Daemon:
             result = {**result, "status": "failed", "summary": summary}
         # A host reboot is not the task's failure: no attempt, no delay, unless the task keeps being
         # the run the host went down under.
-        reboot_lost = status == "lost" and rebooted
+        reboot_lost = status == "lost" and (rebooted or crashed)
         # So is a host sleep, a few times: past max_reboot_losses since the task was last blocked it
         # counts an attempt again, so a task that fails on its own while the host also slept cannot
         # retry for free forever.
@@ -5981,7 +5998,7 @@ class Daemon:
         if rebooted:
             extra["reboot"] = {"at": self.boot_at, "notes": _last_notes(run_dir)}
         wakes = _reboot_wakes(task)
-        if reboot_lost and not slept and not orderly:
+        if reboot_lost and rebooted and not slept and not orderly:
             n = self._reboot_losses(task["id"]) + wakes
             if n >= int(self.cfg["budget"].get("max_reboot_losses", 3)):
                 new, reason = "blocked", f"lost to a host reboot {n} times; it may be causing them"
@@ -10339,7 +10356,9 @@ class Daemon:
             took += float(prev["ended"] or 0) - float(prev["started"] or 0)
             back = (json.loads(prev["note"] or "{}").get("resumes") or {}).get("run")
             prev = self.p.db.one("SELECT * FROM runs WHERE id=?", (back,)) if back else None
-        if cost < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)):
+        # A reboot or a crash cut a live run short: it resumes whatever it cost, its session kept.
+        if cost < float(want.get("min_usd", 0.5)) and took < float(want.get("min_s", 600)) \
+                and not (note.get("lost_to_reboot") or note.get("lost_to_crash")):
             return None
         spec = _read_result(run_dir / "run.json") or {}
         cwd, run_env = str(spec.get("cwd") or ""), spec.get("env") if isinstance(spec.get("env"), dict) else {}
@@ -10347,8 +10366,8 @@ class Daemon:
         if not cwd or not Path(cwd).is_dir() or not prov.resume_args(session) or \
                 not prov.session_saved(session, cwd, run_env):
             return None
-        cause = "reboot" if note.get("lost_to_reboot") else "sleep" if note.get("lost_to_sleep") \
-            else "network" if note.get("lost_to_network") else "lost"
+        cause = "reboot" if note.get("lost_to_reboot") else "crash" if note.get("lost_to_crash") \
+            else "sleep" if note.get("lost_to_sleep") else "network" if note.get("lost_to_network") else "lost"
         return {"run": r["id"], "session": session, "cwd": cwd, "dir": str(run_dir), "ended": r["ended"],
                 "cause": cause, "spec_sha": note.get("spec_sha")}
 
@@ -12204,6 +12223,7 @@ class Daemon:
         self._boot_woken = True
         if not self.boot_at:
             return
+        self._relaunch_prechecks()
         db = self.p.db
         earlier = (db.kv("boot_prev") or {}).get("prev_boot")
         cycle = self._planned_cycle(earlier) if earlier and self._this_boot((db.kv("boot_prev") or {}).get("boot")) \
@@ -12268,6 +12288,42 @@ class Daemon:
             db.update_task(t["id"], not_before=None, result=dump_result(
                 {**prev, **woke, "reboot": reboot, "reboot_wakes": wakes}))
             log(self.p, f"task {t['id']} waited from before the reboot; due now")
+
+    def _relaunch_prechecks(self) -> None:
+        """Review prechecks (_precheck) the reboot killed start again in their folder on the same head,
+        at their old place in the host's checks queue, model-free: only while the review that reads them is
+        open (a cancelled or finished one leaves them stopped), once per folder per boot and at most
+        max_reboot_losses times per folder (checks that take the host down are not started forever)."""
+        from . import checklane
+        from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+        db, cap = self.p.db, int(self.cfg["budget"].get("max_reboot_losses", 3))
+        try:
+            outs = sorted((self.p.state / PRECHECKS_DIR).iterdir())
+        except OSError:
+            return
+        for out in outs:
+            m = re.fullmatch(r"t(\d+)-[0-9a-f]{12}", out.name)
+            if not m or (out / CHECKS_RC).exists():
+                continue
+            info, tid = _read_checks_pid(out), int(m.group(1))
+            boot = info.get("boot")
+            if not isinstance(boot, str) or not boot or self._this_boot(boot) or _checks_alive(info) \
+                    or not checklane.open_precheck(db, str(tid), f"run {out.name}"):
+                continue
+            mine = f"precheck_relaunched:{out.name}:"
+            done = db.q("SELECT fingerprint FROM events WHERE kind='checks_relaunched' AND fingerprint LIKE ?",
+                        (mine + "%",))
+            if any(r["fingerprint"] == mine + self.boot for r in done) or len(done) >= cap:
+                continue
+            why = self._restart_checks(tid, out, info, precheck_run_id(out))
+            if why:
+                log(self.p, f"task {tid}: the reboot killed its review precheck, not started again: {why}")
+                continue
+            db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+                 (time.time(), "daemon", "checks_relaunched", mine + self.boot, "low",
+                  f"#{tid}: the reboot killed its review precheck on {str(info.get('head'))[:12]}; started it "
+                  f"again in {out}, no model run", "handled", tid))
+            log(self.p, f"task {tid}: the reboot killed its review precheck; started it again ({out})")
 
     def _block_after_reboot(self, t: dict, prev: dict, reason: str) -> None:
         """Block waiting task t at boot for `reason`, with a task_blocked event for the coordinator
@@ -12467,15 +12523,18 @@ class Daemon:
             + (["--no-device"] if info.get("no_device") else []) \
             + (["--release"] if info.get("release") else []) \
             + (["--purpose", "harness"] if info.get("purpose") == "harness" else []) + [str(c) for c in cmd]
-        return "" if self._start_checks(Path(wt), out, run_id, tid, argv) else "they could not be started"
+        arrived = info.get("arrived") or info.get("ts")   # back at their place in the host's checks queue
+        arrived = float(arrived) if isinstance(arrived, (int, float)) and not isinstance(arrived, bool) else None
+        return "" if self._start_checks(Path(wt), out, run_id, tid, argv, arrived) else "they could not be started"
 
-    def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str]) -> bool:
+    def _start_checks(self, path: Path, out: Path, run_id: str, tid: int, extra: list[str],
+                      arrived: float | None = None) -> bool:
         """`ttp checks --detach --no-prestage [extra]` in worktree `path`, writing to `out` as a run's
         directory, as a worker's run would: the project's venv, `ttp` first, niced like workers. No
         pre-stage (delivery.check_prestage, or the derived one): it runs in the foreground for up to
         its own limit (90 s by default), longer than this call's inline bound, so the tick would kill
         the start before the full checks begin; it only saves a foreground caller time, and the full
-        checks run anyway."""
+        checks run anyway. `arrived`: the time they first queued for a host checks slot, kept on a restart."""
         runtime_dir = str(Path(__file__).resolve().parent.parent)
         bin_path = f"{service_path()}:{os.environ.get('PATH', '')}"
         venv = worktree.project_venv(self.p, path)
@@ -12484,6 +12543,8 @@ class Daemon:
                "TTP_RUN_ID": run_id, **task_env(tid), "PYTHONPATH": runtime_dir,
                "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}", **usersite.env(self.cfg)}
         env = machines.mask_devices(env)   # as in the worker's run: no direct device opens
+        if arrived is not None:
+            env[checkcap.ARRIVED_ENV] = repr(arrived)
         level = nice_level(self.cfg.get("runner"))[0]
         argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", "--no-prestage", *extra]
         try:

@@ -24661,14 +24661,16 @@ def test_a_lost_run_starts_fresh_without_its_transcript_or_worktree(env, tmp_pat
         assert "The host rebooted" in prompt, "the fresh start lost the reboot note"
 
 
-def test_a_short_lost_run_starts_fresh(env, tmp_path, monkeypatch):
+def test_a_run_a_reboot_cut_short_resumes_however_short(env, tmp_path, monkeypatch):
+    # budget.resume_lost's thresholds skip a fresh start's waste only for other losses (sleep, network):
+    # a run live at a reboot resumes its session whatever it cost; resume_lost false turns resumes off.
     p = make(env)
     from ttp.daemon import Daemon
     _sessions(env, monkeypatch, "short", "costly", "long")
     d = Daemon(p.base)
     short = p.db.add_task("short", "s", kind="work", tier="light", origin="user")
     _lost_with_session(p, d, tmp_path, short, name="a", session="short", cost=0.2, took=120)
-    assert d._resumable(p.db.task(short), "fake") is None
+    assert d._resumable(p.db.task(short), "fake")["cause"] == "reboot"
     costly = p.db.add_task("costly", "s", kind="work", tier="light", origin="user")
     _lost_with_session(p, d, tmp_path, costly, name="b", session="costly", cost=0.6, took=120)
     assert d._resumable(p.db.task(costly), "fake")["session"] == "costly"
@@ -24677,7 +24679,7 @@ def test_a_short_lost_run_starts_fresh(env, tmp_path, monkeypatch):
     assert d._resumable(p.db.task(long), "fake")["session"] == "long"
     p.set_config("budget.resume_lost", {"min_usd": 1.0, "min_s": 3600})
     d.cfg = p.config()
-    assert d._resumable(p.db.task(costly), "fake") is None and d._resumable(p.db.task(long), "fake") is None
+    assert d._resumable(p.db.task(costly), "fake")["session"] == "costly"
     p.set_config("budget.resume_lost", False)
     d.cfg = p.config()
     p.db.update_task(costly, status="queued")
@@ -24715,18 +24717,19 @@ def test_resuming_keeps_attempt_counting(env, tmp_path, monkeypatch):
     _lost_with_session(p, d, tmp_path, rebooted, name="r", session="r")
     supervisor = p.db.add_task("lost supervisor", "s", kind="work", tier="light", origin="user")
     _lost_with_session(p, d, tmp_path, supervisor, name="s", session="s", boot=None)
-    assert p.db.task(rebooted)["attempts"] == 0 and p.db.task(supervisor)["attempts"] == 1
-    assert d._resumable(p.db.task(supervisor), "fake")["cause"] == "lost"
+    # A run whose process died on this boot is restarted once with no attempt spent (a crash).
+    assert p.db.task(rebooted)["attempts"] == 0 and p.db.task(supervisor)["attempts"] == 0
+    assert d._resumable(p.db.task(supervisor), "fake")["cause"] == "crash"
     p.db.update_task(supervisor, not_before=None)
     d.dispatch()
     for tid in (rebooted, supervisor):
         run = p.db.one("SELECT * FROM runs WHERE task=? ORDER BY id DESC LIMIT 1", (tid,))
         assert json.loads(run["note"]).get("resumes"), tid
     prompt = (pathlib.Path(run["dir"]) / "prompt.md").read_text()
-    assert "its supervisor was lost" in prompt and "attempt 2 of 3" in prompt and "does not count" not in prompt
+    assert "a crash" in prompt and "attempt 1 of 3" in prompt and "does not count as an attempt" in prompt
     _finish_runs(p, d)
     # A finished run counts its attempt as ever; the losses before it did as they always did.
-    assert p.db.task(rebooted)["attempts"] == 1 and p.db.task(supervisor)["attempts"] == 2
+    assert p.db.task(rebooted)["attempts"] == 1 and p.db.task(supervisor)["attempts"] == 1
     assert p.db.task(rebooted)["status"] == "done" and p.db.task(supervisor)["status"] == "done"
 
 
@@ -49383,7 +49386,7 @@ def test_host_line_splits_cut_runs_into_lost_and_resumed_and_names_planners(env)
     line = dbm.host_line(boots)
     assert "(1 planned: by proj-a)" in line, line
     assert dbm.host_line([{"ts": time.time(), "lost": []}]).endswith("0 runs cut short")
-    assert line.endswith("3 runs cut short: 2 lost ($1.50), 1 resumed with work kept ($2.50)"), line
+    assert line.endswith("3 runs cut short: 1 resumed (1 with work kept, $2.50), 2 not restarted, $1.50 of work lost"), line
 
 
 def test_memory_supersedes_keeps_a_shared_audience(env):

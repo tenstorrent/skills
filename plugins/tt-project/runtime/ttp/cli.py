@@ -1694,7 +1694,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import screen as scr
     for m in scr.mutes(db, now):
         lines.append(f"muted: {scr.mute_line(m, now, p)}")
-    if h.get("host") and (verbose or re.search(r": [1-9]\d* lost", h["host"])):   # runs a reboot lost: always
+    if h.get("host") and (verbose or re.search(r" [1-9]\d* not restarted|\$(?!0\.00 )[\d.]+ of work lost", h["host"])):
+        # runs a reboot cut short that nothing restarted, or whose work was not kept: always
         lines.append(h["host"])
     if h.get("idle_sleep"):
         lines.append(h["idle_sleep"])

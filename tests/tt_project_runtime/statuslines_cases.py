@@ -63,7 +63,7 @@ def test_status_keeps_routine_lines_behind_verbose_and_shows_their_anomalies(env
     bad = {"self_review": "self-review: overdue (never ran): no schedule",
            "health": "health: 2 ok, 0 fixed today, 1 failing",
            "coverage": "health coverage: 3/4 (missing: machine box-a)",
-           "host": "host: 1 reboot in 24 h (last 01:00 PST), 2 runs cut short: 2 lost ($5.00), 0 resumed with work kept ($0.00)"}
+           "host": "host: 1 reboot in 24 h (last 01:00 PST), 2 runs cut short: 0 resumed (0 with work kept, $0.00), 2 not restarted, $5.00 of work lost"}
     for lines, failing in ((fine, 0), (bad, 1)):
         monkeypatch.setattr(web, "health", lambda *a, _x=lines, **k: {**real(*a, **k), **_x})
         monkeypatch.setattr(heal, "summary", lambda *a, _n=failing, **k: {"failing": _n})
