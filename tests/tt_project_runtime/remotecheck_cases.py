@@ -1883,7 +1883,8 @@ def test_spill_host_slots_follow_idle_cores_and_memory_and_the_probe_reads_its_l
 # disk: the node cannot read it, so the probe exits 3 and a job fails at once), probehide (the node's
 # probe answer never shows on the submit host). Probe jobs (--job-name=ttp-probe) log to probe.log
 # with ids from 901. FAKE_SLURM_NOACCT=1: sacct answers nothing (no accounting), scontrol does.
-# FAKE_SLURM_RC_LAG=<s>: a job's rc file shows that long after the job ended (NFS).
+# FAKE_SLURM_RC_LAG=<s>: a job's rc file shows that long after the job ended (NFS); lag.pids lists the
+# background movers, which a test waits out so none outlives it.
 _SLURM_FAKES = {
     "sbatch": r'''#!/bin/sh
 d=$FAKE_SLURM
@@ -1901,6 +1902,7 @@ elif [ "$FAKE_SLURM_MODE" = nodefail1 ] && [ ! -e "$d/failed" ]; then touch "$d/
 else (cd "$dir" && sh "$script" > "$out" 2>&1); echo COMPLETED > "$d/state.$n"
   if [ -n "$FAKE_SLURM_RC_LAG" ] && [ -e "$dir/rc" ]; then
     mv "$dir/rc" "$dir/rc.late"; (sleep "$FAKE_SLURM_RC_LAG"; mv "$dir/rc.late" "$dir/rc") </dev/null >/dev/null 2>&1 &
+    echo $! >> "$d/lag.pids"
   fi
 fi
 echo "$n"
@@ -1926,6 +1928,20 @@ echo "$1" >> "$FAKE_SLURM/scancel.log"
 echo CANCELLED > "$FAKE_SLURM/state.$1"
 ''',
 }
+
+
+def _wait_out_pids(path, timeout=30):
+    """Wait for the fakes' background processes listed in path to end, so none outlives the test."""
+    deadline = time.monotonic() + timeout
+    for pid in map(int, path.read_text().split() if path.exists() else []):
+        while time.monotonic() < deadline:
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"the fake's background process {pid} still runs")
 
 
 def _slurm_fakes(tmp_path, monkeypatch=None, mode="run"):
@@ -2242,9 +2258,10 @@ def test_a_slurm_job_on_a_cluster_without_accounting_reads_scontrol_and_waits_ou
     assert rc == 5 and "submitting it again" not in out, out
     assert "show job 101" in (d / "scontrol.log").read_text()
     assert len((d / "sbatch.log").read_text().splitlines()) == 1
-    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_RC_LAG": "5"}, rc_grace_s=1)
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_RC_LAG": "3"}, rc_grace_s=1)
     assert rc == remotecheck.FAULT_RC and "submitting it again once" in out and "ended COMPLETED" in out, out
     assert len((d / "sbatch.log").read_text().splitlines()) == 3
+    _wait_out_pids(d / "lag.pids")
     # A node fault scontrol names is a cluster end at once, never waited out: sent again once, then it runs.
     rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_MODE": "nodefail1", "FAKE_SLURM_RC_LAG": ""},
                          rc_grace_s=600)
