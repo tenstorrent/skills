@@ -2019,8 +2019,12 @@ def _approved_mid_search(p, monkeypatch, after, priority):
     return ran
 
 
-def _bad_sixth(env, monkeypatch):
+def _bad_sixth(env, monkeypatch, wait_s=0):
+    """Eight entries, the sixth breaks the checks. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
+    approval never waits for the search's verdict; None: the default, which these millisecond checks meet)."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
+    if wait_s is not None:
+        p.set_config("delivery.push_yield_wait_s", wait_s)
     heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 6 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
     return p, repo, origin, heads
 
@@ -2042,15 +2046,72 @@ def test_an_urgent_approval_arriving_mid_bisect_stops_the_search_after_the_check
     if priority == 1 and after == 2:
         assert len(ran) == m["checks"]["runs"] == 2, "the full head and prefix 4: nothing after the approval"
         assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
-        assert all(r["detail"] == {"yielded": True} for r in m["results"][4:]), "requeued, never blamed"
+        assert all(r["detail"] == {"yielded": True, "restarts": 1} for r in m["results"][4:]), "requeued, never blamed"
     elif priority == 1:
         assert len(ran) == m["checks"]["runs"] == 4, "no check of entries 7-8 without entry 6"
         assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "requeued", "requeued"], m
-        assert [r["detail"] for r in m["results"][6:]] == [{"yielded": True}] * 2 and m["yielded_to"] == [99], m
+        assert [r["detail"] for r in m["results"][6:]] == [{"yielded": True, "restarts": 1}] * 2 and m["yielded_to"] == [99], m
     else:
         # full head, prefixes 4, 6 and 5, then entries 7-8 checked without entry 6 (the rescue)
         assert len(ran) == m["checks"]["runs"] == 5 and not m.get("yielded_to"), m
         assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
+
+
+def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_next_batch(env, monkeypatch, capsys):
+    """delivery.push_yield_wait_s (default 900 s): an urgent approval arriving mid-search, with the
+    search's verdict expected that soon, does not stop it. No entry loses its checks: entry 6 is blamed,
+    the rest land, nothing is requeued, and the urgent one, still approved, goes in the next batch."""
+    from ttp import pushq
+    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=None)
+    ran = _approved_mid_search(p, monkeypatch, 2, 1)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
+    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 5, m
+    assert "urgent approval 99 waits for this batch's verdict, expected in about 0 min" in capsys.readouterr().out
+    assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one still waits, approved"
+    hot = _entry(repo, "hot", {"plugins/p/hot.txt": "h\n"})
+    rc, m = _run_batch(p, _batch_marker(p, [hot], bid="b2"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed"] and _git_out(origin, "show", "proj:plugins/p/hot.txt") == "h", m
+
+
+@pytest.mark.parametrize("cap,before,stops", [(None, 0, True), (None, 1, False), (2, 1, True), (2, 2, False), (0, 0, False)])
+def test_the_restarts_an_urgent_approval_causes_are_capped(env, monkeypatch, cap, before, stops):
+    """delivery.push_yield_restarts (default 1) caps how often one set of approvals has its search
+    stopped for urgent ones: a batch whose rows were requeued that often already finishes its search
+    (entry 6 blamed). A search whose verdict is further off than delivery.push_yield_wait_s stops, and
+    its requeued entries carry the count up by one."""
+    from ttp import push
+    from ttp.project import write_json
+    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=1e-9)
+    if cap is not None:
+        p.set_config("delivery.push_yield_restarts", cap)
+    _approved_mid_search(p, monkeypatch, 2, 1)
+    marker = _batch_marker(p, heads)
+    if before:
+        write_json(marker, {**push._read(marker), "restarts": before})
+    rc, m = _run_batch(p, marker, monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    if stops:
+        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert [r["detail"] for r in m["results"][4:]] == [{"yielded": True, "restarts": before + 1}] * 4, m
+    else:
+        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+
+
+def test_the_daily_audit_names_the_time_from_approval_to_landing(env, monkeypatch):
+    """audit.landing_line: median and p90 of approval to pushed or landed, in the window only."""
+    from ttp import audit
+    s = _pq(env, monkeypatch)
+    now = time.time()
+    for n, (status, wait_min) in enumerate([("pushed", 10), ("landed", 20), ("pushed", 30), ("pushed", 600),
+                                            ("approved", 900)], 1):
+        s.p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) "
+                 "VALUES(?, 'b', ?, 'origin/proj', ?, ?, ?)", (n, "0" * 40, status, now - wait_min * 60, now))
+    s.p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) "
+             "VALUES(9, 'b', ?, 'origin/proj', 'pushed', ?, ?)", ("0" * 40, now - 2 * 86400, now - 86400 - 60))
+    assert audit.landing_line(s.p.db, now - 86400) == "approval to landing: 4 landed, median 20 min, p90 10.0 h"
+    assert audit.landing_line(s.p.db, now + 1) == ""
+    assert "approval to landing: 4 landed" in "\n".join(audit.lines(s.p.db, now=now))
 
 
 def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_and_the_culprit_blamed(env, monkeypatch):
@@ -2068,7 +2129,7 @@ def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_
     assert batch.EXIT["yielded"] == 0
 
 
-@pytest.mark.parametrize("why", ["after_yield", "yield_skip", "all_urgent", "skip_other_tip"])
+@pytest.mark.parametrize("why", ["after_yield", "restarts", "yield_skip", "all_urgent", "skip_other_tip"])
 def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_would_not_take(env, monkeypatch, why):
     """No yield loop: a batch stops its search only for an urgent approval the queue takes next, alone.
     It finishes its search (entry 6 blamed) when it carries entries a batch before it requeued for an
@@ -2082,8 +2143,10 @@ def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_wo
     marker = _batch_marker(p, heads)
     m = push._read(marker)
     tip = _git_out(origin, "rev-parse", "proj")
-    if why == "after_yield":
+    if why == "after_yield":     # an older marker's word for one restart
         m["after_yield"] = True
+    elif why == "restarts":
+        m["restarts"] = 1
     elif why in ("yield_skip", "skip_other_tip"):
         m["yield_skip"] = {"tip": tip if why == "yield_skip" else "f" * 40, "ids": [99]}
     else:
@@ -2098,19 +2161,22 @@ def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_wo
         assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
 
 
-def test_a_batch_marker_records_what_its_search_must_not_yield_to(env, monkeypatch):
-    """pushq.start writes "after_yield" for rows a stopped search requeued, and the failing tip's tried
-    approvals as "yield_skip", so the batch's yield condition matches what due takes next."""
+@pytest.mark.parametrize("detail,restarts", [({"yielded": True}, 1), ({"yielded": True, "restarts": 2}, 2),
+                                             ({"yielded": True, "restarts": "x"}, 1)])
+def test_a_batch_marker_records_what_its_search_must_not_yield_to(env, monkeypatch, detail, restarts):
+    """pushq.start writes the restarts of rows a stopped search requeued (a row from before the count is
+    one), and the failing tip's tried approvals as "yield_skip", so the batch's yield condition matches
+    what due takes next."""
     from ttp import push, pushq
     s = _pq(env, monkeypatch, push_batch_s=10 ** 6, push_batch_max=5)
     _pq_earlier(s)
     row = _pq_review(s)[1]
-    s.p.db.x("UPDATE push_queue SET detail=? WHERE id=?", (json.dumps({"yielded": True}), row))
+    s.p.db.x("UPDATE push_queue SET detail=? WHERE id=?", (json.dumps(detail), row))
     s.p.db.set_kv(pushq.KV, {"bad_tip": {"tip": "a" * 40, "fails": 1, "tried": [7]}})
     rows = s.p.db.q("SELECT * FROM push_queue WHERE id=?", (row,))
     bid = pushq.start(s.p, rows, "origin/proj")
     m = push._read(s.p.state / push.DETACHED / f"{bid}.json")
-    assert m["after_yield"] is True and m["yield_skip"] == {"tip": "a" * 40, "ids": [7]}, m
+    assert m["restarts"] == restarts and m["yield_skip"] == {"tip": "a" * 40, "ids": [7]}, m
 
 
 def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_the_requeued_ones(env, monkeypatch):

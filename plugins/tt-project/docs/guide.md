@@ -1371,7 +1371,10 @@ running work is interrupted only by the preemption below:
 - Push queue: an approved head of an urgent task's review starts its batch at once; a running batch
   or deploy still goes first. An urgent approval stops a running batch's search for a failing entry
   only if it was approved within `delivery.push_yield_grace_s` (300 s) of that batch's first check,
-  and a batch stops at most once, so a stream of urgent approvals never keeps a batch from landing.
+  and only if that search's verdict is not expected within `delivery.push_yield_wait_s` (900 s, at
+  the batch's mean check time so far): a nearer verdict is waited for, so no entry's checks are
+  thrown away. One set of approvals is stopped for at most `delivery.push_yield_restarts` times
+  (default 1), so a stream of urgent approvals never keeps a batch from landing.
   Later urgent approvals lead the next batch, which starts as soon as the running one ends; after a
   stop, the next batch takes the urgent approvals it stopped for, never the stopped batch's own
   entries again.

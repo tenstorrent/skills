@@ -1457,8 +1457,9 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
             was, ids = _members(last["marker"]), [r["id"] for r in rows]
             m["resumes"] = {"batch": last["id"], "kept": [i for i in was if i in ids],
                             "left_out": [i for i in was if i not in ids], "added": [i for i in ids if i not in was]}
-        if any(_detail(r).get("yielded") for r in rows):
-            m["after_yield"] = True     # requeued by a batch that stopped for an urgent one: never again
+        if restarts := max((int(n) if str(n := _detail(r).get("restarts")).isdigit() else 1
+                            for r in rows if _detail(r).get("yielded")), default=0):
+            m["restarts"] = restarts    # stops for urgent ones its rows had: batch.Batch._may_yield caps them
         m["check_run_dir"] = str(checkdirs.new(p.state, marker, push.scratch_need(p, p.root)))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
         write_json(marker, m)

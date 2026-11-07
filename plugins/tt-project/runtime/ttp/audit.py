@@ -78,6 +78,18 @@ def _dur(s: float) -> str:
     return f"{s / 3600:.1f} h" if s >= 3600 else f"{s / 60:.0f} min"
 
 
+def landing_line(db: DB, since: float) -> str:
+    """Time from approval to landing of the push queue rows pushed or landed in the window (median and
+    p90; a requeued row keeps its approval time); '' when none landed."""
+    waits = sorted(max(0.0, float(r["updated"]) - float(r["created"])) for r in db.q(
+        "SELECT created, updated FROM push_queue WHERE status IN ('pushed', 'landed') AND updated>=?", (since,)))
+    if not waits:
+        return ""
+    p90 = waits[min(len(waits) - 1, -(-9 * len(waits) // 10) - 1)]
+    return (f"approval to landing: {len(waits)} landed, median {_dur(waits[(len(waits) - 1) // 2])}, "
+            f"p90 {_dur(p90)}")
+
+
 def asks(db: DB, since: float, now: float, p: Project | None = None) -> list[dict]:
     """Asks sent since `since`, with their text, recommendation and answer (unblock.asks links them)."""
     from .coordinator import _REC_NOTE, _ask_question
@@ -520,6 +532,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
         out.append(shared)
     if suite := suitecost.audit_line(db, now):
         out.append(suite)
+    if landed := landing_line(db, since):
+        out.append(landed)
     if pre := checkprestage.audit_line(db, since):
         out.append(pre)
     if plain := plainreply.audit_line(db, since):

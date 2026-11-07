@@ -87,6 +87,8 @@ RESCUES = 1                        # checks per batch of the entries after a bla
 NO_TESTS = 5                       # pytest's exit status when nothing was selected: a cap probe of a check without cap tests
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
 YIELD_GRACE_S = 300.0              # delivery.push_yield_grace_s: an urgent approval stops a batch only if approved this soon after its checks began
+YIELD_WAIT_S = 900.0               # delivery.push_yield_wait_s: an urgent approval waits for a search whose verdict is expected this soon
+YIELD_RESTARTS = 1                 # delivery.push_yield_restarts: searches one set of approvals may stop for urgent ones
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
 HOST_FAULTS = (envfault.Fault, workerloss.Infra, syntaxfault.Infra, setupfault.Infra)   # the host's, never an entry's
@@ -115,6 +117,14 @@ def _git(cwd: Path, *args: str, env: dict | None = None) -> subprocess.Completed
     return gitmemo.run(["git", "-C", str(cwd), "-c", "rerere.enabled=false", *args], text=True,
                        capture_output=True, env={**os.environ, "GIT_EDITOR": "true", **(env or {})},
                        timeout=None)
+
+
+def _setting(d: dict, key: str, default: float) -> float:
+    """A non-negative number from the delivery settings `d`; `default` when unset or unreadable."""
+    try:
+        return max(0.0, float(d.get(key, default)))
+    except (TypeError, ValueError):
+        return default
 
 
 def _last(text: str, n: int = push.LOG_TAIL) -> str:
@@ -1490,6 +1500,7 @@ class Batch:
         self.fail_rc: dict[str, int] = {}      # a failed check's output tail -> its exit code (_tip_ids)
         self.yielded_to: list[int] = []        # queue ids of urgent approvals the search stopped for (_yield_now)
         self.checks_at: float | None = None    # when this batch's first check began (_check): the yield grace counts from it
+        self.waited: list[int] = []            # urgent approvals that wait for this search's verdict (_yield_now)
 
     # results
 
@@ -1758,7 +1769,7 @@ class Batch:
                 self._set(i, "pushed")
                 self.landed_at[i] = self.rescued[i]
             elif self.yielded_to:
-                self._set(i, "requeued", yielded=True)     # the search stopped for an urgent approval
+                self._set(i, "requeued", yielded=True, restarts=self._restarts() + 1)   # stopped for an urgent approval
             elif failed and not self.retried:
                 self._set(i, "requeued", untested=True)    # after the blamed entry, never checked without it
             else:
@@ -2710,7 +2721,7 @@ class Batch:
         while not bad and hi - lo > 1 and (ids := self.new_ids.get(fails[hi][1])):
             top = hi
             while hi - lo > 1:
-                if self._yield_now():
+                if self._yield_now((hi - lo - 1).bit_length() + 1):
                     return full_lo, heads[full_lo] if full_lo else None, None
                 mid = (lo + hi) // 2
                 heads[mid] = self._head(tip, carried, mid)
@@ -2743,7 +2754,7 @@ class Batch:
                 else:
                     hi, fails[fresh] = fresh, f
         while hi - lo > 1:
-            if self._yield_now():
+            if self._yield_now((hi - lo - 1).bit_length() + 1):
                 return lo, heads[lo] if lo else None, None
             mid = (lo + hi) // 2
             heads[mid] = self._head(tip, carried, mid)
@@ -2858,7 +2869,7 @@ class Batch:
         self.rescued = dict(replayed)
         return head
 
-    def _yield_now(self) -> bool:
+    def _yield_now(self, left: int = 1) -> bool:
         """Before each further full check of the search for the entry that broke the checks: whether an
         urgent approval (urgent.approvals_waiting: priority 1 or urgent) now waits for this target outside the
         batch. Then the search stops: the prefix known to pass goes, a blamed entry stays blamed, the
@@ -2866,21 +2877,49 @@ class Batch:
         never wait out the rest of a bisect. The requeued ones are searched anew on the new tip: no entry
         is blamed on a tip it was not checked on, and the urgent ones are never in that search. Only
         approvals made within delivery.push_yield_grace_s of this batch's first check stop it, and it
-        stops once at most (_yield_late)."""
+        stops once at most (_yield_late). With its verdict expected within delivery.push_yield_wait_s
+        (`left` more checks at this batch's mean check time: _verdict_s), it does not stop: the urgent
+        ones wait for that verdict and go first in the next batch, and no entry's checks are thrown
+        away. One set of approvals is stopped for at most delivery.push_yield_restarts times (_may_yield)."""
         if not self.yielded_to and self._may_yield():
+            hot: list[int] = []
             try:
                 skip = self.m.get("yield_skip") if isinstance(self.m.get("yield_skip"), dict) else {}
                 skip = set(skip.get("ids") or []) if self.tip and skip.get("tip") == self.tip else set()
                 late = self._yield_late()
-                self.yielded_to = [i for i in urgent.approvals_waiting(self.p.db, self.target)
-                                   if i not in skip and i not in late]
+                hot = [i for i in urgent.approvals_waiting(self.p.db, self.target) if i not in skip and i not in late]
             except Exception as e:      # a queue it cannot read: the search goes on as before
                 say(f"cannot read the push queue for urgent approvals: {type(e).__name__}: {e}")
+            wait = _setting(self.d, "push_yield_wait_s", YIELD_WAIT_S)
+            if hot and wait > 0 and (eta := self._verdict_s(left)) is not None and eta <= wait:
+                if hot != self.waited:
+                    say(f"urgent approval{'s' if len(hot) > 1 else ''} {', '.join(map(str, hot))} "
+                        f"wait{'s' if len(hot) == 1 else ''} for this batch's verdict, expected in about "
+                        f"{eta / 60:.0f} min: the search goes on and {'they go' if len(hot) > 1 else 'it goes'} "
+                        "first in the next batch")
+                self.waited, hot = hot, []
+            self.yielded_to = hot
             if self.yielded_to:
                 n = len(self.yielded_to)
                 say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, self.yielded_to))} "
                     f"wait{'s' if n == 1 else ''}: the search stops here and {'they go' if n > 1 else 'it goes'} next")
         return bool(self.yielded_to)
+
+    def _verdict_s(self, left: int) -> float | None:
+        """Seconds until this batch's verdict: `left` more checks at the mean time of its checks so far;
+        None before any check ran."""
+        runs = int(self.checks.get("runs") or 0)
+        if self.checks_at is None or runs < 1:
+            return None
+        return max(0, left) * max(0.0, time.time() - self.checks_at) / runs
+
+    def _restarts(self) -> int:
+        """How often a search already stopped for urgent approvals over this batch's entries (pushq.start
+        writes it from the rows; "after_yield" is an older marker's one)."""
+        try:
+            return max(0, int(self.m.get("restarts") or (1 if self.m.get("after_yield") else 0)))
+        except (TypeError, ValueError):
+            return 1
 
     def _yield_late(self) -> set[int]:
         """Queue ids of approved rows for this target approved more than delivery.push_yield_grace_s
@@ -2907,10 +2946,10 @@ class Batch:
 
     def _may_yield(self) -> bool:
         """Whether this batch may stop its search for an urgent approval at all: never when every entry
-        is urgent itself (the ones waiting would only take its place), nor when it carries entries a
-        batch before it requeued for one (the marker's "after_yield"), so no two batches in a row stop
-        for the same set and the queue cannot loop on yields."""
-        if self.m.get("after_yield"):
+        is urgent itself (the ones waiting would only take its place), nor when its entries were already
+        requeued for one delivery.push_yield_restarts times (the marker's "restarts", default 1), so the
+        queue cannot loop on yields."""
+        if self._restarts() >= int(_setting(self.d, "push_yield_restarts", YIELD_RESTARTS)):
             return False
         try:
             return not all(urgent.covers_urgent(self.p.db, self.p.db.task(e.get("task"))) for e in self.entries)
