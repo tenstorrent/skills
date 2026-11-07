@@ -19659,6 +19659,40 @@ def test_result_rows_naming_a_model_or_effort_carry_what_the_run_used_and_a_mism
     assert ev and "result check: metrics claims effort 'max', run" in ev["text"], ev
 
 
+def test_a_deliverables_own_model_is_never_compared_with_the_runs_llm_and_llm_model_always_is(env):
+    from ttp import correction
+    p = make(env)
+    run = lambda model: p.db.x("INSERT INTO runs(task, role, model, effort) VALUES(?,?,?,?)",
+                               (None, "worker", model, "high"))
+    opus, gpt, other = run("opus"), run("gpt-5.1-codex"), run("newco-large-2")
+    tail = ": the row reports a run that did not use what it names; correct it or rerun"
+    # A video model under metrics.model, a CLAIM_KEYS row naming a run, or moved to video_model: no flag.
+    for result in ({"metrics": {"model": "ltx", "fps": 24}},
+                   {"metrics": {"video_model": "ltx", "fps": 24}},
+                   {"metrics": {"model": "LTX-Video-2B"}},
+                   {"cells": {"a": {"run": opus, "model": "wan-2.1"}}},
+                   {"tried": [{"run": f"#{opus}", "model": "ltx-2"}]}):
+        got, lines = correction.check_claims(p.db, result, opus)
+        assert lines == [] and "claim_mismatch" not in got, (result, lines)
+    # A provider model under `model` still flags: from the price table, a tier default, the anchor names, or
+    # a model another run of this project recorded.
+    for claim in ("claude-sonnet-4-5", "sonnet", "gpt-5", "o3", "newco-large-2"):
+        _, lines = correction.check_claims(p.db, {"metrics": {"model": claim}}, opus)
+        assert lines == [f"result check: metrics claims model {claim!r}, run #{opus} recorded 'opus'{tail}"], claim
+    assert correction.check_claims(p.db, {"metrics": {"model": "opus"}}, opus)[1] == []
+    # llm_model is always compared, even a name the harness has never seen; beside a video model too.
+    _, lines = correction.check_claims(p.db, {"metrics": {"llm_model": "zeta-9", "model": "ltx"}}, opus)
+    assert lines == [f"result check: metrics claims llm_model 'zeta-9', run #{opus} recorded 'opus'{tail}"]
+    assert correction.check_claims(p.db, {"metrics": {"llm_model": "claude-opus-5-5", "model": "ltx"}}, opus)[1] == []
+    # The same rule in a row naming its run.
+    got, lines = correction.check_claims(p.db, {"cells": {"a": {"run": gpt, "model": "ltx", "llm_model": "opus"}},
+                                                "tried": [{"run": other, "model": "claude-haiku-4-5"}]}, None)
+    assert lines == [f"result check: tried[0] claims model 'claude-haiku-4-5', run #{other} recorded "
+                     f"'newco-large-2'{tail}",
+                     f"result check: cells['a'] claims llm_model 'opus', run #{gpt} recorded 'gpt-5.1-codex'{tail}"]
+    assert got["cells"]["a"]["used"]["model"] == "gpt-5.1-codex"
+
+
 def test_the_audit_line_counts_repeated_instructions_and_names_the_top_one(env):
     from ttp import correction
     p = make(env)
