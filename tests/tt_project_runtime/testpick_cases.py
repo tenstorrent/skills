@@ -69,7 +69,8 @@ def test_targeted_checks_run_a_changed_case_file_and_the_tests_using_a_changed_h
     from ttp import testpick
     repo, base = _pick_repo(tmp_path)
     head = _pick_change(repo, base, {
-        "tests/r/bar_cases.py": "def test_bar_one():\n    pass\n",
+        "tests/r/bar_cases.py": ("from ttp import bar\n\n\ndef test_bar_one():\n    pass\n\n\n"
+                                 "def test_bar_two():\n    assert bar.bar_two()\n"),
         "tests/test_r.py": ("def _h():\n    return 'guide.md!'\n\n\ndef test_top():\n    assert _h()\n\n\n"
                             "def test_alone():\n    pass\n")})
     entries, why = testpick.pick(repo, base, head, _PICK_FILES)
@@ -102,8 +103,9 @@ def test_a_module_most_tests_name_runs_the_tests_naming_its_changed_functions(tm
     ("plugins/x/runtime/ttp/nobody.py", "def lonely():\n    return 1\n", "nobody.py"),
     ("tests/test_r.py", "X = 1\n\n\ndef _h():\n    return 1\n\n\ndef test_top():\n    assert _h()\n\n\n"
                         "def test_alone():\n    pass\n", "module-level code of tests/test_r.py"),
-    ("tests/r/other_cases.py", "def test_other():\n    pass\n" + "".join(
-        f"\n\ndef test_more_{i}():\n    pass\n" for i in range(40)), "the diff reaches"),
+    ("tests/r/other_cases.py", "".join(f"def test_other_{i}():\n    pass\n\n\n" for i in range(12)) + "".join(
+        f"def test_more_{i}():\n    pass\n\n\n" for i in range(40)), "the diff reaches"),
+    ("tests/r/bar_cases.py", "N = 1\n\n\ndef test_bar_one():\n    pass\n", "module-level code of tests/r/bar_cases.py"),
 ])
 def test_targeted_checks_run_in_full_where_the_diff_can_reach_anything(tmp_path, rel, text, reason):
     from ttp import testpick
@@ -182,7 +184,6 @@ def test_a_push_queue_project_still_runs_task_checks_in_full_where_the_whole_sui
     assert todo == list(own) and lines[0].startswith(f"{_PICK_CMD}: full: ") and reason in lines[0], lines
 
 
-
 def test_a_push_queue_project_keeps_a_selection_of_most_of_the_suite_targeted(tmp_path):
     # #7217: runs 14448 (65%) and 14462 (76%) ran in full for "the diff reaches N% of the tests" though the push
     # batch runs the full suite anyway; with the push queue on such a selection stays targeted.
@@ -206,6 +207,55 @@ def test_a_push_queue_project_keeps_a_selection_of_most_of_the_suite_targeted(tm
                                      "tests/conftest.py": "X = 1\n"})
     todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
     assert todo == list(own) and "conftest.py" in lines[0], lines
+
+
+def test_a_changed_case_file_helper_also_runs_the_case_files_and_tests_calling_it(tmp_path):
+    # case files run in one shared namespace: b_cases.py calls a_cases.py's helper, and test_r.py's test too
+    from ttp import testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {
+        "tests/r/a_cases.py": "import os\n\n\ndef _a_help():\n    return os.sep\n\n\ndef test_a():\n    assert _a_help()\n",
+        "tests/r/b_cases.py": "def test_b():\n    assert _a_help()\n",
+        "tests/test_r.py": ("def _h():\n    return 'guide.md'\n\n\ndef test_top():\n    assert _h()\n\n\n"
+                            "def test_alone():\n    assert _a_help()\n")})
+    base = head
+    pairs = {"tests/r/a_cases.py": "import os\n\n\ndef _a_help():\n    return os.sep * 2\n\n\ndef test_a():\n    assert _a_help()\n"}
+    head = _pick_change(repo, base, pairs)
+    assert testpick.pick(repo, base, head, _PICK_FILES) == (
+        ["tests/r/a_cases.py", "tests/r/b_cases.py", "tests/test_plugin_catalogue.py::test_cat",
+         "tests/test_r.py::test_alone"], "")
+    # a changed test of the case file runs only that file
+    base = head
+    head = _pick_change(repo, base, {"tests/r/a_cases.py": pairs["tests/r/a_cases.py"].replace(
+        "assert _a_help()", "assert _a_help() or 1")})
+    assert testpick.pick(repo, base, head, _PICK_FILES) == (
+        ["tests/r/a_cases.py", "tests/test_plugin_catalogue.py::test_cat"], "")
+
+
+_PICK_IMPORTS = "import os\n\n\ndef _a_help():\n    return 1\n\n\ndef test_a():\n    assert _a_help()\n"
+
+
+@pytest.mark.parametrize("rel", ["tests/r/a_cases.py", "tests/test_r.py"])
+@pytest.mark.parametrize("old, new, full", [
+    ("import os\n", "", True),                       # removed: another function may still use it
+    ("import os\n", "import sys\n", True),          # changed
+    ("import os\n", "import os\nimport sys\n", False),   # a pure addition
+])
+def test_a_removed_or_changed_top_level_import_runs_in_full_and_an_added_one_stays_targeted(
+        tmp_path, rel, old, new, full):
+    from ttp import testpick
+    repo, base = _pick_repo(tmp_path)
+    base = _pick_change(repo, base, {rel: _PICK_IMPORTS})
+    head = _pick_change(repo, base, {rel: _PICK_IMPORTS.replace(old, new)})
+    entries, why = testpick.pick(repo, base, head, _PICK_FILES)
+    assert testpick.changed_defs(repo, base, head, rel) == (None if full else set())
+    if full:
+        assert entries == [] and why == f"module-level code of {rel} changed", why
+    elif rel.endswith("_cases.py"):
+        assert (entries, why) == ([rel, "tests/test_plugin_catalogue.py::test_cat"], "")
+    else:
+        assert entries == [] and why == f"no test uses what {rel} changes"   # nothing changed that runs
+
 
 def test_narrow_records_targeted_or_full_and_keeps_the_full_pass_key_apart(tmp_path):
     from ttp import cli, push, testpick

@@ -7,13 +7,15 @@ A project check that is one plain local pytest run of listed test files is narro
 merge base with the push target to HEAD. Its units are each top-level test function of a listed file (with
 the same-file helpers and fixtures it uses), each case file `tests/X/<area>_cases.py` a listed
 `tests/test_X.py` executes, and a listed file without top-level tests whole. A changed case file runs
-itself; a changed function of a listed file runs the tests using it. A changed module `foo.py` runs the
+itself and, as case files share one namespace, the units naming its changed helpers; a changed function
+of a listed file runs the tests using it. A changed module `foo.py` runs the
 units that import or name it (`foo.`, `import ... foo`); one named by most tests runs, instead, the units
 naming the functions and methods the diff changes (a `cmd_<name>` function also by its subcommand in
 quotes). Any other file runs the units naming its file (or folder) name. The whole check runs
 (`full: <reason>`) on: a conftest, a test helper, fixture or data file beside the listed tests, the
-checks runner, a manifest or `__init__.py`, a pytest or package config file, a module-level change of a
-listed file or of a module mapped by functions, any file nothing places, or a selection of most of the
+checks runner, a manifest or `__init__.py`, a pytest or package config file, a module-level change
+(a removed or changed top-level import included) of a case file, a listed file or a module mapped by
+functions, any file nothing places, or a selection of most of the
 suite. `delivery.checks_targeted_always` (default ALWAYS) always
 run; `delivery.checks_targeted: false` (or `ttp checks --full`) runs every task's checks in full.
 
@@ -138,6 +140,8 @@ def changed_defs(top: Path, base: str, head: str, path: str) -> set[str] | None:
         start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
         body = [ln for ln in hunk.splitlines()[1:] if ln[:1] in "+-"]
         plus = [(start + i, ln[1:]) for i, ln in enumerate(x for x in body if x[0] == "+")]
+        if any(ln[0] == "-" and _import(ln[1:]) for ln in body):
+            return None   # a top-level import removed or changed: another function may still use it
         real = [ln[1:] for ln in body if _counts(ln[1:])]
         if not real:
             continue   # blank lines, comments and imports only
@@ -152,10 +156,15 @@ def changed_defs(top: Path, base: str, head: str, path: str) -> set[str] | None:
     return names
 
 
+def _import(line: str) -> bool:
+    return bool(re.match(r"(?:from\s+\S+\s+)?import\s", line))
+
+
 def _counts(line: str) -> bool:
-    """Whether a changed line can change behaviour: not blank, a comment or a top-level import."""
+    """Whether an added line can change behaviour: not blank, a comment or a top-level import (a removed
+    import is module level: changed_defs checks it first)."""
     t = line.strip()
-    return bool(t) and not t.startswith("#") and not re.match(r"(?:from\s+\S+\s+)?import\s", line)
+    return bool(t) and not t.startswith("#") and not _import(line)
 
 
 def _weight(us: dict[str, str], keys) -> int:
@@ -182,8 +191,14 @@ def _place(top: Path, base: str, head: str, path: str, us: dict[str, str], liste
         soft.append(why)
         return got, ""
 
-    if path in us:
-        return {path}, ""
+    if path in us:   # a case file: itself, and the units naming a changed helper (case files share one namespace)
+        defs = changed_defs(top, base, head, path)
+        if defs is None:
+            return set(), f"module-level code of {path} changed"
+        got = {path}
+        for d in (d for d in defs if not d.startswith("test_")):
+            got |= _naming(us, d, False)
+        return got, ""
     if path in listed:   # its changed tests and helpers: the tests using them, and case files naming a helper
         defs = changed_defs(top, base, head, path)
         if defs is None:
