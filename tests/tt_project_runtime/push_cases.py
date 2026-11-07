@@ -15014,6 +15014,34 @@ def test_a_push_batch_reruns_each_failing_test_not_yet_judged_at_that_head(env, 
     assert [c[1] for c in calls] == [None], "a quarantined test the batch does not touch is not rerun"
 
 
+def test_a_one_entry_push_batch_blames_its_new_failing_test_without_a_full_tip_check(env, monkeypatch):
+    """The tip fails _FLAKY_ID on its own and the one entry breaks _NEW_ID. The judge saved _FLAKY_ID
+    failing and _NEW_ID passing on the tip: only the new test decides, so entry 1 is blamed with no
+    full check of the tip alone (before, the partly passing saved results sent it to a full tip run)."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip,
+                      lambda tree, sel: {_FLAKY_ID} | ({_NEW_ID} if (tree / "e1.txt").exists() else set()))
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 1)), monkeypatch)
+    assert _statuses(m) == ["check_failed"], m
+    assert ("tip", None, []) not in calls, calls
+    assert _git_out(origin, "rev-parse", "proj") == tip
+
+
+def test_a_push_batch_with_checks_judge_off_quarantines_nothing(env, monkeypatch):
+    """checks.judge false: a failing test that passes on its rerun at the head lets the batch go on (no
+    base), but it is not quarantined, as Batch._verdict says."""
+    from ttp import gatejudge
+    p, repo, origin, other = _push_setup(env, monkeypatch, [_FLAKY_CHECK])
+    p.set_config("checks.judge", False)
+    tip = _git_out(origin, "rev-parse", "proj")
+    calls = _ids_stub(monkeypatch, tip, lambda tree, sel: {_FLAKY_ID} if sel is None else set())
+    rc, m = _run_batch(p, _batch_marker(p, _entries(repo, 1)), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed"], m
+    assert ("head", _SEL, ["e1"]) in calls and not any(c[0] == "tip" for c in calls), calls
+    assert gatejudge.active(p.state, time.time()) == {}
+
+
 def test_stray_running_batch_file_is_closed_at_daemon_start_and_a_live_one_is_left(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)

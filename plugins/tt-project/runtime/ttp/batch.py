@@ -2260,6 +2260,7 @@ class Batch:
         if v["flaky"]:
             self.flaky.append({"ids": v["flaky"], "head": head, "cmd": str(cmd)})
             self.checks["flaky"] = True
+        if v["flaky"] and s["on"]:
             gatejudge.quarantine(self.p.state, v["flaky"], {"head": head, "check": str(cmd), "host": where,
                                                             "batch": self.id}, now, s["days"])
         if v["pre_existing"]:
@@ -2299,10 +2300,12 @@ class Batch:
         there (the failure is the tip's own, flaky or already failing, not the entry's), True when every
         rerun passes or the tests are not on the tip (the entry's own failure), None when that cannot tell
         (no such ids, ids rerun on the tip in this batch already, a rerun out of time or one pytest ends
-        with neither). Base results saved for the tip on this host (gatejudge) count without a rerun: all
-        passing there, True. The batch log and the marker's checks["tip_reruns"] keep the counts."""
+        with neither). A failure whose new tests are known (_judged: self.new_ids) is judged on those alone,
+        as the others failed on the tip or were excused already. Base results saved for the tip on this
+        host (gatejudge) count without a rerun: all passing there, True. The batch log and the marker's
+        checks["tip_reruns"] keep the counts."""
         cmd = fail[0]
-        ids = self._rerun_ids(cmd, self.fail_rc.get(fail[1]), fail[1])
+        ids = self.new_ids.get(fail[1]) or self._rerun_ids(cmd, self.fail_rc.get(fail[1]), fail[1])
         if not ids:
             return None
         saved = gatejudge.saved_base(self.p.state, gatejudge.host(), tip, ids, time.time())
