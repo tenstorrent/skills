@@ -1630,7 +1630,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                cap_note: str = "", worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
                repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None,
-               running: bool = False, landing: bool | str = False) -> Grant | None:
+               running: bool = False, landing: bool | str = False, slots_from: str = "") -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -1663,6 +1663,8 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
     command's: checklane.lane_labels). `slots` may be a function of the lanes held now (checklane.slots):
     it is read again at every try, and a lane is free only while fewer than that many lane files of the
     repository are held, so a count that fell under a holder's lane number admits nobody past it.
+    `slots_from` (checklane.slots_from): where that count comes from, for the wait line; "" says
+    checks.slots sets it.
     `startable()` (pool_room): an overflow lane (cheaper, urgent, past the cap) is taken only while it
     says the run can start now, so no extra lane is held by a run that waits for test slots.
     `running` (with `pending`): the repository's lanes bound only running suites: a lane whose run still
@@ -1816,7 +1818,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                 place = pos + 1
                 rule = ("one at a time behind this wrapper lock (checks.wrap_cmd)" if lock else
                         f"{'one' if slots == 1 else slots} at a time per project and repository, "
-                        f"checks.{SLOTS_KEY} sets it")
+                        f"{slots_from or f'checks.{SLOTS_KEY} sets it'}")
                 rule += (f"; at most {cap} of the project's checks at once (checks.test_project_max{cap_note})"
                          if cap > 0 else "")
                 recs = recs or locks.holder_records(project_held(project_name))

@@ -5546,17 +5546,18 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
         except OSError:
             pass
 
-    def waiting(on: bool, suite: str = "", limit: int = 0) -> None:
+    def waiting(on: bool, suite: str = "", limit: int = 0, limit_from: str = "") -> None:
         # The wait is recorded before the marker shows it, so whoever sees the marker sees both. `suite`:
         # the project's suite lock it waits on (testslots.suite_hold), which the `--result` probe names
-        # with its `limit` (lanes at once).
+        # with its `limit` (lanes at once) and `limit_from` (checklane.slots_from: "" for checks.slots).
         if foreground:
             lk.record_wait(run_dir, key, start, None if on else time.time())
         try:
             if on:
                 write_json(run_dir / CHECKS_SLOT_WAIT, {"since": time.time(), "pid": os.getpid(), "head": head,
                                                         **({"suite": suite} if suite else {}),
-                                                        **({"limit": limit} if suite and limit else {})})
+                                                        **({"limit": limit} if suite and limit else {}),
+                                                        **({"limit_from": limit_from} if suite and limit_from else {})})
             else:
                 (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
         except OSError:
@@ -5845,12 +5846,14 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     def hold(key: str, n, **lane):
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
         on_key = f"w{lane['lock']}" if lane.get("lock") else key
+        # A count read again from checklane.slots: the wait lines say whether checks.slots or the load sets it.
+        n_from = "" if lane.get("lock") or isinstance(n, int) else checklane.slots_from(cfg)
         return testslots.suite_hold(p.name if p else None, tell, left,
                                     lambda on: waiting(on, str(testslots.suite_path(p.name, on_key)),
                                                        1 if lane.get("lock") else n if isinstance(n, int)
-                                                       else checklane.slots_now(p.name, on_key, cfg)),
+                                                       else checklane.slots_now(p.name, on_key, cfg), n_from),
                                     stop, f"run {run_dir.name}", prio, arrived,
-                                    slots=n, repo=key,
+                                    slots=n, repo=key, slots_from=n_from,
                                     cost=run_cost,
                                     max_wait=checklane.max_wait_s(cfg) if key == repo else 0.0,
                                     state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg),
@@ -7066,9 +7069,10 @@ def _checks_result(run_dir: Path) -> int:
             except OSError:
                 held = ""
             n = wait.get("limit") if isinstance(wait.get("limit"), int) else 1
+            n_from = wait.get("limit_from") if isinstance(wait.get("limit_from"), str) else ""
             print(f"ttp checks: waiting (pid {info['pid']}, not running) for this project's other full checks "
-                  f"to end, {'one' if n == 1 else n} at a time per project and repository (checks.slots sets "
-                  f"it): held by {held or 'a run that just ended'}")
+                  f"to end, {'one' if n == 1 else n} at a time per project and repository "
+                  f"({n_from or 'checks.slots sets it'}): held by {held or 'a run that just ended'}")
         elif wait is not None or (run_dir / CHECKS_SLOT_WAIT).exists():
             from . import checkcap
             print(f"ttp checks: queued for a host-wide checks slot (pid {info['pid']}); "

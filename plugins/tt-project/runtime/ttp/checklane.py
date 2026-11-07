@@ -255,6 +255,12 @@ def slots(cfg: dict | None, held: int = 0) -> int:
     return n if n is not None else capacity(cfg, held)["n"]
 
 
+def slots_from(cfg: dict | None) -> str:
+    """Where slots() takes its count, for a wait line: "" when checks.slots or TTP_CHECKS_SLOTS sets it
+    (the line's default), else that the host's load sizes it now."""
+    return "" if _explicit_slots(cfg) is not None else f"sized from the host's load now (checks.{testslots.SLOTS_KEY} unset)"
+
+
 def _awaits_grants(rec: dict) -> bool:
     """Whether a lane holder's record is a run taken with `running` still waiting for its host grants:
     testslots.suite_hold does not count such a lane against its repository's lanes (n_held)."""

@@ -3937,6 +3937,87 @@ def test_a_lane_wait_and_the_status_line_name_the_limit_and_checks_slots(env, tm
         hold.close()
 
 
+@pytest.mark.parametrize("source", ["project", "account", "env", "unset", "unset-bad-values"])
+def test_slots_from_names_checks_slots_only_when_it_or_its_env_sets_the_count(env, monkeypatch, source):
+    from ttp import checklane, project
+    monkeypatch.delenv(checklane.SLOTS_ENV, raising=False)
+    account = {}
+    cfg = {"checks": {"slots": 2}} if source == "project" else {}
+    if source == "account":
+        account = {"checks": {"slots": 3}}
+    elif source == "env":
+        monkeypatch.setenv(checklane.SLOTS_ENV, "2")
+    elif source == "unset-bad-values":   # values slots() ignores leave the count to the host's load
+        cfg = {"checks": {"slots": "0"}}
+        monkeypatch.setenv(checklane.SLOTS_ENV, "abc")
+    monkeypatch.setattr(project, "load_account_settings", lambda: account)
+    said = checklane.slots_from(cfg)
+    if source.startswith("unset"):
+        assert said == "sized from the host's load now (checks.slots unset)", said
+    else:
+        assert said == "", said
+
+
+def test_a_lane_wait_line_names_the_host_s_load_when_checks_slots_is_unset(env, monkeypatch):
+    from ttp import testslots
+    _lane_env(monkeypatch)
+    hold = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1)
+    try:
+        told = []
+        assert testslots.suite_hold("pa", repo=_LANE_REPO, slots=lambda held: 1, wait_s=0.3, tell=told.append,
+                                    slots_from="sized from the host's load now (checks.slots unset)") is None
+        assert ("one at a time per project and repository, sized from the host's load now (checks.slots unset)"
+                in told[0] and "checks.slots sets it" not in told[0]), told
+    finally:
+        hold.close()
+
+
+@pytest.mark.parametrize("set_by", ["checks.slots", "load"])
+def test_ttp_checks_wait_record_and_probe_name_where_the_lane_count_comes_from(
+        env, tmp_path, monkeypatch, capsys, set_by):
+    """The lane count of a waiting run comes from checks.slots (or TTP_CHECKS_SLOTS) or, unset, from the
+    host's load (checklane.capacity): its wait line, its CHECKS_SLOT_WAIT record and the `--result` probe
+    say which, never 'checks.slots sets it' for a count the load set."""
+    from ttp import checkcap, checklane, cli, testslots
+    from ttp.runner import proc_start
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(checkcap, "FOREGROUND_WAIT_S", 0.3)
+    monkeypatch.setattr(cli, "_checks_detach", lambda *a, **k: None)
+    if set_by == "load":
+        monkeypatch.delenv(checklane.SLOTS_ENV, raising=False)
+        monkeypatch.setattr(checklane, "_explicit_slots", lambda cfg: None)   # neither project nor account
+        cap = checklane.capacity
+        monkeypatch.setattr(checklane, "capacity", lambda *a, **k: {**cap(*a, **k), "n": 1})   # a loaded host
+    records, real = [], cli.write_json
+    monkeypatch.setattr(cli, "write_json", lambda path, data, *a, **k: (
+        records.append(dict(data)) if Path(path).name == cli.CHECKS_SLOT_WAIT else None, real(path, data, *a, **k))[1])
+    hold = testslots.suite_hold(p.name, repo=testslots.repo_key(repo))
+    assert hold.files
+    try:
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--", "true"])
+        assert e.value.code == 75
+        said = (run / "checks.log").read_text() + capsys.readouterr().out
+        rec = next(r for r in records if r.get("suite"))
+        # The probe reads the record the wait wrote, of a run still alive (this process).
+        cli.write_json(run / cli.CHECKS_PID, {"pid": os.getpid(), "started": proc_start(os.getpid()), "ts": time.time()})
+        cli.write_json(run / cli.CHECKS_SLOT_WAIT, {**rec, "pid": os.getpid()})
+        capsys.readouterr()
+        assert _ttp("checks", "--result", str(run)) == 1
+        probe = capsys.readouterr().out
+    finally:
+        hold.close()
+    load = "sized from the host's load now (checks.slots unset)"
+    if set_by == "load":
+        assert f"one at a time per project and repository, {load}" in said, said
+        assert rec.get("limit_from") == load, rec
+        assert f"one at a time per project and repository ({load})" in probe and "slots sets it" not in probe, probe
+    else:
+        assert "one at a time per project and repository, checks.slots sets it" in said, said
+        assert "limit_from" not in rec, rec
+        assert "one at a time per project and repository (checks.slots sets it)" in probe, probe
+
 
 def test_checks_suite_concurrency_is_a_chat_settable_alias_of_checks_slots(env, capsys):
     """checks.suite_concurrency (the setting's spec name) validates and stores as checks.slots."""
