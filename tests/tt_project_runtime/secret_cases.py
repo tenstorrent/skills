@@ -1956,7 +1956,7 @@ def _live_run(tmp_path, monkeypatch, body, **spec):
     return t, run_dir
 
 
-def _wait_for(check, s=20):
+def _live_wait(check, s=20):
     end = time.time() + s
     while time.time() < end:
         if check():
@@ -1980,14 +1980,14 @@ def test_a_running_agents_output_holds_no_key_text_while_it_runs(env, tmp_path, 
         "print(json.dumps({'type': 'assistant', 'text': 'printed'}), flush=True)\n"
         "time.sleep(30)\n"))
     out = run_dir / "output.jsonl"
-    assert _wait_for(lambda: out.exists() and "printed" in out.read_text()), "the agent's lines reach the file mid-run"
+    assert _live_wait(lambda: out.exists() and "printed" in out.read_text()), "the agent's lines reach the file mid-run"
     assert not (run_dir / "exit.json").exists(), "the agent still runs"
     text = out.read_text()
     assert _no_key(text, lines) and text.count(redact.KEY_MASK) == 3, text
     assert json.loads(text.splitlines()[0])["tool_result"]["content"] == redact.KEY_MASK + "\n"
     assert "raw:\n" + redact.KEY_MASK + "\n" + redact.KEY_MASK + "\nafter the block\n" in text
     err = run_dir / "stderr.log"
-    assert _wait_for(lambda: "printed" in err.read_text()) and _no_key(err.read_text(), lines), err.read_text()
+    assert _live_wait(lambda: "printed" in err.read_text()) and _no_key(err.read_text(), lines), err.read_text()
     runner.request_stop(run_dir)
     t.join(60)
     assert json.loads((run_dir / "exit.json").read_text())["stopped"]
