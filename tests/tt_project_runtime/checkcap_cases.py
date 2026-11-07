@@ -9616,3 +9616,31 @@ def test_preemption_asks_a_run_never_preempted_before_over_one_already_preempted
             f.unlink()
         fresh.close()
         again.close()
+
+
+def test_project_max_from_names_the_setting_that_binds_the_test_worker_budget(env, monkeypatch):
+    """Task #7176: testslots.project_max_from names what project_max() took its value from, in its order: the
+    environment variable over the account's, a project's own only lowering either, then the pool and the
+    host's per-project worker ceiling bounding all; the value always matches project_max()."""
+    from ttp import project, testslots
+    for k in ("PROJECT_SLOTS", "PROJECT_MAX", "PROJECT_WORKERS", "RUN_MIN"):
+        monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
+    monkeypatch.setenv("TTP_TEST_POOL", "16")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
+    workers = {"n": 64}
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: workers["n"])
+    s = (16, 8)
+    own = lambda n: {"checks": {"test_project_slots": n}}   # noqa: E731
+    for acct, cases in ((None, [({}, ""), (own(12), "project"), (own(32), "pool")]),
+                        (8, [({}, "account"), (own(32), "account"), (own(4), "run")])):
+        if acct:
+            project.set_account_setting("checks.test_project_slots", acct)
+        for cfg, want in cases:
+            assert testslots.project_max_from(cfg, s) == want, (cfg, want, testslots.project_max(cfg, s))
+    monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", "12")
+    assert testslots.project_max_from({}, s) == "env" and testslots.project_max({}, s) == 12, \
+        "the environment variable wins over the account's"
+    assert testslots.project_max_from(own(10), s) == "project" and testslots.project_max(own(10), s) == 10
+    workers["n"] = 9
+    assert testslots.project_max_from({}, s) == "workers" and testslots.project_max({}, s) == 9
+    assert testslots.project_max_from({}, (0, 0)) == "", "the pool off: no budget"
