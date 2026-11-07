@@ -8,7 +8,10 @@ compared models' release dates, so neither saw the change), landed through one p
 its landed change adds or changes tests (addedtests.added). Its base is the commit before its
 landed commits on the push branch. Excluded, with the reason: a spec that quotes the fix (QUOTE_LINES
 added lines verbatim) and held-out tests that use a repository symbol the base lacks and the spec does
-not name. Each kept task gets <out>/<id>/workspace, `git archive` of the base in a fresh
+not name. A task whose spec says its branch starts from another task's branch (PARENT) replays from
+that parent's recorded head (the spec's, else the parent's latest push queue head) up to its own
+branch head; it is excluded when the repository lacks that head or it is not under the branch head,
+since a workspace at the push branch base would lack the parent's work. Each kept task gets <out>/<id>/workspace, `git archive` of the base in a fresh
 repository with one commit and no remotes, tags or reflog, and <out>/<id>/heldout, the head's copy
 of each held-out test file. manifest.json names them with their sha256; manifest.sha256 pins it.
 The bench names no model: what it compares is the runner's choice."""
@@ -30,6 +33,7 @@ from .project import durable_write
 SMALL = 150        # changed non-test lines at most for the small stratum
 QUOTE_LINES = 3    # added lines of the fix quoted verbatim in the spec that exclude it
 QUOTE_LEN = 30     # an added line counts as quotable from this many characters
+PARENT = re.compile(r"This task's branch starts from #(\d+)'s branch(?: \S+ \(head ([0-9a-f]{7,40})\))?")
 _EPOCH = {"GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000"}
 
 
@@ -58,6 +62,22 @@ def landing(repo: Path, rows: list[dict]) -> tuple[str, str, str]:
     same = base and _out(repo, "rev-list", "--count", "--merges", f"{base}..{land}") == "0" and (
         _out(repo, "diff", "--name-only", fork, head) == _out(repo, "diff", "--name-only", base, land))
     return (base, land, "") if same else ("", "", "its landed commits do not match its branch")
+
+
+def from_parent(db, repo: Path, parent: int, recorded: str, head: str) -> tuple[str, str, str]:
+    """(base, head, "") of a task whose branch starts from task `parent`'s branch: base is the parent's
+    `recorded` head (else its latest push queue head under `head`, the task's branch head) when the
+    repository has it under `head`; else ("", "", why)."""
+    heads = [recorded] if recorded else [r["head"] for r in db.q(
+        "SELECT head FROM push_queue WHERE task=? AND head IS NOT NULL AND head != '' ORDER BY id DESC", (parent,))]
+    tip = _out(repo, "rev-parse", "--verify", "-q", f"{head}^{{commit}}") if head else ""
+    shas = [s for h in heads if (s := _out(repo, "rev-parse", "--verify", "-q", f"{h}^{{commit}}"))]
+    for sha in shas:
+        if tip and _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode == 0:
+            return sha, tip, ""
+    what = ("not recorded" if not heads else "not in the repository" if not shas else
+            "not under its branch head")
+    return "", "", f"its branch starts from #{parent}'s branch, whose head is {what}"
 
 
 def _changed(repo: Path, base: str, head: str) -> dict[str, list[str]]:
@@ -175,7 +195,11 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0) -> dict:
             break
         carry = landed.carriers(db, t["id"], rows)
         branches = {v[0] for v in carry.values() if v[0]}
-        base, head, why = landing(repo, [r for r in pushed if r["task"] in carry or r["branch"] in branches])
+        mine = [r for r in pushed if r["task"] in carry or r["branch"] in branches]
+        base, head, why = landing(repo, mine)
+        parent = PARENT.search(t["spec"] or "")
+        if not why and parent:
+            base, head, why = from_parent(db, repo, int(parent[1]), parent[2] or "", mine[0]["head"])
         tests = addedtests.added(repo, base, head) if base else []
         changed = _changed(repo, base, head) if base else {}
         if not why and not tests:
@@ -196,7 +220,7 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0) -> dict:
             durable_write(dest, addedtests._show(repo, head, path), sync=False)
             held[path] = _sha(dest)
         kept.append({"task": t["id"], "kind": t["kind"], "title": t["title"], "spec": t["spec"],
-                     "created": t["created"], "base": base, "head": head, "tree": tree,
+                     "created": t["created"], "parent": int(parent[1]) if parent else None, "base": base, "head": head, "tree": tree,
                      "stratum": "small" if lines <= SMALL else "large", "changed_lines": lines,
                      "tests": [f"{p}::{n}" for p, n in tests], "heldout": held})
     manifest = {"since": since, "made": time.time(), "repo": str(repo.resolve()), "tasks": kept,

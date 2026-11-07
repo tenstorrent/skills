@@ -97,6 +97,53 @@ def test_bench_prep_keeps_replayable_tasks_with_a_clean_base_workspace_and_exclu
     assert json.loads((out / "manifest.json").read_text()) == m
 
 
+def test_bench_prep_replays_a_task_built_on_a_parent_branch_from_the_parent_head_or_excludes_it(env, tmp_path):
+    # A fix task whose branch starts from its parent's branch lands with the parent's commits: a
+    # workspace at the push branch base would lack the parent's work, so both arms fail by construction.
+    from ttp import bench
+    p = make(env)
+    repo, git, commit, rev = _bench_repo(tmp_path)
+    since = 1_000_000.0
+    subprocess.run([*git, "checkout", "-q", "-b", "par", "main"], check=True)
+    par = commit({"mod.py": "def old():\n    return 1\n\n\ndef feat():\n    return 5\n"}, "parent")
+    subprocess.run([*git, "checkout", "-q", "-b", "kid", "par"], check=True)
+    kid_test = "import mod\n\n\ndef test_old():\n    assert mod.old() == 1\n\n\ndef test_feat():\n    assert mod.feat() == 5\n"
+    kid = commit({"tests/test_mod.py": kid_test}, "kid")
+    subprocess.run([*git, "checkout", "-q", "main"], check=True)
+    unrelated = commit({"other.txt": "x\n"}, "other")
+    subprocess.run([*git, "cherry-pick", par, kid], check=True, capture_output=True)
+    land = rev()
+    pid = p.db.add_task("par", "Add feat().", kind="code")
+    p.db.x("UPDATE tasks SET status='done', created=?, branch='par' WHERE id=?", (since - 10, pid))
+    p.db.x("INSERT INTO push_queue(task, branch, head, target, status, created, updated) VALUES(?,?,?,?,?,?,?)",
+           (pid, "par", par, "main", "failed", since - 10, since - 10))
+
+    def kid_task(spec: str) -> int:
+        tid = p.db.add_task("kid", spec, kind="code")
+        p.db.x("UPDATE tasks SET status='done', created=?, branch=? WHERE id=?", (since + tid, f"kid{tid}", tid))
+        p.db.x("INSERT INTO push_queue(task, branch, head, target, status, landed_sha, created, updated) "
+               "VALUES(?,?,?,?,?,?,?,?)", (tid, f"kid{tid}", kid, "main", "landed", land, since, since))
+        return tid
+    on = f"Fix feat() from the review of #{pid}.\nThis task's branch starts from #{pid}'s branch par (head {par[:12]}): build on it."
+    recorded = kid_task(on)
+    pr_fix = kid_task(f"This task's branch starts from #{pid}'s branch head. Fix feat() on the PR.")
+    missing = kid_task(on.replace(par[:12], "0123456789ab"))
+    off = kid_task(on.replace(par[:12], unrelated[:12]))
+    m = bench.prep(p.db, repo, tmp_path / "bench", since)
+    kept = {t["task"]: t for t in m["tasks"]}
+    assert sorted(kept) == [recorded, pr_fix], m["excluded"]
+    for t in kept.values():
+        assert (t["base"], t["head"], t["parent"]) == (par, kid, pid), "replayed from the parent's head"
+        assert t["tests"] == ["tests/test_mod.py::test_feat"]
+        assert "feat" in (tmp_path / "bench" / str(t["task"]) / "workspace" / "mod.py").read_text()
+    why = {e["task"]: e["why"] for e in m["excluded"]}
+    assert why[missing] == f"its branch starts from #{pid}'s branch, whose head is not in the repository"
+    assert why[off] == f"its branch starts from #{pid}'s branch, whose head is not under its branch head"
+    p.db.x("DELETE FROM push_queue WHERE task=?", (pid,))
+    assert bench.from_parent(p.db, repo, pid, "", kid) == (
+        "", "", f"its branch starts from #{pid}'s branch, whose head is not recorded")
+
+
 def test_bench_landing_refuses_a_range_that_does_not_match_its_branch(tmp_path):
     from ttp import bench
     repo, git, commit, rev = _bench_repo(tmp_path)
