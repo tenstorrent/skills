@@ -26,6 +26,7 @@ kept from such a ref before (in refs_over and the note) are dropped (stale_facts
 """
 from __future__ import annotations
 
+import functools
 import re
 
 SEEN_KEY = "ref_waits_seen"   # kv {task id: {"ep": wait episode, "seen": ["ask:12:resolved", ...]}}
@@ -66,9 +67,10 @@ def peer_names(db, own_name: str | None = None, harness=None) -> set[str]:
             if n and n != own and n not in PLAIN_WORDS and project.NAME_RE.match(n)}
 
 
-def _peer_re(peers) -> re.Pattern | None:
-    """Matches the end of the text before a ref when a peer's name stands right before it."""
-    names = sorted({str(n).lower() for n in peers or () if str(n).strip()}, key=len, reverse=True)
+@functools.lru_cache(maxsize=32)
+def _peer_re(names: tuple[str, ...]) -> re.Pattern | None:
+    """Matches the end of the text before a ref when a peer's name (`names`, longest first) stands right
+    before it."""
     if not names:
         return None
     alt = "|".join(re.escape(n) for n in names)
@@ -79,7 +81,7 @@ def refs(text: str, own: int | None = None, peers=()) -> list[tuple[str, int]]:
     """The asks and tasks a wait note names, in order, without repeats (never the task itself, nor a task
     of another project: a name in `peers` stands right before it or before the list it continues)."""
     s = str(text or "")
-    peer = _peer_re(peers)
+    peer = _peer_re(tuple(sorted({str(n).lower() for n in peers or () if str(n).strip()}, key=lambda n: (-len(n), n))))
     found: list[tuple[int, str, int]] = []
     for kind, rx in (("ask", ASK_RE), ("task", TASK_RE)):
         for m in rx.finditer(s):
