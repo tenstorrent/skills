@@ -294,6 +294,8 @@ LOAD_URGENT = "test-slots-load-urgent"   # the one urgent run (priority 1 or bet
 LOAD_OWED = "test-slots-load-owed"   # the one priority-0 run (owed to the user) past it beside LOAD_PASS's
 LOAD_FLOOR = "test-slots-load-floor"   # the one run of any priority past it, so the queue keeps moving
 LOAD_GATE = "host load: "   # pool_gate's reason while the load guard holds a run (gate_lanes records it)
+STARVED_GATE = " run(s) of its project parked longer go first (checkcap.starved_ahead)"   # its reason's end there
+BUDGET_GATE = "its project's test-worker budget: "   # its reason's start while the project's budget holds the run
 
 
 def load_pass_path() -> Path:
@@ -1160,11 +1162,11 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
-    to whichever polls first. The reason names the term that failed, for status (checklane._parked)."""
+    to whichever polls first; one its own gate holds otherwise keeps none. The reason names the term that failed, for status (checklane._parked)."""
     if full and (why := load_held(priority, since=since)):
         return f"{LOAD_GATE}{why}"
     if (ahead := checkcap.starved_ahead(project_name, since, priority=priority, cost=cost)):
-        return f"{len(ahead)} run(s) of its project parked longer go first (checkcap.starved_ahead)"
+        return f"{len(ahead)}{STARVED_GATE}"
     if full and admitted_ahead(project_name, priority):
         return "a run of its project as urgent or more holds a host-wide checks slot and waits for its test slots"
     s = sizes(cfg)
@@ -1187,7 +1189,7 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
             and locks.any_free(urgent := urgent_paths(project_name, top))):
         own_free = _free(urgent)
     if own and own_free < need:
-        return (f"its project's test-worker budget: {own_free} of {len(own)} free, a run needs {need}"
+        return (f"{BUDGET_GATE}{own_free} of {len(own)} free, a run needs {need}"
                 f" (held by {checkcap._some(list(dict.fromkeys(locks.held_labels(own))))})")
     kept = need * urgent_parked(project_name, priority, since)
     if min(s[1], pool - used - kept) < need:
@@ -1199,16 +1201,25 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
 def urgent_parked(project_name: str | None, priority: int | None = None, since: float | None = None) -> int:
     """How many urgent runs (locks.URGENT_PRIORITY or better) of other projects than `project_name` are parked
     for their test slots now (checkcap.PARKED tickets) ahead of a run at `priority` that arrived at `since`
-    (default now): every one for a routine run, else those more urgent, or as urgent and older."""
-    gid = locks.group_id(project_name)
+    (default now): every one for a routine run, else those more urgent, or as urgent and older. A run whose
+    own gate (pool_gate's reason its lane records: gate_lanes) is its project's aged turn (STARVED_GATE), its
+    project's budget (BUDGET_GATE) or the load guard (LOAD_GATE) is not counted: it could not take the slots
+    kept for it, so they would sit idle. One whose lane names no reason, or only the pool, still counts."""
+    gid, d = locks.group_id(project_name), checkcap.slot_dir()
     try:
-        q = locks.queued(checkcap.slot_dir(), checkcap.PARKED)
+        q = locks.queued(d, checkcap.PARKED)
     except OSError:
         return 0
     mine = (float(priority), time.time() if since is None else since) \
         if priority is not None and priority <= locks.URGENT_PRIORITY else None
-    return sum(1 for t in q if locks._urgent(t) and locks.ticket_group(t) != gid
-               and (mine is None or (locks.ticket_priority(t), locks._arrival(t)) < mine))
+    ahead = [t for t in q if locks._urgent(t) and locks.ticket_group(t) != gid
+             and (mine is None or (locks.ticket_priority(t), locks._arrival(t)) < mine)]
+    if not ahead:
+        return 0
+    held = {r.get("pid") for r in locks.holder_records(sorted(d.glob(f"{SUITE}.*.lock")))
+            if (g := str(r.get("gate") or "")).startswith((LOAD_GATE, BUDGET_GATE)) or g.endswith(STARVED_GATE)}
+    held.discard(None)
+    return sum(1 for t in ahead if ticket_pid(t) not in held)
 
 
 @contextlib.contextmanager

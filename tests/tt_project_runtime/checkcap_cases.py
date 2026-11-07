@@ -8012,6 +8012,65 @@ def test_pool_room_keeps_a_slot_for_an_urgent_run_of_another_project_parked_for_
         locks.dequeue(routine)
 
 
+def _parked_urgent_with_gate(gate: str, n: int = 3):
+    """`n` priority-1 runs of project "pa" parked for their test slots, their lane's gate `gate` (gate_lanes)."""
+    from ttp import checkcap, locks, testslots
+    d, t0 = checkcap.slot_dir(), time.time() - 300
+    tickets = [locks.enqueue(d, checkcap.PARKED, f"pa task #{i} ttp checks", t0 + i, group="pa", priority=1)
+               for i in range(n)]
+    lane = locks.try_take([d / f"{testslots.SUITE}.pa.repo.0.lock"], "pa task #0 ttp checks", "ttp checks",
+                          extra={"gate": gate})
+    return tickets, lane
+
+
+def test_an_urgent_parked_run_its_own_gate_holds_keeps_no_test_pool_slots(env, monkeypatch):
+    """#7029: pool_gate keeps pool slots only for urgent parked runs of other projects that could start: one
+    its project's aged turn, budget or the load guard holds keeps none, so another project's p1 run starts
+    on the free slots (8 of 16 free, a run needs 4; 12 were kept for 3 such runs before)."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(8)]
+    for gate in ("46" + testslots.STARVED_GATE,
+                 testslots.BUDGET_GATE + "0 of 8 free, a run needs 4 (held by pa task #9)",
+                 testslots.LOAD_GATE + "the host is overloaded"):
+        tickets, lane = _parked_urgent_with_gate(gate)
+        try:
+            assert testslots.urgent_parked("pb", 1) == 0, gate
+            assert testslots.pool_gate({}, "pb", full=True, priority=1) == "", gate
+            assert testslots.pool_gate({}, "pb", full=True, priority=3) == "", "nor for a routine run"
+        finally:
+            lane.close()
+            for t in tickets:
+                locks.dequeue(t)
+    for f in busy:
+        f.close()
+
+
+def test_an_urgent_parked_run_that_could_start_still_gets_the_freed_slot_ahead_of_a_routine_run(env, monkeypatch):
+    """#7029: a parked urgent run held only by the pool (or naming no reason yet) still counts toward the
+    reserve: another project's routine run leaves the free slot to it."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(12)]
+    for gate in ("the host's test pool: 4 of 16 free, a run needs 4, 4 kept for 1 urgent run(s) of other projects"
+                 " parked ahead", ""):
+        tickets, lane = _parked_urgent_with_gate(gate, n=1)
+        try:
+            assert testslots.urgent_parked("pb") == 1, gate
+            why = testslots.pool_gate({}, "pb", full=True, priority=3)
+            assert "4 kept for 1 urgent run(s)" in why, why
+            assert testslots.pool_gate({}, "pa", full=True, priority=1) == "", "the urgent run itself has room"
+        finally:
+            lane.close()
+            for t in tickets:
+                locks.dequeue(t)
+    for f in busy:
+        f.close()
+
 def test_a_checks_wait_ends_once_its_task_moves_the_branch_off_the_head_and_never_on_a_detached_head(tmp_path):
     """#5893: cli._HeadMoved (asked by _checks_slot_take's stop) is "" while the branch tip is the head,
     the reason once a new commit moves it, and "" for a wait that began on a detached HEAD."""
