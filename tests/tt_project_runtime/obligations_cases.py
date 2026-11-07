@@ -526,3 +526,75 @@ def test_set_due_refusal_says_a_plain_open_obligation_is_open_and_how_to_close_i
                               now=now).split()[1]
     assert ob.set_due(p, open_order, now + 9000, now=now).startswith(f"{open_order} now due")
     assert ob.get(p.db, open_order)["promise"]["due"] == now + 9000
+
+
+def _claim_on_task(env, monkeypatch, due_in=7200):
+    """A claim backed by task `tid` that then failed: (p, check, now, tid, oid, claim events)."""
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    out = p.db.post("out", "the table is posted", chat="c1", kind="reply")
+    [line] = ob.record_claims(p, [(out, "c1", [{"text": "the table is posted", "task": tid,
+                                                "due": now + due_in}])], {}, now=now)
+    p.db.update_task(tid, status="failed")
+    return p, check, now, tid, line.split()[1], lambda: raised((ob.CLAIM_KIND,))
+
+
+def test_a_claim_on_a_failed_task_holds_through_its_done_continuation(env, monkeypatch):
+    """The named task failed, a task that continues it ended done: the claim holds, its receipt names
+    the continuation, and no 'does not hold' is raised."""
+    from ttp import obligations as ob
+    p, check, now, tid, oid, events = _claim_on_task(env, monkeypatch)
+    hop = p.db.add_task("redo the table", "s", kind="work", tier="light", labels=[f"continues:{tid}"])
+    p.db.update_task(hop, status="done")
+    check(now + 600)
+    o = ob.get(p.db, oid)
+    assert o["receipt"]["task"] == hop and f"#{hop}" in o["receipt"]["evidence"] and events() == []
+
+
+def test_a_claim_on_a_failed_task_waits_for_an_open_continuation_until_its_due(env, monkeypatch):
+    from ttp import obligations as ob
+    p, check, now, tid, oid, events = _claim_on_task(env, monkeypatch)
+    hop = p.db.add_task("Continue: the table", "s", kind="work", tier="light", parent=tid)
+    for st in ("queued", "running", "waiting"):
+        p.db.update_task(hop, status=st)
+        check(now + 600)
+        assert events() == [] and not ob.get(p.db, oid)["receipt"]
+    check(now + 7300)   # still open at the due time: it does not hold, naming the open hop
+    [ev] = events()
+    assert "does not hold" in ev["text"] and f"continuation #{hop} is still waiting" in ev["text"]
+    p.db.update_task(hop, status="done")   # it ends done later: the claim holds after all
+    check(now + 7400)
+    assert ob.get(p.db, oid)["receipt"]["task"] == hop
+
+
+def test_a_claim_on_a_failed_task_with_no_continuation_does_not_hold_as_before(env, monkeypatch):
+    p, check, now, tid, oid, events = _claim_on_task(env, monkeypatch)
+    p.db.add_task("unrelated", "s", kind="work", tier="light", labels=[f"continues:{tid + 1000}"])
+    check(now + 600)
+    [ev] = events()
+    assert f"does not hold: #{tid} is failed. You said" in ev["text"]
+
+
+def test_a_claim_holds_through_a_two_hop_chain_of_continuations(env, monkeypatch):
+    """failed -> failed `follows:` hop -> done `continue:` follow-up of the hop: the claim holds on the last."""
+    from ttp import obligations as ob
+    p, check, now, tid, oid, events = _claim_on_task(env, monkeypatch)
+    a = p.db.add_task("redo it", "s", kind="work", tier="light", labels=[f"follows:{tid}"])
+    p.db.update_task(a, status="failed")
+    b = p.db.add_task("continue: redo it", "s", kind="work", tier="light", parent=a)
+    p.db.update_task(b, status="done")
+    check(now + 600)
+    assert ob.get(p.db, oid)["receipt"]["task"] == b and events() == []
+
+
+def test_a_continuation_cycle_never_loops_and_a_chain_of_failures_does_not_hold(env, monkeypatch):
+    import json
+    p, check, now, tid, oid, events = _claim_on_task(env, monkeypatch)
+    a = p.db.add_task("redo it", "s", kind="work", tier="light", labels=[f"continues:{tid}"])
+    b = p.db.add_task("redo it again", "s", kind="work", tier="light", labels=[f"continues:{a}"])
+    p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps([f"continues:{b}"]), tid))   # tid <- b <- a <- tid
+    for t in (a, b):
+        p.db.update_task(t, status="cancelled")
+    check(now + 600)
+    [ev] = events()
+    assert f"#{tid} is failed, and so is each task that continues it (#{a}, #{b})" in ev["text"]
