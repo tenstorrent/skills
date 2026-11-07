@@ -444,7 +444,7 @@ def test_a_broken_command_schedule_can_be_turned_off_without_a_command(env):
     d.gates = {}
     for _ in range(3):
         p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
-        d.run_schedules()
+        _settle(d, "probe")
         d.sweep_alerts()
         if fix := p.db.one("SELECT id FROM tasks WHERE labels LIKE '%schedule_fix:probe%'"):
             p.db.update_task(fix["id"], status="failed")   # its fix task could not fix it: now the alert
@@ -474,9 +474,9 @@ def test_a_schedule_failing_twice_raises_one_alert_that_clears_on_an_ok_run(env)
     d = Daemon(p.base)
     d.gates = {}
 
-    def tick():
+    def tick():   # its run is recorded before the sweep, however long the command takes to start
         p.db.x("UPDATE schedules SET next_run=? WHERE name='probe'", (time.time() - 1,))
-        d.run_schedules()
+        _settle(d, "probe")
         d.sweep_alerts()
 
     def live():
