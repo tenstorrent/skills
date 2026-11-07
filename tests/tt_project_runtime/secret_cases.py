@@ -1935,3 +1935,114 @@ def test_the_keychain_line_never_splits_on_the_users_name(env, monkeypatch, user
     secretstore._keychain_save({}, {"peer-key": _CUSTOM})
     words = seen[0].split()
     assert seen[0].count("\n") == 1 and words[words.index("-a") + 1] == account and len(words) == 8
+
+
+def _live_run(tmp_path, monkeypatch, body, **spec):
+    """Starts runner.supervise in a thread over a stand-in agent running Python `body`; returns
+    (thread, run dir)."""
+    import threading
+    from ttp import runner
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.1")
+    child = tmp_path / "agent.py"
+    tmp_path.mkdir(exist_ok=True)
+    child.write_text("import json, os, sys, time\n" + body)
+    run_dir = tmp_path / "run"
+    run_dir.mkdir(parents=True)
+    (run_dir / "prompt.md").write_text("x")
+    (run_dir / "run.json").write_text(json.dumps({"argv": [sys.executable, str(child)], "cwd": str(tmp_path),
+                                                  "provider": "fake", "timeout_s": 60, **spec}))
+    t = threading.Thread(target=runner.supervise, args=(run_dir,), daemon=True)
+    t.start()
+    return t, run_dir
+
+
+def _wait_for(check, s=20):
+    end = time.time() + s
+    while time.time() < end:
+        if check():
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def test_a_running_agents_output_holds_no_key_text_while_it_runs(env, tmp_path, monkeypatch):
+    """#6934's follow-up: the runner masks each line before it reaches output.jsonl, so a reader in the
+    middle of the run (runwatch, the web app, a copy) finds no key, JSONL-escaped or printed raw."""
+    from ttp import redact, runner
+    block, lines = _key_block()
+    keyfile = tmp_path / "k"
+    keyfile.write_text(block)
+    t, run_dir = _live_run(tmp_path, monkeypatch, (
+        f"block = open({str(keyfile)!r}).read()\n"
+        "print(json.dumps({'type': 'user', 'tool_result': {'content': block}}), flush=True)\n"
+        "sys.stdout.write('raw:\\n' + block + 'after the block\\n'); sys.stdout.flush()\n"
+        "sys.stderr.write('warning: ' + block + 'printed\\n'); sys.stderr.flush()\n"
+        "print(json.dumps({'type': 'assistant', 'text': 'printed'}), flush=True)\n"
+        "time.sleep(30)\n"))
+    out = run_dir / "output.jsonl"
+    assert _wait_for(lambda: out.exists() and "printed" in out.read_text()), "the agent's lines reach the file mid-run"
+    assert not (run_dir / "exit.json").exists(), "the agent still runs"
+    text = out.read_text()
+    assert _no_key(text, lines) and text.count(redact.KEY_MASK) == 3, text
+    assert json.loads(text.splitlines()[0])["tool_result"]["content"] == redact.KEY_MASK + "\n"
+    assert "raw:\n" + redact.KEY_MASK + "\n" + redact.KEY_MASK + "\nafter the block\n" in text
+    err = run_dir / "stderr.log"
+    assert _wait_for(lambda: "printed" in err.read_text()) and _no_key(err.read_text(), lines), err.read_text()
+    runner.request_stop(run_dir)
+    t.join(60)
+    assert json.loads((run_dir / "exit.json").read_text())["stopped"]
+
+
+def test_the_masked_stream_still_shows_progress_to_the_stall_guard_and_loses_no_line(env, tmp_path, monkeypatch):
+    t, run_dir = _live_run(tmp_path, monkeypatch, (
+        "for i in range(25):\n"
+        "    print(json.dumps({'type': 'assistant', 'n': i}), flush=True); time.sleep(0.1)\n"
+        "sys.stdout.write('tail without a line end')\n"), stall_s=1)
+    t.join(60)
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["rc"] == 0 and info["stopped"] is None, info
+    lines = (run_dir / "output.jsonl").read_text().split("\n")
+    assert [json.loads(x)["n"] for x in lines[:-1]] == list(range(25)) and lines[-1] == "tail without a line end"
+    t, run_dir2 = _live_run(tmp_path / "quiet", monkeypatch,
+                            "print(json.dumps({'type': 'assistant'}), flush=True); time.sleep(30)\n", stall_s=1)
+    t.join(60)
+    assert json.loads((run_dir2 / "exit.json").read_text())["stopped"] == "stalled"
+
+
+def test_a_masking_fault_or_a_tool_holding_the_pipe_never_loses_output_or_hangs_the_run(env, tmp_path, monkeypatch):
+    from ttp import redact, runner
+    block, lines = _key_block()
+    keyfile = tmp_path / "k"
+    keyfile.write_text(block)
+
+    def broken(self, data):
+        raise RuntimeError("masking broke")
+    monkeypatch.setattr(redact.LineScrubber, "line", broken)
+    # The agent leaves a process behind that keeps its stdout open: the run still ends.
+    started = time.time()
+    t, run_dir = _live_run(tmp_path, monkeypatch, (
+        "import subprocess\n"
+        "subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(20)'])\n"
+        f"print(json.dumps({{'t': open({str(keyfile)!r}).read()}}), flush=True)\n"
+        "print('last', flush=True)\n"))
+    t.join(60)
+    assert time.time() - started < 15, "the pump gave up on the pipe a tool kept open"
+    info = json.loads((run_dir / "exit.json").read_text())
+    assert info["rc"] == 0, info
+    text = (run_dir / "output.jsonl").read_text()
+    assert text.endswith("last\n") and _no_key(text, lines) and redact.KEY_MASK in text, "masked at the end"
+    assert runner.PUMP_DRAIN_S < 15
+
+
+def test_line_scrubber_drops_a_raw_blocks_body_and_keeps_what_follows():
+    from ttp import redact
+    block, lines = _key_block("RSA", "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0A1B\n\n")
+    s = redact.LineScrubber()
+    stream = ("cat key\n" + block + "plain prose after it, with spaces\n").encode()
+    out = b"".join(s.line(x) for x in stream.splitlines(keepends=True)).decode()
+    assert out == f"cat key\n{redact.KEY_MASK}\n{redact.KEY_MASK}\nplain prose after it, with spaces\n"
+    # A BEGIN line followed by prose ends the block at the prose; a line without a key passes as it was.
+    s = redact.LineScrubber()
+    head = block.splitlines(keepends=True)[0]
+    out = b"".join(s.line(x.encode()) for x in (head, "Not a key line.\n", "x\r\n")).decode()
+    assert out == f"{redact.KEY_MASK}\nNot a key line.\nx\r\n"

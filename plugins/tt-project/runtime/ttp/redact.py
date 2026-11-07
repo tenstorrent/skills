@@ -169,6 +169,42 @@ def scrub(text: Any) -> Any:
     return text
 
 
+# A raw (not JSON-escaped) key block's lines as a plain-text stream shows them: a BEGIN line, base64
+# lines, armor headers, blank lines.
+_RAW_BEGIN_RE = re.compile(rf"-{{4,5}} ?BEGIN {_KEY_TYPE} ?-{{4,5}}[ \t]*\Z")
+_RAW_BODY_RE = re.compile(r"[A-Za-z0-9+/=]*|[A-Za-z][A-Za-z-]*: [^\r\n]*")
+MAX_KEY_LINES = 400
+
+
+class LineScrubber:
+    """Masks a stream line by line as it is written (runner: the agent's stdout): each line whole with
+    `scrub` and its stored secrets' JSON-escaped forms, and the body lines of a raw multi-line key block,
+    which no single line shows as a key, dropped from its BEGIN line to its END line."""
+
+    def __init__(self) -> None:
+        self.key_lines = -1   # body lines dropped so far in a raw key block; -1: not in one
+
+    def line(self, data: bytes) -> bytes:
+        """`data`, one line with its line end (or the stream's unterminated tail), masked."""
+        body = data.rstrip(b"\r\n")
+        if self.key_lines < 0 and b"PRIVATE KEY" not in body and not pairs():
+            return data
+        text = body.decode("utf-8", "surrogateescape")
+        if self.key_lines >= 0:
+            if (_KEY_END_RE.search(text) is None and self.key_lines < MAX_KEY_LINES
+                    and _RAW_BODY_RE.fullmatch(text)):
+                self.key_lines += 1
+                return b""
+            self.key_lines = -1
+        elif _RAW_BEGIN_RE.search(text):
+            self.key_lines = 0
+        text = scrub(text)
+        for value, slot in pairs():
+            for v in _variants(value)[1:]:
+                text = text.replace(v, mask(slot))
+        return text.encode("utf-8", "surrogateescape") + data[len(body):]
+
+
 def scrub_obj(obj: Any) -> Any:
     """A JSON-like value with every string in it scrubbed (keys too)."""
     if isinstance(obj, str):

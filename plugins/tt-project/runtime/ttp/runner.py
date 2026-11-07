@@ -3,7 +3,8 @@
 """Detached run supervisor. The daemon writes <run_dir>/run.json and starts
 `python -m ttp._run <run_dir>` in its own session; this process owns the agent child:
 
-- feeds the prompt on stdin (no argv size limit), streams output to output.jsonl;
+- feeds the prompt on stdin (no argv size limit), streams output to output.jsonl (and stderr.log)
+  through a pipe a line at a time, private keys and stored secrets masked before they reach the disk (OutputPump);
 - refreshes <run_dir>/lease every 30 s while the child lives, so liveness never depends on a model
   remembering to report it;
 - enforces the wall-clock limit with TERM, then KILL 30 s later (a child that ignores TERM would
@@ -49,6 +50,7 @@ import errno
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -80,6 +82,8 @@ TEST_CLOCK_ENV = "TTP_TEST_AWAKE_FILE"   # the test suite's FileClock; unset (al
 SLEEP_GAP_S = 600     # polls are POLL_S apart: a gap this long between two can only be a host sleep
 PDEATHSIG = sys.platform.startswith("linux")   # the kernel also signals the agent itself if the runner dies
 PR_SET_PDEATHSIG = 1
+PUMP_PARTIAL_MAX = 8 << 20   # a line longer than this goes out unmasked in parts (the end-of-run scrub masks it)
+PUMP_DRAIN_S = 2             # after the agent ends, how long its output pipe may stay open (a tool it left)
 
 # Started with every agent: waits on a pipe the runner holds open. A word on it is a normal end; end of
 # file without one means the runner died, and the agent's group is ended, TERM then KILL. PDEATHSIG
@@ -448,6 +452,82 @@ def _env_files(spec: dict) -> dict[str, str]:
     return out
 
 
+class OutputPump(threading.Thread):
+    """Copies the agent's stdout (or stderr) from a pipe into its run file, each line masked (redact.LineScrubber)
+    and written once it is complete, so no key text reaches the disk while the run goes on and readers
+    (the stall guard, runwatch, the web app) see each line as soon as it ends. A masking fault writes
+    lines as they came (the end-of-run scrub masks them) and a write fault drops them: the pipe is
+    always drained, so the agent never blocks on it."""
+
+    def __init__(self, fd: int, out) -> None:
+        super().__init__(daemon=True, name="output-pump")
+        self.fd, self.out, self.buf = fd, out, b""
+        self.ending = threading.Event()
+        self.faults: list[str] = []
+        try:
+            from . import redact
+            self.scrubber = redact.LineScrubber()
+        except Exception as e:
+            self.scrubber = None
+            self.faults.append(f"masking: {type(e).__name__}")
+
+    def _mask(self, line: bytes) -> bytes:
+        if self.scrubber is not None:
+            try:
+                return self.scrubber.line(line)
+            except Exception as e:
+                self.scrubber = None
+                self.faults.append(f"masking: {type(e).__name__}")
+        return line
+
+    def _put(self, lines: list[bytes], raw: bool = False) -> None:
+        try:
+            self.out.write(b"".join(lines if raw else (self._mask(x) for x in lines)))
+            self.out.flush()
+        except Exception as e:
+            if len(self.faults) < 5:
+                self.faults.append(f"write: {type(e).__name__}")
+
+    def run(self) -> None:
+        try:
+            self._pump()
+        except Exception as e:   # never seen: copy the rest unmasked rather than block the agent
+            self.faults.append(f"pump: {type(e).__name__}")
+            self.scrubber = None
+            self._pump()
+
+    def _pump(self) -> None:
+        drain_until = None
+        while True:
+            if self.ending.is_set() and drain_until is None:
+                drain_until = time.monotonic() + 1
+            ready = select.select([self.fd], [], [], 0 if drain_until else 0.2)[0]
+            if not ready and drain_until is None:
+                continue
+            chunk = os.read(self.fd, 1 << 16) if ready else b""
+            if not chunk or (drain_until and time.monotonic() > drain_until):
+                break
+            self.buf += chunk
+            if b"\n" in chunk:
+                *lines, self.buf = self.buf.split(b"\n")
+                self._put([x + b"\n" for x in lines])
+            if len(self.buf) > PUMP_PARTIAL_MAX:
+                buf, self.buf = self.buf, b""
+                self._put([buf], raw=True)
+        if self.buf:
+            buf, self.buf = self.buf, b""
+            self._put([buf])
+
+    def finish(self, wait: float) -> None:
+        """Waits for the agent's output to end: end of file, or `wait` more seconds when a process it
+        left still holds the pipe; then what is buffered goes out."""
+        self.join(wait)
+        self.ending.set()
+        self.join(PUMP_DRAIN_S)
+        if not self.is_alive():
+            os.close(self.fd)
+
+
 def supervise(run_dir: Path) -> int:
     try:
         spec = json.loads((run_dir / "run.json").read_text())
@@ -518,7 +598,7 @@ def supervise(run_dir: Path) -> int:
     err = open(run_dir / "stderr.log", "wb")
     nice = int(spec.get("nice") or 0)
     preexec, _ = _agent_preexec(nice)
-    bridge, launch_auth = None, False
+    bridge, launch_auth, pumps = None, False, []
     try:
         if spec.get("bridge"):
             # The chat provider's loopback bridge: a thread of this process, so it ends with the run
@@ -536,14 +616,31 @@ def supervise(run_dir: Path) -> int:
         from .hook import hooked
         pre_hooked = hooked(run_dir)
         creds = _cred_snapshot()
-        child = subprocess.Popen(argv, stdin=prompt, stdout=out, stderr=err, cwd=cwd, env=env,
-                                 start_new_session=True, preexec_fn=preexec)
+        ends = {}   # the agent's stdout and stderr: a pipe's write end, or the file itself without one
+        for f in (out, err):
+            try:
+                rfd, ends[f] = os.pipe()
+                pumps.append(OutputPump(rfd, f))
+            except OSError as e:   # the agent writes the file itself, masked at the end
+                ends[f] = f
+                print(f"runner: output goes unmasked until the run ends: {type(e).__name__}", flush=True)
+        try:
+            child = subprocess.Popen(argv, stdin=prompt, stdout=ends[out], stderr=ends[err], cwd=cwd, env=env,
+                                     start_new_session=True, preexec_fn=preexec)
+        finally:
+            for end in ends.values():
+                if isinstance(end, int):
+                    os.close(end)
+        for pump in pumps:
+            pump.start()
     except OSError as e:
         # The agent never started (E2BIG: an argument or the whole command line past the kernel's
         # limit; a missing binary; a chat bridge that could not start): a harness fault the same
         # argv repeats, booked as a launch failure.
         if bridge is not None:
             bridge.stop()
+        for pump in pumps:
+            os.close(pump.fd)
         for f in (prompt, out, err):
             f.close()
         let_go(held)
@@ -681,6 +778,11 @@ def supervise(run_dir: Path) -> int:
             rc = child.wait()
             break
     ended, mono_end, up = time.time(), time.monotonic(), awake.tick()
+    drain_end = time.monotonic() + PUMP_DRAIN_S
+    for pump in pumps:
+        pump.finish(max(drain_end - time.monotonic(), 0))
+        for fault in pump.faults:
+            print(f"runner: output pump fault ({fault}); the end-of-run scrub masks the output", flush=True)
     if inst["open"]:
         # A run that ended before a verdict: one last look, which never reports a missing transcript.
         # A quick run can end before the watch thread built its provider: build it here then.
