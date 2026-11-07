@@ -11977,7 +11977,6 @@ def test_a_new_daemon_that_fails_under_the_manager_is_rolled_back_with_its_outpu
 def test_an_old_daemon_still_ticking_after_the_restart_is_never_rolled_back(env, monkeypatch):
     # The pid of the old daemon cannot be seen (a sandbox's own pid namespace) and the restart could not
     # end it: its heartbeat, still moving after the restart, shows it is alive and healthy.
-    import threading
     from ttp import daemon as dm, service
     p = make(env)
     monkeypatch.setattr(dm, "_alive", lambda pid: False)
@@ -11986,8 +11985,15 @@ def test_an_old_daemon_still_ticking_after_the_restart_is_never_rolled_back(env,
     hb.write_text(json.dumps({"pid": 4242, "started": time.time() - 3600}))
     p.db.set_kv("harness_good", {"commit": _git_out(p.harness, "rev-parse", "HEAD")})
     head = _runtime_change(p.harness)
-    threading.Timer(0.2, lambda: os.utime(hb, None)).start()
-    res = service.restart(p, wait_s=0.5, restart_fn=lambda p: "restarted")
+
+    def restart_fn(p):
+        # The old daemon ticks once the restart is made, before the new daemon is judged: no timer racing
+        # the wait. Its mtime is set past now, since a file system's coarse clock may stamp it before t0.
+        beat = time.time() + 1
+        os.utime(hb, (beat, beat))
+        return "restarted"
+
+    res = service.restart(p, wait_s=0.5, restart_fn=restart_fn)
     assert res.outcome == "deferred" and "old daemon has not exited" in res, res
     _no_rollback(p, head)
 
