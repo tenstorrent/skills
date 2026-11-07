@@ -122,7 +122,7 @@ def account_label(who: str) -> str:
 class Cursor(Provider):
     name = "cursor"
     # `--resume <chatId>`, once session_saved finds the chat's store (a resume of a lost chat may start an
-    # empty one). The session's size is the run's summed usage (no per-call usage): it rolls over early.
+    # empty one). The session's size is the run's summed usage (no per-call usage): it compacts early, never late.
     coord_session = "agent"
     binaries = ("agent", "cursor-agent")
     api_host = "api2.cursor.sh"

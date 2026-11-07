@@ -253,7 +253,7 @@ def _telemetry(usage, key: str) -> int:
 
 def context_tokens(usage) -> int:
     """The session's size after a turn: its last model call's prompt and answer. Without per-call
-    usage, the turn's sum, which overstates a turn of several calls and rolls over early, never late."""
+    usage, the turn's sum, which overstates a turn of several calls and compacts early, never late."""
     keys = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")
     return _telemetry(usage, "last_context") or sum(int(getattr(usage, k, 0) or 0) for k in keys)
 
