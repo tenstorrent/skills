@@ -144,6 +144,37 @@ def test_ready_not_started_names_the_backlog_a_red_spend_gate_left_until_it_drai
     assert len(_unstarted_events(p, "ready_backlog")) == 1
 
 
+def test_ready_not_started_waits_for_one_dispatch_pass_after_the_spend_gate_that_held_it_cleared(env, monkeypatch):
+    """Tasks a red gate held past their ready time, seen by a daemon that restarted as it cleared (so
+    their wait counts from when they became ready): in the few minutes after the clear, no
+    ready_not_started wakes the coordinator until a dispatch pass that began after the clear has had its
+    chance to start them; after such a pass, or once unstarted.CLEARED_WAIT_S passed, the alarm is raised."""
+    from ttp import budget as bud
+    from ttp import unstarted
+    p, d, check = _ready_setup(env, monkeypatch)
+    ids = [p.db.add_task(f"queued work {i}", "s", kind="work", tier="light", origin="coordinator", priority=3)
+           for i in range(2)]
+    green = dict(d.gates)
+    d.gates = {prov: bud.Gate(provider=prov, level="red", max_parallel=0, allow_new_work=False,
+                              cause="no new work at red: global daily cap reached") for prov in green}
+    start = time.time()
+    d._dispatch_pass_at = start + 2900   # a pass while the gate was still red
+    assert check(start + 60) == [] and check(start + 3000) == [], "the red gate has its own alert"
+    d.gates = green
+    cleared = start + 3060
+    assert check(cleared) == [], "just cleared: no dispatch pass since"
+    d._unstarted_seen, d._unstarted_held, d._unstarted_ready = {}, set(), None   # a restarted daemon
+    assert check(cleared + 120) == [], "still no dispatch pass since the clear"
+    d._dispatch_pass_at = cleared + 150  # the pass after the clear ran and left them waiting
+    got = check(cleared + 180)
+    assert [e["task"] for e in got] == ids, "a pass had its chance: the alarm"
+    # Without a pass, the wait ends after CLEARED_WAIT_S.
+    p.db.x("DELETE FROM events WHERE kind='ready_not_started'")
+    d._dispatch_pass_at = start
+    assert check(cleared + unstarted.CLEARED_WAIT_S - 30) == []
+    assert [e["task"] for e in check(cleared + unstarted.CLEARED_WAIT_S + 30)] == ids
+
+
 def test_ready_backlog_never_hides_deadline_work(env, monkeypatch):
     """An urgent p1 task in a queue deeper than its free slots keeps its alarm: deadline work is no backlog."""
     p, d, check = _ready_setup(env, monkeypatch)

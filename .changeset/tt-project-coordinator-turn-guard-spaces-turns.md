@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: the runaway guard on the coordinator's self-started turns (the $/h limit when billed by use; the turn-count and same-evidence limits on a plan) now throttles only the coordinator, not worker dispatch. While it is tripped, the gate carries `coord_hold` with the time the trailing hour drops back under the limit. The daemon starts no self-started coordinator turn before then, and one turn afterwards takes every event queued meanwhile. User messages and must-act items (overdue promises and orders, failed claims) still wake it at once. Ready worker tasks keep starting under the normal caps. The waste and total-spend signals, the dollar caps and per-task budgets still hold all new work. `ttp status` and the coordinator's gate line say the turns are spaced out and until when. Also, a `ready_not_started` alarm for a task a spend gate held until moments ago (within 5 minutes) waits for one dispatch pass that began after the clear before it wakes the coordinator.

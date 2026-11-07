@@ -1905,12 +1905,11 @@ def _guard_turns(p, now, n=7, cost=0.60):
         p.db.spend(core, cost, "coordinator")
 
 
-def test_a_tripped_coordinator_turn_guard_starts_urgent_and_user_ordered_tasks_and_holds_routine(
+def test_a_tripped_coordinator_turn_guard_keeps_every_worker_task_starting_and_a_dollar_cap_holds_them(
         env, monkeypatch, tmp_path):
-    """The coordinator's self-started turns past budget.hourly_coordinator_usd hold routine and scheduled
-    work only: urgent tasks (priority 1 or an `urgent:` line) and user-ordered ones (answering a chat,
-    owning an obligation) still start; `ttp status` says which runs it holds. A dollar cap reached
-    holds every one of them."""
+    """The coordinator's self-started turns past budget.hourly_coordinator_usd throttle the coordinator
+    only: routine, scheduled, urgent and user-ordered tasks all keep starting under the normal caps, and
+    `ttp status` says the coordinator's turns are spaced out. A dollar cap reached holds every one."""
     from ttp.cli import status_text
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
     try:
@@ -1920,7 +1919,7 @@ def test_a_tripped_coordinator_turn_guard_starts_urgent_and_user_ordered_tasks_a
         _guard_turns(p, now)
         d.update_gates()
         core = d.cfg.get("core_provider", "claude")
-        assert d.gates[core].level == "red" and d.gates[core].lane, d.gates[core].reasons
+        assert d.gates[core].coord_hold and d.gates[core].level != "red", d.gates[core].as_dict()
         add = lambda title, spec="s", **kw: p.db.task(p.db.add_task(title, spec, kind="work", tier="standard",
                                                                      **{"priority": 3, **kw}))
         routine = add("routine work")
@@ -1933,42 +1932,56 @@ def test_a_tripped_coordinator_turn_guard_starts_urgent_and_user_ordered_tasks_a
 
         def ctx():
             return {"now": time.time(), "paused": {}, "committed": None, "busy": {core: 0}, "logged_out": {}}
-        for t in (prio1, line, chat, owner):
+        for t in (routine, scheduled, prio1, line, chat, owner):
             c = ctx()
             assert d._start_hold(t, core, c) is None, t["title"]
-            assert c["gate"].allow_new_work and c["gate"].max_tier == "deep", t["title"]
-        for t in (routine, scheduled):
-            c = ctx()
-            assert d._start_hold(t, core, c) == "gate", t["title"]
-            assert "runaway guard: coordinator spent" in d._hold_words(t, "gate", c)
-        assert d.gates[core].max_parallel == 0 and not d.gates[core].allow_new_work, "the shared gate stays red"
+            assert c["gate"].allow_new_work and c["gate"].max_parallel > 0, t["title"]
         p.db.set_kv("gates", {core: d.gates[core].as_dict()})
         text = status_text(p)
-        assert "urgent and user-ordered tasks still start" in text, text
+        assert "self-started coordinator turns spaced out" in text and "worker runs keep starting" in text, text
         # A dollar cap reached: nothing new starts, urgent or user-ordered included.
         p.set_config("budget.daily_usd", 1)
         d.cfg = p.config()
         d.update_gates()
-        assert not d.gates[core].lane, d.gates[core].reasons
         for t in (prio1, line, chat, owner, routine, scheduled):
             assert d._start_hold(t, core, ctx()) == "gate", t["title"]
     finally:
         drain(d)
 
 
-def test_a_tripped_coordinator_turn_guard_defers_self_started_turns_and_runs_user_message_turns(env, monkeypatch):
-    """The guard's red still defers the coordinator's self-started turns; a user message's turn runs."""
+def test_a_tripped_coordinator_turn_guard_spaces_out_self_started_turns_into_one_wake(env, monkeypatch):
+    """While the guard is tripped, self-started turns wait for its cool-down (until the trailing hour is
+    back under the limit), and then one turn takes every event queued meanwhile. A user message or a
+    must-act item still wakes the coordinator at once."""
+    from ttp import obligations
     p, d, clock, starts = _batch_setup(env, monkeypatch, busy=0)
     p.set_config("budget.global_daily_usd", 0)
     d.cfg = p.config()
     _guard_turns(p, clock[0])
     d.update_gates()
     core = d.cfg.get("core_provider", "claude")
-    assert d.gates[core].level == "red" and d.gates[core].lane, d.gates[core].reasons
+    hold = d.gates[core].coord_hold
+    assert hold and d.gates[core].allow_new_work, d.gates[core].as_dict()
+    assert hold["until"] - clock[0] > 1500, hold
     _event(p, clock, "task_done")
-    assert not _turn_within(d, clock, starts, 900, step=30), "a self-started turn ran past the guard"
+    assert not _turn_within(d, clock, starts, 900, step=30), "a self-started turn ran inside the cool-down"
+    _event(p, clock, "followup_proposed")
+    assert not _turn_within(d, clock, starts, hold["until"] - clock[0] - 60, step=30)
+    queued = [e["id"] for e in p.db.q("SELECT id FROM events WHERE status='queued'")]
+    assert len(queued) == 2
+    assert _turn_within(d, clock, starts, 300, step=30), "no turn once the cool-down ended"
+    assert len(starts) == 1 and clock[0] >= hold["until"]
+    # A user message wakes it inside a cool-down.
+    clock[0] = hold["until"] - 1500
+    p.db.x("UPDATE events SET status='handled'")
+    n = len(starts)
     p.db.post("in", "what is the status?", chat="c1")
-    assert _turn_within(d, clock, starts, 900, step=30), "the user's message got no turn"
+    assert _turn_within(d, clock, starts, 120, step=30) and len(starts) == n + 1, "the user's message got no turn"
+    # So does a must-act item (an overdue promise).
+    clock[0] += 120
+    p.db.x("UPDATE messages SET handled=1 WHERE direction='in'")
+    _event(p, clock, obligations.PROMISE_KIND)
+    assert clock[0] < hold["until"] and _turn_within(d, clock, starts, 120, step=30), "a must-act item got no turn"
 
 
 def test_user_ordered_urgent_work_starts_in_burst_slots_in_one_tick_and_then_preempts_the_lowest_routine_run(
