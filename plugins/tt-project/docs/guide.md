@@ -3048,7 +3048,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   on request (exit 2 when it kept a tree or stopped after its 30 s). A project runs unsandboxed once its run lines say `sandbox=none` and
   that command finds no tree.
   `providers.<name>.write_fence: true` turns the provider's write fence on (Claude's Bash sandbox,
-  Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. A sandboxed
+  Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. Both are
+  user-only: only the user's own word turns one on (`ttp config` in their own shell, or the web
+  settings page); `ttp config` inside a run (a worker's or a coordinator's) and the coordinator's
+  `config_set` refuse the on value on every provider, and allow false or unset. A sandboxed
   worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged
   command the project allows runs on the host through the daemon: `ttp host-run -- <command...>`
   prints its output and exits with its code (126 refused, 124 timed out, 75 no answer from the

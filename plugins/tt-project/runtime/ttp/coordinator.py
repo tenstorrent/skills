@@ -478,8 +478,10 @@ USER_SETTABLE = {
     "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Unset, chat takes the claude value (project.CHAT_INHERITS); set, it wins.
     "providers.chat.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
-    # The worker sandbox: false runs workers unfenced. Set only in a turn carrying the user's word (NEEDS_USER).
+    # The worker sandbox and the checks' process sandbox: false (unsandboxed) is anyone's; true only the user's
+    # own (SANDBOX_KEYS): config_set refuses it, the web settings page the user drives sets it.
     **{f"providers.{n}.write_fence": lambda v: str(v).lower() in ("1", "true", "yes", "on") for n in chatset.PROVIDERS},
+    "sandbox.checks": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).
@@ -1692,15 +1694,28 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
               "delivery.allow_protected_push_branch": "restriction", "delivery.own_push": "restriction",
               "delivery.rebase_replace": "restriction", "delivery.never_force": "restriction",
               MERGE_KEY: "merge", relay.AGENT_KEY: "restriction", restriction_source.OWNER_IDS_KEY: "restriction"}
-# The worker sandbox (providers.<name>.write_fence) is the user's, both ways: a harness-wide order of theirs
-# (such as unsandboxed runs) sets it for every project, and no project turns it back on or off on its own
-# judgement. `ttp config` refuses it inside a run, as every NEEDS_USER key.
-SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS}
+# The keys that turn namespace sandboxing on (the worker write fence, providers.<name>.write_fence, and the
+# checks' process sandbox, sandbox.checks) are the user's: their harness-wide order runs everything
+# unsandboxed and no project turns it back on by its own decision. Only the user's own word turns one on
+# (`ttp config` in their own shell, the web settings page): a run's `ttp config` and every coordinator
+# config_set refuse the on value, also in a turn carrying a user message; false or unset is anyone's.
+SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS} | {"sandbox.checks"}
 NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
-# The process sandbox for check commands: turning it on is the user's too (sandboxstate); off is the safe side.
-NEEDS_USER["sandbox.checks"] = "restriction"
+
+
+def sandbox_on(value) -> bool:
+    """Whether a value written at a SANDBOX_KEYS key turns the sandbox on (None: unset, off)."""
+    return value is True or str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def sandbox_refusal(key: str) -> str:
+    return (f"{key} turns namespace sandboxing on, a setting only the user may change: only the user's own word "
+            f"turns it on (`ttp config` in their own shell, or the web settings page), never a run or the "
+            f"coordinator; its off value (false, or '' to unset) may be set by anyone")
+
+
 NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe side, needs no word
-SAFE_WHEN_OFF = {"coordinator.session.tools", "sandbox.checks", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
+SAFE_WHEN_OFF = {*SANDBOX_KEYS, "coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
                  "delivery.never_force"}
@@ -3619,6 +3634,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # routing key (chatset) its own check, so no routed tier loses its model or endpoint.
                 remove = a.get("value") == "" and key in USER_SETTABLE and key not in accountset.KEYS
                 value = None if remove else conv(a.get("value"))
+                if key in SANDBOX_KEYS and sandbox_on(value):
+                    raise ValueError(sandbox_refusal(key))
                 chatset.route_ready(cfg, key, value)
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
                                                                                     "backup_remote": value})):

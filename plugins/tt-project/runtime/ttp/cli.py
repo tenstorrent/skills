@@ -9879,11 +9879,12 @@ def _log_account_change(key: str, old, new) -> None:
 def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
     """The user-only setting (coordinator.NEEDS_USER) that writing `val` at `key` into the project.json
     `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
-    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate; so is
-    clearing a superseded sandbox value of project `p` (sandboxstate.clears_superseded)."""
+    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate (a sandbox
+    key, SANDBOX_KEYS: any value but on, removing it too); so is clearing a superseded sandbox value of
+    project `p` (sandboxstate.clears_superseded)."""
     import copy
     from . import sandboxstate
-    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF
+    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF, SANDBOX_KEYS, sandbox_on
 
     def at(node, dotted):
         for part in dotted.split("."):
@@ -9904,13 +9905,17 @@ def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
         if k != key and not k.startswith(key + ".") and not key.startswith(k + "."):
             continue
         new = at(after, k)
-        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])) and not (
+        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])) \
+                and not (k in SANDBOX_KEYS and not sandbox_on(new)) and not (
                 new in (None, False) and sandboxstate.clears_superseded(p, k, new)):
             return k
     return None
 
 
 def _refuse_user_only_in_run(key: str) -> None:
+    from .coordinator import SANDBOX_KEYS, sandbox_refusal
+    if key in SANDBOX_KEYS:
+        die(sandbox_refusal(key) + "; `ttp config` refuses turning it on inside a run")
     die(f"{key} is a setting only the user may change, and `ttp config` refuses to set it inside a run; "
         f"reading it still works. Name the value you need in the hand-off (a followup or the question) "
         f"so the coordinator can ask the user")
@@ -9921,7 +9926,7 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
     value, checked as config_set checks it), without setting anything; `list` prints every accepted key.
     Exit 0 when accepted, 1 when refused."""
     from . import chatset
-    from .coordinator import USER_SETTABLE, settable
+    from .coordinator import SANDBOX_KEYS, USER_SETTABLE, sandbox_on, sandbox_refusal, settable
     if key == "list":
         from . import accountset
         print("\n".join([*sorted([*USER_SETTABLE, *accountset.KEYS]), *chatset.PATTERNS]))
@@ -9934,6 +9939,8 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
             except ValueError:
                 val = value
             val = conv(val)
+        if key in SANDBOX_KEYS and (value is None or sandbox_on(val)):   # only its off value is chat's
+            raise ValueError(sandbox_refusal(key))
     except (ValueError, TypeError) as e:
         print(f"refused: {e}" if str(e).startswith(key) else f"{key}: refused: {e}")
         sys.exit(1)

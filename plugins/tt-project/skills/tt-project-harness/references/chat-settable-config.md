@@ -18,6 +18,9 @@ Besides the fixed list (budget, notify, delivery, review, coordinator and a few 
 The fixed list also holds `runner.host_commands`, the commands `ttp host-run` runs on the host outside the sandbox: a JSON list whose every entry is a command string (the words a request must equal or start with) or `{"cmd": "<command>", "timeout_s": N}` (1 to 3600).
 A plain shell string, a non-list, or any entry `ttp host-run` would refuse (empty, not a string, a bad `timeout_s`, an unknown key, a quote that does not close) is refused, naming the entry, and nothing is stored.
 
+Only off from chat: `providers.<p>.write_fence` and `sandbox.checks`, which turn namespace sandboxing on, are user-only.
+`config_set` (in a turn carrying a user message too) and `ttp config` inside any run refuse true and accept false or `''`; only the user's own word (`ttp config` in their own shell, or the web settings page) turns one on.
+
 Never from chat: any `providers.<p>.base_url`.
 Worker runs carry internal code, so the bridge sends them only to the base URL saved with the endpoint's key; leave `base_url` unset.
 The key itself never goes in config: only the alias does.

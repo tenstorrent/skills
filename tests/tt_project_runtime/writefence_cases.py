@@ -711,28 +711,25 @@ def test_the_upgrade_task_names_the_config_key_for_freed_commands():
 
 @pytest.mark.parametrize("argv_tail", [
     ["providers.claude.write_fence", "true"],                         # turns the sandbox back on
-    ["providers.claude.write_fence", "false"],                        # or off: the user's, both ways
     ["providers.codex.write_fence", "true"],
-    ["providers.claude", json.dumps({"tiers": {}})],                   # drops the user's false: back on
-    ["providers", json.dumps({})],                                     # through the whole section
+    ["providers.cursor.write_fence", '"on"'],
+    ["providers.claude", json.dumps({"write_fence": True})],           # through a parent key
+    ["providers", json.dumps({"chat": {"write_fence": True}})],        # through the whole section
 ])
-def test_a_run_cannot_change_the_worker_sandbox_without_the_user(env, capsys, monkeypatch, argv_tail):
-    """The worker sandbox (providers.<name>.write_fence) is a user-only setting: a run's `ttp config`
-    refuses to turn it back on (or off), directly or through a parent key, as it refuses a spend cap;
-    reading works, and outside a run (the user's own terminal) it sets."""
+def test_a_run_cannot_turn_the_worker_sandbox_on(env, capsys, monkeypatch, argv_tail):
+    """The worker sandbox (providers.<name>.write_fence) is turned on only by the user: a run's `ttp config`
+    refuses it, directly or through a parent key, as it refuses a spend cap; reading works, and outside a
+    run (the user's own terminal) it sets."""
     from ttp import cli
     from ttp.providers import fence_on
     p = make(env)
     p.set_config("providers.claude.write_fence", False)
     before = p.raw_config()
     monkeypatch.setenv("TTP_RUN_ID", "7")
-    if argv_tail[-1] == "false":   # the user's own later word: not superseded, so still theirs to clear
-        from ttp import configwho
-        p.set_config("providers.claude.write_fence", True, by=configwho.by("user", msgs=[3], via="chat"))
-        before = p.raw_config()
     with pytest.raises(SystemExit) as e:
         cli.main(["config", "demo", *argv_tail])
-    assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and "only the user may change" in err and "user's own word" in err, err
     assert p.raw_config() == before
     cli.main(["config", "demo", "providers.claude.write_fence"])      # reading works
     capsys.readouterr()
@@ -741,30 +738,47 @@ def test_a_run_cannot_change_the_worker_sandbox_without_the_user(env, capsys, mo
     assert fence_on(p.config(), "claude", p)
 
 
-def test_the_coordinator_changes_the_worker_sandbox_only_in_a_turn_carrying_the_users_word(env, capsys):
-    """config_set of providers.<name>.write_fence is refused in a turn without the user's message (an
-    event or hand-off wake: its own judgement), and applied in the turn carrying it."""
+@pytest.mark.parametrize("argv_tail", [
+    ["providers.claude.write_fence", "false"],
+    ["providers.claude.write_fence", ""],                             # unset: the default, unfenced
+    ["providers.claude", json.dumps({"tiers": {}})],                   # drops it through a parent key
+])
+def test_a_run_may_turn_the_worker_sandbox_off(env, capsys, monkeypatch, argv_tail):
+    """Off (false or unset) is the direction the user's unsandboxed-runs order takes: a run may write it."""
+    from ttp import cli
+    from ttp.providers import fence_on
+    p = make(env)
+    p.set_config("providers.claude.write_fence", True)
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    cli.main(["config", "demo", *argv_tail])
+    assert not fence_on(p.config(), "claude")
+
+
+def test_the_coordinator_never_turns_the_worker_sandbox_on_and_may_turn_it_off(env, capsys):
+    """config_set of providers.<name>.write_fence true is refused in every turn, the one carrying a user
+    message too, with the reason; false and unset are applied in any turn."""
     from ttp import cli, coordinator as coord
     from ttp.providers import fence_on
     p = make(env)
     p.set_config("providers.claude.write_fence", False)
-    for value in (True, "on", False):
-        out = coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": value}])
-        assert any("needs the user's approval" in x for x in out), (value, out)
-        assert not fence_on(p.config(), "claude", p)
+    for value in (True, "on", "true"):
+        for user_turn in (False, True):
+            out = coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": value}],
+                              user_turn=user_turn)
+            assert any("only the user may change" in x and "user's own word" in x for x in out), (value, out)
+            assert not fence_on(p.config(), "claude")
     assert "providers.claude.write_fence" not in coord.HELD_SETTING
-    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": True}],
-                       user_turn=True) == []
-    assert not fence_on(p.config(), "claude", p), "a turn without the user's own message records no user word"
-    mid = p.db.post("in", "turn the worker sandbox back on", chat="relay-chat")
-    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": True}],
-                       user_turn=True, messages=[mid]) == []
-    assert fence_on(p.config(), "claude", p)
-    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": "false"}],
-                       user_turn=True) == []
+    p.set_config("providers.claude.write_fence", True)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": "false"}]) == []
     assert p.raw_config()["providers"]["claude"]["write_fence"] is False
-    cli.main(["config", "--chat-settable", "providers.claude.write_fence", "true"])
-    assert "providers.claude.write_fence: accepted as true" in capsys.readouterr().out
+    p.set_config("providers.claude.write_fence", True)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": ""}]) == []
+    assert not fence_on(p.config(), "claude")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "--chat-settable", "providers.claude.write_fence", "true"])
+    assert e.value.code == 1 and "only the user may change" in capsys.readouterr().out
+    cli.main(["config", "--chat-settable", "providers.claude.write_fence", "false"])
+    assert "providers.claude.write_fence: accepted as false" in capsys.readouterr().out
 
 
 def _launch_role(env, p, provider, role, cwd, monkeypatch):
