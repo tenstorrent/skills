@@ -90,6 +90,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     restriction_source,
     reviewcap,
     rulecite,
+    sandboxstate,
     selfreview,
     reviewreuse,
     selfblock,
@@ -3639,7 +3640,9 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # Removing a user-only key is safe only where its default is off (none of OFF_VALUE's keys).
                 off = (key not in OFF_VALUE and _default_of(key) in (None, False, "", [])) if remove else (
                     (value == OFF_VALUE[key]) if key in OFF_VALUE else value in (False, "", []))
-                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and off):
+                # A superseded sandbox value (sandboxstate) is ignored by runs already: clearing it changes nothing.
+                if key in NEEDS_USER and not by_user and not (key in SAFE_WHEN_OFF and off) and not (
+                        (remove or value is False) and sandboxstate.clears_superseded(p, key, None if remove else False)):
                     if key in HELD_SETTING and relay.agent_orders(cfg) and messages and relay.recent(db, messages):
                         raise ValueError(relay.held_refusal(f"config_set {key}", HELD_SETTING[key], key,
                                                             "the setting name (HELD_SETTING)"))

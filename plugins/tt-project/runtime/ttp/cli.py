@@ -9753,11 +9753,13 @@ def cmd_account_config(key: str, value: str | None) -> None:
           else f"{key} removed (account-level); the default applies")
 
 
-def _user_only_change(raw: dict, key: str, val) -> str | None:
+def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
     """The user-only setting (coordinator.NEEDS_USER) that writing `val` at `key` into the project.json
     `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
-    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate."""
+    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate; so is
+    clearing a superseded sandbox value of project `p` (sandboxstate.clears_superseded)."""
     import copy
+    from . import sandboxstate
     from .coordinator import NEEDS_USER, SAFE_WHEN_OFF
 
     def at(node, dotted):
@@ -9779,7 +9781,8 @@ def _user_only_change(raw: dict, key: str, val) -> str | None:
         if k != key and not k.startswith(key + ".") and not key.startswith(k + "."):
             continue
         new = at(after, k)
-        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])):
+        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])) and not (
+                new in (None, False) and sandboxstate.clears_superseded(p, k, new)):
             return k
     return None
 
@@ -9907,7 +9910,7 @@ def cmd_config(a) -> None:
                 raise ValueError(f"{a.key} {json.dumps(val)[:160]}: {err}")
         except ValueError as e:
             die(str(e), 2)
-    if run and (k := _user_only_change(p.raw_config(), a.key, val)):
+    if run and (k := _user_only_change(p.raw_config(), a.key, val, p)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
         _refuse_user_only_in_run(k)
@@ -9928,7 +9931,7 @@ def _config_remove(p, key: str, run) -> None:
             or key.startswith("runner.host_commands.")) and configwho.from_env()["by"] == "worker":
         die("runner.host_commands (the commands `ttp host-run` may run outside the sandbox) is set only by "
             "the user or the coordinator, never by a worker: name the exact command in your hand-off")
-    if run and (k := _user_only_change(p.raw_config(), key, None)):
+    if run and (k := _user_only_change(p.raw_config(), key, None, p)):
         _refuse_user_only_in_run(k)
     try:
         removed = p.unset_config(key, by=configwho.from_env())

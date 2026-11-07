@@ -689,8 +689,9 @@ def test_a_run_cannot_change_the_worker_sandbox_without_the_user(env, capsys, mo
     p.set_config("providers.claude.write_fence", False)
     before = p.raw_config()
     monkeypatch.setenv("TTP_RUN_ID", "7")
-    if argv_tail[-1] == "false":
-        p.set_config("providers.claude.write_fence", True)
+    if argv_tail[-1] == "false":   # the user's own later word: not superseded, so still theirs to clear
+        from ttp import configwho
+        p.set_config("providers.claude.write_fence", True, by=configwho.by("user", msgs=[3], via="chat"))
         before = p.raw_config()
     with pytest.raises(SystemExit) as e:
         cli.main(["config", "demo", *argv_tail])
@@ -910,6 +911,55 @@ def test_a_sandbox_setting_the_user_made_after_the_order_stays_on(env, monkeypat
     assert spec["sandbox_state"] == "on: providers.claude.write_fence set by the user"
     assert "sandbox=claude-bash-sandbox (on: providers.claude.write_fence set by the user)" in log
     assert not p.db.q("SELECT 1 FROM issues WHERE watch_key LIKE 'sandbox-superseded:%'")
+
+
+def test_a_superseded_sandbox_setting_is_cleared_without_the_users_word(env, capsys, monkeypatch):
+    """A superseded write_fence or sandbox.checks true (runs ignore it) is removed, or set false, by the
+    coordinator's config_set in a turn without the user and by a run's `ttp config`; one the user set after
+    the order is still refused, and turning a sandbox on still needs the user."""
+    from ttp import cli, configwho, coordinator as coord, sandboxstate
+    p = make(env)
+    fence = "providers.claude.write_fence"
+    for key, value in ((fence, ""), (fence, False), (fence, "false")):   # sandbox.checks is not chat-settable
+        p.set_config(key, True, by=configwho.by("coordinator", via="config_set"))
+        assert sandboxstate.state(p, p.raw_config(), key)[2], "superseded"
+        assert coord.apply(p, [{"type": "config_set", "key": key, "value": value}]) == [], (key, value)
+        assert sandboxstate._value(p.raw_config(), key) in (None, False), (key, value)
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    for key in (fence, "sandbox.checks"):
+        p.set_config(key, True)   # no setter recorded: a leftover
+        cli.main(["config", "demo", key, ""])
+        assert sandboxstate._value(p.raw_config(), key) is None, key
+        p.set_config(key, True)
+        cli.main(["config", "demo", key, "false"])
+        assert sandboxstate._value(p.raw_config(), key) is False, key
+    capsys.readouterr()
+    # The user's own word after the order: still theirs, in a run and in a coordinator turn without them
+    # (sandbox.checks false is the safe side for anyone, SAFE_WHEN_OFF).
+    for key in (fence,):
+        p.set_config(key, True, by=configwho.by("user", msgs=[3], via="chat"))
+        before = p.raw_config()
+        for value in ("", "false"):
+            with pytest.raises(SystemExit) as e:
+                cli.main(["config", "demo", key, value])
+            assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err, (key, value)
+            assert p.raw_config() == before
+    monkeypatch.delenv("TTP_RUN_ID")
+    for value in ("", False):
+        out = coord.apply(p, [{"type": "config_set", "key": fence, "value": value}])
+        assert any("needs the user's approval" in x for x in out), (value, out)
+        assert p.raw_config()["providers"]["claude"]["write_fence"] is True
+    # Turning it on is never a clearing.
+    p.set_config(fence, True, by=configwho.by("coordinator", via="config_set"))
+    assert not sandboxstate.clears_superseded(p, fence, True)
+    for value in (True, "on"):
+        out = coord.apply(p, [{"type": "config_set", "key": "providers.codex.write_fence", "value": value}])
+        assert any("needs the user's approval" in x for x in out), (value, out)
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "demo", "providers.codex.write_fence", "true"])
+    assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err
+    assert "no ask needed" in sandboxstate.state(p, p.raw_config(), fence)[2]
 
 
 def test_status_shows_each_running_runs_sandbox_state(env):

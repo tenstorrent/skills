@@ -8,8 +8,9 @@ a network namespace and its socat proxies; sandbox.checks, the PID-namespace san
 commands) count only when the user's own word set them after that change, as configwho records it
 (role user, newer timestamp). Any other true value (one from before the change, or set by a coordinator,
 a worker, an upgrade or a hand edit) is superseded: runs ignore it and the daemon tells the project's
-coordinator once, at low severity, so it can clean up its own config. Nothing here rewrites a project's
-config. A Restriction that needs a sandbox (no_internet) is not a setting and still applies.
+coordinator once, at low severity, so it can clean up its own config: removing a superseded value, or
+setting it false, needs no one's word (clears_superseded), as runs already ignore it. Nothing here rewrites
+a project's config. A Restriction that needs a sandbox (no_internet) is not a setting and still applies.
 """
 from __future__ import annotations
 
@@ -48,7 +49,23 @@ def state(p, cfg: dict, key: str) -> tuple[bool, str, str]:
         f"{key} is true in project.json but runs ignore it: every project runs unsandboxed since "
         f"{timefmt.long(UNSANDBOXED_SINCE, p)}, "
         f"and only the user's own word after that turns a sandbox back on (this one: {setter}). Remove the key "
-        f"from project.json, or set it again on the user's word if they want it on.")
+        f"(`ttp config {getattr(p, 'name', None) or '<project>'} {key} ''`; no ask needed: runs already ignore it), "
+        f"or set it again on the user's word "
+        f"if they want it on.")
+
+
+def clears_superseded(p, key: str, new) -> bool:
+    """Whether writing `new` (None: remove it) at sandbox setting `key` of project `p` only clears a
+    superseded true value. Runs already ignore that value, so the effective state stays off and the
+    change needs no one's word; a value the user set after UNSANDBOXED_SINCE is never cleared this way."""
+    if new not in (None, False) or p is None or not (
+            key == CHECKS_KEY or (key.startswith("providers.") and key.endswith(".write_fence") and key.count(".") == 2)):
+        return False
+    try:
+        raw = p.raw_config()
+    except Exception:
+        return False
+    return bool(state(p, raw, key)[2])
 
 
 def fence(p, cfg: dict, provider: str) -> tuple[bool, str, str]:
