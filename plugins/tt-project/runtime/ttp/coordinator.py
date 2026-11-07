@@ -3091,10 +3091,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 elif a.get("text"):
                     # Kept as the reason, a note would outlive the state it described.
                     spec = "\n\n".join(x for x in (spec, a["text"]) if x)
-                base, whole, history = task["spec"], False, []
+                base, whole, history, told = task["spec"], False, [], None
                 if spec:   # its `retire:` and `replace:` lines edit the live spec (spec_edits)
                     try:
-                        base, spec, whole, history = spec_edits(base, spec)
+                        base, spec, told, whole, history = spec_edits(base, spec)
                     except ValueError as e:
                         raise ValueError(f"#{task['id']} rejected: {e}") from None
                 if a.get("replace") is not None:   # one step replaced or withdrawn; the old text goes to history
@@ -3102,9 +3102,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                         raise ValueError(f"#{task['id']} rejected: `replace:` replaces the whole spec; drop the `replace` field")
                     base, said = replace_step(base, a["replace"])
                     spec = "\n\n".join(x for x in (spec, said) if x)
+                    told = told and "\n\n".join((told, said))
                     history.append({"old": a["replace"]["old"], "new": a["replace"].get("new") or ""})
                 # Last, so the field wins over a `pr_branch:` line of the same update (recorded_pr_branch).
                 spec = "\n\n".join(x for x in (spec, branch_line) if x)
+                told = told and "\n\n".join(x for x in (told, branch_line) if x)
                 if a.get("priority"):
                     upd["priority"] = int(a["priority"])
                     # A review hop given a priority keeps it; its chain's changes no longer move it.
@@ -3217,8 +3219,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if spec and task["status"] == "running":
                     for r in db.q("SELECT dir FROM runs WHERE task=? AND status='running'", (task["id"],)):
                         if r["dir"]:
-                            _append_update(Path(r["dir"], "steer.md"),
-                                           f"{WHOLE_SPEC_REPLACED}\n\n{spec}" if whole else spec, key)
+                            _append_update(Path(r["dir"], "steer.md"), told or spec, key)
                     if upd.get("status") != "cancelled" and (why := preempt.restart_line(spec)):
                         # The run went the wrong way: stopped at a safe point (after its `ttp lock`s), requeued
                         # with this spec and its work kept, no attempt spent (preempt.request_restart).
@@ -6465,11 +6466,15 @@ def replace_step(spec: str, rep) -> tuple[str, str]:
 _RETIRE_LINE = re.compile(r'^\s*retire:\s*"(.+)"\s*$', re.I)
 _REPLACE_LINE = re.compile(r"^\s*replace:\s*$", re.I)
 WHOLE_SPEC_REPLACED = "The whole spec was replaced: everything it said before no longer applies. It now reads:"
+RETIRED_LIVE = "Retired: an earlier text of this spec no longer applies (it is kept in the task's history)."
+RETIRED_TOLD = "Retired (this earlier text no longer applies; do not act on it):"
 
 
-def spec_edits(spec: str, update: str) -> tuple[str, str, bool, list[dict]]:
-    """(the live spec, the update text to add or, when whole, the new spec, whole, history entries) for a
-    task_update `update`; ValueError on a quote matching nothing, a safety line or a misplaced `replace:`."""
+def spec_edits(spec: str, update: str) -> tuple[str, str, str, bool, list[dict]]:
+    """(the live spec, the update text to add or, when whole, the new spec, the text a running worker is told,
+    whole, history entries) for a task_update `update`; ValueError on a quote matching nothing, a safety line
+    or a misplaced `replace:`. The live spec never repeats a retired quote: only the running worker, who
+    read it, is told which text it was."""
     lines = update.split("\n")
     first = next((i for i, ln in enumerate(lines) if ln.strip()), None)
     whole = [i for i, ln in enumerate(lines) if _REPLACE_LINE.match(ln)]
@@ -6488,8 +6493,8 @@ def spec_edits(spec: str, update: str) -> tuple[str, str, bool, list[dict]]:
                                   if old_lines[i].strip() not in have))
         if kept:
             new += "\n\nKept from the earlier spec (safety lines change only through the charter):\n" + "\n".join(kept)
-        return new, new, True, [{"old": spec, "new": new, "how": "replace"}]
-    history = []
+        return new, new, f"{WHOLE_SPEC_REPLACED}\n\n{new}", True, [{"old": spec, "new": new, "how": "replace"}]
+    history, told = [], list(lines)
     for i in retires:
         quote = _RETIRE_LINE.match(lines[i]).group(1)
         if len(quote.strip()) < 8:
@@ -6503,9 +6508,10 @@ def spec_edits(spec: str, update: str) -> tuple[str, str, bool, list[dict]]:
                                  f"Restrictions and guards change only through the charter")
             at += len(quote)
         spec = spec.replace(quote, "")
-        lines[i] = f"Retired (this earlier text no longer applies; do not act on it): {' '.join(quote.split())[:300]!r}"
+        lines[i] = RETIRED_LIVE
+        told[i] = f"{RETIRED_TOLD} {' '.join(quote.split())[:300]!r}"
         history.append({"old": quote, "new": "", "how": "retire", "copies": n})
-    return spec, "\n".join(lines), False, history
+    return spec, "\n".join(lines), "\n".join(told), False, history
 
 
 def _append_update(steer: Path, text: str, key: str | None = None) -> None:

@@ -22992,8 +22992,8 @@ def test_task_update_spec_retire_line_drops_every_copy_and_keeps_the_history(env
     upd = 'retire: "' + _QUOTED + '"\nRun only the quick sweep.'
     assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
     spec = p.db.task(tid)["spec"]
-    assert "run the full sweep tonight" not in spec.split("Retired (")[0]
-    assert spec.count("run the full sweep tonight") == 1 and "Retired (this earlier text no longer applies" in spec
+    # The live spec never repeats the retired quote (a fresh run never saw it); only the running worker is told.
+    assert "full sweep" not in spec and spec.count(coord.RETIRED_LIVE) == 1 and coord.RETIRED_TOLD not in spec
     assert spec.endswith("Run only the quick sweep.") and "never push to main" in spec and "1. profile it" in spec
     told = steer.read_text()
     assert "Retired (this earlier text no longer applies; do not act on it)" in told and "full sweep tonight" in told
