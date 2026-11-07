@@ -185,6 +185,8 @@ PREEMPTED_ENV = "TTP_CHECKS_PREEMPTED"   # this routine run was preempted: "urge
 CLAIM = "claim"   # check-slots/claim.<token>.json: the slot a preempted run frees is its asker's (preempt)
 CLAIM_S = 30.0   # a claim lapses this long after its asker last renewed it (it renews while the asked run holds)
 CLAIM_MAX_S = 600.0   # and this long after it was made, however often renewed
+CLAIM_POLL_S = 0.5   # an asker with a live claim looks this often, so it takes the freed slot at once
+HANDOVER_S = 3.0   # a parked asker that still cannot start this long after the asked run let go drops its claim
 # The run a preempt would stop: testslots counts the test slots it holds as free (preempt's `startable`).
 FREEING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("checkcap_freeing", default=None)
 RERANK_ENV = "TTP_CHECKS_RERANKED"   # these waiting checks re-executed once as urgent (reranked)
@@ -1099,7 +1101,10 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     relabels its lane: testslots.PARKED_WAITS). With `urgent` an urgent run (is_urgent(`priority`)) that would
     wait takes a free reserved urgent slot instead (urgent_paths; Slot.urgent), parked or not, unless the same
     checks run now; with none free it asks the lowest-priority preemptible routine run on a slot of the cap
-    to give its slot up (preempt), once a wait, and then takes the first one that frees, in turn or not.
+    to give its slot up (preempt), once a wait, and then takes the first one that frees, in turn or not:
+    the freed slot is its own (its claim) and it looks every CLAIM_POLL_S, so it starts within a second of the
+    asked run letting go. Asked while parked, it keeps the claim parked; still parked HANDOVER_S after that run
+    let go, it drops it and the slot goes to the next waiter.
     `preemptible`: the caller stops its checks when asked (preempted), so its slot's label says it may be
     asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`.
     `small` (is_small): its queue and PARKED tickets mark a short run (locks.SMALL_TICKET), which goes first
@@ -1115,6 +1120,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     since = time.time() if since is None else since
     held_as = holder.replace(requeued(), "") if requeued() else holder   # a slot it holds is no requeue
     asked, claim = _asked(since), _asked(since, "claim")   # one request asks once, over a re-execution too
+    parked_ask = bool(_asked(since, "parked"))   # it asked while parked: it waits parked for that run's slots
     waiting = checkwait.chain(waiting, "host-wide checks slot")   # inside a push check: not its run time
     ps, every = paths(n), all_paths(n)
     queued_as = holder + (OBLIGATION_MARK if priority is not None and priority < 1 else "")
@@ -1195,14 +1201,20 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if not f and asked and not twin and not parked:   # the slot a preempted run gave up is this run's
                 f = _take(n, paths(n), every, held_as, what, same, label=label, mine=claim)
             if claim and not f:
-                renew_claim(claim, parked)
+                # Asked while parked, it keeps its claim parked until the asked run lets go; still unable to
+                # start HANDOVER_S after that, it drops it, so the freed slot goes to the next waiter now.
+                renew_claim(claim, parked and not parked_ask)
+                if parked and (gone := claim_freed_s(claim)) is not None and gone >= HANDOVER_S:
+                    drop_claim(claim)
+                    claim = ""
             if (not f and not asked and not twin and urgent and is_urgent(priority)
                     and time.time() - since >= preempt_after_s()):
                 # Only a run whose stop lets this one start: parked, its test slots must fit once that run's free.
-                claim = secrets.token_hex(6)
+                claim, parked_ask = secrets.token_hex(6), parked
                 if asked := preempt(holder, every, project_name, startable=startable if parked else None,
                                     claim=claim, owed=bool(owns)):
-                    os.environ[PREEMPT_ASKED_ENV] = json.dumps({"since": since, "asked": asked, "claim": claim})
+                    os.environ[PREEMPT_ASKED_ENV] = json.dumps({"since": since, "asked": asked, "claim": claim,
+                                                                **({"parked": True} if parked else {})})
                     if tell:
                         tell(PREEMPT_LINE.format(asked))
                 else:
@@ -1227,7 +1239,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 told = time.time()
             if max_wait_s is not None and time.time() - started >= max_wait_s:
                 return None
-            time.sleep(poll_s(POLL_S))
+            # A live claim: the asked run's slot is this run's the moment it frees, so it looks often.
+            time.sleep(poll_s(CLAIM_POLL_S if claim and claim_live(claim) else POLL_S))
             project.ps_cycle()   # pids are read once per poll cycle, never one `ps` each (ps_snapshot)
     finally:
         locks.dequeue(ticket)
@@ -1448,7 +1461,8 @@ def claim_live(token: str) -> bool:
 
 def renew_claim(token: str, parked: bool) -> None:
     """Keep the claim `token` alive while the run it asked still holds its slot and the asker could take
-    it (not `parked`); once that run let it go, or while the asker parks, it lapses within CLAIM_S."""
+    it (not `parked`: an asker that asked while parked passes False, it waits parked for that run's test
+    slots); once that run let it go, or while the asker parks, it lapses within CLAIM_S."""
     path = _claim_path(token)
     rec = _read(path)
     if parked or not _claim_live(rec, time.time()):
@@ -1457,6 +1471,18 @@ def renew_claim(token: str, parked: bool) -> None:
     if rec.get("slot") and locks._slot_labels([slot]) and same_owner(_read(slot), rec.get("victim") or {}):
         with contextlib.suppress(OSError):
             _write(path, {**rec, "at": time.time()})
+
+
+def claim_freed_s(token: str) -> float | None:
+    """Seconds since the run the live claim `token` asked let go of its slot (its last renewal), None while
+    it still holds it or the claim is gone."""
+    rec = _read(_claim_path(token))
+    if not token or not _claim_live(rec, time.time()):
+        return None
+    slot = slot_dir() / str(rec.get("slot") or "")
+    if rec.get("slot") and locks._slot_labels([slot]) and same_owner(_read(slot), rec.get("victim") or {}):
+        return None
+    return max(0.0, time.time() - float(rec.get("at") or 0))
 
 
 def drop_claim(token: str) -> None:

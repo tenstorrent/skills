@@ -9044,6 +9044,95 @@ def test_an_urgent_checks_run_with_no_urgent_slot_preempts_the_lowest_priority_r
                 h.close()
 
 
+def _preempt_cap_of_one(monkeypatch):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+
+
+def test_a_parked_urgent_run_gets_the_slot_its_preempt_frees_at_once_not_at_its_next_poll(env, monkeypatch):
+    """[note 0781a4c0bc1d23dc]: an urgent run parked for its test slots asks a routine holder whose stop lets
+    it start. Its claim lives on while that run holds (past CLAIM_S: the run is still asked), and once the run
+    lets go the asker takes the slot within a second or two, not at its next POLL_S (5 s) poll."""
+    import threading
+    from ttp import checkcap
+    _preempt_cap_of_one(monkeypatch)
+    monkeypatch.delenv("TTP_TEST_POLL_S", raising=False)   # the real poll interval: the wake must beat it
+    monkeypatch.setattr(checkcap, "CLAIM_S", 1.0)
+    assert checkcap.POLL_S >= 5.0
+    victim = checkcap.acquire("routine 5", priority=5, preemptible=True)
+    freed = [False]   # the victim's test slots: free once it stops (testslots counts them so under FREEING)
+    told, got, at = [], [], []
+    t = threading.Thread(target=lambda: (got.append(checkcap.acquire(
+        "urgent", priority=0, urgent=True, tell=told.append, max_wait_s=30,
+        startable=lambda: checkcap.FREEING.get() is not None or freed[0])), at.append(time.time())))
+    t.start()
+    try:
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine 5") in told, 10), told
+        assert checkcap.PARKED_LINE in told, "it asked while parked"
+        time.sleep(2.0)   # past CLAIM_S: a parked asker's claim, and with it the request, must not lapse
+        assert checkcap.preempted(victim.since) == "urgent urgent", "the asked run is still asked"
+        freed[0] = True
+        victim.close()
+        gone = time.time()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None
+        assert at[0] - gone < 2.0, f"granted {at[0] - gone:.1f} s after the slot freed"
+    finally:
+        checkcap.clear_preempt()
+        victim.close()
+        t.join(30)
+        got and got[0] and got[0].close()
+
+
+def test_a_parked_asker_that_still_cannot_start_lets_the_freed_slot_go_to_the_next_waiter(env, monkeypatch):
+    """[note 0781a4c0bc1d23dc]: no slot sits idle while a waiter that could use it waits. The parked urgent
+    asker still cannot start after the asked run let go (its test slots went elsewhere): HANDOVER_S later it
+    drops its claim and the queued routine waiter takes the slot, long before the claim would lapse."""
+    import threading
+    from ttp import checkcap
+    _preempt_cap_of_one(monkeypatch)
+    monkeypatch.setenv("TTP_TEST_POLL_S", "0.2")
+    assert checkcap.CLAIM_S >= 30 and checkcap.HANDOVER_S < 5
+    victim = checkcap.acquire("routine 5", priority=5, preemptible=True)
+    stop = [""]
+    told, urgent, waiter, at = [], [], [], []
+
+    def asker():
+        try:
+            urgent.append(checkcap.acquire("urgent", priority=0, urgent=True, tell=told.append, max_wait_s=30,
+                                           stop=lambda: stop[0],
+                                           startable=lambda: checkcap.FREEING.get() is not None))
+        except checkcap.Cancelled:
+            urgent.append(None)
+    ta = threading.Thread(target=asker)
+    ta.start()
+    tw = None
+    try:
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("routine 5") in told, 10), told
+        tw = threading.Thread(target=lambda: (waiter.append(checkcap.acquire("routine 3", priority=3, max_wait_s=30)),
+                                              at.append(time.time())))
+        tw.start()
+        assert _wait_for(lambda: checkcap.state()["queued"], 10)
+        victim.close()
+        gone = time.time()
+        tw.join(30)
+        assert waiter and waiter[0] is not None and waiter[0].f is not None
+        assert at[0] - gone < checkcap.HANDOVER_S + 2.0, f"the slot sat free {at[0] - gone:.1f} s"
+        assert ta.is_alive() and not urgent, "the asker that cannot start still waits"
+    finally:
+        stop[0] = "test over"
+        checkcap.clear_preempt()
+        victim.close()
+        ta.join(30)
+        tw and tw.join(30)
+        for g in urgent + waiter:
+            g and g.close()
+
+
 def test_a_preempted_routine_checks_run_requeues_at_its_old_place_and_runs_again(env, tmp_path, monkeypatch, capsys):
     """#6149 (c): a routine run asked for its slot (checkcap.preempt) ends its command, frees the slot and
     queues again at its first arrival, then runs to its result."""
