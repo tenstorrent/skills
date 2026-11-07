@@ -1001,8 +1001,8 @@ def test_a_sandbox_setting_the_user_made_after_the_order_stays_on(env, monkeypat
 
 def test_a_superseded_sandbox_setting_is_cleared_without_the_users_word(env, capsys, monkeypatch):
     """A superseded write_fence or sandbox.checks true (runs ignore it) is removed, or set false, by the
-    coordinator's config_set in a turn without the user and by a run's `ttp config`; one the user set after
-    the order is still refused, and turning a sandbox on still needs the user."""
+    coordinator's config_set in a turn without the user and by a run's `ttp config`; so is one the user set
+    after the order (off is anyone's, SANDBOX_KEYS), and turning a sandbox on still needs the user."""
     from ttp import cli, configwho, coordinator as coord, sandboxstate
     p = make(env)
     fence = "providers.claude.write_fence"
@@ -1020,27 +1020,23 @@ def test_a_superseded_sandbox_setting_is_cleared_without_the_users_word(env, cap
         cli.main(["config", "demo", key, "false"])
         assert sandboxstate._value(p.raw_config(), key) is False, key
     capsys.readouterr()
-    # The user's own word after the order: still theirs, in a run and in a coordinator turn without them
-    # (sandbox.checks false is the safe side for anyone, SAFE_WHEN_OFF).
-    for key in (fence,):
-        p.set_config(key, True, by=configwho.by("user", msgs=[3], via="chat"))
-        before = p.raw_config()
-        for value in ("", "false"):
-            with pytest.raises(SystemExit) as e:
-                cli.main(["config", "demo", key, value])
-            assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err, (key, value)
-            assert p.raw_config() == before
+    # The user's own word after the order: off is still anyone's (their unsandboxed-runs order), in a run
+    # and in a coordinator turn without them; only turning a sandbox on is theirs.
+    for value in ("", "false"):
+        p.set_config(fence, True, by=configwho.by("user", msgs=[3], via="chat"))
+        cli.main(["config", "demo", fence, value])
+        assert sandboxstate._value(p.raw_config(), fence) in (None, False), value
     monkeypatch.delenv("TTP_RUN_ID")
     for value in ("", False):
-        out = coord.apply(p, [{"type": "config_set", "key": fence, "value": value}])
-        assert any("needs the user's approval" in x for x in out), (value, out)
-        assert p.raw_config()["providers"]["claude"]["write_fence"] is True
+        p.set_config(fence, True, by=configwho.by("user", msgs=[3], via="chat"))
+        assert coord.apply(p, [{"type": "config_set", "key": fence, "value": value}]) == [], value
+        assert sandboxstate._value(p.raw_config(), fence) in (None, False), value
     # Turning it on is never a clearing.
     p.set_config(fence, True, by=configwho.by("coordinator", via="config_set"))
     assert not sandboxstate.clears_superseded(p, fence, True)
     for value in (True, "on"):
         out = coord.apply(p, [{"type": "config_set", "key": "providers.codex.write_fence", "value": value}])
-        assert any("needs the user's approval" in x for x in out), (value, out)
+        assert any("only the user may change" in x for x in out), (value, out)
     monkeypatch.setenv("TTP_RUN_ID", "7")
     with pytest.raises(SystemExit) as e:
         cli.main(["config", "demo", "providers.codex.write_fence", "true"])
