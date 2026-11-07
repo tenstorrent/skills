@@ -488,6 +488,9 @@ def test_queue_wait_counts_a_detached_push_lock_holder_and_raises_nothing_while_
         ev = _qw_events(p)
         assert len(ev) == 1 and "1 running (cap 1)" in ev[0]["text"] and "task #41" in ev[0]["text"] \
             and "Holding: none seen" not in ev[0]["text"], ev
+        locks.relabel(f, {"since": "garbled"})
+        info = queuewait._holders(p.db, p, "push", "", QW_CFG, now)
+        assert not info.get("live") and len(info["running"]) == 1, "an unreadable start is never within its limit"
     finally:
         for f in held:
             f.close()

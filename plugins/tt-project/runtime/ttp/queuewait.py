@@ -186,7 +186,10 @@ def _push_turns(p, out: dict, now: float) -> None:
         if h.get("alive") is False or h.get("stale"):
             continue
         pids.add(h.get("pid"))
-        held = max(0.0, now - float(h.get("since") or now))
+        try:
+            held = max(0.0, now - float(h.get("since") or now))
+        except (TypeError, ValueError):
+            held = PUSH_HOLD_LIMIT_S + 1   # an unreadable start: counted, never trusted as within its limit
         step = f"step {h['step']}, " if h.get("step") else ""
         out["running"].append(f"{p.name} {h.get('holder') or 'a push'} ({step}held {held / 60:.0f} min)")
         out["live"] = out.get("live") or held <= PUSH_HOLD_LIMIT_S
