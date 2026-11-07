@@ -186,6 +186,7 @@ CLAIM = "claim"   # check-slots/claim.<token>.json: the slot a preempted run fre
 CLAIM_S = 30.0   # a claim lapses this long after its asker last renewed it (it renews while the asked run holds)
 CLAIM_MAX_S = 600.0   # and this long after it was made, however often renewed
 CLAIM_POLL_S = 0.5   # an asker with a live claim looks this often, so it takes the freed slot at once
+PARKED_CLAIM_S = 60.0   # an asker that asked while parked renews its claim parked this long from the ask
 HANDOVER_S = 3.0   # a parked asker that still cannot start this long after the asked run let go drops its claim
 # The run a preempt would stop: testslots counts the test slots it holds as free (preempt's `startable`).
 FREEING: contextvars.ContextVar[dict | None] = contextvars.ContextVar("checkcap_freeing", default=None)
@@ -1203,7 +1204,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if claim and not f:
                 # Asked while parked, it keeps its claim parked until the asked run lets go; still unable to
                 # start HANDOVER_S after that, it drops it, so the freed slot goes to the next waiter now.
-                renew_claim(claim, parked and not parked_ask)
+                renew_claim(claim, parked, parked_ask)
                 if parked and (gone := claim_freed_s(claim)) is not None and gone >= HANDOVER_S:
                     drop_claim(claim)
                     claim = ""
@@ -1459,13 +1460,16 @@ def claim_live(token: str) -> bool:
     return bool(token) and _claim_live(_read(_claim_path(token)), time.time())
 
 
-def renew_claim(token: str, parked: bool) -> None:
+def renew_claim(token: str, parked: bool, asked_parked: bool = False) -> None:
     """Keep the claim `token` alive while the run it asked still holds its slot and the asker could take
-    it (not `parked`: an asker that asked while parked passes False, it waits parked for that run's test
-    slots); once that run let it go, or while the asker parks, it lapses within CLAIM_S."""
+    it (not `parked`); once that run let it go, or while the asker parks, it lapses within CLAIM_S. An asker
+    that asked while parked (`asked_parked`: it waits parked for that run's test slots) renews it parked for
+    PARKED_CLAIM_S from the ask, time for the asked run to see the request and stop, never longer."""
     path = _claim_path(token)
     rec = _read(path)
-    if parked or not _claim_live(rec, time.time()):
+    now = time.time()
+    if not _claim_live(rec, now) or (parked and not (asked_parked and now - float(rec.get("made") or 0)
+                                                      < PARKED_CLAIM_S)):
         return
     slot = slot_dir() / str(rec.get("slot") or "")
     if rec.get("slot") and locks._slot_labels([slot]) and same_owner(_read(slot), rec.get("victim") or {}):
