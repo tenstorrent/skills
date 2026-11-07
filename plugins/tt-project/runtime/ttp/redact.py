@@ -15,10 +15,12 @@ becomes `[secret:<slot>]`, e.g. `[secret:endpoint/tt-cloud]`. One helper for eve
 - text sent to a helper model or service (Jev, Slack) and endpoint client errors.
 
 Every private-key block (PEM, from its `BEGIN <type> PRIVATE KEY` line to its END line, PGP PRIVATE KEY
-BLOCK) becomes KEY_MASK the same way, stored or not, raw or JSON-escaped; one cut off before its END
-line (a lone BEGIN line too) is masked to the end of its string (the first character a key body never
-holds, such as the quote closing a JSON string), so JSONL stays valid; a lone END line is masked with
-the base64 lines right above it (a block whose start output trimming cut off).
+BLOCK) becomes KEY_MASK the same way, stored or not, raw or JSON-escaped. One cut off before its END
+line (a lone BEGIN line too) is masked: in raw text through the last key line after it (base64, or a
+header such as `Proc-Type: 4,ENCRYPTED`), so prose after a quoted marker line stays; inside a
+JSON-escaped string to the end of that string (the first character a key body never holds, such as the
+quote closing it), so JSONL stays valid. A lone END line is masked with the base64 lines right above it
+(a block whose start output trimming cut off).
 
 Nothing here prints or logs a value: callers get the masked text, or a count.
 """
@@ -40,8 +42,16 @@ _KEY_TYPE = r"(?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?"
 # A key body: base64, PEM and PGP armor headers (Proc-Type, DEK-Info, Version, Comment) and line ends,
 # raw or JSON-escaped (once or more: JSON in a JSON string); never a quote or a lone backslash.
 _KEY_BODY = r"(?:[A-Za-z0-9+/=:,.()\- \t\r\n]|\\+[nrt/]|\\+u[0-9a-fA-F]{4})"
-_KEY_RE = (rf"-{{4,5}} ?BEGIN {_KEY_TYPE} ?-{{4,5}}{_KEY_BODY}*?"
-           rf"(?:-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}|(?!{_KEY_BODY}))")
+# Cut off inside a JSON-escaped string (an escaped line end after BEGIN): to the end of that string.
+_ESC_BODY = r"(?:[A-Za-z0-9+/=:,.()\- \t]|\\+[nrt/]|\\+u[0-9a-fA-F]{4})"
+_ESC_CUT = rf"{_ESC_BODY}*?\\+n{_ESC_BODY}*(?!{_ESC_BODY})"
+# Cut off in raw text: base64 on the BEGIN line, then each line that looks like a key line: base64 (a
+# partial one when cut mid-line: 16 or more of it) or a header (Name: value). Prose stops it.
+_B64 = r"[A-Za-z0-9+/=]"
+_RAW_LINE = rf"[ \t]*(?:{_B64}+[ \t]*(?=\r?\n|\Z)|{_B64}{{16,}}|[A-Za-z][A-Za-z0-9-]*:[ \t][^\r\n\"'`\\]*)"
+_RAW_CUT = rf"(?:[ \t]+{_B64}{{16,}})*(?:(?:[ \t]*\r?\n)+{_RAW_LINE})*"
+_KEY_RE = (rf"-{{4,5}} ?BEGIN {_KEY_TYPE} ?-{{4,5}}"
+           rf"(?:{_KEY_BODY}*?-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}|{_ESC_CUT}|{_RAW_CUT})")
 KEY_RE = re.compile(_KEY_RE)
 _KEY_END_RE = re.compile(rf"-{{4,5}} ?END {_KEY_TYPE} ?-{{4,5}}")
 # One base64 line, raw or JSON-escaped, from a line start (or the text's) to its line end last.
@@ -200,18 +210,37 @@ def session_id(output: Path) -> str:
     return ""
 
 
+# A started or queued job in a run's folder (`ttp detach`: <name>.started or .queued; `ttp checks --detach`:
+# checks.pid) that has neither <name>.rc nor <name>.lost yet still writes <name>.log and <name>.out.
+_JOB_MARKS = (".started", ".queued")
+
+
+def live_job_logs(files: list[Path]) -> set[Path]:
+    """The logs among a folder's `files` a detached job still writes. A rewrite renames a new file over
+    one, so the job's later lines would go to the old, unlinked file: they are left for detach.close."""
+    out: set[Path] = set()
+    for f in files:
+        if f.suffix in _JOB_MARKS or f.name == "checks.pid":
+            stem = f.name[:-len(f.suffix)]
+            if not f.with_name(stem + ".rc").exists() and not f.with_name(stem + ".lost").exists():
+                out |= {f.with_name(stem + ".log"), f.with_name(stem + ".out")}
+    return out
+
+
 def scrub_run(run_dir: Path) -> int:
     """Masks private keys and stored secrets in every file of a finished run's folder (output, logs,
-    hand-off) and in the agent's own session transcript for that run. Returns how many it masked; safe
-    to run twice."""
+    hand-off) but the logs a detached job still writes (live_job_logs), and in the agent's own session
+    transcript for that run. Returns how many it masked; safe to run twice."""
     run_dir = Path(run_dir)
     n = 0
     try:
         files = [f for f in run_dir.rglob("*") if f.is_file() and not f.is_symlink()]
+        live = live_job_logs(files)
     except OSError:
-        files = []
+        files, live = [], set()
     for f in files:
-        n += scrub_file(f)
+        if f not in live:
+            n += scrub_file(f)
     try:
         spec = json.loads((run_dir / "run.json").read_text())
     except (OSError, ValueError):

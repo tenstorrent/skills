@@ -1360,23 +1360,98 @@ def test_a_run_that_prints_a_private_key_keeps_it_out_of_every_copy(env, monkeyp
     assert _no_key(dump, lines) and _masked(dump)
     outbox.add("peer", ["say", "the key: " + block], outbox.new_id(), None)
     assert _no_key(outbox.path("peer").read_text(), lines) and _masked(outbox.path("peer").read_text())
-    (run_dir / "progress.md").write_text("15:00 note: " + block + "x" * 7990 + "\n")   # a live run: not masked yet
     if _sockets_refused():
         return
     from ttp import web
     port = _start_web(p)
-    for path in (f"/api/run/{run['id']}", "/api/state"):
-        req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"X-TTP-Token": web.token(p)})
-        for _ in range(50):
-            try:
-                body = urllib.request.urlopen(req, timeout=5).read().decode()
-                break
-            except urllib.error.URLError:
-                time.sleep(0.1)
-        assert _no_key(body, lines), path
-        json.loads(body)
+    # A live run's progress.md (not masked yet): the block inside the 8000-character tail /api/run shows,
+    # then one the tail cut lands inside, mid-line, which only masking before the cut catches.
+    lead = "15:00 note: "
+    cut = block.index(lines[3]) + 10
+    for pad in (100, 8000 + cut - len(block) - 1):
+        (run_dir / "progress.md").write_text(lead + block + "x" * pad + "\n")
+        for path in (f"/api/run/{run['id']}", "/api/state"):
+            req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", headers={"X-TTP-Token": web.token(p)})
+            for _ in range(50):
+                try:
+                    body = urllib.request.urlopen(req, timeout=5).read().decode()
+                    break
+                except urllib.error.URLError:
+                    time.sleep(0.1)
+            assert _no_key(body, lines) and not _key_piece(body, lines), (path, pad)
+            view = json.loads(body)
+            if path.startswith("/api/run"):
+                assert "x" * 50 in view["progress"], "the view shows the progress tail"
+
+
+def _key_piece(text, lines, n=20):
+    """Whether any `n` characters in a row of the key's body show in `text` (a line cut mid-way)."""
+    return any(ln[i:i + n] in text for ln in lines for i in range(0, len(ln) - n + 1))
 
 
 def _masked(text):
     from ttp import redact
     return redact.KEY_MASK in text
+
+
+def test_prose_after_a_lone_key_marker_line_survives_and_a_cut_block_is_still_masked(env):
+    """Review #6952: a raw BEGIN line with no END after it masked everything up to the next quote, so a
+    stored chat message or task spec that quoted the marker lost its prose for good (Db.x scrubs every
+    string). In raw text a cut-off block ends at its last key line; in a JSON string, at the string's end."""
+    from ttp import redact
+    block, lines = _key_block("RSA", "Proc-Type: 4,ENCRYPTED\nDEK-Info: AES-128-CBC,0A1B\n\n")
+    begin = block.splitlines()[0]
+    prose = "This line, with text: (more) and 2.5 words.\n\nAnother paragraph. Done"
+    for text in (begin + "\n" + prose, "see " + begin + " in the file.\n" + prose, begin + "\r\n" + prose,
+                 begin + "\nNote: a header-like line\n" + prose):
+        out = redact.scrub(text)
+        assert out.endswith(prose) and "PRIVATE" not in out and redact.KEY_MASK in out, out
+    cut = block.index(lines[2]) + 30   # cut mid-line, then prose or a trimming mark
+    for tail in ("", "\n" + prose, "...\n" + prose, "\n\n" + prose):
+        out = redact.scrub("x " + block[:cut] + tail)
+        assert _no_key(out, lines) and not _key_piece(out, lines) and "DEK-Info" not in out, out
+        assert out.endswith(tail.lstrip(".")) if tail else out == "x " + redact.KEY_MASK, out
+    squashed = begin + " " + " ".join(lines[:4]) + "\n" + prose   # one line, cut before its END
+    out = redact.scrub(squashed)
+    assert out == redact.KEY_MASK + "\n" + prose and not _key_piece(out, lines)
+    js = json.dumps({"t": "x " + block[:cut] + " then prose, all one string"}) + "\n" + json.dumps({"n": 1})
+    out = redact.scrub(js)   # JSON-escaped: to the end of its string, and the JSONL stays valid
+    assert [json.loads(x) for x in out.splitlines()] == [{"t": "x " + redact.KEY_MASK}, {"n": 1}]
+    p = make(env)
+    tid = p.db.add_task("quote", "The file starts with " + begin + "\n" + prose, kind="work", origin="user")
+    spec = p.db.task(tid)["spec"]
+    assert spec == "The file starts with " + redact.KEY_MASK + "\n" + prose, spec
+
+
+@pytest.mark.parametrize("name,mark", [("job", "job.started"), ("job", "job.queued"), ("checks", "checks.pid")])
+def test_scrub_run_leaves_a_live_detached_jobs_log_whole_and_masks_it_once_the_job_ends(env, monkeypatch, name, mark):
+    """Review #6952: scrub_run renamed a new file over a log a `ttp detach` or `ttp checks --detach` job still
+    wrote, so the job's later lines went to the unlinked file and vanished from the log."""
+    from ttp import detach, project, redact
+    monkeypatch.setattr(project, "HOME_DIR", env["tmp"] / "empty-home")
+    block, lines = _key_block()
+    run = env["tmp"] / "runs" / "13"
+    run.mkdir(parents=True)
+    (run / mark).write_text("1\n")
+    (run / "stderr.log").write_text(block)
+    log = run / f"{name}.log"
+    with open(log, "w") as w:   # as the job wrapper's `>"$log"`: one open file, its own offset
+        w.write("line 0\n" + block)
+        w.flush()
+        assert redact.scrub_run(run) == 1   # stderr.log only
+        for i in range(1, 50):
+            w.write(f"line {i}\n")
+            w.flush()
+    text = log.read_text()
+    assert all(f"line {i}\n" in text for i in range(50)), text[-200:]
+    assert _masked((run / "stderr.log").read_text())
+    rc = run / f"{name}.rc"
+    if name == "job":   # the daemon's sweep closes the job's record once it ended: its log is masked then
+        (run / "detached.json").write_text(json.dumps([{"rc": str(rc), "status": "running"}]))
+        rc.write_text("0\n")
+        assert detach.close(rc)["status"] == "ended"
+    else:
+        rc.write_text("0\n")
+        assert redact.scrub_run(run) == 1
+    text = log.read_text()
+    assert _no_key(text, lines) and _masked(text) and "line 49\n" in text
