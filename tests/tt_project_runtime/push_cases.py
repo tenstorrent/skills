@@ -16407,6 +16407,46 @@ def test_a_push_batch_with_checks_judge_off_quarantines_nothing(env, monkeypatch
     assert gatejudge.active(p.state, time.time()) == {}
 
 
+def test_a_push_batch_rerun_selects_each_failing_test_by_its_full_node_id(tmp_path, monkeypatch):
+    """Batch._run_ids reruns real pytest through the select plugin by full node id: a same-named test in
+    another file does not run, one parametrized case (spaces or brackets in its id) runs alone, and a
+    failing id the collection no longer has is named in the batch log and the marker, not dropped."""
+    from ttp import batch, gatejudge
+    proj = tmp_path / "proj"
+    (proj / "tests").mkdir(parents=True)
+    (proj / "pytest.ini").write_text("[pytest]\n")
+    (proj / "tests" / "test_a.py").write_text(
+        "import pytest\n\ndef test_same():\n    assert 0\n\n"
+        "@pytest.mark.parametrize('v', ['one two', 'a[b]', 'three'])\n"
+        "def test_p(v):\n    assert v != 'one two'\n")
+    (proj / "tests" / "test_b.py").write_text("def test_same():\n    pass\n")
+    clean = {k: v for k, v in os.environ.items() if not k.startswith(("PYTEST_", "TTP_PYTEST_"))}
+    monkeypatch.setattr(batch.Batch, "_checkout", lambda self, head: None)
+    monkeypatch.setattr(batch.Batch, "_urgent_mark", lambda self: False)
+    b = batch.Batch.__new__(batch.Batch)
+    b.wt, b.d, b.checks, b.reran = proj, {}, {}, {"head": set(), "tip": set()}
+    cmd = f"{sys.executable} -m pytest -q -p no:cacheprovider"
+
+    def rerun(ids, extra=""):
+        return b._run_ids("h" * 40, cmd + extra, ids, "head", clean, {})
+    same, gone = "tests/test_a.py::test_same", "tests/test_a.py::test_gone"
+    rc, tail = rerun([same])
+    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail      # test_b.py::test_same is not run
+    rc, tail = rerun(["tests/test_a.py::test_p[one two]"])
+    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail      # the other two cases are not run
+    rc, tail = rerun(["tests/test_a.py::test_p[a[b]]"])
+    assert rc == 0 and gatejudge._ran(tail) == (1, 0), tail
+    assert "not_collected" not in b.checks
+    rc, tail = rerun([gone, same])
+    assert rc == 1 and gatejudge._ran(tail) == (0, 1), tail
+    assert gatejudge.not_collected(tail) == [gone] and b.checks["not_collected"] == [gone], tail
+    assert gatejudge.failed_of(rc, tail, [gone, same], "head") is None, "a missing id proves nothing"
+    pytest.importorskip("xdist")
+    b.checks = {}
+    rc, tail = rerun([gone, "tests/test_b.py::test_same"], " -n 2")
+    assert rc == 0 and b.checks["not_collected"] == [gone], tail   # the workers' list reaches the controller
+
+
 def test_stray_running_batch_file_is_closed_at_daemon_start_and_a_live_one_is_left(env, monkeypatch):
     from ttp import pushq
     s = _pq(env, monkeypatch)

@@ -2659,16 +2659,22 @@ class Batch:
 
     def _run_ids(self, at: str, cmd, ids: list[str], where: str, env: dict, slot_env: dict) -> tuple[int | None, str]:
         """Run only `ids` of check `cmd` once at commit `at`: the check's own command, its other tests
-        deselected by name (pushpass.select_env), killed after delivery.push_rerun_s. (pytest's exit
-        code, None when it ran out of time; the output tail)."""
+        deselected by full node id (gatejudge.select_env: a same-named test in another file never runs),
+        killed after delivery.push_rerun_s. An id the collection there does not have is said in the batch
+        log and kept in the marker's checks["not_collected"]. (pytest's exit code, None when it ran out of
+        time; the output tail)."""
         cmd = _here(cmd)   # only a check's first full run spills: every rerun runs here
         self.reran.setdefault(where, set()).update(ids)
         self._checkout(at)
         self.checks["reruns"] = self.checks.get("reruns", 0) + 1
         rc, tail, late = _stream(_check_argv(cmd, self.wt), self.wt,
-                                 env={**env, **pushpass.select_env(gatejudge.select_rx(ids), env), **slot_env},
+                                 env={**env, **gatejudge.select_env(ids, env), **slot_env},
                                  timeout=_seconds(self.d.get("push_rerun_s"), RERUN_S), group=True,
                                  pass_fds=checkdirs.inherited(), urgent_mark=self._urgent_mark())
+        gone = gatejudge.not_collected(tail)
+        if gone:
+            say(f"not collected on {at[:10]}, so not rerun there: {' '.join(gone)}")
+            self.checks["not_collected"] = sorted(set(self.checks.get("not_collected", [])) | set(gone))
         return (None if late else rc), tail
 
     def _judged(self, head: str, cmd, rc: int | None, tail: str, env: dict, slot_env: dict) -> bool:

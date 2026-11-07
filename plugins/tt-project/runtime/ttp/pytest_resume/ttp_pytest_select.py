@@ -7,7 +7,9 @@ TTP_PYTEST_SELECT is a regex (delivery.push_cap_tests): this run keeps only the 
 part of the node id after its last `::`, it matches (re.search, as conflictfix.cap_failure reads a
 failing id) and deselects the rest. TTP_PYTEST_SELECT_IDS, one full node id per line, keeps only the
 tests with one of those ids (as pytest's node id or relative to the current directory, as its summary
-prints them; set but empty: none), so a same-named test in another file never runs.
+prints them; set but empty: none), so a same-named test in another file never runs. Each of those ids
+the collection does not have is named in a "ttp select: not collected: <id>" line of the terminal
+summary (gatejudge.not_collected; under xdist the workers' lists reach it), never dropped silently.
 TTP_PYTEST_SELECT_FILES, one entry per line (testpick, a task's targeted `ttp checks`), keeps only the
 tests matching an entry: a path keeps the tests defined in that file (a case file an aggregator test
 file executes, or a test file), `path::name` the test function `name` of test file `path` (or of the
@@ -34,6 +36,8 @@ IDS_ENV = "TTP_PYTEST_SELECT_IDS"
 FILES_ENV = "TTP_PYTEST_SELECT_FILES"
 FILES_Z_ENV = FILES_ENV + "_Z"   # the same list zlib-compressed and base64 (testpick.pack)
 NAME = "ttp_pytest_select"
+MISSING = "ttp select: not collected:"
+_KEY = "ttp_select_missing"
 
 
 def _strip_env() -> None:
@@ -103,6 +107,11 @@ def pytest_collection_modifyitems(config, items):
             (tests.add((p, name)) if name else paths.add(p))
     rx = re.compile(pattern) if pattern else None
     want = {i.strip() for i in (ids or "").splitlines() if i.strip()}
+    have = {n for i in items for n in (i.nodeid, _cwd_relative(config, i.nodeid))}
+    missing = sorted(want - have)
+    setattr(config, "_" + _KEY, missing)
+    if hasattr(config, "workeroutput"):   # an xdist worker: the controller prints them
+        config.workeroutput[_KEY] = missing
 
     def keep(item) -> bool:
         if rx is not None and not rx.search(item.nodeid.rpartition("::")[2]):
@@ -114,6 +123,19 @@ def pytest_collection_modifyitems(config, items):
     if gone:
         items[:] = [i for i in items if keep(i)]
         config.hook.pytest_deselected(items=gone)
+
+
+@pytest.hookimpl(optionalhook=True)
+def pytest_testnodedown(node, error):
+    got = getattr(node, "workeroutput", {}).get(_KEY)
+    if got:
+        cfg = node.config
+        setattr(cfg, "_" + _KEY, sorted(set(getattr(cfg, "_" + _KEY, [])) | set(got)))
+
+
+def pytest_terminal_summary(terminalreporter, exitstatus, config):
+    for i in getattr(config, "_" + _KEY, []):
+        terminalreporter.write_line(f"{MISSING} {i}")
 
 
 def _ends(path: str, rel: str) -> bool:
