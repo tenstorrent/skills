@@ -27,7 +27,7 @@ satisfied that everything's been thoroughly checked.
 
 The project is run by a coordinator agent running as a background service and waking up periodically to check on the project. So it runs independently of your chat whenever the machine is on, but you interact with it through your chat. You give it instructions or ask it questions and it responds when it needs to update you in the chat. The background coordinator listens to your instructions from chat, plans the work, hands it to headless workers in isolated git worktrees, watches pull requests and Jira and output logs to find and auto-fix issues, whatever responsibilities you gave it. It never stops, it keeps finding valid work to do, and if it finds it, it does it, unless you give it a reachable goal state or ask it to stop.
 
-By default the coordinator is one persistent session per project, so it remembers every order, promise and decision across wakes; if a session cannot run, a wake falls back to a fresh one-off turn. To use only the one-off turns for a project, run `ttp config <name> coordinator.session.mode off`.
+The coordinator is always one persistent session per project, so it remembers every order, promise and decision across wakes. When a session fills up, fails or is lost (a restart or reboot), the next session starts with a hand-off of the open orders, promises, decisions, running work and recent conversation. No setting turns it into one-off turns; the project and account dollar caps and per-task budgets bound its spend.
 
 Features:
 - Supports: Claude Code and Codex (both tested live); Cursor support is built but not yet tested live ([Providers](docs/providers.md)).

@@ -1446,7 +1446,7 @@ def coordinator_cache(db: DB, now: float | None = None, window_s: float | None =
         # so a drop is judged on the within-1h rate (daily review).
         out[label]["gap_within_60m"] = _cache_summary([r for r in rows if gap(r) is not None and gap(r) <= 3600])
         out[label]["gap_over_60m"] = _cache_summary([r for r in rows if gap(r) is not None and gap(r) > 3600])
-        # Turns that continued the last turn's agent session (cachettl.pick_thread), against the rest.
+        # Turns that continued the last turn's agent session (history: the retired stateless warm thread), against the rest.
         out[label]["continued"] = _cache_summary([r for r in rows if _thread_turn(r) >= 2])
     return out
 

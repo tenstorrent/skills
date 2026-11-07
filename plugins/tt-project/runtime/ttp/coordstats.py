@@ -3,22 +3,22 @@
 """`ttp stats --coord-session`: how the persistent coordinator session (coordsession.py) did, per day
 in the project's home zone, against the stateless coordinator it replaced.
 
-A session wake is a coordinator run whose note has turn.session (coordinator.session.mode on): mode
-"resume", "new" (a rollover) or "stateless" (paused, spend guard, rerun). Per day: wakes, $/wake,
-context growth per resumed wake (its first call's prompt less the previous wake's of the same
-session), rollovers, tool calls per wake (tool_use blocks in its transcript; any provider), and the cache-read
-share of its prompt tokens. The baseline is every coordinator run of the 7 days before the first
-"resume" or "new" wake: turns/day, $/turn and $/day. A day breaks even at <= 2 tool calls and
-<= 20k context growth per wake; it is over the baseline when all its coordinator runs cost more
-than the baseline's $/day (today: so far).
+The session is always on: every coordinator wake resumes it ("resume") or starts the next one ("new",
+seeded with the hand-off: a rollover, a failed resume's rerun, a changed prompt or model). A wake
+counts as rolled over with a hand-off when it is "new" for any reason but "no session" (the first one).
+0 stateless wakes is the expected state; "stateless" stays only for a provider that keeps no session
+and for history rows from before the session was always on (a guard trip, a failed resume's stateless
+rerun, a pause), so old rows stay readable. Per day: wakes, $/wake, context growth per resumed wake (its
+first call's prompt less the previous wake's of the same session), rollovers, tool calls per wake
+(tool_use blocks in its transcript; any provider), and the cache-read share of its prompt tokens. The
+baseline is every coordinator run of the 7 days before the first "resume" or "new" wake: turns/day,
+$/turn and $/day. A day breaks even at <= 2 tool calls and <= 20k context growth per wake; it is over
+the baseline when all its coordinator runs cost more than the baseline's $/day (today: so far).
 
 Why each session wake did or did not resume (reason(), from the mode and why the daemon recorded at
 its decision, coordsession.decide): resumed, handover, a rollover at its context size, a new session
-for another cause, or a stateless fallback (spend guard, a failed resume with its error, paused after
-failed resumes). The fallback rate is stateless wakes over session wakes, so only time with the mode
-on counts. Coordinator wakes with the mode off are counted apart: the daemon records turn.session_off;
-an older wake without either record ran with the mode off or an agent that cannot resume (the daemon
-recorded turn.session for every other one)."""
+for another cause, or (history and session-less providers only) a stateless wake. Coordinator wakes
+with no session record (turn.session_off, or none at all) are older stateless turns, counted apart."""
 from __future__ import annotations
 
 import json
@@ -83,7 +83,7 @@ def tool_calls(r, runs_dir: Path) -> int | None:
 
 NEW_WHY = {"no session": "new: no session", "prefix changed": "new: prompt, charter or schema changed",
            "model or effort changed": "new: model or effort changed", "last run not ok": "new: last wake failed",
-           "session not saved": "new: transcript gone"}
+           "session not saved": "new: transcript gone", "resume failed": "new: failed resume"}
 
 
 def _provider_gaps() -> set:
@@ -163,7 +163,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
     since = now - days * 86400
     prev, by_day, off = {}, {}, {}
     for r in db.q("SELECT started, note FROM runs WHERE role='coordinator' AND started>=?", (since,)):
-        if not session_of(r):   # mode off (or an agent that cannot resume), recorded or not
+        if not session_of(r):   # an older stateless turn (or an agent that cannot resume), recorded or not
             why = str(_part(r, "turn").get("session_off") or "off, not recorded")
             day = off.setdefault(timefmt.today(r["started"], tz), {})
             day[why] = day.get(why, 0) + 1
@@ -199,6 +199,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
         sizes = [t for t in (_rollover_tokens(s) for _, s in d["runs"]) if t is not None]
         out.append({"day": day, "partial": day == today, "wakes": len(rs), "resumed": modes.count("resume"),
                     "rollovers": modes.count("new"), "stateless": modes.count("stateless"),
+                    "handoffs": sum(s.get("mode") == "new" and s.get("why") != "no session" for _, s in d["runs"]),
                     "usd": round(cost, 2), "usd_per_wake": round(cost / len(rs), 3),
                     "reasons": dict(sorted(reasons.items(), key=lambda kv: (-kv[1], kv[0]))),
                     "fallback_rate": round(modes.count("stateless") / len(rs), 3),
@@ -229,14 +230,15 @@ def text(s: dict, name: str = "") -> str:
              + f": {f(b['turns_per_day'], '.1f')} turns/day, ${f(b['usd_per_turn'], '.3f')}/turn, "
              f"${f(b['usd_per_day'], '.2f')}/day"]
     if not s["by_day"]:
-        lines.append("  no session-mode wakes in the window (coordinator.session.mode on)")
+        lines.append("  no session wakes in the window")
     for d in s["by_day"]:
         g = d["growth_per_wake"]
         even = {None: "unknown", True: "met", False: "missed"}[d["break_even"]]
         over = {None: "no baseline", True: "OVER baseline", False: "under baseline"}[d["over_baseline"]]
         lines.append(
             f"  {d['day']}{' (so far)' if d['partial'] else ''}: {d['wakes']} wakes ({d['resumed']} resumed, "
-            f"{d['rollovers']} new, {d['stateless']} stateless), ${d['usd_per_wake']:.3f}/wake, "
+            f"{d['rollovers']} new, {d['handoffs']} rolled over with a hand-off, {d['stateless']} stateless), "
+            f"${d['usd_per_wake']:.3f}/wake, "
             f"context growth {'n/a' if g is None else f'{g / 1000:+.1f}k'}/wake, {d['rollovers']} rollovers, "
             f"{f(d['tool_calls_per_wake'], '.1f')} tool calls/wake, cache reads "
             f"{'n/a' if d['cache_read_ratio'] is None else format(d['cache_read_ratio'], '.0%')}; "
@@ -246,8 +248,8 @@ def text(s: dict, name: str = "") -> str:
         why = ", ".join(f"{k} {v}" + (f" (mean {size / 1000:.0f}k tokens)" if k == "rollover" and size else "")
                         for k, v in d["reasons"].items())
         offs = sum(d["mode_off"].values())
-        lines.append(f"    why: {why}; fallback to stateless {d['fallback_rate']:.0%} of {d['wakes']} wakes with the "
-                     f"mode on" + (f"; {offs} more with it off ("
+        lines.append(f"    why: {why}; stateless {d['fallback_rate']:.0%} of {d['wakes']} session wakes (expected 0)"
+                     + (f"; {offs} more stateless turns with no session record ("
                                    + ", ".join(f"{k} {v}" for k, v in sorted(d["mode_off"].items())) + ")"
                                    if offs else ""))
         lines.extend(f"    failed wake: {e}" for e in d["failed_wakes"])

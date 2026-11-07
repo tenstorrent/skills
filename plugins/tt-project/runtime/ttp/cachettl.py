@@ -254,58 +254,8 @@ def session_ended(state, now: float) -> dict:
     return st
 
 
-# Agents whose prompt cache follows the session (Provider.cache_key_per_session) miss it on every
-# fresh session, however stable the prefix. Their coordinator turns continue the last turn's
-# session instead, while that is cheaper than starting over: same prefix and agent, ended under
-# coordinator.thread_warm_min ago, under coordinator.thread_max_turns turns (under 2 turns: off),
-# history under THREAD_GROWTH x its first turn's prompt, and its last continued turn read the cache.
-THREAD_WARM_MIN = 10
-THREAD_MAX_TURNS = 8
-THREAD_GROWTH = 2.0
-
-
 def _num(value, default: float) -> float:
     try:
         return float(value)
     except (TypeError, ValueError):
         return default
-
-
-def pick_thread(last: dict | None, fp: dict, provider: str, now: float, cfg: dict,
-                saved=lambda session: True) -> tuple[str, dict]:
-    """(session to continue or "", the turn's thread note) for a coordinator turn with prefix `fp`
-    (fingerprint()), given `last`, the newest finished coordinator run. `saved(session)` says the
-    agent can still continue that session."""
-    key = _key(fp)
-    fresh = lambda why: ("", {"key": key, "turn": 1, "why": why})
-    max_turns = _num(cfg.get("thread_max_turns"), THREAD_MAX_TURNS)
-    if max_turns < 2:
-        return fresh("off")
-    if not last:
-        return fresh("no earlier turn")
-    try:
-        prev = (json.loads(last.get("note") or "{}").get("turn") or {}).get("thread") or {}
-    except (ValueError, AttributeError):
-        prev = {}
-    if last.get("provider") != provider or not last.get("session_id"):
-        return fresh("the last turn left no session of this agent")
-    if last.get("status") != "ok":
-        return fresh(f"the last turn ended {last.get('status')}")
-    if not isinstance(prev, dict) or prev.get("key") != key:
-        return fresh("prefix changed")
-    age = now - _num(last.get("ended") or last.get("started"), 0.0)
-    if not 0 <= age <= _num(cfg.get("thread_warm_min"), THREAD_WARM_MIN) * 60:
-        return fresh(f"cold: the last turn ended {max(age, 0) / 60:.0f} min ago")
-    turn = int(_num(prev.get("turn"), 1))
-    if turn >= max_turns:
-        return fresh(f"thread full: {turn} turns")
-    read = int(last.get("cache_read_tokens") or 0)
-    sent = read + int(last.get("input_tokens") or 0) + int(last.get("cache_write_tokens") or 0)
-    base = int(_num(prev.get("base"), 0)) or sent
-    if sent > THREAD_GROWTH * base:
-        return fresh(f"thread grew to {sent} prompt tokens from {base}")
-    if turn >= 2 and read < sent / 2:
-        return fresh("its last continued turn missed the cache")
-    if not saved(last["session_id"]):
-        return fresh("the session is no longer saved")
-    return last["session_id"], {"key": key, "turn": turn + 1, "base": base, "why": "continued"}

@@ -280,22 +280,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # cachettl.py), "1h", "5m", or "off" (the agent's
                     # own choice, and charter and memory stay in the system prompt).
                     "cache_ttl": "auto", "cache_warm_min": 50,
-                    # An agent whose prompt cache follows its session (Codex) continues the last
-                    # turn's session for up to thread_max_turns turns (under 2: off) while it ended
-                    # under thread_warm_min minutes ago (cachettl.pick_thread).
-                    "thread_warm_min": 10, "thread_max_turns": 8,
-                    # The persistent coordinator session (coordsession.py): mode "on" (the default)
-                    # resumes one Claude session each wake; "off" runs each wake as a stateless turn
-                    # ("shadow" is reserved and acts as "off"); a failed or paused session falls back
-                    # to the stateless turn; a new session
-                    # starts once its last call's context reaches its first prompt plus
-                    # rollover_growth_tokens, at most context_window_tokens (0: by model) less
-                    # rollover_margin_tokens (rollover_tokens above 0: a fixed limit instead);
-                    # max_failures_per_h failed resumes within an hour run every turn stateless for pause_h hours;
+                    # The persistent coordinator session (coordsession.py), always on with no
+                    # setting to turn it off: every wake resumes one agent session; a failed resume
+                    # reruns as the next session seeded with the hand-off. A session rolls over
+                    # (a new one, seeded with the hand-off) once its last call's context reaches its
+                    # first prompt plus rollover_growth_tokens, at most context_window_tokens (0: by
+                    # model) less rollover_margin_tokens (rollover_tokens above 0: a fixed limit instead);
                     # row_delta false sends each changed digest section whole (else keyed lists go by row).
-                    "session": {"mode": "on", "rollover_tokens": 0, "rollover_growth_tokens": 100000,
-                                "context_window_tokens": 0, "rollover_margin_tokens": 40000,
-                                "max_failures_per_h": 3, "pause_h": 6, "row_delta": True},
+                    "session": {"rollover_tokens": 0, "rollover_growth_tokens": 100000,
+                                "context_window_tokens": 0, "rollover_margin_tokens": 40000, "row_delta": True},
                     "turn_budget_usd": 1.0,
                     # The most the daemon raises one turn's cap to, once, for a single item that went
                     # over turn_budget_usd alone (0: twice turn_budget_usd); never above the hourly
@@ -559,7 +552,7 @@ EXTRA_KEYS = {
     # comments), read with the project root's git user.name and user.email to verify a cited record's
     # author (restriction_source.owner_identities; default none, set only on the owner's own message).
     # session: the persistent coordinator ({"mode": "on" | "off", default on}). With it on (coordtools.py,
-    # hostcheck.py): "wake_budget_usd" and "wake_budget_s" cap one wake (default: the stateless turn's sized
+    # hostcheck.py): "wake_budget_usd" and "wake_budget_s" cap one wake (default: the coordinator turn's sized
     # budget and timeout), "host_access" ({alias: helper argv in the project folder | ssh config file
     # there}, default none) and "log_paths" ({name: absolute path} `ttp hostcheck log-tail` may read).
     # "tools" ("full" default | "read_only") and "tool_timeout_s" (300, at most 600) set a session

@@ -1616,9 +1616,6 @@ def status_text(p: Project, verbose: bool = False) -> str:
     lines.append(coord)
     if verbose:
         lines.append(coordmodel.line(p.config(), db, p))
-        from . import coordguard
-        if guard := coordguard.status_line(db, p.config(), now, lambda ts: at(ts, now, tz)):
-            lines.append(guard)
         from . import coordsession
         if session_line := coordsession.status_line(p.config(), db.kv(coordsession.KEY)):
             lines.append(session_line)

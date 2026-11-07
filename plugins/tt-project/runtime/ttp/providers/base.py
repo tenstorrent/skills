@@ -234,7 +234,7 @@ class Provider:
     # only the first): runtime-added marks get what is left of MAX_CACHE_BREAKPOINTS.
     own_cache_breakpoints = 0
     # The agent keys its prompt cache to the session, so a fresh session misses even an identical
-    # prefix: coordinator turns continue the last turn's session while warm (cachettl.pick_thread).
+    # prefix (the coordinator resumes its one persistent session every wake: coordsession.py).
     cache_key_per_session = False
     # Workers get coordinator updates (steer.md) from a hook after each tool call (ttp.hook); without
     # one, `ttp note` and `ttp steer` print them (cli.print_update). Either marks them read (steerack).
@@ -244,7 +244,8 @@ class Provider:
     stop_hook = False
     # How a persistent coordinator session (coordsession.py) keeps its history between wakes: "agent"
     # when the CLI saves and resumes it (resume_args, session_saved, RunUsage.session_id); "" when it
-    # cannot yet, and session_gap says why: its wakes then run stateless with that reason.
+    # cannot yet, and session_gap says why: its wakes then run stateless with that reason (the chat
+    # provider only; every agent CLI the coordinator runs on keeps one).
     coord_session = ""
     session_gap = "its CLI keeps no session the harness can resume"
     # The CLI runs ttp's PreToolUse/PostToolUse hooks (coordtools.hook_settings): the coordinator's tool

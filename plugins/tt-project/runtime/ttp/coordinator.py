@@ -509,8 +509,6 @@ USER_SETTABLE = {
     relay.AGENT_KEY: lambda v: v is True or str(v).strip().lower() in ("1", "true", "yes", "on"),
     # The tier and effort every conclusion run starts at, at least (tierfloor.py): 'standard/high', 'off'.
     "coordinator.conclusion_floor": lambda v: tierfloor.floor_of(v),
-    # The persistent coordinator session (coordsession.py): off, on ('shadow' reserved).
-    "coordinator.session.mode": lambda v: coordsession.mode_of(v),
     # A session coordinator's tools (coordtools.py): full or read_only. Back to full only on the user's word.
     "coordinator.session.tools": lambda v: coordtools.tools_mode_of(v),
     # Per-row updates of the keyed digest lists on resumed session wakes: true (default) or false.
@@ -945,7 +943,7 @@ def system_prompt(p: Project, now: float | None = None) -> str:
     return join_prompt(*prompt_parts(p, now))
 
 
-# Leads the prompt of a turn that continues the last turn's agent session (cachettl.pick_thread).
+# Leads the prompt of a wake that resumes the coordinator's session (coordsession.py).
 THREAD_CONTINUED = ("This turn continues your earlier turns in this session: their actions were applied, "
                     "except any the digest below lists as rejected, and their digests are out of date. Decide only on the digest below.")
 

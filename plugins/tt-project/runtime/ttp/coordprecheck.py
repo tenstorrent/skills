@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""A session coordinator's answer checked before its turn ends (coordinator.session.mode "on").
+"""A session coordinator's answer checked before its turn ends (the always-on coordinator session).
 
 The coordinator's PreToolUse hook (coordtools.pre_tool_use) runs `refusal` on the turn's
 StructuredOutput call. An action coord.apply would refuse (an unknown task id, a dependency that can

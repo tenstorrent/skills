@@ -1,10 +1,9 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The tools and the per-wake budget of a coordinator in session mode (coordinator.session.mode
-"on"). Claude takes the hooks below through --settings; an agent without tool_hooks gets them through
+"""The tools and the per-wake budget of the persistent coordinator session (always on: coordsession.py). Claude takes the hooks below through --settings; an agent without tool_hooks gets them through
 its own hook config (Provider.coord_tools: Codex runs HOOK_EVENT and POST_EVENT per call), and a
-whole-wake guard (wake_snapshot, wake_guard) puts back protected files after any such wake. With the mode off or unset, nothing here changes how a coordinator turn launches: the stateless
-turn has no tools.
+whole-wake guard (wake_snapshot, wake_guard) puts back protected files after any such wake. A provider that keeps no session (the chat provider,
+coordsession.keeps_session) runs a stateless turn with no tools.
 
 Full tools (coordinator.session.tools "full", the default): a session wake (a new or resumed session)
 gets a worker's tools (providers/claude.WORKER_TOOLS and its web tools) under a worker's guards: the
@@ -31,7 +30,7 @@ or ROLE_ENV, which the daemon sets for every run). A coordinator run also holds 
 (TTP_NO_DEVICE=1), so the worker device-run rule binds it; hook_settings sets no hook.HOOK_REWRITE, so
 a device test run is denied with the `ttp sandbox` form as its hint, never rewritten (heavy device work
 goes to a worker). Event text stays untrusted data (later hardening: #6095, #6098). A stateless turn
-(also a session's stateless fallback) never gets them: the fallback keeps the read-only set below.
+(a provider with no session) never gets them.
 
 Read-only tools ("read_only", any value but "full"): Read (and Grep/Glob where the CLI has them) on the project folder, and Bash for a fixed list of
 read-only `ttp` commands, `ttp hostcheck` among them (hostcheck.py: git log/show, lock holders and the
@@ -44,12 +43,11 @@ hook denies an answer with an action coord.apply would refuse, with the reason (
 
 Budget: a wake stops at whichever comes first of coordinator.session.wake_budget_usd (the CLI's
 --max-budget-usd) and wake_budget_s (the run's timeout); there is no tool-call cap. Unset, each is
-what the stateless turn it replaces gets: the sized turn budget (coordinator.turn_budget_usd, default
-$1) and the effort-sized turn timeout (coordlimits.turn_timeout). Why: a wake is started by exactly the
-events, gates and hourly cap that start a stateless turn today, one wake per turn, so a per-wake
-ceiling equal to the per-turn ceiling keeps a project's daily ceiling at or under the stateless
-design. A typical wake costs less than its ceiling: the session's cached context is read, not resent.
-A wake that hits either limit ends with what it has; that non-ok end takes the stateless rerun path."""
+the sized turn budget (coordinator.turn_budget_usd, default $1) and the effort-sized turn timeout
+(coordlimits.turn_timeout). A typical wake costs less than its ceiling: the session's cached context is
+read, not resent. A wake that hits either limit ends with what it has; that non-ok end reruns its batch
+as the next session, seeded with the hand-off (coordsession.fail). The project and account dollar caps
+stay the hard limits; there is no other coordinator cost gate."""
 from __future__ import annotations
 
 import json
@@ -106,13 +104,10 @@ def session(cfg: dict) -> dict:
 
 
 def session_on(cfg: dict, provider: str | None = None) -> bool:
-    """coordinator.session.mode == "on" (unset: the default, coordsession.DEFAULTS); anything else is off.
-    With `provider`, also off for a provider that keeps no session (coordsession.keeps_session)."""
-    from .coordsession import DEFAULTS, keeps_session
-    if provider is not None and not keeps_session(provider):
-        return False
-    mode = session(cfg).get("mode")
-    return str(DEFAULTS["mode"] if mode is None else mode).strip().lower() == "on"
+    """Always on: every coordinator wake is a session wake, and no setting turns it off. With `provider`,
+    off only for a provider that keeps no session (coordsession.keeps_session: the chat provider)."""
+    from .coordsession import keeps_session
+    return provider is None or keeps_session(provider)
 
 
 def tools_mode(cfg: dict) -> str:
@@ -188,9 +183,8 @@ def without_edit_deny(argv: list[str]) -> list[str]:
 
 def session_tool_args(cfg: dict, *, project: str = "", root: str = "", denied_reads=(), session_mode: str = "",
                       protected=(), web: bool = True) -> list[str]:
-    """The CLI arguments that give a session coordinator its tools ([] with the mode off): the full
-    set for a session wake (full_tools), else the read-only set. They take the place of the stateless
-    turn's `--tools ""`."""
+    """The CLI arguments that give a session coordinator its tools: the full set for a session wake
+    (full_tools), else the read-only set."""
     if not session_on(cfg):
         return []
     deny = [f"Read(/{p})" for p in denied_reads if os.path.isabs(p)]
@@ -632,7 +626,7 @@ def _records_why(cmd: str) -> bool:
 
 def wake_budget(cfg: dict, turn_usd: float | None, turn_timeout_s: float) -> tuple[float | None, float]:
     """(dollars, seconds) one session wake may use: wake_budget_usd and wake_budget_s where set and
-    positive, else the stateless turn's own (module doc)."""
+    positive, else the sized turn budget and turn timeout (module doc)."""
     s = session(cfg)
     usd = positive(s.get("wake_budget_usd"), 0) or turn_usd
     secs = positive(s.get("wake_budget_s"), 0) or turn_timeout_s

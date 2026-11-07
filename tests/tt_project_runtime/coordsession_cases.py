@@ -1,11 +1,11 @@
 # Persistent coordinator session tests of tests/test_tt_project_runtime.py (coordsession.py:
-# coordinator.session.mode on resumes one agent session per wake), which runs this file in its own
+# always on, every wake resumes one agent session), which runs this file in its own
 # namespace (see _include_cases there): helpers, fixtures and imports come from that file.
 from __future__ import annotations
 
 
 def _cs_cfg(**over):
-    return {"coordinator": {"session": {"mode": "on", **over}}}
+    return {"coordinator": {"session": over}}
 
 
 def _cs_state(**over):
@@ -16,9 +16,7 @@ def _cs_state(**over):
 def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
     from ttp import coordsession as cs
     now, yes = 1000.0, (lambda s: True)
-    assert cs.decide({}, _cs_state(), "k1", "m", "high", yes, now) == ("resume", "continued"), "on by default"
-    assert cs.decide(_cs_cfg(mode="off"), _cs_state(), "k1", "m", "high", yes, now) == ("stateless", "off")
-    assert cs.decide(_cs_cfg(mode="shadow"), _cs_state(), "k1", "m", "high", yes, now)[0] == "stateless"
+    assert cs.decide({}, _cs_state(), "k1", "m", "high", yes, now) == ("resume", "continued"), "always on"
     assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "continued")
     reasons = {
         "no session": (None, "k1", "m", "high", yes),
@@ -47,36 +45,46 @@ def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
         assert cs.decide(_cs_cfg(), bad, "k1", "m", "high", yes, now) == ("new", "no session"), bad
 
 
-def test_coordsession_a_tripped_spend_guard_runs_stateless_until_it_ends():
+def test_coordsession_no_config_value_turns_a_stateless_coordinator_turn_back_on():
+    # (c) The retired switches (mode off or shadow, a tripped spend guard, a pause after failed resumes,
+    # the warm-thread knobs) and any junk value: every wake still resumes or starts a session.
+    import importlib.util, inspect
     from ttp import coordsession as cs
     now, yes = 1000.0, (lambda s: True)
-    tripped = {"tripped": True, "until": now + 60}
-    assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "high", yes, now, guard=tripped) == \
-        ("stateless", "spend guard tripped")
-    assert cs.decide(_cs_cfg(), None, "k1", "m", "high", yes, now, guard=tripped)[0] == "stateless"
-    for open_ in (None, {}, {"tripped": True, "until": now - 1}, {"tripped": False, "until": now + 60},
-                  {"tripped": "yes", "until": now + 60}, {"tripped": True}, "junk"):
-        assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "high", yes, now, guard=open_)[0] == "resume", open_
+    for over in ({"mode": "off"}, {"mode": "shadow"}, {"mode": False}, {"mode": "stateless"},
+                 {"max_failures_per_h": 0, "pause_h": 999}, {"rollover_tokens": "junk"}, {"guard": "on"}):
+        for state in (_cs_state(), _cs_state(paused_until=now + 3600), _cs_state(rerun=True), None):
+            assert cs.decide(_cs_cfg(**over), state, "k1", "m", "high", yes, now)[0] in ("resume", "new"), (over, state)
+    assert "guard" not in inspect.signature(cs.decide).parameters, "decide takes no guard"
+    for gone in ("GUARD_KEY", "MODES", "mode_of", "on", "guard_tripped"):
+        assert not hasattr(cs, gone), gone
+    assert not {"mode", "max_failures_per_h", "pause_h"} & set(cs.DEFAULTS)
+    assert importlib.util.find_spec("ttp.coordguard") is None, "the session spend guard is deleted"
+    from ttp import coordtools
+    for over in ({"mode": "off"}, {"mode": "shadow"}, {}):
+        assert coordtools.session_on(_cs_cfg(**over)) and coordtools.session_on(_cs_cfg(**over), "codex")
+    # Only a provider that keeps no session (chat, out of scope) is stateless, with its own reason.
+    assert cs.decide({}, _cs_state(), "k1", "m", "high", yes, now, no_session="no session here") == \
+        ("stateless", "no session here")
 
 
-def test_coordsession_failed_resumes_rerun_stateless_and_the_cap_pauses_the_mode():
+def test_coordsession_a_failed_resume_reruns_as_the_next_session_and_alerts_without_pausing():
     from ttp import coordsession as cs
     cfg, yes = _cs_cfg(), (lambda s: True)
-    st, paused = cs.fail(cfg, _cs_state(), 1000.0)
-    assert not paused and st["rerun"] and not st["last_ok"]
-    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1001.0) == ("stateless", "rerun of a failed resume")
-    st = cs.record(st, None, "", {"mode": "stateless", "why": "rerun of a failed resume"}, True, 1002.0)
-    assert "rerun" not in st and cs.decide(cfg, st, "k1", "m", "high", yes, 1003.0) == ("new", "last run not ok")
-    # A failure older than an hour does not count toward the cap.
-    st, paused = cs.fail(cfg, {**st, "failures": [1000.0 - 3700, 1000.0]}, 1100.0)
-    assert not paused and len(st["failures"]) == 2
-    st, paused = cs.fail(cfg, st, 1200.0)
-    assert paused and st["paused_until"] == 1200.0 + 6 * 3600 and st["failures"] == []
-    assert cs.decide(cfg, {**st, "rerun": False}, "k1", "m", "high", yes, 1300.0) == \
-        ("stateless", "paused after repeated failed resumes")
-    assert cs.decide(cfg, {**st, "rerun": False}, "k1", "m", "high", yes, 1200.0 + 6 * 3600 + 1) == \
-        ("new", "last run not ok"), "the pause ends with a fresh session"
-    assert cs.fail(_cs_cfg(max_failures_per_h=1, pause_h=1), None, 50.0)[0]["paused_until"] == 3650.0
+    st, alert = cs.fail(cfg, _cs_state(paused_until=5000.0), 1000.0, "run 7: boom")
+    assert not alert and st["rerun"] and not st["last_ok"] and st["fail_error"] == "run 7: boom"
+    assert "paused_until" not in st, "an older daemon's pause is dropped"
+    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1001.0) == ("new", "resume failed")
+    st = cs.record(st, None, "s2", {"mode": "new", "why": "resume failed", "key": "k1", "model": "m",
+                                    "effort": "high"}, True, 1002.0)
+    assert "rerun" not in st and "fail_error" not in st
+    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1003.0) == ("resume", "continued")
+    # A failure older than an hour does not count toward the alert.
+    st, alert = cs.fail(cfg, {**st, "failures": [1000.0 - 3700, 1000.0]}, 1100.0)
+    assert not alert and len(st["failures"]) == 2
+    st, alert = cs.fail(cfg, st, 1200.0)
+    assert alert and st["failures"] == [] and "paused_until" not in st
+    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1300.0) == ("new", "resume failed"), "never stateless"
 
 
 def test_coordsession_record_counts_wakes_and_context_of_its_session():
@@ -94,15 +102,19 @@ def test_coordsession_record_counts_wakes_and_context_of_its_session():
     assert not cs.record(None, use, "s2", turn, False, 30.0)["last_ok"]
     assert not cs.record(None, use, "", turn, True, 30.0)["last_ok"]
     line = cs.status_line(_cs_cfg(), st)
-    assert line == "coordinator session (on): s1 · 2 wakes · 935 context tokens · last: continued", line
-    assert cs.status_line(_cs_cfg(mode="off"), None) == ""
-    assert cs.status_line({}, None).startswith("coordinator session (on): none · 0 wakes"), "on by default"
+    assert line == "coordinator session: s1 · 2 wakes · 935 context tokens · last: continued", line
+    assert cs.status_line(_cs_cfg(mode="off"), None).startswith("coordinator session: none · 0 wakes"), "always on"
+    # An ok wake's own summary is kept for the next session's seed, the newest RECENT_WAKES.
+    for i in range(cs.RECENT_WAKES + 2):
+        st = cs.record(st, None, "s1", {**turn, "mode": "resume", "why": "continued"}, True, 40.0 + i, f"wake {i}")
+    assert [x["summary"] for x in st["recent"]] == [f"wake {i}" for i in range(2, cs.RECENT_WAKES + 2)]
+    assert len(cs.record(st, None, "s1", turn, False, 99.0, "failed")["recent"]) == cs.RECENT_WAKES
     # Only a provider that keeps a session shows the line: a chat coordinator stays silent.
     for prov in ("chat", "no-such-provider"):
         assert cs.status_line({"core_provider": prov}, None) == "", prov
         assert cs.status_line({**_cs_cfg(), "core_provider": prov}, st) == "", prov
     for prov in ("claude", "codex", "cursor"):
-        assert cs.status_line({"core_provider": prov}, None).startswith("coordinator session (on)"), prov
+        assert cs.status_line({"core_provider": prov}, None).startswith("coordinator session:"), prov
 
 
 def _cs_stream(path, calls):
@@ -191,26 +203,21 @@ def test_coordsession_a_fresh_prompt_above_the_old_140k_default_still_resumes(tm
         assert cs.decide(_cs_cfg(), st, "k1", "m", "high", lambda s: True, 20.0) == ("resume", "continued")
 
 
-def test_coordsession_mode_is_chat_settable(env, capsys):
+def test_coordsession_the_retired_mode_key_is_refused_and_absent_from_the_defaults(env, capsys):
     from ttp import cli
     from ttp.coordinator import settable
-    cli.cmd_chat_settable("coordinator.session.mode", "on")
-    assert capsys.readouterr().out.strip() == 'coordinator.session.mode: accepted as "on"'
-    assert settable("coordinator.session.mode")(" OFF ") == "off"
-    with pytest.raises(SystemExit) as e:
-        cli.cmd_chat_settable("coordinator.session.mode", "always")
-    assert e.value.code == 1 and "refused" in capsys.readouterr().out
+    for value in ("on", "off"):
+        with pytest.raises(SystemExit) as e:
+            cli.cmd_chat_settable("coordinator.session.mode", value)
+        assert e.value.code == 1 and "refused" in capsys.readouterr().out, value
     p = make(env)
-    assert p.config()["coordinator"]["session"] == {"mode": "on", "rollover_tokens": 0,
-                                                   "rollover_growth_tokens": 100000, "context_window_tokens": 0,
-                                                   "rollover_margin_tokens": 40000,
-                                                   "max_failures_per_h": 3, "pause_h": 6, "row_delta": True}
+    assert p.config()["coordinator"]["session"] == {"rollover_tokens": 0, "rollover_growth_tokens": 100000,
+                                                   "context_window_tokens": 0, "rollover_margin_tokens": 40000,
+                                                   "row_delta": True}
+    assert not {"thread_warm_min", "thread_max_turns"} & set(p.config()["coordinator"])
     assert settable("coordinator.session.row_delta")(" Off ") is False and settable("coordinator.session.row_delta")(True)
     with pytest.raises(ValueError):
         settable("coordinator.session.row_delta")("sometimes")
-    p.set_config("coordinator.session.mode", settable("coordinator.session.mode")("off"))
-    assert p.config()["coordinator"]["session"]["mode"] == "off"
-    assert p.config()["coordinator"]["session"]["rollover_growth_tokens"] == 100000, "the other defaults stay"
 
 
 def _cs_daemon(env, monkeypatch):
@@ -236,21 +243,29 @@ def _cs_daemon(env, monkeypatch):
     return p, holder, sessions, turn, head, context
 
 
-def test_coordsession_mode_off_launches_today_s_turn_byte_for_byte(env, monkeypatch):
-    from ttp import coordinator as coord
+def test_coordsession_a_leftover_mode_off_or_old_guard_state_still_resumes_the_session(env, monkeypatch):
+    # (c) at the daemon: an old project.json "mode": "off", an old tripped guard and an old pause.
     from ttp import coordsession
-    p, holder, _, turn, head, context = _cs_daemon(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "off")   # the project's own user turned it off
-    runs = [turn("EVENTS golden")]
-    monkeypatch.setattr(coordsession, "on", lambda *a: False)   # the code path before the session mode
-    runs.append(turn("EVENTS golden"))
-    for r, argv, prompt, session in runs:
-        assert r["status"] == "ok" and session is None
-        assert json.loads(r["note"])["turn"]["session_off"] == "mode off", "stats tell it from a fallback"
-        assert argv == [sys.executable, "-m", "ttp.providers.fake", "coordinator"], argv
-        assert prompt == coord.join_prompt(head, context) + "\n\nEVENTS golden"
-    assert runs[0][1:] == runs[1][1:]
-    assert p.db.kv(coordsession.KEY) is None, "mode off saves no session"
+    p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
+    cfg = json.loads((p.base / "project.json").read_text())
+    cfg["coordinator"]["session"]["mode"] = "off"
+    cfg["coordinator"].update(thread_warm_min=999, thread_max_turns=99)
+    (p.base / "project.json").write_text(json.dumps(cfg))
+    p.db.set_kv("coord_session_guard", {"tripped": True, "until": time.time() + 600, "hold": True})
+    first, argv, _, session = turn("EVENTS 1")
+    assert session["mode"] == "new" and "session_off" not in json.loads(first["note"])["turn"]
+    sid = first["session_id"]
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "paused_until": time.time() + 3600})
+    r, argv, _, session = turn("EVENTS 2")
+    assert argv[-2:] == ["--resume", sid] and session["mode"] == "resume", session
+    # The daemon drops the retired guard's state once and closes an issue it left open.
+    p.db.x("INSERT INTO issues(fingerprint,source,first_seen,last_seen,title,status,watch_key,history) "
+           "VALUES('g1','daemon:coord-session-guard',1,1,'guard tripped','open','coord_session_guard','[]')")
+    holder["d"].retire_coord_guard()
+    holder["d"].retire_coord_guard()
+    assert p.db.kv("coord_session_guard") is None and p.db.kv("coord_session_baseline") is None
+    row = p.db.one("SELECT status, cleared_why, history FROM issues WHERE fingerprint='g1'")
+    assert row["status"] == "fixed" and "removed" in row["cleared_why"] and len(json.loads(row["history"])) == 1
 
 
 def test_coordsession_on_resumes_the_same_session_across_wakes_and_a_restart(env, monkeypatch):
@@ -258,7 +273,6 @@ def test_coordsession_on_resumes_the_same_session_across_wakes_and_a_restart(env
     from ttp import coordsession
     from ttp.daemon import Daemon
     p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
     first, argv, prompt, session = turn("EVENTS 1")
     assert first["status"] == "ok" and "--resume" not in argv and session["mode"] == "new", session
     assert session["why"] == "no session" and prompt.endswith("\n\nEVENTS 1")
@@ -274,14 +288,7 @@ def test_coordsession_on_resumes_the_same_session_across_wakes_and_a_restart(env
     assert st["wakes"] == 3 and st["id"] == sid and st["last_ok"] and st["last_why"] == "continued"
     assert len((sessions / f"{sid}.jsonl").read_text().splitlines()) == 3
     from ttp.cli import status_text
-    assert f"coordinator session (on): {sid[:8]} · 3 wakes" in status_text(p, verbose=True)
-    # A tripped spend guard runs the wake stateless and leaves the session for later.
-    p.db.set_kv(coordsession.GUARD_KEY, {"tripped": True, "until": time.time() + 600})
-    r, argv, _, session = turn("EVENTS 4")
-    assert "--resume" not in argv and session["mode"] == "stateless" and session["why"] == "spend guard tripped"
-    assert p.db.kv(coordsession.KEY)["id"] == sid and p.db.kv(coordsession.KEY)["wakes"] == 3
-    p.db.set_kv(coordsession.GUARD_KEY, {"tripped": True, "until": time.time() - 1})
-    assert turn("EVENTS 5")[1][-2:] == ["--resume", sid]
+    assert f"coordinator session: {sid[:8]} · 3 wakes" in status_text(p, verbose=True)
     # The transcript gone (a host move): a new session.
     (sessions / f"{sid}.jsonl").unlink()
     r, argv, _, session = turn("EVENTS 6")
@@ -298,7 +305,7 @@ def _cs_wake(p, d, deadline_s=30):
     return row["id"] if row else None
 
 
-def test_coordsession_a_failed_resume_reruns_its_batch_stateless_and_handles_each_message_once(env, monkeypatch):
+def test_coordsession_a_failed_resume_reruns_its_batch_as_a_seeded_session_and_handles_each_message_once(env, monkeypatch):
     from ttp import coordsession
     from ttp.daemon import Daemon
     from ttp.providers import fake
@@ -323,9 +330,14 @@ def test_coordsession_a_failed_resume_reruns_its_batch_stateless_and_handles_eac
     assert p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0"), "nothing of the failed turn applied"
     assert float(p.db.kv("coordinator_backoff_until", 0)) <= time.time(), "the rerun waits on no backoff"
     assert p.db.kv(coordsession.KEY)["rerun"] is True
+    ev = p.db.q("SELECT text, status FROM events WHERE kind='coord_session_resume_failed'")
+    assert len(ev) == 1 and ev[0]["status"] == "handled" and f"run {failed}" in ev[0]["text"], ev
     rerun = _cs_wake(p, d)
-    assert rerun == failed + 1 and note(rerun) == {**note(rerun), "mode": "stateless", "why": "rerun of a failed resume"}
+    assert rerun == failed + 1 and note(rerun) == {**note(rerun), "mode": "new", "why": "resume failed"}
     assert note(rerun)["error"].startswith(f"run {failed}: "), "the rerun names the failed resume"
+    prompt = (p.runs / str(rerun) / "prompt.md").read_text()
+    assert "# NEW COORDINATOR SESSION (why: resume failed)" in prompt and "## Handover from the previous" in prompt
+    assert (p.state / coordsession.NOTE_DIR / f"{sid}{coordsession.HANDOFF_SUFFIX}").is_file(), "the hand-off is on disk"
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rerun,))["status"] == "ok"
     assert not p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0")
     texts = [m["text"] for m in p.db.unread_for_chat("c1", 0)]
@@ -333,110 +345,60 @@ def test_coordsession_a_failed_resume_reruns_its_batch_stateless_and_handles_eac
     titles = [t["title"] for t in p.db.q("SELECT title FROM tasks")]
     assert titles.count("do: first") == 1 and titles.count("do: second") == 1, titles
     st = p.db.kv(coordsession.KEY)
-    assert "rerun" not in st and st["failures"] and not st["last_ok"]
+    assert "rerun" not in st and st["failures"] and st["last_ok"] and st["id"] != sid
     p.db.post("in", "third", chat="c1")
     nxt = _cs_wake(p, d)
-    assert note(nxt)["mode"] == "new" and note(nxt)["why"] == "last run not ok"
+    assert note(nxt)["mode"] == "resume" and note(nxt)["why"] == "continued", "the rerun's session goes on"
 
 
-def test_coordsession_is_on_by_default_for_new_and_upgraded_projects_and_an_explicit_off_stays_off(env, monkeypatch):
+def test_coordsession_is_always_on_for_new_and_upgraded_projects_and_a_config_off_is_refused(env, monkeypatch):
     from ttp import cli
-    from ttp import configwho
     from ttp.daemon import Daemon
     p = make(env)
     _sessions(env, monkeypatch)
     p.set_config("coordinator.debounce_s", 0)
     note = lambda i: json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (i,))["note"])["turn"]["session"]
-    # A new project: `ttp new` writes no mode, so the shipped default (on) decides.
     assert "mode" not in ((p.raw_config().get("coordinator") or {}).get("session") or {})
-    assert p.config()["coordinator"]["session"]["mode"] == "on"
     d = Daemon(p.base)
     p.db.post("in", "first")
     assert note(_cs_wake(p, d))["mode"] == "new"
-    # An older project.json (written before the mode existed, no coordinator.session at all): on too.
+    # An older project.json (no coordinator.session at all): the session goes on.
     raw = p.raw_config()
     raw.get("coordinator", {}).pop("session", None)
     p.config_path.write_text(json.dumps(raw))
-    assert "session" not in p.raw_config().get("coordinator", {}) and p.config()["coordinator"]["session"]["mode"] == "on"
     p.db.post("in", "second")
     assert note(_cs_wake(p, d))["mode"] == "resume"
-    # The project's own user turns it off: kept, and every wake is the stateless turn.
-    cli.main(["config", p.name, "coordinator.session.mode", "off"])
-    assert p.raw_config()["coordinator"]["session"]["mode"] == "off" and p.config()["coordinator"]["session"]["mode"] == "off"
-    assert configwho.get(p.db, "coordinator.session.mode")
+    # `ttp config ... coordinator.session.mode off` is refused and changes nothing.
+    with pytest.raises(SystemExit):
+        cli.main(["config", p.name, "coordinator.session.mode", "off"])
+    assert "mode" not in ((p.raw_config().get("coordinator") or {}).get("session") or {})
     p.db.post("in", "third")
-    rid = _cs_wake(p, d)
-    assert rid and json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"])["turn"].get("session") is None
+    assert note(_cs_wake(p, d))["mode"] == "resume"
 
 
-def test_coordsession_the_failure_cap_pauses_the_mode_and_raises_an_issue(env, monkeypatch):
+def test_coordsession_repeated_failed_resumes_raise_an_issue_and_never_pause(env, monkeypatch):
     from types import SimpleNamespace
     from ttp import coordsession
     from ttp.daemon import Daemon
     p = make(env)
-    p.set_config("coordinator.session.mode", "on")
     d = Daemon(p.base)
     d.cfg = p.config()
     seen = []
     monkeypatch.setattr(d, "observe", lambda source, text, *a, **k: seen.append((source, text, k.get("key"))))
     p.db.set_kv(coordsession.KEY, _cs_state())
-    use = SimpleNamespace(session_id="", input_tokens=0, cache_read_tokens=0, cache_write_tokens=0, output_tokens=0)
-    for n in range(3):
+    use = SimpleNamespace(session_id="", input_tokens=0, cache_read_tokens=0, cache_write_tokens=0, output_tokens=0,
+                          error="boom")
+    for n in range(coordsession.FAIL_ALERT):
         assert d._coord_session_end({"id": n, "session_id": "s1"}, use, {"mode": "resume"}, False)
     st = p.db.kv(coordsession.KEY)
-    assert st["paused_until"] > time.time() + 5 * 3600 and len(seen) == 1, seen
-    assert seen[0][0] == "daemon:coord-session" and "stateless for the next 6 h" in seen[0][1]
-    assert coordsession.decide(d.cfg, {**st, "rerun": False}, "k1", "m", "high", lambda s: True, time.time()) == \
-        ("stateless", "paused after repeated failed resumes")
-    # A wake that did not resume never takes the failed-resume path.
+    assert "paused_until" not in st and len(seen) == 1, seen
+    assert seen[0][0] == "daemon:coord-session" and seen[0][2] == "coord-session-resume-failing"
+    assert "boom" in seen[0][1] and "next session with the hand-off" in seen[0][1]
+    assert coordsession.decide(d.cfg, st, "k1", "m", "high", lambda s: True, time.time()) == ("new", "resume failed")
+    assert len(p.db.q("SELECT id FROM events WHERE kind='coord_session_resume_failed'")) == coordsession.FAIL_ALERT
+    # A new session that failed takes the usual backoff path, recorded, and is never a failed resume.
     assert not d._coord_session_end({"id": 9, "session_id": "s2"}, use, {"mode": "new"}, False)
-
-
-def test_coordsession_the_failure_cap_trips_across_the_new_sessions_between_failed_resumes(env, monkeypatch):
-    # The real cycle: new -> failed resume -> stateless rerun -> new ("last run not ok") -> failed
-    # resume -> ...: a new session between failures keeps their count, so the third one pauses.
-    from ttp import coordsession
-    from ttp.daemon import Daemon
-    from ttp.providers import fake
-    p = make(env)
-    sessions = _sessions(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
-    p.set_config("coordinator.debounce_s", 0)
-    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
-           (time.time(), "t", time.time()))
-    d = Daemon(p.base)
-    seen = []
-    real_observe = d.observe
-    monkeypatch.setattr(d, "observe", lambda source, text, *a, **k: (
-        seen.append(k.get("key")), real_observe(source, text, *a, **k))[1])
-    monkeypatch.setattr(fake.Fake, "session_saved", lambda self, s, cwd, env=None: True)
-    note = lambda i: json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (i,))["note"])["turn"]["session"]
-    n = 0
-
-    def wake():
-        nonlocal n
-        n += 1
-        p.db.post("in", f"msg {n}", chat="c1")
-        rid = _cs_wake(p, d)
-        assert rid
-        return note(rid)
-
-    for cycle in range(3):
-        first = wake()
-        assert first["mode"] == "new", (cycle, first)
-        # The transcript vanishes: the next wake resumes it and fails.
-        (sessions / f"{p.db.kv(coordsession.KEY)['id']}.jsonl").unlink()
-        assert wake()["mode"] == "resume"
-        st = p.db.kv(coordsession.KEY)
-        assert len(st.get("failures") or []) == (0 if cycle == 2 else cycle + 1), (cycle, st)
-        if cycle < 2:
-            assert not st.get("paused_until") and seen.count("coord-session-paused") == 0
-            assert wake() == {**note(p.db.one("SELECT MAX(id) n FROM runs")["n"]), "mode": "stateless",
-                              "why": "rerun of a failed resume"}
-    st = p.db.kv(coordsession.KEY)
-    assert st["paused_until"] > time.time() + 5 * 3600, st
-    assert seen.count("coord-session-paused") == 1, seen
-    assert wake()["mode"] == "stateless"
+    assert p.db.q("SELECT id FROM events WHERE kind='coord_session_start_failed'")
 
 
 def _cstat_run(p, started, cost, session=None, sid="", fc=None, tools=None, read=0, inp=0, write=0):
@@ -485,6 +447,7 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
                              "turns_per_day": 2.0, "usd_per_turn": 0.5, "usd_per_day": 1.0}
     d1, d2 = s["by_day"]
     assert d1 == {"day": "2026-11-04", "partial": False, "wakes": 4, "resumed": 2, "rollovers": 1, "stateless": 1,
+                  "handoffs": 1,
                   "usd": 0.7, "usd_per_wake": 0.175, "growth_per_wake": 12500.0, "growth_wakes": 2,
                   "tool_calls_per_wake": 1.0, "tool_call_wakes": 3, "cache_read_ratio": round(168000 / 195000, 3),
                   "coordinator_usd": 1.1, "over_baseline": True, "break_even": True,
@@ -499,14 +462,15 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
     assert only["day"] == "2026-11-05" and only["growth_per_wake"] == 35000.0
     out = coordstats.text(s, "demo")
     assert "2.0 turns/day, $0.500/turn, $1.00/day" in out
-    assert "2026-11-04: 4 wakes (2 resumed, 1 new, 1 stateless), $0.175/wake, context growth +12.5k/wake" in out
+    assert ("2026-11-04: 4 wakes (2 resumed, 1 new, 1 rolled over with a hand-off, 1 stateless), $0.175/wake, "
+            "context growth +12.5k/wake") in out
     assert "1.0 tool calls/wake, cache reads 86%; break-even" in out and ": met; coordinator $1.10" in out
     assert "OVER baseline" in out and "2026-11-05 (so far):" in out and ": missed; coordinator $0.50" in out
     # The day bounds follow the home zone: 01:00 UTC on 11-04 is still 11-03 in Los Angeles.
     assert coordstats.report(p.db, p.runs, "America/Los_Angeles", 7, now=now)["by_day"][0]["day"] == "2026-11-03"
 
 
-def test_coord_session_stats_name_why_each_wake_did_not_resume_and_rate_only_mode_on_time(env):
+def test_coord_session_stats_name_why_each_wake_did_not_resume_and_keep_old_rows_readable(env):
     from ttp import coordstats
     p = make(env)
     t0 = 1793750400.0   # 2026-11-04 00:00 UTC
@@ -537,7 +501,7 @@ def test_coord_session_stats_name_why_each_wake_did_not_resume_and_rate_only_mod
         p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,note) VALUES('coordinator','claude',?,?,"
                "'ok',0.5,?)", (t0 + 60 * i, t0 + 60 * i + 30, json.dumps(note)))
     [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000)["by_day"]
-    assert d["wakes"] == 17 and d["stateless"] == 6
+    assert d["wakes"] == 17 and d["stateless"] == 6 and d["handoffs"] == 6
     assert d["reasons"] == {"spend guard": 2, "resumed": 2, "rollover": 2, "decide failed": 1,
                             "failed resume (rerun)": 1, "handover": 1, "new: last wake failed": 1,
                             "new: no session": 1, "new: other": 2, "new: prompt, charter or schema changed": 1,
@@ -548,8 +512,9 @@ def test_coord_session_stats_name_why_each_wake_did_not_resume_and_rate_only_mod
                                  f"run {bare} (new, timeout): no error recorded"]
     out = coordstats.text(coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000))
     assert "    why: new: other 2, resumed 2, rollover 2 (mean 250k tokens), spend guard 2, decide failed 1," in out, out
-    assert ("fallback to stateless 35% of 17 wakes with the mode on; 4 more with it off (mode off 2, off, not "
-            "recorded 1, provider codex cannot resume 1)") in out, out
+    assert ("stateless 35% of 17 session wakes (expected 0); 4 more stateless turns with no session record "
+            "(mode off 2, off, not recorded 1, provider codex cannot resume 1)") in out, out
+    assert coordstats.reason({"mode": "new", "why": "resume failed"}) == "new: failed resume"
     assert f"    failed wake: run {bad} (resume, failed): error_max_budget_usd" in out
     assert coordstats.reason({"mode": "new", "why": "context reached many tokens"}) == "rollover"
     assert coordstats._rollover_tokens({"mode": "new", "why": "context reached many tokens"}) is None
@@ -565,7 +530,7 @@ def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsy
     now = time.time()
     s = coordstats.report(p.db, p.runs, "UTC", 7, now=now)
     assert s["by_day"] == [] and s["first_session_wake"] is None and s["baseline"]["turns_per_day"] is None
-    assert "no session-mode wakes" in coordstats.text(s) and "n/a turns/day" in coordstats.text(s)
+    assert "no session wakes" in coordstats.text(s) and "n/a turns/day" in coordstats.text(s)
     # A session wake with no baseline, no transcript and no first-call context: unknown, not a pass.
     _cstat_run(p, now - 60, 0.1, "new", "s1")
     [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=now)["by_day"]
@@ -601,7 +566,6 @@ def _cs_session_project(env, monkeypatch):
     p = make(env)
     sessions = _sessions(env, monkeypatch)
     p.charter_path.write_text(_CS_CHARTER)
-    p.set_config("coordinator.session.mode", "on")
     p.set_config("coordinator.debounce_s", 0)
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
@@ -631,7 +595,8 @@ def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with
     oid = obligations.add(p, "Report the soak result by 17:00 PST")
     second, system2, _ = wake("second order")
     assert second["mode"] == "resume", second
-    assert not (p.state / coordsession.NOTE_DIR).exists(), "no note outside a handover"
+    assert not [x for x in (p.state / coordsession.NOTE_DIR).glob("*.md")
+                if not x.name.endswith(coordsession.HANDOFF_SUFFIX)], "no note outside a handover"
     # The context reaches its limit: one last resumed wake asks for and saves the handover.
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 150000})
     last, _, prompt3 = wake("third order")
@@ -648,6 +613,10 @@ def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with
     assert "## Order ledger" in seed and "Report the soak result by 17:00 PST" in seed and oid in seed
     assert f"## Handover from the previous session {sid[:8]}" in seed and os.environ["TTP_FAKE_SESSION_NOTE"] in seed
     assert "chat exchanges, verbatim" in seed
+    # (b) the hand-off also carries the last wakes' own summaries and is written to disk.
+    assert "## The last coordinator wakes, their own summaries" in seed and "fake coordinator finished" in seed
+    handoff = (p.state / coordsession.NOTE_DIR / f"{sid}{coordsession.HANDOFF_SUFFIX}").read_text()
+    assert os.environ["TTP_FAKE_SESSION_NOTE"] in handoff and "Report the soak result" in handoff
     for text in ("first order", "ack: first order", "second order", "ack: third order"):
         assert text in seed, text
     assert seed.index("first order") < seed.index("third order")
@@ -981,7 +950,6 @@ def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_roll
     from ttp.daemon import Daemon
     p = make(env)
     _sessions(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
     p.set_config("coordinator.debounce_s", 0)
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
@@ -1096,7 +1064,6 @@ def test_coordsession_whole_digest_keeps_the_lines_of_one_shot_section_builders(
     from ttp.daemon import Daemon
     p = make(env)
     _sessions(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
     p.set_config("coordinator.debounce_s", 0)
     p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
            (time.time(), "t", time.time()))
@@ -1202,7 +1169,6 @@ def test_coordsession_resumed_wakes_book_their_own_cost_and_cap_and_keep_the_gua
     from ttp import coordguard
     p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
     _cs_capped_fake(monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
     t0 = time.time() - 1
     got = []
     for total in (1.0, 1.6, 2.1):   # the session's running total after each wake
@@ -1248,7 +1214,6 @@ def _cs_seed_wakes(env, monkeypatch, seeds=(), **cfg):
     cost, or (seed cost, the wake's whole cost)."""
     p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
     _cs_capped_fake(monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
     for k, v in cfg.items():
         p.set_config(k, v)
     for i, usd in enumerate(seeds):
@@ -1508,7 +1473,6 @@ def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_stateless_
     ttl, why = ttls(turn("EVENTS 0")[0])
     assert ttl == "1h" and why.startswith("cold: no earlier 1h turn"), why
     assert ttls(turn("EVENTS 0b")[0])[0] == "5m" and p.db.kv(cachettl.KEY)
-    p.set_config("coordinator.session.mode", "on")
     r, _, _, session = turn("EVENTS 1")
     assert session["mode"] == "new" and ttls(r)[0] == "1h"
     assert ttls(r)[1].startswith("cold: a new session; next turn likely: "), ttls(r)
@@ -1558,7 +1522,6 @@ def test_coordinator_and_worker_prompts_follow_intent_ask_rarely_and_frame_the_s
     assert all(s in stateless for s in shared)
     assert "you NEVER do it yourself" in stateless and "tool-less turn" in stateless
     assert "hands-on manager" not in stateless and "## Managing" not in stateless
-    p.set_config("coordinator.session.mode", "on")
     session = flat(coordinator_session_role(p))
     assert all(s in session for s in shared)
     assert "you NEVER do it yourself" not in session and "tool-less" not in session
@@ -1615,7 +1578,6 @@ def test_coordsession_an_agent_without_call_usage_or_hooks_keeps_its_session_siz
     from ttp.providers.base import RunUsage
     from ttp.providers.fake import Fake
     p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
     ctx = {"first_context": 40000, "last_context": 42000, "compacted": False}
     monkeypatch.setattr(Fake, "session_context", lambda self, sid, since, env=None: dict(ctx))
     first, _, _, s0 = turn("EVENTS 1", budget_usd=3.0)
@@ -1644,7 +1606,6 @@ def test_coordsession_a_provider_without_a_session_runs_each_wake_stateless_with
     from ttp import coordsession
     from ttp.providers.fake import Fake
     p, _, _, turn, _, _ = _cs_daemon(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "on")
     monkeypatch.setattr(Fake, "coord_session", "")
     for i in (1, 2):
         r, argv, _, s = turn(f"EVENTS {i}")
@@ -1755,7 +1716,6 @@ def test_codex_like_coordinator_session_wake_launches_with_the_agent_s_tools_and
     p.set_config("coordinator.session.mode", "off")
     r, argv, _, _ = turn("EVENTS 0")
     assert not seen and "--coord-tools" not in argv, "session mode off: the stateless turn has no tools"
-    p.set_config("coordinator.session.mode", "on")
     r, argv, _, s = turn("EVENTS 1")
     assert s["mode"] == "new" and seen[-1] == (True, "1") and "--coord-tools" in argv
     assert json.loads((p.runs / str(r["id"]) / "run.json").read_text())["env"]["TTP_COORD_MARK"] == "1"
@@ -1781,7 +1741,6 @@ def _cs_cli_wakes(env, monkeypatch, provider, stdout, help_text, wakes=2, betwee
                  ("HELP", help_text), ("PACE", "0"), ("SESSION", "{}")):
         monkeypatch.setenv(f"FAKE_CLI_{k}", v)
     p = make(env)
-    p.set_config("coordinator.session.mode", "on")
     head, context = coord.prompt_parts(p)
     out = []
     for i in range(wakes):

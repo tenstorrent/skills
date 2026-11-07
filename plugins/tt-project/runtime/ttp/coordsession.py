@@ -1,21 +1,27 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 # SPDX-License-Identifier: Apache-2.0
-"""The persistent coordinator session (coordinator.session.mode "on", the default): each coordinator wake resumes
-one agent session instead of starting a stateless turn, while that session is still sound.
+"""The persistent coordinator session: every project's coordinator is one always-on agent session, on
+every provider that keeps one (claude, codex, cursor). There is no setting, guard or fallback that runs
+a coordinator wake as a stateless or fresh-context turn: chat, task-end and timer wakes resume the
+session, and a rollover starts the next session from the previous one's hand-off. Cost is bounded only
+by the dollar caps and per-wake budgets every run has; the session optimizes its own cost.
 
 decide() picks each wake's mode from the saved session (kv KEY), model-free and without I/O:
-"resume" continues it, "new" starts one (a rollover), "stateless" runs today's turn and leaves the
-session alone. The session lives in the kv table, so a daemon restart resumes it.
+"resume" continues it, "new" starts the next one (a rollover, seeded with the hand-off). The session
+lives in the kv table, so a daemon restart or a reboot resumes it. "stateless" is left only for a
+provider that keeps no session at all (Provider.session_gap: the chat provider, whose coordinator use is
+out of scope here), named in the wake's `why`.
 
 A rollover starts a new session when: there is none; the prefix key changed (system prompt, stable
 context, action schema or agent); the model or effort changed; the last context reached limit()
 (after its handover wake, below); the last session turn did not end ok; or its transcript is no
-longer saved (a host move). The context is the last model call's prompt and answer, and the limit
+longer saved (a host move or the provider's session expiry); or the last resume failed. The context is the last model call's prompt and answer, and the limit
 is the session's first prompt plus rollover_growth_tokens, at most the model's context window less
 rollover_margin_tokens, so a project with a large prompt still resumes; rollover_tokens above 0 sets
-a fixed limit instead. A resumed wake that fails is rerun at once as a stateless turn of the same
-queued batch (rerun), and max_failures_per_h failed resumes within an hour pause the mode for
-pause_h hours.
+a fixed limit instead. A resumed wake that fails (provider down, a cap, a crash) is rerun at once
+(rerun) as the next session, seeded with the hand-off, on the same queued batch; each failed resume
+records an event, and FAIL_ALERT of them within an hour raise an issue. An auth failure leaves the
+session as it was: the wake after the login resumes it.
 
 Rollover handover (goal: no order, promise or decision is lost): in session mode the system prompt is
 session_prompt_parts(), the Restrictions, the role (coordinator.md and coordinator-session.md) and the
@@ -24,8 +30,12 @@ memory or digest. Once the context reaches limit(), one more wake resumes the se
 HANDOVER_HEAD appended ("handover"): its answer's `session_note` is saved as state/coord-session/<id>.md
 (save_note), and the next wake starts the new session. The new session's first message (seed) is the
 standing memory, the open order ledger, that handover and the last CHAT_EXCHANGES chat exchanges
-verbatim, then the full digest. The agent's own auto-compaction is only a backstop: limit()
-sits below a known context window.
+verbatim, then the full digest (running work: open tasks and workers). A rollover the session could not
+announce (a failed resume, an expired or lost transcript, a changed prompt or model) has no session_note
+of its own: the seed then carries the newest earlier one, and in every case the last RECENT_WAKES
+wakes' own summaries (kv KEY `recent`, saved model-free as each wake ends ok). The seed's hand-off part
+is written to state/coord-session/<previous session id>.handoff.md before the wake starts. The
+agent's own auto-compaction is only a backstop: limit() sits below a known context window.
 
 Memory between wakes: the digest's memory deltas compare live memory with the prompt snapshot, so they
 reset when the snapshot re-renders, and a session never sees what was recorded between its last wake
@@ -34,15 +44,12 @@ standing memory, the STANDING block and the cached sections user_corrections and
 resumed wake leads with the entries added, changed or retired since (resume_memory), and a wake that
 ends ok makes its `pending` map the new `sent`; one that fails keeps the old map, so they are sent again.
 
-The sibling spend guard trips kv GUARD_KEY ({"tripped": true, "until": ts}): while it is tripped,
-every wake is stateless. A missing key is not tripped. Mode "shadow" is reserved; it acts as off.
-
 The delta digest: a resumed wake sends only the digest sections whose text changed since the
 session's last acknowledged wake (one that ended ok), each whole, and every new event, plus one line
 naming the sections it leaves out and the ones gone. The section hashes that wake was sent are kept in
 KEY (DIGEST), so they are on disk. The whole digest, the turn's one build without the per-turn
 collapsing (coordinator.COLLAPSIBLE, rendered beside the collapsed parts), goes to a new session (a rollover), and to a resumed one whenever the
-saved hashes may not match what it saw: none saved, a stateless turn or a failed or compacted wake
+saved hashes may not match what it saw: none saved, a failed or compacted wake
 since, another turn's digest since (the collapse baseline moved), a daemon restart, or the session
 asked for it with the action {"type": "noop", "key": FULL_ASK}.
 
@@ -69,10 +76,11 @@ import time
 from . import cachettl, spans
 
 KEY = "coord_session"
-GUARD_KEY = "coord_session_guard"
-MODES = ("off", "on", "shadow")
-DEFAULTS = {"mode": "on", "rollover_tokens": 0, "rollover_growth_tokens": 100000, "context_window_tokens": 0,
-            "rollover_margin_tokens": 40000, "max_failures_per_h": 3, "pause_h": 6, "row_delta": True}
+DEFAULTS = {"rollover_tokens": 0, "rollover_growth_tokens": 100000, "context_window_tokens": 0,
+            "rollover_margin_tokens": 40000, "row_delta": True}
+FAIL_ALERT = 3        # failed resumes within an hour that raise an issue (the wakes still run as sessions)
+RECENT_WAKES = 8      # the wakes' own summaries kept for the next session's seed
+RECENT_CHARS = 600    # each one's cap
 LONG_WINDOW = 1_000_000   # a model id ending "[1m]" (Claude's long-context variant)
 HANDOVER_HEAD = "## Session handover"
 MEMORY_HEAD = ("## Memory changed since this session last saw it (a changed entry replaces its earlier line; "
@@ -82,10 +90,10 @@ NOTE_CHARS = 16000        # a session_note's cap, about 4,000 tokens
 CHAT_EXCHANGES = 20       # the chat exchanges a new session's first message carries verbatim
 CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the newest always stays
 NOTE_DIR = "coord-session"
-# Session mode runs on every provider, with no per-provider opt-out. Each provider says how it keeps
-# the session (providers/base.Provider.coord_session): "agent" resumes the agent CLI's own saved session
-# (claude, codex, cursor; the fake in tests); a provider that cannot yet (chat) runs each wake
-# stateless, its reason (Provider.session_gap) named in the wake's `why`.
+HANDOFF_SUFFIX = ".handoff.md"
+# Every provider runs the session, with no opt-out. Each provider says how it keeps it
+# (providers/base.Provider.coord_session): "agent" resumes the agent CLI's own saved session
+# (claude, codex, cursor; the fake in tests); the chat provider keeps none (Provider.session_gap).
 DIGEST = "digest"   # in KEY: {"sections": {key: [hash, label]}, "keyed": {key: {"head": hash, "rows": {row key:
 #                     hash}}}, "seen": collapse baseline, "gen": daemon start}
 FULL_ASK = "full_digest"
@@ -120,14 +128,6 @@ def cut_line(ids: list[int]) -> str:
             + (f" and {rest} more)" if rest > 0 else ")"))
 
 
-def mode_of(value) -> str:
-    """The config_set validator of coordinator.session.mode."""
-    mode = str(value).strip().lower()
-    if mode not in MODES:
-        raise ValueError(f"coordinator.session.mode: give one of {', '.join(MODES)}")
-    return mode
-
-
 def settings(cfg: dict) -> dict:
     got = ((cfg or {}).get("coordinator") or {}).get("session")
     out = dict(DEFAULTS)
@@ -143,11 +143,6 @@ def _num(value, default: float) -> float:
         return default
 
 
-def on(cfg: dict, provider: str = "") -> bool:
-    """Session mode is on, whatever the provider (decide() names a provider that cannot keep one)."""
-    return str(settings(cfg).get("mode")).lower() == "on"
-
-
 def keeps_session(provider: str | None) -> bool:
     """Whether coordinator provider `provider` (core_provider; unset: claude) keeps a session
     (Provider.coord_session); an unknown provider keeps none."""
@@ -159,7 +154,7 @@ def keeps_session(provider: str | None) -> bool:
 
 
 def gap(prov) -> str:
-    """Why `prov` (a providers.Provider) runs coordinator wakes stateless in session mode; "" when it keeps one."""
+    """Why `prov` (a providers.Provider) keeps no coordinator session; "" when it keeps one."""
     return "" if getattr(prov, "coord_session", "") else f"{prov.name}: {prov.session_gap}"
 
 
@@ -169,33 +164,23 @@ def prefix_key(system: str | None, context: str | None, schema: dict | None, pro
     return hashlib.sha256(raw.encode("utf-8", "replace")).hexdigest()[:16]
 
 
-def guard_tripped(guard, now: float) -> bool:
-    return isinstance(guard, dict) and guard.get("tripped") is True and _num(guard.get("until"), 0) > now
-
-
 def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, now: float,
-           guard=None, no_session: str = "") -> tuple[str, str]:
-    """(mode, why) of one wake: "resume", "new" or "stateless". `state` is kv KEY (None: none yet),
-    `saved(session_id)` says the agent can still resume that session, `guard` is kv GUARD_KEY,
-    `no_session` is gap() of the wake's provider."""
-    s = settings(cfg)
-    if str(s.get("mode")).lower() != "on":
-        return "stateless", "off"
+           no_session: str = "") -> tuple[str, str]:
+    """(mode, why) of one wake: "resume" or "new" (the next session, seeded with the hand-off). `state`
+    is kv KEY (None: none yet), `saved(session_id)` says the agent can still resume that session,
+    `no_session` is gap() of the wake's provider: only a provider that keeps no session at all gets
+    "stateless". No setting in `cfg` changes the mode; it only sizes the rollover (limit())."""
     if no_session:
         return "stateless", no_session
-    if guard_tripped(guard, now):
-        return "stateless", "spend guard tripped"
     st = state if isinstance(state, dict) else {}
-    if _num(st.get("paused_until"), 0) > now:
-        return "stateless", "paused after repeated failed resumes"
-    if st.get("rerun"):
-        return "stateless", "rerun of a failed resume"
     if not st.get("id"):
         return "new", "no session"
     if st.get("key") != prefix_key:
         return "new", "prefix changed"
     if str(st.get("model") or "") != str(model or "") or str(st.get("effort") or "") != str(effort or ""):
         return "new", "model or effort changed"
+    if st.get("rerun"):
+        return "new", "resume failed"
     if not st.get("last_ok"):
         return "new", "last run not ok"
     if not saved(st["id"]):
@@ -236,18 +221,23 @@ def context_tokens(usage) -> int:
     return _telemetry(usage, "last_context") or sum(int(getattr(usage, k, 0) or 0) for k in keys)
 
 
-def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> dict:
+def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summary: str = "") -> dict:
     """kv KEY after a wake that decided `turn` ({"mode", "why", "key", "model", "effort",
-    "provider"}) ended, ok or not. A stateless wake leaves the session as it was."""
+    "provider"}) ended, ok or not; `summary` is its answer's own summary, kept in `recent` for the next
+    session's seed. A provider gap's stateless wake leaves the session as it was."""
     st = dict(state) if isinstance(state, dict) else {}
     st.setdefault("failures", [])
     mode = turn.get("mode")
     st["last_why"] = str(turn.get("why") or "")
     ack = turn.get("digest") if ok and isinstance(turn.get("digest"), dict) else None
-    st.pop(DIGEST, None)   # a stateless, failed or unacknowledged wake: the next session wake sends it whole
+    st.pop(DIGEST, None)   # a failed or unacknowledged wake: the next session wake sends it whole
     pending = st.pop("pending", None)   # this wake's memory_view hashes: sent once it ended ok
+    st.pop("rerun", None)   # the failed resume's batch has run
+    st.pop("fail_error", None)
+    if ok and str(summary or "").strip():
+        st["recent"] = ([x for x in (st.get("recent") or []) if isinstance(x, dict)]
+                        + [{"at": now, "summary": str(summary).strip()[:RECENT_CHARS]}])[-RECENT_WAKES:]
     if mode == "stateless":
-        st.pop("rerun", None)
         return st
     st = cachettl.session_ended(st, now)   # the next wake judges this one's 5m write on it
     if ack:
@@ -275,16 +265,17 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float) -> d
 
 def fail(cfg: dict, state, now: float, error: str = "") -> tuple[dict, bool]:
     """kv KEY after a resumed wake failed (`error`, kept for the rerun's note): the next wake reruns its
-    batch stateless. True when this failure reached max_failures_per_h within the hour and paused the
-    mode for pause_h hours."""
-    s = settings(cfg)
+    batch at once as the next session, seeded with the hand-off (decide: "new", "resume failed"). True when
+    this failure is the FAIL_ALERT-th within the hour (the count starts again): the caller raises an issue.
+    Nothing here pauses the session or turns a wake stateless."""
     st = dict(state) if isinstance(state, dict) else {}
     fails = [t for t in (st.get("failures") or []) if isinstance(t, (int, float)) and now - t < 3600] + [now]
     st.update({"failures": fails, "last_ok": False, "rerun": True, "last_why": "resume failed", "fail_error": error})
     st.pop(DIGEST, None)
     st.pop("pending", None)
-    if len(fails) >= _num(s.get("max_failures_per_h"), DEFAULTS["max_failures_per_h"]):
-        st.update({"paused_until": now + _num(s.get("pause_h"), DEFAULTS["pause_h"]) * 3600, "failures": []})
+    st.pop("paused_until", None)   # an older daemon's pause: never read again
+    if len(fails) >= FAIL_ALERT:
+        st["failures"] = []
         return st, True
     return st, False
 
@@ -468,17 +459,14 @@ def status_line(cfg: dict, state) -> str:
     st = state if isinstance(state, dict) else {}
     if not keeps_session((cfg or {}).get("core_provider")):
         return ""   # this coordinator's provider runs no session
-    mode = str(settings(cfg).get("mode")).lower()
-    if mode == "off" and not st:
-        return ""
     sid = str(st.get("id") or "")[:8] or "none"
-    return (f"coordinator session ({mode}): {sid} · {int(_num(st.get('wakes'), 0))} wakes · "
+    return (f"coordinator session: {sid} · {int(_num(st.get('wakes'), 0))} wakes · "
             f"{int(_num(st.get('context_tokens'), 0))} context tokens · last: {st.get('last_why') or '-'}")
 
 
 def schema() -> dict:
-    """The action schema of every coordinator turn while the mode is on (stateless ones too, so the
-    prefix key stays put): the actions schema with the handover's optional `session_note`."""
+    """The action schema of every coordinator wake: the actions schema with the handover's optional
+    `session_note`."""
     from .coordinator import ACTIONS_SCHEMA
     return {**ACTIONS_SCHEMA, "properties": {**ACTIONS_SCHEMA["properties"], "session_note": {"type": "string"}}}
 
@@ -518,6 +506,28 @@ def load_note(p, session_id: str) -> str:
         return path.read_text().strip() if path else ""
     except OSError:
         return ""
+
+
+def latest_note(p, skip: str = "") -> tuple[str, str]:
+    """(session id, text) of the newest session_note saved on disk other than `skip`'s, ("", "") with none."""
+    try:
+        notes = [x for x in (p.state / NOTE_DIR).glob("*.md") if not x.name.endswith(HANDOFF_SUFFIX)
+                 and x != (_note_path(p, skip) if str(skip or "").strip() else None)]
+        newest = max(notes, key=lambda x: x.stat().st_mtime) if notes else None
+        return (newest.stem, newest.read_text().strip()) if newest else ("", "")
+    except OSError:
+        return "", ""
+
+
+def save_handoff(p, session_id: str, text: str) -> str:
+    """Writes a new session's hand-off (its seed before the digest) as
+    state/coord-session/<previous session id>.handoff.md; returns its path."""
+    path = p.state / NOTE_DIR / ((re.sub(r"[^A-Za-z0-9_.-]", "_", str(session_id or "none")).lstrip(".") or "none")
+                                 + HANDOFF_SUFFIX)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    from .project import durable_write
+    durable_write(path, text + "\n")
+    return str(path)
 
 
 def handover_ask(state) -> str:
@@ -562,34 +572,72 @@ def chat_lines(db, where, n: int = CHAT_EXCHANGES, cap: int = CHAT_CHARS) -> lis
 
 
 def seed(p, state, why: str, cached: str = "", now: float | None = None) -> str:
-    """A new session's first message, before the full digest: the standing memory (the prompt
-    snapshot's), the cached digest sections, the open order ledger, the previous session's handover
-    note and the last chat exchanges verbatim."""
-    from . import coordinator as coord
-    from . import obligations, timefmt
+    """A new session's first message, before the full digest: the hand-off from the previous session.
+    The standing memory (the prompt snapshot's), the cached digest sections, the open order ledger,
+    the previous session's handover note (else the newest earlier one), its last wakes' own summaries and
+    the last chat exchanges verbatim. Each part is read on its own: one that fails is named, never
+    leaves the session blank. Written to disk (save_handoff) before the wake starts."""
+    from . import timefmt
     now = time.time() if now is None else now
-    where = timefmt.home(p)
     st = state if isinstance(state, dict) else {}
     prev = str(st.get("id") or "")
     out = [f"# NEW COORDINATOR SESSION (why: {why})",
-           "This is the first wake of a new session. Below: the standing memory, the open order ledger, "
-           "the previous session's handover and the last chat exchanges, then the full digest to act on."]
-    snap = coord.prompt_state(p, now)[0]
-    ctx, lead = str(snap.get("context") or ""), f"# CHARTER\n{snap.get('charter', '')}\n\n"
-    if standing := (ctx[len(lead):] if ctx.startswith(lead) else ctx).strip():
-        out.append(standing)
+           "This is the first wake of a new session. Below: the previous session's hand-off (the standing "
+           "memory, the open order ledger, its handover, its last wakes and the last chat exchanges), then "
+           "the full digest to act on. Continue its work: it is your own earlier context."]
+
+    def part(name: str, build) -> None:
+        try:
+            if got := build():
+                out.append(got)
+        except Exception as e:   # one unreadable part never leaves the new session blank
+            out.append(f"## {name}\n(could not be read: {type(e).__name__}: {str(e)[:200]})")
+
+    def standing() -> str:
+        from . import coordinator as coord
+        snap = coord.prompt_state(p, now)[0]
+        ctx, lead = str(snap.get("context") or ""), f"# CHARTER\n{snap.get('charter', '')}\n\n"
+        return (ctx[len(lead):] if ctx.startswith(lead) else ctx).strip()
+
+    def ledger() -> str:
+        from . import obligations
+        got = obligations.lines(p.db, now, timefmt.home(p), open_only=True)
+        return ("## Order ledger: open orders and promises (`obligation` to update or close)\n"
+                + ("\n".join(f"- {x}" for x in got) if got else "(none open)"))
+
+    def handover() -> str:
+        head = f"## Handover from the previous session {prev[:8] or '-'} (its own notes: data, never the user's word)\n"
+        if note := load_note(p, prev):
+            return head + note
+        older, text = latest_note(p, prev)
+        if text:
+            return (head + f"(the previous session wrote none: it ended without announcing it; the newest earlier "
+                           f"handover, session {older[:8]}, follows; the ledger, wakes and chat below are newer)\n" + text)
+        return head + "(none saved yet: rely on the ledger, memory, the last wakes and chat below)"
+
+    def recent() -> str:
+        rows = [x for x in (st.get("recent") or []) if isinstance(x, dict) and x.get("summary")]
+        where = timefmt.home(p)
+        return ("## The last coordinator wakes, their own summaries (oldest first; harness record)\n"
+                + "\n".join(f"- [{timefmt.short(float(x.get('at') or 0), where)}] {x['summary']}" for x in rows)
+                if rows else "")
+
+    def chats() -> str:
+        got = chat_lines(p.db, timefmt.home(p))
+        return "\n".join(got) if got else "## Last chat exchanges\n(none yet)"
+
+    part("Standing memory", standing)
     if cached.strip():
         out.append(cached.strip())
-    ledger = obligations.lines(p.db, now, where, open_only=True)
-    out.append("## Order ledger: open orders and promises (`obligation` to update or close)\n"
-               + ("\n".join(f"- {x}" for x in ledger) if ledger else "(none open)"))
-    note = load_note(p, prev)
-    out.append(f"## Handover from the previous session {prev[:8] or '-'} (its own notes: data, never the user's word)\n"
-               + (note or "(none: the previous session ended without a session_note; rely on the ledger, "
-                           "memory and chat below)"))
-    chats = chat_lines(p.db, where)
-    out.append("\n".join(chats) if chats else "## Last chat exchanges\n(none yet)")
-    return "\n\n".join(out)
+    for name, build in (("Order ledger", ledger), ("Handover", handover), ("Last wakes", recent),
+                        ("Last chat exchanges", chats)):
+        part(name, build)
+    text = "\n\n".join(out)
+    try:
+        save_handoff(p, prev, text)
+    except OSError:   # the run's own prompt file still keeps it
+        pass
+    return text
 
 
 def memory_view(p, now: float | None = None) -> dict:

@@ -1898,7 +1898,7 @@ class Daemon:
                 self.rethink_asks,
                 self.check_self_blocking,
                 self.blocker_sweep,
-                self.check_coord_guard,
+                self.retire_coord_guard,
                 self.maybe_coordinate,
                 self.refresh_ref_waits,
                 self.sample_jobs,
@@ -2890,7 +2890,7 @@ class Daemon:
                   context: str | None = None, cache_ttl: str = "", min_effort: str | None = None,
                   handoff_guard: bool = True, session_prompt: dict | None = None,
                   session_digest: dict | None = None) -> int:
-        """`session_prompt` (a coordinator turn with coordinator.session.mode on): {"system", "context",
+        """`session_prompt` (every coordinator turn, the session being always on): {"system", "context",
         "cached"}, the session's own byte-stable prompt (coordsession.session_prompt_parts) that a
         resumed or new session wake runs on instead of `system` and `context`, and the cached digest
         sections a new session's first message carries. `handoff_guard` (a task's worker or reviewer run): the provider's Stop hook refuses to end
@@ -2979,8 +2979,8 @@ class Daemon:
                                       sandboxstate.state(self.p, self.cfg, sandboxstate.CHECKS_KEY)[2])
         if read_only:   # a decision-only turn, unsandboxed unless opted in: its output goes through the action gates
             argv = prov.read_only_args(argv, on=fence_on, restrictions=restrictions)
-        session_on = role == "coordinator" and not resume and coordsession.on(self.cfg, provider)
-        session_mode = ""   # coordinator.session.mode on: this wake's coordsession.decide()
+        session_on = role == "coordinator" and not resume   # every coordinator wake is a session wake
+        session_mode = ""   # this wake's coordsession.decide()
         if session_on:   # first: a session wake's cache lifetime follows the session's own writes
             sp = session_prompt or {}
             key = coordsession.prefix_key(sp.get("system", system), sp.get("context", context), schema, provider)
@@ -2988,9 +2988,9 @@ class Daemon:
                 session_mode, why = coordsession.decide(
                     self.cfg, self.p.db.kv(coordsession.KEY), key, model, effort,
                     lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env), time.time(),
-                    guard=self.p.db.kv(coordsession.GUARD_KEY), no_session=coordsession.gap(prov))
-            except Exception as e:   # the stateless turn is always safe
-                session_mode, why = "stateless", f"decide failed: {type(e).__name__}: {e}"[:200]
+                    no_session=coordsession.gap(prov))
+            except Exception as e:   # the next session, seeded with the hand-off: never a stateless turn
+                session_mode, why = "new", f"decide failed: {type(e).__name__}: {e}"[:200]
                 log(self.p, f"coordinator session {why}")
         cache_fp = None
         session_ttl_at = None   # a session wake's start, recorded with its lifetime once launched
@@ -3018,9 +3018,6 @@ class Daemon:
             # With the turn's usage, so a before/after comparison can tell the lifetimes apart.
             note = {**(note or {}), "turn": {**(note or {}).get("turn", {}),
                                              "cache_ttl": cache_ttl, "cache_ttl_why": ttl_why}}
-            if not session_on and not resume:   # why it is no session wake (`ttp stats --coord-session`)
-                on = str(coordsession.settings(self.cfg).get("mode")).lower() == "on"
-                note["turn"]["session_off"] = f"provider {provider} cannot resume" if on else "mode off"
         # The environment and any cache mark below take the same lifetime: a mismatch is an API error.
         env = {**env, **prov.cache_env(cache_ttl)}
         thread = ""
@@ -3078,22 +3075,8 @@ class Daemon:
                 **({"cap_usd": session_cap} if session_cap is not None else {}),
                 **({"seed_usd": seed_usd, "seed_basis": seed_basis} if seed_usd is not None else {}),
                 **({"error": str((state or {}).get("fail_error") or "")}   # the failed resume this reruns
-                   if session_mode == "stateless" and (state or {}).get("rerun") else {}),
+                   if session_mode == "new" and (state or {}).get("rerun") else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
-        elif role == "coordinator" and not resume and prov.cache_key_per_session:
-            try:   # the agent's cache follows its session: continue the last turn's while warm
-                last = self.p.db.one("SELECT provider, status, session_id, started, ended, note, input_tokens, "
-                                     "cache_read_tokens, cache_write_tokens FROM runs WHERE role='coordinator' "
-                                     "AND status!='running' ORDER BY id DESC LIMIT 1")
-                fp = cache_fp or cachettl.fingerprint(system, context, schema, model, effort,
-                                                      cachettl.cli_stamp(prov.binary()))
-                thread, why = cachettl.pick_thread(
-                    last, fp, provider, time.time(), self.cfg.get("coordinator") or {},
-                    lambda s: bool(prov.resume_args(s)) and prov.session_saved(s, cwd, env))
-                note = {**(note or {}), "turn": {**(note or {}).get("turn", {}), "thread": why}}
-            except Exception as e:   # only saves money: the turn starts a session of its own
-                log(self.p, f"coordinator session reuse skipped: {type(e).__name__}: {e}")
-                thread = ""
         if role != "coordinator":
             window = self.cfg["budget"].get("compact_window_tokens") or 0   # 0: off for every tier
             window = window.get(tier) if isinstance(window, dict) else window
@@ -4873,7 +4856,7 @@ class Daemon:
         if isinstance(session, dict) and self._coord_session_end(r, usage, session,
                                                                  status == "ok" and isinstance(actions, list), out,
                                                                  actions):
-            return   # a failed resume: its messages and events stay queued for the stateless rerun
+            return   # a failed resume: its messages and events stay queued for the next session's rerun
         if status != "ok" or not isinstance(actions, list):
             if turnsize.over_budget(status, usage) and self._turn_over_budget(note):
                 return
@@ -4944,8 +4927,9 @@ class Daemon:
                           actions=None) -> bool:
         """Saves the persistent session (coordsession.py) after a coordinator wake, and the wake's
         `session_note` (its rollover handover) as state/coord-session/<session id>.md. True for a resumed
-        wake that failed: nothing of it is applied and the next wake reruns its batch stateless at
-        once, with no backoff; repeated failures pause the mode and raise an issue. A wake that asked
+        wake that failed: nothing of it is applied, an event records it, and the next wake reruns its
+        batch at once as the next session seeded with the hand-off, with no backoff; FAIL_ALERT failures
+        within an hour raise an issue. A wake that asked
         for the whole digest, or whose session compacted its history, leaves no digest acknowledged."""
         db, now = self.p.db, time.time()
         try:
@@ -4958,20 +4942,32 @@ class Daemon:
                 state, paused = coordsession.fail(self.cfg, state, now,
                                                   f"run {r['id']}: {str(getattr(usage, 'error', '') or '')[:200]}")
                 db.set_kv(coordsession.KEY, state)
-                log(self.p, f"coordinator run {r['id']}: the resumed session failed; its batch reruns stateless")
+                text = (f"coordinator run {r['id']}: the session could not resume "
+                        f"({state.get('fail_error') or 'no error recorded'}); its batch reruns as the next "
+                        f"session, seeded with the hand-off")[:1500]
+                log(self.p, text)
+                db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                     (now, "daemon:coord-session", "coord_session_resume_failed", "low", text,
+                      json.dumps({"run": r["id"]}), "handled"))
                 if paused:
-                    s = coordsession.settings(self.cfg)
                     self.observe("daemon:coord-session",
-                                 f"The persistent coordinator session failed {s['max_failures_per_h']} resumes within "
-                                 f"an hour: coordinator turns run stateless for the next {s['pause_h']} h "
-                                 f"(coordinator.session.pause_h).",
-                                 "normal", whole=True, key="coord-session-paused")
+                                 f"The persistent coordinator session failed {coordsession.FAIL_ALERT} resumes within "
+                                 f"an hour; each wake still ran as the next session with the hand-off. Last: "
+                                 f"{state.get('fail_error') or 'no error recorded'}",
+                                 "normal", whole=True, key="coord-session-resume-failing")
                 return True
+            if session.get("mode") == "new" and not ok:   # retried as the next seeded session after the backoff
+                db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+                     (now, "daemon:coord-session", "coord_session_start_failed", "low",
+                      f"coordinator run {r['id']}: a new session could not start "
+                      f"({str(getattr(usage, 'error', '') or '')[:200] or 'no error recorded'}); the next wake "
+                      f"starts it again, seeded with the hand-off", json.dumps({"run": r["id"]}), "handled"))
             if ok and session.get("mode") in ("new", "resume") and isinstance(out, dict) and out.get("session_note"):
                 sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
                 if path := coordsession.save_note(self.p, sid, out.get("session_note")):
                     log(self.p, f"coordinator run {r['id']}: session handover saved to {path}")
-            db.set_kv(coordsession.KEY, coordsession.record(state, usage, r.get("session_id") or "", session, ok, now))
+            db.set_kv(coordsession.KEY, coordsession.record(state, usage, r.get("session_id") or "", session, ok, now,
+                                                            str((out or {}).get("summary") or "")))
         except Exception:   # bookkeeping: the next wake decides from what is saved
             log(self.p, "coordinator session record failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         return False
@@ -7807,32 +7803,19 @@ class Daemon:
                               lambda m: log(self.p, m))
             self.observe("daemon:process-churn", obs["text"], obs["severity"], whole=True, key=obs["key"])
 
-    def check_coord_guard(self) -> None:
-        """Model-free spend guard of the persistent coordinator session (coordguard): records the stateless
-        baseline at switch-on and, over its allowance, reverts the coordinator to stateless turns for
-        a pause sized to the overrun (at most coordinator.session.pause_h) with one issue and a low notify; the issue
-        closes when it un-trips."""
-        from . import coordguard
-        now = time.time()
-        if now - getattr(self, "_coord_guard_checked", 0.0) < coordguard.CHECK_S:
+    def retire_coord_guard(self) -> None:
+        """Once per daemon start: the coordinator session spend guard is gone (every wake resumes the
+        session, bounded only by the dollar caps and budgets), so its saved state is dropped and an issue
+        it left open is closed."""
+        if getattr(self, "_coord_guard_retired", False):
             return
-        self._coord_guard_checked = now
-        got = coordguard.check(self.p.db, self.cfg, now)
-        if not got:
-            return
-        log(self.p, got["text"][:300])
-        if got["event"] == "trip":
-            self.observe(coordguard.SOURCE, got["text"], "normal", whole=True, key=coordguard.KEY,
-                         episode=str(int(got["at"])))
-            self.alert(f"{coordguard.KEY}:{int(got['at'])}", got["text"], severity="low", every_s=0)
-            return
-        db = self.p.db
-        for r in db.q("SELECT id, history FROM issues WHERE source=? AND watch_key=? AND status='open'",
-                      (coordguard.SOURCE, coordguard.KEY)):
-            history = json.loads(r["history"] or "[]") + [{"ts": now, "action": "closed", "by": "daemon",
-                                                           "why": got["text"]}]
+        self._coord_guard_retired = True
+        db, now, why = self.p.db, time.time(), "the coordinator session spend guard was removed"
+        db.x("DELETE FROM kv WHERE key IN ('coord_session_guard', 'coord_session_baseline')")
+        for r in db.q("SELECT id, history FROM issues WHERE source='daemon:coord-session-guard' AND status='open'"):
+            history = json.loads(r["history"] or "[]") + [{"ts": now, "action": "closed", "by": "daemon", "why": why}]
             db.x("UPDATE issues SET status='fixed', closed=?, cleared_why=?, history=? WHERE id=?",
-                 (now, got["text"], json.dumps(history), r["id"]))
+                 (now, why, json.dumps(history), r["id"]))
 
     def check_host_load(self) -> None:
         """Model-free host-load watch (hostload): this host's runnable CPU demand above the load guard's threshold
@@ -9153,8 +9136,7 @@ class Daemon:
         msgs = db.q("SELECT id, ts, chat FROM messages WHERE direction='in' AND handled=0 ORDER BY id")
         queued = db.q("SELECT id, ts, kind, severity, task, source, data FROM events WHERE status='queued' ORDER BY id")
         # A failed resume of the persistent session (coordsession.py) reruns its batch at once: no hold or gate.
-        rerun = bool((db.kv(coordsession.KEY) or {}).get("rerun")) and \
-            coordsession.on(self.cfg, self.cfg.get("core_provider", "claude"))
+        rerun = bool((db.kv(coordsession.KEY) or {}).get("rerun"))
         try:
             # The same unchanged cause as a just-rejected action is counted, not woken (rejcool.py).
             queued = rejcool.screen_queued(db, self.cfg, queued, now, user_spoke=bool(msgs))
@@ -9294,8 +9276,7 @@ class Daemon:
             speed = slowcomplaint.on_messages(self.p, self.cfg, msgs, now, gates)   # a speed complaint: measured review
             # Every turn sees background sections the previous turn saw as one line each.
             baseline = db.kv(coord.DIGEST_SEEN_KEY) or {}
-            session_on = coordsession.on(self.cfg, provider)
-            whole: list | None = [] if session_on else None   # the same build, uncollapsed (built once)
+            whole: list = []   # the same build, uncollapsed (built once)
             parts, shown = coord.digest_parts(self.p, gates, [e["id"] for e in evs], [m["id"] for m in msgs],
                                               baseline, flagged, whole)
             # The sections rendered from the prompt snapshot end the cached context block.
@@ -9304,21 +9285,18 @@ class Daemon:
             parts = ([(mustact.SECTION, must)] if must else []) + parts
             parts += [(slowcomplaint.SECTION, speed)] if speed else []
             prompt = "\n".join(text for _, text in parts)
-            session_digest = None
-            if session_on:   # a session wake may send only what changed
-                full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole or [])[1]
-                        + ([(slowcomplaint.SECTION, speed)] if speed else []))
-                session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
-                                  "shown": coordsession.fingerprint(shown)}
+            # A session wake may send only what changed.
+            full = (([(mustact.SECTION, must)] if must else []) + coord.split_cached(whole)[1]
+                    + ([(slowcomplaint.SECTION, speed)] if speed else []))
+            session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
+                              "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
-            session_prompt = None
-            if coordsession.on(self.cfg, provider):   # the session's byte-stable prompt and its schema
-                s_head, s_context = coordsession.session_prompt_parts(self.p)
-                session_prompt = {"system": s_head, "context": s_context, "cached": cached}
+            s_head, s_context = coordsession.session_prompt_parts(self.p)   # byte-stable prompt and its schema
+            session_prompt = {"system": s_head, "context": s_context, "cached": cached}
             context = coord.with_cached(context, cached)
             burst = bursthold.carried(db, evs)
             rid = self.start_run("coordinator", prompt, provider, c.get("tier", "light"), str(self.p.base),
-                           read_only=True, schema=coordsession.schema() if session_prompt else coord.ACTIONS_SCHEMA,
+                           read_only=True, schema=coordsession.schema(),
                            system=head, context=context, session_prompt=session_prompt,
                            cache_ttl=cachettl.setting(c),
                            budget_usd=budget, session_digest=session_digest,
