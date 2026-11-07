@@ -51,7 +51,10 @@ first), so it starts within a bound. A run parked outside the queue for its
 test slots (acquire's `startable`) holds a PARKED ticket meanwhile, so the wait is visible: once it has
 waited that long, later runs of its project at its priority or lower leave it their project's next free test
 slots, more urgent ones after aged_turns() of them started (testslots.pool_room, starved_ahead; push checks
-count as least urgent, priority 0 is never held by a less urgent run), and push checks run on their branch's reserved test lane alone
+count as least urgent, priority 0 is never held by a less urgent run). An urgent run (locks.URGENT_PRIORITY or
+better) leaves less urgent aged runs one shared turn per aged_turns() urgent starts since its project's last
+routine start, and then only to the oldest of them (_routine_turn), so a routine backlog never holds it longer
+while it still starts one run per N urgent ones. Push checks run on their branch's reserved test lane alone
 while any run waits for test slots (testslots.acquire), so a stream of pushes never holds them all.
 
 An urgent run (priority locks.URGENT_PRIORITY or better: an obligation owner, a user-ordered or `urgent:` task)
@@ -498,9 +501,10 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     """The other parked runs of `project_name` (PARKED tickets) that have waited starve_s() or longer, arrived
     before the asking run (its own PARKED ticket's arrival, else `since`, else now: a newcomer's) and go before
     it: those at its priority or a more urgent one, and a less urgent one only on its turn (_aged_turn: after
-    aged_turns() more urgent starts), so urgent runs keep their precedence under a backlog. The asking run's
-    priority is its PARKED ticket's, else `priority`; none (push checks) is the least urgent. A priority-0 run
-    is never held by a less urgent one."""
+    aged_turns() more urgent starts), so urgent runs keep their precedence under a backlog. An urgent asking
+    run (locks.URGENT_PRIORITY or better) is held by a less urgent one only on the routine runs' shared turn,
+    and then only by the oldest (_routine_turn). The asking run's priority is its PARKED ticket's, else
+    `priority`; none (push checks) is the least urgent. A priority-0 run is never held by a less urgent one."""
     now = time.time() if now is None else now
     edge, gid = aged_before(now), locks.group_id(project_name)
     try:
@@ -514,7 +518,28 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
             and locks._arrival(t) < me]
     out = [t for t in aged if locks.ticket_priority(t) <= rank]
     passed = [t for t in aged if t not in out] if rank > 0 else []
+    if passed and rank <= locks.URGENT_PRIORITY:
+        return out + _routine_turn(project_name, passed, now)
     return out + (_aged_turn(project_name, passed, now) if passed else [])
+
+
+def _routine_turn(project_name: str | None, aged: list[Path], now: float) -> list[Path]:
+    """For an urgent asking run (locks.URGENT_PRIORITY or better): the oldest of `aged` (less urgent PARKED
+    tickets of `project_name` past starve_s()) once the routine runs' shared turn has come: since the oldest
+    aged and since its project last started a routine run (a queue grant above locks.URGENT_PRIORITY),
+    aged_turns() or more urgent runs of the project took a host-wide checks slot. So an urgent run is held
+    by at most one aged routine run per aged_turns() urgent starts however long the routine backlog, and
+    that backlog still starts one run per aged_turns() urgent starts (the bound: a steady urgent stream
+    takes N of every N + 1 turns). aged_turns() 0: they all go first, as _aged_turn."""
+    n = aged_turns()
+    if n <= 0:
+        return aged
+    oldest = min(aged, key=locks._arrival)
+    rows = [(r["ts"], r["priority"]) for r in grant_records(now, now - locks._arrival(oldest))
+            if r.get("project") == project_name and r.get("slot") == "queue"
+            and isinstance(r.get("priority"), int)]
+    start = max([locks._arrival(oldest) + starve_s()] + [ts for ts, pr in rows if pr > locks.URGENT_PRIORITY])
+    return [oldest] if sum(1 for ts, pr in rows if pr <= locks.URGENT_PRIORITY and ts >= start) >= n else []
 
 
 def _aged_turn(project_name: str | None, aged: list[Path], now: float) -> list[Path]:

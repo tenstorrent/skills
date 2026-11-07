@@ -1929,7 +1929,9 @@ session and stateless coordinators on every provider.
   project leave it their next free test slots. More urgent runs keep their precedence under a backlog,
   but once `checks.priority_turns` N of them (default 3 when it is unset; 0 lets the aged run go first)
   started while it waited, the aged run takes the next turn, so it still starts within a bound; priority-0
-  runs are never held by a less urgent one. An urgent run (priority 0 or 1: a task owed to the user,
+  runs are never held by a less urgent one, and a priority-1 run leaves less urgent aged runs of its
+  project one shared turn per N urgent starts since the project's last routine start, taken by the oldest
+  (a long routine backlog holds it for at most that one run). An urgent run (priority 0 or 1: a task owed to the user,
   live-impact work) that would wait with every slot busy starts within about a minute, in this order:
   on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
   host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past
