@@ -647,6 +647,9 @@ REVIEW_SWEEP_EVERY_S = 300   # how often sweep_reviews looks for code and harnes
 REVIEW_UNQUEUED = "review_unqueued"   # a code task in review the review sweep can queue no review for
 HARNESS_UNMERGED = "harness_review_unmerged"   # event: a harness task passed review but its branch is not merged
 HARNESS_OFF_BRANCH = "harness_off_branch"   # event: a harness task's work is on a branch not its own
+HARNESS_STRANDED = "harness_commit_stranded"   # event: a done harness task's commit is on no branch of its own
+HARNESS_STRANDED_KEY = "harness_stranded_seen"   # kv: done harness task id -> 'settled' once checked (land_stranded)
+HARNESS_STRANDED_WINDOW_S = 2 * 86400   # how long after it ended a done harness task is checked for stranded commits
 # sweep_unreviewed: a done (or long externally waiting) code task with an unlanded head and no review
 UNREVIEWED_EVENT = "review_unqueued"
 UNREVIEWED_PER_PASS = 2        # review.unreviewed_per_pass unreadable: most reviews one pass queues (unset: loadcaps)
@@ -16934,8 +16937,11 @@ class Daemon:
         """Merge the commits of harness tasks that worked in a worktree of their own, once their run ended
         (harnesstree.sweep); one that git refused is tried again next tick, a conflict once its branch or
         the harness moved. It holds the upgrade lock meanwhile and waits while `ttp upgrade` holds it:
-        either one's merge in the live checkout would leave MERGE_HEAD in the way of the other."""
-        if not (self.p.state / harnesstree.DIR).is_dir():
+        either one's merge in the live checkout would leave MERGE_HEAD in the way of the other. Done harness
+        tasks whose commits sit outside the harness HEAD and outside a worktree of their own are landed or
+        raised too (_land_stranded_harness)."""
+        stranded = self._stranded_harness_tasks()
+        if not ((self.p.state / harnesstree.DIR).is_dir() or stranded):
             return
         held = locks.try_take([release.upgrade_lock(self.p)], f"daemon (pid {os.getpid()}): landing harness worktrees",
                               "harness worktree landing")
@@ -16947,10 +16953,57 @@ class Daemon:
             for tid, got in harnesstree.sweep(self.p, running).items():
                 if got in ("merged", "conflict"):
                     log(self.p, f"harness worktree of task {tid}: {got}")
+            self._land_stranded_harness(stranded)
         except Exception:  # never in the way of the tick
             log(self.p, "harness worktree landing error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         finally:
             held.close()
+
+    def _stranded_harness_tasks(self) -> list[dict]:
+        """Done harness tasks that ended within HARNESS_STRANDED_WINDOW_S and are not settled yet
+        (HARNESS_STRANDED_KEY); the key drops tasks that left the window."""
+        db = self.p.db
+        rows = db.q("SELECT * FROM tasks WHERE kind='harness' AND status='done' AND updated>=? ORDER BY id",
+                    (time.time() - HARNESS_STRANDED_WINDOW_S,))
+        seen = db.kv(HARNESS_STRANDED_KEY, {}) or {}
+        kept = {k: v for k, v in seen.items() if int(k) in {t["id"] for t in rows}}
+        if kept != seen:
+            db.set_kv(HARNESS_STRANDED_KEY, kept)
+        return [t for t in rows if str(t["id"]) not in kept]
+
+    def _land_stranded_harness(self, tasks: list[dict]) -> None:
+        """For each done harness task in `tasks` (_stranded_harness_tasks), land its named commits that
+        are on a ttp/t<id>-<slug> branch outside a worktree of its own (harnesstree.land_stranded), and
+        raise one HARNESS_STRANDED event naming each commit that is on no such branch, with the branches
+        holding it, so the coordinator can queue a land. A task is settled once nothing is left to merge
+        (a busy or conflicting merge is tried again on a later pass; a conflict is raised by land)."""
+        db = self.p.db
+        for t in tasks:
+            if harnesstree.path(self.p, t["id"]).exists():
+                continue   # land merges its own worktree's branch; checked once that worktree is gone
+            try:
+                got, alone = harnesstree.land_stranded(self.p, t)
+            except Exception:
+                log(self.p, f"task {t['id']}: stranded harness commits check failed: "
+                            + traceback.format_exc().replace("\n", " | ")[:1500])
+                continue
+            if got == "merged":
+                log(self.p, f"task {t['id']}: merged its harness commits from a branch of its own outside its worktree")
+            if got not in ("", "merged"):
+                continue
+            with db.tx():
+                if alone and not db.one("SELECT id FROM events WHERE kind=? AND task=?", (HARNESS_STRANDED, t["id"])):
+                    where = "; ".join(f"{sha[:10]} on {', '.join(bs) if bs else 'no local branch'}" for sha, bs in alone)
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (time.time(), "daemon", HARNESS_STRANDED, "normal",
+                          f"#{t['id']} {t['title']} ended done, but its commits are not in the harness HEAD "
+                          f"({self.p.harness}) and on no branch of its own: {where}. Queue a harness task to "
+                          f"land them (merge or cherry-pick into the main line, keeping both sides' intents), "
+                          f"or leave them if they are not wanted.", "queued", t["id"]))
+                    log(self.p, f"task {t['id']}: done but its harness commits are stranded ({where}); told the coordinator")
+                seen = db.kv(HARNESS_STRANDED_KEY, {}) or {}
+                seen[str(t["id"])] = "settled"
+                db.set_kv(HARNESS_STRANDED_KEY, seen)
 
     def _workdir_for(self, task: dict) -> tuple[str, str | None]:
         if task["kind"] == "harness":   # its own worktree of the harness while another works there

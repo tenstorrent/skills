@@ -547,3 +547,113 @@ def test_a_harness_land_never_resets_or_aborts_in_the_checkout_and_keeps_its_unc
     kept()
     assert set(_hgit(p.harness, "diff", "--name-only", before, "HEAD").split()) == {"prompts/landed.md"}
     assert (p.harness / "prompts" / "landed.md").read_text() == "l\n"
+
+
+def _ht_done_with_commit_on(p, tmp, branch, title="side edit", base="main"):
+    """A done harness task (no worktree of its own) whose hand-off names a commit made on `branch` in
+    another worktree of the harness repo ({id} in `branch` is the task's id)."""
+    tid = _harness_task(p, title)
+    b = branch.format(id=tid)
+    side = pathlib.Path(tmp) / f"side-{tid}"
+    _hgit(p.harness, "worktree", "add", "-q", "-b", b, str(side), base)
+    _commit_in_harness_tree(side, f"prompts/{title.replace(' ', '-')}.md", "side\n", title)
+    sha = _hgit(side, "rev-parse", "HEAD").strip()
+    p.db.update_task(tid, status="done", result=json.dumps({"status": "done", "commit": sha,
+                                                            "summary": f"committed {sha[:12]}"}))
+    return tid, sha, side
+
+
+def _ht_stranded_events(p, tid=None):
+    from ttp import daemon as dm
+    return p.db.q("SELECT * FROM events WHERE kind=?" + (" AND task=?" if tid else ""),
+                  (dm.HARNESS_STRANDED,) + ((tid,) if tid else ()))
+
+
+def test_a_done_harness_tasks_commit_on_its_own_slug_branch_elsewhere_is_landed(env, tmp_path):
+    """Before: a worker that committed on ttp/t<id>-<slug> in another worktree of the harness repo had
+    its commit stranded there: land only knew ttp/harness-t<id>, and nothing merged or flagged it."""
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, sha, _ = _ht_done_with_commit_on(p, tmp_path, "ttp/t{id}-fix-the-watcher")
+    d = Daemon(p.base)
+    for _ in range(2):
+        d.land_harness_worktrees()
+    assert subprocess.run(["git", "-C", str(p.harness), "merge-base", "--is-ancestor", sha, "HEAD"]).returncode == 0
+    assert (p.harness / "prompts" / "side-edit.md").read_text() == "side\n"
+    assert _hgit(p.harness, "symbolic-ref", "--short", "HEAD").strip() == "main"
+    assert not _ht_stranded_events(p)
+    assert f"task {tid}: merged its harness commits" in (p.logs / "daemon.log").read_text()
+
+
+def test_a_done_harness_tasks_commit_only_on_an_unrelated_branch_is_raised_once(env, tmp_path):
+    from ttp.daemon import Daemon
+    p = make(env)
+    before = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    other = _harness_task(p, "someone else")
+    tid, sha, _ = _ht_done_with_commit_on(p, tmp_path, f"ttp/t{other}-theirs")   # another task's slug branch
+    d = Daemon(p.base)
+    for _ in range(3):
+        d.land_harness_worktrees()
+    (ev,) = _ht_stranded_events(p)
+    assert ev["task"] == tid and ev["status"] == "queued"
+    assert f"#{tid}" in ev["text"] and sha[:10] in ev["text"] and f"ttp/t{other}-theirs" in ev["text"]
+    assert _hgit(p.harness, "rev-parse", "HEAD").strip() == before   # nothing merged
+
+
+def test_a_done_harness_task_with_no_named_commit_or_one_on_head_does_nothing_new(env, tmp_path):
+    from ttp import daemon as dm
+    from ttp.daemon import Daemon
+    p = make(env)
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    none = _harness_task(p, "nothing named")
+    p.db.update_task(none, status="done", result=json.dumps({"status": "done", "summary": "no change needed"}))
+    on_head = _harness_task(p, "already in")
+    p.db.update_task(on_head, status="done", result=json.dumps({"status": "done", "commit": head}))
+    foreign = _harness_task(p, "other repo")
+    p.db.update_task(foreign, status="done", result=json.dumps({"status": "done", "commit": "0123456789abcdef"}))
+    d = Daemon(p.base)
+    d.land_harness_worktrees()
+    assert not _ht_stranded_events(p) and _hgit(p.harness, "rev-parse", "HEAD").strip() == head
+    assert set(p.db.kv(dm.HARNESS_STRANDED_KEY, {})) == {str(none), str(on_head), str(foreign)}   # checked once
+
+
+def test_a_stranded_commit_of_a_task_that_ended_long_ago_is_left_alone(env, tmp_path):
+    from ttp import daemon as dm
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, sha, _ = _ht_done_with_commit_on(p, tmp_path, "elsewhere")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (time.time() - dm.HARNESS_STRANDED_WINDOW_S - 60, tid))
+    Daemon(p.base).land_harness_worktrees()
+    assert not _ht_stranded_events(p) and not p.db.kv(dm.HARNESS_STRANDED_KEY, {})
+
+
+def test_a_stranded_slug_branch_that_conflicts_is_reported_and_tried_again_not_settled(env, tmp_path):
+    from ttp import daemon as dm
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid, sha, _ = _ht_done_with_commit_on(p, tmp_path, "ttp/t{id}-clash", title="clash")
+    _commit_in_harness_tree(p.harness, "prompts/clash.md", "main's\n", "main: clash")
+    d = Daemon(p.base)
+    for _ in range(2):
+        d.land_harness_worktrees()
+    (ev,) = p.db.q("SELECT * FROM events WHERE kind='harness_merge_conflict' AND task=?", (tid,))
+    assert f"ttp/t{tid}-clash" in ev["text"] and "wait on that branch" in ev["text"]
+    assert str(tid) not in (p.db.kv(dm.HARNESS_STRANDED_KEY, {}) or {}) and not _ht_stranded_events(p)
+    assert not _hgit(p.harness, "status", "--porcelain").strip()
+
+
+def test_a_done_harness_task_with_its_own_worktree_still_lands_from_its_own_branch(env):
+    from ttp import harnesstree
+    from ttp.daemon import Daemon
+    p = make(env)
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)
+    _commit_in_harness_tree(own, "prompts/b.md", "b\n", "b")
+    sha = _hgit(own, "rev-parse", "HEAD").strip()
+    p.db.update_task(b, status="done", result=json.dumps({"status": "done", "commit": sha}))
+    p.db.x("UPDATE runs SET status='done'")
+    Daemon(p.base).land_harness_worktrees()
+    assert (p.harness / "prompts" / "b.md").read_text() == "b\n" and not own.exists()
+    assert _hgit(p.harness, "branch", "--list", f"ttp/harness-t{b}").strip() == ""
+    assert not _ht_stranded_events(p)
