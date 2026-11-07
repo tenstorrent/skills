@@ -240,6 +240,9 @@ _PICK_IMPORTS = "import os\n\n\ndef _a_help():\n    return 1\n\n\ndef test_a():\
     ("import os\n", "", True),                       # removed: another function may still use it
     ("import os\n", "import sys\n", True),          # changed
     ("import os\n", "import os\nimport sys\n", False),   # a pure addition
+    ("import os\n", "import os, sys\n", False),         # a changed line keeping every name it bound
+    ("import os\n", "import os as o\n", True),
+    ("import os\n", "from os import (\n    sep,\n)\n", True),   # parts of a multi-line import
 ])
 def test_a_removed_or_changed_top_level_import_runs_in_full_and_an_added_one_stays_targeted(
         tmp_path, rel, old, new, full):
@@ -255,6 +258,16 @@ def test_a_removed_or_changed_top_level_import_runs_in_full_and_an_added_one_sta
         assert (entries, why) == ([rel, "tests/test_plugin_catalogue.py::test_cat"], "")
     else:
         assert entries == [] and why == f"no test uses what {rel} changes"   # nothing changed that runs
+
+
+@pytest.mark.parametrize("rel", ["tests/r/a_cases.py", "tests/test_r.py"])
+def test_a_changed_multi_line_import_header_runs_in_full(tmp_path, rel):
+    from ttp import testpick
+    repo, base = _pick_repo(tmp_path)
+    text = _PICK_IMPORTS.replace("import os\n", "from os import (\n    sep,\n)\n")
+    base = _pick_change(repo, base, {rel: text})
+    head = _pick_change(repo, base, {rel: text.replace("from os import (", "from posixpath import (")})
+    assert testpick.changed_defs(repo, base, head, rel) is None
 
 
 def test_narrow_records_targeted_or_full_and_keeps_the_full_pass_key_apart(tmp_path):

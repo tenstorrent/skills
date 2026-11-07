@@ -140,7 +140,9 @@ def changed_defs(top: Path, base: str, head: str, path: str) -> set[str] | None:
         start, count = int(m.group(1)), int(m.group(2) if m.group(2) is not None else 1)
         body = [ln for ln in hunk.splitlines()[1:] if ln[:1] in "+-"]
         plus = [(start + i, ln[1:]) for i, ln in enumerate(x for x in body if x[0] == "+")]
-        if any(ln[0] == "-" and _import(ln[1:]) for ln in body):
+        gone = [_bound(ln[1:]) for ln in body if ln[0] == "-" and _import(ln[1:])]
+        if gone and (None in set().union(*gone) or not set().union(*gone) <= set().union(*(_bound(ln[1:]) for ln in body
+                                                               if ln[0] == "+" and _import(ln[1:])))):
             return None   # a top-level import removed or changed: another function may still use it
         real = [ln[1:] for ln in body if _counts(ln[1:])]
         if not real:
@@ -158,6 +160,16 @@ def changed_defs(top: Path, base: str, head: str, path: str) -> set[str] | None:
 
 def _import(line: str) -> bool:
     return bool(re.match(r"(?:from\s+\S+\s+)?import\s", line))
+
+
+def _bound(line: str) -> set:
+    """What a one-line top-level import binds ({(level, module, name, as)}); {None} when it cannot tell."""
+    try:
+        nodes = ast.parse(line.strip()).body
+    except (SyntaxError, ValueError):
+        return {None}
+    return {(getattr(n, "level", 0), getattr(n, "module", None), a.name, a.asname)
+            for n in nodes if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names} or {None}
 
 
 def _counts(line: str) -> bool:
