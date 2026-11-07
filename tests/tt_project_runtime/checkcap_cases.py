@@ -2414,7 +2414,7 @@ def test_a_queue_incident_calls_a_holder_still_printing_slow_with_the_host_load_
         tmp_path):
     """A holder past the hang factor that still prints is slow: kept in the incident's "slow", named with
     the host load in the next wake's text, and wakes nobody itself. One whose log stopped growing past its
-    stall threshold (checkstall) is a likely hang; one naming no log is neither."""
+    stall threshold (checkstall) is a likely hang; one naming no log is neither: nothing shows it working."""
     from ttp import checklane, checkstall
     now = time.time()
     printing, silent = tmp_path / "printing.log", tmp_path / "silent.log"

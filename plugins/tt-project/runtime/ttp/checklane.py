@@ -974,14 +974,17 @@ def _holder_key(rec: dict) -> str:
     return f"{rec.get('task') or rec.get('holder') or 'run'}:{rec.get('pid')}:{rec.get('run_since') or rec.get('since')}"
 
 
-def _hung(h: dict, now: float, cfg: dict | None, marks: dict | None, stat=None) -> bool:
+def _hung(h: dict, now: float, cfg: dict | None, marks: dict | None, stat=None) -> bool | None:
     """Whether lane holder `h` looks hung by checkstall's view: its log has not grown for its stall
     threshold and, where the daemon's CPU reading of its tree (`marks`, kv checkstall.KV) is known, the
-    tree has used no CPU for HANG_CPU_IDLE_S. A holder that names no log, or a stall watch that is off
-    (checks.stall_s 0), is never hung: elapsed time alone says slow, not hung."""
+    tree has used no CPU for HANG_CPU_IDLE_S. A stall watch that is off (checks.stall_s 0) never says
+    hung: elapsed time alone says slow, not hung. None for a holder that names no log: nothing shows it
+    either hung or working."""
     from . import checkstall
     v = checkstall.view(h, now, cfg, (marks or {}).get(checkstall.key(h)), **({"stat": stat} if stat else {}))
-    return bool(v and v["stalled"] and (v["cpu_idle_s"] is None or v["cpu_idle_s"] >= HANG_CPU_IDLE_S))
+    if v is None:
+        return None
+    return bool(v["stalled"] and (v["cpu_idle_s"] is None or v["cpu_idle_s"] >= HANG_CPU_IDLE_S))
 
 
 def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: float,
@@ -993,7 +996,7 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
     (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, that is also
     stalled (_hung: its log still, its CPU idle where `marks` knows it; `stat` is for tests), once per
-    holder; such a holder still progressing is only kept in the incident's "slow", for wake_text) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
+    holder; such a holder whose log still grows is only kept in the incident's "slow", for wake_text) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
     only once no review reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
     if not events:
         return [], None
@@ -1016,8 +1019,8 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
                     and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now)
                     > factor * median_s)
 
-    inc["slow"] = [k for k, h in holders.items() if long(h) and not _hung(h, now, cfg, marks, stat)][-20:]
-    for name, test in (("hang", lambda h: long(h) and _hung(h, now, cfg, marks, stat)),
+    inc["slow"] = [k for k, h in holders.items() if long(h) and _hung(h, now, cfg, marks, stat) is False][-20:]
+    for name, test in (("hang", lambda h: long(h) and bool(_hung(h, now, cfg, marks, stat))),
                        ("ownerless", lambda h: h.get("stale") or (h.get("task") and ended(h)))):
         seen = list(inc.get(name) or [])
         for k, h in holders.items():
