@@ -2965,10 +2965,18 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                            "slurm_overflow"}}   # a Slurm cluster the pool's overflow runs on (slurmcheck)
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
-ACCOUNT_USER_ONLY = {"checks.spill_hosts", "checks.slurm_overflow"}
+# The ranking's source and key file too: the key goes to that source, so only the user names either.
+ACCOUNT_USER_ONLY = {"checks.spill_hosts", "checks.slurm_overflow", "providers.chat.ranking_source",
+                     "providers.chat.ranking_key_file"}
 ACCOUNT_OFF_VALUE = {"checks.spill_hosts": [], "checks.slurm_overflow": {}}
 # Host-wide account keys the runtime reads only from the account settings: a project's own copy would
 # show a value nothing uses, so layered() shows the account's in every project and set_config refuses one.
+# Account keys three deep, below a provider: never merged into a project's settings (a project that does not
+# use the provider gets no providers.<name> entry); their reader asks for them (account_value).
+# providers.chat.model_ranking: read under the project's own (modelrank.ranking), kept current by rankfresh.py
+# with its source, interval and key file.
+ACCOUNT_NESTED_KEYS = {"providers.chat.model_ranking", "providers.chat.ranking_source", "providers.chat.ranking_every_s",
+                       "providers.chat.ranking_key_file"}
 HOST_WIDE_KEYS = {"checks.host_max", "route.host_max", "checks.spill_hosts", "checks.slurm_overflow", "checks.dirty_max_mb", "checks.io_full_max",
                   "checks.push_priority_wait_s"}
 
@@ -3024,16 +3032,45 @@ def load_account_settings() -> dict:
             for sec, keys in ACCOUNT_KEYS.items() if isinstance(data.get(sec), dict)}
 
 
+def account_value(dotted: str) -> Any:
+    """An ACCOUNT_NESTED_KEYS value from the account settings, or None."""
+    try:
+        node = statcache.load_json(account_settings_path())
+    except (OSError, ValueError):
+        return None
+    for part in dotted.split("."):
+        node = node.get(part) if isinstance(node, dict) else None
+    return node
+
+
+def account_keys() -> list[str]:
+    return sorted([f"{s}.{k}" for s, ks in ACCOUNT_KEYS.items() for k in ks] + list(ACCOUNT_NESTED_KEYS))
+
+
 def set_account_setting(dotted: str, value: Any) -> None:
     sec, _, key = dotted.partition(".")
-    if key not in ACCOUNT_KEYS.get(sec, set()):
-        allowed = ", ".join(f"{s}.{k}" for s, ks in ACCOUNT_KEYS.items() for k in sorted(ks))
-        raise ValueError(f"{dotted} is not an account-level setting; those are: {allowed}")
+    if key not in ACCOUNT_KEYS.get(sec, set()) and dotted not in ACCOUNT_NESTED_KEYS:
+        raise ValueError(f"{dotted} is not an account-level setting; those are: {', '.join(account_keys())}")
     data = load_account_settings()
-    if value is None:
-        data.get(sec, {}).pop(key, None)
-    else:
-        data.setdefault(sec, {})[key] = value
+    for k in sorted(ACCOUNT_NESTED_KEYS | {dotted}):   # load_account_settings leaves these out: keep them
+        v = value if k == dotted else account_value(k)
+        *path, last = k.split(".") if k in ACCOUNT_NESTED_KEYS else (sec, key)
+        node = data
+        for part in path:
+            if not isinstance(node.get(part), dict):
+                node[part] = {}
+            node = node[part]
+        if v is None:
+            node.pop(last, None)
+        else:
+            node[last] = v
+    if sec != "providers" and data.get(sec) == {}:
+        data.pop(sec)
+    provs = data.get("providers") or {}
+    for name in [n for n, e in provs.items() if not e]:
+        provs.pop(name)
+    if "providers" in data and not provs:
+        data.pop("providers")
     HOME_DIR.mkdir(parents=True, exist_ok=True)
     write_json(account_settings_path(), data, mode=0o600)
 

@@ -40,7 +40,7 @@ from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, scriptwatc
 from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
-                      durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, DEFAULT_CONFIG, deep_merge,
+                      durable_append, durable_write, write_json, ACCOUNT_KEYS, ACCOUNT_USER_ONLY, account_keys, DEFAULT_CONFIG, deep_merge,
                       load_account_settings, set_account_setting, zombie, device_timeout_max, command_env,
                       NOTE_RUN_ENV, in_run, replace_copy, sync_all, MEMORY_AUDIENCES, append_text,
                       open_append_or_null, tree_writes)
@@ -10282,6 +10282,13 @@ def cmd_account_cap(key: str, value: str, run: bool) -> None:
 
 def cmd_account_config(key: str, value: str | None) -> None:
     """Read or set an account-level setting (project.ACCOUNT_KEYS) in ~/.tt-project/settings.json."""
+    from . import rankfresh
+    from .project import ACCOUNT_NESTED_KEYS, account_value
+    nested = key in ACCOUNT_NESTED_KEYS
+    if value is None and nested:
+        print(json.dumps(account_value(key) if key in (rankfresh.KEY, rankfresh.KEY_FILE_KEY) else rankfresh.setting(key),
+                         indent=1))
+        return
     if value is None:
         node = deep_merge(DEFAULT_CONFIG, load_account_settings())
         for part in key.split("."):
@@ -10306,10 +10313,12 @@ def cmd_account_config(key: str, value: str | None) -> None:
             slurmcheck.settings_of(val)
         except ValueError as e:
             bad = [str(e)]
+    if nested and (why := rankfresh.check_setting(key, val)):
+        bad = [why]
     if bad:
         die(bad[0])
     from . import accountset
-    old = accountset.current(key)
+    old = account_value(key) if nested else accountset.current(key)
     try:
         set_account_setting(key, None if val == "" else val)
     except ValueError as e:
@@ -10319,6 +10328,14 @@ def cmd_account_config(key: str, value: str | None) -> None:
           else f"{key} removed (account-level{was}); the default applies")
     if key in ACCOUNT_USER_ONLY:   # who changed the account's pool or overflow, when (and slurmcheck's re-arm)
         _log_account_change(key, old, None if val == "" else val)
+    if key == rankfresh.KEY:   # the ranking's change log, beside the refresher's own changes
+        from .modelrank import ranking_of
+        try:
+            was = ranking_of(old)
+        except ValueError:
+            was = []
+        if ranking_of(val) != was:
+            rankfresh.log_change(was, ranking_of(val), "set", time.time(), by="ttp config")
 
 
 def _account_off(key: str, value: str) -> bool:
@@ -13982,8 +13999,7 @@ def main(argv: list[str] | None = None) -> None:
                                             "'': remove the key so its default applies); a list or object key "
                                             "refuses another type")
     s.add_argument("--account", action="store_true",
-                   help="the account-level setting (" + ", ".join(
-                       f"{sec}.{k}" for sec, ks in ACCOUNT_KEYS.items() for k in sorted(ks)) + "); '' removes it")
+                   help="the account-level setting (" + ", ".join(account_keys()) + "); '' removes it")
     s.add_argument("--chat-settable", action="store_true",
                    help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
                         "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")

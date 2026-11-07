@@ -107,9 +107,10 @@ CLEARED_TEXT = {
 # gh-auth: this host's gh is logged out while a project here uses gh (ghauth.py; `gh auth login`).
 # fleethold: a hold the user set is past its expected end while tasks here wait on it (fleethold.passed_alerts).
 USER_BLOCKERS = ("network", "paused", "coord-budget", "linger-off", "notifier", "fleethold", "user-step",
-                 "slurm-paused", "gh-auth")   # slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
+                 "slurm-paused", "gh-auth", "model-ranking-key")   # model-ranking-key: no Artificial Analysis key (rankfresh); slurm-paused: the checks overflow's start-failure breaker (slurmcheck); paused: a long project pause (projpause); user-step: userstep.py
 CLEARED_SEVERITY = {"network": "low", "paused": "low", "fleethold": "low", "coord-budget": "low", "account-mismatch": "low",
-                    "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low"}
+                    "linger-off": "low", "notifier": "low", "user-step": "low", "slurm-paused": "low", "gh-auth": "low",
+                    "model-ranking-key": "low"}
 # Conditions that lift by themselves: below high they are a self-clearing feed line, never "needs you".
 # account-mismatch: the provider's login has no plan readings of its own yet (budget.evaluate); its next
 # run reports them, or it turns out billed by use.
@@ -219,6 +220,9 @@ def holds(db: DB, key: str, since: float, now: float) -> bool:
     if key == "slurm-paused":   # until the user sets checks.slurm_overflow again (slurmcheck.tripped)
         from . import slurmcheck
         return slurmcheck.tripped() is not None
+    if key == "model-ranking-key":   # until the refresher finds a key (rankfresh.api_key)
+        from .rankfresh import api_key
+        return api_key() is None
     if kind == "user-step":   # one standing item per task and user-only step (userstep.py)
         from . import userstep
         return userstep.holds(db, arg)

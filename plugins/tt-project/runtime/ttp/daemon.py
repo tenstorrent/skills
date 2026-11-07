@@ -1162,6 +1162,8 @@ class Daemon:
         self._mcp_tried = 0.0   # when it last started: an unwritable answer is not retried every tick
         self._models_probe: threading.Thread | None = None   # the routed endpoint's /models check (check_route_models)
         self._models_tried = 0.0
+        self._rank_job: threading.Thread | None = None   # the chat model ranking refresh (refresh_model_ranking)
+        self._rank_tried, self._rank_out = 0.0, None
         self._cli_watch: threading.Thread | None = None   # CLI versions being read (watch_cli_versions)
         self._cli_watched = 0.0   # when that last started
         self._replica_checked = 0.0
@@ -1955,6 +1957,7 @@ class Daemon:
                 self.archive_hidden_memory,
                 self.route_machines,
                 self.check_route_models,
+                self.refresh_model_ranking,
                 self.refresh_coverage,
                 self.lift_quarantine,
                 self.sweep_holds,
@@ -3928,6 +3931,47 @@ class Daemon:
 
         self._models_probe = threading.Thread(target=work, name="route-models", daemon=True)
         self._models_probe.start()
+
+    def refresh_model_ranking(self) -> None:
+        """Keep the account's chat model ranking current (rankfresh.py), model-free and on by default wherever
+        the chat provider has an endpoint: once a refresh is due (weekly, a model the /models check newly
+        lists, a failed try's retry) it runs in a thread, at most every 5 minutes. Its outcome is posted on
+        a later tick: a change is one low feed line, an outage's start one observation; no key, one
+        user-only item (rankfresh.NEEDS_KEY) and nothing is fetched."""
+        from . import modelrank, rankfresh
+        out, self._rank_out = self._rank_out, None
+        if out and out.get("changed"):
+            log(self.p, f"model ranking: {out['trigger']}: {out['old']} -> {out['new']}")
+            self.alert(f"model-ranking:{int(time.time())}", rankfresh.change_text(out), severity="low", every_s=0)
+        elif out and out.get("error"):
+            log(self.p, f"model ranking: refresh failed ({out['error']}); the last ranking stays")
+            if out.get("outage_new"):
+                self.observe("model-ranking", f"error: the chat model ranking refresh from the {rankfresh.SOURCE_NAME} "
+                             f"failed ({out['error']}); the last ranking stays and it retries hourly", hint="normal",
+                             key="model-ranking-outage", episode=str(int(out["since"])))
+        if os.environ.get("PYTEST_CURRENT_TEST") and not os.environ.get("TTP_TEST_MODEL_RANKING"):
+            return   # daemons under test never fetch, unless a test asks
+        now = time.time()
+        if (not rankfresh.configured(self.cfg) or now - self._rank_tried < 300
+                or self._rank_job is not None and self._rank_job.is_alive()):
+            return
+        served = modelrank.served(self.p.state)
+        if not served or not (trigger := rankfresh.due(served, now)):
+            return
+        self._rank_tried = now
+        if not (key := rankfresh.api_key()):
+            self.alert(rankfresh.NEEDS_KEY, rankfresh.NEEDS_KEY_TEXT, severity="normal", every_s=0)
+            return
+        where = self.p
+
+        def work() -> None:
+            try:
+                self._rank_out = rankfresh.refresh(served, trigger, time.time(), key)
+            except Exception as e:   # a local fault (an unwritable account home): the type only
+                log(where, f"model ranking: refresh failed: {type(e).__name__}")
+
+        self._rank_job = threading.Thread(target=work, name="model-ranking", daemon=True)
+        self._rank_job.start()
 
     def probe_mcp(self) -> None:
         """Refresh this host's connected MCP servers for the status feed (mcpgap.py): `claude mcp list` in
@@ -17777,7 +17821,8 @@ class Daemon:
         """The per-user claim key of a condition every project on this machine sees alike: a
         logged-out CLI, a lost VPN or network sign-in (netwait), linger off (downtime), or a low disk on the filesystem the
         guard found short. None otherwise."""
-        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY, "notifier", "gh-auth"):
+        if key.startswith(("auth:", "account-mismatch:")) or key in (netwait.KEY, downtime.LINGER_KEY, "notifier", "gh-auth",
+                                                                     "model-ranking-key"):
             return f"{hostname()}|{key}"
         if key == "disk":
             path = (self.p.db.kv("disk_low") or {}).get("path")

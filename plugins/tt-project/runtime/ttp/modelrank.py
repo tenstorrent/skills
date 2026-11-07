@@ -2,8 +2,9 @@
 # SPDX-License-Identifier: Apache-2.0
 """Model ranking: when the chat model a worker run would use is down, run the smartest one still served.
 
-`providers.chat.model_ranking` lists the chat endpoint's model ids, smartest first (a list, or "a,b").
-Unset or empty, the shipped default, nothing changes. Set, a model is down (down()) while a run was
+`providers.chat.model_ranking` lists the chat endpoint's model ids, smartest first (a list, or "a,b"): the
+project's own, else the account's, which rankfresh.py keeps current from the Artificial Analysis
+Intelligence Index wherever a chat endpoint is set. Unset or empty in both, nothing changes. Set, a model is down (down()) while a run was
 refused it (route.py's model_missing hold for a tier, or a ranked model's own refusal here, kept for
 route.RETRY_QUIET_S) or while the last good model-free /models check (route.MODELS_FILE) leaves it out; a check over STALE_S
 old counts as none (route.models_due keeps it fresh while a ranking is set and chat may run).
@@ -43,9 +44,14 @@ def ranking_of(v: Any) -> list[str]:
 
 
 def ranking(cfg: dict) -> list[str]:
-    """The project's ranking, or [] (unset or malformed: config_problems names it)."""
+    """The project's own ranking, else the account's (`ttp config --account`, kept current by rankfresh.py),
+    or [] (unset or malformed: config_problems names it)."""
+    v = ((cfg.get("providers") or {}).get(route.TO) or {}).get("model_ranking")
+    if v is None:
+        from .project import account_value
+        v = account_value(f"providers.{route.TO}.model_ranking")
     try:
-        return ranking_of(((cfg.get("providers") or {}).get(route.TO) or {}).get("model_ranking"))
+        return ranking_of(v)
     except ValueError:
         return []
 
