@@ -275,12 +275,20 @@ def test_a_leftover_checks_read_or_stop_that_hangs_times_out_and_does_not_hold_t
         hung, other = procs
         if where == "read":
             real_argv = leftoverchecks._argv
-            monkeypatch.setattr(leftoverchecks, "_argv", lambda pid: (pid != hung.pid or release.wait(30))
-                                and real_argv(pid))
+
+            def argv(pid):
+                if pid == hung.pid:
+                    release.wait(30)
+                return real_argv(pid)
+            monkeypatch.setattr(leftoverchecks, "_argv", argv)
         else:
             real_end = leftoverstop.end
-            monkeypatch.setattr(leftoverstop, "end", lambda targets, *a, **k: (
-                all(t["pid"] != hung.pid for t in targets) or release.wait(30)) and real_end(targets, *a, **k))
+
+            def end(targets, *a, **k):
+                if any(t["pid"] == hung.pid for t in targets):
+                    release.wait(30)
+                return real_end(targets, *a, **k)
+            monkeypatch.setattr(leftoverstop, "end", end)
         d = dmod.Daemon(p.base)
 
         def tick():   # in time: well before the hang (30 s) ends
@@ -302,3 +310,38 @@ def test_a_leftover_checks_read_or_stop_that_hangs_times_out_and_does_not_hold_t
     finally:
         release.set()
         _lc_end(*procs)
+
+
+def test_reading_who_joined_a_done_tasks_checks_times_out_and_does_not_hold_the_judge(env, tmp_path, monkeypatch):
+    """The checks-join records (and the /proc reads of their pids) are read in a bounded thread: a hang
+    there gives "timeout" within PROBE_S, then "stuck" at once while it lasts, and the verdict once it ends."""
+    from ttp import checkjoin, leftoverchecks, leftoverstop
+    p = make(env)
+    monkeypatch.setattr(leftoverchecks, "PROBE_S", 0.5, raising=False)
+    monkeypatch.setattr(leftoverchecks, "_stuck", {}, raising=False)
+    monkeypatch.setattr(leftoverstop, "GRACE_S", 1e6)   # its run ended too recently to count; its task long ago
+    tid = p.db.add_task("t", "s", kind="code")
+    p.db.x("UPDATE tasks SET status='done', updated=0 WHERE id=?", (tid,))
+    run_dir = tmp_path / "run"
+    run_dir.mkdir()
+    (run_dir / "exit.json").write_text("{}")
+    env_ = {"TTP_PROJECT": str(p.base), "TTP_TASK": str(tid), "TTP_RUN_ID": "7", "TTP_RUN_DIR": str(run_dir)}
+    release = threading.Event()
+    real_records = checkjoin.records
+
+    def records(*a, **k):
+        release.wait(30)
+        return real_records(*a, **k)
+    monkeypatch.setattr(checkjoin, "records", records)
+    slots = tmp_path / "slots"
+    slots.mkdir()
+    try:
+        began = time.monotonic()
+        verdict, why = leftoverchecks.judge(p, os.getpid(), slots, set(), env_)
+        assert time.monotonic() - began < 12 and verdict == "timeout", (verdict, why)
+        assert leftoverchecks.judge(p, os.getpid(), slots, set(), env_)[0] == "stuck"
+        release.set()
+        leftoverchecks._stuck[os.getpid()].join(15)
+        assert leftoverchecks.judge(p, os.getpid(), slots, set(), env_) == ("leftover", f"its task #{tid} is done")
+    finally:
+        release.set()

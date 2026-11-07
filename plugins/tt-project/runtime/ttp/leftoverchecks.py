@@ -177,7 +177,8 @@ def _facts(p, pid: int, slots: Path, env: dict) -> dict:
 
 def judge(p, pid: int, slots: Path, guarded: set[int], env: dict, facts: dict | None = None) -> tuple[str, str]:
     """("leftover" | "keep", why) for this user's `ttp checks` process `pid` that has a file under `slots` open;
-    `facts` (_facts) as read already."""
+    `facts` (_facts) as read already. ("timeout" | "stuck", why) when the reads of who joined its checks
+    outlast PROBE_S (_bounded)."""
     from . import leftoverstop
     facts = _facts(p, pid, slots, env) if facts is None else facts
     if procowner.foreign_env(p.base, env):
@@ -220,7 +221,11 @@ def judge(p, pid: int, slots: Path, guarded: set[int], env: dict, facts: dict | 
         return "leftover", f"its task #{task} is {status}"
     if status == "done" and run_id.isdigit():
         from . import jobstop
-        why = jobstop.checks_consumer(p, Path(run_dir)) if run_dir else None
+        why = jobstop.checks_waiter(p, Path(run_dir)) if run_dir else None
+        if run_dir and not why:   # the join records' pids are read in a bounded thread (_bounded)
+            state, why = _bounded(pid, lambda: jobstop.checks_joiner(p.state, Path(run_dir)), PROBE_S)
+            if state != "done":
+                return state, f"reading who joined its checks took over {PROBE_S:.0f} s"
         if not why:
             return "leftover", f"its task #{task} is done"
     return "keep", "no sign it outlived its run"
@@ -255,6 +260,8 @@ def check(p, pid: int, slots: Path, guarded: set[int]) -> tuple[str, dict | None
         return "keep", None
     env = got["env"]
     verdict, why = judge(p, pid, slots, guarded, env, got["facts"])
+    if verdict in ("timeout", "stuck"):
+        return verdict, None
     if verdict != "leftover":
         return "keep", None
     return "leftover", {"pid": pid, "start": got["start"], "run_dir": env.get("TTP_RUN_DIR") or "", "why": why,
