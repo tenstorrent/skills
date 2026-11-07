@@ -503,7 +503,7 @@ def test_ttp_sandbox_and_clip_run_pytest_without_n_where_xdist_is_missing(tmp_pa
         assert ("dropped -n 4" in r.stdout + r.stderr) is (rc == 3), (r.stdout, r.stderr)
 
 
-def _gone(pid: int) -> bool:
+def _pid_ended(pid: int) -> bool:
     """The process ended: no such pid, or a zombie waiting for its reaper. It can vanish between any two
     reads, so every failed read means gone."""
     try:
@@ -513,7 +513,7 @@ def _gone(pid: int) -> bool:
         return True
 
 
-def _kill(pid: int) -> None:
+def _kill_left(pid: int) -> None:
     try:
         os.kill(pid, signal.SIGKILL)
     except OSError:
@@ -533,11 +533,11 @@ def test_a_check_run_without_a_sandbox_ends_the_processes_it_left_behind(tmp_pat
         assert push._run_one("bash check.sh", tmp_path, dict(env), lambda m: None) == want
         pid = int(pidfile.read_text())
         for _ in range(100):
-            if _gone(pid):
+            if _pid_ended(pid):
                 break
             time.sleep(0.05)
         else:
-            _kill(pid)
+            _kill_left(pid)
             pytest.fail(f"the check's leftover process {pid} outlived it (exit {rc})")
 
 
@@ -573,11 +573,11 @@ def test_a_check_whose_push_is_killed_outright_ends_with_it(tmp_path):
         pusher.wait()
         deadline = time.time() + 15
         while time.time() < deadline:
-            if _gone(left):
+            if _pid_ended(left):
                 break
             time.sleep(0.1)
         else:
-            _kill(left)
+            _kill_left(left)
             pytest.fail(f"the check's process {left} outlived its killed push")
     finally:
         if pusher.poll() is None:   # once reaped, its pid (and group id) may be another process's
