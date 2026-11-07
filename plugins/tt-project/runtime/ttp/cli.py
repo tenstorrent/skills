@@ -3416,6 +3416,15 @@ def cmd_checks(a) -> None:
         ok, line = checkcap.ask_preempt(a.preempt, checkcap.label(p.name if p else None, "ttp checks --preempt"))
         print(f"ttp checks: {line}")
         sys.exit(0 if ok else 1)
+    if getattr(a, "freeze_lock", None):
+        try:   # a lock pinning what the checks import from the user site (runnerenv.freeze)
+            added = runnerenv.freeze(Path(a.freeze_lock))
+        except (OSError, subprocess.SubprocessError, runnerenv.Unavailable) as e:
+            die(f"ttp checks: --freeze-lock: {e}")
+        print(f"ttp checks: wrote {a.freeze_lock}: the default pins plus {len(added)} from the user site"
+              + (f" ({', '.join(added)})" if added else "") + "; review it, commit it to the checkout and set "
+              f"`ttp config <project> checks.python_lock <path in the checkout>`")
+        sys.exit(0)
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp checks only works inside a tt-project run")
@@ -12693,6 +12702,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--gap", metavar="SIG", help="read-only probe: exit 0 when a missing check's config changed")
     s.add_argument("--gap-config", metavar="FINGERPRINT",
                    help="with --gap: the push_checks fingerprint the waiter failed under")
+    s.add_argument("--freeze-lock", metavar="FILE",
+                   help="write a checks Python lock (checks.python_lock) to FILE: the default pins plus "
+                        "the user site's packages, at their installed versions; runs no check")
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
     s.add_argument("--full", action="store_true",

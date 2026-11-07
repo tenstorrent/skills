@@ -22,6 +22,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import secrets
 import shutil
 import subprocess
@@ -99,7 +100,7 @@ def ensure(lock: Path | None = None) -> dict:
         text = lock.read_bytes()
     except OSError as e:
         raise Unavailable(f"the checks' Python lock {lock} cannot be read ({e.strerror or e}); fix "
-                          "checks.python_lock (`ttp config checks.python_lock <file>`) or restore the file")
+                          "checks.python_lock (`ttp config <project> checks.python_lock <file>`) or restore the file")
     base = _base_python()
     key = key_of(text, base)
     if key in _ready:
@@ -158,6 +159,40 @@ def apply(env: dict, lock: Path | None = None) -> dict:
     out = {k: v for k, v in env.items() if k != "PIP_USER"}
     out["PATH"] = os.pathsep.join([str(Path(info["path"]) / "bin"), *([env["PATH"]] if env.get("PATH") else [])])
     return {**out, "PYTHONNOUSERSITE": "1", "TTP_CHECKS_PYTHON_ENV": info["key"]}
+
+
+def _name(s: str) -> str:
+    return re.sub(r"[-_.]+", "-", s).lower()
+
+
+def freeze(out: Path, lock: Path | None = None) -> list[str]:
+    """Writes a lock for checks.python_lock to `out`: `lock`'s pins (default LOCK) plus every package
+    in the user site (~/.local) that it does not name, at the version installed there, so checks that
+    import those keep them once the user site is off. Exact pins without hashes (pip's hash-checking
+    needs every line hashed, and a hash of this host's wheel can refuse another host's). Reads package
+    metadata only: installs nothing. Returns the pins it added from the user site."""
+    from importlib import metadata
+    try:
+        text = Path(lock or LOCK).read_text()
+    except OSError as e:
+        raise Unavailable(f"the lock {lock or LOCK} cannot be read ({e.strerror or e})")
+    env = {k: v for k, v in os.environ.items() if k != "PYTHONNOUSERSITE"}
+    r = subprocess.run([_base_python(), "-c", "import site; print(site.getusersitepackages())"],
+                       capture_output=True, text=True, timeout=60, env=env)
+    usersite = r.stdout.strip()
+    pins = [re.split(r"\s--hash=", ln)[0].rstrip() for ln in text.splitlines() if ln.strip() and not ln.startswith("#")]
+    have = {_name(re.split(r"[=<>!~ ;\[]", p, maxsplit=1)[0]) for p in pins}
+    added = {}
+    for d in (metadata.distributions(path=[usersite]) if usersite and Path(usersite).is_dir() else ()):
+        n = d.metadata["Name"]
+        if n and _name(n) not in have:
+            added.setdefault(_name(n), f"{n}=={d.version}")
+    added = sorted(added.values(), key=str.lower)
+    Path(out).write_text(f"# The checks' Python lock (checks.python_lock), written by `ttp checks --freeze-lock`:\n"
+                         f"# the pins of {lock or LOCK} and the packages of the user site it does not name.\n"
+                         "# Exact pins without hashes; review it, drop what the checks do not import.\n"
+                         + "".join(p + "\n" for p in pins) + "".join(p + "\n" for p in added))
+    return added
 
 
 def describe(info: dict) -> str:

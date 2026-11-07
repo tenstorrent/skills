@@ -177,3 +177,29 @@ def test_runnerenv_base_python_is_outside_any_venv(tmp_path):
                          env={**os.environ, "PYTHONPATH": str(Path(runnerenv.__file__).parents[1])}).stdout.strip()
     assert got and not Path(os.path.abspath(got)).is_relative_to(os.path.abspath(venv)), got
     assert Path(got).resolve() == Path(runnerenv._base_python()).resolve()
+
+
+def test_ttp_checks_freeze_lock_pins_the_user_sites_packages_the_lock_does_not_name(env, tmp_path, monkeypatch, capsys):
+    # A project whose checks import packages from ~/.local pins them: the default pins (hashes dropped,
+    # since pip's hash mode needs every line hashed), plus the user site's other packages at their
+    # versions; a user-site pytest never replaces the lock's own. Nothing is installed.
+    from ttp import cli, runnerenv
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    userbase = tmp_path / "userbase"
+    plain = {k: v for k, v in os.environ.items() if k != "PYTHONNOUSERSITE"}
+    site_dir = Path(subprocess.run([runnerenv._base_python(), "-c", "import site; print(site.getusersitepackages())"],
+                                   env={**plain, "PYTHONUSERBASE": str(userbase)}, capture_output=True, text=True,
+                                   check=True).stdout.strip())
+    for name, ver in (("Some_Pkg", "1.2.3"), ("pytest", "99.0")):
+        info = site_dir / f"{name}-{ver}.dist-info"
+        info.mkdir(parents=True)
+        (info / "METADATA").write_text(f"Metadata-Version: 2.1\nName: {name}\nVersion: {ver}\n")
+    monkeypatch.setenv("PYTHONUSERBASE", str(userbase))
+    out = tmp_path / "py.lock"
+    with pytest.raises(SystemExit) as ex:
+        cli.main(["checks", "--freeze-lock", str(out)])
+    assert ex.value.code == 0
+    lines = [ln for ln in out.read_text().splitlines() if not ln.startswith("#")]
+    assert "Some_Pkg==1.2.3" in lines and "pytest==8.4.2" in lines and "pytest==99.0" not in lines
+    assert "--hash" not in out.read_text() and "Some_Pkg==1.2.3" in capsys.readouterr().out
+    assert not (run / "checks.json").exists(), "it runs no check"

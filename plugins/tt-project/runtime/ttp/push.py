@@ -837,7 +837,8 @@ def venv_cmd(cmd: str, top: str | Path, env: dict | None = None) -> str:
     return f"printf '%s\\n' {shlex.quote('ttp: ' + why)} >&2\n{out}" if why else out
 
 
-ENV_FIX = "check command lacks dependencies: point delivery checks at a venv"
+ENV_FIX = ("check command lacks dependencies: point delivery checks at a venv, or pin them in the "
+           "checks' Python lock (checks.python_lock; `ttp checks --freeze-lock <file>` writes one)")
 _NO_MODULE = re.compile(r"(?:ModuleNotFoundError|ImportError): No module named '?([A-Za-z0-9_.]+)'?")
 _NO_PYTEST = re.compile(r"No module named '?pytest'?$|\bpy(?:test|\.test): (?:command )?not found", re.M)
 
