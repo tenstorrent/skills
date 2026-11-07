@@ -7,21 +7,31 @@ TTP_PYTEST_SELECT is a regex (delivery.push_cap_tests): this run keeps only the 
 part of the node id after its last `::`, it matches (re.search, as conflictfix.cap_failure reads a
 failing id) and deselects the rest. TTP_PYTEST_SELECT_IDS, one full node id per line, keeps only the
 tests with one of those ids (as pytest's node id or relative to the current directory, as its summary
-prints them; set but empty: none), so a same-named test in another file never runs. A run that keeps
-none exits 5, pytest's "no tests" status."""
+prints them; set but empty: none), so a same-named test in another file never runs.
+TTP_PYTEST_SELECT_FILES, one entry per line (testpick, a task's targeted `ttp checks`), keeps only the
+tests matching an entry: a path keeps the tests defined in that file (a case file an aggregator test
+file executes, or a test file), `path::name` the test function `name` of test file `path`. The filters
+combine (a test must pass each one set). A run that keeps none exits 5, pytest's "no tests" status."""
 from __future__ import annotations
 
+import inspect
 import os
 import re
 
 ENV = "TTP_PYTEST_SELECT"
 IDS_ENV = "TTP_PYTEST_SELECT_IDS"
+FILES_ENV = "TTP_PYTEST_SELECT_FILES"
 
 
 def pytest_collection_modifyitems(config, items):
-    pattern, ids = os.environ.get(ENV), os.environ.get(IDS_ENV)
-    if not pattern and ids is None:
+    pattern, ids, files = os.environ.get(ENV), os.environ.get(IDS_ENV), os.environ.get(FILES_ENV)
+    if not pattern and ids is None and files is None:
         return
+    paths, tests = set(), set()
+    for e in (files or "").splitlines():
+        if e.strip():
+            p, _, name = e.strip().partition("::")
+            (tests.add((p, name)) if name else paths.add(p))
     rx = re.compile(pattern) if pattern else None
     want = {i.strip() for i in (ids or "").splitlines() if i.strip()}
     rel = getattr(config, "cwd_relative_nodeid", lambda n: n)
@@ -29,8 +39,27 @@ def pytest_collection_modifyitems(config, items):
     def keep(item) -> bool:
         if rx is not None and not rx.search(item.nodeid.rpartition("::")[2]):
             return False
+        if files is not None and not _in_files(item, paths, tests):
+            return False
         return ids is None or item.nodeid in want or rel(item.nodeid) in want
     gone = [i for i in items if not keep(i)]
     if gone:
         items[:] = [i for i in items if keep(i)]
         config.hook.pytest_deselected(items=gone)
+
+
+def _ends(path: str, rel: str) -> bool:
+    path = path.replace(os.sep, "/")
+    return path == rel or path.endswith("/" + rel)
+
+
+def _in_files(item, paths: set, tests: set) -> bool:
+    where = str(getattr(item, "path", "") or getattr(item, "fspath", ""))
+    fn = getattr(item, "function", None)
+    try:
+        code = inspect.unwrap(fn).__code__.co_filename if fn is not None else ""
+    except (AttributeError, ValueError):
+        code = ""
+    name = getattr(item, "originalname", None) or item.name.partition("[")[0]
+    return any(_ends(code, p) or _ends(where, p) for p in paths) \
+        or any(n == name and _ends(where, p) for p, n in tests)

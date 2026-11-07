@@ -2144,6 +2144,19 @@ session and stateless coordinators on every provider.
   off. Known gap: a project that opts in owns its globs. A glob that covers installed or
   test-asserted content (for example a plugin README that tests read) skips the checks those
   changes need; list only paths nothing installs or tests.
+- Targeted task checks (on by default): a task's `ttp checks` narrows each project check that is one
+  plain local pytest run of listed test files to the tests its diff from the push target can reach.
+  A changed runtime module runs the case files and tests that import or name it (a module most tests
+  name: those naming the functions it changes); a changed test or case file runs itself; any other
+  file runs the tests naming it. The whole check runs instead on a conftest, a shared test helper or
+  fixture, the checks runner, a manifest or `__init__.py`, a pytest or package config file, a file
+  nothing places, or a selection of half the suite or more. `tests/test_plugin_catalogue.py`
+  always runs (`delivery.checks_targeted_always`, a list of test files). The output and the run's
+  `checks.json` (`scope`) say `targeted: N case files, ...` or `full: <reason>`.
+  A targeted pass counts only for that narrowed run: it never counts as the full check's pass and
+  sets no verified-through marker. `ttp push` and the push queue never narrow: every batch runs the
+  full required checks. `delivery.checks_targeted: false` (or `ttp checks --full`) restores full
+  runs.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
   several quoted strings run as one check each (`ttp checks -- 'pytest -q' 'ruff check .'`). An

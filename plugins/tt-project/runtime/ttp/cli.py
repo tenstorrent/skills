@@ -3462,7 +3462,7 @@ def cmd_checks(a) -> None:
     log = Path(run_dir) / "checks.log"
     passed, failed, failure, rc, scope_error = True, None, None, None, None
     clean_note = ""   # why a check found no clean checkout, or what only this worktree has
-    fast_skipped, fast_cmds = [], []
+    fast_skipped, fast_cmds, scope_lines = [], [], []
     executed, selected, rerun = [], [], None
     run_envs, run_parts, reused = None, None, []   # each check's environment; those a suite pass spared (_suite_pass)
     timed_out, deadline, ran_since = None, None, 0.0   # the wall-time cap (checkwall) and its outcome
@@ -3556,6 +3556,16 @@ def cmd_checks(a) -> None:
         todo = [c for c in todo if c not in queue_cmds]
         if queue_cmds and todo:
             hit = _recorded_pass(p, tree, todo, purpose)
+        # A task's own pytest checks run only the tests its diff can reach (testpick); the push batch
+        # never comes here and runs the full suite. A narrowed check's pass is its own (its env is in its key).
+        if todo and passed and not hit and not fast_cmds and purpose == "candidate":
+            from . import testpick
+            todo, scope_lines = testpick.narrow(Path(top), base, head, todo, own, fcfg, full=a.full)
+            for said in scope_lines:
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
+            if any(getattr(c, "targeted", False) for c in todo) and not a.fresh:
+                hit = _recorded_pass(p, tree, todo, purpose)
         if not todo and passed and verified_cmds:
             said = f"every applicable check was {mark['line']}"
             out.write(f"{said}\n")
@@ -4142,6 +4152,7 @@ def cmd_checks(a) -> None:
                                                           "tip": e.get("tip") or "", "ts": e.get("ts")}
                                                          for c, e in queue_hits]} if queue_hits else {}),
                                                      "purpose": purpose, "checks_from": source,
+                                                     **({"scope": scope_lines} if scope_lines else {}),
                                                      **({"fast_path": True, "skipped_project_checks": fast_skipped}
                                                         if fast_cmds else {}),
                                                      **({"not_run": not_run} if not_run else {}),
@@ -4197,7 +4208,7 @@ def cmd_checks(a) -> None:
     spared = {x["check"] for x in excused}
     if purpose == "candidate":
         _mark_verified(p, head, tree, [c for c in list(todo) + list(verified_cmds) + list(queue_cmds)
-                                       if str(c) not in spared])
+                                       if str(c) not in spared and not getattr(c, "targeted", False)])
     if hit:
         print(said)
         return
@@ -12298,7 +12309,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--fresh", action="store_true",
                    help="run the checks even when they already passed on this tree")
     s.add_argument("--full", action="store_true",
-                   help="run the project's checks even for a docs/data-only diff (no fast path)")
+                   help="run the project's checks in full: even for a docs/data-only diff (no fast path), and "
+                        "every test rather than those the diff can reach (checks.targeted)")
     s.add_argument("--light", action="store_true",
                    help="the commands after -- are light checks (syntax, lint, format, validation): with only "
                         "light checks to run they run at once, without waiting for a checks slot (checklane)")

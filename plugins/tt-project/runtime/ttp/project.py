@@ -607,6 +607,7 @@ EXTRA_KEYS = {
                  "after_push_timeout_s", "backup_remote", "fast_forward_also", "mirror_remotes",
                  "allow_protected_push_branch", "own_push", "own_push_remote", "own_push_reserved_lane", "deploy_restart_wait_s", "plugin_version_guard",
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
+                 "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
                  "checks_host",   # where checks run (remotecheck)
                  "checks_spill_hosts", "checks_spill_after_s",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
@@ -1108,10 +1109,12 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
     out += [f"delivery.push_checks_by_repo: {p}" for p in by_repo_problems(delivery.get("push_checks_by_repo"))]
-    for k in ("checks_fast_globs", "checks_fast_exclude"):
+    if delivery.get("checks_targeted") not in (None, True, False):
+        out.append("delivery.checks_targeted: not true or false")
+    for k in ("checks_fast_globs", "checks_fast_exclude", "checks_targeted_always"):
         v = delivery.get(k)
         if v is not None and not (isinstance(v, list) and all(isinstance(x, str) for x in v)):
-            out.append(f"delivery.{k}: not a list of glob strings")
+            out.append(f"delivery.{k}: not a list of " + ("path strings" if k == "checks_targeted_always" else "glob strings"))
     out += [f"delivery.push_exclude_paths: {p}" for p in [scalar_problem(delivery.get("push_exclude_paths"))] if p]
     from .checkprestage import problems as prestage_problems
     out += prestage_problems(delivery.get("check_prestage"))
