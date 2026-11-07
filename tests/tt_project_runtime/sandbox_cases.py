@@ -499,3 +499,29 @@ def test_ttp_sandbox_and_clip_run_pytest_without_n_where_xdist_is_missing(tmp_pa
                            env=env, capture_output=True, text=True, timeout=120)
         assert r.returncode == 0 and f"ARGS: {args}" in r.stdout, (r.stdout, r.stderr)
         assert ("dropped -n 4" in r.stdout + r.stderr) is (rc == 3), (r.stdout, r.stderr)
+
+
+def test_a_check_run_without_a_sandbox_ends_the_processes_it_left_behind(tmp_path, monkeypatch):
+    """No PID namespace reaps a check by default: the check runs in a process group of its own, and
+    whatever of it is still alive once it ends, passed or failed, is killed with that group."""
+    from ttp import push, sandbox
+    monkeypatch.delenv(sandbox.ENV, raising=False)
+    env = {k: v for k, v in os.environ.items() if k != sandbox.ENV}
+    for rc, want in ((0, 0), (1, push.CHECKS_FAILED)):
+        pidfile = tmp_path / f"left-{rc}.pid"
+        (tmp_path / "check.sh").write_text(
+            f"sleep 300 </dev/null >/dev/null 2>&1 &\necho $! > {pidfile}\nexit {rc}\n")
+        assert push._run_one("bash check.sh", tmp_path, dict(env), lambda m: None) == want
+        pid = int(pidfile.read_text())
+        for _ in range(100):
+            try:
+                os.kill(pid, 0)
+            except ProcessLookupError:
+                break
+            stat = Path(f"/proc/{pid}/stat")
+            if stat.exists() and stat.read_text().rsplit(")", 1)[1].split()[0] == "Z":
+                break   # killed, waiting for its reaper
+            time.sleep(0.05)
+        else:
+            os.kill(pid, signal.SIGKILL)
+            pytest.fail(f"the check's leftover process {pid} outlived it (exit {rc})")

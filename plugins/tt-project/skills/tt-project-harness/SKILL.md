@@ -215,7 +215,7 @@ read the one for the lever you change.
 - Nothing runs in a namespace sandbox by default: tests run as they are. `TT_VISIBLE_DEVICES` only
   asks, so under `TTP_NO_DEVICE=1` on a host tagged `device` the tool hook refuses device commands
   outside a device `ttp lock` (itself refused on a held or paused device) or `ttp devq`: reset, flash
-  and power tools (`tt-smi -r`, `tt-smi -glx_reset`, `tt-flash`, `tt-topology`, `ipmitool power`),
+  and power tools (`tt-smi` resets, `tt-flash`, `tt-topology`, `ipmitool power`),
   a path under `/dev/tenstorrent` (listing it with `ls` or `stat` passes), and a change to the mask
   (`TT_VISIBLE_DEVICES=`, `unset`, `env -u`, `env -i`), also behind `sudo`, wrappers and `sh -c`.
   It guards against accidents: code that opens a device from a script or inline code is not read.
