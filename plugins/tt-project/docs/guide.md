@@ -1948,8 +1948,15 @@ session and stateless coordinators on every provider.
   only a run whose stop leaves its project's test budget and the host's test pool room for it; else
   nobody. Its log and its task's notes say `preempted by urgent #<task>`, its queue entry in
   `ttp status` says `requeued after preemption by urgent #<task>` until it holds a slot again, and its
-  own rerun goes on to its result. Another urgent run, a push check and a run behind a lock (the `checks.wrap_cmd` wrapper, or
-  commands that run `ttp lock`, `ttp devq` or `flock`) are never asked. A routine run whose task
+  own rerun goes on to its result. A push check and a run behind a lock (the `checks.wrap_cmd` wrapper, or
+  commands that run `ttp lock`, `ttp devq` or `flock`) are never asked, nor is another urgent run, with
+  one exception: a run whose task owns an open obligation (owed to the user) asks an urgent run that owes
+  nothing, after every routine run, so owed work never waits behind urgent work that owes nothing. An
+  owed run is never asked. When a reserved urgent slot frees, the waiting owed run gets it first, then
+  the urgent run that has waited longest, never whichever happens to look first. `ttp checks --preempt
+  <run>` sends the same request by hand to run `<run>`'s checks, with the asker logged in the host's
+  check-slots folder (`preempt-asks.jsonl`); it refuses push checks, owed runs, runs behind a lock and
+  runs on a reserved urgent slot. The freed slot goes to the next waiter in queue order. A routine run whose task
   turns urgent while it waits notices within 30 s and re-executes once as an urgent run, at the same
   arrival. `ttp status` shows `urgent slot beyond the cap: ...` while one runs. While any run waits for test slots, push
   checks use only their branch's reserved test slot. There is no

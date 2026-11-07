@@ -8419,6 +8419,195 @@ def test_push_priority_urgent_and_lock_holding_checks_runs_are_never_preempted(e
             h.close()
 
 
+def _owed_preempt_env(monkeypatch, cap="2"):
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", cap)
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "0")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    return checkcap
+
+
+def test_an_owed_checks_run_preempts_an_urgent_holder_that_owes_nothing_after_every_routine_one(env, monkeypatch):
+    """#7057 (a): the slot label records whether the holder's task owns an open obligation; an owed waiter
+    asks an urgent holder that owes nothing (the latest granted first), but a routine holder before it, even
+    one of another project while the urgent one is of its own."""
+    import threading
+    checkcap = _owed_preempt_env(monkeypatch, cap="3")
+    hold = [checkcap.acquire("owed holder", priority=0, owns=["o1"], preemptible=True),
+            checkcap.acquire("urgent early", project_name="mine", priority=0, preemptible=True),
+            checkcap.acquire("urgent late", project_name="mine", priority=1, preemptible=True)]
+    told, got = [], []
+    try:
+        labels = [json.loads(h.f.name and Path(h.f.name).read_text()) for h in hold]
+        assert [lb["owed"] for lb in labels] == [True, False, False], "the writer records it"
+        t = threading.Thread(target=lambda: got.append(checkcap.acquire(
+            "owed", project_name="mine", priority=0, owns=["o1"], urgent=True, tell=told.append, max_wait_s=30)))
+        t.start()
+        assert _wait_for(lambda: checkcap.PREEMPT_LINE.format("urgent late") in told), told
+        assert checkcap.preempted(hold[2].since) == "urgent owed"
+        hold[2].close()
+        t.join(30)
+        assert got and got[0] is not None and got[0].f is not None
+    finally:
+        checkcap.clear_preempt()
+        for h in hold + got:
+            if h is not None:
+                h.close()
+    routine = checkcap.acquire("routine other", project_name="other", priority=5, preemptible=True)
+    urgent = checkcap.acquire("urgent mine", project_name="mine", priority=1, preemptible=True)
+    owed = checkcap.acquire("owed holder", priority=0, owns=["o1"], preemptible=True)
+    told = []
+    try:
+        assert checkcap.acquire("owed", project_name="mine", priority=0, owns=["o1"], urgent=True,
+                                tell=told.append, max_wait_s=1.0) is None
+        assert checkcap.PREEMPT_LINE.format("routine other") in told, told
+    finally:
+        checkcap.clear_preempt()
+        for h in (routine, urgent, owed):
+            h.close()
+
+
+def test_an_owed_checks_run_never_preempts_an_owed_holder_or_a_push_check_and_others_never_preempt_urgent(env, monkeypatch):
+    """#7057 (b): an owed waiter asks nobody while the cap holds only owed runs, with a push branch's priority
+    slot and a push check's turn on the cap held too; a waiter that owes nothing never asks an urgent holder."""
+    checkcap = _owed_preempt_env(monkeypatch)
+    owed = checkcap.acquire("owed holder", priority=0, owns=["o2"], preemptible=True)
+    push_turn = checkcap.acquire("push turn", "push checks on abc", priority=0)   # push.turn(): never preemptible
+    push = checkcap.acquire_priority("origin/branch", "push checks")
+    told = []
+    try:
+        assert checkcap.acquire("owed", priority=0, owns=["o1"], urgent=True, tell=told.append, max_wait_s=1.0) is None
+        assert not any(m.startswith("urgent checks with every") for m in told), told
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json")), "nobody was asked"
+    finally:
+        push.close()
+        push_turn.close()
+        owed.close()
+    urgent = [checkcap.acquire("urgent a", priority=0, preemptible=True),
+              checkcap.acquire("urgent b", priority=1, preemptible=True)]
+    try:
+        assert checkcap.acquire("not owed", priority=0, urgent=True, tell=told.append, max_wait_s=1.0) is None
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json")), "only an owed waiter asks urgent"
+    finally:
+        for h in urgent:
+            h.close()
+
+
+def test_a_preempted_urgent_checks_run_that_owes_nothing_requeues_at_its_old_place(env, tmp_path, monkeypatch, capsys):
+    """#7057 (a): an urgent run that owes nothing, asked for its cap slot, ends its command, frees the slot
+    and queues again at its first arrival, then runs to its result, as a routine one does."""
+    from ttp import checkcap, checkwall, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checkwall, "POLL_S", 0.1)
+    monkeypatch.setattr(checkcap, "task_rank", lambda _p: (1, []))
+    real, arrivals = checkcap.acquire, []
+    monkeypatch.setattr(checkcap, "acquire",
+                        lambda *a, **k: arrivals.append((a[5] if len(a) > 5 else k.get("since"), k.get("urgent")))
+                        or real(*a, **k))
+    monkeypatch.setenv(checkcap.PREEMPTED_ENV, "")
+    mark, req = tmp_path / "ran-once", checkcap.slot_dir() / f"{checkcap.PREEMPT}.{os.getpid()}.json"
+    script = (f'if [ -e {mark} ]; then exit 0; fi; touch {mark}; '
+              f'printf \'{{"by": "urgent u", "task": "78", "at": %s}}\' "$(($(date +%s) + 1))" > {req}; sleep 60')
+    t0 = time.time()
+    cli.main(["checks", "--", "sh", "-c", script])
+    out = capsys.readouterr().out
+    assert time.time() - t0 < 45, "its command ended once asked"
+    assert "preempted by urgent #78" in out, out
+    assert "passed" in out.rsplit("preempted by", 1)[1], "its own retry ran to its result"
+    assert len(arrivals) == 2 and arrivals[0] == arrivals[1] and arrivals[0][1], "an urgent run queued again at its old place"
+
+
+def test_a_freed_reserved_urgent_slot_goes_to_the_parked_owed_waiter_before_an_older_urgent_one(env, monkeypatch):
+    """#7057 (3): with the cap and the reserved urgent slot held, an owed waiter parked for its test slots gets
+    the urgent slot when it frees, before an urgent waiter that owes nothing and arrived earlier; a newcomer
+    that owes nothing takes none while the owed one waits; the older one gets the next."""
+    import threading
+    from ttp import checkcap, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    monkeypatch.setenv(checkcap.PREEMPT_AFTER_ENV, "3600")
+    monkeypatch.setenv(checkcap.PREEMPT_ASKED_ENV, "")
+    monkeypatch.setattr(checkcap, "POLL_S", 0.1)
+    routine = checkcap.acquire("routine", priority=3)
+    first = checkcap.acquire("first urgent", priority=1, urgent=True, max_wait_s=5)
+    assert first is not None and first.urgent
+    got: dict = {}
+    older = threading.Thread(target=lambda: got.update(older=checkcap.acquire(
+        "older urgent", priority=1, urgent=True, since=time.time() - 600, max_wait_s=30)))
+    owed = threading.Thread(target=lambda: got.update(owed=checkcap.acquire(
+        "owed parked", priority=0, owns=["o1"], urgent=True, startable=lambda: False, max_wait_s=30)))
+    older.start()
+    owed.start()
+    try:
+        assert _wait_for(lambda: len(locks.queued(checkcap.slot_dir(), checkcap.URGENT_WAIT)) == 2)
+        first.close()
+        owed.join(30)
+        assert got.get("owed") is not None and got["owed"].urgent, "the owed waiter took it"
+        assert "older" not in got, "the older one still waits"
+        late = checkcap.acquire("newcomer", priority=1, urgent=True, max_wait_s=0.5)
+        got["owed"].close()
+        assert late is None or (late.close() and False), "a newcomer never goes before a waiting one"
+        older.join(30)
+        assert got.get("older") is not None and got["older"].urgent
+    finally:
+        for k in ("older", "owed"):
+            if got.get(k) is not None:
+                got[k].close()
+        routine.close()
+        first.close()
+
+
+def test_ttp_checks_preempt_asks_a_run_by_hand_and_refuses_owed_push_and_locked_runs(env, monkeypatch, capsys):
+    """#7057 (d): `ttp checks --preempt <run>` writes the request preempt() writes for that run's checks and
+    logs who asked; it refuses an owed holder, an urgent one whose label does not say it owes nothing, a push
+    check (priority slot or a push turn on the cap), a run behind a lock and an unknown run."""
+    from ttp import checkcap, cli, locks
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "5")
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    holds = {}
+    for run, kw in (("r-owed", {"priority": 0, "owns": ["o1"], "preemptible": True}),
+                    ("r-urgent", {"priority": 0, "preemptible": True}),
+                    ("r-routine", {"priority": 4, "preemptible": True}),
+                    ("r-locked", {"priority": 4, "preemptible": checkcap.preemptible(["ttp lock b -- t"])}),
+                    ("r-turn", {"priority": 4})):
+        monkeypatch.setenv("TTP_RUN_ID", run)
+        holds[run] = checkcap.acquire(f"holder {run}", "push checks on abc" if run == "r-turn" else "", **kw)
+    monkeypatch.setenv("TTP_RUN_ID", "r-push")
+    holds["r-push"] = checkcap.acquire_priority("origin/branch", "push checks")
+    monkeypatch.setenv("TTP_RUN_ID", "r-asker")
+    monkeypatch.setenv("TTP_TASK", "91")
+
+    def ask(run):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["checks", "--preempt", run])
+        return e.value.code, capsys.readouterr().out
+
+    try:
+        locks.relabel(holds["r-urgent"].f, {"owed": None})   # an older label: does not say it owes nothing
+        for run, why in (("r-owed", "is owed"), ("r-urgent", "is owed"), ("r-push", "push checks"),
+                         ("r-turn", "push checks"), ("r-locked", "cannot be asked"), ("r-none", "no checks of run")):
+            rc, out = ask(run)
+            assert rc == 1 and "not asked" in out and why in out, (run, out)
+        assert not list(checkcap.slot_dir().glob(f"{checkcap.PREEMPT}.*.json")), "nobody was asked"
+        rc, out = ask("r-routine")
+        assert rc == 0 and "asked holder r-routine" in out, out
+        assert checkcap.preempted(holds["r-routine"].since) == "urgent #91"
+        log = [json.loads(x) for x in (checkcap.slot_dir() / checkcap.PREEMPT_LOG).read_text().splitlines()]
+        assert len(log) == 1 and log[0]["run"] == "r-routine" and log[0]["task"] == "91" and log[0]["by"], log
+        with pytest.raises(SystemExit):
+            cli.main(["checks", "--preempt", "r-routine", "--", "pytest"])
+        assert "--preempt runs nothing" in capsys.readouterr().err
+    finally:
+        checkcap.clear_preempt()
+        for h in holds.values():
+            h.close()
+
+
 def test_no_preemption_within_the_grace_and_it_counts_from_the_arrival(env, monkeypatch):
     """#6246 (3): an urgent waiter asks nobody while it has waited less than checks.preempt_after_s (default
     PREEMPT_AFTER_S); one that arrived longer ago (a re-execution keeps its arrival) asks at once."""

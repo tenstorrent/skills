@@ -3301,6 +3301,12 @@ def cmd_checks(a) -> None:
         sys.exit(_checks_lane_status(bool(getattr(a, "json", False)) or "--json" in a.cmd))
     if getattr(a, "env_ok", None) is not None:
         sys.exit(_checks_env_ok(here(), a.env_ok))
+    if getattr(a, "preempt", None):
+        from . import checkcap
+        p = here()
+        ok, line = checkcap.ask_preempt(a.preempt, checkcap.label(p.name if p else None, "ttp checks --preempt"))
+        print(f"ttp checks: {line}")
+        sys.exit(0 if ok else 1)
     run_dir = os.environ.get("TTP_RUN_DIR")
     if not run_dir:
         die("ttp checks only works inside a tt-project run")
@@ -4686,6 +4692,8 @@ def _checks_cmd_error(a) -> str:
         return (f"`status` takes only {', '.join(_CHECKS_STATUS_FLAGS)}; unknown: {' '.join(extra)}" if extra else "")
     if getattr(a, "slot_status", False):
         return f"--slot-status runs nothing and takes no command; got: {' '.join(cmd)}" if cmd else ""
+    if getattr(a, "preempt", None):
+        return f"--preempt runs nothing and takes no command; got: {' '.join(cmd)}" if cmd else ""
     if not cmd or cmd[0] == "--":
         return ""
     first = cmd[0]
@@ -12420,6 +12428,10 @@ def main(argv: list[str] | None = None) -> None:
                    help="run nothing (also `ttp checks status`): print each repository's checks lanes, their "
                         "holders (pid, task, run, age, alive) and the waiters in queue order; never queues")
     s.add_argument("--json", action="store_true", help="with --slot-status or status: as JSON")
+    s.add_argument("--preempt", metavar="RUN",
+                   help="run nothing: ask run RUN's checks to give up their host-wide checks slot and queue again "
+                        "at their place, as an urgent waiter would (logged with who asked); refused for push "
+                        "checks, owed runs (their task owns an open obligation) and runs behind a lock")
     s.add_argument("--rc", help=argparse.SUPPRESS)   # the detached process itself: where it writes its exit code
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check commands after --: one quoted string runs through the shell "
                         "(ttp checks -- 'FOO=1 pytest -q && ruff check'); several quoted strings run as "

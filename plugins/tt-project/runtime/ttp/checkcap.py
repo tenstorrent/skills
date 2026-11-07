@@ -76,9 +76,14 @@ it from every other waiter while the asker lives and renews it, and a request wh
 A waiter parked for its test slots asks only a run whose stop lets it start (preempt's `startable`, FREEING:
 its project's budget and the host's test pool counted without that run's slots); else nobody. Its log says
 `preempted by urgent #<task>`; its queue entry says `requeued after preemption by ...` until it holds a slot
-again (PREEMPTED_ENV, label(), requeued()). Never another urgent run or a push check (their priority
-slots are no cap slots), nor a run behind a lock (a wrapper lock, `ttp lock`, `ttp devq`: preemptible()); a
-holder whose label does not say it can be asked (an older ttp) is skipped. A routine run whose task turns urgent
+again (PREEMPTED_ENV, label(), requeued()). Never a push check (their priority slots are no cap slots), nor a
+run behind a lock (a wrapper lock, `ttp lock`, `ttp devq`: preemptible()); a holder whose label does not say
+it can be asked (an older ttp) is skipped. Never an urgent run either, except that a waiter whose task owns an
+open obligation (owed: the slot label's "owed") asks an urgent run that owes nothing, after every routine one,
+so an owed run never waits behind urgent work that owes nothing; an owed holder is never asked. `ttp checks
+--preempt <run>` writes the same request by hand, logged with who asked (ask_preempt). A freed reserved urgent
+slot goes to the urgent waiter that ranks first (URGENT_WAIT tickets: an owed one, then the oldest), not to
+whichever polls first. A routine run whose task turns urgent
 while it waits sees it within RERANK_S (reranked) and re-executes as an urgent run (cli._checks_reexec).
 
 While the host is lightly loaded (1-minute load average under half its cores) up to `checks.load_extra`
@@ -1018,8 +1023,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`."""
     n = limit()
     was_preempted = bool(os.environ.get(PREEMPTED_ENV))   # preempted once: queues at its place, asked again last
-    label = {"priority": priority, "checks_project": project_name, **({"preemptible": True} if preemptible else {}),
-             **({"preempted": True} if was_preempted else {})}
+    label = {"priority": priority, "checks_project": project_name, "owed": bool(owns),
+             **({"preemptible": True} if preemptible else {}), **({"preempted": True} if was_preempted else {})}
     again = {"holder": holder, "what": what, "project_name": project_name, "priority": priority, "owns": owns,
              "cap": cap, "preemptible": preemptible}
     if not n or os.environ.get(HELD_ENV):
@@ -1043,11 +1048,12 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             locks.mark_turn(slot_dir(), RESOURCE, None)
             _granted(tell, state, project_name, priority, owns, since, cap=cap, lane_at=lane_at)
             return Slot(f, again=again)
-        if f := _urgent_take(urgent, priority, every, held_as, what, same):
+        if f := _urgent_take(urgent, priority, every, held_as, what, same, owns, rank=_urgent_rank(owns, since)):
             drop_claim(claim)
             return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
                                                    priority=priority, requeued=was_preempted)
+        uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, None, queued_as, since, owns)
         if parked and tell:   # told once a wait: its pool's room may come and go
             tell(PARKED_LINE)
         park = _park(parked, None, queued_as, since, project_name, priority)
@@ -1070,6 +1076,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 _drop_pass()
             try:
                 park = _park(parked, park, queued_as, since, project_name, priority)
+                uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, uwait, queued_as, since, owns)
             except OSError as e:
                 raise _unavailable(e) from e
             if parks and parked != was:
@@ -1099,7 +1106,8 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                     f = _take_in_turn(n, ticket, ps, every, held_as, what, same, label, mine=claim)
                 except OSError:
                     f = None
-            if not f and not twin and (f := _urgent_take(urgent, priority, every, held_as, what, same)):
+            if not f and not twin and (f := _urgent_take(urgent, priority, every, held_as, what, same, owns,
+                                                         mine=uwait)):
                 return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
             if not f and asked and not twin and not parked:   # the slot a preempted run gave up is this run's
                 f = _take(n, paths(n), every, held_as, what, same, label=label, mine=claim)
@@ -1110,7 +1118,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
                 # Only a run whose stop lets this one start: parked, its test slots must fit once that run's free.
                 claim = secrets.token_hex(6)
                 if asked := preempt(holder, every, project_name, startable=startable if parked else None,
-                                    claim=claim):
+                                    claim=claim, owed=bool(owns)):
                     os.environ[PREEMPT_ASKED_ENV] = json.dumps({"since": since, "asked": asked, "claim": claim})
                     if tell:
                         tell(PREEMPT_LINE.format(asked))
@@ -1140,6 +1148,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             project.ps_cycle()   # pids are read once per poll cycle, never one `ps` each (ps_snapshot)
     finally:
         locks.dequeue(ticket)
+        locks.dequeue(uwait)
         drop_claim(claim)   # taken, or given up: the asked run need not stop for it any more (preempted)
         _park(False, park, "", 0.0, None, None)
         if told and waiting:
@@ -1150,11 +1159,46 @@ URGENT_LINE = ("urgent checks with every host-wide checks slot busy: running now
                "the cap (checks.urgent_slots), with its reserved test lane")
 
 
-def _urgent_take(urgent: bool, priority: int | None, every: list[Path], holder: str, what: str, same: str):
-    """A free reserved urgent slot for an urgent run (acquire's `urgent`), else None."""
-    if not urgent or not is_urgent(priority) or _running(every, same):
+def _urgent_take(urgent: bool, priority: int | None, every: list[Path], holder: str, what: str, same: str,
+                 owns=(), mine: Path | None = None, rank: tuple | None = None):
+    """A free reserved urgent slot for an urgent run (acquire's `urgent`), else None: none while an urgent
+    waiter ranked before it waits for one (_urgent_ahead; `mine` its own URGENT_WAIT ticket, else its `rank`)."""
+    if not urgent or not is_urgent(priority) or _running(every, same) or _urgent_ahead(mine, rank):
         return None
-    return locks.try_take(urgent_paths(), holder, what, key=same, extra={"priority": priority, "urgent": True})
+    return locks.try_take(urgent_paths(), holder, what, key=same,
+                          extra={"priority": priority, "urgent": True, "owed": bool(owns)})
+
+
+URGENT_WAIT = "checks-urgent-wait"   # check-slots queue: the urgent runs that could take a reserved urgent slot now
+
+
+def _urgent_rank(owns, since: float) -> tuple[float, float]:
+    """An urgent waiter's place for a reserved urgent slot: an open obligation's owner first, then arrival
+    (its URGENT_WAIT ticket's priority: OBLIGATION_PRIORITY, else locks.URGENT_PRIORITY)."""
+    return (float(OBLIGATION_PRIORITY if owns else locks.URGENT_PRIORITY), since)
+
+
+def _urgent_wait(want: bool, ticket: Path | None, holder: str, since: float, owns) -> Path | None:
+    """The URGENT_WAIT ticket an urgent run holds while it could take a reserved urgent slot (acquire: not
+    while the same checks run), so a freed one goes to the owed waiter first, then the oldest, not to whichever
+    polls first (_urgent_take); dropped once it no longer could."""
+    if want and ticket is None:
+        return locks.enqueue(slot_dir(), URGENT_WAIT, holder, since, priority=int(_urgent_rank(owns, since)[0]))
+    if not want and ticket is not None:
+        locks.dequeue(ticket)
+        return None
+    return ticket
+
+
+def _urgent_ahead(mine: Path | None, rank: tuple | None = None) -> bool:
+    """Whether another live URGENT_WAIT ticket ranks before `mine` (or before `rank` without one)."""
+    try:
+        q = locks.queued(slot_dir(), URGENT_WAIT)
+    except OSError:
+        return False
+    key = (lambda t: (locks.ticket_priority(t), locks._arrival(t)))
+    me = key(mine) if mine is not None and mine in q else rank
+    return me is not None and any(t != mine and key(t) < me for t in q)
 
 
 def _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at) -> Slot:
@@ -1184,13 +1228,15 @@ def _preempt_path(pid: int) -> Path:
 
 
 def preempt(by: str, every: list[Path], project_name: str | None = None,
-            startable: Callable[[], bool] | None = None, claim: str = "") -> str:
+            startable: Callable[[], bool] | None = None, claim: str = "", owed: bool = False) -> str:
     """Ask one routine run holding a slot of the cap (`every`) to give it up: one never preempted before first
     (a preempted one's label says so: acquire's `preempted`), then a run of the asker's project
     (`project_name`), then the lowest priority (none first, then the highest number), the latest granted
     among equals (it loses the least work). Only a holder whose label says it can be asked (acquire's
-    `preemptible`), never an urgent run (is_urgent) or a reserved slot's; push checks hold priority slots,
-    never these. With `startable` (the asker waits for its test slots) only a run whose stop lets it start:
+    `preemptible`), never a reserved slot's; push checks hold priority slots, never these. An urgent run
+    (is_urgent) only when the asker is `owed` (its task owns an open obligation) and the holder's label says
+    it owes nothing (acquire's "owed" false; an older label without it is skipped), after every routine one:
+    an owed run never waits behind urgent work that owes nothing. With `startable` (the asker waits for its test slots) only a run whose stop lets it start:
     `startable()` true with that run's test slots counted free (FREEING), else nobody is asked. With `claim`
     the slot it frees is the asker's (claims): no other waiter takes it while the claim lives, and the request
     lapses with it (preempted). Returns the holder asked, or ""."""
@@ -1202,14 +1248,18 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
             h = json.loads(path.read_text() or "{}")
         except (OSError, ValueError):
             continue
-        if not isinstance(h, dict) or not h.get("preemptible") or h.get("urgent") or is_urgent(h.get("priority")):
+        if not isinstance(h, dict) or not h.get("preemptible") or h.get("urgent"):
+            continue
+        band = is_urgent(h.get("priority"))
+        if band and not (owed and h.get("owed") is False):
             continue
         pid = int(h.get("ns_pid") or h.get("pid") or 0)
         if pid <= 0 or claim_live(str(_read(_preempt_path(pid)).get("claim") or "")):
             continue   # none, or another asker's live claim waits for its slot already
         prio = h.get("priority")
         again = bool(h.get("preempted")) or "[preempted by " in str(h.get("holder") or "")
-        found.append(((not again, bool(project_name) and h.get("checks_project") == project_name, prio is None,
+        found.append(((not band, not again, bool(project_name) and h.get("checks_project") == project_name,
+                       prio is None,
                        prio if isinstance(prio, int) else 0, float(h.get("since") or 0)), pid, path, h))
     for _, pid, path, h in sorted(found, key=lambda x: x[0], reverse=True):
         if startable is not None:
@@ -1230,6 +1280,41 @@ def preempt(by: str, every: list[Path], project_name: str | None = None,
             return ""
         return str(h.get("holder") or pid)
     return ""
+
+
+PREEMPT_LOG = "preempt-asks.jsonl"   # check-slots/preempt-asks.jsonl: who asked by hand (ask_preempt), one line each
+
+
+def ask_preempt(run: str, by: str) -> tuple[bool, str]:
+    """`ttp checks --preempt <run>`: ask the checks of run `run` (its slot label's run_id) to give up their
+    slot of the cap, with the request preempt() writes (no claim: the freed slot goes to the queue's next
+    waiter in its order), and log who asked (PREEMPT_LOG). Refused for push checks (a priority slot, or a push
+    turn on the cap), a reserved urgent slot's run, an owed holder (its task owns an open obligation; an urgent
+    one whose label does not say it owes nothing counts as owed), and one that cannot be asked (behind a lock,
+    or an older ttp: preemptible). Returns (asked, the line to print)."""
+    for path in all_paths() + urgent_paths() + priority_paths():
+        h = _read(path)
+        if str(h.get("run_id") or "") != str(run) or not locks.held_labels([path]):
+            continue
+        who = str(h.get("holder") or f"run {run}")
+        if path.name.startswith(PRIORITY + ".") or str(h.get("command") or "").startswith("push checks"):
+            return False, f"not asked: {who} runs push checks, which are never preempted"
+        if h.get("urgent") or path.name.startswith(URGENT + "."):
+            return False, f"not asked: {who} holds a reserved urgent slot beyond the cap, no slot of the cap"
+        if h.get("owed") or (is_urgent(h.get("priority")) and h.get("owed") is not False):
+            return False, f"not asked: {who} is owed (its task owns an open obligation, or its label does not say it owes nothing)"
+        pid = int(h.get("ns_pid") or h.get("pid") or 0)
+        if not h.get("preemptible") or pid <= 0:
+            return False, f"not asked: {who} cannot be asked (behind a lock or device queue, or an older ttp)"
+        rec = {"by": by, "task": os.environ.get("TTP_TASK") or "", "at": time.time(), "manual": True}
+        try:
+            _preempt_path(pid).write_text(json.dumps(rec))
+            with open(slot_dir() / PREEMPT_LOG, "a") as log:
+                log.write(json.dumps({**rec, "victim": who, "run": str(run), "slot": path.name, **locks.taker()}) + "\n")
+        except OSError as e:
+            return False, f"not asked: {e}"
+        return True, f"asked {who} to give up its host-wide checks slot and queue again at its place"
+    return False, f"not asked: no checks of run {run} hold a host-wide checks slot"
 
 
 OWNER_KEYS = ("pid", "pid_start", "ns_pid")   # a slot label's fields that name the process holding it (same_owner)
