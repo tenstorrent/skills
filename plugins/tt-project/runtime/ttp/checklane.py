@@ -69,9 +69,10 @@ WAIT_EVENT_S; 0 turns it off) naming holder and waiter (wait_events). Only one o
 per queue incident (wait_wake: from the first waiter past the threshold until none is); the incident wakes it
 again only when a decision is due: its longest waiter past `checks.wait_escalate_s` (default WAIT_ESCALATE_S,
 then once per as long again; 0: never), a holder running `checks.wait_hang_factor` (default WAIT_HANG_FACTOR;
-0: never) times the recent median checks run whose log has also stopped growing (checkstall; a likely hang:
-one still printing results is named slow under load, with the host's load, and wakes nobody), or a holder
-whose task has ended (no owner to fix it).
+0: never) times the median run of its own command list (scope_median_s: a full suite is never timed against
+targeted runs) whose log has also stopped growing (checkstall; a likely hang: one still printing results is
+named slow under load, with the host's load, and wakes nobody), or a holder whose task has ended (no owner
+to fix it).
 """
 from __future__ import annotations
 
@@ -1117,7 +1118,7 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     when they do not, and the queue incident to keep). An incident opens with the first waiter past
     checks.wait_event_s (reason "new") and closes once no waiter is past it (None). Within it, a wake again
     only for: "escalate" (its longest wait past checks.wait_escalate_s, then once per as long again), "hang"
-    (a holder running checks.wait_hang_factor times `median_s`, the recent median checks run, that is also
+    (a holder running checks.wait_hang_factor times its scope_median_s (`median_s` only without a cost label), that is also
     stalled (_hung: its log still, its CPU idle where `marks` knows it; `stat` is for tests), once per
     holder; such a holder whose log still grows is only kept in the incident's "slow", for wake_text) and "ownerless" (a holder whose task has ended (`ended(holder record)`; a review precheck
     only once no review reading it is open, open_precheck) or whose hold is stale, once per holder). Every other waiter shows in the digest and ttp status only."""
@@ -1137,10 +1138,11 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     factor = wait_hang_factor(cfg)
     # A holder still waiting for a later gate (testslots.lane_waits) is not hung: its clock starts once
     # it has its test slots (granted_at), or with its commands (run_since).
+    # Each holder is timed against runs of its own scope (scope_median_s), never a mix of full and targeted.
     def long(h: dict) -> bool:
-        return bool(factor > 0 and median_s and median_s > 0 and not h.get("waits")
+        return bool(factor > 0 and (base := scope_median_s(h, median_s)) and not h.get("waits")
                     and now - float(h.get("run_since") or h.get("granted_at") or h.get("since") or now)
-                    > factor * median_s)
+                    > factor * base)
 
     inc["slow"] = [k for k, h in holders.items() if long(h) and _hung(h, now, cfg, marks, stat) is False][-20:]
     for name, test in (("hang", lambda h: long(h) and bool(_hung(h, now, cfg, marks, stat))),
@@ -1155,12 +1157,28 @@ def wait_wake(events: list[dict], incident: dict | None, cfg: dict | None, now: 
     return why, inc
 
 
+def scope_median_s(h: dict, median_s: float | None = None) -> float | None:
+    """The usual run time a lane holder `h` is timed against: the median of the passing runs of its own
+    command list (its label's cost est_s, median_s()). A label with a cost but no est_s (its command list
+    has no passing run yet) has none, so its wall time alone flags nothing; only a label without a cost
+    (an older runtime) falls back to `median_s`, the project's recent median."""
+    c = h.get("cost")
+    if isinstance(c, dict) and c:
+        est = c.get("est_s")
+        return float(est) if isinstance(est, (int, float)) and est > 0 else None
+    return float(median_s) if median_s and median_s > 0 else None
+
+
 def wake_text(why: list[str], events: list[dict], inc: dict, cfg: dict | None, now: float,
               median_s: float | None = None, load=None) -> str:
     """The waking `checks_slot_wait` event's text: the reasons, a slow holder's count with the host's load
     (`load`, default _load_text), then the longest waiter's own event text."""
     head = max(events, key=lambda e: float(e.get("waited_s") or 0))
-    over = f"over {wait_hang_factor(cfg):g}x the recent median checks run ({mins(median_s or 0)})"
+    holders = {_holder_key(h): h for e in events for h in e.get("holders") or []}
+    flagged = [holders[k] for w in ("hang", "slow") if w in why or w == "slow"
+               for k in (inc.get(w) or [])[-1:] if k in holders]
+    base = scope_median_s(flagged[0], median_s) if flagged else median_s
+    over = f"over {wait_hang_factor(cfg):g}x the median run of its own command list ({mins(base or 0)})"
     say = {"new": f"a checks queue incident started ({len(events)} waiting past {mins(wait_event_s(cfg))})",
            "escalate": f"its longest wait passed {mins(wait_escalate_s(cfg))}",
            "hang": f"a holder has run {over} and its log stopped growing, its CPU idle: a likely hang",

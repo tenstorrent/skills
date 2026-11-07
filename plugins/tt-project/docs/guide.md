@@ -2225,8 +2225,9 @@ session and stateless coordinators on every provider.
   wakes the coordinator per queue incident (from the first waiter past that threshold until none is); the
   rest are recorded `coalesced` and show in the digest and `ttp status`. The incident wakes it again only when
   a decision is due: its longest wait passes `checks.wait_escalate_s` (default 7200, then once per as long
-  again; 0 never), a holder has run `checks.wait_hang_factor` (default 3, 0 never) times the recent median
-  checks run (a likely hang), or a holder's task has ended (a review precheck: once no review reading it is open). An `observation_mute` on source
+  again; 0 never), a holder has run `checks.wait_hang_factor` (default 3, 0 never) times the median
+  passing run of its own command list (a full suite is never timed against targeted runs; a label with no
+  such run yet is not timed; a likely hang only once its log stopped growing, else slow), or a holder's task has ended (a review precheck: once no review reading it is open). An `observation_mute` on source
   `daemon:checks_slot_wait` covers these events too (recorded `muted`); coalescing already keeps a long queue
   to one wake, so a mute is only for a queue the coordinator has already decided to leave alone.
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
@@ -3276,7 +3277,11 @@ holds and waits for each place, and the wait so far. Its unblock options come fr
 without a model call: spill to an allowed check host (only when the project or account lists one), raise
 a cap within the host's limit (never a cap the user or account set), let it go ahead of routine work,
 route to another allowed device, cut the stale queued tail, or cancel it (never a user's own task). A
-resource the user paused leaves no option: the user is told once.
+resource the user paused leaves no option: the user is told once. The push queue's occupancy also counts
+pushes that never enter push_queue (`ttp push`, detached or not): the live holder of the branch push lock
+is running (with its step and minutes held) and each other running detached push is queued (with its last
+`ttp push:` log line). While that holder lives within a push check's time limit (4 h) no wait behind it is
+raised; a holder whose pid died frees the lock, so the wait is raised as before.
 
 The coordinator must act on it that turn, in either the per-wake or the persistent session and on every
 provider: a `config_set`, a `task_add` or `task_update` naming the key or updating the task, or a reply

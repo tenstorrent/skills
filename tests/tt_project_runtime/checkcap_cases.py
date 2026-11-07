@@ -5448,12 +5448,13 @@ def test_a_checks_queue_incident_rewakes_for_a_likely_hung_holder_and_for_an_own
         env, tmp_path, monkeypatch):
     from ttp import checklane, checkwall, daemon, worktree
     from ttp.daemon import Daemon
+    from ttp import cli
     assert checklane.PRECHECK_LABEL == daemon.PRECHECK_LABEL
     p = make(env)
     _lane_env(monkeypatch)
     p.set_config("checks.slots", 3)
-    for _ in range(checkwall.MIN_RUNS):
-        checkwall.record_run(p.state, 600.0, True)
+    for _ in range(checkwall.MIN_RUNS):   # runs of the holder's own command list (_RUN_HOLDER's): its baseline
+        checkwall.record_run(p.state, 600.0, True, key=cli._commands_hash(["true"]))
     work = p.db.add_task("w", "s", kind="code")
     p.db.x("UPDATE tasks SET status='running' WHERE id=?", (work,))
     run = p.state / "runs" / "77"
@@ -12050,3 +12051,56 @@ def test_checks_fair_share_counts_runs_with_no_project_and_older_runtimes_labels
         for s in held + [pushed]:
             s.close()
         old.close()
+
+
+def test_a_queue_incident_times_a_holder_against_runs_of_its_own_command_list_and_calls_hang_only_on_silence(
+        tmp_path, monkeypatch):
+    """The project's recent median mixes cheap targeted runs with full suites. A full suite at 40 min whose
+    own command list's median is 35 min is neither slow nor hung, though it is far over the mixed median; past
+    the factor of its own median it is a likely hang only once its log stopped growing, else slow. A command
+    list with no passing run yet has no baseline: its wall time alone flags nothing."""
+    from ttp import checklane, checkstall, checkwall, locks, testslots
+    _lane_env(monkeypatch)
+    state = tmp_path / "state"
+    state.mkdir()
+    full, quick = ["pytest -q tests/"], ["pytest -q tests/test_a.py::test_one"]
+    for _ in range(checkwall.MIN_RUNS):
+        checkwall.record_run(state, 35 * 60, True, key="full")
+        checkwall.record_run(state, 60, True, key="quick")
+        checkwall.record_run(state, 60, True, key="quick")
+    import statistics
+    mixed = statistics.median(checkwall.recent(state))
+    assert mixed == 60, "the project median is the targeted runs'"
+    cfg = {"checks": {"wait_hang_factor": 3}}
+    log = tmp_path / "full.log"
+    log.write_text("..... [ 40%]\n")
+    for key, cmds, stalls in (("full", full, False), ("new", quick, True)):
+        g = testslots.suite_hold("pa", repo=_LANE_REPO, wait_s=5, cost=checklane.cost(state, key, cmds, cfg))
+        try:
+            testslots.suite_running(g, 0, str(log))
+            rec = locks.holder_records([Path(f.name) for f in g.files])[0]
+            start = float(rec["run_since"])
+            evs = _queue_events(1, holders=[rec])
+            if key == "full":
+                assert checklane.scope_median_s(rec, mixed) == 35 * 60
+                os.utime(log, (start + 40 * 60,) * 2)
+                assert checklane.wait_wake(evs, {"start": 1.0}, cfg, start + 40 * 60, mixed)[0] == [], \
+                    "40 min against its own 35 min median: no hang, not slow"
+                os.utime(log, (start + 110 * 60,) * 2)
+                why, inc = checklane.wait_wake(evs, None, cfg, start + 110 * 60, mixed)
+                assert why == ["new"] and inc["slow"] and not inc["hang"], \
+                    "over 3x its own median but still printing: slow, never a hang"
+                text = checklane.wake_text(why, evs, inc, cfg, start + 110 * 60, mixed, load=lambda: "1 on 8 cores")
+                assert "its own command list (35 min)" in text and "likely hang" not in text, text
+                silent = start + 110 * 60 + checkstall.stall_s(cfg, rec) + 60
+                why, inc = checklane.wait_wake(evs, {"start": 1.0}, cfg, silent, mixed)
+                assert why == ["hang"], "no output for the stall window: a likely hang"
+                text = checklane.wake_text(why, evs, inc, cfg, silent, mixed)
+                assert "its own command list (35 min)" in text and "likely hang" in text, text
+            else:
+                assert checklane.scope_median_s(rec, mixed) is None
+                os.utime(log, (start,) * 2)
+                assert checklane.wait_wake(evs, {"start": 1.0}, cfg, start + 600 * 60, mixed)[0] == [], \
+                    "no passing run of its command list yet: nothing to time it against"
+        finally:
+            g.close()
