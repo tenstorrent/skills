@@ -412,6 +412,17 @@ def label(hits: list[dict], chained: int | None = None, landing: bool = True) ->
     return f"{LABEL}{','.join(map(str, ids))}:{warning(hits, landing)}" if hits else ""
 
 
+_ADVICE = re.compile(r": runs beside (?:it|them), conflicts settle at landing; chain only if it needs (?:its|their) "
+                     r"new file or symbol$")
+ADVICE = "overlaps: runs beside those tasks, conflicts settle at landing; chain only if it needs their new file or symbol"
+
+
+def short(note: str) -> str:
+    """A digest row's overlap note without the advice every such note repeats: the Open tasks header says
+    it once (ADVICE)."""
+    return _ADVICE.sub("", note or "")
+
+
 def digest_note(task: dict) -> str:
     """The overlap warning a queued task carries, '' once it waits on the task(s) it names or has started."""
     if task.get("status") != "queued":

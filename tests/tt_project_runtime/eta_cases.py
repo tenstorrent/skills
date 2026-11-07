@@ -535,3 +535,18 @@ def test_eta_outside_wait_reads_a_measured_eta_from_the_task_s_progress_reports(
     cli.main(["progress", "report", "result", "--key", "box/job", "--eta", "soon"])
     assert "--eta is ignored" in capsys.readouterr().err
     assert eta.estimate(p.db, t2, now)["end"] == pytest.approx(now + 3000 + 1200, abs=1)
+
+
+def test_expected_finish_names_tasks_with_no_estimate_for_one_reason_on_one_line(env):
+    """A stateless coordinator turn paid for one 'no estimate yet' line per urgent task, each repeating
+    its title (already in Open tasks) and the same reason. Tasks sharing a reason share one line naming
+    every id; a lone one keeps its own line with its title."""
+    from ttp import eta
+    p = make(env)
+    a = p.db.add_task("first new work", "s", kind="work", priority=1)
+    lines = eta.state_lines(p.db, p)
+    assert f"#{a} first new work: ETA: no estimate yet (no measured work run yet)" in lines[1]
+    b = p.db.add_task("second new work", "s", kind="work", priority=1)
+    c = p.db.add_task("third new work", "s", kind="work", priority=1)
+    lines = eta.state_lines(p.db, p)
+    assert lines[1:] == [f"- #{a}, #{b}, #{c}: ETA: no estimate yet (no measured work run yet)"], lines

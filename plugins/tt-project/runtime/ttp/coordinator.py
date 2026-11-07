@@ -1423,6 +1423,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     in_review = db.review_since()
     setting_held = settinghold.digest_lines(rows)   # tasks held on a setting being asked about: one line each
     held_on = {}   # blocked tasks held on the same ask or resource: one line for them all
+    advice = False   # a row's overlap note: its advice once in the header (overlap.ADVICE), not on each row
     for t in rows:
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         if held and held[0] in anchors.SHARED_KINDS and not (setting_held and settinghold.held_key(t)):
@@ -1443,7 +1444,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
             note = spans.wrap(note, f"{'blocked reason' if t['blocked_reason'] else 'hand-off'} of #{t['id']}", tag)
         held = anchors.anchor(t) if t["status"] == "blocked" else None
         note = f"{anchors.describe(*held, p)}: {note}" if held else note
-        clash = file_overlap.digest_note(t)
+        clash = file_overlap.short(file_overlap.digest_note(t))
+        advice = advice or bool(clash)
         note = f"{clash}; {note}" if clash and note else clash or note
         if host := onhost.line(p, t, now, host_est):   # what may be said of its work on the host
             note = f"{host}; {note}" if note else host
@@ -1453,6 +1455,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
                      f"{(now - t['created']) / 3600:.1f}h | {title} | {note}")
+    if advice:
+        lines[0] = lines[0][:-1] + f"; {file_overlap.ADVICE})"
     lines += setting_held
     if len(rows) == coordsession.OPEN_ROWS:   # the open tasks past the limit, so none reads as closed
         cut = [r["id"] for r in db.q("SELECT id FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
@@ -1617,8 +1621,12 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         lines.append(f"- [{why}] {reason[:_rejection_cap(reason)]}{told}")
     for x in rejcool.digest_lines(db, where=p):
         lines.append(f"- [counted, not woken: the same unchanged cause as a rejected action] {x}")
-    for x in db.kv(NOTES_KEY, []) or []:
-        lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {x[:500]}")
+    notes = db.kv(NOTES_KEY, []) or []
+    if len(notes) == 1:
+        lines.append(f"- [note on your previous turn's action: applied, nothing to fix] {notes[0][:500]}")
+    elif notes:   # the label once, not on each note
+        lines.append("- [notes on your previous turn's actions: applied, nothing to fix]")
+        lines += [f"  - {x[:500]}" for x in notes]
     for x in chaincap.notices(db):
         lines.append(f"- [continue hop queued by the daemon (progress or an urgent task's follow-up, under the chain "
                      f"caps): nothing to decide; task_update it to cancelled to cancel one] {x[:800]}")

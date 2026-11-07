@@ -22828,3 +22828,18 @@ def test_coordinator_running_workers_fold_unchanged_rows_on_session_wakes(env):
     # Measured on this fixture (8 runs): the full section and a delta where no row changed.
     tokens = len(full) / 4
     assert tokens <= 300, (tokens, full)
+
+
+def test_digest_labels_several_action_notes_once(env):
+    """Notes on the previous turn's applied actions: a lone note keeps its inline label; several share
+    one label line with each note under it, so the label is not paid once per note on every turn."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.db.set_kv(coord.NOTES_KEY, ["first applied note"])
+    d = coord.digest(p, {}, [], [])
+    assert "- [note on your previous turn's action: applied, nothing to fix] first applied note" in d
+    p.db.set_kv(coord.NOTES_KEY, ["first applied note", "second applied note"])
+    d = coord.digest(p, {}, [], [])
+    assert d.count("applied, nothing to fix") == 1
+    assert ("- [notes on your previous turn's actions: applied, nothing to fix]\n  - first applied note\n"
+            "  - second applied note") in d

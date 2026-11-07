@@ -554,8 +554,18 @@ def state_lines(db, where, now: float | None = None, host=None) -> list[str]:
         return []
     est = _Est(db, now, core=core_of(where))
     out = ["## Expected finish (critical path, measured medians; quote these, never padded worst cases)"]
+    same: dict[str, list[tuple[dict, dict]]] = {}   # no estimate for one reason: one line (titles in Open tasks)
     for t in hot[:10]:
         on = host(t) if host else ""
-        out.append(f"- #{t['id']} {t['title'][:80]}: {field(est.task(t['id']), where, now)}" + (f"; {on}" if on else ""))
+        e = est.task(t['id'])
+        why = str(e["why"] or "").removeprefix(f"#{t['id']} ")
+        if why and not on:
+            same.setdefault(why, []).append((t, e))
+            continue
+        out.append(f"- #{t['id']} {t['title'][:80]}: {field(e, where, now)}" + (f"; {on}" if on else ""))
+    for why, got in same.items():
+        ids = ", ".join(f"#{t['id']}" for t, _ in got)
+        out.append(f"- {ids}: ETA: no estimate yet ({why})" if len(got) > 1 else
+                   f"- #{got[0][0]['id']} {got[0][0]['title'][:80]}: {field(got[0][1], where, now)}")
     out += [f"- promise {o['id']}: {field(obligation_estimate(db, o, now, est), where, now)}" for o in proms[:10]]
     return out
