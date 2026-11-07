@@ -939,6 +939,74 @@ def test_a_confirmation_is_the_senders_ack_and_closes_on_the_fixing_project_with
     assert len(_upstream_inbox(env)) == 1 and not upstream.acked(other)
 
 
+def _page_pair(env, monkeypatch):
+    """A paging project, a second one that made three changes on made-up machines, and a page from the
+    first one's daemon to the second about each, read by the second."""
+    from ttp import machine_ledger as ml, machines, pagesev, upstream
+    src, dst, _ = _confirm_pair(env)
+    now = time.time()
+    pages = {}
+    for alias in ("box-a", "box-b", "box-c"):
+        machines.add(alias)
+        c = ml.add_change(alias, "lowered the clock", "reset the clock", "second", expires="1h", now=now - 7200)
+        text = f"Machine change #{c['id']} on {alias} is overdue: lowered the clock (by second). Page 1."
+        assert upstream.send(src.name, None, "second", text, "normal", sender="daemon",
+                             extra={"page_fp": pagesev.change_fingerprint(f"machine-change:{c['id']}", c["added"])}) == "sent"
+        pages[c["id"]] = upstream._inbox()[-1]["fp"]
+    upstream.ingest(dst, dst.config())
+    return src, dst, pages
+
+
+def test_a_reply_that_only_reports_a_page_changes_close_is_settled_without_a_coordinator_wake(env, monkeypatch, capsys):
+    """`ttp machines change close <id>` answers the page about it with the canonical close report; the
+    paging project settles it model-free, recorded with its reason and note id and counted in the daily
+    review. An open change, more words, high severity or a reply to a note that is not a page all wake."""
+    from ttp import audit, cli, machine_ledger as ml, upstream
+    src, dst, pages = _page_pair(env, monkeypatch)
+    by_id = {c["id"]: c for c in ml.changes()}
+
+    def reply(cid, text, sev="normal", to_note=None):
+        assert upstream.send("second", 5, src.name, text, sev, reply_to=to_note or pages[cid]) == "sent"
+
+    def ingest():
+        before = {r["id"] for r in src.db.q("SELECT id FROM events")}
+        upstream.ingest(src, src.config())
+        return [dict(r) for r in src.db.q("SELECT id, severity, status, text FROM events WHERE kind='upstream_note'")
+                if r["id"] not in before]
+
+    # The change is still open: the report wakes.
+    reply(2, upstream.close_report_text(by_id[2]))
+    (ev,) = ingest()
+    assert ev["status"] == "queued", ev
+    # Closed, but the reply says more (a request): wakes.
+    ml.close_change(3, "", by="second")
+    reply(3, upstream.close_report_text(by_id[3]) + " Please also restart its service.")
+    # Closed, the exact report, but high: wakes.
+    reply(3, upstream.close_report_text(by_id[3]), "high")
+    # The exact report of a closed change, answering a worker's note instead of a page: wakes.
+    assert upstream.send(src.name, 7, "second", "Is box-c still lowered?") == "sent"
+    reply(3, upstream.close_report_text(by_id[3]), to_note=upstream._inbox()[-1]["fp"])
+    got = ingest()
+    assert [e["status"] for e in got] == ["queued"] * 3, got
+    assert upstream.close_reports_settled(src.name) == 0
+    # The close itself answers the page: settled, recorded once, with no wake.
+    _note_run(env, monkeypatch, dst)
+    cli.main(["machines", "change", "close", "1"])
+    assert f"answered page note {pages[1]}" in capsys.readouterr().out
+    n = upstream._inbox()[-1]
+    assert (n["reply_to"], n["confirms"], n["to"]) == (pages[1], pages[1], src.name)
+    (ev,) = ingest()
+    assert ev["status"] == "handled" and ev["severity"] == "low" and upstream.CLOSE_REPORT in ev["text"], ev
+    assert f"[note {n['fp']}]" in ev["text"]
+    rec = upstream.wontfixed(n["fp"])
+    assert rec["note"].startswith(upstream.CLOSE_REPORT) and pages[1] in rec["note"] and rec["by"] == src.name
+    src.db.set_kv(upstream.KV_CURSOR, {})   # read again after a crash: recorded once
+    ingest()
+    assert upstream.close_reports_settled(src.name, time.time() - 60) == 1
+    assert any("close reports settled model-free" in x and x.endswith(": 1")
+               for x in audit.lines(src.db, p=src)), audit.lines(src.db, p=src)
+
+
 def test_a_confirmation_marker_survives_the_outbox_the_run_queue_and_forwarding(env, monkeypatch):
     """The marker travels every path an addressed note takes: the run's queue, the outbox past the hourly
     limit, and a forwarded line checked by `_valid`; a malformed marker is dropped, never filed."""

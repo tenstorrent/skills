@@ -1648,7 +1648,7 @@ def route(now: float | None = None, able: Callable[[str], tuple[bool, str]] | No
                             + (f"; its output ended: {_clip(str(gave_up['tail'])[-AUTO_UNDO_PAGE_TAIL_CHARS:], AUTO_UNDO_PAGE_TAIL_CHARS)}"
                                if gave_up.get("tail") else "") + ". " if gave_up else "")
                          + f"Page {page['stage'] + 1}: undo it with `{c['undo']}`, "
-                         f"then `ttp machines change close {c['id']}`.")
+                         f"then `ttp machines change close {c['id']}`, which answers this page itself.")
                 # Normal unless a live serving machine's change is past its end unconfirmed; one
                 # fingerprint per change and episode, so each project hears of it once (pagesev.py).
                 page["pending"].update(

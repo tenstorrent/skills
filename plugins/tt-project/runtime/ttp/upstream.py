@@ -758,7 +758,7 @@ def _file(p: project.Project, sources, offsets: dict, known: set, seen: list, no
             seen.extend([n["fp"]] + ([esc] if esc else []))
             if not to and (n.get("project"), n.get("host")) == me:
                 continue      # this project's own notes reached its coordinator with the hand-off
-            if to and n.get("from") == "worker" and _close_confirmation(p, n, now):
+            if to and n.get("from") == "worker" and (_close_confirmation(p, n, now) or _settle_close_report(p, n, now)):
                 added += 1
                 continue
             sev, text = _event(n, cap)
@@ -849,6 +849,110 @@ def confirmations_closed(name: str, since: float = 0.0) -> int:
     """How many received notes project `name` closed model-free as CONFIRMATION at or after `since`."""
     return sum(1 for r in _records() if r.get("kind") == "wontfix" and r.get("by") == name
                and str(r.get("note") or "").startswith(CONFIRMATION) and float(r.get("ts") or 0) >= since)
+
+
+# A reply that only reports a machine change closed -------------------------------------------------
+# A daemon pages the project that must undo an overdue machine change (machine_ledger.py), as a note
+# from the paging project with the change's page_fp. `ttp machines change close <id>` answers each such
+# page that reached the closing project with close_report_text, marked as confirming that page
+# (`reply_close`). The paging project settles that reply model-free (`close_report`), on structure only:
+# the page is its own daemon's, the reply is the paged project's, its words are exactly the canonical
+# text, the ledger shows the change closed by that project (or the reply carries the confirm marker),
+# and its severity is low or normal. Anything else (an open change, other words, high) wakes as before.
+CLOSE_REPORT = "machine change close report"
+_PAGE_FP_RE = re.compile(r"machine-change:(\d+)@\d+")
+
+
+def close_report_text(c: dict) -> str:
+    """The only reply text `close_report` settles: what `reply_close` sends for closed change `c`."""
+    return (f"Machine change #{c['id']} on {c['alias']} is closed. This reply only reports the close "
+            f"(sent by `ttp machines change close`): nothing to do.")
+
+
+def _inbox() -> list[dict]:
+    try:
+        with open(path(), "rb") as f:
+            fcntl.flock(f, fcntl.LOCK_SH)
+            return _lines(f.read())[0]
+    except FileNotFoundError:
+        return []
+
+
+def _own_page(n: dict | None, name: str) -> int | None:
+    """The machine change id of `n` when it is a page project `name`'s daemon sent from this machine."""
+    if not n or n.get("from") != "daemon" or n.get("project") != name or n.get("via") \
+            or n.get("host") != project.hostname():
+        return None
+    m = _PAGE_FP_RE.fullmatch(str(n.get("page_fp") or ""))
+    return int(m.group(1)) if m else None
+
+
+def close_report(n: dict, name: str) -> tuple[dict, str] | None:
+    """(the closed change, the page note) when received note `n` only reports that the change a page of
+    project `name` named is closed; else None. Only structure counts, never the note's meaning."""
+    page_id = reply_of(n.get("spec"))
+    if not page_id or n.get("from") != "worker" or n.get("severity") not in ("low", "normal"):
+        return None
+    page, _ = _find(page_id)
+    cid = _own_page(page, name)
+    if cid is None or page.get("to") != n.get("project"):
+        return None
+    from . import machine_ledger
+    c = next((c for c in machine_ledger.changes(open_only=False) if c.get("id") == cid), None)
+    if not c or not c.get("closed") or (c.get("closed_by") != n.get("project")
+                                        and _confirms(n.get("confirms")) != page_id):
+        return None
+    body = " ".join(_REPLY_RE.sub("", str(n.get("spec") or ""), count=1).split())
+    return (c, page_id) if body == close_report_text(c) else None
+
+
+def _settle_close_report(p: project.Project, n: dict, now: float) -> bool:
+    """A close report (`close_report`) settled model-free: recorded as CLOSE_REPORT with the note's id and
+    kept as a handled event, which wakes no coordinator. False to file it as usual."""
+    try:
+        got = close_report(n, p.name)
+        if not got:
+            return False
+        c, page_id = got
+        if not wontfixed(n["fp"]):   # read again after a crash before the cursor moved: recorded once
+            wontfix(n["fp"], f"{CLOSE_REPORT}: machine change #{c['id']} closed, reply to page note {page_id}",
+                    p.name, now)
+    except (OSError, ValueError):
+        return False
+    from .coordinator import EVENT_CHARS_BY_KIND
+    cap = EVENT_CHARS_BY_KIND["upstream_note"]
+    text = f"settled model-free as {CLOSE_REPORT}: " + _event(n, cap)[1]
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+           (now, "upstream", "upstream_note", None, "low", text[:cap], "handled"))
+    return True
+
+
+def close_reports_settled(name: str, since: float = 0.0) -> int:
+    """How many received close reports project `name` settled model-free at or after `since`."""
+    return sum(1 for r in _records() if r.get("kind") == "wontfix" and r.get("by") == name
+               and str(r.get("note") or "").startswith(CLOSE_REPORT) and float(r.get("ts") or 0) >= since)
+
+
+def reply_close(p: project.Project, c: dict) -> list[str]:
+    """Answer each page about closed change `c` that other projects' daemons on this machine sent `p`
+    (the newest per paging project) with close_report_text, marked as confirming it. Returns the page
+    note ids answered; one that cannot be routed or filed is skipped (the page's sender sees the close
+    in the ledger)."""
+    pages: dict = {}
+    for n in _inbox():
+        if n.get("to") == p.name and n.get("project") != p.name and _own_page(n, n.get("project")) == c.get("id"):
+            pages[n["project"]] = n["fp"]
+    out = []
+    for fp in pages.values():
+        try:
+            to, at, back = reply_route(p, fp)
+            got = send_or_queue(p.state, p.name, None, to, close_report_text(c), "normal", at=at, back=back,
+                                confirms=fp, reply_to=fp)[0]
+        except (OSError, ValueError):
+            continue
+        if got in ("sent", "queued", "duplicate"):
+            out.append(fp)
+    return out
 
 
 def _route(n: dict, src: str, now: float) -> dict:

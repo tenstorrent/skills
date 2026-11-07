@@ -9902,6 +9902,10 @@ def _machine_change(a) -> None:
         except OSError as e:
             die(_unwritable(e))
         print(_queued_line(c) if c.get("queued") else f"closed machine change #{c['id']} on {c['alias']}")
+        if p and not c.get("queued") and c.get("closed_by") == p.name:
+            from . import upstream
+            for fp in upstream.reply_close(p, c):   # the pager settles it model-free (upstream.close_report)
+                print(f"answered page note {fp}: the close is its reply, no other reply is needed")
         return
     if a.change == "edit":
         flag_only = a.test is not None and not any((a.what, a.undo, a.expires, a.until_probe, a.until_task)) \
