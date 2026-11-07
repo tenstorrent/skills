@@ -713,6 +713,7 @@ def test_the_upgrade_task_names_the_config_key_for_freed_commands():
     ["providers.claude.write_fence", "true"],                         # turns the sandbox back on
     ["providers.codex.write_fence", "true"],
     ["providers.cursor.write_fence", '"on"'],
+    ["providers.chat.write_fence", "9"],                               # not a plain off value: the fence reads it on
     ["providers.claude", json.dumps({"write_fence": True})],           # through a parent key
     ["providers", json.dumps({"chat": {"write_fence": True}})],        # through the whole section
 ])

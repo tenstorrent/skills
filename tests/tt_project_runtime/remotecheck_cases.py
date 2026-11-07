@@ -1868,8 +1868,8 @@ def test_overflow_jobs_dying_at_start_pause_it_with_one_alert_and_the_runs_stay_
 
 @pytest.mark.parametrize("run_env", ["TTP_RUN_ID", "TTP_RUN_DIR", "TTP_NOTE_RUN_DIR"])
 @pytest.mark.parametrize("task", ["42", ""])   # a worker's run, or a coordinator's (the session's own shell)
-@pytest.mark.parametrize("argv_tail", [["sandbox.checks", "true"], ["sandbox.checks", "1"],
-                                       ["sandbox", json.dumps({"checks": True})]])
+@pytest.mark.parametrize("argv_tail", [["sandbox.checks", "true"], ["sandbox.checks", "1"], ["sandbox.checks", "9"],
+                                       ["sandbox.checks", "enabled"], ["sandbox", json.dumps({"checks": True})]])
 def test_a_run_cannot_turn_the_checks_sandbox_on(env, capsys, monkeypatch, run_env, task, argv_tail):
     """sandbox.checks (the checks' PID namespace) is user-only, like checks.slurm_overflow: a `ttp config`
     inside any run, a worker's or a coordinator's, refuses turning it on, directly or through its parent;

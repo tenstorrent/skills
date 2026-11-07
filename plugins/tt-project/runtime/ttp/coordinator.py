@@ -1704,8 +1704,9 @@ NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
 
 
 def sandbox_on(value) -> bool:
-    """Whether a value written at a SANDBOX_KEYS key turns the sandbox on (None: unset, off)."""
-    return value is True or str(value).strip().lower() in ("1", "true", "yes", "on")
+    """Whether a value written at a SANDBOX_KEYS key may turn the sandbox on: anything but a plain off value
+    (None or '' unset it; a reader such as the write fence counts only `false` as off, so 9 is on)."""
+    return not (value is None or value is False or str(value).strip().lower() in ("", "0", "false", "no", "off"))
 
 
 def sandbox_refusal(key: str) -> str:
