@@ -128,6 +128,7 @@ class Cursor(Provider):
     # on an undocumented layout, so its runs take the disk block (ctxfork.py) and only a lost run resumes.
     no_fork_why = "cursor-agent resumes its own chats (--resume) but has no fork, and its chat store is undocumented"
     binaries = ("agent", "cursor-agent")
+    final_events = ("result",)   # base.stream_ended
     api_host = "api2.cursor.sh"
     login_hint = "run `agent login` there"
     isolate_read_only = True

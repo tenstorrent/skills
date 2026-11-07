@@ -98,6 +98,7 @@ PLUGIN_EXTRA_FILES = ("hooks", "hooks.json", ".mcp.json", ".app.json")
 class Codex(Provider):
     name = "codex"
     binaries = ("codex",)
+    final_events = ("turn.completed", "turn.failed")   # base.stream_ended
     api_host, api_base_env = "api.openai.com", "OPENAI_BASE_URL"
     login_hint = "run `codex login` there"
     efforts = ("minimal", "low", "medium", "high", "xhigh")

@@ -590,6 +590,32 @@ class Provider:
         to progress.md and git."""
         return [], offset
 
+    final_events: tuple[str, ...] = ()   # stream event types that end a run (its last turn's result)
+
+    def stream_ended(self, output_path: Path) -> bool:
+        """Whether the run's stream already holds its final event (one of final_events) among its last
+        STREAM_END_BYTES: the run's work is over even before its runner writes exit.json. False when the
+        provider names none or the stream cannot be read."""
+        if not self.final_events:
+            return False
+        try:
+            with open(output_path, "rb") as fh:
+                fh.seek(max(os.fstat(fh.fileno()).st_size - STREAM_END_BYTES, 0))
+                tail = fh.read().decode(errors="replace")
+        except OSError:
+            return False
+        for line in reversed(tail.splitlines()):
+            line = line.strip()
+            if not line.startswith("{"):
+                continue
+            try:
+                ev = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(ev, dict) and ev.get("type") in self.final_events:
+                return True
+        return False
+
     def harness_hook(self, argv: list[str]) -> bool:
         """Whether a run started with `argv` passes its tool calls through the harness hook (ttp.hook);
         False: the runner checks them from the stream instead (streamguard)."""
@@ -652,6 +678,7 @@ def jsonl_from(path: Path, offset: int, needles: tuple[bytes, ...]) -> tuple[lis
     return out, offset
 
 
+STREAM_END_BYTES = 65536   # the end of a run's stream stream_ended reads
 CMD_MAX = 400   # characters of a shell command an activity event keeps
 
 

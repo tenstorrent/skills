@@ -106,6 +106,7 @@ WORKER_DENIED_TOOLS = ("Workflow", "ScheduleWakeup", "CronCreate", "CronDelete",
 class Claude(Provider):
     name = "claude"
     binaries = ("claude",)
+    final_events = ("result",)   # base.stream_ended
     api_host, api_base_env = "api.anthropic.com", "ANTHROPIC_BASE_URL"
     # Measured (CLI 2.1.285, its system prompt and latest messages): three on a run's first call and
     # four on every later one (after a tool result or a schema retry). A user block's own mark on top
