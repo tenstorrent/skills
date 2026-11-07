@@ -37,7 +37,9 @@ that rule still binds, so its copies are right. Likewise a memory entry's retire
 never retires a phrase a current Restrictions item with its source (a user cite, origin: Brief or harness gate)
 or its heading states (_states: holds it whole, or as one run of its words apart from naming words and cites,
 such as 'the X restriction' or a heading quoted with its item): a hit on it is advisory (_current), wherever it
-stands; a user Correction or a charter replacement keeps its fix orders. A supersede whose only user cite names
+stands. So is a phrase any live memory entry (its superseder or another, the matched entry too) holds whole: an
+older copy of current words; one only part of it holds, or only the retired entry, keeps its class. Accepted
+gap: a stale live copy of a memory entry the user withdrew gets no fix order from that retirement. A user Correction or a charter replacement keeps its fix orders. A supersede whose only user cite names
 messages older than the entry it retires (where a rule came from, such as a current item's source) is one
 coordinator entry replacing another: SUPERSEDED (coordinator._withdrawn `since`). One the coordinator dropped on its own is SUPERSEDED, never
 WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
@@ -695,8 +697,9 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
             from .restriction_audit import still_stated
             stated = still_stated(charter, rec.get("old") or "")
         weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
-        # A memory entry's retirement never retires what a current cited Restrictions item still states.
-        cur = {ph for ph in own if _states(units, ph)} if _MEMORY_RETIRED.match(rec.get("source") or "") else set()
+        # A memory entry's retirement never retires what a current cited Restrictions item or a live entry states.
+        cur = ({ph for ph in own if _states(units, ph) or any(_hit({}, flat, [ph]) for flat in live.values())}
+               if _MEMORY_RETIRED.match(rec.get("source") or "") else set())
         own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         mine = _own_decision(rec)
@@ -710,7 +713,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
                 why = (f"still stated in {stated}: no action" if stated else
-                       "a current Restrictions item with its source states it: no action" if ph in cur else
+                       ("a current Restrictions item with its source states it: no action" if _states(units, ph)
+                        else "a live memory entry states it: no action") if ph in cur else
                        "a coordinator's own decision retired, no user rule withdrawn: no action" if mine else
                        "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
@@ -783,7 +787,7 @@ def digest_lines(p, now: float | None = None) -> list[str]:
     if advisory:   # counted, never a fix order
         lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
                      f"coordinator's own decision, a retirement of unknown origin, a name a current cited "
-                     f"Restrictions item states or only a file name, version "
+                     f"Restrictions item or a live memory entry states or only a file name, version "
                      f"or evidence reference, never a rule the user withdrew; change nothing for them (all: "
                      f"`ttp echoes`)")
     return lines

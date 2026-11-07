@@ -108,7 +108,8 @@ def test_a_retired_claim_planted_in_every_binding_place_is_found_and_memory_name
     from ttp import echoes, schedule as sched
     p = make(env)
     claim = "Retry the stuck card with `legacy-hard-reset` first."
-    echoes.record(p.db, "memory [old] superseded by [new]", claim, "Use the documented reset command.")
+    # A charter replacement: a memory retirement's phrase a live entry holds is current (advisory), below.
+    echoes.record(p.db, "charter 'Recovery' quote replaced", claim, "Use the documented reset command.")
     root = p.root
     mem = p.add_memory("Recovery: retry the stuck card with LEGACY-HARD-RESET first.", kind="decision")
     p.charter_path.write_text(p.charter_path.read_text().rstrip() + "\n\n## Recovery\n- Run legacy-hard-reset.\n")
@@ -596,6 +597,34 @@ def test_a_user_withdrawal_quoting_a_current_restriction_heading_flags_only_the_
     assert not echoes._states(units, "hosts spare-pool")
     assert not echoes._states(units, "keep hosts free")
     assert not echoes._states(units, "the hosts rule")   # one word, not the unit's whole wording
+
+
+def test_a_phrase_a_live_memory_entry_states_whole_is_advisory_never_a_fix_order(env):
+    """A user-withdrawn memory entry's phrase that another live entry still holds whole is an older copy of
+    current words: advisory wherever it is quoted. A phrase only the retired entry holds, or one a live entry
+    holds only inside a longer name, keeps its fix order; a charter replacement keeps its fix orders even
+    where a live memory entry holds the phrase (that entry is the copy to fix)."""
+    from ttp import coordinator as coord, echoes
+    p = make(env)
+    p.add_memory("Release notes: run `ship-it --canary` in staging; see roll-back-faster for drills.", kind="fact")
+    old = p.add_memory("Deploy with `ship-it --canary` and `roll-back-fast` before each job.", kind="decision")
+    said = _echo_said(p, "Stop using roll-back-fast, deploy with ship-fast.")
+    assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
+                            "text": f"Deploy with `ship-fast` before each job (user msg #{said})."}],
+                       user_turn=True, turn=1, messages=[said]) == []
+    assert [r["kind"] for r in echoes.records(p)] == [echoes.WITHDRAWN]
+    both = p.db.add_task("both", "Run ship-it --canary on the staging box.")
+    retired = p.db.add_task("retired", "Then call roll-back-fast on failure.")
+    hits = {h["key"].split(":", 1)[1]: h for h in echoes.scan(p)}
+    assert hits[f"task:{both}:spec"]["class"] == "advisory", hits
+    assert hits[f"task:{both}:spec"]["why"] == "a live memory entry states it: no action"
+    assert hits[f"task:{retired}:spec"]["class"] == "directive", hits
+    assert hits[f"task:{retired}:spec"]["phrase"] == "roll-back-fast"
+    assert [h["key"] for h in echoes.scan(p) if h["class"] == "directive"] == [hits[f"task:{retired}:spec"]["key"]]
+    echoes.record(p.db, "charter 'Deploys' quote replaced", "Deploy with `ship-it --canary` before each job.")
+    charter = [h for h in echoes.scan(p) if h["source"].startswith("charter")]
+    assert charter and all(h["class"] == "directive" for h in charter), charter
+    assert {h["key"].split(":", 1)[1] for h in charter} >= {f"task:{both}:spec"}
 
 
 def test_a_supersede_citing_a_user_message_is_a_withdrawal_unless_every_cited_message_predates_the_entry(env):
