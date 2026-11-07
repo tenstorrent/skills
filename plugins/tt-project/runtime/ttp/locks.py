@@ -1120,6 +1120,7 @@ MULTI_TICKET = ".m"         # after the pid, a waiter for several resources at o
 PRIORITY_TICKET = ".p"      # before it, the waiter's task priority (lowest first; checkcap uses 0 for obligation owners)
 LANDING_TICKET = ".l"       # right after the pid, a waiter inside a landing's checks (landmark.verified; landing_first)
 REQUEUED_TICKET = ".r"      # after the pid, a waiter that gave its slot up to a more urgent one and queued again (fair_order)
+SMALL_TICKET = ".s"         # after the pid, a short run (checkcap.is_small): first among its group's at its priority
 LANDING_AGE_S = 3600.0      # a waiter that has waited this long is no longer passed by later landings (landing_first)
 SERVED_KEEP_S = 86400.0     # a group's last-served time older than this no longer changes its turn
 
@@ -1131,7 +1132,7 @@ def group_id(group: str | None) -> str:
 
 def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = None,
             shared: bool = False, group: str | None = None, priority: int | None = None,
-            multi: bool = False, landing: bool = False, requeued: bool = False) -> Path:
+            multi: bool = False, landing: bool = False, requeued: bool = False, small: bool = False) -> Path:
     """A ticket for this process in the resource's arrival queue. Like a slot, it is an OS file lock
     held by this process, so it ends with it (a crash, a kill, a reboot) whatever its pid becomes.
     Not written durably: a power cut ends every waiter with it. Remove it with `dequeue`. `since`
@@ -1142,13 +1143,14 @@ def enqueue(locks_dir: Path, resource: str, holder: str, since: float | None = N
     still read the group. `multi`: one of the tickets of a waiter for several resources at once
     (MULTI_TICKET after the pid), which a waiter that holds locks already does not wait behind (my_turn).
     `landing`: a waiter inside a landing's checks (LANDING_TICKET); only a verified one (landmark.verified).
-    `requeued`: a waiter that gave its slot up (preempted) and queues again at `since` (REQUEUED_TICKET)."""
+    `requeued`: a waiter that gave its slot up (preempted) and queues again at `since` (REQUEUED_TICKET).
+    `small`: a short run (SMALL_TICKET), which fair_order serves first among its group's waiters at its priority."""
     d = queue_dir(locks_dir, resource)
     d.mkdir(parents=True, exist_ok=True)
     gid = group_id(group)
     prio = f"{PRIORITY_TICKET}{int(priority)}" if priority is not None else ""
     name = (f"{time.time() if since is None else since:017.6f}-{os.getpid()}{LANDING_TICKET if landing else ''}"
-            f"{MULTI_TICKET if multi else ''}{REQUEUED_TICKET if requeued else ''}{prio}"
+            f"{MULTI_TICKET if multi else ''}{REQUEUED_TICKET if requeued else ''}{SMALL_TICKET if small else ''}{prio}"
             f"{GROUP_TICKET + gid if gid else ''}{SHARED_TICKET if shared else ''}")
     # Locked under a hidden name first, then renamed in: `queued` never sees it unlocked.
     tmp = d / f".{name}.tmp"
@@ -1295,6 +1297,10 @@ def is_requeued(ticket: Path) -> bool:
     return REQUEUED_TICKET in ticket.name.partition(PRIORITY_TICKET)[0].partition(GROUP_TICKET)[0]
 
 
+def is_small(ticket: Path) -> bool:
+    return SMALL_TICKET in ticket.name.partition(PRIORITY_TICKET)[0].partition(GROUP_TICKET)[0]
+
+
 def is_landing(ticket: Path) -> bool:
     head = ticket.name.removesuffix(SHARED_TICKET).split("-", 1)[-1]
     return LANDING_TICKET in head.partition(GROUP_TICKET)[0].partition(PRIORITY_TICKET)[0]
@@ -1386,7 +1392,8 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
-    (ticket_priority), then arrival. A waiter below URGENT_PRIORITY (a user-ordered urgent task's,
+    (ticket_priority), then short runs (is_small) first, then arrival: a stream of short runs holds a
+    longer one only until it ages past `aged_before` below. A waiter below URGENT_PRIORITY (a user-ordered urgent task's,
     urgent.queue_priority, or an open obligation's owner) goes before the other groups' waiters too.
 
     `urgent_max` > 0: urgent waiters (task priority URGENT_PRIORITY or better) go first, taking turns
@@ -1425,7 +1432,7 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     served = _served(locks_dir, resource)
     key = {g: (0, max(served.get(g, 0.0), _arrival(ts[0])), ts[0].name) for g, ts in groups.items()}
     for ts in groups.values():
-        ts.sort(key=ticket_priority)   # stable: arrival order within a priority
+        ts.sort(key=lambda t: (ticket_priority(t), not is_small(t)))   # stable: then arrival order
     hot = sum(map(_urgent, q)) if urgent_max > 0 or first else 0
     cold = len(q) - hot + len(aged)   # aged ones are routine here, or there are no urgent turns (hot 0)
     streak = _streak(locks_dir, resource) if hot and cold else 0

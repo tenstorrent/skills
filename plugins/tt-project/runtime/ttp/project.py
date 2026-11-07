@@ -2916,7 +2916,7 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_sp
                 "checks": {"host_max", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",
                            "test_project_max", "test_project_slots", "test_project_workers", "load_guard", "build_pool", "build_run_max", "build_project_max", "wall_cap_s",
                            "slots", "light_cmds", "max_wait_s", "wait_event_s", "priority_age_s",
-                           "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s",
+                           "wait_escalate_s", "wait_hang_factor", "done_holder_flag_s", "done_holder_grace_s", "stall_s", "starve_s", "small_tests",
                            "push_load_wait_s",
                            "push_priority_wait_s",   # a push's longest wait behind another priority holder (checkcap.priority_wait_s)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)

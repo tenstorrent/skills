@@ -171,8 +171,6 @@ def test_a_push_queue_project_narrows_a_wide_modules_module_level_and_checks_fun
     ("pyproject.toml", "[tool.pytest]\n", "pyproject.toml"),
     ("tests/test_r.py", "X = 1\n\n\ndef _h():\n    return 1\n\n\ndef test_top():\n    assert _h()\n\n\n"
                         "def test_alone():\n    pass\n", "module-level code of tests/test_r.py"),
-    ("tests/r/other_cases.py", "def test_other():\n    pass\n" + "".join(
-        f"\n\ndef test_more_{i}():\n    pass\n" for i in range(40)), "the diff reaches"),
 ])
 def test_a_push_queue_project_still_runs_task_checks_in_full_where_the_whole_suite_is_affected(tmp_path, rel, text,
                                                                                               reason):
@@ -183,6 +181,31 @@ def test_a_push_queue_project_still_runs_task_checks_in_full_where_the_whole_sui
     todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
     assert todo == list(own) and lines[0].startswith(f"{_PICK_CMD}: full: ") and reason in lines[0], lines
 
+
+
+def test_a_push_queue_project_keeps_a_selection_of_most_of_the_suite_targeted(tmp_path):
+    # #7217: runs 14448 (65%) and 14462 (76%) ran in full for "the diff reaches N% of the tests" though the push
+    # batch runs the full suite anyway; with the push queue on such a selection stays targeted.
+    from ttp import push, testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {"tests/r/other_cases.py": "".join(
+        f"def test_other_{i}():\n    assert {i} >= 0\n\n\n" for i in range(15))})
+    entries, why = testpick.pick(repo, base, head, _PICK_FILES)
+    assert entries == [] and why == "the diff reaches 76% of the tests", why
+    sizes: dict = {}
+    assert testpick.pick(repo, base, head, _PICK_FILES, soft=[], sizes=sizes) == (
+        ["tests/r/other_cases.py", "tests/test_plugin_catalogue.py::test_cat"], "")
+    assert sizes == {"tests": 16, "of": 21}
+    own = push.check_list([_PICK_CMD])
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
+    assert todo[0].targeted and lines == [f"{_PICK_CMD}: targeted: 1 case files, 1 tests in 1 test files"], lines
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, None)
+    assert todo == list(own) and lines == [f"{_PICK_CMD}: full: the diff reaches 76% of the tests"], lines
+    # a conftest still runs the whole check with the push queue on
+    head = _pick_change(repo, base, {"tests/r/other_cases.py": "def test_other_0():\n    pass\n",
+                                     "tests/conftest.py": "X = 1\n"})
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
+    assert todo == list(own) and "conftest.py" in lines[0], lines
 
 def test_narrow_records_targeted_or_full_and_keeps_the_full_pass_key_apart(tmp_path):
     from ttp import cli, push, testpick

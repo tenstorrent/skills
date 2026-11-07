@@ -1972,7 +1972,10 @@ session and stateless coordinators on every provider.
   project one shared turn per N urgent starts since the project's last routine start, taken by the oldest
   (a long routine backlog holds it for at most that one run). A run at least 4 times cheaper (a targeted
   run beside full suites) is not held by an aged run of its priority or a less urgent one; a landing's run
-  still is. An urgent run (priority 0 or 1: a task owed to the user,
+  still is. A short targeted run (fewer than `checks.small_tests` tests, account-level, env
+  `TTP_CHECKS_SMALL_TESTS`, default 500, 0 off) goes first among its project's waiters at its priority
+  in the queue and is held by no longer parked run of its priority or a less urgent one (a landing's
+  still holds it); the cap and every other rule hold it as any run. An urgent run (priority 0 or 1: a task owed to the user,
   live-impact work) that would wait with every slot busy starts within about a minute, in this order:
   on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
   host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past
@@ -2226,8 +2229,8 @@ session and stateless coordinators on every provider.
   runs. With the push queue on, the batch's full run on the merged tree (bisected to the changes at
   fault when it fails) is the full-suite gate, so a task's own checks run in full only where the
   whole suite is affected (a conftest, a shared test helper or fixture, the checks runner's own
-  files, a manifest, `__init__.py` or config file, a test file's module-level code, half the suite or
-  more). A change only the full suite covers (a module's module-level code, the checks functions in
+  files, a manifest, `__init__.py` or config file, a test file's module-level code); a selection of
+  half the suite or more stays targeted. A change only the full suite covers (a module's module-level code, the checks functions in
   a module, something no test names) adds the tests it can place, and the scope line ends `; the push
   batch runs the rest: <reasons>`. Checks already waiting for a slot re-execute on the new runtime
   and pick their scope again.

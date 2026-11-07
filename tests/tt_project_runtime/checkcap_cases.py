@@ -7558,7 +7558,8 @@ def test_a_short_targeted_run_goes_ahead_of_aged_long_full_runs_but_never_of_urg
         assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [p1], "a more urgent one goes first"
         locks.dequeue(p1)
         unknown = locks.enqueue(d, P, "pa task #43 (run 43)", since=now - 8000, group="pa", priority=2)
-        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [unknown], "no lane label: held"
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=near) == [p2, unknown], "no lane label: held"
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [], "short (#7217): not held"
         locks.dequeue(unknown)
         landing = locks.enqueue(d, P, "pa task #42 (run 42)", since=now - 8000, group="pa", priority=2, landing=True)
         assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [landing], "a landing goes first"
@@ -7577,6 +7578,81 @@ def test_a_short_targeted_run_goes_ahead_of_aged_long_full_runs_but_never_of_urg
         for h in holders:
             _stop(h)
 
+
+
+def test_a_short_targeted_run_is_not_held_by_parked_full_runs_and_queues_first_within_the_host_cap(
+        env, monkeypatch):
+    # #7217: the 13-test targeted run 14440 waited 50 min behind 13 parked full runs. A targeted run of fewer
+    # than checks.small_tests tests (checkcap.is_small) is held by no parked longer run of its priority or a
+    # less urgent one (starved_ahead), whatever their costs; an older short one, a landing's and a more urgent
+    # one still hold it. In the host queue it goes first among its project's waiters at its priority
+    # (locks.SMALL_TICKET, fair_order), and the host cap (checks.host_max) still holds it.
+    import threading
+    from ttp import checkcap, locks, project
+    monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
+    tiny, full = {"cls": 2, "tests": 13, "of": 9000}, {"cls": 2, "tests": 6000, "of": 9000}
+    assert checkcap.small_tests() == checkcap.SMALL_TESTS == 500
+    assert checkcap.is_small(tiny) and not checkcap.is_small(full) and not checkcap.is_small({"cls": 2})
+    assert not checkcap.is_small(None) and not checkcap.is_small({"tests": True})
+    monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"small_tests": 20}})
+    assert checkcap.small_tests() == 20 and checkcap.is_small(tiny)
+    monkeypatch.setenv(checkcap.SMALL_ENV, "10")
+    assert checkcap.small_tests() == 10 and not checkcap.is_small(tiny), "the env wins"
+    monkeypatch.setenv(checkcap.SMALL_ENV, "-3")
+    assert checkcap.small_tests() == 20, "a negative env value is ignored"
+    monkeypatch.delenv(checkcap.SMALL_ENV)
+    monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"small_tests": "x"}})
+    assert checkcap.small_tests() == 500, "unreadable: the default"
+    monkeypatch.setattr(project, "load_account_settings", lambda: {})
+    now = time.time()
+    d, P = checkcap.slot_dir(), checkcap.PARKED
+    parked = [locks.enqueue(d, P, f"pa task #{60 + i} (run {60 + i})", since=now - 9000 + i, group="pa", priority=2)
+              for i in range(13)]
+    extra = []
+    try:
+        assert len(checkcap.starved_ahead("pa", now, now, priority=2, cost=full)) == 13, "a full run: as before"
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [], "13 tests: not held"
+        monkeypatch.setenv(checkcap.SMALL_ENV, "0")   # off: the cost rule alone, and unknown costs hold it
+        assert len(checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny)) == 13
+        monkeypatch.delenv(checkcap.SMALL_ENV)
+        extra.append(older := locks.enqueue(d, P, "pa task #80 (run 80)", since=now - 9500, group="pa",
+                                            priority=2, small=True))
+        assert locks.is_small(older) and not locks.is_small(parked[0])
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [older], "short ones: first come"
+        locks.dequeue(extra.pop())
+        extra.append(landing := locks.enqueue(d, P, "pa task #81 (run 81)", since=now - 9500, group="pa",
+                                              priority=2, landing=True))
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [landing], "a landing holds it"
+        locks.dequeue(extra.pop())
+        extra.append(urgent := locks.enqueue(d, P, "pa task #82 (run 82)", since=now - 9500, group="pa", priority=1))
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [urgent], "a more urgent one too"
+    finally:
+        for t in parked + extra:
+            locks.dequeue(t)
+    # The host queue: a full run then a 13-test run, same project and priority, behind the one slot of the cap.
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    for small, want in ((False, ["full", "tiny"]), (True, ["tiny", "full"])):
+        held = checkcap.acquire("h")
+        got, slots = [], []
+
+        def take(label, is_small):
+            s = checkcap.acquire(label, project_name="pa", priority=2, small=is_small)
+            got.append((label, len(checkcap.state()["running"])))
+            slots.append(s)
+            s.close()
+
+        waiters = []
+        for i, args in enumerate([("full", False), ("tiny", small)]):
+            waiters.append(threading.Thread(target=take, args=args))
+            waiters[-1].start()
+            assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
+        assert checkcap.state()["queued"] == want, "the 13-test run ranks first only as a short one"
+        time.sleep(0.3)
+        assert got == [] and checkcap.state()["running"] == ["h"], "the cap holds both while its slot is held"
+        held.close()
+        for w in waiters:
+            w.join(20)
+        assert [g[0] for g in got] == want and all(n == 1 for _, n in got), "one at a time: the cap holds"
 
 def test_aged_routine_waiters_take_routine_turns_and_nothing_changes_without_a_backlog(tmp_path):
     # #6033 on the host queue (locks.fair_order): aged routine waiters go ahead of later routine ones only;

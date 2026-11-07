@@ -5056,7 +5056,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     startable=startable,
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
-                                    urgent=urgent, preemptible=checkcap.preemptible(cmds, lock))
+                                    urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),
+                                    small=checkcap.is_small(run_cost))
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
