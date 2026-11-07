@@ -13,6 +13,10 @@ mark or a file nobody holds waits as a non-landing waiter (locks.landing_first o
 A batch that pushes an urgent approval labels its mark urgent (hold(urgent=True)): its `ttp lock` waiters
 carry urgent.PRIORITY, read only from a verified mark (label(); cli.cmd_lock), so a forged ENV gains no rank either.
 
+A mark's liveness is its OS lock alone, never its label's pid: the lock goes with its holder's open files, so a
+file left by a holder that died (killed before close()) is never verified, even when its pid now names a live
+process. hold() first reaps such files (reap): no live process holds them and they are older than GRACE.
+
 Known gap: a `ttp lock` inside a check's process sandbox (its own PID namespace) cannot see its
 ancestors and waits as a non-landing one; a gate in checks.wrap_cmd runs outside the sandbox."""
 from __future__ import annotations
@@ -26,6 +30,7 @@ from pathlib import Path
 from . import locks
 
 ENV = "TTP_LANDING_MARK"
+GRACE = 60.0   # seconds a mark file may sit unlocked before reap() removes it (a hold() between open and flock)
 
 
 def marks_dir() -> Path:
@@ -49,15 +54,48 @@ class Mark:
             self.f = None
 
 
+def reap() -> int:
+    """Remove mark files no live process holds (their holder died before close()), older than GRACE; the
+    number removed. Each is removed under its own lock and only if the path still names that file."""
+    d, n = marks_dir(), 0
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    for name in names:
+        if not name.endswith(".lock"):
+            continue
+        path = d / name
+        try:
+            with open(path) as f:
+                st = os.fstat(f.fileno())
+                if time.time() - st.st_mtime < GRACE:
+                    continue
+                try:
+                    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except OSError:
+                    continue   # held: its holder lives
+                if os.stat(path).st_ino == st.st_ino:
+                    path.unlink()
+                    n += 1
+        except OSError:
+            continue
+    return n
+
+
 def hold(urgent: bool = False) -> Mark | None:
     """A landing mark held by this process until close(), labelled urgent when `urgent`; None when the
-    folder cannot be written (the check then waits as a non-landing one, never fails)."""
+    folder cannot be written (the check then waits as a non-landing one, never fails). Reaps dead marks first."""
     try:
         d = marks_dir()
         d.mkdir(parents=True, exist_ok=True)
+        reap()
         path = d / f"{os.getpid()}-{time.time():.6f}.lock"
         f = open(path, "a+")
         fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if os.stat(path).st_ino != os.fstat(f.fileno()).st_ino:   # reaped between open and flock
+            f.close()
+            return None
         f.write(json.dumps({"since": time.time(), **locks._owner(os.getpid()), **({"urgent": True} if urgent else {})}))
         f.flush()
         return Mark(f, path)

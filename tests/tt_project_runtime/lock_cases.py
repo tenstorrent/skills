@@ -2367,6 +2367,41 @@ def test_only_a_held_landing_mark_of_an_ancestor_makes_a_landing_waiter(env, tmp
     assert _verified(dict(run_env, **{landmark.ENV: str(mine.path)})) == "False", "let go: no landing"
 
 
+def test_a_landing_mark_left_by_a_dead_holder_is_never_verified_and_is_reaped(env):
+    """A mark file whose holder died before close() (its pid gone, or reused by a live ancestor with the same
+    start time) is never a verified landing: liveness is the OS lock, not the label's pid. hold() reaps such
+    files once older than landmark.GRACE; a younger one and a live holder's mark stay."""
+    from ttp import landmark
+    run_env = dict(os.environ, TTP_HOME=str(env["home"]), PYTHONPATH=str(RUNTIME))
+    r = subprocess.run([sys.executable, "-c", "import os\nfrom ttp import landmark\nm = landmark.hold()\n"
+                        "print(m.path, flush=True)\nos._exit(0)"], env=run_env, capture_output=True, text=True,
+                       timeout=60)
+    dead = Path(r.stdout.strip())
+    assert dead.exists() and dead.parent == landmark.marks_dir(), r
+    reused = landmark.hold()   # labelled with this live process, an ancestor of the waiter below
+    reused.f.close()           # its lock gone without close(): a dead holder whose pid lives on
+    reused.f = None
+    other, live = _mark_holder(run_env)
+    try:
+        for path in (dead, reused.path):
+            assert _verified(dict(run_env, **{landmark.ENV: str(path)})) == "False", path
+        assert landmark.reap() == 0, "younger than GRACE: kept"
+        old = time.time() - landmark.GRACE - 5
+        for path in (dead, reused.path, Path(live)):
+            os.utime(path, (old, old))
+        mine = landmark.hold()
+        try:
+            assert sorted(landmark.marks_dir().iterdir()) == sorted([mine.path, Path(live)])
+            assert _verified(dict(run_env, **{landmark.ENV: str(mine.path)})) == "True"
+        finally:
+            mine.close()
+    finally:
+        other.stdin.close()
+        other.wait(timeout=60)
+    assert landmark.reap() == 1, "the other holder died before close(): its aged mark goes too"
+    assert list(landmark.marks_dir().iterdir()) == []
+
+
 def test_a_wait_line_names_a_holders_project_from_its_root_not_its_project_field(tmp_path):
     """locks.holder_kind: the project comes from the record's project_root (a lock's tt-project folder or a
     bare root), never from its project field, which may name only the harness folder; a record with no root
