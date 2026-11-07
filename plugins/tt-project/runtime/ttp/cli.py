@@ -4055,11 +4055,17 @@ def cmd_checks(a) -> None:
                     check_start = out.tell()
                 began = time.monotonic()
                 loss_reruns = torn_reruns = setup_reruns = 0
-                took = [0.0]
+                took, runs = [0.0], [0]
 
                 def run_once():   # one run of the check; the run's deadline moves by any cap extension
                     nonlocal deadline
                     t0 = time.monotonic()
+                    if runs[0] and (record := resume_vars.get("TTP_PYTEST_RESUME")):
+                        try:   # a rerun after a fault in this run runs every file again
+                            Path(record).write_text("")
+                        except OSError:
+                            pass
+                    runs[0] += 1
                     try:
                         return _run_check(_low_priority(push.check_argv(c, cwd, env, commit=head)), group, record=reap_rec, cwd=cwd,
                                           stdout=out,
