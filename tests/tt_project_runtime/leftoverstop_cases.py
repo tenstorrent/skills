@@ -623,7 +623,6 @@ def test_no_shipped_default_starts_a_sandbox(env, monkeypatch):
     from ttp import coordtools, project, sandbox
     from ttp.providers.claude import Claude
     monkeypatch.setattr(Claude, "supports", lambda self, flag: True)
-    monkeypatch.setattr(Claude, "hook_rewrites", lambda self: False)
     for read_only in (False, True):
         argv, _ = Claude().build(role="worker", model="m", effort="high", cwd="/tmp", budget_usd=1.0,
                                  read_only=read_only, schema=None, restrictions={})
