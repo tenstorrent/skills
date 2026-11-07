@@ -76,6 +76,10 @@ while every slot is busy). Each slow lane names its limiting setting and whether
 reached while work waited (`at_limit`) or capacity sat idle (`idle`; for the checks lane also
 `serialized`: runs went one at a time back to back, the queue's own fault, not the limit's).
 
+The report also shows the host-wide checks pool per project (host_shares: grants, running runs and wait
+time in the window), and how many of each project's waits ended while another project held more than its
+fair share of the cap (checkcap's fair share). Information only: nothing is raised for it.
+
 apply() changes only LEVERS, each a key config_set accepts (coordinator.USER_SETTABLE), and only for a
 slow lane whose limit was reached while work waited and whose resource has headroom: the provider
 gate allows new work and is not the binding cap, the provider is not paused, and the host's load leaves
@@ -1122,6 +1126,7 @@ def review(p, cfg: dict, since_s: float = DAY, do_apply: bool = False, trigger: 
     """measure(), then apply() when asked; kept as LAST_KV. Changes of the last day are listed too."""
     now = time.time() if now is None else now
     rep = measure(p.db, cfg, since_s, now, gates)
+    rep["host_checks"] = host_shares(since_s, now)
     earlier = recent(p.db, now)
     if do_apply:
         rep["changes"], rep["kept"] = apply(p, cfg, rep, trigger, now)
@@ -1133,6 +1138,39 @@ def review(p, cfg: dict, since_s: float = DAY, do_apply: bool = False, trigger: 
     p.db.set_kv(LAST_KV, {k: rep[k] for k in ("ts", "trigger", "changes", "kept", "earlier_changes")}
                 | {"slow": [ln["lane"] for ln in rep["lanes"] if ln["slow"]]})
     return rep
+
+
+def host_shares(since_s: float = DAY, now: float | None = None) -> dict:
+    """The host-wide checks pool per project over the window: {"cap", "share", "projects": {name: {"grants",
+    "running", "wait_s", "over_share_waits", "over_share_by"}}}. Grants and waits come from the host grants
+    log (checkcap.grant_records), running ones from the slots held now; over_share_waits counts the grants
+    whose wait ended while another project held more than its fair share of the cap (checkcap.over_share),
+    over_share_by names those projects. {} when it cannot be read or nothing ran."""
+    now = time.time() if now is None else now
+    try:
+        from . import checkcap, locks
+        cap, rows, run = checkcap.limit(), checkcap.grant_records(now, since_s), checkcap.running_by_project()
+        waiting = {locks.ticket_group(t) for t in locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)}
+    except Exception:
+        return {}
+    projects: dict[str, dict] = {}
+    for name in run:
+        projects.setdefault(name, {"grants": 0, "running": 0, "wait_s": 0.0, "over_share_waits": 0,
+                                   "over_share_by": []})["running"] = run[name]
+    for r in rows:
+        x = projects.setdefault(str(r.get("project") or ""), {"grants": 0, "running": 0, "wait_s": 0.0,
+                                                              "over_share_waits": 0, "over_share_by": []})
+        x["grants"] += 1
+        x["wait_s"] += max(0.0, float(r["ts"]) - float(r["since"]))
+        if by := [str(b) for b in r.get("over_share") or () if isinstance(b, str)]:
+            x["over_share_waits"] += 1
+            x["over_share_by"] = sorted(set(x["over_share_by"]) | set(by))
+    if not projects:
+        return {}
+    for x in projects.values():
+        x["wait_s"] = round(x["wait_s"])
+    k = len({locks.group_id(n) for n, c in run.items() if c} | waiting)
+    return {"cap": cap, "share": locks.share_of(cap, k) if cap else None, "projects": projects}
 
 
 def _dur(s: float) -> str:
@@ -1162,6 +1200,14 @@ def text(rep: dict) -> str:
                       if ln["at_limit"] or ln["idle"] or ln["lane"] == "worker_slots" else "")
                    + (f", serialized {ln['serialized']}" if ln.get("serialized") else "")
                    + (f", {ln['waiting_now']} waiting now" if ln["waiting_now"] else "") + extra)
+    if hc := rep.get("host_checks"):
+        cap = (f"cap {hc['cap']}, fair share {hc['share']} each now" if hc.get("cap") else "no cap")
+        out.append(f"Host checks pool ({cap}), per project:")
+        for name, x in sorted(hc["projects"].items(), key=lambda kv: -kv[1]["wait_s"]):
+            out.append(f"- {name or 'no project'}: {x['grants']} grant(s), {x['running']} running, waited "
+                       f"{_dur(x['wait_s'])}" + (f"; {x['over_share_waits']} wait(s) ended while "
+                                                 f"{', '.join(x['over_share_by'])} held over its fair share"
+                                                 if x["over_share_waits"] else ""))
     for c in rep.get("changes") or []:
         out.append(f"Changed #{c['id']}: {c['key']} {c['old']} -> {c['new']} ({c['why']}); undo: {c['undo']}")
     for c in rep.get("would_change") or []:

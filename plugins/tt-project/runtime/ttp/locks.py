@@ -1433,7 +1433,7 @@ def _served(locks_dir: Path, resource: str) -> dict[str, float]:
 
 def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urgent_max: int = 0,
                aged_before: float | None = None, aged_turns: int | None = None,
-               bare_last: bool = False) -> list[Path]:
+               bare_last: bool = False, share: tuple[int, dict[str, int]] | None = None) -> list[Path]:
     """The waiters in the order a fair queue serves them: each next turn goes to the oldest waiter
     of the group that has waited longest since it last got the resource (since its oldest waiter
     arrived, if later), so one group's burst cannot starve the others. Within a group by task priority
@@ -1467,11 +1467,15 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
     one (requeued_place), so its project's turn spent on the run that took its slot never sends it back.
 
     `bare_last`: waiters with no group (a run with no project) go after every grouped one, by priority then
-    arrival, aged or not (accepted gap: they wait while any project's waiter does)."""
+    arrival, aged or not (accepted gap: they wait while any project's waiter does).
+
+    `share` (cap N, {group id: slots it holds now}): the routine turns go first to groups below their fair
+    share of the cap (fair_share), so one group's backlog cannot hold every slot while another waits."""
     q = queued(locks_dir, resource) if q is None else q
     if bare_last and (bare := [t for t in q if not ticket_group(t)]):
         rest = [t for t in q if ticket_group(t)]
-        return (fair_order(locks_dir, resource, rest, urgent_max, aged_before, aged_turns) if rest else []) + \
+        return (fair_order(locks_dir, resource, rest, urgent_max, aged_before, aged_turns, share=share)
+                if rest else []) + \
             sorted(bare, key=lambda t: (ticket_priority(t), _arrival(t)))
     first = urgent_max == URGENT_FIRST
     aged = sorted((t for t in q if _arrival(t) <= aged_before and not ((first or urgent_max > 0) and _urgent(t))),
@@ -1518,7 +1522,37 @@ def fair_order(locks_dir: Path, resource: str, q: list[Path] | None = None, urge
             key[g] = (1, len(out), "")
         else:
             del groups[g]
-    return requeued_place(out)
+    return requeued_place(fair_share(out, *share) if share else out)
+
+
+def share_of(cap: int, groups: int) -> int:
+    """A group's fair share of `cap` slots while `groups` groups run or wait: max(1, cap // groups)."""
+    return max(1, int(cap) // max(1, int(groups)))
+
+
+def fair_share(q: list[Path], cap: int, running: dict[str, int]) -> list[Path]:
+    """`q` (fair_order's) with its routine turns (not _urgent) given first to groups below their fair share
+    (share_of over the groups that hold a slot or wait), counting each turn before as one more slot of its
+    group; with none below it, the next routine waiter in `q`'s order (work-conserving). Urgent and
+    requeued (preempted: requeued_place) waiters keep their places, so urgent and owed runs and preemption
+    keep their order and the routine turns stay where they were. It only orders the queue: a running holder
+    is never stopped for a share."""
+    if not cap or cap <= 0:
+        return q
+    held = {g: n for g, n in running.items() if n > 0}
+    share = share_of(cap, len(set(held) | {ticket_group(t) for t in q}))
+    pinned = lambda t: _urgent(t) or is_requeued(t)
+    routine = [t for t in q if not pinned(t)]
+    out = []
+    for t in q:
+        if pinned(t):
+            pick = t
+        else:
+            pick = next((r for r in routine if held.get(ticket_group(r), 0) < share), routine[0])
+            routine.remove(pick)
+        out.append(pick)
+        held[ticket_group(pick)] = held.get(ticket_group(pick), 0) + 1
+    return out
 
 
 def requeued_place(q: list[Path]) -> list[Path]:
@@ -1580,12 +1614,13 @@ def mark_turn(locks_dir: Path, resource: str, ticket: Path | None) -> None:
 
 def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool = False,
             urgent_max: int = 0, past_multi: bool = False, aged_before: float | None = None,
-            aged_turns: int | None = None, bare_last: bool = False) -> bool:
+            aged_turns: int | None = None, bare_last: bool = False,
+            share: tuple[int, dict[str, int]] | None = None) -> bool:
     """Whether this ticket may take the resource now. An exclusive one: among the first `slots`
     waiters (urgent tickets, task priority URGENT_PRIORITY or better, before the rest), one per free
     slot, with no shared waiter ahead. A shared one: no exclusive waiter
     ahead, so it never jumps one. `fair`: waiters are counted in fair_order (with `urgent_max`), not
-    arrival order (and `aged_before`, `aged_turns`, `bare_last` as there). Either way landing waiters go first (landing_first). `past_multi`
+    arrival order (and `aged_before`, `aged_turns`, `bare_last`, `share` as there). Either way landing waiters go first (landing_first). `past_multi`
     (a waiter that holds locks already): waiters for several resources at
     once ahead are not counted, as one of them may wait for a lock this waiter's holder has: waiting
     behind it would never end."""
@@ -1593,7 +1628,7 @@ def my_turn(locks_dir: Path, resource: str, ticket: Path, slots: int, fair: bool
     if ticket not in q:   # none queued, unless it was this process's and was dropped (its run ended): never
         return not dropped(ticket)
     if fair:
-        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns, bare_last)
+        q = fair_order(locks_dir, resource, q, urgent_max, aged_before, aged_turns, bare_last, share)
     else:   # urgent waiters (an urgent task's) first, a user-ordered one (priority 0) before them, arrival
         q = sorted(q, key=lambda t: min(ticket_priority(t), URGENT_PRIORITY + 1))   # order within: plain arrival
     q = landing_first(q)

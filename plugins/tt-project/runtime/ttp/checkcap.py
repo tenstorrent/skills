@@ -108,6 +108,15 @@ always starts. The run's test grant then follows the same free cores (testslots.
 `checks.live_cores` 0 (TTP_CHECKS_LIVE_CORES) turns both off. Nor is one taken while the host's disk is
 saturated by writes (diskgate: dirty page cache or IO pressure over their limits), even with no check running.
 
+Routine waiters of a project below its fair share of the cap (max(1, cap // the projects running or waiting
+checks here), counting the slots it holds) go before those of projects at or over theirs (locks.fair_share):
+one project's backlog cannot hold every slot while another waits. A share nobody waits for goes to whoever
+waits, and no running check is stopped for a share; urgent and owed waiters keep their places ahead. Each
+grant after a wait logs the other projects then over their share ("over_share", record_grant), which
+`ttp throughput` shows per project. Accepted gaps: a project's run waiting outside the queue for test slots
+(parked) does not count toward the number of projects; an aged run of a project at its share waits for the
+under-share projects' turns, at most their shares; runtimes older than this order the queue without shares.
+
 Waiters take turns by project (locks.fair_order); within one, by task priority (1 first;
 a spec's `urgent:` line counts as 1, urgent.is_urgent), then arrival; a running check is never stopped.
 The checks of a task that is a required owner of an open obligation (obligations.owned_open: an urgent
@@ -561,9 +570,10 @@ def is_small(cost: dict | None) -> bool:
 
 
 def order() -> dict:
-    """locks.fair_order's (and my_turn's) ordering arguments for the checks queue: runs with no project last."""
+    """locks.fair_order's (and my_turn's) ordering arguments for the checks queue: runs with no project last,
+    and each project's fair share of the cap (share())."""
     return {"urgent_max": priority_turns(), "aged_before": aged_before(), "aged_turns": aged_turns(),
-            "bare_last": True}
+            "bare_last": True, "share": share()}
 
 
 def bare_slots() -> int:
@@ -583,6 +593,43 @@ def _bare_held(every: list[Path]) -> int:
 def _project_waits() -> bool:
     """A run of some project waits in the host-wide queue (its ticket has a group)."""
     return any(locks.ticket_group(t) for t in locks.queued(slot_dir(), RESOURCE))
+
+
+def running_by_project() -> dict[str, int]:
+    """{project: checks it runs now on the cap's slots and those load opened beyond it}, from each held
+    slot's "checks_project" (acquire's label), else its holder label (an older runtime's: _project); ""
+    for runs with no project. The push and urgent slots beyond the cap are no share of it."""
+    out: dict[str, int] = {}
+    for path in all_paths() if limit() else []:
+        if not locks.held_labels([path]):
+            continue
+        try:
+            h = json.loads(path.read_text() or "{}")
+        except (OSError, ValueError):
+            h = {}
+        h = h if isinstance(h, dict) else {}
+        name = (h.get("checks_project") or "") if "checks_project" in h else _project(str(h.get("holder") or ""))
+        name = "" if name == "no project" else name
+        out[name] = out.get(name, 0) + 1
+    return out
+
+
+def share() -> tuple[int, dict[str, int]] | None:
+    """locks.fair_order's `share`: (the cap, {queue group id: slots held}); None with the cap off."""
+    n = limit()
+    return (n, {locks.group_id(k): v for k, v in running_by_project().items()}) if n else None
+
+
+def over_share(project_name: str | None) -> list[str]:
+    """The other projects that hold more than their fair share of the cap now (locks.share_of over the
+    projects running or waiting): what kept a slot from `project_name` while it waited."""
+    n = limit()
+    if not n:
+        return []
+    run = running_by_project()
+    waiting = {locks.ticket_group(t) for t in locks.queued(slot_dir(), RESOURCE)}
+    k = len({locks.group_id(p) for p in run} | waiting | {locks.group_id(project_name)})
+    return sorted(p for p, c in run.items() if p != (project_name or "") and c > locks.share_of(n, k))
 
 
 def aged_before(now: float | None = None) -> float:
@@ -2007,7 +2054,11 @@ def _granted(tell, state, project_name, priority, owns, since: float, told: bool
              cap: int | None = None, lane_at: float | None = None) -> None:
     """Log a slot taken (record_wait) and tell it when it waited, here or before a relaunch."""
     now = time.time()
-    record_wait(state, project_name, priority, since, now, owns=owns, cap=cap, lane_at=lane_at)
+    try:   # only the log's note: a failed read never costs the slot
+        over = over_share(project_name) if now - since > POLL_S else []
+    except Exception:
+        over = []
+    record_wait(state, project_name, priority, since, now, owns=owns, cap=cap, lane_at=lane_at, over=over)
     if tell and (told or now - since > GRANT_TELL_S):
         tell(grant_line(priority, owns, since, now))
 
@@ -2175,13 +2226,14 @@ WAITS_WINDOW_S = 24 * 3600
 
 def record_wait(state: Path | None, project_name: str | None, priority: int | None, queued_at: float,
                 granted_at: float, slot: str = "queue", owns: list[str] | tuple = (),
-                cap: int | None = None, lane_at: float | None = None) -> None:
+                cap: int | None = None, lane_at: float | None = None, over: list[str] | tuple = ()) -> None:
     """Append one slot wait to `state`/WAITS_LOG and sync it, and the grant to the host-wide log
     (record_grant). Never raises: a log that cannot be written must not cost the checks their slot.
     No `state`: only the host-wide line is logged. `cap`: the project cap in force (checklane.project_cap,
     0: none), stored as "cap" so throughput judges the wait by it; None (no project lane): no field.
     `lane_at`: when the run got its repository's lane (`ttp checks` queues for it before this slot, from
-    the same `queued_at`), stored as "lane_at": only the time after it waited for the host."""
+    the same `queued_at`), stored as "lane_at": only the time after it waited for the host. `over`: the
+    other projects over their fair share of the cap when a wait ended (over_share), stored as "over_share"."""
     task, run = _task_run()
     task = task or ""
     rec = {"project": project_name, "task": int(task) if task.isdigit() else None,
@@ -2191,6 +2243,8 @@ def record_wait(state: Path | None, project_name: str | None, priority: int | No
         rec["cap"] = int(cap)
     if lane_at is not None:
         rec["lane_at"] = round(lane_at, 3)
+    if over:
+        rec["over_share"] = list(over)
     if state is not None:
         _append(Path(state), WAITS_LOG, WAITS_OLD, WAITS_LOCK, WAITS_MAX_BYTES, rec)
     record_grant(rec, owns)
@@ -2231,6 +2285,8 @@ def record_grant(rec: dict, owns: list[str] | tuple = ()) -> None:
     row = {"ts": rec["granted_at"], "project": rec["project"], "task": rec["task"], "run": rec["run"],
            "slot": rec["slot"], "priority": rec["priority"], "obligations": list(owns or ()),
            "since": rec["queued_at"], "waited_s": round(max(0.0, rec["granted_at"] - rec["queued_at"]), 3)}
+    if rec.get("over_share"):
+        row["over_share"] = rec["over_share"]
     d = grants_dir()
     try:
         d.mkdir(parents=True, exist_ok=True)

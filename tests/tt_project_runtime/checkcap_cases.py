@@ -11888,3 +11888,165 @@ def test_a_push_run_takes_the_next_free_slot_ahead_of_queued_task_checks(env, mo
         for h in task + push:
             if h is not None:
                 h.close()
+
+
+def _share_holders(monkeypatch, cap, held):
+    """Hold host-wide checks slots under a cap of `cap`: {project: count}, labelled as acquire's callers do."""
+    from ttp import checkcap
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", str(cap))
+    monkeypatch.setenv("TTP_CHECKS_LOAD_EXTRA", "0")
+    monkeypatch.setenv("TTP_CHECKS_LIVE_CORES", "0")
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    return [checkcap.acquire(checkcap.label(p), project_name=p) for p, n in held.items() for _ in range(n)]
+
+
+def _share_queue(spec, at):
+    """Queue tickets (label, project, priority) on the checks queue, one second apart from `at`."""
+    from ttp import checkcap, locks
+    return [locks.enqueue(checkcap.slot_dir(), checkcap.RESOURCE, label, since=at + i, group=g, priority=pr)
+            for i, (label, g, pr) in enumerate(spec)]
+
+
+def test_checks_fair_share_gives_the_next_slot_to_a_project_below_its_share_over_a_long_backlog(env, monkeypatch):
+    # #7088: cap 4, project A holds 3 and has a long backlog; B waits with none: B's waiter goes before
+    # A's backlog, though A waited longer since its last turn. A real waiter takes the freed slot.
+    import threading
+    from ttp import checkcap, locks
+    held = _share_holders(monkeypatch, 4, {"A": 4})
+    t0 = time.time()
+    tk = _share_queue([(f"a{i}", "A", 3) for i in range(6)], t0 - 600) + _share_queue([("b0", "B", 3)], t0 + 60)
+    names = lambda **k: [t.read_text() for t in locks.fair_order(checkcap.slot_dir(), checkcap.RESOURCE, **k)]
+    try:
+        assert names()[0] == "a0", "without shares: A's turn (it was served before B arrived)"
+        assert names(**checkcap.order())[:3] == ["b0", "a0", "a1"], "B below its share (2 of 4) goes first"
+        assert checkcap.over_share("B") == ["A"], "A holds 4 of a share of 2"
+        held.pop().close()   # A holds 3: B (0) still below its share
+        assert locks.my_turn(checkcap.slot_dir(), checkcap.RESOURCE, tk[-1], 1, fair=True, **checkcap.order())
+        assert not locks.my_turn(checkcap.slot_dir(), checkcap.RESOURCE, tk[0], 1, fair=True, **checkcap.order())
+        for t in tk[-1:]:
+            locks.dequeue(t)
+        got = []
+        w = threading.Thread(target=lambda: got.append(checkcap.acquire(checkcap.label("B"), project_name="B",
+                                                                       since=time.time() - 30, max_wait_s=30)))
+        w.start()
+        w.join(30)
+        assert got and got[0] is not None, "the free slot went to B over A's six older waiters"
+        held.append(got[0])
+        rows = checkcap.grant_records()
+        assert rows[-1]["project"] == "B" and rows[-1].get("over_share") == ["A"], rows
+        rep = __import__("ttp.throughput", fromlist=["x"]).host_shares()
+        assert rep["cap"] == 4 and rep["share"] == 2, rep
+        assert rep["projects"]["B"]["over_share_waits"] == 1 and rep["projects"]["B"]["over_share_by"] == ["A"]
+        assert rep["projects"]["A"]["running"] == 3 and rep["projects"]["B"]["running"] == 1
+        assert rep["projects"]["B"]["grants"] == 1 and rep["projects"]["B"]["wait_s"] >= 0
+    finally:
+        for t in tk:
+            locks.dequeue(t)
+        for s in held:
+            s.close()
+
+
+def test_checks_fair_share_three_projects_on_a_cap_of_four_each_get_one_before_a_second(env, monkeypatch):
+    from ttp import checkcap, locks
+    held = _share_holders(monkeypatch, 4, {"A": 3})
+    t0 = time.time()
+    tk = _share_queue([("a0", "A", 3), ("a1", "A", 3)], t0 - 600) + _share_queue([("b0", "B", 3), ("b1", "B", 3)], t0 + 10) \
+        + _share_queue([("c0", "C", 3), ("c1", "C", 3)], t0 + 20)
+    try:
+        assert locks.share_of(4, 3) == 1
+        order = [t.read_text() for t in locks.fair_order(checkcap.slot_dir(), checkcap.RESOURCE, **checkcap.order())]
+        assert order[:2] == ["b0", "c0"], "B and C (0 of a share of 1) before A (3) and before their own second"
+        assert sorted(order[2:]) == ["a0", "a1", "b1", "c1"], order
+        assert checkcap.over_share("C") == ["A"]
+    finally:
+        for t in tk:
+            locks.dequeue(t)
+        for s in held:
+            s.close()
+
+
+def test_checks_fair_share_a_lone_waiting_project_may_take_every_free_slot(env, monkeypatch):
+    # Work-conserving: B holds 1 and waits for none; A (share 2 of 4) may still take all 3 free slots.
+    from ttp import checkcap, locks
+    held = _share_holders(monkeypatch, 4, {"B": 1})
+    tk = _share_queue([(f"a{i}", "A", 3) for i in range(4)], time.time())
+    try:
+        turn = [locks.my_turn(checkcap.slot_dir(), checkcap.RESOURCE, t, 3, fair=True, **checkcap.order()) for t in tk]
+        assert turn == [True, True, True, False], turn
+        assert checkcap.over_share("A") == []
+    finally:
+        for t in tk:
+            locks.dequeue(t)
+        for s in held:
+            s.close()
+    held = _share_holders(monkeypatch, 4, {})
+    got = [checkcap.acquire(checkcap.label("A"), project_name="A", max_wait_s=5) for _ in range(4)]
+    try:
+        assert all(got) and checkcap.running_by_project() == {"A": 4}, "alone, a project uses the whole cap"
+    finally:
+        for s in got:
+            s and s.close()
+
+
+def test_checks_fair_share_keeps_owed_and_urgent_first_and_a_requeued_run_its_place(env, monkeypatch):
+    # A is over its share; its owed (priority 0) and urgent (1) waiters still go first, and its preempted
+    # routine run (requeued) keeps the place it has without shares. Shares only order routine turns.
+    from ttp import checkcap, locks
+    held = _share_holders(monkeypatch, 4, {"A": 4})
+    d, r = checkcap.slot_dir(), checkcap.RESOURCE
+    t0 = time.time()
+    tk = _share_queue([("a-routine", "A", 3), ("a-urgent", "A", 1), ("a-owed", "A", checkcap.OBLIGATION_PRIORITY)],
+                      t0 - 600)
+    tk += _share_queue([("b-routine", "B", 3), ("b-urgent", "B", 1)], t0 + 10)
+    try:
+        for m in (locks.URGENT_FIRST, 0, 2):
+            with_share = [t.read_text() for t in locks.fair_order(d, r, urgent_max=m, share=checkcap.share())]
+            plain = [t.read_text() for t in locks.fair_order(d, r, urgent_max=m)]
+            pinned = lambda xs: [(i, x) for i, x in enumerate(xs) if "routine" not in x]
+            assert pinned(with_share) == pinned(plain), (m, with_share, plain)
+            assert with_share.index("b-routine") < with_share.index("a-routine"), (m, with_share)
+        first = [t.read_text() for t in locks.fair_order(d, r, **checkcap.order())][:3]
+        assert first[0] == "a-owed" and sorted(first[1:]) == ["a-urgent", "b-urgent"], first
+        rq = locks.enqueue(d, r, "a-requeued", since=t0, group="A", priority=3, requeued=True)
+        tk.append(rq)
+        got = [t.read_text() for t in locks.fair_order(d, r, **checkcap.order())]
+        plain = [t.read_text() for t in locks.fair_order(d, r, urgent_max=locks.URGENT_FIRST)]
+        assert got.index("a-requeued") == plain.index("a-requeued"), (got, plain)
+        locks.dequeue(tk[0])   # with no older routine waiter of A before it, it goes before B's later one
+        got = [t.read_text() for t in locks.fair_order(d, r, **checkcap.order())]
+        assert got.index("a-requeued") < got.index("b-routine"), got
+    finally:
+        for t in tk:
+            locks.dequeue(t)
+        for s in held:
+            s.close()
+
+
+def test_throughput_text_shows_the_host_checks_pool_per_project(env, monkeypatch):
+    from ttp import throughput
+    rep = {"thresholds_s": {"p1": 60, "other": 60}, "since_s": 86400, "lanes": [],
+           "host_checks": {"cap": 4, "share": 2, "projects": {
+               "A": {"grants": 9, "running": 3, "wait_s": 7200, "over_share_waits": 0, "over_share_by": []},
+               "B": {"grants": 2, "running": 0, "wait_s": 9000, "over_share_waits": 2, "over_share_by": ["A"]}}}}
+    out = throughput.text(rep)
+    assert "Host checks pool (cap 4, fair share 2 each now), per project:" in out
+    assert "- B: 2 grant(s), 0 running, waited 2h30m; 2 wait(s) ended while A held over its fair share" in out
+    assert "- A: 9 grant(s), 3 running, waited 2h00m\n" in out + "\n"
+
+
+def test_checks_fair_share_counts_runs_with_no_project_and_older_runtimes_labels(env, monkeypatch):
+    # A run with no project counts as "" (its tickets' group); an older runtime's slot without
+    # "checks_project" counts by its holder label; push and urgent slots beyond the cap count for none.
+    from ttp import checkcap, locks
+    held = _share_holders(monkeypatch, 4, {})
+    held.append(checkcap.acquire(checkcap.label(None)))
+    old = locks.try_take(checkcap.paths(), "C task #5 (run 9)", "ttp checks")
+    pushed = checkcap.acquire_priority("branch-key", checkcap.label("D"), project_name="D")
+    try:
+        assert checkcap.running_by_project() == {"": 1, "C": 1}, checkcap.running_by_project()
+        cap, run = checkcap.share()
+        assert cap == 4 and run == {locks.group_id(""): 1, locks.group_id("C"): 1}
+    finally:
+        for s in held + [pushed]:
+            s.close()
+        old.close()
