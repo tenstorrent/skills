@@ -307,7 +307,7 @@ def scrub_later(paths: list, log: Path) -> int | None:
         return None
     runtime = str(Path(__file__).resolve().parent.parent)
     try:
-        with open(log, "ab") as out:
+        with open(log, "ab") as out:   # own session: the masking job outlives the daemon tick that starts it
             return subprocess.Popen([sys.executable, "-m", "ttp.redact", *map(str, paths)], cwd=runtime,
                                     env={**os.environ, "PYTHONPATH": runtime}, stdin=subprocess.DEVNULL,
                                     stdout=out, stderr=out, start_new_session=True).pid
