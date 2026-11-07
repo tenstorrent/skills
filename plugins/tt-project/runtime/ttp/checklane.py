@@ -905,10 +905,113 @@ def _ticket_task(t: Path) -> str:
     return locks.ticket_task(t)
 
 
+_WORKTREE = re.compile(r"/worktrees/t(\d+)(?:/|$)")   # a task's worktree: <project folder>/worktrees/t<id>
+_RUN_DIR = re.compile(r"/runs/(\d+)/?$")
+
+
+def _env_task(env: dict | None) -> tuple[str, str]:
+    """(task, run) an environment names (TTP_TASK, TTP_RUN_ID or its TTP_RUN_DIR's number), "" each without."""
+    env = env or {}
+    task = str(env.get("TTP_TASK") or env.get("TTP_TASK_ID") or "")
+    run = str(env.get("TTP_RUN_ID") or "")
+    if not run and (m := _RUN_DIR.search(str(env.get("TTP_RUN_DIR") or ""))):
+        run = m.group(1)
+    return (task if task.isdigit() else ""), (run if run.isdigit() else "")
+
+
+def _run_dir_task(run_dir: str) -> str:
+    """The task of the worker run in folder `run_dir` (the TTP_TASK its run.json gives the worker), else ""."""
+    try:
+        env = json.loads((Path(run_dir) / "run.json").read_text()).get("env")
+    except (OSError, ValueError, AttributeError, TypeError):
+        return ""
+    return _env_task(env if isinstance(env, dict) else {})[0]
+
+
+def _proc(pid: int | None) -> dict:
+    """A live process's command line, working folder, parent pid, session id and environment, each "" or
+    None when unreadable (gone, another user's, no /proc)."""
+    from . import procowner
+    out = {"command": "", "cwd": "", "ppid": None, "sid": None, "env": None}
+    if not pid:
+        return out
+    try:
+        out["command"] = " ".join(Path(f"/proc/{pid}/cmdline").read_bytes().decode(errors="replace").split("\0")).strip()
+    except OSError:
+        pass
+    try:
+        out["cwd"] = os.readlink(f"/proc/{pid}/cwd")
+    except OSError:
+        pass
+    try:
+        f = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
+        out["ppid"], out["sid"] = int(f[1]), int(f[3])
+    except (OSError, ValueError, IndexError):
+        pass
+    out["env"] = procowner.environ(pid)
+    return out
+
+
+def waiter(t: Path) -> dict:
+    """Who a checks-lane waiter's ticket `t` is: task, run, pid, command, cwd (its working folder). The
+    ticket's text is read once (a waiter that leaves and rejoins the queue between two reads must not lose
+    its task); when it names no task, the task comes from the ticket's owner record (the run it waits for),
+    the waiter's environment or a parent's in its session (a worker run's TTP_TASK, TTP_RUN_DIR), else its worktree
+    (worktrees/t<id>). Only a waiter none of these link to a task is taskless: its pid, command and
+    folder then name it (waiter_text)."""
+    text = testslots._ticket_text(t)
+    m = re.search(r"task #(\d+)", text)
+    task, run, pid = (m.group(1) if m else ""), _run_of(text), testslots.ticket_pid(t)
+    if task:   # the usual case: no /proc read
+        return {"task": task, "run": run, "pid": pid, "command": "", "cwd": "", "label": text}
+    me = _proc(pid)
+    try:
+        rec = json.loads(locks._owner_file(t).read_text())
+        rec = rec if isinstance(rec, dict) else {}
+    except (OSError, ValueError, AttributeError):
+        rec = {}
+    owner = str(rec.get("run_dir") or "")
+    task = str(rec.get("task_id") or "")   # the ticket's record (locks.waiter_ids), else its run folder's
+    task = task if task.isdigit() else (_run_dir_task(owner) if owner else "")
+    if not run and str(rec.get("run_id") or "").isdigit():
+        run = str(rec["run_id"])
+    if not run and (r := _RUN_DIR.search(owner)):
+        run = r.group(1)
+    up, seen = me, 0
+    while not task and up["env"] is not None and seen < 8:   # its own environment, then its parents'
+        task, r = _env_task(up["env"])
+        run = run or r
+        task = task or _run_dir_task(str(up["env"].get("TTP_RUN_DIR") or ""))
+        seen += 1
+        if task or not up["ppid"] or up["ppid"] <= 1:
+            break
+        up = _proc(up["ppid"])
+        if up["sid"] != me["sid"]:   # a detached waiter's starter is not its task
+            break
+    if not task and (w := _WORKTREE.search(me["cwd"])):
+        task = w.group(1)
+    return {"task": task, "run": run, "pid": pid, "command": me["command"], "cwd": me["cwd"], "label": text}
+
+
+def waiter_text(w: dict, since: float, cfg: dict | None = None, now: float | None = None) -> str:
+    """How a wait line names its waiter: "#12", a run no record links to a task "run 7 (no task)"
+    (_waiter_name), else "a run with no task (pid 4242 'ttp checks ...' in /path, first queued 12:40 PST)"
+    so it can be acted on without a hunt; a gone waiter's command is its ticket label's."""
+    if w.get("task") or w.get("run"):
+        return _waiter_name(str(w.get("task") or ""), f"run {w['run']}" if w.get("run") else "")
+    from . import timefmt
+    cmd = str(w.get("command") or "") or " ".join(str(w.get("label") or "").split(": ", 1)[-1].split())
+    cmd = cmd if len(cmd) <= 80 else cmd[:77] + "..."
+    bits = [f"pid {w['pid']}" if w.get("pid") else "pid unknown", repr(cmd) if cmd else "command unknown",
+            f"in {w['cwd']}" if w.get("cwd") else "folder unknown",
+            f"first queued {timefmt.short(since, cfg or {}, now)}"]
+    return f"a run with no task ({' '.join(bits[:3])}, {bits[3]})"
+
+
 def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s: float = 0.0) -> list[dict]:
     """The project's waiters for a lane that have waited over `over_s`, in queue order (the aging step
     of `cfg`, checks.priority_age_s — the order the lanes grant): task, waited_s, since (arrival),
-    position (1-based), the waiter's run (`run`, from its label) and who it is (`who`: _waiter_name), the
+    position (1-based), the waiter's run (`run`), who it is (`waiter`: waiter) and its name (`who`: waiter_text), the
     lane's label (lane_labels), what it waits on (the lane, the project cap or a host gate:
     _lane_waits_on), the limit holding it ("lanes", "project_cap", "host" or "" for none), the holders'
     records (of the lane, else of every lane) and how many lanes the repository has now (slots_note)."""
@@ -929,13 +1032,9 @@ def waits(project_name: str, cfg: dict | None, now: float | None = None, over_s:
             for i, t in enumerate(q):
                 waited = now - locks._arrival(t)
                 if waited > over_s:
-                    try:
-                        text = t.read_text()
-                    except OSError:
-                        text = ""
-                    task = _ticket_task(t)
-                    out.append({"task": task, "run": _run_of(text), "who": _waiter_name(task, text, t.name),
-                                "waited_s": waited, "since": locks._arrival(t),
+                    who, since = waiter(t), locks._arrival(t)
+                    out.append({"task": who["task"], "run": who["run"], "who": waiter_text(who, since, cfg, now),
+                                "waiter": who, "waited_s": waited, "since": since,
                                 "position": i + 1, "of": len(q), "lane": labels[key], "waits_on": on[i],
                                 "holders": lane_recs if on[i] == labels[key] else all_recs,
                                 "limit": "lanes" if on[i] == labels[key] else "project_cap" if on[i] == CAP_LABEL
@@ -1174,11 +1273,8 @@ def lane_status(project_name: str, now: float | None = None, cfg: dict | None = 
         for i, t in enumerate(q):
             m = re.match(r"\d+(?:\.\d+)?-(\d+)", t.name)
             prio = locks.ticket_priority(t)
-            try:
-                label = t.read_text()
-            except OSError:
-                label = ""
-            waiters.append({"position": i + 1, "task": _ticket_task(t), "run": _run_of(label),
+            who = waiter(t)
+            waiters.append({"position": i + 1, "task": who["task"], "run": who["run"],
                             "pid": int(m.group(1)) if m else None,
                             "priority": None if prio == float("inf") else prio,
                             "rank": testslots.suite_priority(t, now, age), "label": testslots.rank_text(t, now, age),

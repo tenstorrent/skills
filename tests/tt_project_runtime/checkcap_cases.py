@@ -3271,6 +3271,122 @@ def test_long_wait_lines_order_by_the_project_s_priority_age_s_not_the_account_s
             locks.dequeue(t)
 
 
+_LANE_WAITER = """
+import sys
+from ttp import testslots
+testslots.suite_hold(sys.argv[1], repo=sys.argv[2], since=float(sys.argv[3]))
+"""
+
+
+def _lane_waiter(name, since, cwd, env=None, shell=False):
+    """A real `ttp checks`-style waiter for the held lane (its own session, so no test-runner parent's
+    TTP_TASK is its), queued at `since` once this returns; `shell`: started by a `sh` that keeps `env`'s
+    TTP_TASK from it (a parent run's task)."""
+    from ttp import testslots
+    clean = {k: v for k, v in os.environ.items()
+             if k not in ("TTP_TASK", "TTP_TASK_ID", "TTP_RUN_ID", "TTP_RUN_DIR", "TTP_DETACHED")}
+    argv = [sys.executable, "-c", _LANE_WAITER, name, _LANE_REPO, repr(since)]
+    if shell:
+        argv = ["sh", "-c", 'env -u TTP_TASK "$@"; :', "sh", *argv]
+    proc = subprocess.Popen(argv, cwd=cwd, env={**clean, "PYTHONPATH": str(RUNTIME), **(env or {})},
+                            start_new_session=True)
+    assert _wait_for(lambda: testslots.suite_order(name, repo=_LANE_REPO)), "the waiter never queued"
+    return proc
+
+
+def _stop_group(proc):
+    try:
+        os.killpg(proc.pid, 9)
+    except OSError:
+        pass
+    proc.wait(10)
+
+
+def test_a_waiter_that_requeues_between_reads_keeps_its_task_in_the_wait_event_and_status(env, tmp_path, monkeypatch):
+    # requeued-ticket-label: the daemon read the queue (suite_order), then the ticket's text; a waiter
+    # that left the queue to rejoin it at its place in between read as "a run with no task".
+    from ttp import checklane, testslots
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, "pa", _LANE_REPO)
+    waiter = _lane_waiter("pa", time.time() - 1000, tmp_path, {"TTP_TASK": "13"})
+    real = testslots.suite_order
+
+    def requeueing(*a, **k):   # each ticket leaves the queue right after it was read
+        q = real(*a, **k)
+        for t in q:
+            t.unlink()
+        return q
+
+    monkeypatch.setattr(testslots, "suite_order", requeueing)
+    try:
+        (ev,) = checklane.wait_events("pa", {})
+        assert ev["task"] == 13 and "Checks lane wait: #13 has waited" in ev["text"], ev
+        assert ev["fingerprint"].startswith("checks_slot_wait:13:"), ev
+        assert _wait_for(lambda: real("pa", repo=_LANE_REPO)), "the waiter queues again"
+        (line,) = checklane.long_wait_lines("pa", {}, over_s=0)
+        assert line.startswith("checks lane wait: #13 has waited"), line
+    finally:
+        _stop_group(waiter)
+        _stop(holder)
+
+
+@pytest.mark.parametrize("how", ["run_dir", "worktree", "parent"])
+def test_a_ticket_without_its_task_is_labelled_from_its_run_worktree_or_parent(env, tmp_path, monkeypatch, how):
+    # detached-ticket-label: a waiter whose ticket names no task (a detached or re-executed `ttp checks`
+    # without TTP_TASK) is still its task's: by the worker run it checks for, its worktree or its parent.
+    from ttp import checklane
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, "pa", _LANE_REPO)
+    cwd, extra = tmp_path, {}
+    if how == "run_dir":
+        run = tmp_path / "state" / "runs" / "77"
+        run.mkdir(parents=True)
+        (run / "run.json").write_text(json.dumps({"env": {"TTP_TASK": "14"}}))
+        extra = {"TTP_RUN_DIR": str(run), "TTP_DETACHED": "1"}
+    elif how == "worktree":
+        cwd = tmp_path / "tt-project" / "worktrees" / "t14"
+        cwd.mkdir(parents=True)
+    else:
+        extra = {"TTP_TASK": "14"}
+    waiter = _lane_waiter("pa", time.time() - 1000, cwd, extra, shell=how == "parent")
+    try:
+        (w,) = checklane.waits("pa", {}, over_s=0)
+        assert w["task"] == "14", (how, w)
+        assert w["run"] == ("77" if how == "run_dir" else ""), w
+        (ev,) = checklane.wait_events("pa", {})
+        assert ev["task"] == 14 and "#14 has waited" in ev["text"] and "no task" not in ev["text"], ev
+        (lane,) = checklane.lane_status("pa")
+        assert [x["task"] for x in lane["waiters"]] == ["14"], lane
+    finally:
+        _stop_group(waiter)
+        _stop(holder)
+
+
+def test_a_truly_taskless_waiter_is_named_by_pid_command_folder_and_first_queued_time(env, tmp_path, monkeypatch):
+    # taskless-names-pid: only a waiter no record links to a task reads "a run with no task", and then
+    # with what the coordinator needs to act on it without a hunt.
+    from ttp import checklane, timefmt
+    _lane_env(monkeypatch)
+    holder = _lane_holder(tmp_path, "pa", _LANE_REPO)
+    cwd = tmp_path / "plain"
+    cwd.mkdir()
+    since = time.time() - 1000
+    waiter = _lane_waiter("pa", since, cwd)
+    cfg = {"home_timezone": "America/Los_Angeles"}
+    try:
+        (ev,) = checklane.wait_events("pa", cfg)
+        assert ev["task"] is None and ev["fingerprint"].startswith("checks_slot_wait:run:"), ev
+        who = (f"a run with no task (pid {waiter.pid} '{sys.executable} -c " )
+        assert who in ev["text"], ev["text"]
+        assert f" in {cwd}, first queued {timefmt.short(since, cfg)})" in ev["text"], ev["text"]
+        (line,) = checklane.long_wait_lines("pa", cfg, over_s=0)
+        assert line.startswith(f"checks lane wait: a run with no task (pid {waiter.pid} "), line
+        assert "#" not in line.split(" has waited")[0], line
+    finally:
+        _stop_group(waiter)
+        _stop(holder)
+
+
 def test_two_repositories_check_side_by_side_while_one_repository_takes_turns(env, tmp_path, monkeypatch, capsys):
     from ttp import checkcap, cli, testslots
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
