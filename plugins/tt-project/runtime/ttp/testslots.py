@@ -394,13 +394,13 @@ def release_load_pass() -> None:
 
 
 def full_startable(grant, cfg: dict | None, project_name: str | None, holder: str,
-                   priority: int | None = None, since: float | None = None) -> bool:
+                   priority: int | None = None, since: float | None = None, cost: dict | None = None) -> bool:
     """A full run's startable gate for checkcap.acquire (cli._checks_slot_take): pool_room(full=True),
     its reason (pool_gate) recorded on the lanes `grant` holds (gate_lanes). Once it passes under the load
     guard the run takes its load pass at once (reserve_load_pass), so one parked run leaves the park per
     pass; held off again, it lets the pass go."""
-    gate = "" if pool_room(cfg, project_name, full=True, priority=priority, since=since) \
-        else pool_gate(cfg, project_name, full=True, priority=priority, since=since)
+    gate = "" if pool_room(cfg, project_name, full=True, priority=priority, since=since, cost=cost) \
+        else pool_gate(cfg, project_name, full=True, priority=priority, since=since, cost=cost)
     if gate:
         release_load_pass()
     else:
@@ -1139,13 +1139,13 @@ def others_wait(project_name: str | None) -> bool:
 
 
 def pool_room(cfg: dict | None, project_name: str | None, full: bool = False, priority: int | None = None,
-              since: float | None = None) -> bool:
+              since: float | None = None, cost: dict | None = None) -> bool:
     """Whether a run could take its test slots now: pool_gate finds nothing that holds it."""
-    return not pool_gate(cfg, project_name, full, priority, since)
+    return not pool_gate(cfg, project_name, full, priority, since, cost)
 
 
 def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, priority: int | None = None,
-              since: float | None = None) -> str:
+              since: float | None = None, cost: dict | None = None) -> str:
     """What holds a run off its test slots now, "" when it could take them (pool_room): the pool is off,
     or it has a slot free (pool_now) with nobody queued for one, and the project's budget (project_max) has
     one free. suite_hold's overflow lanes ask it, so a run takes one only once it can start beside the
@@ -1156,14 +1156,14 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     its urgent slots instead (urgent_paths), as acquire takes them. A run of the project parked past
     checkcap.starve_s() that arrived before `since` (this run's arrival; default now) goes first
     (checkcap.starved_ahead), unless this run is more urgent and that one's turn (one per
-    checkcap.aged_turns() urgent starts) has not come; an urgent run leaves that turn only to the oldest
+    checkcap.aged_turns() urgent starts) has not come, or this run, of `cost`, is much cheaper than that one's; an urgent run leaves that turn only to the oldest
     less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
     to whichever polls first. The reason names the term that failed, for status (checklane._parked)."""
     if full and (why := load_held(priority, since=since)):
         return f"{LOAD_GATE}{why}"
-    if (ahead := checkcap.starved_ahead(project_name, since, priority=priority)):
+    if (ahead := checkcap.starved_ahead(project_name, since, priority=priority, cost=cost)):
         return f"{len(ahead)} run(s) of its project parked longer go first (checkcap.starved_ahead)"
     if full and admitted_ahead(project_name, priority):
         return "a run of its project as urgent or more holds a host-wide checks slot and waits for its test slots"

@@ -229,9 +229,10 @@ def _place(top: Path, base: str, head: str, path: str, us: dict[str, str], liste
 
 
 def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS,
-         soft: list[str] | None = None) -> tuple[list[str], str]:
+         soft: list[str] | None = None, sizes: dict | None = None) -> tuple[list[str], str]:
     """(selection entries, "") for a narrowed check, else ([], why it runs in full). With `soft` (a
-    push-queue project) what only the full suite covers is left to the push batch and listed there."""
+    push-queue project) what only the full suite covers is left to the push batch and listed there. A
+    narrowed check's size goes in `sizes`: {"tests": the selected tests, "of": the check's tests} (_weight)."""
     if not base:
         return [], "no push target to diff against"
     diff = _git(top, "diff", "--name-only", "--no-renames", "-z", f"{base}...{head}")
@@ -253,11 +254,14 @@ def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS,
     chosen |= {k for k in us for a in always if k == a or k.startswith(f"{a}::")}
     if not chosen:
         return [], "nothing in the diff maps to a test"
-    if (share := _weight(us, chosen) / max(1, _weight(us, us))) >= MAX_SHARE:
+    n, total = _weight(us, chosen), max(1, _weight(us, us))
+    if (share := n / total) >= MAX_SHARE:
         return [], f"the diff reaches {share:.0%} of the tests"
     out = sorted(chosen)
     if len("\n".join(out)) > MAX_ENV:
         return [], "the selection is too long"
+    if sizes is not None:
+        sizes.update(tests=n, of=total)
     return out, ""
 
 
@@ -288,7 +292,8 @@ def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | N
             continue
         why = "--full" if full else "" if enabled(cfg) else f"delivery.{KEY} is false"
         soft: list[str] | None = [] if queued else None
-        entries, why = ([], why) if why else pick(top, base, head, files, always, soft)
+        sizes: dict = {}
+        entries, why = ([], why) if why else pick(top, base, head, files, always, soft, sizes)
         if not entries:
             out.append(c)
             lines.append(f"{c}: full: {why}")
@@ -301,6 +306,8 @@ def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | N
                                FILES_ENV: "\n".join(entries)}.items()))
         c2.spill = False   # the select plugin's path is this host's
         c2.targeted = True   # a part of the suite: never a verified-through marker
+        c2.scope = sizes     # its size, and the full check it narrows, price its lane (checklane.cost)
+        c2.full = c
         out.append(c2)
         lines.append(f"{c}: {summary(entries)}"
                      + (f"; the push batch runs the rest: {'; '.join(dict.fromkeys(soft))}" if soft else ""))

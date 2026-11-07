@@ -1762,7 +1762,8 @@ session and stateless coordinators on every provider.
   --light -- <cmds>` declares its own) runs at once outside every slot, and still fails when it fails. A lane
   whose holder's process is gone or whose heartbeat stopped is reclaimed and logged. A waiter that has waited
   `checks.max_wait_s` (default 300, 0 turns it off) and is cheaper than every holder (by recorded run time,
-  else by kind) takes an extra lane beside them. A waiter says who holds the lanes and its place in the queue
+  else by kind) takes an extra lane beside them. A task's targeted checks (only the tests its diff reaches)
+  are priced by that share of the full checks' run time and shown as `targeted: N tests`. A waiter says who holds the lanes and its place in the queue
   each minute; `ttp status` and the coordinator's digest list waits over 10 min, and the daemon records one
   `checks_slot_wait` event per wait past `checks.wait_event_s` (default 900, 0 turns it off). Only one of them
   wakes the coordinator per queue incident (from the first waiter past that threshold until none is); the
@@ -1931,7 +1932,9 @@ session and stateless coordinators on every provider.
   started while it waited, the aged run takes the next turn, so it still starts within a bound; priority-0
   runs are never held by a less urgent one, and a priority-1 run leaves less urgent aged runs of its
   project one shared turn per N urgent starts since the project's last routine start, taken by the oldest
-  (a long routine backlog holds it for at most that one run). An urgent run (priority 0 or 1: a task owed to the user,
+  (a long routine backlog holds it for at most that one run). A run at least 4 times cheaper (a targeted
+  run beside full suites) is not held by an aged run of its priority or a less urgent one; a landing's run
+  still is. An urgent run (priority 0 or 1: a task owed to the user,
   live-impact work) that would wait with every slot busy starts within about a minute, in this order:
   on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
   host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past

@@ -2504,16 +2504,18 @@ import json, sys, time
 from pathlib import Path
 from ttp import checklane, testslots
 checklane.HEARTBEAT_S = 3600.0   # no touch of the lane file while a test compares it
-g = testslots.suite_hold(sys.argv[1], repo=sys.argv[3], what=sys.argv[4], cost=json.loads(sys.argv[5]))
+g = testslots.suite_hold(sys.argv[1], repo=sys.argv[3], what=sys.argv[4], cost=json.loads(sys.argv[5]),
+                         who=sys.argv[6] if len(sys.argv) > 6 else "")
 Path(sys.argv[2]).write_text("held")
 while True:
     time.sleep(1)
 """
 
 
-def _lane_holder(tmp_path, name, repo, what="pytest -q", cost=None, task="12"):
+def _lane_holder(tmp_path, name, repo, what="pytest -q", cost=None, task="12", who=""):
     got = tmp_path / f"held-{time.time_ns()}"
-    proc = subprocess.Popen([sys.executable, "-c", _LANE_HOLDER, name, str(got), repo, what, json.dumps(cost or {})],
+    proc = subprocess.Popen([sys.executable, "-c", _LANE_HOLDER, name, str(got), repo, what, json.dumps(cost or {}),
+                             who],
                             env={**os.environ, "PYTHONPATH": str(RUNTIME), "TTP_TASK": task})
     assert _wait_for(got.exists), "the lane holder never took its lane"
     return proc
@@ -7348,6 +7350,57 @@ def test_an_urgent_run_is_held_by_at_most_the_oldest_aged_routine_run_on_its_sha
     finally:
         for t in p3s + p2s + [p1]:
             locks.dequeue(t)
+
+
+def test_a_short_targeted_run_goes_ahead_of_aged_long_full_runs_but_never_of_urgent_or_landing_ones(
+        env, tmp_path, monkeypatch):
+    # #7109: a targeted run (testpick.narrow) parked for its test slots is not held by aged parked full runs
+    # of its priority or less urgent whose lane label's cost is checklane.CHEAP_FACTOR times its own; a more
+    # urgent one, a landing's and one of unknown or near cost still go first (checkcap.starved_ahead).
+    from ttp import checkcap, checklane, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
+    monkeypatch.setenv("TTP_TEST_POOL", "8")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "4")
+    monkeypatch.setattr(testslots, "load_guard", lambda: "")
+    full = {"cls": checklane.SUITE, "est_s": 1260.0}
+    holders = [_lane_holder(tmp_path, "pa", r, cost=full, task=str(t), who=f"run {t}")   # one lane per repository
+               for t, r in ((41, _LANE_REPO), (42, "ba9876543210"))]
+    now = time.time()
+    d, P = checkcap.slot_dir(), checkcap.PARKED
+    p2 = locks.enqueue(d, P, "pa task #41 (run 41)", since=now - 9000, group="pa", priority=2)
+    try:
+        short = {"cls": checklane.SUITE, "est_s": 140.0, "tests": 87, "of": 1960}
+        assert checkcap.starved_ahead("pa", now, now, priority=2) == [p2], "no cost given: as before"
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [], "much cheaper: it goes first"
+        assert testslots.pool_room({}, "pa", priority=2, cost=short)
+        assert not testslots.pool_room({}, "pa", priority=2)
+        assert checkcap.starved_ahead("pa", now, now, priority=1, cost=short) == [], "a more urgent one too"
+        near = {"cls": checklane.SUITE, "est_s": 600.0, "tests": 900, "of": 1960}
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=near) == [p2], "not 4x cheaper: held"
+        assert checkcap.starved_ahead("pa", now, now, cost=short) == [p2], "push checks (no priority): as before"
+        p1 = locks.enqueue(d, P, "pa task #42 (run 42)", since=now - 8000, group="pa", priority=1)
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [p1], "a more urgent one goes first"
+        locks.dequeue(p1)
+        unknown = locks.enqueue(d, P, "pa task #43 (run 43)", since=now - 8000, group="pa", priority=2)
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [unknown], "no lane label: held"
+        locks.dequeue(unknown)
+        landing = locks.enqueue(d, P, "pa task #42 (run 42)", since=now - 8000, group="pa", priority=2, landing=True)
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [landing], "a landing goes first"
+        locks.dequeue(landing)
+        # With no medians known, a targeted run of at most a quarter of its tests is much cheaper than a full one.
+        assert checklane.much_cheaper({"cls": checklane.SUITE, "tests": 87, "of": 1960}, {"cls": checklane.SUITE})
+        assert not checklane.much_cheaper({"cls": checklane.SUITE, "tests": 900, "of": 1960}, {"cls": checklane.SUITE})
+        assert not checklane.much_cheaper({"cls": checklane.SUITE}, {"cls": checklane.SUITE})
+        assert not checklane.much_cheaper(short, None) and not checklane.much_cheaper(None, full)
+        # and cheaper() (the overflow lane past checks.max_wait_s) prefers it over a full one, never the reverse.
+        assert checklane.cheaper({"cls": checklane.SUITE, "tests": 87, "of": 1960}, {"cls": checklane.SUITE})
+        assert not checklane.cheaper({"cls": checklane.SUITE}, {"cls": checklane.SUITE, "tests": 87, "of": 1960})
+        assert checklane.cheaper(short, full) and not checklane.cheaper(full, short)
+    finally:
+        locks.dequeue(p2)
+        for h in holders:
+            _stop(h)
 
 
 def test_aged_routine_waiters_take_routine_turns_and_nothing_changes_without_a_backlog(tmp_path):

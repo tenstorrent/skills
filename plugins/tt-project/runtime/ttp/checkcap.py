@@ -502,14 +502,17 @@ def aged_before(now: float | None = None) -> float:
 
 
 def starved_ahead(project_name: str | None, since: float | None = None, now: float | None = None,
-                  priority: int | None = None) -> list[Path]:
+                  priority: int | None = None, cost: dict | None = None) -> list[Path]:
     """The other parked runs of `project_name` (PARKED tickets) that have waited starve_s() or longer, arrived
     before the asking run (its own PARKED ticket's arrival, else `since`, else now: a newcomer's) and go before
     it: those at its priority or a more urgent one, and a less urgent one only on its turn (_aged_turn: after
     aged_turns() more urgent starts), so urgent runs keep their precedence under a backlog. An urgent asking
     run (locks.URGENT_PRIORITY or better) is held by a less urgent one only on the routine runs' shared turn,
     and then only by the oldest (_routine_turn). The asking run's priority is its PARKED ticket's, else
-    `priority`; none (push checks) is the least urgent. A priority-0 run is never held by a less urgent one."""
+    `priority`; none (push checks) is the least urgent. A priority-0 run is never held by a less urgent one.
+    A run of `cost` (checklane.cost) is not held by one at its priority or less urgent whose run costs
+    CHEAP_FACTOR times as much (checklane.much_cheaper: a targeted run beside full suites), its run's lane
+    label's cost by the run id in its ticket; a landing's ticket always holds it."""
     now = time.time() if now is None else now
     edge, gid = aged_before(now), locks.group_id(project_name)
     try:
@@ -521,6 +524,10 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     rank = locks.ticket_priority(mine) if mine in q else math.inf if priority is None else float(priority)
     aged = [t for t in q if t != mine and locks.ticket_group(t) == gid and locks._arrival(t) <= edge
             and locks._arrival(t) < me]
+    if cost and (costly := [t for t in aged if locks.ticket_priority(t) >= rank and not locks.is_landing(t)]):
+        from . import checklane
+        costs = checklane.run_costs(project_name)
+        aged = [t for t in aged if t not in costly or not checklane.much_cheaper(cost, costs.get(_ticket_run(t)))]
     out = [t for t in aged if locks.ticket_priority(t) <= rank]
     passed = [t for t in aged if t not in out] if rank > 0 else []
     if passed and rank <= locks.URGENT_PRIORITY:
@@ -545,6 +552,15 @@ def _routine_turn(project_name: str | None, aged: list[Path], now: float) -> lis
             and isinstance(r.get("priority"), int)]
     start = max([locks._arrival(oldest) + starve_s()] + [ts for ts, pr in rows if pr > locks.URGENT_PRIORITY])
     return [oldest] if sum(1 for ts, pr in rows if pr <= locks.URGENT_PRIORITY and ts >= start) >= n else []
+
+
+def _ticket_run(t: Path) -> str:
+    """The run id a ticket's text names ("... (run 42)"), else ''."""
+    try:
+        m = re.search(r"\(run (\d+)", t.read_text())
+    except OSError:
+        return ""
+    return m.group(1) if m else ""
 
 
 def _aged_turn(project_name: str | None, aged: list[Path], now: float) -> list[Path]:

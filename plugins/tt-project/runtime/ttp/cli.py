@@ -4813,7 +4813,7 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     from . import testslots
     repo = testslots.repo_key(top) if p else ""
     cmds = cmds or []
-    what = " && ".join(str(c) for c in cmds)[:300] or "full checks"
+    what = checklane.scope_text(cmds)[:300] or "full checks"   # a targeted check by its scope
     # One of the repository's checks lanes (testslots.suite_hold; checks.slots of them, checklane), or with
     # `lock` its wrapper lock's one lane, taken before the checks slot so a run never holds one of the
     # host's slots while it waits. Its wait is told, recorded and cancellable as the checks slot's is; the
@@ -4976,6 +4976,10 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     except ValueError:
         pass
 
+    # A targeted check (testpick.narrow) is priced by its scope against the full checks it narrows.
+    run_cost = checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg,
+                              _commands_hash([getattr(c, "full", c) for c in cmds]))
+
     def hold(key: str, n, **lane):
         left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
         on_key = f"w{lane['lock']}" if lane.get("lock") else key
@@ -4985,7 +4989,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                                        else checklane.slots_now(p.name, on_key, cfg)),
                                     stop, f"run {run_dir.name}", prio, arrived,
                                     slots=n, repo=key,
-                                    cost=checklane.cost(p.state if p else None, _commands_hash(cmds), cmds, cfg),
+                                    cost=run_cost,
                                     max_wait=checklane.max_wait_s(cfg) if key == repo else 0.0,
                                     state=p.state if p else None, what=what, age=checklane.priority_age_s(cfg),
                                     check=f"{head[:12]}.{_commands_hash(cmds)[:12]}",
@@ -5008,7 +5012,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                             worktree=top, headroom=checklane.headroom, pending=True, running=True,
                                             landing=_landing_check(p),
                                             startable=lambda: testslots.pool_room(
-                                                cfg, p.name if p else None, priority=prio, since=arrived))) is None:
+                                                cfg, p.name if p else None, priority=prio, since=arrived,
+                                                cost=run_cost))) is None:
             if tree is not None:
                 tree.close()
             return None
@@ -5025,7 +5030,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
         # slots are granted (testslots.full_startable), so only one parked run leaves the park per pass.
         startable = None if os.environ.get(testslots.HELD_ENV) else (
             lambda: testslots.full_startable(suite, cfg, p.name if p else None,
-                                             checkcap.label(p.name if p else None), priority=prio, since=arrived))
+                                             checkcap.label(p.name if p else None), priority=prio, since=arrived,
+                                             cost=run_cost))
         while True:
             left = max(0.0, limit - (time.time() - t0)) if limit is not None else None
             testslots.lane_waits(suite, "a host-wide checks slot")   # held, not running yet: status says why

@@ -54,7 +54,9 @@ file's mtime, touched every HEARTBEAT_S by the holder) is older than HEARTBEAT_D
 the reclaim logged (RECLAIM_LOG). A waiter that has waited past `checks.max_wait_s` (default
 MAX_WAIT_S; 0 turns it off) and whose run is cheaper than every current holder's (cost(): the median
 duration of this command list's recorded passing runs, else its class: light, other, test suite or
-build) takes one of as many overflow lanes alongside them, not after.
+build) takes one of as many overflow lanes alongside them, not after. A targeted check (testpick.narrow)
+is priced by its scope: its own median, else the full checks' median times its share of their tests, and
+its lane label reads 'targeted: N tests' (scope_text).
 
 Visible. A waiter says who holds the lanes (task, command, running for) and its queue position every
 TELL_S. Each lane is named for people (lane_labels): 'repository <directory name>', 'wrapper lock
@@ -602,22 +604,84 @@ def median_s(state: Path | None, key: str) -> float | None:
     return statistics.median(got[-checkwall.RECENT:]) if got else None
 
 
-def cost(state: Path | None, key: str, cmds: list, cfg: dict | None = None) -> dict:
-    """What a run costs, as its lane label keeps it: {"cls": run_class, "est_s": median_s or absent}."""
-    est = median_s(state, key)
-    return {"cls": run_class(cmds, cfg), **({"est_s": round(est, 1)} if est is not None else {})}
+def scope(cmds: list) -> dict | None:
+    """The narrowed size of `cmds` (testpick.narrow's targeted checks): {"tests": selected, "of": their
+    checks' tests}, summed over the targeted ones; None when none is targeted."""
+    got = [c.scope for c in cmds if getattr(c, "targeted", False) and isinstance(getattr(c, "scope", None), dict)
+           and isinstance(c.scope.get("tests"), int) and isinstance(c.scope.get("of"), int)]
+    return {"tests": sum(x["tests"] for x in got), "of": sum(x["of"] for x in got)} if got else None
+
+
+def scope_text(cmds: list) -> str:
+    """`cmds` for a lane's label and status: a targeted check as 'targeted: N tests', others as written."""
+    def one(c) -> str:
+        n = (scope([c]) or {}).get("tests")
+        return str(c) if n is None else f"targeted: {n} test{'' if n == 1 else 's'}"
+    return " && ".join(one(c) for c in cmds)
+
+
+def cost(state: Path | None, key: str, cmds: list, cfg: dict | None = None, full_key: str = "") -> dict:
+    """What a run costs, as its lane label keeps it: {"cls": run_class, "est_s": median_s or absent}, and
+    for a targeted run (scope) its "tests" and "of". A targeted run's est_s is its own recorded median
+    (`key` keeps its selection), else the median of the full checks it narrows (`full_key`) times its share
+    of their tests, the whole median while another of `cmds` is a full suite."""
+    est, sc = median_s(state, key), scope(cmds)
+    if est is None and sc and full_key and (whole := median_s(state, full_key)) is not None:
+        full = [c for c in cmds if not getattr(c, "targeted", False) and run_class([c], cfg) == SUITE]
+        est = whole if full else whole * sc["tests"] / max(1, sc["of"])
+    return {"cls": run_class(cmds, cfg), **({"est_s": round(est, 1)} if est is not None else {}), **(sc or {})}
+
+
+def _targeted_only(mine: dict, theirs: dict) -> bool:
+    """Whether `mine` is a targeted run (its "tests") and `theirs` a full one of its class or costlier."""
+    t = theirs.get("cls")
+    return (isinstance(mine.get("tests"), int) and not theirs.get("tests")
+            and int(mine.get("cls", SUITE)) <= (int(t) if isinstance(t, int) else SUITE))
 
 
 def cheaper(mine: dict | None, theirs: dict) -> bool:
     """Whether a run of cost `mine` is cheaper than a holder's (`theirs`, its lane label): by both medians
-    when both are known, else by class (a holder without one, from an older runtime, is a SUITE run)."""
+    when both are known, else a targeted run is cheaper than a full one of its class, else by class (a holder
+    without one, from an older runtime, is a SUITE run)."""
     if not mine:
         return False
     a, b = mine.get("est_s"), theirs.get("est_s")
     if isinstance(a, (int, float)) and isinstance(b, (int, float)):
         return a < b
+    if _targeted_only(mine, theirs):
+        return True
     t = theirs.get("cls")
     return int(mine.get("cls", SUITE)) < (int(t) if isinstance(t, int) else SUITE)
+
+
+CHEAP_FACTOR = 4.0   # a run this many times cheaper than an aged parked one goes before it (much_cheaper)
+
+
+def much_cheaper(mine: dict | None, theirs: dict | None) -> bool:
+    """Whether a run of cost `mine` costs at most 1/CHEAP_FACTOR of `theirs` (both lane labels' costs): by
+    both medians when both are known, else a targeted run of at most that share of its tests against a
+    full one of its class. Unknown costs never are."""
+    if not mine or not theirs:
+        return False
+    a, b = mine.get("est_s"), theirs.get("est_s")
+    if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+        return a * CHEAP_FACTOR <= b
+    return _targeted_only(mine, theirs) and mine["tests"] * CHEAP_FACTOR <= max(1, int(mine.get("of") or 0))
+
+
+def run_costs(project_name: str | None) -> dict[str, dict]:
+    """The cost (lane label "cost") of each run holding one of `project_name`'s checks lanes, by run id."""
+    if not project_name:
+        return {}
+    out = {}
+    try:
+        for b in testslots.suite_bases(project_name):
+            for r in locks.holder_records(testslots._lanes_of(b)):
+                if (run := _run_of(r.get("holder"))) and isinstance(r.get("cost"), dict):
+                    out[run] = r["cost"]
+    except OSError:
+        return {}
+    return out
 
 
 def done_flag_s(cfg: dict | None) -> float:

@@ -205,6 +205,68 @@ def test_narrow_records_targeted_or_full_and_keeps_the_full_pass_key_apart(tmp_p
     assert testpick.narrow(repo, base, head, list(own) + list(extra), own, None)[0][1] is extra[0]
 
 
+def test_a_targeted_check_is_priced_and_labelled_by_its_scope_never_as_the_full_suite(tmp_path):
+    # #7109: a narrowed check keeps its size (testpick.narrow); its lane cost (checklane.cost) is the full
+    # checks' median times its share of their tests (or its own recorded median), and its lane label says
+    # 'targeted: N tests' instead of the full command.
+    from ttp import checklane, checkwall, cli, push, testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {"plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
+    own = push.check_list([_PICK_CMD])
+    todo, _ = testpick.narrow(repo, base, head, list(own), own, None)
+    assert todo[0].scope == {"tests": 2, "of": 18} and todo[0].full is own[0]
+    state = tmp_path / "state"
+    state.mkdir()
+    key, full_key = cli._commands_hash(todo), cli._commands_hash([getattr(c, "full", c) for c in todo])
+    assert full_key == cli._commands_hash(list(own)) != key
+    for s in (1200, 1260, 1300):
+        checkwall.record_run(state, s, True, key=full_key)
+    whole = checklane.cost(state, full_key, list(own))
+    mine = checklane.cost(state, key, todo, None, full_key)
+    assert whole == {"cls": checklane.SUITE, "est_s": 1260.0}
+    assert mine == {"cls": checklane.SUITE, "est_s": 140.0, "tests": 2, "of": 18}
+    assert checklane.cheaper(mine, whole) and checklane.much_cheaper(mine, whole)
+    assert checklane.cost(state, key, todo) == {"cls": checklane.SUITE, "tests": 2, "of": 18}, "no full key"
+    checkwall.record_run(state, 90, True, key=key)
+    assert checklane.cost(state, key, todo, None, full_key)["est_s"] == 90.0, "its own median once recorded"
+    # Beside another full suite, the whole median stands.
+    other = push.check_list(["python3 -m pytest -q tests/test_other.py"])
+    both = todo + list(other)
+    checkwall.record_run(state, 1500, True, key=cli._commands_hash(list(own) + list(other)))
+    assert checklane.cost(state, cli._commands_hash(both), both, None,
+                          cli._commands_hash([getattr(c, "full", c) for c in both]))["est_s"] == 1500.0
+    assert checklane.scope_text(todo) == "targeted: 2 tests"
+    assert checklane.scope_text(both) == "targeted: 2 tests && python3 -m pytest -q tests/test_other.py"
+    assert checklane.scope_text(list(own)) == _PICK_CMD and checklane.cost(state, full_key, list(own)) == whole
+
+
+def test_a_targeted_ttp_checks_run_queues_for_its_lane_labelled_and_priced_by_its_scope(env, tmp_path, monkeypatch):
+    # #7109: the lane `ttp checks` queues for (cli._checks_slot -> testslots.suite_hold) is labelled
+    # 'targeted: N tests' and priced from the full checks' median by its share, never as the full suite.
+    from ttp import checkwall, cli, push, testpick, testslots
+    p, _, run, _ = _checks_repo(env, tmp_path, monkeypatch)
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {"plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
+    own = push.check_list([_PICK_CMD])
+    todo, _ = testpick.narrow(repo, base, head, list(own), own, None)
+    checkwall.record_run(p.state, 1260, True, key=cli._commands_hash(list(own)))
+    seen = []
+
+    class Seen(Exception):
+        pass
+
+    def hold(*a, **k):
+        seen.append(k)
+        raise Seen
+
+    monkeypatch.setattr(testslots, "suite_hold", hold)
+    for cmds in (todo, list(own)):
+        with pytest.raises(Seen):
+            cli._checks_slot(p, run, io.StringIO(), head, cmds=cmds, top=str(repo))
+    assert seen[0]["what"] == "targeted: 2 tests" and seen[0]["cost"]["est_s"] == 140.0, seen[0]
+    assert seen[1]["what"] == _PICK_CMD and seen[1]["cost"] == {"cls": 2, "est_s": 1260.0}, seen[1]
+
+
 def test_the_select_plugin_keeps_only_the_listed_case_files_and_tests(tmp_path):
     from ttp import pushpass
     t = tmp_path / "proj"
