@@ -1795,3 +1795,124 @@ def test_codex_coordinator_resumes_its_session_across_wakes_and_a_restart(env, m
     assert "resume" not in wakes[0][1] and "resume" not in wakes[2][1]
     assert p.db.kv(coordsession.KEY)["id"] == "th-1"
     assert json.loads((p.runs / str(wakes[1][0]["id"]) / "run.json").read_text())["budget_usd"] == 3.0
+
+
+def _cs_provider_project(env, monkeypatch, tmp_path, provider):
+    """A project whose core provider is `provider`: the fake agent (Claude Code's --resume, provider
+    "fake") for claude, the fake CLI (FAKE_CLI) for codex and cursor, each keeping a session the daemon can
+    resume. Returns (project, daemon, the session id the provider reports)."""
+    from ttp.daemon import Daemon
+    if provider == "claude":
+        p = make(env)
+        _sessions(env, monkeypatch)
+        sid = None
+    else:
+        bin_dir = tmp_path / "fakebin"
+        bin_dir.mkdir()
+        for name in ("codex", "agent"):
+            exe = bin_dir / name
+            exe.write_text(FAKE_CLI.format(python=sys.executable))
+            exe.chmod(0o755)
+        monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
+        if provider == "codex":
+            home = tmp_path / "codexhome"
+            monkeypatch.setenv("CODEX_HOME", str(home))
+            saved = home / "sessions" / "2026" / "11" / "05" / "rollout-2026-11-05T00-00-00-th-1.jsonl"
+            stdout = _codex_events(*_codex_turn(json.dumps({"actions": []}), inp=2000, cached=1000, out=100))
+            help_text, sid = CODEX_EXEC_HELP, "th-1"
+        else:
+            cfg_dir = tmp_path / "cursorcfg"
+            monkeypatch.setenv("CURSOR_CONFIG_DIR", str(cfg_dir))
+            saved = cfg_dir / "chats" / "x" / "s-9" / "store.db"
+            usage = {"inputTokens": 2_000, "outputTokens": 100, "cacheReadTokens": 1_000, "cacheWriteTokens": 0}
+            stdout = _codex_events(*CURSOR_STREAM_OK[:-1], {**CURSOR_STREAM_OK[-1], "usage": usage,
+                                                            "result": json.dumps({"actions": []})})
+            help_text, sid = CURSOR_HELP + "  --resume [chatId]          Resume a chat session\n", "s-9"
+        saved.parent.mkdir(parents=True)
+        saved.write_text("")
+        for k, v in (("LOG", str(tmp_path / "fakecli")), ("STDOUT", stdout), ("STDERR", ""), ("RC", "0"),
+                     ("RESULT", ""), ("HELP", help_text), ("PACE", "0"), ("SESSION", "{}")):
+            monkeypatch.setenv(f"FAKE_CLI_{k}", v)
+        p = make(env)
+        p.set_config("core_provider", provider)
+    p.set_config("coordinator.debounce_s", 0)
+    p.db.x("INSERT INTO chats(id,created,label,last_active,last_read) VALUES('c1',?,?,?,0)",
+           (time.time(), "t", time.time()))
+    return p, Daemon(p.base), sid
+
+
+@pytest.mark.parametrize("provider", ["claude", "codex", "cursor"])
+def test_coordsession_chat_task_end_and_timer_wakes_each_resume_the_same_session(env, monkeypatch, tmp_path, provider):
+    """(a) Whatever wakes the coordinator, a chat message, a task's end or its own timer, the wake
+    resumes the project's one session on every shipped coordinator provider: never a stateless turn."""
+    from ttp import coordsession
+    p, d, sid = _cs_provider_project(env, monkeypatch, tmp_path, provider)
+
+    def chat():
+        p.db.post("in", "hello", chat="c1")
+
+    def task_end():
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time() - 60, "task:1", "task_done", "high", "task 1 done", "queued"))
+
+    def timer():   # nothing pending: the idle wake comes coordinator.idle_wake_s after the last turn
+        p.db.x("UPDATE tasks SET status='done'")   # the fake agent's chat replies queue tasks
+        p.db.set_kv("last_coordinator_turn", time.time() - 7200)
+        p.db.set_kv("idle_wake", {})
+
+    sessions = []
+    for name, trigger in (("first chat", chat), ("chat", chat), ("task end", task_end), ("timer", timer)):
+        trigger()
+        rid = _cs_wake(p, d)
+        assert rid, f"the {name} wake started no coordinator turn"
+        r = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+        assert r["status"] == "ok" and r["provider"] == ("fake" if provider == "claude" else provider), (name, dict(r))
+        turn = json.loads(r["note"])["turn"]
+        assert "session_off" not in turn and turn["session"]["mode"] != "stateless", (name, turn)
+        sessions.append((name, turn["session"]["mode"], r["session_id"]))
+    assert [m for _, m, _ in sessions] == ["new", "resume", "resume", "resume"], sessions
+    first = sessions[0][2]
+    assert first and (sid is None or first == sid) and {s for *_, s in sessions} == {first}, sessions
+    st = p.db.kv(coordsession.KEY)
+    assert st["id"] == first and st["wakes"] == 4 and st["last_why"] == "continued", st
+
+
+def test_coordsession_the_project_and_account_dollar_caps_still_stop_session_wakes(env, monkeypatch, tmp_path):
+    """(d) The dollar caps stay hard limits on the always-on session: at the project's daily cap or
+    the account's global cap no task-end or timer wake starts a turn. Once the cap lifts, the held
+    wake resumes the same session: a cap is no reason to drop it or run a stateless turn."""
+    from ttp import coordsession
+    from ttp import project
+    p, d, _ = _cs_provider_project(env, monkeypatch, tmp_path, "claude")
+    p.db.post("in", "hello", chat="c1")
+    first = _cs_wake(p, d)
+    sid = p.db.one("SELECT session_id FROM runs WHERE id=?", (first,))["session_id"]
+    assert sid and p.db.kv(coordsession.KEY)["id"] == sid
+    p.db.x("UPDATE tasks SET status='done'")
+    p.db.spend("fake", 6.0, "task:1")
+
+    def held(why):
+        d.cfg = p.config()
+        d.update_gates()
+        g = d.gates["fake"]
+        assert g.level == "red" and any(why in r for r in g.reasons), g.reasons
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time() - 60, "task:1", "task_done", "high", "task 1 done", "queued"))
+        p.db.set_kv("last_coordinator_turn", time.time() - 7200)   # the timer is due too
+        assert _cs_wake(p, d) is None, f"a wake started a coordinator turn past the {why}"
+
+    p.set_config("budget.daily_usd", 5)
+    held("cap reached: $6.00/")
+    p.set_config("budget.daily_usd", 1000)
+    project.set_account_setting("budget.global_daily_usd", 5)
+    held("global daily cap reached")
+    project.set_account_setting("budget.global_daily_usd", 1000)
+    d.cfg = p.config()
+    d.update_gates()
+    assert d.gates["fake"].level != "red", d.gates["fake"].reasons
+    rid = _cs_wake(p, d)
+    assert rid, "the held wake never ran once the cap lifted"
+    r = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert r["status"] == "ok" and r["session_id"] == sid
+    assert json.loads(r["note"])["turn"]["session"]["mode"] == "resume"
+    assert p.db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator'")["n"] == 2
