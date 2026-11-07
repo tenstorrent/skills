@@ -1619,6 +1619,69 @@ def test_credential_guards_fail_only_on_the_sessions_own_changes(tmp_path):
     assert c.guarded_changes(changes, None, str(real)) == ([f"  {p}: {how}" for p, how in changes], [])
 
 
+def _secret_folder_session(tmp_path, monkeypatch):
+    """A conftest loaded for a scratch "account" home (its .ssh and gh folders the guarded ones), a write
+    log and a recorder for it as pytest_sessionstart sets them up, and a finish() returning the session's
+    exit status and the lines it reported. The account's real ssh and gh folders are never read."""
+    home = tmp_path / "account"
+    (home / ".ssh").mkdir(parents=True)
+    (home / ".ssh" / "id_ed25519").write_text("key\n")
+    monkeypatch.setenv("HOME", str(home))
+    c = _test_conftest()
+    monkeypatch.setattr(c, "_REAL_ENV", {"HOME": str(home), "PATH": os.environ.get("PATH", "")})
+    assert c.secret_folders() == [str(home / ".ssh"), str(home / ".config" / "gh")]
+    log = tmp_path / "writes.log"
+    log.write_text("")
+    monkeypatch.setattr(c, "_WRITE_LOG", str(log))
+    rec = c._WriteRecorder(str(home), c.HOME_WATCHED + c.GUARDED, str(log), {"HOME": str(tmp_path / "session-home")})
+    rec.watch(c.secret_folders())
+    lines: list[str] = []
+    tr = types.SimpleNamespace(write_line=lambda line, **kw: lines.append(line))
+    cfg = types.SimpleNamespace(_ttp_secret=c.folder_marks(c.secret_folders()),
+                                pluginmanager=types.SimpleNamespace(get_plugin=lambda n: tr))
+
+    def finish():
+        lines.clear()
+        session = types.SimpleNamespace(config=cfg, items=[], exitstatus=pytest.ExitCode.OK)
+        c.pytest_sessionfinish(session, 0)
+        return session.exitstatus, list(lines)
+    return home, rec, finish
+
+
+def test_an_outside_process_writing_the_ssh_folder_warns_and_the_session_passes(tmp_path, monkeypatch):
+    """A process outside the session (not in its write log) creating a key pair in the account's ssh folder
+    mid-run is a warning naming each path in the session's summary, not a failed suite."""
+    import subprocess
+    home, rec, finish = _secret_folder_session(tmp_path, monkeypatch)
+    assert finish() == (pytest.ExitCode.OK, [])
+    key = home / ".ssh" / "id_outside"
+    subprocess.run(["sh", "-c", 'printf k > "$1" && printf p > "$1.pub"', "sh", str(key)], check=True)
+    status, lines = finish()
+    assert status == pytest.ExitCode.OK, lines
+    assert lines[0].startswith("ttp-suite: warning: the account's ssh or gh config folder changed while the tests "
+                               "ran, by no write of this session"), lines
+    assert [line.split(" at ")[0] for line in lines[1:]] == [f"  {key}: created", f"  {key}.pub: created"], lines
+
+
+def test_the_sessions_own_write_to_the_ssh_folder_fails_the_session(tmp_path, monkeypatch):
+    """A write the session recorded to the account's ssh folder fails the session, as does any change there
+    when the write log is gone (no attribution: every change counts as the session's)."""
+    home, rec, finish = _secret_folder_session(tmp_path, monkeypatch)
+    key = home / ".ssh" / "id_test"
+    rec("open", (str(key), "w", os.O_WRONLY | os.O_CREAT | os.O_TRUNC))   # what the audit hook sees
+    key.write_text("k\n")
+    status, lines = finish()
+    assert status == pytest.ExitCode.TESTS_FAILED, lines
+    assert lines == ["the account's ssh or gh config folder changed while the tests ran (a test must use its temp "
+                     "HOME, and pass ssh and ssh-keygen paths under it):", f"  {key}: created"], lines
+    pathlib.Path(rec.log).unlink()
+    key.unlink()
+    (home / ".ssh" / "id_outside").write_text("k\n")
+    status, lines = finish()
+    assert status == pytest.ExitCode.TESTS_FAILED and f"  {home}/.ssh/id_outside: created" in lines, lines
+    assert not any("by no write of this session" in line for line in lines), lines
+
+
 def test_ssh_keygen_child_is_handed_the_accounts_ssh_folder(tmp_path):
     """ssh-keygen and ssh-copy-id find the ssh folder from passwd, not HOME, so a child running one (by
     argv, an `sh -c` command or os.system's string) counts as handed <home>/.ssh unless ssh-keygen gets
