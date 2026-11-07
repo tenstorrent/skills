@@ -12169,8 +12169,10 @@ class Daemon:
             elif rc in NOT_YET_RCS and task and task["status"] == "queued" and (task["not_before"] or 0) > now \
                     and (dirs := self._checks_gone(tid, probe, now)):
                 self._checks_gone_release(task, dirs, now)   # checks that left the queue: never "not yet" for good
-            elif gated == "changed" and rc is not None and rc not in NOT_YET_RCS:
+            elif gated == "changed" and rc is not None and rc not in NOT_YET_RCS \
+                    and not self._gh_logged_out(rc, outs[id(proc)], now):
                 # A new answer after a skip that no branch above handles: wake now, not at the backoff.
+                # A gh logout sleeps on to its timer (_hold_waiting folds it into the host's gh-auth alert).
                 self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now)
         for gone_tid in [t for t in self._probe_ctx.keys() | self._probe_diag.keys()
                          if t not in self._probes and t not in self._probe_rc]:
