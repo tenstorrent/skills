@@ -7627,6 +7627,67 @@ def test_ttp_checks_run_drops_a_subset_pytest_extra_and_keeps_the_push_checks_co
            "'python3 -m pytest -q tests'" in out
 
 
+def test_ttp_checks_runs_a_subset_pytest_extra_when_its_push_check_does_not_run_in_full(env, tmp_path, monkeypatch,
+                                                                                        capsys):
+    """A subset extra stands for nothing once testpick narrows its covering push check, or the fast path
+    skips it: it runs, with a notice saying why. A push check run in full still drops it."""
+    from ttp import cli, push, testpick
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    count = tmp_path / "count"
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text(f"def test_a():\n    open({str(count)!r}, 'a').write('x\\n')\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "tests"], check=True)
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q tests"])
+    extra = "python3 -m pytest -q tests/test_a.py"
+    ran = lambda: len(count.read_text().splitlines()) if count.exists() else 0
+
+    def narrowed(top, base, head, todo, own, cfg, full=False):
+        out, mine = [], {str(o) for o in own}
+        for c in todo:
+            if str(c) not in mine:
+                out.append(c)
+                continue
+            c2 = push.Check(str(c))
+            c2.__dict__.update(c.__dict__)
+            c2.env, c2.targeted = (("TTP_T", "1"),), True   # a part of the suite, as testpick marks it
+            out.append(c2)
+        return out, [f"{c}: targeted: 1 tests in 1 test files" for c in out if getattr(c, "targeted", False)]
+    monkeypatch.setattr(testpick, "narrow", narrowed)
+    cli.main(["checks", "--fresh", "--", extra])
+    out = capsys.readouterr().out
+    assert ran() == 2, "the extra's tests did not run beside the narrowed push check"
+    assert f"running {extra!r} after `--`: delivery.push_checks does not run " \
+           "'python3 -m pytest -q tests' in full here" in out and "not running" not in out
+    assert json.loads((run / "checks.json").read_text())["commands"][1:] == [extra]
+    # Run in full (--full, a full: reason): the extra is dropped, as its tests already ran.
+    monkeypatch.setattr(testpick, "narrow", lambda top, base, head, todo, own, cfg, full=False:
+                        (todo, [f"{c}: full: --full" for c in todo]))
+    count.unlink()
+    cli.main(["checks", "--fresh", "--", extra])
+    out = capsys.readouterr().out
+    assert ran() == 1 and f"not running {extra!r} after `--`: delivery.push_checks already runs its tests in " in out
+    assert json.loads((run / "checks.json").read_text())["commands"] == \
+["python3 -m pytest -q tests"]
+    # The fast path (never with --fresh, so on a new tree) skips the push check: the extra runs.
+    (repo / "notes.md").write_text("n\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "notes"], check=True)
+    monkeypatch.setattr(push, "fast_path", lambda *a, **k: True)
+    monkeypatch.setattr(push, "fast_checks", lambda base: [])
+    count.unlink()
+    cli.main(["checks", "--", extra])
+    out = capsys.readouterr().out
+    assert ran() == 1 and f"running {extra!r} after `--`: " in out, out
+    # Twice given, held once: the second is the same run as the first.
+    count.unlink()
+    monkeypatch.setattr(push, "fast_path", lambda *a, **k: False)
+    monkeypatch.setattr(testpick, "narrow", narrowed)
+    cli.main(["checks", "--fresh", "--", extra, extra])
+    out = capsys.readouterr().out
+    assert ran() == 2 and "an earlier command after `--` is the same run" in out
+
+
 
 def _arg_logging_wrapper(path, log, rc=None):
     """A stand-in lock wrapper: logs a CALL line and each argument on its own line, then runs its

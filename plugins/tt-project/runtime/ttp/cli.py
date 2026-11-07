@@ -3256,7 +3256,8 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
     here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike in
     the worktree `top`, _same_run_key), and so is a plain pytest run of paths inside such a check's
     (_within: `pytest -q tests/a.py` after `pytest -q tests`), so the run keeps that check set's
-    command hash and can reuse or share its pass. One that
+    command hash and can reuse or share its pass; cmd_checks runs it after all when that check does
+    not run in full there (_held_extras). One that
     only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
     it once that check applies)."""
     if not extra:
@@ -3272,6 +3273,25 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
         (dropped if key in seen or _within(c, own, py, top) is not None else mine).append(c)
         seen.add(key)
     return mine, dropped
+
+
+def _held_extras(held: list, own: list, py: str, top: str, source: str, todo: list,
+                 passed_full: list) -> tuple[list, list[str]]:
+    """(the held extras to run after all, the notice lines). `held` pairs each extra dropped as inside a
+    project check's paths (_within) with its command as this run would run it. It stands only when that
+    check runs (or passed) in full on this tree: in `todo` (or its recorded pass) not narrowed by testpick,
+    or in `passed_full` (the push queue's pass). A narrowed check (testpick) or one the fast path skipped
+    may leave out its tests, so it runs."""
+    full = {str(c) for c in passed_full} | {str(c) for c in todo if not getattr(c, "targeted", False)}
+    more, lines = [], []
+    for c, cmd in held:
+        o = _within(c, own, py, top)
+        if str(o) in full:
+            lines.append(f"not running {c!r} after `--`: {source} already runs its tests in {str(o)!r}")
+        else:
+            more.append(cmd)
+            lines.append(f"running {c!r} after `--`: {source} does not run {str(o)!r} in full here")
+    return more, lines
 
 
 def _ran_again(todo: list, own: list, py: str = "", top: str = "") -> tuple[list, list]:
@@ -3467,7 +3487,14 @@ def cmd_checks(a) -> None:
     # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy, top)
-    mine = push.with_host(mine, checks_host)
+    # An extra dropped as inside a project check's paths (_within) is held, ready to run: it stands only
+    # when that check runs in full here, never when testpick narrows it or the fast path skips it.
+    held_at = {}   # each held run's key: its first place in `dropped`
+    for i, c in enumerate(dropped):
+        if _covered_by(c, own, vpy, top) is None and _within(c, own, vpy, top) is not None:
+            held_at.setdefault(_same_run_key(c, vpy, top), i)
+    held_s = [dropped[i] for i in held_at.values()]
+    mine = push.with_host(mine + held_s, checks_host)
     # A program the commands after `--` run that is not installed: refused now, not an exit 127 later.
     from . import envfault
     for c in mine:
@@ -3504,10 +3531,11 @@ def cmd_checks(a) -> None:
         if wrap and (remote := [c for c in mine if push.remote_host(c)]):
             print(f"ttp checks: {', '.join(map(repr, map(str, remote)))} run on their check host without "
                   f"{push.WRAP_KEY}, which wraps only commands run on this machine")
-    for c in dropped:   # each names the project check that runs it, when another spelling
-        if (cover := _covered_by(c, own, vpy, top)) is None and (inside := _within(c, own, vpy, top)) is not None:
-            print(f"ttp checks: not running {c!r} after `--`: {source} already runs its tests in {str(inside)!r}")
-            continue
+    mine, held = mine[:len(mine) - len(held_s)], list(zip(held_s, mine[len(mine) - len(held_s):]))
+    for i, c in enumerate(dropped):   # each names the project check that runs it, when another spelling
+        if i in held_at.values():
+            continue   # its notice comes once its project check's scope here is known (_held_extras)
+        cover = _covered_by(c, own, vpy, top)
         by = ("an earlier command after `--` is the same run" if cover is None else f"{source} already runs it"
               + (f" as {str(cover)!r}" if str(cover) != c else ""))
         print(f"ttp checks: not running {c!r} after `--` again: {by}")
@@ -3664,6 +3692,14 @@ def cmd_checks(a) -> None:
                 out.write(f"{said}\n")
             if any(getattr(c, "targeted", False) for c in todo) and not a.fresh:
                 hit = _recorded_pass(p, tree, todo, purpose)
+        if held and passed:
+            more, lines = _held_extras(held, own, vpy, top, source, todo, queue_cmds)
+            for said in lines:
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
+            if more:
+                todo, selected = todo + more, selected + more
+                hit = _recorded_pass(p, tree, todo, purpose) if not a.fresh else None
         if not todo and passed and verified_cmds:
             said = f"every applicable check was {mark['line']}"
             out.write(f"{said}\n")
@@ -3735,7 +3771,7 @@ def cmd_checks(a) -> None:
         spill_ok = not checkspill.all_off(no_spill) and checkspill.spillable(todo, cfg)
         fresh_ok = not a.fresh
         slot = None
-        light = bool(todo) and checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ())
+        light = bool(todo) and checklane.all_light(todo, cfg, mine + [h for _, h in held] if getattr(a, "light", False) else ())
         # The task's same checks queued twice run one suite; a newer head's supersede an older waiter (checkjoin).
         if todo and not hit and not light and not getattr(a, "release", False):
             join_rec = _checks_join_register(p, str(top), head, todo, purpose, pre_env, Path(run_dir), arrived)
