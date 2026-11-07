@@ -48,7 +48,8 @@ TICK_GIT_S = 45.0   # one git read a daemon tick step makes, at most (Daemon._ru
 TX_GIT_S = 20.0     # all git a finish write transaction makes, together (Daemon._finish_tx)
 HOLD_SLICE_S = 1.5  # live git one strict round of a finish transaction may run (strict())
 MAX_ROUNDS = 50     # rounds of one finish before its last, which never aborts (Daemon._finish_rounds)
-FINISH_WALL_S = 240.0   # nor past this long
+FINISH_WALL_S = 90.0    # nor past this long: the reads it learns between rounds share this wall too
+PREFETCH_GIT_S = 60.0   # all git one finish's warm-up (Daemon._prefetch_git) runs, together
 # git's own options that take the next argument (git -C <dir> <verb> ...)
 _OPTS_WITH_VALUE = frozenset({"-C", "-c", "--git-dir", "--work-tree", "--namespace", "--exec-path", "--config-env"})
 # Verbs that only read the repository (a scratch GIT_INDEX_FILE aside): bounded() caps them anywhere.

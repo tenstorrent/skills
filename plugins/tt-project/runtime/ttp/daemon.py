@@ -310,7 +310,7 @@ TICK_OVERRUN_S = 900
 # A tick with no progress this long gets its stacks written too: well before the watchdogs restart it
 # (WATCHDOG_S after the last progress they saw), so a step blocked in a call with no timeout leaves them.
 TICK_STALL_S = HEARTBEAT_STALE_S
-# A tick step's time budget. A step that loops over items (probe_waiting, probe_deferred, retire_ended)
+# A tick step's time budget. A step that loops over items (reap_runs, probe_waiting, probe_deferred, retire_ended)
 # stops at the first item past it and resumes there next tick, so message handling and worker starts
 # always run. A step that took longer raises one model-free tick_step_slow event naming the item that
 # held it longest, at most once per STEP_SLOW_EVERY_S per step.
@@ -3520,9 +3520,15 @@ class Daemon:
             preempt.release_pending(self.p, self.cfg, [r for r in running if r["role"] != "coordinator"])
         except Exception:   # a pending restart never holds up reaping
             log(self.p, "pending restarts failed\n" + traceback.format_exc())
-        for r in running:
+        rows = self._resume_order("reap_runs", running)
+        for i, r in enumerate(rows):
             if self.stopping:   # the runs not reaped yet are the next daemon's: a stop never waits on them
                 return
+            if self._step_over(f"run {r['id']}'s end", r["task"]) and i:
+                # Its STEP_BUDGET_S spent (each end runs git, under load minutes): the rest stay running on
+                # record with their exit.json on disk, so the next tick, or the next daemon, reaps each once.
+                self._step_cursor["reap_runs"] = rows[i - 1]["id"]
+                break
             try:
                 # Liveness first: a runner writes exit.json before it exits, so a run found dead here
                 # has its exit.json by the look below. The other order calls a run that ends between
@@ -5318,8 +5324,10 @@ class Daemon:
         memo = self._git_memo[task["id"]] = {}
         att = self._git_attempts[task["id"]] = gitmemo.Attempt()   # its reads replay in the rounds
         result = result if isinstance(result, dict) else {}
-        try:
-            with gitmemo.attempt(att), gitmemo.scope(memo):
+        t0 = time.monotonic()
+        try:   # all its git within PREFETCH_GIT_S: a failed review's area (reviewcap.area) once read git for minutes
+            with gitmemo.attempt(att), gitmemo.scope(memo), \
+                    gitmemo.bounded(gitmemo.TICK_GIT_S, gitmemo.PREFETCH_GIT_S):
                 if task["kind"] == "review" and result.get("status") != "done":
                     self._review_area(dict(task, result=dump_result(result)))
                 fups = [f for f in result.get("followups") or [] if isinstance(f, dict)]
@@ -5335,6 +5343,8 @@ class Daemon:
                 pushq.prefetch_git(self.p, task, result, self.cfg)
         except Exception as e:
             log(self.p, f"task {task['id']}: reading git before finishing failed: {type(e).__name__}: {e}")
+        if time.monotonic() - t0 >= gitmemo.PREFETCH_GIT_S:   # the rest is read in the finish, or degrades as a git failure does
+            log(self.p, f"task {task['id']}: reading git before finishing stopped at its {gitmemo.PREFETCH_GIT_S:.0f} s budget")
 
     def _prefetch_hop(self, task: dict, fups: list[dict]) -> None:
         """For _prefetch_git: what _split and _continue_ready read from git for a done task."""
@@ -5400,8 +5410,9 @@ class Daemon:
                 if not miss.learn:   # raw git: no answer to keep, so another strict round cannot do better
                     final = True
                     continue
-                try:
-                    with gitmemo.attempt(att), gitmemo.bounded(gitmemo.TICK_GIT_S):
+                try:   # within the rounds' wall: 50 misses learned at TICK_GIT_S each once held a reap for minutes
+                    with gitmemo.attempt(att), gitmemo.bounded(
+                            gitmemo.TICK_GIT_S, max(0.0, t0 + gitmemo.FINISH_WALL_S - time.monotonic())):
                         gitmemo.run(miss.argv, timeout=miss.own, read=miss.read, **miss.kw)
                 except (OSError, subprocess.SubprocessError):   # kept (a timeout) or not: the round degrades
                     pass
