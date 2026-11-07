@@ -107,6 +107,20 @@ def root_pid(job: dict) -> int | None:
         return None
 
 
+def live_pid(job: dict) -> int | None:
+    """root_pid while that process lives and is still the job's wrapper (detach.job_pid: the start time
+    detached.json recorded for it, else its arguments naming the job's .rc), else None: not started yet,
+    gone, or the pid now names another process. Never read from the job's lock file: a process that
+    inherited it, or a lock file a stop left behind, says nothing about the job."""
+    from .detach import job_pid
+    from .locks import start_time
+    pid = root_pid(job)
+    if not pid or pid <= 1:
+        return None
+    pid = job_pid(Path(job["rc"]), pid)
+    return pid if pid and start_time(pid) is not None else None
+
+
 def _stat(pid: int) -> list[str] | None:
     try:
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()

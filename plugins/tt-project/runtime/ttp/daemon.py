@@ -15358,14 +15358,17 @@ class Daemon:
                           (t["id"], now - 7 * 86400)):
                 for j in _detached_jobs(Path(r["dir"])):
                     rc = Path(j["rc"])
-                    if rc.exists() or locks.any_free([locks.job_lock(rc)]):
-                        continue   # ended, or not started yet
+                    # Live from its record and its wrapper's pid, never its lock: a stopped job's lock may
+                    # outlive it (a leftover that inherited it), and its old pid may name another process.
+                    if j.get("status") in detach.CLOSED or rc.exists() or detach.lost(rc).exists():
+                        continue   # ended, died or stopped
+                    if not (pid := jobuse.live_pid(j)):
+                        continue   # not started yet, gone, or its pid now names another process
                     req = dict(j.get("requested") or {})
                     if not req.get("devices") and needs_device(t, self.cfg):
                         req["devices"] = 1   # the task holds the device while the job runs
-                    pid = jobuse.root_pid(j)
                     was = old.get(str(rc)) or {}
-                    got = with_containers(jobuse.sample(pid, nodes)) if pid else None
+                    got = with_containers(jobuse.sample(pid, nodes))
                     st = jobuse.assess(was.get("st"), got, req, now, s)[0]
                     entry = {"task": t["id"], "name": j["name"], "req": req, "st": st, "line": jobuse.line(req, st)}
                     if jobuse.declared(j):

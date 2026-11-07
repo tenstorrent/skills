@@ -46419,7 +46419,8 @@ def _job_of_waiting_task(p, tid, requested, next_in=3.7 * 3600):
     rc = run_dir / "build.rc"
     (run_dir / "build.started").write_text(f"{os.getpid()}\n")
     (run_dir / "detached.json").write_text(json.dumps([{"name": "build", "rc": str(rc), "log": str(run_dir / "build.log"),
-                                                        "requested": requested}]))
+                                                        "pid": os.getpid(), "pid_start": locks.start_time(os.getpid()),
+                                                        "status": "running", "requested": requested}]))
     p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir) VALUES(?,?,?,?,?,?,?)",
            (tid, "worker", "fake", time.time() - 1200, time.time() - 1100, "ok", str(run_dir)))
     now = time.time()

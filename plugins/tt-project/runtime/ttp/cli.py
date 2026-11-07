@@ -8777,6 +8777,7 @@ def _detach_stop(what: str, given: str | None = None) -> int:
     if not jobstop.running(rc):
         print(f"{rc.stem}: not running; nothing to stop")
         _free_ended_slots(rc)
+        jobstop.drop_lock(rc)
         return 0
     caller, run = os.environ.get("TTP_TASK") or "", os.environ.get("TTP_RUN_ID") or ""
     ok, why = jobstop.may_stop(p, rc, caller, run)

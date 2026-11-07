@@ -1316,6 +1316,39 @@ def test_an_owners_stop_writes_the_rc_so_a_reader_of_the_rc_alone_sees_a_stop_no
         _end_group(pgid)
 
 
+def test_detach_stop_removes_the_jobs_lock_file_and_a_live_holder_keeps_it(env, tmp_path):
+    """`ttp detach --stop` leaves no <name>.lock naming the dead wrapper: removed once free and the job is
+    over. A stop of a job that no longer runs removes a leftover one too; one still held, or of a job not
+    over, stays."""
+    from ttp import detach, jobstop, locks as lk
+    p = make(env)
+    broker = _stub_broker(tmp_path)
+    tid = p.db.add_task("soak", "s", kind="work", tier="light", origin="user")
+    rc, pgid = _locked_job(p, tid, broker, status="running")
+    try:
+        run = p.db.one("SELECT id FROM runs WHERE dir=?", (str(rc.parent),))["id"]
+        assert lk.job_lock(rc).exists()
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(tid, run))
+        assert r.returncode == 0 and "stopped detached job loop" in r.stdout, r.stderr
+        assert not lk.job_lock(rc).exists() and detach.state(rc)[0] == "ended"
+        # A leftover lock file (an earlier stop that left it): a stop of the ended job removes it.
+        lk.job_lock(rc).write_text(json.dumps({"holder": "detached job loop", "pid": pgid}))
+        r = _ttp_run(p, "detach", "--stop", str(rc), env=_as(tid, run))
+        assert r.returncode == 0 and "not running" in r.stdout, r.stderr
+        assert not lk.job_lock(rc).exists()
+        # Held by a live process, or the job is not over: kept.
+        held = lk.try_take([lk.job_lock(rc)], "detached job loop", "sleep")
+        try:
+            assert not jobstop.drop_lock(rc) and lk.job_lock(rc).exists()
+        finally:
+            held.close()
+        other = rc.with_name("other.rc")
+        lk.job_lock(other).write_text("{}")
+        assert not jobstop.drop_lock(other) and lk.job_lock(other).exists()
+    finally:
+        _end_group(pgid)
+
+
 def test_a_stop_never_overwrites_an_exit_code_the_job_wrote_itself(env, tmp_path):
     """A job that wrote its own .rc before the stop's record keeps it (and gets no .lost); a natural exit
     of 137 with no .lost, or a job not stopped (no .rc yet), never reads as stopped; a path outside the
