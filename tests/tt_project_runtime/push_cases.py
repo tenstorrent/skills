@@ -8266,6 +8266,7 @@ def test_ttp_checks_names_the_project_check_an_extra_in_another_spelling_repeats
     stub.mkdir()
     (stub / "pytest").write_text(f"#!/bin/sh\necho \"$*\" >> {count}\n")
     (stub / "pytest").chmod(0o755)
+    _as_checks_python_env(tmp_path, monkeypatch, stub)
     monkeypatch.setenv("PATH", f"{stub}:{os.environ['PATH']}")
     check = "pytest -q a.txt"
     p.set_config("delivery.push_checks", [check])
@@ -12460,6 +12461,20 @@ def _fake_python(tmp_path, find_rc=0, version="", name="python3"):
     return stub, ran
 
 
+def _as_checks_python_env(tmp_path, monkeypatch, stub):
+    """Makes the programs in `stub` the checks' pinned Python env (runnerenv's test stand-in), since that
+    env's bin comes first on a check's PATH: a stub only fronting PATH would never run."""
+    env_dir = tmp_path / "stub-pyenv"
+    (env_dir / "bin").mkdir(parents=True)
+    for prog in stub.iterdir():
+        (env_dir / "bin" / prog.name).symlink_to(prog)
+    if not (env_dir / "bin" / "python").exists():
+        (env_dir / "bin" / "python").symlink_to(sys.executable)
+    (env_dir / "ttp-env.json").write_text(json.dumps({"key": "stub", "lock": "stub", "lock_sha256": "0" * 64,
+                                                      "python": "3", "pytest": None}))
+    monkeypatch.setenv("TTP_TEST_CHECKS_PYTHON_ENV", str(env_dir))
+
+
 def _env_events(p):
     return p.db.q("SELECT fingerprint, severity FROM events WHERE kind='observation' AND fingerprint LIKE 'env%'")
 
@@ -12471,6 +12486,7 @@ def test_ttp_checks_waits_on_a_python_that_cannot_import_pytest_and_counts_nothi
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     stub, ran = _fake_python(tmp_path, find_rc=3)
+    _as_checks_python_env(tmp_path, monkeypatch, stub)
     monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
     tasks = p.db.one("SELECT COUNT(*) n FROM tasks")["n"]
     with pytest.raises(SystemExit) as e:
@@ -12491,6 +12507,7 @@ def test_two_tasks_hitting_one_runner_fault_raise_one_observation(env, tmp_path,
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     stub, _ = _fake_python(tmp_path, find_rc=3)
+    _as_checks_python_env(tmp_path, monkeypatch, stub)
     monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
     for task in ("11", "12"):
         monkeypatch.setenv("TTP_TASK", task)
@@ -12507,6 +12524,7 @@ def test_ttp_checks_with_its_runner_present_runs_as_before_and_records_no_fault(
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.delenv("VIRTUAL_ENV", raising=False)
     stub, ran = _fake_python(tmp_path, find_rc=0)
+    _as_checks_python_env(tmp_path, monkeypatch, stub)
     monkeypatch.setenv("PATH", f"{stub}{os.pathsep}{os.environ['PATH']}")
     cli.main(["checks", "--fresh", "--", "python3 -m pytest -q"])
     assert json.loads((run / "checks.json").read_text())["passed"] is True

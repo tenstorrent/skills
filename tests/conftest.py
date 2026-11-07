@@ -196,7 +196,8 @@ _session_home()
 
 def _checks_python_env() -> None:
     """A stand-in for the checks' pinned Python env (runnerenv), made once per session: its python,
-    python3 and pytest run the interpreter running these tests, so a `ttp checks` in a test never builds one.
+    python3 and pytest run the interpreter running these tests (with its user site, if it loads one), so a
+    `ttp checks` in a test never builds one; a check's command runs `python3`, not sys.executable.
     runnerenv's own tests unset TTP_TEST_CHECKS_PYTHON_ENV."""
     import atexit
     import json
@@ -207,7 +208,8 @@ def _checks_python_env() -> None:
     atexit.register(shutil.rmtree, str(d), True)
     (d / "bin").mkdir()
     for name, tail in (("python", ""), ("python3", ""), ("pytest", " -m pytest")):
-        (d / "bin" / name).write_text(f'#!/bin/sh\nexec {shlex.quote(sys.executable)}{tail} "$@"\n')
+        # with the user site this interpreter itself loads (a venv loads none), as it runs these tests
+        (d / "bin" / name).write_text(f'#!/bin/sh\nunset PYTHONNOUSERSITE\nexec {shlex.quote(sys.executable)}{tail} "$@"\n')
         (d / "bin" / name).chmod(0o755)
     (d / "ttp-env.json").write_text(json.dumps({"key": "test", "lock": "test", "lock_sha256": "0" * 64,
                                                 "python": platform.python_version(), "pytest": pytest.__version__}))

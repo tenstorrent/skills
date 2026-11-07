@@ -38724,8 +38724,8 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
         "test_status_without_a_name_uses_the_project_of_the_current_folder",
         "test_check_commands_have_first_failure_semantics",
     )]
-    p.set_config("delivery.push_checks", [shlex.join([
-        sys.executable, "-m", "pytest", "-q", "-p", "ttp_forbid_audit", "-o", "tmp_path_retention_policy=all",
+    p.set_config("delivery.push_checks", [shlex.join([   # python3: the checks' pinned env's (its test stand-in)
+        "python3", "-m", "pytest", "-q", "-p", "ttp_forbid_audit", "-o", "tmp_path_retention_policy=all",
         *targets,
     ])])
     # The child run's TMPDIR is the deep run-local folder itself, with no short alias elsewhere; the
