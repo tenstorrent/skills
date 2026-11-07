@@ -88,7 +88,7 @@ NO_TESTS = 5                       # pytest's exit status when nothing was selec
 RERUN_S = 600.0                    # delivery.push_rerun_s: the time limit of one rerun of a failed check's failing tests
 YIELD_GRACE_S = 300.0              # delivery.push_yield_grace_s: an urgent approval stops a batch only if approved this soon after its checks began
 YIELD_WAIT_S = 900.0               # delivery.push_yield_wait_s: an urgent approval waits for a search whose verdict is expected this soon
-YIELD_RESTARTS = 1                 # delivery.push_yield_restarts: searches one set of approvals may stop for urgent ones
+YIELD_RESTARTS = 0                 # delivery.push_yield_restarts: searches one set of approvals may stop for urgent ones (0: none, they join the next check)
 RERUN_IDS = 10                     # a check failing more tests than this is not rerun: that is no flake
 TIP_RERUNS = 3                     # reruns on the tip alone of a blamed failure's failing tests: one failing clears the entry
 HOST_FAULTS = (envfault.Fault, workerloss.Infra, syntaxfault.Infra, setupfault.Infra)   # the host's, never an entry's
@@ -1501,6 +1501,8 @@ class Batch:
         self.yielded_to: list[int] = []        # queue ids of urgent approvals the search stopped for (_yield_now)
         self.checks_at: float | None = None    # when this batch's first check began (_check): the yield grace counts from it
         self.waited: list[int] = []            # urgent approvals that wait for this search's verdict (_yield_now)
+        self.full_fail: tuple[str, str] | None = None  # the full head's failure (_judge): a stop carries it (_known_fail)
+        self.known_failed = False              # the full head's failure came from a stopped search, not checked here
 
     # results
 
@@ -1769,7 +1771,8 @@ class Batch:
                 self._set(i, "pushed")
                 self.landed_at[i] = self.rescued[i]
             elif self.yielded_to:
-                self._set(i, "requeued", yielded=True, restarts=self._restarts() + 1)   # stopped for an urgent approval
+                self._set(i, "requeued", yielded=True, restarts=self._restarts() + 1,   # stopped for an urgent approval
+                          **self._fail_carried(carried, k, failed))
             elif failed and not self.retried:
                 self._set(i, "requeued", untested=True)    # after the blamed entry, never checked without it
             else:
@@ -2710,11 +2713,15 @@ class Batch:
                     return lo, heads[lo], fails[hi]
                 hi, fails[lo] = lo, f
             lo = 0
+        elif not bad and (kf := self._known_fail(carried)):
+            say(f"the full head of these {m} entries failed {kf[0]} in a search stopped for an urgent approval: "
+                "the search resumes without checking it again")
+            self.known_failed, self.full_fail, fails = True, kf, {m: kf}
         else:
             fail = self._check(heads[m], checks)
             if fail is None:
                 return m, heads[m], None
-            fails = {m: fail}
+            self.full_fail, fails = fail, {m: fail}
         # A failure whose new tests are known (_judged) is searched on those tests alone (_ids_check), then
         # the longest prefix that passed them is checked in full once; failing there, the search goes below.
         full_lo = 0
@@ -2799,6 +2806,9 @@ class Batch:
         if rerun:
             say(f"every prefix passed; checking {heads[m][:10]} again")
             f = self._check(heads[m], checks)
+            if f is None and self.known_failed:
+                say("the full head passes on this tip: the stopped search's failure is gone")
+                return m, heads[m], None
             if f is None:
                 self.checks["flaky"] = True
                 say("the full head passed on the rerun: the failure was flaky")
@@ -2872,38 +2882,67 @@ class Batch:
     def _yield_now(self, left: int = 1) -> bool:
         """Before each further full check of the search for the entry that broke the checks: whether an
         urgent approval (urgent.approvals_waiting: priority 1 or urgent) now waits for this target outside the
-        batch. Then the search stops: the prefix known to pass goes, a blamed entry stays blamed, the
-        rest is requeued "yielded", and the queue runs the urgent ones alone next (pushq.due), so they
-        never wait out the rest of a bisect. The requeued ones are searched anew on the new tip: no entry
-        is blamed on a tip it was not checked on, and the urgent ones are never in that search. Only
-        approvals made within delivery.push_yield_grace_s of this batch's first check stop it, and it
-        stops once at most (_yield_late). With its verdict expected within delivery.push_yield_wait_s
-        (`left` more checks at this batch's mean check time: _verdict_s), it does not stop: the urgent
-        ones wait for that verdict and go first in the next batch, and no entry's checks are thrown
-        away. One set of approvals is stopped for at most delivery.push_yield_restarts times (_may_yield)."""
-        if not self.yielded_to and self._may_yield():
-            hot: list[int] = []
-            try:
-                skip = self.m.get("yield_skip") if isinstance(self.m.get("yield_skip"), dict) else {}
-                skip = set(skip.get("ids") or []) if self.tip and skip.get("tip") == self.tip else set()
-                late = self._yield_late()
-                hot = [i for i in urgent.approvals_waiting(self.p.db, self.target) if i not in skip and i not in late]
-            except Exception as e:      # a queue it cannot read: the search goes on as before
-                say(f"cannot read the push queue for urgent approvals: {type(e).__name__}: {e}")
-            wait = _setting(self.d, "push_yield_wait_s", YIELD_WAIT_S)
-            if hot and wait > 0 and (eta := self._verdict_s(left)) is not None and eta <= wait:
-                if hot != self.waited:
-                    say(f"urgent approval{'s' if len(hot) > 1 else ''} {', '.join(map(str, hot))} "
-                        f"wait{'s' if len(hot) == 1 else ''} for this batch's verdict, expected in about "
-                        f"{eta / 60:.0f} min: the search goes on and {'they go' if len(hot) > 1 else 'it goes'} "
-                        "first in the next batch")
-                self.waited, hot = hot, []
-            self.yielded_to = hot
-            if self.yielded_to:
-                n = len(self.yielded_to)
-                say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, self.yielded_to))} "
-                    f"wait{'s' if n == 1 else ''}: the search stops here and {'they go' if n > 1 else 'it goes'} next")
+        batch and stops the search. By default none does (delivery.push_yield_restarts 0): the urgent ones
+        join the search's next split, which goes on with no check thrown away, and they go first in the
+        next batch's check, which starts as soon as this one ends (pushq.due). With
+        delivery.push_yield_restarts above 0, a set of approvals may be stopped that many times (_may_yield),
+        only for approvals made within delivery.push_yield_grace_s of this batch's first check (_yield_late)
+        and only while its verdict is not expected within delivery.push_yield_wait_s (`left` more checks at
+        this batch's mean check time: _verdict_s). Then the prefix known to pass goes, a blamed entry stays
+        blamed, the rest is requeued "yielded" with what the search learned (_fail_carried), and the
+        queue runs the urgent ones alone next."""
+        if self.yielded_to:
+            return True
+        hot: list[int] = []
+        try:
+            skip = self.m.get("yield_skip") if isinstance(self.m.get("yield_skip"), dict) else {}
+            skip = set(skip.get("ids") or []) if self.tip and skip.get("tip") == self.tip else set()
+            late = self._yield_late()
+            hot = [i for i in urgent.approvals_waiting(self.p.db, self.target) if i not in skip and i not in late]
+        except Exception as e:      # a queue it cannot read: the search goes on as before
+            say(f"cannot read the push queue for urgent approvals: {type(e).__name__}: {e}")
+        if not hot:
+            return False
+        wait = _setting(self.d, "push_yield_wait_s", YIELD_WAIT_S)
+        eta = self._verdict_s(left) if wait > 0 else None
+        if not self._may_yield() or (eta is not None and eta <= wait):
+            if hot != self.waited:
+                n = len(hot)
+                when = f"its verdict, expected in about {eta / 60:.0f} min" if eta is not None and eta <= wait \
+                    else "its next check once the search ends"
+                say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, hot))} join{'s' if n == 1 else ''} "
+                    f"this batch's next split: the search goes on, no check is thrown away, and "
+                    f"{'they go' if n > 1 else 'it goes'} first in the next batch, after {when}")
+            self.waited = hot
+            return False
+        self.yielded_to = hot
+        n = len(hot)
+        say(f"urgent approval{'s' if n > 1 else ''} {', '.join(map(str, hot))} "
+            f"wait{'s' if n == 1 else ''}: the search stops here and {'they go' if n > 1 else 'it goes'} next")
         return bool(self.yielded_to)
+
+    def _fail_carried(self, carried: list, k: int, failed) -> dict:
+        """What a search stopped for an urgent approval learned, for its requeued rows: with no entry
+        blamed, the full head's failure and the entries it covered above the k that go (pushq.start puts
+        it on the next batch's marker as "known_fail", _known_fail reads it there)."""
+        f = self.full_fail
+        if failed is not None or f is None or f[0] in (STALE, push.NONE_APPLY) or k >= len(carried):
+            return {}
+        heads = [[self.entries[i].get("id"), self.entries[i].get("head")] for i, _ in carried[k:]]
+        return {"known_fail": {"heads": heads, "cmd": f[0], "tail": f[1]}}
+
+    def _known_fail(self, carried: list) -> tuple[str, str] | None:
+        """The (cmd, tail) a stopped search saw the full head of exactly these entries (same queue ids and
+        heads, same order) fail with (the marker's "known_fail"): this batch takes it as its own full head's
+        failure, so it never checks that head again unless every prefix passes (_judge's rerun). None for
+        one entry (its blame needs a check on this tip) or any other set."""
+        kf = self.m.get("known_fail")
+        if not isinstance(kf, dict) or len(carried) < 2 or not kf.get("cmd"):
+            return None
+        mine = [[self.entries[i].get("id"), self.entries[i].get("head")] for i, _ in carried]
+        if mine != [list(h) for h in kf.get("heads") or [] if isinstance(h, (list, tuple))]:
+            return None
+        return str(kf["cmd"]), str(kf.get("tail") or "")
 
     def _verdict_s(self, left: int) -> float | None:
         """Seconds until this batch's verdict: `left` more checks at the mean time of its checks so far;

@@ -1460,6 +1460,11 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
         if restarts := max((int(n) if str(n := _detail(r).get("restarts")).isdigit() else 1
                             for r in rows if _detail(r).get("yielded")), default=0):
             m["restarts"] = restarts    # stops for urgent ones its rows had: batch.Batch._may_yield caps them
+        kfs = [_detail(r).get("known_fail") for r in rows]
+        if kfs and isinstance(kfs[0], dict) and all(k == kfs[0] for k in kfs) and \
+                sorted(str(h[0]) for h in kfs[0].get("heads") or [] if isinstance(h, list) and h) == \
+                sorted(str(r["id"]) for r in rows):
+            m["known_fail"] = kfs[0]    # what the stopped search learned: batch.Batch._known_fail resumes from it
         m["check_run_dir"] = str(checkdirs.new(p.state, marker, push.scratch_need(p, p.root)))
         m["check_report_dir"] = str(checkdirs.reports(Path(m["check_run_dir"])))
         write_json(marker, m)

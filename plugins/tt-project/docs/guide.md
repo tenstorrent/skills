@@ -1369,12 +1369,14 @@ running work is interrupted only by the preemption below:
   review sweeps skip `review.sweep_after_s` and `review.unreviewed_per_pass` for it. An urgent task in
   review for 10 minutes raises `review_stall`.
 - Push queue: an approved head of an urgent task's review starts its batch at once; a running batch
-  or deploy still goes first. An urgent approval stops a running batch's search for a failing entry
-  only if it was approved within `delivery.push_yield_grace_s` (300 s) of that batch's first check,
-  and only if that search's verdict is not expected within `delivery.push_yield_wait_s` (900 s, at
-  the batch's mean check time so far): a nearer verdict is waited for, so no entry's checks are
-  thrown away. One set of approvals is stopped for at most `delivery.push_yield_restarts` times
-  (default 1), so a stream of urgent approvals never keeps a batch from landing.
+  or deploy still goes first. An urgent approval that arrives while a batch searches for a failing
+  entry joins that search's next split: the search goes on, no entry's checks are thrown away, and
+  the urgent approval goes first in the next batch. Stopping the search instead is opt-in:
+  `delivery.push_yield_restarts` (default 0) stops one set of approvals at most that many times,
+  only for approvals made within `delivery.push_yield_grace_s` (300 s) of the batch's first check
+  and only when the verdict is not expected within `delivery.push_yield_wait_s` (900 s, at the
+  batch's mean check time so far). A stopped search's requeued entries carry the full head's
+  failure, so the next batch of exactly them skips that check.
   Later urgent approvals lead the next batch, which starts as soon as the running one ends; after a
   stop, the next batch takes the urgent approvals it stopped for, never the stopped batch's own
   entries again.
