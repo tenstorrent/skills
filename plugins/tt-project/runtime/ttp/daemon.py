@@ -5015,7 +5015,7 @@ class Daemon:
             spec = {}
         try:
             ctx = get_provider(r["provider"]).session_context(sid, float(r["started"] or 0) or None, spec.get("env"))
-        except Exception:   # the turn's summed usage stands: it rolls over early, never late
+        except Exception:   # the turn's summed usage stands: it compacts early, never late
             log(self.p, f"run {r['id']}: session context not read: " + traceback.format_exc().replace("\n", " | ")[:500])
             return None
         if ctx and sid:

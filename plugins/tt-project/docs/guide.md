@@ -459,11 +459,14 @@ only in the feed and never under "needs you".
   `ttp config <name> coordinator.session.mode off` (kept across upgrades). A project's coordinator
   may set the mode itself (`config_set`). A new session starts
   when there is none, the system prompt, stable context or action schema changed, the model or
-  effort changed, the context reached its limit, the last session turn did not end ok, or its
-  transcript is gone (a host move). The context is the last model call's prompt and answer; the
-  limit is the session's first prompt plus `rollover_growth_tokens` (100000), at most the model's
-  context window (`context_window_tokens`; 0 reads it from a `[1m]` model id, else no cap) less
-  `rollover_margin_tokens` (40000). `rollover_tokens` above 0 (default 0) sets a fixed limit instead. A resumed wake that fails is rerun at once as a
+  effort changed, the last session turn did not end ok, or its transcript is gone (a host move).
+  A full context never starts a new session: the session compacts in place and keeps its id. The
+  context is the last model call's prompt and answer; the compaction point is the session's first
+  prompt (or its size after its last compaction, the larger) plus `compact_growth_tokens` (100000),
+  at most the model's context window (`context_window_tokens`; 0 reads it from a `[1m]` model id,
+  else no cap) less `compact_margin_tokens` (40000). `compact_tokens` above 0 (default 0) sets a
+  fixed point instead. The older `rollover_tokens`, `rollover_growth_tokens` and
+  `rollover_margin_tokens` names are still read for a project that sets no `compact_*` value. A resumed wake that fails is rerun at once as a
   stateless turn, so each message and event is handled once; `max_failures_per_h` (3) failed resumes
   within an hour run every turn stateless for `pause_h` (6) hours and raise an issue. The session
   spend guard compares the session's coordinator spend with the stateless baseline (a day's
@@ -477,21 +480,24 @@ only in the feed and never under "needs you".
   provider that runs no session (the chat provider, for now) keeps stateless turns, with no spend guard
   and no session line in `ttp status`. `ttp status --verbose` shows the session's
   short id, wakes, context size and last decision. `ttp stats <name> --coord-session` reports each
-  day's wakes, $/wake, context growth and tool calls per wake, rollovers and cache-read share beside
+  day's wakes, $/wake, context growth and tool calls per wake, in-place compactions (session id,
+  tokens before and after, how) and cache-read share beside
   the stateless baseline (the 7 days before the first session wake: turns/day, $/turn), and flags
   the break-even (at most 2 tool calls and 20k context growth per wake) and a day costing more
-  than the baseline's $/day. Each day also names why wakes did not resume (handover, rollover with
-  its mean context size, a new session and its cause, spend guard, failed resume, pause, a provider that keeps no session, decide
+  than the baseline's $/day. Each day also names why wakes did not resume (a new session and its cause, spend guard, failed resume, pause, a provider that keeps no session, decide
   failed), the fallback-to-stateless rate over wakes with the mode on only, wakes with the mode off
   by cause, and failed session wakes with their transcript's error. In session mode the system prompt is the
   Restrictions, the coordinator role with `prompts/coordinator-session.md` and the charter verbatim:
-  the same bytes every wake while the charter is unchanged, so the prompt cache holds. Once the
-  context reaches its limit, one last resumed wake also returns a `session_note` (at most
-  4,000 tokens: open threads, promises in their chat wording, pending checks, decisions with their
-  reasons, user corrections), saved as `state/coord-session/<session id>.md`. The next session's
-  first message carries the standing memory, the open order ledger, that handover note and the last
-  20 chat exchanges verbatim, then the full digest. The agent's own auto-compaction is only a
-  backstop. A resumed wake sends only the digest sections
+  the same bytes every wake while the charter is unchanged, so the prompt cache holds. Every
+  session wake sets the agent's own compaction switch at the compaction point (Claude Code and the
+  chat provider: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`; Codex: `model_auto_compact_token_limit`), so it
+  compacts its history inside the same session. Only where the agent has no such switch (Cursor),
+  the wake at the compaction point also asks for a `session_note` (at most 4,000 tokens: open
+  threads, promises in their chat wording, pending checks, decisions with their reasons, user
+  corrections), saved as `state/coord-session/<session id>.md`; it is the harness's summary of the
+  same session. Each compaction is recorded, and the next wake starts with `# CONTEXT COMPACTED`:
+  the standing memory, the open order ledger, the session's latest note and the last 20 chat
+  exchanges verbatim, restored from disk, then the full digest. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
   line naming the sections left out. Only the Open tasks section, keyed by task id, and the Course
   check, keyed by sign and task id (`- costly: #<id>`), go row by row (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,
@@ -3135,9 +3141,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `coordinator.cache_ttl`. Codex and Cursor have no such switch.
 - Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
-  past `budget.bash_output_max_chars` also goes to a file. A worker whose run re-reads more than
-  `budget.split_reread_tokens` of context is told once to hand the rest on as a follow-up; its run
-  note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
+  past `budget.bash_output_max_chars` also goes to a file. A worker compacts its own context inside
+  its run (`budget.compact_window_tokens`) and is never ended or restarted because its context grew.
+  `budget.split_reread_tokens` is off (0) by default; a project that sets it tells a worker whose
+  run re-reads more than that once to hand the rest on as a follow-up; its run note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
 - `ttp killscan <script>` flags kills by name or pattern (`pkill`, `killall`, any `pgrep` or
   `pidof`, `ps | grep` feeding a kill) before a worker runs a script; `--shim <dir>` writes
   stand-ins for `pkill`, `killall`, `pgrep` and `pidof` that only log the call (`ps | grep` and calls
