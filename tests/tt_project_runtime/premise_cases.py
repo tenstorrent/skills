@@ -384,7 +384,8 @@ def test_task_add_refuses_a_premise_a_check_already_proved_false_for_two_weeks(e
 def _cmd_daemon(env, monkeypatch, tmp_path, cmd, **kw):
     """A recording daemon (_floor_daemon) with a scratch HOME and a code task whose premise is `cmd`."""
     for k in ("HOME", "XDG_CONFIG_HOME", "GH_CONFIG_DIR"):   # never the real ~/.config/gh or ~/.ssh
-        monkeypatch.setenv(k, str(tmp_path / "scratch-home" / k.lower()))
+        (scratch := tmp_path / "scratch-home" / k.lower()).mkdir(parents=True)   # a missing HOME falls back
+        monkeypatch.setenv(k, str(scratch))   # to passwd's (project.owner_home): the account's real one
     p, d, runs = _floor_daemon(env, monkeypatch)
     cid = _code(p, spec=f"Goal: add the retry.\npremise_cmd: {cmd}\nChange: add it.", **kw)
     return p, d, runs, cid
