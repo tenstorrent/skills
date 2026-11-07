@@ -989,9 +989,38 @@ def priority_paths() -> list[Path]:
         return []
 
 
+def host_holders(n: int | None = None) -> list[str]:
+    """The labels of every check run holding a host-wide checks slot right now, each run once: the cap's
+    slots and the ones load opened beyond it, the push priority slots, the urgent slots and the shared
+    holders. A run seen on several slots (same holder, pid and since) counts once; a taken slot whose label
+    does not read counts as "". The one reading the queue-wait report (state's "held") and the slot status
+    (hostload) count, so the two never disagree."""
+    n = limit() if n is None else n
+    if not n:
+        return []
+    every, seen, out = all_paths(n), set(), []
+    for path in every + priority_paths() + urgent_paths():
+        if not locks._slot_labels([path]):
+            continue
+        try:
+            h = locks.read_label(path)
+        except (OSError, ValueError):
+            h = {}
+        k = (h.get("holder"), h.get("pid"), h.get("since")) if h else ("unread", path.name)
+        if k not in seen:
+            seen.add(k)
+            out.append(str(h.get("holder") or ""))
+    for h in locks.shared_holders(every):
+        if (k := (h.get("holder"), h.get("pid"), h.get("since"))) not in seen:
+            seen.add(k)
+            out.append(str(h.get("holder") or ""))
+    return out
+
+
 def state() -> dict:
     """Who runs checks host-wide now and who waits: {"limit", "running": [labels], "queued": [labels],
-    "priority": [labels of push checks on their priority slots]}."""
+    "priority": [labels of push checks on their priority slots], "held": [every slot holder once]
+    (host_holders: what reports count as running)}."""
     n = limit()
     running = locks.held_labels(all_paths(n)) if n else []
     priority = locks.held_labels(priority_paths()) if n else []
@@ -1014,7 +1043,8 @@ def state() -> dict:
             continue
     return {"limit": n, "extra": extra(n), "running": running, "queued": queued, "priority": priority,
             "ahead": ahead, "queued_at": arrived, "priority_since": since, "parked": parked,
-            "pool": len(pool_runs()) if n else 0, "urgent": locks.held_labels(urgent_paths()) if n else []}
+            "pool": len(pool_runs()) if n else 0, "urgent": locks.held_labels(urgent_paths()) if n else [],
+            "held": host_holders(n)}
 
 
 def _project(holder: str) -> str:

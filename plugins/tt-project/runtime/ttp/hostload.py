@@ -30,7 +30,7 @@ import math
 import os
 import time
 
-from . import checkcap, checkspill, locks, testslots
+from . import checkcap, checkspill, testslots
 
 KEY = "checks_host_overloaded"
 SOURCE = "daemon:checks-host-overloaded"
@@ -61,7 +61,7 @@ def snapshot(cfg: dict | None = None) -> dict:
     cap, c = checkcap.limit(), checkcap.cores()
     factor = testslots.load_guard_factor() or 1.0
     try:
-        running = len(locks.held_labels(checkcap.all_paths(cap))) if cap else 0
+        running = len(checkcap.host_holders(cap))   # the queue-wait report's count too
     except OSError:
         running = 0
     spilled: dict[str, int] = {}

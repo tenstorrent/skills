@@ -95,7 +95,8 @@ def collect(p, cfg: dict, now: float, host: dict | None = None, device: set | No
     db, name, out = p.db, p.name, {}
     host = host or {}
     device = set(device or ())
-    running = list(host.get("running") or []) + list(host.get("priority") or []) + list(host.get("urgent") or [])
+    running = list(host["held"]) if "held" in host else \
+        list(host.get("running") or []) + list(host.get("priority") or []) + list(host.get("urgent") or [])
     queued = list(host.get("queued") or []) + [h for h, _ in host.get("parked") or []]
     checks = {"cap": host.get("limit"), "running": running, "queued": queued, "cap_set": bool(host.get("limit_set"))}
     busy = {_task_of(x, name) for x in running}

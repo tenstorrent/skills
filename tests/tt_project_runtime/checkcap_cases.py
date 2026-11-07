@@ -10953,3 +10953,36 @@ def test_a_lane_waiter_is_named_by_the_task_in_its_run_record(env, tmp_path, mon
         for t in (tasked, bare, adopted):
             locks.dequeue(t)
         _stop(holder)
+
+
+def test_the_queue_wait_report_and_slot_status_count_the_same_host_wide_slot_holders(env, monkeypatch):
+    # The queue-wait report once read 5 running against cap 4 while slot status read 2: it added the push
+    # priority and urgent slots to the cap's, and a run seen on several slots counted each time. Both now
+    # read checkcap.host_holders: every holder once, the same count in both.
+    import time
+    from ttp import checkcap, hostload, locks, queuewait
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "2")
+    monkeypatch.setenv(checkcap.URGENT_SLOTS_ENV, "1")
+    p = make(env)
+    held = [locks.try_take(checkcap.paths(), "acme task #71 (run 5)"),
+            locks.try_take(checkcap.paths(), "acme task #71 (run 5)"),   # the same run seen on a second slot
+            locks.try_take(checkcap.urgent_paths(), "acme task #72 (run 6)"),
+            locks.try_take([checkcap.priority_path("acme/branch")], "push batch b1")]
+    try:
+        assert all(held)
+        paths = checkcap.paths()
+        paths[1].write_text(paths[0].read_text())   # the same label: holder, pid and since
+        names = sorted(checkcap.state()["held"])
+        assert names == ["acme task #71 (run 5)", "acme task #72 (run 6)", "push batch b1"]
+        assert hostload.snapshot()["running"] == 3, "slot status counts what the report counts"
+        tid = p.db.add_task("waits", "s", kind="code")
+        now = time.time()
+        host = {**checkcap.state(), "queued": [f"{p.name} task #{tid} (run 3) ttp checks"], "queued_at": [now - 600]}
+        waits = queuewait.collect(p, {"coordinator": {"queue_wait_escalate_min": 5}}, now, host)
+        assert [sorted(w["running"]) for w in waits if w["queue"] == "checks"] == [names]
+        legacy = {k: v for k, v in host.items() if k != "held"}   # an older daemon's state: the old sum
+        assert len([w for w in queuewait.collect(p, {}, now, legacy) if w["queue"] == "checks"][0]["running"]) == 4
+    finally:
+        for f in held:
+            if f is not None:
+                f.close()
