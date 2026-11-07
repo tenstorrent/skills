@@ -293,3 +293,102 @@ def test_a_premature_claim_beside_facts_is_still_marked(env):
         got = _oh_sent(p)[-1]
         assert got.startswith(f"{_OH_FACTS[0]} {onhost.MARK} {claim}"), got
         assert "new task 'free the check slots held by stale runs': queued for a worker" in got, got
+
+
+def _oh_order_batch(p, env, reply):
+    """A batch as one turn sent it: a task_add carrying the user's order on a resource (its note once rebound
+    the batch's action list), then a reply, then a task_update of another task."""
+    other = p.db.add_task("tidy the docs", "s", kind="work", reply_chat="c1")
+    msg = p.db.x("INSERT INTO messages(ts,direction,kind,text) VALUES(?,'in','user','power-cycle rig now')",
+                 (time.time(),))
+    return other, [{"type": "task_add", "title": "power-cycle rig", "spec": "power-cycle rig", "tier": "light",
+                    "resources": ["rig"], "user_msg": msg, "reply_chat": "c1"},
+                   {"type": "reply", "text": reply, "chat": "c1"},
+                   {"type": "task_update", "id": other, "priority": 1}]
+
+
+def test_a_user_order_task_add_leaves_the_rest_of_its_batch_applied_and_checked(env):
+    """A task_add recording a user order once rebound the batch's action list to its note: the later
+    task_update failed with 'not enough values to unpack' and the reply after it went out unchecked."""
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    other, batch = _oh_order_batch(p, env, "Power cycling rig now.")
+    assert coord.apply(p, batch, turn=1) == []
+    assert p.db.task(other)["priority"] == 1
+    notes = p.db.kv(coord.NOTES_KEY, [])
+    assert not any("went unchecked" in n for n in notes), notes
+    (got,) = _oh_sent(p)
+    assert got.startswith(f"{onhost.MARK} Power cycling rig now") and "queued for a worker" in got, got
+
+
+def test_a_fault_in_the_started_on_host_check_is_a_harness_event_never_a_silent_pass(env, monkeypatch):
+    from ttp import coordinator as coord, onhost
+    p = make(env)
+    tid = _oh_task(p)
+
+    def boom(*a, **k):
+        raise ValueError("not enough values to unpack (expected 2, got 1)")
+    monkeypatch.setattr(onhost, "guard", boom)
+    coord.apply(p, [{"type": "reply", "text": _OH_CLAIM, "chat": "c1", "owners": [tid]}], turn=1)
+    assert _oh_sent(p) == [_OH_CLAIM]   # never lost to the check
+    ev = p.db.q("SELECT source, kind, status, text FROM events WHERE kind='onhost_fault'")
+    assert len(ev) == 1 and ev[0]["source"] == "harness" and ev[0]["status"] == "queued", ev
+    assert "unchecked" in ev[0]["text"] and "ValueError" in ev[0]["text"] and "reply" in ev[0]["text"], ev
+    assert any("went unchecked" in n for n in p.db.kv(coord.NOTES_KEY, []))
+    # The batch's remaining actions are read whatever shape they come in: no fault, no event.
+    monkeypatch.undo()
+    notes = []
+    out = coord._onhost_checked(p, _OH_CLAIM, "c1", {"owners": [tid]}, list("text") + [(5, None), (6,)], {}, notes)
+    assert out.startswith(onhost.MARK) and not any("unchecked" in n for n in notes), (out, notes)
+    assert len(p.db.q("SELECT id FROM events WHERE kind='onhost_fault'")) == 1
+
+
+@pytest.mark.parametrize("err", [ValueError("not enough values to unpack (expected 2, got 1)"), KeyError("x"),
+                                 TypeError("'NoneType' object is not subscriptable")])
+def test_an_internal_error_applying_an_action_is_named_a_harness_fault_never_a_bare_error(env, monkeypatch, err):
+    from ttp import coordinator as coord
+    p = make(env)
+    tid = p.db.add_task("tidy the docs", "s", kind="work", reply_chat="c1")
+
+    def boom(*a, **k):
+        raise err
+    monkeypatch.setattr(coord.chainprio, "follow", boom)
+    (got,) = coord.apply(p, [{"type": "task_update", "id": tid, "priority": 1}], turn=1)
+    assert got.startswith("task_update: not applied: an internal harness error") and type(err).__name__ in got, got
+    assert "fields: id, priority, type" in got and "harness fault" in got and "coordinator.py:" in got, got
+    ev = p.db.q("SELECT source, status, text FROM events WHERE kind='action_fault'")
+    assert len(ev) == 1 and ev[0]["source"] == "harness" and ev[0]["status"] == "queued", ev
+    # A refusal of a field the coordinator wrote stays as it was: it names the field, value and form.
+    (got,) = coord.apply(p, [{"type": "task_update", "id": tid, "status": "blocked", "waits_on": "nonsense"}], turn=2)
+    assert "waits_on 'nonsense' is not one of ask:<id>" in got and "internal" not in got, got
+    assert len(p.db.q("SELECT id FROM events WHERE kind='action_fault'")) == 1
+
+
+def test_the_batch_loop_never_rebinds_its_action_list_or_position():
+    """`order` (the batch's (index, action) pairs), `k` and `i` are read by later actions of the batch
+    (order[k + 1:], failed.add(i)): rebinding one inside the loop corrupts every action after it."""
+    import ast
+    import inspect
+    import textwrap
+    from ttp import coordinator as coord
+    fn = ast.parse(textwrap.dedent(inspect.getsource(coord.apply)))
+    loop = next(n for n in ast.walk(fn) if isinstance(n, ast.For) and isinstance(n.iter, ast.Call)
+                and getattr(n.iter.func, "id", "") == "enumerate" and getattr(n.iter.args[0], "id", "") == "order")
+    scopes = (ast.FunctionDef, ast.Lambda, ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
+    bad = []
+
+    def walk(node):
+        for ch in ast.iter_child_nodes(node):
+            if isinstance(ch, scopes):
+                continue   # its own scope
+            names = []
+            if isinstance(ch, (ast.Assign, ast.AugAssign, ast.AnnAssign, ast.For)):
+                for tg in (ch.targets if isinstance(ch, ast.Assign) else [ch.target]):
+                    names += [x.id for x in ast.walk(tg) if isinstance(x, ast.Name) and isinstance(x.ctx, ast.Store)]
+            elif isinstance(ch, ast.NamedExpr):
+                names.append(ch.target.id)
+            bad.extend((n, ch.lineno) for n in names if n in ("order", "k", "i"))
+            walk(ch)
+    for stmt in loop.body:
+        walk(stmt)
+    assert not bad, bad

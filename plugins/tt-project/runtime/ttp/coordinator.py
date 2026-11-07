@@ -2372,14 +2372,45 @@ def _clock(ts: float, where=None) -> str:
     return t.strftime("%H:%M %Z" if t.date() == today.date() else "%Y-%m-%d %H:%M %Z")
 
 
+# Python's own messages for a value of the wrong shape: an exception carrying one was raised inside the
+# harness, not by a check that names the field (every refusal of a field the coordinator wrote does).
+_RAW_ERROR = re.compile(r"(?:not enough|too many) values to unpack|invalid literal for|could not convert|"
+                        r"object is not (?:subscriptable|iterable|callable)|has no attribute|unhashable type|"
+                        r"index out of range|takes \d+ positional|unsupported operand|got an unexpected keyword")
+
+
+def _internal_fault(p: Project, t: str | None, a: Any, e: Exception) -> str:
+    """The rejection of an action that failed on an internal error, not on a value the coordinator wrote
+    (`_RAW_ERROR`, or a KeyError, IndexError or AttributeError): it names the error, where it was raised and
+    the action's fields, and queues a harness event (action_fault), so the coordinator never reads a bare
+    Python error as its own mistake. "" for a refusal that names its field."""
+    if not (isinstance(e, (KeyError, IndexError, AttributeError)) or _RAW_ERROR.search(str(e))):
+        return ""
+    import traceback
+    frames = [f for f in traceback.extract_tb(e.__traceback__) if "/ttp/" in f.filename.replace(os.sep, "/")]
+    where = f" at {Path(frames[-1].filename).name}:{frames[-1].lineno}" if frames else ""
+    fields = ", ".join(sorted(str(k) for k in a)) if isinstance(a, dict) else type(a).__name__
+    why = (f"not applied: an internal harness error ({type(e).__name__}: {clip(str(e), 160)}{where}), not a "
+           f"refusal of a field you wrote (fields: {clip(fields, 200)}); it is reported as a harness fault. "
+           f"Resend it unchanged once that is fixed, or apply the change another way")
+    try:
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+               (time.time(), "harness", "action_fault", "normal", f"{t or 'action'} {why}", "queued"))
+    except Exception:
+        pass
+    return why
+
+
 def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list, batch_tasks: dict,
                     notes: list) -> str:
     """A reply or notify as onhost.guard posts it: a claim that work is under way or done on a host where its
     task has not started (or was stopped while its jobs run) is sent marked as planned, with the honest
     status appended. `rest`: the batch's actions not applied yet (task_add and task_update it covers).
-    Any fault posts the text unchanged: a message is never lost to this check."""
+    Any fault posts the text unchanged: a message is never lost to this check, and never passes it silently
+    either: the coordinator hears of it as a queued harness event (onhost_fault)."""
     try:
-        later = [b for _, b in rest if isinstance(b, dict)]
+        later = [b for b in (x[-1] if isinstance(x, (tuple, list)) and x else x for x in rest or [])
+                 if isinstance(b, dict)]   # `rest` holds (index, action) pairs
         updates = {int(b["id"]): b for b in later if b.get("type") == "task_update" and str(b.get("id") or "").isdigit()}
         tasks = onhost.scope(p, text, chat, a.get("owners") or [], [*batch_tasks, *updates],
                              onhost.pending(later, p.config()))
@@ -2389,7 +2420,14 @@ def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list
         text, why = onhost.guard(p, text, tasks)
         notes += why
     except Exception as e:
-        notes.append(f"onhost: the started-on-host check failed ({type(e).__name__}: {e}); the message went unchecked")
+        why = (f"onhost: the started-on-host check failed on a {a.get('type') or 'message'} "
+               f"({type(e).__name__}: {str(e)[:200]}); the message went unchecked")
+        notes.append(why)
+        try:   # a harness fault: the coordinator must not read the message as checked
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status) VALUES(?,?,?,?,?,?)",
+                   (time.time(), "harness", "onhost_fault", "normal", f"{why}: {clip(text, 200)}", "queued"))
+        except Exception:
+            pass
     return text
 
 
@@ -3821,7 +3859,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
             failed.add(i)
             sent_as = f"; {GATE_MARK}: {json.dumps(order[k][1], ensure_ascii=False, default=str)}" \
                 if isinstance(e, DraftGateRejection) else ""
-            problems.append(f"{t}: {e}{sent_as}"[:RESEND_CHARS] if sent_as else f"{t}: {e}")
+            problems.append(f"{t}: {e}{sent_as}"[:RESEND_CHARS] if sent_as else
+                            f"{t}: {fault}" if (fault := _internal_fault(p, t, a, e)) else f"{t}: {e}")
             if t == "charter_update":
                 # a source refusal of a change citing a readable user message: a filled resend first, then why
                 filled = chartertemplate.template(db, a, str(e))
