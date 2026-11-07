@@ -193,18 +193,17 @@ def land(p: Project, tid: int) -> str:
             if last == pair + ["conflict"]:
                 return "conflict-known"     # the same two commits conflict again: no merge until one moves
             from .upjournal import _differs, _put_back, _touched
-            settled, backup = _settle(p, tid, b)
-            touched = _touched(p.harness, before, b)
-            clean = [f for f in touched if f not in _differs(p.harness, touched)]
-            with tree_writes(p.harness):
-                r = _git(p.harness, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
-            conflicted = False
-            if r.returncode != 0:
-                conflicted = bool(_git(p.harness, "diff", "--name-only", "--diff-filter=U").stdout.strip())
-                if conflicted or landing_merge(p.harness):
-                    with tree_writes(p.harness):
-                        _git(p.harness, "merge", "--abort")
-                if _git(p.harness, "rev-parse", "HEAD").stdout.strip() == before:
+            settled, backup = [], None
+            # Merged aside, never in the checkout: a merge there that conflicts needs `merge --abort`
+            # (a reset), which takes back what runs working in the checkout staged meanwhile.
+            r, merged, conflicted = _merge_aside(p, tid, b, before)
+            if merged:
+                settled, backup = _settle(p, tid, b)
+                touched = _touched(p.harness, before, merged)
+                clean = [f for f in touched if f not in _differs(p.harness, touched)]
+                with tree_writes(p.harness):   # a fast-forward: other files and staged changes stay
+                    r = _git(p.harness, "merge", "--ff-only", "-q", merged, timeout=120)
+                if r.returncode != 0 and _git(p.harness, "rev-parse", "HEAD").stdout.strip() == before:
                     # git refused only after writing them (the template guard on main refuses a branch that
                     # holds a template merge): left there, they fail `ttp upgrade --apply`'s fast-forward
                     _put_back(p.harness, clean)
@@ -241,6 +240,37 @@ def land(p: Project, tid: int) -> str:
     _git(p.harness, "branch", "-d", b)
     _set_conflicted(p, tid, None)
     return outcome or "merged"
+
+
+MERGE_ASIDE = ".merge-aside"   # under DIR: land's scratch worktree (not a task's: no t<id> name)
+
+
+def _merge_aside(p: Project, tid: int, b: str, base: str) -> tuple[subprocess.CompletedProcess, str, bool]:
+    """Merge branch `b` into commit `base` in a scratch worktree of the harness, so a conflict (or a
+    leftover merge) never touches the checkout's files or index. Returns git's answer, the merge
+    commit ('' when it failed) and whether files conflicted. The scratch worktree is removed after."""
+    aside = p.state / DIR / MERGE_ASIDE
+    _drop_aside(p, aside)
+    r = _git(p.harness, "worktree", "add", "-q", "--detach", str(aside), base, timeout=120)
+    if r.returncode != 0:
+        _drop_aside(p, aside)
+        return r, "", False
+    try:
+        r = _git(aside, "merge", "--no-edit", "-m", f"{MERGE_MSG} #{tid} ({b})", b, timeout=120)
+        if r.returncode == 0:
+            return r, _git(aside, "rev-parse", "HEAD").stdout.strip(), False
+        return r, "", bool(_git(aside, "diff", "--name-only", "--diff-filter=U").stdout.strip())
+    finally:
+        _drop_aside(p, aside)
+
+
+def _drop_aside(p: Project, aside: Path) -> None:
+    if aside.exists():
+        _git(p.harness, "worktree", "remove", "--force", "--force", str(aside), timeout=120)
+        if aside.exists():
+            import shutil
+            shutil.rmtree(aside, ignore_errors=True)
+    _git(p.harness, "worktree", "prune")
 
 
 def _settle(p: Project, tid: int, b: str) -> tuple[list[str], Path | None]:

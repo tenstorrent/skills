@@ -8883,7 +8883,8 @@ def test_a_conflicting_harness_worktree_is_aborted_kept_and_reported_once(env, m
     merges = []
     git = harnesstree._git
     monkeypatch.setattr(harnesstree, "_git", lambda cwd, *a, **k: (merges.append(a) if a[:1] == ("merge",) and
-                                                                    "--abort" not in a else None) or git(cwd, *a, **k))
+                                                                    "--abort" not in a and "--ff-only" not in a else None)
+                        or git(cwd, *a, **k))
     _harness_task(p, "a")
     _harness_task(p, "b")
     a, b = _task_ids(p)[-2:]

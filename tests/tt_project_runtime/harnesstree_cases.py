@@ -503,3 +503,47 @@ def test_dirty_copies_are_never_set_aside_while_another_harness_run_works_in_the
     (p.harness / "prompts" / "shared.md").write_text("v1\n")
     assert harnesstree.land(p, b) == "busy"
     assert (p.harness / "prompts" / "shared.md").read_text() == "v1\n" and not _ht_backups(p)
+
+
+def test_a_harness_land_never_resets_or_aborts_in_the_checkout_and_keeps_its_uncommitted_work(env):
+    """Before: a branch that conflicted was merged in the checkout and undone with `merge --abort`
+    (reflog 'reset: moving to HEAD') each time HEAD moved; a run's staged edit there was taken back."""
+    p = make(env)
+    from ttp import harnesstree
+    _commit_in_harness_tree(p.harness, "prompts/edit.md", "e0\n", "edit e0")
+    _commit_in_harness_tree(p.harness, "prompts/staged.md", "s0\n", "staged s0")
+    a, b = _harness_task(p, "a"), _harness_task(p, "b")
+    _harness_run(p, a)
+    own = harnesstree.workdir(p, b)   # a works in the checkout: b gets a worktree
+    p.db.x("UPDATE runs SET status='done'")
+    _commit_in_harness_tree(own, "prompts/clash.md", "from b\n", "b")
+    _commit_in_harness_tree(p.harness, "prompts/clash.md", "from a\n", "a")
+    p.db.update_task(b, status="done")
+    (p.harness / "prompts" / "edit.md").write_text("e1, uncommitted\n")
+    (p.harness / "prompts" / "untracked.md").write_text("new\n")
+    (p.harness / "prompts" / "staged.md").write_text("s1, staged\n")
+    _hgit(p.harness, "add", "prompts/staged.md")
+
+    def kept():
+        assert (p.harness / "prompts" / "edit.md").read_text() == "e1, uncommitted\n"
+        assert (p.harness / "prompts" / "untracked.md").read_text() == "new\n"
+        assert _hgit(p.harness, "show", ":prompts/staged.md") == "s1, staged\n"
+        assert (p.harness / "prompts" / "staged.md").read_text() == "s1, staged\n"
+        assert "reset: moving to HEAD" not in _hgit(p.harness, "reflog")
+    head = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert harnesstree.land(p, b) == "conflict"
+    _commit_in_harness_tree(p.harness, "prompts/other.md", "x\n", "a2")   # HEAD moved: tried again
+    assert harnesstree.land(p, b) == "conflict"
+    kept()
+    assert _hgit(p.harness, "rev-parse", "HEAD^").strip() == head
+    assert subprocess.run(["git", "-C", str(p.harness), "rev-parse", "-q", "--verify", "MERGE_HEAD"],
+                          capture_output=True).returncode != 0
+    assert not (p.state / harnesstree.DIR / harnesstree.MERGE_ASIDE).exists()
+    assert harnesstree.MERGE_ASIDE not in _hgit(p.harness, "worktree", "list")
+    _hgit(own, "merge", "-q", "--no-edit", "-X", "theirs", "main")   # resolved on the branch: it lands
+    _commit_in_harness_tree(own, "prompts/landed.md", "l\n", "b: landed")
+    before = _hgit(p.harness, "rev-parse", "HEAD").strip()
+    assert harnesstree.land(p, b) == "merged"
+    kept()
+    assert set(_hgit(p.harness, "diff", "--name-only", before, "HEAD").split()) == {"prompts/landed.md"}
+    assert (p.harness / "prompts" / "landed.md").read_text() == "l\n"
