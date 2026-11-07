@@ -488,7 +488,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # The project's own tool guards (localguard.py): Python files, by path from the harness folder and
     # outside runtime/ and prompts/, each with refusal(cmd) (and optionally tool_refusal(tool, input)),
     # asked after the built-in guards on every worker and coordinator tool call. Never edit runtime/ files.
-    "guards": {"local": []},
+    # Set as guards.local, in the one "guards" section below (a second "guards" key would replace it).
     # A running worker that has not read a coordinator update (steer.md) for ack_after_s raises one
     # steer_unread event to the coordinator (steerack.py); 0: off.
     "steer": {"ack_after_s": 300},
@@ -499,7 +499,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "sandbox": {"fence_freed_commands": [], "checks": False},
     # Paths no run writes (pathguard): added to its built-in credential folders, never replacing them;
     # also an account setting (ttp config --account), which every project on the host adds.
-    "guards": {"protected_paths": []},
+    # user_site: "auto" refuses installs into the shared ~/.local while `ttp list` shows several projects
+    # on the host, "on" always (usersite.py).
+    "guards": {"local": [], "protected_paths": [], "user_site": "auto"},
     # Worker and reviewer runs, everything they start (detached checks, tests, reference models) and
     # the pushes and push batches the daemon starts run this many nice levels below the daemon
     # (0-19; 0 = normal priority), so they never slow the host's own work. The daemon and the

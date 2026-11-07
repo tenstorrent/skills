@@ -40,6 +40,7 @@ from . import ackwait
 from . import sidefx
 from . import cursorhook
 from . import pausegone
+from . import usersite
 from . import urgentfup
 from . import topup
 from . import cursortiers
@@ -3316,7 +3317,9 @@ class Daemon:
                    # daemon start the push or job.
                    **({"TTP_PIDNS": ns} if (ns := push.pid_ns()) else {}),
                    **({"TTP_CGROUP": cg} if (cg := push.cgroup()) else {}),
-                   "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', path)}"}
+                   "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', path)}",
+                   # pip refuses installs outside a venv on a host of several projects (usersite)
+                   **usersite.env(self.cfg)}
             # A task that holds no device runs CPU tests only: hooks (the harness skill's pytest plugin)
             # skip tests that would open a device outside the broker. A device task gets "0", never an
             # inherited "1" (the runner adds its own environment under this one).
@@ -12338,7 +12341,7 @@ class Daemon:
         venv_vars = worktree.venv_env(venv, bin_path) if venv else {}
         env = {**os.environ, **venv_vars, "TTP_RUN_DIR": str(out), "TTP_PROJECT": str(self.p.base),
                "TTP_RUN_ID": run_id, **task_env(tid), "PYTHONPATH": runtime_dir,
-               "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}"}
+               "PATH": f"{self.p.harness / 'bin'}:{venv_vars.get('PATH', bin_path)}", **usersite.env(self.cfg)}
         env = machines.mask_devices(env)   # as in the worker's run: no direct device opens
         level = nice_level(self.cfg.get("runner"))[0]
         argv = (["nice", "-n", str(level)] if level else []) + [sys.executable, "-m", "ttp", "checks", "--detach", "--no-prestage", *extra]

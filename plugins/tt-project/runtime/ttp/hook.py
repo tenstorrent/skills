@@ -1119,6 +1119,14 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = fenced_ssh(segments, commands) or fenced_git(segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = lock_privileged(cmd)
+    if not why and os.environ.get("TTP_NO_USER_SITE") == "1":   # usersite: a host of several projects
+        from . import usersite
+        if why := usersite.refusal(commands):
+            _log_refusal(cmd, kind="user_site")
+            try:
+                usersite.flag(cmd)
+            except Exception:   # the refusal stands; only the coordinator's count is lost
+                pass
     if not why:
         from . import killguard
         why = killguard.refusal(cmd, str(payload.get("cwd") or os.getcwd()))
