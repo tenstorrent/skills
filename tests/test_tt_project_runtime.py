@@ -4836,8 +4836,9 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     lines = out.splitlines()
     assert len(lines) <= 25, out
     # The budget is one plain line; caps, top spenders and gate reasons are in the web app's Budget tab.
-    assert "budget: 24h $4.50 this project, $4.50 of $200 global" in lines, out
-    assert [ln for ln in lines if "$" in ln] == ["budget: 24h $4.50 this project, $4.50 of $200 global"], out
+    money = [ln for ln in lines if "$" in ln]
+    assert len(money) == 1 and re.fullmatch(r"budget: 24h \$4\.50 this project, \$4\.50 of \$200 global; at \$0\.\d\d/h: "
+                                             r"reset time unknown \(rolling 24 h\), no projection", money[0]), out
     assert "top 7d" not in out and "spend:" not in out, out
     wait = [ln for ln in lines if "measure on a board" in ln]
     assert wait and "waiting, next try" in wait[0] and wait[0].count("next try") == 1, out

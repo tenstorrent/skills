@@ -911,7 +911,12 @@ only in the feed and never under "needs you".
   24 h: `virtual` (list-price equivalent) on a plan, `actual` when billed by use (only spend made
   on a usage-billed account). A usage-billed account with a budget day or a global cap shows
   `today $1.20 this project, $85 of $1000 global - resets in 6.5 h` instead, with
-  `(1 machine stale)` when a machine's answer is old.
+  `(1 machine stale)` when a machine's answer is old, then when the global cap is reached at the
+  current rate (the last hour's readings, else the day's average), against its reset:
+  `at $86/h: not reached before the reset at 08:00 PST`, or `at $400/h: reaches the cap at 07:48
+  PST, before the reset at 08:00 PST`. A reach time after the reset is never shown; a rolling 24 h
+  has no reset, so it says `reset time unknown (rolling 24 h), no projection`. The coordinator's
+  STATE budget line carries the same projection for the global and daily caps.
 
 ## Model tiers
 

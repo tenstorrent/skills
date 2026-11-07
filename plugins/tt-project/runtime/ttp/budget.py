@@ -37,7 +37,7 @@ from typing import Any
 
 from . import ackwait, credits
 from . import globalcap as gcap
-from . import timefmt
+from . import spendproj, timefmt
 from . import localspend  # noqa: F401  (adds this machine's other Claude Code spend to the global total)
 from .billing import PLAN_LAPSE_RUNS, billed_by_account, declared, table_stamp
 from .db import DB
@@ -516,19 +516,25 @@ def plan_paid(db: DB, since: float, until: float | None = None) -> float:
     return max(total - sum(billed_by_account(db.conn, since, until, memo=db.billing_memo).values()), 0.0)
 
 
-def caps_line(db: DB, gates: dict, b: dict, now: float) -> str:
+def caps_line(db: DB, gates: dict, b: dict, now: float, where=None) -> str:
     """The project dollar caps, once for all usage-billed providers together: the numbers of any
     caps-regime gate in `gates` (dicts; the caps count every provider's billed spend, so they are the
     same in each), else the billed spend itself; the 7 days' plan-paid spend beside it, so the total
     is the ledger's; and the global daily cap when one is set, per provider: each gate's global total
     counts only its own provider's spend across the account (globalcap.total), so the line names each
-    provider and lists the one nearest its cap first."""
+    provider and lists the one nearest its cap first. Each daily cap set carries when it is reached
+    at the current rate, against its reset (spendproj.line), in the zone of `where`."""
     n = next((g.get("numbers") or {} for g in gates.values() if g.get("regime") not in ("windows", "plan")), None)
     if n is None:
         n = {"spent_24h": round(db.spent_since(now - DAY, billed=True), 2),
-             "spent_7d": round(db.spent_since(now - WEEK, billed=True), 2)}
+             "spent_7d": round(db.spent_since(now - WEEK, billed=True), 2),
+             "per_h": round(db.spent_since(now - HOUR, billed=True), 2)}
     plan = any(g.get("regime") == "windows" for g in gates.values())
     out = caps_spend(n, b.get("daily_usd"), b.get("weekly_usd"), plan, plan_paid=round(plan_paid(db, now - WEEK), 2))
+    ahead = spendproj.line(float(n.get("spent_today", n.get("spent_24h", 0)) or 0), float(b.get("daily_usd") or 0),
+                           n.get("per_h"), n.get("day_end"), now, where)
+    if ahead:
+        out += f" (daily cap, {ahead})"
     totals = [(prov, (g.get("numbers") or {})) for prov, g in gates.items() if "global_today" in (g.get("numbers") or {})]
     if not totals:
         return out
@@ -539,9 +545,10 @@ def caps_line(db: DB, gates: dict, b: dict, now: float) -> str:
     parts = []
     for prov, m in sorted(totals, key=lambda t: (-share(t[1]), t[0])):
         stale = f", {len(m['global_stale'])} machine(s) stale" if m.get("global_stale") else ""
-        reached = ", reached" if share(m) >= 1.0 else ""
+        ahead = spendproj.line(float(m["global_today"]), float(m.get("global_cap") or 0), m.get("global_per_h"),
+                               m.get("global_resets_at"), now, where)
         parts.append(f"{prov} ${float(m['global_today']):.2f} of ${float(m.get('global_cap') or 0):.0f} today "
-                     f"({m.get('global_includes') or 'this account'}{stale}{reached})")
+                     f"({m.get('global_includes') or 'this account'}{stale})" + (f", {ahead}" if ahead else ""))
     return out + " · global daily cap (whole account, per provider): " + "; ".join(parts)
 
 
@@ -572,6 +579,8 @@ def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: 
     if day:
         today, label = db.spent_since(day[0], exclude=windowed, billed=True) + live, "today"
         g.numbers.update({"spent_today": round(today, 2), "day_start": day[0], "day_end": day[1]})
+    # The last hour's billed spend: the burn rate of the daily cap's projection (spendproj).
+    g.numbers["per_h"] = round(db.spent_since(now - HOUR, exclude=windowed, billed=True), 2)
     ratio = max(today / day_cap if day_cap else 0.0, w7 / week_cap if week_cap else 0.0)
     g.numbers["cap_ratio"] = round(ratio, 3)
     if ratio >= 1.0:
@@ -627,6 +636,12 @@ def _global(db: DB, g: Gate, b: dict, provider: str, day: tuple[float, float] | 
     g.numbers.update({"global_today": round(t["usd"], 2), "global_cap": cap, "global_stale": t["stale"],
                       "global_includes": t["includes"], "global_resets_at": end if day else None,
                       **{f"global_{k}": round(t.get(k) or 0, 2) for k in ("plan_usd", "unbilled_usd", "stale_usd")}})
+    # The burn rate for the reach-the-cap projection (spendproj): this total's recent readings, kept
+    # in the saved gate across ticks.
+    prev = ((db.kv("gates", {}) or {}).get(provider) or {}).get("numbers") or {}
+    g.numbers["global_trail"] = spendproj.trail(prev.get("global_trail"), t["usd"], now, start)
+    per_h = spendproj.rate(g.numbers["global_trail"], t["usd"], now, start)
+    g.numbers["global_per_h"] = None if per_h is None else round(per_h, 2)
     if t["usd"] >= cap:
         when = f"; new work resumes at the reset in {max(end - now, 0) / HOUR:.1f} h" if day else ""
         stale = f" ({len(t['stale'])} machine{'s' if len(t['stale']) != 1 else ''} stale)" if t["stale"] else ""

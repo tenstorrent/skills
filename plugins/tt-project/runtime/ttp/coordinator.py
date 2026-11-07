@@ -1295,7 +1295,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      + (f" · {bud.lane_words(g['lane'])}" if (g.get("lane") or {}).get("max_parallel") else "")
                      + (f" · unblock path: {path}" if path else ""))
     # Once, not per provider: the caps bound every usage-billed provider's spend together.
-    lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now))
+    lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now, home))
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
     section("budget", lines)
     lines = []

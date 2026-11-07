@@ -2884,7 +2884,9 @@ def test_without_budget_settings_a_usage_billed_account_gets_a_200_global_cap(en
     assert g.level == "green" and g.numbers["spent_24h"] == 30.0, (g.level, g.reasons)
     assert (g.numbers["global_cap"], g.numbers["global_today"]) == (200, 180.0), g.numbers
     assert "spent_today" not in g.numbers, g.numbers
-    assert budget_line(p.db, now, "fake", g.as_dict()) == "24h $30.00 this project, $180 of $200 global"
+    # A rolling 24 h has no reset: the line says so and projects nothing (the rate is the window's average).
+    assert re.fullmatch(r"24h \$30\.00 this project, \$180 of \$200 global; at \$7\.\d\d/h: reset time unknown "
+                        r"\(rolling 24 h\), no projection", budget_line(p.db, now, "fake", g.as_dict()))
 
 
 
@@ -3014,11 +3016,14 @@ def test_the_budget_line_of_a_usage_billed_account_and_of_a_plan(env, tmp_path):
     other.spend("fake", 340.0, "task:1", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
     line = budget_line(p.db, now, "fake", g)
-    assert re.fullmatch(r"today \$1\.20 this project, \$341 of \$1000 global - resets in \d+\.\d h", line), line
+    # The global part ends with its projection against the reset (spendproj.line).
+    assert re.fullmatch(r"today \$1\.20 this project, \$341 of \$1000 global - resets in \d+\.\d h; "
+                        r"at \$\d+/h: (not reached before|reaches the cap at \d\d:\d\d UTC, before) "
+                        r"the reset at \d\d:\d\d UTC", line), line
     end = gcap.day_bounds(p.config()["budget"], now)[1]
-    assert line.endswith(f"resets in {(end - now) / 3600:.1f} h")
+    assert f"resets in {(end - now) / 3600:.1f} h;" in line
     g["numbers"]["global_stale"] = ["box2"]
-    assert budget_line(p.db, now, "fake", g).endswith(" h (1 machine stale)")
+    assert " h (1 machine stale); at $" in budget_line(p.db, now, "fake", g)
     # Global cap off: this project only.
     del g["numbers"]["global_today"]
     assert re.fullmatch(r"today \$1\.20 this project - resets in \d+\.\d h", budget_line(p.db, now, "fake", g))
@@ -4839,7 +4844,8 @@ def test_the_caps_line_names_each_providers_global_total_and_puts_the_reached_on
              "claude": caps("claude", 2013.0, "red", ["global daily cap reached: $2013 of $2000 today"])}
     line = bud.caps_line(p.db, gates, b, now)
     assert "global daily cap (whole account, per provider): claude $2013.00 of $2000 today " \
-           "(2 project(s), reached); chat $0.00 of $2000 today (2 project(s))" in line, line
+           "(2 project(s)), cap reached, reset time unknown (rolling 24 h); chat $0.00 of $2000 today " \
+           "(2 project(s)), no burn rate measured yet: no projection" in line, line
     assert line.startswith(bud.caps_line(p.db, {"chat": gates["chat"]}, b, now).split(" · global daily cap")[0]), line
     # Without a global total the line is the project caps alone.
     for g in gates.values():
@@ -5163,3 +5169,123 @@ def test_other_machines_are_named_missing_from_a_codex_total(env, monkeypatch):
     assert "other Codex sessions on far (not sent between machines)" in t["includes"], t["includes"]
     t = gcap.total(p.db, "claude", start, end, now + 1, account="")
     assert "Codex" not in t["includes"] and t["sessions_missing"] == ["far"], t
+
+
+# Spend projections stop at the cap's reset (spendproj): made-up numbers, a $3,000 daily cap whose
+# budget day resets at 08:00 in the home zone, 24 min after `now`.
+_PROJ_ZONE = "America/Los_Angeles"
+
+
+def _proj_now():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    z = ZoneInfo(_PROJ_ZONE)
+    return (datetime(2026, 11, 7, 7, 36, tzinfo=z).timestamp(), datetime(2026, 11, 7, 8, 0, tzinfo=z).timestamp())
+
+
+def test_a_projection_past_the_caps_reset_says_not_reached_before_the_reset():
+    """At $86/h, $2,915 of $3,000 would reach the cap 59 min on (08:35), after the reset 24 min on
+    (08:00): the line says it is not reached before the reset and prints no time after it."""
+    from ttp import spendproj
+    now, reset = _proj_now()
+    got = spendproj.line(2915.0, 3000.0, 86.0, reset, now, _PROJ_ZONE)
+    assert got == "at $86/h: not reached before the reset at 08:00 PST", got
+    assert "08:35" not in got and "reaches" not in got, got
+
+
+def test_a_projection_before_the_caps_reset_gives_the_reach_time():
+    """At $400/h the $85 left lasts 12.75 min: the cap is reached at 07:48, before the 08:00 reset."""
+    from ttp import spendproj
+    now, reset = _proj_now()
+    got = spendproj.line(2915.0, 3000.0, 400.0, reset, now, _PROJ_ZONE)
+    assert got == "at $400/h: reaches the cap at 07:48 PST, before the reset at 08:00 PST", got
+
+
+@pytest.mark.parametrize("spent,per_h,reset,want", [
+    (2915.0, 0.0, True, "at $0.00/h: not reached before the reset at 08:00 PST"),
+    (3000.0, 86.0, True, "cap reached: new work waits until the reset at 08:00 PST"),
+    (3100.0, 0.0, True, "cap reached: new work waits until the reset at 08:00 PST"),
+    (2915.0, 86.0, False, "at $86/h: reset time unknown (rolling 24 h), no projection"),
+    (3000.0, 86.0, False, "cap reached, reset time unknown (rolling 24 h)"),
+    (2915.0, None, True, "no burn rate measured yet: no projection"),
+])
+def test_projection_edge_cases_rate_zero_at_or_over_the_cap_and_an_unknown_reset(spent, per_h, reset, want):
+    """A rate of 0 never reaches the cap; at or over it the line names the reset (no reach time); an
+    unknown reset or an unmeasured rate says so and projects nothing; an unset cap has no line."""
+    from ttp import spendproj
+    now, at = _proj_now()
+    assert spendproj.line(spent, 3000.0, per_h, at if reset else None, now, _PROJ_ZONE) == want
+    assert spendproj.line(spent, 0, per_h, at, now, _PROJ_ZONE) == ""
+
+
+def test_the_projection_never_prints_a_reach_time_after_the_reset():
+    """Over a sweep of rates and spends, a printed reach time always falls before the reset."""
+    import re
+    from ttp import spendproj
+    now, reset = _proj_now()
+    for spent in (0.0, 1500.0, 2900.0, 2999.0):
+        for per_h in (1.0, 86.0, 200.0, 212.5, 213.0, 400.0, 10_000.0):
+            got = spendproj.line(spent, 3000.0, per_h, reset, now, _PROJ_ZONE)
+            reach = now + (3000.0 - spent) / per_h * 3600
+            assert ("reaches the cap" in got) == (reach < reset), (spent, per_h, got)
+            m = re.search(r"reaches the cap at (\d\d):(\d\d)", got)
+            assert not m or (int(m.group(1)), int(m.group(2))) < (8, 0), got
+
+
+def test_the_burn_rate_is_the_recent_slope_else_the_periods_average():
+    """The trail keeps an hour of readings, one per 5 min, and drops a new period's leftovers; the
+    rate is its slope once it spans 15 min, else the spend since the period's start."""
+    from ttp import spendproj
+    now, _ = _proj_now()
+    start = now - 23.6 * 3600
+    t = []
+    for i, usd in enumerate((2829.0, 2850.5, 2872.0, 2893.5, 2915.0)):   # +$21.5 per 15 min
+        t = spendproj.trail(t, usd, now - (4 - i) * 900, start)
+    assert len(t) == 5 and spendproj.rate(t, 2915.0, now, start) == pytest.approx(86.0)
+    # A minute on: the reading now past an hour drops off, and none is added within 5 min of the last.
+    assert spendproj.trail(t, 2915.0, now + 60, start) == t[1:]
+    # Older than an hour, from before the period's start, or above today's total: dropped.
+    assert spendproj.trail([[now - 4000, 1.0], [start - 1, 2.0], [now - 600, 9999.0]], 10.0, now, start) == [[now, 10.0]]
+    assert spendproj.rate([[now - 60, 2900.0]], 2915.0, now, start) == pytest.approx(2915.0 / 23.6)
+    assert spendproj.rate([], 5.0, now, None) is None and spendproj.trail("junk", 1.0, now) == [[now, 1.0]]
+
+
+def test_status_and_state_budget_lines_carry_the_projection_with_the_reset(env):
+    """`ttp status` and the web header (usage_line) and the coordinator's STATE (caps_line) quote
+    the projection against the global cap's reset, in the home zone: never '08:35'."""
+    from ttp import budget as bud
+    from ttp.web import usage_line
+    p = make(env)
+    now, reset = _proj_now()
+    n = {"spent_today": 545.0, "day_start": reset - 86400, "day_end": reset, "global_today": 2915.0,
+         "global_cap": 3000.0, "global_stale": [], "global_includes": "8 project(s)", "global_resets_at": reset,
+         "global_per_h": 86.0, "spent_24h": 545.0, "spent_7d": 900.0, "daily_cap": 0, "weekly_cap": 0}
+    got = usage_line(n, now, _PROJ_ZONE)
+    assert got.endswith("$2,915 of $3000 global - resets in 0.4 h; at $86/h: not reached before the reset at 08:00 PST") \
+        or "at $86/h: not reached before the reset at 08:00 PST" in got, got
+    gate = bud.Gate(provider="claude", level="green", regime="caps", max_parallel=6, max_tier="deep",
+                    allow_optional=True, reasons=[], numbers=n).as_dict()
+    line = bud.caps_line(p.db, {"claude": gate}, p.config()["budget"], now, _PROJ_ZONE)
+    assert "claude $2915.00 of $3000 today (8 project(s)), at $86/h: not reached before the reset at 08:00 PST" in line, line
+    assert "08:35" not in line + got
+    n["global_per_h"] = 400.0
+    assert "at $400/h: reaches the cap at 07:48 PST, before the reset at 08:00 PST" in usage_line(n, now, _PROJ_ZONE)
+
+
+def test_the_global_gate_records_its_burn_rate_across_ticks(env, monkeypatch):
+    """budget._global keeps the total's recent readings in the saved gate and derives global_per_h
+    from them, so the projection follows the current burn, not the day's average."""
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    p = make(env)
+    p.set_config("budget.global_daily_usd", 3000)
+    p.set_config("budget.day_start", "08:00")
+    p.set_config("budget.timezone", _PROJ_ZONE)
+    now, reset = _proj_now()
+    spent = {"usd": 2829.0}
+    monkeypatch.setattr(gcap, "total", lambda *a, **k: {"usd": spent["usd"], "stale": [], "includes": "1 project(s)"})
+    for i in range(5):
+        spent["usd"] = 2829.0 + 21.5 * i
+        g = bud.evaluate(p.db, p.config(), "claude", [], now - (4 - i) * 900)
+        p.db.set_kv("gates", {"claude": g.as_dict()})
+    assert g.numbers["global_resets_at"] == reset and g.numbers["global_per_h"] == pytest.approx(86.0), g.numbers

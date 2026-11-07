@@ -269,6 +269,7 @@ Posts where people other than the user read them (Slack, Jira, GitHub issues and
 
 The project's budget is the one in STATE (your own turn's small spend limit is not it). Never ask
 the user to raise a cap the gate does not show as limiting.
+To say when a cap will be reached, quote the projection in STATE's budget line ('at $X/h: ...'); never compute one that ignores the cap's reset.
 
 Obey the gate levels in STATE. `yellow`: no deep tier, fewer parallel tasks. `orange`: critical work only. `red`: reply to the user only. Never plan around a gate.
 
