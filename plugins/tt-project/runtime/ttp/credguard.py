@@ -28,7 +28,8 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
   file is refused like a key's. Also passing: a key path handed to ssh-add or
   ssh-keygen, a config given by its tool's option (`kubectl --kubeconfig`, CONFIG_OPTIONS) or
   variable (`KUBECONFIG=`, CONFIG_VARS), mkdir, chmod, chown, touch and test of them, and ls or stat
-  of a store folder itself (any other mention of the folder, or a glob naming it, does not);
+  of a store folder itself (any other mention of the folder, or a glob naming it, does not; a bare
+  folder name counts only where its path may lead to HOME, so a repo's own folder of that name passes);
   kubectl, docker, gcloud, aws and az read their own config unnamed. The words of a command ssh runs
   on another host are checked the same way, quotes are dropped before the check (~/.ss''h), and a
   find whose name test matches a private key or credential file is refused. Known gaps, accepted: a
@@ -62,10 +63,10 @@ SSH_PUBLIC = {"config", "known_hosts", "known_hosts.old", "authorized_keys", "au
 SSH_PATH_RE = re.compile(r"(?<![\w.-])\.ssh(?:/+([^\s\"'`;&|<>()]*))?(?![\w.-])")
 # The other stores by name, or by the variable that moves them
 STORE_RE = re.compile(r"(?:(?<![\w.-])gh|GH_CONFIG_DIR\}?)/+hosts\.ya?ml\b|(?<![\w.-])\.git-credentials\b"
-                      r"|(?<![\w.-])\.netrc\b|(?<![\w.-])\.credentials\.json\b"
+                      r"|(?<![\w.-])\.netrc(?![\w.-])|(?<![\w.-])\.credentials\.json\b"
                       r"|(?:(?<![\w.-])\.codex|CODEX_HOME\}?)/+auth\.json\b"
                       r"|(?:(?<![\w.-])\.docker|DOCKER_CONFIG\}?)/+config\.json\b|(?<![\w.-])\.kube/+config\b"
-                      r"|(?<![\w.-])\.pypirc\b|(?:(?<![\w.-])\.config|XDG_CONFIG_HOME\}?)/+git/+credentials(?![\w.-])")
+                      r"|(?<![\w.-])\.pypirc(?![\w.-])|(?:(?<![\w.-])\.config|XDG_CONFIG_HOME\}?)/+git/+credentials(?![\w.-])")
 # Store folders (the variable that moves each) and the entries in them that hold a token or key; their
 # other entries hold none (aws `config`, gcloud `configurations`, azure `azureProfile.json`, kube `cache`,
 # docker `buildx`, gh `config.yml`). A bare folder counts (`grep -r token ~/.kube`), but to ls, stat or mkdir it
@@ -411,7 +412,8 @@ def _unquoted(text: str) -> str:
     return re.sub(r"[\"'\\]", "", text)
 
 
-def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = None) -> str | None:
+def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = None,
+                 cwd: str | None = None) -> str | None:
     """Why a Bash call reads a credential store, else None: it names one by path, other than as a
     word a passing command takes (each such word excuses one mention), prints a token, or finds a
     key by name. The command an ssh call runs remotely counts as its own commands."""
@@ -430,13 +432,15 @@ def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = 
     rest = _unquoted(cmd)
     hands_on = bool(HANDS_ON_RE.search(rest))
     stores = [str(p) for p in _stores(Path(home or os.path.expanduser("~")))]
+    # with the wrappers the parser drops (`sudo -i`, `env -C ~`)
+    cwds = _cwds(segments + _segments(cmd, strip=False), cwd or os.getcwd(), str(home or os.path.expanduser("~")))
     words = [w for argv in segments for w in _passing_words(argv, hands_on)]
     # a config variable's value, also as an assignment the parser drops (`KUBECONFIG=<file> kubectl ...`)
     words += [w for argv in _segments(cmd, strip=False) for w in argv if w.startswith(CONFIG_VARS)]
     for w in map(_unquoted, words):
-        if ".ssh" in w or _names_store(w, stores):   # the whole word, never part of a longer path
+        if ".ssh" in w or _names_store(w, stores, cwds):   # the whole word, never part of a longer path
             rest = re.sub(r"(?<![^\s;&|()<>])" + re.escape(w) + r"(?![^\s;&|()<>])", " ", rest, count=1)
-    if _names_store(rest, stores) or any(not ssh_public(m.group(1) or "") for m in SSH_PATH_RE.finditer(rest)):
+    if _names_store(rest, stores, cwds) or any(not ssh_public(m.group(1) or "") for m in SSH_PATH_RE.finditer(rest)):
         return WHY
     # a glob the shell expands to a store or into one (`~/.kube/conf?g`, `$HOME/.py*`), but to list it
     globs = [os.path.expandvars(os.path.expanduser(w.split("=", 1)[-1])) for argv in segments
@@ -460,11 +464,60 @@ def _glob_takes(pattern: str, path: str) -> bool:
     return len(pp) >= len(sp) and all(fnmatchcase(s, p) and (s[:1] != "." or p[:1] == ".") for p, s in zip(pp, sp))
 
 
-def _names_store(text: str, stores: list[str]) -> bool:
+def _names_store(text: str, stores: list[str], cwds: list[str] | None = None) -> bool:
     """`text` names a store but ~/.ssh: by its usual name (STORE_RE, a DIR_STORES secret entry or the
-    folder itself) or by the path its variable gives it."""
+    folder itself) or by the path its variable gives it. With `cwds` (_cwds), the folder itself counts
+    only where the path before it in its word may lead to HOME (_homeward)."""
+    def counts(m: re.Match) -> bool:
+        if cwds is None or [p for p in (m.group(1) or "").split("/") if p not in ("", ".")]:
+            return True
+        start = max(text.rfind(c, 0, m.start()) for c in " \t\n;&|(<>") + 1   # `$(echo ~)/` stays one word
+        return _homeward(text[start:m.start()].rsplit("=", 1)[-1], cwds)
     return bool(STORE_RE.search(text)) or any(p in text for p in stores) or any(
-        not dir_public(d, m.group(1) or "") for d, rx in DIR_RES.items() for m in rx.finditer(text))
+        not dir_public(d, m.group(1) or "") and counts(m) for d, rx in DIR_RES.items() for m in rx.finditer(text))
+
+
+def _resolve(path: str, cwds: list[str], home: str) -> list[str] | None:
+    """Where `path` leads from each of `cwds` (~, $HOME and ${HOME} put at `home`), None for a path the
+    shell expands some other way (another variable, a substitution, a brace, ~user, `host:`)."""
+    for h in ("~", "${HOME}", "$HOME"):
+        if path == h or path.startswith(h + "/"):
+            path = home + path[len(h):]
+            break
+    if not re.fullmatch(r"[\w./+@%-]*", path):
+        return None
+    try:
+        return [os.path.realpath(os.path.join(c, path)) for c in cwds]
+    except (OSError, ValueError):
+        return None
+
+
+def _homeward(prefix: str, cwds: list[str]) -> bool:
+    """A store folder after `prefix` may be HOME's: `prefix` leads to HOME (cwds[0]) from a folder the
+    command may run in (cwds[1:]), or the shell expands it some other way."""
+    places = _resolve(prefix, cwds[1:], cwds[0])
+    return places is None or cwds[0] in places
+
+
+def _cwds(segments: list[list[str]], cwd: str, home: str) -> list[str]:
+    """HOME, then the folders a relative path in the command may start from: `cwd`, each cd or pushd
+    target, and HOME again when a word may name it (`tar -C ~`, `cd ..`, `$D`) or a remote shell or
+    another user's shell runs (ssh, su, sudo)."""
+    home = os.path.realpath(home)
+    cwds = [home, os.path.realpath(cwd)]
+    for argv in segments:
+        name = os.path.basename(argv[0])
+        targets = [w for w in argv[1:] if not w.startswith("-")] if name in ("cd", "pushd") else []
+        if name in SSH_FAMILY | {"su", "sudo", "doas", "runuser", "popd"} or name in ("cd", "pushd") and not targets:
+            cwds.append(home)
+        for w in argv[1:]:
+            for v in {w.split("=", 1)[-1], w[2:] if re.match(r"-\w.", w) else ""} - {""}:
+                places = _resolve(v, cwds[1:], home)
+                if places is None and v[0] in "$~`" or places and home in places:
+                    cwds.append(home)
+                elif places and w in targets:
+                    cwds += places
+    return [home] + list(dict.fromkeys(cwds[1:]))
 
 
 def ssh_secret(path: str, search: bool = False, home: str | Path | None = None) -> bool:

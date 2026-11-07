@@ -385,6 +385,36 @@ def test_bash_refuses_recursive_reads_of_the_folders_holding_single_file_stores(
     assert len(files) == len(set(files))
 
 
+def test_longer_store_names_and_store_folders_outside_home_pass_bash_and_the_real_stores_do_not(env, tmp_path,
+                                                                                             monkeypatch):
+    # a name that only starts with a store's is another file; a store folder named outside HOME (a repo's
+    # .docker) is another folder, as the file tools already see it
+    home = _store_home(tmp_path, monkeypatch)
+    work = tmp_path / "work"
+    (home / "proj").mkdir()
+    (work / "h").symlink_to(home)
+    for cmd in ("find . -name '*.pypirc.example'", "cat .netrc.sample", "cp docs/.pypirc.example /tmp/x",
+                "cat ~/.netrc-template", "git add .docker", "docker build repo/.docker", "grep -r FROM repo/.docker",
+                "git add .kube/ ./.aws", f"tar cz {work}/.docker", "cd /tmp/repo && git add .docker",
+                "(git add .docker)", "grep -r x /etc/.kube", "git add .config/gh", f"git -C {work} add .docker"):
+        assert "credential stores" not in _bash_why(work, cmd), cmd
+    for cwd, cmd in ((work, "cat ~/.pypirc"), (work, "cat ~/.netrc"), (work, "base64 .pypirc"),
+                     (work, "cat ~/.pypirc?"), (work, "cat $HOME/.netrc/"), (work, "find . -name .netrc"),
+                     (work, "grep -r x ~/.docker"), (work, "grep -r x ${HOME}/.kube"),
+                     (work, f"grep -r x {home}//./.docker"), (work, "cd && grep -r x .docker"),
+                     (work, "cd ~ && grep -r x .kube"), (work, "cd $HOME; tar cz .docker"),
+                     (work, "tar -C ~ -cz .docker"), (work, "tar -C~ -cz .docker"), (work, "git -C $D add .kube"),
+                     (work, "pushd ~; zip -r /tmp/k.zip .kube"), (work, "cd - && grep -r x .kube"),
+                     (work, "grep -r x ../home/.docker"), (work, "grep -r x h/.docker"),
+                     (work, "grep -r x $D/.docker"), (work, "grep -r x $(echo ~)/.docker"),
+                     (work, "grep -r x `pwd`/.docker"), (work, "grep -r x {~,x}/.docker"), (work, "cp -r ~user/.kube x"),
+                     (work, "ssh box grep -r x .docker"), (work, "sudo -i grep -r x .kube"), (work, "env -C ~ tar cz .kube"),
+                     (work, "rsync -a box:.docker /tmp/d"), (work, "cat .aws/credentials"),
+                     (home, "grep -r x .docker"), (home, "tar cz ./.kube"), (home / "proj", "grep -r x ../.docker"),
+                     (home / "proj", "cd .. && grep -r x .docker")):
+        assert "credential stores" in _bash_why(cwd, cmd), (cwd, cmd)
+
+
 def test_the_gh_wrapper_fails_closed_on_ref_writes_when_its_guard_errors_in_a_run(env, tmp_path, monkeypatch):
     from ttp import prguard
     ran = []

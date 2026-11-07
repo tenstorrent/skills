@@ -1273,7 +1273,8 @@ def pre_tool_use(payload: dict, stage: str = "before") -> tuple[dict | None, Non
         why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
     if not why:
         from . import credguard
-        why = credguard.bash_refusal(cmd, _all_segments(commands))
+        why = credguard.bash_refusal(cmd, _all_segments(commands),
+                                     cwd=str(payload.get("cwd") or os.getcwd()))
     if not why:   # a run reading untrusted input: no foreign push, write or credential read
         from . import untrusted
         why = untrusted.bash_refusal(_all_segments(commands), _segments(commands, strip=False),
