@@ -4062,7 +4062,7 @@ def cmd_checks(a) -> None:
                     t0 = time.monotonic()
                     if runs[0] and (record := resume_vars.get("TTP_PYTEST_RESUME")):
                         try:   # a rerun after a fault in this run runs every file again
-                            Path(record).write_text("")
+                            durable_write(Path(record), "")
                         except OSError:
                             pass
                     runs[0] += 1
