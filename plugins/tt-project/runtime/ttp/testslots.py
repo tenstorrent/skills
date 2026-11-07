@@ -2300,9 +2300,13 @@ def priority_line(cfg: dict | None = None, where: str = "", which=shutil.which) 
 def low_priority(argv: list) -> list:
     """A check command's argv under `nice` (nice_level) and `ionice` (ionice_args) where they exist, so a
     host's live services go first; either missing is skipped. checks.nice false (priority_args)
-    runs it as it is."""
-    prio = priority_args(_cfg())
+    runs it as it is. Where checks.cpu_quota or a busy probe is set, it also runs in a CPU-quota group
+    (cpuquota.wrap), since nice does not protect a service in another cgroup."""
+    from . import cpuquota
+    cfg = _cfg()
+    group = cpuquota.settings(cfg, project.load_account_settings())
+    prio = priority_args(cfg)
     if prio is None:
-        return list(argv)
+        return cpuquota.wrap(argv, group)
     nice, ionice = prio
-    return (nice if shutil.which("nice") else []) + (ionice if shutil.which("ionice") else []) + list(argv)
+    return cpuquota.wrap((nice if shutil.which("nice") else []) + (ionice if shutil.which("ionice") else []) + list(argv), group)

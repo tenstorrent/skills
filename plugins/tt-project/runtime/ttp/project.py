@@ -878,6 +878,7 @@ def _known_keys(path: list[str]) -> set[str] | None:
         # spill_wrap_cmd: the wrapper a check runs behind on a spill host (push.spill_wrap_of; default "", none).
         # spill_beside_device: spill hosts a device job keeps no spill off (checkspill.beside_device; default none).
         # spill_quarantine_after: strikes in a row that quarantine a spill host (checkspill.strike_settle; default 3).
+        # cpu_quota, busy_cpu_quota, busy_probe, busy_probe_s, cpu_cgroup: the CPU-quota group checks run in (cpuquota).
         # python_lock: the pinned requirements file the checks' Python env is built from, relative to the
         # checkout (runnerenv.lock_of; default "", the plugin's own lock of pytest and pytest-xdist).
         # spill_pre_cmd: the project's own read-only go/skip command before a spill to a host (checkspill.pre_check;
@@ -890,7 +891,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max", "test_run_min",
                 "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s",
-                "smoke_max_s"}   # the landing check time limit (gatetime.max_s; default 300 s, 0: off)
+                "smoke_max_s",   # the landing check time limit (gatetime.max_s; default 300 s, 0: off)
+                *CPU_GROUP_KEYS}
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -3178,6 +3180,8 @@ def unregister(name: str) -> None:
             write_json(registry_path(), reg)
 
 
+# The CPU-quota group check and test commands run in (cpuquota.settings), per project or account.
+CPU_GROUP_KEYS = {"cpu_quota", "busy_cpu_quota", "busy_probe", "busy_probe_s", "cpu_cgroup"}
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
 ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
@@ -3194,7 +3198,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
                            "no_spill_hosts",   # hosts no project's checks spill to (checkspill.no_spill; a run only adds)
                            "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)
-                           "smoke_max_s"}}   # the landing check time limit (gatetime.max_s), project first
+                           "smoke_max_s",
+                           *CPU_GROUP_KEYS}}   # the landing check time limit (gatetime.max_s), project first
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.

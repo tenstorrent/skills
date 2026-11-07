@@ -228,7 +228,7 @@ def run(argv: list[str]) -> int:
     options are dropped where xdist is not installed (testslots.drop_xdist). The command gets the
     account's leak-pattern file by path (leakfile), as checks do, and the sudo wrapper (sudowatch): once
     it ends, stderr says what sudo it ran and which root processes that left running."""
-    from . import hoststate, leakfile, sudowatch, testslots
+    from . import cpuquota, hoststate, leakfile, project, sudowatch, testslots
     # The host's real crontab, systemd user units and power state are out of its reach (hoststate)
     run_dir = os.environ.get("TTP_RUN_DIR")
     env = hoststate.fake_env(leakfile.with_path(dict(os.environ)),
@@ -243,14 +243,15 @@ def run(argv: list[str]) -> int:
         env = watch.env
     except OSError:
         watch = None
-    wrapped = wrap(argv)
+    wrapped, group = wrap(argv), cpuquota.settings(testslots._cfg(), project.load_account_settings())
     plain = wrapped == list(argv)
     if plain and (line := notice()):
         print(f"ttp sandbox: {line}", file=sys.stderr, flush=True)
     try:
         guard = hoststate.Guard(env)
         try:
-            proc = subprocess.Popen(wrapped, env=env, pass_fds=grant.fds() if grant else ())
+            # a CPU-quota group, where checks.cpu_quota or a busy probe is set
+            proc = subprocess.Popen(cpuquota.wrap(wrapped, group), env=env, pass_fds=grant.fds() if grant else ())
         except OSError as e:
             print(f"ttp sandbox: {argv[0]}: {e.strerror}", file=sys.stderr)
             if temp and env.get(hoststate.MARKER):
