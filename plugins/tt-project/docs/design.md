@@ -380,8 +380,11 @@ What each supported CLI offers, with doc links: [providers.md](providers.md).
   make ref updates and `git gc --auto` fail: once older than `harness_git.root_ref_lock_s` (3600 s; 0:
   off), open in no process, and with no live process that started before the lock having its working
   directory or GIT_DIR in the repository (git may close a ref lock before renaming it, so an open-file
-  check alone proves nothing). Without /proc it does nothing. Each lock's path, age and holder check
-  go to the daemon log.
+  check alone proves nothing). It also moves aside a config.lock that is a sandbox's leftover
+  placeholder (empty, no write bits, past that age, open in no process, and no live git process in the
+  repository that started before it), which otherwise blocks every `git config` write; a config.lock
+  git wrote is writable and stays. Without /proc it does nothing. Each lock's path, age and holder
+  check go to the daemon log.
 - Before a task's workspace is made, run-start checks (`ttp.startcheck`) look for what a reboot
   or cleanup took away. A worktree whose git dir is gone moves aside to `worktrees/.stale-<time>/`.
   If its repository is gone too, the task is blocked, since its unpushed commits went with it.
