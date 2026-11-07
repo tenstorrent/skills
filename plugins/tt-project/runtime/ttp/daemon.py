@@ -1097,6 +1097,7 @@ class Daemon:
         self._step_mark = 0.0   # and when its current item did
         self._step_holder, self._step_task = "", None   # the item it works on now (_step_over)
         self._step_worst: tuple[float, str, int | None] = (0.0, "", None)   # its slowest item so far
+        self._sandbox_due = 0.0   # sweep_sandbox_trees: its first pass is at start
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
@@ -1801,6 +1802,7 @@ class Daemon:
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
         for step in (self.lift_boot_pause, self.reap_runs, self.reap_waiting_checks, self.wake_after_reboot, self.meter_running, self.watch_runs, self.check_steer_reads, self.relay_escalations, self.post_held_notifies, self.reconcile_tasks, self.retry_workspaces, self.tend_pushes,
+                     self.sweep_sandbox_trees,
                      self.verify_pushes,
                      self.prune_worktrees, self.prune_leftovers, self.land_harness_worktrees, self.backup_branches, self.replicate_state, self.check_local_only, self.check_disk,
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
@@ -2474,6 +2476,21 @@ class Daemon:
             self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
                         (r["ts"], "daemon", "append_refused", "normal", text[:500], json.dumps(r), "handled"))
 
+    def sweep_sandbox_trees(self) -> None:
+        """End the sandbox trees (bwrap and its proxy listeners) that outlived their runs (sandboxreap): the
+        first pass at start, then each jobstop.SWEEP_EVERY_S. It keeps STEP_BUDGET_S, stopping between
+        trees, and the next tick resumes after the last tree done; a walk past its time is left for a
+        later pass and logged once."""
+        from . import jobstop, sandboxreap
+        if time.monotonic() < self._sandbox_due and "sandbox_sweep" not in self._step_cursor:
+            return
+        self._sandbox_due = time.monotonic() + jobstop.SWEEP_EVERY_S
+        found = sandboxreap.sweep(
+            self.p, over=self._step_over, order=lambda rows: self._resume_order("sandbox_sweep", rows),
+            stop=lambda at: self._step_cursor.__setitem__("sandbox_sweep", at), say=lambda text: log(self.p, text))
+        if found:
+            log(self.p, sandboxreap.summary(found))
+
     def tend_pushes(self) -> None:
         """Start the detached pushes and jobs queued from inside a sandbox; record the dead pushes as failed. Then
         the push queue's bookkeeping, also while paused: approvals whose review moved on, a queue
@@ -2515,13 +2532,6 @@ class Daemon:
                     log(self.p, r["text"])
         except Exception:
             log(self.p, "stopping the leftover processes of ended tasks failed\n" + traceback.format_exc())
-        try:   # sandbox trees (bwrap and its proxy listeners) that outlived their runs; the first pass is at start
-            if due:
-                from . import sandboxreap
-                if found := sandboxreap.sweep(self.p):
-                    log(self.p, sandboxreap.summary(found))
-        except Exception:
-            log(self.p, "stopping the sandbox trees of ended runs failed\n" + traceback.format_exc())
         try:
             self.stop_cancelled_checks()
         except Exception:

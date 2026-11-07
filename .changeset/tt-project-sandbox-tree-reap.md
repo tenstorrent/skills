@@ -8,5 +8,8 @@ orphaned `bwrap` trees with their proxy listeners, which run in their own sessio
 the init process before. The daemon's sweep, first at start, ends the project's orphaned sandbox trees
 of ended runs and writes a `sandbox_trees_stopped` receipt; `ttp leftover-procs --sandboxes
 [--dry-run]` does it on request. A `ttp detach` job's tree, a live run's, another project's or user's
-and one with a protected or device member are never touched. A test pins that no shipped default
+and one with a protected or device member are never touched. No pass waits on a hung process: the
+daemon's sweep is its own tick step that keeps the step budget and resumes on the next tick, the scan
+and each tree's `/proc` reads and end are time-capped (a hung one is left for a later pass and logged
+once), and the runner's run-end cleanup waits at most a minute. A test pins that no shipped default
 starts a sandbox.

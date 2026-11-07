@@ -2908,8 +2908,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   with its proxy listeners (1080, 3128, loopback ports) and outlives the agent otherwise. The daemon's
   sweep, at start and then each pass, ends the project's orphaned sandbox trees of ended runs and writes
   a `sandbox_trees_stopped` receipt; a `ttp detach` job's tree, a live run's and any with a protected,
-  device or foreign member stay. `ttp leftover-procs --sandboxes [--dry-run]` does the same on request
-  (exit 2 when it kept a tree). A project runs unsandboxed once its run lines say `sandbox=none` and
+  device or foreign member stay. The sweep keeps the daemon's step budget (the next tick goes on after
+  the last tree it ended), and a tree whose `/proc` reads hang is left for a later pass and logged once;
+  the runner's part waits at most a minute. `ttp leftover-procs --sandboxes [--dry-run]` does the same
+  on request (exit 2 when it kept a tree or stopped after its 30 s). A project runs unsandboxed once its run lines say `sandbox=none` and
   that command finds no tree.
   `providers.<name>.write_fence: true` turns the provider's write fence on (Claude's Bash sandbox,
   Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. A sandboxed

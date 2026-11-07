@@ -64,6 +64,7 @@ from .project import Project, durable_write, lower_priority
 LEASE_EVERY_S = 30
 KILL_AFTER_S = 30
 END_GRACE_S = 5.0   # a normal end: TERM to what the agent left in its group, KILL this long after
+END_LEFTOVERS_S = 60.0   # the run's end waits at most this for end_leftovers; the daemon's sweep ends the rest
 PRE_GRANT_EVERY_S = 30   # a whole-run take that waits asks the project's pre-grant check again this often
 PRE_GRANT_FRESH_S = 3    # a pre-grant answer older than this is asked again once the take has the slot
 POLL_S = 5
@@ -349,9 +350,22 @@ def end_leftovers(pgid: int, run_dir: Path, project: str | None) -> None:
             if found:
                 print(f"runner: {sandboxreap.summary(found, 'ended')}", flush=True)
             for k in kept:
-                print(f"runner: kept sandbox tree {k['root']}: {k['why']}", flush=True)
+                print(f"runner: kept sandbox tree {k['root'] or '(host scan)'}: {k['why']}", flush=True)
     except Exception as e:   # never lose the run's exit.json to a cleanup fault
         print(f"runner: could not end the run's leftover processes: {type(e).__name__}: {e}", flush=True)
+
+
+def end_leftovers_within(pgid: int, run_dir: Path, project: str | None) -> bool:
+    """end_leftovers in a thread, waited on for at most END_LEFTOVERS_S: a /proc read of a hung process
+    never holds the run's exit.json. False when it was left running (it ends with the runner)."""
+    t = threading.Thread(target=end_leftovers, args=(pgid, run_dir, project), name="end leftovers", daemon=True)
+    t.start()
+    t.join(END_LEFTOVERS_S)
+    if t.is_alive():
+        print(f"runner: ending the run's leftover processes took over {END_LEFTOVERS_S:.0f} s; left to the "
+              "daemon's sweep", flush=True)
+        return False
+    return True
 
 
 def remove_files(paths: list[str]) -> None:
@@ -679,7 +693,7 @@ def supervise(run_dir: Path) -> int:
             watchdog.wait(timeout=10)
         except subprocess.TimeoutExpired:
             pass
-    end_leftovers(child.pid, run_dir, env_extra.get("TTP_PROJECT"))
+    end_leftovers_within(child.pid, run_dir, env_extra.get("TTP_PROJECT"))
     remove_files(spec.get("private_files") or [])
     remove_tmp(run_dir, spec)
     if held:

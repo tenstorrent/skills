@@ -494,6 +494,128 @@ def test_the_runner_ends_its_agent_s_group_and_its_own_orphaned_sandbox_tree_at_
             _ls_kill(pid)
 
 
+def _sr_cleanup(procs):
+    for proc, root, child in procs:
+        for pid in (child, root):
+            _ls_kill(pid)
+        proc.wait(timeout=10)
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/environ").exists(), reason="Linux /proc only")
+def test_the_daemon_sandbox_sweep_keeps_its_step_budget_and_ends_the_rest_on_later_ticks(env, tmp_path, monkeypatch):
+    """Many ended runs' trees, each slow to end, never hold one tick step past STEP_BUDGET_S: the sweep stops
+    between trees, and later ticks (inside jobstop's sweep interval) resume after the last tree done until
+    each tree is ended exactly once."""
+    from ttp import daemon as dm
+    from ttp import leftoverstop as ls
+    p = make(env)
+    names = [f"sr-many-{n}" for n in range(4)]
+    for n in names:
+        (p.runs / n).mkdir(parents=True)
+        (p.runs / n / "exit.json").write_text("{}")
+    real_end, ends = ls.end, []
+
+    def slow_end(targets, term_s=ls.TERM_S, group_ok=None):
+        time.sleep(0.3)   # one tree's end on a loaded host
+        ends.append(targets[0]["pid"])
+        return real_end(targets, term_s, group_ok)
+    monkeypatch.setattr(ls, "end", slow_end)
+    monkeypatch.setattr(dm, "STEP_BUDGET_S", 0.2)
+    procs = []
+    try:
+        procs = [_sr_spawn(tmp_path, n, _sr_marks(p, n)) for n in names]
+        roots = sorted(root for _, root, _ in procs)
+        d = dm.Daemon(p.base)
+        for tick in range(4 * len(roots)):   # other sandboxes on the host are items too, one per tick here
+            before, t0 = len(ends), time.monotonic()
+            d._run_step(d.sweep_sandbox_trees)
+            assert time.monotonic() - t0 < 4.0, "the step ran past its budget by more than one tree's end"
+            assert len(ends) - before <= 1, "the step went on past its budget"
+            if sorted(ends) == roots:
+                break
+            assert "sandbox_sweep" in d._step_cursor, "the rest are not resumed on the next tick"
+        assert tick >= len(roots) - 1 and sorted(ends) == roots and len(set(ends)) == len(ends), ends
+        for proc, *_ in procs:
+            proc.wait(timeout=10)
+        assert not any(_sr_alive(pid) for _, *pids in procs for pid in pids)
+    finally:
+        _sr_cleanup(procs)
+
+
+@pytest.mark.skipif(not pathlib.Path("/proc/self/environ").exists(), reason="Linux /proc only")
+def test_a_hung_proc_read_never_holds_the_sandbox_sweep_the_runner_end_or_the_scan(env, tmp_path, monkeypatch):
+    """A /proc read of a hung process blocks with no timeout: the sweep leaves that tree after ITEM_S, logs it
+    once, ends the other tree, skips it while that read still hangs and ends it once the read returns. A
+    hung scan of the host's processes ends by WALK_S; the runner's run-end cleanup by END_LEFTOVERS_S."""
+    import threading
+    from ttp import leftoverstop as ls
+    from ttp import runner, sandboxreap
+    from ttp.project import Project
+    p = make(env)
+    for n in ("sr-hung", "sr-fine"):
+        (p.runs / n).mkdir(parents=True)
+        (p.runs / n / "exit.json").write_text("{}")
+    monkeypatch.setattr(sandboxreap, "ITEM_S", 0.5)
+    monkeypatch.setattr(sandboxreap, "WALK_S", 0.5)
+    release, hung = threading.Event(), set()
+    real_env = ls._read_env
+
+    def read_env(pid):
+        if pid in hung:
+            release.wait(30)
+        return real_env(pid)
+    monkeypatch.setattr(ls, "_read_env", read_env)
+
+    def bounded(fn, wait=10.0):   # fn runs in a thread of its own: it opens its own Project (sqlite)
+        box = {}
+        t = threading.Thread(target=lambda: box.setdefault("v", fn()), daemon=True)
+        t0 = time.monotonic()
+        t.start()
+        t.join(wait)
+        assert not t.is_alive(), "a hung /proc read held the pass"
+        return box["v"], time.monotonic() - t0
+    procs, said = [], []
+    try:
+        procs = [_sr_spawn(tmp_path, n, _sr_marks(p, n)) for n in ("sr-hung", "sr-fine")]
+        (_, hroot, hchild), (_, froot, _) = procs
+        hung.add(hroot)
+        found, took = bounded(lambda: sandboxreap.sweep(Project(p.base), say=said.append))
+        assert [t["root"] for t in found] == [froot] and took < 5.0, (found, took)
+        assert len(said) == 1 and f"sandbox tree {hroot}" in said[0] and "left for a later pass" in said[0]
+        found, took = bounded(lambda: sandboxreap.sweep(Project(p.base), say=said.append))
+        assert found == [] and took < 2.0 and len(said) == 1, "a walk still hung is skipped and logged once"
+        assert _sr_alive(hroot) and _sr_alive(hchild)
+        release.set()
+        hung.clear()
+        _ls_wait = time.monotonic() + 10
+        while sandboxreap._late.get(f"tree {hroot}") and sandboxreap._late[f"tree {hroot}"].is_alive() \
+                and time.monotonic() < _ls_wait:
+            time.sleep(0.02)
+        found, _ = bounded(lambda: sandboxreap.sweep(Project(p.base), say=said.append))
+        assert [t["root"] for t in found] == [hroot] and len(said) == 1
+        procs[0][0].wait(timeout=10)
+
+        scan_free = threading.Event()
+        monkeypatch.setattr(ls, "_uid_pids", lambda: scan_free.wait(30) and [])
+        try:
+            (found, kept), took = bounded(lambda: sandboxreap.reap(p.base, lambda d: True))
+            assert found == [] and [k["late"] for k in kept] == ["scan"] and took < 3.0
+        finally:
+            scan_free.set()
+
+        gate = threading.Event()
+        monkeypatch.setattr(runner, "end_leftovers", lambda *a: gate.wait(30))
+        monkeypatch.setattr(runner, "END_LEFTOVERS_S", 0.3)
+        try:
+            ok, took = bounded(lambda: runner.end_leftovers_within(0, tmp_path, str(p.base)))
+            assert ok is False and took < 3.0
+        finally:
+            gate.set()
+    finally:
+        release.set()
+        _sr_cleanup(procs)
+
+
 def test_no_shipped_default_starts_a_sandbox(env, monkeypatch):
     """Every run is unsandboxed by default: a Claude worker's settings turn the Bash sandbox off (even one the
     user's own settings turn on) and its launch records no sandbox; the coordinator session's settings do

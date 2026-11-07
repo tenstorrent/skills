@@ -6514,7 +6514,8 @@ def cmd_leftover_procs(a) -> None:
 def _leftover_sandboxes(a) -> int:
     """`ttp leftover-procs --sandboxes [--dry-run]`: end this project's sandbox trees (bwrap with its proxy
     listeners) whose runs have ended and that nothing owns any more (sandboxreap). 0 when none is left, 2 when
-    one is kept (a guarded, foreign or device member) or this caller cannot see the host's processes."""
+    one is kept (a guarded, foreign or device member, or a walk past its time: sandboxreap.reap stops
+    starting trees after RUNNER_S) or this caller cannot see the host's processes."""
     from . import sandboxreap
     from .push import _boxed
     p = Project(os.environ["TTP_PROJECT"]) if os.environ.get("TTP_PROJECT") else here()
@@ -6525,14 +6526,19 @@ def _leftover_sandboxes(a) -> int:
               "namespace); the daemon's sweep ends them", file=sys.stderr)
         return 2
     found, kept = sandboxreap.reap(p.base, sandboxreap.run_ended(p), sandboxreap.ls._guarded(p),
-                                   lambda pid, env: sandboxreap.ls._untouchable(p, pid, env), dry=a.dry_run)
+                                   lambda pid, env: sandboxreap.ls._untouchable(p, pid, env), dry=a.dry_run,
+                                   stop=(cut := []).append)
     for t in found:
         print(f"{'would end' if a.dry_run else 'ended'} sandbox tree {t['root']} of run {Path(t['run_dir']).name}: "
               f"{len(t['members'])} process{'es' if len(t['members']) != 1 else ''}")
     for k in kept:
-        print(f"kept sandbox tree {k['root']} of run {Path(k['run_dir']).name}: {k['why']}", file=sys.stderr)
+        where = f" of run {Path(k['run_dir']).name}" if k['run_dir'] else ""
+        print(f"kept sandbox tree {k['root'] or '(host scan)'}{where}: {k['why']}", file=sys.stderr)
+    if cut:
+        print(f"ttp leftover-procs --sandboxes: stopped after {sandboxreap.RUNNER_S:.0f} s; run it again for the "
+              "rest, or the daemon's sweep ends them", file=sys.stderr)
     print(sandboxreap.summary(found, "would end" if a.dry_run else "ended"))
-    return 2 if kept else 0
+    return 2 if kept or cut else 0
 
 
 def _leftover_stop(a) -> int:
