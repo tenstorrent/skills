@@ -174,6 +174,29 @@ def test_gate_rerun_selects_each_failing_id_by_its_full_node_id(tmp_path):
     assert rc == 0 and gatejudge._ran(out) == (1, 0), out
 
 
+def test_the_select_plugin_matches_a_cwd_relative_id_without_config_cwd_relative_nodeid(tmp_path, monkeypatch):
+    # pytest 9's config.cwd_relative_nodeid takes a node id object, not the item's string: the plugin
+    # computes the cwd-relative id itself, so a gate rerun by id works under either pytest.
+    import importlib
+    import types
+    sel = importlib.import_module("ttp.pytest_resume.ttp_pytest_select")
+
+    def no_str(nodeid):
+        raise AssertionError("cwd_relative_nodeid takes no str")
+    root = tmp_path / "proj"
+    config = types.SimpleNamespace(
+        rootpath=root, invocation_params=types.SimpleNamespace(dir=root / "tests"),
+        cwd_relative_nodeid=no_str, hook=types.SimpleNamespace(pytest_deselected=lambda items: None))
+    items = [types.SimpleNamespace(nodeid=n) for n in ("tests/test_b.py::test_x", "tests/test_a.py::test_x")]
+    monkeypatch.delenv("TTP_PYTEST_SELECT", raising=False)
+    monkeypatch.delenv("TTP_PYTEST_SELECT_FILES", raising=False)
+    monkeypatch.setenv("TTP_PYTEST_SELECT_IDS", "test_b.py::test_x\n")
+    sel.pytest_collection_modifyitems(config, items)
+    assert [i.nodeid for i in items] == ["tests/test_b.py::test_x"]
+    # Run from the root dir, the id is unchanged.
+    config.invocation_params.dir = root
+    assert sel._cwd_relative(config, "tests/test_b.py::test_x") == "tests/test_b.py::test_x"
+
 def test_gate_judge_uses_a_saved_base_result_only_from_the_same_host(tmp_path):
     from ttp import gatejudge
     a = "tests/test_a.py::test_pre"
