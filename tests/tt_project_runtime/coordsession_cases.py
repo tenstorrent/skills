@@ -247,10 +247,10 @@ def test_coordsession_a_leftover_mode_off_or_old_guard_state_still_resumes_the_s
     # (c) at the daemon: an old project.json "mode": "off", an old tripped guard and an old pause.
     from ttp import coordsession
     p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
-    cfg = json.loads((p.base / "project.json").read_text())
-    cfg["coordinator"]["session"]["mode"] = "off"
+    cfg = p.raw_config()
+    cfg.setdefault("coordinator", {}).setdefault("session", {})["mode"] = "off"
     cfg["coordinator"].update(thread_warm_min=999, thread_max_turns=99)
-    (p.base / "project.json").write_text(json.dumps(cfg))
+    p.config_path.write_text(json.dumps(cfg))
     p.db.set_kv("coord_session_guard", {"tripped": True, "until": time.time() + 600, "hold": True})
     first, argv, _, session = turn("EVENTS 1")
     assert session["mode"] == "new" and "session_off" not in json.loads(first["note"])["turn"]
@@ -586,6 +586,7 @@ def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with
     from ttp.prompts import restrictions_block
     p, d, sessions, wake = _cs_session_project(env, monkeypatch)
     monkeypatch.setenv("TTP_FAKE_SESSION_NOTE", "1. Open threads: task #7 waits on its review (msg #2).")
+    monkeypatch.setenv("TTP_FAKE_SUMMARY", "fake coordinator finished")
     rules = restrictions_block(p, advisory=False)
     assert "Never push to main (user msg #1)." in rules
     first, system1, prompt1 = wake("first order")
@@ -944,7 +945,7 @@ def test_coordsession_only_an_ok_session_wake_keeps_its_digest_acknowledged():
     assert cs.DIGEST not in cs.fail(_cs_cfg(), st, 3.0)[0]
 
 
-def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_rollover_fallback_or_ask(env, monkeypatch):
+def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_rollover_failed_resume_or_ask(env, monkeypatch):
     from ttp import coordinator as coord
     from ttp import coordsession
     from ttp.daemon import Daemon
@@ -991,13 +992,12 @@ def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_roll
     assert s["mode"] == "new" and s["sent"] == "full: new session" and "Since your last wake" not in prompt
     p.set_config("coordinator.session.rollover_tokens", 140000)
     assert wake()[0]["sent"].startswith("delta: ")
-    # A fallback to a stateless turn: today's digest then, the whole digest on the next session wake.
-    p.db.set_kv(coordsession.GUARD_KEY, {"tripped": True, "until": time.time() + 600})
+    # A failed resume: its batch reruns as the next session, seeded, with the whole digest.
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "rerun": True})
     s, prompt, _ = wake()
-    assert s["mode"] == "stateless" and "sent" not in s and "Since your last wake" not in prompt
-    p.db.set_kv(coordsession.GUARD_KEY, {"tripped": False})
-    s, prompt, _ = wake()
-    assert s["mode"] == "resume" and s["sent"] == "full: no acknowledged digest", s
+    assert (s["mode"], s["why"]) == ("new", "resume failed") and s["sent"] == "full: new session", s
+    assert "Since your last wake" not in prompt
+    assert wake()[0]["sent"].startswith("delta: ")
     # The session asks for the whole digest, or compacts its history: the next wake sends it whole.
     monkeypatch.setenv("TTP_FAKE_ACTIONS", json.dumps([{"type": "noop", "key": coordsession.FULL_ASK}]))
     assert wake()[0]["sent"].startswith("delta: ")
@@ -1008,11 +1008,6 @@ def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_roll
     wake()
     monkeypatch.setattr(Daemon, "_compacted", lambda self, r: False)
     assert wake()[0]["sent"] == "full: no acknowledged digest"
-    # Mode off: today's digest, and nothing of the delta runs.
-    p.set_config("coordinator.session.mode", "off")
-    monkeypatch.setattr(coordsession, "wake_digest", lambda *a: pytest.fail("off sends no delta"))
-    s, prompt, _ = wake()
-    assert s is None and "Since your last wake" not in prompt
 
 
 def test_coordsession_delta_digest_size_on_recorded_wakes():
@@ -1162,11 +1157,9 @@ def _cs_capped_fake(monkeypatch):
         build(self, **kw)[0] + ["--max-budget-usd", f"{float(kw['budget_usd']):.2f}"], {}))
 
 
-def test_coordsession_resumed_wakes_book_their_own_cost_and_cap_and_keep_the_guard_quiet(env, monkeypatch):
+def test_coordsession_resumed_wakes_book_their_own_cost_and_cap(env, monkeypatch):
     """Like Claude Code, the fake reports a resumed session's running total: each wake books only what
-    it added, gets the per-wake cap on top of what the session booked, and the spend guard reads the
-    netted figures."""
-    from ttp import coordguard
+    it added and gets the per-wake cap on top of what the session booked."""
     p, holder, _, turn, _, _ = _cs_daemon(env, monkeypatch)
     _cs_capped_fake(monkeypatch)
     t0 = time.time() - 1
@@ -1185,12 +1178,8 @@ def test_coordsession_resumed_wakes_book_their_own_cost_and_cap_and_keep_the_gua
     assert caps == [f"{3.0 + s0['seed_usd']:.2f}", "4.00", "4.60"], caps
     assert s0["cap_usd"] == round(3.0 + s0["seed_usd"], 2) and s1["cap_usd"] == 4.0 and s2["cap_usd"] == 4.6
     assert "seed_usd" not in s1 and "seed_usd" not in s2
-    # Allowance $2.40 at the first hour: the netted $2.10 is under it, the summed totals ($4.70) are not.
-    p.db.set_kv(coordguard.BASELINE_KEY, {"at": t0, "turns": 10, "usd": 8.0, "days": 1.0,
-                                          "usd_turn": 0.8, "usd_day": 0.0})
-    p.db.set_kv(coordguard.KEY, {"tripped": False, "trips": []})
-    assert abs(coordguard.spend(p.db, t0)[0] - 2.1) < 1e-6
-    assert coordguard.check(p.db, p.config(), time.time()) is None and not coordguard.tripped(p.db)
+    booked = p.db.one("SELECT SUM(cost_usd) s FROM runs WHERE role='coordinator' AND started>=?", (t0,))["s"]
+    assert abs(booked - 2.1) < 1e-6, "the caps read the netted figures, not the summed totals ($4.70)"
 
 
 _CS_RATE = 10.0 / 1e6   # dollars per weighted token of the seed-history rows
@@ -1460,19 +1449,21 @@ def test_coordsession_cache_ttl_follows_the_sessions_own_writes_on_a_fake_clock(
         .startswith("cold: no 1h write of this session")
 
 
-def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_stateless_turns_are_unchanged(env, monkeypatch):
+def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_a_sessionless_providers_turns_are_unchanged(env, monkeypatch):
     from ttp import cachettl
     from ttp import coordsession
     from ttp.providers import fake
     monkeypatch.setattr(fake.Fake, "cache_env",
                         lambda self, ttl: {"FAKE_CACHE_TTL": ttl} if ttl in ("5m", "1h") else {}, raising=False)
     p, holder, sessions, turn, head, context = _cs_daemon(env, monkeypatch)
-    p.set_config("coordinator.session.mode", "off")
+    # Only a provider that keeps no session (the chat provider) runs a stateless turn: this stand-in keeps none.
+    monkeypatch.setattr(fake.Fake, "coord_session", "")
     ttls = lambda r: (json.loads(r["note"])["turn"]["cache_ttl"], json.loads(r["note"])["turn"]["cache_ttl_why"])
-    # Stateless (mode off): today's choice on the stateless prefix, recorded in its own kv.
+    # Stateless: today's choice on the stateless prefix, recorded in its own kv.
     ttl, why = ttls(turn("EVENTS 0")[0])
     assert ttl == "1h" and why.startswith("cold: no earlier 1h turn"), why
     assert ttls(turn("EVENTS 0b")[0])[0] == "5m" and p.db.kv(cachettl.KEY)
+    monkeypatch.setattr(fake.Fake, "coord_session", "agent")
     r, _, _, session = turn("EVENTS 1")
     assert session["mode"] == "new" and ttls(r)[0] == "1h"
     assert ttls(r)[1].startswith("cold: a new session; next turn likely: "), ttls(r)
@@ -1502,8 +1493,8 @@ def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_stateless_
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 10 ** 9})
     r, _, _, session = turn("EVENTS 3b")
     assert session["why"] == "handover" and ttls(r)[0] == "5m" and "handover wake" in ttls(r)[1], ttls(r)
-    # Back to stateless: the stateless prefix's warm 1h turn still decides.
-    p.set_config("coordinator.session.mode", "off")
+    # Back to a sessionless provider: the stateless prefix's warm 1h turn still decides.
+    monkeypatch.setattr(fake.Fake, "coord_session", "")
     r = turn("EVENTS 4")[0]
     assert ttls(r)[0] == "5m" and ttls(r)[1].startswith("warm: same prefix sent at 1h"), ttls(r)
 
@@ -1535,11 +1526,11 @@ def test_coordinator_and_worker_prompts_follow_intent_ask_rarely_and_frame_the_s
 
 
 def test_coordsession_runs_on_every_provider_or_names_why_it_cannot():
-    from ttp import coordsession
+    from ttp import coordsession, coordtools
     from ttp.providers import get_provider
     cfg = _cs_cfg()
     gaps = {n: coordsession.gap(get_provider(n)) for n in ("claude", "chat", "codex", "cursor", "fake")}
-    assert all(coordsession.on(cfg, n) for n in gaps), "no per-provider opt-out"
+    assert all(coordtools.session_on(cfg, n) == (not gaps[n]) for n in gaps), "no per-provider opt-out"
     assert {n for n, g in gaps.items() if g} == {"chat"}, gaps
     assert gaps["chat"].startswith("chat: ")
     assert [get_provider(n).tool_hooks for n in ("claude", "chat", "codex", "cursor")] == [True, False, False, False]
@@ -1703,7 +1694,7 @@ def test_codex_session_coordinator_gets_its_tools_through_its_own_hooks(env, mon
 
 def test_codex_like_coordinator_session_wake_launches_with_the_agent_s_tools_and_env(env, monkeypatch):
     """The daemon gives an agent without ttp's Claude hooks its coordinator tools (Provider.coord_tools)
-    on session wakes and on the read-only turns of session mode, never with session mode off."""
+    on every session wake, new or resumed, and only the full set unless tools is read_only."""
     from ttp.providers.fake import Fake
     p, _, _, turn, _, _ = _cs_daemon(env, monkeypatch)
     seen = []
@@ -1713,9 +1704,6 @@ def test_codex_like_coordinator_session_wake_launches_with_the_agent_s_tools_and
         return argv[:-1] + ["--coord-tools", argv[-1]] if argv and argv[-1] == "-" else argv + ["--coord-tools"], \
             {"TTP_COORD_MARK": "1"}
     monkeypatch.setattr(Fake, "coord_tools", tools)
-    p.set_config("coordinator.session.mode", "off")
-    r, argv, _, _ = turn("EVENTS 0")
-    assert not seen and "--coord-tools" not in argv, "session mode off: the stateless turn has no tools"
     r, argv, _, s = turn("EVENTS 1")
     assert s["mode"] == "new" and seen[-1] == (True, "1") and "--coord-tools" in argv
     assert json.loads((p.runs / str(r["id"]) / "run.json").read_text())["env"]["TTP_COORD_MARK"] == "1"

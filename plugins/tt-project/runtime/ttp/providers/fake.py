@@ -94,6 +94,8 @@ def _main(role: str, args: list[str] | None = None) -> int:
             out = {"actions": actions or [{"type": "noop"}]}
         if os.environ.get("TTP_FAKE_SESSION_NOTE") and "## Session handover" in prompt:
             out["session_note"] = os.environ["TTP_FAKE_SESSION_NOTE"]   # a persistent session's handover
+        if os.environ.get("TTP_FAKE_SUMMARY"):   # the turn's own summary (a session keeps the last ones)
+            out["summary"] = os.environ["TTP_FAKE_SUMMARY"]
     else:
         run_dir = Path(os.environ["TTP_RUN_DIR"])
         if os.environ.get("TTP_FAKE_SHELL"):

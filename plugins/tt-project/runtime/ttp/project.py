@@ -551,7 +551,7 @@ EXTRA_KEYS = {
     # owner_identities: names, handles or emails the owner writes external records under (tickets, chat
     # comments), read with the project root's git user.name and user.email to verify a cited record's
     # author (restriction_source.owner_identities; default none, set only on the owner's own message).
-    # session: the persistent coordinator ({"mode": "on" | "off", default on}). With it on (coordtools.py,
+    # session: the persistent coordinator, always on and with no off switch (coordtools.py,
     # hostcheck.py): "wake_budget_usd" and "wake_budget_s" cap one wake (default: the coordinator turn's sized
     # budget and timeout), "host_access" ({alias: helper argv in the project folder | ssh config file
     # there}, default none) and "log_paths" ({name: absolute path} `ttp hostcheck log-tail` may read).
@@ -818,8 +818,17 @@ def _without_bad_sections(raw: dict) -> dict:
     return out
 
 
+# Keys the runtime no longer reads and refuses to set, with why.
+RETIRED_KEYS = {
+    "coordinator.session.mode": "the coordinator session is always on, with no off switch",
+    "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
+}
+
+
 def unknown_key_hint(dotted: str) -> str | None:
     """'unknown key ... (did you mean ...?)' when no part of the runtime reads `dotted`, else None."""
+    if dotted in RETIRED_KEYS:
+        return f"{dotted} is retired: {RETIRED_KEYS[dotted]}"
     parts = dotted.split(".")
     for i, part in enumerate(parts):
         known = _known_keys(parts[:i])

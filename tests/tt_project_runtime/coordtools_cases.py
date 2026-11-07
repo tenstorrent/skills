@@ -26,19 +26,14 @@ def _coord_argv(env, monkeypatch, session=None, budget=1.0):
     return [a.replace(str(run), "<run>") for a in spec["argv"]], spec["timeout_s"], note, p
 
 
-def test_mode_off_coordinator_argv_is_unchanged(env, monkeypatch):
-    base, timeout, note, _ = _coord_argv(env, monkeypatch, {"mode": "off"})
-    i = base.index("--tools")
-    assert base[i - 2:i + 2] == ["--safe-mode", "--strict-mcp-config", "--tools", ""]
-    for off in ({"mode": "OFF ", "wake_budget_usd": 9, "wake_budget_s": 5}, {"mode": "shadow"}, {"mode": ""}):
-        argv, t, n, _ = _coord_argv(env, monkeypatch, off)
-        assert argv == base and t == timeout, off
-        assert "wake_budget" not in n["turn"]
-    assert "--allowedTools" not in base and "--settings" not in base
-    # No mode of its own (unset, an empty section or one saved as a plain value): the default, on.
-    for unset in (None, {}, "on"):
-        argv = _coord_argv(env, monkeypatch, unset)[0]
-        assert argv[argv.index("--tools") + 1] != "" and "--safe-mode" not in argv, unset
+def test_no_session_setting_takes_the_coordinators_tools_away(env, monkeypatch):
+    # User msg #2040: the session is always on; a leftover "mode" of any value keeps its tools.
+    base = _coord_argv(env, monkeypatch, None)[0]
+    tools = base[base.index("--tools") + 1]
+    assert tools != "" and "--safe-mode" not in base
+    for cfg in ({"mode": "off"}, {"mode": "OFF "}, {"mode": "shadow"}, {"mode": ""}, {}, "on"):
+        argv = _coord_argv(env, monkeypatch, cfg)[0]
+        assert argv[argv.index("--tools") + 1] == tools and "--safe-mode" not in argv, cfg
 
 
 def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
@@ -472,7 +467,7 @@ def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypat
     assert f"Edit(/{p.config_path})" in deny and f"Edit(/{p.state / 'project.db'})" in deny
     assert s["env"]["TTP_COORD_FULL_TOOLS"] == "1" and s["env"]["BASH_MAX_TIMEOUT_MS"] == "300000"
     assert str(p.charter_path) in s["env"]["TTP_COORD_PROTECTED"].split(os.pathsep)
-    # read_only (or any unknown value) keeps the read-only set; so does a session's stateless fallback.
+    # read_only (or any unknown value) keeps the read-only set; so does the stateless turn of a provider that keeps no session.
     for cfg in ({"mode": "on", "tools": "read_only"}, {"mode": "on", "tools": "everything"}):
         argv, _, _, _ = _coord_argv(env, monkeypatch, cfg)
         assert argv[argv.index("--tools") + 1] == "Read,Bash", cfg
@@ -480,9 +475,6 @@ def test_full_session_coordinator_gets_a_workers_tools_and_guards(env, monkeypat
     monkeypatch.setattr(coordsession, "decide", lambda *a, **k: ("stateless", "test"))
     argv, _, _, _ = _coord_argv(env, monkeypatch, {"mode": "on"})
     assert argv[argv.index("--tools") + 1] == "Read,Bash"
-    # The stateless turn (mode off) still has no tools at all.
-    argv, _, _, _ = _coord_argv(env, monkeypatch, {"mode": "off"})
-    assert argv[argv.index("--tools") + 1] == "" and "--settings" not in argv
 
 
 def _full_env(tmp_path, monkeypatch, timeout_s="300"):
@@ -1095,7 +1087,8 @@ def test_session_on_with_a_provider_is_off_for_one_that_runs_no_session():
     from ttp import coordtools
     assert all(coordtools.session_on({}, n) for n in (None, "claude", "codex", "cursor", "fake"))
     assert not coordtools.session_on({}, "chat") and not coordtools.session_on({}, "no-such-provider")
-    assert not coordtools.session_on({"coordinator": {"session": {"mode": "off"}}}, "claude")
+    # No setting turns it off (user msg #2040): a leftover "mode": "off" is ignored.
+    assert coordtools.session_on({"coordinator": {"session": {"mode": "off"}}}, "claude")
 
 
 # A stand-in agent CLI for a coordinator turn without ttp's tool hooks: before it answers as FAKE_CLI
@@ -1116,11 +1109,13 @@ os.execv(sys.executable, [sys.executable, os.environ["FAKE_CLI_FILE"], *sys.argv
 """
 
 
-def _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text, session_mode):
-    """One stateless coordinator turn of `provider` (no ttp tool hooks) against ACT_CLI, reaped by the
-    daemon: (project, run row, original charter, the pushes' record, the turn's session note)."""
-    from ttp import coordinator as coord, coordsession
+def _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text):
+    """One stateless coordinator turn of `provider` (no ttp tool hooks), made to keep no session as the
+    chat provider does, against ACT_CLI, reaped by the daemon: (project, run row, original charter, the
+    pushes' record, the turn's session note)."""
+    from ttp import coordinator as coord
     from ttp.daemon import Daemon
+    from ttp.providers import get_provider
     bin_dir = env["tmp"] / "actbin"
     bin_dir.mkdir(exist_ok=True)
     (bin_dir / "fake_cli.py").write_text(FAKE_CLI.format(python=sys.executable))
@@ -1129,9 +1124,7 @@ def _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text, sess
         (bin_dir / name).chmod(0o755)
     acts = env["tmp"] / "act.json"
     p = make(env)
-    p.set_config("coordinator.session.mode", session_mode)
-    if session_mode == "on":   # session mode's fallback: decide() sends this wake stateless
-        monkeypatch.setattr(coordsession, "decide", lambda *a, **k: ("stateless", "test: fallback"))
+    monkeypatch.setattr(type(get_provider(provider)), "coord_session", "")   # only a sessionless provider runs one
     charter = p.charter_path.read_text()
     monkeypatch.setenv("PATH", f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}")
     for k, v in (("LOG", str(env["tmp"] / "fakecli")), ("STDOUT", stdout), ("STDERR", ""), ("RC", "0"),
@@ -1156,11 +1149,10 @@ def _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text, sess
     return p, r, charter, json.loads(acts.read_text()), json.loads(r["note"])["turn"].get("session")
 
 
-@pytest.mark.parametrize("session_mode", ["off", "on"])
 @pytest.mark.parametrize("provider", ["codex", "cursor"])
 def test_a_stateless_coordinator_turn_without_tool_hooks_gets_its_charter_put_back_and_pushes_nothing(
-        env, monkeypatch, provider, session_mode):
-    # Provider parity: a stateless coordinator turn (session mode off, or its fallback) on an agent
+        env, monkeypatch, provider):
+    # Provider parity: a stateless coordinator turn (a provider that keeps no session) on an agent
     # without ttp's tool hooks runs a shell of its own. The daemon's whole-wake guard puts back and
     # reports a charter edit, and the run's bin/git and `ttp push` refuse a push, as on Claude.
     from ttp import coordtools
@@ -1171,7 +1163,7 @@ def test_a_stateless_coordinator_turn_without_tool_hooks_gets_its_charter_put_ba
     else:
         stdout, help_text = _codex_events(*CURSOR_STREAM_OK[:-1], {**CURSOR_STREAM_OK[-1],
                                                                     "result": json.dumps({"actions": []})}), CURSOR_HELP
-    p, r, charter, acts, session = _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text, session_mode)
+    p, r, charter, acts, session = _stateless_hookless_turn(env, monkeypatch, provider, stdout, help_text)
     assert (session or {}).get("mode", "stateless") == "stateless", session
     # (a) the charter is back, its changed content saved, the put-back reported in daemon.log and events
     assert p.charter_path.read_text() == charter

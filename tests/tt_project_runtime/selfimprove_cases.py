@@ -37,7 +37,7 @@ def test_selfimprove_guardrails_refuse_restrictions_caps_gates_checks_reviews_an
         ("charter_note", "Restrictions", "ttp charter --undo 3"),
         ("config", "budget.daily_usd", "ttp config budget.daily_usd 20"),
         ("config", "spend.cap", "ttp config spend.cap 5"),
-        ("config", "coordinator.session.max_failures_per_h", "ttp config x 3"),
+        ("config", "coordinator.session.rollover_tokens", "ttp config x 3"),
         ("config", "checks.required", "ttp config checks.required pytest"),
         ("config", "push.review_gate", "ttp config push.review_gate on"),
         ("config", "askauto.after_min", "ttp config askauto.after_min 30"),
@@ -233,10 +233,8 @@ def test_selfimprove_the_self_change_action_applies_with_its_guardrails(env, mon
     assert len(rec) == 1 and rec[0]["check_at"] > time.time() + 2.9 * 86400, "default: measured in 3 days"
     for k in ("metric", "fresh_project", "generic"):
         assert k in coord.ACTIONS_SCHEMA["properties"]["actions"]["items"]["properties"], k
-    # The prompt row shows only in the persistent session's role: the stateless role keeps today's prompt.
-    p.set_config("coordinator.session.mode", "off")
-    assert "session" not in prompts.coordinator_features(p)
-    p.set_config("coordinator.session.mode", "on")
+    # The prompt row shows only in the persistent session's role, always on: the stateless role (a
+    # provider that keeps no session) keeps today's prompt.
     assert "session" in prompts.coordinator_features(p)
     assert "`self_change`" not in prompts.coordinator_role(p)
     assert "`self_change`" in prompts.coordinator_session_role(p)

@@ -5878,7 +5878,9 @@ def _auto_ttl_daemon(env, monkeypatch, tmp_path):
     monkeypatch.setattr(claude, "_FLAGS", {claude.INPUT_FORMAT: True})
     monkeypatch.setattr(claude.Claude, "own_cache_breakpoints", 3)   # room for the runtime's own mark
     p = make(env)
-    p.set_config("coordinator.session.mode", "off")   # the stateless turn's cache TTL
+    # The stateless turn's cache TTL: only a provider that keeps no session (the chat provider) runs
+    # one, so this Claude stand-in keeps none.
+    monkeypatch.setattr(claude.Claude, "coord_session", "")
     _no_schedule_due(p.db, time.time())
     head, context = coord.prompt_parts(p)
     box = {"d": Daemon(p.base)}
@@ -24784,42 +24786,6 @@ def test_codex_resume_puts_the_subcommand_after_its_options(env, monkeypatch):
     assert argv.index("-C") < argv.index("resume") and argv.index("-s") < argv.index("resume")
     assert any(a.startswith("sandbox_workspace_write.writable_roots=") for a in argv[:argv.index("resume")])
     assert "PROMPT-MARKER" in stdin and run["status"] == "ok" and task["status"] == "done"
-
-
-def test_pick_thread_continues_only_a_warm_cheap_session_of_the_same_prefix():
-    from ttp import cachettl
-    fp = cachettl.fingerprint("head", "ctx", {"type": "object"}, "m", "high", "cli")
-    key = cachettl._key(fp)
-    now = 10_000.0
-    note = lambda **t: json.dumps({"turn": {"thread": {"key": key, "turn": 1, **t}}})
-    last = {"provider": "codex", "status": "ok", "session_id": "s1", "started": now - 200, "ended": now - 120,
-            "note": note(), "input_tokens": 30_000, "cache_read_tokens": 0, "cache_write_tokens": 0}
-    pick = lambda row=last, cfg=None, f=fp, saved=lambda s: True: \
-        cachettl.pick_thread(row, f, "codex", now, cfg or {}, saved)
-    session, thread = pick()
-    assert session == "s1" and thread == {"key": key, "turn": 2, "base": 30_000, "why": "continued"}
-    cases = [
-        (None, {}, fp, "no earlier turn"),
-        ({**last, "provider": "claude"}, {}, fp, "no session of this agent"),
-        ({**last, "session_id": None}, {}, fp, "no session of this agent"),
-        ({**last, "status": "failed"}, {}, fp, "ended failed"),
-        (last, {}, {**fp, "effort": "xhigh"}, "prefix changed"),
-        ({**last, "note": "not json"}, {}, fp, "prefix changed"),
-        ({**last, "ended": now - 11 * 60}, {}, fp, "cold"),
-        (last, {"thread_warm_min": 1}, fp, "cold"),
-        (last, {"thread_max_turns": 1}, fp, "off"),
-        ({**last, "note": note(turn=8)}, {}, fp, "thread full"),
-        ({**last, "note": note(turn=3, base=20_000), "cache_read_tokens": 30_000}, {}, fp, "thread grew"),
-        ({**last, "note": note(turn=2, base=30_000), "input_tokens": 20_000, "cache_read_tokens": 10_000},
-         {}, fp, "missed the cache"),
-    ]
-    for row, cfg, f, why in cases:
-        session, thread = pick(row, cfg, f)
-        assert session == "" and thread["turn"] == 1 and why in thread["why"], (why, thread)
-    assert pick(saved=lambda s: False)[1]["why"] == "the session is no longer saved"
-    session, thread = pick({**last, "note": note(turn=2, base=30_000), "input_tokens": 5_000,
-                            "cache_read_tokens": 30_000})
-    assert session == "s1" and thread["turn"] == 3 and thread["base"] == 30_000
 
 
 def test_only_an_agent_whose_cache_follows_the_session_continues_coordinator_sessions(env, monkeypatch, tmp_path):
@@ -43799,7 +43765,6 @@ def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkey
     p.set_config("coordinator.model", "reasoning-model")
     p.set_config("coordinator.effort", pin)
     p.set_config("coordinator.turn_timeouts_s.fake", {"low": 300, "high": 1200, "xhigh": 1800})
-    p.set_config("coordinator.session.mode", "off")   # the stateless turn's record
     d = daemon.Daemon(p.base)
     d.update_gates()
     real_popen = daemon.subprocess.Popen
@@ -43813,10 +43778,11 @@ def test_coordinator_launch_uses_resolved_effort_and_records_timeout(env, monkey
     row = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
     spec = json.loads((pathlib.Path(row["dir"]) / "run.json").read_text())
     details = json.loads(row["note"])["turn"]
-    assert details == {"provider": "fake", "model": "reasoning-model", "effort": expected,
+    assert details["session"]["mode"] == "new", "every coordinator wake is a session wake"
+    assert {k: v for k, v in details.items() if k not in ("session", "wake_budget")} == {"provider": "fake", "model": "reasoning-model", "effort": expected,
                        "prompt_bytes": len("digest ésystemcontext".encode()),
                        "timeout_s": {"low": 300, "high": 1200, "xhigh": 1800}[expected],
-                       "cache_ttl": "", "cache_ttl_why": "configured", "session_off": "mode off"}
+                       "cache_ttl": "", "cache_ttl_why": "configured"}
     assert spec["timeout_s"] == details["timeout_s"] and spec["effort"] == expected
     d.finish_run(row, {"rc": 1, "stopped": "timeout", "ended": time.time()})
     finished = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
