@@ -37,6 +37,14 @@ A project whose own rules let CPU-only checks run beside device jobs on a host l
 `checks.spill_beside_device` (ssh aliases, or "*" for every spill host; default none: beside_device): there
 neither the device locks, the broker nor the holder scan keep a run off (its pause and machine lock still
 do), and the run and its `ttp status` line say it runs beside a device job.
+A project may also set its own pre-run hook, `checks.spill_pre_cmd` (a command; default none, so nothing
+ships here: no neighbour, serving-state or site check): pick runs it here, read-only, before a run spills to a
+host that passed the gates above, with the host as its last argument (pre_check). Exit 0: go; PRE_SKIP_RC (75):
+skip the host for now; any other exit, a timeout or a hook that cannot run: an error, told, and the host is
+skipped. It runs on hosts `checks.spill_beside_device` lists too, so there the project's hook decides about
+device jobs. A machine with several hosts lists one of them as `alias:host` (target): the machine alias decides
+whether it is allowed (machines list, charter or pool, pauses, its machine lock, which the run holds), the host
+is what ssh reaches, what its own pause, lock and device checks name, and where the slots are claimed.
 Runs already on the host go on. The skip shows in one line in `ttp status` and the web app (skip_lines)
 while it is fresh (SKIP_SHOW_S). Its slots follow what it has idle now (checklane.host_slots): the runs
 its idle cores (cores less the 1-minute load average) and available memory fit, at most the runs its
@@ -52,7 +60,8 @@ delivery.checks_host; `"host": "local"` too unless the check says `"spill": true
 (the project's lock or queue wrapper, which may hold a device or a machine here) unless it has a remote
 wrapper (the check's `spill_wrap_cmd`, else checks.spill_wrap_cmd: push.spill_wrap_of) or the project
 says its wrappers need no device (`checks.wrap_needs_device: false`; unset or true: the need is unknown
-or real, so it stays here), and never a light run (it never waits). On a spill host a check never runs
+or real, so it stays here: `ttp checks` and the queue-wait item say so and name both settings, wrap_note), and
+never a light run (it never waits). On a spill host a check never runs
 behind this machine's checks.wrap_cmd: it runs behind its remote wrapper when it has one (push.spill_to),
 a wrapper missing there being a host fault (remotecheck), else unwrapped. A run that does not pass on a spill host runs again
 (OFF_ENV): a spill host's own environment never fails a change, only a pass there counts, unless the tests gate proved
@@ -90,6 +99,9 @@ KEY = "checks_spill_hosts"
 ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
 BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
 NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
+PRE_KEY = "spill_pre_cmd"   # checks.spill_pre_cmd: the project's own go/skip command before a spill to a host (pre_check)
+PRE_TIMEOUT_S = 30
+PRE_SKIP_RC = 75   # the pre-run hook's "not now": the host is skipped this time, no error
 AFTER_KEY = "checks_spill_after_s"
 FIRST_KEY = "checks_spill_first"   # delivery.checks_spill_first: a spillable run tries the spill hosts before a place here (first)
 SPILL_AFTER_S = 60.0
@@ -278,11 +290,75 @@ def beside_device(cfg: dict | None, alias: str) -> bool:
         got = beside_of(v) if v is not None else []
     except ValueError:
         return False
-    return got == "*" or alias in got
+    return got == "*" or alias in got or target(alias)[1] in got
+
+
+def pre_cmd_of(v: Any) -> tuple[str, ...]:
+    """A `checks.spill_pre_cmd` value as argv words; () when unset or empty. ValueError when it is not a
+    string or does not parse."""
+    from . import push
+    return push._words(v, f"checks.{PRE_KEY}")
+
+
+def pre_check(p, cfg: dict | None, alias: str) -> str:
+    """"" when the project's own pre-run hook (checks.spill_pre_cmd; none set: always "") lets a run spill to
+    `alias`, else why not. The hook runs here, in the project's folder, with the host as its last argument and
+    TTP_SPILL_HOST, TTP_SPILL_MACHINE and TTP_PROJECT set; it must only read. Exit 0: go; PRE_SKIP_RC: not now;
+    any other exit, a timeout (PRE_TIMEOUT_S) or a hook that cannot run is an error, and the host is skipped."""
+    checks = (cfg or {}).get("checks")
+    try:
+        words = pre_cmd_of(checks.get(PRE_KEY) if isinstance(checks, dict) else None)
+    except ValueError as e:
+        return f"its pre-run hook error: {e}"
+    if not words:
+        return ""
+    machine, host = target(alias)
+    env = {**os.environ, "TTP_SPILL_HOST": host, "TTP_SPILL_MACHINE": machine, "TTP_PROJECT": str(p.name)}
+    try:
+        r = subprocess.run([*words, host], cwd=str(p.root), env=env, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, timeout=PRE_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return f"its pre-run hook error: checks.{PRE_KEY} timed out after {PRE_TIMEOUT_S} s"
+    except OSError as e:
+        return f"its pre-run hook error: checks.{PRE_KEY} cannot run: {e}"
+    said = ((r.stdout or "").strip() or (r.stderr or "").strip()).splitlines()
+    said = f": {said[-1][:200]}" if said else ""
+    if r.returncode == 0:
+        return ""
+    if r.returncode == PRE_SKIP_RC:
+        return f"its pre-run hook says not now (checks.{PRE_KEY}){said}"
+    return f"its pre-run hook error: checks.{PRE_KEY} exited {r.returncode}{said}"
+
+
+WRAP_NOTE = (f"checks behind checks.wrap_cmd never spill while neither checks.spill_wrap_cmd (their wrapper on a "
+             f"spill host) is set nor checks.{NO_DEVICE_KEY} is false (the wrapper needs no device); set one to let "
+             "them spill")
+
+
+def wrap_note(cfg: dict | None) -> str:
+    """WRAP_NOTE when the project's checks.wrap_cmd keeps the commands behind it here (no spill wrapper, and
+    wrapped_ok not set), else ""."""
+    from . import push
+    try:
+        if not push.wrap_of(cfg) or push.spill_wrap_of(None, cfg) or wrapped_ok(cfg):
+            return ""
+    except ValueError:
+        return ""
+    return WRAP_NOTE
+
+
+def wrap_keeps_here(cmds: list, cfg: dict | None) -> str:
+    """WRAP_NOTE when a check of `cmds` stays here only because it runs behind checks.wrap_cmd (check_spills
+    with wrapped_ok would let it go), else ""."""
+    checks = (cfg or {}).get("checks")
+    ok = {**(cfg or {}), "checks": {**(checks if isinstance(checks, dict) else {}), NO_DEVICE_KEY: False}}
+    return WRAP_NOTE if any(getattr(c, "wrap", ()) and not check_spills(c, cfg) and check_spills(c, ok)
+                            for c in cmds) else ""
 
 
 def wrap_problems(checks: Any) -> list[str]:
-    """Config check of checks.wrap_needs_device, checks.spill_wrap_cmd and checks.spill_beside_device."""
+    """Config check of checks.wrap_needs_device, checks.spill_wrap_cmd, checks.spill_beside_device and
+    checks.spill_pre_cmd."""
     from . import push
     v = checks.get(NO_DEVICE_KEY) if isinstance(checks, dict) else None
     out = [] if v is None or isinstance(v, bool) else [f"checks.{NO_DEVICE_KEY}: {v!r} is not true or false"]
@@ -291,6 +367,10 @@ def wrap_problems(checks: Any) -> list[str]:
             beside_of(b)
         except ValueError as e:
             out.append(str(e).replace("; nothing was changed", ""))
+    try:
+        pre_cmd_of(checks.get(PRE_KEY) if isinstance(checks, dict) else None)
+    except ValueError as e:
+        out.append(str(e))
     try:
         push.spill_wrap_of(None, {"checks": checks})
     except ValueError as e:
@@ -462,21 +542,35 @@ def _charter_names(p, alias: str) -> bool:
     return bool(re.search(rf"(?<![\w.@+:-]){re.escape(alias)}(?![\w@+-]|[.:]\w)", text))
 
 
+def target(spec: str, known: dict | None = None) -> tuple[str, str]:
+    """(machine alias, ssh host) of spill host `spec`: an alias of the machines list is both; `alias:host`
+    whose alias is in the list (and `spec` itself is not) is one host of that machine, which has several."""
+    from . import machines
+    known = machines.load() if known is None else known
+    m, sep, h = spec.partition(":")
+    if spec not in known and sep and h and m in known:
+        return m, h
+    return spec, spec
+
+
 def allowed(p, cfg: dict, alias: str) -> str:
-    """"" when the project may run checks on `alias`, else why not."""
+    """"" when the project may run checks on spill host `alias`, else why not: its machine (target) must be
+    allowed, and neither the machine nor its host paused."""
     from . import lockprobe, machines
     known = machines.load()
-    if alias not in known:
+    machine, host = target(alias, known)
+    if machine not in known:
         return "not in the machines list (ttp machines add)"
-    if machines.retired(known.get(alias)):
+    if machines.retired(known.get(machine)):
         return "retired in the machines list"
-    if not _charter_names(p, alias) and alias not in account_hosts():
+    if not _charter_names(p, machine) and alias not in account_hosts() and machine not in account_hosts():
         return "not named in the charter"
-    if (held := lockprobe.pause(p, cfg, alias)) is not None:
-        return f"paused{': ' + str(held.get('reason')) if isinstance(held, dict) and held.get('reason') else ''}"
-    if got := paused_elsewhere(p, alias, known.get(alias)):
-        who, held = got
-        return f"paused by {who}{': ' + str(held.get('reason')) if held.get('reason') else ''}"
+    for n in dict.fromkeys([machine, host]):
+        if (held := lockprobe.pause(p, cfg, n)) is not None:
+            return f"paused{': ' + str(held.get('reason')) if isinstance(held, dict) and held.get('reason') else ''}"
+        if got := paused_elsewhere(p, n, known.get(n)):
+            who, held = got
+            return f"paused by {who}{': ' + str(held.get('reason')) if held.get('reason') else ''}"
     return ""
 
 
@@ -561,14 +655,17 @@ def claim_dir() -> Path:
 
 
 def lock_busy(p, cfg: dict, alias: str) -> str:
-    """"" when `alias`'s machine lock is free for a shared taker (as `ttp lock --probe --shared` answers),
-    else why not: "busy (held by ...; N waiting)"."""
+    """"" when the machine lock of spill host `alias` (and its host's, for one host of a machine: target) is
+    free for a shared taker (as `ttp lock --probe --shared` answers), else why not: "busy (held by ...; N waiting)"."""
     from . import lockprobe
-    try:
-        rc, said = lockprobe.answer(p, cfg, alias, shared_mode=True)
-    except OSError as e:
-        return f"its lock cannot be read: {e}"
-    return "" if rc == 0 else str(said).split(": ", 1)[-1]
+    for res in dict.fromkeys(target(alias)):
+        try:
+            rc, said = lockprobe.answer(p, cfg, res, shared_mode=True)
+        except OSError as e:
+            return f"its lock cannot be read: {e}"
+        if rc != 0:
+            return str(said).split(": ", 1)[-1]
+    return ""
 
 
 def _device_names(cfg: dict, alias: str, known: dict | None = None) -> list[str]:
@@ -694,7 +791,8 @@ def skip_dir() -> Path:
 
 
 def _note_skip(alias: str, why: str, project_name: str, own_only: bool = False) -> None:
-    """Record that `alias` took no new checks because of a device job (skip_lines shows it); "" clears it
+    """Record that `alias` took no new checks because of a device job or the project's pre-run hook (skip_lines
+    shows it); "" clears it
     (with `own_only`, only a skip `project_name` recorded)."""
     f = skip_dir() / f"{alias}.json"
     try:
@@ -716,7 +814,7 @@ def _note_skip(alias: str, why: str, project_name: str, own_only: bool = False) 
 
 
 def skip_lines(now: float | None = None) -> list[str]:
-    """`ttp status` and web app lines: each spill host the pool skipped for a device job in the last
+    """`ttp status` and web app lines: each spill host the pool skipped for a device job or a pre-run hook in the last
     SKIP_SHOW_S, one line each, with the reason."""
     now = time.time() if now is None else now
     out = []
@@ -812,44 +910,48 @@ def kept_off(off: str) -> set[str]:
 
 
 def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") -> Claim | None:
-    """The first spill host that is allowed, reachable and has a free slot, claimed; None when none is.
-    Each host skipped is told with why. `off`: OFF_ENV's value, whose hosts (kept_off) are skipped.
-    `why_here`: why the run tries them now (default: the slots here stayed busy). The claim's `workers` are
-    sized to the host's idle cores at its probe (workers)."""
+    """The first spill host that is allowed, reachable and has a free slot, and that the project's pre-run hook
+    (pre_check) lets the run go to, claimed; None when none is. One host of a machine with several (target) is
+    probed, claimed and held by its own name, its machine's lock held too. Each host skipped is told with why.
+    `off`: OFF_ENV's value, whose hosts (kept_off) are skipped. `why_here`: why the run tries them now (default:
+    the slots here stayed busy). The claim's `workers` are sized to the host's idle cores at its probe (workers)."""
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
     skipped, keep = [], kept_off(off)
     for alias in hosts(cfg):
-        if alias in keep:
+        machine, host = target(alias)
+        if alias in keep or host in keep:
             skipped.append(f"{alias} (these checks did not pass there in this run)")
             continue
         beside = beside_device(cfg, alias)   # the project lets its checks run there beside a device job
         why, dev = allowed(p, cfg, alias) or lock_busy(p, cfg, alias), ""
         if not why and beside:
-            dev = device_busy(p, cfg, alias)
-            _note_skip(alias, "", p.name, own_only=True)   # this project's earlier skip no longer holds
+            dev = device_busy(p, cfg, host)
+            _note_skip(host, "", p.name, own_only=True)   # this project's earlier skip no longer holds
         elif not why:
-            why = device_busy(p, cfg, alias)
-            _note_skip(alias, why, p.name)
+            why = device_busy(p, cfg, host)
+            _note_skip(host, why, p.name)
+        if not why and (why := pre_check(p, cfg, alias)):
+            _note_skip(host, why, p.name)
         free, note = 0, ""
         if not why:
-            free, why, note = probe(alias, beside)
+            free, why, note = probe(host, beside)
             if why.startswith(DEVICE_WHY):
-                _note_skip(alias, why, p.name)
+                _note_skip(host, why, p.name)
             if note.startswith(DEVICE_WHY):
                 dev, note = dev or note, ""
         dev = dev[len(DEVICE_WHY):] if dev.startswith(DEVICE_WHY) else dev
-        if not why and (got := _claim(alias, free, {**rec, "host": alias,
-                                                    **({"beside": dev[:300]} if dev else {})})) is not None:
-            got.lock = _hold(p, cfg, alias, what)
+        if not why and (got := _claim(host, free, {**rec, "host": host,
+                                                   **({"beside": dev[:300]} if dev else {})})) is not None:
+            got.lock = _hold(p, cfg, machine, what)
             if got.lock is None:
                 got.close()
                 skipped.append(f"{alias} (busy: its lock was taken just now)")
                 continue
-            cores, load = _READ.pop(alias, (0, None))
+            cores, load = _READ.pop(host, (0, None))
             from . import testslots
             top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
-            got.workers = workers(cores, load, max(0, _ours(alias) - 1), top[1] if top else 0)
+            got.workers = workers(cores, load, max(0, _ours(host) - 1), top[1] if top else 0)
             tell(f"spilling to {alias}: "
                  + (why_here or f"the slots here stayed busy for {after_s(cfg):g} s")
                  + f" ({_source(cfg, alias)}); the checks run there on a copy of the commit"

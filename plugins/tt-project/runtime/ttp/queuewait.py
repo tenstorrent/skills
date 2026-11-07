@@ -181,8 +181,16 @@ def spill_ready(p, cfg: dict) -> tuple[list[str], list[str]]:
     return ok, why
 
 
-def spill_note(spill: tuple[list[str], list[str]] | None) -> str:
-    """The item's line when spill hosts are set but none can take checks now (spill_ready), else ""."""
+def spill_note(spill: tuple[list[str], list[str]] | None, cfg: dict | None = None) -> str:
+    """The item's line when spill hosts are set but none can take checks now (spill_ready), else "". With the
+    project's checks.wrap_cmd keeping the checks behind it here (checkspill.wrap_note), it says so and names the
+    settings, first: a host's pause is not why those never spill."""
+    from . import checkspill
+    wrapped = checkspill.wrap_note(cfg) if spill and (spill[0] or spill[1]) else ""
+    if wrapped:
+        rest = (f" Other checks: no spill host can take them now ({'; '.join(spill[1][:3])})."
+                if not spill[0] and spill[1] else "")
+        return f"No spill host can take checks behind checks.wrap_cmd: {wrapped}.{rest}"
     if not spill or spill[0] or not spill[1]:
         return ""
     return f"No spill host can take checks now ({'; '.join(spill[1][:3])}), so none is offered."
@@ -296,11 +304,11 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
             spill = spill_ready(p, cfg)   # once a scan, only when a wait could spill
         sp = spill if w["queue"] in ("checks", "cpu", "pool") else None
         opts = options(db, {**w, "project": p.name}, cfg, paused, device, cores, sp)
-        msg = text(w, opts, now, spill_note(sp))
+        msg = text(w, opts, now, spill_note(sp, cfg))
         if ev := db.one("SELECT id, text, data FROM events WHERE kind=? AND status='queued' AND data LIKE ?",
                         (KIND, f'%"key": "{k}"%')):
             got = json.loads(ev["data"] or "{}")
-            now_fold = fold(w, opts, now, spill_note(sp))
+            now_fold = fold(w, opts, now, spill_note(sp, cfg))
             if ev["text"] != msg[:4000] or got.get(FOLD) != now_fold:   # still unread: the holders, occupancy
                 got[FOLD] = now_fold   # and options of this scan, not the raise's, in its text and its FOLD data
                 db.x("UPDATE events SET text=?, data=? WHERE id=?", (msg[:4000], json.dumps(got), ev["id"]))
@@ -311,7 +319,7 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
         if rec.get("sig") == said and mark - int(rec.get("mark") or 0) < REPEAT_MARKS:
             continue   # raised before and nothing it says changed: no new wake for the same words
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep},
-                FOLD: fold(w, opts, now, spill_note(sp))}
+                FOLD: fold(w, opts, now, spill_note(sp, cfg))}
         fp = f"{KIND}:{ep}:{mark}"
         if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data):
             raised.append(fp)   # the longest waits first; the rest at a later scan

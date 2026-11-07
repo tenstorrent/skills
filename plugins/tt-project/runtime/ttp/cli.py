@@ -5105,6 +5105,9 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     # take it too; with none set it still waits in bounds of checks_spill_after_s, in the same place.
     spill_to = bool(spill and p)
     told: set[str] = set()
+    if p and not spill_to and not checkspill.all_off(spill_off) and checkspill.hosts(cfg) \
+            and (kept := checkspill.wrap_keeps_here(cmds, cfg)):
+        tell(f"no spill host can take these checks: {kept}")   # never blamed on a host's pause
     first = True
     # An urgent run never waits behind routine ones (checkcap: urgent slots): it tries the pool's hosts at once
     # (a first bound of 0 s here), then, with none free, a reserved urgent slot here, before the Slurm overflow.

@@ -1400,6 +1400,7 @@ def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_de
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec, rec
     assert "/ttp-check." not in log.read_text() and mark.read_text() == "wrapped\n"
+    assert f"no spill host can take these checks: {checkspill.WRAP_NOTE}" in (run / "checks.log").read_text()
     c = push.with_wrap(push.check_list(["make test"]), (str(wrapper),))
     for v in (None, True, "false", 0):
         assert not checkspill.spillable(c, {"checks": {"wrap_needs_device": v}}), v
@@ -1407,6 +1408,122 @@ def test_a_wrapped_run_spills_only_when_its_project_says_the_wrapper_needs_no_de
     assert not checkspill.spillable(push.with_host(c, "check-host-a"), {"checks": {"wrap_needs_device": False}})
     assert not project.config_problems({"checks": {"wrap_needs_device": False}})
     assert any("checks.wrap_needs_device" in x for x in project.config_problems({"checks": {"wrap_needs_device": "no"}}))
+
+
+def test_a_wrapped_check_kept_here_says_its_wrapper_keeps_it_and_names_the_settings_not_a_pause(env, tmp_path):
+    """Checks behind checks.wrap_cmd with neither checks.spill_wrap_cmd set nor checks.wrap_needs_device false
+    never spill: wrap_keeps_here and the queue-wait item's spill note say so and name both settings, ahead of
+    any host's pause; a check kept here for another reason, an unwrapped one, or either setting set: no note."""
+    from ttp import checkspill, push, queuewait
+    wrapped = {"checks": {"wrap_cmd": "./wrap.sh"}}
+    c = push.with_wrap(push.check_list(["make test"]), ("./wrap.sh",))
+    assert checkspill.wrap_note(wrapped) == checkspill.WRAP_NOTE
+    assert checkspill.wrap_keeps_here(c, wrapped) == checkspill.WRAP_NOTE
+    for v in ("checks.wrap_cmd", "checks.spill_wrap_cmd", "checks.wrap_needs_device"):
+        assert v in checkspill.WRAP_NOTE
+    for cfg in ({"checks": {"wrap_cmd": "./wrap.sh", "spill_wrap_cmd": "./remote-wrap.sh"}},
+                {"checks": {"wrap_cmd": "./wrap.sh", "wrap_needs_device": False}}):
+        assert checkspill.wrap_note(cfg) == "" and checkspill.wrap_keeps_here(c, cfg) == "", cfg
+    assert checkspill.wrap_note({}) == "", "no checks.wrap_cmd"
+    assert checkspill.wrap_keeps_here(push.check_list(["make test"]), wrapped) == "", "unwrapped"
+    kept = push.with_wrap(push.check_list([{"run": "make test", "spill": False}]), ("./wrap.sh",))
+    assert checkspill.wrap_keeps_here(kept, wrapped) == "", "kept here by its own spill: false"
+    note = queuewait.spill_note(([], ["host-a: paused: lent out"]), wrapped)
+    assert note.startswith("No spill host can take checks behind checks.wrap_cmd: checks behind"), note
+    assert "checks.spill_wrap_cmd" in note and "Other checks: no spill host can take them now (host-a: paused" in note
+    assert "checks.wrap_needs_device" in queuewait.spill_note((["host-a"], []), wrapped), "a free host too"
+    assert queuewait.spill_note(([], ["host-a: paused: lent out"]), {}) == (
+        "No spill host can take checks now (host-a: paused: lent out), so none is offered.")
+    assert queuewait.spill_note((["host-a"], []), {}) == "" and queuewait.spill_note(([], []), wrapped) == ""
+
+
+def test_busy_checks_spill_to_one_host_of_a_machine_with_several_hosts(env, tmp_path, monkeypatch):
+    """A spill host `alias:host` is one host of machine `alias`: it is allowed when the machine is (machines
+    list, charter, no pause of the machine or of the host), ssh reaches the host, and the run, its claim and
+    checks.json name the host. A plain alias reads as before; an unknown machine is not in the list."""
+    from ttp import checkspill, cli, db as dbm, machines
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["cluster-a:host-b"], charter=("cluster-a",))
+    assert checkspill.target("cluster-a:host-b") == ("cluster-a", "host-b")
+    assert checkspill.target("cluster-a") == ("cluster-a", "cluster-a")
+    assert checkspill.target("cluster-x:host-b") == ("cluster-x:host-b", "cluster-x:host-b")
+    cfg = p.config()
+    assert checkspill.allowed(p, cfg, "cluster-a:host-b") == ""
+    assert checkspill.allowed(p, cfg, "cluster-x:host-b").startswith("not in the machines list")
+    machines.add("cluster-c")
+    assert checkspill.allowed(p, cfg, "cluster-c:host-b") == "not named in the charter"
+    for n in ("host-b", "cluster-a"):
+        p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {n: {"reason": "held", "by": "user", "since": 1}})
+        assert checkspill.allowed(p, cfg, "cluster-a:host-b") == "paused: held", n
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {})
+    assert checkspill.beside_device({"checks": {"spill_beside_device": ["host-b"]}}, "cluster-a:host-b")
+    log = tmp_path / "where.log"
+    cmd = f"pwd >> {log}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    try:
+        cli.main(["checks", "--fresh"])
+    finally:
+        lane.close()
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "host-b" and rec["hosts"] == {cmd: "host-b"}, rec
+    assert "spilling to cluster-a:host-b" in (run / "checks.log").read_text()
+    assert "/ttp-check." in log.read_text() and checkspill.holders(p.name) == []
+    assert checkspill.kept_off(checkspill.spill_off_add("", "host-b", False)) == {"host-b"}
+
+
+def test_spill_pre_run_hook_decides_per_host_go_skip_or_error(env, tmp_path, monkeypatch):
+    """checks.spill_pre_cmd (none by default): run here with the host as its last argument before a run spills
+    there. Exit 0 lets the run go; 75 skips the host for now; any other exit is an error, told, and the host is
+    skipped; neither skip probes the host. It runs on a host spill_beside_device lists too, and a hook that does
+    not parse is a config problem and skips every host."""
+    from ttp import checkspill, project
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    probed = []
+    monkeypatch.setattr(checkspill, "probe", lambda alias, beside=False: (probed.append(alias), (1, "", ""))[1])
+    seen, rc = tmp_path / "hook.seen", tmp_path / "hook.rc"
+    hook = tmp_path / "hook.sh"
+    hook.write_text(f'#!/bin/sh\necho "$* $TTP_SPILL_HOST $TTP_SPILL_MACHINE" >> {seen}\n'
+                    f'echo "said $(cat {rc})"\nexit "$(cat {rc})"\n')
+    hook.chmod(0o755)
+    assert "spill_pre_cmd" in project._known_keys(["checks"])
+    assert checkspill.pre_check(p, p.config(), "check-host-a") == "", "no hook: go"
+
+    def pick():
+        told = []
+        got = checkspill.pick(p, p.config(), told.append, "pytest -q")
+        if got is not None:
+            got.close()
+        return got, " ".join(told)
+    p.set_config("checks.spill_pre_cmd", f"{hook} --check")
+    rc.write_text("0")
+    got, told = pick()
+    assert got is not None and got.host == "check-host-a" and probed == ["check-host-a"], told
+    assert seen.read_text() == "--check check-host-a check-host-a check-host-a\n", "the host last"
+    probed.clear()
+    rc.write_text("75")
+    got, told = pick()
+    assert got is None and probed == [], told
+    assert "check-host-a (its pre-run hook says not now (checks.spill_pre_cmd): said 75)" in told, told
+    assert any("check-host-a takes no new checks: its pre-run hook says not now" in x
+               for x in checkspill.skip_lines()), checkspill.skip_lines()
+    rc.write_text("3")
+    got, told = pick()
+    assert got is None and probed == [], told
+    assert "check-host-a (its pre-run hook error: checks.spill_pre_cmd exited 3: said 3)" in told, told
+    p.set_config("checks.spill_beside_device", "*")
+    rc.write_text("75")
+    got, told = pick()
+    assert got is None and "pre-run hook says not now" in told, "the hook decides beside a device job too"
+    raw = json.loads(p.config_path.read_text())
+    raw["checks"]["spill_pre_cmd"] = 'a "b'
+    p.config_path.write_text(json.dumps(raw))
+    got, told = pick()
+    assert got is None and "its pre-run hook error: checks.spill_pre_cmd" in told, told
+    assert any("checks.spill_pre_cmd" in x for x in project.config_problems(raw)), "named as a config problem"
+    raw["checks"]["spill_pre_cmd"] = str(tmp_path / "missing-hook")
+    p.config_path.write_text(json.dumps(raw))
+    got, told = pick()
+    assert got is None and "checks.spill_pre_cmd cannot run" in told, told
 
 
 def test_a_wrapped_project_with_a_narrower_own_list_spills_to_the_rest_of_the_account_pool(

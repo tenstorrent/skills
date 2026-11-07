@@ -2075,13 +2075,22 @@ session and stateless coordinators on every provider.
   `checks.spill_beside_device` (ssh aliases, or `"*"` for every spill host; default none) names hosts where the
   project's own rules let its CPU-only checks run beside a device job: there the device job keeps no run off, a
   pause or a held machine lock still does, and the run and its `ttp status` line say it runs beside a device job
-  (`ttp config <project> checks.spill_beside_device '["host-a"]'`). The account's pool, `checks.spill_hosts`
+  (`ttp config <project> checks.spill_beside_device '["host-a"]'`). A spill host may be one host of a
+  machines-list entry with several hosts, written `<alias>:<host>` (`"cluster-a:host-b"`): it is allowed when its
+  machine is, a pause of the machine or the host keeps it off, the device gate and probe look at the host and the
+  run holds the machine's lock; single-host entries work as before. `checks.spill_pre_cmd` (user-set, no default)
+  is the project's own read-only pre-run hook, run here before a run spills to a host, with the host as its last
+  argument and `TTP_SPILL_HOST`, `TTP_SPILL_MACHINE`, `TTP_PROJECT` set (30 s bound): exit 0 goes, exit 75 skips
+  the host for now, any other exit is reported as a hook error and the host is skipped. It also runs on
+  `checks.spill_beside_device` hosts, so there the hook decides; tt-project ships no neighbour, serving-state or
+  site check (`ttp config <project> checks.spill_pre_cmd './tools/may-spill.sh'`). The account's pool, `checks.spill_hosts`
   (`ttp config --account checks.spill_hosts '["pool-a", "pool-b"]'`; only the user sets it, a run may only
   clear it with `[]`), follows each project's own list, so every project on the machine spills to it without a
   list of its own; its hosts need no charter line but must be in the machines list. A project's own `[]` keeps
   its runs here, pool included. Runs with a check host or the authoring tree never spill; runs behind
   `checks.wrap_cmd` spill only when the project sets `checks.wrap_needs_device: false` (they run there without
-  the wrapper; unset or true, the run stays here). Two settings drop the wrapper, for different cases.
+  the wrapper; unset or true, the run stays here, and its `checks.log` and queue-wait item say `no spill host can
+  take these checks` because neither `checks.spill_wrap_cmd` nor `checks.wrap_needs_device: false` is set). Two settings drop the wrapper, for different cases.
   `checks.no_device_cmds` (or `ttp checks --no-device` for one run) names commands that never need a device or
   the wrapper's lock (lint, unit tests): they run without the wrapper here too, and a run of only such commands
   may spill (`ttp config <project> checks.no_device_cmds '["ruff", "pytest -q tests/unit"]'`).
