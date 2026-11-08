@@ -80,6 +80,13 @@ def no_write(text: str) -> bool:
     return any(t in (text or "").lower() for t in _NO_WRITE_TEXT)
 
 
+def local_changes(text: str) -> bool:
+    """A failed fast-forward's output says uncommitted edits (or untracked files) in the checkout are in
+    the way: git wrote nothing, so a later retry may pass."""
+    t = (text or "").lower()
+    return "would be overwritten" in t or "local changes" in t
+
+
 def fast_forward(h: Path, merged: str, guard_env: str) -> str:
     """Fast-forward main in `h` to `merged`; "" when done, else why not. On a failure every file it
     touched that matched main before it is put back to main's version, so the tree is as it was: a local

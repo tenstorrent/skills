@@ -12105,7 +12105,8 @@ def cmd_upgrade(a) -> None:
     template snapshots on its `upstream` branch, so this is an ordinary three-way merge. `--auto` is
     the daemon's own call (release.py): it records the outcome and sends one low notify when applied.
     Exit 75 = deferred, nothing changed and the project finishes it itself (another upgrade, a harness
-    task or the daemon landing a harness worktree holds it, a push is in flight, or a conflicting merge waits for a harness task or for the daemon's
+    task or the daemon landing a harness worktree holds it, a push is in flight, uncommitted edits in the
+    checkout block --apply's fast-forward, or a conflicting merge waits for a harness task or for the daemon's
     retry, which comes only for a newer version under upgrade.auto). Exit 1 = failed, including a conflict
     nothing will retry (upgrade.auto off, or the same version from another commit). After main moved, the
     restart decides: exit RESTART_DEFERRED (76) = main is applied and the restart deferred (the old daemon
@@ -12968,6 +12969,11 @@ def _apply_upgrade(p: Project, commit: str) -> None:
               f"fast-forward main")
         outcome, why = applyff.request(p, merged, os.environ.get("TTP_TASK") or "")
         why = "" if outcome == "done" or _git(h, "rev-parse", "HEAD") == merged else why
+    if why and applyff.local_changes(why) and _git(h, "rev-parse", "HEAD") == base:
+        # Someone is mid-edit in the checkout: a transient busy state, not a failure (git wrote nothing).
+        die(f"--apply deferred: uncommitted edits in {h} are in the way ({why}); nothing was changed, main is "
+            f"still {base[:12]} and no restart is coming: rerun `ttp upgrade {p.name} --apply {commit}` once "
+            f"they are committed", UPGRADE_BUSY)
     if why:
         die(f"--apply: could not fast-forward main to {commit}: {why}. Main is still "
             f"{_git(h, 'rev-parse', 'HEAD')[:12]} and nothing was restarted; rerun "

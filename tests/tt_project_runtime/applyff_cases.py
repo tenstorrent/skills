@@ -519,3 +519,20 @@ def test_apply_over_another_tasks_uncommitted_runtime_edit_is_busy_and_changes_n
     # The coordinator's uncommitted CHARTER and MEMORY edits are files the upgrade does not write: it applies.
     cli.main(["upgrade", "demo", "--apply", merged])
     assert _git_out(h, "rev-parse", "HEAD") == merged and restarts
+
+
+def test_apply_over_an_uncommitted_edit_git_refuses_exits_busy_with_nothing_changed(
+        env, monkeypatch, tmp_path, capsys):
+    """An uncommitted edit to a file the upgrade changes is a transient busy state (the coordinator or a
+    task is mid-edit): `--apply` exits 75 (retry later), not 1, and main, the edit and the daemon stay."""
+    from ttp import cli
+    p, merged, base, restarts = _landed_template_branch(env, monkeypatch, tmp_path)
+    h, rel = p.harness, "runtime/ttp/restriction_audit.py"
+    edit = (h / rel).read_text() + "# a local edit\n"
+    (h / rel).write_text(edit)
+    with pytest.raises(SystemExit) as e:
+        cli.main(["upgrade", "demo", "--apply", merged])
+    err = capsys.readouterr().err
+    assert e.value.code == 75 and "nothing was changed" in err and "would be overwritten" in err, err
+    assert _git_out(h, "rev-parse", "HEAD") == base and not restarts
+    assert (h / rel).read_text() == edit
