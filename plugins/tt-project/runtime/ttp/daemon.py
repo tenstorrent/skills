@@ -4776,8 +4776,8 @@ class Daemon:
         """Session `session`'s running total as Claude Code last reported it before run `before`, from the
         newest earlier run of it (any task or role: a session id names one session) that shows it: its
         note's session_cost_usd, else its output's last result, else, for the run that started the
-        session, what it booked as reported. None when no recent run shows it (the caller then nets
-        the old way). A run with no result is passed over: an older, lower total only books more."""
+        session (no earlier run of it, _session_runs_before), what it booked as reported. None when no
+        recent run shows it (the caller then nets the old way). A run with no result is passed over: an older, lower total only books more."""
         from .providers import claude
         for o in self.p.db.q("SELECT * FROM runs WHERE session_id=? AND id<? AND status!='running' "
                              "ORDER BY id DESC LIMIT 8", (session, before)):
@@ -4792,9 +4792,19 @@ class Daemon:
                 return got
             if not ((note.get("resumes") or {}).get("session") or _resumed_coord_session(o, note)
                     or ctxfork.forked(note)) and (o["cost_basis"] or "reported") == "reported" \
-                    and not o["cost_estimated"] and float(o["cost_usd"] or 0) > 0:
+                    and not o["cost_estimated"] and float(o["cost_usd"] or 0) > 0 \
+                    and not self._session_runs_before(session, o["id"]):
                 return float(o["cost_usd"])
         return None
+
+    def _session_runs_before(self, session: str, before: int) -> bool:
+        """Whether any run of `session` (any task) came before run `before`: by runs.session_id, or for a
+        row from before that column, by the session id in its note. Such a run makes `before` a resume
+        whatever its note says, so its booking is not the session's total."""
+        return any(o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session
+                   for o in self.p.db.q("SELECT session_id, note FROM runs WHERE id<? AND "
+                                        "(session_id=? OR (session_id IS NULL AND note LIKE ?))",
+                                        (before, session, f"%{session}%")))
 
     def _session_reported(self, session: str, task, before: int) -> float:
         """The highest session total an earlier run of `session` (of `task`) reported (note
