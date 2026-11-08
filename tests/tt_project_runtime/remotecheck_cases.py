@@ -1541,28 +1541,30 @@ def test_an_agent_cli_or_host_local_check_splits_off_to_run_here_while_the_rest_
     assert not any(x in checkspill._probe_script() for x in checkspill.AGENT_CLIS)
 
 
-def _split_run(env, tmp_path, monkeypatch, cli_rc: int):
-    """A spilled run of a spilled check and a claude CLI check (a fake one here, exiting `cli_rc`) whose spill
-    host drops any script naming the claude command, as a host without it would fail it: (checks.json,
-    checks.log, where the spilled check ran, where the claude check ran)."""
+def _split_run(env, tmp_path, monkeypatch, cli_rc: int, extra: bool = False, cli_check="claude plugin validate . --strict",
+               sleep_s: int = 0):
+    """A spilled run of a spilled check and a claude CLI check (a fake one here, sleeping `sleep_s`, then exiting
+    `cli_rc`; given after `--` as a plain command with `extra`) whose spill host drops any script naming the
+    claude command, as a host without it would fail it: (checks.json, checks.log, where the spilled check ran,
+    where the claude check ran)."""
     import threading
     from ttp import cli
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
     agent = tmp_path / "agentbin"
     agent.mkdir()
     ran, here = tmp_path / "spilled.log", tmp_path / "here.log"
-    (agent / "claude").write_text(f"#!/bin/sh\npwd >> {here}\nexit {cli_rc}\n")
+    (agent / "claude").write_text(f"#!/bin/sh\npwd >> {here}\nsleep {sleep_s}\nexit {cli_rc}\n")
     (agent / "claude").chmod(0o755)
     monkeypatch.setenv("PATH", f"{agent}{os.pathsep}{os.environ['PATH']}")
     monkeypatch.setenv("FAKE_SSH_FAIL", "claude plugin validate")
-    p.set_config("delivery.push_checks", [f"pwd >> {ran}", "claude plugin validate . --strict"])
+    p.set_config("delivery.push_checks", [f"pwd >> {ran}"] + ([] if extra else [cli_check]))
     lane = _spill_lane(p, repo)
     late = threading.Timer(20.0, lane.close)
     late.start()
     try:
-        cli.main(["checks", "--fresh"])
+        cli.main(["checks", "--fresh"] + (["--", cli_check] if extra else []))
     except SystemExit as e:   # a failing run exits 1
-        assert e.code == 1 and cli_rc, e.code
+        assert e.code == 1 and (cli_rc or sleep_s), e.code
     finally:
         late.cancel()
         lane.close()
@@ -1585,6 +1587,25 @@ def test_a_split_runs_failing_agent_cli_check_here_fails_it_without_a_rerun(env,
     fault that reruns the checks."""
     rec, text, ran, here = _split_run(env, tmp_path, monkeypatch, 1)
     assert rec["passed"] is False and rec["spilled_to"] == "check-host-a", (rec, text)
+    assert "did not pass on spill host" not in text and len(ran) == len(here) == 1, (text, ran, here)
+
+
+def test_a_split_run_keeps_a_plain_agent_cli_command_after_the_dashes_here(env, tmp_path, monkeypatch):
+    """The claude CLI check given after `--` (a plain command, no checks_host or wrap_cmd set) splits off to
+    run here like a configured one: one passing verdict, never a crash on the check's spill fields."""
+    rec, text, ran, here = _split_run(env, tmp_path, monkeypatch, 0, extra=True)
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", (rec, text)
+    assert len(ran) == 1 and len(here) == 1 and "/ttp-check." not in here[0], (ran, here, text)
+
+
+def test_a_split_off_check_timing_out_here_is_the_verdict_without_a_rerun(env, tmp_path, monkeypatch):
+    """A check split off to run here stopped at its silence limit: that timeout is the run's verdict, never a
+    spill host fault that reruns the checks (and puts the host off spilling)."""
+    from ttp import checkwall
+    monkeypatch.setattr(checkwall, "POLL_S", 0.2)
+    hang = {"run": "claude plugin validate . --strict", "silent_s": 1}
+    rec, text, ran, here = _split_run(env, tmp_path, monkeypatch, 0, cli_check=hang, sleep_s=4)
+    assert rec["passed"] is False and rec["spilled_to"] == "check-host-a" and rec.get("timed_out"), (rec, text)
     assert "did not pass on spill host" not in text and len(ran) == len(here) == 1, (text, ran, here)
 
 

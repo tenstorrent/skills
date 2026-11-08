@@ -3001,12 +3001,15 @@ def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
     pass is recorded, and found, under the same key as a run here (_command_key), so a later local `ttp checks`
     of the same tree (a review's pre-started checks, the reviewer's own) reuses it instead of running
     the suite again. A check that may not spill (it runs an agent CLI or says "host": "local":
-    checkspill.stays_here) stays as it is and runs here in the same run."""
+    checkspill.stays_here) runs here in the same run, as a push.Check (a command after `--` may be a plain str)."""
     from . import checkspill, push
     out = []
     for was in todo:
         if not checkspill.check_spills(was, cfg):
-            out.append(was)
+            c = push.Check(str(was))
+            if isinstance(was, push.Check):
+                c.__dict__.update(was.__dict__)
+            out.append(c)
             continue
         c = push.spill_to([was], host, cfg)[0]
         if not push.remote_host(was) and isinstance(c, push.Check):
@@ -3836,7 +3839,7 @@ def cmd_checks(a) -> None:
             for c in todo if slurm else []:
                 if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
                     c.slurm, c.time_min = slurm, minutes
-            for w in dict.fromkeys(c.remote_wrap for c in todo if c.remote_wrap):
+            for w in dict.fromkeys(w for c in todo if (w := getattr(c, "remote_wrap", ()))):
                 said = f"on {spilled.host} the checks run behind their spill wrapper {shlex.join(w)}"
                 print(f"ttp checks: {said}", flush=True)
                 out.write(f"ttp checks: {said}\n")
@@ -4168,9 +4171,9 @@ def cmd_checks(a) -> None:
             out.write(f"ttp checks: {said}\n")
             out.flush()
             print(f"ttp checks: {said}", flush=True)
-        # Nor when a check split off to run here failed (checkspill.stays_here): its failure counts as is.
+        # Nor when a check split off to run here failed or timed out (checkspill.stays_here): that counts as is.
         elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
-                and not (failed in todo and not timed_out and not getattr(failed, "spill_host", "")):
+                and not (failed in todo and not getattr(failed, "spill_host", "")):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
             no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out)
             said = (f"the checks did not pass on spill host {spilled.host} ({how}); running them again on "
