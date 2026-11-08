@@ -2116,8 +2116,9 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     read -= {"dropped", "json", "log", "out", "pid", "queued", "rc", "stalled"}   # file names (checks.json), not keys
     # project-only: the project's own lock or queue wrapper (and the one its checks run behind on a spill host),
     # set by the user per project, its fallback lane, the spill hosts its user lets it share with device jobs,
-    # and the Python lock its checks' pinned env is built from
-    read -= {"wrap_cmd", "spill_wrap_cmd", "wrap_lane", "fallback_lane", "spill_beside_device", "python_lock"}
+    # the Python lock its checks' pinned env is built from, and the strikes that quarantine a spill host for it
+    read -= {"wrap_cmd", "spill_wrap_cmd", "wrap_lane", "fallback_lane", "spill_beside_device", "python_lock",
+             "spill_quarantine_after"}
     # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads
     read -= {"suite_concurrency"}
     assert "wrap_cmd" in project._known_keys(["checks"])
