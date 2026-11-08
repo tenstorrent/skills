@@ -294,8 +294,23 @@ def spill_to(checks: list, host: str, cfg: dict | None) -> list:
         if isinstance(c, Check):
             c2.__dict__.update(c.__dict__)
         c2.spill_host, c2.remote_wrap = host, spill_wrap_of(c2, cfg)
+        _ship_plugins(c2)
         out.append(c2)
     return out
+
+
+def _ship_plugins(c: Any) -> None:
+    """A spilled check whose env puts this runtime's pytest plugins (pushpass.PLUGIN_DIR: a narrowed
+    check's select plugin, testpick.narrow) on PYTHONPATH: the plugins go with it (remotecheck's shipped
+    files, in the copy of the commit there) and the entry names that copy instead of this host's path."""
+    env = dict(getattr(c, "env", ()) or ())
+    local = str(pushpass.PLUGIN_DIR)
+    if local not in env.get("PYTHONPATH", ""):
+        return
+    env["PYTHONPATH"] = env["PYTHONPATH"].replace(local, f"$PWD/{remotecheck.SHIP_DIR}")
+    c.env = tuple(sorted(env.items()))
+    own = tuple(getattr(c, "ship_py", ()) or ())
+    c.ship_py = own + tuple(str(f) for f in sorted(pushpass.PLUGIN_DIR.glob("*.py")) if str(f) not in own)
 
 
 WRAP_LANE_KEY = "checks.wrap_lane"
@@ -576,7 +591,8 @@ def check_argv(cmd: str, top: str | Path | None = None, env: dict | None = None,
     lane = tuple(getattr(cmd, "lane", ()) or ()) if wrap else ()
     isolate = isolate and getattr(cmd, "sandbox", True) is not False
     if slurm := getattr(cmd, "slurm", None):   # the account's Slurm overflow: one batch job (slurmcheck)
-        return slurmcheck.argv(str(cmd), slurm, exports, commit, getattr(cmd, "time_min", 0))
+        return slurmcheck.argv(str(cmd), slurm, exports, commit, getattr(cmd, "time_min", 0),
+                               tuple(getattr(cmd, "ship_py", ()) or ()), dict(getattr(cmd, "literal_env", ()) or ()))
     if host := remote_host(cmd):
         return remotecheck.argv(str(cmd), host, exports, commit, tuple(getattr(cmd, "remote_wrap", ()) or ()),
                                 tuple(getattr(cmd, "ship_py", ()) or ()), dict(getattr(cmd, "literal_env", ()) or ()))

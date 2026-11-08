@@ -472,11 +472,15 @@ def paused_line(now: float | None = None) -> str:
             f"setting {KEY} again re-arms it")
 
 
-def argv(cmd: str, s: dict, env: dict | None = None, commit: str = "", minutes: int = 0) -> list[str]:
-    """The local command that runs check `cmd` as one job on the cluster (main)."""
+def argv(cmd: str, s: dict, env: dict | None = None, commit: str = "", minutes: int = 0,
+         py: tuple[str, ...] = (), literal: dict | None = None) -> list[str]:
+    """The local command that runs check `cmd` as one job on the cluster (main); `py` and `literal` as
+    remotecheck.argv's (its shipped files)."""
     return [sys.executable, "-c", _BOOT, str(Path(__file__).resolve().parents[1]),
             "--settings", json.dumps(s, sort_keys=True), "--time-min", str(minutes or time_min(None, s)),
-            "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []), "--", cmd]
+            "--env", json.dumps(env or {}, sort_keys=True), *(["--commit", commit] if commit else []),
+            *(["--py", json.dumps(list(py))] if py else []),
+            *(["--literal", json.dumps(literal, sort_keys=True)] if literal else []), "--", cmd]
 
 
 def job_script(q: str, exports_: str, cmd: str, lock: str | None = None) -> str:
@@ -537,7 +541,7 @@ def _start_fail(job: str, state: str, why: str, seen: dict) -> dict | None:
 
 
 def main(args: list[str]) -> int:
-    s, env, commit, minutes = {}, {}, "", 0
+    s, env, commit, minutes, py, literal = {}, {}, "", 0, [], {}
     while args and args[0] != "--":
         flag, value, args = args[0], args[1] if len(args) > 1 else "", args[2:]
         if flag == "--settings":
@@ -548,13 +552,17 @@ def main(args: list[str]) -> int:
             commit = value
         elif flag == "--time-min":
             minutes = int(value or 0)
+        elif flag == "--py":
+            py = [str(f) for f in json.loads(value or "[]")]
+        elif flag == "--literal":
+            literal = json.loads(value or "{}")
     cmd = " ".join(args[1:])
     try:
         s = settings_of(s)
     except ValueError as e:
         _say(f"usage: --settings <{KEY}> [--time-min <n>] [--env <json>] -- <command> ({e})")
         return 2
-    if remotecheck.env_problem(env) or not cmd:
+    if remotecheck.env_problem(env) or remotecheck.env_problem(literal) or not cmd:
         _say(f"usage: --settings <{KEY}> [--time-min <n>] [--env <json>] -- <command>")
         return 2
     host = s["host"]
@@ -609,9 +617,10 @@ def main(args: list[str]) -> int:
             _say(f"git archive of {head[:12]} failed (exit {archive.returncode})")
             return 2
         try:
-            script = job_script(q, remotecheck.exports(env), cmd, os.environ.get(runnerenv.LOCK_ENV)).encode()
+            script = job_script(q, remotecheck.exports(env) + remotecheck.shipped(py, literal), cmd,
+                                os.environ.get(runnerenv.LOCK_ENV)).encode()
         except OSError as e:
-            _say(f"cannot read the checks' Python lock: {e}")
+            _say(f"cannot read the checks' Python lock or a file to copy there: {e}")
             return 2
         try:
             put = _ssh(host, f"cat > {q}/tree.tar", remotecheck.SETUP_TIMEOUT_S, archive.stdout)

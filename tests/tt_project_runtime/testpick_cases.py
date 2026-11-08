@@ -215,7 +215,7 @@ def test_narrow_records_targeted_or_full_and_keeps_the_full_pass_key_apart(tmp_p
     todo, lines = testpick.narrow(repo, base, head, list(own), own, None)
     assert lines == [f"{_PICK_CMD}: targeted: 1 case files, 1 tests in 1 test files"]
     c = todo[0]
-    assert str(c) == _PICK_CMD and c.targeted and not c.spill
+    assert str(c) == _PICK_CMD and c.targeted
     assert dict(c.env)[testpick.FILES_ENV] == "tests/r/foo_cases.py\ntests/test_plugin_catalogue.py::test_cat"
     assert cli._command_key(c) != cli._command_key(own[0])   # a targeted pass is never the full check's
     assert testpick.narrow(repo, base, head, list(own), own, None, full=True)[1] == [f"{_PICK_CMD}: full: --full"]
@@ -422,3 +422,31 @@ def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite
 def test_delivery_checks_targeted_settings_are_validated():
     from ttp import project
     assert "checks_targeted" in project.EXTRA_KEYS["delivery"] and "checks_targeted_always" in project.EXTRA_KEYS["delivery"]
+
+
+def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host_or_the_slurm_overflow(tmp_path, monkeypatch):
+    """A targeted check may spill as a full one does: spill_to ships the select plugin with the copy of
+    the commit and points its PYTHONPATH entry there, never at this host's folder, so on a stand-in spill
+    host (fake ssh), and as a Slurm overflow job, only its selection runs."""
+    from ttp import checkspill, push, pushpass, remotecheck, slurmcheck, testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {"plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
+    own = push.check_list([_PICK_CMD])
+    c = testpick.narrow(repo, base, head, list(own), own, None)[0][0]
+    assert c.targeted and checkspill.check_spills(c) and checkspill.spillable([c])
+    s = push.spill_to([c], "box1", {})[0]
+    env = dict(s.env)
+    assert str(pushpass.PLUGIN_DIR) not in json.dumps(env), "never this host's path there"
+    assert env["PYTHONPATH"].startswith(f"$PWD/{remotecheck.SHIP_DIR}")
+    assert env[testpick.FILES_ENV] == dict(c.env)[testpick.FILES_ENV] and env["PYTEST_ADDOPTS"] == dict(c.env)["PYTEST_ADDOPTS"]
+    assert str(pushpass.PLUGIN_DIR / f"{pushpass.SELECT_PLUGIN}.py") in s.ship_py
+    assert push.spill_to([s], "box1", {})[0].ship_py == s.ship_py, "spilled again: shipped once"
+    plain = push.spill_to(list(own), "box1", {})[0]
+    assert not getattr(plain, "ship_py", ()) and not getattr(plain, "env", ()), "a full check ships nothing"
+    fake, _ = _slurm_fakes(tmp_path)
+    run = {**os.environ, **fake}
+    r = subprocess.run(push.check_argv(s, commit=head), cwd=repo, env=run, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "1 passed, 2 deselected" in r.stdout, r.stdout + r.stderr
+    s.slurm, s.time_min = slurmcheck.settings_of({**_SLURM_SET, "workdir": str(tmp_path / "remote")}), 1
+    r = subprocess.run(push.check_argv(s, commit=head), cwd=repo, env=run, capture_output=True, text=True, timeout=120)
+    assert r.returncode == 0 and "1 passed, 2 deselected" in r.stdout, r.stdout + r.stderr

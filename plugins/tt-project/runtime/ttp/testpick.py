@@ -305,7 +305,6 @@ def narrow(top: Path, base: str, head: str, todo: list, own: list, cfg: dict | N
         c2.env = tuple(sorted({"PYTHONPATH": f"{pushpass.PLUGIN_DIR}${{PYTHONPATH:+:$PYTHONPATH}}",
                                "PYTEST_ADDOPTS": f"${{PYTEST_ADDOPTS:+$PYTEST_ADDOPTS }}-p {pushpass.SELECT_PLUGIN}",
                                FILES_ENV: "\n".join(entries)}.items()))
-        c2.spill = False   # the select plugin's path is this host's
         c2.targeted = True   # a part of the suite: never a verified-through marker
         c2.scope = sizes     # its size, and the full check it narrows, price its lane (checklane.cost)
         c2.full = c
