@@ -12,7 +12,7 @@ from pathlib import Path
 
 from . import budget as bud
 from . import chaincap, conflictfix, ctxblock, overlap, relay, replymsg, settinghold, settled, taskfacts, tierfloor, timefmt
-from . import preempt, sidefx, streamguard
+from . import preempt, sidefx, specfold, streamguard
 from .db import continues_id, load_result
 from .hook import unread_update
 from .project import rebase_replace
@@ -925,7 +925,7 @@ def worker_task(p: Project, task: dict, cwd: str, branch: str | None, wake: dict
            + ("refused; never push any branch but the push branch)" if own_off else
               "`ttp push --own` publishes only onto a branch the remote already has)")
            if own_push(cfg) != "on" and delivery.get("own_push") is not None else "") + "\n"
-        f"{history}\n## Spec\n{task['spec'] or task['title']}\n",
+        f"{history}\n## Spec\n{specfold.for_prompt(p.state, task)}\n",
         replymsg.prompt_block(dict(task)),
         settled.prompt_block(p, dict(task)),
         taskfacts.prompt_block(p, dict(task)),
