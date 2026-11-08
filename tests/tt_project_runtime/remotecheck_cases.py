@@ -1798,6 +1798,46 @@ def test_a_remote_wrapper_missing_on_the_host_is_a_fault_and_the_command_never_r
     assert _rc_left(tmp_path) == []
 
 
+def test_a_remote_wrapper_that_records_its_refusal_is_a_host_fault_and_a_plain_exit_75_still_fails(tmp_path):
+    """A spill wrapper that refuses the run (a busy host) writes the file TTP_WRAP_REFUSED names and exits
+    FAULT_RC: a host fault, so the check runs again elsewhere, never a failed check. Exit 75 without that
+    file (from the wrapper or the check), the file with any other exit, or a check that writes it unwrapped
+    keep today's reading: 75 as 1, other codes as they are; a real failure stays a failure."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    git = ["git", "-C", str(repo), "-c", "user.email=t@example.com", "-c", "user.name=t"]
+    (repo / "busy.sh").write_text('#!/bin/sh\n[ -n "$REFUSE" ] || exec "$@"\necho "host busy" >&2\n'
+                                  'case "$REFUSE" in mark*) : > "$TTP_WRAP_REFUSED";; esac\n'
+                                  'case "$REFUSE" in *75) exit 75;; *) exit 9;; esac\n')
+    (repo / "busy.sh").chmod(0o755)
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "busy"], check=True)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    ran = tmp_path / "ran"
+
+    def go(cmd, refuse="", wrap=("./busy.sh",)):
+        penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote),
+                "REFUSE": refuse}
+        r = subprocess.run(remotecheck.argv(cmd, "box1", {}, "", wrap), cwd=repo, env=penv, capture_output=True,
+                           text=True, timeout=60)
+        return r.returncode, r.stdout + r.stderr
+    rc, out = go(f"echo ran >> {ran}", refuse="mark75")
+    assert rc == remotecheck.FAULT_RC and f"{remotecheck.SIG}box1" in out and "refused" in out, out
+    assert "host busy" in out and not ran.exists() and "ttp-remote-rc" not in out, out
+    assert _rc_left(tmp_path) == []
+    rc, out = go("exit 3")
+    assert rc == 3 and remotecheck.SIG not in out, "a real failure behind the wrapper stays a failure"
+    rc, out = go("exit 75")
+    assert rc == 1 and "reported as 1" in out and remotecheck.SIG not in out, out
+    rc, out = go("true", refuse="plain75")
+    assert rc == 1 and remotecheck.SIG not in out, "the wrapper's own 75 without the file is today's 1"
+    rc, out = go("true", refuse="mark9")
+    assert rc == 9 and remotecheck.SIG not in out, "the file with another exit code is no refusal"
+    rc, out = go('[ -n "$TTP_WRAP_REFUSED" ] && touch "$TTP_WRAP_REFUSED"; exit 75', wrap=())
+    assert rc == 1 and remotecheck.SIG not in out, "unwrapped, there is no wrapper to refuse"
+    assert _rc_left(tmp_path) == []
+
+
 def test_a_host_local_check_that_opts_in_spills_behind_its_remote_wrapper_and_a_missing_one_reruns_here(
         env, tmp_path, monkeypatch):
     """A push check with host "local" and `spill: true` spills when the lane here stays busy and runs

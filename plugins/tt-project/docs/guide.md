@@ -2094,7 +2094,8 @@ session and stateless coordinators on every provider.
   entries too), `"spill": true` lets it spill even with `"host": "local"`, `"spill": false` keeps it here (left out:
   a check with host `local` stays here, others follow the pool rules), and `"spill_wrap_cmd"` overrides the
   project's remote wrapper. A remote wrapper missing or not executable on the host is a host fault: the check never
-  runs unwrapped. The order: a run asks the spill hosts first (with `delivery.checks_spill_first` false, only
+  runs unwrapped. A wrapper that refuses a run (say, a busy host) writes the file `$TTP_WRAP_REFUSED` names and
+  exits 75: a host fault too, so the check runs again elsewhere; exit 75 without that file reads as a failed check. The order: a run asks the spill hosts first (with `delivery.checks_spill_first` false, only
   once the slots here are full: an urgent run at once, others after `delivery.checks_spill_after_s`); a run
   waiting here (its lanes, the host-wide checks cap or the load guard) asks again after each such bound; the first listed host
   that is allowed, free and reachable takes the run; only when every one is full, paused or unreachable does it

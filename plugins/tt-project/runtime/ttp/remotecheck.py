@@ -18,7 +18,9 @@ project's, a shared or another project's pause; nothing reaches it over ssh): th
 exit FAULT_RC is reported as 1, so it never reads as a fault. A check spilled with a remote wrapper
 (--wrap: push.spill_to) runs behind it there; a wrapper missing or not executable on the host (a
 relative path in the copy of the commit, else a name on the host's PATH) is a fault too: the check
-never runs unwrapped. `--py` files (the tests gate's select plugin, cli._remote_select) are written into the
+never runs unwrapped. So is a wrapper that refuses the run (a busy host): it writes the file its
+TTP_WRAP_REFUSED variable names and exits FAULT_RC, and the check runs again elsewhere; exit FAULT_RC
+without that file still reads as 1. `--py` files (the tests gate's select plugin, cli._remote_select) are written into the
 run folder's .git, out of the tree the check sees, and put first on PYTHONPATH; `--literal` variables are
 exported as given, never expanded there.
 
@@ -41,6 +43,8 @@ ENV_DIR = ".git/ttp-env"   # the pinned Python env's maker and lock in the run f
 SHIP_DIR = ".git/ttp-py"   # where shipped Python files go in the run folder: never in the tree the check sees
 NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there (runnerenv.remote_lines): a host fault
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
+WRAP_REFUSED = "wrap-refused"   # ... and when the wrapper refused the run (WRAP_REFUSED_ENV): a host fault
+WRAP_REFUSED_ENV = "TTP_WRAP_REFUSED"   # the file a wrapper writes before it exits FAULT_RC to refuse a run
 LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_host is set
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -191,7 +195,8 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     then KILL after STOP_GRACE_S) once ssh's stdin ends: without a tty, ssh signals nothing when the
     local side stops or dies, and the command would run on. Then the exit-code marker, and the
     directory is removed. With `wrap`, the command runs behind it, and a wrapper that is missing or not
-    executable there prints the marker's NO_WRAP form instead of starting anything. With `prio`, it all
+    executable there prints the marker's NO_WRAP form instead of starting anything, and one that exits
+    FAULT_RC after writing the file WRAP_REFUSED_ENV names prints its WRAP_REFUSED form. With `prio`, it all
     runs behind the host's `nice` and `ionice` (_priority)."""
     w = " ".join(map(shlex.quote, wrap))
     run = f"{w} bash -e -o pipefail -c {shlex.quote(cmd)}".lstrip()
@@ -199,7 +204,10 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     if wrap:
         exe = shlex.quote(wrap[0])
         test = f"[ -f {exe} ] && [ -x {exe} ]" if "/" in wrap[0] else f"command -v {exe} >/dev/null 2>&1"
-        has = f"if ! {{ {test}; }}; then printf '\\n%s%s\\n' {mark} {NO_WRAP}; exit 96; fi\n"
+        has = (f"if ! {{ {test}; }}; then printf '\\n%s%s\\n' {mark} {NO_WRAP}; exit 96; fi\n"
+               f"export {WRAP_REFUSED_ENV}={q}/.git/ttp-wrap-refused\n")
+    refused = (f"if [ \"$rc\" = {FAULT_RC} ] && [ -e \"${WRAP_REFUSED_ENV}\" ]; then "
+               f"printf '\\n%s%s\\n' {mark} {WRAP_REFUSED}; fi\n") if wrap else ""
     return (f"cd {q} || exit 97\ntrap 'cd / && rm -rf {q}' EXIT\n{exports_}{has}"
             f"if command -v bash >/dev/null 2>&1; then set -- {run}; else set -- {w} sh -e -c {shlex.quote(cmd)}; fi\n"
             f"{_priority(prio)}"
@@ -219,7 +227,7 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
             f"sleep {STOP_GRACE_S}; kill -KILL -$pid 2>/dev/null || kill -KILL $pid 2>/dev/null) >/dev/null 2>&1 &\n"
             "watch=$!\nexec 3<&-\n"
             "wait $pid\nrc=$?\nkill $watch 2>/dev/null\ntrap '' PIPE\n"
-            f"printf '\\n%s%s\\n' {mark} \"$rc\"\nexit $rc\n")
+            f"{refused}printf '\\n%s%s\\n' {mark} \"$rc\"\nexit $rc\n")
 
 
 class _Stop(Exception):
@@ -347,7 +355,7 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
         # stdin stays open and unwritten: its end on the host (we stopped, died or lost ssh) stops the command.
         proc = subprocess.Popen(_ssh(host, script, direct), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT)
-        rc, held, no_wrap, refused = None, b"", False, False
+        rc, held, no_wrap, refused, wrap_refused = None, b"", False, False, False
         out = sys.stdout.buffer
         for raw in iter(proc.stdout.readline, b""):
             text = raw.decode(errors="replace").strip()
@@ -355,6 +363,9 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if text.startswith(mark) and text[len(mark):].isdigit():
                 rc = int(text[len(mark):])
                 held = b""   # the blank line printed before the marker is ours
+                continue
+            if text == mark + WRAP_REFUSED:
+                wrap_refused, held = True, b""
                 continue
             if text in (mark + NO_WRAP, mark + NO_ENV):
                 no_wrap, held = text[len(mark):], b""
@@ -377,6 +388,10 @@ def _attempt(host, top, head, env, extra, cmd, mark, wrap, wait) -> tuple[int, s
             if proc.returncode == 255 and refused:
                 return FAULT_RC, why
             return _fault(host, why), ""
+        if rc == FAULT_RC and wrap_refused:
+            return _fault(host, f"the spill wrapper {wrap[0]!r} refused the run there (exit {FAULT_RC} and "
+                                f"{WRAP_REFUSED_ENV}; its reason, if any, is above), so the check did not run "
+                                "there"), ""
         if rc == FAULT_RC:
             _say(f"the command exited {FAULT_RC}; reported as 1, so it does not read as an unreachable host")
             return 1, ""
