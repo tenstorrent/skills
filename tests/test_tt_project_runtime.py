@@ -32648,7 +32648,8 @@ def test_a_mechanical_or_light_continue_hop_is_queued_at_light_tier_and_reads_it
     assert hop["tier"] == "light" and hop["spec"].startswith("Run the checks.\n\nParent branch "), hop["spec"]
     # The hop of a split (a code task with changes and a `continue:` follow-up) takes its branch over:
     # its worker starts from that head and reads the parent's summary.
-    prompt = worker_prompt(p, p.db.task(hop["id"]), str(p.root), None)
+    from ttp import spans
+    prompt = spans.strip(worker_prompt(p, p.db.task(hop["id"]), str(p.root), None))   # the summary is a span
     assert f"This task continues #{root} feature (done) on branch {p.db.task(root)['branch']}, and starts from " \
            f"that branch's head. Its last summary: feature: part done, checks left" in prompt
     mech = {"status": "done", "summary": "other: done, push left",
