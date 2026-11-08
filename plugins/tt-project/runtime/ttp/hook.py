@@ -1589,7 +1589,7 @@ def too_many_workers(cmd: str) -> str | None:
         return (f"pytest -n {max(big)} is above this run's test-worker budget of {k} on this shared host. "
                 f"Use -n {k} or fewer (or `-n auto`) through {how}")
     if not os.environ.get(testslots.HELD_ENV) and (bare := testslots.unpooled(cmd)):
-        return (f"pytest -n {max(bare)} outside `ttp clip` or `ttp sandbox` holds none of this shared host's "
+        return (f"pytest -n {bare[0]} outside `ttp clip` or `ttp sandbox` holds none of this shared host's "
                 f"test slots. Run it as {how}, or with no -n")
     return None
 
