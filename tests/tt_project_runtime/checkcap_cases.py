@@ -4365,6 +4365,8 @@ def test_the_cap_label_shows_only_at_the_cap_and_below_it_the_wait_names_the_hos
     p.set_config("checks.slots", 3)
     p.set_config("checks.wait_event_s", 1)
     cfg = p.config()
+    # the waiter's process reads as gone: this test's own environment and worktree must not name its task
+    monkeypatch.setattr(checklane, "_proc", lambda pid: {"command": "", "cwd": "", "ppid": None, "sid": None, "env": None})
     three = lambda _held: 3   # noqa: E731
     hold = lambda: testslots.suite_hold(p.name, repo=_LANE_REPO, slots=three, cap=2, wait_s=0,   # noqa: E731
                                         pending=True, running=True, who="run 1")
@@ -11479,6 +11481,8 @@ def test_a_lane_waiter_is_named_by_the_task_in_its_run_record(env, tmp_path, mon
     holder = _lane_holder(tmp_path, p.name, _LANE_REPO)
     base = testslots.suite_base(p.name, _LANE_REPO)
     now = time.time()
+    # the waiters' process reads as gone: this test's own environment and worktree must not name a task
+    monkeypatch.setattr(checklane, "_proc", lambda pid: {"command": "", "cwd": "", "ppid": None, "sid": None, "env": None})
     monkeypatch.setenv("TTP_TASK", "71")
     monkeypatch.setenv("TTP_RUN_ID", "501")
     tasked = locks.enqueue(checkcap.slot_dir(), base, f"{p.name}: full checks (run 501, pid 1)", now - 900, priority=2)
@@ -11492,7 +11496,9 @@ def test_a_lane_waiter_is_named_by_the_task_in_its_run_record(env, tmp_path, mon
         texts = [e["text"] for e in checklane.wait_events(p.name, {"checks": {"wait_event_s": 600}}, now)]
         assert any(t.startswith("Checks lane wait: #71 has waited") for t in texts), texts
         assert any(t.startswith("Checks lane wait: #73 has waited") for t in texts), texts
-        assert any(t.startswith("Checks lane wait: a run with no task (full checks (pid 2)) has waited") for t in texts), texts
+        # a gone taskless waiter is named by its pid, its ticket label's command, and when it first queued
+        assert any(t.startswith(f"Checks lane wait: a run with no task (pid {os.getpid()} 'full checks (pid 2)' "
+                                f"folder unknown, first queued ") for t in texts), texts
         waiters = [w["task"] for r in checklane.lane_status(p.name, now) for w in r["waiters"]]
         assert sorted(waiters) == ["", "71", "73"], waiters
         assert checklane._who({"task": "", "pid": 2}) == "no task pid 2"
