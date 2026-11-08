@@ -191,7 +191,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
     for c in kept if isinstance(kept, list) else []:
         if isinstance(c, dict) and isinstance(c.get("at"), (int, float)) and c["at"] >= since:
             compactions.setdefault(timefmt.today(c["at"], tz), []).append(
-                {k: c.get(k) for k in ("at", "session", "before", "after", "how")})
+                {k: c.get(k) for k in ("at", "session", "before", "after", "how", "post") if k != "post" or c.get(k)})
     out = []
     today = timefmt.today(now, tz)
     for day, d in sorted(by_day.items()):
@@ -290,7 +290,8 @@ def text(s: dict, name: str = "") -> str:
                                    if offs else ""))
         lines.extend(f"    failed wake: {e}" for e in d["failed_wakes"])
         lines.extend(f"    compacted in place: session {str(c['session'] or '-')[:8]} at {timefmt.short(c['at'], s['zone'])}, "
-                     f"{int(c['before'] or 0) / 1000:.0f}k -> {int(c['after'] or 0) / 1000:.0f}k tokens ({c['how']})"
+                     f"{int(c['before'] or 0) / 1000:.0f}k -> {int(c['after'] or 0) / 1000:.0f}k tokens ({c['how']}"
+                     + (f"; {int(c['post']) / 1000:.0f}k history right after" if c.get("post") else "") + ")"
                      for c in d.get("compactions") or [])
     for d in s.get("worker_context") or []:
         lines.append(f"  worker and review runs {d['day']}: {d['runs']} started, "

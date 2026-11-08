@@ -5584,8 +5584,9 @@ class Daemon:
         return ctx
 
     def _compaction(self, r: dict) -> dict | None:
-        """{"pre_tokens": the size before} when the run's agent compacted its session (Claude's
-        stream-json `compact_boundary` and its compact_metadata; 0: not given), else None."""
+        """{"pre_tokens": the size before, "post_tokens": its history right after} when the run's agent
+        compacted its session (Claude's stream-json `compact_boundary` and its compact_metadata; 0: not
+        given), else None."""
         try:
             with open(self._run_dir(r) / "output.jsonl", "rb") as f:
                 lines = [line for line in f if b'"compact_boundary"' in line]
@@ -5596,9 +5597,11 @@ class Daemon:
         try:
             meta = json.loads(lines[0]).get("compact_metadata") or {}
             pre = meta.get("pre_tokens") or meta.get("preTokens")
+            post = meta.get("post_tokens") or meta.get("postTokens")
         except (ValueError, AttributeError):
-            pre = None
-        return {"pre_tokens": pre if isinstance(pre, int) and not isinstance(pre, bool) and pre > 0 else 0}
+            pre = post = None
+        ok = lambda v: v if isinstance(v, int) and not isinstance(v, bool) and v > 0 else 0
+        return {"pre_tokens": ok(pre), "post_tokens": ok(post)}
 
     def _compacted(self, r: dict) -> bool:
         """The agent compacted the run's session history (Claude's stream-json `compact_boundary`)."""

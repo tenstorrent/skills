@@ -223,6 +223,40 @@ def test_coordsession_a_last_call_over_the_limit_compacts_in_place(tmp_path):
     assert cs.context_tokens(use) == 110000
 
 
+def test_coordsession_skips_a_compaction_that_would_free_under_compact_min_free_unless_the_window_forces_it(
+        tmp_path):
+    """A session whose last compaction left 260k would compact again at 360k and free under 30%: it waits
+    until 30% would come free, unless the context window forces it."""
+    import json
+    from types import SimpleNamespace
+    from ttp import coordsession as cs
+    from ttp.daemon import Daemon
+    yes = lambda s: True
+    st = {**_cs_state(), "base_tokens": 30000, "compact_floor": 260000, "context_tokens": 365000}
+    assert cs.limit(_cs_cfg(), st, "m") == int(260000 / 0.7)
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 50.0) == ("resume", "continued")
+    assert cs.decide(_cs_cfg(), {**st, "context_tokens": 372000}, "k1", "m", "high", yes, 50.0) == ("resume", "compact")
+    # The window cap stays the last word, and 0 turns the guard off; a junk value keeps the default.
+    assert cs.decide(_cs_cfg(context_window_tokens=400000), st, "k1", "m", "high", yes, 50.0) == ("resume", "compact")
+    assert cs.limit(_cs_cfg(compact_min_free=0), st, "m") == 360000
+    assert cs.limit(_cs_cfg(compact_min_free="x"), st, "m") == int(260000 / 0.7)
+    # A low floor leaves the growth rule in charge.
+    assert cs.limit(_cs_cfg(), {**st, "compact_floor": 40000}, "m") == 140000
+    # The agent's own size right after compacting is kept beside the wake-end size, and shown.
+    out = tmp_path / "run"
+    out.mkdir()
+    (out / "output.jsonl").write_text(json.dumps({"type": "system", "subtype": "compact_boundary",
+                                                  "compact_metadata": {"pre_tokens": 146000, "post_tokens": 9000}}) + "\n")
+    got = Daemon._compaction(SimpleNamespace(_run_dir=lambda r: out), {})
+    assert got == {"pre_tokens": 146000, "post_tokens": 9000}
+    turn = {"mode": "resume", "why": "continued", "key": "k1", "model": "m", "effort": "high", "provider": "claude"}
+    from ttp.providers.claude import Claude
+    st = cs.record({**st, "context_tokens": 140000}, Claude().parse(_cs_stream(tmp_path / "g.jsonl", [(142000, 100)])),
+                   "s1", turn, True, 60.0, compacted=got)
+    assert st["compactions"][-1] == {"at": 60.0, "session": "s1", "before": 146000, "after": 142100, "how": "agent",
+                                     "post": 9000}
+
+
 def test_coordsession_a_fresh_prompt_above_the_old_140k_default_still_resumes(tmp_path):
     """A project whose first call alone is 145k tokens resumes; its first wake grew to 186k."""
     from ttp import coordsession as cs
@@ -255,7 +289,7 @@ def test_coordsession_the_retired_mode_key_is_refused_and_absent_from_the_defaul
     p = make(env)
     assert p.config()["coordinator"]["session"] == {"compact_tokens": 0, "compact_growth_tokens": 100000,
                                                    "context_window_tokens": 0, "compact_margin_tokens": 40000,
-                                                   "row_delta": True,
+                                                   "compact_min_free": 0.3, "row_delta": True,
                                                    "worker_context": "fork", "worker_fork_max_tokens": 0,
                                                    "worker_fork_max_age_h": 12, "worker_chat_chars": 30000}
     assert not {"thread_warm_min", "thread_max_turns"} & set(p.config()["coordinator"])
@@ -518,14 +552,15 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
     # Each in-place compaction coordsession recorded is listed on its day: session, tokens before and after.
     from ttp import coordsession
     rows = [{"at": first - 9 * day, "session": "s0", "before": 1, "after": 1, "how": "agent"},   # outside the window
-            {"at": t0 + day + 900, "session": "s1-abcdef-long", "before": 151000, "after": 52100, "how": "agent"},
+            {"at": t0 + day + 900, "session": "s1-abcdef-long", "before": 151000, "after": 52100, "how": "agent",
+             "post": 9000},
             "junk", {"at": "x"}]
     p.db.set_kv(coordsession.KEY, {"id": "s1", "compactions": rows})
     s = coordstats.report(p.db, p.runs, "UTC", 7, now=now)
     assert [d["compactions"] for d in s["by_day"]] == [[], [rows[1]]]
     out = coordstats.text(s, "demo")
     assert "1 compactions in place" in out and "0 compactions in place" in out, out
-    assert "    compacted in place: session s1-abcde at " in out and "151k -> 52k tokens (agent)" in out, out
+    assert "    compacted in place: session s1-abcde at " in out and "151k -> 52k tokens (agent; 9k history right after)" in out, out
 
 
 def test_coord_session_stats_name_why_each_wake_did_not_resume_and_keep_old_rows_readable(env):
