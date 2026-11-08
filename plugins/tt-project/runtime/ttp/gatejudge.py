@@ -189,12 +189,17 @@ def _same_mark(a: str, b: str) -> bool:
 
 
 def _mark_norm(text: str) -> str:
-    """`text` with what differs between two runs of one failure left out: addresses, temp names and the
-    numbers in paths (pytest's numbered temp folders). What may be a temp name's random part in a path
-    (mkdtemp's `home-y7h9wyh0`, mktemp's `check.T6w5cg3S`) stays as it is for _same_mark to compare.
+    """`text` with what differs between two runs of one failure left out: addresses, temp names, hashes (a
+    venv or checks env folder), pids, durations and the numbers in paths (pytest's numbered temp folders).
+    What may be a temp name's random part in a path (mkdtemp's `home-y7h9wyh0`, mktemp's `check.T6w5cg3S`)
+    stays as it is for _same_mark to compare.
     Other numbers stay: `assert 5 == 0` (a run that selected nothing) is not `assert 1 == 0`."""
     text = re.sub(r"0x[0-9a-fA-F]+", "N", re.sub(r"\btmp[\w-]+", "tmp", text or ""))
+    text = re.sub(r"\b[0-9a-fA-F]{6,}\b", lambda m: "H" if re.search(r"\d", m[0]) and re.search(r"[a-fA-F]", m[0])
+                  else m[0], text)   # hashes (a checks env's folder, a commit), never a word or a plain number
     text = _PATH.sub(lambda m: _TEMP_OR_DIGITS.sub(lambda t: t.group(1) or "N", m.group(0)), text)
+    text = re.sub(r"\b(pid[ =:]*)\d+", r"\1N", text, flags=re.I)
+    text = re.sub(r"\b\d+(?:\.\d+)?(?:ms|s|seconds?|secs?)\b", "Ns", text)   # durations
     return re.sub(r"\s+", " ", text).strip()[:MARK_MAX]
 
 
@@ -501,8 +506,10 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
         return v
     head_how = marks(got[1], still)
     saved = _saved(state, where, base, still, now) if base else {}
-    # A saved base failure without its mark (saved before marks were) cannot be compared: run the base again.
-    known = {i: bool(e.get("failed")) for i, e in saved.items() if not e.get("failed") or e.get("mark")}
+    # A saved base failure without its mark (saved before marks were, or an output it could not read) cannot
+    # be compared: run the base again.
+    known = {i: bool(e.get("failed")) for i, e in saved.items()
+             if not e.get("failed") or any((e.get("mark") or {}).values())}
     how = {i: saved[i]["mark"] for i in known if known[i]}
     need = [i for i in still if i not in known]
     if need and base:
