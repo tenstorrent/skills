@@ -58,6 +58,8 @@ def _real_dir() -> Path:
 def make(store: Path) -> Path:
     """Write the stand-ins into <store>/bin (again only where missing); returns that folder."""
     bin_dir = store / "bin"
+    if (bin_dir / SHIMS).exists() and all((bin_dir / n).exists() for n in (*NAMES, "_hostshim.py")):
+        return bin_dir   # a nested run's inherited store: no mkdir or write outside its own temp folder
     bin_dir.mkdir(parents=True, exist_ok=True)
     prog = bin_dir / "_hostshim.py"   # a copy: a plugin upgrade during the run leaves it in place
     if not prog.exists():

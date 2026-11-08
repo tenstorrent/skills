@@ -269,3 +269,17 @@ def test_a_batch_check_stopped_mid_run_still_restores_and_reports_a_host_change(
                         True, (), None)
     assert tabf.read_text() == "0 1 * * * keep\n"
     assert "host guard: FAILED" in capsys.readouterr().out
+
+
+def test_a_nested_run_reuses_its_inherited_stand_ins_without_writing_to_their_folder(tmp_path, monkeypatch):
+    """A child run under `ttp checks` inherits the store: fake_env makes no folder or file there, so a
+    run whose temp files must stay in its own TMPDIR never touches the outer store's folder."""
+    from ttp import hoststate
+    store = tmp_path / "store"
+    env = hoststate.fake_env({"PATH": os.defpath}, store)
+    calls = []
+    monkeypatch.setattr(os, "mkdir", lambda *a, **k: calls.append(a))
+    monkeypatch.setattr(os, "replace", lambda *a, **k: calls.append(a))
+    again = hoststate.fake_env(dict(env))
+    assert again[hoststate.MARKER] == str(store) and again["PATH"].split(os.pathsep)[0] == str(store / "bin")
+    assert calls == []
