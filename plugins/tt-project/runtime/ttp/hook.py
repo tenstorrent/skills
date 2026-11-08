@@ -1108,6 +1108,7 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         from . import credguard
         why = credguard.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
                                      str(payload.get("cwd") or os.getcwd()))
+        why = why or local_guard(payload)
         return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
         from . import aitag
