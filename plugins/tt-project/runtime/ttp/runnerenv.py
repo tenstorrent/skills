@@ -247,7 +247,8 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
     `where` there, make or reuse the pinned env from them with that host's python3 (as ensure does
     here, under its TTP_HOME, or `home`, a shell word, when given), and put it in force as apply does.
     Where it cannot be made, they print why and run `fail`: the check never runs with that host's user
-    site. OSError when a file cannot be read."""
+    site. TTP_CHECKS_ENV_BIN names its bin, so a check behind a spill wrapper puts it first again
+    (remotecheck.REFRONT). OSError when a file cannot be read."""
     lock = Path(lock or LOCK)
     out, w = f"mkdir -p {shlex.quote(where)}\n", shlex.quote(where)
     for name, text in (("runnerenv.py", Path(__file__).read_text()), ("checks-python.lock", lock.read_text())):
@@ -255,7 +256,8 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
         out += f"cat > {w}/{name} <<'{end}'\n{text.rstrip(chr(10))}\n{end}\n"
     return (out + f'ttp_env=$({f"TTP_HOME={home} " if home else ""}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
             f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
-            'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1\nunset PIP_USER\n')
+            'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1 TTP_CHECKS_ENV_BIN="$ttp_env/bin"\n'
+            'unset PIP_USER\n')
 
 
 def _name(s: str) -> str:

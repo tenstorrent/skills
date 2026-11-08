@@ -2955,3 +2955,24 @@ def test_spill_first_setting_is_validated(env):
     assert settable("off") is False and settable("true") is True
     with pytest.raises(ValueError, match="nothing was changed"):
         settable("sometimes")
+
+
+def test_a_spill_wrapper_that_puts_its_own_venv_first_never_hides_the_pinned_checks_env(tmp_path):
+    """A host's spill wrapper may put its own Python env first on PATH (one that lacks a package the
+    checks import): behind it the command still runs with the pinned checks env's bin first and the user
+    site off, so every check there failing at collection never keeps a healthy host off."""
+    from ttp import remotecheck
+    repo = _rc_repo(tmp_path)
+    venv = tmp_path / "wrapper-venv" / "bin"
+    venv.mkdir(parents=True)
+    wrap = tmp_path / "venv-wrap.sh"
+    wrap.write_text(f'#!/bin/sh\nPATH="{venv}:$PATH"; PYTHONNOUSERSITE=; export PATH PYTHONNOUSERSITE\nexec "$@"\n')
+    wrap.chmod(0o755)
+    bin_, remote = _rc_fake_ssh(tmp_path)
+    penv = {**os.environ, "PATH": f"{bin_}{os.pathsep}{os.environ['PATH']}", "FAKE_REMOTE_TMP": str(remote)}
+    for w in ((str(wrap),), (str(wrap), "env", "X=1")):
+        r = subprocess.run(remotecheck.argv('echo "first=${PATH%%:*} nousersite=$PYTHONNOUSERSITE"', "box1", {}, "", w),
+                           cwd=repo, env=penv, capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0, r.stdout + r.stderr
+        first = r.stdout.split("first=", 1)[1].split()[0]
+        assert first != str(venv) and first.endswith("/bin") and "nousersite=1" in r.stdout, (w, r.stdout)

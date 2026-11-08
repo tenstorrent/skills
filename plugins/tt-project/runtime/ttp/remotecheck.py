@@ -45,6 +45,9 @@ NO_ENV = "no-env"     # ... and when the pinned Python env cannot be made there 
 NO_WRAP = "no-wrap"   # the exit marker's form when the remote wrapper is missing there: a host fault
 WRAP_REFUSED = "wrap-refused"   # ... and when the wrapper refused the run (WRAP_REFUSED_ENV): a host fault
 WRAP_REFUSED_ENV = "TTP_WRAP_REFUSED"   # the file a wrapper writes before it exits FAULT_RC to refuse a run
+# Behind a spill wrapper: the pinned checks env first on PATH again and the user site off (runnerenv.remote_lines)
+REFRONT = ('if [ -n "${TTP_CHECKS_ENV_BIN:-}" ]; then PATH="$TTP_CHECKS_ENV_BIN${PATH:+:$PATH}"; '
+           'PYTHONNOUSERSITE=1; export PATH PYTHONNOUSERSITE; unset PIP_USER; fi\n')
 LOCAL = "local"      # a check's `host` that keeps it here when delivery.checks_host is set
 HOST_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.@+:-]{0,252}")
 ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
@@ -197,7 +200,10 @@ def _run_script(q: str, exports_: str, cmd: str, mark: str, wrap: tuple[str, ...
     directory is removed. With `wrap`, the command runs behind it, and a wrapper that is missing or not
     executable there prints the marker's NO_WRAP form instead of starting anything, and one that exits
     FAULT_RC after writing the file WRAP_REFUSED_ENV names prints its WRAP_REFUSED form. With `prio`, it all
-    runs behind the host's `nice` and `ionice` (_priority)."""
+    runs behind the host's `nice` and `ionice` (_priority). Behind a wrapper the pinned checks env
+    (TTP_CHECKS_ENV_BIN, runnerenv.remote_lines) goes first on PATH again, so a wrapper that puts its own env first never hides it."""
+    if wrap:
+        cmd = REFRONT + cmd
     w = " ".join(map(shlex.quote, wrap))
     run = f"{w} bash -e -o pipefail -c {shlex.quote(cmd)}".lstrip()
     has = ""
