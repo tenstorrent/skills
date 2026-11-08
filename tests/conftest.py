@@ -1011,6 +1011,12 @@ def processes_in(root: str | Path) -> list[tuple[int, int, str]] | None:
 
 
 LEFT_GRACE_S = 1.0   # how long a test's leftover processes get to end on their own before they are stopped
+# A run's own runner and the fake provider it started end by themselves once the run finishes; a test that
+# returns as soon as the run's row says what it checks may leave them writing the run's last files. They
+# get this much longer (waited on by their exit, so it costs nothing when they end at once) under load;
+# anything else, or one still running after it, is stopped and reported as before.
+SELF_ENDING_GRACE_S = 20.0
+_SELF_ENDING = re.compile(r"-m ttp\.runner |ttp\.providers\.fake ")
 
 
 @pytest.fixture(autouse=True)
@@ -1027,6 +1033,10 @@ def _reap_test_processes(request):
     deadline = time.time() + LEFT_GRACE_S
     while (found := processes_in(root)) and time.time() < deadline:
         time.sleep(0.1)
+    deadline += SELF_ENDING_GRACE_S
+    while found and all(_SELF_ENDING.search(cmd + " ") for _, _, cmd in found) and time.time() < deadline:
+        time.sleep(0.1)
+        found = processes_in(root)
     if not found:
         return
     left = reap(found, root, finder=processes_in)

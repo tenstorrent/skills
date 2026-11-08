@@ -428,8 +428,8 @@ def test_the_subreaper_stand_in_keeps_the_tests_ttp_variables_and_ends_with_its_
     assert own[checkreap.MARKER] == "lc-token" and own["TTP_RUN_DIR"] == str(tmp_path) and "TTP_PROJECT" not in own
     os.kill(proc.pid, signal.SIGKILL)
     assert proc.gone_within(5) and proc.reaper.gone_within(5), "the subreaper outlived its stand-in"
-    late, _ = lc_spawn({}, name="b", reaper_s=1)
-    assert late.reaper.gone_within(10) and late.alive(), "the subreaper outlived its time limit"
+    late, _ = lc_spawn({}, name="b", reaper_s=4)   # long enough for a loaded host to start the stand-in under it
+    assert late.reaper.gone_within(_load_scaled(20)) and late.alive(), "the subreaper outlived its time limit"
 
 
 def test_a_test_s_process_tree_orphaned_in_its_pytest_temp_folder_is_stopped_and_nothing_else(env, tmp_path, monkeypatch):

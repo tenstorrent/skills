@@ -524,6 +524,29 @@ def _spill_lane(p, repo):
     return g
 
 
+def _close_when_back(lane, run, said="did not pass on spill host"):
+    """Free the held lane once checks.log says the spilled run came back here, not after a fixed time: a slow
+    spill under load would otherwise find the lane free first and run here without spilling. A bounded wait
+    in a daemon thread keeps a run that never says it from holding the lane past the test."""
+    import threading
+    log = run / "checks.log"
+    start = log.stat().st_size if log.exists() else 0
+
+    def watch():
+        end = time.time() + _load_scaled(120)
+        while time.time() < end:
+            try:
+                with open(log, "rb") as f:
+                    f.seek(start)
+                    if said.encode() in f.read():
+                        break
+            except OSError:
+                pass
+            time.sleep(0.05)
+        lane.close()
+    threading.Thread(target=watch, daemon=True).start()
+
+
 def test_busy_checks_spill_to_the_first_reachable_allowed_host_and_name_it(env, tmp_path, monkeypatch):
     """delivery.checks_spill_hosts: with the lane here held past checks_spill_after_s, the run skips an
     unreachable host (never a failure), runs on the next listed one, and checks.json and checks.log name
@@ -2662,7 +2685,7 @@ def test_an_unreachable_spill_host_backs_off_and_its_share_spreads_over_the_othe
 # probe answer never shows on the submit host). Probe jobs (--job-name=ttp-probe) log to probe.log
 # with ids from 901. FAKE_SLURM_NOACCT=1: sacct answers nothing (no accounting), scontrol does.
 # FAKE_SLURM_RC_LAG=<s>: a job's rc file shows that long after the job ended (NFS); lag.pids lists the
-# background movers, which a test waits out so none outlives it.
+# background movers, which a test waits out so none outlives it; "never": it never shows.
 _SLURM_FAKES = {
     "sbatch": r'''#!/bin/sh
 d=$FAKE_SLURM
@@ -2678,7 +2701,9 @@ elif [ "$FAKE_SLURM_MODE" = hold ]; then echo RUNNING > "$d/state.$n"
 elif [ "$FAKE_SLURM_MODE" = startfail ]; then echo FAILED > "$d/state.$n"; echo "1:0" > "$d/code.$n"
 elif [ "$FAKE_SLURM_MODE" = nodefail1 ] && [ ! -e "$d/failed" ]; then touch "$d/failed"; echo NODE_FAIL > "$d/state.$n"
 else (cd "$dir" && sh "$script" > "$out" 2>&1); echo COMPLETED > "$d/state.$n"
-  if [ -n "$FAKE_SLURM_RC_LAG" ] && [ -e "$dir/rc" ]; then
+  if [ "$FAKE_SLURM_RC_LAG" = never ] && [ -e "$dir/rc" ]; then
+    mv "$dir/rc" "$dir/rc.late"
+  elif [ -n "$FAKE_SLURM_RC_LAG" ] && [ -e "$dir/rc" ]; then
     mv "$dir/rc" "$dir/rc.late"; (sleep "$FAKE_SLURM_RC_LAG"; mv "$dir/rc.late" "$dir/rc") </dev/null >/dev/null 2>&1 &
     echo $! >> "$d/lag.pids"
   fi
@@ -3075,7 +3100,8 @@ def test_a_slurm_job_on_a_cluster_without_accounting_reads_scontrol_and_waits_ou
     assert rc == 5 and "submitting it again" not in out, out
     assert "show job 101" in (d / "scontrol.log").read_text()
     assert len((d / "sbatch.log").read_text().splitlines()) == 1
-    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_RC_LAG": "3"}, rc_grace_s=1)
+    # Past the grace: an rc file that never shows, not a lag a slow poll under load could outwait.
+    rc, out = _slurm_run(tmp_path, repo, "echo ran", {**fake, "FAKE_SLURM_RC_LAG": "never"}, rc_grace_s=1)
     assert rc == remotecheck.FAULT_RC and "submitting it again once" in out and "ended COMPLETED" in out, out
     assert len((d / "sbatch.log").read_text().splitlines()) == 3
     _wait_out_pids(d / "lag.pids")
@@ -3398,7 +3424,7 @@ def test_a_spilled_failure_whose_head_rerun_cannot_tell_still_runs_again_here_an
                                base.replace("def test_x():\n    pass", "def test_x():\n    assert False"))
     monkeypatch.setattr(gatejudge, "rerun", lambda *a, **k: got)
     lane = _spill_lane(p, repo)
-    threading.Timer(2.0, lane.close).start()
+    _close_when_back(lane, run)
     with pytest.raises(SystemExit) as e:
         cli.main(["checks", "--fresh"])
     assert e.value.code == 1
@@ -3426,7 +3452,7 @@ def _spill_gate_unproven(env, tmp_path, monkeypatch, at):
         return next(faults) if where == at else real(run_, where, ids, *a, **k)
     monkeypatch.setattr(gatejudge, "rerun", rerun)
     lane = _spill_lane(p, repo)
-    threading.Timer(2.0, lane.close).start()
+    _close_when_back(lane, run)
     with pytest.raises(SystemExit) as e:
         cli.main(["checks", "--fresh"])
     assert e.value.code == 1

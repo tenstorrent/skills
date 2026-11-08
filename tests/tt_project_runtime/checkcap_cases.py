@@ -3633,10 +3633,12 @@ def test_checks_test_project_max_auto_sizes_from_the_host_over_a_fixed_account_n
     a = testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, wait_s=0)
     told = []
     # No wall-clock deadline (wait_s), which a slow first poll under load passes before the first line:
-    # the wait ends once it has told (stop), however long that took.
+    # the wait ends once it has told (stop), however long that took, or after a minute that never tells.
+    began = time.time()
     with pytest.raises(checkcap.Cancelled):
         testslots.suite_hold("pa", repo=_LANE_REPO, slots=4, cap=1, tell=told.append, cap_note=note,
-                             stop=lambda: "told" if told else "")
+                             stop=lambda: "told" if told else "timeout" if time.time() - began > 60 else "")
+    assert told, "the waiter at the cap told nothing within a minute"
     assert "(checks.test_project_max 3, set in the account settings; the host fits" in told[0], told
     a.close()
     # config_set takes auto for the cap, not for the test-worker budget, which is a number of slots.
