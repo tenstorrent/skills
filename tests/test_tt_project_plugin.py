@@ -604,7 +604,7 @@ def test_reviews_and_landings_never_wait_on_a_repeat_of_a_passed_test():
     assert "a further test you want is a finding in your verdict, and the verdict still goes out" in review
     assert "Only the required checks and your verdict hold a landing." in review
     code = " ".join((prompts / "kind-code.md").read_text(encoding="utf-8").split())
-    assert "A landing waits only on the required checks (the suite and any smoke test) and the review's verdict." in code
+    assert "A landing waits only on the required checks (suite, any smoke test) and the review's verdict;" in code
 
 
 
