@@ -147,6 +147,71 @@ def test_pathguard_script_files_a_command_runs(cred_home):
     assert pathguard_why(_pg_bash(f"python3 {shipped} keys box --run", w)) is None
 
 
+PG_DATA = "~/data/records"
+PG_DATA_FILE = "os.path.expanduser('~/data/records/a.json')"
+PG_DATA_WRITES = [   # each Python write form, its target in a protected_paths folder
+    f"python3 -c \"import os; p = {PG_DATA_FILE}\nwith open(p, 'w') as f: f.write('x')\"",
+    f"python3 -c \"import os\ndef put(q): open(q, 'a').write('x')\nput({PG_DATA_FILE})\"",
+    "python3 -c \"import os, glob\nfor f in glob.glob(os.path.expanduser('~/data/records/*')): os.remove(f)\"",
+    f"python3 -c \"import shutil, os; shutil.copy('/tmp/x', {PG_DATA_FILE})\"",
+    "python3 -c \"from pathlib import Path; (Path.home() / 'data' / 'records' / 'a').write_text('x')\"",
+    "python3 -c \"from pathlib import Path; p = Path.home() / 'data/records/a'; p.unlink()\"",
+    "python3 -c 'import sys, os; os.remove(sys.argv[1])' ~/data/records/a.json",
+    "F=~/data/records/a python3 -c 'import os; open(os.environ[\"F\"], \"w\")'",
+    f"python3 -c \"from os import remove as r; import os; r({PG_DATA_FILE})\"",
+    f"python3 -c \"import os; f = os.remove; f({PG_DATA_FILE})\"",
+    f"python3 -c \"import os; list(map(os.remove, [{PG_DATA_FILE}]))\"",
+    f"python3 -c \"import os; exec('open(' + repr({PG_DATA_FILE}) + ', \\\"w\\\")')\"",
+    f"python3 -c \"import zipfile, os; zipfile.ZipFile({PG_DATA_FILE}, 'w')\"",
+    f"python3 -c \"import os; p = {PG_DATA_FILE}; m = 'w'; open(p, m)\"",
+    f"python3 -c \"import os; d = {{'k': {PG_DATA_FILE}}}; open(d['k'], 'w')\"",
+    f"python3 -c \"import os\nclass W:\n  def __init__(s, p): open(p, 'w')\nW({PG_DATA_FILE})\"",
+    f"python3 -c \"import os, subprocess; subprocess.run(['cp', '/tmp/x', {PG_DATA_FILE}])\"",
+    f"python3 - <<'PY'\nimport os\nopen({PG_DATA_FILE}, 'w')\nPY",
+]
+PG_DATA_READS = [   # reads of the folder, and mentions of it only in quoted data
+    f"python3 -c \"import os, json\nrows = [json.load(open(f)) for f in [{PG_DATA_FILE}]]\n"
+    "json.dump(rows, open('/tmp/out.json', 'w'))\"",
+    f"python3 -c \"import os; p = {PG_DATA_FILE}; print(os.path.exists(p)); open('/tmp/o', 'w').write(p)\"",
+    "python3 -c 'import sys; print(sys.argv[1])' ~/data/records/a.json",
+    "python3 -c 'import json; json.dump({\"artifacts\": [\"~/data/records/a.json\"]}, open(\"/tmp/r.json\", \"w\"))'",
+    "python3 -c 'import json, sys; json.dump({\"summary\": \"read ~/data/records\"}, sys.stdout)'",
+    "grep -c 'save ~/data/records' /tmp/log; python3 -c 'print(1)'",
+    "python3 -c 'print(1)' --note 'wrote a copy into ~/data/records'",
+    "python3 -c 'import sys; open(\"/tmp/o\", \"w\").write(sys.argv[1])' '~/data/records is read only'",
+    "python3 report.py /tmp/out.html",
+]
+
+
+@pytest.mark.parametrize("cmd", PG_DATA_READS)
+def test_pathguard_tells_reads_and_quoted_data_from_writes(cred_home, cmd):
+    """A script that reads a protected_paths folder and writes elsewhere passes, and so does a path
+    only inside quoted data (a JSON hand-off, a note, another command's argument)."""
+    (cred_home.work / "report.py").write_text(
+        "import glob, json, os, sys\nrows = []\n"
+        "for f in sorted(glob.glob(os.path.expanduser('~/data/records/*.json'))):\n"
+        "    with open(f) as fh:\n        rows.append(json.load(fh))\n"
+        "out = sys.argv[1] if len(sys.argv) > 1 else 'out.html'\n"
+        "with open(out, 'w') as o:\n    o.write(''.join(map(str, rows)))\n")
+    assert pathguard_why(_pg_bash(cmd, cred_home.work), {"guards": {"protected_paths": [PG_DATA]}}) is None, cmd
+
+
+@pytest.mark.parametrize("cmd", PG_DATA_WRITES)
+def test_pathguard_still_refuses_each_python_write_form(cred_home, cmd):
+    assert pathguard_why(_pg_bash(cmd, cred_home.work), {"guards": {"protected_paths": [PG_DATA]}}), cmd
+
+
+def test_pathguard_refuses_a_script_that_writes_a_protected_folder_it_reads(cred_home):
+    w = cred_home.work
+    (w / "sync.py").write_text("import glob, os, shutil\n"
+                               "for f in glob.glob(os.path.expanduser('~/data/records/*.json')):\n"
+                               "    shutil.copy('/tmp/new.json', f)\n")
+    (w / "dyn.py").write_text("import os\np = os.path.expanduser('~/data/records/a')\n"
+                              "getattr(os, 'remove')(p)\n")   # code it cannot follow: any write word counts
+    cfg = {"guards": {"protected_paths": [PG_DATA]}}
+    for cmd in ("python3 sync.py", "python3 dyn.py"):
+        assert pathguard_why(_pg_bash(cmd, w), cfg), cmd
+
 def test_pathguard_list_adds_account_and_project_paths_never_drops_defaults(cred_home):
     from ttp import pathguard
     (cred_home.acct / "settings.json").write_text(json.dumps({"guards": {"protected_paths": ["~/.config/acct-access"]}}))

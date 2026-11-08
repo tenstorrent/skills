@@ -16,7 +16,9 @@ refuses any create, change, move, chmod or delete it can read under a protected 
   one); the commands that rewrite a store themselves (`gh auth login`, `gh config set`, `docker login`,
   `aws configure`, `kubectl config set-*`, `git credential approve`, ssh-keygen writing a key or
   known_hosts); interpreter code (python, perl, node, ruby ...: one-liners, heredocs, the script files a
-  command runs) that names one and writes anything; the same inside `sh -c` and shell scripts.
+  command runs) that writes one: Python's write calls by their target, so reading one passes, other code
+  (or Python too dynamic to follow) when it names one and writes anything; words of the line outside the
+  code count only when the code reads its input; the same inside `sh -c` and shell scripts.
 Words are read after ~, $HOME, ${HOME}, $XDG_CONFIG_HOME and $GH_CONFIG_DIR are expanded with the run's
 environment and symlinks resolved, and the account's own home counts besides HOME. Reads pass as before.
 Known gap: a path a program builds at run time from parts no word names (an argument read from a file).
@@ -547,8 +549,9 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
                 text = f.read_text(errors="replace")
             except OSError:
                 continue
-            first = text.split("\n", 1)[0]
-            h = (shell_refusal(text, env, cwd, rts, depth + 1) if f.suffix == ".sh" or any(s in first for s in SHELLS)
+            # The shebang's interpreter (`#!/usr/bin/env bash`): a first line of code (import shutil) names none
+            first = " ".join(os.path.basename(w) for w in text.split("\n", 1)[0][2:].split()) if text[:2] == "#!" else ""
+            h = (shell_refusal(text, env, cwd, rts, depth + 1) if f.suffix == ".sh" or set(first.split()) & SHELLS
                  else _code_refusal(text, ctx, depth + 1, scan,
                                     f.suffix == ".py" or bool(re.search(r"python|pypy", first))))
             if h:
