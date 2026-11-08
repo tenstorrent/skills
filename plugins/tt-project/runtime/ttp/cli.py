@@ -1931,6 +1931,14 @@ def cmd_stats(a) -> None:
         s = coordstats.report(p.db, p.runs, timefmt.home(p), a.days)
         print(json.dumps(s, indent=1) if a.json else coordstats.text(s, p.name))
         return
+    if a.babysit:
+        from . import babysit
+        tz = timefmt.home(p)
+        until = _stats_time(a.until, tz, "--until") or time.time()
+        since = _stats_time(a.since, tz, "--since") or until - a.days * 86400
+        s = babysit.stats(p.db, since, until)
+        print(json.dumps(s, indent=1) if a.json else babysit.stats_text(s, p.name, tz))
+        return
     if a.wakes:
         from . import waketier
         s = waketier.stats(p.db, timefmt.home(p), a.days)
@@ -13096,6 +13104,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
     s.add_argument("--top", type=int, default=10, help="how many of the costliest runs to list (default 10)")
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
+    s.add_argument("--babysit", action="store_true",
+                   help="the chat watcher instead: decisions it settled and fallbacks, per purpose, model and hour "
+                        "(read-only; --since/--until, else the last --days)")
     s.add_argument("--wakes", action="store_true",
                    help="task wakes per day by reason instead: runs, $, re-waits and who chose the tier")
     s.add_argument("--effort-ab", action="store_true",

@@ -92,14 +92,15 @@ def avoided(db: DB, cfg: dict, tier: str, now: float | None = None) -> float:
 
 
 def pick(db: DB, cfg: dict, task: dict, prev: dict, jev=None, now: float | None = None) -> dict | None:
-    """For an escalated wake of a JUDGE reason above light: {"tier": "light", "by": "jev", "call",
-    "from"} when Jev is confident the run needs no judgment, else None (the wake keeps its tier)."""
+    """For an escalated wake of a JUDGE reason above light: {"tier": "light", "by", "call", "from"} when
+    the chat watcher answers a light wake (or skip), or, with no watcher answer, Jev is confident the run
+    needs no judgment; else None (the wake keeps its tier)."""
     if not isinstance(prev, dict) or not prev.get("escalated_wake") or reason(prev) not in JUDGE:
         return None
     tier = bud.wake_tier(task.get("tier") or "standard", prev, cfg)
     if tier is None or tier == bud.TIER_ORDER[0]:
         return None
-    if jev is None or not jev.enabled() or not jevuse.allowed(db, cfg, USE):
+    if jev is None or not jev.enabled():
         return None
     now = time.time() if now is None else now
     state = "\n".join([
@@ -110,6 +111,27 @@ def pick(db: DB, cfg: dict, task: dict, prev: dict, jev=None, now: float | None 
         f"what it waited for: {str(prev.get('waiting_for') or '')[:400]}",
         f"next step it named: {str(prev.get('next_step') or '')[:300]}",
     ])
+    try:   # the chat watcher first: its verb's tier (light, or more) decides; it costs nothing
+        if (ask := getattr(jev, "decision", None)) and (d := ask(
+                state, "A waiting task woke because its spec changed. Wake it at light when the change only adds "
+                       "context or notes and a check or report is all that is left; at standard when the change "
+                       "asks for new or different work or the wait's outcome needs a decision.",
+                target=str(task["id"]), purpose=USE)):
+            light = bool(d.get("parsed")) and (d["verb"] == "skip" or (d["verb"] == "wake" and d.get("tier") == bud.TIER_ORDER[0]))
+            call = jevuse.record(db, USE, {"task": task["id"], "by": "babysit", "model": d.get("model"),
+                                           "verb": d["verb"], "tier": d.get("tier"), "light": light}, 0.0,
+                                 avoided(db, cfg, tier, now) if light else 0.0, ref=f"task:{task['id']}",
+                                 changed=light, settle_s=None, now=now)
+            return {"tier": bud.TIER_ORDER[0], "by": "babysit", "model": d.get("model"), "call": call,
+                    "from": tier} if light else None
+    except Exception:   # the tier stays: an error never lowers a run
+        return None
+    if hasattr(jev, "decision"):   # the watcher logged why it did not answer: Jev itself, never a re-ask
+        jev = jev.jev
+        if jev is None or not jev.enabled():
+            return None
+    if not jevuse.allowed(db, cfg, USE):
+        return None
     try:
         ans = jev.decide(state=state, questions={"judgment": {
             "type": "noul",

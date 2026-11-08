@@ -719,6 +719,13 @@ def _log_torn(path: Path) -> bool:
         return f.read(1) != b"\n"
 
 
+def _picked_by(got: dict) -> str:
+    """Who lowered a wake's tier, for its log line: the watcher's model or Jev's score."""
+    if got.get("by") == "babysit":
+        return f"the watcher {got.get('model') or 'chat model'} said light"
+    return f"jev judgment={got.get('judgment')}"
+
+
 def log(p: Project, msg: str) -> None:
     """Append a line to daemon.log. Never raises on a write failure (a full or read-only state
     filesystem): the line is dropped, stderr says so once per LOG_FAIL_S, and the next line written
@@ -1099,7 +1106,7 @@ class Daemon:
         self._load_config()
         self._jev_pause, self._chat_pause = JevPause(), JevPause()
         self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
-                                self._chat_pause)
+                                self._chat_pause, log=lambda m: log(self.p, m))
         self._slack = None
         self._last_cfg = 0.0
         self._trouble_checked = 0.0
@@ -1937,7 +1944,7 @@ class Daemon:
             self._load_config()
             self._last_cfg = now
             self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
-                                    self._chat_pause)
+                                    self._chat_pause, log=lambda m: log(self.p, m))
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
@@ -7739,7 +7746,7 @@ class Daemon:
 
         def body() -> tuple[str, float | None]:
             host.jev = babysit.wrap(host.cfg, Jev(host.cfg, db=host.p.db, pause=host._jev_pause), host.p.db,
-                                    getattr(host, "_chat_pause", None))
+                                    getattr(host, "_chat_pause", None), log=lambda m: log(host.p, m))
             if s["kind"] == "llm":
                 return host._schedule_llm(s, payload), None
             if s["kind"] == "command" and payload.get("heal"):
@@ -10366,6 +10373,11 @@ class Daemon:
             if skipped:
                 fate[task["id"]] = "start_after"   # it re-deferred the wake
                 continue
+            if gated and (gated.get("tier") or gated.get("flag")):   # the watcher's tier or flag, acted on
+                prev = waitgate.steer(prev, gated)
+                task = dict(task, result=dump_result(prev))
+                db.update_task(task["id"], result=task["result"])
+                need = self._floor_need(task, bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness), prev)
             if lowered := self._wake_pick(task, prev):   # an escalated wake Jev finds needs no judgment
                 task, prev = dict(task, result=dump_result(lowered)), lowered
                 need = self._floor_need(task, bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness), prev)
@@ -10443,7 +10455,7 @@ class Daemon:
                     pv = load_result(task["result"])
                     note["wake"] = {"tier": tier, "escalated": bool(pv.get("escalated_wake")),
                                     "reason": waketier.reason(pv), "gate": (gated or {}).get("by") or "none",
-                                    "by": "jev" if pv.get(waketier.PICK) else "rule",
+                                    "by": (pv[waketier.PICK].get("by") or "jev") if pv.get(waketier.PICK) else "rule",
                                     **({"pick": pv[waketier.PICK]} if pv.get(waketier.PICK) else {})}
                 if gated:
                     note[waitgate.USE] = gated
@@ -11118,7 +11130,7 @@ class Daemon:
             return None
         out = waketier.lowered(prev, got)
         self.p.db.update_task(task["id"], result=dump_result(out))
-        log(self.p, f"task {task['id']} wake tier: light, not {got['from']} (jev judgment={got['judgment']}; "
+        log(self.p, f"task {task['id']} wake tier: light, not {got['from']} ({_picked_by(got)}; "
                     f"reason {waketier.reason(prev)})")
         return out
 
