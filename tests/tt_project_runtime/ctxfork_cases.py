@@ -415,7 +415,7 @@ def test_stats_show_how_worker_runs_started_and_follow_ups_resumed(env):
     assert "fork 2 (40%)" in text and "follow-ups resumed 1 of 2" in text
 
 
-def _codex_rollout(home, sid, cwd="/coord"):
+def _fork_codex_rollout(home, sid, cwd="/coord"):
     """A Codex rollout as `codex exec` 0.160 saves it: session meta, a finished turn naming the thread,
     then a turn still running and a last line still being written."""
     folder = home / "sessions" / "2026" / "11" / "08"
@@ -432,7 +432,7 @@ def _codex_rollout(home, sid, cwd="/coord"):
     return path
 
 
-def _fake_codex(tmp_path, monkeypatch):
+def _fork_fake_codex(tmp_path, monkeypatch):
     """A codex CLI whose `exec --help` lists the resume subcommand, as 0.160's does."""
     bin_dir = tmp_path / "fakebin"
     bin_dir.mkdir(exist_ok=True)
@@ -448,7 +448,7 @@ def test_codex_fork_session_copies_the_rollout_under_a_new_id(monkeypatch, tmp_p
     home = tmp_path / "codex-home"
     monkeypatch.setenv("CODEX_HOME", str(home))
     sid, new = str(uuid.uuid4()), str(uuid.uuid4())
-    _codex_rollout(home, sid)
+    _fork_codex_rollout(home, sid)
     assert codex.fork_session(sid, "/run", None, "../x") == "bad session id"
     assert codex.fork_session(str(uuid.uuid4()), "/run", None, new) == "the session's rollout is not on disk"
     own = tmp_path / "run-home"   # the run's own CODEX_HOME gets the copy
@@ -464,9 +464,9 @@ def test_codex_fork_session_copies_the_rollout_under_a_new_id(monkeypatch, tmp_p
     assert codex.session_saved(new, "/run", {"CODEX_HOME": str(own)})
     # A rollout with no session meta, or with no finished turn, is not one to start from.
     bad = str(uuid.uuid4())
-    _codex_rollout(home, bad).write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n")
+    _fork_codex_rollout(home, bad).write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n")
     assert "no session_meta" in codex.fork_session(bad, "/run", None, str(uuid.uuid4()))
-    path = _codex_rollout(home, bad)
+    path = _fork_codex_rollout(home, bad)
     path.write_text("\n".join(x for x in path.read_text().splitlines() if "task_complete" not in x) + "\n")
     assert "no finished turn" in codex.fork_session(bad, "/run", None, str(uuid.uuid4()))
 
@@ -482,7 +482,7 @@ def test_ctxfork_forks_across_providers_only_into_the_same_session_format(env, m
     cfg_dir, home = tmp_path / "claude-config", tmp_path / "codex-home"
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
     monkeypatch.setenv("CODEX_HOME", str(home))
-    _fake_codex(tmp_path, monkeypatch)
+    _fork_fake_codex(tmp_path, monkeypatch)
     p = make(env)
     cfg = p.config()
     sid = str(uuid.uuid4())
@@ -496,7 +496,7 @@ def test_ctxfork_forks_across_providers_only_into_the_same_session_format(env, m
         got = ctxfork.prepare(p, cfg, get(name), name, str(p.root), None)
         assert got["how"] == "disk" and "cannot resume its sessions" in got["why"], got
     csid = str(uuid.uuid4())
-    _codex_rollout(home, csid)
+    _fork_codex_rollout(home, csid)
     p.db.set_kv(coordsession.KEY, {"id": csid, "provider": "codex", "context_tokens": 7000})
     got = ctxfork.prepare(p, cfg, get("codex"), "codex", str(p.root), None)
     assert got["how"] == "fork" and got["from"] == "codex", got
