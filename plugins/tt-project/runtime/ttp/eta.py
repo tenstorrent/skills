@@ -23,7 +23,13 @@ last WINDOW_S days), never a worst case or padding:
 - landing wait: a queued or waiting task whose start_when waits only on other tasks' landings (exactly
   `landed:#N`, or `ttp landed --task N` terms joined by `&&`, optionally ending `|| exit 1`) starts no
   earlier than the latest of those tasks' own expected landing (their finish plus their review and
-  landing legs); one already landed (landed.recorded) adds nothing. Any other probe is not judged.
+  landing legs); one already landed (landed.recorded) adds nothing. A waiting hand-off's retry_when made
+  only of landing waits counts the same, never as its next probe time. A gated task with no live owner
+  (done but not landed, with no open review, fix, rebase or push row carrying it on: deadwait.path; or
+  failed, cancelled or abandoned), or one whose own estimate has none, gives no clock time: the estimate
+  carries `after` ('landed:#N') and field() reads 'ETA: after landed:#N (why)'. Any other probe is not
+  judged, except a merge gate (merge_gate: `gh pr view <n>` or `gh api .../pulls/<n>` reading the
+  PR's state or merge), which reads 'after PR #<n> merges or closes' unless the hand-off measured an eta.
 - outside work: a waiting task whose retry_when watches work outside the harness (outside_wait: any
   probe but a bare clock gate or a landing wait, such as a Slurm job, a detached run or a peer's ack) has
   no measured finish yet, unless its hand-off gives `eta` (epoch, or ISO time with offset, still ahead)
@@ -62,6 +68,8 @@ CLOSED = ("done", "failed", "cancelled")
 PUSH_DONE = ("pushed", "landed")
 LANDED_ALL = re.compile(r"\s*ttp\s+landed\s+--task\s+#?\d+(?:\s*&&\s*ttp\s+landed\s+--task\s+#?\d+)*"
                         r"(?:\s*\|\|\s*exit\s+1)?\s*")
+MERGE_GATE = re.compile(r"\bgh\s+pr\s+view\s+#?(\d+)\b|\bgh\s+api\s+\S*/pulls/(\d+)\b")
+MERGE_WORDS = re.compile(r"state|merged|closed", re.I)
 PUSH_FINAL = ("pushed", "landed", "conflict", "check_failed", "refused", "scope_held", "nothing", "dropped")
 
 
@@ -81,12 +89,29 @@ def _locks(t: dict) -> list[str]:
     return sorted(lb for lb in _labels(t) if lb.startswith(("resource:", "exclusive:")))
 
 
+def gate_probe(t: dict) -> str:
+    """The probe a task waits on: its start_when, else the retry_when of its waiting hand-off (not one
+    the daemon already woke); '' for none."""
+    from .db import deferral, load_result, waiting_handoff
+    if when := deferral(t).get("when"):
+        return when
+    res = load_result(t.get("result")) if t.get("status") == "waiting" else waiting_handoff(t)
+    return str(res.get("retry_when") or "") if res.get("status") == "waiting" and not res.get("woke") else ""
+
+
+def merge_gate(probe: str) -> int | None:
+    """The PR number a merge gate probe waits on (`gh pr view <n>` or `gh api .../pulls/<n>`, reading its
+    state or merge), None for any other probe."""
+    m = MERGE_GATE.search(probe or "")
+    return int(m.group(1) or m.group(2)) if m and MERGE_WORDS.search(probe) else None
+
+
 def landing_waits(t: dict) -> list[int]:
-    """The task ids a start_when made only of landing waits names: `landed:#N`, or `ttp landed --task N`
-    terms joined by `&&` (optionally ending `|| exit 1`); [] for any other probe or none."""
-    from .db import deferral
+    """The task ids a start_when (or a waiting hand-off's retry_when, gate_probe) made only of landing
+    waits names: `landed:#N`, or `ttp landed --task N` terms joined by `&&` (optionally ending `|| exit 1`);
+    [] for any other probe or none."""
     from .landed import LANDED_PROBE
-    when = deferral(t).get("when") or ""
+    when = gate_probe(t)
     if m := LANDED_PROBE.fullmatch(when):
         return [int(m.group(1))]
     if LANDED_ALL.fullmatch(when):
@@ -273,7 +298,7 @@ class _Est:
         self.memo[tid] = {"done": self.now, "end": self.now, "path": [tid], "legs": [], "why": None, "overrun": False}
         e = self.task(rv, tuple(x for x in seen if x != tid))
         if e["why"]:
-            return {**self._none(tid, e["why"]), "path": [tid] + e["path"]}
+            return self._from(tid, e)
         legs, end = list(e["legs"]), e["end"]
         if self.h["land"]:
             legs.append(("landing", _med(self.h["land"])))
@@ -303,6 +328,31 @@ class _Est:
 
     def _none(self, tid, why: str) -> dict:
         return {"done": None, "end": None, "path": [tid], "legs": [], "why": why, "overrun": False}
+
+    def _from(self, tid, e: dict) -> dict:
+        """No estimate for `tid` because the task `e` estimates on its path has none: its why and gate."""
+        return {**self._none(tid, e["why"]), "path": [tid] + e["path"],
+                **({"after": e["after"]} if e.get("after") else {})}
+
+    def _gate_dead(self, n: int, waiter: int) -> str | None:
+        """Why gated task `n`, not landed, has no live owner to land it ('' -> None: it has one): failed,
+        cancelled, abandoned or gone, or done with nothing open carrying it on (deadwait.path)."""
+        from . import deadwait, landed
+        t = self.db.task(n)
+        if not t:
+            return f"#{n} is gone"
+        if t["status"] in ("failed", "cancelled"):
+            return f"#{n} {t['status']}"
+        if landed.abandoned(self.db, n):
+            return f"#{n} was abandoned"
+        if t["status"] != "done" or deadwait.path(self.db, n, {waiter}):
+            return None
+        stuck = deadwait.stuck_by(self.db, n)
+        return (f"#{n} is done but not landed and nothing open carries it on"
+                + (f"; {stuck['what']}" if stuck else ""))
+
+    def _after(self, tid: int, gate: str, why: str, path: list) -> dict:
+        return {**self._none(tid, why), "path": path, "after": gate}
 
     def _task(self, t: dict | None, tid: int, seen: tuple) -> dict:
         now = self.now
@@ -361,7 +411,7 @@ class _Est:
                     return self._cycle(tid, seen, d)
                 e = self.task(d, seen)
                 if e["why"]:
-                    return {**self._none(tid, e["why"]), "path": [tid] + e["path"]}
+                    return self._from(tid, e)
                 if crit is None or e["done"] > crit["done"]:
                     crit = e
             if crit and crit["done"] > start:
@@ -372,13 +422,19 @@ class _Est:
                     continue   # landed: the probe passes
                 if n in seen:
                     return self._cycle(tid, seen, n)
+                # Its gate's own critical path while a live owner can land it; else no clock time, never
+                # the probe's next check.
+                if dead := self._gate_dead(n, tid):
+                    return self._after(tid, f"landed:#{n}", dead, [tid, n])
                 e = self.task(n, seen)
                 if e["why"]:
-                    return {**self._none(tid, e["why"]), "path": [tid] + e["path"]}
+                    return self._after(tid, e.get("after") or f"landed:#{n}", e["why"], [tid] + e["path"])
                 if e["end"] > start:   # its own finish, review and landing: the probe passes then
                     start, path = e["end"], [tid] + e["path"]
             runs = self._run(t)
             ow = outside_wait(t, now, self.reports) if st != "running" else None
+            if st != "running" and (pr := merge_gate(gate_probe(t))) is not None and not (ow and ow["at"]):
+                return self._after(tid, f"PR #{pr} merges or closes", "a merge gate has no measured finish", path)
             if ow and ow["at"] is None:
                 return {**self._none(tid, f"#{tid} waits on outside work: no measured finish yet"), "path": path}
             if not runs and not (ow and ow["follows"]):
@@ -462,8 +518,11 @@ def _dur(s: float) -> str:
 
 
 def field(e: dict, where, now: float | None = None) -> str:
-    """One short field: `ETA 22:40 PST (critical path #5→#3)` or `ETA: no estimate yet (why)`."""
+    """One short field: `ETA 22:40 PST (critical path #5→#3)`, `ETA: after landed:#3 (why)` or `ETA: no
+    estimate yet (why)`."""
     from . import timefmt
+    if e.get("after"):   # a landing or merge gate with no live owner or estimate: no clock time
+        return f"ETA: after {e['after']} ({e['why']})"
     if e["why"]:
         return f"ETA: no estimate yet ({e['why']})"
     path = "→".join(f"#{i}" for i in e["path"])

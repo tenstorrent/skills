@@ -107,6 +107,35 @@ def path(db, x: int, held: set[int], rows: Rows | None = None) -> str:
     return f"push queue row of #{row['task']} ({row['status']})" if row else ""
 
 
+PUSH_FAILED = ("conflict", "check_failed", "refused", "dropped")
+
+
+def stuck_by(db, x: int, rows: Rows | None = None) -> dict | None:
+    """What ended the last try to land producer `x`'s change: its newest review (of it or a task carrying
+    it on, landed.carriers) failed or was cancelled (superseded), else its carriers' newest push queue row
+    failed (a batch's checks, a conflict, a refusal). {"review": id or None, "row": id or None, "what":
+    plain words, "at": when}; None when neither (no review yet, or the newest passed and nothing failed)."""
+    carried = landed.carriers(db, x, rows)
+    ids = sorted(carried)
+    q = ",".join("?" * len(ids))
+    rv = db.one(f"SELECT id, status, updated FROM tasks WHERE kind='review' AND id IN ({q}) ORDER BY id DESC LIMIT 1",
+                ids)
+    if rv and rv["status"] in ("failed", "cancelled"):
+        word = "failed" if rv["status"] == "failed" else "was cancelled"
+        return {"review": rv["id"], "row": None, "what": f"its last review #{rv['id']} {word}",
+                "at": float(rv["updated"] or 0)}
+    try:
+        row = db.one(f"SELECT id, task, status, updated FROM push_queue WHERE task IN ({q}) ORDER BY id DESC LIMIT 1",
+                     ids)
+    except Exception:
+        row = None
+    if row and row["status"] in PUSH_FAILED:
+        return {"review": rv["id"] if rv else None, "row": row["id"],
+                "what": f"its push queue row of #{row['task']} ended {row['status']}"
+                        + (f" after review #{rv['id']}" if rv else ""), "at": float(row["updated"] or 0)}
+    return None
+
+
 def check(db, cfg: dict, held_by: dict[int, list[dict]], now: float) -> None:
     """`held_by`: producer id -> the queued tasks whose start_when is `landed:#<it>`. Raises
     one DEAD_EVENT per producer dead for `waiting.landed_wait_dead_s`, and clears it (handled, state

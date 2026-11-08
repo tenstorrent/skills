@@ -1761,7 +1761,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
         est = None
     for t in hot[:8]:   # the urgent lane: each waiting urgent task, with how long it has waited and its ETA
         try:
-            fin = f", {eta.field(e, p, now)}" if est and (e := est.task(t["id"]))["end"] else ""
+            fin = f", {eta.field(e, p, now)}" if est and ((e := est.task(t["id"]))["end"] or e.get("after")) else ""
         except Exception:
             fin = ""
         row(t, f"{t['status']} ({urgent.mark(db, t, now)}{fin})", f"urgent: {urgent.shown_why(db, t, now)}"

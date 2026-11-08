@@ -1421,10 +1421,11 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
         o["receipt"] = {"at": now, "task": None, "evidence": kept}
         _retire(p.db, now, "promise kept", prefix=fp)
         return True
+    stuck_changed = _check_landing_stuck(p, o, now, raised)
     if pr.get("order") is not None:
-        return _check_order(p, o, now, raised)
+        return _check_order(p, o, now, raised) or stuck_changed
     if now < pr["due"] or pr.get("raised") is not None:
-        return False
+        return stuck_changed
     from . import replan, timefmt
     pr["raised"] = now
     twice = replan.note_miss(pr, now) >= 2
@@ -1440,6 +1441,56 @@ def _check_promise(p, o: dict, st: dict, now: float, raised: list[str]) -> bool:
     if _raise(p.db, now, fp, PROMISE_KIND, text, pr["tasks"][0] if pr["tasks"] else None, _must(o, twice)):
         raised.append(fp)
     return True
+
+
+def _landing_stuck(p, o: dict, now: float) -> tuple[str, str, int | None] | None:
+    """(fingerprint, text, gated task) of the first owner of open promise or order `o` that waits on a landing
+    nothing can make (LANDING_STUCK_KIND), past the grace; None when none. Saved rows only. The fingerprint
+    sits under `obligation:<id>:promise`, so a kept, closed or dropped promise retires it."""
+    from . import deadwait, eta, landed
+    for tid in _owner_ids(o):
+        t = p.db.task(tid)
+        if not t or t["status"] in CLOSED or t["status"] == "running":
+            continue
+        for n in eta.landing_waits(t):
+            g = p.db.task(n)
+            if not g or g["status"] != "done" or landed.abandoned(p.db, n) or landed.recorded(p.db, n)[0]:
+                continue   # open work lands it, abandoned has its own notice, or it landed
+            if not (stuck := deadwait.stuck_by(p.db, n)):
+                continue
+            try:
+                grace = float((p.config().get("waiting") or {}).get("landed_wait_dead_s", deadwait.GRACE_S) or 0)
+            except Exception:
+                grace = float(deadwait.GRACE_S)
+            if now - stuck["at"] < grace:
+                continue   # a fix or re-review the same step queues gets its chance
+            held = {w["id"] for w in deadwait.waiters(p.db, {n})} | {tid}
+            if deadwait.path(p.db, n, held):
+                continue
+            ep = f"r{stuck['review']}" if stuck["row"] is None else f"q{stuck['row']}"
+            kind = "Order" if o["promise"].get("order") is not None else "Promise"
+            text = (f"{kind} {o['id']} cannot finish: its owner #{tid} waits on landed:#{n}, but #{n} {g['title'][:100]} "
+                    f"is done and not landed, {stuck['what']}, and no open review, fix, rebase or push carries it "
+                    f"on. Its ETA reads 'after landed:#{n}'. Act now: queue the fix and re-review (or the push) of "
+                    f"#{n}, re-point or clear #{tid}'s wait, or tell the user in chat {o['promise']['chat']} and "
+                    f"re-date or drop {o['id']} (`obligation` with key {o['id']}).")
+            return f"obligation:{o['id']}:promise:landing_stuck:{n}:{ep}", text, n
+    return None
+
+
+def _check_landing_stuck(p, o: dict, now: float, raised: list[str]) -> bool:
+    """One must-act event per episode for an open promise or order stuck behind a landing nothing can make
+    (_landing_stuck), retired once that clears. Returns whether `o` changed."""
+    got = _landing_stuck(p, o, now)
+    was = o.get("landing_stuck")
+    if got and got[0] == was:
+        return False
+    if was:
+        _retire(p.db, now, "landing path back", was)
+    o["landing_stuck"] = got[0] if got else None
+    if got and _raise(p.db, now, got[0], LANDING_STUCK_KIND, got[1], got[2], _must(o)):
+        raised.append(got[0])
+    return bool(got or was)
 
 
 def _promise_state(o: dict, now: float, where) -> str:
@@ -1597,7 +1648,12 @@ def deliver(p, sent: list[tuple[int, str | None, list]], now: float | None = Non
 ORDER_LATE_KIND = "order_late"
 ORDER_KIND = "order_overdue"
 CLAIM_KIND = "claim_failed"
-MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND)
+# An open promise or order whose owner waits on a landing (eta.landing_waits) that nothing can make:
+# the gated task is done, not landed, its last review failed or was cancelled (or its push row failed:
+# deadwait.stuck_by) and no open task carries it on (deadwait.path). One high event per episode (the
+# gate and the failed review or row), after waiting.landed_wait_dead_s; it is retired once a path appears.
+LANDING_STUCK_KIND = "order_landing_stuck"
+MUST_ACT_KINDS = (PROMISE_KIND, ORDER_LATE_KIND, ORDER_KIND, CLAIM_KIND, LANDING_STUCK_KIND)
 ORDER_CLASSES = ("read", "change", "device")
 ORDER_START_S = 1800          # an order with no start_by: its owner's run starts within this after the message
 CLAIM_WAIT_S = 1800           # a claim's probe that cannot answer (75, 255, timeout) past its due: failed after this

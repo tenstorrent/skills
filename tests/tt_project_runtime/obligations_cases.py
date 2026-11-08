@@ -598,3 +598,44 @@ def test_a_continuation_cycle_never_loops_and_a_chain_of_failures_does_not_hold(
     check(now + 600)
     [ev] = events()
     assert f"#{tid} is failed, and so is each task that continues it (#{a}, #{b})" in ev["text"]
+
+
+def test_order_stuck_behind_a_landing_nothing_can_make_raises_one_must_act_per_episode(env, monkeypatch):
+    """An order whose owner waits on landed:#n, where n is done, its last review failed and nothing open
+    carries it on: one order_landing_stuck must-act event past the grace, naming the order, the owner, n and
+    the review; never twice; retired once a fix continues n; a new failed review is a new episode."""
+    from ttp import deadwait, eta
+    from ttp import obligations as ob
+    p, d, now, tid, check, mid, raised = _order_setup(env, monkeypatch)
+    n = p.db.add_task("the fix", "s", kind="code", status="done")
+    p.db.update_task(n, branch=f"ttp/t{n}-fix")
+    p.db.update_task(tid, labels=[f"start_when:landed:#{n}"])
+    rv = p.db.add_task(f"Review #{n}", "s", kind="review", depends_on=[n], status="failed")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now, rv))
+    oid = ob.add_order(p, "build the deliverable", mid, [tid], due=now + 86400, action_class="change", now=now).split()[1]
+    kind = [ob.LANDING_STUCK_KIND]
+    check(now + deadwait.GRACE_S - 60)
+    assert raised(kind) == [], "a re-review the same step queues gets the grace"
+    check(now + deadwait.GRACE_S + 60)
+    ev = raised(kind)
+    assert len(ev) == 1 and ev[0]["severity"] == "high"
+    for word in (oid, f"#{tid}", f"landed:#{n}", f"review #{rv} failed", "after landed:#"):
+        assert word in ev[0]["text"], word
+    import json
+    assert json.loads(ev[0]["data"])["must_act"]["key"] == oid
+    assert eta.estimate(p.db, tid, now + deadwait.GRACE_S + 60)["after"] == f"landed:#{n}"
+    check(now + deadwait.GRACE_S + 300)
+    assert len(raised(kind)) == 1, "one event per episode"
+    # A fix continuing n is a path again: the event is retired.
+    fix = p.db.add_task("Fix review", "s", kind="code", labels=[f"continues:{n}"])
+    check(now + deadwait.GRACE_S + 400)
+    assert [e["status"] for e in raised(kind)] == ["handled"] and ob.get(p.db, oid).get("landing_stuck") is None
+    # The fix's re-review fails too and nothing continues it: a new episode, one new event.
+    p.db.update_task(fix, status="done")
+    rv2 = p.db.add_task(f"Review #{fix}", "s", kind="review", depends_on=[fix], status="failed")
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (now + 500, rv2))
+    check(now + 500 + deadwait.GRACE_S + 60)
+    ev = raised(kind)
+    assert len(ev) == 2 and f"review #{rv2} failed" in ev[1]["text"]
+    check(now + 500 + deadwait.GRACE_S + 120)
+    assert len(raised(kind)) == 2
