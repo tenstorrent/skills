@@ -10554,7 +10554,7 @@ def _config_remove(p, key: str, run) -> None:
         _refuse_user_only_in_run(k)
     try:
         removed = p.unset_config(key, by=configwho.from_env())
-    except RuntimeError as e:
+    except (RuntimeError, configwho.Protected) as e:   # project.json unreadable; a value its owner set
         die(str(e))
     node = p.config()
     for part in key.split("."):

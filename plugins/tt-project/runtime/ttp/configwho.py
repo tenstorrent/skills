@@ -197,6 +197,8 @@ FAIL_RUNS = 3
 FAIL_TASKS = 2
 HEALTHY_S = 86400.0   # a failing host passed within this long before the change
 REFUSAL_EVERY_S = 86400.0   # one logged refusal and event per key and setter role in this long
+RUNS = "config-watch-runs.jsonl"   # the watch's own record of check runs (note_run)
+RUNS_MAX_BYTES = 64 * 1024
 
 
 class Protected(ValueError):
@@ -335,11 +337,10 @@ def guard(p, key: str, setter: dict | None, before, after) -> bool:
     raise Protected(why)
 
 
-def _runs(p) -> list[dict]:
-    from .checkwall import RUNS_LOG
+def _rows(path) -> list[dict]:
     out = []
     try:
-        lines = (p.state / RUNS_LOG).read_text().splitlines()
+        lines = path.read_text().splitlines()
     except OSError:
         return out
     for text in lines:
@@ -347,9 +348,44 @@ def _runs(p) -> list[dict]:
             r = json.loads(text)
             out.append({"ts": float(r["ts"]), "passed": bool(r["passed"]), "host": str(r.get("host") or ""),
                         "task": str(r.get("task") or "")})
-        except (ValueError, KeyError, TypeError):
+        except (ValueError, KeyError, TypeError, AttributeError):
             continue
     return out
+
+
+def note_run(state, ts: float, passed: bool, host: str = "", task: str = "") -> None:
+    """Keep one completed check run (checkwall.record_run) in the watch's own record, RUNS: RUNS_LOG keeps
+    only its last RECENT rows across all hosts once it grows, which with many spill hosts can drop a
+    host's last pass before a change. Past RUNS_MAX_BYTES this record keeps the runs of the last WATCH_S
+    (every run after a watched change) and each host's last pass. Raises OSError."""
+    from pathlib import Path
+    from .project import durable_append, durable_write
+    path = Path(state) / RUNS
+    durable_append(path, json.dumps({"ts": ts, "passed": bool(passed), **({"host": host} if host else {}),
+                                     **({"task": str(task)} if task else {})}) + "\n")
+    if path.stat().st_size <= RUNS_MAX_BYTES:
+        return
+    rows = _rows(path)
+    last = {}
+    for r in rows:
+        if r["passed"] and r["ts"] >= last.get(r["host"], float("-inf")):
+            last[r["host"]] = r["ts"]
+    keep = [r for r in rows if r["ts"] >= ts - WATCH_S or (r["passed"] and last.get(r["host"]) == r["ts"])]
+    durable_write(path, "".join(json.dumps({"ts": r["ts"], "passed": r["passed"],
+                                            **({"host": r["host"]} if r["host"] else {}),
+                                            **({"task": r["task"]} if r["task"] else {})}) + "\n" for r in keep))
+
+
+def _runs(p) -> list[dict]:
+    """The check runs the watch reads: its own record (note_run) with RUNS_LOG's rows (from before it)."""
+    from .checkwall import RUNS_LOG
+    seen, out = set(), []
+    for r in _rows(p.state / RUNS) + _rows(p.state / RUNS_LOG):
+        k = (r["ts"], r["passed"], r["host"], r["task"])
+        if k not in seen:
+            seen.add(k)
+            out.append(r)
+    return sorted(out, key=lambda r: r["ts"])
 
 
 def watch(p, now: float | None = None) -> list[str]:

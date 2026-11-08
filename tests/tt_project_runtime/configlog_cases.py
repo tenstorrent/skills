@@ -216,3 +216,79 @@ def test_a_worker_runs_config_of_a_coordinator_set_spill_wrap_cmd_is_refused_and
     events = _config_events(p, "config_overwrite_refused")
     assert [e["fingerprint"] for e in events] == ["config_overwrite_refused:checks.spill_wrap_cmd:worker"]
     assert events[0]["status"] == "queued" and "set by" in events[0]["text"]
+
+
+def test_config_breakage_watch_fires_when_the_passes_before_the_change_are_older_than_recent_rows(env, monkeypatch):
+    """Many spill hosts: the passes of the failing hosts before a change are more than checkwall.RECENT
+    rows back, and RUNS_LOG has been trimmed to its last RECENT rows; the watch's own record still has
+    each host's last pass, so the alarm fires once."""
+    import time as _time
+    from ttp import checkwall, configwho
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    monkeypatch.setattr(checkwall, "RUNS_MAX_BYTES", 1)   # RUNS_LOG trims to RECENT rows on every run
+    monkeypatch.setattr(configwho, "RUNS_MAX_BYTES", 1)   # and the watch's record trims on every run too
+    clock = [_time.time() - 4000 - configwho.WATCH_S]
+    monkeypatch.setattr(_time, "time", lambda: clock[0])
+
+    def run(passed, host, task):
+        clock[0] += 10
+        checkwall.record_run(p.state, 60.0, passed, host=host, task=task)
+
+    run(True, "spill-a", "1")
+    run(True, "spill-b", "2")
+    for i in range(checkwall.RECENT + 5):
+        run(True, f"spill-{i % 7 + 10}", str(100 + i))
+    clock[0] += configwho.WATCH_S   # the passes before the change are older than the record's window
+    p.set_config("checks.spill_wrap_cmd", "/opt/example/wrap.sh", by=configwho.by("worker", task=5, via="cli"))
+    change = float(configwho.history(p, "checks.spill_wrap_cmd")[-1]["ts"])
+    for task, host in (("3", "spill-a"), ("4", "spill-b"), ("5", "spill-a")):
+        run(False, host, task)
+        for i in range(checkwall.RECENT):
+            run(True, "", str(200 + i))   # local reruns after each spill failure
+    assert len((p.state / checkwall.RUNS_LOG).read_text().splitlines()) <= checkwall.RECENT + 1
+    kept = (p.state / configwho.RUNS).read_text().splitlines()
+    assert len(kept) == 3 * (checkwall.RECENT + 1) + 2 + 7, "the runs since the window plus each host's last pass"
+    fps = configwho.watch(p, now=clock[0])
+    assert fps == [f"config_breakage:checks.spill_wrap_cmd:{change}"]
+    assert configwho.watch(p, now=clock[0]) == [] and len(_config_events(p, "config_breakage")) == 1
+    assert "spill-a, spill-b" in _config_events(p, "config_breakage")[0]["text"]
+
+
+def test_a_worker_runs_config_removal_of_a_coordinator_set_value_ends_cleanly(env, monkeypatch, capsys):
+    """`ttp config NAME KEY ''` from a worker run over a coordinator's value: the guard's refusal ends the
+    command with its message (no traceback) and the propose-it text, and the value stays."""
+    from ttp import cli, configwho
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    monkeypatch.setenv("TTP_RUN_ID", "15290")
+    cli.main(["config", "demo", "checks.spill_wrap_cmd", "/opt/example/spill-wrap.sh env A=1"])
+    monkeypatch.setenv("TTP_RUN_ID", "15316")
+    monkeypatch.setenv("TTP_TASK_ID", "7492")
+    with pytest.raises(SystemExit) as exc:
+        cli.main(["config", "demo", "checks.spill_wrap_cmd", ""])
+    assert exc.value.code not in (0, None)
+    err = capsys.readouterr().err
+    assert "worker may not change" in err and "propose it in your hand-off" in err and "Traceback" not in err
+    assert p.raw_config()["checks"]["spill_wrap_cmd"] == "/opt/example/spill-wrap.sh env A=1"
+
+
+@needs_sockets
+def test_the_web_app_serves_without_saving_its_port_over_an_owners_falsy_web_port(env):
+    """An owner set web.port to 0: the web app's default port save is refused by the guard; it still
+    binds a port and serves, and the owner's value stays."""
+    from ttp import configwho, web
+    p = make(env)
+    p.set_config("web.port", 0, by=configwho.by("user", via="cli"))
+
+    class Stub:
+        pass
+    stub = Stub()
+    stub.p = p
+    httpd = web.bind(stub)
+    try:
+        assert httpd.server_address[1] > 0
+    finally:
+        httpd.server_close()
+    assert p.raw_config()["web"]["port"] == 0
+    assert configwho.role(configwho.lookup(p.db, "web.port", p.raw_config())) == "user"
