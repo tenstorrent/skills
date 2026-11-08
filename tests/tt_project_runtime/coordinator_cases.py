@@ -11454,7 +11454,7 @@ def test_config_set_accepts_the_push_queue_keys_and_rejects_a_sentence_after_pus
 def test_every_key_the_code_reads_is_known(env):
     from ttp.coordinator import USER_SETTABLE
     from ttp.project import unknown_key_hint
-    extra = ["budget.estimate_weights", "budget.hourly_waste_usd", "budget.hourly_waste_runs", "budget.hourly_coordinator_usd",
+    extra = ["budget.estimate_weights", "budget.hourly_waste_usd", "budget.hourly_waste_runs",
              "budget.max_pace_hold_s", "jev.via", "jev.url", "jev.model"]
     for key in [*USER_SETTABLE, *extra]:
         assert unknown_key_hint(key) is None, key

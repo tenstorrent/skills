@@ -450,14 +450,18 @@ def test_productive_burst_is_not_a_runaway_but_waste_is(env):
 
 
 
-def test_coordinator_runaway_guard_counts_only_self_started_turns(env):
-    """The coordinator $/h guard (billed by use) sums only turns the daemon started on its own (events,
-    schedules, idle wakes, sweeps); a turn started for a user message or an ask answer is the user's own work."""
+def test_coordinator_self_started_spend_is_shown_and_never_trips_a_dollar_guard(env):
+    """coordinator_1h sums only turns the daemon started on its own (events, schedules, idle wakes,
+    sweeps); a turn started for a user message or an ask answer is the user's own work. Billed by use,
+    no amount of it holds the coordinator or worker runs: the always-on coordinator optimizes its own
+    cost inside the dollar caps (budget.hourly_coordinator_usd is retired)."""
     p = make(env)
     from ttp import budget as bud
+    from ttp.project import unknown_key_hint
     now = time.time()
     p.set_config("budget.global_daily_usd", 0)
-    wins = []   # no plan windows: billed by use, so the guard counts dollars
+    wins = []   # no plan windows: billed by use
+    workers = int(p.config()["budget"]["max_parallel_workers"])
 
     def turn(cost, messages, ago, events=()):
         note = json.dumps({"messages": list(messages), "events": list(events),
@@ -466,41 +470,34 @@ def test_coordinator_runaway_guard_counts_only_self_started_turns(env):
                "VALUES('coordinator','claude','high','ok',?,?,?,?)", (now - ago - 60, now - ago, cost, note))
         p.db.spend("claude", cost, "coordinator")
 
-    def coord_reasons():
+    def free():
         g = bud.evaluate(p.db, p.config(), "claude", wins, now=now)
-        return g, [r for r in g.coord_hold.get("reasons", []) if "coordinator spent" in r]
+        assert not g.coord_hold and g.level != "red" and g.allow_new_work and g.max_parallel == workers, g.as_dict()
+        assert not any("coordinator" in r for r in g.reasons), g.reasons
+        return g
 
-    # (1) an hour of 12 user-message turns (tricky turns), $7.20 against a $4/h limit
+    # an hour of 12 user-message turns, $7.20
     for i in range(12):
         turn(0.60, [100 + i], 60 + i * 250)
-    g, hit = coord_reasons()
-    assert not hit and g.level != "red", g.reasons
+    g = free()
     assert g.numbers["coordinator_1h"] == 0 and g.numbers["coordinator_user_1h"] == 7.2
-
-    # (3) a mixed hour: self-started turns under the limit do not trip it...
-    for i in range(6):
+    # self-started turns past the old $4/h limit: shown, nothing held
+    for i in range(7):
         turn(0.60, [], 90 + i * 300, events=[i])
-    g, hit = coord_reasons()
-    assert not hit, g.reasons
-    # ...and trip it once the self-started share alone passes the limit
-    turn(0.60, [], 120, events=[99])
-    g, hit = coord_reasons()
-    assert hit and g.level != "red" and g.allow_new_work and "$4.20" in hit[0], g.reasons
-    assert not any("coordinator spent" in r for r in g.reasons), "kept out of the reasons that hold new work"
-
-    # (2) 40 self-wakes on the same digest within an hour still trip it
+    assert free().numbers["coordinator_1h"] == 4.2
+    # 40 self-wakes on the same digest within an hour, $6: no dollar signal (on a plan the same-evidence
+    # signal coalesces them, test_runaway_guard_on_a_plan_trips_on_repeated_turns_not_virtual_dollars)
     p.db.x("DELETE FROM runs")
     for i in range(40):
         turn(0.15, [], 30 + i * 80, events=[7])
-    g, hit = coord_reasons()
-    assert hit and g.allow_new_work, g.coord_hold
+    assert free().numbers["coordinator_1h"] == 6.0
     # an unreadable or missing note counts as self-started, never as the user's
     p.db.x("DELETE FROM runs")
     for note in (None, "not json", "[]"):
         p.db.x("INSERT INTO runs(role,provider,status,started,ended,cost_usd,note) "
                "VALUES('coordinator','claude','ok',?,?,1.5,?)", (now - 600, now - 300, note))
-    assert coord_reasons()[1]
-
+    assert free().numbers["coordinator_1h"] == 4.5
+    assert "budget.hourly_coordinator_usd is retired" in unknown_key_hint("budget.hourly_coordinator_usd")
 
 
 def test_usage_billed_known_from_its_own_runs_without_a_recorded_change(env):
@@ -4837,7 +4834,7 @@ def test_a_reading_that_matches_the_new_logins_window_is_filed_under_it(env, tmp
 
 
 def _coordinator_guard_turns(p, now, n=7, cost=0.60):
-    """`n` self-started coordinator turns in the last hour costing `cost` each: past the $4 guard at 7."""
+    """`n` self-started coordinator turns in the last hour costing `cost` each: past the old $4/h limit at 7."""
     for i in range(n):
         p.db.x("INSERT INTO runs(role,provider,effort,status,started,ended,cost_usd,note) "
                "VALUES('coordinator','claude','high','ok',?,?,?,?)",
@@ -4845,11 +4842,10 @@ def _coordinator_guard_turns(p, now, n=7, cost=0.60):
         p.db.spend("claude", cost, "coordinator")
 
 
-def test_the_coordinator_turn_guard_spaces_out_coordinator_turns_only_and_a_dollar_cap_holds_everything(env):
-    """The coordinator's self-started turns past their $/h limit throttle the coordinator only
-    (Gate.coord_hold, until the trailing hour is back under the limit): worker runs keep starting under
-    the rest of the gate. A dollar cap reached, or a worker runaway signal (the total spend ceiling),
-    still holds all new work."""
+def test_coordinator_spend_past_the_old_hourly_limit_holds_nothing_and_a_dollar_cap_holds_everything(env):
+    """Self-started coordinator turns past the old $4/h limit neither space out the coordinator nor
+    hold, defer or narrow worker runs. A dollar cap reached, or a worker runaway signal (the total spend
+    ceiling), still holds all new work."""
     p = make(env)
     from ttp import budget as bud
     now = time.time()
@@ -4858,12 +4854,12 @@ def test_the_coordinator_turn_guard_spaces_out_coordinator_turns_only_and_a_doll
     g = bud.evaluate(p.db, p.config(), "claude", [], now=now)
     workers = int(p.config()["budget"]["max_parallel_workers"])
     assert g.level != "red" and g.allow_new_work and g.max_parallel == workers and g.lane == {}, g.as_dict()
-    assert g.coord_hold["reasons"][0].startswith("runaway guard: coordinator spent $4.20"), g.coord_hold
-    assert not any("runaway" in r for r in g.reasons), "worker dispatch and hold_clears do not see it"
-    # $4.20 over $4: back under once the oldest $0.60 turn (ended now-1860) leaves the hour
-    assert g.coord_hold["until"] == round(now - 1860 + bud.HOUR, 1), g.coord_hold
-    assert bud.Gate(**g.as_dict()).coord_hold == g.coord_hold, "the saved gate keeps its hold"
-    assert "worker runs keep starting" in bud.coord_hold_words(g.coord_hold, "in 29 min")
+    assert not g.coord_hold and g.numbers["coordinator_1h"] == 4.2, g.as_dict()
+    assert not any("runaway" in r for r in g.reasons), g.reasons
+    hold = {"reasons": ["runaway guard: 4 self-started coordinator turns in the last hour met the same evidence"],
+            "until": now + 600}
+    assert bud.Gate(**{**g.as_dict(), "coord_hold": hold}).coord_hold == hold, "a saved gate keeps its hold"
+    assert "worker runs keep starting" in bud.coord_hold_words(hold, "in 10 min")
     assert bud.coord_hold_words({}, "x") == ""
     # A dollar cap reached: nothing new starts.
     p.set_config("budget.daily_usd", 1)

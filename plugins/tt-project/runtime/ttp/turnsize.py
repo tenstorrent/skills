@@ -8,8 +8,7 @@ record per pending item that went over, keyed by the item (`m:<id>`, `e:<id>`), 
 - A failed batch of n > 1 items is split: each of its items joins only batches of at most n // 2,
   at the configured cap, down to one item alone.
 - An item that fails alone at the base cap gets exactly one retry alone, raised to the ceiling
-  (coordinator.turn_budget_ceiling_usd, 0: twice the cap; never above the hourly coordinator limit
-  or a dollar cap), when the caps leave room for it now; meanwhile the other items go on.
+  (coordinator.turn_budget_ceiling_usd, 0: twice the cap; never above a dollar cap), when the caps leave room for it now; meanwhile the other items go on.
 - An item that fails alone with no higher cap allowed is parked: it stays pending, and one normal
   alert names it with every other parked item. It runs again, alone, only once the base cap or the
   ceiling rose above the cap it went over.
@@ -50,30 +49,25 @@ def configured(cfg: dict) -> float:
 
 
 def ceiling(cfg: dict) -> float:
-    """The most one raise may set: the configured ceiling (0: twice the cap), never above the hourly
-    coordinator limit or the project's daily or global daily cap."""
+    """The most one raise may set: the configured ceiling (0: twice the cap), never above the
+    project's daily or global daily cap."""
     c, b = cfg.get("coordinator") or {}, cfg.get("budget") or {}
     top = float(c.get("turn_budget_ceiling_usd") or 0) or 2 * configured(cfg)
-    for cap in (b.get("hourly_coordinator_usd", 4.0), b.get("daily_usd"), b.get("global_daily_usd")):
+    for cap in (b.get("daily_usd"), b.get("global_daily_usd")):
         if cap and float(cap) > 0:
             top = min(top, float(cap))
     return round(top, 2)
 
 
 def headroom(cfg: dict, numbers: dict) -> float:
-    """What the caps leave now for one turn: the hourly coordinator limit less every coordinator
-    turn of the last hour, and each dollar cap less its spend."""
-    b = cfg.get("budget") or {}
-    room = [float(b.get("hourly_coordinator_usd", 4.0)) - float(numbers.get("coordinator_1h") or 0)
-            - float(numbers.get("coordinator_user_1h") or 0)]
-    if (dollars := dollar_room(numbers)) is not None:
-        room.append(dollars)
-    return min(room)
+    """What the dollar caps leave now for one turn: each cap less its spend (no cap: no limit)."""
+    dollars = dollar_room(numbers)
+    return float("inf") if dollars is None else dollars
 
 
 def dollar_room(numbers: dict) -> float | None:
     """What the project and account dollar caps leave now (None: no cap set). A coordinator session
-    wake's cap is bounded by this alone, never by the hourly coordinator limit (seedcap.py)."""
+    wake's cap is bounded by this alone (seedcap.py)."""
     room = []
     if numbers.get("daily_cap"):
         room.append(float(numbers["daily_cap"]) - float(numbers.get("spent_today", numbers.get("spent_24h")) or 0))
@@ -228,5 +222,5 @@ def alert_text(db: DB, cfg: dict, project: str) -> str | None:
     return (f"{len(now)} coordinator item{'s are' if len(now) != 1 else ' is'} parked in {project}: "
             f"{names}. Each went over the most a turn may spend on it here (cap ${configured(cfg):.2f}, "
             f"ceiling ${ceiling(cfg):.2f}); the other items go on. Raise coordinator.turn_budget_usd or "
-            f"coordinator.turn_budget_ceiling_usd (it never goes above the hourly coordinator limit or "
+            f"coordinator.turn_budget_ceiling_usd (it never goes above "
             f"the dollar caps) above it to run it.")

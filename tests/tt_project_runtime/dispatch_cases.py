@@ -1896,7 +1896,7 @@ def test_an_obligation_owner_takes_the_extra_slot_past_full_slots_and_routine_pr
 
 def _guard_turns(p, now, n=7, cost=0.60):
     """`n` self-started coordinator turns in the last hour on the core provider costing `cost` each:
-    past the $4 guard at 7."""
+    past the old $4/h limit (the retired budget.hourly_coordinator_usd) at 7."""
     core = p.config().get("core_provider", "claude")
     for i in range(n):
         p.db.x("INSERT INTO runs(role,provider,effort,status,started,ended,cost_usd,note) "
@@ -1905,11 +1905,11 @@ def _guard_turns(p, now, n=7, cost=0.60):
         p.db.spend(core, cost, "coordinator")
 
 
-def test_a_tripped_coordinator_turn_guard_keeps_every_worker_task_starting_and_a_dollar_cap_holds_them(
+def test_coordinator_spend_past_the_old_hourly_limit_holds_no_worker_task_and_a_dollar_cap_holds_them(
         env, monkeypatch, tmp_path):
-    """The coordinator's self-started turns past budget.hourly_coordinator_usd throttle the coordinator
-    only: routine, scheduled, urgent and user-ordered tasks all keep starting under the normal caps, and
-    `ttp status` says the coordinator's turns are spaced out. A dollar cap reached holds every one."""
+    """Self-started coordinator turns past the old $4/h limit hold no worker task: routine, scheduled,
+    urgent and user-ordered tasks all start under the normal caps, and `ttp status` says nothing is
+    spaced out. A dollar cap reached holds every one."""
     from ttp.cli import status_text
     p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=4)
     try:
@@ -1919,7 +1919,8 @@ def test_a_tripped_coordinator_turn_guard_keeps_every_worker_task_starting_and_a
         _guard_turns(p, now)
         d.update_gates()
         core = d.cfg.get("core_provider", "claude")
-        assert d.gates[core].coord_hold and d.gates[core].level != "red", d.gates[core].as_dict()
+        g = d.gates[core]
+        assert not g.coord_hold and g.level != "red" and g.numbers["coordinator_1h"] == 4.2, g.as_dict()
         add = lambda title, spec="s", **kw: p.db.task(p.db.add_task(title, spec, kind="work", tier="standard",
                                                                      **{"priority": 3, **kw}))
         routine = add("routine work")
@@ -1937,8 +1938,7 @@ def test_a_tripped_coordinator_turn_guard_keeps_every_worker_task_starting_and_a
             assert d._start_hold(t, core, c) is None, t["title"]
             assert c["gate"].allow_new_work and c["gate"].max_parallel > 0, t["title"]
         p.db.set_kv("gates", {core: d.gates[core].as_dict()})
-        text = status_text(p)
-        assert "self-started coordinator turns spaced out" in text and "worker runs keep starting" in text, text
+        assert "spaced out" not in status_text(p)
         # A dollar cap reached: nothing new starts, urgent or user-ordered included.
         p.set_config("budget.daily_usd", 1)
         d.cfg = p.config()
@@ -1949,20 +1949,39 @@ def test_a_tripped_coordinator_turn_guard_keeps_every_worker_task_starting_and_a
         drain(d)
 
 
-def test_a_tripped_coordinator_turn_guard_spaces_out_self_started_turns_into_one_wake(env, monkeypatch):
-    """While the guard is tripped, self-started turns wait for its cool-down (until the trailing hour is
-    back under the limit), and then one turn takes every event queued meanwhile. A user message or a
-    must-act item still wakes the coordinator at once."""
-    from ttp import obligations
+def test_a_coordinator_past_the_old_hourly_limit_still_gets_its_next_self_started_wake(env, monkeypatch):
+    """Self-started coordinator spend past the old $4/h limit never defers the session's next wake."""
     p, d, clock, starts = _batch_setup(env, monkeypatch, busy=0)
     p.set_config("budget.global_daily_usd", 0)
     d.cfg = p.config()
     _guard_turns(p, clock[0])
     d.update_gates()
     core = d.cfg.get("core_provider", "claude")
-    hold = d.gates[core].coord_hold
-    assert hold and d.gates[core].allow_new_work, d.gates[core].as_dict()
-    assert hold["until"] - clock[0] > 1500, hold
+    assert not d.gates[core].coord_hold and d.gates[core].allow_new_work, d.gates[core].as_dict()
+    _event(p, clock, "task_done")
+    assert _turn_within(d, clock, starts, 600, step=30), "the coordinator's next wake was deferred"
+    # A dollar cap reached still stops its self-started turns.
+    p.db.x("UPDATE events SET status='handled'")
+    p.set_config("budget.daily_usd", 1)
+    d.cfg = p.config()
+    d.update_gates()
+    assert d.gates[core].level == "red", d.gates[core].as_dict()
+    _event(p, clock, "task_done")
+    assert not _turn_within(d, clock, starts, 600, step=30), "a self-started turn ran past the dollar cap"
+
+
+def test_a_tripped_coordinator_turn_guard_spaces_out_self_started_turns_into_one_wake(env, monkeypatch):
+    """While a coordinator turn signal is tripped (on a plan: too many self-started turns, or turns on the
+    same evidence), self-started turns wait for its cool-down, and then one turn takes every event queued
+    meanwhile. A user message or a must-act item still wakes the coordinator at once."""
+    from ttp import obligations
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=0)
+    d.update_gates()
+    core = d.cfg.get("core_provider", "claude")
+    hold = {"reasons": ["runaway guard: 4 self-started coordinator turns in the last hour met the same evidence"],
+            "until": clock[0] + 1800}
+    d.gates[core].coord_hold = hold
+    assert d.gates[core].allow_new_work, d.gates[core].as_dict()
     _event(p, clock, "task_done")
     assert not _turn_within(d, clock, starts, 900, step=30), "a self-started turn ran inside the cool-down"
     _event(p, clock, "followup_proposed")

@@ -18,8 +18,9 @@ it under the dollar caps whatever windows it reports; `plan` with no windows to 
 meter) is regime "plan": no dollar cap holds it and its spend is plan spend, not billed.
 A runaway check (a loop: wasted runs, a coordinator spinning, spend far above this project's own
 norm) overrides both. On plan windows its dollars are virtual, so it counts wasted runs and
-coordinator turns there. Its coordinator signals (self-started turns) throttle the coordinator
-only (Gate.coord_hold): its self-started turns wait out a cool-down and run as one wake, while worker
+coordinator turns there. It has no coordinator dollar signal: the always-on session coordinator
+optimizes its own cost inside the dollar caps. Its coordinator signals (self-started turns and turns
+on the same evidence, on a plan) throttle the coordinator only (Gate.coord_hold): its self-started turns wait out a cool-down and run as one wake, while worker
 runs keep starting under the rest of the gate, so the dollar caps and every other red still hold them.
 """
 from __future__ import annotations
@@ -364,10 +365,9 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
     # Runaway guard: catch loops, not busy projects. Three signals over the last hour:
     # - waste: spend on runs that ended without an outcome (failed, stalled, timed out, lost), except
     #   runs a reboot cut short or whose hand-off stood;
-    # - thrash: spend on coordinator turns the daemon started by itself (events, schedules, idle
-    #   wakes, sweeps): decisions should be cents, dollars mean it is spinning. A turn started for
-    #   a user message or an ask answer (its note lists them) is the user's own work, not a loop;
-    #   the total signal still bounds it;
+    # - coordinator: no dollar signal. The always-on session coordinator optimizes its own cost inside
+    #   the dollar caps, which bound it with everything else; its self-started spend is only shown
+    #   (coordinator_1h). Loops show as turns re-woken on the same evidence (on a plan, below);
     # - total: all spend above max(k x this project's 7-day hourly norm, a floor sized to the
     #   parallel work it is allowed), so even "successful" repetition is bounded.
     # On a plan below its line the dollars are virtual: the windows and their line already bound the
@@ -399,7 +399,6 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                              (provider, hour_ago, *WASTED)) if wasted(r)]
     workers = min(max(_peak_tasks(spans, now), 1), max(spend_workers(db, int(b.get("max_parallel_workers", 6))), 1))
     waste_cap = float(b.get("hourly_waste_usd", 8.0)) * workers
-    thrash_cap = float(b.get("hourly_coordinator_usd", 4.0))
     # Each signal's share of its limit: red past 1, and a red alert's episode ends only well below it
     # (daemon: RED_CLEAR_RATIO), so a value hovering at a limit is one alert, not one per crossing.
     shares: list[float] = []
@@ -440,11 +439,7 @@ def evaluate(db: DB, cfg: dict, provider: str, windows: list[Window], now: float
                              f"same evidence (limit {repeat_cap - 1}); resumes automatically as the hour rolls over")
             resume.append(rolls_under(selfs, lambda rs: repeated_turns(rs) >= repeat_cap, now))
     else:
-        shares += [_share(thrash, thrash_cap), _share(last_h, ceiling)]
-    if not virtual and thrash > thrash_cap:
-        coord_red.append(f"runaway guard: coordinator spent ${thrash:.2f} on self-started turns in the last hour "
-                         f"(limit ${thrash_cap:.0f}; turns for user messages not counted)")
-        resume.append(rolls_under(selfs, lambda rs: sum(float(r["cost_usd"] or 0) for r in rs) > thrash_cap, now))
+        shares.append(_share(last_h, ceiling))
     if last_h > ceiling and not virtual:
         _raise(g, "red", f"runaway guard: ${last_h:.2f} spent in the last hour (long runs pro rata), ceiling ${ceiling:.2f}/h; "
                          f"resumes automatically as the hour rolls over")

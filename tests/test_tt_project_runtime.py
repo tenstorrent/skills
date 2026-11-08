@@ -48257,19 +48257,21 @@ def test_a_normal_backlog_runs_as_one_turn_at_the_configured_cap(env, monkeypatc
     assert not p.db.q("SELECT id FROM events WHERE kind='turn_budget'") and not turnsize.records(p.db)
 
 
-def test_turn_cap_ceiling_is_clipped_by_the_hourly_coordinator_and_dollar_caps(env):
+def test_turn_cap_ceiling_is_clipped_by_the_dollar_caps_only(env):
+    """No hourly coordinator limit clips a turn: the retired budget.hourly_coordinator_usd is ignored."""
     p = make(env)
     from ttp import turnsize
     cfg = p.config()
     assert turnsize.ceiling(cfg) == 2.0 and cfg["coordinator"]["turn_budget_ceiling_usd"] == 0
     cfg["coordinator"]["turn_budget_ceiling_usd"] = 50
-    cfg["budget"].update(hourly_coordinator_usd=3.0, daily_usd=2.5, global_daily_usd=0)
+    cfg["budget"].update(hourly_coordinator_usd=0.5, daily_usd=2.5, global_daily_usd=0)
     assert turnsize.ceiling(cfg) == 2.5
     cfg["budget"]["global_daily_usd"] = 1.2
     assert turnsize.ceiling(cfg) == 1.2
-    room = turnsize.headroom(cfg, {"coordinator_1h": 1.0, "coordinator_user_1h": 0.5, "daily_cap": 20,
+    room = turnsize.headroom(cfg, {"coordinator_1h": 9.0, "coordinator_user_1h": 0.5, "daily_cap": 20,
                                    "spent_today": 19.0, "global_cap": 100, "global_today": 10})
     assert room == pytest.approx(1.0)
+    assert turnsize.headroom(cfg, {"coordinator_1h": 9.0}) == float("inf"), "no cap: no limit"
 
 
 def test_a_single_item_over_budget_runs_once_at_the_ceiling_when_there_is_room(env, monkeypatch):
@@ -48278,7 +48280,7 @@ def test_a_single_item_over_budget_runs_once_at_the_ceiling_when_there_is_room(e
     (mid,), _ = _backlog(p, 1, 0)
     d, turns, step = _turn_budget_rig(p, monkeypatch, lambda m, e: 1.5 if mid in m else 0.2)
     step()
-    # The hourly coordinator limit leaves no room for the raise yet: it waits, other items go on.
+    # The dollar caps leave no room for the raise yet: it waits, other items go on.
     monkeypatch.setattr(turnsize, "headroom", lambda cfg, numbers: 0.5)
     other = p.db.post("in", "other", chat="cli")
     p.db.x("UPDATE messages SET ts=ts-60 WHERE id=?", (other,))
@@ -48354,8 +48356,8 @@ def test_an_item_unparked_by_a_higher_ceiling_runs_at_it_even_after_another_item
 
 def test_two_heavy_items_parked_run_at_a_raised_ceiling_with_no_wasted_base_turn(env, monkeypatch):
     """#2064 probe 2: two items costing $3.00 each are parked at the default $2.00 ceiling, the rest and
-    new messages go on in one batch; the ceiling set to $6 (clipped to the $4 hourly coordinator limit)
-    runs each alone at $4, with no turn at the $1 base in between."""
+    new messages go on in one batch; the ceiling set to $6 (no hourly coordinator limit clips it)
+    runs each alone at $6, with no turn at the $1 base in between."""
     p = make(env)
     from ttp import turnsize
     (a, b, c, dd), _ = _backlog(p, 4, 0)
@@ -48382,7 +48384,7 @@ def test_two_heavy_items_parked_run_at_a_raised_ceiling_with_no_wasted_base_turn
     for _ in range(4):
         step()
         _turn_budget_invariant(p)
-    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[n:]] == [([a], 4.0, True), ([b], 4.0, True)], turns[n:]
+    assert [(t["messages"], t["cap"], t["ok"]) for t in turns[n:]] == [([a], 6.0, True), ([b], 6.0, True)], turns[n:]
     assert _episodes(p, turnsize.ALERT_KEY)[-1]["cleared"] and not turnsize.records(p.db)
 
 
@@ -48444,7 +48446,6 @@ def test_turn_budget_invariant_holds_over_random_failures_and_setting_changes(en
         _turn_budget_invariant(p)
     p.set_config("coordinator.turn_budget_usd", 10.0)
     p.set_config("coordinator.turn_budget_ceiling_usd", 0)
-    p.set_config("budget.hourly_coordinator_usd", 50.0)
     room["v"] = 100.0
     d2, turns2, step2 = _turn_budget_rig(p, monkeypatch, cost)
     for _ in range(60):

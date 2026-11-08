@@ -115,8 +115,9 @@
   (unpriced: $0, labelled). `ttp status` shows a `routed 24h:` phrase; `ttp stats --runs --tier <t>` lists runs.
 - Gates tighten as spend rises: `green` → `yellow` → `orange` → `red` (paused).
 - A spend spike far above the project's norm pauses it ("runaway guard").
-  Its coordinator-turn signal only spaces out self-started coordinator turns (user messages and
-  must-act items still wake it); worker tasks keep starting under the normal caps.
+  It has no coordinator dollar limit. Its coordinator-turn signal (on a plan) only spaces out
+  self-started coordinator turns (user messages and must-act items still wake it); worker tasks keep
+  starting under the normal caps.
 - Raising a cap: tell the coordinator, or `ttp config <name> budget.daily_usd <n>`.
   Warn the user to raise caps carefully.
 

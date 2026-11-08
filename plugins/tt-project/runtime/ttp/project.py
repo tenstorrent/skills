@@ -300,8 +300,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
                                 "worker_fork_max_age_h": 12, "worker_chat_chars": 30000},
                     "turn_budget_usd": 1.0,
                     # The most the daemon raises one turn's cap to, once, for a single item that went
-                    # over turn_budget_usd alone (0: twice turn_budget_usd); never above the hourly
-                    # coordinator limit or the dollar caps (turnsize.py). project.json is not changed.
+                    # over turn_budget_usd alone (0: twice turn_budget_usd); never above the
+                    # dollar caps (turnsize.py). project.json is not changed.
                     "turn_budget_ceiling_usd": 0,
                     # Turn timeout (coordlimits.turn_timeout): turn_timeouts_s.<provider>.<effort> set
                     # here wins, then a flat turn_timeout_s (0: unset; a stored 600, the old default,
@@ -546,7 +546,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
 META_KEYS = {"name", "id", "host", "root", "created", "tt_project_version", "pricing", "restrictions",
              "home_timezone", "home_timezone_from"}
 EXTRA_KEYS = {
-    "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs", "hourly_coordinator_usd",
+    "budget": {"max_waits", "hourly_floor_usd", "estimate_weights", "hourly_waste_usd", "hourly_waste_runs",
                "hourly_coordinator_turns", "hourly_coordinator_repeats", "max_pace_hold_s",
                "cap_yellow_pct"},   # max_pace_hold_s: deprecated and ignored; accepted so old configs stay quiet
     # blocker_sweep_h, blocker_sweep_min_gap_h, review_backlog_h: the blocker sweep's timing (sweep.py);
@@ -848,6 +848,7 @@ def _without_bad_sections(raw: dict) -> dict:
 RETIRED_KEYS = {
     "coordinator.session.mode": "the coordinator session is always on, with no off switch",
     "coordinator.session.pause_h": "the session spend guard is gone: the dollar caps are the cost limits",
+    "budget.hourly_coordinator_usd": "the coordinator's hourly dollar guard is gone: the dollar caps are the cost limits",
 }
 
 

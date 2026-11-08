@@ -223,15 +223,16 @@ only in the feed and never under "needs you".
   what other machines ask for.
 - Work backs off in steps as spend rises, pauses at the cap, and tells you how to raise it.
 - A runaway guard pauses a project whose hourly spend jumps far above its own norm.
-  Its coordinator signal (self-started coordinator turns past `budget.hourly_coordinator_usd`, or
-  too many of them on a plan) throttles the coordinator only: its self-started turns wait until the
+  It has no coordinator dollar limit (`budget.hourly_coordinator_usd` is retired): the always-on
+  coordinator optimizes its own cost inside the dollar caps. Its coordinator signal (on a plan, too
+  many self-started turns or turns on the same evidence) throttles the coordinator only: its self-started turns wait until the
   trailing hour is back under the limit, then one turn takes everything queued meanwhile. Your
   messages and must-act items still wake it at once, and worker tasks keep starting under the normal
   caps. `ttp status` says so on its coordinator line.
 - A coordinator turn that goes over `coordinator.turn_budget_usd` is never retried as is: its batch is
   halved down to single items; a single item runs once more alone at the ceiling
-  (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above the hourly coordinator limit
-  or the dollar caps). One that fails even then is parked and you get one alert naming every parked
+  (`coordinator.turn_budget_ceiling_usd`, 0: twice the cap, never above
+  the dollar caps). One that fails even then is parked and you get one alert naming every parked
   item; it runs again once you raise the cap or the ceiling. The other items go on.
 - High events that arrive close together share coordinator turns. The first one after a quiet
   spell wakes the coordinator at once; high events within `coordinator.burst_window_s` (120 s) after
