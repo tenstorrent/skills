@@ -549,3 +549,45 @@ def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host_or_the_s
     s.slurm, s.time_min = slurmcheck.settings_of({**_SLURM_SET, "workdir": str(tmp_path / "remote")}), 1
     r = subprocess.run(push.check_argv(s, commit=head), cwd=repo, env=run, capture_output=True, text=True, timeout=120)
     assert r.returncode == 0 and "1 passed, 2 deselected" in r.stdout, r.stdout + r.stderr
+
+
+@pytest.mark.parametrize("flags", [["--release", "--full"], ["--release"]])
+def test_a_release_check_runs_in_full_with_the_push_queue_on(env, tmp_path, monkeypatch, capsys, flags):
+    """Review #7629: the release cut's required suite runs through `ttp checks --release`; with the push queue
+    on it is never refused (--full), narrowed (testpick.narrow full=True) or fast-pathed."""
+    from ttp import testpick
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    p.set_config("delivery.push_queue", True)
+    calls, real = [], testpick.narrow
+    monkeypatch.setattr(testpick, "narrow", lambda *a, **k: (calls.append(k.get("full")), real(*a, **k))[1])
+    cli.main(["checks", *flags])
+    out = capsys.readouterr().out
+    assert "FAST PATH" not in out and mark.exists(), "the release check skipped the project's checks"
+    assert calls == [True], calls
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "fast_path" not in rec
+
+
+def test_the_fast_path_advice_names_a_command_the_push_queue_does_not_refuse(env, tmp_path, monkeypatch, capsys):
+    """Review #7629: the fast-path messages (ttp checks, prguard, the daemon's checks wait) named `ttp checks
+    --full`, which a push-queue project refuses; the command they name runs the project's checks there."""
+    import inspect
+    import re
+    from ttp import daemon, prguard
+    cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
+    p.set_config("delivery.push_queue", True)
+    cli.main(["checks"])
+    out = capsys.readouterr().out
+    assert "FAST PATH" in out and not mark.exists()
+    named = set()
+    for said in (out, prguard._checks_problem(os.getcwd()), inspect.getsource(daemon.Daemon._checks_wait)):
+        said = said[re.search(r"fast.path", said, re.I).start():]   # the advice after the fast-path text
+        hits = re.findall(r"`ttp checks([^`]*)`", said)
+        assert hits, said
+        named.add(tuple(hits[0].split()))
+    assert len(named) == 1, named
+    [flags] = named
+    cli.main(["checks", *flags])
+    assert "FAST PATH" not in capsys.readouterr().out and mark.exists(), "the advice ran no project check"
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and prguard.candidate_record(rec) and not rec.get("fast_path")

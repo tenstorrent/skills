@@ -2460,8 +2460,8 @@ session and stateless coordinators on every provider.
   fast path: when every changed path matches one and none matches `delivery.checks_fast_exclude`
   (by default code, scripts, manifests, tests, templates and skill/prompt files; a list replaces
   it), `ttp checks` runs only the whitespace and CRLF checks and says so. That pass is not a full
-  pass: it never counts for a PR or `on_pass`. `ttp checks --full` runs the project's checks
-  anyway (it is kept when the checks are queued or relaunched after a reboot), and a full pass
+  pass: it never counts for a PR or `on_pass`. `ttp checks --fresh` (or `--full`, where it is not
+  refused) runs the project's checks anyway (it is kept when the checks are queued or relaunched after a reboot), and a full pass
   already recorded for the tree is reused. A scoped `push_checks` entry that applies also turns it
   off. Known gap: a project that opts in owns its globs. A glob that covers installed or
   test-asserted content (for example a plugin README that tests read) skips the checks those
@@ -2485,7 +2485,8 @@ session and stateless coordinators on every provider.
   code) runs only the units importing or naming the changed file, plus those naming a function or
   fixture it changes, and a selection of half the suite or more stays targeted. A task's
   `ttp checks --full` is refused with a one-line reason unless the user set
-  `delivery.checks_task_full: true`. A change only the full suite covers adds the tests it can place,
+  `delivery.checks_task_full: true`; `ttp checks --release` (the release cut's required suite) always
+  runs in full: never narrowed, refused or fast-pathed. A change only the full suite covers adds the tests it can place,
   and the scope line ends `; the push batch runs the rest: <reasons>`. With the push queue off a
   task's checks narrow and widen as before. Each checks run records its wall and CPU seconds
   (`wall_s`, `cpu_s`) in `checks.json`; `ttp stats <name> --landing` shows per day the test runs and

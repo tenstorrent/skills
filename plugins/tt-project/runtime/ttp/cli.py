@@ -3537,8 +3537,8 @@ def cmd_checks(a) -> None:
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
-    if a.full and purpose == "candidate":
-        from . import testpick
+    if a.full and purpose == "candidate" and not getattr(a, "release", False):
+        from . import testpick   # a release run (the release cut's required suite) always runs in full
         if why := testpick.full_refusal(cfg):   # the push train is the only full run
             die(f"ttp checks: {why}")
     d = cfg.get("delivery") or {}
@@ -3769,7 +3769,7 @@ def cmd_checks(a) -> None:
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
             fcfg = p.config() if p else None
-            if todo and purpose == "candidate" and not a.full and not a.fresh \
+            if todo and purpose == "candidate" and not a.full and not a.fresh and not getattr(a, "release", False) \
                     and not any(getattr(c, "if_changed", ()) for c in todo) \
                     and not _recorded_pass(p, tree, todo, purpose) \
                     and push.fast_path(Path(top), base, head, push.fast_globs(fcfg), push.fast_exclude(fcfg)):
@@ -3778,7 +3778,7 @@ def cmd_checks(a) -> None:
                 fast_cmds = push.fast_checks(base)
                 todo = [c for c in todo if str(c) not in own_s] + fast_cmds
                 said = ("FAST PATH: the diff changes only docs/data paths, so the project's checks were NOT run; "
-                        "only the whitespace and CRLF checks run; `ttp checks --full` runs them all (delivery.checks_fast_globs sets the paths, "
+                        "only the whitespace and CRLF checks run; `ttp checks --fresh` runs them (delivery.checks_fast_globs sets the paths, "
                         "delivery.checks_fast_exclude the paths that never take it)"
                         + (f"; commands after `--` still run" if len(todo) > len(fast_cmds) else ""))
                 print(f"ttp checks: {said}")
@@ -3828,7 +3828,8 @@ def cmd_checks(a) -> None:
         # never comes here and runs the full suite. A narrowed check's pass is its own (its env is in its key).
         if todo and passed and not hit and not fast_cmds and purpose == "candidate":
             from . import testpick
-            todo, scope_lines = testpick.narrow(Path(top), base, head, todo, own, fcfg, full=a.full)
+            todo, scope_lines = testpick.narrow(Path(top), base, head, todo, own, fcfg,
+                                              full=a.full or getattr(a, "release", False))
             for said in scope_lines:
                 print(f"ttp checks: {said}")
                 out.write(f"{said}\n")
