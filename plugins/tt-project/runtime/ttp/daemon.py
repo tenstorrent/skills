@@ -14338,8 +14338,9 @@ class Daemon:
         return ""
 
     def _relaunch_jobs(self, t: dict, prev: dict) -> tuple[bool, bool]:
-        """A task waiting on local detached jobs (`ttp detach --check <rc...>` in its retry_when, alone
-        or in a compound probe: rebootwait.local_jobs) that all
+        """A task waiting on local detached jobs (`ttp detach --check <rc...>` in its retry_when, or any
+        local command naming their .rc such as `test -s <rc>`, alone or in a compound probe:
+        rebootwait.local_jobs) that all
         opted in with `--resumable`: start each the reboot cut short (no .rc) again, model-free, note
         it on the task and keep the task asleep on its retry_when. Returns (asleep, cut). asleep when it
         stays asleep (relaunched now, or already on this boot: a daemon restart). Else it wakes as
