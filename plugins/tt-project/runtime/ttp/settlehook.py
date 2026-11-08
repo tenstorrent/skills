@@ -25,12 +25,11 @@ event, the same task's follow-up included, is a new event and wakes on its own."
 from __future__ import annotations
 
 import json
-import os
 import re
-import signal
-import subprocess
 import threading
 import time
+
+from . import boundedchild
 
 ROUTINE_KINDS = ("task_done", "upstream_note", "observation")
 SEVERITIES = ("info", "low", "normal")
@@ -172,18 +171,19 @@ class Run:
 
     def _go(self) -> None:
         try:
-            proc = subprocess.Popen(self._cmd, shell=True, cwd=self._cwd, stdin=subprocess.PIPE,
-                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
-            try:
-                out, err = proc.communicate(self._stdin, timeout=self._timeout)
-            except subprocess.TimeoutExpired:
-                _killpg(proc)
+            res = boundedchild.run(self._cmd, self._timeout, shell=True, cwd=self._cwd, input=self._stdin,
+                                   text=False, grace=KILL_WAIT_S)
+            if res.timed_out:
                 self.fault = f"timed out after {self._timeout:g} s"
                 return
-            if proc.returncode != 0:
-                tail = " ".join(err.decode("utf-8", "replace").split())[-200:]
-                self.fault = f"exited {proc.returncode}" + (f": {tail}" if tail else "")
+            if res.rc is None:
+                self.fault = f"could not run: {res.error}"[:300]
                 return
+            if res.rc != 0:
+                tail = " ".join(res.err.decode("utf-8", "replace").split())[-200:]
+                self.fault = f"exited {res.rc}" + (f": {tail}" if tail else "")
+                return
+            out = res.out
             if len(out) > MAX_OUT:
                 self.fault = f"printed over {MAX_OUT} bytes"
                 return
@@ -195,17 +195,6 @@ class Run:
             self.fault = f"could not run: {type(e).__name__}: {e}"[:300]
         finally:
             self._done.set()
-
-
-def _killpg(proc) -> None:
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except OSError:
-        pass
-    try:
-        proc.communicate(timeout=KILL_WAIT_S)
-    except (OSError, subprocess.SubprocessError, ValueError):
-        pass
 
 
 def _keep(rows, now: float) -> list:
