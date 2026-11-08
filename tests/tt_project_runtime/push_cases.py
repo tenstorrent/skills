@@ -16924,7 +16924,7 @@ def test_a_push_check_still_making_progress_runs_on_past_its_limit_up_to_its_str
 
 def test_a_push_check_waiting_for_a_pool_slot_past_its_limit_is_no_progress(monkeypatch, tmp_path):
     """Lines a check prints while it waits for a test-pool slot (`ttp pool-wait` says it waits) are no
-    progress: past the limit, still waiting for a slot, it is ended at the limit."""
+    progress: past the limit, still waiting for a slot, it is ended at the limit (busy, the pool's wait)."""
     from ttp import checkwait, locks, push, workerloss
     clock = [1000.0]
     monkeypatch.setattr(push.time, "time", lambda: clock[0])
@@ -16943,7 +16943,7 @@ def test_a_push_check_waiting_for_a_pool_slot_past_its_limit_is_no_progress(monk
         rc = push._timed_wait(proc, waits, "run-shards", said.append, out)
     finally:
         locks.record_wait(waits / checkwait.POOL, "shard-1", 1000.0, clock[0])
-    assert rc == 124 and 900 <= clock[0] - 1000 < 905, clock[0]
+    assert rc == push.POOL_BUSY and 900 <= clock[0] - 1000 < 905, (rc, clock[0])
     assert "still making progress" not in "\n".join(said)
 
 

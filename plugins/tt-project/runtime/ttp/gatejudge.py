@@ -494,7 +494,7 @@ def rerun(run, at: str, ids: list[str], tries: int = BUSY_TRIES, wait_s: float =
 
 def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
           touched=lambda _id: True, tries: int = BUSY_TRIES, wait_s: float = BUSY_WAIT_S,
-          sleep=time.sleep, head_out: str = "") -> dict:
+          sleep=time.sleep, head_out: str = "", base_first: bool = True) -> dict:
     """Judge a check's failing `ids`. `run(at, ids)` reruns ids at "base" or "head" on this host and
     returns (exit code or None, output); one that exits BUSY is retried (rerun). The base goes first: an id
     failing there (saved or rerun) the same way as in the head's failed run `head_out` (same_failure) is
@@ -504,7 +504,9 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
     failed) while `busy` is not. `proven` is the part of `new` a conclusive head rerun failed and a real base
     result on this host passed or did not have; the rest of `new` is a failure the reruns could not tell
     apart (a timeout, an odd exit, an incomplete list, no base, or a base that failed it another way:
-    `other_failure`). Only a base failure the same as the head's is `pre_existing`."""
+    `other_failure`). Only a base failure the same as the head's is `pre_existing`. With `base_first` false
+    (the push batch, which reruns its tip itself) the head reruns first and only the ids still failing
+    there go to the base, compared with that rerun."""
     v = {"new": [], "proven": [], "pre_existing": [], "other_failure": [], "flaky": [], "quarantined": [], "busy": [],
          "base": base, "host": where}
     q = active(state, now)
@@ -513,29 +515,39 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
         (v["quarantined"] if i in q and not touched(i) else todo).append(i)
     if not todo:
         return v
-    saved = _saved(state, where, base, todo, now) if base else {}
-    # A saved base failure without its mark (saved before marks were, or an output it could not read) cannot
-    # be compared: run the base again.
-    known = {i: bool(e.get("failed")) for i, e in saved.items()
-             if not e.get("failed") or any((e.get("mark") or {}).values())}
-    how = {i: saved[i]["mark"] for i in known if known[i]}
-    need = [i for i in todo if i not in known]
-    base_busy: list[str] = []
-    if need and base:
+    known: dict[str, bool] = {}
+    how: dict[str, dict] = {}
+
+    def on_base(some: list[str]) -> list[str]:
+        """Fill known/how for `some` from the saved base, rerunning the base for the rest; the ids it was busy for."""
+        saved = _saved(state, where, base, some, now) if base else {}
+        # A saved base failure without its mark (saved before marks were, or an output it could not read)
+        # cannot be compared: run the base again.
+        known.update({i: bool(e.get("failed")) for i, e in saved.items()
+                      if not e.get("failed") or any((e.get("mark") or {}).values())})
+        how.update({i: saved[i]["mark"] for i in some if known.get(i) is True and i in saved})
+        need = [i for i in some if i not in known]
+        if not (need and base):
+            return []
         got = rerun(run, "base", need, tries, wait_s, sleep)
-        if got[0] == BUSY:   # no slot for the base: not proven pre-existing; the head rerun still runs
-            base_busy = need
-        bad = None if got[0] == BUSY else failed_of(*got, need)
+        if got[0] == BUSY:   # no slot for the base: not proven pre-existing nor new, never excused
+            return need
+        bad = failed_of(*got, need)
         if bad is not None:
             fresh, fresh_how = {i: i in bad for i in need}, marks(got[1], sorted(bad))
             save_base(state, where, base, fresh, now, fresh_how)
             known.update(fresh)
             how.update(fresh_how)
-    first = marks(head_out, [i for i in todo if known.get(i) is True]) if head_out else {}
-    v["pre_existing"] = [i for i in todo if known.get(i) is True and same_failure(first.get(i), how.get(i))]
-    rest = [i for i in todo if i not in v["pre_existing"]]
-    if not rest:
-        return v
+        return []
+
+    rest = todo
+    base_busy = on_base(todo) if base_first else []
+    if base_first:
+        first = marks(head_out, [i for i in todo if known.get(i) is True]) if head_out else {}
+        v["pre_existing"] = [i for i in todo if known.get(i) is True and same_failure(first.get(i), how.get(i))]
+        rest = [i for i in todo if i not in v["pre_existing"]]
+        if not rest:
+            return v
     got = rerun(run, "head", rest, tries, wait_s, sleep)
     if got[0] == BUSY:
         v["busy"] = rest
@@ -546,7 +558,11 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
         return v
     v["flaky"] = [i for i in rest if i not in again]
     still = [i for i in rest if i in again]
-    head_how = marks(got[1], [i for i in still if known.get(i) is True])
+    if not still:
+        return v
+    head_how = marks(got[1], still)
+    if not base_first:
+        base_busy = on_base(still)
     same = {i for i in still if known.get(i) is True and same_failure(head_how.get(i), how.get(i))}
     v["pre_existing"] += [i for i in still if i in same]
     v["other_failure"] = [i for i in still if known.get(i) is True and i not in same]
@@ -554,7 +570,6 @@ def judge(ids: list[str], run, state: Path, base: str, where: str, now: float,
     v["new"] = [i for i in still if i not in same and i not in base_busy]
     v["proven"] = [i for i in v["new"] if known.get(i) is False]
     return v
-
 
 def blocks(v: dict) -> bool:
     return bool(v.get("new"))
@@ -586,7 +601,7 @@ def lines(v: dict) -> list[str]:
         out.append("quarantined as flaky earlier and not touched by this change, not blocking: "
                    + ", ".join(v["quarantined"]))
     if (sure := proven(v)):
-        out.append("new on this head (passed on the base, failed again on its rerun), blocking: " + ", ".join(sure))
+        out.append("new on this head (failed again on its rerun, not on the base), blocking: " + ", ".join(sure))
     if (other := [i for i in v.get("other_failure") or [] if i in (v.get("new") or [])]):
         out.append(f"failed on the base {str(v.get('base'))[:12]} too but another way (another first error "
                    "line, message or location), so not pre-existing: blocking: " + ", ".join(other))

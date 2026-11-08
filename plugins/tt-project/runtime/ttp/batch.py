@@ -2734,7 +2734,7 @@ class Batch:
                 if got[0] != 0:
                     break
             return got
-        v = gatejudge.judge(ids, run, self.p.state, base, where, now, touched, tries=0)
+        v = gatejudge.judge(ids, run, self.p.state, base, where, now, touched, tries=0, base_first=False)
         if v["flaky"]:
             self.flaky.append({"ids": v["flaky"], "head": head, "cmd": str(cmd)})
             self.checks["flaky"] = True

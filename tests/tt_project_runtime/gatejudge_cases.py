@@ -19,12 +19,17 @@ def _fake_run(head: dict, base: dict, calls: list):
     return run
 
 
+def _head_out(ids: list) -> str:
+    # The check's own failed run: a FAILED line per id, as _fake_run prints them.
+    return "".join(f"FAILED {i} - assert 0\n" for i in ids) + f"{len(ids)} failed in 0.1s\n"
+
+
 def test_gate_judge_sorts_pre_existing_flaky_and_new_failures(tmp_path):
     from ttp import gatejudge
     a, b, c = "tests/test_a.py::test_pre", "tests/test_a.py::test_flaky", "tests/test_a.py::test_new"
     calls = []
     run = _fake_run({a: True, b: False, c: True}, {a: True, c: False}, calls)
-    v = gatejudge.judge([a, b, c], run, tmp_path, "base1", "host-a", 1000.0)
+    v = gatejudge.judge([a, b, c], run, tmp_path, "base1", "host-a", 1000.0, head_out=_head_out([a, b, c]))
     assert v["pre_existing"] == [a] and v["flaky"] == [b] and v["new"] == [c]
     assert gatejudge.blocks(v)
     # Only the failing ids rerun: all three on the base, only those not failing there on the head.
@@ -115,14 +120,19 @@ def test_gate_judge_never_reruns_on_the_head_an_id_that_fails_on_the_base(tmp_pa
     new, flaky = "tests/test_g.py::test_new", "tests/test_g.py::test_flaky"
     calls = []
     run = _fake_run({**{i: True for i in pre}, new: True}, {i: True for i in pre}, calls)
-    v = gatejudge.judge([*pre, new, flaky], run, tmp_path, "base1", "host-a", 1000.0)
+    v = gatejudge.judge([*pre, new, flaky], run, tmp_path, "base1", "host-a", 1000.0,
+                        head_out=_head_out([*pre, new, flaky]))
     assert calls == [("base", [*pre, new, flaky]), ("head", [new, flaky])]
     assert v["pre_existing"] == pre and v["new"] == [new] and v["flaky"] == [flaky]
     assert any(line.startswith("failing on both") and "not rerun on the head" in line for line in gatejudge.lines(v))
     # Saved on this host for this base: neither rerun runs for them.
     calls.clear()
-    v = gatejudge.judge(pre, run, tmp_path, "base1", "host-a", 1001.0)
+    v = gatejudge.judge(pre, run, tmp_path, "base1", "host-a", 1001.0, head_out=_head_out(pre))
     assert calls == [] and v["pre_existing"] == pre and not gatejudge.blocks(v)
+    # The check's own run shows no failure to compare (or none at all): it reruns on the head, compared there.
+    calls.clear()
+    v = gatejudge.judge(pre[:2], run, tmp_path, "base1", "host-a", 1001.0)
+    assert calls == [("head", pre[:2])] and v["pre_existing"] == pre[:2] and not gatejudge.blocks(v)
     # No slot for the base: the head rerun still runs; failing again there is undecided, never excused or new.
     i = pre[0]
     v = gatejudge.judge([i, flaky], _busy_run({"base": [(75, "")] * 9, "head": [
@@ -156,7 +166,7 @@ def test_gate_judge_keeps_a_failure_whose_head_rerun_selected_none_or_not_all_of
     assert v["new"] == [a, b] and v["flaky"] == [] and v["pre_existing"] == []
     seen = []
     v = gatejudge.judge([a, b], lambda at, ids: (seen.append((at, ids)), fail_q)[1], tmp_path / "q2", "b1",
-                        "host-a", 1000.0)
+                        "host-a", 1000.0, head_out=fail_q[1])
     assert v["pre_existing"] == [b] and seen == [("base", [a, b]), ("head", [a])]
     assert gatejudge.active(tmp_path, 1000.0) == {}
     # One passed and one failed (both ran): the passed one is flaky, the other compared on the base.
@@ -491,7 +501,7 @@ def test_gate_judge_retries_a_busy_base_rerun_on_the_same_host_then_judges_it(tm
     fail = (1, f"FAILED {i} - assert 0\n1 failed in 0.1s\n")
     calls, slept = [], []
     run = _busy_run({"head": [fail], "base": [(75, "ADMISSION TIMEOUT\n"), fail]}, calls)
-    v = gatejudge.judge([i], run, tmp_path, "b" * 40, "h1", 1000.0, sleep=slept.append)
+    v = gatejudge.judge([i], run, tmp_path, "b" * 40, "h1", 1000.0, sleep=slept.append, head_out=fail[1])
     assert v["pre_existing"] == [i] and not v["new"] and not v.get("busy")
     assert [c[0] for c in calls] == ["base", "base"] and slept == [gatejudge.BUSY_FIRST_S]
     assert not gatejudge.blocks(v) and not gatejudge.undecided(v)
@@ -961,7 +971,14 @@ def test_gate_judge_calls_a_failure_pre_existing_only_when_base_and_head_fail_th
     gatejudge.save_base(tmp_path / "old", "host-a", "b1", {a: True}, 1000.0)
     calls.clear()
     v = gatejudge.judge([a], head_only, tmp_path / "old", "b1", "host-a", 1001.0)
-    assert calls == ["head", "base"] and v["new"] == [a] and v["pre_existing"] == []
+    assert calls == ["base", "head"] and v["new"] == [a] and v["pre_existing"] == []
+    # The check's own failed run shows the base's failure: excused with no head rerun. Shows another: the
+    # head reruns and that rerun is compared, so a change's own new way of failing still blocks.
+    calls.clear()
+    assert gatejudge.judge([a], head_only, tmp_path / "b", "b1", "host-a", 1001.0,
+                           head_out=_fails({a: same})[1])["pre_existing"] == [a] and calls == []
+    assert gatejudge.judge([a], head_only, tmp_path / "c0", "b1", "host-a", 1001.0,
+                           head_out=_fails({a: same})[1])["other_failure"] == [a] and calls == ["head"]
     # Marks that share nothing (a base rerun showing neither a traceback nor a summary message) prove nothing.
     assert not gatejudge.same_failure({"line": "assert 0"}, {"at": "test_a.py:3: AssertionError"})
     assert not gatejudge.same_failure({}, {})
