@@ -3350,3 +3350,27 @@ def test_a_hand_offs_detach_check_feeding_a_fallback_is_stored_guarded_with_its_
     r = subprocess.run(["sh", "-c", stored], capture_output=True, text=True,
                        env={**os.environ, "PYTHONPATH": str(Path(dmod.__file__).parent.parent)})
     assert r.returncode == detach.FAILED_RC and detach.failed_check(res["retry_when"], r.returncode), r
+
+
+def test_detach_state_reads_a_bare_job_path_as_its_rc_and_an_rc_written_late_wins(env, tmp_path, monkeypatch):
+    """Upstream note f08269644b34508b: `detach --check <dir>/<name>` (no .rc) read the bare path, found no
+    exit code and marked the ended job lost. The bare path maps to <name>.rc; detached.json entries match by
+    absolute path; an .rc that shows while the loss reasons are read wins over the guess."""
+    from ttp import detach
+    run = tmp_path / "run"
+    run.mkdir()
+    (run / "job.v2.rc").write_text("0\n")
+    assert detach.state(run / "job.v2") == ("ended", "0") and detach.recorded(run / "job.v2")
+    assert not (run / "job.v2.lost").exists() and not (run / "job.lost").exists()
+    assert detach.job_rc(run) == run, "a series driver's dir stays as given"
+    monkeypatch.chdir(tmp_path)
+    (run / "detached.json").write_text(json.dumps([{"rc": "./run/other.rc", "boot": "b1"}]))
+    assert detach._entry(run / "other.rc") == {"rc": "./run/other.rc", "boot": "b1"}
+    late = run / "late.rc"
+    real = detach.started
+
+    def started_then_rc(rc):   # the job writes its exit code while state() works out why it is gone
+        late.write_text("3\n")
+        return real(rc)
+    monkeypatch.setattr(detach, "started", started_then_rc)
+    assert detach.state(late) == ("ended", "3") and not detach.lost(late).exists()

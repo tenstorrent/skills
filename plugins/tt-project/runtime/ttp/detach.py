@@ -1157,7 +1157,7 @@ def record_stop(rc: Path, why: str) -> bool:
 def stopped(rc: Path) -> str | None:
     """Why the job at this .rc was stopped on purpose (its .rc holds STOP_RC and <name>.lost says
     why: record_stop), else None: an exit code the job wrote itself, or no .rc yet."""
-    rc = Path(rc)
+    rc = job_rc(rc)
     try:
         if rc.read_text().strip() != str(STOP_RC):
             return None
@@ -1268,20 +1268,29 @@ def sweep(state: Path) -> None:
             _drop(d)
 
 
+def job_rc(rc) -> Path:
+    """The .rc path of a job named by its bare path <dir>/<name> (a probe's `detach --check <dir>/<name>`),
+    as state(), recorded() and stopped() read it: with_suffix on the bare path would read <name>'s own
+    files under another name and mark an exited job lost. A .rc path or a series driver's dir is as given."""
+    rc = Path(rc)
+    return rc if rc.suffix == ".rc" or rc.is_dir() else rc.with_name(rc.name + ".rc")
+
+
 def _entry(rc: Path) -> dict:
     try:
         jobs = json.loads((rc.parent / "detached.json").read_text())
     except (OSError, ValueError):
         return {}
-    return next((j for j in jobs if isinstance(j, dict) and j.get("rc") == str(rc)), {}) \
-        if isinstance(jobs, list) else {}
+    want = os.path.abspath(rc)   # an entry written with a relative or ./ path is the same job
+    return next((j for j in jobs if isinstance(j, dict) and isinstance(j.get("rc"), str)
+                 and os.path.abspath(j["rc"]) == want), {}) if isinstance(jobs, list) else {}
 
 
 def recorded(rc: Path) -> bool:
     """Whether anything records a detached job at this .rc path: its exit code, its loss, its start,
     its entry in detached.json, a queued request or its held lock. False for a path no `ttp detach`
     wrote, which state() would call lost (and mark so)."""
-    rc = Path(rc)
+    rc = job_rc(rc)
     return (rc.exists() or lost(rc).exists() or started(rc).exists() or bool(_entry(rc)) or pending(rc)
             or not locks.any_free([locks.job_lock(rc)]))
 
@@ -1327,7 +1336,7 @@ def series(rc: Path) -> tuple[str, str] | None:
 def state(rc: Path) -> tuple[str, str]:
     """("ended", exit code), ("running" or "queued", ""), or ("lost", why). The first look at a lost
     job records why in <name>.lost."""
-    rc = Path(rc)
+    rc = job_rc(rc)
     for _ in range(2):   # a job that ends between the looks wrote its .rc before its lock went free
         if rc.exists():
             return "ended", rc.read_text().strip() or "?"
@@ -1350,6 +1359,8 @@ def state(rc: Path) -> tuple[str, str]:
     else:
         why = ("it was killed after it started, before it wrote an exit code, or the host restarted: the boot "
                "id could not be read, so which is unknown")
+    if rc.exists():   # it ended while the reasons were read: its own exit code wins over a guess
+        return "ended", rc.read_text().strip() or "?"
     return "lost", _mark_lost_first(rc, why)
 
 
