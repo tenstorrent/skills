@@ -191,7 +191,7 @@ def test_a_waiting_tasks_retry_when_that_fails_for_gh_login_sleeps_on_the_host_a
            (json.dumps({"status": "waiting", "retry_when": probe, "waiting_since": now - 60}), now + 600, tid))
     d = Daemon(p.base)
     woke = []
-    monkeypatch.setattr(d, "_wake_waiting", lambda t, why, at, extra=None: woke.append(why))
+    monkeypatch.setattr(d, "_wake_waiting", lambda t, why, at, extra=None, kind=None: woke.append(why))
 
     def hold(rc, at):
         d._probe_rc[tid] = (rc, at, probe)
