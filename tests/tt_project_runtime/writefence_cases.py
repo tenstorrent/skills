@@ -711,28 +711,26 @@ def test_the_upgrade_task_names_the_config_key_for_freed_commands():
 
 @pytest.mark.parametrize("argv_tail", [
     ["providers.claude.write_fence", "true"],                         # turns the sandbox back on
-    ["providers.claude.write_fence", "false"],                        # or off: the user's, both ways
     ["providers.codex.write_fence", "true"],
-    ["providers.claude", json.dumps({"tiers": {}})],                   # drops the user's false: back on
-    ["providers", json.dumps({})],                                     # through the whole section
+    ["providers.cursor.write_fence", '"on"'],
+    ["providers.chat.write_fence", "9"],                               # not a plain off value: the fence reads it on
+    ["providers.claude", json.dumps({"write_fence": True})],           # through a parent key
+    ["providers", json.dumps({"chat": {"write_fence": True}})],        # through the whole section
 ])
-def test_a_run_cannot_change_the_worker_sandbox_without_the_user(env, capsys, monkeypatch, argv_tail):
-    """The worker sandbox (providers.<name>.write_fence) is a user-only setting: a run's `ttp config`
-    refuses to turn it back on (or off), directly or through a parent key, as it refuses a spend cap;
-    reading works, and outside a run (the user's own terminal) it sets."""
+def test_a_run_cannot_turn_the_worker_sandbox_on(env, capsys, monkeypatch, argv_tail):
+    """The worker sandbox (providers.<name>.write_fence) is turned on only by the user: a run's `ttp config`
+    refuses it, directly or through a parent key, as it refuses a spend cap; reading works, and outside a
+    run (the user's own terminal) it sets."""
     from ttp import cli
     from ttp.providers import fence_on
     p = make(env)
     p.set_config("providers.claude.write_fence", False)
     before = p.raw_config()
     monkeypatch.setenv("TTP_RUN_ID", "7")
-    if argv_tail[-1] == "false":   # the user's own later word: not superseded, so still theirs to clear
-        from ttp import configwho
-        p.set_config("providers.claude.write_fence", True, by=configwho.by("user", msgs=[3], via="chat"))
-        before = p.raw_config()
     with pytest.raises(SystemExit) as e:
         cli.main(["config", "demo", *argv_tail])
-    assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and "only the user may change" in err and "user's own word" in err, err
     assert p.raw_config() == before
     cli.main(["config", "demo", "providers.claude.write_fence"])      # reading works
     capsys.readouterr()
@@ -741,30 +739,81 @@ def test_a_run_cannot_change_the_worker_sandbox_without_the_user(env, capsys, mo
     assert fence_on(p.config(), "claude", p)
 
 
-def test_the_coordinator_changes_the_worker_sandbox_only_in_a_turn_carrying_the_users_word(env, capsys):
-    """config_set of providers.<name>.write_fence is refused in a turn without the user's message (an
-    event or hand-off wake: its own judgement), and applied in the turn carrying it."""
+@pytest.mark.parametrize("argv_tail", [
+    ["providers.claude.write_fence", "false"],
+    ["providers.claude.write_fence", ""],                             # unset: the default, unfenced
+    ["providers.claude", json.dumps({"tiers": {}})],                   # drops it through a parent key
+])
+def test_a_run_may_turn_the_worker_sandbox_off(env, capsys, monkeypatch, argv_tail):
+    """Off (false or unset) is the direction the user's unsandboxed-runs order takes: a run may write it."""
+    from ttp import cli
+    from ttp.providers import fence_on
+    p = make(env)
+    p.set_config("providers.claude.write_fence", True)
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    cli.main(["config", "demo", *argv_tail])
+    assert not fence_on(p.config(), "claude")
+
+
+def test_the_coordinator_never_turns_the_worker_sandbox_on_and_may_turn_it_off(env, capsys):
+    """config_set of providers.<name>.write_fence true is refused in every turn, the one carrying a user
+    message too, with the reason; false and unset are applied in any turn."""
     from ttp import cli, coordinator as coord
     from ttp.providers import fence_on
     p = make(env)
     p.set_config("providers.claude.write_fence", False)
-    for value in (True, "on", False):
-        out = coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": value}])
-        assert any("needs the user's approval" in x for x in out), (value, out)
-        assert not fence_on(p.config(), "claude", p)
+    for value in (True, "on", "true"):
+        for user_turn in (False, True):
+            out = coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": value}],
+                              user_turn=user_turn)
+            assert any("only the user may change" in x and "user's own word" in x for x in out), (value, out)
+            assert not fence_on(p.config(), "claude")
     assert "providers.claude.write_fence" not in coord.HELD_SETTING
-    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": True}],
-                       user_turn=True) == []
-    assert not fence_on(p.config(), "claude", p), "a turn without the user's own message records no user word"
-    mid = p.db.post("in", "turn the worker sandbox back on", chat="relay-chat")
-    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": True}],
-                       user_turn=True, messages=[mid]) == []
-    assert fence_on(p.config(), "claude", p)
-    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": "false"}],
-                       user_turn=True) == []
+    p.set_config("providers.claude.write_fence", True)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": "false"}]) == []
     assert p.raw_config()["providers"]["claude"]["write_fence"] is False
-    cli.main(["config", "--chat-settable", "providers.claude.write_fence", "true"])
-    assert "providers.claude.write_fence: accepted as true" in capsys.readouterr().out
+    p.set_config("providers.claude.write_fence", True)
+    assert coord.apply(p, [{"type": "config_set", "key": "providers.claude.write_fence", "value": ""}]) == []
+    assert not fence_on(p.config(), "claude")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "--chat-settable", "providers.claude.write_fence", "true"])
+    assert e.value.code == 1 and "only the user may change" in capsys.readouterr().out
+    cli.main(["config", "--chat-settable", "providers.claude.write_fence", "false"])
+    assert "providers.claude.write_fence: accepted as false" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("var", ["TTP_RUN_ID", "TTP_RUN_DIR", "TTP_NOTE_RUN_DIR"])
+@pytest.mark.parametrize("start,argv_tail", [
+    (None, ["restrictions.no_internet", "true"]),                      # turns Codex's and Cursor's sandbox on
+    (None, ["restrictions", json.dumps({"no_internet": True})]),       # through the parent key
+    (True, ["restrictions.no_internet", "false"]),                     # clearing it loosens a Restriction
+    (True, ["restrictions.no_internet", ""]),                          # unset, the same
+    (True, ["restrictions", json.dumps({})]),                          # dropped through the parent key
+])
+def test_a_run_cannot_change_restrictions_no_internet(env, capsys, monkeypatch, var, start, argv_tail):
+    """restrictions.no_internet turns sandboxing on (Codex workspace-write and read-only, Cursor --sandbox) and is
+    a Restriction: a run's `ttp config` refuses it in both directions, directly or through `restrictions`, and
+    the coordinator's config_set refuses it; the user's own `ttp config`, outside a run, sets it."""
+    from ttp import cli, coordinator as coord
+    from ttp.providers import fence_on, get_provider
+    p = make(env)
+    if start is not None:
+        p.set_config("restrictions.no_internet", start)
+    before = p.raw_config()
+    monkeypatch.setenv(var, "7")
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "demo", *argv_tail])
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and "only the user may change" in err and "restrictions.no_internet" in err, err
+    assert p.raw_config() == before
+    monkeypatch.delenv(var)
+    for user_turn in (False, True):
+        out = coord.apply(p, [{"type": "config_set", "key": "restrictions.no_internet", "value": not start}],
+                          user_turn=user_turn)
+        assert out and p.raw_config() == before, out
+    cli.main(["config", "demo", "restrictions.no_internet", "true"])  # the user's own terminal
+    cfg = p.config()
+    assert get_provider("codex").fenced(fence_on(cfg, "codex"), cfg["restrictions"])
 
 
 def _launch_role(env, p, provider, role, cwd, monkeypatch):
@@ -952,8 +1001,8 @@ def test_a_sandbox_setting_the_user_made_after_the_order_stays_on(env, monkeypat
 
 def test_a_superseded_sandbox_setting_is_cleared_without_the_users_word(env, capsys, monkeypatch):
     """A superseded write_fence or sandbox.checks true (runs ignore it) is removed, or set false, by the
-    coordinator's config_set in a turn without the user and by a run's `ttp config`; one the user set after
-    the order is still refused, and turning a sandbox on still needs the user."""
+    coordinator's config_set in a turn without the user and by a run's `ttp config`; so is one the user set
+    after the order (off is anyone's, SANDBOX_KEYS), and turning a sandbox on still needs the user."""
     from ttp import cli, configwho, coordinator as coord, sandboxstate
     p = make(env)
     fence = "providers.claude.write_fence"
@@ -971,27 +1020,23 @@ def test_a_superseded_sandbox_setting_is_cleared_without_the_users_word(env, cap
         cli.main(["config", "demo", key, "false"])
         assert sandboxstate._value(p.raw_config(), key) is False, key
     capsys.readouterr()
-    # The user's own word after the order: still theirs, in a run and in a coordinator turn without them
-    # (sandbox.checks false is the safe side for anyone, SAFE_WHEN_OFF).
-    for key in (fence,):
-        p.set_config(key, True, by=configwho.by("user", msgs=[3], via="chat"))
-        before = p.raw_config()
-        for value in ("", "false"):
-            with pytest.raises(SystemExit) as e:
-                cli.main(["config", "demo", key, value])
-            assert e.value.code == 2 and "only the user may change" in capsys.readouterr().err, (key, value)
-            assert p.raw_config() == before
+    # The user's own word after the order: off is still anyone's (their unsandboxed-runs order), in a run
+    # and in a coordinator turn without them; only turning a sandbox on is theirs.
+    for value in ("", "false"):
+        p.set_config(fence, True, by=configwho.by("user", msgs=[3], via="chat"))
+        cli.main(["config", "demo", fence, value])
+        assert sandboxstate._value(p.raw_config(), fence) in (None, False), value
     monkeypatch.delenv("TTP_RUN_ID")
     for value in ("", False):
-        out = coord.apply(p, [{"type": "config_set", "key": fence, "value": value}])
-        assert any("needs the user's approval" in x for x in out), (value, out)
-        assert p.raw_config()["providers"]["claude"]["write_fence"] is True
+        p.set_config(fence, True, by=configwho.by("user", msgs=[3], via="chat"))
+        assert coord.apply(p, [{"type": "config_set", "key": fence, "value": value}]) == [], value
+        assert sandboxstate._value(p.raw_config(), fence) in (None, False), value
     # Turning it on is never a clearing.
     p.set_config(fence, True, by=configwho.by("coordinator", via="config_set"))
     assert not sandboxstate.clears_superseded(p, fence, True)
     for value in (True, "on"):
         out = coord.apply(p, [{"type": "config_set", "key": "providers.codex.write_fence", "value": value}])
-        assert any("needs the user's approval" in x for x in out), (value, out)
+        assert any("only the user may change" in x for x in out), (value, out)
     monkeypatch.setenv("TTP_RUN_ID", "7")
     with pytest.raises(SystemExit) as e:
         cli.main(["config", "demo", "providers.codex.write_fence", "true"])

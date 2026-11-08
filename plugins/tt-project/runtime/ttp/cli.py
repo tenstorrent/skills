@@ -1587,6 +1587,11 @@ def status_text(p: Project, verbose: bool = False) -> str:
         if u["below_floor"]:
             lines.append(f"  {u['below_floor']} of the questions are below every chat's severity floor; lower "
                          f"notify.chat_min_severity or the chat's own floor to see them")
+    try:
+        from . import machine_ledger
+        lines += machine_ledger.orphan_lines(now, p)[:6]
+    except Exception as e:   # a status line must not keep the status from showing
+        lines.append(f"undelivered machine pages: not read ({type(e).__name__})")
     if h["runtime"]["line"]:
         lines.append(h["runtime"]["line"])
     from . import lease
@@ -2913,6 +2918,75 @@ def _covered_by(c, checks: list, py: str = "", top: str = ""):
                  and _same_run_key(o, py, top) == key), None)
 
 
+_NORECURSE = re.compile(r"\..+|_darcs|build|CVS|dist|node_modules|venv|\{arch\}|.+\.egg")
+
+
+def _pytest_args(key: str) -> list[str] | None:
+    """The words after `pytest` of a _same_run_key that is one plain pytest run, else None."""
+    try:
+        words = shlex.split(key)
+    except ValueError:
+        return None
+    return words[1:] if words and words[0] == "pytest" and "--" not in words else None
+
+
+def _inside(path: str, root: str, top: str) -> bool:
+    """Whether a pytest run given `root` (a directory or file of the worktree `top`) already runs every test
+    of `path` (a file, a directory or a node id) given alone: it lies inside `root`, a file is named as
+    pytest collects it by default (test_*.py, *_test.py) and no top-level config sets python_files, no
+    directory on the way is one pytest skips by default, and no pytest config file between them would
+    become the lone run's own."""
+    from . import push
+    file = path.partition("::")[0]
+    if not file or not root or "::" in root or Path(file).is_absolute() or Path(root).is_absolute():
+        return False
+    f, r = Path(os.path.normpath(file)), Path(os.path.normpath(root))
+    if ".." in f.parts or ".." in r.parts or not (f == r or str(r) == "." or r in f.parents):
+        return False
+    t = Path(top)
+    try:
+        if not (t / f).is_dir():
+            if not (t / f).is_file() or not re.fullmatch(r"test_.*\.py|.*_test\.py", f.name):
+                return False
+            if any((t / n).is_file() and "python_files" in (t / n).read_text(errors="replace")
+                   for n in push.PYTEST_FILES if n.endswith((".ini", ".cfg", ".toml"))):
+                return False
+        below = f.parts if str(r) == "." else f.parts[len(r.parts):]
+        if any(_NORECURSE.fullmatch(w) for w in below):
+            return False
+        d, stop = (t / f if (t / f).is_dir() else (t / f).parent), (t / r if (t / r).is_dir() else (t / r).parent)
+        while d != stop and stop in d.parents:
+            if any((d / n).is_file() for n in push.PYTEST_FILES if n != "conftest.py"):
+                return False
+            d = d.parent
+    except OSError:
+        return False
+    return True
+
+
+def _within(c, checks: list, py: str = "", top: str = ""):
+    """The first of `checks` (unscoped, one plain pytest run of named paths) whose run already runs every
+    test of the extra command `c`: `c` is a plain pytest run with the same options (_same_run_key) and only
+    paths (files, directories or node ids) that lie inside that check's paths (_inside). None otherwise:
+    any other option, a path outside, or a command that is not plain pytest stays."""
+    if not isinstance(c, str) or not top or (mine := _pytest_args(_same_run_key(c, py, top))) is None:
+        return None
+    flags, paths = sorted(w for w in mine if w.startswith("-")), [w for w in mine if not w.startswith("-")]
+    if not paths or not set(flags) <= set(_TOP_FLAGS):
+        return None   # any other option (-k, -m, -p, --ignore ...) may run other tests: it stays
+    for o in checks:
+        if getattr(o, "if_exists", "") or getattr(o, "if_changed", ()) or not _plain_check(o):
+            continue
+        theirs = _pytest_args(_same_run_key(o, py, top))
+        if theirs is None or any("::" in w for w in theirs):
+            continue
+        roots = [w for w in theirs if not w.startswith("-")]
+        if roots and sorted(w for w in theirs if w.startswith("-")) == flags \
+                and all(any(_inside(w, r, top) for r in roots) for w in paths):
+            return o
+    return None
+
+
 def _commands_hash(cmds: list) -> str:
     import hashlib
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
@@ -3177,7 +3251,10 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
     quoted so each stays one word (`-- pytest -k 'a and b'`). A command the same as one of the
     project's checks that runs on every head (no `if_exists`/`if_changed`), or as an earlier one
     here, is dropped: it would run twice (a pytest run in any spelling the venv `py` runs alike in
-    the worktree `top`, _same_run_key). One that
+    the worktree `top`, _same_run_key), and so is a plain pytest run of paths inside such a check's
+    (_within: `pytest -q tests/a.py` after `pytest -q tests`), so the run keeps that check set's
+    command hash and can reuse or share its pass; cmd_checks runs it after all when that check does
+    not run in full there (_held_extras). One that
     only a scoped check matches stays, as that check may be skipped on this head (_ran_again drops
     it once that check applies)."""
     if not extra:
@@ -3190,9 +3267,28 @@ def _extra_checks(extra: list[str], own: list, py: str = "", top: str = "") -> t
     mine, dropped = [], []
     for c in given:
         key = _same_run_key(c, py, top)
-        (dropped if key in seen else mine).append(c)
+        (dropped if key in seen or _within(c, own, py, top) is not None else mine).append(c)
         seen.add(key)
     return mine, dropped
+
+
+def _held_extras(held: list, own: list, py: str, top: str, source: str, todo: list,
+                 passed_full: list) -> tuple[list, list[str]]:
+    """(the held extras to run after all, the notice lines). `held` pairs each extra dropped as inside a
+    project check's paths (_within) with its command as this run would run it. It stands only when that
+    check runs (or passed) in full on this tree: in `todo` (or its recorded pass) not narrowed by testpick,
+    or in `passed_full` (the push queue's pass). A narrowed check (testpick) or one the fast path skipped
+    may leave out its tests, so it runs."""
+    full = {str(c) for c in passed_full} | {str(c) for c in todo if not getattr(c, "targeted", False)}
+    more, lines = [], []
+    for c, cmd in held:
+        o = _within(c, own, py, top)
+        if str(o) in full:
+            lines.append(f"not running {c!r} after `--`: {source} already runs its tests in {str(o)!r}")
+        else:
+            more.append(cmd)
+            lines.append(f"running {c!r} after `--`: {source} does not run {str(o)!r} in full here")
+    return more, lines
 
 
 def _ran_again(todo: list, own: list, py: str = "", top: str = "") -> tuple[list, list]:
@@ -3388,7 +3484,14 @@ def cmd_checks(a) -> None:
     # The python a bare pytest runs with (push.venv_cmd): an extra spelled with it runs the same tests.
     vpy = str(push.venv_python(top, {**os.environ, **venv_vars}) or "")
     mine, dropped = _extra_checks(a.cmd[1:] if a.cmd[:1] == ["--"] else a.cmd, own, vpy, top)
-    mine = push.with_host(mine, checks_host)
+    # An extra dropped as inside a project check's paths (_within) is held, ready to run: it stands only
+    # when that check runs in full here, never when testpick narrows it or the fast path skips it.
+    held_at = {}   # each held run's key: its first place in `dropped`
+    for i, c in enumerate(dropped):
+        if _covered_by(c, own, vpy, top) is None and _within(c, own, vpy, top) is not None:
+            held_at.setdefault(_same_run_key(c, vpy, top), i)
+    held_s = [dropped[i] for i in held_at.values()]
+    mine = push.with_host(mine + held_s, checks_host)
     # A program the commands after `--` run that is not installed: refused now, not an exit 127 later.
     from . import envfault
     for c in mine:
@@ -3425,7 +3528,10 @@ def cmd_checks(a) -> None:
         if wrap and (remote := [c for c in mine if push.remote_host(c)]):
             print(f"ttp checks: {', '.join(map(repr, map(str, remote)))} run on their check host without "
                   f"{push.WRAP_KEY}, which wraps only commands run on this machine")
-    for c in dropped:   # each names the project check that runs it, when another spelling
+    mine, held = mine[:len(mine) - len(held_s)], list(zip(held_s, mine[len(mine) - len(held_s):]))
+    for i, c in enumerate(dropped):   # each names the project check that runs it, when another spelling
+        if i in held_at.values():
+            continue   # its notice comes once its project check's scope here is known (_held_extras)
         cover = _covered_by(c, own, vpy, top)
         by = ("an earlier command after `--` is the same run" if cover is None else f"{source} already runs it"
               + (f" as {str(cover)!r}" if str(cover) != c else ""))
@@ -3583,6 +3689,14 @@ def cmd_checks(a) -> None:
                 out.write(f"{said}\n")
             if any(getattr(c, "targeted", False) for c in todo) and not a.fresh:
                 hit = _recorded_pass(p, tree, todo, purpose)
+        if held and passed:
+            more, lines = _held_extras(held, own, vpy, top, source, todo, queue_cmds)
+            for said in lines:
+                print(f"ttp checks: {said}")
+                out.write(f"{said}\n")
+            if more:
+                todo, selected = todo + more, selected + more
+                hit = _recorded_pass(p, tree, todo, purpose) if not a.fresh else None
         if not todo and passed and verified_cmds:
             said = f"every applicable check was {mark['line']}"
             out.write(f"{said}\n")
@@ -3654,7 +3768,7 @@ def cmd_checks(a) -> None:
         spill_ok = not checkspill.all_off(no_spill) and checkspill.spillable(todo, cfg)
         fresh_ok = not a.fresh
         slot = None
-        light = bool(todo) and checklane.all_light(todo, cfg, mine if getattr(a, "light", False) else ())
+        light = bool(todo) and checklane.all_light(todo, cfg, mine + [h for _, h in held] if getattr(a, "light", False) else ())
         # The task's same checks queued twice run one suite; a newer head's supersede an older waiter (checkjoin).
         if todo and not hit and not light and not getattr(a, "release", False):
             join_rec = _checks_join_register(p, str(top), head, todo, purpose, pre_env, Path(run_dir), arrived)
@@ -4919,17 +5033,20 @@ def _git_out(top: str, *args: str) -> str:
         return ""
 
 
-def _landing_check(p) -> bool:
-    """Whether this `ttp checks` run lands work rather than tests a task: it runs under a verified landing
-    mark (a push batch's or `ttp push`'s checks) or is the project's coordinator's own run for no task. Such
-    a run takes the project's landing lane (testslots.landing_room) and never waits behind its task checks
-    for the project cap. Any other task-less run (a user's, a script's) shares the project's lanes as before."""
+def _landing_check(p) -> str:
+    """Whether this `ttp checks` run lands work rather than tests a task, and how: "mark" under a verified
+    landing mark (a push batch's or `ttp push`'s checks), "coordinator" for the project's coordinator's own
+    run for no task, "" otherwise. Such a run takes a landing lane (testslots.landing_room) and never waits
+    behind its task checks for the project cap; a mark run never waits behind the coordinator's either. Any
+    other task-less run (a user's, a script's) shares the project's lanes as before."""
     from . import coordtools, landmark
     if not p:
-        return False
+        return ""
     if landmark.label() is not None:
-        return True
-    return not os.environ.get("TTP_TASK") and os.environ.get(coordtools.ROLE_ENV) == "coordinator"
+        return "mark"
+    if not os.environ.get("TTP_TASK") and os.environ.get(coordtools.ROLE_ENV) == "coordinator":
+        return "coordinator"
+    return ""
 
 
 def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: float | None, arrived, same: str,
@@ -5045,7 +5162,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
                                     startable=startable,
                                     parks=lambda on: testslots.lane_waits(
                                         suite, testslots.PARKED_WAITS if on else "a host-wide checks slot"),
-                                    urgent=urgent, preemptible=checkcap.preemptible(cmds, lock))
+                                    urgent=urgent, preemptible=checkcap.preemptible(cmds, lock),
+                                    small=checkcap.is_small(run_cost))
             kept_slot = None
             if slot is None or slot.served:
                 suite.close()
@@ -7844,12 +7962,14 @@ def _detach_stop(what: str, given: str | None = None) -> int:
 
 def _detach_stop_checks(rc: Path, given: str | None) -> int:
     """`ttp detach --stop <run>/checks.rc`: stop the run's detached `ttp checks` (jobstop.stop_checks: the
-    may_stop rule, then end_checks). 0 once stopped or when they no longer run, 1 when they still run, 2
-    outside a tt-project run, 3 when refused. A sandboxed caller queues the stop for the daemon."""
+    may_stop rule, then end_checks; a review precheck's folder counts as its code task's, jobstop.task_of).
+    0 once stopped or when they no longer run, 1 when they still run, 2 outside a tt-project run or
+    precheck, 3 when refused. A sandboxed caller queues the stop for the daemon."""
     from . import jobstop
     from .push import _boxed
     run_dir = rc.parent
-    base = run_dir.parent.parent.parent if run_dir.parent.name == "runs" else None
+    # a run's folder (state/runs/<id>) or the daemon's review precheck (state/prechecks/t<task>-<head>)
+    base = run_dir.parent.parent.parent if run_dir.parent.name in ("runs", "prechecks") else None
     if base is None or not (base / "state").is_dir():
         print(f"ttp detach --stop: {rc} is not the checks of a tt-project run", file=sys.stderr)
         return 2
@@ -8903,6 +9023,10 @@ def cmd_memory(a) -> None:
         return
     if not a.text and not a.forget:
         sys.exit("give the memory's text, or --forget <entry>, or --search <words>")
+    from . import coordtools
+    if a.text and coordtools.coordinator_run():   # also past the hook (a command a coordinator tool started)
+        sys.exit("ttp memory: a coordinator writes memory with the `memory_add` action (its `supersedes` too), which checks lines "
+                 "labelled as the user's words against the chat log; `ttp memory` writes are the user's own")
     if (a.title or a.audience) and not a.text:
         sys.exit("--title and --audience go with the memory's text")
     if a.permanent and not a.supersedes:
@@ -9862,11 +9986,12 @@ def _log_account_change(key: str, old, new) -> None:
 def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
     """The user-only setting (coordinator.NEEDS_USER) that writing `val` at `key` into the project.json
     `raw` would change, or None. A parent key (`budget`, `delivery`) counts through what it holds, and
-    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate; so is
-    clearing a superseded sandbox value of project `p` (sandboxstate.clears_superseded)."""
+    turning a SAFE_WHEN_OFF switch off is the safe direction, as in the coordinator's own gate (a sandbox
+    key, SANDBOX_KEYS: any value but on, removing it too); so is clearing a superseded sandbox value of
+    project `p` (sandboxstate.clears_superseded)."""
     import copy
     from . import sandboxstate
-    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF
+    from .coordinator import NEEDS_USER, SAFE_WHEN_OFF, SANDBOX_KEYS, sandbox_on
 
     def at(node, dotted):
         for part in dotted.split("."):
@@ -9887,13 +10012,17 @@ def _user_only_change(raw: dict, key: str, val, p=None) -> str | None:
         if k != key and not k.startswith(key + ".") and not key.startswith(k + "."):
             continue
         new = at(after, k)
-        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])) and not (
+        if new != at(raw, k) and not (k in SAFE_WHEN_OFF and new in (False, "", [])) \
+                and not (k in SANDBOX_KEYS and not sandbox_on(new)) and not (
                 new in (None, False) and sandboxstate.clears_superseded(p, k, new)):
             return k
     return None
 
 
 def _refuse_user_only_in_run(key: str) -> None:
+    from .coordinator import SANDBOX_KEYS, sandbox_refusal
+    if key in SANDBOX_KEYS:
+        die(sandbox_refusal(key) + "; `ttp config` refuses turning it on inside a run")
     die(f"{key} is a setting only the user may change, and `ttp config` refuses to set it inside a run; "
         f"reading it still works. Name the value you need in the hand-off (a followup or the question) "
         f"so the coordinator can ask the user")
@@ -9904,7 +10033,7 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
     value, checked as config_set checks it), without setting anything; `list` prints every accepted key.
     Exit 0 when accepted, 1 when refused."""
     from . import chatset
-    from .coordinator import USER_SETTABLE, settable
+    from .coordinator import SANDBOX_KEYS, USER_SETTABLE, sandbox_on, sandbox_refusal, settable
     if key == "list":
         from . import accountset
         print("\n".join([*sorted([*USER_SETTABLE, *accountset.KEYS]), *chatset.PATTERNS]))
@@ -9917,6 +10046,8 @@ def cmd_chat_settable(key: str, value: str | None) -> None:
             except ValueError:
                 val = value
             val = conv(val)
+        if key in SANDBOX_KEYS and (value is None or sandbox_on(val)):   # only its off value is chat's
+            raise ValueError(sandbox_refusal(key))
     except (ValueError, TypeError) as e:
         print(f"refused: {e}" if str(e).startswith(key) else f"{key}: refused: {e}")
         sys.exit(1)
@@ -12535,7 +12666,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("cmd", nargs=argparse.REMAINDER, help="extra check commands after --: one quoted string runs through the shell "
                         "(ttp checks -- 'FOO=1 pytest -q && ruff check'); several quoted strings run as "
                         "one check each (-- 'pytest -q' 'ruff check .'); plain words run as argv "
-                        "(-- pytest -q tests/a.py). One that delivery.push_checks already runs is dropped")
+                        "(-- pytest -q tests/a.py). One that delivery.push_checks already runs is dropped, as is a plain "
+                        "pytest run of paths inside a push_checks pytest path")
     s.set_defaults(fn=cmd_checks)
 
     s = sub.add_parser("stats", help="context re-read (cache-read) tokens per run and per $, by kind and tier")

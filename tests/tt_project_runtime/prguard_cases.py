@@ -328,6 +328,43 @@ def test_only_a_harness_task_edits_the_gh_wrapper_and_its_pre_hooks(env, tmp_pat
         assert not denied("Bash", command=cmd), cmd
 
 
+def test_a_patch_to_the_gh_wrapper_is_refused_like_an_edit_on_every_provider(env, tmp_path, monkeypatch):
+    """Codex's apply_patch reaches the hook with the patch in tool_input.command: each add, update, delete
+    or move target is checked as an Edit's file_path is, also a patch in a shell command and relative paths."""
+    from ttp import hook
+    p = make(env)
+    code = p.db.add_task("Fix it", "x", kind="code", tier="standard", origin="coordinator")
+    harness = p.db.add_task("Add a gh hook", "x", kind="harness", tier="standard", origin="coordinator")
+    monkeypatch.setenv("TTP_RUN_DIR", str(tmp_path))
+    monkeypatch.setenv("TTP_PROJECT", str(p.base))
+    bin_ = p.harness / "bin"
+
+    def denied(tool, body, cwd=tmp_path, key="command"):
+        text = f"*** Begin Patch\n{body}\n*** End Patch"
+        inp = {key: f"apply_patch <<'EOF'\n{text}\nEOF" if tool == "Bash" else text}
+        out, _ = hook.pre_tool_use({"tool_name": tool, "tool_input": inp, "cwd": str(cwd)})
+        return bool(out) and out["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+    bad = [(f"*** Update File: {bin_ / 'gh'}\n@@\n-a\n+b", tmp_path), (f"*** Add File: {bin_ / 'gh.d' / '10-x'}\n+x", tmp_path),
+           (f"*** Delete File: {bin_ / 'gh.d' / 'README.md'}", tmp_path),
+           ("*** Update File: notes.txt\n*** Move to: " + str(bin_ / "gh"), tmp_path),
+           ("  *** Update File:   gh\n@@\n-a\n+b", bin_), ("*** Add File: gh.d/20-y\n+x", bin_),
+           ("*** Add File: src/a.py\n+x\n*** Update File: " + os.path.relpath(bin_ / "gh", tmp_path), tmp_path)]
+    ok = [("*** Add File: src/a.py\n+x", tmp_path), ("*** Update File: gh\n@@\n-a\n+b", tmp_path),
+          (f"*** Update File: {p.harness / 'prompts' / 'worker.md'}\n@@\n-a\n+b", tmp_path)]
+    for task in (code, None):
+        monkeypatch.setenv("TTP_TASK", str(task or ""))
+        for body, cwd in bad:
+            assert denied("apply_patch", body, cwd), (task, body)
+            assert denied("apply_patch", body, cwd, key="input"), (task, body)
+            assert denied("Bash", body, cwd), (task, body)
+        for body, cwd in ok:
+            assert not denied("apply_patch", body, cwd) and not denied("Bash", body, cwd), body
+    monkeypatch.setenv("TTP_TASK", str(harness))
+    for body, cwd in bad:
+        assert not denied("apply_patch", body, cwd) and not denied("Bash", body, cwd), body
+
+
 def test_draft_guard_allows_a_path_that_keeps_the_harness_bin_first(env, tmp_path, monkeypatch):
     """A test may put a fake gh behind the wrapper; every PATH that drops the wrapper or puts it behind
     another dir stays refused."""

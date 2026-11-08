@@ -271,8 +271,13 @@ Company-wide practice; the long form is in the `tt-project:setup-box` skill's re
   `ttp host-run --result <id>` (its output, its exit code). A lock that must cover the whole run:
   `ttp detach <name> --lock <res> -- ttp host-run -- <command...>`, not `ttp lock` around `--detach`
   (which frees the lock once the run started).
-- The worker sandbox (`providers.<name>.write_fence`) is the user's setting: `ttp config` refuses it
-  inside a run and the coordinator sets it only in a turn carrying the user's word. A user's
+- The keys that turn namespace sandboxing on (`providers.<name>.write_fence`, `sandbox.checks`) are
+  user-only: only the user's own word turns one on (`ttp config` in their own shell, or the web
+  settings page). `ttp config` inside any run, a worker's or a coordinator's, and every coordinator
+  `config_set` refuse the on value, in a turn carrying a user message too; the off value (false, or
+  `''` to unset) anyone may write. `restrictions.no_internet` also turns Codex's and Cursor's
+  sandbox on and is a Restriction: a run's `ttp config` refuses it on or off, and `config_set`
+  cannot set it. A user's
   harness-wide order (such as unsandboxed runs) applies to every project; a project never opts out
   on its own judgement: it records the workaround it relied on instead.
 - A fenced Claude worker's (write_fence true) `ssh`, `scp`, `sftp`, `rsync` and `ttp lock` run outside the Bash sandbox

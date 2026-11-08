@@ -635,16 +635,26 @@ def test_heal_detached_fix_holds_its_lock_and_reads_busy_until_it_ends(env):
     """fix_detached: the fix runs as a tracked job past timeout_s, under its resource lock the whole time;
     the check reads 75 (busy) and is not run while it runs, a daemon restart keeps it, and its end settles."""
     from ttp import heal
-    from ttp.daemon import Daemon
     held, go, runs = (env["repo"] / n for n in ("held", "go", "runs"))
     p, d, up = _heal_setup(env, resource="dev-x", fix_detached=True, check=f"echo x >> {runs}; test -e {env['repo'] / 'up'}",
-                           fix=f'echo "$TTP_LOCKS_HELD" > {held}; while [ ! -e {go} ]; do {_nap(0.1)}; done; '
-                               f'touch {env["repo"] / "up"}')
+                           # `held` appears whole (a redirection creates it empty before echo writes)
+                           fix=f'echo "$TTP_LOCKS_HELD" > {held}.tmp; mv {held}.tmp {held}; '
+                               f'while [ ! -e {go} ]; do {_nap(0.1)}; done; touch {env["repo"] / "up"}')
     spec, now = _heal_spec(p), time.time()
     assert spec["fix_timeout_s"] == heal.FIX_TIMEOUT_S > heal.MAX_TIMEOUT_S
+    try:
+        _heal_detached_fix_runs(p, d, spec, now, held, go, runs)
+    finally:
+        go.touch()   # a failed assert never leaves the fix running
+
+
+def _heal_detached_fix_runs(p, d, spec, now, held, go, runs):
+    from ttp import heal
+    from ttp.daemon import Daemon
     assert heal.run(d, "svc", spec, now) == ("unhealthy (detached fix started; rechecking when it ends)",
                                              now + heal.FIX_POLL_S)
-    assert _wait_for(held.exists) and "dev-x" in held.read_text()
+    # Bounds only against a hang: a loaded host can take long to start the fix and its `ttp lock`.
+    assert _wait_for(held.exists, timeout=300) and "dev-x" in held.read_text()
     assert not _lock_free(p, "dev-x"), "the detached fix runs under its lock"
     st = heal.state(p.db, "svc")
     assert st["phase"] == "fixing" and st["fixes"] == [now] and d._healing()
@@ -655,8 +665,8 @@ def test_heal_detached_fix_holds_its_lock_and_reads_busy_until_it_ends(env):
     assert status.startswith("unhealthy (detached fix running 600 s") and again == now + 600 + heal.FIX_POLL_S
     assert runs.read_text().count("x") == checks, "the check never runs under its fix"
     go.touch()
-    assert _wait_for(lambda: pathlib.Path(heal.state(p.db, "svc")["fix_job"]["rc"]).exists())
-    assert _wait_for(lambda: _lock_free(p, "dev-x")), "the lock goes with the fix"
+    assert _wait_for(lambda: pathlib.Path(heal.state(p.db, "svc")["fix_job"]["rc"]).exists(), timeout=300)
+    assert _wait_for(lambda: _lock_free(p, "dev-x"), timeout=300), "the lock goes with the fix"
     assert heal.run(d2, "svc", spec, now + 700) == ("unhealthy (fixed; rechecking)", now + 700)
     st = heal.state(p.db, "svc")
     assert "fix_job" not in st and st["fix_rc"] == 0 and st["fixes"] == [now]
@@ -4028,7 +4038,9 @@ def _change_entry(ml, cid):
     return next(c for c in ml.changes(open_only=False) if c["id"] == cid)
 
 
-def _overdue_pages(ml, at, claimer="alpha"):
+def _overdue_pages(ml, at, claimer=""):
+    # An empty claimer is a reader that is no project's daemon (may_claim takes every page for one); these
+    # tests are not the daemon's own claim of the entry's page.
     return [x for x in ml.route(at, able=lambda n: (True, ""), claimer=claimer) if x["kind"] == "machine_change_overdue"]
 
 

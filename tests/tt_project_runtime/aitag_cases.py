@@ -287,7 +287,7 @@ def test_curl_and_wget_posts_to_github_slack_jira_and_confluence_need_the_ai_tag
         "curl -F text='Build is green' -F channel=C1 https://slack.com/api/chat.update",
         "curl -X POST -d 'payload={\"text\": \"hi\"}' https://hooks.slack.com/services/T0/B0/xyz",
         "cd /tmp && curl -sd @body.json https://api.github.com/repos/a/b/issues/7/comments",
-        "timeout 30 curl --data-binary @body.json https://api.github.com/repos/a/b/releases",
+        "timeout 30 curl --data-binary @body.json https://api.github.com/repos/a/b/commits/abc1/comments",
         "curl -u u:t -H 'Content-Type: application/json' -d '{\"body\": \"Done\"}' "
         "https://site.example.com/rest/api/2/issue/X-1/comment",
         "curl -X POST --data '{\"fields\": {\"summary\": \"s\", \"description\": \"d\"}}' "

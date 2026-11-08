@@ -350,6 +350,13 @@ class Provider:
 
     coord_tools_note = ""   # coord_tools' last fallback, named in daemon.log
 
+    def coord_tool_set(self, cwd: str) -> tuple[str, str]:
+        """What a full-tools session coordinator wake run in `cwd` really gets, for its prompt's Tools
+        section (prompts.coordinator_session_role): ("full", "") a worker's tools, ("read", why)
+        read-only tools, ("none", why) none beyond its answer. `why` is a fixed phrase without paths,
+        so the prompt stays byte-stable for one provider and tool state. Default: no tools."""
+        return "none", f"{self.name} gives a coordinator no tools beyond its answer"
+
     def session_context(self, session_id: str, since: float, env: dict | None = None) -> dict | None:
         """For an agent whose stream gives no per-call usage: what its saved session says of the run that
         started at `since`, {"first_context", "last_context": a model call's prompt plus answer,

@@ -2391,6 +2391,78 @@ def test_a_push_batch_replays_heads_in_order_and_keeps_an_approval_only_when_the
         assert _git_out(origin, "show", f"proj:{path}") == tip.rstrip("\n")
 
 
+CAP_BASE = ('def test_prompt_size(env):\n'
+            '    for kind, cap in (("code", 31_473), ("question", 24_505)):   # code: +128 for waits; +30 both: cites\n'
+            '        assert size(kind) <= cap\n')
+
+
+def test_merge3_counters_add_both_raises_of_a_cap_and_keep_both_reasons():
+    """Two changes each raise one test's prompt size cap by what their own text needs (the push
+    conflict that sent approvals back most often): the cap gets old + both raises and the comment
+    both reasons, ours first. Anything else stays a conflict: a lowered number, a code edit beside
+    the numbers, a reworded reason, a cap only one side raised while the other edited the comment
+    only, a `#` inside a string, and a file the caller did not mark (counters off)."""
+    from ttp.batch import merge3
+    tip = CAP_BASE.replace("31_473", "31_593").replace("+128 for waits;", "+128 for waits; code: +120 for eta;")
+    change = CAP_BASE.replace("31_473", "31_551").replace("24_505", "24_583").replace("# code:", "# +78 both: acks; code:")
+    kinds: set = set()
+    got = merge3(tip, CAP_BASE, change, py=True, hunks=True, counters=True, kinds=kinds)
+    assert got == CAP_BASE.replace("31_473", "31_671").replace("24_505", "24_583").replace(
+        "# code: +128 for waits;", "# +78 both: acks; code: +128 for waits; code: +120 for eta;"), got
+    assert kinds == {"counters"}
+    assert merge3(tip, CAP_BASE, change, py=True, hunks=True) is None, "counters off: a conflict as before"
+    lowered = change.replace("31_551", "31_400")
+    assert merge3(tip, CAP_BASE, lowered, py=True, hunks=True, counters=True) is None, "a lowered cap"
+    edited = change.replace("for kind, cap in", "for kind, limit in")
+    assert merge3(tip, CAP_BASE, edited, py=True, hunks=True, counters=True) is None, "a code edit"
+    reworded = change.replace("+30 both: cites", "+30 both: the charter's cites")
+    assert merge3(tip, CAP_BASE, reworded, py=True, hunks=True, counters=True) is None, "a reworded reason"
+    note_only = CAP_BASE.replace("# code:", "# +78 both: acks; code:").replace("31_473", "31_473")
+    tip_note = CAP_BASE.replace("31_473", "31_593").replace("# code:", "# +120: eta; code:")
+    assert merge3(tip_note, CAP_BASE, note_only, py=True, hunks=True, counters=True) is None, \
+        "no number both raised: no counters"
+    s_base = 'x = f("a # 5", 10)  # base\n'
+    assert merge3(s_base.replace("10", "12").replace("# base", "# base; t"), s_base,
+                  s_base.replace("10", "11").replace("a # 5", "a # 6"), py=True, counters=True) is None, \
+        "a number inside a string that holds a #"
+    assert merge3(s_base.replace("10", "12").replace("# base", "# base; t"), s_base,
+                  s_base.replace("10", "11").replace("# base", "# base; c"), py=True, counters=True) == \
+        'x = f("a # 5", 13)  # base; t; c\n', "a quoted # is no comment"
+
+
+@pytest.mark.parametrize("case", ["counters", "counters_code", "own_logic"])
+def test_a_push_batch_settles_a_test_cap_both_sides_raised_and_keeps_the_approval(env, monkeypatch, case):
+    """Replayed push conflicts of approved heads in one batch. `counters`: the tip and the change each
+    raised one test's prompt size cap with a reason (the conflict that sent #6434's approval back
+    twice): settled in the batch, the checks run on the result and both land with no model.
+    `counters_code` (the same line outside a test file, where a number is no allowance) and
+    `own_logic` (both changed one line of a function) still go back to the review as a conflict."""
+    path = {"counters": "tests/test_caps.py", "counters_code": "pkg/caps.py", "own_logic": "pkg/m.py"}[case]
+    base = CAP_BASE if case != "own_logic" else "def f(x):\n    return x + 1\n"
+    if case == "own_logic":
+        tip, change = base.replace("x + 1", "x + 2"), base.replace("x + 1", "x * 3")
+    else:
+        tip = base.replace("31_473", "31_593").replace("+30 both: cites", "+30 both: cites; code: +120 for eta")
+        change = base.replace("24_505", "24_565").replace("31_473", "31_533").replace("# code:", "# +60 both: acks; code:")
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    (other / path).parent.mkdir(parents=True)
+    _commit(other, path, base)
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {path: tip}), _entry(repo, "e2", {path: change})]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    if case == "counters":
+        assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed", "pushed"], m
+        d = m["results"][1]["detail"]
+        assert d["settled"] == [path] and d["settled_by"] == ["counters"], d
+        assert _git_out(origin, "show", f"proj:{path}") == base.replace("31_473", "31_653").replace(
+            "24_505", "24_565").replace("# code:", "# +60 both: acks; code:").replace(
+            "+30 both: cites", "+30 both: cites; code: +120 for eta").rstrip("\n")
+    else:
+        assert _statuses(m) == ["pushed", "conflict"], m
+        assert m["results"][1]["detail"]["files"] == [path], m
+        assert _git_out(origin, "show", f"proj:{path}") == tip.rstrip("\n")
+
+
 def test_merge3_keeps_the_final_newline_as_the_sides_had_it(env):
     """git ends each side of a conflict at the end of the file with a newline. The settled result ends
     as the sides had it: without one where none had it, with one where a side added it."""
@@ -7500,6 +7572,120 @@ def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, t
     # A scoped project check may be skipped on this head: the extra that matches it stays.
     scoped = push.check_list([{"run": "pytest -q", "if_changed": "src/**"}])
     assert cli._extra_checks(["pytest", "-q"], scoped) == (["pytest -q"], [])
+
+
+def test_ttp_checks_drops_an_extra_pytest_run_of_paths_inside_a_project_pytest_path(env, tmp_path, monkeypatch, capsys):
+    """An extra plain pytest run of files, directories or node ids inside a project pytest path that runs
+    on every head already ran: it is dropped with a notice, and the run keeps the project's command set
+    (so its pass is the push check's). Other options, other paths, other collection rules or other
+    commands stay."""
+    from ttp import cli, push
+    top = tmp_path / "wt"
+    for f in ("tests/test_a.py", "tests/sub/test_b.py", "tests/helper.py", "tests/build/test_c.py",
+              "tests/cfg/test_d.py", "other/test_e.py"):
+        (top / f).parent.mkdir(parents=True, exist_ok=True)
+        (top / f).write_text("def test_x():\n    pass\n")
+    (top / "tests/cfg/pytest.ini").write_text("[pytest]\n")
+    own = push.check_list(["pytest -q tests"])
+    t = str(top)
+    for c in ("pytest -q tests/test_a.py", "pytest tests/sub", "pytest -q tests/sub/test_b.py::test_x",
+              "python3 -m pytest -q tests/test_a.py tests/sub/test_b.py", "pytest -q ./tests/test_a.py"):
+        assert cli._extra_checks([c], own, "", t) == ([], [c]), c
+    for c in ("pytest -q other/test_e.py", "pytest -q tests/test_a.py other/test_e.py",
+              "pytest -q -k x tests/test_a.py", "pytest -x tests/test_a.py", "pytest -q tests/helper.py",
+              "pytest -q tests/build/test_c.py", "pytest -q tests/cfg/test_d.py", "pytest -q tests/missing_test.py",
+              "pytest -q", "ruff check tests", "pytest -q ../wt/tests/test_a.py", "FOO=1 pytest -q tests/test_a.py"):
+        assert cli._extra_checks([c], own, "", t) == ([c], []), c
+    # Only an unscoped project check, of named paths and the same options, stands for the extra.
+    scoped = push.check_list([{"run": "pytest -q tests", "if_changed": "src/**"}])
+    assert cli._extra_checks(["pytest -q tests/test_a.py"], scoped, "", t) == (["pytest -q tests/test_a.py"], [])
+    for o in ("pytest -q", "pytest -q -k slow tests", "pytest -q tests/test_a.py::test_x"):
+        assert cli._extra_checks(["pytest -q tests/test_a.py"], push.check_list([o]), "", t)[1] == [], o
+    (top / "pytest.ini").write_text("[pytest]\npython_files = check_*.py\n")
+    assert cli._extra_checks(["pytest -q tests/test_a.py"], own, "", t) == (["pytest -q tests/test_a.py"], [])
+    assert cli._extra_checks(["pytest -q tests/sub"], own, "", t) == ([], ["pytest -q tests/sub"])
+
+
+def test_ttp_checks_run_drops_a_subset_pytest_extra_and_keeps_the_push_checks_commands(env, tmp_path, monkeypatch, capsys):
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text("def test_a():\n    pass\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "tests"], check=True)
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q -p no:cacheprovider tests"])
+    cli.main(["checks", "--fresh", "--", "python3 -m pytest -q -p no:cacheprovider tests/test_a.py"])
+    out = capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["commands"] == [
+        "python3 -m pytest -q -p no:cacheprovider tests", "python3 -m pytest -q -p no:cacheprovider tests/test_a.py"]
+    assert "not running" not in out   # -p is another option: kept
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q tests"])
+    cli.main(["checks", "--fresh", "--", "pytest -q tests/test_a.py"])
+    out = capsys.readouterr().out
+    assert json.loads((run / "checks.json").read_text())["commands"] == ["python3 -m pytest -q tests"]
+    assert "not running 'pytest -q tests/test_a.py' after `--`: delivery.push_checks already runs its tests in " \
+           "'python3 -m pytest -q tests'" in out
+
+
+def test_ttp_checks_runs_a_subset_pytest_extra_when_its_push_check_does_not_run_in_full(env, tmp_path, monkeypatch,
+                                                                                        capsys):
+    """A subset extra stands for nothing once testpick narrows its covering push check, or the fast path
+    skips it: it runs, with a notice saying why. A push check run in full still drops it."""
+    from ttp import cli, push, testpick
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    count = tmp_path / "count"
+    (repo / "tests").mkdir()
+    (repo / "tests" / "test_a.py").write_text(f"def test_a():\n    open({str(count)!r}, 'a').write('x\\n')\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "tests"], check=True)
+    p.set_config("delivery.push_checks", ["python3 -m pytest -q tests"])
+    extra = "python3 -m pytest -q tests/test_a.py"
+    ran = lambda: len(count.read_text().splitlines()) if count.exists() else 0
+
+    def narrowed(top, base, head, todo, own, cfg, full=False):
+        out, mine = [], {str(o) for o in own}
+        for c in todo:
+            if str(c) not in mine:
+                out.append(c)
+                continue
+            c2 = push.Check(str(c))
+            c2.__dict__.update(c.__dict__)
+            c2.env, c2.targeted = (("TTP_T", "1"),), True   # a part of the suite, as testpick marks it
+            out.append(c2)
+        return out, [f"{c}: targeted: 1 tests in 1 test files" for c in out if getattr(c, "targeted", False)]
+    monkeypatch.setattr(testpick, "narrow", narrowed)
+    cli.main(["checks", "--fresh", "--", extra])
+    out = capsys.readouterr().out
+    assert ran() == 2, "the extra's tests did not run beside the narrowed push check"
+    assert f"running {extra!r} after `--`: delivery.push_checks does not run " \
+           "'python3 -m pytest -q tests' in full here" in out and "not running" not in out
+    assert json.loads((run / "checks.json").read_text())["commands"][1:] == [extra]
+    # Run in full (--full, a full: reason): the extra is dropped, as its tests already ran.
+    monkeypatch.setattr(testpick, "narrow", lambda top, base, head, todo, own, cfg, full=False:
+                        (todo, [f"{c}: full: --full" for c in todo]))
+    count.unlink()
+    cli.main(["checks", "--fresh", "--", extra])
+    out = capsys.readouterr().out
+    assert ran() == 1 and f"not running {extra!r} after `--`: delivery.push_checks already runs its tests in " in out
+    assert json.loads((run / "checks.json").read_text())["commands"] == \
+["python3 -m pytest -q tests"]
+    # The fast path (never with --fresh, so on a new tree) skips the push check: the extra runs.
+    (repo / "notes.md").write_text("n\n")
+    subprocess.run([*git, "add", "-A"], check=True)
+    subprocess.run([*git, "commit", "-qm", "notes"], check=True)
+    monkeypatch.setattr(push, "fast_path", lambda *a, **k: True)
+    monkeypatch.setattr(push, "fast_checks", lambda base: [])
+    count.unlink()
+    cli.main(["checks", "--", extra])
+    out = capsys.readouterr().out
+    assert ran() == 1 and f"running {extra!r} after `--`: " in out, out
+    # Twice given, held once: the second is the same run as the first.
+    count.unlink()
+    monkeypatch.setattr(push, "fast_path", lambda *a, **k: False)
+    monkeypatch.setattr(testpick, "narrow", narrowed)
+    cli.main(["checks", "--fresh", "--", extra, extra])
+    out = capsys.readouterr().out
+    assert ran() == 2 and "an earlier command after `--` is the same run" in out
 
 
 
@@ -16838,6 +17024,79 @@ def test_a_push_batch_carries_a_pass_onto_a_tip_that_moved_only_in_ignored_paths
     else:
         assert len(runs) == 2 and "carried" not in m["checks"]
 
+
+def _task_pass(p, repo, cmds, targeted=False, suite=False):
+    """Record a task's own `ttp checks` pass of `cmds` on HEAD as cli._record_pass does after a run: per
+    command its check_env_parts, and the head and its merge base with the push target. `targeted`: the
+    run was testpick's narrowed one (the check with a test-selecting env); `suite`: one command's suite pass."""
+    from ttp import cli, push, pushpass, testpick
+    cmds = push.check_list(cmds)
+    if targeted:
+        cmds = [push.Check(str(c)) for c in cmds]
+        for c in cmds:
+            c.env, c.targeted = ((testpick.FILES_ENV, "tests/test_a.py"),), True
+    (run := repo.parent / "task-run").mkdir(exist_ok=True)
+    run_env = push.check_env("checks", run_dir=str(run))
+    parts = pushpass.check_env_parts(repo, cmds, run_env)
+    head = _git_out(repo, "rev-parse", "HEAD")
+    cli._record_pass(p, pushpass.tree_of(repo, "HEAD"), cmds, "candidate", "", [pushpass.digest(x) for x in parts],
+                     parts, suite=suite, at=None if suite else cli._carry_ref(repo, head, "origin/proj"))
+
+
+@pytest.mark.parametrize("case", ["same", "covered_upstream", "ignored_upstream", "targeted", "suite", "other_cmds"])
+def test_a_push_batch_carries_a_tasks_own_full_checks_pass_of_the_same_change(env, monkeypatch, capsys, case):
+    """A task's own full `ttp checks` pass of the push checks on its head carries to the batch's head of that
+    change (the batch's version bump aside) when its patch is the same and the upstream delta misses what the
+    check covers: the check does not run again and the marker says so. A delta in a covered path, a targeted
+    run, a single command's suite pass or a pass of other commands runs it."""
+    log = env["tmp"] / "checked"
+    check = {"run": f"git rev-parse HEAD >> {log}", "ignore_paths": ["docs/**"]}
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [check])
+    heads = [_entry(repo, "e1", {"plugins/p/f1.txt": "1\n"})]
+    cmds = [check] if case != "other_cmds" else [check, "true"]
+    monkeypatch.setenv("TTP_RUN_ID", "41")
+    _task_pass(p, repo, cmds[1:] if case == "other_cmds" else cmds, targeted=case == "targeted", suite=case == "suite")
+    if case in ("covered_upstream", "ignored_upstream"):
+        (other / "docs").mkdir(exist_ok=True)
+        _commit(other, "docs/late.md" if case == "ignored_upstream" else "src.txt", "x\n")
+        _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed", m
+    out = capsys.readouterr().out
+    ran = log.read_text().split() if log.exists() else []
+    if case in ("same", "ignored_upstream"):
+        assert ran == [], out
+        [line] = m["checks"]["carried"]
+        delta = "docs/late.md" if case == "ignored_upstream" else "nothing"
+        assert line.startswith(f"verdict carried from {heads[0][:10]}; upstream delta touched only: {delta} "
+                               "(the task's own ttp checks run 41)"), line
+        assert line in out
+    else:
+        assert len(ran) == 1 and not m["checks"].get("carried"), out
+
+
+def test_a_batch_judges_a_task_pass_without_its_own_version_bump_only(tmp_path):
+    """_bump_only: the replayed head under the batch's bump when the bump touched only the version files and
+    changesets; None when it changed anything else; the head itself when the batch made no bump."""
+    from ttp import batch
+    repo = tmp_path / "r"
+    subprocess.run(["git", "init", "-q", str(repo)], check=True)
+    def commit(path, text):
+        (repo / path).parent.mkdir(parents=True, exist_ok=True)
+        (repo / path).write_text(text)
+        _git_out(repo, "add", "-A")
+        _git_out(repo, "-c", "user.email=t@t", "-c", "user.name=t", "commit", "-qm", path)
+        return _git_out(repo, "rev-parse", "HEAD")
+    under = commit("a.txt", "a\n")
+    commit("v.json", "1\n")
+    clean = commit(".changeset/x.md", "x\n")
+    dirty = commit("src.py", "y\n")
+    b = batch.Batch.__new__(batch.Batch)
+    b.wt, b.cfg = repo, {"files": ["v.json"], "changeset_dir": ".changeset"}
+    b.unbumped = {clean: under, dirty: under}
+    assert b._bump_only(clean) == under
+    assert b._bump_only(dirty) is None
+    assert b._bump_only(under) == under
 
 def test_the_coordinator_and_guide_state_the_verdict_carry_rule_without_a_user_step():
     import re

@@ -1866,6 +1866,69 @@ def test_overflow_jobs_dying_at_start_pause_it_with_one_alert_and_the_runs_stay_
     assert len(p.db.q("SELECT id FROM messages WHERE ref=? AND kind='alert'", (slurmcheck.ALERT_KEY,))) == 1
 
 
+@pytest.mark.parametrize("run_env", ["TTP_RUN_ID", "TTP_RUN_DIR", "TTP_NOTE_RUN_DIR"])
+@pytest.mark.parametrize("task", ["42", ""])   # a worker's run, or a coordinator's (the session's own shell)
+@pytest.mark.parametrize("argv_tail", [["sandbox.checks", "true"], ["sandbox.checks", "1"], ["sandbox.checks", "9"],
+                                       ["sandbox.checks", "enabled"], ["sandbox", json.dumps({"checks": True})]])
+def test_a_run_cannot_turn_the_checks_sandbox_on(env, capsys, monkeypatch, run_env, task, argv_tail):
+    """sandbox.checks (the checks' PID namespace) is user-only, like checks.slurm_overflow: a `ttp config`
+    inside any run, a worker's or a coordinator's, refuses turning it on, directly or through its parent;
+    the message says only the user's own word does."""
+    from ttp import cli
+    p = make(env)
+    monkeypatch.setenv(run_env, "7")
+    if task:
+        monkeypatch.setenv("TTP_TASK", task)
+    before = p.raw_config()
+    with pytest.raises(SystemExit) as e:
+        cli.main(["config", "demo", *argv_tail])
+    err = capsys.readouterr().err
+    assert e.value.code == 2 and "only the user may change" in err and "user's own word" in err, err
+    assert p.raw_config() == before and p.config()["sandbox"]["checks"] is False
+
+
+@pytest.mark.parametrize("argv_tail", [["sandbox.checks", "false"], ["sandbox.checks", ""],
+                                       ["sandbox", json.dumps({"fence_freed_commands": []})]])
+def test_a_run_may_turn_the_checks_sandbox_off_and_the_user_turns_it_on(env, capsys, monkeypatch, argv_tail):
+    """The off value (false, unset, dropped through the parent) follows the user's unsandboxed-runs order:
+    a run may write it. The user's own `ttp config` (no run) turns it on."""
+    from ttp import cli
+    p = make(env)
+    cli.main(["config", "demo", "sandbox.checks", "true"])
+    assert p.config()["sandbox"]["checks"] is True
+    monkeypatch.setenv("TTP_RUN_ID", "7")
+    monkeypatch.setenv("TTP_TASK", "42")
+    cli.main(["config", "demo", *argv_tail])
+    assert p.config()["sandbox"]["checks"] is False
+    cli.main(["config", "demo", "sandbox.checks", "false"])   # already off: a no-op write stays allowed
+
+
+def test_the_coordinator_never_turns_the_checks_sandbox_on(env, capsys):
+    """A coordinator config_set of sandbox.checks on is refused with the reason, in a turn carrying a user
+    message too; false and unset are applied. `ttp config --chat-settable` says the same."""
+    from ttp import cli, coordinator as coord
+    p = make(env)
+    for value in (True, "true", "on", 1):
+        for user_turn in (False, True):
+            out = coord.apply(p, [{"type": "config_set", "key": "sandbox.checks", "value": value}], user_turn=user_turn)
+            assert any("only the user may change" in x and "user's own word" in x for x in out), (value, out)
+            assert p.config()["sandbox"]["checks"] is False
+    p.set_config("sandbox.checks", True)
+    assert coord.apply(p, [{"type": "config_set", "key": "sandbox.checks", "value": False}]) == []
+    assert p.raw_config()["sandbox"]["checks"] is False
+    p.set_config("sandbox.checks", True)
+    assert coord.apply(p, [{"type": "config_set", "key": "sandbox.checks", "value": ""}]) == []
+    assert p.config()["sandbox"]["checks"] is False
+    for args in (["sandbox.checks"], ["sandbox.checks", "true"]):
+        with pytest.raises(SystemExit) as e:
+            cli.main(["config", "--chat-settable", *args])
+        out = capsys.readouterr().out
+        assert e.value.code == 1 and out.startswith("refused: sandbox.checks") and "user's own word" in out, out
+    cli.main(["config", "--chat-settable", "sandbox.checks", "false"])
+    assert "sandbox.checks: accepted as false" in capsys.readouterr().out
+    assert coord.SANDBOX_KEYS >= {"sandbox.checks", *(f"providers.{n}.write_fence" for n in ("claude", "codex", "cursor", "chat"))}
+
+
 def test_a_slurm_job_runs_the_check_on_a_copy_of_head_as_one_cpu_job_with_its_time_and_is_logged(env, tmp_path):
     from ttp import slurmcheck
     repo = _rc_repo(tmp_path)

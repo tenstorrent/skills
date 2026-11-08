@@ -20,7 +20,7 @@ from . import globalcap as gcap
 from . import coordinator as coord
 from . import credits, eta, fleethold, heal, identity, lockprobe, mcpgap, obligations, outagetask, projpause, pushq, redact, release, responsibilities, route, sweep, timefmt, urgent, waits
 from . import schedule as sched
-from . import pauseends, selfreview, startgate, sweepskip, timefmt, topup, trend, upstream
+from . import pauseends, selfreview, spendproj, startgate, sweepskip, timefmt, topup, trend, upstream
 from .daemon import (AUTH_PROBE_S, HEARTBEAT_STALE_S, KV_LOCAL_ONLY, KV_WORKTREES_DIRTY, LOGGED_OUT_NOTE, NET_HELD_NOTE,
                      SLACK_ERROR_KEY, WAIT_KEYS, heartbeat, idle_wake)
 from .alerts import cleared  # noqa: F401  (readers import it from here)
@@ -197,7 +197,7 @@ def holding(db: DB, now: float, core: str = "claude", gates: dict | None = None)
 
 
 def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: dict | None = None,
-                spent_24h: float | None = None, gates: dict | None = None) -> str:
+                spent_24h: float | None = None, gates: dict | None = None, where=None) -> str:
     """The budget in one line, for the web app's header and `ttp status`:
     '5h 4% - resets in 3.9 h, 7d 21% - resets in 6.0 d, 24h $0.17 virtual, 5h avg 31%, 7d avg 72%'.
     The windows and averages are the current account's, from its plan readings (none once the
@@ -228,7 +228,7 @@ def budget_line(db: DB, now: float | None = None, core: str = "claude", gate: di
     plan = gate["regime"] in ("windows", "plan") if (gate or {}).get("regime") else bool(wins)
     n = (gate or {}).get("numbers") or {}
     if not plan and ("spent_today" in n or "global_today" in n):
-        return ", ".join([usage_line(n, now), *held])
+        return ", ".join([usage_line(n, now, where), *held])
     actual = db.spent_since(now - DAY, billed=True)
     if plan:
         total = db.spent_since(now - DAY) if spent_24h is None else spent_24h
@@ -264,12 +264,14 @@ def _label(window: str) -> str:
     return "5h" if window in FIVE_HOUR else "7d" if window in SEVEN_DAY else window
 
 
-def usage_line(n: dict, now: float) -> str:
+def usage_line(n: dict, now: float, where=None) -> str:
     """The one budget line of a usage-billed account, from its gate's numbers:
     'today $1.20 this project, $85 of $200 global; not counted: $96 subscription plan, $3 stale - resets
     in 6.5 h (1 machine stale)'.
     'Today' is the budget day (budget.day_start in budget.timezone), else the last 24 h; the global
-    part is left out when budget.global_daily_usd is 0."""
+    part is left out when budget.global_daily_usd is 0. The global part ends with when that cap is
+    reached at the current rate, against its reset, in the zone of `where` (spendproj.line):
+    '...; at $86/h: not reached before the reset at 08:00 PST'."""
     mine = n["spent_today"] if "spent_today" in n else n.get("spent_24h", 0)
     line = f"{'today' if 'spent_today' in n else '24h'} {gcap.money(mine)} this project"
     if "global_today" in n:
@@ -281,6 +283,10 @@ def usage_line(n: dict, now: float) -> str:
     stale = len(n.get("global_stale") or []) if "global_today" in n else 0
     if stale:
         line += f" ({stale} machine{'s' if stale != 1 else ''} stale)"
+    if "global_today" in n:
+        ahead = spendproj.line(float(n["global_today"]), float(n.get("global_cap") or 0), n.get("global_per_h"),
+                               n.get("global_resets_at"), now, where)
+        line += f"; {ahead}" if ahead else ""
     return line
 
 
@@ -501,7 +507,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
     from . import audit   # runs by provider and how their cost was known: measured apart from guessed $
     spend["bases_7d"] = audit.cost_bases(db, since=now - WEEK)
     spend["bases_line"] = audit.bases_text(spend["bases_7d"]) if spend["bases_7d"] else ""
-    spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates)
+    spend["headline"] = budget_line(db, now, core, g, spend["spent_24h"], gates, where=tz)
     spend["route_line"] = route.phrase(db, now)   # routing stats: the Budget tab and ttp status --verbose
     # A provider whose budget gate allows fewer worker slots than budget.max_parallel_workers: ttp status
     spend["slot_lines"] = bud.slot_lines(gates, int(cfg["budget"].get("max_parallel_workers", 6) or 0), {
@@ -509,7 +515,7 @@ def health(p: Project, db: DB, alive: bool = True, now: float | None = None) -> 
                                              "AND role!='coordinator' GROUP BY provider")})
     spend["detail"] = gate_detail(g, now, tz, gates) if g else ""
     # The project caps once, with the 7 days' plan-paid spend beside the billed figure (budget.caps_line).
-    spend["caps_line"] = bud.caps_line(db, gates or {}, p.config()["budget"], now)
+    spend["caps_line"] = bud.caps_line(db, gates or {}, p.config()["budget"], now, where=tz)
     return {
         "zone": timefmt.zone_name(p.raw_config()),   # the home zone every time here is shown in
         "spend": spend,

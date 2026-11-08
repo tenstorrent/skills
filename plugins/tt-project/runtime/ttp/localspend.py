@@ -32,6 +32,12 @@ line. What it found lives in ~/.tt-project/session-spend.json (under a lock besi
 per session, with the calls already counted, so a file rewritten or truncated is read again without
 counting a call twice.
 
+Codex sessions are read the same way from <CODEX_HOME or ~/.codex>/sessions rollouts (the Codex
+section below) into their own cache, priced at the Codex table (account-level `pricing.codex` over
+it), always as an estimate, and left out by the same session ids (a run still going by the thread id
+on its output's first line). A Codex API-key login is billed per use; a ChatGPT login is a plan.
+Cursor keeps no local usage log: its other sessions are named unknown.
+
 What it cannot see: other machines (each machine reports only its own logs), claude.ai web, desktop
 and mobile, cloud sessions, sessions run with --no-session-persistence or another
 CLAUDE_CONFIG_DIR, API calls missing from the log (about 1%), and discounts off the list price.
@@ -285,6 +291,100 @@ def _read_from(path: str, offset: int) -> tuple[list[bytes], int]:
     return lines, offset
 
 
+# Codex ------------------------------------------------------------------------------------------
+# Codex writes each session to <CODEX_HOME or ~/.codex>/sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl.
+# Its event_msg token_count events carry the session's running total_token_usage (input with the
+# cached part inside it, and output); a call is what a total grew by since the one before.
+ROLLOUT_ID = re.compile(r"rollout-.*?([0-9A-Fa-f]{8}-[0-9A-Fa-f-]{27})\.jsonl$")
+CODEX_KEYS = ("input_tokens", "cached_input_tokens", "output_tokens")
+
+
+def codex_root() -> Path:
+    from .providers.codex import codex_home
+    return codex_home() / "sessions"
+
+
+def codex_files(root: Path, since: float) -> list[tuple[str, os.stat_result]]:
+    """Rollouts under `root` changed at or after `since`. No folder yet is no sessions; one that
+    cannot be listed raises."""
+    if not os.path.lexists(root):
+        return []
+    os.listdir(root)
+    out = []
+    for path in root.glob("*/*/*/rollout-*.jsonl"):
+        try:
+            st = path.stat(follow_symlinks=False)
+        except OSError:
+            continue
+        if st.st_mtime >= since and path.is_file():
+            out.append((str(path), st))
+    return out
+
+
+def codex_calls(lines, rec: dict, totals: dict) -> "list[dict]":
+    """The token use in a rollout's `lines` (bytes): {ts, key, session, model, usage}, one per
+    token_count event whose total grew past the session's last one (`totals`, per session id,
+    updated). `rec` keeps the file's session id and current model (turn_context) across reads. A
+    total that shrank starts over and counts whole; the key is the session and its total, so a
+    reading seen again (a file read again, a resumed session's copy) counts once."""
+    out = []
+    for line in lines:
+        if b'"token_count"' not in line and b'"turn_context"' not in line and b'"session_meta"' not in line:
+            continue
+        try:
+            ev = json.loads(line)
+            p = ev["payload"]
+            kind = p.get("type") if ev.get("type") == "event_msg" else ev.get("type")
+        except (ValueError, TypeError, KeyError, AttributeError):
+            continue
+        if kind == "session_meta":
+            rec["sid"] = str(p.get("id") or rec.get("sid") or "")
+        elif kind == "turn_context":
+            rec["model"] = str(p.get("model") or rec.get("model") or "")
+        elif kind == "token_count" and isinstance(p.get("info"), dict):
+            total = p["info"].get("total_token_usage")
+            ts, sid = _ts(ev.get("timestamp")), str(rec.get("sid") or "")
+            if not isinstance(total, dict) or ts is None:
+                continue
+            try:
+                tok = [max(int(total.get(k) or 0), 0) for k in CODEX_KEYS]
+            except (TypeError, ValueError):
+                continue
+            was = totals.get(sid) or [0, 0, 0]
+            if any(a < b for a, b in zip(tok, was)):
+                was = [0, 0, 0]
+            totals[sid] = tok
+            grew = [a - b for a, b in zip(tok, was)]
+            if any(grew):
+                out.append({"ts": ts, "key": hashlib.sha1(f"codex\0{sid}\0{tok}".encode()).hexdigest()[:16],
+                            "session": sid, "model": str(rec.get("model") or ""), "usage": grew})
+    return out
+
+
+def codex_price(model: str, grew: list[int], rows: dict) -> tuple[float, bool]:
+    """List price in $ of `grew` (input, cached, output tokens) at `rows` (the Codex table with the
+    account's `pricing.codex`), and whether the model had no row of its own (priced at 'default')."""
+    from .providers.base import price_row
+    pin, pcached, pout = price_row(rows, {}, model)
+    inp, cached, out = grew
+    return (max(inp - cached, 0) * pin + cached * pcached + out * pout) / 1e6, model not in rows
+
+
+def codex_rows() -> dict:
+    from .providers.codex import PRICES as CODEX_PRICES
+    own = ((project.load_account_settings().get("pricing") or {}).get("codex")) or {}
+    return {**CODEX_PRICES, **{k: v for k, v in own.items() if isinstance(v, (list, tuple)) and len(v) == 3}}
+
+
+def codex_billing() -> str:
+    """How this machine's Codex login is billed, from CODEX_HOME's auth.json: 'usage' (an API key),
+    'plan' (a ChatGPT login, metered by its plan windows) or 'unknown' (no login, another kind)."""
+    from .providers.codex import _auth, _mode
+    auth = _auth()
+    how = _mode(auth).lower().replace("_", "") if auth else ""
+    return {"apikey": "usage", "chatgpt": "plan"}.get(how, "unknown")
+
+
 # the day ----------------------------------------------------------------------------------------
 def mode(budget: dict) -> str:
     """What a bucket is: the fixed budget day, or (no day_start) the UTC hour."""
@@ -297,31 +397,36 @@ def bucket(budget: dict, ts: float) -> float:
 
 
 # the cache --------------------------------------------------------------------------------------
-def cache_path() -> Path:
-    return project.HOME_DIR / "session-spend.json"
+KINDS = ("claude", "codex")   # whose local logs are read, each into its own cache
 
 
-def load() -> dict:
+def cache_path(kind: str = "claude") -> Path:
+    return project.HOME_DIR / ("session-spend.json" if kind == "claude" else f"{kind}-session-spend.json")
+
+
+def load(kind: str = "claude") -> dict:
     try:
-        data = json.loads(cache_path().read_text())
+        data = json.loads(cache_path(kind).read_text())
         return data if isinstance(data, dict) else {}
     except (OSError, ValueError):
         return {}
 
 
-def scan(budget: dict, now: float | None = None, root: Path | None = None) -> dict:
-    """Read what the logs added since the last scan into the cache, and return it. One process at a
-    time (a lock beside the cache); a scan already running elsewhere returns the cache as it is. A
-    corrupt cache, other day settings or another logs folder start over from scratch."""
+def scan(budget: dict, now: float | None = None, root: Path | None = None, kind: str = "claude") -> dict:
+    """Read what the logs of `kind` (Claude Code's, or Codex's rollouts) added since the last scan
+    into its cache, and return it. One process at a time (a lock beside the cache); a scan already
+    running elsewhere returns the cache as it is. A corrupt cache, other day settings or another logs
+    folder start over from scratch."""
     now = now or time.time()
-    root = Path(root or logs_root())
+    codex = kind == "codex"
+    root = Path(root or (codex_root() if codex else logs_root()))
     project.HOME_DIR.mkdir(parents=True, exist_ok=True)
-    with open(project.HOME_DIR / "session-spend.lock", "a") as lk:
+    with open(project.HOME_DIR / f"{'' if kind == 'claude' else kind + '-'}session-spend.lock", "a") as lk:
         try:
             fcntl.flock(lk, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
-            return load()
-        cache = load()
+            return load(kind)
+        cache = load(kind)
         fresh = {"v": 2, "mode": mode(budget), "root": str(root), "files": {}, "buckets": {}}
         if not (cache.get("v") == 2 and cache.get("mode") == fresh["mode"] and cache.get("root") == str(root)
                 and isinstance(cache.get("files"), dict) and isinstance(cache.get("buckets"), dict)):
@@ -330,32 +435,42 @@ def scan(budget: dict, now: float | None = None, root: Path | None = None) -> di
         buckets = {k: b for k, b in cache["buckets"].items() if float(k) >= keep_from}
         seen = {key for b in buckets.values() for key in b.get("k") or []}
         try:
-            found = log_files(root, keep_from - SLACK_S)
+            found = (codex_files if codex else log_files)(root, keep_from - SLACK_S)
         except OSError as e:
             cache.update(ok=False, error=f"cannot read the session logs: {e.strerror or e}", scanned=now)
-            project.write_json(cache_path(), cache, mode=0o600)
+            project.write_json(cache_path(kind), cache, mode=0o600)
             return cache
         files = {}
-        rows = table(overrides())
-        scale, keys = factors(rows[0]), {}
+        rows = codex_rows() if codex else table(overrides())
+        scale, keys = ({}, {}) if codex else (factors(rows[0]), {})
+        totals = cache.get("totals") if isinstance(cache.get("totals"), dict) else {}
         for path, st in found:
             was = cache["files"].get(path) or {}
             off = int(was.get("off") or 0)
             if was.get("ino") != st.st_ino or st.st_size < off:
                 off = 0   # replaced or truncated: read again; counted calls stay counted once
+            rec = {}
+            if codex:   # a rollout's id from its name until its session_meta names it
+                m = ROLLOUT_ID.search(os.path.basename(path))
+                rec = ({"sid": was["sid"], "model": was.get("model") or ""} if off and was.get("sid")
+                       else {"sid": m.group(1) if m else path, "model": ""})
             if st.st_size > off and not (was.get("ino") == st.st_ino and was.get("size") == st.st_size):
                 try:
                     lines, off = _read_from(path, off)
                 except OSError:
                     continue
-                for c in calls(lines):
+                got = codex_calls(lines, rec, totals) if codex else calls(lines)
+                for c in got:
                     if c["ts"] < keep_from or c["key"] in seen:
                         continue
                     seen.add(c["key"])
-                    usd, est = price(c["model"], c["usage"], rows=rows)
-                    if c["model"] not in keys:
-                        keys[c["model"]] = row_key(c["model"], rows[0])
-                    usd *= scale.get(keys[c["model"]], 1.0)
+                    if codex:
+                        usd, est = codex_price(c["model"], c["usage"], rows)
+                    else:
+                        usd, est = price(c["model"], c["usage"], rows=rows)
+                        if c["model"] not in keys:
+                            keys[c["model"]] = row_key(c["model"], rows[0])
+                        usd *= scale.get(keys[c["model"]], 1.0)
                     b = buckets.setdefault(f"{bucket(budget, c['ts']):.0f}", {"s": {}, "k": [], "unknown": []})
                     b["k"].append(c["key"])
                     s = b["s"].setdefault(c["session"], [0.0, 0])
@@ -364,9 +479,12 @@ def scan(budget: dict, now: float | None = None, root: Path | None = None) -> di
                         s[1] = 1
                         if c["model"] not in b["unknown"]:
                             b["unknown"].append(c["model"])
-            files[path] = {"ino": st.st_ino, "size": st.st_size, "off": off}
+            files[path] = {"ino": st.st_ino, "size": st.st_size, "off": off, **rec}
         cache.update(files=files, buckets=buckets, ok=True, error="", scanned=now)
-        project.write_json(cache_path(), cache, mode=0o600)
+        if codex:
+            live = {f.get("sid") for f in files.values()}
+            cache["totals"] = {k: v for k, v in totals.items() if k in live}
+        project.write_json(cache_path(kind), cache, mode=0o600)
         return cache
 
 
@@ -389,20 +507,23 @@ def scan_async(budget: dict, now: float | None = None) -> None:
     t = _THREAD.get("t")
     if t and t.is_alive():
         return
-    c = load()
-    if c.get("mode") == mode(budget) and now - float(c.get("scanned") or 0) < SCAN_S:
+    due = [k for k, c in ((k, load(k)) for k in KINDS)
+           if not (c.get("mode") == mode(budget) and now - float(c.get("scanned") or 0) < SCAN_S)]
+    if not due:
         return
-    t = threading.Thread(target=lambda: _scan_quietly(dict(budget), now), daemon=True)
+    t = threading.Thread(target=lambda: _scan_quietly(dict(budget), now, due), daemon=True)
     _THREAD["t"] = t
     t.start()
 
 
-def _scan_quietly(budget: dict, now: float) -> None:
-    """scan() in the background. A failure leaves the cache as it was; the next due scan tries again."""
-    try:
-        scan(budget, now)
-    except Exception:
-        pass
+def _scan_quietly(budget: dict, now: float, kinds=("claude",)) -> None:
+    """scan() of each of `kinds` in the background. A failure leaves its cache as it was; the next due
+    scan tries again."""
+    for kind in kinds:
+        try:
+            scan(budget, now, kind=kind)
+        except Exception:
+            pass
 
 
 # tt-project's own runs --------------------------------------------------------------------------
@@ -418,6 +539,10 @@ def _init_session(output: Path) -> str:
                     ev = json.loads(line)
                     if ev.get("type") == "system" and ev.get("subtype") == "init":
                         return str(ev.get("session_id") or "")
+                elif b'"thread.started"' in line:   # codex exec --json: a run going has no id recorded yet
+                    ev = json.loads(line)
+                    if ev.get("type") == "thread.started":
+                        return str(ev.get("thread_id") or "")
     except (OSError, ValueError):
         pass
     return ""
@@ -458,15 +583,17 @@ def tt_sessions(since: float) -> tuple[set[str], list[str]]:
 _MEMO: dict[tuple, tuple[float, dict | None]] = {}
 
 
-def estimate(budget: dict, start: float, end: float, now: float | None = None) -> dict | None:
-    """Other Claude Code spend on this machine in [start, end): {usd, sessions, estimated, unknown,
-    billing (billing_mode)}, or None when it is unknown (no scan yet, or the logs could not be read)."""
+def estimate(budget: dict, start: float, end: float, now: float | None = None,
+             kind: str = "claude") -> dict | None:
+    """Other Claude Code (or Codex, `kind`) spend on this machine in [start, end): {usd, sessions,
+    estimated, unknown, billing (billing_mode or codex_billing)}, or None when it is unknown (no scan
+    yet, or the logs could not be read)."""
     now = now or time.time()
-    key = (str(project.HOME_DIR), start, end, mode(budget))
+    key = (str(project.HOME_DIR), start, end, mode(budget), kind)
     hit = _MEMO.get(key)
     if hit and now - hit[0] < MEMO_S:
         return hit[1]
-    c = load()
+    c = load(kind)
     out = None
     if c.get("ok") and c.get("v") == 2 and c.get("mode") == mode(budget) and now - float(c.get("scanned") or 0) < 4 * SCAN_S:
         mine, _ = tt_sessions(start - SLACK_S)
@@ -483,14 +610,24 @@ def estimate(budget: dict, start: float, end: float, now: float | None = None) -
                 est = est or bool(flag)
             unknown |= set(b.get("unknown") or [])
         out = {"usd": round(usd, 4), "sessions": len(n), "estimated": est, "unknown": sorted(unknown),
-               "billing": billing_mode()}
+               "billing": codex_billing() if kind == "codex" else billing_mode()}
     _MEMO[key] = (now, out)
     return out
 
 
 def source(provider: str, account: str, start: float, end: float) -> tuple[float, str, str]:
-    """globalcap's other-spend source: this machine's other Claude Code sessions, with how they are
-    billed (globalcap counts only 'usage' toward the cap)."""
+    """globalcap's other-spend source: this machine's other Claude Code or Codex sessions, with how
+    they are billed (globalcap counts only 'usage' toward the cap). Cursor keeps no local log of its
+    use: its other sessions are named unknown, never $0."""
+    if provider == "codex":
+        e = estimate(account_budget(), start, end, kind="codex")
+        if e is None:
+            return 0.0, "other Codex sessions on this machine (unknown: the local rollouts are not read yet)", "usage"
+        flag = ", some at the default row" if e["unknown"] else ""
+        return e["usd"], (f"other Codex sessions on this machine ({gcap.money(e['usd'])}, estimated from local "
+                          f"rollouts at list prices{flag})"), e.get("billing") or codex_billing()
+    if provider == "cursor":
+        return 0.0, "other Cursor sessions on this machine (unknown: Cursor keeps no local usage log)", "usage"
     if provider != "claude":
         return 0.0, "", "usage"
     e = estimate(account_budget(), start, end)

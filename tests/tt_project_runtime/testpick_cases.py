@@ -171,8 +171,6 @@ def test_a_push_queue_project_narrows_a_wide_modules_module_level_and_checks_fun
     ("pyproject.toml", "[tool.pytest]\n", "pyproject.toml"),
     ("tests/test_r.py", "X = 1\n\n\ndef _h():\n    return 1\n\n\ndef test_top():\n    assert _h()\n\n\n"
                         "def test_alone():\n    pass\n", "module-level code of tests/test_r.py"),
-    ("tests/r/other_cases.py", "def test_other():\n    pass\n" + "".join(
-        f"\n\ndef test_more_{i}():\n    pass\n" for i in range(40)), "the diff reaches"),
 ])
 def test_a_push_queue_project_still_runs_task_checks_in_full_where_the_whole_suite_is_affected(tmp_path, rel, text,
                                                                                               reason):
@@ -183,6 +181,31 @@ def test_a_push_queue_project_still_runs_task_checks_in_full_where_the_whole_sui
     todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
     assert todo == list(own) and lines[0].startswith(f"{_PICK_CMD}: full: ") and reason in lines[0], lines
 
+
+
+def test_a_push_queue_project_keeps_a_selection_of_most_of_the_suite_targeted(tmp_path):
+    # #7217: runs 14448 (65%) and 14462 (76%) ran in full for "the diff reaches N% of the tests" though the push
+    # batch runs the full suite anyway; with the push queue on such a selection stays targeted.
+    from ttp import push, testpick
+    repo, base = _pick_repo(tmp_path)
+    head = _pick_change(repo, base, {"tests/r/other_cases.py": "".join(
+        f"def test_other_{i}():\n    assert {i} >= 0\n\n\n" for i in range(15))})
+    entries, why = testpick.pick(repo, base, head, _PICK_FILES)
+    assert entries == [] and why == "the diff reaches 76% of the tests", why
+    sizes: dict = {}
+    assert testpick.pick(repo, base, head, _PICK_FILES, soft=[], sizes=sizes) == (
+        ["tests/r/other_cases.py", "tests/test_plugin_catalogue.py::test_cat"], "")
+    assert sizes == {"tests": 16, "of": 21}
+    own = push.check_list([_PICK_CMD])
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
+    assert todo[0].targeted and lines == [f"{_PICK_CMD}: targeted: 1 case files, 1 tests in 1 test files"], lines
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, None)
+    assert todo == list(own) and lines == [f"{_PICK_CMD}: full: the diff reaches 76% of the tests"], lines
+    # a conftest still runs the whole check with the push queue on
+    head = _pick_change(repo, base, {"tests/r/other_cases.py": "def test_other_0():\n    pass\n",
+                                     "tests/conftest.py": "X = 1\n"})
+    todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
+    assert todo == list(own) and "conftest.py" in lines[0], lines
 
 def test_narrow_records_targeted_or_full_and_keeps_the_full_pass_key_apart(tmp_path):
     from ttp import cli, push, testpick
@@ -287,6 +310,68 @@ def test_the_select_plugin_keeps_only_the_listed_case_files_and_tests(tmp_path):
                        cwd=t, env=env, capture_output=True, text=True, timeout=120)
     ran = sorted(re.findall(r"^PASSED \S+::(\w+)", r.stdout, re.M))
     assert ran == ["test_a1", "test_a2", "test_top"], r.stdout[-2000:]
+
+
+_NESTED_OUTER = """import os, subprocess, sys, pathlib
+
+
+def test_outer():
+    leaked = [k for k in os.environ if k.startswith("TTP_PYTEST_SELECT")]
+    assert not leaked and "ttp_pytest_select" not in os.environ.get("PYTEST_ADDOPTS", ""), os.environ
+    assert PLUGIN_DIR not in os.environ.get("PYTHONPATH", "").split(os.pathsep)
+    inner = pathlib.Path(__file__).parent / "inner"
+    for pp in ("", os.environ.get("PYTHONPATH", "")):   # a test that sets its own PYTHONPATH, and one that keeps it
+        r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(inner),
+                            str(inner)], cwd=inner, env={**os.environ, "PYTHONPATH": pp},
+                           capture_output=True, text=True, timeout=120)
+        assert r.returncode == 0 and "1 passed" in r.stdout, r.stdout + r.stderr
+"""
+
+
+@pytest.mark.parametrize("workers", [[], ["-n", "2"]], ids=["serial", "xdist"])
+def test_a_nested_pytest_a_targeted_test_starts_runs_its_own_tests(tmp_path, workers):
+    """The targeted checks' select setting (testpick.narrow: PYTEST_ADDOPTS, TTP_PYTEST_SELECT_FILES and the
+    plugin folder on PYTHONPATH) acts only in the checks' own pytest and its xdist workers: a pytest a test
+    starts neither fails on the missing plugin module nor deselects all its tests (exit 5)."""
+    from ttp import pushpass
+    if workers:
+        pytest.importorskip("xdist")
+    t = tmp_path / "proj"
+    (t / "tests" / "inner").mkdir(parents=True)
+    (t / "tests" / "inner" / "test_inner.py").write_text("def test_inner():\n    pass\n")
+    (t / "tests" / "test_outer.py").write_text(_NESTED_OUTER.replace("PLUGIN_DIR", repr(str(pushpass.PLUGIN_DIR))))
+    (t / "tests" / "test_other.py").write_text("def test_other():\n    pass\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_PYTEST_", "PYTEST_XDIST"))}
+    env.update({"PYTHONPATH": str(pushpass.PLUGIN_DIR), "PYTEST_ADDOPTS": f"-p {pushpass.SELECT_PLUGIN}",
+                "TTP_PYTEST_SELECT_FILES": "tests/test_outer.py\n"})
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(t), *workers,
+                        "tests/test_outer.py", "tests/test_other.py", "-rA"],
+                       cwd=t, env=env, capture_output=True, text=True, timeout=300)
+    ran = sorted(re.findall(r"^PASSED \S+::(\w+)", r.stdout, re.M))
+    assert r.returncode == 0 and ran == ["test_outer"], r.stdout[-3000:] + r.stderr[-2000:]
+
+
+
+@pytest.mark.parametrize("path", ["gate_rerun", "cap_probe"])
+def test_a_push_batch_gate_rerun_or_cap_probe_leaves_no_select_setting_in_a_nested_pytest(tmp_path, path):
+    """A push batch's failing-test rerun (gatejudge.select_env) and cap probe (pushpass.select_env) load the
+    select plugin too: it selects only their tests, and a pytest such a test starts gets none of its setting,
+    so a real failure there is never masked as one on both head and tip."""
+    from ttp import gatejudge, pushpass
+    t = tmp_path / "proj"
+    (t / "tests" / "inner").mkdir(parents=True)
+    (t / "tests" / "inner" / "test_inner.py").write_text("def test_inner():\n    pass\n")
+    (t / "tests" / "test_outer.py").write_text(_NESTED_OUTER.replace("PLUGIN_DIR", repr(str(pushpass.PLUGIN_DIR))))
+    (t / "tests" / "test_other.py").write_text("def test_other():\n    pass\n")
+    env = {k: v for k, v in os.environ.items() if not k.startswith(("TTP_PYTEST_", "PYTEST_XDIST"))}
+    env.pop("PYTEST_ADDOPTS", None)
+    sel = (gatejudge.select_env(["tests/test_outer.py::test_outer"], env) if path == "gate_rerun"
+           else pushpass.select_env("^test_outer$", env))
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", "--rootdir", str(t),
+                        "tests/test_outer.py", "tests/test_other.py", "-rA"],
+                       cwd=t, env={**env, **sel}, capture_output=True, text=True, timeout=300)
+    ran = sorted(re.findall(r"^PASSED \S+::(\w+)", r.stdout, re.M))
+    assert r.returncode == 0 and ran == ["test_outer"], r.stdout[-3000:] + r.stderr[-2000:]
 
 
 def test_only_a_tasks_ttp_checks_narrows_so_every_push_batch_runs_the_full_suite():

@@ -111,12 +111,24 @@ def _top_level(text: str) -> list[str] | None:
     return out + ["".join(cur)]
 
 
+_PLAIN = re.compile(r"\s*(?:echo|printf|true|:)(?:\s.*)?", re.S)
+_QUOTED = re.compile(r"'[^']*'|\"(?:\\.|[^\"\\])*\"")
+
+
+def _plain(term: str) -> bool:
+    """`term` is a plain echo, printf, true or `:` with no command substitution, redirect, pipe or group."""
+    return (bool(_PLAIN.fullmatch(term)) and "$(" not in term and "`" not in term
+            and not re.search(r"[<>|&(){}]", _QUOTED.sub("", term)))
+
+
 def user_gate(probe: object, cfg: dict | None = None) -> list[str]:
     """The user-marker paths `probe` requires: each a file test term of a top-level chain joined only by
-    `&&` (optionally ending in `|| exit 1`), so the probe fails while any of them is missing. Empty when
-    another operator (`||`, `;`, `&`) could let it pass without them."""
+    `&&` (optionally ending in `|| exit 1`, optionally after plain `echo ...;` terms), so the probe fails
+    while any of them is missing. Empty when another operator (`||`, `;`, `&`) could let it pass without them."""
     text = _TAIL.sub("", str(probe or ""), count=1)
     parts = _top_level(text) if text.strip() else None
+    while parts and len(parts) > 2 and parts[1] in (";", "\n") and _plain(parts[0]):
+        parts = parts[2:]   # a leading plain `echo ...;` never decides the exit status
     if not parts or set(parts[1::2]) - {"&&"}:
         return []
     rx = marker(cfg)

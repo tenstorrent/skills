@@ -895,7 +895,8 @@ _HOLDS = ["test -e state/user-example || exit 1",                               
           "test -e state/user-example || test -e state/other-ok || exit 1",        # (b) or another marker file
           "[ -f state/user-example ] && test -e state/user-other"]                 # user markers only
 _GATED = ["test -e state/user-example && ssh somehost true || exit 1",             # (c) and a live check
-          "test -e state/user-example && test -e state/other-ok || exit 1"]        # and a marker the project writes
+          "test -e state/user-example && test -e state/other-ok || exit 1",        # and a marker the project writes
+          'echo "waiting on: go"; test -e state/user-example && systemctl is-active --quiet some-svc || exit 1']
 _LIVE = ["test -e state/user-example || ssh somehost test -e ready || exit 1",     # or a live check
          "test -e state/out-ready || exit 1"]                                      # a plain live probe
 
@@ -948,6 +949,22 @@ def test_a_user_pause_probe_raises_no_probe_stall_and_the_sweep_and_wait_stale_a
     ("test -e 'state/user-x && b", []),                               # an open quote
     ("! test -e state/user-x && a", []),
     ("a && test -e state/out-ready", []),                             # no user marker
+    # Leading plain echo, printf, true or `:` terms joined by `;` never decide the exit status.
+    ('echo "waiting on: go"; test -e state/user-x && systemctl is-active --quiet svc && python3 bin/g.py --gate || exit 1',
+     ["state/user-x"]),
+    ('echo "waiting on: go"; test -e state/user-x && systemctl is-active --quiet svc && python3 bin/g.py --gate',
+     ["state/user-x"]),
+    ("printf 'a; b'; true; :\n echo 'x > y'; test -e state/user-x && a", ["state/user-x"]),
+    ('echo "waiting $(bin/act)"; test -e state/user-x && a', []),    # a command substitution runs code
+    ("echo `bin/act`; test -e state/user-x && a", []),
+    ("echo x > state/out; test -e state/user-x && a", []),            # a redirect
+    ("echo x | bin/act; test -e state/user-x && a", []),              # a pipe
+    ("bin/act; test -e state/user-x && a", []),                       # any other command
+    ("echoed; test -e state/user-x && a", []),
+    ("echo x && test -e state/user-x; a", []),                        # `&&` after the echo: the last term decides
+    ("echo x; test -e state/user-x && a; echo done", []),             # a trailing echo decides
+    ("echo x & test -e state/user-x && a", []),                       # background, not `;`
+    ("echo x;", []),                                                  # nothing gated
 ])
 def test_user_gate_names_only_markers_every_path_to_a_pass_needs(probe, needs):
     """userpause.user_gate: the user markers a probe's top-level `&&` chain requires (optionally ending in

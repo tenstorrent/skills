@@ -313,11 +313,13 @@ def test_throughput_checks_lane_names_the_limit_that_held_the_wait(env, monkeypa
 
     def writer_text(p, task, lock):
         """checklane.wait_events' text for `task` queued on the repository's lanes while #12 holds a
-        lane: the repository's own lane (lane limit), or a wrapper lock's lane (lanes free: the cap)."""
+        lane: the repository's own lane (lane limit), or a wrapper lock's lane (lanes free: the cap,
+        which #12's running checks fill)."""
         _lane_env(monkeypatch)
         monkeypatch.setenv("TTP_TASK", "12")
         hold = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, lock=lock, what="pytest -q tests/a.py")
         monkeypatch.delenv("TTP_TASK")
+        monkeypatch.setenv("TTP_TEST_PROJECT_MAX", "1")   # the writer's cap (wait_events gets no config)
         ticket = locks.enqueue(checkcap.slot_dir(), testslots.suite_base(p.name, _LANE_REPO),
                                f"task #{task} {p.name}: full checks (run 9, pid 1)", time.time() - 1000, priority=2)
         try:
@@ -325,6 +327,7 @@ def test_throughput_checks_lane_names_the_limit_that_held_the_wait(env, monkeypa
         finally:
             locks.dequeue(ticket)
             hold.close()
+            monkeypatch.delenv("TTP_TEST_PROJECT_MAX")
         assert len(ev) == 1 and f"#{task} has waited" in ev[0]["text"] and "#12" in ev[0]["text"], ev
         return ev[0]["text"]
 
@@ -1159,21 +1162,101 @@ def test_throughput_a_checks_slot_wait_event_names_the_host_only_when_every_lane
     assert (ck["holder"], ck["limit_key"], ck["at_limit"]) == (throughput.HOST_CORES, None, 0), ck
 
 
+@pytest.mark.parametrize("kind", ["cap", "host", "about"])
+def test_throughput_a_checks_wait_counts_against_the_limit_its_event_names_cap_host_gate_or_none(
+        env, monkeypatch, kind):
+    """A checks_slot_wait event (checklane.wait_events) below the project cap names the host's gate or
+    nothing (about to start): slot_limit counts the first toward the host holder (HOST_CORES), the second
+    against no cap; only a wait at the project cap (its running checks fill it) counts as checks.test_project_max.
+    Beside a 1 h wait on the repository's lanes, a 3 h wait of each kind makes the lane's limit the cap only
+    for a wait at the cap; the host-gate wait is named in held_by and the note, the about-to-start one nowhere."""
+    from ttp import checkcap, checklane, locks, testslots, throughput
+    _lane_env(monkeypatch)
+    _slot_sizes(monkeypatch, 32, 4, TTP_TEST_PROJECT_MAX=2)
+    p = make(env)
+    p.set_config("checks.slots", 3)
+    p.set_config("checks.wait_event_s", 1)
+    now = time.time()
+    lane_t, t = (_tp_task(p, "checks wait", now - (h + 1) * 3600, prio=1) for h in (1, 3))
+    three = lambda _held: 3   # noqa: E731
+    hold = lambda: testslots.suite_hold(p.name, repo=_LANE_REPO, slots=three, cap=2, wait_s=0,   # noqa: E731
+                                        pending=True, running=True, who="run 1")
+    texts = {}
+
+    def text(task, cfg):
+        ticket = locks.enqueue(checkcap.slot_dir(), testslots._suite_resource(p.name, _LANE_REPO),
+                               f"task #{task} {p.name}: full checks (run 9, pid 1)", time.time() - 1000, priority=2)
+        try:
+            (ev,) = [e for e in checklane.wait_events(p.name, cfg) if e["task"] == task]
+        finally:
+            locks.dequeue(ticket)
+        return ev["text"]
+
+    one = testslots.suite_hold(p.name, repo=_LANE_REPO, slots=1, lock="", what="pytest -q tests/a.py")
+    try:
+        texts["lanes"] = text(lane_t, {})   # its repository's one lane held: the lane limit
+    finally:
+        one.close()
+    gs = [hold(), hold()]
+    try:
+        assert all(g and g.files for g in gs) and testslots.claim_running(gs[0], p.name, three, 2)
+        texts["about"] = text(t, p.config())
+        testslots.lane_waits(gs[1], testslots.LOAD_WAITS + "1-minute load 70.0 above its 64 cores")
+        texts["host"] = text(t, p.config())
+        assert testslots.claim_running(gs[1], p.name, three, 2)
+        texts["cap"] = text(t, p.config())
+    finally:
+        for g in gs:
+            g and g.close()
+    assert "held by the per-repository lane limit" in texts["lanes"], texts["lanes"]
+    assert "held by nothing (about to start)" in texts["about"], texts["about"]
+    assert "held by " + checklane.HOST_GATE in texts["host"], texts["host"]
+    assert "held by the project cap" in texts["cap"], texts["cap"]
+    want = {"lanes": throughput.SLOTS_KEY, "cap": throughput.CAP_KEY, "host": throughput.HOST_CORES, "about": ""}
+    assert {k: throughput.slot_limit(v) for k, v in texts.items()} == want, texts
+    assert throughput.host_held(texts["host"]) and not throughput.host_held(texts["cap"])
+    # only the closing "held by" names the limit: a gate reason or a header naming another limit does not
+    gate = texts["host"].rpartition(checklane.HOST_GATE)[2]
+    assert throughput.slot_limit(texts["host"].replace(gate, "the project cap (checks.test_project_max).")) \
+        == throughput.HOST_CORES
+    assert throughput.slot_limit(texts["host"].replace(gate, "the per-repository lane limit.")) == throughput.HOST_CORES
+    assert throughput.slot_limit("This wait was held by the project cap. " + texts["about"]) == ""
+    assert throughput.slot_limit("Checks lane wait: #3 has waited 20 min") == throughput.CAP_KEY   # an older event
+    for task, hours, ev in ((lane_t, 1, texts["lanes"]), (t, 3, texts[kind])):
+        p.db.x("INSERT INTO runs(task, role, started, ended, status, note) VALUES(?,?,?,?,?,?)",
+               (task, "worker", now - (hours + 1) * 3600, now - hours * 3600, "ok", "{}"))
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (now - (hours - 0.5) * 3600, "daemon", "checks_slot_wait", "low", ev, "handled", task))
+        p.db.x("UPDATE tasks SET status='queued', blocked_reason='waiting for the checks slot' WHERE id=?", (task,))
+    ck = _tp_lane(throughput.measure(p.db, p.config(), now=now, gates={}), "checks_slots")
+    assert ck["count"] == 2, ck
+    assert ck["limit_key"] == (throughput.CAP_KEY if kind == "cap" else throughput.SLOTS_KEY), ck
+    held = ck.get("held_by") or {}
+    assert held.get(throughput.HOST_CORES, 0) == (kind == "host"), ck
+    assert ("free-cores gate" in ck["note"]) == (kind == "host"), ck["note"]
+
+
 @pytest.mark.parametrize("budget,where,holds", [(8, "project", True), (8, "env", True), (24, "project", False),
-                                                (None, None, False)])
+                                                (None, None, False), (8, "account", True),
+                                                (8, "account_over", True), (8, "workers", True)])
 def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budget(env, monkeypatch, tmp_path,
                                                                                    budget, where, holds):
     """Task #5710: a set test-worker budget (checks.test_project_slots 8) with full runs of at least 4 workers
     (checks.test_run_min, half of a run's 8) admits 2 runs at once, fewer than checks.slots 3 and the cap 4,
     so it held the lane: the lane names it and says raising checks.slots changes nothing. One that fits as
-    many runs as both limits (24), or none set (the default follows the host's spare cores), keeps checks.slots."""
-    from ttp import checkcap, slowcomplaint, testslots, throughput
+    many runs as both limits (24), or none set (the default follows the host's spare cores), keeps checks.slots.
+    Task #7176: the lane names where the binding budget comes from (budget_from): the account's 8 holds a
+    project whose own 32 only lowers it, so it names the account setting, never raising the project's; the
+    host's per-project worker ceiling (testslots.project_workers, 8 here) under a project budget of 32 is named
+    as that ceiling, not as checks.test_project_slots."""
+    from ttp import checkcap, project as pj, slowcomplaint, testslots, throughput
     from ttp.daemon import Daemon
     monkeypatch.setattr(checkcap, "grants_dir", lambda: tmp_path / "host")
     monkeypatch.setattr(checkcap, "cores", lambda: 64)
     for k in ("POOL", "RUN_MAX", "RUN_MIN", "PROJECT_SLOTS", "PROJECT_WORKERS"):
         monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
-    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: 32)
+    workers = 8 if where == "workers" else 32
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: workers)
     p = make(env)
     d, now = Daemon(p.base), time.time()
     p.set_config("checks.test_project_max", 4)
@@ -1182,6 +1265,12 @@ def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budg
         p.set_config("checks.test_project_slots", budget)
     elif where == "env":
         monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", str(budget))
+    elif where in ("account", "account_over"):
+        pj.set_account_setting("checks.test_project_slots", budget)
+        if where == "account_over":
+            p.set_config("checks.test_project_slots", 32)
+    elif where == "workers":
+        p.set_config("checks.test_project_slots", 32)
     for i, w0 in enumerate((now - 5 * 3600, now - 3 * 3600)):
         t = _tp_checks_requeue(p, d, monkeypatch, tmp_path, f"budget wait {i}", w0, 2400)
         _tp_checks_run(p, monkeypatch, w0 - 60, 2500)   # one run at a time: the budget, not the lanes
@@ -1195,8 +1284,21 @@ def test_throughput_checks_waits_under_a_small_test_worker_budget_name_that_budg
         return
     assert (ck["limit_key"], ck["limit"], ck["budget_runs"]) == ("checks.test_project_slots", 8, 2), ck
     assert ck["limits"]["checks.test_project_slots"] == 8, ck
-    assert ck["note"].startswith("the project's test-worker budget (checks.test_project_slots 8) admits only 2 "
-                                 "full run(s)") and "raising those changes nothing" in ck["note"], ck["note"]
+    assert ck["note"].startswith("the project's test-worker budget (checks.test_project_slots 8") \
+        and "admits only 2 full run(s)" in ck["note"] and "raising those changes nothing" in ck["note"], ck["note"]
+    src = {"account_over": "account"}.get(where, where)
+    assert ck["budget_from"] == src, ck
+    if src == "account":
+        assert "ttp config --account checks.test_project_slots" in ck["note"], ck["note"]
+        assert "the account's setting" in ck["note"] and "raise or unset checks." not in ck["note"], ck["note"]
+        assert ("its own 32 only lowers it" in ck["note"]) == (where == "account_over"), ck["note"]
+    elif src == "workers":
+        assert "per-project worker ceiling" in ck["note"] and "checks.test_project_workers" in ck["note"], ck["note"]
+        assert "raise or unset checks.test_project_slots" not in ck["note"], ck["note"]
+    elif src == "env":
+        assert "TTP_TEST_PROJECT_SLOTS" in ck["note"], ck["note"]
+    else:
+        assert "raise or unset checks.test_project_slots (unset, it follows" in ck["note"], ck["note"]
     _, kept = throughput.plan(p.db, p.config(), rep)
     (k,) = [k for k in kept if k["lane"] == "checks_slots"]
     assert k["key"] == "checks.test_project_slots" and not k.get("info"), k

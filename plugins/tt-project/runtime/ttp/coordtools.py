@@ -549,7 +549,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
             denied = [d for d in os.environ.get(DENIED_ENV, "").split(os.pathsep) if d]
             search = tool != "Read"
             path = str(args.get("file_path") or args.get("path") or (os.getcwd() if search else ""))
-            if path and _denied_read(path, denied, search):
+            from .credguard import tool_refusal
+            if path and (_denied_read(path, denied, search) or tool_refusal(tool, args)):
                 return _deny("that file holds a credential; a coordinator never reads it"), None
             return None, None
         if tool == ANSWER_TOOL:   # the turn's structured answer (module doc)

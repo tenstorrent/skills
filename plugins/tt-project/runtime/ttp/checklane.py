@@ -756,21 +756,17 @@ def finished_holders(p, cfg: dict | None, now: float | None = None) -> list[dict
 
 
 PRECHECK_LABEL = "precheck:"   # daemon.PRECHECK_LABEL: the review task's label naming its precheck folder
+# Review statuses that still read their precheck: queued (Daemon._precheck_holds, _precheck_failed at
+# dispatch), running (the reviewer reads its result) and waiting (a reviewer may wait on it). A review past
+# them (pushing in the push queue, done, failed) reads it no more.
+PRECHECK_READERS = ("queued", "running", "waiting")
 
 
-def open_precheck(db, task: str, holder) -> bool:
-    """Whether lane holder label `holder` of task `task` is the daemon's review precheck of that task
-    (Daemon._precheck: `ttp checks` run as the code task, its run folder prechecks/t<task>-<head>) and a
-    review that reads it (labelled precheck:t<task>-<head>) is still open. Such a check starts as its
-    task ends, so it is not a finished task's lane until that review ends too. Its lane label names its
-    run folder ("run t<task>-<head>", cli._checks_slot); its slot labels name its run id
-    ("run precheck-t<task>-<head>", daemon.precheck_run_id)."""
-    m = re.search(r"\brun (?:precheck-)?(t(\d+)-[0-9a-f]{7,40})\b", str(holder or ""))
-    if db is None or not m or m.group(2) != str(task):
-        return False
-    want = PRECHECK_LABEL + m.group(1)
-    rows = db.q("SELECT labels FROM tasks WHERE kind='review' AND status NOT IN (?,?,?,?) AND labels LIKE ?",
-                (*FINISHED, f"%{want}%"))
+def precheck_read(db, name: str) -> bool:
+    """Whether a review labelled precheck:<name> is still in PRECHECK_READERS."""
+    want = PRECHECK_LABEL + name
+    rows = db.q("SELECT labels FROM tasks WHERE kind='review' AND status IN (?,?,?) AND labels LIKE ?",
+                (*PRECHECK_READERS, f"%{want}%"))
     for r in rows:
         try:
             if want in json.loads(r["labels"] or "[]"):
@@ -778,6 +774,19 @@ def open_precheck(db, task: str, holder) -> bool:
         except (ValueError, TypeError):
             continue
     return False
+
+
+def open_precheck(db, task: str, holder) -> bool:
+    """Whether lane holder label `holder` of task `task` is the daemon's review precheck of that task
+    (Daemon._precheck: `ttp checks` run as the code task, its run folder prechecks/t<task>-<head>) and a
+    review that reads it (labelled precheck:t<task>-<head>, precheck_read) is still open. Such a check starts as its
+    task ends, so it is not a finished task's lane until that review ends too. Its lane label names its
+    run folder ("run t<task>-<head>", cli._checks_slot); its slot labels name its run id
+    ("run precheck-t<task>-<head>", daemon.precheck_run_id)."""
+    m = re.search(r"\brun (?:precheck-)?(t(\d+)-[0-9a-f]{7,40})\b", str(holder or ""))
+    if db is None or not m or m.group(2) != str(task):
+        return False
+    return precheck_read(db, m.group(1))
 
 
 def stop_finished(p, h: dict) -> dict | None:

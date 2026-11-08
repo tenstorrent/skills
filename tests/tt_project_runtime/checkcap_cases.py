@@ -201,6 +201,99 @@ def test_daemon_asks_only_an_ended_tasks_still_waiting_checks_to_stop_waiting(en
         proc.wait()
 
 
+def test_daemon_stops_a_live_tasks_earlier_runs_waiting_checks_once_it_moved_to_a_newer_run(env, tmp_path):
+    # #7172: a task re-dispatched (or woken again) whose earlier run's detached checks still wait or park
+    # holds two checks runs; they are stopped unless a task's wait names them or another run follows them.
+    from ttp import checkjoin, cli
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    proc = subprocess.Popen(["sleep", "60"])
+    try:
+        started = proc_start(proc.pid)
+        runs = tmp_path / "runs"
+
+        def task_of(status, result=None):
+            tid = p.db.add_task("t", "s", kind="code")
+            p.db.x("UPDATE tasks SET status=?, result=?, updated=? WHERE id=?",
+                   (status, json.dumps(result) if result else None, time.time(), tid))
+            return tid
+
+        def run_of(tid, status="ok", role="worker", waits=True):
+            rid = p.db.x("INSERT INTO runs(task,role,provider,started,status) VALUES(?,?,?,?,?)",
+                         (tid, role, "fake", time.time(), status))
+            run_dir = runs / str(rid)
+            run_dir.mkdir(parents=True)
+            p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+            if waits:
+                (run_dir / cli.CHECKS_PID).write_text(json.dumps({"pid": proc.pid, "started": started}))
+                (run_dir / cli.CHECKS_SLOT_WAIT).write_text(json.dumps({"pid": proc.pid}))
+            return rid, run_dir
+
+        def probe(run_dir):
+            return f"ttp checks --result {run_dir}"
+        # its retry_when moved to the newer run's checks, and a re-dispatched task running its newer run
+        moved = task_of("waiting")
+        old, old_dir = run_of(moved)
+        new, new_dir = run_of(moved)
+        p.db.x("UPDATE tasks SET result=? WHERE id=?",
+               (json.dumps({"status": "waiting", "retry_when": probe(new_dir)}), moved))
+        redone = task_of("running")
+        old2, old2_dir = run_of(redone)
+        new2, _ = run_of(redone, status="running", waits=False)
+        stop = {old_dir: f"task #{moved} moved to run {new}", old2_dir: f"task #{redone} moved to run {new2}"}
+        keep = []
+        # the task's own hand-off still waits on the earlier run's checks (a later wake reads them)
+        own = task_of("waiting")
+        _, d = run_of(own)
+        run_of(own, waits=False)
+        p.db.x("UPDATE tasks SET result=? WHERE id=?", (json.dumps({"status": "waiting", "retry_when": probe(d)}), own))
+        keep.append(d)
+        # another task waits on them, in a later step of its known sequence, by a path relative to the root
+        theirs = task_of("waiting")
+        _, d = run_of(theirs)
+        run_of(theirs, waits=False)
+        task_of("waiting", {"status": "waiting", "retry_when": "true",
+                            "then": [{"retry_when": f"ttp checks --result state/{d.parent.name}/{d.name}"}]})
+        keep.append(d)
+        # another run joined them (checkjoin): it would lose its outcome
+        joined = task_of("queued")
+        _, d = run_of(joined)
+        run_of(joined, waits=False)
+        lead = checkjoin.register(p.state, task=str(joined), head="h", commit_ts=0, key="k", group="g", run=d.name,
+                                  arrived=time.time(), pid=proc.pid)
+        follower = checkjoin.register(p.state, task="99", head="h", commit_ts=0, key="k", group="g2", run="x",
+                                      arrived=time.time())
+        checkjoin.update(follower, phase=checkjoin.JOINED, follows=checkjoin.read(lead)["id"])
+        keep.append(d)
+        # the earlier run still runs, the newer run is a coordinator's, or the task has one run only
+        for runs_of in (("running", "ok"), ("ok", "coordinator"), ("ok",)):
+            t = task_of("queued")
+            _, d = run_of(t, status=runs_of[0])
+            if len(runs_of) > 1:
+                run_of(t, role="worker" if runs_of[1] == "ok" else runs_of[1], waits=False)
+            keep.append(d)
+        # a name that only starts with the run's (runs/12 vs runs/123) is not a wait on it
+        prefix = task_of("waiting")
+        _, d = run_of(prefix)
+        run_of(prefix, waits=False)
+        task_of("waiting", {"status": "waiting", "retry_when": probe(d) + "0"})
+        stop[d] = f"task #{prefix} moved to run "
+        Daemon(p.base).reap_waiting_checks(every_s=0)
+        for run_dir, why in stop.items():
+            req = json.loads((run_dir / cli.CHECKS_SLOT_CANCEL).read_text())
+            assert req["pid"] == proc.pid and req["started"] == started and req["why"].startswith(why), req
+        assert not [d for d in keep if (d / cli.CHECKS_SLOT_CANCEL).exists()], \
+            [d.name for d in keep if (d / cli.CHECKS_SLOT_CANCEL).exists()]
+        assert not (new_dir / cli.CHECKS_SLOT_CANCEL).exists(), "the task's latest run keeps its checks"
+        checkjoin.forget(p.state)   # the follower ended: the earlier run's checks follow nobody's wait now
+        Daemon(p.base).reap_waiting_checks(every_s=0)
+        assert (keep[2] / cli.CHECKS_SLOT_CANCEL).exists()
+    finally:
+        proc.kill()
+        proc.wait()
+
+
 def test_a_slot_cancel_request_ends_only_its_own_waiter_and_only_while_it_waits(env, tmp_path, monkeypatch, capsys):
     from ttp import checkcap, cli
     from ttp.runner import proc_start
@@ -1178,11 +1271,13 @@ def test_ttp_checks_waits_for_its_project_s_other_full_checks(env, tmp_path, mon
         "with the other run gone it runs, and frees the project's suite lock at its end"
 
 
+@pytest.mark.parametrize("moved", [False, True])
 def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_stop_once_their_task_ended(
-        env, tmp_path, monkeypatch, capsys):
+        env, tmp_path, monkeypatch, capsys, moved):
     """The per-project suite-lock wait is told like the checks-slot wait: CHECKS_SLOT_WAIT names it, the
-    `--result` probe says queued, and the daemon's cancel for an ended task ends it with nothing run."""
-    from ttp import cli, testslots
+    `--result` probe says queued, and the daemon's cancel for an ended task ends it with nothing run;
+    `moved` (#7172): so does its cancel for a live task that moved to a newer run, freeing the queue."""
+    from ttp import checkcap, cli, locks, testslots
     from ttp.daemon import Daemon
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     monkeypatch.setenv("TTP_TEST_POLL_S", "0.05")
@@ -1201,17 +1296,21 @@ def test_detached_checks_waiting_for_their_project_s_full_checks_are_queued_and_
         assert f"waiting (pid {info['pid']}, not running) for this project's other full checks" in said, said
         assert f"held by {p.name}: full checks (pid {os.getpid()})" in said and "host-wide" not in said, said
         tid = p.db.add_task("t", "s", kind="code")
-        p.db.x("UPDATE tasks SET status='done', updated=? WHERE id=?", (time.time(), tid))
+        p.db.x("UPDATE tasks SET status=?, updated=? WHERE id=?", ("queued" if moved else "done", time.time(), tid))
         p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
                (tid, "worker", "fake", time.time(), "ok", str(run)))
+        newer = moved and p.db.x("INSERT INTO runs(task,role,provider,started,status,dir) VALUES(?,?,?,?,?,?)",
+                                 (tid, "worker", "fake", time.time(), "running", str(tmp_path / "newer")))
         Daemon(p.base).reap_waiting_checks(every_s=0)
         assert _wait_for(lambda: (run / cli.CHECKS_RC).exists()), "the cancel did not end the wait"
+        assert not locks.queued(checkcap.slot_dir(), testslots._suite_resource(p.name, testslots.repo_key(repo))), \
+            "it left the project's checks queue"
     finally:
         hold.close()
     assert (run / cli.CHECKS_RC).read_text().strip() == "1" and not ran.exists()
     assert not (run / cli.CHECKS_SLOT_WAIT).exists()
-    assert f"not run: stopped waiting for this project's other full checks: task #{tid} ended (done)" in \
-        (run / "checks.log").read_text()
+    why = f"task #{tid} moved to run {newer}" if moved else f"task #{tid} ended (done)"
+    assert f"not run: stopped waiting for this project's other full checks: {why}" in (run / "checks.log").read_text()
 
 
 _SUITE_RUN = "touch {started}; while [ ! -e {release} ]; do sleep 0.05; done"
@@ -5584,6 +5683,31 @@ def test_a_landing_check_never_waits_behind_task_checks_on_the_project_cap(env, 
         assert p1 and "-x." in p1.files[0].name, "a priority-1 run keeps its own over-cap lane beside it"
         p1.close()
         land.close()
+        # The coordinator's task-less run holds a landing lane: a run under a landing mark (a push batch's)
+        # still starts at once on its own lane, a second coordinator run waits, and so does a second mark run.
+        coord = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0, landing="coordinator")
+        assert coord and "-x." in coord.files[0].name, "the coordinator's run takes a landing lane past the cap"
+        try:
+            mark = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0, landing="mark")
+            assert mark and "-x." in mark.files[0].name, \
+                "a landing-mark run never waits behind the coordinator's landing lane"
+            kinds = sorted(r["landing"] for r in locks.holder_records(testslots.lane_paths("pa", repo=None))
+                           if r.get("landing"))
+            assert kinds == ["coordinator", "mark"], kinds
+            assert testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, wait_s=0,
+                                        landing="coordinator") is None, "one coordinator landing lane at a time"
+            assert testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, wait_s=0,
+                                        landing="mark") is None, "one mark landing lane at a time"
+            mark.close()
+        finally:
+            coord.close()
+        # A mark run holds the lane: the coordinator's run queues under the cap like a task's.
+        mark = testslots.suite_hold("pa", repo=_LANE_REPO, slots=1, cap=2, wait_s=0, landing="mark")
+        try:
+            assert mark and testslots.suite_hold("pa", repo="c0ffee000000", slots=1, cap=2, wait_s=0,
+                                                 landing="coordinator") is None
+        finally:
+            mark and mark.close()
     finally:
         for g in hold:
             g and g.close()
@@ -5604,7 +5728,29 @@ def test_a_landing_check_never_waits_behind_task_checks_on_the_project_cap(env, 
     monkeypatch.setenv(landmark.ENV, "/nonexistent/forged-mark")
     assert not cli._landing_check(proj), "a forged landing mark path is no landing check"
     monkeypatch.setattr(landmark, "label", lambda env=None: {"pid": 1})
-    assert cli._landing_check(proj), "a run under a verified landing mark lands, even inside a task"
+    assert cli._landing_check(proj) == "mark", "a run under a verified landing mark lands, even inside a task"
+    monkeypatch.delenv("TTP_TASK")
+    monkeypatch.setenv(coordtools.ROLE_ENV, "coordinator")
+    assert cli._landing_check(proj) == "mark", "the coordinator's run under a landing mark is a mark run"
+    monkeypatch.setattr(landmark, "label", lambda env=None: None)
+    assert cli._landing_check(proj) == "coordinator"
+
+
+def test_checks_slot_take_passes_its_landing_kind_to_the_lane_hold(env, monkeypatch, tmp_path):
+    # _checks_slot_take hands _landing_check(p) to the lane hold as `landing`, so a push batch's checks
+    # take the mark lane and the coordinator's own run its lane.
+    import types
+    from ttp import cli, testslots
+    _lane_env(monkeypatch)
+    proj = types.SimpleNamespace(name="pa", state=tmp_path / "state")
+    seen = []
+    monkeypatch.setattr(testslots, "suite_hold", lambda *a, **kw: seen.append(kw) or None)
+    for kind in ("mark", "coordinator", ""):
+        seen.clear()
+        monkeypatch.setattr(cli, "_landing_check", lambda p, kind=kind: kind if p is proj else "")
+        got = cli._checks_slot_take(proj, tmp_path / "run", None, "a" * 40, None, lambda *a: None, 0.0,
+                                    time.time(), "", None, 2, None, {}, _LANE_REPO, ["true"], "checks")
+        assert got is None and seen and seen[-1].get("landing") == kind, (kind, seen)
 
 
 def test_cap_turn_counts_one_lane_for_the_old_unkeyed_base(env, monkeypatch):
@@ -7511,7 +7657,8 @@ def test_a_short_targeted_run_goes_ahead_of_aged_long_full_runs_but_never_of_urg
         assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [p1], "a more urgent one goes first"
         locks.dequeue(p1)
         unknown = locks.enqueue(d, P, "pa task #43 (run 43)", since=now - 8000, group="pa", priority=2)
-        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [unknown], "no lane label: held"
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=near) == [p2, unknown], "no lane label: held"
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [], "short (#7217): not held"
         locks.dequeue(unknown)
         landing = locks.enqueue(d, P, "pa task #42 (run 42)", since=now - 8000, group="pa", priority=2, landing=True)
         assert checkcap.starved_ahead("pa", now, now, priority=2, cost=short) == [landing], "a landing goes first"
@@ -7530,6 +7677,81 @@ def test_a_short_targeted_run_goes_ahead_of_aged_long_full_runs_but_never_of_urg
         for h in holders:
             _stop(h)
 
+
+
+def test_a_short_targeted_run_is_not_held_by_parked_full_runs_and_queues_first_within_the_host_cap(
+        env, monkeypatch):
+    # #7217: the 13-test targeted run 14440 waited 50 min behind 13 parked full runs. A targeted run of fewer
+    # than checks.small_tests tests (checkcap.is_small) is held by no parked longer run of its priority or a
+    # less urgent one (starved_ahead), whatever their costs; an older short one, a landing's and a more urgent
+    # one still hold it. In the host queue it goes first among its project's waiters at its priority
+    # (locks.SMALL_TICKET, fair_order), and the host cap (checks.host_max) still holds it.
+    import threading
+    from ttp import checkcap, locks, project
+    monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
+    tiny, full = {"cls": 2, "tests": 13, "of": 9000}, {"cls": 2, "tests": 6000, "of": 9000}
+    assert checkcap.small_tests() == checkcap.SMALL_TESTS == 500
+    assert checkcap.is_small(tiny) and not checkcap.is_small(full) and not checkcap.is_small({"cls": 2})
+    assert not checkcap.is_small(None) and not checkcap.is_small({"tests": True})
+    monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"small_tests": 20}})
+    assert checkcap.small_tests() == 20 and checkcap.is_small(tiny)
+    monkeypatch.setenv(checkcap.SMALL_ENV, "10")
+    assert checkcap.small_tests() == 10 and not checkcap.is_small(tiny), "the env wins"
+    monkeypatch.setenv(checkcap.SMALL_ENV, "-3")
+    assert checkcap.small_tests() == 20, "a negative env value is ignored"
+    monkeypatch.delenv(checkcap.SMALL_ENV)
+    monkeypatch.setattr(project, "load_account_settings", lambda: {"checks": {"small_tests": "x"}})
+    assert checkcap.small_tests() == 500, "unreadable: the default"
+    monkeypatch.setattr(project, "load_account_settings", lambda: {})
+    now = time.time()
+    d, P = checkcap.slot_dir(), checkcap.PARKED
+    parked = [locks.enqueue(d, P, f"pa task #{60 + i} (run {60 + i})", since=now - 9000 + i, group="pa", priority=2)
+              for i in range(13)]
+    extra = []
+    try:
+        assert len(checkcap.starved_ahead("pa", now, now, priority=2, cost=full)) == 13, "a full run: as before"
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [], "13 tests: not held"
+        monkeypatch.setenv(checkcap.SMALL_ENV, "0")   # off: the cost rule alone, and unknown costs hold it
+        assert len(checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny)) == 13
+        monkeypatch.delenv(checkcap.SMALL_ENV)
+        extra.append(older := locks.enqueue(d, P, "pa task #80 (run 80)", since=now - 9500, group="pa",
+                                            priority=2, small=True))
+        assert locks.is_small(older) and not locks.is_small(parked[0])
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [older], "short ones: first come"
+        locks.dequeue(extra.pop())
+        extra.append(landing := locks.enqueue(d, P, "pa task #81 (run 81)", since=now - 9500, group="pa",
+                                              priority=2, landing=True))
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [landing], "a landing holds it"
+        locks.dequeue(extra.pop())
+        extra.append(urgent := locks.enqueue(d, P, "pa task #82 (run 82)", since=now - 9500, group="pa", priority=1))
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == [urgent], "a more urgent one too"
+    finally:
+        for t in parked + extra:
+            locks.dequeue(t)
+    # The host queue: a full run then a 13-test run, same project and priority, behind the one slot of the cap.
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    for small, want in ((False, ["full", "tiny"]), (True, ["tiny", "full"])):
+        held = checkcap.acquire("h")
+        got, slots = [], []
+
+        def take(label, is_small):
+            s = checkcap.acquire(label, project_name="pa", priority=2, small=is_small)
+            got.append((label, len(checkcap.state()["running"])))
+            slots.append(s)
+            s.close()
+
+        waiters = []
+        for i, args in enumerate([("full", False), ("tiny", small)]):
+            waiters.append(threading.Thread(target=take, args=args))
+            waiters[-1].start()
+            assert _wait_for(lambda: len(checkcap.state()["queued"]) == i + 1)
+        assert checkcap.state()["queued"] == want, "the 13-test run ranks first only as a short one"
+        time.sleep(0.3)
+        assert got == [] and checkcap.state()["running"] == ["h"], "the cap holds both while its slot is held"
+        held.close()
+        for w in waiters:
+            w.join(20)
+        assert [g[0] for g in got] == want and all(n == 1 for _, n in got), "one at a time: the cap holds"
 
 def test_aged_routine_waiters_take_routine_turns_and_nothing_changes_without_a_backlog(tmp_path):
     # #6033 on the host queue (locks.fair_order): aged routine waiters go ahead of later routine ones only;
@@ -8010,6 +8232,153 @@ def test_pool_room_keeps_a_slot_for_an_urgent_run_of_another_project_parked_for_
         assert testslots.pool_room({}, "A"), "a routine parked run keeps nothing"
     finally:
         locks.dequeue(routine)
+
+
+def _parked_urgent_with_gate(gate: str, n: int = 3):
+    """`n` priority-1 runs of project "pa" parked for their test slots, their lane's gate `gate` (gate_lanes)."""
+    from ttp import checkcap, locks, testslots
+    d, t0 = checkcap.slot_dir(), time.time() - 300
+    tickets = [locks.enqueue(d, checkcap.PARKED, f"pa task #{i} ttp checks", t0 + i, group="pa", priority=1)
+               for i in range(n)]
+    lane = locks.try_take([d / f"{testslots.SUITE}.pa.repo.0.lock"], "pa task #0 ttp checks", "ttp checks",
+                          extra={"gate": gate})
+    return tickets, lane
+
+
+def test_an_urgent_parked_run_its_own_gate_holds_keeps_no_test_pool_slots(env, monkeypatch):
+    """#7029: pool_gate keeps pool slots only for urgent parked runs of other projects that could start: one
+    its project's aged turn, budget or the load guard holds keeps none, so another project's p1 run starts
+    on the free slots (8 of 16 free, a run needs 4; 12 were kept for 3 such runs before)."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(8)]
+    for gate in ("46" + testslots.STARVED_GATE,
+                 testslots.BUDGET_GATE + "0 of 8 free, a run needs 4 (held by pa task #9)",
+                 testslots.LOAD_GATE + "the host is overloaded"):
+        tickets, lane = _parked_urgent_with_gate(gate)
+        try:
+            assert testslots.urgent_parked("pb", 1) == 0, gate
+            assert testslots.pool_gate({}, "pb", full=True, priority=1) == "", gate
+            assert testslots.pool_gate({}, "pb", full=True, priority=3) == "", "nor for a routine run"
+        finally:
+            lane.close()
+            for t in tickets:
+                locks.dequeue(t)
+    for f in busy:
+        f.close()
+
+
+def test_an_urgent_parked_run_that_could_start_still_gets_the_freed_slot_ahead_of_a_routine_run(env, monkeypatch):
+    """#7029: a parked urgent run held only by the pool (or naming no reason yet) still counts toward the
+    reserve: another project's routine run leaves the free slot to it."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(12)]
+    for gate in ("the host's test pool: 4 of 16 free, a run needs 4, 4 kept for 1 urgent run(s) of other projects"
+                 " parked ahead", ""):
+        tickets, lane = _parked_urgent_with_gate(gate, n=1)
+        try:
+            assert testslots.urgent_parked("pb") == 1, gate
+            why = testslots.pool_gate({}, "pb", full=True, priority=3)
+            assert "4 kept for 1 urgent run(s)" in why, why
+            assert testslots.pool_gate({}, "pa", full=True, priority=1) == "", "the urgent run itself has room"
+        finally:
+            lane.close()
+            for t in tickets:
+                locks.dequeue(t)
+    for f in busy:
+        f.close()
+
+def test_an_urgent_parked_run_whose_project_budget_is_full_keeps_no_test_pool_slots(env, monkeypatch):
+    """#7029: whatever its lane's gate names, a project counts toward the pool reserve at most the urgent runs
+    its free test-worker budget could start now: a full budget keeps no pool slots, so another project's p1
+    run starts on the free ones; urgent slots open while only less urgent runs hold it count as pool_gate's."""
+    from ttp import checkcap, locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    cfg = {"checks": {"test_project_slots": 8}}
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(8)]
+    own = testslots.own_paths("pa", 8)
+    for rank, held, counted in ((1, 8, 0), (1, 4, 1), (3, 8, 2), (1, 0, 2)):
+        holders = [locks.try_take(own, f"pa task #{90 + i} ttp checks", "pytest", extra={"priority": rank})
+                   for i in range(held)]
+        tickets, lane = _parked_urgent_with_gate("", n=3)
+        try:
+            assert testslots.urgent_parked("pb", 1, budget=8, need=4, run_max=8) == counted, (rank, held)
+            assert testslots.urgent_parked("pb", 1) == 3, "without a budget every one counts"
+            why = testslots.pool_gate(cfg, "pb", full=True, priority=1)
+            assert (why == "") == (counted <= 1), (rank, held, why)
+        finally:
+            lane.close()
+            for t in tickets:
+                locks.dequeue(t)
+            for f in holders:
+                f.close()
+    for f in busy:
+        f.close()
+
+
+def test_an_urgent_parked_run_that_leaves_free_pool_room_untaken_keeps_no_slots_after_untaken_s(env, monkeypatch):
+    """#7029: a parked urgent run of another project the pool's free room fits, still parked UNTAKEN_S later
+    (some hold its lane names no reason for keeps it off), keeps no pool slots, so a routine run starts on
+    them; one the room does not fit, or once the room is gone, starts its count again."""
+    from ttp import locks, testslots
+    _lane_env(monkeypatch)
+    monkeypatch.setattr(testslots, "_ROOM_SINCE", {})
+    monkeypatch.setattr(testslots, "sizes", lambda *a, **k: (16, 8))
+    monkeypatch.setattr(testslots, "pool_now", lambda cfg, pool, held, *a, **k: pool)
+    clock = [1000.0]
+    monkeypatch.setattr(testslots.time, "time", lambda: clock[0])
+    busy = [locks.try_take(testslots.paths(16), f"pc task #{i} ttp checks", "pytest") for i in range(12)]
+    tickets, lane = _parked_urgent_with_gate("", n=2)
+    try:
+        assert testslots.urgent_parked("pb", need=4, room=4) == 2
+        assert "8 kept for 2 urgent run(s)" in testslots.pool_gate({}, "pb", full=True, priority=3)
+        clock[0] += testslots.UNTAKEN_S
+        assert testslots.urgent_parked("pb", need=4, room=4) == 1, "the oldest one the room fits: dropped"
+        assert testslots.urgent_parked("pb", need=4, room=3) == 2, "no room: every count starts again"
+        assert testslots.urgent_parked("pb", need=4, room=4) == 2
+        clock[0] += testslots.UNTAKEN_S - 1
+        assert testslots.urgent_parked("pb", need=4, room=4) == 2, "not yet"
+        clock[0] += 1
+        assert testslots.urgent_parked("pb", need=4, room=8) == 1, "the room fits the second only from now"
+        clock[0] += testslots.UNTAKEN_S
+        assert testslots.urgent_parked("pb", need=4, room=8) == 0
+    finally:
+        lane.close()
+        for t in tickets:
+            locks.dequeue(t)
+        for f in busy:
+            f.close()
+
+
+def test_upgraded_names_a_runtime_tree_changed_on_disk_without_a_version_bump(env, tmp_path, monkeypatch):
+    """#7029: a waiting detached `ttp checks` re-executes once its runtime's code changes on disk (a fix
+    landing in place, version unchanged), once settled, and never again for the same tree."""
+    import ttp
+    from ttp import checkcap
+    monkeypatch.setattr(checkcap, "_SEEN", {})
+    monkeypatch.setattr(checkcap, "_TREE0", {})
+    monkeypatch.setenv(checkcap.REEXEC_ENV, "")
+    init, mod = tmp_path / "__init__.py", tmp_path / "gate.py"
+    init.write_text(f'__version__ = "{ttp.__version__}"\n')
+    mod.write_text("A = 1\n")
+    assert checkcap.upgraded(init, now=100.0) == "", "the tree it imported"
+    mod.write_text("A = 22\n")
+    os.utime(mod, ns=(1, 1))
+    assert checkcap.upgraded(init, now=200.0) == "", "just changed: other files may still be copying"
+    new = checkcap.upgraded(init, now=200.0 + checkcap.UPGRADE_SETTLE_S)
+    assert new == f"{ttp.__version__}+{checkcap._tree(tmp_path)}", new
+    (tmp_path / "__pycache__").mkdir()
+    (tmp_path / "__pycache__" / "gate.py").write_text("compiled\n")
+    assert checkcap.upgraded(init, now=300.0) == new, "byte code is not code"
+    monkeypatch.setenv(checkcap.REEXEC_ENV, new)
+    assert checkcap.upgraded(init, now=9999.0, settle=0) == "", "re-executed for it once already: never a loop"
 
 
 def test_a_checks_wait_ends_once_its_task_moves_the_branch_off_the_head_and_never_on_a_detached_head(tmp_path):
@@ -9422,3 +9791,31 @@ def test_preemption_asks_a_run_never_preempted_before_over_one_already_preempted
             f.unlink()
         fresh.close()
         again.close()
+
+
+def test_project_max_from_names_the_setting_that_binds_the_test_worker_budget(env, monkeypatch):
+    """Task #7176: testslots.project_max_from names what project_max() took its value from, in its order: the
+    environment variable over the account's, a project's own only lowering either, then the pool and the
+    host's per-project worker ceiling bounding all; the value always matches project_max()."""
+    from ttp import project, testslots
+    for k in ("PROJECT_SLOTS", "PROJECT_MAX", "PROJECT_WORKERS", "RUN_MIN"):
+        monkeypatch.delenv(f"TTP_TEST_{k}", raising=False)
+    monkeypatch.setenv("TTP_TEST_POOL", "16")
+    monkeypatch.setenv("TTP_TEST_RUN_MAX", "8")
+    workers = {"n": 64}
+    monkeypatch.setattr(testslots, "project_workers", lambda cfg=None, cores=None, project_name=None: workers["n"])
+    s = (16, 8)
+    own = lambda n: {"checks": {"test_project_slots": n}}   # noqa: E731
+    for acct, cases in ((None, [({}, ""), (own(12), "project"), (own(32), "pool")]),
+                        (8, [({}, "account"), (own(32), "account"), (own(4), "run")])):
+        if acct:
+            project.set_account_setting("checks.test_project_slots", acct)
+        for cfg, want in cases:
+            assert testslots.project_max_from(cfg, s) == want, (cfg, want, testslots.project_max(cfg, s))
+    monkeypatch.setenv("TTP_TEST_PROJECT_SLOTS", "12")
+    assert testslots.project_max_from({}, s) == "env" and testslots.project_max({}, s) == 12, \
+        "the environment variable wins over the account's"
+    assert testslots.project_max_from(own(10), s) == "project" and testslots.project_max(own(10), s) == 10
+    workers["n"] = 9
+    assert testslots.project_max_from({}, s) == "workers" and testslots.project_max({}, s) == 9
+    assert testslots.project_max_from({}, (0, 0)) == "", "the pool off: no budget"

@@ -833,6 +833,146 @@ def test_a_routed_tier_starts_on_chat_unless_pinned_reviewed_or_retried(env, mon
     assert route.target({**d.cfg, "core_provider": "chat"}, "light") is None
 
 
+# Rule routing (providers.chat.routes, route.match): by kind and label, first match wins, per-tier fallback.
+_ROUTE_RULES = [{"kinds": ["code", "work"], "tiers": ["standard"], "model": "rule-model-a", "effort": "max",
+           "route_timeout_s": 1800},
+          {"labels_any": ["bulk"], "labels_none": ["keep"], "model": "rule-model-b"}]
+
+
+def _route_rules_cfg(rules=_ROUTE_RULES, light_route=True):
+    return {"providers": {"chat": {"tiers": {"light": {"model": _RT_MODEL, "route": light_route, "effort": "low"},
+                                             "standard": {"effort": "medium", "route_timeout_s": 600}},
+                                   "routes": rules}}}
+
+
+def test_route_rules_first_match_wins_and_the_per_tier_route_is_the_fallback():
+    from ttp import route
+    cfg = _route_rules_cfg()
+    code = {"kind": "code", "labels": "[]", "priority": 2}
+    assert route.match(cfg, code, "standard") == {"to": "chat", "model": "rule-model-a", "rule": 0}
+    # Both rules match a bulk-labelled code task at standard: the first one wins.
+    bulk = {**code, "labels": '["bulk"]'}
+    assert route.match(cfg, bulk, "standard")["rule"] == 0 and route.match(cfg, bulk, "deep")["rule"] == 1
+    assert route.match(_route_rules_cfg(_ROUTE_RULES[::-1]), bulk, "standard")["rule"] == 0   # order decides, not specificity
+    assert route.match(_route_rules_cfg(_ROUTE_RULES[::-1]), bulk, "standard")["model"] == "rule-model-b"
+    # No rule matches: the tier's own route, else nowhere.
+    assert route.match(cfg, code, "light") == {"to": "chat", "model": _RT_MODEL, "rule": None}
+    assert route.match(cfg, {**code, "kind": "question"}, "standard") is None
+    assert route.match(cfg, code, "deep") is None
+    # A rule's labels_none (also as `label:<id>`) skips it; labels_any needs one of its labels.
+    assert route.match(cfg, {**code, "labels": '["bulk", "keep:3"]'}, "deep") is None
+    # Effort and time limit: the rule's, else the tier's.
+    assert route.run_model(cfg, "standard", {"rule": 0, "model": "rule-model-a"}) == ("rule-model-a", "max")
+    assert route.run_model(cfg, "light", {"rule": 1, "model": "rule-model-b"}) == ("rule-model-b", "low")
+    assert route.run_model(cfg, "light", {"model": _RT_MODEL}) is None   # the tier's own route: its own model
+    assert route.timeout_s(cfg, "standard", 0) == 1800.0 and route.timeout_s(cfg, "standard", 1) == 600.0
+    # Off: no list, an empty list, chat as the core provider or not allowed.
+    for off in (_route_rules_cfg([]), {**cfg, "core_provider": "chat"}, {**cfg, "providers_allowed": ["claude"]}):
+        assert route.match(off, code, "standard") is None, off
+    assert route.match(_route_rules_cfg(None), code, "light")["rule"] is None
+    # Tier-only readers (gates, /models checks) see every model a tier may route to.
+    assert route.target(cfg, "deep") == ("chat", "rule-model-b") and route.models(cfg, "light") == {_RT_MODEL, "rule-model-b"}
+
+
+@pytest.mark.parametrize("task", [
+    {"labels": '["urgent"]'}, {"labels": '["needs_deep"]'}, {"labels": '["user_deep"]'},
+    {"labels": '["review_fix:41"]'}, {"labels": '["untrusted_input"]'}, {"labels": ["review_fix:7"]},
+    {"priority": 1}, {"spec": "urgent: the user is waiting"}, {"result": '{"needs_deep": "too hard at standard"}'},
+])
+def test_route_rules_keep_urgent_deep_review_fix_and_untrusted_tasks_on_core(task):
+    """With a rule list set these route nowhere, the tier's own route included; with none, as before."""
+    from ttp import route
+    t = {"kind": "code", "labels": "[]", "priority": 2, **task}
+    assert route.kept_core(t)
+    assert route.match(_route_rules_cfg([{"model": "any-model"}]), t, "standard") is None
+    assert route.match(_route_rules_cfg([{"model": "any-model"}]), t, "light") is None
+    assert route.match(_route_rules_cfg(None), t, "light")["rule"] is None   # no rule list: per-tier routing unchanged
+    assert not route.kept_core({"kind": "code", "labels": '["urgently"]', "priority": 2})
+
+
+def test_a_rule_routes_a_standard_code_run_by_kind_and_keeps_every_exclusion(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": _RT_URL,
+                                    "tiers": {"light": {"model": _RT_MODEL, "route": True}}, "routes": _ROUTE_RULES})
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "_pick_effort", lambda task, provider: None)
+    core = d.cfg.get("core_provider", "claude")
+
+    def start(**kw):
+        tid = p.db.add_task(kw.pop("title", "t"), kw.pop("spec", "s"), budget_usd=8.0,
+                            **{"kind": "code", "tier": "standard", "priority": 2, "labels": [], **kw})
+        return _dispatch_task(p, d, monkeypatch, tid)
+
+    prov, tier, k = start()
+    assert (prov, tier, k["timeout_s"]) == ("chat", "standard", 1800.0)
+    assert k["note"][route.KEY] == {"tier": "standard", "to": "chat", "model": "rule-model-a", "rule": 0,
+                                    "fallback": "none", "timeout_s": 1800.0}
+    prov, tier, k = start(tier="light")   # no rule for a light code run: the tier's own route
+    assert prov == "chat" and k["note"][route.KEY]["model"] == _RT_MODEL and "rule" not in k["note"][route.KEY]
+    for why, kw in (("urgent", {"priority": 1}), ("review fix", {"labels": ["review_fix:9"]}),
+                    ("pinned model", {"model": "some-model"}), ("pinned provider", {"provider": core}),
+                    ("review", {"kind": "review"}), ("question: conclusion floor", {"kind": "question", "labels": ["bulk"]}),
+                    ("device run: floor", {"labels": ["needs_device"]})):
+        prov, _, k = start(title=why, **kw)
+        assert prov == core and (k["note"].get(route.KEY) or {}).get("fallback") in (None,), why
+    # A model_missing hold is per model: a hold on the tier's own model leaves the rule's model routing.
+    p.db.set_kv(route.MISSING + "standard", {"model": "rule-model-a", "since": time.time()})
+    prov, _, k = start(title="held")
+    assert prov == core and k["note"][route.KEY]["fallback"] == "model_missing" and k["note"][route.KEY]["rule"] == 0
+    p.db.set_kv(route.MISSING + "standard", {"model": "another-model", "since": time.time()})
+    assert start(title="other hold")[0] == "chat"
+
+
+def test_a_rule_routed_run_starts_with_the_rules_model_and_effort(env, monkeypatch):
+    from ttp import route
+    from ttp.daemon import Daemon
+    from ttp.providers import chat as chat_provider
+
+    class Built(Exception):
+        pass
+
+    def build(self, **kw):   # what the run would start with; no agent process starts
+        raise Built((kw["model"], kw["effort"]))
+    monkeypatch.setattr(chat_provider.Chat, "build", build)
+    p = make(env)
+    p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": _RT_URL, "routes": _ROUTE_RULES,
+                                    "tiers": {"standard": {"model": "tier-model", "effort": "medium"}}})
+    d = Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="code", tier="standard", priority=2)
+
+    def launch(entry):
+        with pytest.raises(Built) as got:
+            d.start_run("worker", "go", "chat", "standard", str(p.root), task=p.db.task(tid), note={route.KEY: entry})
+        return got.value.args[0]
+
+    assert launch({"to": "chat", "model": "rule-model-a", "rule": 0, "fallback": "none"}) == ("rule-model-a", "max")
+    assert launch({"to": "chat", "model": "rule-model-b", "rule": 1, "fallback": "none"}) == ("rule-model-b", "medium")
+    assert launch({"to": "chat", "model": "tier-model", "fallback": "none"}) == ("tier-model", "medium")
+
+
+def test_route_rules_config_problems_and_chat_setter():
+    from ttp import chatset, route
+    from ttp.cli import cmd_chat_settable
+    bad = [{"model": "m", "tiers": ["huge"]}, {"kinds": "code", "model": "m"}, {"tiers": ["light"]},
+           {"model": "m", "extra": 1}, {"model": "m", "route_timeout_s": 0}, "rule"]
+    got = route.config_problems({"providers": {"chat": {"routes": bad}}})
+    assert len(got) == len(bad) and "[0].tiers: unknown tier 'huge'" in got[0] and all("rule skipped" in g for g in got[1:])
+    assert route.config_problems({"providers": {"chat": {"routes": {"model": "m"}}}}) == [
+        "providers.chat.routes: give a list of rules; nothing is routed by rule"]
+    assert [i for i, _ in route.rules({"providers": {"chat": {"routes": [*bad, {"model": "ok"}]}}})] == [0, len(bad)]
+    assert route.config_problems({"providers": {"chat": {"routes": _ROUTE_RULES}}}) == []
+    conv = chatset.setter("providers.chat.routes")
+    assert conv(_ROUTE_RULES) == _ROUTE_RULES and conv(json.dumps(_ROUTE_RULES)) == _ROUTE_RULES and conv("[]") == []
+    for v in ("nope", {"model": "m"}, [{"model": ""}], [{"model": "https://x.invalid/m"}], [{"model": "m", "tiers": ["huge"]}],
+              [{"model": "m", "effort": "turbo"}], [{"model": "m", "route_timeout_s": 10 ** 9}],
+              [{"model": "m", "labels_any": ["a b"]}], [{"model": "m", "base_url": "x"}], [{"model": "m"}] * 33):
+        with pytest.raises(ValueError):
+            conv(v)
+    assert "providers.chat.routes" in chatset.PATTERNS and chatset.setter("providers.claude.routes") is None
+    cmd_chat_settable("providers.chat.routes", None)
+
 def _route_slots(p, d, monkeypatch, n, core_max=1, chat_max=1, chat_open=True, core_running=0, tag="t"):
     """Queue n light routed tasks, one dispatch tick under the given gates; returns [(provider, fallback)]."""
     from ttp import budget as bud

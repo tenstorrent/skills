@@ -146,6 +146,11 @@ class Claude(Provider):
     tool_hooks = True
     fence_optional = True   # the Bash sandbox (fence_args)
 
+    def coord_tool_set(self, cwd):
+        # The session tools come only with ttp's tool hooks (coordtools.session_tool_args); a subclass
+        # without them (chat) runs its coordinator turns tool-less.
+        return ("full", "") if self.tool_hooks else ("none", "ttp's tool hooks are not wired for this provider yet")
+
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
         argv = [self.binary() or "claude", "-p", "--output-format", "stream-json", "--verbose", "--no-chrome"]
@@ -608,8 +613,9 @@ def hook_settings() -> dict:
                                                                          "timeout": 20}]}],
                       # Denies Bash calls that would get around the harness's PR draft guard, and edits
                       # to the harness's gh wrapper and gh.d pre-hooks outside a harness task, and connector
-                      # posts to others without the AI-authorship tag (aitag).
-                      "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|mcp__.*",
+                      # posts to others without the AI-authorship tag (aitag), and file tool reads of a
+                      # credential store (credguard).
+                      "PreToolUse": [{"matcher": "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*",
                                       "hooks": [{"type": "command", "command": f"{cmd} PreToolUse", "timeout": 20}]}],
                       # Refuses to end a task run whose result.json is missing or no hand-off (twice at most),
                       # or fails a hand-off check (the checks get handoffcheck.STOP_BUDGET_S in all).

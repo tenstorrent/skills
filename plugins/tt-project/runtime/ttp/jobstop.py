@@ -32,7 +32,8 @@ a running one gets SIGTERM to its group (it ends its check and writes a failed o
 A push queue batch serves many tasks and is never stopped here. A task that handed off done has its
 detached checks stopped too (sweep_done_checks), so they stop holding a check slot of the host, unless
 its own hand-off names them or something still waits on their result (checks_consumer: an open task's
-wait, another checks run that joined them).
+wait, another checks run that joined them). The daemon's review prechecks (state/prechecks, no runs row)
+are stopped once no review still reads them (sweep_prechecks).
 
 `ttp detach --stop-pids <file>` stops the processes a task's own driver listed in a pid file (stop_pids),
 for a driver started some other way than `ttp detach` (setsid and a pid file, its own launcher), so the
@@ -533,6 +534,43 @@ def sweep_done_checks(p: Project, now: float | None = None) -> list[dict]:
     return out
 
 
+def sweep_prechecks(p: Project, now: float | None = None) -> list[dict]:
+    """Stop the daemon's review prechecks (state/prechecks/t<task>-<head>) still running once no review
+    labelled precheck:<name> still reads them (checklane.precheck_read): their review is past dispatch (in
+    the push queue, done, failed) or none was ever labelled, so they only hold a host checks slot. They
+    must have started checks.done_holder_flag_s ago (checklane.done_flag_s), so the review's label is
+    written first; checks whose checks.rc is written are ending by themselves; those another task's hand-off
+    or a joined checks run still waits on (checks_consumer) stay; a group checks_refused names is never
+    signalled."""
+    from .checklane import done_flag_s, precheck_read
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    now = time.time() if now is None else now
+    grace = done_flag_s(p.config())
+    try:
+        dirs = sorted(x for x in (p.state / "prechecks").iterdir() if x.is_dir())
+    except OSError:
+        return []
+    out = []
+    for d in dirs:
+        task = precheck_task(p, d)
+        if task is None or (d / CHECKS_RC).exists():
+            continue
+        info = _read_checks_pid(d)
+        if not _checks_alive(info):
+            continue
+        try:
+            since = float(info.get("ts") or (d / "checks.pid").stat().st_mtime)
+        except (OSError, TypeError, ValueError):
+            continue
+        if now - since < grace or precheck_read(p.db, d.name) or checks_consumer(p, d) \
+                or checks_refused(p, d, task):
+            continue
+        r = end_checks(p, d, f"no review of task #{task} reads its precheck {d.name} any more", task)
+        if r:
+            out.append(r)
+    return out
+
+
 def stop_checks(p: Project, run_dir: Path, caller: str | None, caller_run: str | None = None,
                 given: str | None = None) -> tuple[int, str, dict | None]:
     """`ttp detach --stop <run>/checks.rc`: stop the run's detached checks (end_checks) when may_stop allows
@@ -812,11 +850,28 @@ def task_live_jobs(p: Project, task: int, now: float | None = None) -> list[Path
     return out
 
 
+PRECHECK_NAME = re.compile(r"t(\d+)-[0-9a-f]{7,40}")   # a review precheck's folder (Daemon._precheck)
+
+
+def precheck_task(p: Project, d: Path) -> int | None:
+    """The code task whose head the daemon's review precheck in folder `d` checks: state/prechecks/t<id>-<head>
+    (Daemon._precheck: no runs row), else None."""
+    d = Path(d)
+    m = PRECHECK_NAME.fullmatch(d.name)
+    if not m or os.path.realpath(d.parent) != os.path.realpath(p.state / "prechecks"):
+        return None
+    return int(m[1])
+
+
 def task_of(p: Project, rc: Path) -> dict | None:
-    """The task whose run started the job at this .rc."""
+    """The task whose run started the job at this .rc; for a review precheck's checks (precheck_task), the
+    code task it checks."""
     d = Path(rc).parent
-    return p.db.one("SELECT t.* FROM runs r JOIN tasks t ON t.id=r.task WHERE r.dir IN (?,?) ORDER BY r.id DESC LIMIT 1",
-                    (str(d), str(d.resolve())))
+    t = p.db.one("SELECT t.* FROM runs r JOIN tasks t ON t.id=r.task WHERE r.dir IN (?,?) ORDER BY r.id DESC LIMIT 1",
+                 (str(d), str(d.resolve())))
+    if t is None and (tid := precheck_task(p, d)) is not None:
+        return p.db.one("SELECT * FROM tasks WHERE id=?", (tid,))
+    return t
 
 
 def run_of(p: Project, rc: Path) -> int | None:
@@ -861,6 +916,7 @@ def sweep(p: Project, now: float | None = None) -> list[dict]:
                 out.append(r)
     out += _sweep_handed_off(p, now)
     out += sweep_done_checks(p, now)
+    out += sweep_prechecks(p, now)
     for marker, task, state in ended_pushes(p):
         if waited_on(p, marker) is None and (r := end_push(p, marker, f"task #{task} is {state}", task)):
             out.append(r)

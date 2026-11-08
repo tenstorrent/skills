@@ -819,12 +819,35 @@ def check(args: list[str], real: str, db=None, stdin_text: str | None = None, _d
     if cmd == "issue" and rest[:1] == ["edit"]:   # a PR is an issue: this may rewrite a PR's body
         from . import prbody
         return prbody.issue_problem(rest[1:], _project_config() if cfg is None else cfg, real, stdin_text)
+    if os.environ.get("TTP_RUN_DIR"):
+        from . import credguard
+        why = credguard.gh_refusal(args)
+        if not why and cmd == "api":
+            endpoint, method = _api_target(rest)
+            why = credguard.REF_WHY if credguard.ref_write(endpoint, method, _api_text(rest, stdin_text)) else None
+        if why:
+            return why
     if cmd == "api":
         return _check_api(rest, real, db, stdin_text, allowed, seen) or _api_body_problem(rest, real, stdin_text, cfg)
     return None
 
 
 _ALIAS_LISTS: dict[str, str] = {}   # real gh -> its `gh alias list`, read once per gh call (main clears it)
+
+
+def _api_text(args: list[str], stdin_text: str | None) -> str:
+    """A `gh api` call's fields and the bodies it sends (files it cannot read count as empty)."""
+    text = " ".join(_opts(args, ("-f", "-F", "--field", "--raw-field")))
+    for f in _opts(args, ("--input",)) + [v[1:] for v in (x.partition("=")[2] for x in _opts(args, ("-F", "--field")))
+                                           if v.startswith("@")]:
+        if f == "-":
+            text += " " + (stdin_text or "")
+            continue
+        try:
+            text += " " + Path(f).read_text(errors="replace")
+        except OSError:
+            continue
+    return text
 
 
 def _alias(real: str, name: str) -> str | None:
@@ -1200,6 +1223,8 @@ def main(argv: list[str], own_dir: str) -> int:
         why = check(args, real, db, stdin_text, allowed=allowed, seen=seen)
     except Exception as e:   # fails closed only for the calls it guards
         guarded = (args[:2] in (["pr", "ready"], ["pr", "create"]) or args[:1] == ["api"]
+                   or os.environ.get("TTP_RUN_DIR") and (args[:1] == ["release"] or args[:2] in (
+                       ["pr", "update-branch"], ["repo", "sync"]))   # credguard.gh_refusal
                    or args[:2] in (["pr", "edit"], ["issue", "edit"])
                    and any(a.startswith(("-b", "--body", "-F")) for a in args[2:]))
         why = f"refused: the PR draft guard failed ({e})" if guarded else None

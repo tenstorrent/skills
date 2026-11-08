@@ -21163,7 +21163,7 @@ def test_config_set_still_refuses_every_key_it_refused_before(env):
                  for k in ("model", "effort", "route", "route_timeout_s", "max_tokens", "context_window")}
     new = ({f"providers.{p}.tiers.{t}.{k}" for p in chatset.PROVIDERS for t in chatset.TIERS for k in ("model", "effort")}
            | {f"providers.chat.tiers.{t}.{k}" for t in chatset.TIERS for k in ("route", "route_timeout_s")}
-           | {"providers.chat.endpoint", "providers.chat.effort_fields"})
+           | {"providers.chat.endpoint", "providers.chat.effort_fields", "providers.chat.routes"})
     accepted = set()
     for k in keys:
         try:

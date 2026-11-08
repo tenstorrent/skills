@@ -172,6 +172,8 @@ PRIORITY_WAIT_ENV = "TTP_CHECKS_PRIORITY_WAIT_S"
 STARVE_S = 3600.0   # default checks.starve_s: a run waiting this long goes before later arrivals at its priority or lower
 AGED_TURNS = 3   # default urgent turns an aged routine run lets go before its own (aged_turns())
 STARVE_ENV = "TTP_CHECKS_STARVE_S"
+SMALL_TESTS = 500   # default checks.small_tests: a targeted run of fewer tests is short (is_small)
+SMALL_ENV = "TTP_CHECKS_SMALL_TESTS"
 URGENT = "checks-urgent"   # check-slots/checks-urgent.<n>.lock: the reserved urgent slots beyond the cap (urgent_paths)
 URGENT_SLOTS = 1   # default checks.urgent_slots: urgent runs at once above the cap
 URGENT_SLOTS_ENV = "TTP_CHECKS_URGENT_SLOTS"
@@ -491,6 +493,24 @@ def aged_turns() -> int:
     return AGED_TURNS if n == locks.URGENT_FIRST else max(n, 0)
 
 
+def small_tests() -> int:
+    """A targeted run (checklane.cost's "tests") of fewer tests than this is short (is_small): TTP_CHECKS_SMALL_TESTS,
+    else the account's checks.small_tests, else SMALL_TESTS; 0 turns it off. Account-level as starve_s: every waiter
+    on the host orders the shared queues by it. Negative or unreadable: the default."""
+    v = _number(os.environ.get(SMALL_ENV))
+    if v is None:
+        v = _number((project.load_account_settings().get("checks") or {}).get("small_tests"))
+    return SMALL_TESTS if v is None else v
+
+
+def is_small(cost: dict | None) -> bool:
+    """Whether a run of `cost` (checklane.cost) is a short targeted one: fewer than small_tests() tests. Such a
+    run goes first among its project's waiters at its priority (locks.SMALL_TICKET) and is held by no parked
+    longer one at its priority or a less urgent one (starved_ahead); the host cap (limit) still holds it."""
+    n = (cost or {}).get("tests")
+    return isinstance(n, int) and not isinstance(n, bool) and 0 <= n < small_tests()
+
+
 def order() -> dict:
     """locks.fair_order's (and my_turn's) ordering arguments for the checks queue."""
     return {"urgent_max": priority_turns(), "aged_before": aged_before(), "aged_turns": aged_turns()}
@@ -512,7 +532,8 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
     `priority`; none (push checks) is the least urgent. A priority-0 run is never held by a less urgent one.
     A run of `cost` (checklane.cost) is not held by one at its priority or less urgent whose run costs
     CHEAP_FACTOR times as much (checklane.much_cheaper: a targeted run beside full suites), its run's lane
-    label's cost by the run id in its ticket; a landing's ticket always holds it."""
+    label's cost by the run id in its ticket; a short one (is_small: shortest first) is held there only by
+    short ones (locks.is_small), whatever the others' costs; a landing's ticket always holds it."""
     now = time.time() if now is None else now
     edge, gid = aged_before(now), locks.group_id(project_name)
     try:
@@ -526,8 +547,10 @@ def starved_ahead(project_name: str | None, since: float | None = None, now: flo
             and locks._arrival(t) < me]
     if cost and (costly := [t for t in aged if locks.ticket_priority(t) >= rank and not locks.is_landing(t)]):
         from . import checklane
-        costs = checklane.run_costs(project_name)
-        aged = [t for t in aged if t not in costly or not checklane.much_cheaper(cost, costs.get(_ticket_run(t)))]
+        short = is_small(cost)
+        costs = {} if short else checklane.run_costs(project_name)
+        aged = [t for t in aged if t not in costly
+                or (locks.is_small(t) if short else not checklane.much_cheaper(cost, costs.get(_ticket_run(t))))]
     out = [t for t in aged if locks.ticket_priority(t) <= rank]
     passed = [t for t in aged if t not in out] if rank > 0 else []
     if passed and rank <= locks.URGENT_PRIORITY:
@@ -728,19 +751,39 @@ class Reranked(Upgraded):
 _SEEN: dict = {}   # upgraded(): the installed version it last saw differ, and since when
 
 
+def _tree(pkg: Path) -> str:
+    """A fingerprint of the runtime package's code in `pkg` (each .py file's path, size and mtime), "" if
+    unreadable: a fix that lands changes it without a version bump (upgraded)."""
+    try:
+        files = sorted(f for f in pkg.rglob("*.py") if "__pycache__" not in f.parts)
+        return hashlib.sha256("\n".join(f"{f.relative_to(pkg)} {(st := f.stat()).st_size} {st.st_mtime_ns}"
+                                         for f in files).encode()).hexdigest()[:12]
+    except OSError:
+        return ""
+
+
+_TREE0: dict = {str(Path(__file__).parent): _tree(Path(__file__).parent)}   # the tree this process imported
+
+
 def upgraded(init: Path | None = None, now: float | None = None, settle: float | None = None) -> str:
     """The runtime version now installed where this process imported its code from (`init`: that package's
-    __init__.py), when it differs from the version it runs and has stayed for `settle` seconds
-    (UPGRADE_SETTLE_S), else "". A version it re-executed for already (REEXEC_ENV) is never returned
+    __init__.py), when it differs from the version it runs, or the same version with its code changed on
+    disk since this process imported it (_tree: "<version>+<fingerprint>"), and has stayed for `settle`
+    seconds (UPGRADE_SETTLE_S), else "". A version it re-executed for already (REEXEC_ENV) is never returned
     again, so a re-execution that did not take the new code cannot loop."""
     from . import __file__ as own_init, __version__
     now = time.time() if now is None else now
+    init = Path(init or own_init)
     try:
-        text = Path(init or own_init).read_text(errors="replace")
+        text = init.read_text(errors="replace")
     except OSError:
         return ""
     m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', text, re.M)
     new = m.group(1) if m else ""
+    if new and new == __version__:
+        was = _TREE0.setdefault(str(init.parent), _tree(init.parent))
+        if was and (now_tree := _tree(init.parent)) and now_tree != was:
+            new = f"{new}+{now_tree}"
     if not new or new == __version__ or new == os.environ.get(REEXEC_ENV):
         _SEEN.clear()
         return ""
@@ -1008,7 +1051,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             owns: list[str] | tuple = (), cap: int | None = None, lane_at: float | None = None,
             startable: Callable[[], bool] | None = None,
             parks: Callable[[bool], None] | None = None, urgent: bool = False,
-            preemptible: bool = False) -> Slot | None:
+            preemptible: bool = False, small: bool = False) -> Slot | None:
     """Take a host-wide checks slot, waiting while all are held. Waiters take turns by project
     (`project_name`; none form their own group), within one by task priority (`priority`, 1 first;
     OBLIGATION_PRIORITY before it, its ticket marked OBLIGATION_MARK; none last), then arrival (locks.fair_order),
@@ -1036,7 +1079,9 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
     checks run now; with none free it asks the lowest-priority preemptible routine run on a slot of the cap
     to give its slot up (preempt), once a wait, and then takes the first one that frees, in turn or not.
     `preemptible`: the caller stops its checks when asked (preempted), so its slot's label says it may be
-    asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`."""
+    asked; Slot.since is when it was granted. It asks only once it waited preempt_after_s() from `since`.
+    `small` (is_small): its queue and PARKED tickets mark a short run (locks.SMALL_TICKET), which goes first
+    among its project's waiters at its priority; the cap and every other rule hold it as any run."""
     n = limit()
     was_preempted = bool(os.environ.get(PREEMPTED_ENV))   # preempted once: queues at its place, asked again last
     label = {"priority": priority, "checks_project": project_name, "owed": bool(owns),
@@ -1068,11 +1113,11 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             drop_claim(claim)
             return _urgent_granted(f, tell, state, project_name, priority, owns, since, cap, lane_at)
         ticket = None if parked else locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
-                                                   priority=priority, requeued=was_preempted)
+                                                   priority=priority, requeued=was_preempted, small=small)
         uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, None, queued_as, since, owns)
         if parked and tell:   # told once a wait: its pool's room may come and go
             tell(PARKED_LINE)
-        park = _park(parked, None, queued_as, since, project_name, priority)
+        park = _park(parked, None, queued_as, since, project_name, priority, small)
         if parked and parks:
             parks(True)
     except OSError as e:
@@ -1091,7 +1136,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             if twin:
                 _drop_pass()
             try:
-                park = _park(parked, park, queued_as, since, project_name, priority)
+                park = _park(parked, park, queued_as, since, project_name, priority, small)
                 uwait = _urgent_wait(urgent and is_urgent(priority) and not twin, uwait, queued_as, since, owns)
             except OSError as e:
                 raise _unavailable(e) from e
@@ -1109,7 +1154,7 @@ def acquire(holder: str, what: str = "", tell: Callable[[str], None] | None = No
             elif not twin and not parked and ticket is None:
                 try:
                     ticket = locks.enqueue(slot_dir(), RESOURCE, queued_as, since, group=project_name,
-                                           priority=priority, requeued=was_preempted)
+                                           priority=priority, requeued=was_preempted, small=small)
                 except OSError as e:
                     raise _unavailable(e) from e
                 if done and done():
@@ -1524,11 +1569,12 @@ def _drop_pass() -> None:
 
 
 def _park(parked: bool, park: Path | None, holder: str, since: float, project_name: str | None,
-          priority: int | None) -> Path | None:
+          priority: int | None, small: bool = False) -> Path | None:
     """The PARKED ticket a run holds while it waits outside the queue for its test slots (acquire), at its
     arrival `since`; dropped once it no longer does."""
     if parked and park is None:
-        park = _PARKS.park = locks.enqueue(slot_dir(), PARKED, holder, since, group=project_name, priority=priority)
+        park = _PARKS.park = locks.enqueue(slot_dir(), PARKED, holder, since, group=project_name, priority=priority,
+                                           small=small)
     elif not parked and park is not None:
         _PARKS.park = None
         locks.dequeue(park)

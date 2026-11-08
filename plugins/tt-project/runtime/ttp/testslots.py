@@ -75,6 +75,7 @@ gives a bare ninja -j k) through clamp_build(). A build inside a check uses the 
 """
 from __future__ import annotations
 
+import collections
 import contextlib
 import fcntl
 import hashlib
@@ -294,6 +295,8 @@ LOAD_URGENT = "test-slots-load-urgent"   # the one urgent run (priority 1 or bet
 LOAD_OWED = "test-slots-load-owed"   # the one priority-0 run (owed to the user) past it beside LOAD_PASS's
 LOAD_FLOOR = "test-slots-load-floor"   # the one run of any priority past it, so the queue keeps moving
 LOAD_GATE = "host load: "   # pool_gate's reason while the load guard holds a run (gate_lanes records it)
+STARVED_GATE = " run(s) of its project parked longer go first (checkcap.starved_ahead)"   # its reason's end there
+BUDGET_GATE = "its project's test-worker budget: "   # its reason's start while the project's budget holds the run
 
 
 def load_pass_path() -> Path:
@@ -451,6 +454,35 @@ def project_max(cfg: dict | None = None, s: tuple[int, int] | None = None, kind:
     if kind is TESTS and (w := project_workers(cfg, project_name=project_name)):
         top = min(top, w)
     return top
+
+
+def project_max_from(cfg: dict | None = None, s: tuple[int, int] | None = None,
+                     project_name: str | None = None) -> str:
+    """Which setting sets project_max() for tests, as project_max applies them: "workers" (project_workers:
+    the host's per-project ceiling), "pool" (the pool, checks.test_pool), "project" (its own
+    checks.test_project_slots), "env" (TTP_TEST_PROJECT_SLOTS), "account" (the account's, which a project's
+    own one only lowers), "run" (one run's grant, the floor) or "" (none set: the project cap's default)."""
+    s = s or sizes(cfg) or (0, 0)
+    if not s[0]:
+        return ""
+    env, key = TESTS.setting(TESTS.budget)
+    mine = _number(_section(cfg, "checks").get(key))
+    upper = _number(os.environ.get(env)) if os.environ.get(env) not in (None, "") else None
+    acct = _number((project.load_account_settings().get("checks") or {}).get(key))
+    top = upper or acct or mine
+    src = "env" if upper else "account" if acct else "project" if mine else ""
+    if mine and top and mine < top:
+        top, src = mine, "project"
+    if not top:
+        from . import checklane
+        top = max(1, checklane.project_cap(cfg)) * s[1]
+    w = project_workers(cfg, project_name=project_name)
+    bounded = max(s[1], min(top, s[0]))
+    if w and w < bounded:
+        return "workers"
+    if top < s[1]:
+        return "run"
+    return "pool" if s[0] < top else src
 
 
 def own_paths(project_name: str | None, n: int, kind: Kind = TESTS) -> list:
@@ -1160,11 +1192,11 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
     less urgent one, once per checkcap.aged_turns() urgent starts since its project's last routine start. A run leaves `need` slots of the pool to each urgent
     run of another project parked for its test slots ahead of it (urgent_parked: a routine run to every one,
     an urgent run to those more urgent or as urgent and older), so a freed slot goes to the urgent one, not
-    to whichever polls first. The reason names the term that failed, for status (checklane._parked)."""
+    to whichever polls first; one its own gate holds otherwise keeps none. The reason names the term that failed, for status (checklane._parked)."""
     if full and (why := load_held(priority, since=since)):
         return f"{LOAD_GATE}{why}"
     if (ahead := checkcap.starved_ahead(project_name, since, priority=priority, cost=cost)):
-        return f"{len(ahead)} run(s) of its project parked longer go first (checkcap.starved_ahead)"
+        return f"{len(ahead)}{STARVED_GATE}"
     if full and admitted_ahead(project_name, priority):
         return "a run of its project as urgent or more holds a host-wide checks slot and waits for its test slots"
     s = sizes(cfg)
@@ -1187,28 +1219,77 @@ def pool_gate(cfg: dict | None, project_name: str | None, full: bool = False, pr
             and locks.any_free(urgent := urgent_paths(project_name, top))):
         own_free = _free(urgent)
     if own and own_free < need:
-        return (f"its project's test-worker budget: {own_free} of {len(own)} free, a run needs {need}"
+        return (f"{BUDGET_GATE}{own_free} of {len(own)} free, a run needs {need}"
                 f" (held by {checkcap._some(list(dict.fromkeys(locks.held_labels(own))))})")
-    kept = need * urgent_parked(project_name, priority, since)
+    kept = need * urgent_parked(project_name, priority, since, budget=project_max(cfg, (pool, s[1])), need=need,
+                                 run_max=s[1], room=pool - used)
     if min(s[1], pool - used - kept) < need:
         return (f"the host's test pool: {pool - used} of {pool} free, a run needs {need}"
                 + (f", {kept} kept for {kept // need} urgent run(s) of other projects parked ahead" if kept else ""))
     return ""
 
 
-def urgent_parked(project_name: str | None, priority: int | None = None, since: float | None = None) -> int:
+def urgent_parked(project_name: str | None, priority: int | None = None, since: float | None = None,
+                  budget: int = 0, need: int = 1, run_max: int = 0, room: int | None = None) -> int:
     """How many urgent runs (locks.URGENT_PRIORITY or better) of other projects than `project_name` are parked
     for their test slots now (checkcap.PARKED tickets) ahead of a run at `priority` that arrived at `since`
-    (default now): every one for a routine run, else those more urgent, or as urgent and older."""
-    gid = locks.group_id(project_name)
+    (default now): every one for a routine run, else those more urgent, or as urgent and older. A run whose
+    own gate (pool_gate's reason its lane records: gate_lanes) is its project's aged turn (STARVED_GATE), its
+    project's budget (BUDGET_GATE) or the load guard (LOAD_GATE) is not counted: it could not take the slots
+    kept for it, so they would sit idle. One whose lane names no reason, or only the pool, still counts.
+    With a `budget` (the account's project_max), each project counts at most the runs of `need` slots its
+    free budget could start now (its urgent slots too while only less urgent runs hold it, as pool_gate
+    counts them): one whose budget is full keeps no pool slots. With the pool's free slots (`room`), one
+    the free room fitted (most urgent and oldest first) for UNTAKEN_S keeps none either: some other hold
+    keeps it off them (_untaken)."""
+    gid, d = locks.group_id(project_name), checkcap.slot_dir()
     try:
-        q = locks.queued(checkcap.slot_dir(), checkcap.PARKED)
+        q = locks.queued(d, checkcap.PARKED)
     except OSError:
         return 0
     mine = (float(priority), time.time() if since is None else since) \
         if priority is not None and priority <= locks.URGENT_PRIORITY else None
-    return sum(1 for t in q if locks._urgent(t) and locks.ticket_group(t) != gid
-               and (mine is None or (locks.ticket_priority(t), locks._arrival(t)) < mine))
+    ahead = [t for t in q if locks._urgent(t) and locks.ticket_group(t) != gid
+             and (mine is None or (locks.ticket_priority(t), locks._arrival(t)) < mine)]
+    if not ahead:
+        return 0
+    held = {r.get("pid") for r in locks.holder_records(sorted(d.glob(f"{SUITE}.*.lock")))
+            if (g := str(r.get("gate") or "")).startswith((LOAD_GATE, BUDGET_GATE)) or g.endswith(STARVED_GATE)}
+    held.discard(None)
+    ahead = sorted((t for t in ahead if ticket_pid(t) not in held),
+                   key=lambda t: (locks.ticket_priority(t), locks._arrival(t)))
+    stale = _untaken(ahead[:max(0, room) // max(1, need)]) if room is not None else set()
+    groups = collections.Counter(locks.ticket_group(t) for t in ahead if str(t) not in stale)
+    return sum(min(n, _group_free(d, g, budget, run_max) // max(1, need)) if budget and g else n
+               for g, n in groups.items())
+
+
+UNTAKEN_S = 300.0   # a parked urgent run that leaves free pool room untaken this long keeps no slots
+_ROOM_SINCE: dict = {}   # _untaken(): each parked ticket this process saw beside free room, and since when
+
+
+def _untaken(tickets: list, now: float | None = None) -> set:
+    """Of `tickets` (the parked runs the pool's free room fits now, most urgent and oldest first), those
+    (paths, as str) this process has seen so for UNTAKEN_S or longer: a run that could start takes free
+    room within a poll, so one that leaves it untaken is held by something else. Room taken or gone
+    starts its count again."""
+    now = time.time() if now is None else now
+    keep = {str(t) for t in tickets}
+    for k in set(_ROOM_SINCE) - keep:
+        del _ROOM_SINCE[k]
+    return {k for k in keep if now - _ROOM_SINCE.setdefault(k, now) >= UNTAKEN_S}
+
+
+def _group_free(d: Path, gid: str, budget: int, run_max: int) -> int:
+    """How many test slots the project of group id `gid` could still take under the account's `budget`
+    (project_max): the budget less every slot of its budget held, or while only less urgent runs hold
+    them, its free urgent slots (urgent_paths, one run's grant: `run_max`)."""
+    own = locks.slot_paths(d, f"{TESTS.own}.{gid}", max(budget, checkcap.cores()))
+    held = locks.holder_records(own)
+    free = max(0, budget - _held(own))
+    if held and all(_rank(r) > 1 for r in held):
+        free = max(free, _free(locks.slot_paths(d, f"{TESTS.own}.{gid}-x", min(budget, run_max or budget))))
+    return free
 
 
 @contextlib.contextmanager
@@ -1307,11 +1388,15 @@ def over_cap_room(project_name: str, cap: int) -> bool:
                         for r in locks.holder_records(lane_paths(project_name, repo=None))))
 
 
-def landing_room(project_name: str) -> bool:
-    """Whether a landing check (task-less or under a landing mark) may take the project's landing lane:
-    no lane of the project is held as one ("landing") already. It skips the project's lanes and cap."""
-    return bool(project_name) and not any(
-        r.get("landing") for r in locks.holder_records(lane_paths(project_name, repo=None)))
+def landing_room(project_name: str, kind: str = "mark") -> bool:
+    """Whether a landing check of `kind` may take a landing lane past the project's lanes and cap. A run under
+    a landing mark ("mark": a push batch's or `ttp push`'s checks) has its own lane: only another mark run
+    holding one keeps it waiting, never the coordinator's task-less run. The coordinator's run ("coordinator")
+    takes one only while no landing lane of the project is held. A lane taken by an older runtime ("landing":
+    true) counts as a mark run's."""
+    recs = locks.holder_records(lane_paths(project_name, repo=None)) if project_name else []
+    held = [r.get("landing") for r in recs if r.get("landing")]
+    return bool(project_name) and not (held if kind == "coordinator" else [k for k in held if k != "coordinator"])
 
 
 def _reclaim(path, tell, state) -> bool:
@@ -1421,7 +1506,7 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                cap_note: str = "", worktree: str = "", headroom: Callable[[], bool] | None = None,
                age: float | None = None, pending: bool = False, check: str = "",
                repo_name: str = "", name: str = "", startable: Callable[[], bool] | None = None,
-               running: bool = False, landing: bool = False) -> Grant | None:
+               running: bool = False, landing: bool | str = False) -> Grant | None:
     """Hold one of project `project_name`'s `slots` checks lanes in repository `repo` (repo_key) for its
     full checks (above), waiting while its other runs there hold them all or a more urgent waiter is ahead
     (suite_order); Grant(0) holding one, Grant() with no project or nested in a check, None once `wait_s`
@@ -1562,11 +1647,13 @@ def suite_hold(project_name: str | None, tell: Callable[[str], None] | None = No
                     if over:   # one priority-1 run at a time past the project's full cap
                         f = locks.try_take(extra_lanes, label, what,
                                            extra={**fields, "overflow": True, "over_cap": True, "urgent": True})
-                    if f is None and landing and landing_room(project_name):
-                        # A landing check (a push batch's or another task-less one) never waits behind the
-                        # project's task checks: one at a time takes its own lane past the lanes and the cap.
+                    kind = "coordinator" if landing == "coordinator" else "mark" if landing else ""
+                    if f is None and kind and landing_room(project_name, kind):
+                        # A landing check (a push batch's, or the coordinator's task-less one) never waits behind
+                        # the project's task checks: one of each kind at a time takes its own lane past the lanes
+                        # and the cap, and a mark run never waits behind the coordinator's (landing_room).
                         f = locks.try_take(extra_lanes, label, what,
-                                           extra={**fields, "overflow": True, "over_cap": True, "landing": True})
+                                           extra={**fields, "overflow": True, "over_cap": True, "landing": kind})
                         if f is not None and tell:
                             tell("took the project's landing lane: a task-less or landing check never waits "
                                  "behind its task checks (the host-wide cap still applies)")

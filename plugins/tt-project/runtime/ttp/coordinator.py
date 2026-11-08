@@ -110,6 +110,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     upstream,
     userwords,
     verified,
+    wakemode,
     watchdup,
     worktree,
     yesask,
@@ -478,8 +479,10 @@ USER_SETTABLE = {
     "providers.codex.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # Unset, chat takes the claude value (project.CHAT_INHERITS); set, it wins.
     "providers.chat.worker_isolation": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
-    # The worker sandbox: false runs workers unfenced. Set only in a turn carrying the user's word (NEEDS_USER).
+    # The worker sandbox and the checks' process sandbox: false (unsandboxed) is anyone's; true only the user's
+    # own (SANDBOX_KEYS): config_set refuses it, the web settings page the user drives sets it.
     **{f"providers.{n}.write_fence": lambda v: str(v).lower() in ("1", "true", "yes", "on") for n in chatset.PROVIDERS},
+    "sandbox.checks": lambda v: str(v).lower() in ("1", "true", "yes", "on"),
     # MCP servers from the user's own Claude config that isolated workers still get, by name.
     "providers.claude.mcp_servers": lambda v: name_list(v, strict=True),
     # Connected MCP servers kept from workers on purpose: ttp status no longer names them (mcpgap.py).
@@ -1290,7 +1293,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                      + (f" · {bud.lane_words(g['lane'])}" if (g.get("lane") or {}).get("max_parallel") else "")
                      + (f" · unblock path: {path}" if path else ""))
     # Once, not per provider: the caps bound every usage-billed provider's spend together.
-    lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now))
+    lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now, home))
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
     section("budget", lines)
     lines = []
@@ -1690,15 +1693,32 @@ NEEDS_USER = {"budget.daily_usd": "spend", "budget.weekly_usd": "spend", "budget
               "delivery.allow_protected_push_branch": "restriction", "delivery.own_push": "restriction",
               "delivery.rebase_replace": "restriction", "delivery.never_force": "restriction",
               MERGE_KEY: "merge", relay.AGENT_KEY: "restriction", restriction_source.OWNER_IDS_KEY: "restriction"}
-# The worker sandbox (providers.<name>.write_fence) is the user's, both ways: a harness-wide order of theirs
-# (such as unsandboxed runs) sets it for every project, and no project turns it back on or off on its own
-# judgement. `ttp config` refuses it inside a run, as every NEEDS_USER key.
-SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS}
+# The keys that turn namespace sandboxing on (the worker write fence, providers.<name>.write_fence, and the
+# checks' process sandbox, sandbox.checks) are the user's: their harness-wide order runs everything
+# unsandboxed and no project turns it back on by its own decision. Only the user's own word turns one on
+# (`ttp config` in their own shell, the web settings page): a run's `ttp config` and every coordinator
+# config_set refuse the on value, also in a turn carrying a user message; false or unset is anyone's.
+SANDBOX_KEYS = {f"providers.{n}.write_fence" for n in chatset.PROVIDERS} | {"sandbox.checks"}
 NEEDS_USER.update(dict.fromkeys(SANDBOX_KEYS, "restriction"))
-# The process sandbox for check commands: turning it on is the user's too (sandboxstate); off is the safe side.
-NEEDS_USER["sandbox.checks"] = "restriction"
+# restrictions.no_internet also turns sandboxing on (Codex workspace-write and read-only, Cursor --sandbox) and
+# is a Restriction: a run changes it in neither direction, as clearing it loosens one (not SAFE_WHEN_OFF).
+NEEDS_USER["restrictions.no_internet"] = "restriction"
+
+
+def sandbox_on(value) -> bool:
+    """Whether a value written at a SANDBOX_KEYS key may turn the sandbox on: anything but a plain off value
+    (None or '' unset it; a reader such as the write fence counts only `false` as off, so 9 is on)."""
+    return not (value is None or value is False or str(value).strip().lower() in ("", "0", "false", "no", "off"))
+
+
+def sandbox_refusal(key: str) -> str:
+    return (f"{key} turns namespace sandboxing on, a setting only the user may change: only the user's own word "
+            f"turns it on (`ttp config` in their own shell, or the web settings page), never a run or the "
+            f"coordinator; its off value (false, or '' to unset) may be set by anyone")
+
+
 NEEDS_USER["coordinator.session.tools"] = "restriction"   # read_only, its safe side, needs no word
-SAFE_WHEN_OFF = {"coordinator.session.tools", "sandbox.checks", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
+SAFE_WHEN_OFF = {*SANDBOX_KEYS, "coordinator.session.tools", relay.AGENT_KEY, "delivery.code_tasks_may_push", "budget.reset_credits_auto", "delivery.backup_remote", "delivery.fast_forward_also",
                  "delivery.mirror_remotes",
                  "delivery.allow_protected_push_branch", "delivery.own_push", "delivery.rebase_replace",
                  "delivery.never_force"}
@@ -2373,6 +2393,19 @@ def _onhost_checked(p: Project, text: str, chat: str | None, a: dict, rest: list
     return text
 
 
+def _wakemode_checked(p: Project, text: str, notes: list) -> str:
+    """A reply, notify or ask as wakemode.guard posts it: a claim that the coordinator runs in its always-on
+    session is sent marked (unverified) with the recorded wake mode when the wake is stateless or most of
+    today's wakes were. Any fault posts the text unchanged: a message is never lost to this check.
+    Kept apart so the live-state claim check can take it in as one of its claims."""
+    try:
+        text, why = wakemode.guard(p.db, timefmt.home(p), text)
+        notes += why
+    except Exception as e:
+        notes.append(f"wakemode: the session-claim check failed ({type(e).__name__}: {e}); the message went unchecked")
+    return text
+
+
 def apply(p: Project, actions: list[dict], default_chat: str | None = None, user_turn: bool = False,
           turn: int | None = None, messages: list[int] | None = None, lean: bool = False,
           applied: list | None = None) -> list[str]:
@@ -2444,6 +2477,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None if chat in (None, "all") else chat, a, order[k + 1:],
                                             batch_tasks, notes)
+                a["text"] = _wakemode_checked(p, a["text"], notes)
                 replies.append(msgparts.post(db, a["text"], chat=None if chat in (None, "all") else chat, kind="reply",
                                              severity=_norm_severity(a.get("severity") or "normal"))[0])
                 turnrules.record_cites(db, chat, cites, replies[-1])
@@ -3178,6 +3212,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     why = prguard.findings_problem(db, text)
                     if why:
                         raise ValueError(f"ask_user rejected: {why}")
+                text = _wakemode_checked(p, text, notes)
                 text, rec = db.for_user(text), db.for_user((a.get("recommendation") or "").strip())   # notes follow them
                 least = db.for_user(least)   # the least-disruptive part is appended mid-message: its tag would stay
                 if a["blocking"] == "restriction":
@@ -3228,6 +3263,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     obligations.check_claims(a["claims"], p)
                 said = workernotify.named(a["text"])   # the ids the coordinator named, before onhost's status line
                 a["text"] = _onhost_checked(p, a["text"], None, a, order[k + 1:], batch_tasks, notes)
+                a["text"] = _wakemode_checked(p, a["text"], notes)
                 sent.append((msgparts.post(db, a["text"], chat=None, kind="alert",
                                            severity=_norm_severity(a.get("severity")))[0], None, a["text"]))
                 if a.get("claims"):
@@ -3238,6 +3274,12 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "
                              f"({', '.join(rec['files']) or 'no file named: it reaches no task prompt'})")
             elif t == "memory_add":
+                if forged := coordsession.checked(db, a["text"], relay.agent_orders(cfg), strict=False)[1]:
+                    coordsession.log_dropped(db, "memory_add", forged)
+                    raise ValueError(f"memory_add rejected: a line labelled as the user's words fails the verbatim "
+                                     f"check: {forged[0][1]}. Quoted text on such a line must be that message's own "
+                                     f"words, with its msg #N; put names and terms in backticks, or record it as "
+                                     f"your own decision or a fact, without the user's-words label")
                 text = _unapplied_config_note(a["text"], cfg_refused)
                 if text != a["text"]:
                     notes.append("memory_add: noted in the entry that a config_set it names was rejected")
@@ -3611,6 +3653,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 # routing key (chatset) its own check, so no routed tier loses its model or endpoint.
                 remove = a.get("value") == "" and key in USER_SETTABLE and key not in accountset.KEYS
                 value = None if remove else conv(a.get("value"))
+                if key in SANDBOX_KEYS and sandbox_on(value):
+                    raise ValueError(sandbox_refusal(key))
                 chatset.route_ready(cfg, key, value)
                 if key == "delivery.backup_remote" and (why := push.backup_problem({**(cfg.get("delivery") or {}),
                                                                                     "backup_remote": value})):

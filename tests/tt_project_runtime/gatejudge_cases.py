@@ -191,6 +191,8 @@ def test_the_select_plugin_matches_a_cwd_relative_id_without_config_cwd_relative
     monkeypatch.delenv("TTP_PYTEST_SELECT", raising=False)
     monkeypatch.delenv("TTP_PYTEST_SELECT_FILES", raising=False)
     monkeypatch.setenv("TTP_PYTEST_SELECT_IDS", "test_b.py::test_x\n")
+    for k in ("PYTEST_ADDOPTS", "PYTHONPATH"):   # the configure strip edits them: restored after
+        monkeypatch.setenv(k, os.environ.get(k, ""))
     sel.pytest_configure(config)
     sel.pytest_collection_modifyitems(config, items)
     assert [i.nodeid for i in items] == ["tests/test_b.py::test_x"]

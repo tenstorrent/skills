@@ -20,7 +20,8 @@ run; `delivery.checks_targeted: false` (or `ttp checks --full`) runs every task'
 With the push queue on (project.push_queue_on), every batch runs the full suite on the merged tree before
 anything is pushed and bisects a failure to the changes at fault, so a task's own checks run in full only
 where the whole suite is affected (HARD: a conftest, test helper or data file, the runner files, a
-manifest, `__init__.py` or config file, a listed file's module-level code, most of the suite). A change
+manifest, `__init__.py` or config file, a listed file's module-level code); a selection of most of the suite
+stays targeted, since the batch runs every test anyway. A change
 only the full suite would cover (SOFT: a module's module-level code, the checks runner's functions in a
 module, what no test names) adds the tests it can place, and the scope line names it as left to the batch."""
 from __future__ import annotations
@@ -35,7 +36,7 @@ from pathlib import Path
 KEY, ALWAYS_KEY = "checks_targeted", "checks_targeted_always"   # delivery.<key>
 ALWAYS = ("tests/test_plugin_catalogue.py",)
 FILES_ENV = "TTP_PYTEST_SELECT_FILES"   # one unit per line: a source file, or <test file>::<test name>
-MAX_SHARE = 0.5      # a selection of at least this share of the tests runs in full
+MAX_SHARE = 0.5      # a selection of at least this share of the tests runs in full (not in a push-queue project)
 MAX_ENV = 64_000     # the selection's size cap (one exported variable of the check's shell line)
 FULL_NAMES = {"conftest.py", "__init__.py", "plugin.json", "marketplace.json", "pytest.ini", "pyproject.toml",
               "setup.cfg", "setup.py", "tox.ini", "requirements.txt"}
@@ -255,7 +256,7 @@ def pick(top: Path, base: str, head: str, files: list[str], always=ALWAYS,
     if not chosen:
         return [], "nothing in the diff maps to a test"
     n, total = _weight(us, chosen), max(1, _weight(us, us))
-    if (share := n / total) >= MAX_SHARE:
+    if soft is None and (share := n / total) >= MAX_SHARE:   # a push batch runs the whole suite anyway
         return [], f"the diff reaches {share:.0%} of the tests"
     out = sorted(chosen)
     if len("\n".join(out)) > MAX_ENV:

@@ -109,6 +109,7 @@ from . import chaincap
 from . import publishkind
 from . import chatbridge
 from . import route
+from .route import KEY as ROUTE_KEY, run_model as route_run_model   # start_run's local `route` shadows the module
 from . import checkcap
 from . import conflictfix
 from . import correction
@@ -206,6 +207,7 @@ from . import verified
 from . import waitgate
 from . import waitheal
 from . import watchdup
+from . import wakemode
 from . import queuetrim
 from . import schedrun
 from . import screen as scr
@@ -2338,8 +2340,14 @@ class Daemon:
             log(self.p, "ledger pause check failed\n" + traceback.format_exc())
         try:
             self._machine_probes.tick(now)
+            mine: list = []
+
+            def lists(alias: str) -> bool:   # a user page no maker or owner here takes: only if the charter lists it
+                if not mine:
+                    mine.append(set(machine_ledger.resource_machines(self.p)))
+                return alias in mine[0]
             pages = machine_ledger.route(now, claimer=self.p.name, budgets=outagetask.budgets(self.cfg),
-                                          log=lambda m: log(self.p, m))
+                                          log=lambda m: log(self.p, m), lists=lists)
         except Exception:
             log(self.p, "routing shared-machine pages failed\n" + traceback.format_exc())
             return
@@ -2942,6 +2950,9 @@ class Daemon:
             # pick, a review's sizing, a retry) moves its budget and timeout, never a pinned model or effort.
             # The runner checks that the agent's session resolves the pin before its first turn (check_pin).
             pin = {k: str(task.get(k)) for k in ("model", "effort") if str(task.get(k) or "")}
+            routed = (note or {}).get(ROUTE_KEY) or {}
+            if provider == routed.get("to") and (by_rule := route_run_model(self.cfg, tier, routed)):
+                model, effort = by_rule   # a providers.chat.routes rule's model and effort (route.run_model)
             model = pin.get("model") or model
             effort = pin.get("effort") or effort
             ab = (note or {}).get(effortab.KEY)
@@ -2966,7 +2977,8 @@ class Daemon:
         denied = coord.tool_list(self.cfg["providers"].get(provider, {}).get("disallowed_tools") or [])
         from .project import secrets_path
         from .web import token_path
-        no_reads = [str(token_path(self.p).resolve()), str(secrets_path().resolve())]
+        from .credguard import credential_files
+        no_reads = [str(token_path(self.p).resolve()), str(secrets_path().resolve()), *credential_files()]
         argv, env = prov.build(role=role, model=model, effort=effort, cwd=cwd, budget_usd=budget_usd,
                                read_only=read_only, schema=schema, restrictions=restrictions,
                                disallowed_tools=denied, denied_reads=no_reads,
@@ -3047,9 +3059,11 @@ class Daemon:
                 system, context = session_prompt["system"], session_prompt["context"]
                 try:   # a new or compacted session's pinned record (coordsession.py): no order, promise or decision is lost
                     if session_mode == "new" or restoring:
-                        lead = (coordsession.seed(self.p, state, why, session_prompt.get("cached") or "")
+                        from .relay import agent_orders
+                        agent = agent_orders(self.cfg)
+                        lead = (coordsession.seed(self.p, state, why, session_prompt.get("cached") or "", agent=agent)
                                 if session_mode == "new" else
-                                coordsession.restore(self.p, state, session_prompt.get("cached") or ""))
+                                coordsession.restore(self.p, state, session_prompt.get("cached") or "", agent=agent))
                         prompt = lead + "\n\n" + prompt
                         pending = {k: v[0] for k, v in coordsession.memory_view(self.p).items()}
                     else:   # memory recorded since the last wake, though a re-render emptied the digest's deltas
@@ -3060,6 +3074,7 @@ class Daemon:
                         prompt = prompt + "\n\n" + coordsession.compact_ask(state)
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
+            prompt = self._wake_mode_line(session_mode, why, True, prompt)   # before the seed cap counts it
             compact_at = 0   # the agent's own compaction switch, at the size the session compacts at
             if session_mode in ("new", "resume"):   # never below this wake's own prompt, whatever the state knows
                 fixed = sum(len(t or "") for t in (system, context, append_system, prompt)) // CHARS_PER_TOKEN \
@@ -3532,9 +3547,12 @@ class Daemon:
         """Stop the detached checks that still wait for a host-wide checks slot though nobody will read
         their result: those of an ended task's runs (done, failed or changes_needed, cancelled, however
         long ago), of a run whose task is gone, and of an ended run that has no task. Each holds a place
-        other tasks' checks wait behind. A cancel request (cli.CHECKS_SLOT_CANCEL) names the waiter by pid
-        and start time and why, and only that process honours it, only while it waits: checks that hold a
-        slot already run on to their end. Runs started within REAP_CHECKS_WINDOW_S only."""
+        other tasks' checks wait behind. Also those of a live task's earlier run once the task moved to a
+        newer run (re-dispatched; _moved_checks): one task never holds two checks runs. A cancel request
+        (cli.CHECKS_SLOT_CANCEL) names the waiter by pid and start time and why, and only that process
+        honours it, only while it waits (for its lane, a slot, its test slots while parked on its lane, or
+        a run it follows): it leaves the queue and frees its lane; checks that hold a slot already run on
+        to their end. Runs started within REAP_CHECKS_WINDOW_S only."""
         now = time.time()
         if now - getattr(self, "_reaped_checks", 0.0) < every_s:
             return
@@ -3544,7 +3562,7 @@ class Daemon:
         for r in self.p.db.q(f"SELECT runs.id, runs.dir, runs.task, tasks.status FROM runs LEFT JOIN tasks ON tasks.id=runs.task "
                              f"WHERE runs.started > ? AND (tasks.status IN ({marks}) OR (tasks.id IS NULL AND "
                              "(runs.task IS NOT NULL OR runs.status != 'running')))",
-                             (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES)):
+                             (now - REAP_CHECKS_WINDOW_S, *TERMINAL_TASK_STATES)) + self._moved_checks(now):
             run_dir = self._run_dir(r)
             try:
                 wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
@@ -3553,7 +3571,10 @@ class Daemon:
             info = _read_checks_pid(run_dir)
             if not isinstance(wait, dict) or wait.get("pid") != info.get("pid") or not _checks_alive(info):
                 continue
-            why = f"task #{r['task']} ended ({r['status']})" if r["status"] else \
+            if r.get("newer") and self._checks_still_wanted(run_dir, info):
+                continue
+            why = f"task #{r['task']} moved to run {r['newer']}" if r.get("newer") else \
+                f"task #{r['task']} ended ({r['status']})" if r["status"] else \
                 f"task #{r['task']} is gone" if r["task"] is not None else f"run {r['id']} ended and has no task"
             req = {"pid": info["pid"], "started": info["started"], "why": why}
             try:
@@ -3568,6 +3589,42 @@ class Daemon:
                 continue
             log(self.p, f"run {r['id']}: asked its checks (pid {info['pid']}) to stop waiting for a host-wide "
                         f"checks slot: {why}")
+
+    def _moved_checks(self, now: float) -> list[dict]:
+        """The ended worker runs of live tasks that have a newer worker run (re-dispatched, or woken again),
+        each with "newer" (the task's latest run): reap_waiting_checks stops their waiting checks unless
+        _checks_still_wanted."""
+        marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+        since = now - REAP_CHECKS_WINDOW_S
+        return self.p.db.q(   # one pass over the runs (no index on runs.task)
+            "SELECT runs.id, runs.dir, runs.task, tasks.status, m.newer FROM runs JOIN tasks ON tasks.id=runs.task "
+            "JOIN (SELECT task, MAX(id) AS newer FROM runs WHERE started > ? AND role != 'coordinator' "
+            "AND task IS NOT NULL GROUP BY task) m ON m.task=runs.task WHERE runs.started > ? AND m.newer > runs.id "
+            f"AND runs.status != 'running' AND runs.role != 'coordinator' AND tasks.status NOT IN ({marks})",
+            (since, since, *TERMINAL_TASK_STATES))
+
+    def _checks_still_wanted(self, run_dir: Path, info: dict) -> str:
+        """Why an earlier run's waiting checks (_moved_checks) stay, or "": a live task's recorded wait names
+        that run (its retry_when, then, on_pass_cmd or next_step: the task's own hand-off still points at
+        them, or another task waits on them), or another run follows them (checkjoin: it joined them, or
+        they superseded it), whose outcome it would lose."""
+        from . import checkjoin
+        tail = re.compile(re.escape(f"{run_dir.parent.name}/{run_dir.name}") + r"(?![\w.-])")
+        marks = ",".join("?" * len(TERMINAL_TASK_STATES))
+        for t in self.p.db.q(f"SELECT id, result FROM tasks WHERE status NOT IN ({marks}) AND result LIKE ?",
+                             (*TERMINAL_TASK_STATES, f"%{run_dir.name}%")):
+            res = load_result(t["result"])
+            waits = [res.get(k) for k in ("retry_when", "on_pass_cmd", "next_step")]
+            waits += [w.get(k) for w in (res.get("then") or []) if isinstance(w, dict)
+                      for k in ("retry_when", "on_pass_cmd")]
+            if any(isinstance(w, str) and tail.search(w) for w in waits):
+                return f"task #{t['id']} waits on them"
+        recs = checkjoin.records(self.p.state, prune=False)
+        mine = {x.get("id") for x in recs if x.get("pid") == info.get("pid") and x.get("run") == run_dir.name
+                and not x.get("outcome")}
+        if any(x.get("follows") in mine and x.get("alive") is not False and not x.get("outcome") for x in recs):
+            return "another run follows them"
+        return ""
 
     def reap_runs(self) -> None:
         up = self._awake.tick()
@@ -4382,6 +4439,15 @@ class Daemon:
             (before if before is not None else 1 << 62, task, session, f"%{session}%"))
             if o["session_id"] == session or json.loads(o["note"] or "{}").get("session_id") == session)
 
+    def _wake_mode_line(self, mode: str, why: str, session: bool, prompt: str) -> str:
+        """The coordinator wake's prompt led by its real mode and today's counts, from the record `ttp stats
+        --coord-session` reads, never the mode setting (wakemode.py). A fault runs the wake without it."""
+        try:
+            return wakemode.prompt_line(self.p.db, timefmt.home(self.p), mode, why, session=session) + "\n\n" + prompt
+        except Exception as e:
+            log(self.p, f"coordinator wake mode line failed: {type(e).__name__}: {e}"[:300])
+            return prompt
+
     def renet_coord_sessions(self) -> list[tuple[int, float, float]]:
         """Once per project (kv COORD_RENET_KEY): resumed coordinator session wakes booked before
         _net_of_session covered them carry the session's running total. Re-net each, oldest first, with
@@ -4950,8 +5016,9 @@ class Daemon:
         db, now = self.p.db, time.time()
         try:
             ctx = self._session_context(r, usage) if session.get("mode") in ("new", "resume") else None
-            if session.get("digest") and (coordsession.asked_full(actions) or self._compacted(r)
-                                          or (ctx or {}).get("compacted")):
+            compacted = ok and session.get("mode") in ("new", "resume") and (self._compacted(r)
+                                                                             or bool((ctx or {}).get("compacted")))
+            if session.get("digest") and (coordsession.asked_full(actions) or compacted):
                 session = {k: v for k, v in session.items() if k != "digest"}
             state = db.kv(coordsession.KEY)
             if session.get("mode") == "resume" and not ok:
@@ -4991,7 +5058,8 @@ class Daemon:
                       f"starts it again, seeded with the hand-off", json.dumps({"run": r["id"]}), "handled"))
             if ok and session.get("mode") in ("new", "resume") and isinstance(out, dict) and out.get("session_note"):
                 sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
-                if path := coordsession.save_note(self.p, sid, out.get("session_note")):
+                from .relay import agent_orders
+                if path := coordsession.save_note(self.p, sid, out.get("session_note"), agent_orders(self.cfg)):
                     log(self.p, f"coordinator run {r['id']}: session note saved to {path}")
             compacted = None
             if session.get("mode") in ("new", "resume"):
@@ -9344,7 +9412,7 @@ class Daemon:
             session_digest = {"parts": parts, "full": full, "seen": coordsession.fingerprint(baseline),
                               "shown": coordsession.fingerprint(shown)}
             head, context = coord.prompt_parts(self.p)
-            s_head, s_context = coordsession.session_prompt_parts(self.p)   # byte-stable prompt and its schema
+            s_head, s_context = coordsession.session_prompt_parts(self.p, provider)   # byte-stable prompt and its schema
             session_prompt = {"system": s_head, "context": s_context, "cached": cached}
             context = coord.with_cached(context, cached)
             burst = bursthold.carried(db, evs)
@@ -9656,7 +9724,7 @@ class Daemon:
                     routed["waited_s"] = round(now - self._route_waits.pop(task["id"]), 1)
                 routed["fallback"] = why or "none"
             run_prov = routed["to"] if routed and routed["fallback"] == "none" else provider
-            if run_prov != provider and (limit := route.timeout_s(self.cfg, tier)):
+            if run_prov != provider and (limit := route.timeout_s(self.cfg, tier, routed.get("rule"))):
                 routed["timeout_s"] = limit   # the tier's routed run time limit, in place of its run_timeout_s
             if run_prov != ctx["slot"].get(task["id"], provider):
                 # Its tier or the route changed after the slot check: it takes a slot where it runs.
@@ -10013,11 +10081,11 @@ class Daemon:
     def _floor_keeps_core(self, task: dict, tier: str, picked: dict | None) -> str:
         """The routed model (route.py) a floor run (tierfloor.target) skips to run on the core provider,
         or '' when its tier routes nowhere or it is no floor run."""
-        to = route.target(self.cfg, tier)
+        to = route.match(self.cfg, task, tier)
         if not to or not route.eligible(task, picked):
             return ""
         try:
-            return f"{to[0]}:{to[1]}" if tierfloor.target(self.p.db, self.cfg, task) else ""
+            return f"{to['to']}:{to['model']}" if tierfloor.target(self.p.db, self.cfg, task) else ""
         except Exception as e:   # the floor must never hold a task back
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
             return ""
@@ -10058,16 +10126,16 @@ class Daemon:
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)
-            to = (got["provider"], got["model"]) if got else None
+            to = {"to": got["provider"], "model": got["model"], "rule": None} if got else None
         else:
-            to = route.target(self.cfg, tier)
+            to = route.match(self.cfg, task, tier)
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
-        name, model = to
+        name, model = to["to"], to["model"]
         if dp is not None:
             return {**self._route_entry(task, tier, name, model, now), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
-        return self._route_entry(task, tier, name, model, now)
+        return self._route_entry(task, tier, name, model, now, to["rule"])
 
     def _model_pick(self, task: dict, tier: str, peek: bool = False) -> dict | None:
         """This start's model pick (modelpick.pick), or None: the tier's own route decides. `peek`
@@ -10084,21 +10152,22 @@ class Daemon:
             log(self.p, f"task {task.get('id')}: model not picked: {e}")
             return None
 
-    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float) -> dict:
+    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | None = None) -> dict:
+        rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
-            return {"tier": tier, "to": name, "model": model, "fallback": "rerun", "after": after}
+            return {"tier": tier, "to": name, "model": model, **rule, "fallback": "rerun", "after": after}
         try:
             esc = route.escalation(self.p.db, task) if task.get("id") else {}
         except Exception as e:   # escalation must never hold a task back
             log(self.p, f"task {task['id']}: route escalation not checked: {type(e).__name__}: {e}")
             esc = {}
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
-            return {"tier": tier, "to": name, "model": model, "fallback": route.ESCALATED, **esc}
-        why ="model_missing" if route.held(self.p.db, self.cfg, tier) else route.cooling(self.p.db, name, now)
+            return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
+        why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
         if not why and self._logged_out(name) and not self._may_probe(name, now):
             why = "auth"   # the auth gate holds it; its one login check may be a routed run
-        return {"tier": tier, "to": name, "model": model, "fallback": why or "none"}
+        return {"tier": tier, "to": name, "model": model, **rule, "fallback": why or "none"}
 
     def _slot_provider(self, task: dict, provider: str, ctx: dict) -> str:
         """The provider whose worker slots a start of `task` takes: the one its tier is routed to
@@ -10128,7 +10197,7 @@ class Daemon:
         (route.host_take): (provider, key), or None when the host's slots are all held. A lease file
         that cannot be written never holds the run back (logged)."""
         prov, key = routed["to"], self._route_key(task["id"])
-        limit = route.timeout_s(self.cfg, tier) or (self.cfg["budget"].get("run_timeout_s") or {}).get(tier, 3600)
+        limit = route.timeout_s(self.cfg, tier, routed.get("rule")) or (self.cfg["budget"].get("run_timeout_s") or {}).get(tier, 3600)
         until = now + float(limit) + route.LEASE_GRACE_S
         pid = os.getpid()
         if run_id is not None:

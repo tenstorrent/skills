@@ -139,14 +139,28 @@ def coordinator_role(p: Project) -> str:
     return feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), coordinator_features(p) - {"session"})
 
 
-def coordinator_session_role(p: Project) -> str:
+def coordinator_session_role(p: Project, tools: tuple[str, str] = ("full", "")) -> str:
     """The persistent session's role (coordinator.md, then prompts/coordinator-session.md: how wakes
     continue one session and compact it in place), under the coordinator role's size budget. It
     always carries the order ledger's rules: the first open order or the last closed one would
-    otherwise change the prompt and start a new session."""
-    on = coordinator_features(p) | {"obligations"}
+    otherwise change the prompt and start a new session. Its Tools section names
+    only the wake's real tools (session_tools): `tools` is (full, read or none, why)."""
+    from .coordtools import tools_mode
+    state, why = tools
+    if state == "full" and tools_mode(p.config()) != "full":
+        state, why = "read", "`coordinator.session.tools` is read_only"
+    on = coordinator_features(p) | {"obligations", f"tools_{state}"}
     role = feature_blocks((p.harness / "prompts" / "coordinator.md").read_text(), on)
-    return f"{role}\n\n{_read(p, 'coordinator-session.md', on)}".rstrip() + "\n"
+    return f"{role}\n\n{_read(p, 'coordinator-session.md', on)}".rstrip().replace("{tools_why}", why) + "\n"
+
+
+def session_tools(p: Project, provider: str | None = None) -> tuple[str, str]:
+    """What a full-tools session wake of coordinator `provider` (unset: claude) really gets
+    (Provider.coord_tool_set), in the folder its read-only turn runs in (daemon.start_run)."""
+    from .providers import get_provider
+    from .providers.base import scratch_dir
+    prov = get_provider(provider or "claude")
+    return prov.coord_tool_set(scratch_dir(str(p.base)) if prov.isolate_read_only else str(p.base))
 
 
 # kind-review.md's two delivery sections; a review's prompt carries only the one its project uses.

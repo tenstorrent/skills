@@ -8,8 +8,10 @@ replays the entries in order onto the target's tip in a worktree of its own (`wo
 settles the conflicts that need no judgment: version lines, both sides adding different lines at
 one spot, and both sides changing different lines that git calls a conflict only because they are
 adjacent. The marker counts the entries that conflicted, were settled and were sent back. It bumps the version once for all entries, runs the push checks once on the result and
-pushes it without force. It always runs them itself and never reads the passes `ttp checks` records;
-it skips only a check a batch recorded passing on the same tree, command and environment (pushpass). When the checks fail, a binary search over prefixes finds the first failing
+pushes it without force. It always runs them itself; it skips only a check a batch recorded passing on the
+same tree, command and environment (pushpass), one carried from another tip, or a task's own full `ttp checks`
+pass of the push checks on the same change (pushpass.task_carriable) where the patch is unchanged and nothing the
+check covers moved besides the batch's version bump (_task_carried). When the checks fail, a binary search over prefixes finds the first failing
 entry, and the passing prefix is pushed. A failed check is judged as `ttp checks` judges one
 (gatejudge): its failing pytest ids not yet judged at that head are rerun once there, those failing
 again on the tip alone (the base, this host) up to TIP_RERUNS times; a base result saved for the tip
@@ -65,9 +67,10 @@ SETTLED_WORDS = {"version": "version lines", "added": "lines both sides added",
                  "hunks": "changes of different lines", "taken_in": "a change the other side holds",
                  "imports": "names both sides import", "release": "release notes both sides wrote",
                  "cells": "different cells of a table row",
+                 "counters": "a test's size cap both sides raised",
                  "union": "lines both sides added to a shared doc (delivery.mechanical_merge_paths)"}
 RELEASE_KINDS = {"version", "release"}   # settlements in the shared release files only (release_kind)
-MERGED_KINDS = {"added", "hunks", "imports", "cells", "union"}   # settlements that keep both sides' changes: kept only when the checks pass
+MERGED_KINDS = {"added", "hunks", "imports", "cells", "counters", "union"}   # settlements that keep both sides' changes: kept only when the checks pass
 # delivery.mechanical_merge_paths default: shared docs and changesets, whose conflicts settle_union
 # settles by keeping the lines both sides added (fnmatch on the repo path, so `*` also crosses `/`).
 MECHANICAL_PATHS = ("docs/*.md", "*/docs/*.md", "*README.md", "*CHANGELOG.md", "*.changeset/*.md")
@@ -313,7 +316,8 @@ def _sweep_after_push(p: Project, repo: Path) -> None:
 
 def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool = False,
            hunks: bool = False, kinds: set | None = None, superseded: bool = False,
-           near: bool = False, imports: bool = False, cells: bool = False) -> str | None:
+           near: bool = False, imports: bool = False, cells: bool = False,
+           counters: bool = False) -> str | None:
     """git's three-way merge of the texts, where each conflict in which both sides only added lines
     at one spot (an empty base section) keeps both: ours first, then theirs (in Python, see _seam).
     With `taken_in`, a conflict whose change on our side theirs already holds (_taken_in) takes
@@ -323,7 +327,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
     (_superseded). With `near`, both sides' added lines are not kept (by the added or hunks rule)
     when one nearly repeats the other (_near). With `imports`, a Python conflict made only of import
     statements keeps every name each side imports (_imports). With `cells`, a conflict of Markdown
-    table rows where the two sides changed different cells takes both (_cells). None when any other conflict
+    table rows where the two sides changed different cells takes both (_cells). With `counters`, a
+    conflict of lines where both sides only raised numbers and added comment parts adds both raises
+    (_counters). None when any other conflict
     remains, or when keeping both could be wrong (_clash). `kinds` collects how each conflict was
     settled ("added", "taken_in", "hunks", "cells"). The conflict markers carry a random tag, so file content
     never passes for one; a hunk whose base-to-end part holds more than one separator line is not read.
@@ -361,7 +367,7 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         while j < len(lines) and lines[j].rstrip("\r\n") != sep:
             old.append(lines[j])
             j += 1
-        if old and not (taken_in or hunks or superseded or imports or cells):
+        if old and not (taken_in or hunks or superseded or imports or cells or counters):
             return None                 # the base section is not empty: a real conflict
         j, theirs_lines = j + 1, []
         while j < len(lines) and lines[j].rstrip("\r\n") != end:
@@ -391,6 +397,9 @@ def merge3(ours: str, base: str, theirs: str, py: bool = False, taken_in: bool =
         elif old and cells and (both := _cells(mine, old, theirs_lines)) is not None:
             res += both
             how = "cells"
+        elif old and counters and (both := _counters(mine, old, theirs_lines)) is not None:
+            res += both
+            how = "counters"
         else:                           # a real conflict
             return None
         if kinds is not None:
@@ -465,6 +474,118 @@ def _cells(mine: list[str], old: list[str], theirs: list[str]) -> list[str] | No
             row.append(z if x == y else x)
         out.append("|".join(row) + o[len(rows[0]):])
     return out
+
+
+_NUM = re.compile(r"(?<![\w.])\d[\d_]*(?![\w.])")   # an integer literal (not part of a name or a float)
+
+
+def _counters(mine: list[str], old: list[str], theirs: list[str]) -> list[str] | None:
+    """Both sides' raises of the numbers on one conflict's lines, as when two changes each raise a
+    test's prompt size cap by what their own text needs: per line, each side kept the code around
+    the numbers and only raised numbers, so each number becomes old + both raises, and each side
+    only added `; `-separated parts to the line's trailing comment (the reasons), kept with ours
+    first. A line only one side changed is taken from it. None otherwise: a lowered number, any
+    other code edit, a reworded comment part, or no line where both raised a number."""
+    if not (len(mine) == len(old) == len(theirs)):
+        return None
+    out, raised = [], False
+    for o, b, t in zip(mine, old, theirs):
+        if o == t or t == b:
+            out.append(o)
+            continue
+        if o == b:
+            out.append(t)
+            continue
+        eol = o[len(o.rstrip("\r\n")):]
+        (co, mo), (cb, mb), (ct, mt) = (_code_comment(x.rstrip("\r\n")) for x in (o, b, t))
+        spans = [_numbers(x) for x in (co, cb, ct)]
+        if not _skeleton(co, spans[0]) == _skeleton(cb, spans[1]) == _skeleton(ct, spans[2]):
+            return None
+        code, at = [], 0
+        for (i, j), (x, y, z) in zip(spans[1], zip(*([c[i:j] for i, j in sp] for c, sp in zip((co, cb, ct), spans)))):
+            vx, vy, vz = (int(v.replace("_", "")) for v in (x, y, z))
+            if vx < vy or vz < vy or any(v.startswith("0") and v != "0" for v in (x, y, z)):
+                return None
+            raised |= vx > vy and vz > vy
+            v = vx + vz - vy
+            code += [cb[at:i], f"{v:_}" if "_" in x + y + z else str(v)]
+            at = j
+        note = _comment_parts(mo, mb, mt)
+        if note is None:
+            return None
+        out.append("".join(code) + cb[at:] + note + eol)
+    return out if raised else None
+
+
+def _numbers(code: str) -> list[tuple[int, int]]:
+    """The spans of the integer literals (_NUM) in `code` outside quoted strings."""
+    out, quote, i = [], "", 0
+    while i < len(code):
+        c = code[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif (m := _NUM.match(code, i)) and not (i and (code[i - 1].isalnum() or code[i - 1] in "_.")):
+            out.append(m.span())
+            i = m.end()
+            continue
+        i += 1
+    return out
+
+
+def _skeleton(code: str, spans: list[tuple[int, int]]) -> str:
+    """`code` with each number span (_numbers) replaced by a 0."""
+    out, at = [], 0
+    for i, j in spans:
+        out += [code[at:i], "0"]
+        at = j
+    return "".join(out) + code[at:]
+
+
+def _code_comment(line: str) -> tuple[str, str]:
+    """A line split before its trailing ` # ` comment: the first `#` outside a quoted string, after
+    a space. The whole line and no comment when there is none, or a string is still open."""
+    quote, i = "", 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == "\\":
+                i += 1
+            elif c == quote:
+                quote = ""
+        elif c in "'\"":
+            quote = c
+        elif c == "#" and i and line[i - 1] == " ":
+            k = len(line[:i].rstrip(" "))
+            return line[:k], line[k:]
+        i += 1
+    return line, ""
+
+
+def _comment_parts(mine: str, old: str, theirs: str) -> str | None:
+    """Three trailing comments merged when each side only added `; `-separated parts to the old one
+    (conflictfix.additive, ours first); None for any other change."""
+    if mine == theirs or theirs == old:
+        return mine
+    if mine == old:
+        return theirs
+    head = re.compile(r"^\s*#\s*")
+    if not all(head.match(x) for x in (mine, old, theirs)):
+        return None
+    lead = head.match(old).group()
+    parts = [x[head.match(x).end():].split("; ") for x in (mine, old, theirs)]
+    both = conflictfix.additive(parts[0], parts[1], parts[2])
+    return None if both is None else lead + "; ".join(both)
+
+
+def _test_file(path: str) -> bool:
+    """Whether `path` is a test file, where a raised number is an allowance (a size cap) both raises add to."""
+    parts = path.replace("\\", "/").split("/")
+    return any(d in ("tests", "test") for d in parts[:-1]) or parts[-1].startswith("test_")
 
 
 def _edge_ok(k: int, new: list[str], e1: int, e2: int, edit: list[str], old: list[str]) -> bool:
@@ -799,8 +920,9 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
     never conflicts. A pure addition keeps both sides (merge3), unless in a .py file that leaves a
     top-level def or class name twice where neither side had it twice (it would silently shadow a
     test). `taken_in`, `hunks`, `superseded`, `near`, `imports` and `kinds` are merge3's; a version line taken adds "version" to
-    `kinds`. With `hunks`, a Markdown file also settles table rows by cell (merge3's `cells`). A
-    file both sides created is never settled."""
+    `kinds`. With `hunks`, a Markdown file also settles table rows by cell (merge3's `cells`), and
+    a test file numbers both sides raised (merge3's `counters`, _test_file). A file both sides
+    created is never settled."""
     ours, base, theirs = _show(wt, 2, path), _show(wt, 1, path), _show(wt, 3, path)
     if ours is None or theirs is None or base is None:
         return False                    # deleted on one side, or created on both
@@ -819,7 +941,7 @@ def settle(wt: Path, path: str, version_files: list[str], taken_in: bool = False
         b, t = vb, vt
     merged = merge3(o, b, t, py=path.endswith(".py"), taken_in=taken_in, hunks=hunks, kinds=how,
                     superseded=superseded, near=near, imports=imports,
-                    cells=hunks and path.lower().endswith(".md"))
+                    cells=hunks and path.lower().endswith(".md"), counters=hunks and _test_file(path))
     if merged is None:
         return False
     if path.endswith(".py") and _duplicates(merged) - _duplicates(o) - _duplicates(t):
@@ -1335,6 +1457,7 @@ class Batch:
         self.conflicted: set[int] = set()      # entries whose replay hit a conflict it did not settle
         self._settling: tuple[list[str], set, list] = ([], set(), [])   # files, kinds and doc merges of the replay running
         self.rescued: dict[int, str] = {}      # entry index -> its head, replayed again without a blamed entry
+        self.unbumped: dict[str, str] = {}     # a head with this batch's version bump -> the replayed head under it
         self.held: dict[int, dict] = {}        # entry index -> the token scope a refused push needs for it
         self.scopes: list[dict] = []           # those refusals: scope, files, entry ids, check (scopehold)
         self.retried = False                   # this round checked the entries after a blamed one (_rescue)
@@ -1987,7 +2110,9 @@ class Batch:
             raise Refused(f"delivery.version_bump: the bump commit failed ({_last(r.stderr, 3)}); not pushing")
         say(f"bumped {package or 'the version'} to {new} for {k} entr{'y' if k == 1 else 'ies'}"
             + (" with a batch changeset" if wrote else ""))
-        return _git(self.wt, "rev-parse", "HEAD").stdout.strip()
+        bumped = _git(self.wt, "rev-parse", "HEAD").stdout.strip()
+        self.unbumped[bumped] = h
+        return bumped
 
     def _version(self, head: str) -> str | None:
         if not self.cfg:
@@ -2045,14 +2170,14 @@ class Batch:
         self.checks["runs"] += 1
         env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
         tree, run = pushpass.tree_of(self.wt, head), []
-        for cmd in todo:
+        for n, cmd in enumerate(todo):
             parts = pushpass.env_parts(self.wt, cmd, env, self.tip or "")
             eid = pushpass.digest(parts)
             if hit := pushpass.passed(self.p, tree, str(cmd), eid):
                 say(f"reused pass from {hit.get('batch') or '?'} (tree {tree[:10]}): {cmd}")
                 self.checks["reused"] = self.checks.get("reused", 0) + 1
                 self._passed(cmd)
-            elif carried := self._carried(head, cmd, parts):
+            elif carried := self._carried(head, cmd, parts) or self._task_carried(head, cmd, parts, todo[:n], env):
                 say(f"{carried}: {cmd}")
                 self.checks.setdefault("carried", []).append(f"{carried}: {cmd}")
                 self._passed(cmd)
@@ -2171,6 +2296,36 @@ class Batch:
             delta = verdictcarry.carry(self.wt, cmd, e["tip"], e["head"], self.tip or "", head, exclude)
             if delta is not None:
                 return verdictcarry.line(e["head"], delta)
+        return ""
+
+    def _bump_only(self, head: str) -> str | None:
+        """The replayed head under `head` when `head` is it plus this batch's own version bump (_head)
+        touching only delivery.version_bump's files and changesets, or `head` itself with no such bump;
+        None when the bump commit changed anything else or cannot be read."""
+        under = self.unbumped.get(head)
+        if under is None:
+            return head
+        names = verdictcarry._names(self.wt, under, head)
+        if names is None or not self.cfg:
+            return None
+        own = {*(self.cfg.get("files") or ()), *([self.cfg["changeset_file"]] if self.cfg.get("changeset_file") else [])}
+        csdir = (self.cfg.get("changeset_dir") or "").strip("/")
+        return under if all(f in own or (csdir and f.startswith(csdir + "/")) for f in names) else None
+
+    def _task_carried(self, head: str, cmd, parts: dict, before: list, env: dict) -> str:
+        """The record line of a full pass of `cmd` a task's own `ttp checks` recorded (pushpass.task_carriable:
+        the same push checks in order, never a targeted run or a single command's suite pass) that carries
+        to `head` under verdictcarry's rule, or "". It is judged on the replayed head under this batch's
+        version bump (_bump_only): the bump is the batch's own mechanical edit of the version files and a
+        changeset, so the change's patch must match the one that passed and the upstream delta must miss
+        what the check covers; a batch of several entries has another patch than any one task's."""
+        if cmd == STALE or not (under := self._bump_only(head)):
+            return ""
+        exclude = push.exclude_list(self.d.get("push_exclude_paths"))
+        for e in pushpass.task_carriable(self.p, self.wt, [*before, cmd], parts, env)[:CARRY_TRIES]:
+            delta = verdictcarry.carry(self.wt, cmd, e["tip"], e["head"], self.tip or "", under, exclude)
+            if delta is not None:
+                return f"{verdictcarry.line(e['head'], delta)} (the task's own ttp checks run {e.get('run') or '?'})"
         return ""
 
     def _rerun_ids(self, cmd, rc: int | None, tail: str) -> list[str]:

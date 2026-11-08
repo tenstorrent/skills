@@ -312,12 +312,10 @@ class Codex(Provider):
         # the tool timeout (coordtools.full_refusal), so the turn keeps its read-only tool set and
         # coord_tools_note names why.
         self.coord_tools_note = ""
-        if not self.hooks_supported():
-            self.coord_tools_note = "codex: this build runs no hooks: the coordinator has no shell"
-            return argv, {}
-        others = hook_sources(cwd, user_config=IGNORE_USER_CONFIG not in argv)
-        if others:
-            self.coord_tools_note = f"codex: hooks cannot run here ({', '.join(others)}): the coordinator has no shell"
+        gap, others = self._coord_hook_gap(cwd, user_config=IGNORE_USER_CONFIG not in argv)
+        if gap:
+            self.coord_tools_note = (f"codex: hooks cannot run here ({', '.join(others)}): the coordinator has no shell"
+                                     if others else "codex: this build runs no hooks: the coordinator has no shell")
             return argv, {}
         back = {f"features.{f}=false" for f in READ_ONLY_OFF if f != "web_search_request" or (full and web)}
         out = []
@@ -331,6 +329,19 @@ class Codex(Provider):
         i = len(out) - 1 if out and out[-1] == "-" else len(out)
         out[i:i] = [HOOK_TRUST_BYPASS, *hook_config_args(hooks)]
         return out, dict(settings.get("env") or {})
+
+    def _coord_hook_gap(self, cwd: str, user_config: bool) -> tuple[str, list[str]]:
+        """Why ttp's hook cannot run in a coordinator wake in `cwd` ("" when it can), and the other hook
+        sources that keep it out ([] for a build without hooks). coord_tools and coord_tool_set share it."""
+        if not self.hooks_supported():
+            return "this Codex build runs no hooks", []
+        others = hook_sources(cwd, user_config=user_config)
+        return ("another hook source is set for Codex here, so ttp's hooks cannot run" if others else ""), others
+
+    def coord_tool_set(self, cwd):
+        # As coord_tools gives them: build's read-only turn reads config.toml unless _ignore_user_config.
+        gap, _ = self._coord_hook_gap(cwd, user_config=not self._ignore_user_config())
+        return ("none", f"{gap}: no shell, web or file edits") if gap else ("full", "")
 
     def write_fence(self, restrictions=None) -> str:
         return ""   # workspace-write: Seatbelt on macOS, bubblewrap or the bundled helper on Linux

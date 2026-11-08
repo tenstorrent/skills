@@ -499,7 +499,23 @@ only in the feed and never under "needs you".
   summaries and the last 20 chat exchanges verbatim, restored from disk, then the full digest. A
   new session (only for the causes above, never a restart or a full context) leads with the same
   parts as its hand-off, also written to `state/coord-session/<previous session id>.handoff.md`; a
-  part that cannot be read is named, never left out silently. A resumed wake sends only the digest sections
+  part that cannot be read is named, never left out silently. The compacted wake's lead says the
+  agent's summary is the session's own notes, never the user's word. An injected instruction cannot
+  ride across wakes as a user order: a session note line labelled as the user's words ("user's
+  word(s)", the owner's too, "User (msg #N):", "per the user/owner", "the user/owner said|wrote"
+  right before a quote) is kept only when it cites a logged message from the user (msg #N) whose own
+  words hold each of its quotes, the check charter changes use (the owner's agent's words count too
+  with `coordinator.agent_orders_as_user`); a failing or quote-less labelled line is dropped and
+  logged as an `order_claim_dropped` event, when it is saved and again when a seed or restore
+  carries it. Unlabelled lines (a paraphrase citing a msg, a quoted term) are carried as the note's
+  data; put names and terms in backticks. The note's header vouches only for that drop: nothing in
+  it is the user's word unless the chat log, order ledger, memory or charter shows it. A
+  `memory_add` with a labelled line that fails the same check is refused; a paraphrase is stored as
+  data. A coordinator run's `ttp memory` writes are refused (use `memory_add`); the user's own `ttp
+  memory` is unchanged. Known gaps: only quotes are checked, so unquoted text on a labelled line
+  with a checked quote is carried; a claim phrased past those label forms ("the user ordered
+  '...'", "as the user put it", "User:", another language) is not checked and is carried as data
+  under the header above. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
   line naming the sections left out. Only the Open tasks section, keyed by task id, and the Course
   check, keyed by sign and task id (`- costly: #<id>`), go row by row (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,
@@ -518,6 +534,9 @@ only in the feed and never under "needs you".
   or drops it in the same turn. An action resent unchanged goes through and is refused after the
   turn as before; at most 2 answers a wake are sent back.
   `tools` (`full`, the default, or `read_only`) sets what a session wake may use (coordtools.py).
+  The session prompt's Tools section names only what the wake really gets on its provider
+  (`Provider.coord_tool_set`): a worker's tools, read-only tools or none, with the reason, and hands
+  what it cannot do to workers.
   With `full` it gets a worker's tools (Bash, Read, Edit, Write, Skill, ToolSearch and the web
   tools unless `no_internet`) under a worker's PreToolUse checks, so it can edit, build, ssh to the
   machines its charter allows and run the `ttp` CLI. Direct writes to the charter, the memory
@@ -900,7 +919,12 @@ only in the feed and never under "needs you".
   24 h: `virtual` (list-price equivalent) on a plan, `actual` when billed by use (only spend made
   on a usage-billed account). A usage-billed account with a budget day or a global cap shows
   `today $1.20 this project, $85 of $1000 global - resets in 6.5 h` instead, with
-  `(1 machine stale)` when a machine's answer is old.
+  `(1 machine stale)` when a machine's answer is old, then when the global cap is reached at the
+  current rate (the last hour's readings, else the day's average), against its reset:
+  `at $86/h: not reached before the reset at 08:00 PST`, or `at $400/h: reaches the cap at 07:48
+  PST, before the reset at 08:00 PST`. A reach time after the reset is never shown; a rolling 24 h
+  has no reset, so it says `reset time unknown (rolling 24 h), no projection`. The coordinator's
+  STATE budget line carries the same projection for the global and daily caps.
 
 ## Model tiers
 
@@ -1053,6 +1077,18 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    counts them apart (`2 escalated to core`) and `ttp stats --runs` ends with their count by kind.
    `"route_timeout_s"` next to a routed tier's `model` sets the time limit of its routed runs in
    place of the tier's `budget.run_timeout_s`; a start on the core provider keeps the tier default.
+   To route by kind and label, not only by tier, set `providers.chat.routes`, an ordered list of
+   rules (default `[]`, off), for example
+   `"routes": [{"kinds": ["code", "work"], "tiers": ["standard"], "model": "<model id>", "effort": "max"}]`.
+   Each rule takes `model` and any of `kinds`, `tiers`, `labels_any` (one of these labels),
+   `labels_none` (none of these), `effort` and `route_timeout_s`; a label `x` also matches `x:<id>`.
+   The first rule a run matches routes it, at the rule's effort and time limit (else the tier's), and
+   the run's `route` record names the rule's index (`rule`); with no match the tier's own `route`
+   applies. Rules never route reviews, coordinator turns, pinned tasks, tier-up retries or conclusion
+   and device runs, and while a rule list is set, urgent tasks, tasks whose hand-off asked for deep and
+   tasks labelled `urgent`, `needs_deep`, `user_deep`, `review_fix` or `untrusted_input` stay on the
+   core provider, the tier's own route included. A missing-model hold applies to that tier's runs
+   routed to that model only. The coordinator can set the list with `config_set` on your word.
    Routed spend uses the `pricing.chat` row for the model (or its `default` row:
    `[$/M input, cached input, output]`); with no row it is zero and labelled unpriced. Without a row
    a chat run keeps Claude Code's `--max-budget-usd`, priced at its fallback rate for a model it does
@@ -1613,8 +1649,11 @@ session and stateless coordinators on every provider.
   queue batch marker) say `verdict carried from <sha>; upstream delta touched only: <paths>`. A
   delta touching a covered path reruns the check as usual. `ignore_paths` only decides this reuse:
   it never narrows what a check covers or whether it runs on a fresh head, so setting it is not a
-  rescoping and a coordinator may set it itself. Only passes the push or the push queue made carry,
-  never passes recorded by `ttp checks`.
+  rescoping and a coordinator may set it itself. Passes the push or the push queue made carry; of
+  the passes `ttp checks` records, only a task's own full candidate run of the push checks carries,
+  to that change's head in a push queue batch (judged without the batch's own version bump, which
+  touches only the version files and a changeset), with `(the task's own ttp checks run <id>)`
+  added to the line. A targeted run, a single command's pass or a batch of several changes does not.
 - Config warnings flag checks that pin a full commit SHA, use an absolute temporary environment,
   or name a target missing from the branch tip without `if_exists`. Declare applicability with
   `if_exists`/`if_changed` and retain coverage for the code the check protects. Warnings do not skip
@@ -1949,7 +1988,10 @@ session and stateless coordinators on every provider.
   project one shared turn per N urgent starts since the project's last routine start, taken by the oldest
   (a long routine backlog holds it for at most that one run). A run at least 4 times cheaper (a targeted
   run beside full suites) is not held by an aged run of its priority or a less urgent one; a landing's run
-  still is. An urgent run (priority 0 or 1: a task owed to the user,
+  still is. A short targeted run (fewer than `checks.small_tests` tests, account-level, env
+  `TTP_CHECKS_SMALL_TESTS`, default 500, 0 off) goes first among its project's waiters at its priority
+  in the queue and is held by no longer parked run of its priority or a less urgent one (a landing's
+  still holds it); the cap and every other rule hold it as any run. An urgent run (priority 0 or 1: a task owed to the user,
   live-impact work) that would wait with every slot busy starts within about a minute, in this order:
   on a free host of the account's test pool at once (no `checks_spill_after_s` wait first; a paused
   host is never picked); else on a reserved urgent slot beyond the cap, with a reserved test lane past
@@ -1993,6 +2035,11 @@ session and stateless coordinators on every provider.
   re-executed. A cancel (`checks-slot.cancel`, a reaped waiter) also ends a wait for test slots.
   The daemon reaps a waiter nobody will read: one whose task ended (however long ago) or is gone, or
   whose run ended without a task (runs of the last 7 days); the cancel and the daemon log say why.
+  It also reaps a live task's earlier run's waiting or parked checks once the task moved to a newer
+  run (re-dispatched, or its `retry_when` moved to the newer run's checks), so one task never holds two
+  checks runs: they leave the queue and free their repository lane. It keeps them while a live task's
+  wait (`retry_when`, `then`, `on_pass_cmd`, `next_step`) names that run, or another run joined or
+  follows them. Checks already running their commands (holding a host-wide checks slot) run to their end.
 - Shared check failures: a task waiting on its own detached `ttp checks` that failed only on pytest
   ids (the failing command's `FAILED`/`ERROR path::name` lines, complete against pytest's summary)
   that also failed in at least `checks.shared_min_tasks` (default 2) other changes' checks on other
@@ -2203,8 +2250,8 @@ session and stateless coordinators on every provider.
   runs. With the push queue on, the batch's full run on the merged tree (bisected to the changes at
   fault when it fails) is the full-suite gate, so a task's own checks run in full only where the
   whole suite is affected (a conftest, a shared test helper or fixture, the checks runner's own
-  files, a manifest, `__init__.py` or config file, a test file's module-level code, half the suite or
-  more). A change only the full suite covers (a module's module-level code, the checks functions in
+  files, a manifest, `__init__.py` or config file, a test file's module-level code); a selection of
+  half the suite or more stays targeted. A change only the full suite covers (a module's module-level code, the checks functions in
   a module, something no test names) adds the tests it can place, and the scope line ends `; the push
   batch runs the rest: <reasons>`. Checks already waiting for a slot re-execute on the new runtime
   and pick their scope again.
@@ -2258,8 +2305,9 @@ session and stateless coordinators on every provider.
   that need no judgment are settled in the batch and judged by those checks: version lines, lines
   both sides added at one spot, and changes of different lines that git calls a conflict only
   because they are adjacent (also a block one side added right beside a line the other only
-  reworded or deleted, each line as its side wrote it), and edits of different cells of one Markdown
-  table row. A conflict only in the shared release files (the version files,
+  reworded or deleted, each line as its side wrote it), edits of different cells of one Markdown
+  table row, and numbers in a test file that both sides only raised (two changes each raising one
+  prompt size cap: the cap gets both raises, the trailing comment both sides' added reasons). A conflict only in the shared release files (the version files,
   changesets, the release changeset, a CHANGELOG.md) is settled mechanically: both sides' notes
   stay, a changeset both sides created keeps a file each, and the approval holds as long as the
   change's own diff outside those files is still the approved one. A conflict left only in shared
@@ -2941,6 +2989,61 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   checks and guard tests run read-only, under a fresh `mktemp -d` HOME. The tripwire is
   `credwatch.snapshot()` and `credwatch.changes()` in `runtime/ttp/credwatch.py`, its path list
   `credwatch.files()`, for other guards to reuse.
+- Runs are unsandboxed, so credential stores are kept out of tool calls model-free (credguard.py).
+  Claude Code runs get a Read deny rule for gh's hosts file, `~/.git-credentials`, `~/.netrc`, the
+  agents' login files (Claude's `.credentials.json`, Codex's `auth.json`), every file in `~/.ssh`
+  but public keys, `config`, `known_hosts` and control sockets, and these stores, each guarded only
+  where a model read would show a secret and no task needs to read it:
+  - AWS: `~/.aws/credentials` (or `AWS_SHARED_CREDENTIALS_FILE`), `sso/` and `cli/` (token caches).
+    `config` passes: profiles and regions only.
+  - gcloud (`CLOUDSDK_CONFIG`): `credentials.db`, `access_tokens.db`, `legacy_credentials` and
+    `application_default_credentials.json`. `configurations/` and `active_config` pass.
+  - Azure (`AZURE_CONFIG_DIR`): the token caches and service principal entries. `azureProfile.json`
+    and `config` pass.
+  - Docker (`DOCKER_CONFIG`): `config.json`, whose `auths` may hold a base64 user and password.
+    The rest of `~/.docker` passes.
+  - Kubernetes: `~/.kube/config` or each `KUBECONFIG` file (client keys and tokens);
+    `kubectl config view` shows the same with secrets hidden. `cache/` passes.
+  - PyPI: `~/.pypirc` (upload tokens in plain text). pip's config passes.
+  - git: `~/.config/git/credentials`, like `~/.git-credentials`. git's `config` and `ignore` pass.
+
+  The worker hook refuses a Read, Grep or Glob call that reaches one of them (also by a symlink, a
+  key made after launch, or a search over a folder holding one: search a narrower folder) and a
+  Bash call that names one, also by a glob the shell expands to one (`~/.kube/conf?g`; `ls` and
+  `stat` of a glob pass), plus `gh auth token`, `gh auth status --show-token` and
+  `git credential fill`. The tools read their own config untouched: kubectl, helm, docker, aws,
+  gcloud, az, twine and git, also `--kubeconfig <file>` (kubectl, helm, k9s), twine's
+  `--config-file`, and `KUBECONFIG`, `DOCKER_CONFIG`, `AWS_SHARED_CREDENTIALS_FILE`,
+  `CLOUDSDK_CONFIG`, `AZURE_CONFIG_DIR`, `GOOGLE_APPLICATION_CREDENTIALS` or `GH_CONFIG_DIR` set to
+  one, and `docker --config <dir>`; `ls`, `stat`, `mkdir` or `chmod` of a store's folder (`~/.kube`,
+  `~/.docker`, `~/.config/git`, `~/.config/gh`, the cloud folders) passes, any other mention of the
+  folder (`grep -r token ~/.kube`, `tar cz ~/.docker`), a glob naming it, `..` or a second mention
+  does not.
+  ssh, git and gh still read them themselves: `ssh -i <key>`, `-o IdentityFile=`, `ssh-add`,
+  `ssh-keygen`, and chmod or test of a key pass, also as the ssh command given to rsync (`-e`,
+  `--rsh`, `RSYNC_RSH`) or git (`GIT_SSH_COMMAND`, `-c core.sshCommand=`); a `stat` with a format
+  (`-c`, `--format`, `--printf`) passes when nothing pipes or redirects its output, and a path with a
+  `..` part never counts as public. A command ssh runs on another host is checked the
+  same way (`ssh box 'mkdir -p ~/.ssh'` passes, `ssh box cat ~/.ssh/<key>` does not), quotes inside
+  a path do not hide it, and a `find` looking for a private key or credential file by name is
+  refused. Known gaps: a path a script builds at run time, a variable read later
+  (`cat $KUBECONFIG`), and a recursive read of all of HOME or `~/.config` (`grep -r x ~`,
+  `find ~ -name config.json -exec cat {} +`). Provider parity: docs/providers.md (Codex runs get the Bash check only,
+  Cursor runs none).
+- Pushes go only through `ttp push` and the push queue. Inside a run, the harness's gh refuses `gh api`
+  calls that create, move or delete refs or tags, write file contents, merge branches, update a PR's
+  branch, write releases or the rules that protect a branch or tag (branch and tag protection,
+  rulesets; REST, and GraphQL `createRef`, `updateRef(s)`, `deleteRef`, `createCommitOnBranch`,
+  `mergeBranch`, `updatePullRequestBranch` and the branch protection rule and repository ruleset
+  mutations), `gh release` create, edit, delete, upload and delete-asset, `gh pr update-branch` and
+  `gh repo sync` of a named repo; reads of the same endpoints pass, and the hook refuses the same
+  requests sent by curl and the like. PR merges follow the charter's merge policy.
+- A session coordinator's Read, Grep and Glob calls are refused on the credential files listed at
+  its launch and on what the worker hook's file tool check refuses.
+- Guards in the harness are a second line. Give the account the harness uses a fine-grained token
+  that can write only the repositories, and where the host allows it only the branches, its
+  projects push to, and protect each repository's default branch (required reviews, no force pushes
+  or deletions), so a run that gets around a guard still cannot change it.
 - Secrets are entered in a terminal (`ttp secret …`), never in chat, and never copied into a project.
   An OpenAI-compatible endpoint's API key: `ttp secret endpoint <alias> --url <base url>` checks it with
   `GET <base url>/models` and saves it with its URL as `endpoint/<alias>`; `ttp secret show` lists it
@@ -2969,7 +3072,12 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   on request (exit 2 when it kept a tree or stopped after its 30 s). A project runs unsandboxed once its run lines say `sandbox=none` and
   that command finds no tree.
   `providers.<name>.write_fence: true` turns the provider's write fence on (Claude's Bash sandbox,
-  Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. A sandboxed
+  Codex's workspace-write), and `sandbox.checks: true` the process sandbox for checks. Both are
+  user-only: only the user's own word turns one on (`ttp config` in their own shell, or the web
+  settings page); `ttp config` inside a run (a worker's or a coordinator's) and the coordinator's
+  `config_set` refuse the on value on every provider, and allow false or unset.
+  `restrictions.no_internet`, which also turns Codex's and Cursor's sandbox on, is a Restriction:
+  a run's `ttp config` refuses it in both directions and the coordinator cannot set it. A sandboxed
   worker cannot gain privileges (sudo fails with 'no new privileges'). A privileged
   command the project allows runs on the host through the daemon: `ttp host-run -- <command...>`
   prints its output and exits with its code (126 refused, 124 timed out, 75 no answer from the

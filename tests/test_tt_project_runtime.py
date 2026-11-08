@@ -717,6 +717,12 @@ def host_tz(monkeypatch):
 MAKE_BRIEF = "Keep the README friendly."
 
 
+def _unmoded(text: str) -> str:
+    """A coordinator prompt without the wake-mode line the daemon puts first (wakemode.py)."""
+    from ttp import wakemode
+    return re.sub("(?m)^" + re.escape(wakemode.HEAD) + ".*\n\n", "", text)
+
+
 def make(env, name="demo"):
     from ttp.project import register
     p = _clone_project(env, name)
@@ -4556,16 +4562,35 @@ def test_every_db_connection_waits_for_a_busy_database(env, tmp_path):
     assert any(k.arg == "timeout" for k in connects[0].keywords)
 
 
+def _release_once_busy(monkeypatch, release):
+    """The lock holder lets go once the writer met the lock past its busy timeout (its first busy
+    error), before the retry pause: no timer races the writer's retries under load."""
+    from ttp import db as dbm
+    met = []
+    real = dbm.is_busy
+
+    def is_busy(e):
+        busy = real(e)
+        if busy and not met:
+            met.append(e)
+            release()
+        return busy
+    monkeypatch.setattr(dbm, "is_busy", is_busy)
+    return met
+
+
 def test_db_write_retries_a_lock_held_past_the_busy_timeout(env, tmp_path, monkeypatch):
     import sqlite3
     from ttp import db as dbm
     _short_busy_waits(monkeypatch, timeout_s=0.05, pauses=(0.2, 0.4))
     d = dbm.DB(tmp_path / "x.db")
-    _hold_write_lock(tmp_path / "x.db", release_after=0.3)
+    met = _release_once_busy(monkeypatch, _hold_write_lock(tmp_path / "x.db"))
     d.set_kv("a", 1)                        # a write on its own
-    _hold_write_lock(tmp_path / "x.db", release_after=0.3)
+    assert met, "the write never met the held lock"
+    met = _release_once_busy(monkeypatch, _hold_write_lock(tmp_path / "x.db"))
     with d.tx():                            # a transaction's BEGIN IMMEDIATE
         d.set_kv("b", 2)
+    assert met, "the transaction never met the held lock"
     assert (d.kv("a"), d.kv("b")) == (1, 2)
     release = _hold_write_lock(tmp_path / "x.db")
     try:
@@ -4811,8 +4836,9 @@ def test_status_shows_spend_waiting_retry_and_coordinator_health(env):
     lines = out.splitlines()
     assert len(lines) <= 25, out
     # The budget is one plain line; caps, top spenders and gate reasons are in the web app's Budget tab.
-    assert "budget: 24h $4.50 this project, $4.50 of $200 global" in lines, out
-    assert [ln for ln in lines if "$" in ln] == ["budget: 24h $4.50 this project, $4.50 of $200 global"], out
+    money = [ln for ln in lines if "$" in ln]
+    assert len(money) == 1 and re.fullmatch(r"budget: 24h \$4\.50 this project, \$4\.50 of \$200 global; at \$0\.\d\d/h: "
+                                             r"reset time unknown \(rolling 24 h\), no projection", money[0]), out
     assert "top 7d" not in out and "spend:" not in out, out
     wait = [ln for ln in lines if "measure on a board" in ln]
     assert wait and "waiting, next try" in wait[0] and wait[0].count("next try") == 1, out
@@ -5804,7 +5830,7 @@ def test_coordinator_turns_pass_the_cache_settings_through(env, monkeypatch):
     assert spec["stdin"] == "input.jsonl"
     assert "--input-format" in spec["argv"] and spec["argv"][spec["argv"].index("--system-prompt") + 1] == head
     blocks = json.loads((run / "input.jsonl").read_text())["message"]["content"]
-    assert [b["text"] for b in blocks] == [context, "EVENTS"]
+    assert [_unmoded(b["text"]) for b in blocks] == [context, "EVENTS"]
     for ttl, supported in (("off", True), ("1h", False)):
         spec, run = start(ttl, supported)
         assert "stdin" not in spec and not (run / "input.jsonl").exists()
@@ -6362,7 +6388,9 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
     argv, run_dir, _ = _dispatch_claude_worker(p, monkeypatch, {})
     settings = json.loads(argv[argv.index("--settings") + 1])
     from ttp.project import secrets_path   # the per-user secrets store too
-    assert settings["permissions"]["deny"] == [f"Read(/{token_path(p).resolve()})", f"Read(/{secrets_path().resolve()})"]
+    from ttp.credguard import credential_files   # and the credential stores (credguard_cases)
+    assert settings["permissions"]["deny"] == [f"Read(/{token_path(p).resolve()})", f"Read(/{secrets_path().resolve()})",
+                                               *(f"Read(/{f})" for f in credential_files())]
     assert settings["permissions"]["deny"][0].startswith("Read(//")
     assert "PreToolUse" in settings["hooks"]
     assert "permissions" not in claude.worker_settings()
@@ -24832,7 +24860,7 @@ def test_codex_gets_its_system_text_and_compact_window_as_config_overrides(env, 
     # The coordinator's system text goes the same way; its session compacts in place at its own limit
     # (coordsession.limit, user msg #2043), not at a tier's window.
     argv, prompt = start("coordinator", system=system, read_only=True)
-    assert overrides(argv)["developer_instructions"] == system and prompt == "PROMPT-MARKER"
+    assert overrides(argv)["developer_instructions"] == system and _unmoded(prompt) == "PROMPT-MARKER"
     assert overrides(argv)["model_auto_compact_token_limit"] >= 100000 and argv[-1] == "-"
     # Text too long for one argument leads the prompt, as before.
     big = "x" * 200_000
@@ -29478,7 +29506,7 @@ def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path)
     worker, _ = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None,
                                              read_only=False, schema=None, restrictions={})
     pre = json.loads(worker[worker.index("--settings") + 1])["hooks"]["PreToolUse"][0]
-    assert pre["matcher"] == "Bash|Edit|Write|MultiEdit|NotebookEdit|mcp__.*"
+    assert pre["matcher"] == "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*"
     assert pre["hooks"][0]["command"].endswith("ttp.hook PreToolUse")
 
 

@@ -388,6 +388,17 @@ def _api_draft_change(text: str, full: str = "") -> bool:
     return bool(api and change and HTTP_CLIENT_RE.search(text))
 
 
+def api_ref_write(text: str) -> bool:
+    """An HTTP client sending a write to a GitHub API route that moves refs, tags, releases or file
+    contents (credguard), or a GraphQL ref mutation."""
+    from .credguard import REF_MUTATION_RE, REF_URL_RE
+    api = GITHUB_API_RE.search(text) or (TOKEN_API_RE.search(text) and API_PATH_RE.search(text))
+    write = WRITE_RE.search(text) or re.search(r"(?:-X\s*|--request[\s=]+|--method[\s=]+|method\s*[=:]\s*)[\"']?"
+                                               r"DELETE\b|\.delete\s*\(", text, re.I)
+    change = (write and REF_URL_RE.search(text)) or REF_MUTATION_RE.search(text)
+    return bool(api and change and HTTP_CLIENT_RE.search(text))
+
+
 def _quoting(line: str) -> list[tuple[bool, int]]:
     """Per character of `line`: whether it is quoted (or escaped, or in a comment), and the depth
     of parentheses around it."""
@@ -635,6 +646,9 @@ def draft_bypass(text: str, path_changed: bool = False, trusted: bool = True) ->
     if _api_draft_change(text, full):
         return ("create or update PRs with gh, not a direct GitHub API call: a PR leaves draft only with "
                 "the user's recorded approval")
+    if api_ref_write(text):
+        from .credguard import REF_WHY
+        return REF_WHY.removeprefix("refused: ")
     return None
 
 
@@ -1085,6 +1099,11 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         why = harness_gh_edit(payload) if payload["tool_name"] in EDIT_TOOLS else harness_gh_patch(payload)
         why = why or local_guard(payload)
         return (_deny(why) if why else None), None
+    if payload.get("tool_name") in ("Read", "Grep", "Glob"):   # a credential store's contents (credguard)
+        from . import credguard
+        why = credguard.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
+                                     str(payload.get("cwd") or os.getcwd()))
+        return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
         from . import aitag
         why = aitag.tool_problem(str(payload["tool_name"]), payload.get("tool_input"), aitag.project_config())
@@ -1111,8 +1130,13 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why and (HARNESS_GH_RE.search(cmd) or HARNESS_BIN_RE.search(cmd) and GH_D_RE.search(cmd)) \
             and not _harness_task():
         why = HARNESS_GH_WHY
+    if not why and "***" in cmd:   # a patch in the command (`apply_patch <<EOF`), relative paths too
+        why = harness_gh_patch(payload)
     if not why:
         why = secret_read(cmd, segments, str(payload.get("cwd") or os.getcwd()))
+    if not why:
+        from . import credguard
+        why = credguard.bash_refusal(cmd, _all_segments(commands))
     if not why:
         why = git_push_bypass(segments)
     if not why:

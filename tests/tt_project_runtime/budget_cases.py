@@ -339,7 +339,9 @@ def test_a_switch_to_a_usage_billed_account_drops_plan_windows_before_its_first_
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 70.0 and g.level == "yellow", (g.numbers, g.reasons)
     line = budget_line(p.db, now, "claude", g.as_dict())
-    assert line == "24h $70.00 this project, $70.00 of $200 global", "the old plan's spend was never billed: " + line
+    assert line.startswith("24h $70.00 this project, $70.00 of $200 global; at $"), \
+        "the old plan's spend was never billed: " + line
+    assert line.endswith("/h: reset time unknown (rolling 24 h), no projection"), line
     # a run that started earlier under the plan account does not bring its windows back
     _run(p, "acct-a | plan", now - 7300)
     assert bud.plan_windows(p.db, now) == []
@@ -361,11 +363,15 @@ def test_account_switch_mid_window_counts_only_billed_spend(env):
     g = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
     assert g.regime == "caps" and g.numbers["spent_24h"] == 15.0 and g.numbers["spent_7d"] == 15.0, g.numbers
     assert g.level == "green" and g.allow_new_work, (g.level, g.reasons)
-    assert budget_line(p.db, now, "claude", g.as_dict()) == "24h $15.00 this project, $15.00 of $200 global"
+    line = budget_line(p.db, now, "claude", g.as_dict())
+    assert line.startswith("24h $15.00 this project, $15.00 of $200 global; at $"), line
+    assert line.endswith("/h: reset time unknown (rolling 24 h), no projection"), line
     assert budget_line(p.db, now, "claude") == "24h $15.00 actual"
     _login(env, "acct-c", "billed")   # the global total is the machine's own login's: another one spent nothing
     other = bud.evaluate(p.db, p.config(), "claude", bud.plan_windows(p.db, now), now)
-    assert budget_line(p.db, now, "claude", other.as_dict()) == "24h $15.00 this project, $0.00 of $200 global"
+    line = budget_line(p.db, now, "claude", other.as_dict())
+    assert line.startswith("24h $15.00 this project, $0.00 of $200 global; "), line
+    assert "reaches the cap" not in line, "a rolling 24 h cap has no reset to project against: " + line
     _login(env, "acct-b", "billed")
     # B's run still going counts; a run that started under A before the switch does not
     _run(p, "acct-b | billed", now - 300, None, 2.5)
@@ -2770,7 +2776,9 @@ def test_without_budget_settings_a_usage_billed_account_gets_a_200_global_cap(en
     assert g.level == "green" and g.numbers["spent_24h"] == 30.0, (g.level, g.reasons)
     assert (g.numbers["global_cap"], g.numbers["global_today"]) == (200, 180.0), g.numbers
     assert "spent_today" not in g.numbers, g.numbers
-    assert budget_line(p.db, now, "fake", g.as_dict()) == "24h $30.00 this project, $180 of $200 global"
+    # A rolling 24 h has no reset: the line says so and projects nothing (the rate is the window's average).
+    assert re.fullmatch(r"24h \$30\.00 this project, \$180 of \$200 global; at \$7\.\d\d/h: reset time unknown "
+                        r"\(rolling 24 h\), no projection", budget_line(p.db, now, "fake", g.as_dict()))
 
 
 
@@ -2900,11 +2908,14 @@ def test_the_budget_line_of_a_usage_billed_account_and_of_a_plan(env, tmp_path):
     other.spend("fake", 340.0, "task:1", ts=now - 60)
     g = bud.evaluate(p.db, p.config(), "fake", [], now).as_dict()
     line = budget_line(p.db, now, "fake", g)
-    assert re.fullmatch(r"today \$1\.20 this project, \$341 of \$1000 global - resets in \d+\.\d h", line), line
+    # The global part ends with its projection against the reset (spendproj.line).
+    assert re.fullmatch(r"today \$1\.20 this project, \$341 of \$1000 global - resets in \d+\.\d h; "
+                        r"at \$\d+/h: (not reached before|reaches the cap at \d\d:\d\d UTC, before) "
+                        r"the reset at \d\d:\d\d UTC", line), line
     end = gcap.day_bounds(p.config()["budget"], now)[1]
-    assert line.endswith(f"resets in {(end - now) / 3600:.1f} h")
+    assert f"resets in {(end - now) / 3600:.1f} h;" in line
     g["numbers"]["global_stale"] = ["box2"]
-    assert budget_line(p.db, now, "fake", g).endswith(" h (1 machine stale)")
+    assert " h (1 machine stale); at $" in budget_line(p.db, now, "fake", g)
     # Global cap off: this project only.
     del g["numbers"]["global_today"]
     assert re.fullmatch(r"today \$1\.20 this project - resets in \d+\.\d h", budget_line(p.db, now, "fake", g))
@@ -2930,7 +2941,9 @@ def test_no_local_logs_leave_the_estimate_unknown_and_the_gate_alone(env, tmp_pa
     day = __import__("ttp.globalcap", fromlist=["day_bounds"]).day_bounds(b, now) or (now - 86400, now)
     assert ls.estimate(b, day[0], day[1], now) is None
     assert ls.source("claude", "", now - 60, now) == (0.0, ls.source("claude", "", now - 60, now)[1], "usage")
-    assert "unknown" in ls.source("claude", "", now - 60, now)[1] and ls.source("codex", "", 0, now)[:2] == (0.0, "")
+    assert "unknown" in ls.source("claude", "", now - 60, now)[1]
+    cx = ls.source("codex", "", 0, now)
+    assert cx[0] == 0.0 and "other Codex sessions on this machine (unknown" in cx[1], cx
     g = bud.evaluate(p.db, p.config(), "claude", [], now)
     assert g.level == "green" and g.numbers["global_today"] == 0, (g.level, g.reasons, g.numbers)
     assert "other Claude Code sessions on this machine (unknown" in g.numbers["global_includes"]
@@ -4723,7 +4736,8 @@ def test_the_caps_line_names_each_providers_global_total_and_puts_the_reached_on
              "claude": caps("claude", 2013.0, "red", ["global daily cap reached: $2013 of $2000 today"])}
     line = bud.caps_line(p.db, gates, b, now)
     assert "global daily cap (whole account, per provider): claude $2013.00 of $2000 today " \
-           "(2 project(s), reached); chat $0.00 of $2000 today (2 project(s))" in line, line
+           "(2 project(s)), cap reached, reset time unknown (rolling 24 h); chat $0.00 of $2000 today " \
+           "(2 project(s)), no burn rate measured yet: no projection" in line, line
     assert line.startswith(bud.caps_line(p.db, {"chat": gates["chat"]}, b, now).split(" · global daily cap")[0]), line
     # Without a global total the line is the project caps alone.
     for g in gates.values():
@@ -4908,3 +4922,262 @@ def test_same_probe_compares_probes_after_normalising_their_formatting(a, b, sam
     from ttp.daemon import _same_probe
     assert _same_probe({"retry_when": a}, {"retry_when": b}) is same
     assert _same_probe({"retry_when": a}, {"retry_when": "other", "retry_when_orig": b}) is same
+
+
+def _codex_home(tmp_path, monkeypatch, mode="apikey"):
+    """A CODEX_HOME with a login of `mode` (apikey: billed per use; chatgpt: a plan) and its sessions folder."""
+    home = tmp_path / "codex-home"
+    (home / "sessions").mkdir(parents=True)
+    (home / "auth.json").write_text(json.dumps({"auth_mode": mode, **({"OPENAI_API_KEY": "test-key"} if mode == "apikey" else {})}))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    return home / "sessions"
+
+
+def _rollout(sessions, sid, records, ts):
+    """Append Codex rollout records to the session's file under its day folder."""
+    day = time.strftime("%Y/%m/%d", time.gmtime(ts))
+    path = sessions / day / f"rollout-{time.strftime('%Y-%m-%dT%H-%M-%S', time.gmtime(ts))}-{sid}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a") as f:
+        for r in records:
+            f.write(json.dumps(r) + "\n")
+    return path
+
+
+def _rec(kind, ts, payload):
+    return {"timestamp": time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(ts)), "type": kind, "payload": payload}
+
+
+def _tokens(ts, inp, cached, out):
+    total = {"input_tokens": inp, "cached_input_tokens": cached, "output_tokens": out}
+    return _rec("event_msg", ts, {"type": "token_count", "info": {"total_token_usage": total, "last_token_usage": total}})
+
+
+def _session(sid, ts, model="gpt-test"):
+    return [_rec("session_meta", ts, {"id": sid, "cwd": "/work"}), _rec("turn_context", ts, {"model": model})]
+
+
+def test_other_codex_sessions_are_priced_from_their_rollouts_and_tt_projects_runs_left_out(env, tmp_path, monkeypatch):
+    # Codex writes no Claude Code logs: a usage-billed Codex account's sessions outside tt-project
+    # are read from CODEX_HOME's rollouts, priced at the Codex table (account pricing.codex wins),
+    # and tt-project's own runs, ended or still going, never count as other spend.
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    from ttp import project as proj
+    sessions = _codex_home(tmp_path, monkeypatch)
+    proj.write_json(proj.account_settings_path(), {"pricing": {"codex": {"gpt-priced": [1.0, 0.5, 10.0]}}})
+    p = make(env)
+    other = _other_project(tmp_path, "other")
+    now = time.time()
+    M = 1_000_000
+    user = "11111111-2222-3333-4444-555555555555"
+    ended = "aaaaaaaa-2222-3333-4444-555555555555"
+    going = "bbbbbbbb-2222-3333-4444-555555555555"
+    path = _rollout(sessions, user, [*_session(user, now - 300), _tokens(now - 290, M, M // 2, 0),
+                                     _rec("event_msg", now - 289, {"type": "token_count", "info": None, "rate_limits": {}}),
+                                     _tokens(now - 280, 2 * M, M, M), _tokens(now - 279, 2 * M, M, M)], now - 300)
+    _rollout(sessions, ended, [*_session(ended, now - 200), _tokens(now - 190, M, 0, M)], now - 200)
+    _rollout(sessions, going, [*_session(going, now - 100), _tokens(now - 90, M, 0, M)], now - 100)
+    other.x("INSERT INTO runs(role,provider,started,ended,status,session_id) VALUES('worker','codex',?,?,'ok',?)",
+            (now - 210, now - 150, ended))
+    rid = other.x("INSERT INTO runs(role,provider,started,status) VALUES('worker','codex',?,'running')", (now - 110,))
+    out = Path(other.path).parent / "runs" / str(rid) / "output.jsonl"
+    out.parent.mkdir(parents=True)
+    out.write_text(json.dumps({"type": "thread.started", "thread_id": going}) + "\n")
+    b = _far_day(now)
+    ls.scan(b, now, kind="codex")
+    start, end = gcap.day_bounds(b, now)
+    e = ls.estimate(b, start, end, now, kind="codex")
+    # default row (4, 0.4, 20): 0.5M fresh + 0.5M cached, then 0.5M + 0.5M + 1M out; the repeat counts nothing
+    assert e["usd"] == 24.4 and e["sessions"] == 1 and e["billing"] == "usage" and e["unknown"] == ["gpt-test"], e
+    # More growth is read from where the scan stopped, under the model the session switched to.
+    with open(path, "a") as f:
+        f.write(json.dumps(_rec("turn_context", now - 60, {"model": "gpt-priced"})) + "\n")
+        f.write(json.dumps(_tokens(now - 50, 3 * M, M, 2 * M)) + "\n")
+    ls.scan(b, now + 1, kind="codex")
+    ls._MEMO.clear()
+    assert ls.estimate(b, start, end, now + 1, kind="codex")["usd"] == 24.4 + 11.0
+    # The file rewritten (a new inode, read from the start) counts nothing twice.
+    text = path.read_text()
+    path.unlink()
+    path.write_text(text)
+    ls.scan(b, now + 2, kind="codex")
+    ls._MEMO.clear()
+    assert ls.estimate(b, start, end, now + 2, kind="codex")["usd"] == 35.4
+    # The global Codex total counts them and the caps line names them; the Claude total does not.
+    monkeypatch.setattr(ls, "account_budget", lambda: b)
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    ls._MEMO.clear()
+    t = gcap.total(p.db, "codex", start, end, now + 2, account="")
+    assert t["usd"] == 35.4 and "other Codex sessions on this machine ($35.40, estimated from local rollouts" in t["includes"], t
+    assert "Codex" not in gcap.total(p.db, "claude", start, end, now + 2, account="")["includes"]
+
+
+def test_a_chatgpt_codex_logins_sessions_are_shown_not_counted_and_cursor_is_unknown_not_zero(env, tmp_path, monkeypatch):
+    # User correction: the global cap counts usage-billed spend only. A ChatGPT login's sessions are
+    # metered by its plan windows; Cursor keeps no local log, so its other sessions are named unknown.
+    from ttp import globalcap as gcap
+    from ttp import localspend as ls
+    sessions = _codex_home(tmp_path, monkeypatch, mode="chatgpt")
+    p = make(env)
+    now = time.time()
+    sid = "cccccccc-2222-3333-4444-555555555555"
+    _rollout(sessions, sid, [*_session(sid, now - 100), _tokens(now - 90, 1_000_000, 0, 0)], now - 100)
+    b = _far_day(now)
+    ls.scan(b, now, kind="codex")
+    start, end = gcap.day_bounds(b, now)
+    monkeypatch.setattr(ls, "account_budget", lambda: b)
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    t = gcap.total(p.db, "codex", start, end, now, account="")
+    assert t["usd"] == 0 and t["plan_usd"] == 4.0 and "$4.00 subscription-plan sessions on this machine" in t["includes"], t
+    t = gcap.total(p.db, "cursor", start, end, now, account="")
+    assert t["usd"] == 0 and "other Cursor sessions on this machine (unknown" in t["includes"], t
+    # The daemon's background scan reads the rollouts too, when they are due.
+    monkeypatch.setattr(ls, "_THREAD", {})
+    ls.scan_async({"global_daily_usd": 1}, now + ls.SCAN_S)
+    ls._THREAD["t"].join(10)
+    assert ls.load("codex")["scanned"] == now + ls.SCAN_S and ls.load("codex")["ok"], ls.load("codex")
+    # No rollout folder yet is no sessions ($0, read), not an unreadable log.
+    (tmp_path / "empty").mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "empty"))
+    assert ls.scan(b, now + 1, kind="codex")["ok"] is True
+
+
+def test_other_machines_are_named_missing_from_a_codex_total(env, monkeypatch):
+    # Answers between machines carry only their Claude Code estimate: a Codex total names those
+    # machines as not counted rather than counting their Codex sessions as $0.
+    from ttp import globalcap as gcap
+    p = make(env)
+    now = time.time()
+    start, end = now - 3600, now + 3600
+    monkeypatch.setattr(gcap, "OTHER_SOURCES", [lambda *a: (0.0, "this machine's own sessions", "usage")])
+    monkeypatch.setattr(gcap, "targets", lambda: [])
+    key = gcap.account_key("codex", "")
+    rec = {"v": 1, "host": "far", "sent": now, "windows": [{"start": start, "end": end, "projects": ["x"],
+                                                           "rows": [{"provider": "codex", "key": key, "usd": 2.0}]}]}
+    assert gcap.receive((json.dumps(rec) + "\n").encode(), "far", now)[1] == 0
+    t = gcap.total(p.db, "codex", start, end, now + 1, account="")
+    assert t["usd"] == 2.0 and t["sessions_missing"] == ["far"], t
+    assert "other Codex sessions on far (not sent between machines)" in t["includes"], t["includes"]
+    t = gcap.total(p.db, "claude", start, end, now + 1, account="")
+    assert "Codex" not in t["includes"] and t["sessions_missing"] == ["far"], t
+
+
+# Spend projections stop at the cap's reset (spendproj): made-up numbers, a $3,000 daily cap whose
+# budget day resets at 08:00 in the home zone, 24 min after `now`.
+_PROJ_ZONE = "America/Los_Angeles"
+
+
+def _proj_now():
+    from datetime import datetime
+    from zoneinfo import ZoneInfo
+    z = ZoneInfo(_PROJ_ZONE)
+    return (datetime(2026, 11, 7, 7, 36, tzinfo=z).timestamp(), datetime(2026, 11, 7, 8, 0, tzinfo=z).timestamp())
+
+
+def test_a_projection_past_the_caps_reset_says_not_reached_before_the_reset():
+    """At $86/h, $2,915 of $3,000 would reach the cap 59 min on (08:35), after the reset 24 min on
+    (08:00): the line says it is not reached before the reset and prints no time after it."""
+    from ttp import spendproj
+    now, reset = _proj_now()
+    got = spendproj.line(2915.0, 3000.0, 86.0, reset, now, _PROJ_ZONE)
+    assert got == "at $86/h: not reached before the reset at 08:00 PST", got
+    assert "08:35" not in got and "reaches" not in got, got
+
+
+def test_a_projection_before_the_caps_reset_gives_the_reach_time():
+    """At $400/h the $85 left lasts 12.75 min: the cap is reached at 07:48, before the 08:00 reset."""
+    from ttp import spendproj
+    now, reset = _proj_now()
+    got = spendproj.line(2915.0, 3000.0, 400.0, reset, now, _PROJ_ZONE)
+    assert got == "at $400/h: reaches the cap at 07:48 PST, before the reset at 08:00 PST", got
+
+
+@pytest.mark.parametrize("spent,per_h,reset,want", [
+    (2915.0, 0.0, True, "at $0.00/h: not reached before the reset at 08:00 PST"),
+    (3000.0, 86.0, True, "cap reached: new work waits until the reset at 08:00 PST"),
+    (3100.0, 0.0, True, "cap reached: new work waits until the reset at 08:00 PST"),
+    (2915.0, 86.0, False, "at $86/h: reset time unknown (rolling 24 h), no projection"),
+    (3000.0, 86.0, False, "cap reached, reset time unknown (rolling 24 h)"),
+    (2915.0, None, True, "no burn rate measured yet: no projection"),
+])
+def test_projection_edge_cases_rate_zero_at_or_over_the_cap_and_an_unknown_reset(spent, per_h, reset, want):
+    """A rate of 0 never reaches the cap; at or over it the line names the reset (no reach time); an
+    unknown reset or an unmeasured rate says so and projects nothing; an unset cap has no line."""
+    from ttp import spendproj
+    now, at = _proj_now()
+    assert spendproj.line(spent, 3000.0, per_h, at if reset else None, now, _PROJ_ZONE) == want
+    assert spendproj.line(spent, 0, per_h, at, now, _PROJ_ZONE) == ""
+
+
+def test_the_projection_never_prints_a_reach_time_after_the_reset():
+    """Over a sweep of rates and spends, a printed reach time always falls before the reset."""
+    import re
+    from ttp import spendproj
+    now, reset = _proj_now()
+    for spent in (0.0, 1500.0, 2900.0, 2999.0):
+        for per_h in (1.0, 86.0, 200.0, 212.5, 213.0, 400.0, 10_000.0):
+            got = spendproj.line(spent, 3000.0, per_h, reset, now, _PROJ_ZONE)
+            reach = now + (3000.0 - spent) / per_h * 3600
+            assert ("reaches the cap" in got) == (reach < reset), (spent, per_h, got)
+            m = re.search(r"reaches the cap at (\d\d):(\d\d)", got)
+            assert not m or (int(m.group(1)), int(m.group(2))) < (8, 0), got
+
+
+def test_the_burn_rate_is_the_recent_slope_else_the_periods_average():
+    """The trail keeps an hour of readings, one per 5 min, and drops a new period's leftovers; the
+    rate is its slope once it spans 15 min, else the spend since the period's start."""
+    from ttp import spendproj
+    now, _ = _proj_now()
+    start = now - 23.6 * 3600
+    t = []
+    for i, usd in enumerate((2829.0, 2850.5, 2872.0, 2893.5, 2915.0)):   # +$21.5 per 15 min
+        t = spendproj.trail(t, usd, now - (4 - i) * 900, start)
+    assert len(t) == 5 and spendproj.rate(t, 2915.0, now, start) == pytest.approx(86.0)
+    # A minute on: the reading now past an hour drops off, and none is added within 5 min of the last.
+    assert spendproj.trail(t, 2915.0, now + 60, start) == t[1:]
+    # Older than an hour, from before the period's start, or above today's total: dropped.
+    assert spendproj.trail([[now - 4000, 1.0], [start - 1, 2.0], [now - 600, 9999.0]], 10.0, now, start) == [[now, 10.0]]
+    assert spendproj.rate([[now - 60, 2900.0]], 2915.0, now, start) == pytest.approx(2915.0 / 23.6)
+    assert spendproj.rate([], 5.0, now, None) is None and spendproj.trail("junk", 1.0, now) == [[now, 1.0]]
+
+
+def test_status_and_state_budget_lines_carry_the_projection_with_the_reset(env):
+    """`ttp status` and the web header (usage_line) and the coordinator's STATE (caps_line) quote
+    the projection against the global cap's reset, in the home zone: never '08:35'."""
+    from ttp import budget as bud
+    from ttp.web import usage_line
+    p = make(env)
+    now, reset = _proj_now()
+    n = {"spent_today": 545.0, "day_start": reset - 86400, "day_end": reset, "global_today": 2915.0,
+         "global_cap": 3000.0, "global_stale": [], "global_includes": "8 project(s)", "global_resets_at": reset,
+         "global_per_h": 86.0, "spent_24h": 545.0, "spent_7d": 900.0, "daily_cap": 0, "weekly_cap": 0}
+    got = usage_line(n, now, _PROJ_ZONE)
+    assert got.endswith("$2,915 of $3000 global - resets in 0.4 h; at $86/h: not reached before the reset at 08:00 PST") \
+        or "at $86/h: not reached before the reset at 08:00 PST" in got, got
+    gate = bud.Gate(provider="claude", level="green", regime="caps", max_parallel=6, max_tier="deep",
+                    allow_optional=True, reasons=[], numbers=n).as_dict()
+    line = bud.caps_line(p.db, {"claude": gate}, p.config()["budget"], now, _PROJ_ZONE)
+    assert "claude $2915.00 of $3000 today (8 project(s)), at $86/h: not reached before the reset at 08:00 PST" in line, line
+    assert "08:35" not in line + got
+    n["global_per_h"] = 400.0
+    assert "at $400/h: reaches the cap at 07:48 PST, before the reset at 08:00 PST" in usage_line(n, now, _PROJ_ZONE)
+
+
+def test_the_global_gate_records_its_burn_rate_across_ticks(env, monkeypatch):
+    """budget._global keeps the total's recent readings in the saved gate and derives global_per_h
+    from them, so the projection follows the current burn, not the day's average."""
+    from ttp import budget as bud
+    from ttp import globalcap as gcap
+    p = make(env)
+    p.set_config("budget.global_daily_usd", 3000)
+    p.set_config("budget.day_start", "08:00")
+    p.set_config("budget.timezone", _PROJ_ZONE)
+    now, reset = _proj_now()
+    spent = {"usd": 2829.0}
+    monkeypatch.setattr(gcap, "total", lambda *a, **k: {"usd": spent["usd"], "stale": [], "includes": "1 project(s)"})
+    for i in range(5):
+        spent["usd"] = 2829.0 + 21.5 * i
+        g = bud.evaluate(p.db, p.config(), "claude", [], now - (4 - i) * 900)
+        p.db.set_kv("gates", {"claude": g.as_dict()})
+    assert g.numbers["global_resets_at"] == reset and g.numbers["global_per_h"] == pytest.approx(86.0), g.numbers
