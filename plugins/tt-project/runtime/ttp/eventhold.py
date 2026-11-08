@@ -12,21 +12,25 @@ ask_timeout, machine and resource events, ...), any high or critical event, and 
 slot is free while no ready task is queued to fill it, so capacity never idles waiting on the hold.
 The model-free start of ready work runs in dispatch, apart from the coordinator, and is not held.
 
-The wake gap (gap_until) is the coalescing floor under that hold: an event-only batch of the kinds
-GAP_KINDS at a routine severity (task ends and hand-offs, timers, sweeps, notes) waits until
+The wake gap (gap_until) is the coalescing floor under that hold: an event-only batch with no
+immediate event (task ends and hand-offs, timers, sweeps, notes, waits) waits until
 coordinator.wake_gap_s (default 300; 0: off) after the last turn ended even when a worker slot is
 free, so a stream of such events costs one wake per gap, not one per free slot. Dispatch starts ready
-work without a model run meanwhile. Every other kind, a high or critical event and a user message or
-answered ask wake at once. A held event stays queued on disk and rides the next turn."""
+work without a model run meanwhile. A user message or answered ask, a high or critical event and the
+kinds of IMMEDIATE_KINDS and IMMEDIATE_PREFIXES (must-act, overdue obligations, safety and outage
+events) wake at once. A held event stays queued on disk and rides the next turn."""
 from __future__ import annotations
 
 KINDS = frozenset({"task_done", "followup_proposed", "upstream_note", "checks_slot_wait", "task_waiting"})
 SEVERITIES = frozenset({"info", "low", "normal"})
 DEFAULT_S = 300.0
-GAP_KINDS = KINDS | frozenset({
-    "task_failed", "task_blocked", "task_review", "task_changes_needed", "task_notes", "observation",
-    "blocker_sweep", "stall", "no_progress", "deferral_expired", "time_only_hold", "announced_not_started",
-    "ready_not_started", "ready_backlog", "budget_kind_change"})
+# Kinds that never wait for the wake gap or the watcher, at any severity: must-act items (mustact.KINDS),
+# answered or timed-out asks, overdue obligations, safety (charter, restriction, outside writes, spend)
+# and outage events (machines, resources, providers, hosts, pauses, the daemon's boot).
+IMMEDIATE_KINDS = frozenset({"turn_budget", "detached_job_spend_cap", "boot", "coord_session_start_failed",
+                             "user_order_fanout", "relayer_ordered", "outside_writes", "outscan_refused"})
+IMMEDIATE_PREFIXES = ("ask_", "charter_", "obligation_", "pause_", "machine_", "resource_", "provider_", "host_",
+                      "outage", "gate_", "credential", "secret", "auth", "login", "restriction", "safety")
 
 
 def hold_s(cfg: dict) -> float:
@@ -51,9 +55,17 @@ def until(cfg: dict, msgs: list, evs: list[dict], last_end: float | None, now: f
     return end if now < end else None
 
 
+def immediate(e: dict) -> bool:
+    """Whether event `e` wakes the coordinator at once: a high or critical one or a kind above."""
+    from . import mustact
+    kind = str(e.get("kind") or "")
+    return e.get("severity") not in SEVERITIES or kind in mustact.KINDS or kind in IMMEDIATE_KINDS or \
+        kind.startswith(IMMEDIATE_PREFIXES)
+
+
 def can_wait(evs: list[dict]) -> bool:
-    """Whether every event in `evs` (at least one) may wait for the next wake: GAP_KINDS, routine severity."""
-    return bool(evs) and all(e.get("kind") in GAP_KINDS and e.get("severity") in SEVERITIES for e in evs)
+    """Whether every event in `evs` (at least one) may wait for the next wake (none is immediate)."""
+    return bool(evs) and not any(immediate(e) for e in evs)
 
 
 def gap_until(cfg: dict, evs: list[dict], last_end: float | None, now: float) -> float | None:

@@ -56,8 +56,8 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    ready to fill it (eventhold.py). That exception stays even for batches of only plain hand-offs,
    checks_slot_wait and task_waiting: replayed, turns of only those events still queued work, replied
    or updated tasks (`python3 -m ttp.replay --event-hold-s 300 --quiet-hold`). Under both, the wake
-   gap: a batch of only task ends, hand-offs, timers, sweeps or notes at routine severity wakes at
-   most once per `coordinator.wake_gap_s` (300 s) after the last turn ended, a free slot included
+   gap: an event-only batch with no immediate event (high or critical, must-act, asks, overdue
+   obligations, safety and outage kinds: eventhold.IMMEDIATE_KINDS) wakes at most once per `coordinator.wake_gap_s` (300 s) after the last turn ended, a free slot included
    (dispatch starts ready work without a model run meanwhile), and before that wake the watcher model
    (`babysit.ask`, target coordinator) may fold it into the next wake: the events stay queued and ride
    the next digest, at most `coordinator.wake_triage_max_s` (1800 s); a watcher error wakes and logs

@@ -29,7 +29,7 @@ def test_wakegap_routine_events_in_the_gap_share_one_wake_even_with_a_free_slot(
     p, d, clock, starts, _ = _wg_setup(env, monkeypatch, busy=0)
     ended = clock[0]
     assert float(p.config()["coordinator"]["wake_gap_s"]) == 300
-    for kind in ("task_done", "task_failed", "blocker_sweep", "task_waiting"):
+    for kind in ("task_done", "task_failed", "blocker_sweep", "urgent_check_wait"):
         clock[0] += 40   # events at +40, +110, +180 and +250 s, each checked for 30 s
         _event(p, clock, kind)
         assert not _turn_within(d, clock, starts, 30), f"{kind} woke the coordinator inside the wake gap"
@@ -44,7 +44,8 @@ def test_wakegap_user_messages_and_urgent_events_wake_at_once(env, monkeypatch):
     p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)", (clock[0], "in", "web", "hi"))
     assert _turn_within(d, clock, starts, 60), "a user message waited on the wake gap"
     for kind, sev in (("task_done", "high"), ("obligation_overdue", "normal"), ("ask_timeout", "normal"),
-                      ("machine_condition", "normal"), ("promise_overdue", "normal")):
+                      ("machine_condition", "normal"), ("promise_overdue", "normal"), ("queue_wait", "normal"),
+                      ("charter_retry", "normal"), ("outside_writes", "normal")):
         p, d, clock, starts, _ = _wg_setup(env, monkeypatch)
         clock[0] += 10
         _event(p, clock, "task_done")
