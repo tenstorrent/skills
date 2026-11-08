@@ -972,7 +972,7 @@ def test_gate_judge_same_failure_ignores_a_venv_path_and_reads_long_pytest_heade
     name = a.rpartition("::")[2]
 
     def run(env, pid, secs):
-        line = (f"AssertionError: CompletedProcess(args=['/home/u/.tt-project/checks-env/{env}/bin/python3'], "
+        line = (f"AssertionError: CompletedProcess(args=['/opt/ci/.tt-project/checks-env/{env}/bin/python3'], "
                 f"pid {pid}, took {secs}s)")
         out = (f"=== FAILURES ===\n_ {name} _\n\n    def {name}():\n        helper()\n\n"
                f"tests/test_a.py:3: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n"
