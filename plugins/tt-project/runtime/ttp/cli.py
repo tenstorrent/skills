@@ -8081,7 +8081,7 @@ def cmd_detach(a) -> None:
         jobs.append({"name": a.name, "rc": str(rc), "log": str(logf), "pid": pid, **detach.owner(state=state),
                  **({"pid_start": lk.start_time(pid)} if pid else {}), "started": time.time(),
                  "boot": boot_id(), "queued": pid is None, "status": "running" if pid else "queued",
-                 "command": " ".join(cmd)[:300],
+                 "command": " ".join(cmd), "argv": [str(c) for c in cmd],
                  **({"resumable": True} if getattr(a, "resumable", False) else {}),
                  **({"remote": remote} if remote else {}),
                  **({"locks": job_locks} if job_locks else {}),

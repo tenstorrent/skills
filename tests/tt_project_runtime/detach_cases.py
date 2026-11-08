@@ -3099,3 +3099,103 @@ def test_the_sweep_removes_the_work_dir_of_a_checks_job_gone_without_its_wrapper
         held.close()
     detach.sweep(p.state)
     assert not detach.scratch(live).exists()
+
+
+def test_detach_records_the_full_command_and_argv_however_long_its_env_prefix(env, tmp_path):
+    """detached.json keeps the job's whole command line and its argv, never a cut: a long env prefix
+    used to push the real command past the cut, so tools matching on it missed the job."""
+    p = make(env)
+    run_dir = p.runs / "7"
+    run_dir.mkdir(parents=True)
+    argv = ["env", *(f"VAR_{i}={'x' * 40}" for i in range(12)), "sh", "-c", "exit 0", "the-real-gate"]
+    r = _ttp_run(p, "detach", "job1", "--", *argv, env=_lock_job_env(env, p, run_dir))
+    assert r.returncode == 0, r.stderr
+    job = json.loads((run_dir / "detached.json").read_text())[0]
+    assert job["argv"] == argv and job["command"] == " ".join(argv) and len(job["command"]) > 300
+    assert job["command"].endswith("the-real-gate")
+    assert _wait_for_path((run_dir / "job1.rc").resolve())
+
+
+def _closable(p, name, code=None, lost_why=None, **entry):
+    """A run's detached job record (open) whose job ended with exit `code` or was lost with `lost_why`."""
+    run_dir = p.runs / "31"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    rc = (run_dir / f"{name}.rc").resolve()
+    reg = run_dir / "detached.json"
+    jobs = json.loads(reg.read_text()) if reg.exists() else []
+    jobs.append({"name": name, "rc": str(rc), "log": str(rc.with_suffix(".log")), "pid": 4242, "task": 77,
+                 "status": "running", "started": time.time() - 60, **entry})
+    reg.write_text(json.dumps(jobs))
+    if code is not None:
+        rc.write_text(f"{code}\n")
+    if lost_why is not None:
+        rc.with_suffix(".lost").write_text(lost_why)
+    return rc
+
+
+def test_a_kill_from_outside_tt_project_is_recorded_once_at_reap_and_a_stop_on_record_is_not(env):
+    """A job that died by a signal no tt-project path sent (no detach --stop, no jobstop row) gets one
+    row in job-signals.jsonl when its record closes, naming the signal from its exit code; a job lost
+    with its wrapper gets one with an unknown signal. An ordinary exit, a stop on record, a job that
+    already has a signal row and a reboot write none, and closing twice writes no second row."""
+    from ttp import detach
+    p = make(env)
+    term = _closable(p, "termed", 143)
+    killed = _closable(p, "gone", lost_why="it was killed after it started, before it wrote an exit code "
+                                           "(same boot: it crashed or was killed)")
+    plain = [_closable(p, f"exit{c}", c) for c in (0, 1, 2, 127, 255)]
+    stopped = _closable(p, "stopped")
+    assert detach.record_stop(stopped, "task #77 is cancelled")
+    rowed = _closable(p, "rowed", 137)
+    detach.signalled(rowed, signal.SIGKILL, 4242, "jobstop.sweep", "task #77 is cancelled", by="jobstop")
+    reboot = _closable(p, "reboot", lost_why="the driver died with the host reboot: the host restarted while it ran")
+    for rc in (term, killed, *plain, stopped, rowed, reboot):
+        assert detach.close(rc)["status"] in ("ended", "died")
+        detach.close(rc)   # closed already: nothing more
+    rows = [x for x in _signal_rows(p) if x["reason"] == "unseen"]
+    assert [(x["job"], x["signal"], x["exit"], x["by"], x["seen"], x["pid"], x["task"]) for x in rows] == [
+        ("termed", "SIGTERM", 143, "unknown", "at reap", 4242, 77),
+        ("gone", "unknown", None, "unknown", "at reap", 4242, 77)], rows
+    assert "died by signal 15 (SIGTERM) with no ttp detach --stop" in rows[0]["why"]
+    assert len(_signal_rows(p)) == 3   # the two unseen rows and the jobstop row the test wrote
+
+
+def test_a_job_that_kills_itself_by_signal_is_recorded_by_ttp_detach_reap(env, tmp_path):
+    """End to end: a detached command ended by SIGTERM from outside tt-project; `ttp detach --reap`
+    closes its record and leaves the row that names it."""
+    p = make(env)
+    run_dir = p.runs / "8"
+    run_dir.mkdir(parents=True)
+    job_env = _lock_job_env(env, p, run_dir)
+    r = _ttp_run(p, "detach", "selfterm", "--", "sh", "-c", "kill -TERM $$", env=job_env)
+    assert r.returncode == 0, r.stderr
+    rc = (run_dir / "selfterm.rc").resolve()
+    assert _wait_for_path(rc) and rc.read_text().strip() == "143"
+    r = _ttp_run(p, "detach", "--reap", str(rc), env=job_env)
+    assert r.returncode == 0, r.stderr
+    (row,) = _signal_rows(p)
+    assert (row["job"], row["signal"], row["reason"], row["rc"]) == ("selfterm", "SIGTERM", "unseen", str(rc))
+
+
+def test_last_progress_reads_a_live_jobs_newest_log_and_skips_ended_lost_and_remote_jobs(env):
+    """detach.last_progress: the newest of a live job's log, .started and .queued mtimes; None for a job
+    that ended or was lost, for a --host probe and for a probe with no detach --check."""
+    from ttp import detach
+    p = make(env)
+    now = time.time()
+    live = _closable(p, "live")
+    for path, ago in ((live.with_suffix(".started"), 7200), (live.with_suffix(".log"), 120)):
+        path.write_text("x")
+        os.utime(path, (now - ago, now - ago))
+    old = _closable(p, "old")
+    old.with_suffix(".started").write_text("x")
+    os.utime(old.with_suffix(".started"), (now - 9000, now - 9000))
+    ended = _closable(p, "ended", 0)
+    ended.with_suffix(".log").write_text("x")
+    assert abs(detach.last_progress(f"ttp detach --check {live}") - (now - 120)) < 2
+    assert abs(detach.last_progress(f"ttp detach --check {old}") - (now - 9000)) < 2
+    assert abs(detach.last_progress(f"ttp detach --check {old} {live}") - (now - 120)) < 2
+    assert detach.last_progress(f"ttp detach --check {ended}") is None
+    assert detach.last_progress(f"ttp detach --check --host box-a {live}") is None
+    assert detach.last_progress("test -e state/out-ready || exit 1") is None
+    assert abs(detach.last_progress(f"ttp detach --check {live.name}", live.parent) - (now - 120)) < 2

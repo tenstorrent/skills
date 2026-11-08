@@ -12261,8 +12261,9 @@ class Daemon:
         NOT_YET_RCS: 1, 75 (a busy `ttp lock`) and 255 (ssh could not reach the host a remote marker
         lives on; only when the host named really does not answer, _own_255). A broken probe
         (any other exit, a timeout, a probe that cannot start) wakes it at its timer so a worker can
-        fix the probe. Past `waiting.max_hold_s` after the hand-off a "not yet" keeps it asleep too (a
-        model run cannot make the probe pass) and raises one `wait_stale` event for the coordinator.
+        fix the probe. Past `waiting.max_hold_s` after the hand-off (for a wait on a live detached job, after
+        its log last advanced: detach.last_progress) a "not yet" keeps it asleep too (a model run cannot
+        make the probe pass) and raises one `wait_stale` event for the coordinator.
         Tasks with the same probe share its runs."""
         db, now = self.p.db, time.time()
         self._poll_on_pass(now)
@@ -13586,6 +13587,8 @@ class Daemon:
             start, peer = self._peer_hold(task, prev, since, max_hold, now)
             if now >= start + max_hold:   # a user-marker gate is timed from when the marker appeared
                 start = max(start, userpause.gate_opened(prev.get("retry_when"), self.cfg, self.p.root, now) or 0)
+            if now >= start + max_hold:   # a wait on a live detached job is timed from its last progress
+                start = max(start, detach.last_progress(str(prev.get("retry_when") or ""), self.p.root) or 0)
             held = now >= start + max_hold
             gate = time_gate(str(prev.get("retry_when") or ""))
             # A pure time gate whose epoch is still ahead is not stuck: no turn could make it pass sooner.
