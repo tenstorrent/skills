@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+A Claude Code run that resumes or forks a session reports the session's running total (`total_cost_usd`). Such a run now books only what that total rose by since the session's last reported total (any task or role), and never less than its own tokens at list price. It no longer nets against what earlier wakes booked, floored at the project's measured rate. That rate could over-book one wake, push the booked sum past the next reported total, and from then on make every wake book the whole running total. When the reported total drops, the CLI has started its count over, so the whole report is booked. A resumed coordinator wake's `--max-budget-usd` is now the session's last reported total plus the wake's budget, not the booked sum. On the first daemon start after the upgrade, every project re-books once the resumed runs of the last 7 days that were booked at the running total. The re-book lowers each run's cost and its task's spend, adds a negative ledger row at the run's end time, and writes one daemon log line per project: runs re-booked and $ before -> after.

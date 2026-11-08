@@ -36,6 +36,7 @@ the Edit rules (a `python3 -c` write passed those), a check and not a fence; rea
 interpreter were not probed."""
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -657,6 +658,27 @@ def result_models(path: Path) -> tuple[list[str], str]:
     except OSError:
         return [], ""
     return ids, init
+
+
+def result_total(path: Path) -> float | None:
+    """The total_cost_usd of the last result event in a run's output.jsonl (for a resumed or forked
+    session, the session's running total), or None when it has none."""
+    total = None
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if '"total_cost_usd"' not in line:
+                    continue
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(ev, dict) and ev.get("type") == "result" and ev.get("total_cost_usd") is not None:
+                    with contextlib.suppress(TypeError, ValueError):
+                        total = float(ev["total_cost_usd"])
+    except OSError:
+        return None
+    return total
 
 
 def _whole_answer(row: dict) -> bool:

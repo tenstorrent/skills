@@ -1571,9 +1571,8 @@ def _cs_booked_run(p, session, cost, mode, *, out=0, task=None, role="coordinato
                   (task, role, time.time() - 600, time.time() - 500, cost, out, session, basis, json.dumps(note)))
 
 
-def test_coordsession_a_resumed_wake_s_report_is_netted_only_when_its_tokens_agree(env):
+def test_coordsession_a_resumed_wake_books_what_the_session_total_rose_by(env):
     p = make(env)
-    p.set_config("budget.estimate_usd_per_mtok", 1.0)   # 200k output tokens price at $1.00
     from ttp.daemon import Daemon
     d = Daemon(p.base)
     _cs_booked_run(p, "S", 4.0, "new")
@@ -1582,13 +1581,102 @@ def test_coordsession_a_resumed_wake_s_report_is_netted_only_when_its_tokens_agr
                  (time.time(), json.dumps({"turn": {"session": {"mode": "resume"}}})))
     r = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
     from ttp.providers.base import RunUsage
-    assert d._net_of_session(r, RunUsage(cost_usd=5.0, output_tokens=200_000)) == 1.0
-    # Its own tokens price at $8.00: a $1.00 delta disagrees, so the report is this wake's own cost.
-    assert d._net_of_session(r, RunUsage(cost_usd=5.0, output_tokens=1_600_000)) == 5.0
-    assert d._net_of_session(r, RunUsage(cost_usd=3.0)) == 3.0, "a report below the session's booking was netted"
+    opus = {"model_usage": ["claude-opus-5-5"]}
+    assert d._net_of_session(r, RunUsage(cost_usd=5.0, output_tokens=20_000, extra=dict(opus))) == 1.0
+    # Never below its own tokens at list price ($4.00 for 200k output tokens).
+    assert d._net_of_session(r, RunUsage(cost_usd=5.0, output_tokens=200_000, extra=dict(opus))) == 4.0
+    assert d._net_of_session(r, RunUsage(cost_usd=3.0)) == 3.0, "a report below the session's total was netted"
     for note in ({"turn": {"session": {"mode": "new"}}}, {"turn": {"session": {"mode": "stateless"}}}, {}):
         assert d._net_of_session(dict(r, note=json.dumps(note)), RunUsage(cost_usd=5.0)) == 5.0, note
     assert d._net_of_session(dict(r, task=1), RunUsage(cost_usd=5.0)) == 5.0, "a task's run netted over the coordinator's"
+
+
+def _cs_claude_run(p, session, total, note, *, task=None, role="coordinator", out=20_000, ended=None):
+    """A finished Claude run whose output.jsonl reports `total` as Claude Code does (a resumed or forked
+    session's running total) with this run's own `out` output tokens; returns its row."""
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,session_id,cost_basis,note) "
+                 "VALUES(?,?,'claude','opus',?,?,'running',?,'reported',?)",
+                 (task, role, (ended or time.time()) - 60, ended or time.time(), session, json.dumps(note)))
+    d = p.runs / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "output.jsonl").write_text("\n".join(json.dumps(e) for e in (
+        {"type": "system", "subtype": "init", "session_id": session, "model": "claude-opus-5-5"},
+        {"type": "result", "subtype": "success", "session_id": session, "total_cost_usd": total,
+         "usage": {"input_tokens": 10, "output_tokens": out, "cache_read_input_tokens": 0,
+                   "cache_creation_input_tokens": 0},
+         "modelUsage": {"claude-opus-5-5": {"outputTokens": 10 ** 6, "costUSD": total}}})) + "\n")
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), rid))
+    return p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def _cs_finish(p, d, r):
+    """Book run `r` the way finish_run does: parse its output, net it, record the reported total."""
+    from ttp.providers import get_provider
+    usage = get_provider("claude").parse(p.runs / str(r["id"]) / "output.jsonl")
+    cost = d._net_of_session(r, usage)
+    note = json.loads(r["note"] or "{}")
+    if "session_cost_usd" in usage.extra:
+        note["session_cost_usd"] = usage.extra["session_cost_usd"]
+    p.db.x("UPDATE runs SET cost_usd=?, status='ok', note=? WHERE id=?", (cost, json.dumps(note), r["id"]))
+    p.db.spend("claude", cost, "coordinator" if r["task"] is None else f"task:{r['task']}", ts=r["ended"])
+    return round(cost, 6)
+
+
+def test_resumed_and_forked_claude_sessions_book_only_their_own_cost(env):
+    """Claude Code reports a resumed or forked session's running total (total_cost_usd): three wakes of
+    the coordinator's session, a worker forked from it and that worker's resume each book only what the
+    total rose by. A project rate that prices a wake's tokens above its delta once (the floor the old
+    netting took) must not make every later wake book the whole running total; a fresh run books its
+    report as it stands."""
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 100.0)   # the project's measured rate, inflated
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
+    got = [_cs_finish(p, d, _cs_claude_run(p, "C", 1.0, wake("new"))),
+           _cs_finish(p, d, _cs_claude_run(p, "C", 2.0, wake("resume")))]
+    fork = _cs_claude_run(p, "F", 2.6, {"coord_context": {"how": "fork"}}, task=7, role="worker")
+    got.append(_cs_finish(p, d, fork))
+    got.append(_cs_finish(p, d, _cs_claude_run(p, "C", 2.5, wake("resume"))))
+    got.append(_cs_finish(p, d, _cs_claude_run(p, "F", 3.5, {"resumes": {"session": "F"},
+                                                             "coord_context": {"how": "resume", "run": fork["id"]}},
+                                               task=7, role="worker")))
+    got.append(_cs_finish(p, d, _cs_claude_run(p, "N", 0.7, {}, task=8, role="worker")))
+    assert got == [1.0, 1.0, 0.40004, 0.5, 0.9, 0.7], got   # a fork's first run: its own tokens at list price
+    assert d._session_total_before("C", 1 << 62) == 2.5, "the resumed wake's cap base is the session's last total"
+    assert d._session_total_before("F", 1 << 62) == 3.5
+
+
+def test_runs_booked_at_a_session_s_running_total_are_re_booked_once(env):
+    p = make(env)
+    from ttp.daemon import SESSION_REBOOK_KEY, Daemon
+    d = Daemon(p.base)
+    wake = lambda mode: {"turn": {"session": {"mode": mode, "why": "continued"}}}
+    old = time.time() - 8 * 86400
+    rows = [_cs_claude_run(p, "C", 3.0, wake("resume"), ended=old),   # outside the window
+            _cs_claude_run(p, "C", 4.0, wake("new")), _cs_claude_run(p, "C", 5.5, wake("resume")),
+            _cs_claude_run(p, "C", 6.0, wake("resume")),
+            _cs_claude_run(p, "W", 9.0, {"resumes": {"session": "W"}}, task=7, role="worker"),   # no earlier total
+            _cs_claude_run(p, "N", 0.7, {}, task=8, role="worker")]
+    p.db.x("INSERT INTO tasks(id,title,kind,status,spent_usd) VALUES(7,'t','code','done',20.0)")
+    for r in rows:   # booked the old way: each at its full report
+        total = json.loads((p.runs / str(r["id"]) / "output.jsonl").read_text().splitlines()[1])["total_cost_usd"]
+        p.db.x("UPDATE runs SET cost_usd=?, status='ok' WHERE id=?", (total, r["id"]))
+        p.db.spend("claude", total, "x", ts=r["ended"])
+    ids = [r["id"] for r in rows]
+    ledger = lambda: round(p.db.one("SELECT SUM(usd) s FROM ledger")["s"], 6)
+    assert d.rebook_session_totals(dry_run=True) == [(ids[2], 5.5, 1.5), (ids[3], 6.0, 0.5)]
+    assert ledger() == 28.2 and p.db.kv(SESSION_REBOOK_KEY) is None, "a dry run wrote"
+    assert d.rebook_session_totals() == [(ids[2], 5.5, 1.5), (ids[3], 6.0, 0.5)]
+    cost = {r["id"]: round(r["cost_usd"], 6) for r in p.db.q("SELECT id, cost_usd FROM runs")}
+    assert [cost[i] for i in ids] == [3.0, 4.0, 1.5, 0.5, 9.0, 0.7]
+    assert ledger() == 18.7, "the ledger (dollar caps, global daily total) still counts the old totals"
+    assert json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (ids[3],))["note"])["session_rebooked"] == 6.0
+    assert p.db.kv(SESSION_REBOOK_KEY)["runs"] == 2
+    assert d.rebook_session_totals() is None, "ran twice"
+    p.db.x("DELETE FROM kv WHERE key=?", (SESSION_REBOOK_KEY,))
+    assert d.rebook_session_totals() == [], "a re-booked row was re-booked again"
+    assert ledger() == 18.7
 
 
 def test_coordsession_wakes_booked_at_the_running_total_are_re_netted_once(env):
