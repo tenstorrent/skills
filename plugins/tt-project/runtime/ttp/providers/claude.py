@@ -140,6 +140,7 @@ class Claude(Provider):
 
     caps_budget = True   # --max-budget-usd
     coord_session = "agent"   # --resume <session id>
+    session_format = "claude-code"   # projects/<cwd slug>/<id>.jsonl (fork_session); the chat provider's too
     tool_hooks = True
     fence_optional = True   # the Bash sandbox (fence_args)
 

@@ -348,6 +348,11 @@ class Provider:
         own, which may point the agent at another config directory), is still on disk to resume."""
         return False
 
+    # The saved-session format fork_session copies: a session saved by one provider can be forked into a
+    # run of another with the same format (the chat provider runs Claude Code, so it forks a Claude
+    # session; ctxfork.py). "" for none.
+    session_format = ""
+
     def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
         """Copy the saved session `session_id` to a new session `new_id` that a run in `cwd` with the
         environment `env` resumes (resume_args(new_id)), so the run starts from its history and never

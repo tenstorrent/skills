@@ -3321,8 +3321,12 @@ class Daemon:
                     resume, resume_extra = got["session"], prov.resume_args(got["session"])
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
-                note = {**(note or {}), ctxfork.KEY: {k: got[k] for k in ("how", "why", "session", "tokens", "run")
+                note = {**(note or {}), ctxfork.KEY: {k: got[k] for k in ("how", "why", "session", "tokens", "run", "from")
                                                       if k in got}}
+            elif task and role in ctxfork.ROLES:   # a lost run continued in its own session (_resumable)
+                note = {**(note or {}), ctxfork.KEY: {"how": "resume", "why": "continues its own session",
+                                                      "session": resume} if resume_extra else
+                        {"how": "none", "why": f"{provider} cannot resume its own session"}}
         if thread:
             resume, resume_extra = thread, prov.resume_args(thread)
             prompt = coord.THREAD_CONTINUED + "\n\n" + prompt

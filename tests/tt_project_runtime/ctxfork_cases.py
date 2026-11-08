@@ -87,7 +87,7 @@ def test_a_worker_run_forks_the_coordinator_session_and_never_writes_into_it(env
     assert src.read_bytes() == before   # the coordinator's own transcript is untouched
     # A lost run continuing its own session gets neither a fork nor the disk block.
     argv, prompt, got, session = run(resume=str(uuid.uuid4()))
-    assert got is None and not prompt.startswith(ctxfork.FORK_HEAD) and ctxfork.DISK_HEAD not in prompt
+    assert got["how"] == "resume" and not prompt.startswith(ctxfork.FORK_HEAD) and ctxfork.DISK_HEAD not in prompt
 
 
 def test_the_shipped_default_forks_a_coordinator_session_of_any_size(env, monkeypatch, tmp_path):
@@ -166,8 +166,9 @@ def test_a_worker_run_falls_back_to_the_coordinator_context_on_disk(env, monkeyp
 
 
 def test_fork_session_per_provider(env, monkeypatch, tmp_path):
-    """Claude Code forks by a transcript copy; Codex, Cursor and the chat provider's own coordinator keep
-    no forkable session (the disk block stands in); the fake copies its saved session."""
+    """Claude Code forks by a transcript copy (the chat provider runs Claude Code: the same copy); Codex
+    by a rollout copy (codex_fork cases below); Cursor keeps no forkable session (the disk block stands
+    in); the fake copies its saved session."""
     from ttp.providers import get_provider as get
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "cfg"))
     sid = str(uuid.uuid4())
@@ -181,8 +182,8 @@ def test_fork_session_per_provider(env, monkeypatch, tmp_path):
     new = str(uuid.uuid4())
     assert claude.fork_session(sid, "/w", {"CLAUDE_CONFIG_DIR": str(own)}, new) == ""
     assert (own / "projects" / "-w" / f"{new}.jsonl").is_file()
-    for name in ("codex", "cursor"):
-        assert "cannot fork" in get(name).fork_session(sid, "/w", None, str(uuid.uuid4()))
+    assert "cannot fork" in get("cursor").fork_session(sid, "/w", None, str(uuid.uuid4()))
+    assert get("chat").session_format == claude.session_format and not get("cursor").session_format
     # The copy starts at the session's last compaction: the agent resumes from there anyway.
     src = next((tmp_path / "cfg" / "projects").glob(f"*/{sid}.jsonl"))
     src.write_text(_fork_line("user", sid, "before compaction") + "\n"
@@ -412,3 +413,105 @@ def test_stats_show_how_worker_runs_started_and_follow_ups_resumed(env):
     assert day["follow_ups"] == 2 and day["resumed"] == 1
     text = coordstats.text(s)
     assert "fork 2 (40%)" in text and "follow-ups resumed 1 of 2" in text
+
+
+def _codex_rollout(home, sid, cwd="/coord"):
+    """A Codex rollout as `codex exec` 0.160 saves it: session meta, a finished turn naming the thread,
+    then a turn still running and a last line still being written."""
+    folder = home / "sessions" / "2026" / "11" / "08"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"rollout-2026-11-08T10-00-00-{sid}.jsonl"
+    path.write_text("\n".join(json.dumps(r) for r in [
+        {"type": "session_meta", "payload": {"id": sid, "session_id": sid, "cwd": cwd}},
+        {"type": "turn_context", "payload": {"turn_id": "t1", "cwd": cwd}},
+        {"type": "event_msg", "payload": {"type": "item_completed", "thread_id": sid, "text": "decided X"}},
+        {"type": "event_msg", "payload": {"type": "task_complete", "thread_id": sid}},
+        {"type": "event_msg", "payload": {"type": "task_started", "thread_id": sid}},
+        {"type": "response_item", "payload": {"type": "message", "role": "user", "text": "next wake"}},
+    ]) + "\n" + '{"type": "event_msg", "payload": {"thread_id": "' + sid)
+    return path
+
+
+def _fake_codex(tmp_path, monkeypatch):
+    """A codex CLI whose `exec --help` lists the resume subcommand, as 0.160's does."""
+    bin_dir = tmp_path / "fakebin"
+    bin_dir.mkdir(exist_ok=True)
+    exe = bin_dir / "codex"
+    exe.write_text("#!/bin/sh\necho 'Commands:'\necho '  resume  Resume a previous session by id'\n")
+    exe.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ.get('PATH', '')}")
+
+
+def test_codex_fork_session_copies_the_rollout_under_a_new_id(monkeypatch, tmp_path):
+    from ttp.providers import get_provider as get
+    codex = get("codex")
+    home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    sid, new = str(uuid.uuid4()), str(uuid.uuid4())
+    _codex_rollout(home, sid)
+    assert codex.fork_session(sid, "/run", None, "../x") == "bad session id"
+    assert codex.fork_session(str(uuid.uuid4()), "/run", None, new) == "the session's rollout is not on disk"
+    own = tmp_path / "run-home"   # the run's own CODEX_HOME gets the copy
+    assert codex.fork_session(sid, "/run", {"CODEX_HOME": str(own)}, new) == ""
+    [copy] = list((own / "sessions").glob(f"*/*/*/rollout-*-{new}.jsonl"))
+    assert copy.stat().st_mode & 0o777 == 0o600
+    text = copy.read_text()
+    assert sid not in text and text.endswith("\n")   # every id swapped; the partial last line left out
+    rows = [json.loads(x) for x in text.splitlines()]   # up to the last finished turn
+    assert rows[-1]["payload"]["type"] == "task_complete" and "next wake" not in text
+    assert len(rows) == 4 and rows[0]["payload"] == {"id": new, "session_id": new, "cwd": "/run"}
+    assert rows[2]["payload"]["thread_id"] == new and rows[2]["payload"]["text"] == "decided X"
+    assert codex.session_saved(new, "/run", {"CODEX_HOME": str(own)})
+    # A rollout with no session meta, or with no finished turn, is not one to start from.
+    bad = str(uuid.uuid4())
+    _codex_rollout(home, bad).write_text(json.dumps({"type": "event_msg", "payload": {"type": "task_complete"}}) + "\n")
+    assert "no session_meta" in codex.fork_session(bad, "/run", None, str(uuid.uuid4()))
+    path = _codex_rollout(home, bad)
+    path.write_text("\n".join(x for x in path.read_text().splitlines() if "task_complete" not in x) + "\n")
+    assert "no finished turn" in codex.fork_session(bad, "/run", None, str(uuid.uuid4()))
+
+
+def test_ctxfork_forks_across_providers_only_into_the_same_session_format(env, monkeypatch, tmp_path):
+    """A chat-provider run forks a Claude coordinator's session (it runs Claude Code); a Codex run forks a
+    Codex coordinator's (rollout copy, resumed by `codex exec resume`); a Codex or Cursor run of a
+    Claude coordinator, or a Claude run of a Codex one, takes the disk block, saying why."""
+    from ttp import coordsession, ctxfork
+    from ttp.providers import claude as claude_mod, get_provider as get
+    monkeypatch.setattr(claude_mod, "_FLAGS", {"--resume": True, "--session-id": True})
+    monkeypatch.delenv("TTP_TEST_WORKER_CONTEXT")
+    cfg_dir, home = tmp_path / "claude-config", tmp_path / "codex-home"
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(cfg_dir))
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    _fake_codex(tmp_path, monkeypatch)
+    p = make(env)
+    cfg = p.config()
+    sid = str(uuid.uuid4())
+    _fork_transcript(cfg_dir, p.base, sid)
+    p.db.set_kv(coordsession.KEY, {"id": sid, "provider": "claude", "context_tokens": 9000})
+    got = ctxfork.prepare(p, cfg, get("chat"), "chat", str(p.root), None)
+    assert got["how"] == "fork" and got["from"] == "claude" and got["tokens"] == 9000, got
+    assert get("chat").resume_args(got["session"]) == ["--resume", got["session"]]
+    assert list((cfg_dir / "projects").glob(f"*/{got['session']}.jsonl"))
+    for name in ("codex", "cursor"):
+        got = ctxfork.prepare(p, cfg, get(name), name, str(p.root), None)
+        assert got["how"] == "disk" and "cannot resume its sessions" in got["why"], got
+    csid = str(uuid.uuid4())
+    _codex_rollout(home, csid)
+    p.db.set_kv(coordsession.KEY, {"id": csid, "provider": "codex", "context_tokens": 7000})
+    got = ctxfork.prepare(p, cfg, get("codex"), "codex", str(p.root), None)
+    assert got["how"] == "fork" and got["from"] == "codex", got
+    assert get("codex").resume_args(got["session"]) == ["resume", got["session"]]
+    assert list((home / "sessions").glob(f"*/*/*/rollout-*-{got['session']}.jsonl"))
+    for name in ("claude", "chat"):
+        assert ctxfork.prepare(p, cfg, get(name), name, str(p.root), None)["how"] == "disk"
+    # An unknown provider name in the saved state is another format, never an error.
+    p.db.set_kv(coordsession.KEY, {"id": csid, "provider": "gone", "context_tokens": 7000})
+    assert "runs on gone" in ctxfork.prepare(p, cfg, get("codex"), "codex", str(p.root), None)["why"]
+
+
+def test_a_continued_run_records_that_it_resumed_its_own_session(env, monkeypatch, tmp_path):
+    p, d, cfg_dir, run = _fork_daemon(env, monkeypatch, tmp_path)
+    own = str(uuid.uuid4())
+    argv, prompt, got, session = run(resume=own)
+    assert got == {"how": "resume", "why": "continues its own session", "session": own}
+    assert "--resume" in argv and not prompt.startswith(("# FORKED", "# COORDINATOR CONTEXT"))

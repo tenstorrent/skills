@@ -52,7 +52,7 @@ import re
 import shlex
 import subprocess
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from . import register
@@ -106,6 +106,7 @@ class Codex(Provider):
     # turn read 0 cached tokens on most turns with a byte-identical prefix (measured on 0.160).
     cache_key_per_session = True
     coord_session = "agent"   # `codex exec ... resume <id> -`; size and compaction from the rollout (session_context)
+    session_format = "codex-rollout"   # sessions/YYYY/MM/DD/rollout-<time>-<id>.jsonl (fork_session)
     mcp_by_args = True   # `-c mcp_servers=...` (codexmcp.py): Codex has no per-run MCP config file
     # Whether build() left the harness hook out only because the user's config.toml defines hooks or
     # plugins; isolation_args() then adds it, as an isolated run ignores that file.
@@ -145,6 +146,45 @@ class Codex(Provider):
         own = (env or {}).get("CODEX_HOME")
         homes = ([Path(own).expanduser()] if own else []) + [codex_home()]
         return [f for h in dict.fromkeys(homes) for f in (h / "sessions").glob(f"*/*/*/rollout-*-{session_id}.jsonl")]
+
+    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
+        # `codex fork` is interactive only and `codex exec` has none (0.160), so a copy that `exec resume
+        # <new id>` continues: the rollout's whole lines up to its last finished turn (a task_complete
+        # event: a wake still running leaves a partial turn) with the old id swapped for the new one (session
+        # meta, thread and turn records), the meta's cwd set to the run's, written owner-only as today's
+        # rollout under the run's CODEX_HOME. The rollout layout is not in the official docs: if it
+        # moves, the session is not found and the run takes the disk block (ctxfork.py).
+        if not re.fullmatch(r"[A-Za-z0-9-]+", new_id or "") or not re.fullmatch(r"[A-Za-z0-9-]+", session_id or ""):
+            return "bad session id"
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return "the session's rollout is not on disk"
+        raw = max(src, key=lambda x: x.stat().st_mtime).read_text(errors="replace")
+        rows: list[dict] = []
+        for line in raw.split("\n")[:-1]:   # a line not yet ended by a newline is partial
+            try:
+                row = json.loads(line.replace(session_id, new_id))
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        done = [i for i, r in enumerate(rows) if r.get("type") == "event_msg"
+                and isinstance(r.get("payload"), dict) and r["payload"].get("type") == "task_complete"]
+        if not done:
+            return "the session has no finished turn to start from"
+        rows = rows[:done[-1] + 1]
+        meta = next((r for r in rows if r.get("type") == "session_meta" and isinstance(r.get("payload"), dict)), None)
+        if meta is None:
+            return "the session's rollout has no session_meta line"
+        if cwd:
+            meta["payload"]["cwd"] = cwd
+        own = (env or {}).get("CODEX_HOME")
+        now = datetime.now(timezone.utc)
+        folder = (Path(own).expanduser() if own else codex_home()) / "sessions" / now.strftime("%Y/%m/%d")
+        from ..project import durable_write
+        durable_write(folder / f"rollout-{now.strftime('%Y-%m-%dT%H-%M-%S')}-{new_id}.jsonl",
+                      "".join(json.dumps(r) + "\n" for r in rows), mode=0o600)
+        return ""
 
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):

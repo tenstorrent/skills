@@ -5,11 +5,14 @@ coordinator's full context). coordinator.session.worker_context picks it, read o
 
 "fork" (default): the run continues a copy of the coordinator's saved session (Provider.fork_session),
   so it holds everything the coordinator saw and decided, and its prompt is the first new turn. The
-  copy is the run's own session: nothing it does writes into the coordinator's. Only when the session
-  is the same provider's and its transcript was written within worker_fork_max_age_h hours. It forks at
+  copy is the run's own session: nothing it does writes into the coordinator's. Only when the run's
+  provider saves sessions in the same format (Provider.session_format: Claude Code's for claude and the
+  chat provider, which runs Claude Code through its bridge and compacts within the model's window; the
+  rollout for codex) and the transcript was written within worker_fork_max_age_h hours. It forks at
   any size, up to the provider's own context limit: the run compacts in place inside its session if it
   must (worker_fork_max_tokens above 0 sets a cap a user chooses; 0, the default, none). Otherwise, and
-  on a provider that cannot fork (Codex, Cursor, the chat provider):
+  on a provider that cannot fork (Cursor: its CLI keeps chats in a store it cannot copy safely; a
+  session of another format, as a Claude coordinator's for a Codex run):
 "disk": the prompt leads with what the coordinator's context keeps on disk (disk_block): the open
   order ledger, the coordinator session's latest note and the last chat exchanges verbatim (at most
   worker_chat_chars), beside the records block (ctxblock.py) the prompt always carries.
@@ -24,8 +27,9 @@ session cannot be copied, the run falls back to the coordinator fork, then to di
 "off" no session is copied.
 
 A continued run (a lost run's own session) keeps its session and gets neither. The run note's KEY
-records what the run got ({"how": "fork" | "resume" | "disk" | "none", "why", "session", "tokens",
-"run": a resume's source run}), so `ttp stats --coord-session` can show the share of each."""
+records how the run started ({"how": "fork" | "resume" | "disk" | "none", "why", "session", "tokens",
+"run": a resume's source run, "from": the provider whose session a fork copied}), so
+`ttp stats --coord-session` can show the share of each and the fork rate per provider."""
 from __future__ import annotations
 
 import os
@@ -184,7 +188,7 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
                 why = prov.fork_session(str(st["id"]), cwd, env, new)
                 if not why:
                     return {"how": "fork", "why": f"session {str(st['id'])[:8]}" + (f"; no resume: {gap}" if gap else ""),
-                            "session": new,
+                            "session": new, "from": str(st.get("provider") or provider),
                             "lead": fork_lead(), "tokens": int(coordsession._num(st.get("context_tokens"), 0))}
         except Exception as e:   # the disk block is always safe
             why = f"fork failed: {type(e).__name__}: {e}"[:200]
@@ -237,11 +241,18 @@ def _fork_gap(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now
     sid = str((st or {}).get("id") or "") if isinstance(st, dict) else ""
     if not sid:
         return "no coordinator session saved"
-    if str(st.get("provider") or "") != provider:
-        return f"the coordinator session runs on {st.get('provider') or 'another provider'}, this run on {provider}"
+    if (src := str(st.get("provider") or "")) != provider:
+        try:
+            from .providers import get_provider
+            same = prov.session_format and get_provider(src).session_format == prov.session_format
+        except KeyError:
+            same = False
+        if not same:
+            return (f"the coordinator session runs on {src or 'another provider'}, this run on {provider}, "
+                    "which cannot resume its sessions")
     if not prov.resume_args(sid):
         return f"{provider} cannot resume a session"
-    paths = [x for x in prov.session_paths(sid, str(p.base), env) if x.name == f"{sid}.jsonl"]
+    paths = [x for x in prov.session_paths(sid, str(p.base), env) if x.name.endswith(f"{sid}.jsonl")]
     if not paths:
         return "the coordinator session's transcript is not on disk"
     age_h = (now - max(x.stat().st_mtime for x in paths)) / 3600
