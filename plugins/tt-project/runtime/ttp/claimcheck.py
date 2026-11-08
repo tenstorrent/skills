@@ -14,8 +14,9 @@ check() judges each claim sentence, first backing that applies:
   `due`, a `task` or an `action` is tracked by obligations.record_claims and sent as written;
 - a config key it names (`budget.daily_usd`, or an ALIASES phrase such as 'daily cap') with 'to <value>':
   the live config must hold that value;
-- the tasks (#id) and runs ('run 123') it names, each by the claim of its own clause (_bound; a binding
-  that is ambiguous is unverified, never false): a task running for 'running'/'restarted', started for
+- the tasks (#id) and runs ('run 123') it names as a claim's subject, each by the claim of its own clause
+  (_bound; an id after the verb or a hedge word is left out, a binding that is ambiguous is unverified,
+  never false): a task running for 'running'/'restarted', started for
   'started', not running for 'stopped', done for the rest; a run running, any run for 'started', ended for
   the rest. A worker notify's own task and run (relayed after its run ended) count as running then.
 A claim that does not hold is not sent as written: it goes prefixed with what is true (FALSE_MARK), and
@@ -58,6 +59,8 @@ _VALUE = re.compile(r"(?i)\bto\s+\$?([\w.:-]+)")
 # Verbs that only bind an id to an ended state ('#1 finished'); not claims on their own.
 _ENDED = re.compile(r"(?i)\b(?:finished|completed|merged|ended|done|passed)\b")
 _FILLER = {"task", "tasks", "run", "runs", "the", "both", "also", "too", "then", "and", "but"}
+# Words that may stand between a verb and the id it is about ('started on #1').
+_ATTACH = _FILLER | {"on", "in", "for", "at"}
 _CLAUSE = re.compile(r"(?i)[,;]|\s(?:and|but)\s")
 _SPLIT = re.compile(r"((?<=[.!?;])[ \t]+|\n)")
 _WORD = re.compile(r"[a-z0-9]{3,}")
@@ -79,26 +82,39 @@ def _verbs(s: str) -> list:
 
 
 def _bound(sentence: str) -> list[tuple[str, int, str | None]]:
-    """Each task ('task') and run ('run') id of `sentence` with the class of the claim verb its own clause
-    (split on ',', ';', ' and ', ' but ') holds, or the sentence's one claim class when its clause holds
-    none; None where that is ambiguous (several classes). An id whose clause holds only a hedged verb is
-    not claimed and left out."""
+    """Each task ('task') and run ('run') id of `sentence` that a claim is about, with the class of the
+    claim verb after it in its own clause (split on ',', ';', ' and ', ' but '), or of the first verb after
+    it when its clause holds ids alone ('#1, #2 and #3 landed'), or of the verb before it in a clause with
+    no id before that verb when only small words stand between ('runs started on #1'); None where its own
+    clause holds several classes. Any other id after a verb or a hedge word in its clause (the verb's
+    object, 'after #1 landed'), or whose clause verb is hedged, is not claimed and left out."""
     s = _CODE.sub(" ", sentence)
-    verbs = [(m.start(), _cls(m["v"].lower())) for m in _verbs(s)]
-    every = {c for _, c in verbs}
-    verbs += [(m.start(), "done") for m in _ENDED.finditer(s) if not _HEDGE.search(s[:m.start()])]
+    verbs = [(m.start(), m.end(), _cls(m["v"].lower())) for m in _verbs(s)]
+    verbs += [(m.start(), m.end(), "done") for m in _ENDED.finditer(s) if not _HEDGE.search(s[:m.start()])]
+    verbs.sort()
     cuts = [0] + [m.end() for m in _CLAUSE.finditer(s)] + [len(s)]
     out = []
     for kind, rx in (("task", _TASK), ("run", _RUN)):
         for m in rx.finditer(s):
             lo = max(c for c in cuts if c <= m.start())
             hi = min(c for c in cuts if c > m.start())
-            own = {c for at, c in verbs if lo <= at < hi}
-            if not own and (_VERB.search(s[lo:hi]) or _ENDED.search(s[lo:hi])):
+            before, after = s[lo:m.start()], s[m.end():hi]
+            if _HEDGE.search(before):
+                continue   # 'after #1 landed', 'once #1 lands': a condition, not a claim about it
+            if _VERB.search(before) or _ENDED.search(before):
+                # Bound to that verb only as its subject-less target; otherwise the verb's object: left out.
+                pre = [v for v in verbs if lo <= v[0] < m.start()]
+                if not pre or _TASK.search(s[lo:pre[-1][0]]) or _RUN.search(s[lo:pre[-1][0]]) \
+                        or not set(re.findall(r"[a-z]+", s[pre[-1][1]:m.start()].lower())) <= _ATTACH:
+                    continue
+                out.append((kind, int(m.group(1)), pre[-1][2]))
+                continue
+            own = {c for at, _, c in verbs if m.end() <= at < hi}
+            if not own and (_VERB.search(after) or _ENDED.search(after)):
                 continue   # its clause's verb is a plan or a condition: no claim about it
-            # A verbless clause of ids alone ('#1, #2 and #3 landed') takes the sentence's one claim class.
             alone = set(re.findall(r"[a-z]+", _RUN.sub(" ", _TASK.sub(" ", s[lo:hi])).lower())) <= _FILLER
-            cls = own or (every if alone else set())
+            nxt = [c for at, _, c in verbs if at > m.start()][:1] if alone else []
+            cls = own or set(nxt)
             out.append((kind, int(m.group(1)), next(iter(cls)) if len(cls) == 1 else None))
     return out
 

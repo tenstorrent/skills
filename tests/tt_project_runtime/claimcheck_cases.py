@@ -172,3 +172,21 @@ def test_an_ended_run_started_and_a_worker_notify_on_its_own_run_are_not_false(e
     got = _cc_sent(p, "alert")
     assert got[-1].endswith(f"#{tid} is running the smoke in run 4321."), got
     assert len(_cc_false_events(p)) == 1
+
+
+def test_an_id_after_the_claim_verb_or_a_hedge_in_its_clause_is_not_judged_as_its_subject(env):
+    from ttp import claimcheck, coordinator as coord
+    p = make(env)
+    done = p.db.add_task("a", "s", kind="work", status="done")
+    run = p.db.add_task("b", "s", kind="work", status="running")
+    p.db.x("INSERT INTO runs(id,task,role,status) VALUES(777,?,'worker','done')", (done,))
+    for turn, text in enumerate((f"#{run} is running the review of #{done}.", f"#{run} is running checks from run 777.",
+                                 f"#{run} restarted after #{done} landed.", f"After #{done} landed, #{run} restarted.",
+                                 f"#{done} and run 777 finished, #{run} is running."), 1):
+        coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=turn)
+        assert _cc_sent(p)[-1] == text, _cc_sent(p)[-1]
+    assert not _cc_false_events(p)
+    text = f"#{run} is running and #{done} is running."
+    coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=9)
+    assert _cc_sent(p)[-1] == f"{claimcheck.FALSE_MARK} (#{done} is done): {text}", _cc_sent(p)[-1]
+    assert len(_cc_false_events(p)) == 1
