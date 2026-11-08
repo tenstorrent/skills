@@ -11652,10 +11652,14 @@ class Daemon:
                 return
         if evs and not msgs and not rerun and settlehook.command(self.cfg):
             # The project's own hook settles routine events model-free (settlehook.py).
+            own_n = len([e for e in evs if not pagesev.rides_along(e)])
             evs, hold = self._settle_hook(evs, now)
             if hold:
                 return
-            if not [e for e in evs if not pagesev.rides_along(e)]:
+            # The hook settled every event that would start a turn: what is left waits, unless a wake was
+            # due anyway (w) or a ride-along left is past its hour.
+            if own_n and w is None and not [e for e in evs if not pagesev.rides_along(e)] and (
+                    not evs or now - min(e["ts"] for e in evs) < pagesev.RIDE_ALONG_MAX_S):
                 return
         if not msgs and not rerun and not fire:
             try:

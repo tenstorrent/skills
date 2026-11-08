@@ -26,6 +26,8 @@ elif mode == "badjson":
     print("settled, I think")
 elif mode == "noreason":
     print(json.dumps([{"event_id": e["event_id"], "settle": True} for e in evs]))
+elif mode == "none":
+    print("[]")
 elif mode == "dict":
     print(json.dumps({"event_id": evs[0]["event_id"], "settle": True, "reason": "x"}))
 '''
@@ -124,6 +126,51 @@ def test_settlehook_settles_a_routine_batch_with_its_logged_reason(env, monkeypa
     clock[0] += 60
     f = _ev_x(p, clock, "followup_proposed", "#3 proposes: more docs", "normal", "task:3", 3, None)
     assert _drive(d, clock, starts) and f in turns[-1]
+
+
+def _sh_ride(p, clock):
+    from ttp import pagesev
+    return _ev_x(p, clock, "observation", "a watcher line", "low", "cli-watch", None,
+                 json.dumps({pagesev.RIDE_ALONG: True}))
+
+
+def test_settlehook_a_ride_along_only_batch_past_its_hour_still_starts_a_turn(env, monkeypatch, tmp_path):
+    from ttp import pagesev
+    p, d, clock, starts, turns = _sh_setup(env, monkeypatch, tmp_path, mode="none")
+    p.set_config("coordinator.idle_wake_s", 6 * 3600)
+    p.set_config("coordinator.starve_wake_s", 6 * 3600)
+    d.cfg = p.config()
+    i = _sh_ride(p, clock)
+    clock[0] += pagesev.RIDE_ALONG_MAX_S + 60
+    assert _drive(d, clock, starts), "a ride-along past RIDE_ALONG_MAX_S never woke with the hook on"
+    assert i in turns[-1]
+
+
+@pytest.mark.parametrize("due", ["idle", "starve"])
+def test_settlehook_an_idle_or_starve_wake_with_a_queued_ride_along_still_starts_a_turn(env, monkeypatch, tmp_path,
+                                                                                       due):
+    from ttp import daemon as daemon_mod
+    p, d, clock, starts, turns = _sh_setup(env, monkeypatch, tmp_path, mode="none")
+    clock[0] += 60
+    _sh_ride(p, clock)
+    p.db.set_kv("last_coordinator_turn", clock[0] - 7200)
+    monkeypatch.setattr(daemon_mod, "idle_wake", lambda *a, **k: {"due": due, "wake": {}, "starve": {}})
+    monkeypatch.setattr(daemon_mod.quietgate, "quiet", lambda *a, **k: False)
+    assert _drive(d, clock, starts), f"a {due} wake with a queued ride-along never started with the hook on"
+
+
+def test_settlehook_a_rejection_due_wake_with_a_queued_ride_along_still_starts_a_turn(env, monkeypatch, tmp_path):
+    from ttp import coordinator as coord, daemon as daemon_mod
+    p, d, clock, starts, turns = _sh_setup(env, monkeypatch, tmp_path, mode="none")
+    p.set_config("coordinator.idle_wake_s", 6 * 3600)
+    p.set_config("coordinator.starve_wake_s", 6 * 3600)
+    d.cfg = p.config()
+    clock[0] += 60
+    _sh_ride(p, clock)
+    p.db.set_kv(coord.REJECTED_KEY, ["refused: a push to main"])
+    p.db.set_kv(coord.REJECTED_AT_KEY, clock[0] - coord.REJECTION_WAIT_S - 60)
+    monkeypatch.setattr(daemon_mod.quietgate, "quiet", lambda *a, **k: False)
+    assert _drive(d, clock, starts), "a rejection-due wake with a queued ride-along never started with the hook on"
 
 
 def test_settlehook_settles_only_what_it_names_the_rest_wakes(env, monkeypatch, tmp_path):
