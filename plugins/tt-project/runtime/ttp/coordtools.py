@@ -66,7 +66,16 @@ ANSWER_TOOL = "StructuredOutput"
 # `ttp <words...>` prefixes a session coordinator may run, each followed by any plain arguments.
 # "*" is one project name: the CLI rules name the coordinator's own, the hook takes any (all read-only).
 READ_COMMANDS = (("status",), ("task", "*", "show"), ("task", "*", "list"), ("said",), ("eta",), ("landed",),
-                 ("stats",), ("hostcheck",), ("machines", "list"), ("machines", "activity"), ("machines", "status"))
+                 ("stats",), ("hostcheck",), ("machines", "list"), ("machines", "activity"), ("machines", "status"),
+                 ("checks", "queue"))
+# The queue commands a session coordinator may run too (checksqueue: park, cancel, resume a queued checks run).
+# They change the queue, so they are no read: full tools audit them; the read-only hook admits them by
+# queue_refusal, with quoted reasons and a `--until` probe of PROBES only.
+QUEUE_COMMANDS = (("checks", "park"), ("checks", "cancel"), ("checks", "resume"))
+# A parked run's `--until` probe a read-only session may set: a read-only command, or a time check.
+PROBES = (("checks", "--result"), ("lock", "--probe"), ("upstream", "--fixed"), ("eta",), ("landed",))
+_TIME_PROBE = re.compile(r'test "\$\(date \+%s\)" -ge \d+')
+_QUOTED = re.compile(r"'[^']*'|\"[^\"$`\\!]*\"")
 FULL_ENV = "TTP_COORD_FULL_TOOLS"   # "1": the hook applies full_refusal, not the read-only list
 ROLE_ENV = "TTP_ROLE"   # the run's role, set for every run (daemon.start_run): "coordinator" in a coordinator's
 # `ttp push` forms that land or move nothing (cli.cmd_push): the only ones a coordinator may run
@@ -136,7 +145,7 @@ def protected_paths(p) -> list[str]:
 
 def _rules(project: str) -> list[str]:
     out = []
-    for words in READ_COMMANDS:
+    for words in READ_COMMANDS + QUEUE_COMMANDS:
         line = " ".join(project if w == "*" else w for w in ("ttp", *words))
         out += [f"Bash({line})", f"Bash({line} *)"]
     return out
@@ -227,6 +236,28 @@ def bash_refusal(cmd: str) -> str | None:
         if len(head) == len(words) and all(w == "*" and not h.startswith("-") or h == w for w, h in zip(words, head)):
             return None
     return f"`ttp {' '.join(argv[1:3])}` is not one of the coordinator's read-only commands"
+
+
+def queue_refusal(cmd: str) -> str | None:
+    """Why a read-only session coordinator may not run `cmd` as a queue command (None: `ttp checks
+    park|cancel|resume ...`, shell characters only inside quotes, a `--until` probe of PROBES)."""
+    if SHELL_META.search(_QUOTED.sub("''", cmd)):
+        return "no shell operators, redirects or substitutions outside quotes"
+    try:
+        argv = shlex.split(cmd)
+    except ValueError:
+        return "the command does not parse"
+    if argv[:1] != ["ttp"] or tuple(argv[1:3]) not in QUEUE_COMMANDS:
+        return "not a queue command"
+    for i, w in enumerate(argv):
+        probe = w.removeprefix("--until=") if w.startswith("--until=") else (
+            argv[i + 1] if w == "--until" and i + 1 < len(argv) else None)
+        if probe is not None and not _TIME_PROBE.fullmatch(probe.strip()):
+            words = shlex.split(probe) if not SHELL_META.search(probe) else []
+            if words[:1] != ["ttp"] or not any(tuple(words[1:1 + len(p)]) == p for p in PROBES) and bash_refusal(probe):
+                return ("a parked run's --until probe is a read-only ttp check (checks --result, lock --probe, "
+                        "upstream --fixed, eta, landed or a listed read) or test \"$(date +%s)\" -ge <epoch>")
+    return None
 
 
 def _answer_check(payload: dict) -> dict | None:
@@ -556,7 +587,8 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
             return _answer_check(payload), None
         if tool == "Bash":
             from .hook import local_guard
-            why = bash_refusal(str(args.get("command") or "")) or local_guard(payload)
+            cmd = str(args.get("command") or "")
+            why = (None if queue_refusal(cmd) is None else bash_refusal(cmd)) or local_guard(payload)
             return (_deny(why) if why else None), None
         return _deny(f"a session coordinator has read-only tools only; {tool or 'this tool'} is not one"), None
     except Exception as e:   # fail closed

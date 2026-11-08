@@ -36,7 +36,7 @@ from . import __version__, poll_s  # noqa: E402
 from .db import CHANGES_NEEDED, SUPERSEDED, chat_floor, task_outcome
 from . import outbox, redact
 from .devq import unmask_devices
-from . import chatgone, checkwait, hoststate, runnerenv, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
+from . import chatgone, checksqueue, checkwait, hoststate, runnerenv, scriptwatch, setupfault, sshcmd, syntaxfault, timefmt, workerloss
 from . import schedule as sched
 from .project import here as project_here
 from .project import (NAME_RE, Project, hostname, load_registry, load_secrets, register, save_secret,
@@ -3401,6 +3401,8 @@ def cmd_checks(a) -> None:
         sys.exit(_checks_passed(Path(a.result)) if a.passed else _checks_result(Path(a.result)))
     if getattr(a, "settle", None):
         sys.exit(_checks_settle(Path(a.settle), a.head))
+    if a.cmd[:1] and a.cmd[0] in checksqueue.ACTIONS:   # park, cancel, resume a queued run; list the queue
+        sys.exit(checksqueue.main(here(), list(a.cmd)))
     if bad := _checks_cmd_error(a):
         die(f"ttp checks: {bad}")
     if getattr(a, "slot_status", False) or a.cmd[:1] == ["status"]:
@@ -5007,6 +5009,21 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
             slot = _checks_slot_take(p, run_dir, out, head, tell, waiting, limit, arrived, same, done, prio, owns,
                                      cfg, repo, cmds, what, top, lock, restart=detached, yielder=yielder,
                                      moved=moved, urgent=urgent and not pool_first)
+        except checksqueue.Parked:
+            # Parked: it waits outside the queue holding nothing, then queues again at its first arrival.
+            arrived = start if arrived is None else arrived
+            if why := checksqueue.hold(p, run_dir, head, checksqueue.request(run_dir) or {},
+                                       lambda: _checks_cancelled(run_dir) or (moved() or ""),
+                                       lambda d: write_json(run_dir / CHECKS_SLOT_WAIT, d)):
+                said = f"not run: stopped waiting while parked: {why}"
+                out.write(f"ttp checks: {said}\n")
+                out.flush()
+                (run_dir / CHECKS_SLOT_WAIT).unlink(missing_ok=True)
+                if _read_checks_pid(run_dir).get("pid") == os.getpid():
+                    _checks_drop(run_dir, why, rc=False)
+                die(f"ttp checks: {said}", 1)
+            tell(f"resumed from parking: queuing again at its first arrival ({timefmt.clock(now=arrived)})")
+            continue
         except checkcap.Upgraded as e:
             if p:   # its checkjoin record goes: the re-executed run registers again at the same arrival
                 checkjoin.forget(p.state)
@@ -5111,6 +5128,8 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
     def stop() -> str:
         if why := _checks_cancelled(run_dir) or (moved() if moved else ""):
             return why
+        if checksqueue.request(run_dir):   # parked (`ttp checks park`): out of the queue, holding nothing
+            raise checksqueue.Parked()
         if restart and (new := checkcap.upgraded()):
             raise checkcap.Upgraded(new)
         if restart and (rank := checkcap.reranked(p, prio)) is not None:   # its task turned urgent: queue as urgent
@@ -5251,7 +5270,7 @@ def _checks_slot_take(p, run_dir: Path, out, head: str, tell, waiting, limit: fl
             slot.tests.files.append(ports[0])   # the run's own ports, freed with its test slots
             slot.tests.extra.update(ports[1])
         return slot
-    except checkjoin.Yield:
+    except (checkjoin.Yield, checksqueue.Parked):
         for g in (slot, suite, tree):   # a yield in the test-slot wait already holds the checks slot
             if g is not None:
                 g.close()
@@ -6290,7 +6309,9 @@ def _checks_result(run_dir: Path) -> int:
             wait = json.loads((run_dir / CHECKS_SLOT_WAIT).read_text())
         except (OSError, ValueError):
             wait = None
-        if isinstance(wait, dict) and wait.get("follows"):   # joined or superseded (checkjoin): no suite of its own
+        if isinstance(wait, dict) and isinstance(wait.get("parked"), dict):   # out of the queue, keeping its place
+            print(f"ttp checks: waiting (pid {info['pid']}, not running): {checksqueue.note(wait['parked'])}")
+        elif isinstance(wait, dict) and wait.get("follows"):   # joined or superseded (checkjoin): no suite of its own
             print(f"ttp checks: waiting (pid {info['pid']}, not running): {wait['follows']}")
         elif isinstance(wait, dict) and wait.get("suite"):
             from . import checkcap, locks as lk

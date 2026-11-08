@@ -874,6 +874,25 @@ def task_of(p: Project, rc: Path) -> dict | None:
     return t
 
 
+def precheck_read(p: Project, run_dir: Path) -> str:
+    """Why daemon review precheck folder `run_dir` is still read (its code task is not ended, no review
+    names it yet, or one queued, running or waiting reads it: checklane.open_precheck), "" once it may be stopped."""
+    from . import checklane
+    d = Path(run_dir)
+    tid = precheck_task(p, d)
+    t = p.db.task(tid) if tid is not None else None
+    if t is None:
+        return f"{d.name} is no review precheck of a task of this project"
+    if t["status"] not in STOPPABLE:
+        return f"task #{tid} is {t['status']}: its precheck {d.name} may still be read"
+    if not p.db.one("SELECT id FROM tasks WHERE kind='review' AND labels LIKE ?",
+                    (f'%"{checklane.PRECHECK_LABEL}{d.name}"%',)):
+        return f"no review names precheck {d.name} yet"
+    if checklane.open_precheck(p.db, str(tid), f"run {d.name}"):
+        return f"a queued, running or waiting review still reads task #{tid}'s precheck {d.name}"
+    return ""
+
+
 def run_of(p: Project, rc: Path) -> int | None:
     """The id of the run that started the job at this .rc."""
     d = Path(rc).parent
@@ -969,6 +988,12 @@ def may_stop(p: Project, rc: Path, caller: str | None, caller_run: str | None = 
     t = task_of(p, rc)
     if t is None:
         return False, f"no task of this project started the job at {rc}"
+    if t["status"] in STOPPABLE and (pre := precheck_task(p, Path(rc).parent)) is not None:
+        # A review precheck of an ended task stays while a review still reads it (checklane.open_precheck).
+        from . import checklane
+        name = Path(rc).parent.name
+        if checklane.open_precheck(p.db, str(pre), f"run {name}"):
+            return False, f"refused: a queued, running or waiting review still reads task #{pre}'s precheck {name}"
     if t["status"] in STOPPABLE:
         return True, f"task #{t['id']} is {t['status']}"
     if (own := _own_stop(p, rc, t, caller, caller_run)) is not None:

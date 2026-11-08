@@ -43,8 +43,8 @@ def test_mode_on_coordinator_gets_only_read_only_tools(env, monkeypatch):
     for flag in ("--restricted", "--strict-mcp-config", "--disallowedTools"):
         assert flag in argv
     assert argv[argv.index("--permission-mode") + 1] == "dontAsk"
-    allowed = argv[argv.index("--allowedTools") + 1:argv.index("--allowedTools") + 30]
-    allowed = allowed[:next(i for i, a in enumerate(allowed) if a.startswith("--"))]
+    allowed = argv[argv.index("--allowedTools") + 1:]
+    allowed = allowed[:next((i for i, a in enumerate(allowed) if a.startswith("--")), len(allowed))]
     assert f"Read(/{p.root.resolve()}/**)" in allowed
     assert f"Bash(ttp task {p.name} show *)" in allowed and "Bash(ttp hostcheck *)" in allowed
     assert "StructuredOutput" in allowed, "the turn's --json-schema answer goes through it"

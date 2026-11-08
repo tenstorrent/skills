@@ -9990,3 +9990,253 @@ def test_project_max_from_names_the_setting_that_binds_the_test_worker_budget(en
     workers["n"] = 9
     assert testslots.project_max_from({}, s) == "workers" and testslots.project_max({}, s) == 9
     assert testslots.project_max_from({}, (0, 0)) == "", "the pool off: no budget"
+
+
+# `ttp checks park|cancel|resume|queue` (checksqueue, #7120).
+
+def _queue_run(p, tid, wait=True, own=True):
+    """A run folder of task `tid` (a runs row) whose live checks (this process) wait in the queue, or with
+    wait=False hold a slot."""
+    from ttp import cli
+    from ttp.project import write_json
+    from ttp.runner import proc_start
+    rid = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)", (tid, time.time()))
+    d = p.runs / str(rid)
+    d.mkdir(parents=True, exist_ok=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(d), rid))
+    if own:
+        write_json(d / cli.CHECKS_PID, {"pid": os.getpid(), "started": proc_start(os.getpid())})
+    if wait:
+        write_json(d / cli.CHECKS_SLOT_WAIT, {"pid": os.getpid(), "since": time.time() - 60, "head": "abc"})
+    return rid, d
+
+
+def test_checks_park_frees_the_queue_place_and_resumes_at_its_first_arrival_once_its_probe_passes(env, tmp_path,
+                                                                                                    monkeypatch):
+    import threading
+    from ttp import checkcap, checksqueue, cli, locks
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    monkeypatch.setattr(checksqueue, "PROBE_S", 0)
+    monkeypatch.setattr(checksqueue, "POLL_S", 0.05)
+    tickets = lambda: [float(x.name.split("-")[0]) for x in locks.queued(checkcap.slot_dir(), checkcap.RESOURCE)]
+    held = checkcap.acquire("other")
+    ran, flag, done = tmp_path / "ran", tmp_path / "flag", []
+
+    def go():
+        try:
+            done.append(cli.main(["checks", "--", "sh", "-c", f"touch {ran}"]))
+        except SystemExit as e:
+            done.append(e.code)
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert _wait_for(lambda: (run / cli.CHECKS_SLOT_WAIT).exists() and len(tickets()) == 1)
+        first = tickets()[0]
+        code, text = checksqueue.act(p, run, "park", "the coordinator", "user msg #1: let p1 go first",
+                                     f"test -e {flag}")
+        assert code == 0 and "parked" in text and f"resumes when `test -e {flag}` passes" in text, text
+        assert _wait_for(lambda: not tickets()), "a parked run holds no queue place"
+        wait = json.loads((run / cli.CHECKS_SLOT_WAIT).read_text())
+        assert wait["note"].startswith("checks run parked by the coordinator: user msg #1: let p1 go first"), wait
+        assert not ran.exists()
+        flag.touch()
+        assert _wait_for(lambda: len(tickets()) == 1), "the probe passed: it queues again"
+        assert tickets()[0] == first, "it queues again at its first arrival, never at the back"
+        assert not (run / checksqueue.PARK).exists()
+    finally:
+        held.close()
+    t.join(30)
+    assert not t.is_alive() and ran.exists(), "resumed, it took the slot and ran"
+    acts = [json.loads(x)["action"] for x in (run / checksqueue.LOG).read_text().splitlines()]
+    assert acts == ["park", "resume"], acts
+    assert "resumed from parking: queuing again at its first arrival" in (run / "checks.log").read_text()
+
+
+def test_checks_resume_lets_a_parked_run_queue_again(env, tmp_path, monkeypatch):
+    from ttp import checksqueue
+    from ttp.runner import proc_start
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code")
+    rid, d = _queue_run(p, tid)
+    monkeypatch.setattr(checksqueue, "POLL_S", 0.01)
+    assert checksqueue.act(p, d, "park", "the user", "why", "")[0] == 0
+    req = checksqueue.request(d)
+    assert req["pid"] == os.getpid() and req["started"] == proc_start(os.getpid())
+    assert checksqueue.act(p, d, "resume", "the user", "", "")[0] == 0
+    waits = []
+    assert checksqueue.hold(p, d, "abc", req, lambda: "", waits.append) == "" and waits[0]["parked"] == req
+    assert checksqueue.act(p, d, "resume", "the user", "", "")[0] == 3, "not parked any more"
+
+
+def test_checks_cancel_drops_a_queued_run_and_logs_who_and_why(env, monkeypatch):
+    from ttp import checksqueue, cli
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code")
+    rid, d = _queue_run(p, tid)
+    assert checksqueue.act(p, d, "cancel", "the coordinator (run 7)", "user msg #2: routine", "")[0] == 0
+    assert cli._checks_cancelled(d) == "cancelled by the coordinator (run 7): user msg #2: routine"
+    rec = json.loads((d / checksqueue.LOG).read_text())
+    assert (rec["action"], rec["who"], rec["why"], rec["task"]) == ("cancel", "the coordinator (run 7)",
+                                                                     "user msg #2: routine", tid)
+    ev = p.db.one("SELECT * FROM events WHERE kind=?", (checksqueue.EVENT,))
+    assert ev and ev["status"] == "handled" and ev["task"] == tid and "cancel by the coordinator" in ev["text"]
+    assert "checks: cancel by the coordinator (run 7)" in (d / "progress.md").read_text()
+    assert p.db.task(tid)["status"] == "queued" and p.db.task(tid).get("attempts", 0) == 0, "no attempt spent"
+    # A parked run that is then cancelled stops waiting with the cancel's reason.
+    rid2, d2 = _queue_run(p, tid)
+    assert checksqueue.act(p, d2, "park", "the user", "why", "")[0] == 0
+    req = checksqueue.request(d2)
+    assert checksqueue.act(p, d2, "cancel", "the user", "drop it", "")[0] == 0
+    assert checksqueue.hold(p, d2, "abc", req, lambda: cli._checks_cancelled(d2), lambda w: None) \
+        == "cancelled by the user: drop it"
+
+
+def test_checks_park_and_cancel_refuse_a_slot_holder_a_push_batch_and_another_projects_run(env, tmp_path,
+                                                                                         monkeypatch):
+    from ttp import checksqueue, cli, procowner
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code")
+    _, held = _queue_run(p, tid, wait=False)
+    for action in ("park", "cancel"):
+        code, text = checksqueue.act(p, held, action, "the user", "why", "")
+        assert code == 3 and "hold a slot" in text, text
+    _, d = _queue_run(p, tid)
+    monkeypatch.setattr(procowner, "environ", lambda pid: {"TTP_PUSH_MODE": "checks"})
+    assert not checksqueue.push_batch({"pid": 1}), "a run inside `ttp checks` (mode checks) is no push batch"
+    monkeypatch.setattr(procowner, "environ", lambda pid: {"TTP_PUSH_MODE": "own"})
+    assert not checksqueue.push_batch({"pid": 1}), "a task's own-branch push is no push batch"
+    monkeypatch.setattr(procowner, "environ", lambda pid: {"TTP_PUSH_MODE": "target"})
+    for action in ("park", "cancel"):
+        code, text = checksqueue.act(p, d, action, "the user", "why", "")
+        assert code == 3 and "push batch" in text, text
+    assert not (d / checksqueue.PARK).exists() and not (d / checksqueue.LOG).exists()
+    od = tmp_path / "other" / "tt-project" / "state" / "runs" / "5"   # another project's run folder
+    od.mkdir(parents=True)
+    for f in (cli.CHECKS_PID, cli.CHECKS_SLOT_WAIT):
+        (od / f).write_text((d / f).read_text())
+    for target in (str(od), str(od.parent.parent / "x")):
+        with pytest.raises(ValueError, match="refused: .* is no checks run of project demo"):
+            checksqueue.resolve(p, target, "", "park")
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    monkeypatch.delenv("TTP_RUN_ID", raising=False)
+    monkeypatch.setenv("TTP_ROLE", "coordinator")
+    assert checksqueue.main(p, ["cancel", str(od), "--reason", "x"]) == 3
+    assert not (od / checksqueue.LOG).exists()
+
+
+def test_checks_park_callers_the_coordinator_and_an_ordered_urgent_worker_only(env, monkeypatch, capsys):
+    from ttp import checksqueue, coordtools
+    p = make(env)
+    monkeypatch.setattr(coordtools, "coordinator_run", lambda: False)
+    monkeypatch.delenv("TTP_TASK", raising=False)
+    monkeypatch.delenv("TTP_RUN_ID", raising=False)
+    monkeypatch.setenv("TTP_ROLE", "coordinator")
+    assert checksqueue.caller(p, "park") == ("the coordinator (run ?)", "")
+    crun = p.db.x("INSERT INTO runs(role,status,started) VALUES('coordinator','running',?)", (time.time(),))
+    monkeypatch.setenv("TTP_RUN_ID", str(crun))
+    assert checksqueue.caller(p, "cancel") == (f"the coordinator (run {crun})", "")
+    monkeypatch.setenv("TTP_RUN_ID", "999999")
+    assert "no coordinator run" in checksqueue.caller(p, "park")[1]
+    monkeypatch.setenv("TTP_ROLE", "worker")
+    order = "Do it.\n\nOwner's order (user msg #1972): park routine checks runs with `ttp checks park`."
+    cases = [(3, order, "not urgent or priority 1"), (1, "plain spec, nothing about the queue", "gives no order"),
+             (1, "park them\n\nper user msg #5", "gives no order"), (1, order, ""),
+             (0, "Cancel the queued runs, as the coordinator ordered.", "")]
+    for prio, spec, want in cases:
+        tid = p.db.add_task("t", spec, kind="code", priority=prio)
+        rid = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)",
+                     (tid, time.time()))
+        monkeypatch.setenv("TTP_TASK", str(tid))
+        monkeypatch.setenv("TTP_RUN_ID", str(rid))
+        who, no = checksqueue.caller(p, "park")
+        assert (want in no and not who) if want else (who == f"task #{tid} (run {rid})" and not no), (prio, spec, no)
+    monkeypatch.setenv("TTP_RUN_ID", "1")   # a run of another task
+    assert "no task run of this project" in checksqueue.caller(p, "park")[1]
+    # An unordered worker is refused before anything is touched, with exit 3.
+    tid = p.db.add_task("t", "plain", kind="code", priority=3)
+    rid, d = _queue_run(p, tid)
+    monkeypatch.setenv("TTP_TASK", str(tid))
+    monkeypatch.setenv("TTP_RUN_ID", str(rid))
+    assert checksqueue.main(p, ["park", "--task", str(tid), "--reason", "x"]) == 3
+    assert "refused" in capsys.readouterr().err and not (d / checksqueue.PARK).exists()
+
+
+def test_checks_park_task_parks_its_waiting_runs_and_the_queue_lists_them(env, monkeypatch, capsys):
+    from ttp import checksqueue, coordtools
+    p = make(env)
+    monkeypatch.setattr(coordtools, "coordinator_run", lambda: False)
+    spec = "Urgent.\n\nThe coordinator orders: park the routine checks runs (user msg #1972)."
+    me = p.db.add_task("me", spec, kind="code", priority=1)
+    mrun = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)",
+                  (me, time.time()))
+    tid = p.db.add_task("routine", "s", kind="code", priority=3)
+    _, d1 = _queue_run(p, tid)
+    _, d2 = _queue_run(p, tid, wait=False)   # holds a slot: --task leaves it alone
+    assert checksqueue.main(p, ["queue", "--json"]) == 0
+    rows = json.loads(capsys.readouterr().out)
+    assert [(r["run"], r["task"], r["priority"], r["kind"], r["owed"]) for r in rows] \
+        == [(d1.name, tid, 3, "task", False)], rows
+    monkeypatch.setenv("TTP_TASK", str(me))
+    monkeypatch.setenv("TTP_RUN_ID", str(mrun))
+    assert checksqueue.main(p, ["park", "--task", str(tid), "--reason", "user msg #1972: p1 first"]) == 0
+    assert f"run {d1.name}: parked; checks run parked by task #{me}" in capsys.readouterr().out
+    assert (d1 / checksqueue.PARK).exists() and not (d2 / checksqueue.PARK).exists()
+    assert checksqueue.main(p, ["resume", "--task", str(tid)]) == 0
+    assert not (d1 / checksqueue.PARK).exists()
+    assert checksqueue.main(p, ["resume", "--task", str(tid)]) == 1, "nothing parked any more"
+    assert checksqueue.main(p, ["park", "--task", str(tid)]) == 2, "--reason is required"
+    assert checksqueue.main(p, ["cancel", "--task", str(tid), "--reason", "r", "--until", "true"]) == 2
+
+
+def test_a_precheck_stops_counting_as_read_once_its_review_is_pushing_and_may_then_be_stopped(env, monkeypatch):
+    from ttp import checklane, checksqueue, jobstop
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="code")
+    head = "5a2b0978dd8f"
+    d = p.state / "prechecks" / f"t{tid}-{head}"
+    d.mkdir(parents=True)
+    rc = d / "checks.rc"
+    p.db.x("UPDATE tasks SET status='running' WHERE id=?", (tid,))
+    assert f"task #{tid} is running" in jobstop.may_stop(p, rc, None)[1], "its code task still runs"
+    assert "may still be read" in jobstop.precheck_read(p, d)
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (tid,))
+    # no review reads it (sa24): `ttp detach --stop` may stop it; `ttp checks cancel` waits for its review's label
+    assert jobstop.may_stop(p, rc, None) == (True, f"task #{tid} is done")
+    assert "no review names" in jobstop.precheck_read(p, d), "started just before its review is queued"
+    rid = p.db.add_task("review", "r", kind="review", labels=[f"precheck:t{tid}-{head}"])
+    for status in ("queued", "running"):
+        p.db.x("UPDATE tasks SET status=? WHERE id=?", (status, rid))
+        assert checklane.open_precheck(p.db, str(tid), f"run t{tid}-{head}")
+        ok, why = jobstop.may_stop(p, rc, None)
+        assert not ok and "still reads" in why, why
+    p.db.x("UPDATE tasks SET status='pushing' WHERE id=?", (rid,))
+    assert not checklane.open_precheck(p.db, str(tid), f"run t{tid}-{head}"), "past its verdict: read no more"
+    assert not checklane.open_precheck(p.db, str(tid), f"run precheck-t{tid}-{head}")
+    assert jobstop.may_stop(p, rc, None)[0]
+    assert jobstop.task_of(p, rc)["id"] == tid
+    # `ttp checks cancel` resolves the precheck by its run id and refuses while a review still reads it.
+    assert checksqueue.resolve(p, f"precheck-t{tid}-{head}", "", "cancel") == [Path(os.path.realpath(d))]
+    p.db.x("UPDATE tasks SET status='running' WHERE id=?", (rid,))
+    code, text = checksqueue.act(p, Path(os.path.realpath(d)), "cancel", "the user", "why", "")
+    assert code == 3 and "still reads" in text, text
+
+
+def test_session_coordinator_may_run_queue_commands_with_quoted_reasons_and_read_only_probes():
+    from ttp import coordtools
+    ok = ["ttp checks queue", "ttp checks park 14111 --reason 'user msg #1972: p1 first'",
+          "ttp checks cancel --task 6844 --reason \"routine; owner's order\"",
+          "ttp checks park 5 --reason x --until 'ttp checks --result /x/runs/9'",
+          "ttp checks park 5 --reason x --until 'test \"$(date +%s)\" -ge 1700000000'",
+          "ttp checks park 5 --reason x --until='ttp landed --task 7'", "ttp checks resume 5"]
+    for cmd in ok[1:]:
+        assert coordtools.queue_refusal(cmd) is None, cmd
+    assert coordtools.bash_refusal(ok[0]) is None
+    bad = ["ttp checks park 5 --reason x; rm -rf /tmp/x", "ttp checks park 5 --reason \"$(id)\"",
+           "ttp checks park 5 --reason x --until 'rm -f /tmp/x'", "ttp checks park 5 --reason x --until 'ttp push'",
+           "ttp checks park 5 --reason x --until 'ttp checks --result a; touch b'", "ttp checks --detach",
+           "ttp push --detach", "ttp checks park 5 --reason x > /tmp/f"]
+    for cmd in bad:
+        assert coordtools.queue_refusal(cmd) is not None, cmd
+    rules = coordtools._rules("demo")
+    assert "Bash(ttp checks park *)" in rules and "Bash(ttp checks queue)" in rules
