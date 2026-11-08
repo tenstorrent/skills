@@ -2494,6 +2494,82 @@ def test_a_push_batch_counts_requeued_conflicts_and_not_rebase_stops(env, monkey
     assert m["conflicts"] == {"entries": 3, "conflicted": 1, "auto_resolved": 0, "by_hunks": 0, "sent_back": 0}
 
 
+
+def test_an_import_conflict_whose_tip_side_is_only_a_comment_is_a_conflict_not_an_error():
+    """The tip replaced an import with a comment and the head extended that import: the imports rule
+    read the comment-only side as no statements and raised IndexError, which failed every batch."""
+    from ttp.batch import _import_stmts, merge3
+    assert _import_stmts(["# b is gone\n"]) is None and _import_stmts(["\n"]) is None
+    base = "import a\nimport b\n\nX = 1\n"
+    ours, theirs = base.replace("import b", "# b is gone"), base.replace("import b", "import b, c")
+    for mine, other in ((ours, theirs), (theirs, ours)):
+        assert merge3(mine, base, other, py=True, hunks=True, imports=True) is None
+
+
+def _conflict_batch(env, monkeypatch):
+    """Five entries onto a tip that moved after they branched: e1 and e5 apply cleanly, e2 edits the
+    line of notes.txt the tip edited (a real conflict), e3 adds a line where the tip added one (settled
+    without judgment) and e4 extends the import the tip replaced with a comment."""
+    p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
+    _commit(other, "notes.txt", "a\nb\nc\n")
+    _commit(other, "log.txt", "x\n")
+    _commit(other, "mod.py", "import a\nimport b\n\nX = 1\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    heads = [_entry(repo, "e1", {"more.txt": "1\n"}), _entry(repo, "e2", {"notes.txt": "a\nB2\nc\n"}),
+             _entry(repo, "e3", {"log.txt": "x\ne3\n"}),
+             _entry(repo, "e4", {"mod.py": "import a\nimport b, c\n\nX = 1\n"}), _entry(repo, "e5", {"f5.txt": "5\n"})]
+    _commit(other, "notes.txt", "a\nBT\nc\n")
+    _commit(other, "log.txt", "x\ntip\n")
+    _commit(other, "mod.py", "import a\n# b is gone\n\nX = 1\n")
+    _git_out(other, "push", "-q", "origin", "HEAD:proj")
+    return p, repo, origin, heads
+
+
+def test_a_push_batch_sends_back_its_conflicting_entries_and_lands_the_rest(env, monkeypatch):
+    """Batch shape of the IndexError that landed nothing three batches running: several entries, two
+    conflicting, one settled. Each conflicting entry goes back once, as a conflict, and the rest land."""
+    p, repo, origin, heads = _conflict_batch(env, monkeypatch)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["pushed", "conflict", "pushed", "conflict", "pushed"], m
+    assert m["conflicts"] == {"entries": 5, "conflicted": 3, "auto_resolved": 1, "by_hunks": 0, "sent_back": 2}, m
+    assert [r["detail"]["files"] for r in m["results"] if r["status"] == "conflict"] == [["notes.txt"], ["mod.py"]]
+    tree = _git_out(origin, "ls-tree", "--name-only", "proj").split()
+    assert {"more.txt", "f5.txt"} <= set(tree) and _git_out(origin, "show", "proj:log.txt") == "x\ntip\ne3"
+
+
+def test_an_entry_whose_replay_raises_goes_back_alone_and_the_batch_goes_on(env, monkeypatch, capsys):
+    """An unexpected error while one entry replays takes only that entry out, as a conflict naming the
+    error, with the worktree reset for the next; the same error in every entry, or a host fault, is
+    the batch's own and requeues every entry as before."""
+    from ttp import batch, envfault
+    p, repo, origin, heads = _conflict_batch(env, monkeypatch)
+    rebase = batch.Batch._rebase
+
+    def broken(self, onto, top, **kw):
+        if top in bad:
+            batch._git(self.wt, "checkout", "-q", "--detach", onto)
+            (self.wt / "stray.txt").write_text("left behind\n")
+            raise raised(*args)
+        return rebase(self, onto, top, **kw)
+    monkeypatch.setattr(batch.Batch, "_rebase", broken)
+    bad, raised, args = {heads[0]}, KeyError, ("boom",)
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert m["outcome"] == "pushed" and _statuses(m) == ["conflict", "conflict", "pushed", "conflict", "pushed"], m
+    d = m["results"][0]["detail"]
+    assert d["error"].startswith("KeyError: 'boom' at ") and d["files"][0].startswith("(the rebase could not run"), d
+    assert m["conflicts"]["sent_back"] == 2, "a fault is no textual conflict"
+    assert "e1): the batch could not replay it (KeyError" in capsys.readouterr().out
+    assert "stray.txt" not in _git_out(origin, "ls-tree", "--name-only", "proj").split()
+    # the same fault in every entry so far is the batch's: an error, every entry requeued
+    bad = set(heads)
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert m["outcome"] == "error" and set(_statuses(m)) == {"requeued"}, m
+    # a host fault is never an entry's
+    bad, raised, args = {heads[1]}, envfault.Fault, ({"kind": "disk", "detail": "full"},)
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b3"), monkeypatch)
+    assert m["outcome"] == "env_fault" and "conflict" not in _statuses(m), m
+
+
 def _landed_fixture(env, monkeypatch):
     """The target has notes.txt; a first change A edits its line b and lands on the target in a
     different form (as a batch settles it, or squashed): a branch that still carries A conflicts
