@@ -26,6 +26,7 @@ def test_smoke_list_names_existing_tests_and_covers_each_area():
     # each area's case file, the plugin manifests and catalogue, and the leak scan are in the smoke suite
     smoked = by_file["tests/test_tt_project_runtime.py"]
     bare = [c.stem for c in sorted(_CASES.glob("*_cases.py")) if not defined(c) & smoked and defined(c) & here]
-    assert not bare, f"case files with no test in the smoke list: {bare}"
+    assert not bare, (f"case files with no test in the smoke list: {bare}; add at least one fast test "
+                      "of each to tests/tt_project_smoke.txt")
     assert {"test_no_local_leak_patterns_in_plugin"} <= by_file["tests/test_tt_project_plugin.py"]
     assert by_file["tests/test_plugin_catalogue.py"]
