@@ -2420,6 +2420,7 @@ class Daemon:
                 self.refresh_ref_waits,
                 self.sample_jobs,
                 self.watch_progress,
+                self.relaunch_dead_checks,
                 self.probe_waiting,
                 self.start_pushes,
                 self.dispatch,
@@ -15288,6 +15289,76 @@ class Daemon:
               f"no model run", "handled", tid))
         log(self.p, f"task {tid}: the reboot killed its checks; started them again on {head[:12]} ({out})")
         return True, 0
+
+    def relaunch_dead_checks(self) -> None:
+        """Detached checks that died on this boot without writing checks.rc (an OOM kill, a crash) start
+        again in their folder on the same head, at their old place in the host's checks queue, model-free,
+        as _relaunch_checks and _relaunch_prechecks do after a reboot: a waiting task's own `ttp checks
+        --detach` (retry_when `ttp checks --result <its run dir>`, not deferred) and the precheck of a
+        review still open. Once per folder and head: a second death leaves them to the task's probe, which
+        reports them killed as before. Runs before probe_waiting and dispatch, so neither reads the death
+        first. Per run one checks.pid read and one pid check; a db read and git only for a dead one."""
+        if not self.boot or self.boot == "unknown":
+            return
+        from . import checklane
+        db, now = self.p.db, time.time()
+        todo: list[tuple[int, str, Path, str, bool]] = []
+        for t in db.q("SELECT id, title, labels, result FROM tasks WHERE status='queued' AND not_before IS NOT NULL "
+                      "AND result LIKE '%--result%'"):
+            prev = load_result(t["result"])
+            m = re.search(r"\bchecks\s+--result\s+(\S+)", str(prev.get("retry_when") or ""))
+            if prev.get("status") != "waiting" or not m or (dfr := deferral(t)).get("when") \
+                    or (dfr.get("after") or 0) > now:
+                continue
+            try:
+                out = Path(shlex.split(m.group(1))[0])
+            except (ValueError, IndexError):
+                continue
+            todo.append((t["id"], f"#{t['id']} {t['title']}: its checks", out, f"relaunch-t{t['id']}", True))
+        for r in db.q("SELECT id, labels FROM tasks WHERE kind='review' AND status IN (?,?,?) AND labels LIKE ?",
+                      (*checklane.PRECHECK_READERS, f"%{PRECHECK_LABEL}%")):
+            name = next((x[len(PRECHECK_LABEL):] for x in push._labels(r) if x.startswith(PRECHECK_LABEL)), "")
+            if m := re.fullmatch(r"t(\d+)-[0-9a-f]{12}", name):
+                out = self.p.state / PRECHECKS_DIR / name
+                todo.append((int(m[1]), f"#{m[1]}: the precheck of review #{r['id']}", out, precheck_run_id(out), False))
+        for i, (tid, what, out, run_id, own) in enumerate(todo):
+            if self._step_over(f"{what} (dead checks)", tid) and i:
+                break
+            self._relaunch_dead(tid, what, out, run_id, own)
+
+    def _relaunch_dead(self, tid: int, what: str, out: Path, run_id: str, own: bool) -> None:
+        """relaunch_dead_checks for one run folder `out`: start its checks again when checks.pid names a
+        process of this boot that is gone, no checks.rc was written, tt-project did not stop them
+        (jobstop.end_checks, a stall stop) and they were not restarted on this head before. `own`: the
+        folder must be one of task tid's runs."""
+        from . import checkstall
+        from .cli import CHECKS_RC, _checks_alive, _checks_elsewhere, _read_checks_pid
+        rc = out / CHECKS_RC
+        if rc.exists() or detach.pending(rc) or detach.lost(rc).exists():
+            return
+        info = _read_checks_pid(out)
+        pid, head = info.get("pid"), info.get("head")
+        if not isinstance(pid, int) or not info.get("started") or not isinstance(head, str) or not head \
+                or not self._this_boot(info.get("boot")) or _checks_alive(info) or _checks_elsewhere(info):
+            return
+        if rc.exists():
+            return   # they wrote it as they ended, between the two reads
+        db = self.p.db
+        fp = f"checks_crash_relaunched:{out}:{head[:12]}"
+        if db.one("SELECT id FROM events WHERE fingerprint=? OR fingerprint=?",
+                  (fp, f"checks_stopped:{out}:{pid}:{info.get('started')}")) \
+                or ((checkstall.marker(out, pid) or {}).get("stopped")):
+            return   # restarted once on this head already, or tt-project stopped them: the probe reports it
+        if own and not db.one("SELECT id FROM runs WHERE task=? AND dir=?", (tid, str(out))):
+            return
+        why = self._restart_checks(tid, out, info, run_id)
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "checks_crash_relaunched", fp, "low",
+              f"{what} (pid {pid}) died on {head[:12]} without an exit code; "
+              + (f"not started again: {why}" if why else f"started them again in {out}, no model run"),
+              "handled", tid))
+        log(self.p, f"task {tid}: {what} (pid {pid}) died without an exit code; "
+                    + (f"not started again: {why}" if why else f"started them again on {head[:12]} ({out})"))
 
     def _lost_before_boot(self, rc: Path) -> bool:
         """Whether detached job rc was found lost on an earlier boot (its <name>.lost predates this one).

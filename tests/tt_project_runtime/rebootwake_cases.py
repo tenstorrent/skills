@@ -558,3 +558,96 @@ def test_a_reboot_never_relaunches_checks_of_a_deferred_or_closed_task(env, tmp_
     for tid, run_dir in ((fine, fine_dir), (passed, passed_dir)):
         assert len(_relaunches(p, tid)) == 1, f"#{tid}: an open task's checks were not started again"
         assert _wait_precheck(run_dir) == "0"
+
+
+def _crashed_checks(p, tmp_path, d, tid):
+    """Task tid waits on its own detached checks, which died on this boot (d.boot) without checks.rc."""
+    _, run_dir = _checks_killed_by_reboot(p, tmp_path, tid, boot=d.boot)
+    return run_dir
+
+
+def _crash_relaunches(p, tid):
+    return p.db.q("SELECT * FROM events WHERE kind='checks_crash_relaunched' AND task=?", (tid,))
+
+
+def test_checks_that_died_on_this_boot_restart_once_at_their_queue_place(env, tmp_path, monkeypatch):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    d = Daemon(p.base)
+    run_dir = _crashed_checks(p, tmp_path, d, tid)
+    ts = json.loads((run_dir / cli.CHECKS_PID).read_text())["ts"]
+    starts = _record_starts(monkeypatch, d)
+    d.relaunch_dead_checks()
+    assert starts == [(run_dir, f"relaunch-t{tid}", ts)], starts
+    (ev,) = _crash_relaunches(p, tid)
+    assert ev["status"] == "handled" and ev["fingerprint"].endswith(
+        json.loads((run_dir / cli.CHECKS_PID).read_text())["head"][:12]), dict(ev)
+    assert p.db.task(tid)["not_before"] and "woke" not in json.loads(p.db.task(tid)["result"])
+    assert not _relaunches(p, tid), "a same-boot restart is no reboot relaunch"
+    # Dead again on the same head: left to the task's probe, which reports them killed as today.
+    d.relaunch_dead_checks()
+    assert len(starts) == 1 and len(_crash_relaunches(p, tid)) == 1
+    assert cli._checks_result(run_dir) == 0 and (run_dir / cli.CHECKS_RC).read_text().strip() == "killed"
+
+
+def test_checks_alive_finished_or_stopped_on_this_boot_are_not_restarted(env, tmp_path, monkeypatch):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    from ttp.runner import proc_start
+    p = make(env)
+    d = Daemon(p.base)
+    starts = _record_starts(monkeypatch, d)
+    alive = p.db.add_task("alive", "s", kind="code", tier="light", origin="user")
+    run_dir = _crashed_checks(p, tmp_path, d, alive)
+    info = json.loads((run_dir / cli.CHECKS_PID).read_text())
+    (run_dir / cli.CHECKS_PID).write_text(json.dumps({**info, "pid": os.getpid(), "started": proc_start(os.getpid())}))
+    ended = p.db.add_task("ended", "s", kind="code", tier="light", origin="user")
+    (_crashed_checks(p, tmp_path, d, ended) / cli.CHECKS_RC).write_text("1\n")
+    stopped = p.db.add_task("stopped", "s", kind="code", tier="light", origin="user")
+    run_dir = _crashed_checks(p, tmp_path, d, stopped)
+    info = json.loads((run_dir / cli.CHECKS_PID).read_text())
+    p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
+           (time.time(), "daemon", "checks_stopped", f"checks_stopped:{run_dir}:{info['pid']}:{info['started']}",
+            "low", "stopped", "handled", stopped))
+    earlier = p.db.add_task("earlier boot", "s", kind="code", tier="light", origin="user")
+    _checks_killed_by_reboot(p, tmp_path, earlier)   # the reboot path's, not this one's
+    d.relaunch_dead_checks()
+    assert starts == [] and not p.db.q("SELECT id FROM events WHERE kind='checks_crash_relaunched'"), starts
+
+
+def test_dead_checks_of_a_cancelled_done_or_deferred_task_are_not_restarted(env, tmp_path, monkeypatch):
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    starts = _record_starts(monkeypatch, d)
+    for status in ("cancelled", "done"):
+        tid = p.db.add_task(status, "s", kind="code", tier="light", origin="user")
+        _crashed_checks(p, tmp_path, d, tid)
+        p.db.update_task(tid, status=status)
+    deferred = p.db.add_task("deferred", "s", kind="code", tier="light", origin="user")
+    _crashed_checks(p, tmp_path, d, deferred)
+    p.db.update_task(deferred, labels=json.dumps(["start_when:test -e /nonexistent/gate"]))
+    d.relaunch_dead_checks()
+    assert starts == [] and not p.db.q("SELECT id FROM events WHERE kind='checks_crash_relaunched'"), starts
+
+
+def test_a_review_precheck_that_died_on_this_boot_restarts_once_while_its_review_is_open(env, tmp_path, monkeypatch):
+    from ttp import cli
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    tid = p.db.add_task("feature", "s", kind="code", tier="light", origin="user")
+    out, rid = _precheck_killed_by_reboot(p, tmp_path, tid)
+    info = json.loads((out / cli.CHECKS_PID).read_text())
+    (out / cli.CHECKS_PID).write_text(json.dumps({**info, "boot": d.boot}))
+    shut = p.db.add_task("other", "s", kind="code", tier="light", origin="user")
+    out2, rid2 = _precheck_killed_by_reboot(p, tmp_path, shut)
+    (out2 / cli.CHECKS_PID).write_text(json.dumps({**json.loads((out2 / cli.CHECKS_PID).read_text()), "boot": d.boot}))
+    p.db.update_task(rid2, status="cancelled")
+    starts = _record_starts(monkeypatch, d)
+    d.relaunch_dead_checks()
+    d.relaunch_dead_checks()
+    assert starts == [(out, f"precheck-{out.name}", info["arrived"])], starts
+    assert len(p.db.q("SELECT id FROM events WHERE kind='checks_crash_relaunched'")) == 1
