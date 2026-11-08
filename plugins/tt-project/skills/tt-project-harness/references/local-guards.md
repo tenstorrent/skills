@@ -48,7 +48,9 @@ def refusal(cmd):
   every shell command; one that raises refuses the call it raised on. Each refusal names the file and
   the error. A `guards.local` that is not a list of paths refuses every shell command.
 - Only a harness task edits a listed guard file: other runs' Edit and Write calls on it, Codex
-  apply_patch calls naming it (also as a move target), and shell commands naming its path, are refused.
+  `apply_patch` calls naming it (Add, Update, Delete File or Move to), and shell commands naming its
+  path, are refused. A shell command naming it only relative to a directory it changed into first
+  (`cd guards && rm a.py`) is not caught.
 - `ttp doctor <project>` shows each guard and whether it loads, and flags one inside `runtime/` or
   `prompts/`.
 - The upgrade's conflict message for `runtime/ttp/hook.py` points here.

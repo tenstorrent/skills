@@ -256,6 +256,33 @@ def test_a_full_tools_coordinator_edits_a_listed_guard_only_through_a_harness_ta
     assert out is None
 
 
+def test_a_codex_apply_patch_edits_a_listed_guard_only_through_a_harness_task(env, monkeypatch, tmp_path):
+    """Codex's apply_patch naming a listed guard (Update, Delete, Add or Move to; absolute or relative to
+    cwd; any input key) is refused outside a harness task, in a worker run and a full-tools coordinator."""
+    from ttp import coordtools
+    p, _ = _guarded(env, monkeypatch, tmp_path, {"guards/no_wipe.py": NO_WIPE}, ["guards/no_wipe.py"])
+    target = p.harness / "guards" / "no_wipe.py"
+    patches = [(f"*** Begin Patch\n*** {op}: {name}\n*** End Patch\n", cwd)
+               for op in ("Update File", "Delete File", "Add File") for name, cwd in
+               ((str(target), tmp_path), ("guards/no_wipe.py", p.harness), ("./no_wipe.py", p.harness / "guards"))]
+    patches.append((f"*** Begin Patch\n*** Update File: {tmp_path}/x.py\n*** Move to: {target}\n*** End Patch\n", tmp_path))
+    for patch, cwd in patches:
+        assert "harness task" in (_worker("apply_patch", cwd, command=patch) or ""), patch
+    assert "harness task" in (_worker("apply_patch", p.harness, input=patches[1][0]) or "")
+    from ttp import hook
+    out, _ = hook.pre_tool_use({"tool_name": "apply_patch", "tool_input": patches[0][0], "cwd": str(tmp_path)})
+    assert "harness task" in out["hookSpecificOutput"]["permissionDecisionReason"]
+    assert _worker("apply_patch", p.harness, command=patches[1][0].replace("no_wipe.py", "other.py")) is None
+    monkeypatch.setenv(coordtools.FULL_ENV, "1")
+    for patch, cwd in (patches[0], patches[4]):
+        out, _ = coordtools.pre_tool_use({"tool_name": "apply_patch", "tool_input": {"command": patch}, "cwd": str(cwd)})
+        assert "harness task" in out["hookSpecificOutput"]["permissionDecisionReason"], patch
+    monkeypatch.delenv(coordtools.FULL_ENV)
+    monkeypatch.setenv("TTP_TASK", str(p.db.add_task("tune the local guard", kind="harness")))
+    for patch, cwd in patches:
+        assert _worker("apply_patch", cwd, command=patch) is None, patch
+
+
 def test_a_shell_command_names_a_listed_guard_only_by_whole_path_components(env, monkeypatch, tmp_path):
     p, _ = _guarded(env, monkeypatch, tmp_path, {"a.py": NO_WIPE, "guards/b.py": NO_WIPE}, ["a.py", "guards/b.py"])
     for cmd in ("rm a.py", "rm ./a.py", "mv 'a.py' x", f"rm {p.harness / 'a.py'}", "echo >a.py", "cat x;rm a.py",
