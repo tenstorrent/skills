@@ -431,6 +431,9 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_an
     other_value = msg("raise the weekly cap to $500")
     other_cap = msg("raise the global daily cap to $400")
     old = msg("weekly cap $400", ts=now - capword.MAX_AGE_S - 60)
+    p.db.x("INSERT INTO messages(ts,direction,chat,kind,text) VALUES(?,?,?,?,?)",
+           (now - 30, "out", "c", "user", "weekly cap $400"))   # an outbound row is nobody's order
+    out = p.db.one("SELECT MAX(id) i FROM messages")["i"]
     monkeypatch.setattr(cli, "in_run", lambda: True)
     monkeypatch.setenv("TTP_TASK_ID", "7")
     monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "1"))
@@ -439,10 +442,14 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_an
         cli.main(["config", "demo", "budget.weekly_usd", "400"])
     assert "--user-msg" in capsys.readouterr().err   # the refusal names the path
     for mid, why in ((harness, "not the user's own"), (relayed, "do not name"), (other_value, "the value"),
-                     (other_cap, "do not name"), (old, "older than"), (99999, "not the user's own")):
+                     (other_cap, "do not name"), (old, "older than"), (out, "not the user's own"),
+                     (99999, "not the user's own")):
         with pytest.raises(SystemExit):
             cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(mid)])
         assert why in capsys.readouterr().err, mid
+    with pytest.raises(SystemExit):   # a section write that would change the cap: only the cap's own key
+        cli.main(["config", "demo", "budget", json.dumps({"weekly_usd": 400}), "--user-msg", str(ok)])
+    assert "itself, not budget" in capsys.readouterr().err
     with pytest.raises(SystemExit):   # another user-only key never takes this path
         cli.main(["config", "demo", "delivery.code_tasks_may_push", "true", "--user-msg", str(ok)])
     assert "applies only" in capsys.readouterr().err

@@ -99,6 +99,10 @@
   scripts and test stubs you run: check each with `ttp killscan <script>` (it also flags `kill $(pgrep -f ...)`); if it
   finds one, run it with `ttp killscan --shim <dir>` stand-ins on PATH
   (`PATH=<dir>:"$PATH" <script>`) and edit out any `ps | grep` or call by absolute path.
+<!-- ttp:if remote -->
+- A long queue for CPU-only work here (builds, tests): run it on another host your charter allows
+  that has room, rather than wait.
+<!-- /ttp:if remote -->
 <!-- ttp:if clusters -->
 
 ## Shared clusters (Slurm and other shared machines)

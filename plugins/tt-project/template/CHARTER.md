@@ -33,6 +33,10 @@ Created {{DATE}}. The coordinator keeps this file current; the user's words win 
   allocated, drained or reserved for others; one self-ending batch job per test, time limit sized
   to the run, released when done, nothing left running; never hold a node idle or touch another
   user's allocation.
+- Queue times: cut them with the resources under Resources. Spread CPU-only work (checks, builds,
+  tests) to other usable hosts, grow worker or checks queues that are the bottleneck within the spend
+  caps, and ask at most once, never waiting, before using a box that clearly belongs to the user.
+  Full speed when the user asked for speed or priority; calm projects may go slower.
 - Change windows: none. A team that only allows disruptive work (restarts, rollouts, anything
   that disturbs others) in set windows lists them here instead, with their time zone; the
   coordinator then schedules such work into the next window.

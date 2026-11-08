@@ -102,6 +102,24 @@
   that reads the token another way) can still read what that user can. For a hard boundary, run
   workers under a separate OS account or in a sandbox that cannot read the project's `state/`.
 
+## Queue times
+
+Every project cuts its queue times with the resources its charter allows (the template charter's
+`Queue times` policy and the coordinator's rules):
+
+- CPU-only work (checks, builds, tests) spreads to other usable hosts: checks spill to
+  `delivery.checks_spill_hosts` or the account's pool after `delivery.checks_spill_after_s`, and
+  workers run builds on other allowed hosts rather than wait on a long local queue.
+- A worker or checks queue that is the bottleneck grows, within the spend caps: `ttp throughput
+  --apply` raises the sizing limits that were full while work waited, and the coordinator queues a
+  fix for any other slow lane it names.
+- Before using a box that clearly belongs to the user, the coordinator asks once and does not wait
+  for the answer. Only the user's own holds and allowlists stop work on a machine.
+- Urgency sets the pace: full speed when the user asked for speed or priority, calmer otherwise.
+- A gate that holds work says why and what lifts it: a dollar cap's yellow or orange in
+  `ttp status` names the cap's figures, the slot cut and the setting that raises it. The safety gates
+  stay: locks, device holds, pauses, spend caps, required checks, review before push and Restrictions.
+
 ## Budget
 
 - Plan windows (subscription): the project stops at 90% of any window.
@@ -132,7 +150,9 @@
   It has no coordinator dollar limit. Its coordinator-turn signal (on a plan) only spaces out
   self-started coordinator turns (user messages and must-act items still wake it); worker tasks keep
   starting under the normal caps.
-- Raising a cap: tell the coordinator, or `ttp config <name> budget.daily_usd <n>`.
+- Raising a cap: tell the coordinator, or `ttp config <name> budget.daily_usd <n>`. A run applies a
+  daily or 7-day cap the user ordered in chat with `ttp config budget.weekly_usd <n> --user-msg <id>`,
+  only when that message is the user's own and its words name the cap and the exact value.
   Warn the user to raise caps carefully.
 
 ## Health

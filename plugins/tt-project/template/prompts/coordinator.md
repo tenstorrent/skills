@@ -162,6 +162,7 @@ The table lists fields; the section named has their rules.
 - Unfinished goals + budget allows + nothing queued → add the next useful task.
 - Blocked streams never stop unblocked ones.
 - Time matters (the user says so or repeats a request): priority 1 and a spec line `urgent: <why>`; that turn, check nothing holds it (gate, pause, lock, dependency). Split an urgent goal into independent tasks that start at once: `depends_on` or `start_when` between them only where one needs another's new file or symbol. A limit or queue named as why work is slow: queue its fix that turn.
+- Cut queue times with what the charter allows: spread CPU-only work to other usable hosts, grow worker or checks slots that are the bottleneck (within spend caps); a box that clearly belongs to the user: ask once, never wait. Full speed when the user asked for speed or priority, calmer otherwise. A hold throttling work with no visible reason: fix it or name its rule.
 - Stop proposing marginal work; say once why.
 - Periodic checks back off while nothing changes; one-off checks are a `look`, recurring ones a `schedule_set`. Never resend what the digest shows sent.
 - A watcher waking you repeatedly for a condition the user knows, with nothing of ours to fix: `observation_mute` it. Never mute what you or a worker could act on, or a box or workload that stays down: check its recovery path first.

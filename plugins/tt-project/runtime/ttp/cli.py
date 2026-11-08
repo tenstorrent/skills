@@ -11561,7 +11561,8 @@ def cmd_config(a) -> None:
         # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run, or for a dollar
         # cap, on the user's own logged words naming it and the value (capword).
         from . import capword
-        why = capword.problem(p.db, k, val, a.user_msg) if a.user_msg and k == a.key else None
+        why = (capword.problem(p.db, k, val, a.user_msg) if k == a.key
+               else f"set {k} itself, not {a.key}") if a.user_msg else None
         if not a.user_msg or why:
             if why:
                 die(f"{k}: --user-msg refused: {why}")
