@@ -152,7 +152,7 @@ item items restriction restrictions exception exceptions excepted scope scoped s
 charter policy policies section sections binding spec specs harness retired retire""".split())
 # A value with a unit: '900 W', '2 hours', '50%', '4 chips'. Both forms ('900 w', '900w') are terms.
 _VALUE = re.compile(r"(?<![\w.])(\d+(?:\.\d+)?)\s?(%|[kmg]?w|watts?|v|volts?|°c|ms|secs?|seconds?|mins?|minutes?"
-                    r"|hrs?|hours?|days?|weeks?|[kmgt]i?b|chips?|cores?|nodes?|trays?|hosts?|boxes)(?!\w)", re.I)
+                    r"|hrs?|hours?|days?|weeks?|[kmgt]i?b|chips?|cores?|nodes?|tray(?:s)?|hosts?|boxes)(?!\w)", re.I)
 _TOKEN = re.compile(r"\w+")
 # Letters and digits joined by '-', bounded by neither: box-a, tt-box-3 (a date has no letter: clause_words).
 _HYPHENATED = re.compile(r"(?<![\w-])[a-z0-9]+(?:-[a-z0-9]+)+(?![\w-])")
