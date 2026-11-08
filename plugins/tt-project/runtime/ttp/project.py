@@ -66,6 +66,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # Usually set once per machine for every project: `ttp config --account KEY VALUE`. $200 and
         # rolling by default; plan windows never count toward it.
         "global_daily_usd": 200.0,
+        # A spend goal, not a cap: ttp status and the daily review show today's Claude spend against it
+        # (0 = unset, the default; `ttp config --account budget.daily_target_usd 330`).
+        "daily_target_usd": 0.0,
         "day_start": "",
         "timezone": "",
         "hourly_alarm_x": 4.0,          # spend rate this many times the 7-day hourly norm = runaway
@@ -1633,6 +1636,9 @@ class Project:
                 node[p] = {}
             node = node[p]
         node[parts[-1]] = value
+        from . import routeguard
+        if why := routeguard.refusal(before, raw, by):
+            raise ValueError(why)
         if self.config_status == "fallback":
             self.keep_broken_config()
         write_json(self.config_path, raw)
@@ -1665,6 +1671,9 @@ class Project:
             if trail[i]:
                 break
             del trail[i - 1][parts[i - 1]]
+        from . import routeguard
+        if why := routeguard.refusal(before, raw, by):
+            raise ValueError(why)
         if self.config_status == "fallback":
             self.keep_broken_config()
         write_json(self.config_path, raw)
@@ -2953,7 +2962,7 @@ def unregister(name: str) -> None:
 
 # Account-level settings: one file per user and machine that every project reads, below the
 # project's own project.json, so the projects on a machine agree unless one overrides a key.
-ACCOUNT_KEYS = {"budget": {"global_daily_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
+ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", "timezone", "push_spend_to"}, "pricing": {"claude", "codex"},
                 "guards": {"protected_paths"},   # paths no run on the host writes (pathguard)
                 "route": {"host_max"},   # routed runs per provider at once on this host (route.host_limit)
                 "checks": {"host_max", "bare_slots", "idle_hold_s", "load_extra", "live_cores", "nice", "ionice", "priority_turns", "urgent_slots", "preempt_after_s", "test_pool", "test_run_max",

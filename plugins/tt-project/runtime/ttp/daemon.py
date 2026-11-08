@@ -156,7 +156,7 @@ from . import shutrec
 from . import identity
 from . import idlecap
 from . import integrity
-from . import jevuse
+from . import babysit, jevuse
 from . import jobuse
 from . import land
 from . import landed
@@ -1092,8 +1092,9 @@ class Daemon:
         self.cfg_status = "ok"
         self._bad_sections: list[str] = []   # project.json sections holding no object, as last logged
         self._load_config()
-        self._jev_pause = JevPause()
-        self.jev = Jev(self.cfg, db=self.p.db, pause=self._jev_pause)
+        self._jev_pause, self._chat_pause = JevPause(), JevPause()
+        self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
+                                self._chat_pause)
         self._slack = None
         self._last_cfg = 0.0
         self._trouble_checked = 0.0
@@ -1929,7 +1930,8 @@ class Daemon:
         if now - self._last_cfg > 10:
             self._load_config()
             self._last_cfg = now
-            self.jev = Jev(self.cfg, db=self.p.db, pause=self._jev_pause)
+            self.jev = babysit.wrap(self.cfg, Jev(self.cfg, db=self.p.db, pause=self._jev_pause), self.p.db,
+                                    self._chat_pause)
         self.tend_lease()
         # Compared as callables, not by name, so a step replaced on the instance is gated the same way.
         lease_off = [] if self.lease_held() else [getattr(self, n) for n in LEASE_STEPS]
@@ -7724,7 +7726,8 @@ class Daemon:
         host._progress = lambda: None
 
         def body() -> tuple[str, float | None]:
-            host.jev = Jev(host.cfg, db=host.p.db, pause=host._jev_pause)
+            host.jev = babysit.wrap(host.cfg, Jev(host.cfg, db=host.p.db, pause=host._jev_pause), host.p.db,
+                                    getattr(host, "_chat_pause", None))
             if s["kind"] == "llm":
                 return host._schedule_llm(s, payload), None
             if s["kind"] == "command" and payload.get("heal"):

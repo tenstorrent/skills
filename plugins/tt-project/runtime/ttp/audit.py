@@ -456,6 +456,19 @@ def _more(rows: list, shown: int = TOP) -> str:
     return f"; and {len(rows) - shown} more" if len(rows) > shown else ""
 
 
+def target_line(db: DB, cfg: dict) -> str:
+    """Today's whole-account Claude spend against budget.daily_target_usd, from the daemon's last gate
+    count (kv 'gates'); '' when no target is set or nothing was counted."""
+    from . import budget as bud
+    from .overview import _gate_global
+    try:
+        _, totals = _gate_global(db.conn)
+    except Exception:   # a busy or older database: the review goes on without the line
+        return ""
+    t = bud.target_text((cfg or {}).get("budget") or {}, totals)
+    return t.removeprefix(" · ") if t else ""
+
+
 def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_h: float = BLOCKED_H,
           p: Project | None = None) -> list[str]:
     """The daily review's 'Self-efficiency audit' lines for the last `window_s`; [NOTHING] on an empty
@@ -463,6 +476,8 @@ def lines(db: DB, now: float | None = None, window_s: float = WINDOW_S, blocked_
     now = time.time() if now is None else now
     since = now - window_s
     out: list[str] = []
+    if p is not None and (tl := target_line(db, p.config())):
+        out.append(tl)
     sent = asks(db, since, now, p)
     for a in sent:
         rec = f"; recommended: {a['recommendation']}" if a["recommendation"] else ""

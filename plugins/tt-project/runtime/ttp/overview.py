@@ -181,7 +181,8 @@ def overview(now: float | None = None) -> dict:
     for r in rows:
         r.pop("gate_ts", None)
         r.pop("gate_global", None)
-    g = {"cap": float(account.get("global_daily_usd") or 0), "label": "per 24h" if rolling else "today",
+    g = {"cap": float(account.get("global_daily_usd") or 0), "target": float(account.get("daily_target_usd") or 0),
+         "label": "per 24h" if rolling else "today",
          "local": {k: round(v, 2) for k, v in local.items() if round(v, 2)}, "local_projects": sum(1 for r in rows if r["ok"])}
     if counted and now - counted[0] <= GATE_FRESH_S:
         g["counted"] = {"by": counted[1], "age_s": round(now - counted[0]),
@@ -217,7 +218,26 @@ def line(r: dict) -> str:
             + "".join(f" · {x}" for x in r.get("slots") or []))
 
 
+def target_line(g: dict) -> str:
+    """Today's Claude spend against budget.daily_target_usd ('' when unset): every machine's count when
+    a daemon counted it lately, else this machine's."""
+    t = float(g.get("target") or 0)
+    if t <= 0:
+        return ""
+    c = (g.get("counted") or {}).get("providers") or {}
+    usd = float((c.get("claude") or {}).get("usd") or 0) if "claude" in c else float((g.get("local") or {}).get("claude") or 0)
+    where = "every machine" if "claude" in c else "this machine"
+    diff = f"{gcap.money(usd - t)} over" if usd > t else f"{gcap.money(t - usd)} under"
+    return f"daily target ${t:.0f}: Claude {gcap.money(usd)} {g['label']} ({where}), {diff}"
+
+
 def footer(g: dict) -> str:
+    if (tl := target_line(g)):
+        return _footer(g) + "\n" + tl
+    return _footer(g)
+
+
+def _footer(g: dict) -> str:
     if not g["cap"]:
         return "global daily cap: off (budget.global_daily_usd is 0)"
     c = g.get("counted")
