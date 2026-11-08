@@ -10627,6 +10627,7 @@ def test_checks_park_frees_the_queue_place_and_resumes_at_its_first_arrival_once
 
 
 def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path, monkeypatch):
+    import contextlib
     import threading
     from ttp import checkcap, checkjoin, checksqueue, cli, locks
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -10645,7 +10646,7 @@ def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path
             done.append(cli.main(["checks", "--", "true"]))
         except SystemExit as e:
             done.append(e.code)
-    t = threading.Thread(target=go)
+    t = threading.Thread(target=go, daemon=True)   # a stuck thread never holds the test worker past its exit
     t.start()
     try:
         # Its queue ticket is taken before its wait is recorded: park only once both show (as the park test does).
@@ -10665,6 +10666,10 @@ def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path
         got = checkjoin.target(b, checkjoin.records(p.state, prune=False))
         assert got and got[0]["id"] == a["id"] and got[1] == checkjoin.JOINED, got
         b_path.unlink()
+    except BaseException:
+        with contextlib.suppress(Exception):   # never left queued; the assert's own error still shows
+            checksqueue.act(p, run, "cancel", "the test", "a failed assert", "")
+        raise
     finally:
         flag.touch()   # a failed assert never leaves the thread parked or queued past teardown
         held.close()
