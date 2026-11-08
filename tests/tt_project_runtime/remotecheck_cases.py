@@ -3111,6 +3111,67 @@ def test_a_slurm_job_on_a_cluster_without_accounting_reads_scontrol_and_waits_ou
     assert rc == 0 and "(cluster: it ended NODE_FAIL" in out and "ran" in out, out
 
 
+def _slurm_clock_fakes(monkeypatch, sacct, shows):
+    """A fake clock (each sleep moves it on) and a fake ssh answering the poll (squeue never lists the
+    job), sacct and scontrol: sacct(t) gives sacct's 'State|ExitCode' line at time t, shows(t) what the
+    rc or probe.out file reads on the submit host then ('' while hidden, as NFS can)."""
+    import re
+    from types import SimpleNamespace
+    from ttp import slurmcheck
+    clock = {"t": 0.0}
+    monkeypatch.setattr(slurmcheck, "time", SimpleNamespace(
+        time=lambda: clock["t"], sleep=lambda s: clock.__setitem__("t", clock["t"] + s)))
+    token = {}
+
+    def ssh(host, script, timeout, data=None):
+        t, out = clock["t"], ""
+        put = re.search(r"printf '%s\\n' (\w+) > \S+/probe\.in", script)
+        mark = re.search(r"\{?(ttp-(?:slurm|probe):[0-9a-f]+)", script)
+        if put:
+            token["v"] = put.group(1)
+        elif script.startswith("sbatch"):
+            out = "901\n"
+        elif script.startswith("sacct"):
+            out = sacct(t) + "\n"
+        elif script.startswith("scontrol"):
+            out = ""   # sacct answers in these cases
+        elif mark:
+            shown = shows(t)
+            out = f"{mark.group(1)}||{token.get('v', '') if shown == 'TOKEN' else shown}\n"
+        return subprocess.CompletedProcess(script, 0, out.encode(), b"")
+    monkeypatch.setattr(slurmcheck, "_ssh", ssh)
+    monkeypatch.setattr(slurmcheck, "scancel", lambda *a: pytest.fail("nothing is cancelled"))
+    return clock
+
+
+def test_a_slurm_job_slurm_calls_failed_still_waits_out_its_late_rc_file(monkeypatch):
+    # The node could not make the env: the script writes `noenv` and exits 1, so Slurm says FAILED, while
+    # the rc file shows here 30 s late (NFS). It gets the same rc_grace_s a COMPLETED job gets.
+    from ttp import slurmcheck
+    s = slurmcheck.settings_of({"host": "h", "partition": "p", "rc_grace_s": 90})
+    clock = _slurm_clock_fakes(monkeypatch, lambda t: "FAILED|1:0", lambda t: slurmcheck.NO_ENV if t >= 30 else "")
+    rc, state, why, _ = slurmcheck._follow("h", "/w/q", "901", s, 10, 0, lambda **kw: None)
+    assert (rc, state) == (None, "FAILED") and "pinned Python env could not be made" in why, why
+    assert clock["t"] >= 30
+    # A FAILED job whose rc file never shows is a cluster end once the grace passed.
+    clock = _slurm_clock_fakes(monkeypatch, lambda t: "FAILED|1:0", lambda t: "")
+    rc, state, why, _ = slurmcheck._follow("h", "/w/q", "901", s, 10, 0, lambda **kw: None)
+    assert rc is None and why.startswith("cluster: it ended FAILED") and clock["t"] >= 90, why
+
+
+def test_a_slurm_job_squeue_misses_while_sacct_shows_it_active_gets_the_full_rc_grace_after_its_end(monkeypatch):
+    # squeue does not list the job, yet sacct shows it RUNNING until t=100; its rc file shows at t=150.
+    # The grace counts from the end sacct shows (t=100), not from squeue's first miss (t=0).
+    from ttp import slurmcheck
+    s = slurmcheck.settings_of({"host": "h", "partition": "p", "rc_grace_s": 90})
+    sacct = lambda t: "RUNNING|" if t < 100 else "COMPLETED|0:0"
+    _slurm_clock_fakes(monkeypatch, sacct, lambda t: "0" if t >= 150 else "")
+    assert slurmcheck._follow("h", "/w/q", "901", s, 10, 0, lambda **kw: None)[:3] == (0, "COMPLETED", "")
+    # The workdir probe job alike: its answer under the workdir shows at t=150.
+    _slurm_clock_fakes(monkeypatch, sacct, lambda t: "TOKEN" if t >= 150 else "")
+    assert slurmcheck._probe("h", s, "/w/q", 10, lambda **kw: None) == (True, "")
+
+
 def test_a_workdir_the_nodes_cannot_see_is_found_by_one_probe_job_before_any_check_job(env, tmp_path, monkeypatch, capsys):
     # The workdir on the submit host's own disk: one tiny probe job finds it before any check job is
     # sent; the run goes on here, the overflow is marked unusable with why (status, slot status, pick),

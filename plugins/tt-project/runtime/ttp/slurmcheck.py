@@ -14,7 +14,7 @@ folder on the cluster's shared file system (absolute, or under ~ or $HOME; defau
 `max_jobs` this machine's overflow jobs at once (default 2); `margin_s` added to the run's median wall
 time for `--time` (default 600); `max_time_s` the cap of `--time` (default 7200), also its value before
 a passing run's time is known; `max_pending_s` how long a job may wait to start (default 1800); `rc_grace_s` how long a job's exit-code
-file may stay unseen after the job left the queue before the job counts as ended without one (default 90:
+file may stay unseen after the job ended before the job counts as ended without one (default 90:
 NFS caches a file's attributes for up to a minute).
 
 Before its first job on a (host, partition, workdir) a run sends one tiny probe job there (probe): a
@@ -673,7 +673,8 @@ def _probe(host: str, s: dict, q: str, poll: float, note) -> tuple[bool | None, 
                 continue
             left = left or now
             final, code, _ = _final(host, job)
-            if final in _ACTIVE:
+            if final in _ACTIVE:   # squeue missed it: the grace counts from its end
+                left = None
                 time.sleep(poll)
                 continue
             if code.split(":")[0] == "3":
@@ -907,7 +908,8 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
         if elapsed is None and started is not None:   # sacct gave none: from when it was seen running
             elapsed = round(time.time() - started)
         seen = {"out_bytes": sent, "code": code, "elapsed_s": elapsed}
-        if final in _ACTIVE:
+        if final in _ACTIVE:   # squeue missed it: the grace counts from its end
+            left = None
             time.sleep(poll)
             continue
         if rc == NO_ENV:
@@ -917,7 +919,7 @@ def _follow(host: str, q: str, job: str, s: dict, poll: float, submitted: float,
             return None, final or "FAILED", "cluster: the node could not set up the tree", seen
         if final == "TIMEOUT":
             return None, final, "it ran past its time limit", seen
-        if not rc and final in ("", "COMPLETED") and time.time() - left < s["rc_grace_s"]:
+        if not rc and final in ("", "COMPLETED", "FAILED") and time.time() - left < s["rc_grace_s"]:
             time.sleep(poll)   # NFS: the rc file the node wrote may show here late
             continue
         return None, final or "UNKNOWN", f"cluster: it ended {final or 'unseen'} ({code or 'no exit code'}) before the command reported one", seen
