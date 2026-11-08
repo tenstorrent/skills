@@ -1362,7 +1362,7 @@ def host_line(boots: list[dict], where=None) -> str:
     last = short(float(boots[-1]["ts"]), where)
     ini = boots[-1].get("initiator") if isinstance(boots[-1].get("initiator"), dict) else {}
     cause = "; ".join(str(x)[:160] for x in (ini.get("text"), ini.get("kernel") and f"kernel: {ini['kernel']}")
-                      if x and x != "unknown")
+                      if x and not str(x).startswith("unknown"))
     if cause:
         last += f": {cause}"
     n = len(runs)

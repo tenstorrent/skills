@@ -1050,10 +1050,12 @@ def test_the_unit_systemd_started_just_before_the_marker_is_found_however_long_t
     assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
                    "rebooting.); example-broker-recover.service (Example recovery: power-cycle a hung shutdown) "
                    f"armed, not fired: it logged nothing of its own before the boot's journal ended {end} s later"}, got
-    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)]] * 2 + [["--since", f"@{_T0 - 600}"]] + \
-        [["-n", str(initiator.UNIT_ENTRIES)], ["-n", "1"]], reads
-    assert reads[0] == initiator.marker_args() and reads[1] == initiator.command_args(), reads
-    assert reads[3] == initiator.unit_args("example-broker-recover.service") and reads[4] == initiator.end_args()
+    assert [r[:2] for r in reads] == [["-n", str(initiator.MARK_ENTRIES)], ["-n", str(initiator.KERNEL_ENTRIES)],
+                                      ["-n", str(initiator.MARK_ENTRIES)], ["--since", f"@{_T0 - 600}"],
+                                      ["-n", str(initiator.UNIT_ENTRIES)], ["-n", "1"]], reads
+    assert reads[0] == initiator.marker_args() and reads[1] == initiator.kernel_args() \
+        and reads[2] == initiator.command_args(), reads
+    assert reads[4] == initiator.unit_args("example-broker-recover.service") and reads[5] == initiator.end_args()
 
 
 # A shutdown watchdog systemd-run started just before the reboot request, to power-cycle the host if the
@@ -1087,7 +1089,7 @@ def test_a_watchdog_systemd_only_started_before_the_request_is_armed_not_the_ini
     assert got == {"source": "journal", "text": "a request to systemd-logind that names no user (journal: System is "
                    f"rebooting.); {_WATCHDOG} (power-cycle a hung shutdown) armed, not fired: it logged nothing of "
                    "its own before the boot's journal ended 88 s later"}, got
-    assert reads[3:] == [initiator.unit_args(_WATCHDOG), initiator.end_args()], reads
+    assert reads[4:] == [initiator.unit_args(_WATCHDOG), initiator.end_args()], reads
     # Its lines from before this start (an earlier run of the same name) are no sign it fired.
     early = [_j(-300, "ready", _WATCHDOG, "example-watchdog"), *_ARMED]
     assert _find_over(monkeypatch, early)["text"] == got["text"]
@@ -1095,7 +1097,7 @@ def test_a_watchdog_systemd_only_started_before_the_request_is_armed_not_the_ini
     both = [_ARMED[0], _j(-0.02, f"Starting {_WATCHDOG} - power-cycle a hung shutdown...", "init.scope", "systemd",
                           about=_WATCHDOG), *_ARMED[1:]]
     reads.clear()
-    assert _find_over(monkeypatch, both, reads)["text"] == got["text"] and len(reads) == 5, reads
+    assert _find_over(monkeypatch, both, reads)["text"] == got["text"] and len(reads) == 6, reads
     # The request names nobody, so a host-cycle record for the boot still wins over it.
     monkeypatch.setattr(hostcycle, "planned", lambda p, boot, at: {"path": "/x/rec/cycle.json", "id": "c1",
                                                                    "project": "other", "reason": "kernel update"})
@@ -1158,12 +1160,12 @@ def test_a_unit_line_that_is_no_systemd_start_is_the_initiator_without_reading_i
     reads = []
     assert _find_over(monkeypatch, plain, reads) == {
         "source": "journal", "text": f"{_BROKER} (power-cycle requested by the operator console)"}
-    assert len(reads) == 3 and initiator.unit_args(_BROKER) not in reads and initiator.end_args() not in reads, reads
+    assert len(reads) == 4 and initiator.unit_args(_BROKER) not in reads and initiator.end_args() not in reads, reads
     # A unit line that reads like a start (not systemd's) is the unit's own line: named, nothing more read.
     own = [_j(-2, f"Started {_WATCHDOG} - power-cycle a hung shutdown.", _BROKER, "example-broker"), *_ARMED[2:]]
     reads.clear()
     assert _find_over(monkeypatch, own, reads)["text"].startswith(f"{_BROKER} (Started ")
-    assert len(reads) == 3 and initiator.unit_args(_WATCHDOG) not in reads, reads
+    assert len(reads) == 4 and initiator.unit_args(_WATCHDOG) not in reads, reads
 
 
 def test_a_full_marker_read_with_no_marker_never_claims_no_clean_shutdown(monkeypatch):
@@ -1201,10 +1203,12 @@ def test_a_permission_limited_journal_is_read_through_sudo_n_never_prompting(env
     got = initiator.find(p, "0123456789abcdef0123456789abcdef", time.time(), None)
     assert got["source"] == "journal" and got["read"] == "sudo" \
         and got["text"].startswith("example-broker-recover.service (power-cycle a hung shutdown"), got
-    user, check, sudo, commands, window = (c[0] for c in calls)
+    user, check, sudo, kernel, commands, window = (c[0] for c in calls)
     assert user[:3] == ["journalctl", "-b", "0123456789abcdef0123456789abcdef"] and "json" in user \
         and "SYSLOG_IDENTIFIER=systemd-logind" in user
     assert check == ["sudo", "-n", "-l", "journalctl"] and sudo == ["sudo", "-n", *user]
+    k = initiator.kernel_args()
+    assert kernel[:2] == ["sudo", "-n"] and kernel[-len(k):] == k, kernel
     assert commands[:2] == ["sudo", "-n"] and commands[-2:] == ["SYSLOG_IDENTIFIER=sudo", "SYSLOG_IDENTIFIER=pkexec"]
     assert window[:2] == ["sudo", "-n"] and window[window.index("--since") + 1] == f"@{_T0 - 600}" \
         and window[window.index("--until") + 1] == f"@{_T0 + 1}", window   # the 10 min before the marker
