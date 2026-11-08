@@ -43,7 +43,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatejudge, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -4402,7 +4402,6 @@ def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str
     quarantined, or pre-existing: failing the same way on the base), each named; BUSY when a rerun found no
     slot; else CHECKS_FAILED, the failure as it was. A failing id matching delivery.push_hard_tests (the leak
     scan) is never excused. `p` (else TTP_PROJECT): its settings, base results and quarantine."""
-    from . import gatejudge, pushq
     if p is None and (at := os.environ.get("TTP_PROJECT")):
         p = Project(at)
     if p is None or not p.exists() or not _gated(cmd):
@@ -4455,7 +4454,11 @@ def _gate(cmd: Any, repo: Path, env: dict, say: Callable[[str], None], head: str
         new = gatejudge.quarantine(p.state, v["flaky"], {"head": head, "check": str(cmd), "host": host_,
                                                          "task": os.environ.get("TTP_TASK") or ""}, now, s["days"])
         if new:   # one fix note per newly quarantined test
-            pushq._event(p.db, None, gatejudge.EVENT, gatejudge.note_text(new, head, str(cmd)), queued=True)
+            # pushq._event's row, written here: pushq imports push (and landed) at import time, and a
+            # sibling import inside a function on the push path is refused
+            p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                   (time.time(), "daemon", gatejudge.EVENT, "normal",
+                    gatejudge.note_text(new, head, str(cmd))[:6000], "queued", None))
     if gatejudge.blocks(v):
         say(f"new on {head[:10]}, the failure stands: {' '.join(v['new'])}")
         return CHECKS_FAILED
