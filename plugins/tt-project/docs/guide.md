@@ -466,7 +466,8 @@ only in the feed and never under "needs you".
   daemon restart or a host reboot resumes the same session id (kept in the project's kv table) and
   never starts a new session. A new session starts only when there is none, the system prompt,
   stable context or action schema changed, the model or effort changed, a new session's first wake
-  did not end ok, its transcript is gone (a host move or a provider-side expiry), or the provider
+  did not end ok and did no work (one that did, then hit its dollar cap or timeout, keeps its session:
+  the next wake resumes it), its transcript is gone (a host move or a provider-side expiry), or the provider
   rejected a resume. A full context never starts a new session: the session compacts in place and
   keeps its id. The context is the last model call's prompt and answer; the compaction point is the
   session's first prompt (or its size after its last compaction, the larger) plus
@@ -523,8 +524,11 @@ only in the feed and never under "needs you".
   memory` is unchanged. Known gaps: only quotes are checked, so unquoted text on a labelled line
   with a checked quote is carried; a claim phrased past those label forms ("the user ordered
   '...'", "as the user put it", "User:", another language) is not checked and is carried as data
-  under the header above. A new session's first wake's dollar cap is the per-wake cap plus the expected seed cost, within the
-  dollar and hourly caps (seedcap.py): the dearest of the last 3 new-session wakes' seeds (their
+  under the header above. A session wake's per-wake dollar cap, with `coordinator.session.wake_budget_usd` unset, is sized to
+  the session: twice the dearest of the last 20 resumed wakes that ended ok, never below the sized turn
+  budget (`coordinator.turn_budget_usd`) nor past what the project and account dollar caps leave; a set
+  value wins. A new session's first wake's dollar cap is the per-wake cap plus the expected seed cost,
+  within the project and account dollar caps only, never the hourly coordinator limit (seedcap.py): the dearest of the last 3 new-session wakes' seeds (their
   cache writes and uncached input at their own booked rate), each counted at most 3 times its
   seeded prompt size (`turn.session.seed_chars`; older wakes without it, their size before the
   seed) / 4 in tokens. The factor 3 rests on one measured wake, which wrote 2.6 times its size

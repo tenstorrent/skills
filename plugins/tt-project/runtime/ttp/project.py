@@ -566,8 +566,9 @@ EXTRA_KEYS = {
     # comments), read with the project root's git user.name and user.email to verify a cited record's
     # author (restriction_source.owner_identities; default none, set only on the owner's own message).
     # session: the persistent coordinator, always on and with no off switch (coordtools.py,
-    # hostcheck.py): "wake_budget_usd" and "wake_budget_s" cap one wake (default: the coordinator turn's sized
-    # budget and timeout), "host_access" ({alias: helper argv in the project folder | ssh config file
+    # hostcheck.py): "wake_budget_usd" and "wake_budget_s" cap one wake (default: twice the session's dearest
+    # recent ok resumed wake, at least the turn's sized budget, within the dollar caps (seedcap.wake_usd);
+    # and the turn's timeout), "host_access" ({alias: helper argv in the project folder | ssh config file
     # there}, default none) and "log_paths" ({name: absolute path} `ttp hostcheck log-tail` may read).
     # "tools" ("full" default | "read_only") and "tool_timeout_s" (300, at most 600) set a session
     # wake's tools and its foreground command limit.

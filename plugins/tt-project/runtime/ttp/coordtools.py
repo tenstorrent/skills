@@ -41,11 +41,14 @@ own tool for the turn's --json-schema answer, without which the turn has no stru
 hook denies an answer with an action coord.apply would refuse, with the reason (coordprecheck.py).
 
 Budget: a wake stops at whichever comes first of coordinator.session.wake_budget_usd (the CLI's
---max-budget-usd) and wake_budget_s (the run's timeout); there is no tool-call cap. Unset, each is
-the sized turn budget (coordinator.turn_budget_usd, default $1) and the effort-sized turn timeout
-(coordlimits.turn_timeout). A typical wake costs less than its ceiling: the session's cached context is
-read, not resent. A wake that hits either limit ends with what it has; that non-ok end reruns its batch
-as the next session, seeded with the hand-off (coordsession.fail). The project and account dollar caps
+--max-budget-usd) and wake_budget_s (the run's timeout); there is no tool-call cap. Unset, the dollar
+limit is sized to the session (seedcap.wake_usd: twice the dearest recent resumed wake that ended ok,
+never below the sized turn budget, coordinator.turn_budget_usd, default $1, nor past what the dollar
+caps leave), and the time limit is the effort-sized turn timeout (coordlimits.turn_timeout). A new
+session's first wake also gets its expected seed cost on top (seedcap.cap). A typical wake costs less
+than its ceiling: the session's cached context is read, not resent. A wake that hits either limit ends
+with what it has; once it did work in a saved session, the next wake reruns its batch resuming that
+same session (coordsession.fail), never a new or stateless one. The project and account dollar caps
 stay the hard limits; there is no other coordinator cost gate."""
 from __future__ import annotations
 
@@ -667,10 +670,13 @@ def _records_why(cmd: str) -> bool:
     return words[:3] == ["ttp", "audit", "why"] and not any(w and set(w) <= set("();<>|&") for w in words)
 
 
-def wake_budget(cfg: dict, turn_usd: float | None, turn_timeout_s: float) -> tuple[float | None, float]:
+def wake_budget(cfg: dict, turn_usd: float | None, turn_timeout_s: float,
+                measured: float | None = None) -> tuple[float | None, float]:
     """(dollars, seconds) one session wake may use: wake_budget_usd and wake_budget_s where set and
-    positive, else the sized turn budget and turn timeout (module doc)."""
+    positive, else the larger of the sized turn budget and `measured` (the session's own wake cost,
+    seedcap.wake_usd, within the dollar caps), and the turn timeout (module doc)."""
     s = session(cfg)
-    usd = positive(s.get("wake_budget_usd"), 0) or turn_usd
+    usd = positive(s.get("wake_budget_usd"), 0) or (
+        max(float(turn_usd), float(measured or 0)) if turn_usd is not None else turn_usd)
     secs = positive(s.get("wake_budget_s"), 0) or turn_timeout_s
     return usd, secs

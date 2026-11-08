@@ -66,13 +66,22 @@ def headroom(cfg: dict, numbers: dict) -> float:
     b = cfg.get("budget") or {}
     room = [float(b.get("hourly_coordinator_usd", 4.0)) - float(numbers.get("coordinator_1h") or 0)
             - float(numbers.get("coordinator_user_1h") or 0)]
+    if (dollars := dollar_room(numbers)) is not None:
+        room.append(dollars)
+    return min(room)
+
+
+def dollar_room(numbers: dict) -> float | None:
+    """What the project and account dollar caps leave now (None: no cap set). A coordinator session
+    wake's cap is bounded by this alone, never by the hourly coordinator limit (seedcap.py)."""
+    room = []
     if numbers.get("daily_cap"):
         room.append(float(numbers["daily_cap"]) - float(numbers.get("spent_today", numbers.get("spent_24h")) or 0))
     if numbers.get("weekly_cap"):
         room.append(float(numbers["weekly_cap"]) - float(numbers.get("spent_7d") or 0))
     if numbers.get("global_cap"):
         room.append(float(numbers["global_cap"]) - float(numbers.get("global_today") or 0))
-    return min(room)
+    return min(room) if room else None
 
 
 def item_key(kind: str, i) -> str:

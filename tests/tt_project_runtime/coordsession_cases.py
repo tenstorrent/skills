@@ -1477,25 +1477,84 @@ def test_coordsession_a_new_session_without_history_prices_its_seed_prompt(env, 
     _, a0, prompt, s0 = turn("EVENTS", budget_usd=1.0)
     want = round(len(prompt) // 4 * 1.25 * 400.0 / 1e6, 2)
     assert s0["seed_basis"] == "estimate" and abs(s0["seed_usd"] - want) <= 0.02, (s0, want)
-    assert _cs_cap(a0) == round(1.0 + min(s0["seed_usd"], 3.0), 2) > 1.0, a0
+    assert _cs_cap(a0) == round(1.0 + s0["seed_usd"], 2) > 4.0, "the hourly coordinator limit ($4) never clips it"
 
 
 def test_coordsession_a_new_session_s_seed_raise_stays_inside_the_dollar_caps(env, monkeypatch):
     """The project and account caps stay hard: the raise stops at what they leave and never lowers the
-    per-wake cap; the hourly coordinator limit bounds it too."""
+    per-wake cap; the hourly coordinator limit never bounds it (runs 12883, 15122: no room left under it
+    after a few capped wakes, so every new session's seed failed on the bare $1 cap)."""
     from types import SimpleNamespace
     from ttp import coordsession, seedcap
     p, holder, turn = _cs_seed_wakes(env, monkeypatch, seeds=(1.2,))
     for numbers, want in (({"daily_cap": 10.0, "spent_today": 8.5}, 1.5),       # project day: $1.50 left
                           ({"global_cap": 50.0, "global_today": 49.4}, 1.0),   # account: under the per-wake cap
                           ({"weekly_cap": 20.0, "spent_7d": 18.2}, 1.8),
-                          ({"coordinator_1h": 2.6}, 1.4),                      # hourly coordinator limit $4
+                          ({"coordinator_1h": 3.9}, 2.2),                      # hourly coordinator limit: no bound
                           ({}, 2.2)):
         p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))   # no session yet: the wake starts one
         holder["d"].gates = {"fake": SimpleNamespace(numbers=numbers)}
         _, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
         assert s0["mode"] == "new" and _cs_cap(a0) == want == s0["cap_usd"], (numbers, a0, s0)
     assert seedcap.cap(1.0, 5.0, None) == 6.0 and seedcap.cap(1.0, 5.0, 0.2) == 1.0 and seedcap.cap(1.0, -1, 9) == 1.0
+
+
+def test_coordsession_a_session_wake_over_the_old_one_dollar_cap_completes_and_the_next_wake_resumes(env, monkeypatch):
+    """Runs 15087 and 15122: a session wake with its full seed failed on a fixed $1 per-wake cap and the
+    next wake started a new session, so none resumed. A wake over $1 completes under its session-sized
+    cap, and one that still hits its cap keeps its session: the next wake resumes it, never a new one."""
+    from types import SimpleNamespace
+    from ttp import coordsession, coordstats
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch, seeds=(1.03,))
+    holder["d"].gates = {"fake": SimpleNamespace(numbers={"coordinator_1h": 3.9})}   # the hourly limit nearly spent
+    monkeypatch.setenv("TTP_FAKE_COST", "1.6")
+    first, a0, _, s0 = turn("EVENTS", budget_usd=1.0)
+    assert s0["mode"] == "new" and _cs_cap(a0) == 2.03 and first["status"] == "ok" and first["cost_usd"] > 1.0, (s0, a0)
+    monkeypatch.setenv("TTP_FAKE_COST", "2.4")   # the session's running total: this wake adds $0.80
+    second, a1, _, s1 = turn("EVENTS", budget_usd=1.0)
+    assert s1["mode"] == "resume" and second["status"] == "ok" and second["session_id"] == first["session_id"], s1
+    # A new session whose first wake still overruns its cap: the session is kept and the next wake resumes it.
+    p.db.x("DELETE FROM kv WHERE key=?", (coordsession.KEY,))
+    monkeypatch.setenv("TTP_FAKE_COST", "9.0")
+    capped, a2, _, s2 = turn("EVENTS", budget_usd=1.0)
+    assert s2["mode"] == "new" and capped["status"] != "ok" and capped["session_id"], (capped["status"], s2)
+    st = p.db.kv(coordsession.KEY)
+    assert st["id"] == capped["session_id"] and st["rerun"] is True and not st["rejected"], st
+    monkeypatch.setenv("TTP_FAKE_COST", "9.5")
+    rerun, a3, _, s3 = turn("EVENTS", budget_usd=1.0)
+    assert (s3["mode"], s3["why"]) == ("resume", "rerun") and rerun["status"] == "ok", (rerun["status"], s3, a3)
+    assert rerun["session_id"] == capped["session_id"] and _cs_cap(a3) > 9.5, a3
+    ev = p.db.q("SELECT text FROM events WHERE kind='coord_session_resume_failed'")
+    assert len(ev) == 1 and "the new session's first wake failed" in ev[0]["text"], ev
+    assert not p.db.q("SELECT id FROM events WHERE kind='coord_session_start_failed'")
+    [day] = coordstats.report(p.db, p.runs, "UTC", 7)["by_day"][-1:]
+    assert day["stateless"] == 0 and day["reasons"].get("resumed") == 1, day["reasons"]
+    assert day["reasons"].get("resumed after a failed resume") == 1, day["reasons"]
+
+
+def test_coordsession_the_per_wake_cap_is_sized_to_the_session_s_measured_wakes(env, monkeypatch):
+    """With coordinator.session.wake_budget_usd unset, a wake's cap is twice the dearest recent ok resumed
+    wake, never below the sized turn budget nor past what the dollar caps leave; a set value wins."""
+    from types import SimpleNamespace
+    from ttp import coordtools, seedcap
+    p, holder, turn = _cs_seed_wakes(env, monkeypatch)
+    wake = lambda r: json.loads(r["note"])["turn"]["wake_budget"]["usd"]
+    first, *_ = turn("EVENTS", budget_usd=1.0)
+    assert wake(first) == 1.0, "no measured wake yet: the sized turn budget"
+    for cost, status in ((0.7, "ok"), (1.5, "ok"), (6.0, "failed")):   # a capped wake never raises the cap
+        rid = _cs_booked_run(p, "OLD", cost, "resume")
+        p.db.x("UPDATE runs SET provider='fake', model='other', status=? WHERE id=?", (status, rid))
+    assert seedcap.wake_usd(p.db, "fake", "nomatch") == 3.0
+    second, a1, _, s1 = turn("EVENTS", budget_usd=1.0)
+    assert wake(second) == 3.0 and s1["mode"] == "resume", (s1, a1)
+    holder["d"].gates = {"fake": SimpleNamespace(numbers={"daily_cap": 10.0, "spent_today": 8.8})}
+    third, *_ = turn("EVENTS", budget_usd=1.0)
+    assert wake(third) == 1.2, "the dollar caps bound it"
+    holder["d"].gates = {"fake": SimpleNamespace(numbers={"daily_cap": 10.0, "spent_today": 9.9})}
+    assert wake(turn("EVENTS", budget_usd=1.0)[0]) == 1.0, "never below the sized turn budget"
+    p.set_config("coordinator.session.wake_budget_usd", 4)
+    assert wake(turn("EVENTS", budget_usd=1.0)[0]) == 4.0, "a set value wins"
+    assert coordtools.wake_budget({}, None, 60, 5.0) == (None, 60)
 
 
 def _cs_booked_run(p, session, cost, mode, *, out=0, task=None, role="coordinator", basis="reported"):

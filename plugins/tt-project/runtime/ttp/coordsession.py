@@ -15,7 +15,8 @@ wake's `why`.
 
 A new session starts only when: there is none; the prefix key changed (system prompt, stable
 context, action schema or agent); the model or effort changed; the last new session's first wake did
-not end ok; its transcript is no longer saved (a host move or the provider's session expiry); or the
+not end ok and did no work in it (one that did, then hit its dollar cap or timeout, is kept like a
+failed resume: the next wake resumes it); its transcript is no longer saved (a host move or the provider's session expiry); or the
 provider rejected the resume (resume failed, below). Never because the context grew: the session
 compacts its own context in place and keeps its id (user order: every agent compacts its own
 context as needed). The context is the last model call's prompt and answer; limit() is the size

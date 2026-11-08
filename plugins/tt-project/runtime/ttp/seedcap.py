@@ -21,8 +21,17 @@ the per-wake cap plus the expected seed cost:
   A wake that reported no cache writes is skipped. Without such a wake, the seed prompt's size at
   the model's prices (budget.estimate_cost: this project's own rate on the provider, else the
   configured fallback).
-- cap(): the raise never goes past what the dollar caps and the hourly coordinator limit leave
-  (turnsize.headroom), and never lowers the per-wake cap. A resumed wake is not raised here.
+- cap(): the raise never goes past what the project and account dollar caps leave
+  (turnsize.dollar_room), and never lowers the per-wake cap. The hourly coordinator limit does not
+  bound it: after a few capped wakes it left no room, so a seed over the bare cap failed on every
+  try and no wake ever resumed (no session spend guard, user order). A resumed wake is not raised here.
+
+The per-wake cap itself, with coordinator.session.wake_budget_usd unset, is sized to the session
+(wake_usd): WAKE_FACTOR times the dearest of the last WAKES resumed wakes that ended ok (same
+provider, same model where there are any), never below the sized turn budget and never past what
+the dollar caps leave. Only ok wakes count, so a capped wake never raises the next cap by itself.
+A wake that still hits its cap is not lost: its session is kept and the next wake resumes it
+(coordsession.fail).
 
 The project and account caps stay hard, and the wake's whole cost is booked to the coordinator as
 before, so the spend guards count it."""
@@ -39,6 +48,8 @@ CACHE_WRITE_1H = 2.0   # a 1h cache write costs 2x input (cachettl.py); the 5m w
 # (turn.prompt_bytes): it wrote 2.6 times that size / 4 to the cache. Its seeded size was not recorded,
 # so the ratio to seed_chars, which includes the seed, is lower by an unmeasured amount.
 SEED_FACTOR = 3.0
+WAKES = 20
+WAKE_FACTOR = 2.0   # room for a wake twice as dear as the dearest recent one
 
 
 def _size(v) -> int:
@@ -109,6 +120,29 @@ def expected(db, cfg: dict, provider: str, model: str, chars: int) -> tuple[floa
     from .budget import estimate_cost
     tokens = max(int(chars), 0) // CHARS_PER_TOKEN
     return round(estimate_cost(db, cfg, provider, model or "", {"cache_write": tokens}), 2), "estimate"
+
+
+def _wake_costs(db, provider: str, model: str | None) -> list[float]:
+    got = []
+    for r in db.q("SELECT cost_usd, note FROM runs WHERE role='coordinator' AND task IS NULL AND provider=? "
+                  "AND (? IS NULL OR model=?) AND status='ok' AND cost_usd>0 AND note LIKE '%\"resume\"%' "
+                  "ORDER BY id DESC LIMIT 100", (provider, model, model)):
+        try:
+            session = (json.loads(r["note"] or "{}").get("turn") or {}).get("session") or {}
+        except (ValueError, AttributeError):
+            continue
+        if isinstance(session, dict) and session.get("mode") == "resume":
+            got.append(float(r["cost_usd"]))
+            if len(got) >= WAKES:
+                break
+    return got
+
+
+def wake_usd(db, provider: str, model: str) -> float:
+    """The per-wake cap a session wake's measured cost calls for: WAKE_FACTOR times the dearest of the
+    last WAKES resumed wakes that ended ok (this model's, else the provider's), 0 with none."""
+    costs = _wake_costs(db, provider, model or None) or _wake_costs(db, provider, None)
+    return round(WAKE_FACTOR * max(costs), 2) if costs else 0.0
 
 
 def cap(budget_usd: float, seed_usd: float, room: float | None) -> float:

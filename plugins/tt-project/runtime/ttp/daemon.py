@@ -2984,8 +2984,19 @@ class Daemon:
             note = {**(note or {}), "turn": {"prompt_bytes": prompt_bytes, "provider": provider,
                     "model": model, "effort": effort, "timeout_s": timeout_s}}
             if coordtools.session_on(self.cfg, provider):
-                # A session wake stops at its dollar or time limit, whichever comes first (coordtools).
-                budget_usd, timeout_s = coordtools.wake_budget(self.cfg, budget_usd, timeout_s)
+                # A session wake stops at its dollar or time limit, whichever comes first (coordtools),
+                # the dollar one sized to the session's measured wakes within the dollar caps (seedcap).
+                measured = None
+                if budget_usd is not None:
+                    try:
+                        measured = seedcap.wake_usd(self.p.db, provider, model)
+                        g = self.gates.get(provider)
+                        room = turnsize.dollar_room(dict(g.numbers) if g else {})
+                        measured = round(min(measured, room), 2) if room is not None else measured
+                    except Exception as e:   # the sized turn budget still bounds the wake
+                        measured = None
+                        log(self.p, f"coordinator session wake cap failed: {type(e).__name__}: {e}"[:300])
+                budget_usd, timeout_s = coordtools.wake_budget(self.cfg, budget_usd, timeout_s, measured)
                 note["turn"].update(timeout_s=timeout_s, wake_budget={"usd": budget_usd, "s": timeout_s})
         if role != "coordinator":   # a routed model pick runs its option's model and effort
             model, effort = modelpick.run_model(note, provider, model, effort)
@@ -3140,7 +3151,7 @@ class Daemon:
                 try:   # the seed rides on this wake: its cap covers it, within the dollar caps (seedcap.py)
                     seed_usd, seed_basis = seedcap.expected(self.p.db, self.cfg, provider, model, seed_chars)
                     g = self.gates.get(provider)
-                    room = turnsize.headroom(self.cfg, dict(g.numbers) if g else {})
+                    room = turnsize.dollar_room(dict(g.numbers) if g else {})   # never the hourly limit
                     session_cap = seedcap.cap(float(budget_usd), seed_usd, room)
                     argv = _with_flag(argv, "--max-budget-usd", f"{session_cap:.2f}")
                 except Exception as e:   # the bare per-wake cap still bounds the wake
@@ -5088,7 +5099,8 @@ class Daemon:
                           actions=None) -> bool:
         """Saves the persistent session (coordsession.py) after a coordinator wake, with any compaction
         the agent made in it, and the wake's `session_note` (a compaction's summary) as
-        state/coord-session/<session id>.md. True for a resumed wake that failed: nothing of it is
+        state/coord-session/<session id>.md. True for a resumed wake that failed, or a new session's first
+        wake that failed after doing work in its session (a dollar cap, a timeout): nothing of it is
         applied, an event records it, and the next wake reruns its batch at once, with no backoff,
         resuming the same session (a new one seeded with the hand-off only once the provider rejected
         the session id, coordsession.fail); FAIL_ALERT failures within an hour raise an issue. A wake that asked
@@ -5101,7 +5113,14 @@ class Daemon:
             if session.get("digest") and (coordsession.asked_full(actions) or compacted):
                 session = {k: v for k, v in session.items() if k != "digest"}
             state = db.kv(coordsession.KEY)
-            if session.get("mode") == "resume" and not ok:
+            sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
+            # A new session's first wake that did work before it failed (its dollar cap, its timeout) keeps
+            # its session like a failed resume: the next wake resumes it, never seeds a new one.
+            kept = session.get("mode") == "new" and not ok and bool(sid) and (
+                _has_tokens(usage) or bool(getattr(usage, "cost_usd", 0)))
+            if kept:
+                state = coordsession.record(state, usage, sid, session, False, now)
+            if (session.get("mode") == "resume" or kept) and not ok:
                 err = str(getattr(usage, "error", "") or "")[:200]
                 if not coordsession.rejected(err):   # an agent may name a rejected session id on stderr only
                     try:
@@ -5115,8 +5134,9 @@ class Daemon:
                     self.cfg, state, now, f"run {r['id']}: {err}",
                     idle=not _has_tokens(usage) and not getattr(usage, "cost_usd", 0))
                 db.set_kv(coordsession.KEY, state)
-                text = (f"coordinator run {r['id']}: the session could not resume "
-                        f"({state.get('fail_error') or 'no error recorded'}); its batch reruns "
+                text = (f"coordinator run {r['id']}: "
+                        + ("the new session's first wake failed " if kept else "the session could not resume ")
+                        + f"({state.get('fail_error') or 'no error recorded'}); its batch reruns "
                         + ("as the next session, seeded with the hand-off" if state.get("rejected") else
                            f"at once in the same session {str(state.get('id') or '')[:8]}"))[:1500]
                 log(self.p, text)

@@ -74,6 +74,8 @@ class Fake(Provider):
         u.cost_usd = float(data.get("_cost", 0.0)) if isinstance(data, dict) else 0.0
         u.output_tokens = int(data.get("_output_tokens", 0)) if isinstance(data, dict) else 0
         u.session_id = str(data.get("_session") or "") if isinstance(data, dict) else ""
+        if isinstance(data, dict) and data.get("_error"):
+            u.error, u.extra["subtype"] = str(data["_error"]), str(data["_error"])
         if isinstance(data, dict) and data.get("_model"):
             u.extra["model"] = str(data["_model"])
         return u
@@ -93,6 +95,11 @@ def _main(role: str, args: list[str] | None = None) -> int:
         with open(Path(sessions) / f"{session}.jsonl", "a") as f:
             f.write(json.dumps({"role": role, "prompt": prompt}) + "\n")
     cost = float(os.environ.get("TTP_FAKE_COST", "0"))
+    cap = args[args.index("--max-budget-usd") + 1] if "--max-budget-usd" in args[:-1] else ""
+    if cap and cost > float(cap):   # like Claude Code: a session total over the cap ends the run, the session kept
+        sys.stdout.write(json.dumps({"_cost": cost, "_session": session, "_error": "error_max_budget_usd",
+                                     "_output_tokens": 1000}))
+        return 1
     if role == "coordinator":
         scripted = os.environ.get("TTP_FAKE_ACTIONS")
         if scripted:
