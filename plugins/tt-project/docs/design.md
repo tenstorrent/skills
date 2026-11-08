@@ -217,10 +217,9 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
 - A git timeout defers a coordinator action only for task_add and task_update that wrote nothing
   yet (`actdefer.py`; the daemon applies it again next tick, up to `actdefer.MAX_TRIES`). Other
   action types, and one that wrote before it timed out, are still rejected, with the timeout as the
-  reason. A spent deadline gives pure local git calls (`gitmemo._pure`: check-ref-format, var, a
-  config read) `gitmemo.PURE_FLOOR_S` only through `gitmemo.run` and `gitmemo.timeout`; a raw git
-  spawn past a strict round's slice still times out at 0 s. Branch names are checked in-process
-  (`worktree.valid_branch`), so the coordinator's branch checks spawn no git.
+  reason. A spent deadline still refuses every new git call, local reads included (no floor: a
+  finish transaction's cap bounds how long it holds the write lock); branch names are checked
+  in-process (`worktree.valid_branch`), so the coordinator's branch checks spawn no git.
 
 - A wait on another project of this machine gets nothing extra from the daemon: no note to that
   project, no default end, no matching of project names in `waiting_for`. The worker tells the

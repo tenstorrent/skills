@@ -604,30 +604,6 @@ def test_gitmemo_bounded_caps_reads_and_a_deadline_caps_every_call(monkeypatch):
             gitmemo.timeout(120, ("merge-base",))
 
 
-
-def test_a_pure_local_git_call_gets_a_floor_past_a_spent_deadline(monkeypatch, tmp_path):
-    """A spent deadline (or the last round's spent slice) never times out a pure local git call such as
-    check-ref-format at 0 s: it gets PURE_FLOOR_S. Reads and writes still start no new call."""
-    from ttp import gitmemo
-    clock = [1000.0]
-    monkeypatch.setattr(gitmemo.time, "monotonic", lambda: clock[0])
-    with gitmemo.bounded(45, 20):
-        clock[0] += 100
-        assert gitmemo.timeout(None, ("check-ref-format", "--branch", "a/b")) == gitmemo.PURE_FLOOR_S
-        assert gitmemo.timeout(2, ("var", "GIT_EDITOR")) == 2, "a shorter own timeout stays"
-        for args in (("rev-parse", "HEAD"), ("commit",), ("hash-object", "-w", "f")):
-            with pytest.raises(subprocess.TimeoutExpired):
-                gitmemo.timeout(30, args)
-    monkeypatch.undo()
-    seen = []
-    monkeypatch.setattr(gitmemo, "_spawn", lambda argv, t, kw: seen.append(t) or subprocess.CompletedProcess(argv, 0, "", ""))
-    with gitmemo.attempt(), gitmemo.strict(0.0, abortable=False):   # the last round, its slice spent
-        assert gitmemo.run(["git", "check-ref-format", "--branch", "a/b"], capture_output=True).returncode == 0
-        with pytest.raises(subprocess.TimeoutExpired):
-            gitmemo.run(["git", "-C", str(tmp_path), "rev-parse", "HEAD"], capture_output=True)
-    assert seen == [gitmemo.PURE_FLOOR_S], seen
-
-
 def test_valid_branch_checks_in_process_as_git_does(monkeypatch):
     """worktree.valid_branch spawns no git (a spent deadline cannot refuse it) and agrees with
     `git check-ref-format --branch` on valid and malformed names."""
