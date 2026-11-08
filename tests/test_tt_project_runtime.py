@@ -48647,7 +48647,7 @@ def test_prguard_fast_path_remedy_names_a_working_flag(env, tmp_path, monkeypatc
     cli, p, run, mark = _fast_cli(env, tmp_path, monkeypatch, {"docs/n.md": "hi\n"}, True)
     cli.main(["checks"])
     msg = prguard._checks_problem(os.getcwd())
-    assert "ttp checks --full" in msg and "unset" not in msg
+    assert "ttp checks --fresh" in msg and "unset" not in msg   # --full is refused with the push queue on (#7629)
 
 
 def test_fast_path_skipped_when_a_scoped_check_applies(env, tmp_path, monkeypatch, capsys):
