@@ -1931,6 +1931,11 @@ def cmd_stats(a) -> None:
         s = coordstats.report(p.db, p.runs, timefmt.home(p), a.days)
         print(json.dumps(s, indent=1) if a.json else coordstats.text(s, p.name))
         return
+    if a.wakes:
+        from . import waketier
+        s = waketier.stats(p.db, timefmt.home(p), a.days)
+        print(json.dumps(s, indent=1) if a.json else waketier.text(s))
+        return
     if a.tools:
         s = bud.tool_output_stats(p.db, p.runs, a.days)
         print(json.dumps(s, indent=1) if a.json else bud.tool_output_text(s))
@@ -13091,6 +13096,8 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
     s.add_argument("--top", type=int, default=10, help="how many of the costliest runs to list (default 10)")
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
+    s.add_argument("--wakes", action="store_true",
+                   help="task wakes per day by reason instead: runs, $, re-waits and who chose the tier")
     s.add_argument("--effort-ab", action="store_true",
                    help="the effort A/B instead (effort_ab.enabled): per arm, $ per landed change, output tokens and "
                         "calls per run, review and checks fail rates, fix-review hops, tier-up retries, end rule")

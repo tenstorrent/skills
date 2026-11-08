@@ -146,6 +146,15 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    decision (a wake that only handed the wait back, or a skip whose next turn found work, is a
    miss), and the daily review reports skips, Jev spend and the estimated saving.
    `waiting.wake_gate.enabled` false turns it off.
+   Each wake records its reason (`wake_reason`: a failed check or job, a probe pass, a spec change,
+   a light run that asked for more, a timer, ...), and the run note's `wake` keeps it with the gate
+   step and who chose the tier (`waketier.py`). An escalated wake whose work is known (a failure to
+   fix, an ask for more) keeps its tier by rule. One for a spec change that slept with the wait asks
+   Jev, where its `wake_tier` use is on, whether the run needs judgment; below
+   `waiting.wake_tier.jev_light_below` (0.3) it runs light as a plain wake, so it can still ask for
+   its own tier. Jev off, unsure or failing keeps the tier; a light pick whose run asked for more
+   settles as wrong. `ttp stats --wakes` shows task wakes per day by reason, with their $, how many
+   only handed the wait back and who chose the tier.
 8. The project folder ignores itself; nothing of a project is ever committed to the user's repo.
 9. Secrets live only in `~/.tt-project/secrets.json` (0600). Never in argv, logs or projects.
 10. The runtime is standard-library Python ≥ 3.9. Web assets are static files.

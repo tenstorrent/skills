@@ -5295,6 +5295,11 @@ def test_a_waiting_hand_off_whose_probe_reads_another_tasks_worktree_logs_one_li
     assert log.count(f"task {tid} retry_when reads the worktree of task(s) #{other}: kept from pruning") == 1
 
 
+def _tier_of(wake: dict) -> dict:
+    """A run note's wake, tier and escalation only (it also records the reason and who chose the tier)."""
+    return {k: wake[k] for k in ("tier", "escalated")}
+
+
 def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_runs_are_unchanged(
         env, monkeypatch):
     p = make(env)
@@ -5321,13 +5326,13 @@ def test_a_wake_runs_at_light_or_its_wake_tier_never_above_the_task_and_other_ru
     failed_before = task("deep", {"status": "failed", "waiting_for": "a build"})
     for _ in range(4):   # a few start per tick
         d.dispatch()
-    assert started[waits_for][:2] == ("light", {"tier": "light", "escalated": False})
+    assert started[waits_for][:2] == ("light", {"tier": "light", "escalated": False, "reason": "timer", "gate": "none", "by": "rule"})
     assert "this run: light wake" in started[waits_for][2] and 'wake_tier: "standard"' in started[waits_for][2]
-    assert started[probes][:2] == ("light", {"tier": "light", "escalated": False})
+    assert (started[probes][0], _tier_of(started[probes][1])) == ("light", {"tier": "light", "escalated": False})
     assert started[asks_deep][0] == "standard", "a wake_tier above the task's own tier is capped"
     assert started[asks_std][0] == "standard"
     assert started[light_task][0] == "light"
-    assert started[says_nothing][:2] == ("standard", {"tier": "standard", "escalated": False})
+    assert (started[says_nothing][0], _tier_of(started[says_nothing][1])) == ("standard", {"tier": "standard", "escalated": False})
     assert "retry_after_s: 0" not in started[says_nothing][2], "a wake at the task's tier has nothing to escalate"
     for tid, tier in ((never_waited, "standard"), (failed_before, "deep")):
         assert started[tid][:2] == (tier, None)
@@ -5380,7 +5385,8 @@ def test_a_light_wake_escalates_once_at_once_and_free(env, monkeypatch):
     assert _run_until(d, p, lambda: len(runs()) == 2 and p.db.task(tid)["status"] == "queued"
                       and all(r["status"] != "running" for r in runs()))
     wakes = [json.loads(r["note"])["wake"] for r in runs()]
-    assert wakes == [{"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
+    assert [_tier_of(w) for w in wakes] == [{"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
+    assert wakes[1]["reason"] == "asked" and wakes[1]["by"] == "rule", "the escalation records why it woke"
     t = p.db.task(tid)
     # The escalated run asked again: that is an ordinary wait now, not a second free run.
     assert t["attempts"] == 0 and json.loads(t["result"])["waits"] == 3
@@ -5417,7 +5423,7 @@ def test_an_escalated_wake_that_keeps_a_retry_when_runs_only_once_its_probe_pass
     flag.write_text("")
     monkeypatch.delenv("TTP_FAKE_RESULT")
     assert _run_until(d, p, lambda: len(runs()) == 2)
-    assert json.loads(runs()[1]["note"])["wake"] == {"tier": "standard", "escalated": True}
+    assert _tier_of(json.loads(runs()[1]["note"])["wake"]) == {"tier": "standard", "escalated": True}
 
 
 def test_a_mechanical_wake_that_escalates_but_keeps_next_step_reruns_at_the_tasks_tier(env, monkeypatch):
@@ -5440,7 +5446,7 @@ def test_a_mechanical_wake_that_escalates_but_keeps_next_step_reruns_at_the_task
         return p.db.q("SELECT status, effort, note FROM runs WHERE task=? AND role='worker' ORDER BY id", (tid,))
 
     assert _run_until(d, p, lambda: len(runs()) == 2 and all(r["status"] != "running" for r in runs()))
-    assert [json.loads(r["note"])["wake"] for r in runs()] == [
+    assert [_tier_of(json.loads(r["note"])["wake"]) for r in runs()] == [
         {"tier": "light", "escalated": False}, {"tier": "standard", "escalated": True}]
     assert [r["effort"] for r in runs()] == ["low", "high"]
 

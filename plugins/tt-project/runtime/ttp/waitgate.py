@@ -305,7 +305,7 @@ def skipped(prev: dict, d: Decision, now: float) -> dict:
     """The hand-off a skip leaves on the task: the same wait, no wake reason (the probe loop treats it
     as asleep again), and the gate's memory: its skips' log ids and the evidence it saw."""
     gate = prev.get("wake_gate") if isinstance(prev.get("wake_gate"), dict) else {}
-    out = {k: v for k, v in prev.items() if k not in ("woke",)}
+    out = {k: v for k, v in prev.items() if k not in ("woke", "wake_reason")}
     out["wake_gate"] = {"log": list(gate.get("log") or []) + [d.log_id], "seen": d.seen,
                         "since": gate.get("since") or now, "by": d.by, "reason": d.reason[:200]}
     return out

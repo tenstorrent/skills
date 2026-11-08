@@ -937,7 +937,7 @@ def test_a_mechanical_next_step_wakes_at_light_and_that_run_finishes_it(env, mon
 
     assert _run_until(d, p, lambda: all(p.db.task(t)["status"] == "done" for t in (mech, plain)))
     (one,) = runs(mech)
-    assert json.loads(one["note"])["wake"] == {"tier": "light", "escalated": False}
+    assert {k: json.loads(one["note"])["wake"][k] for k in ("tier", "escalated")} == {"tier": "light", "escalated": False}
     assert one["effort"] == "low"
     (other,) = runs(plain)
     assert json.loads(other["note"])["wake"]["tier"] == "standard"

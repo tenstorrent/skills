@@ -213,6 +213,7 @@ from . import upstream
 from . import userpause
 from . import verified
 from . import waitgate
+from . import waketier
 from . import waitheal
 from . import watchdup
 from . import wakemode
@@ -6522,11 +6523,13 @@ class Daemon:
                 # It found work for after its probe passes: the probe says when, not a model run.
                 not_before = time.time() + PROBE_TIMEOUT_S
                 extra["escalated_wake"] = True
+                extra[waketier.KEY] = "asked"
                 extra["waiting_since"] = time.time()
                 reason = f"woke at {wake['tier']} and asked for {up}; runs at {up} once its probe passes"
             elif escalate:
                 not_before = time.time()
                 extra["escalated_wake"] = True
+                extra[waketier.KEY] = "asked"
                 extra["woke"] = f"the {wake['tier']} wake found work and asked for {up}"
                 reason = f"woke at {wake['tier']} and found work; runs again now at {up}"
             elif waits > int(self.cfg["budget"].get("max_waits", 24)):
@@ -6793,6 +6796,10 @@ class Daemon:
                                 isinstance(result, dict) and result.get("status") == "waiting")
         except Exception as e:
             log(self.p, f"task {task['id']}: wake gate settling failed: {type(e).__name__}: {e}")
+        try:   # a light wake tier Jev picked: wrong when its run asked for more
+            waketier.settle(db, json.loads(r.get("note") or "{}"), result)
+        except Exception as e:
+            log(self.p, f"task {task['id']}: wake tier settling failed: {type(e).__name__}: {e}")
         if new == "done" and worktree.own_worktree(task):
             self._local_only_due = 0.0   # is its work on a remote? checked this tick
             self._queue_backup(task)
@@ -9856,7 +9863,7 @@ class Daemon:
         if waiting:
             from .prompts import spec_digest
             self._wake_waiting(task, "probe stale: released once by the blocker sweep", now,
-                               extra=None if pending else {SPEC_SEEN_KEY: spec_digest(task)})
+                               extra=None if pending else {SPEC_SEEN_KEY: spec_digest(task)}, kind="stale_release")
             return
         self._probe_rc.pop(tid, None)
         self._start_rc.pop(tid, None)
@@ -10359,6 +10366,9 @@ class Daemon:
             if skipped:
                 fate[task["id"]] = "start_after"   # it re-deferred the wake
                 continue
+            if lowered := self._wake_pick(task, prev):   # an escalated wake Jev finds needs no judgment
+                task, prev = dict(task, result=dump_result(lowered)), lowered
+                need = self._floor_need(task, bud.wake_tier(task["tier"], prev, self.cfg, self.p.harness), prev)
             review_pick = None
             if task["kind"] == "review" and self._reuse_review(task):
                 continue
@@ -10430,7 +10440,11 @@ class Daemon:
                 if found:
                     note["start_checks"] = found
                 if wake:
-                    note["wake"] = {"tier": tier, "escalated": bool(load_result(task["result"]).get("escalated_wake"))}
+                    pv = load_result(task["result"])
+                    note["wake"] = {"tier": tier, "escalated": bool(pv.get("escalated_wake")),
+                                    "reason": waketier.reason(pv), "gate": (gated or {}).get("by") or "none",
+                                    "by": "jev" if pv.get(waketier.PICK) else "rule",
+                                    **({"pick": pv[waketier.PICK]} if pv.get(waketier.PICK) else {})}
                 if gated:
                     note[waitgate.USE] = gated
                 if picked:
@@ -11092,6 +11106,21 @@ class Daemon:
         log(self.p, f"task {tid} wake gate: skip ({d.by}: {d.reason}); asleep until {timefmt.short(nb, self.p)}")
         self._unreserve(task)
         return True, None
+
+    def _wake_pick(self, task: dict, prev: dict) -> dict | None:
+        """The hand-off of an escalated wake lowered to light (waketier.pick), stored, or None: it keeps its tier."""
+        try:
+            got = waketier.pick(self.p.db, self.cfg, task, prev, jev=self.jev)
+        except Exception as e:   # a wake keeps its tier
+            log(self.p, f"task {task['id']}: wake tier pick failed: {type(e).__name__}: {e}")
+            return None
+        if not got:
+            return None
+        out = waketier.lowered(prev, got)
+        self.p.db.update_task(task["id"], result=dump_result(out))
+        log(self.p, f"task {task['id']} wake tier: light, not {got['from']} (jev judgment={got['judgment']}; "
+                    f"reason {waketier.reason(prev)})")
+        return out
 
     def _unreserve(self, task: dict) -> None:
         for res in _exclusive(task):
@@ -12486,7 +12515,7 @@ class Daemon:
             elif gone and task and task["status"] == "queued" and (task["not_before"] or 0) > now:
                 raw = self._probe_raw(tid, probe)   # no timer can make it pass
                 self._wake_waiting(task, f"probe broken: {rc}" + (f" ({raw[:300]})" if raw else ""), now,
-                                   {"probe_raw": raw} if raw else None)
+                                   {"probe_raw": raw} if raw else None, kind="probe_broken")
             elif rc in NOT_YET_RCS and task and task["status"] == "queued" and (task["not_before"] or 0) > now \
                     and (dirs := self._checks_gone(tid, probe, now)):
                 self._checks_gone_release(task, dirs, now)   # checks that left the queue: never "not yet" for good
@@ -12494,7 +12523,7 @@ class Daemon:
                     and not self._gh_logged_out(rc, outs[id(proc)], now):
                 # A new answer after a skip that no branch above handles: wake now, not at the backoff.
                 # A gh logout sleeps on to its timer (_hold_waiting folds it into the host's gh-auth alert).
-                self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now)
+                self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now, kind="probe_changed")
         for gone_tid in [t for t in self._probe_ctx.keys() | self._probe_diag.keys()
                          if t not in self._probes and t not in self._probe_rc
                          and all(t != left[0] for left in self._probe_left)]:
@@ -12998,14 +13027,14 @@ class Daemon:
             reboot = {"at": self.boot_at}
             if cycle:
                 reboot["planned"] = str(cycle.get("reason") or "no reason recorded")[:300]
-            woke = {"woke": "the host rebooted"}
+            woke = {"woke": "the host rebooted", waketier.KEY: "reboot"}
             if gone := [rc for rc in rcs if rc in lost]:
                 # Only relaunching its jobs and re-arming the same wait is left: a light run does that.
                 names = ", ".join(rc.stem for rc in gone[:5]) + (f" and {len(gone) - 5} more" if len(gone) > 5 else "")
                 woke = {"woke": f"the host rebooted and cut short detached job{'s' if len(gone) > 1 else ''} {names} "
                                 f"(in {gone[0].parent}), not relaunched: relaunch each with the same command and "
                                 "hand off waiting again with the same retry_when (naming the new .rc paths)",
-                        "wake_tier": "light"}
+                        "wake_tier": "light", waketier.KEY: "reboot"}
                 prev.pop("escalated_wake", None)
             # A spec change that slept with the task rides on this wake as on any other (_wake_waiting).
             self._spec_deferred.discard(t["id"])
@@ -13688,7 +13717,7 @@ class Daemon:
         "not yet". True when a probe must run before that can be decided."""
         tid = task["id"]
         if prev.get("underuse_wake"):   # sample_jobs pulled this check in: a worker looks at the job
-            self._wake_waiting(task, f"its detached job under-uses what it asked for: {prev['underuse_wake']}", now)
+            self._wake_waiting(task, f"its detached job under-uses what it asked for: {prev['underuse_wake']}", now, kind="underuse")
             return False
         max_hold = float((self.cfg.get("waiting") or {}).get("max_hold_s") or 6 * 3600)
         since = float(prev["waiting_since"])
@@ -13705,7 +13734,7 @@ class Daemon:
                 rc, (self._probe_out.get(tid) or ("",))[0], now)):
             raw = self._probe_raw(tid, str(prev.get("retry_when") or ""))
             self._wake_waiting(task, f"probe broken: {rc if isinstance(rc, str) else f'exit {rc}'}"
-                               + (f" ({raw[:300]})" if raw else ""), now, {"probe_raw": raw} if raw else None)
+                               + (f" ({raw[:300]})" if raw else ""), now, {"probe_raw": raw} if raw else None, kind="probe_broken")
         elif fresh and (dirs := self._checks_gone(tid, str(prev.get("retry_when") or ""), now)):
             self._checks_gone_release(task, dirs, now)
         elif fresh:
@@ -14204,17 +14233,19 @@ class Daemon:
                                   spec=f"{task['spec'] or ''}\n\nStarted by the daemon: {why}.".lstrip())
             log(self.p, f"task {tid} start_when cleared: {why}")
         else:
-            self._wake_waiting(task, why, now)
+            self._wake_waiting(task, why, now, kind="checks_gone")
 
-    def _wake_waiting(self, task: dict, why: str, now: float, extra: dict | None = None) -> None:
-        """Make a waiting task due now and tell its next run why it woke."""
+    def _wake_waiting(self, task: dict, why: str, now: float, extra: dict | None = None,
+                      kind: str = "other") -> None:
+        """Make a waiting task due now and tell its next run why it woke; `kind` is its reason
+        (waketier.KINDS), kept in the hand-off for the tier pick and the run note."""
         tid = task["id"]
         got = self._probe_rc.pop(tid, None)
         if got:
             self._woke_on[tid] = got
         self._spec_deferred.discard(tid)
         prev = load_result(task["result"])
-        extra, why = _with_pending_spec(task, prev, dict(extra or {}), why)
+        extra, why = _with_pending_spec(task, prev, {waketier.KEY: kind, **(extra or {})}, why)
         prev.pop(SPEC_WAKE_NOW_KEY, None)
         self.p.db.update_task(tid, not_before=min(task["not_before"] or now, now),
                               result=dump_result({**prev, **extra, "woke": why}))
@@ -14294,7 +14325,7 @@ class Daemon:
         self._wake_waiting(t, SPEC_WOKE if seen != sha else "a task_update asked to wake it now", now, extra={SPEC_SEEN_KEY: sha, SPEC_WAKES_KEY: wakes + [now],
                                                      SPEC_WOKE_KEY: now, "wake_tier": tier, "escalated_wake": True,
                                                      SPEC_URGENT_KEY: urgent.lines(t["spec"]),
-                                                     **({SPEC_URGENT_WOKE_KEY: _wait_key(prev)} if hurry else {})})
+                                                     **({SPEC_URGENT_WOKE_KEY: _wait_key(prev)} if hurry else {})}, kind="wake_now")
         self.p.db.update_task(tid, blocked_reason=f"woken: {'its spec changed' if seen != sha else 'wake_now'}"
                                                   f"; it runs by rank, before its probe passes")
         return True
@@ -14380,7 +14411,7 @@ class Daemon:
         if isinstance(seen, str) and seen != sha:
             # Its spec changed since the hand-off: no on_pass (written before the change) is recorded.
             self._wake_waiting(task, f"{why}, but {SPEC_WOKE}", now,
-                               extra={SPEC_SEEN_KEY: sha, "wake_tier": _own_tier(task), "escalated_wake": True})
+                               extra={SPEC_SEEN_KEY: sha, "wake_tier": _own_tier(task), "escalated_wake": True}, kind="spec_change")
             return
         if self._staged_pass(task, now, why):
             return
@@ -14407,7 +14438,7 @@ class Daemon:
                 started = f"it could not start: {type(e).__name__}: {e}"
             if started is True:
                 return
-            self._wake_waiting(task, f"{why}; its checks passed but its on_pass_cmd was not run: {started}", now)
+            self._wake_waiting(task, f"{why}; its checks passed but its on_pass_cmd was not run: {started}", now, kind="on_pass_failed")
             return
         if got and got[0] == "pass":
             _, r, run_dir, on_pass, head = got
@@ -14430,7 +14461,7 @@ class Daemon:
             tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
             self._wake_waiting(task, f"its checks failed ({'killed' if rc == 'killed' else f'exit {rc}'}); "
                                      f"the end of checks.out:\n{tail}", now,
-                               extra={"wake_tier": tier, "escalated_wake": True})
+                               extra={"wake_tier": tier, "escalated_wake": True}, kind="checks_failed")
             return
         if not got and load_result(task["result"]).get("on_pass_cmd") is None:
             try:
@@ -14466,7 +14497,7 @@ class Daemon:
             if started:
                 why += f"; its on_pass_cmd was not run: {started}"
         more, extra = self._push_landing(task)
-        self._wake_waiting(task, why + more, now, extra=extra)
+        self._wake_waiting(task, why + more, now, extra=extra, kind="probe_passed")
 
     def _match_text(self, tid: int, probe: str) -> str:
         """The raw output tail a probe_match reads from task `tid`'s last run of `probe` ("" when none)."""
@@ -14509,7 +14540,7 @@ class Daemon:
             if r:
                 _task_note(Path(r["dir"]), f"probe_match: fail, waking the task: {probematch.tail(out, 300)}")
             self._wake_waiting(task, f"probe passed; its output matched its probe_match fail:\n{probematch.tail(out)}",
-                               now, extra={"wake_tier": _own_tier(task), "escalated_wake": True})
+                               now, extra={"wake_tier": _own_tier(task), "escalated_wake": True}, kind="match_fail")
             return True
         if verdict == "pass" and prev.get("on_pass_cmd") is not None:
             return None   # that command decides (_start_on_pass)
@@ -14659,7 +14690,7 @@ class Daemon:
         a final result and not a broken probe. It wakes at the task's own tier unless there was nothing
         to push."""
         why, extra = self._push_landing(task)
-        self._wake_waiting(task, f"its push finished without pushing{why}", now, extra=extra)
+        self._wake_waiting(task, f"its push finished without pushing{why}", now, extra=extra, kind="push_unlanded")
 
     def _push_landing(self, task: dict) -> tuple[str, dict | None]:
         """For a wake of a task waiting on its push's result: the words to add and the hand-off fields
@@ -14837,7 +14868,7 @@ class Daemon:
                                  f"{', ' if holds_tip else ': '}{todo}; no fix task was added"
                                  + (f" (the daemon did not rebase it: {why})" if why else ""), now,
                            extra={"wake_tier": task["tier"] if task["tier"] in bud.TIER_ORDER else "standard",
-                                  "shared_hold": {}})
+                                  "shared_hold": {}}, kind="tests_failed")
         return True
 
     def _tip_rebase(self, tid: int, run_dir: Path, tip: str) -> tuple[dict, str]:
@@ -14981,7 +15012,7 @@ class Daemon:
         if logs:
             why += f"\n{logs}"
         tier = task["tier"] if task["tier"] in bud.TIER_ORDER else "standard"
-        self._wake_waiting(task, why, now, extra={"wake_tier": tier, "escalated_wake": True})
+        self._wake_waiting(task, why, now, extra={"wake_tier": tier, "escalated_wake": True}, kind="job_failed")
 
     def _start_on_pass(self, task: dict, now: float, said: str = "probe passed",
                        fallback: dict | None = None) -> bool | str | None:
@@ -15110,7 +15141,7 @@ class Daemon:
             self._wake_waiting(task, f"{said}; its on_pass_cmd did not record done "
                                      f"({why or 'its run is gone'}; ran with {where}); "
                                      f"the end of its output:\n{tail}", now,
-                               extra={"wake_tier": tier, "escalated_wake": True} if failed else None)
+                               extra={"wake_tier": tier, "escalated_wake": True} if failed else None, kind="on_pass_failed")
 
     def _sweep_on_pass_notes(self, now: float) -> None:
         """File the notes an on_pass_cmd queued that no settle filed (a daemon restarted while it ran,
@@ -19225,8 +19256,9 @@ def _with_pending_spec(task: dict, prev: dict, extra: dict, why: str) -> tuple[d
     wake's (a light relaunch after a reboot, say). Every wake of a sleeping waiting task goes through it."""
     if SPEC_SEEN_KEY in extra or not (pending := _spec_pending(task, prev)):
         return extra, why
-    return ({**extra, SPEC_SEEN_KEY: pending, "wake_tier": _own_tier(task), "escalated_wake": True},
-            f"{why}; also {SPEC_WOKE}")
+    kind = extra.get(waketier.KEY) if extra.get(waketier.KEY) in waketier.FIX else "spec_change"
+    return ({**extra, SPEC_SEEN_KEY: pending, "wake_tier": _own_tier(task), "escalated_wake": True,
+             waketier.KEY: kind}, f"{why}; also {SPEC_WOKE}")
 
 
 def _urgent_seen(prev: dict) -> list[str]:

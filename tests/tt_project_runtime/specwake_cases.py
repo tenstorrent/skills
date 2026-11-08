@@ -776,3 +776,93 @@ def test_spec_hold_after_needs_a_spec_wake_and_the_same_wait_and_head():
     assert dmod._spec_hold_after(woke, key, 0, nb) is None, "off"
     soon = time.time() + 600
     assert dmod._spec_hold_after(woke, key, 7200, soon)["until"] == soon, "its own retry time ends it first"
+
+
+class _TierJev:
+    """Stands in for providers.jev.Jev on the wake tier question only (waketier.pick): a judgment score."""
+
+    def __init__(self, judgment):
+        self.judgment, self.calls, self.last_cost = judgment, 0, 0.0001
+
+    def enabled(self):
+        return True
+
+    def decide(self, state, questions, purpose="decide", timeout=None):
+        if "judgment" not in questions:
+            return None
+        self.calls += 1
+        return {"judgment": {"noul": self.judgment}}
+
+
+@pytest.mark.parametrize("judgment, tier", [(0.1, "light"), (0.9, "standard")])
+def test_a_spec_change_wake_runs_light_when_jev_finds_no_judgment_needed(env, monkeypatch, tmp_path, judgment, tier):
+    """User msg #2230: an escalated wake for a spec change that slept with the wait asks Jev for its tier:
+    light unless Jev finds judgment is needed. The run note keeps the reason and who chose the tier, and
+    a light run that asks for more settles Jev's call as wrong."""
+    p = make(env)
+    d, tid, flag, runs, idle = _deferred_flow(p, monkeypatch, tmp_path)
+    d.jev = jev = _TierJev(judgment)
+    _edit_spec(p, tid, "also report the peak memory", wake_now=False)
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps(
+        {"status": "waiting", "summary": "found work", "retry_after_s": 0, "wake_tier": "standard",
+         "retry_when": f"test -e {flag}"}))
+    flag.write_text("")
+    assert _run_until(d, p, lambda: runs() == 2), "the probe pass did not run the task"
+    wake = _last_wake(p, tid)
+    assert jev.calls == 1 and wake["tier"] == tier and wake["reason"] == "spec_change", wake
+    assert wake["by"] == ("jev" if tier == "light" else "rule") and wake["escalated"] is (tier != "light"), wake
+    call = p.db.one("SELECT * FROM jev_calls WHERE use='wake_tier'")
+    assert call["ref"] == f"task:{tid}"
+    if tier == "light":
+        assert wake["pick"]["from"] == "standard" and wake["pick"]["call"] == call["id"]
+        assert _run_until(d, p, lambda: runs() == 3), "the light run's ask for more did not run it again"
+        assert p.db.one("SELECT outcome FROM jev_calls WHERE id=?", (call["id"],))["outcome"] == "wrong", \
+            "a light run that asked for more settles Jev's pick as wrong"
+        assert _last_wake(p, tid)["tier"] == "standard"
+
+
+@pytest.mark.parametrize("kind", ["checks_failed", "job_failed", "match_fail", "asked", "wake_now"])
+def test_an_escalated_wake_with_known_work_keeps_its_tier_and_asks_no_jev(env, kind):
+    """A failed check, job or probe_match, a light wake that asked for more and a coordinator's wake_now
+    keep the tier their wake set, with no Jev call; a spec change asks it."""
+    from ttp import waketier
+    p = make(env)
+    tid = p.db.add_task("t", "s", kind="work", tier="standard", origin="user")
+    prev = {"status": "waiting", "retry_when": "exit 1", "escalated_wake": True, "wake_tier": "standard",
+            waketier.KEY: kind}
+    jev = _TierJev(0.0)
+    assert waketier.pick(p.db, p.config(), p.db.task(tid), prev, jev=jev) is None and jev.calls == 0
+    got = waketier.pick(p.db, p.config(), p.db.task(tid), {**prev, waketier.KEY: "spec_change"}, jev=jev)
+    assert jev.calls == 1 and got["tier"] == "light"
+    lowered = waketier.lowered(prev, got)
+    assert "escalated_wake" not in lowered and lowered["wake_tier"] == "light"
+    p.set_config("jev.uses.wake_tier", "off")
+    assert waketier.pick(p.db, p.config(), p.db.task(tid), {**prev, waketier.KEY: "spec_change"}, jev=jev) is None
+    assert jev.calls == 1
+
+
+def test_each_wake_records_its_reason_and_stats_counts_wakes_and_dollars_by_reason(env, tmp_path):
+    """Every _wake_waiting stores its reason in the hand-off; `ttp stats --wakes` sums wake runs per home-zone
+    day by reason, with their $ and how many handed the wait back."""
+    from ttp import daemon as dmod, waketier
+    p = make(env)
+    dm = dmod.Daemon(p.base)
+    tid = p.db.add_task("t", "s", kind="work", tier="standard", origin="user")
+    p.db.update_task(tid, status="queued", not_before=time.time() + 3600,
+                     result=json.dumps({"status": "waiting", "retry_when": "exit 1", "waiting_since": time.time()}))
+    dm._wake_waiting(p.db.task(tid), "its checks failed (exit 1)", time.time(), kind="checks_failed")
+    assert waketier.reason(json.loads(p.db.task(tid)["result"])) == "checks_failed"
+    assert waketier.reason({"status": "waiting"}) == "timer"
+    now = time.time()
+    for i, (why, cost, back) in enumerate([("spec_change", 0.8, True), ("spec_change", 0.2, False), ("timer", 0.1, True)]):
+        rd = tmp_path / f"r{i}"
+        rd.mkdir()
+        (rd / "result.json").write_text(json.dumps({"status": "waiting" if back else "done"}))
+        p.db.x("INSERT INTO runs(task,role,provider,started,ended,status,dir,note,cost_usd) VALUES(?,?,?,?,?,?,?,?,?)",
+               (tid, "worker", "fake", now - 60, now, "ok", str(rd),
+                json.dumps({"wake": {"tier": "standard", "reason": why, "by": "rule"}}), cost))
+    s = waketier.stats(p.db, "America/Los_Angeles", 1, now)
+    (day,) = s["per_day"].values()
+    assert day["spec_change"]["wakes"] == 2 and day["spec_change"]["usd"] == 1.0 and day["spec_change"]["rewaited"] == 1
+    assert day["timer"]["wakes"] == 1 and day["spec_change"]["by"] == {"rule/standard": 2}
+    assert "spec_change: 2 wakes, $1.00, 1 handed the wait back" in waketier.text(s)
