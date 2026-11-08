@@ -2902,9 +2902,8 @@ class Batch:
         """After _judge blamed carried entry 1 (k 0): replay the later carried entries in order onto the
         tip and check that head once, in this batch. With k entries before the blamed one that passed
         (k > 0), none: their head pushes at once and the later entries go to the next train, as no
-        entry joins a head that passed (user msg #2317). An entry built on the
-        blamed one (it would replay its commits) or whose replay conflicts or adds nothing without it is
-        skipped and requeued; the others still go. Returns the head that pushes the first k entries and
+        entry joins a head that passed (user msg #2317). An entry built on the blamed one (it would
+        replay its commits) or whose replay conflicts or adds nothing without it is skipped and requeued; the others still go. Returns the head that pushes the first k entries and
         the replayed ones (self.rescued), or None (nothing after the blamed entry, none replays, or a
         failing check: those entries are requeued). A batch makes at most RESCUES such checks, whatever
         their outcome."""
@@ -3014,7 +3013,7 @@ class Batch:
     def _known_fail(self, carried: list) -> tuple[str, str] | None:
         """The (cmd, tail) a stopped search saw the full head of exactly these entries (same queue ids and
         heads, same order) fail with (the marker's "known_fail"): this batch takes it as its own full head's
-        failure, so it never checks that head again unless every prefix passes (_judge's rerun). None for
+        failure, so it never checks that head again (a prefix that passes pushes at once). None for
         one entry (its blame needs a check on this tip) or any other set."""
         kf = self.m.get("known_fail")
         if not isinstance(kf, dict) or len(carried) < 2 or not kf.get("cmd"):

@@ -2563,9 +2563,11 @@ session and stateless coordinators on every provider.
   since rewritten goes after that change (in the same batch when both are approved, else it waits
   for that landing, at most two hours), so it is rebased and re-reviewed once instead of losing
   its approval at each of the other's landings; a failed check fails the
-  review and wakes the coordinator. The batch finds the first change that fails by checking
-  prefixes, pushes the ones before it, and checks the ones after it once more without it, pushing
-  them too when they pass. A failed pytest check is judged as `ttp checks` judges one: its failing
+  review and wakes the coordinator. When the whole train fails, the batch checks prefixes, and the
+  first one that passes every push check pushes at once: it is never checked again and no change
+  joins it, and the changes after it go untested and unblamed into the next train on the new tip.
+  Only when even the first change fails alone is it blamed; the ones after it are then checked once
+  more without it and pushed when they pass. A failed pytest check is judged as `ttp checks` judges one: its failing
   tests (at most 10) not yet judged at that head rerun once there, within `push_rerun_s` (default
   600), and those failing again rerun on the tip alone, on the same host, up to 3 times. A test that
   passes on its rerun is flaky (quarantined), one that fails on the tip too is pre-existing, and a
@@ -2573,7 +2575,7 @@ session and stateless coordinators on every provider.
   the batch goes on and the coordinator is told once per test so a fix gets queued. A check that did
   not exit 1, or that pytest stopped early (`-x`, `--maxfail`, an interrupt), is never rerun. The
   search runs only the new failing tests at each prefix and the full suite once, at the prefix they
-  pass on. Keys, all under `delivery`: `push_batch_s` (default 300: with
+  pass on, which then pushes. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
   oldest approval waited this long; 0 = at once), `push_batch_max`
   (default 8: start at once with this many; it caps nothing: one train takes every approval due), `push_min_gap_s`
