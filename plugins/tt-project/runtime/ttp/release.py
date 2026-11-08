@@ -591,9 +591,25 @@ def hold_reason(p: Project, d: dict) -> str:
             return (f"the last merge task ended without landing this release and nothing changed since (owner: "
                     f"this project's daemon; looks again at {timefmt.long(float(rec.get('until') or 0), p)})")
         return ""
+    if rec.get("key") == d["key"] and rec.get("outcome") == "conflict" and own_files_moved(p):
+        return ""       # its merge task ended unlanded and the project's own files changed since: merge again
     if rec.get("key") == d["key"] and rec.get("outcome") != "held":
         return "already tried for this release"
     return ""
+
+
+def own_files_moved(p: Project) -> bool:
+    """The project's own runtime and template files at the harness HEAD differ from those the last merge
+    task was queued on (KV_MERGE_BASIS): `ttp upgrade --auto` then queues the next merge, or defers it
+    through unchanged_merge when they match again. False when no basis was recorded or git fails."""
+    from . import cli
+    files = (p.db.kv(KV_MERGE_BASIS) or {}).get("files")
+    if not files:
+        return False
+    try:
+        return cli._own_files(p.harness, "HEAD") != files
+    except (subprocess.SubprocessError, OSError):
+        return False
 
 
 CYCLE_HELD = "held until it is gone"   # the tail of hold_reason's power-cycle line: rechecked soon

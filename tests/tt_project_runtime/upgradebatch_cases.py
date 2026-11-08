@@ -315,3 +315,32 @@ def test_a_merge_that_ends_without_landing_raises_one_event_naming_the_project_a
            (f"{release.FENCED_PREFIX} to x", first))
     assert overview._merge_unlanded(db, target, {}) is None          # the harness superseded it: not unlanded
     conn.close()
+
+
+def test_an_unlanded_merge_is_retried_by_the_daemon_once_the_projects_own_files_change(env, monkeypatch):
+    """A merge task that ended without landing left KV_AUTO at 'conflict' for the release, so the daemon's
+    hold_reason said 'already tried' for good and an edit to the project's own files queued nothing. Now it
+    holds only while those files match the ones the task was queued on; a commit to them lets the daemon's
+    `ttp upgrade --auto` run again, which queues the next merge task."""
+    from ttp import cli, release
+    p, restarts = _conflicting_upgrade(env, monkeypatch)
+    d = release.drift(p)
+    argv = ["upgrade", "demo", "--auto", "--project-dir", str(p.base)]
+    p.db.set_kv(release.KV_AUTO, {"key": d["key"], "outcome": "running", "ts": time.time()})   # release.start
+    with pytest.raises(SystemExit):
+        cli.main(argv)
+    first = p.db.one("SELECT id FROM tasks WHERE kind='harness'")["id"]
+    assert p.db.kv(release.KV_AUTO)["outcome"] == "conflict"
+    assert release.hold_reason(p, d).startswith(f"harness task #{first} finishes"), "one merge task at a time"
+    p.db.update_task(first, status="done")          # ended without landing: the harness still runs the old one
+    assert release.hold_reason(p, d) == "already tried for this release", "same files: the same conflict"
+    k = p.harness / "prompts" / "kind-harness.md"
+    k.write_text(k.read_text() + "One more local rule.\n")
+    _git_out(p.harness, "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qam", "local edit")
+    assert release.hold_reason(p, d) == "", "an edit to the project's own files merges again"
+    with pytest.raises(SystemExit) as e:
+        cli.main(argv)
+    tids = _harness_tasks(p)
+    assert e.value.code == 75 and len(tids) == 2 and release.finish_holder(p)["task"] == tids[1], tids
+    p.db.update_task(tids[1], status="failed")
+    assert release.hold_reason(p, d) == "already tried for this release" and not restarts

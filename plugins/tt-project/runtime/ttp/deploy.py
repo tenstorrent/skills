@@ -202,8 +202,8 @@ def _merge_event(p, rec: dict, row: dict, now: float) -> None:
            (now, "deploy", "observation", "normal",
             f"{name}'s template merge to tt-project {rec['target']} ended without landing (its harness task "
             f"#{m['task']} {m['status']}; {m['files']}). Take it over now: resolve the merge in "
-            f"{name}'s harness (an edit there or a newer release queues its next merge "
-            f"task at once), or run `ttp upgrade {name}` on this host.", "queued"))
+            f"{name}'s harness (a commit to its own runtime or template files, or a newer release, queues "
+            f"its next merge task at once; `ttp upgrade {name}` on unchanged files only defers it).", "queued"))
 
 
 def _judge(p, rec: dict, row: dict, t: dict, now: float, start: bool = False) -> tuple[str, str, str]:
