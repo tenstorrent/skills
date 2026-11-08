@@ -2157,8 +2157,9 @@ def test_every_checks_key_the_runtime_reads_is_an_account_key_and_settable(env):
     # set by the user per project, its fallback lane, the spill hosts its user lets it share with device jobs,
     # the Python lock its checks' pinned env is built from, the strikes that quarantine a spill host for it, and a
     # project's own refusal of sudo in its suites (sudowatch)
+    # and its checks' throwaway HOME (scratchhome)
     read -= {"wrap_cmd", "spill_wrap_cmd", "wrap_lane", "fallback_lane", "spill_beside_device", "python_lock",
-             "spill_quarantine_after", "refuse_sudo"}
+             "spill_quarantine_after", "refuse_sudo", "scratch_home", "home_files"}
     # a chat-only alias of checks.slots (coordinator.ALIASES), not a key the runtime reads
     read -= {"suite_concurrency"}
     assert "wrap_cmd" in project._known_keys(["checks"])
