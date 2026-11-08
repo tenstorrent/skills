@@ -96,10 +96,40 @@ def test_ssh_git_and_gh_still_use_the_credential_stores_themselves(env, tmp_path
                 "rsync -e 'ssh -i ~/.ssh/work-key' a box:/tmp/", "rsync -az --rsh='ssh -i ~/.ssh/work-key' a box:",
                 "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key' git clone git@github.com:o/r",
                 "env GIT_SSH_COMMAND='ssh -o IdentityFile=~/.ssh/work-key' git fetch",
-                "RSYNC_RSH='ssh -i ~/.ssh/work-key' rsync a box:", "export RSYNC_RSH='ssh -i ~/.ssh/work-key'",
-                "git -c core.sshCommand='ssh -i ~/.ssh/work-key' fetch"):
+                "RSYNC_RSH='ssh -i ~/.ssh/work-key' rsync a box:",
+                "git -c core.sshCommand='ssh -i ~/.ssh/work-key' fetch",
+                "git -C /tmp/r -c core.sshCommand='ssh -i ~/.ssh/work-key' fetch origin",
+                "ssh -o 'IdentityFile ~/.ssh/work-key' box", "timeout 30 ssh -i ~/.ssh/work-key box true",
+                "ssh -i ~/.ssh/work-key -o IdentitiesOnly=yes -J jump box true"):
         assert credguard.bash_refusal(cmd, hook._all_segments(hook._split(cmd)[0])) is None, cmd
         assert "credential stores" not in _bash_why(tmp_path, cmd), cmd
+
+
+def test_a_key_path_passes_only_as_the_identity_of_a_plain_ssh_call(env, tmp_path, monkeypatch):
+    """One class rule: a key path is the direct value of -i or -o IdentityFile, also in a plain ssh -i that git
+    fetch|clone|ls-remote or rsync runs, and nothing in the call runs a local program; any other mention reads it."""
+    from ttp import credguard, hook
+    _cred_home(tmp_path, monkeypatch)
+    for cmd in ("ssh -i ~/.ssh/work-key -o ProxyCommand='nc %h %p' box",
+                "ssh -i ~/.ssh/work-key -o LocalCommand=true -o PermitLocalCommand=yes box",
+                "ssh -i ~/.ssh/work-key -oKnownHostsCommand=/bin/true box",
+                "ssh -i ~/.ssh/work-key -o 'Match exec true' box",
+                "ssh -i ~/.ssh/work-key -o Include=/tmp/c box", "ssh -i ~/.ssh/work-key -F /tmp/c box",
+                "ssh -vi ~/.ssh/work-key -F/tmp/c box", "ssh box -i ~/.ssh/work-key -o ProxyCommand=true",
+                "ssh -i ~/.ssh/work-key -I /tmp/lib.so box", "scp -S /tmp/prog -i ~/.ssh/work-key a box:",
+                "sftp -b /tmp/batch -i ~/.ssh/work-key box", "ssh -i ~/.ssh/work-key box cat -i ~/.ssh/id_ed25519",
+                "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key -o ProxyCommand=true' git fetch",
+                "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key $(true)' git fetch",
+                "GIT_SSH_COMMAND='python3 -i ~/.ssh/work-key' git fetch",
+                "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key' git -c alias.x='!true' fetch",
+                "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key' git fetch --upload-pack=true",
+                "GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key' git log",
+                "git -c core.sshCommand='ssh -i ~/.ssh/work-key' -c core.pager=cat fetch",
+                "export GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key'", "export RSYNC_RSH='ssh -i ~/.ssh/work-key'",
+                "echo GIT_SSH_COMMAND='ssh -i ~/.ssh/work-key'",
+                "rsync -e 'ssh -i ~/.ssh/work-key -o ProxyCommand=true' a box:"):
+        assert credguard.bash_refusal(cmd, hook._all_segments(hook._split(cmd)[0])), cmd
+        assert "credential stores" in _bash_why(tmp_path, cmd), cmd
 
 
 def test_a_run_may_not_write_refs_tags_or_contents_through_an_http_client(env, tmp_path, monkeypatch):

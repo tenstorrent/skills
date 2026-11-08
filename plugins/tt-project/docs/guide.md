@@ -3607,9 +3607,17 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `~/.docker`, `~/.config/git`, `~/.config/gh`, the cloud folders) passes, any other mention of the
   folder (`grep -r token ~/.kube`, `tar cz ~/.docker`), a glob naming it, `..` or a second mention
   does not.
-  ssh, git and gh still read them themselves: `ssh -i <key>`, `-o IdentityFile=`, `ssh-add`,
-  `ssh-keygen`, and chmod or test of a key pass, also as the ssh command given to rsync (`-e`,
-  `--rsh`, `RSYNC_RSH`) or git (`GIT_SSH_COMMAND`, `-c core.sshCommand=`); a `stat` with a format
+  ssh, git and gh still read them themselves. A key path passes by one rule: it is the direct value
+  of `-i` or `-o IdentityFile=` of ssh, scp or sftp, also inside a plain `ssh -i <key>` that git
+  (`GIT_SSH_COMMAND` right before git, `-c core.sshCommand=`, for fetch, clone and ls-remote) or
+  rsync (`-e`, `--rsh`, `RSYNC_RSH` right before rsync) runs, and nothing in that call runs a local
+  program (no `ProxyCommand`, `LocalCommand`, `KnownHostsCommand`, `Match exec`, `Include`, `-F`
+  with another config, scp or sftp `-S`, no `;`, `|` or `$(...)` inside the ssh command, no git
+  `-c` alias or `--upload-pack`). Every other mention of a key path, an exported
+  `GIT_SSH_COMMAND` too, is refused as a credential-store read. Known gaps, accepted: programs git
+  starts on its own (hooks, config an earlier call wrote), an ssh config an earlier call wrote, and
+  a key path read back from a running ssh's process table. `ssh-add`, `ssh-keygen`, and chmod or
+  test of a key pass; a `stat` with a format
   (`-c`, `--format`, `--printf`) passes when nothing pipes or redirects its output, and a path with a
   `..` part never counts as public. A command ssh runs on another host is checked the
   same way (`ssh box 'mkdir -p ~/.ssh'` passes, `ssh box cat ~/.ssh/<key>` does not), quotes inside
@@ -3783,12 +3791,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   names one of these paths anywhere is refused, since a variable may carry it. That holds for code
   that only uses a key as an ssh or git identity too (a known false positive): run ssh or git as a
   plain shell command instead, or name the key as `IdentityFile` in an ssh config. A shell line
-  that uses a key passes only as `ssh|scp|sftp -i KEY ...` (the remote command is the host's) or
-  `GIT_SSH_COMMAND='ssh -i KEY' git fetch|clone|ls-remote ...`, with nothing else that runs a local
-  program: no other variable before it, no git `-c`, `--config-env`, `--upload-pack` or
-  `--template`, no ssh `-F` or `-o ProxyCommand`, `LocalCommand` or `KnownHostsCommand`, no
-  command substitution, no redirect to a built target, and beside it only plain commands such as
-  `cd`, `echo` or `cat`. Add a path for one project with
+  that uses a key passes only by the key rule above (the remote command is the host's), with no
+  other variable before it, no command substitution, no redirect to a built target, and beside it
+  only plain commands such as `cd`, `echo` or `cat`; otherwise it is refused as a credential-store
+  read. Add a path for one project with
   `ttp config guards.protected_paths '["~/.config/example-access"]'`, or for every project in the
   account settings (`~/.tt-project/settings.json`, same key). A setting only adds: the built-in
   folders always stay. Tests and experiments use a scratch `HOME`, `XDG_CONFIG_HOME` and

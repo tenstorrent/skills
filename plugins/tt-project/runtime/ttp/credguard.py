@@ -13,15 +13,24 @@ stays in the run's log and transcript, so the stores are kept out of tool calls 
   (tool_refusal);
 - the worker hook (hook.py) refuses a Bash call that names one by path (bash_refusal), or prints a
   token (`gh auth token`, `gh auth status --show-token`, `git credential fill`). ssh, git and gh
-  read them themselves: a key given to ssh by `-i` or `-o IdentityFile=`, a key path handed to
-  ssh-add or ssh-keygen, a config given by its tool's option (`kubectl --kubeconfig`, CONFIG_OPTIONS)
-  or variable (`KUBECONFIG=`, CONFIG_VARS), mkdir, chmod, chown, touch and test of them, and ls or
-  stat of a store folder itself pass (any other mention of the folder, or a glob naming it, does
-  not); kubectl, docker, gcloud, aws and az read their own config unnamed. The words of a command
-  ssh runs on another host are checked the same way, quotes
-  are dropped before the check (~/.ss''h), and a find whose name test matches a private key or
-  credential file is refused. Known gaps: a path built at run time inside a script or inline code, and a
-  recursive read of all of HOME or ~/.config (`grep -r x ~`).
+  read them themselves. A key path passes in one class of use only (ssh_keys): the direct value of
+  `-i` or `-o IdentityFile=` of ssh, scp or sftp, also inside a plain `ssh -i <key>` that git
+  (GIT_SSH_COMMAND right before git, `git -c core.sshCommand=`, for fetch, clone and ls-remote) or
+  rsync (`-e`, `--rsh`, RSYNC_RSH right before rsync) runs, and only when nothing in that call runs a
+  local program: no ProxyCommand, LocalCommand, KnownHostsCommand, Match exec, Include or provider
+  option, no `-F` with another config (ssh_runs_local), no shell separator or substitution inside the
+  ssh command, no git option that runs one (GIT_RUNS_RE). Every other mention of a key path is
+  refused (an exported GIT_SSH_COMMAND too). Also passing: a key path handed to ssh-add or
+  ssh-keygen, a config given by its tool's option (`kubectl --kubeconfig`, CONFIG_OPTIONS) or
+  variable (`KUBECONFIG=`, CONFIG_VARS), mkdir, chmod, chown, touch and test of them, and ls or stat
+  of a store folder itself (any other mention of the folder, or a glob naming it, does not);
+  kubectl, docker, gcloud, aws and az read their own config unnamed. The words of a command ssh runs
+  on another host are checked the same way, quotes are dropped before the check (~/.ss''h), and a
+  find whose name test matches a private key or credential file is refused. Known gaps, accepted: a
+  path built at run time inside a script or inline code; a recursive read of all of HOME or
+  ~/.config (`grep -r x ~`); programs git starts on its own that inherit its ssh command (hooks or
+  config an earlier call set up); ssh options in a config file an earlier call wrote; a key path
+  read back from the process table of a running ssh.
 Secrets stay reachable only through `ttp secret env` (hook.secret_read).
 
 Pushes go only through `ttp push` and the push queue. The run's bin/gh (prguard.check) refuses, inside
@@ -69,8 +78,20 @@ CONFIG_OPTIONS = {"kubectl": "--kubeconfig", "helm": "--kubeconfig", "k9s": "--k
 CONFIG_VARS = ("KUBECONFIG=", "DOCKER_CONFIG=", "AWS_SHARED_CREDENTIALS_FILE=", "CLOUDSDK_CONFIG=",
                "AZURE_CONFIG_DIR=", "GOOGLE_APPLICATION_CREDENTIALS=", "GH_CONFIG_DIR=")
 SSH_FAMILY = {"ssh", "scp", "sftp", "autossh", "ssh-copy-id"}
-# ssh -o options that only name a key or a socket ssh opens itself (never ProxyCommand: it runs a command)
-SSH_KEY_OPTION_RE = re.compile(r"(?:IdentityFile|CertificateFile|ControlPath|IdentityAgent)[\s=]", re.I)
+# The ssh -o option that names a key ssh reads itself
+SSH_KEY_OPTION_RE = re.compile(r"\s*IdentityFile[\s=]", re.I)
+# ssh -o options that run a local program or read another config or library
+SSH_RUNS_RE = re.compile(r"(?i)\s*(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match|include"
+                         r"|pkcs11provider|securitykeyprovider|xauthlocation)\b")
+# Per client: its options that take a value, and those that run a local program or read another config
+SSH_OPTS = {"ssh": ("BbcDEeFIiJLlmOoPpQRSWw", "FI"), "autossh": ("BbcDEeFIiJLlMmOoPpQRSWw", "FI"),
+            "scp": ("cDFiJloPSX", "DFS"), "sftp": ("BbcDFiJloPRSsX", "bDFS"), "ssh-copy-id": ("FiopPt", "F")}
+# Shell syntax that makes an ssh command string more than one plain ssh call
+SHELL_META_RE = re.compile(r"[;&|<>`\n]|\$\(")
+# The git subcommands a key ssh command may serve, and git words that run a local program
+KEY_GIT = {"fetch", "clone", "ls-remote"}
+GIT_RUNS_RE = re.compile(r"-[cu].*|ext::.*|--(?:config|config-env|upload-pack|receive-pack|template|exec-path|exec)"
+                         r"(?:=.*)?")
 # Commands that never print a file's contents or name; ls and stat may name the ~/.ssh dir only
 SILENT = {"mkdir", "chmod", "chown", "touch", "test", "[", "ssh-add", "ssh-keygen"}
 LISTERS = {"ls", "stat"}
@@ -78,10 +99,10 @@ LISTERS = {"ls", "stat"}
 STAT_FORMAT_RE = re.compile(r"-c.|--format(=|$)|--printf(=|$)")
 # A pipe, a substitution or a file redirect (not 2>) that could hand a listed key name to a reader
 HANDS_ON_RE = re.compile(r"(?<!\|)\|(?!\|)|`|\$\(|<\(|(?<!2)>")
-# Variables that hold an ssh command a client runs: git's and rsync's
-SSH_COMMAND_VARS = ("GIT_SSH_COMMAND=", "RSYNC_RSH=")
+# The variable that holds the ssh command a client runs, given right before that client
+SSH_COMMAND_VARS = {"git": "GIT_SSH_COMMAND=", "rsync": "RSYNC_RSH="}
 # ssh options that take a value (the next word, or the rest of the same word)
-SSH_VALUE_FLAGS = set("BbcDEeFIiJLlmOoPpQRSWw")
+SSH_VALUE_FLAGS = set(SSH_OPTS["ssh"][0])
 # Names find may look for that only private keys and credential files have
 FIND_SECRET_NAMES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", "id_ecdsa_sk", "id_ed25519_sk",
                      ".git-credentials", ".netrc", ".pypirc")
@@ -183,16 +204,47 @@ def _passing_words(argv: list[str], hands_on: bool = True) -> list[str]:
     if option:
         return ([w for prev, w in zip(argv[1:], argv[2:]) if prev == option]
                 + [w for w in argv[1:] if w.startswith(option + "=")])
-    if name not in SSH_FAMILY:
-        return []
-    out = []
-    for i, w in enumerate(argv[1:], 1):
-        if argv[i - 1] == "-i" or (w.startswith("-i") and len(w) > 2):
-            out.append(w)
-        elif (argv[i - 1] == "-o" or w.startswith("-o")) and SSH_KEY_OPTION_RE.match(w[2:] if w.startswith("-o")
-                                                                                    else w):
-            out.append(w)
+    return ssh_keys(argv) if name in SSH_FAMILY else []
+
+
+def ssh_options(argv: list[str]) -> list[tuple[str, str, str]]:
+    """(option letter, value, the word holding the value) for each option of an ssh, scp or sftp call.
+    Options end at the first operand, for ssh at the one after its host: the rest is the remote command."""
+    name = os.path.basename(argv[0])
+    takes = SSH_OPTS.get(name, SSH_OPTS["ssh"])[0]
+    out, i, host = [], 1, name not in ("ssh", "autossh")
+    while i < len(argv) and argv[i] != "--":
+        w = argv[i]
+        if not w.startswith("-") or w == "-":
+            if host:
+                break
+            host, i = True, i + 1
+            continue
+        j = next((k for k, c in enumerate(w[1:], 1) if c in takes), None)
+        out += [(c, "", "") for c in w[1:j]]
+        if j is None:
+            i += 1
+            continue
+        tail = w[j + 1:]
+        val = tail or (argv[i + 1] if i + 1 < len(argv) else "")
+        out.append((w[j], val, w if tail else val))
+        i += 1 if tail else 2
     return out
+
+
+def ssh_runs_local(argv: list[str]) -> bool:
+    """An ssh, scp or sftp call whose options run a local program or read another config (-F,
+    ProxyCommand, LocalCommand, KnownHostsCommand, Match exec, Include, a provider library, scp -S)."""
+    runs = SSH_OPTS.get(os.path.basename(argv[0]), SSH_OPTS["ssh"])[1]
+    return any(o in runs or o == "o" and SSH_RUNS_RE.match(v) for o, v, _ in ssh_options(argv))
+
+
+def ssh_keys(argv: list[str]) -> list[str]:
+    """The words naming the key of a plain ssh, scp or sftp call (its -i or -o IdentityFile values),
+    none when its options run a local program."""
+    if ssh_runs_local(argv):
+        return []
+    return [word for o, v, word in ssh_options(argv) if o == "i" or o == "o" and SSH_KEY_OPTION_RE.match(v + " ")]
 
 
 def _prints_token(argv: list[str]) -> bool:
@@ -220,21 +272,35 @@ def ssh_remote(argv: list[str]) -> str:
     return " ".join(argv[i + 1:])
 
 
-def _ssh_commands(argv: list[str]) -> list[str]:
-    """The ssh commands `argv` gives a client as one string: a GIT_SSH_COMMAND or RSYNC_RSH value,
-    rsync's -e/--rsh, git's -c core.sshCommand."""
-    name = os.path.basename(argv[0])
-    out = [w.split("=", 1)[1] for w in argv if w.startswith(SSH_COMMAND_VARS)]
+def ssh_commands(raw: list[str]) -> list[str]:
+    """The ssh commands a plain git or rsync call `raw` (assignments before it kept) hands its client
+    as one string: GIT_SSH_COMMAND or RSYNC_RSH right before it, rsync's -e/--rsh, git's -c
+    core.sshCommand. None when git runs a local program (GIT_RUNS_RE) or serves anything but KEY_GIT."""
+    from .hook import _strip_prefix
+    argv = _strip_prefix(raw)
+    name = os.path.basename(argv[0]) if argv else ""
+    if name not in SSH_COMMAND_VARS:
+        return []
+    var = SSH_COMMAND_VARS[name]
+    out = [w[len(var):] for w in raw[:len(raw) - len(argv)] if w.startswith(var)]
+    if name == "git":
+        i = 1
+        while argv[i:i + 1] in (["-C"], ["-c"]) and i + 1 < len(argv):
+            if argv[i] == "-c":
+                if not argv[i + 1].lower().startswith("core.sshcommand="):
+                    return []
+                out.append(argv[i + 1].split("=", 1)[1])
+            i += 2
+        if argv[i:i + 1] == [] or argv[i] not in KEY_GIT or any(GIT_RUNS_RE.fullmatch(a) for a in argv[i + 1:]):
+            return []
+        return out
     for prev, w in zip(argv, argv[1:]):
-        if name == "rsync":
-            if prev == "--rsh" or re.fullmatch(r"-[a-zA-Z]*e", prev):
-                out.append(w)
-            elif w.startswith("--rsh="):
-                out.append(w[6:])
-            elif re.match(r"-[a-zA-Z]*e.", w) and not w.startswith("--"):
-                out.append(w[w.index("e") + 1:])
-        elif name == "git" and prev == "-c" and w.lower().startswith("core.sshcommand="):
-            out.append(w.split("=", 1)[1])
+        if prev == "--rsh" or re.fullmatch(r"-[a-zA-Z]*e", prev):
+            out.append(w)
+        elif w.startswith("--rsh="):
+            out.append(w[6:])
+        elif re.match(r"-[a-zA-Z]*e.", w) and not w.startswith("--"):
+            out.append(w[w.index("e") + 1:])
     return out
 
 
@@ -264,10 +330,12 @@ def bash_refusal(cmd: str, segments: list[list[str]], home: str | Path | None = 
     from .hook import _all_segments, _segments
     segments = [argv for argv in segments if argv]
     # ssh commands handed to rsync or git (env assignments read before the parser drops them, each
-    # value once, as both parses see it); only their ssh calls count, so other words excuse nothing
-    values = dict.fromkeys(v for argv in segments + _segments(cmd, strip=False) for v in _ssh_commands(argv))
-    segments += [inner for value in values for inner in _all_segments(value)
-                 if os.path.basename(inner[0]) in SSH_FAMILY]
+    # value once, as both parses see it); only a value that is one plain ssh call counts, so other
+    # words excuse nothing
+    values = dict.fromkeys(v for argv in segments + _segments(cmd, strip=False) for v in ssh_commands(argv))
+    segments += [inner[0] for value in values if not SHELL_META_RE.search(value)
+                 for inner in [_all_segments(value)] if len(inner) == 1 and inner[0]
+                 and os.path.basename(inner[0][0]) in SSH_FAMILY]
     segments += [inner for argv in segments for inner in _all_segments(ssh_remote(argv))]
     if any(_prints_token(argv) or _finds_secret(argv) for argv in segments):
         return WHY

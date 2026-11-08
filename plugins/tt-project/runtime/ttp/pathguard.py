@@ -68,21 +68,24 @@ MCP_READ_RE = re.compile(r"(?:^|_)(?:read|get|list|search|find|view|stat|info|tr
                          r"grep|glob|cat|head|tail|lookup|status)(?:_|$)", re.I)
 MCP_WRITE_RE = re.compile(r"write|edit|create|move|rename|delete|remove|copy|put|patch|append|chmod|mkdir|upload|"
                           r"save|set|update", re.I)
-# A key used as an ssh identity in a plain shell line (ssh -i KEY, GIT_SSH_COMMAND='ssh -i KEY' git fetch): ssh's
-# options that take a value, its -o settings that run a local program, git's commands that only fetch, the words
-# that make git run another program, the wrappers it may run under and the commands that may sit beside it
+# A key used as an ssh identity passes by credguard's class rule (ssh_keys, ssh_commands): the clients that take
+# one, the wrappers they may run under, and the commands that may sit beside them
 SSH_TOOLS = {"ssh", "scp", "sftp"}
-SSH_VALUE_OPTS = set("bBcDEeFIiJLlmOoPpQRSsWwX")
-SSH_RUNS_RE = re.compile(r"(?i)\s*(?:proxycommand|localcommand|permitlocalcommand|knownhostscommand|match)\b")
-KEY_GIT = {"fetch", "clone", "ls-remote"}
-GIT_RUNS_RE = re.compile(r"-[cu].*|ext::.*|--(?:config|config-env|upload-pack|receive-pack|template|exec-path|exec)(?:=.*)?")
-KEY_WRAPPERS = {"timeout", "nohup", "nice"}
+KEY_WRAPPERS = {"env", "timeout", "nohup", "nice"}
 KEY_SAFE = {"echo", "printf", "true", "false", ":", "test", "[", "cd", "pwd", "ls", "cat", "grep", "head", "tail",
             "wc", "sleep", "date"}
-KEY_ROUTE = ("To use a key as an ssh identity, run `ssh|scp|sftp -i KEY ...` or `GIT_SSH_COMMAND='ssh -i KEY' git "
-             "fetch|clone|ls-remote ...` as a plain shell command, with nothing else in the line that runs a local "
-             "program or writes, or name the key as IdentityFile in an ssh config, instead of calling them from "
-             "inside interpreter code")
+KEY_ROUTE = ("To use a key as an ssh identity, give it as the direct value of `ssh|scp|sftp -i KEY` or "
+             "`-o IdentityFile=KEY`, or in a plain `ssh -i KEY` that `GIT_SSH_COMMAND=... git "
+             "fetch|clone|ls-remote` or rsync's -e runs, as a plain shell command with no option that runs a local program (ProxyCommand, "
+             "LocalCommand, KnownHostsCommand, Match exec, -F) and nothing else in the line that runs a program or "
+             "writes, or name the key as IdentityFile in an ssh config, instead of calling them from inside "
+             "interpreter code")
+
+
+class KeyHit(str):
+    """A protected key a command line names outside credguard's class rule: refused as a credential-store read."""
+
+
 # The plugin's own shipped scripts (setup-box's write ~/.ssh on a remote box, in ssh command text):
 # reviewed code, so the script-file read skips them; a script a run wrote is read
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.realpath(__file__))))
@@ -362,11 +365,12 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0, scrip
 
 
 def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
-    """A command line that uses a protected key as an ssh identity passes only in a plain form that runs no local
-    program: `ssh|scp|sftp -i KEY ...` (its remote command is the remote host's), or `GIT_SSH_COMMAND='ssh -i KEY'
-    git fetch|clone|ls-remote ...` with no other assignment. Beside it only KEY_SAFE commands, no command
-    substitution and no redirect to a built target. Anything else that uses one is refused."""
-    from . import hook
+    """A command line that uses a protected key as an ssh identity passes only by credguard's class rule: the key is
+    the direct value of `ssh|scp|sftp -i` or `-o IdentityFile=` (its remote command is the remote host's), or of a
+    plain `ssh -i KEY` in GIT_SSH_COMMAND before git fetch|clone|ls-remote or RSYNC_RSH before rsync (the only
+    assignment), and no option runs a local program. Beside it only KEY_SAFE commands, no command substitution and
+    no redirect to a built target. Anything else that names one is refused as a credential-store read (KeyHit)."""
+    from . import credguard, hook
     hit, bad = None, False
     for raw in hook._segments(commands, strip=False):
         argv = hook._strip_prefix(raw)
@@ -374,16 +378,16 @@ def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
         sets = [w.split("=", 1) for w in pre if re.match(r"[A-Za-z_]\w*=", w)]
         keys = [h for w in raw if re.match(r"[A-Za-z_]\w*=.*\b(?:ssh|scp|sftp)\b", w) and (h := _names(w, ctx))]
         hit = hit or (keys[0] if keys else None)
-        ok = all(re.fullmatch(r"\w+=.*|-.*|\d+[smhd]?", w) or w in KEY_WRAPPERS for w in pre)
+        ok = all(re.fullmatch(r"\w+=.*|-.*|\d+[smhd]?", w) or w in KEY_WRAPPERS for w in pre) and not (
+            "env" in pre and any(w.startswith("-") for w in pre))
         if name in SSH_TOOLS:   # ssh -i KEY, with no assignment before it
             h, opts = _ssh_key(argv, ctx)
             ok = ok and opts and not sets
-        elif name == "git":   # GIT_SSH_COMMAND='ssh -i KEY' git fetch|clone|ls-remote, its only assignment
-            v = sets[0][1] if len(sets) == 1 and sets[0][0] == "GIT_SSH_COMMAND" else ""
+        elif name in credguard.SSH_COMMAND_VARS:   # GIT_SSH_COMMAND='ssh -i KEY' git fetch, RSYNC_RSH=... rsync
+            v = sets[0][1] if len(sets) == 1 and sets[0][0] + "=" == credguard.SSH_COMMAND_VARS[name] else ""
             ssh = shlex.split(v) if v and not re.search(r"[;&|<>`$()\n\\]", VAR_RE.sub("", v)) else []
             h, opts = _ssh_key(ssh, ctx) if ssh[:1] == ["ssh"] else (None, False)
-            ok = ok and opts and argv[1:2] != [] and argv[1] in KEY_GIT and not any(
-                GIT_RUNS_RE.fullmatch(a) or _names(a, ctx) for a in argv[2:])
+            ok = ok and opts and v in credguard.ssh_commands(raw) and not any(_names(a, ctx) for a in argv[1:])
         else:
             h, ok = None, name in KEY_SAFE and not keys
         hit, bad = hit or h, bad or not ok
@@ -407,29 +411,19 @@ def _key_refusal(cmd: str, commands: str, ctx) -> str | None:
     for m in [*REDIRECT_RE.finditer(cmd), *re.finditer(r">&\s*(?![\d-])", cmd)]:
         if not flags[m.start()][0] and (m.re is not REDIRECT_RE or re.search(r"[$`]", m[2])):
             bad = True
-    return hit if bad else None
+    return KeyHit(hit) if bad else None
 
 
 def _ssh_key(argv: list[str], ctx) -> tuple[str | None, bool]:
-    """(a protected path the options of ssh, scp or sftp `argv` name, whether they run no local program and name
-    none but as -i). Options end at the first operand, for ssh at the one after its host: the rest is the remote
-    command, or a file."""
-    hit, ok, i, host = None, True, 1, argv[:1] != ["ssh"]
-    while i < len(argv) and argv[i] != "--":
-        w = argv[i]
-        if not w.startswith("-") or w == "-":
-            if host:
-                break
-            host, i = True, i + 1
-            continue
-        j = next((k for k, c in enumerate(w[1:], 1) if c in SSH_VALUE_OPTS), None)
-        opt = w[j] if j else ""
-        val = (w[j + 1:] or (argv[i + 1] if i + 1 < len(argv) else "")) if j else ""
-        i += 2 if j and not w[j + 1:] else 1
-        if opt == "F" or opt == "o" and SSH_RUNS_RE.match(val):
-            ok = False
-        elif h := _names(val, ctx):
-            hit, ok = hit or h, ok and opt == "i"
+    """(a protected path the options of ssh, scp or sftp `argv` name, whether they follow credguard's class rule:
+    no option runs a local program, and each naming a protected path is its key, -i or -o IdentityFile). A control
+    socket or host list ssh keeps itself (-S, -o ControlPath=, credguard.ssh_public) is none."""
+    from . import credguard
+    keys, hit, ok = credguard.ssh_keys(argv), None, not credguard.ssh_runs_local(argv)
+    for o, val, word in credguard.ssh_options(argv):
+        own = o in "So" and word not in keys and credguard.ssh_public(os.path.basename(re.split(r"[\s=]", val)[-1]))
+        if not own and (h := _names(val, ctx)):
+            hit, ok = hit or h, ok and word in keys
     return hit, ok
 
 
@@ -474,6 +468,10 @@ def refusal(payload: dict, env=None, cfg: dict | None = None) -> str | None:
         hit = next((p for p in DEFAULT_PATHS + tuple(rts) if p.lstrip("~/") in text), None)
     if not hit:
         return None
+    if isinstance(hit, KeyHit):   # a key named outside the plain ssh use: a credential-store read
+        from . import credguard
+        return (f"{credguard.WHY}, and never writes under the account's credential folders ({hit} is named "
+                f"outside a plain ssh key use). {KEY_ROUTE}")
     # A key used as an ssh or git identity: name the route that passes
     route = re.search(r"(?<![\w./-])(?:ssh|scp|sftp)(?![\w.-])|GIT_SSH_COMMAND", json.dumps(payload.get("tool_input") or {}))
     return WHY.format(hit=hit) + (". " + KEY_ROUTE if route else "")
