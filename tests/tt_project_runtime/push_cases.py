@@ -4374,7 +4374,7 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
     assert [r["task"] for r in rows] == [fix], why
     bid = _pq_batch(s)
     m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
-    assert m["bad_tip"] == {"tip": tip, "fresh": 1, "cmd": check}, m
+    assert m["bad_tip"] == {"tip": tip, "fresh": 1, "cmd": check, "ids": []}, m
     assert m["outcome"] == "pushed" and m["checks"]["runs"] == 1, log(bid)
     _pq_tend(s)
     assert db.task(fix)["status"] == "done" and _git_out(s.origin, "show", "proj:fix.txt") == "fix"
