@@ -464,3 +464,39 @@ def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_an
     with pytest.raises(SystemExit):
         cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(ok)])
     assert "later value stands" in capsys.readouterr().err
+    p.set_config("budget.weekly_usd", 350.0, by=configwho.by("coordinator"))   # a later coordinator set wins too
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(ok)])
+    assert "later value stands" in capsys.readouterr().err
+
+
+def test_capword_grants_only_a_dollar_value_bound_to_the_cap_in_one_clause(env):
+    """Loose words never grant a cap (review #7384): a day or week word and any number elsewhere, a
+    '#' id, a limit the user named (negated or above/below), a past value, and a key name inside
+    another key ('global_daily_usd') are refused; a $ value bound to the cap phrase is granted."""
+    from ttp import capword
+    p = make(env)
+    now = time.time()
+
+    def problem(text, key, value):
+        p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,provenance) VALUES(?,?,?,?,?,?)",
+               (now - 60, "in", "c", "user", text, ""))
+        return capword.problem(p.db, key, value, p.db.one("SELECT MAX(id) i FROM messages")["i"], now=now)
+
+    for text, key, value in (("the H3 run did 5000 steps this week", "budget.weekly_usd", 5000),
+                             ("run it with 8192 tokens, finish by end of day", "budget.daily_usd", 8192),
+                             ("per user msg #2010 the weekly report is fine", "budget.weekly_usd", 2010),
+                             ("the global_daily_usd stays at 3000", "budget.daily_usd", 3000),
+                             ("don't raise the weekly cap above 300", "budget.weekly_usd", 300),
+                             ("never raise the weekly cap above $300", "budget.weekly_usd", 300),
+                             ("keep the daily budget below $300", "budget.daily_usd", 300),
+                             ("the weekly cap was $300", "budget.weekly_usd", 300),
+                             ("run it with $8192 budget, finish by end of day", "budget.daily_usd", 8192),
+                             ("raise the weekly cap per #400", "budget.weekly_usd", 400),
+                             ("raise the weekly cap to $400 and spend $5000 on it", "budget.weekly_usd", 5000)):
+        assert problem(text, key, value), text
+    for text, key, value in (("raise the weekly cap to $400 please", "budget.weekly_usd", 400),
+                             ("daily cap $1.5k", "budget.daily_usd", 1500),
+                             ("set the weekly limit to 1,200 usd.", "budget.weekly_usd", 1200),
+                             ("set budget.daily_usd to 250", "budget.daily_usd", 250)):
+        assert problem(text, key, value) is None, text
