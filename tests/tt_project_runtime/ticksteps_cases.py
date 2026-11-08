@@ -124,15 +124,15 @@ def test_probe_waiting_over_its_budget_stops_and_resumes_in_order_next_tick(env,
 
 def test_dispatch_cut_at_its_budget_reaches_the_tasks_it_did_not_walk_next_tick(env, monkeypatch):
     """A dispatch walk the step budget cuts after one task each tick (a held task first) still starts the
-    tasks behind it on later ticks, instead of walking the same held task every tick; a whole walk goes
-    back to plain priority order."""
+    tasks behind it in its band (one priority) on later ticks, instead of walking the same held task every
+    tick; a whole walk goes back to plain order."""
     p = make(env)
     from ttp import daemon as dmod
     p.db.x("UPDATE tasks SET status='done'")
     d = dmod.Daemon(p.base)
-    held = p.db.add_task("held", "s", kind="code", tier="light", origin="user", priority=1)
+    held = p.db.add_task("held", "s", kind="code", tier="light", origin="user", priority=2)
     b = p.db.add_task("b", "s", kind="code", tier="light", origin="user", priority=2)
-    c = p.db.add_task("c", "s", kind="code", tier="light", origin="user", priority=3)
+    c = p.db.add_task("c", "s", kind="code", tier="light", origin="user", priority=2)
     monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
     started = []
 
@@ -155,6 +155,52 @@ def test_dispatch_cut_at_its_budget_reaches_the_tasks_it_did_not_walk_next_tick(
     late = p.db.add_task("late", "s", kind="code", tier="light", origin="user", priority=3)
     d._run_step(d.dispatch)
     assert started == [b, c, late] and d._dispatch_walked == []
+
+
+def test_dispatch_cut_walk_keeps_an_urgent_task_it_walked_before_unreached_lower_priority_ones(env, monkeypatch):
+    """A priority-1 task a cut walk reached but could not start (held) is still walked first on the next
+    ticks, before a priority-3 task the walk never reached, and starts once it can; the rotation moves
+    tasks only within their band."""
+    p = make(env)
+    from ttp import daemon as dmod
+    p.db.x("UPDATE tasks SET status='done'")
+    d = dmod.Daemon(p.base)
+    top = p.db.add_task("top", "s", kind="code", tier="light", origin="user", priority=1)
+    low = p.db.add_task("low", "s", kind="code", tier="light", origin="user", priority=3)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    started, hold = [], [True]
+
+    def start(*a, **k):
+        started.append(k["task"]["id"])
+        p.db.update_task(k["task"]["id"], status="running")
+        return 0
+    monkeypatch.setattr(d, "start_run", start)
+    orig = d._start_hold
+    monkeypatch.setattr(d, "_start_hold", lambda t, *a, **k: (orig(t, *a, **k), "held")[1]
+                        if t["id"] == top and hold[0] else orig(t, *a, **k))
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0)   # spent at once: one task a tick
+    d._run_step(d.dispatch)
+    assert started == [] and d._dispatch_walked == [top]
+    d._run_step(d.dispatch)
+    assert started == [], "the walked priority-1 task goes first again, not the unreached priority-3 one"
+    hold[0] = False   # its slot frees
+    d._run_step(d.dispatch)
+    assert started == [top]
+    d._run_step(d.dispatch)
+    assert started == [top, low]
+
+
+def test_rotate_walked_moves_tasks_only_within_a_band():
+    from ttp import daemon as dmod
+    rows = [{"id": 1, "priority": 1, "spec": "urgent: deadline"}, {"id": 2, "priority": 1, "spec": ""},
+            {"id": 3, "priority": 1, "spec": ""}, {"id": 4, "priority": 2, "spec": ""},
+            {"id": 5, "priority": 3, "spec": ""}, {"id": 6, "priority": 3, "spec": ""},
+            {"id": 7, "priority": 2, "spec": ""}]   # a tail moved out of order (a logged-out provider) stays
+    now = time.time()
+    got = [r["id"] for r in dmod._rotate_walked(rows, {1, 2, 5}, {}, now)]
+    assert got == [1, 3, 2, 4, 6, 5, 7]
+    assert [r["id"] for r in dmod._rotate_walked(rows, {3}, {2: 0.0}, now)] == [1, 2, 3, 4, 5, 6, 7], \
+        "an obligation owner is its own band"
 
 
 def test_retire_ended_over_its_budget_resumes_after_the_last_entry_done(env, monkeypatch):

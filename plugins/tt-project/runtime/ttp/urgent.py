@@ -177,6 +177,13 @@ def first(rows: list[dict], now: float | None = None, owners=()) -> list[dict]:
     return sorted(rows, key=lambda r: (not leads(r), not stated(r, now), r["id"] not in owners, not is_urgent(r)))
 
 
+def band(task: dict, now: float, owners=()) -> tuple:
+    """The dispatch band of `task`: its place in first()'s urgent lane, then its priority. Dispatch's
+    rotation of a cut walk (Daemon._dispatch) reorders tasks only among those of one band."""
+    return (not leads(task), not stated(task, now), task["id"] not in owners, not is_urgent(task),
+            _priority(task))
+
+
 def extra_ok(task: dict | None, now: float) -> bool:
     """Whether `task` may start in budget.urgent_extra_slots past a full gate: the template-merge task
     or a fresh `urgent:` line, not priority alone, so a project's routine priority-1 work never holds

@@ -749,6 +749,29 @@ def _push_not_landed(probe, rc) -> bool:
     return rc == push.NOT_PUSHED and (bud.result_wait(probe) or ("",))[0] == "push"
 
 
+def _owner_due(db) -> dict:
+    """obligations.owner_due, or none when unreadable (ready_tasks treats it the same way)."""
+    try:
+        return obligations.owner_due(db)
+    except Exception:
+        return {}
+
+
+def _rotate_walked(ready: list, walked: set, owners, now: float) -> list:
+    """`ready` with each run of neighbours in one dispatch band (urgent.band) put as its tasks not in
+    `walked` first, then the walked ones, each part in its own order. The bands keep their order, so a
+    rotation never moves a task past one of a better band."""
+    out, run, key = [], [], None
+    for t in ready + [None]:
+        k = urgent.band(t, now, owners) if t else None
+        if run and k != key:
+            out += [r for r in run if r["id"] not in walked] + [r for r in run if r["id"] in walked]
+            run = []
+        run.append(t)
+        key = k
+    return out
+
+
 def _raised_at(e: BaseException) -> str:
     """ " at <file>:<line>" of the last frame of this runtime that the exception passed through (where
     a start failure's cause is, without digging in the log), "" when none did."""
@@ -11277,11 +11300,14 @@ class Daemon:
         probing, probe_tried = None, False   # the task whose start retries an open run-start breaker this tick
         ready = startbreaker.probe_first(db, ready, now)   # a due retry goes to a task its cause has not failed
         # Tasks walked since the last whole walk (ticks cut short at the step budget, e.g. by slow git reads
-        # under load) go after the ones not reached yet, so every ready task is reached in turn.
+        # under load) go after the ones not reached yet in their band (urgent.band), so every ready task of
+        # a band is reached in turn, and an urgent or better-priority task walked but not started still
+        # goes before every task of a later band.
         ids = {t["id"] for t in ready}
         walked = self._dispatch_walked = [i for i in self.__dict__.get("_dispatch_walked") or () if i in ids]
         fresh = [t for t in ready if t["id"] not in walked]
-        ready = fresh + [t for t in ready if t["id"] in walked]
+        if walked:
+            ready = _rotate_walked(ready, set(walked), _owner_due(db), now)
         for i, task in enumerate(ready):
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
