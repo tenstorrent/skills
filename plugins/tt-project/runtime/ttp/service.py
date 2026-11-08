@@ -47,6 +47,10 @@ def watchdog_argv(p: Project) -> list[str]:
     return [sys.executable, "-m", "ttp.watchdog", str(p.base)]
 
 
+def overseer_argv(p: Project) -> list[str]:
+    return [sys.executable, "-m", "ttp.overseer", str(p.base)]
+
+
 def launchd_label(p: Project, watchdog: bool = False) -> str:
     return f"com.tt-project.{unit_name(p)}" + (".watchdog" if watchdog else "")
 
@@ -222,6 +226,55 @@ WantedBy=default.target
 """
 
 
+def _overseer_unit(p: Project) -> Path:
+    return hoststate.unit_dir() / f"{unit_name(p)}-overseer.service"
+
+
+def _overseer_text(p: Project) -> str:
+    """The overseer's own service (ttp.overseer): no lock, process or tick step shared with the daemon."""
+    env = "\n".join(f"Environment={k}={v}" for k, v in _env(p).items())
+    return f"""[Unit]
+Description=tt-project overseer for {p.name}
+
+[Service]
+Type=simple
+WorkingDirectory={p.base}
+ExecStart={' '.join(shlex.quote(a) for a in overseer_argv(p))}
+{env}
+Restart=always
+RestartSec=10
+TimeoutStopSec=30
+
+[Install]
+WantedBy=default.target
+"""
+
+
+def _write_overseer_unit(p: Project) -> bool:
+    path, text = _overseer_unit(p), _overseer_text(p)
+    if path.exists() and path.read_text(errors="replace") == text:
+        return False
+    durable_write(path, text)
+    return True
+
+
+def ensure_overseer(p: Project) -> str:
+    """Start the overseer again (the daemon calls this when its heartbeat is stale): through its systemd
+    unit where the daemon has one, else as a detached process. Its own lock keeps a second one out."""
+    if _unit(p).exists():
+        if _write_overseer_unit(p):
+            _run("systemctl", "--user", "daemon-reload")
+        r = _run("systemctl", "--user", "enable", "--now", _overseer_unit(p).name)
+        if r.returncode == 0:
+            r = _run("systemctl", "--user", "restart", _overseer_unit(p).name)
+        return "restarted its unit" if r.returncode == 0 else f"systemctl failed: {r.stderr.strip()[:200]}"
+    env = " ".join(f"{k}={shlex.quote(v)}" for k, v in _env(p).items())
+    cmd = (f"cd {shlex.quote(str(p.base))} && {env} {' '.join(shlex.quote(a) for a in overseer_argv(p))} "
+           f">> {shlex.quote(str(p.logs / 'overseer.out'))} 2>&1")
+    subprocess.Popen(["sh", "-c", cmd], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    return "started a detached overseer"
+
+
 SYSTEMD_FAILED = "systemd failed"
 
 
@@ -229,17 +282,19 @@ def _install_systemd(p: Project) -> str:
     _unit(p).parent.mkdir(parents=True, exist_ok=True)
     durable_write(_unit(p), _unit_text(p))
     _write_watchdog_units(p)
+    _write_overseer_unit(p)
     _run("systemctl", "--user", "daemon-reload")
     r = _run("systemctl", "--user", "enable", "--now", f"{unit_name(p)}.service")
     if r.returncode != 0:
         # Remove the unit that never ran: installed(), refresh() and restart_service() go by its file,
         # and would treat the crontab watchdog that takes over as a systemd service.
         _run("systemctl", "--user", "disable", f"{unit_name(p)}.service")
-        for path in (_unit(p), *_watchdog_units(p)):
+        for path in (_unit(p), *_watchdog_units(p), _overseer_unit(p)):
             path.unlink(missing_ok=True)
         _run("systemctl", "--user", "daemon-reload")
         return SYSTEMD_FAILED + " (" + r.stderr.strip()[:200] + "); " + _install_cron(p)
     w = _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
+    _run("systemctl", "--user", "enable", "--now", _overseer_unit(p).name)
     return f"systemd user unit {unit_name(p)}" + (" with a watchdog timer" if w.returncode == 0 else
                                                    f" (watchdog timer failed: {w.stderr.strip()[:200]})")
 
@@ -325,6 +380,9 @@ def uninstall(p: Project) -> str:
         _run("systemctl", "--user", "disable", "--now", _watchdog_unit(p, "timer").name)
     for ext in ("timer", "service"):
         _watchdog_unit(p, ext).unlink(missing_ok=True)
+    if _overseer_unit(p).exists():
+        _run("systemctl", "--user", "disable", "--now", _overseer_unit(p).name)
+        _overseer_unit(p).unlink()
     if unit.exists():
         _run("systemctl", "--user", "disable", "--now", unit.name)
         unit.unlink()
@@ -387,7 +445,7 @@ def refresh(p: Project) -> None:
         changed = unit.read_text(errors="replace") != _unit_text(p)
         if changed:
             durable_write(unit, _unit_text(p))
-        if _write_watchdog_units(p) or changed:
+        if _write_overseer_unit(p) | _write_watchdog_units(p) or changed:
             _run("systemctl", "--user", "daemon-reload")
             _run("systemctl", "--user", "enable", "--now", _watchdog_unit(p, "timer").name)
     if sys.platform == "darwin" and _agent(p).exists() and not _agent(p, watchdog=True).exists():

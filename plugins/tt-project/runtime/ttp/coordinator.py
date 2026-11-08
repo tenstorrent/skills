@@ -1317,6 +1317,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
                 f"tasks): " + clip(", ".join(f"#{t}" for t in kept), 200) if kept else "")
         lines.append(f"## Disk: {disk.get('free_gb')} GB free of {disk.get('total_gb')} GB; {guard}{held}")
     section("host", lines)
+    from . import overseer
+    section("loop_health", overseer.digest_lines(p, now))   # results, from the overseer's last pass
     lines = []
     if pause := projpause.current(db, now):
         lines.append(f"## Project {projpause.describe(pause, p, now)}: no new runs start until it resumes")

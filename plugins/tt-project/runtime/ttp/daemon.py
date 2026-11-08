@@ -1132,6 +1132,7 @@ class Daemon:
         self._sandbox_due = 0.0   # sweep_sandbox_trees: its first pass is at start
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
         self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
+        self._overseer_kicked = 0.0   # when check_overseer last started the overseer
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
@@ -1884,7 +1885,7 @@ class Daemon:
                      self.sweep_alerts, self.check_release, self.sync_shared_pauses, self.check_pause_ends,
                      self.check_integrity, self.heal_harness_git,
                      self.sync_schedules, self.lint_charter, self.tend_holds, self.record_ttr, self.alert_long_pause,
-                     self.check_linger, self.check_notifier, self.alert_slurm_paused, self.check_chats,
+                     self.check_linger, self.check_notifier, self.check_overseer, self.alert_slurm_paused, self.check_chats,
                      self.probe_mcp):
             if step in lease_off:
                 continue
@@ -3981,6 +3982,21 @@ class Daemon:
             self.alert(notifier.ALERT_KEY, f"Desktop notifications on {hostname()} fail since {since} "
                        f"({bad.get('backend')}: {str(bad.get('error'))[:160]}). Alerts still reach this chat and "
                        f"the web app. `ttp notifier test` on {hostname()} shows the fix.", severity="normal")
+
+    def check_overseer(self, now: float | None = None) -> str | None:
+        """The loop's half of the mutual check: start the overseer (ttp.overseer) again when its heartbeat
+        is older than overseer.STALE_S, at most once per STALE_S, only where a service keeps this daemon
+        (a test or a hand-run daemon starts none). The overseer's own service restarts it when it dies."""
+        from . import overseer, service
+        now = time.time() if now is None else now
+        age = overseer.heartbeat_age(self.p, now)
+        if (age is not None and age <= overseer.STALE_S) or now - self._overseer_kicked < overseer.STALE_S \
+                or not service.installed(self.p):
+            return None
+        self._overseer_kicked = now
+        how = service.ensure_overseer(self.p)
+        log(self.p, f"overseer heartbeat {'missing' if age is None else f'{age:.0f} s old'}: {how}")
+        return how
 
     def alert_slurm_paused(self) -> None:
         """One alert per trip of the Slurm checks overflow's start-failure breaker (slurmcheck.alert_due: the

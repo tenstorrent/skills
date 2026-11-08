@@ -1556,7 +1556,8 @@ def status_text(p: Project, verbose: bool = False) -> str:
     head = f"{p.name}: daemon {state}" + (f" ({projpause.describe(pause, p, now)})" if pause else "")
     head += " · tasks: " + (", ".join(f"{k} {v}" for k, v in sorted(counts.items())) if counts else "none yet")
     head += " · " + timefmt.long(now, p)
-    lines = [head]
+    from . import overseer
+    lines = [head, "  " + overseer.line(overseer.read(p), now)]
     for m in attention(db, now, p)[:6]:
         text = " ".join(m["text"].split())
         what = (f"ask {m['id']}" + (f"; {m['auto']}" if m.get("auto") else "")) if m["kind"] == "ask" else f"alert {m['id']}"
