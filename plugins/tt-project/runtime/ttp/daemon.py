@@ -5347,8 +5347,8 @@ class Daemon:
         they come from the result's own usage, which covers this run only (the cumulative
         modelUsage and duration_api_ms are not read).
         A run that started as a fork of the coordinator's session (note coord_context.how 'fork') reports
-        the parent session's total too: its first run books its own tokens priced (fork_base_usd keeps the
-        rest), and a later resume of that session nets against the highest total an earlier run of it
+        the parent session's total too: its first run books its own tokens priced, its subagents' calls
+        each at its own model (_subagent_cost; fork_base_usd keeps the rest), and a later resume of that session nets against the highest total an earlier run of it
         reported, so the parent's cost is never booked again.
         A resumed Claude Code run nets against the session's last reported running total
         (_session_total_before), never the sum of what its earlier runs booked: that sum drifts above the
@@ -5369,7 +5369,11 @@ class Daemon:
             # The fork's report carries the coordinator session's whole cost up to the fork: book this
             # run's own tokens at list price (the project's measured rate is itself inflated by forks
             # booked before this fix). With no priced tokens nothing is netted (over-booking is safe).
-            own = _list_cost(r, usage, on_unknown=self._unpriced_model) or own
+            # Its subagents' calls, which the result's usage leaves out, are its own too.
+            sub = self._subagent_cost(r, usage)
+            own = (_list_cost(r, usage, on_unknown=self._unpriced_model) + sub) or own
+            if sub:
+                usage.extra["subagent_usd"] = sub
             if own > 0 and reported > own:
                 usage.extra["session_cost_usd"] = reported
                 usage.extra["fork_base_usd"] = round(reported - own, 6)
@@ -5389,6 +5393,37 @@ class Daemon:
             usage.extra["session_cost_usd"] = reported
             usage.cost_usd = round(max(delta, own, 0.0), 6)
         return usage.cost_usd
+
+    def _subagent_cost(self, r: dict, usage) -> float:
+        """The list price of a Claude run's subagent calls (claude.subagent_calls: the stream and the
+        session's subagent transcripts, in the run's own config directory too), each at the model it
+        names; 0 for another provider or none found. A model no price row names books at the dearest
+        row and is told (_unpriced_model)."""
+        if (r["provider"] or "") != "claude":
+            return 0.0
+        from . import localspend
+        from .providers import claude
+        run_dir = self._run_dir(r)
+        try:
+            spec = json.loads((run_dir / "run.json").read_text(errors="replace"))
+        except (OSError, ValueError):
+            spec = {}
+        env = spec.get("env") if isinstance(spec, dict) and isinstance(spec.get("env"), dict) else None
+        usd, unknown = 0.0, set()
+        try:
+            got = claude.subagent_calls(run_dir / "output.jsonl", usage.session_id or r["session_id"] or "", env)
+            rows = localspend.table(localspend.overrides())
+            for c in got:
+                model = c["model"] or _priced_model(r, usage)
+                u, est = localspend.price(model, c["usage"], rows=rows)
+                usd += u
+                if est:
+                    unknown.add(model)
+        except Exception:   # an unreadable record: book none of them (the result's usage still books)
+            return 0.0
+        for model in unknown:
+            self._unpriced_model(model)
+        return round(usd, 6)
 
     def _session_total_before(self, session: str, before: int) -> float | None:
         """Session `session`'s running total as Claude Code last reported it before run `before`, from the
@@ -6085,6 +6120,8 @@ class Daemon:
         for k in ("reported_usd", CALLS_NOTE):   # Claude Code's own total, kept beside the per-call booking
             if k in usage.extra:
                 note[k] = usage.extra[k]
+        if usage.extra.get("subagent_usd"):   # its subagents' share of cost_usd (_subagent_cost)
+            note["subagent_usd"] = usage.extra["subagent_usd"]
         # The runaway guard counts runs that ended without an outcome; a reboot, a host sleep or a
         # hand-off that stands is an outcome, not a loop.
         if status == "lost" and r["boot_id"] and not self._this_boot(r["boot_id"]):

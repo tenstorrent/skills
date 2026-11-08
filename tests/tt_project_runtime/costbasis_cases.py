@@ -403,3 +403,74 @@ def test_the_no_call_rebook_takes_back_past_estimates_with_signed_rows_once(env)
     assert db.one("SELECT cost_usd FROM runs WHERE id=?", (called,))["cost_usd"] == 3.59
     assert db.one("SELECT cost_usd FROM runs WHERE id=?", (old,))["cost_usd"] == 3.59
     assert d.rebook_no_call() is None, "it runs once"
+
+
+# A forked run's subagents (Agent or Task tool) book with it, each call at its own model ---------------
+
+def _sub_msg(mid, model, parent=None, **usage):
+    ev = {"type": "assistant", "message": {"id": mid, "model": model, "content": [{"type": "text", "text": "x"}],
+                                           "usage": {k: usage.get(k, 0) for k in (
+                                               "input_tokens", "output_tokens", "cache_read_input_tokens",
+                                               "cache_creation_input_tokens")}}}
+    if parent:
+        ev["parent_tool_use_id"] = parent
+    return ev
+
+
+def test_a_forked_run_books_its_subagent_calls_at_each_ones_model(env):
+    """The result's usage counts the main thread only (Claude Code 2.1.285 and 2.1.296 alike); its
+    total_cost_usd and modelUsage carry the parent session's cost too. The stream shows only some of a
+    subagent's messages, with partial counts; the session's subagent transcripts, in the run's own config
+    directory, hold them all. Each message books once, at its fullest reading and its own model."""
+    p = make(env)
+    from ttp import localspend
+    from ttp.daemon import Daemon
+    from ttp.providers import get_provider
+    d = Daemon(p.base)
+    _, r = _fork_run(d)
+    run_dir = d.p.runs / str(r["id"])
+    run_dir.mkdir(parents=True)
+    cfg = p.base / "agent-config"
+    (run_dir / "run.json").write_text(json.dumps({"env": {"CLAUDE_CONFIG_DIR": str(cfg)}, "argv": []}))
+    lines = [{"type": "system", "subtype": "init", "session_id": "F1", "model": "claude-opus-5-5"},
+             _sub_msg("m-main", "claude-opus-5-5", output_tokens=900),
+             {"type": "assistant", "message": {"id": "m-main2", "model": "claude-opus-5-5", "content": [
+                 {"type": "tool_use", "id": "toolu_A", "name": "Agent", "input": {"prompt": "p"}}]}},
+             _sub_msg("m-s1", "claude-haiku-5-5", "toolu_A", input_tokens=2, output_tokens=17,
+                      cache_creation_input_tokens=18_717),
+             {"type": "result", "subtype": "success", "total_cost_usd": 12.0, "result": "ok", "session_id": "F1",
+              "usage": {"input_tokens": 0, "output_tokens": 20_000},
+              "modelUsage": {"claude-opus-5-5": {"outputTokens": 20_000}, "claude-haiku-5-5": {"outputTokens": 77}}}]
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    sub = cfg / "projects" / "-some-worktree" / "F1" / "subagents"
+    sub.mkdir(parents=True)
+    full_s1 = dict(input_tokens=2, output_tokens=74, cache_creation_input_tokens=18_717)
+    s2 = dict(input_tokens=2, output_tokens=3, cache_read_input_tokens=18_717, cache_creation_input_tokens=3_724)
+    nested = dict(input_tokens=5, output_tokens=1_000, cache_read_input_tokens=40_000)
+    (sub / "agent-a.jsonl").write_text("".join(json.dumps(x) + "\n" for x in (
+        _sub_msg("m-s1", "claude-haiku-5-5", output_tokens=17, input_tokens=2, cache_creation_input_tokens=18_717),
+        _sub_msg("m-s1", "claude-haiku-5-5", **full_s1), _sub_msg("m-s2", "claude-haiku-5-5", **s2),
+        _sub_msg("m-syn", "<synthetic>", output_tokens=99_999))))
+    (sub / "agent-b.jsonl").write_text(json.dumps(_sub_msg("m-s3", "claude-sonnet-4-5", **nested)) + "\n")
+
+    def priced(model, **u):
+        return localspend.price(model, u, overrides=localspend.overrides())[0]
+    own = priced("claude-opus-5-5", output_tokens=20_000)
+    subs = priced("claude-haiku-5-5", **full_s1) + priced("claude-haiku-5-5", **s2) + priced("claude-sonnet-4-5", **nested)
+    u = get_provider("claude").parse(run_dir / "output.jsonl")
+    assert abs(d._net_of_session(r, u) - (own + subs)) < 1e-6, "the fork left its subagents' calls unbooked"
+    assert abs(u.extra["subagent_usd"] - subs) < 1e-6 and abs(u.extra["fork_base_usd"] - (12.0 - own - subs)) < 1e-6
+    # No transcript on disk (another host's config, cleaned up): the streamed subagent message still books.
+    for f in sub.iterdir():
+        f.unlink()
+    u = get_provider("claude").parse(run_dir / "output.jsonl")
+    streamed = priced("claude-haiku-5-5", input_tokens=2, output_tokens=17, cache_creation_input_tokens=18_717)
+    assert abs(d._net_of_session(r, u) - (own + streamed)) < 1e-6
+    # A malformed transcript count books none of them, never fails the booking.
+    (sub / "agent-c.jsonl").write_text(json.dumps(_sub_msg("m-bad", "claude-haiku-5-5", output_tokens="lots")) + "\n")
+    u = get_provider("claude").parse(run_dir / "output.jsonl")
+    assert abs(d._net_of_session(r, u) - own) < 1e-6 and "subagent_usd" not in u.extra
+    # A run that is no fork books the report as it stands: it already covers its subagents.
+    plain = dict(r, note=json.dumps({"coord_context": {"how": "disk"}}))
+    u = get_provider("claude").parse(run_dir / "output.jsonl")
+    assert d._net_of_session(plain, u) == 12.0 and "subagent_usd" not in u.extra

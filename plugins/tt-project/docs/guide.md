@@ -3868,6 +3868,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   elapsed share of its budget (flagged estimated).
   A run that wrote no output and reported no tokens is booked at $0 (except on an older Cursor
   build, which prints nothing until it ends).
+- A Claude run that forks the coordinator's session reports the parent session's total too, so it
+  books its own tokens at list price instead. Its subagents (Agent or Task tool) count as its own:
+  their calls, which the result's usage leaves out, are read from the stream and the session's
+  subagent transcripts and priced each at its own model (the note's `subagent_usd`).
 - Codex workers run in `danger-full-access` (no sandbox) by default. With `providers.codex.write_fence:
   true` or the `no_internet` restriction they run in Codex's workspace-write sandbox, with the
   project's state folder, the repository's git folder and the shared lock folder
