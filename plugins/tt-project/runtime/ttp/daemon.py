@@ -1836,8 +1836,8 @@ class Daemon:
         self._degrade_said[name] = now
         stacks = self.p.logs / f"degraded-{name}-{int(now)}.txt"
         stacks.parent.mkdir(parents=True, exist_ok=True)
-        with open(stacks, "w") as f:
-            faulthandler.dump_traceback(f, all_threads=True)
+        durable_write(stacks, "\n".join(f"Thread {t}:\n" + "".join(traceback.format_stack(fr))
+                                         for t, fr in sys._current_frames().items()))
         from .overseer import INCIDENTS_FILE
         durable_append(self.p.state / INCIDENTS_FILE, json.dumps(
             {"at": now, "why": why, "step": name, "overruns": counts, "stacks": str(stacks)}) + "\n")
