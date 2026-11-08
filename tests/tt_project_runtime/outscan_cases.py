@@ -427,11 +427,12 @@ def test_push_scan_in_a_partial_clone_looks_up_without_lazy_fetches_and_prefetch
         out = _git_out(clone, "rev-list", "--objects", "--missing=print", base)
         return {line[1:] for line in out.splitlines() if line.startswith("?")}
 
-    def sent(text):
+    def sent(text, replaced=None):
+        replaced = replaced or old_blob
         new_blob = subprocess.run(["git", "-C", str(clone), "hash-object", "-w", "--stdin"], input=text,
                                   capture_output=True, text=True, check=True).stdout.strip()
         # The tree object written by hand: read-tree and mktree would fetch every missing blob it names
-        raw = b"".join(f"{mode} {name}\0".encode() + bytes.fromhex(new_blob if sha == old_blob else sha)
+        raw = b"".join(f"{mode} {name}\0".encode() + bytes.fromhex(new_blob if sha == replaced else sha)
                        for mode, _, sha, name in (line.split() for line in
                                                   _git_out(clone, "ls-tree", base).splitlines()))
         tree = subprocess.run(["git", "-C", str(clone), "hash-object", "-t", "tree", "-w", "--stdin"], input=raw,
@@ -464,8 +465,16 @@ def test_push_scan_in_a_partial_clone_looks_up_without_lazy_fetches_and_prefetch
     assert keep_blob in missing()   # only what the diff reads, not the whole tree
     assert seen["fetches"] == 1 and outscan.push_problem(sent("clean\n"), str(srv), p=p) is None
     assert seen["fetches"] == 1   # nothing left to fetch
+    # A remote name shaped like an option is never passed to git fetch.
+    _git_out(clone, "config", "remote.--upload-pack=false.promisor", "true")
+    for key in ("promisor", "partialclonefilter"):
+        _git_out(clone, "config", "--unset", f"remote.origin.{key}")
+    with pytest.raises(ValueError):   # keep.txt's old blob stays missing, so git log cannot read the diff
+        outscan.push_problem(sent("clean\n", replaced=keep_blob), str(srv), p=p)
+    assert seen["fetches"] == 1
     # Outside a partial clone nothing is fetched and the scan reads as before.
-    _git_out(clone, "config", "--unset", "remote.origin.promisor")
+    _git_out(clone, "config", "--unset", "remote.--upload-pack=false.promisor")
+    assert outscan.push_problem(sent("clean\n"), str(srv), p=p) is None
     assert "stored secret" in outscan.push_problem(sent(f"key {_OUT_SECRET}\n"), str(srv), p=p)
     assert seen["fetches"] == 1
 

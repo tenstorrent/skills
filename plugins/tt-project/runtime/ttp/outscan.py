@@ -392,10 +392,12 @@ def _prefetch(revs: str) -> None:
     commit. Does nothing outside a partial clone; on any failure git log fetches what it still lacks."""
     try:
         remotes = [_git("config", "--get", "extensions.partialClone").stdout.strip()]
-        remotes += [w[0][len("remote."):-len(".promisor")] for line in
-                    _git("config", "--get-regexp", r"^remote\..*\.promisor$").stdout.splitlines()
-                    if len(w := line.split()) == 2 and w[1].lower() in ("true", "yes", "on", "1")]
-        remotes = list(dict.fromkeys(r for r in remotes if r))
+        # as git counts promisor remotes: remote.<name>.promisor true, or a partialclonefilter set
+        remotes += [w[0][len("remote."):].rpartition(".")[0] for line in
+                    _git("config", "--get-regexp", r"^remote\..*\.(promisor|partialclonefilter)$").stdout.splitlines()
+                    if len(w := line.split(maxsplit=1)) == 2
+                    and (w[0].endswith(".partialclonefilter") or w[1].lower() in ("true", "yes", "on", "1"))]
+        remotes = list(dict.fromkeys(r for r in remotes if r and not r.startswith("-")))   # never an option
         if not remotes:
             return
         raw = _git("log", "--stdin", "--raw", "--no-abbrev", "--root", "--cc", "--no-renames", "--format=",
