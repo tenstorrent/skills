@@ -173,7 +173,7 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
             gap = _resume_gap(src, prov, provider) or _fork_rejected(p, task, "resume") if src else ""
             if src and not gap:
                 new = str(uuid.uuid4())
-                gap = prov.fork_session(src["session"], cwd, env, new)
+                gap = prov.start_from_session(src["provider"] or provider, src["session"], cwd, env, new)
                 if not gap:
                     return {"how": "resume", "why": f"run {src['run']}'s session {src['session'][:8]}",
                             "session": new, "run": src["run"],
