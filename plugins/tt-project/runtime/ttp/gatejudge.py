@@ -148,17 +148,53 @@ def failed_of(rc: int | None, output: str, ids: list[str], at: str = "base") -> 
     return set(ids) & set(got) if complete else None
 
 
-# The random end of a temp name inside a path: 6 to 12 name characters after a "-" or ".", ending the path part.
-_TEMP_SUFFIX = re.compile(r"(?<=[-.])[A-Za-z0-9_]{6,12}(?=[/'\"]|$)")
+# What may be the random end of a temp name inside a path: 6 to 12 name characters after a "-" or ".",
+# ending the path part. _mark_norm keeps it as it is; same_failure decides pairwise whether two differ only
+# by it (_temp_pair).
+_TEMP_SUFFIX = re.compile(r"(?<=[-.])([A-Za-z0-9_]{6,12})(?=[/'\"]|$)")
+_TEMP_OR_DIGITS = re.compile(_TEMP_SUFFIX.pattern + r"|\d+")
+_PATH = re.compile(r"(\S*/\S*)")
+
+
+def _temp_pair(a: str, b: str) -> bool:
+    """`a` and `b` are the random parts of two names from one temp template: the same length and both
+    Python tempfile's 8 characters of [a-z0-9_] or both mktemp's X-run of [A-Za-z0-9], and at least one
+    shows randomness (a digit, a "_" or a capital after the first character), so two path words
+    (`tt-project`, `tt-dogfood`; `report-summary`, `report-details`) stay different."""
+    if len(a) != len(b):
+        return False
+    shape = r"[a-z0-9_]{8}" if re.fullmatch(r"[a-z0-9_]{8}", a) else r"[A-Za-z0-9]+"
+    if not (re.fullmatch(shape, a) and re.fullmatch(shape, b)):
+        return False
+    return any(re.search(r"[0-9_]|.[A-Z]", t) for t in (a, b))
+
+
+def _same_mark(a: str, b: str) -> bool:
+    """Two normalized marks are equal, or differ only where both paths hold a temp name's random part."""
+    if a == b:
+        return True
+    pa, pb = _PATH.split(a), _PATH.split(b)
+    if len(pa) != len(pb):
+        return False
+    for n, (x, y) in enumerate(zip(pa, pb)):
+        if x == y:
+            continue
+        if n % 2 == 0:
+            return False
+        tx, ty = _TEMP_SUFFIX.split(x), _TEMP_SUFFIX.split(y)
+        if len(tx) != len(ty) or any(u != v and (k % 2 == 0 or not _temp_pair(u, v))
+                                     for k, (u, v) in enumerate(zip(tx, ty))):
+            return False
+    return True
 
 
 def _mark_norm(text: str) -> str:
-    """`text` with what differs between two runs of one failure left out: addresses, temp names, the random
-    part of a temp name in a path (mkdtemp's `home-y7h9wyh0`, mktemp's `check.T6w5cg3S`) and the numbers
-    in paths (pytest's numbered temp folders). Other numbers stay: `assert 5 == 0` (a run that selected
-    nothing) is not `assert 1 == 0`."""
+    """`text` with what differs between two runs of one failure left out: addresses, temp names and the
+    numbers in paths (pytest's numbered temp folders). What may be a temp name's random part in a path
+    (mkdtemp's `home-y7h9wyh0`, mktemp's `check.T6w5cg3S`) stays as it is for _same_mark to compare.
+    Other numbers stay: `assert 5 == 0` (a run that selected nothing) is not `assert 1 == 0`."""
     text = re.sub(r"0x[0-9a-fA-F]+", "N", re.sub(r"\btmp[\w-]+", "tmp", text or ""))
-    text = re.sub(r"\S*/\S*", lambda m: re.sub(r"\d+", "N", re.sub(_TEMP_SUFFIX, "X", m.group(0))), text)
+    text = _PATH.sub(lambda m: _TEMP_OR_DIGITS.sub(lambda t: t.group(1) or "N", m.group(0)), text)
     return re.sub(r"\s+", " ", text).strip()[:MARK_MAX]
 
 
@@ -185,11 +221,11 @@ def same_failure(head: dict | None, base: dict | None) -> bool:
     both show it (two asserts can print the same `assert 1 == 0`; a line number moves with any edit above
     it). Marks with nothing in common prove nothing."""
     head, base = head or {}, base or {}
-    if head.get("src") and base.get("src") and head["src"] != base["src"]:
+    if head.get("src") and base.get("src") and not _same_mark(head["src"], base["src"]):
         return False
     for k in ("line", "msg", "at"):
         if head.get(k) and base.get(k):
-            return head[k] == base[k]
+            return _same_mark(head[k], base[k])
     return False
 
 

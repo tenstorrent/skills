@@ -942,6 +942,16 @@ def test_gate_judge_calls_a_failure_pre_existing_only_when_base_and_head_fail_th
         m = gatejudge.marks(_fails({a: (f"AssertionError: '/tmp/pytest-of-u/pytest-350/t0/{x}' left", "t.py:3")})[1], [a])[a]
         m2 = gatejudge.marks(_fails({a: (f"AssertionError: '/tmp/pytest-of-u/pytest-351/t0/{y}' left", "t.py:3")})[1], [a])[a]
         assert gatejudge.same_failure(m, m2), (m, m2)
+    # Ordinary path words are not a temp name's random part: unproven sameness never excuses a failure.
+    for x, y in (("plugins/tt-project/x", "plugins/tt-review/x"),
+                 ("refs/heads/user/tt-project", "refs/heads/user/tt-dogfood"),
+                 ("out/report-summary", "out/report-details"), ("state/task.status", "state/task.summary"),
+                 ("out/run-complete", "out/run-finished"), ("homes/home-y7h9wyh0", "homes/home-y7h9wyh01"),
+                 ("homes/home-y7h9wyh0", "homes/user-w56a_m92")):
+        m = gatejudge.marks(_fails({a: (f"AssertionError: '/tmp/pytest-of-u/pytest-350/t0/{x}' left", "t.py:3")})[1], [a])[a]
+        m2 = gatejudge.marks(_fails({a: (f"AssertionError: '/tmp/pytest-of-u/pytest-351/t0/{y}' left", "t.py:3")})[1], [a])[a]
+        assert not gatejudge.same_failure(m, m2), (m, m2)
+    m = gatejudge.marks(_fails({a: ("AssertionError: '/tmp/pytest-of-u/pytest-350/t0/homes/home-y7h9wyh0' left", "t.py:3")})[1], [a])[a]
     m2 = gatejudge.marks(_fails({a: ("AssertionError: '/tmp/pytest-of-u/pytest-351/t0/homes/home-y7h9wyh0' gone", "t.py:3")})[1], [a])[a]
     assert not gatejudge.same_failure(m, m2)
     # A base rerun that errors (exit 4) or selects nothing (exit 5, a test the base does not have) never
