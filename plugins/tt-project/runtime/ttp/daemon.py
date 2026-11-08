@@ -93,6 +93,7 @@ from . import probespawn
 from . import probevars
 from . import urgent
 from . import eventhold
+from . import waketriage
 from . import convgate
 from . import unstarted
 from . import boundedchild
@@ -9997,6 +9998,17 @@ class Daemon:
             except Exception:   # the gate only saves money: a failure runs the turn
                 log(self.p, "coordinator turn gate failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
                 seen_now = {}
+        triage = [e for e in evs if not pagesev.rides_along(e)]
+        if triage and not msgs and not rerun and w is None and waketriage.on(self.cfg) and \
+                eventhold.can_wait(triage):
+            try:   # the watcher model decides whether this routine batch needs the coordinator now
+                folded, line = waketriage.fold(db, self.cfg, triage, now)
+            except Exception:   # the triage only saves money: a failure runs the turn
+                folded, line = False, "coordinator wake triage failed: " + traceback.format_exc().replace("\n", " | ")[:1500]
+            if line:
+                log(self.p, line)
+            if folded:
+                return
         hour_turns = db.one("SELECT COUNT(*) n FROM runs WHERE role='coordinator' AND started>?", (now - 3600,))["n"]
         if hour_turns >= int(c.get("max_turns_per_hour", 30)) and not msgs:
             return
@@ -10125,7 +10137,15 @@ class Daemon:
         no ready task to fill it."""
         try:
             row = self.p.db.one("SELECT MAX(ended) t FROM runs WHERE role='coordinator'")
-            end = eventhold.until(self.cfg, [], evs, row["t"] if row else None, now)
+            last_end = row["t"] if row else None
+            gap = eventhold.gap_until(self.cfg, evs, last_end, now)
+            if gap is not None:   # the wake gap: a free slot does not end it (dispatch fills slots model-free)
+                if self.p.db.kv("wake_gap_logged") != [e["id"] for e in evs]:
+                    self.p.db.set_kv("wake_gap_logged", [e["id"] for e in evs])
+                    log(self.p, f"coordinator wake held for the wake gap: events {[e['id'] for e in evs]} "
+                        f"share one turn in {int(gap - now)} s")
+                return True
+            end = eventhold.until(self.cfg, [], evs, last_end, now)
             if end is None:
                 return False
             busy, slots = self._worker_slots()

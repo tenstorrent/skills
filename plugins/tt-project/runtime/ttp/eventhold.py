@@ -10,12 +10,23 @@ Never held: a user message (an answered ask arrives as one), any event of anothe
 check or blocker sweep, a budget or gate change, obligation_overdue, pause_end_due, charter_retry,
 ask_timeout, machine and resource events, ...), any high or critical event, and a moment a worker
 slot is free while no ready task is queued to fill it, so capacity never idles waiting on the hold.
-The model-free start of ready work runs in dispatch, apart from the coordinator, and is not held."""
+The model-free start of ready work runs in dispatch, apart from the coordinator, and is not held.
+
+The wake gap (gap_until) is the coalescing floor under that hold: an event-only batch of the kinds
+GAP_KINDS at a routine severity (task ends and hand-offs, timers, sweeps, notes) waits until
+coordinator.wake_gap_s (default 300; 0: off) after the last turn ended even when a worker slot is
+free, so a stream of such events costs one wake per gap, not one per free slot. Dispatch starts ready
+work without a model run meanwhile. Every other kind, a high or critical event and a user message or
+answered ask wake at once. A held event stays queued on disk and rides the next turn."""
 from __future__ import annotations
 
 KINDS = frozenset({"task_done", "followup_proposed", "upstream_note", "checks_slot_wait", "task_waiting"})
 SEVERITIES = frozenset({"info", "low", "normal"})
 DEFAULT_S = 300.0
+GAP_KINDS = KINDS | frozenset({
+    "task_failed", "task_blocked", "task_review", "task_changes_needed", "task_notes", "observation",
+    "blocker_sweep", "stall", "no_progress", "deferral_expired", "time_only_hold", "announced_not_started",
+    "ready_not_started", "ready_backlog", "budget_kind_change"})
 
 
 def hold_s(cfg: dict) -> float:
@@ -37,4 +48,21 @@ def until(cfg: dict, msgs: list, evs: list[dict], last_end: float | None, now: f
     if hold <= 0 or msgs or not routine(evs) or not last_end:
         return None
     end = float(last_end) + hold
+    return end if now < end else None
+
+
+def can_wait(evs: list[dict]) -> bool:
+    """Whether every event in `evs` (at least one) may wait for the next wake: GAP_KINDS, routine severity."""
+    return bool(evs) and all(e.get("kind") in GAP_KINDS and e.get("severity") in SEVERITIES for e in evs)
+
+
+def gap_until(cfg: dict, evs: list[dict], last_end: float | None, now: float) -> float | None:
+    """When the wake gap over this event-only batch ends, or None when the turn may start now."""
+    try:
+        gap = max(float((cfg.get("coordinator") or {}).get("wake_gap_s", DEFAULT_S)), 0.0)
+    except (TypeError, ValueError):
+        gap = DEFAULT_S
+    if gap <= 0 or not last_end or not can_wait(evs):
+        return None
+    end = float(last_end) + gap
     return end if now < end else None

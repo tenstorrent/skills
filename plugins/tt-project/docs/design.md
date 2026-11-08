@@ -55,7 +55,13 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    `coordinator.event_hold_s` (300 s) after the last turn ended, unless a slot is free with nothing
    ready to fill it (eventhold.py). That exception stays even for batches of only plain hand-offs,
    checks_slot_wait and task_waiting: replayed, turns of only those events still queued work, replied
-   or updated tasks (`python3 -m ttp.replay --event-hold-s 300 --quiet-hold`). A ride-along event (data flag `ride_along`: a forgotten
+   or updated tasks (`python3 -m ttp.replay --event-hold-s 300 --quiet-hold`). Under both, the wake
+   gap: a batch of only task ends, hand-offs, timers, sweeps or notes at routine severity wakes at
+   most once per `coordinator.wake_gap_s` (300 s) after the last turn ended, a free slot included
+   (dispatch starts ready work without a model run meanwhile), and before that wake the watcher model
+   (`babysit.ask`, target coordinator) may fold it into the next wake: the events stay queued and ride
+   the next digest, at most `coordinator.wake_triage_max_s` (1800 s); a watcher error wakes and logs
+   (eventhold.gap_until, waketriage.py). A ride-along event (data flag `ride_along`: a forgotten
    `continue:` follow-up, a repeat block of a non-urgent task) starts no turn alone: it joins the
    next turn something else starts, or starts one an hour after it was raised. It stays queued
    in the database, so a restart keeps it (pagesev.py).

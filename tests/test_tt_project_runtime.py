@@ -48178,6 +48178,7 @@ def _turn_budget_rig(p, monkeypatch, cost_of, flaky=lambda note: False):
     from types import SimpleNamespace
     from ttp.daemon import Daemon
     p.set_config("coordinator.max_turns_per_hour", 100000)
+    p.set_config("coordinator.wake_gap_s", 0)   # back-to-back turns in real time: no wake gap (wakegap_cases.py)
     d = Daemon(p.base)
     turns = []
 
