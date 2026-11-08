@@ -848,9 +848,6 @@ def _requeue(db, task: dict, woke: str, extra: dict | None = None) -> None:
     prev.pop(conflictfix.KEY, None)
     db.update_task(task["id"], status="queued", not_before=None, blocked_reason=None,
                    result=dump_result({**prev, "woke": woke[:1500], **(extra or {})}))
-    if task.get("status") != "queued":   # an explicit re-run: dispatch's done count restarts (dispatchguard)
-        from . import dispatchguard
-        dispatchguard.record_requeue(db, task["id"], task.get("status") or "done", "push queue")
 
 
 def _cancel(db, ids: list[int]) -> None:

@@ -8,8 +8,8 @@ each run handing off done once more. `refusal` re-reads the row just before the 
 over-limit task back to its last hand-off status and records why, model-free.
 
 Every explicit requeue records a `task_requeued` event (`ttp task requeue`, the web app, the coordinator's
-status queued on an ended task once the update is written, a chain continue, the push queue's re-runs):
-the done hand-offs before it no longer count. A task past its attempt limit whose last hand-off
+status queued on an ended task once the update is written, a chain continue, the push queue's review
+re-runs, the daemon's lost-run requeues): the done hand-offs before it no longer count. A task past its attempt limit whose last hand-off
 was done (its last run ended in a task_done event) is refused too
 unless an explicit requeue came after that hand-off, start_when probe or not: a deferral that passes
 only makes it ready, never a reason to run it again. A cancel (`ttp task cancel`, the web app, the

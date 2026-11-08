@@ -2196,10 +2196,10 @@ def test_a_rejected_coordinator_requeue_records_nothing_and_an_accepted_one_does
     assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
 
 
-def test_a_chain_continue_and_a_push_queue_re_run_record_a_requeue(env):
-    """chaincap.requeue (a continue hop) and pushq._requeue (a push conflict re-run) each record
-    task_requeued, so dispatch's done count restarts after them."""
-    from ttp import chaincap, dispatchguard, pushq
+def test_a_chain_continue_records_a_requeue(env):
+    """chaincap.requeue (a continue hop) records task_requeued, so dispatch's done count restarts after it.
+    The push queue's re-runs record theirs with their own text (push_cases)."""
+    from ttp import chaincap, dispatchguard
     p = make(env)
     tid = _closed_done(p, "a chained code task", 3)
     p.db.update_task(tid, status="done", kind="code", branch="b")
@@ -2207,11 +2207,6 @@ def test_a_chain_continue_and_a_push_queue_re_run_record_a_requeue(env):
     assert chaincap.requeue(p, p.config(), p.db.task(tid), {"title": "continue: more", "spec": "x"}, "progress", 0)
     assert [r["source"] for r in _requeues(p, tid)] == ["continue"]
     assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
-    rv = _closed_done(p, "a review re-run by the push queue", 3)
-    p.db.update_task(rv, status="done")
-    pushq._requeue(p.db, p.db.task(rv), "conflict")
-    assert p.db.task(rv)["status"] == "queued" and [r["source"] for r in _requeues(p, rv)] == ["push queue"]
-    assert dispatchguard.refusal(p.db, p.db.task(rv)) == ""
 
 
 def test_a_cancelled_task_queued_again_without_a_requeue_is_not_dispatched(
