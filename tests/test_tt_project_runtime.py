@@ -27339,6 +27339,7 @@ DURABLE_EXEMPT = {
     ("hostshim.py", "os.replace(tmp, os.path.join(store, name))"): "places that fake store file atomically; same lifetime as above",
     ("hostshim.py", 'with open(tab + ".tmp", "w") as f'): "a test run's fake crontab, thrown away with the run; never state",
     ("hostshim.py", 'os.replace(tab + ".tmp", tab)'): "places that fake crontab atomically; same lifetime as above",
+    ("overseer.py", 'lock = open(p.state / LOCK_FILE, "a")'): "the overseer's flock guard file, never written",
 }
 
 

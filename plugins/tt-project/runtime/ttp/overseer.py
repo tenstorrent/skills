@@ -38,7 +38,7 @@ import sys
 import time
 from pathlib import Path
 
-from .project import Project, durable_write
+from .project import Project, durable_append, durable_write
 
 EVERY_S = 60            # one pass a minute: a few read-only queries and a stat per running run
 FAIL_S = 300            # results failing this long make an incident
@@ -214,8 +214,7 @@ def check(p: Project, now: float | None = None) -> dict:
         except Exception as e:   # the incident is recorded even when the stacks cannot be had
             stacks = f"not captured ({type(e).__name__}: {e})"
         inc = {"at": now, "why": why, "stacks": str(stacks) if stacks else "not captured (no live daemon)"}
-        with open(p.state / INCIDENTS_FILE, "a") as f:
-            f.write(json.dumps(inc) + "\n")
+        durable_append(p.state / INCIDENTS_FILE, json.dumps(inc) + "\n")
     elif not h.get("failing") and not h.get("error"):
         inc = None
     if inc:
