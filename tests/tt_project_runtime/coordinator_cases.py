@@ -23022,6 +23022,56 @@ def test_task_update_spec_replace_line_makes_the_whole_spec_and_keeps_safety_lin
     assert data["how"] == "replace" and data["old"] == _STEPS_SPEC + "\n\n## Update\n" + _QUOTED and data["new"] == spec
 
 
+def _with_obligation(p, tid):
+    """The task's spec once an obligation with a milestone is attached, and its appended block."""
+    import time
+    from ttp import obligations
+    from ttp.coordinator import _obligation_spans
+    oid = obligations.add(p, "ship the quick sweep numbers (user msg #1)", owners=[tid],
+                          milestones=[{"key": "m1", "due": time.time() + 7200, "evidence_required": "a result"}])
+    spec = p.db.task(tid)["spec"]
+    [(a, b)] = _obligation_spans(spec)
+    block = spec[a:b]
+    assert block.startswith(f"## Obligation {oid} ") and f"### Obligation {oid} milestone m1" in block, spec
+    return oid, spec, block
+
+
+@pytest.mark.parametrize("then", ["", "\n\n## Update\nRun only the quick sweep."])
+def test_task_update_spec_replace_line_keeps_an_attached_obligation_block_byte_for_byte(env, tmp_path, then):
+    # obligations._attach never re-appends a block for an owner it has: a whole replace carries it over.
+    p = make(env)
+    from ttp import coordinator as coord, obligations
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    oid, _, block = _with_obligation(p, tid)
+    if then:
+        p.db.update_task(tid, spec=p.db.task(tid)["spec"] + then)
+    upd = "replace:\nGoal: run the quick sweep and report its numbers."
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": upd}]) == []
+    spec = p.db.task(tid)["spec"]
+    assert spec.startswith("Goal: run the quick sweep") and spec.count(block) == 1 and spec.endswith(block)
+    assert "Run only the quick sweep." not in spec and "profile it" not in spec
+    assert obligations.attach(p, oid, [tid]) == [] and p.db.task(tid)["spec"] == spec, "never appended twice"
+    # Sent again with the block already quoted in the new text: it is not added a second time.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": "replace:\nGoal: y\n\n" + block}]) == []
+    assert p.db.task(tid)["spec"].count(block) == 1, p.db.task(tid)["spec"]
+
+
+@pytest.mark.parametrize("quote", ["ttp obligation progress", "This task is a required owner.", "--milestone m1",
+                                   "(urgent, owed to the user)"])
+def test_task_update_retire_or_replace_inside_an_obligation_block_is_refused(env, quote):
+    p = make(env)
+    from ttp import coordinator as coord
+    tid = p.db.add_task("sweep", _STEPS_SPEC, kind="work")
+    oid, spec, _ = _with_obligation(p, tid)
+    for act in ({"spec": f'retire: "{quote}"'}, {"replace": {"old": quote, "new": "x"}}):
+        problems = coord.apply(p, [{"type": "task_update", "id": tid, **act}])
+        assert problems and "ttp obligation" in " ".join(map(str, problems)), (act, problems)
+        assert p.db.task(tid)["spec"] == spec
+    # Text outside the block still retires, and the block stays.
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": 'retire: "Goal: speed up the loader."'}]) == []
+    assert "speed up" not in p.db.task(tid)["spec"] and f"## Obligation {oid} " in p.db.task(tid)["spec"]
+
+
 @pytest.mark.parametrize("upd, why", [
     ('retire: "run the whole sweep tonight"', "matches no earlier spec text"),
     ('retire: "sweep"', "too short"),

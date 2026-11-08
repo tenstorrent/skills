@@ -6438,6 +6438,25 @@ def _safety_lines(spec: str) -> set[int]:
     return out
 
 
+def _obligation_spans(spec: str) -> list[tuple[int, int]]:
+    """(start, end) of each `## Obligation` owner block and milestone note the harness appended to the spec
+    (prompts._OBLIGATION_BLOCK), without the newlines around it. obligations._attach never re-appends a
+    block for an owner it already has, so a spec edit keeps them whole."""
+    from .prompts import _OBLIGATION_BLOCK
+    out = []
+    for m in _OBLIGATION_BLOCK.finditer(spec):
+        start = m.start() + len(m.group(0)) - len(m.group(0).lstrip("\n"))
+        out.append((start, start + len(m.group(0).strip("\n"))))
+    return out
+
+
+def _in_obligation(spec: str, start: int, end: int, what: str) -> None:
+    """ValueError when spec[start:end] overlaps an appended obligation block."""
+    if any(start < b and end > a for a, b in _obligation_spans(spec)):
+        raise ValueError(f"{what} falls inside an `## Obligation` block the harness appended: an obligation changes "
+                         f"only through `ttp obligation` (or an `obligation` action), never by a task_update")
+
+
 def replace_step(spec: str, rep) -> tuple[str, str]:
     """(the spec with `rep['old']` replaced by `rep['new']`, the update line saying so); ValueError when
     `old` is not in the spec exactly once or touches a safety line."""
@@ -6447,6 +6466,7 @@ def replace_step(spec: str, rep) -> tuple[str, str]:
     if (n := spec.count(old)) != 1:
         raise ValueError(f"`replace` old text is in the spec {n} times, not once: quote one step exactly")
     start = spec.index(old)
+    _in_obligation(spec, start, start + len(old), "`replace` old text")
     first, last = spec.count("\n", 0, start), spec.count("\n", 0, start + len(old))
     if hit := sorted(_safety_lines(spec) & set(range(first, last + 1))):
         line = spec.split("\n")[hit[0]].strip()
@@ -6462,7 +6482,8 @@ def replace_step(spec: str, rep) -> tuple[str, str]:
 # every copy of that text (a re-sent update repeats it), and a first line `replace:` makes the rest of the
 # update the whole live spec. Both lines are exact forms, so a plain "Replace: the loader" step stays
 # appended. A quote matching nothing is refused, never ignored. The spec's safety lines are never retired
-# and survive a replace. Each earlier text goes to a STEP_REPLACED_KIND event; the worker reads the notice.
+# and survive a replace, as do the `## Obligation` blocks the harness appended (carried over byte for byte;
+# a quote inside one is refused). Each earlier text goes to a STEP_REPLACED_KIND event; the worker reads the notice.
 _RETIRE_LINE = re.compile(r'^\s*retire:\s*"(.+)"\s*$', re.I)
 _REPLACE_LINE = re.compile(r"^\s*replace:\s*$", re.I)
 WHOLE_SPEC_REPLACED = "The whole spec was replaced: everything it said before no longer applies. It now reads:"
@@ -6487,12 +6508,14 @@ def spec_edits(spec: str, update: str) -> tuple[str, str, str, bool, list[dict]]
         new = "\n".join(lines[first + 1:]).strip()
         if not new:
             raise ValueError("`replace:` needs the new spec on the lines after it")
-        old_lines = spec.split("\n")
+        old_lines, blocks = spec.split("\n"), _obligation_spans(spec)
         have = {ln.strip() for ln in new.split("\n")}
-        kept = list(dict.fromkeys(old_lines[i].strip() for i in sorted(_safety_lines(spec))
+        inside = {i for a, b in blocks for i in range(spec.count("\n", 0, a), spec.count("\n", 0, b) + 1)}
+        kept = list(dict.fromkeys(old_lines[i].strip() for i in sorted(_safety_lines(spec) - inside)
                                   if old_lines[i].strip() not in have))
         if kept:
             new += "\n\nKept from the earlier spec (safety lines change only through the charter):\n" + "\n".join(kept)
+        new += "".join("\n\n" + spec[a:b] for a, b in blocks if spec[a:b] not in new)   # unchanged, last
         return new, new, f"{WHOLE_SPEC_REPLACED}\n\n{new}", True, [{"old": spec, "new": new, "how": "replace"}]
     history, told = [], list(lines)
     for i in retires:
@@ -6506,6 +6529,7 @@ def spec_edits(spec: str, update: str) -> tuple[str, str, str, bool, list[dict]]
             if hit := sorted(safety & set(range(spec.count("\n", 0, at), spec.count("\n", 0, at + len(quote)) + 1))):
                 raise ValueError(f"`retire:` quote touches a safety line ({spec.split(chr(10))[hit[0]].strip()[:120]!r}): "
                                  f"Restrictions and guards change only through the charter")
+            _in_obligation(spec, at, at + len(quote), "`retire:` quote")
             at += len(quote)
         spec = spec.replace(quote, "")
         lines[i] = RETIRED_LIVE
