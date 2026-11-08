@@ -4109,6 +4109,7 @@ def cmd_checks(a) -> None:
     # And in the pinned Python env, the user site off (runnerenv): made first when missing, never skipped.
     # Its lock as committed at `head` (runnerenv.at_commit), never the worktree's edited copy. One that
     # cannot be made is the host's fault, waited for as a missing runner is, unless `head` changed the lock.
+    push.check_cfg = cfg   # checks.scratch_home, for every check_env below (scratchhome)
     lock = None
     try:
         lock = runnerenv.at_commit(cfg, top, head, run_dir)

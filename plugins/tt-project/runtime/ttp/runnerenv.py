@@ -395,7 +395,9 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
     site. A build there that cannot reach its package index (an offline host) fails within a minute, not
     after pip's silent retries: REMOTE_PIP_RETRIES and REMOTE_PIP_TIMEOUT_S unless the host's own PIP_RETRIES
     and PIP_DEFAULT_TIMEOUT say otherwise. TTP_CHECKS_ENV_BIN names its bin, so a check behind a spill wrapper puts it first again
-    (remotecheck.REFRONT). OSError when a file cannot be read."""
+    (remotecheck.REFRONT). Then the check's throwaway HOME there, in `where`, when it has one here
+    (scratchhome.remote_lines). OSError when a file cannot be read."""
+    from . import scratchhome   # here only: this file also runs alone on the other host
     lock = Path(lock or LOCK)
     out, w = f"mkdir -p {shlex.quote(where)}\n", shlex.quote(where)
     for name, text in (("runnerenv.py", Path(__file__).read_text()), ("checks-python.lock", lock.read_text())):
@@ -405,7 +407,7 @@ def remote_lines(lock: Path | str | None, where: str, fail: str, home: str = "")
     return (out + f'ttp_env=$({pip}{f"TTP_HOME={home} " if home else ""}python3 -I {w}/runnerenv.py "$PWD"/{w}/checks-python.lock) || {{ '
             f"echo 'ttp: the checks pinned Python env could not be made on this host; the check did not run' >&2; {fail}; }}\n"
             'export PATH="$ttp_env/bin${PATH:+:$PATH}" PYTHONNOUSERSITE=1 TTP_CHECKS_ENV_BIN="$ttp_env/bin"\n'
-            'unset PIP_USER\n')
+            'unset PIP_USER\n' + scratchhome.remote_lines(where, fail))
 
 
 def _name(s: str) -> str:

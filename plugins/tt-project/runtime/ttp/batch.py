@@ -2461,7 +2461,7 @@ class Batch:
         cfg = self.p.config()
         lock = push.runnerenv.lock_of(cfg, self.wt)
         try:
-            env = push.check_env("target", self.tip, self.check_run_dir, self.branch, lock=lock)
+            env = push.check_env("target", self.tip, self.check_run_dir, self.branch, lock=lock, cfg=cfg)
         except push.runnerenv.Unavailable as e:
             if head and push.runnerenv.changed_by(self.wt, cfg, self.tip or "", head):
                 raise
@@ -2947,7 +2947,7 @@ class Batch:
         tail) when one is new there; False when the probe cannot tell (out of time, another exit): the
         full checks decide then."""
         cmd = fail[0]
-        env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
+        env = push.check_env("target", self.tip, self.check_run_dir, self.branch, cfg=self.p.config())
         self._runners([_here(cmd)], env)
         slot = self._slot(head)
         started, cpu0 = time.time(), checkcap.child_cpu_s()

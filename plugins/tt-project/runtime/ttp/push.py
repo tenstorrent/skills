@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, ghroute, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv, scratchhome,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from .budget import DOC_SUFFIXES, task_default_usd
 from .db import continues_id, dependency_ids, load_result
@@ -1229,10 +1229,11 @@ def own_lane_key(repo: Path, remote: str, cfg: dict | None) -> str:
 
 
 check_lock: Path | None = None   # the lock check_env uses when given none: the project's (`ttp push` sets it)
+check_cfg: dict | None = None   # the project config check_env reads checks.scratch_home from when given none
 
 
 def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str = "",
-              lock: Path | None = None) -> dict[str, str]:
+              lock: Path | None = None, cfg: dict | None = None) -> dict[str, str]:
     """The environment push_checks run in. TTP_PUSH_MODE says what they gate: `target` (`ttp push`
     or the push queue, to delivery.push_branch), `own` (`ttp push --own`, the task's own branch) or
     `checks` (`ttp checks`, which pushes nothing). TTP_PUSH_TIP is the tip of the branch pushed to,
@@ -1241,7 +1242,9 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     short, without refs/heads/, so a check can refuse content by where it goes rather than by the
     branch checked out; empty for `ttp checks`. TTP_LEAK_PATTERNS_FILE names the account's local
     leak-pattern file when it has one (leakfile). Every check runs in the pinned Python env built
-    from `lock` (default runnerenv.LOCK), the user site off: runnerenv.Unavailable when it cannot be made."""
+    from `lock` (default runnerenv.LOCK), the user site off: runnerenv.Unavailable when it cannot be made.
+    Every check also gets a throwaway HOME (in a guarded run's scratch, checkdirs.scratch), unless `cfg` (default
+    check_cfg) turns checks.scratch_home off (scratchhome); a refused checks.home_files copies nothing."""
     output = checkdirs.writable(run_dir if run_dir is not None else os.environ.get("TTP_RUN_DIR"))
     env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH" and k not in checkcap.RUN_ONLY_ENV}  # a `ttp checks` run's own state stays out of its checks
     if pp := check_pythonpath(os.environ):
@@ -1249,9 +1252,15 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     env = leakfile.with_path(env)   # the account's leak-pattern file, by path, for a check's temp HOME
     # host-state stand-ins on PATH, after only the pinned env's bin (which holds none of their commands)
     env = hoststate.fake_env(env, Path(output) / "hoststate" if output else None)
-    return runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
-                                                "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}),
-                           lock or check_lock)
+    env = checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
+                               "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)})
+    try:
+        on, files = scratchhome.settings(cfg if cfg is not None else check_cfg)
+    except ValueError:
+        on, files = True, []
+    if on:
+        env = scratchhome.apply(env, checkdirs.scratch(env) or scratchhome.own_folder(), files)
+    return runnerenv.apply(env, lock or check_lock)
 
 
 def short_branch(ref: str) -> str:
@@ -5163,6 +5172,8 @@ def _run(p: Project, repo: Path, own: bool = False, recorded: dict | None = None
     check_limit_s, check_queue_s, pool_wait_s = limit_s, wait_s, pool_s
     global check_lock
     check_lock = runnerenv.lock_of(p.config(), repo)
+    global check_cfg
+    check_cfg = p.config()
     try:   # the checks' pinned Python env, made first (runnerenv): no check runs without it
         if checks:
             print(f"ttp push: {runnerenv.describe(runnerenv.ensure(check_lock))}", file=sys.stderr)
