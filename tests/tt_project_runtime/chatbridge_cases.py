@@ -1601,6 +1601,31 @@ def test_a_routed_tier_whose_model_is_down_runs_the_top_ranked_served_model(env,
     assert p.db.kv(modelrank.SWITCH + "light") is None and "back on " + _RT_MODEL in (p.logs / "daemon.log").read_text()
 
 
+def test_rule_routes_of_one_tier_keep_their_own_model_ranking_switch(env, monkeypatch):
+    """Two models of one tier (its own route and a providers.chat.routes rule) both down: each start
+    keeps its own switch record, so alternating starts raise one low alert per switch, not one each."""
+    from ttp import modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-a"])
+    _route_config(p, model_ranking=["rank-a"], routes=[{"labels_any": ["bulk"], "model": "rule-model-b"}])
+    d._load_config()
+    task = {"id": None, "kind": "work"}
+    for _ in range(3):
+        own = d._route_entry(task, "light", "chat", _RT_MODEL, time.time())
+        by_rule = d._route_entry(task, "light", "chat", "rule-model-b", time.time(), 0)
+        assert own["model"] == by_rule["model"] == "rank-a" and by_rule["rule"] == 0
+        assert by_rule[modelrank.KEY] == {"from": "rule-model-b", "why": "not listed"}
+    assert len(alerts) == 2 and {a[2] for a in alerts} == {"low"}
+    assert p.db.kv(modelrank.SWITCH + "light")["from"] == _RT_MODEL
+    assert p.db.kv(modelrank.SWITCH + "light:rule0")["from"] == "rule-model-b"
+    # The rule's model is served again: only its own record ends.
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a", "rule-model-b"], time.time())
+    assert d._route_entry(task, "light", "chat", "rule-model-b", time.time(), 0)["model"] == "rule-model-b"
+    assert p.db.kv(modelrank.SWITCH + "light:rule0") is None and p.db.kv(modelrank.SWITCH + "light")
+
+
 def test_a_model_left_out_of_the_served_list_is_ranked_and_an_empty_ranking_changes_nothing(env, monkeypatch):
     from ttp import modelrank, route
     from ttp.daemon import Daemon

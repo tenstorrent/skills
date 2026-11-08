@@ -12,7 +12,7 @@ highest-ranked model that check lists and that is not down itself (pick); with n
 as before (model_missing: the core provider). A cool-down (the whole endpoint faulted) swaps nothing.
 A task's own model pin on chat that is down is swapped the same way, unless the pin is required
 (failover.required: only the user's own words mark it): such a task waits, held, until its model is
-served again, and is never swapped. Each switch (per tier, or per pinned model) is one low alert;
+served again, and is never swapped. Each switch (per tier, routes rule or pinned model) is one low alert;
 once the model is served again the next start runs it, and the switch record ends (back).
 
 Only the chat provider has a served list; Claude Code, Codex and Cursor models are not ranked here
@@ -27,7 +27,7 @@ from . import route
 
 TO = route.TO                         # the one provider with a served list
 KEY = "model_rank"                    # the route entry's or run note's {"from", "why"} of a swapped run
-SWITCH = "model_rank_switch:"         # kv per tier or "pin:<model>": {"from", "to", "since"} while swapped
+SWITCH = "model_rank_switch:"         # kv per tier, "<tier>:rule<i>" or "pin:<model>": {"from", "to", "since"} while swapped
 REFUSED = "model_rank_refused:"       # kv per ranked model a swapped run was refused: {"at", "run"}
 
 

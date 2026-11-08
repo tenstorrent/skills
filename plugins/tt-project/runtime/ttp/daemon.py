@@ -10210,8 +10210,9 @@ class Daemon:
         if esc:   # urgent, user-ordered, a fix of a routed change or a lineage's misses: the core provider
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
-        ranked = self._rank_pick(f"tier {tier}", tier, model, now) \
-            if name == modelrank.TO and why in ("", "model_missing") else None
+        where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
+        ranked = self._rank_pick(where, key, model, now) \
+            if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
         if ranked:   # its model is down: the smartest model still served (modelrank.py)
             model, why = ranked[0], ""
         if not why and self._logged_out(name) and not self._may_probe(name, now):
