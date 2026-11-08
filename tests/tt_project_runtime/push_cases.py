@@ -7877,6 +7877,17 @@ def test_batch_inherited_takes_only_the_named_fd(env, tmp_path, monkeypatch):
         os.close(mine)
 
 
+def test_ttp_checks_records_its_wall_and_cpu_seconds(env, tmp_path, monkeypatch, capsys):
+    """User msg #2220 (#2221): each checks run records its wall and CPU seconds (its check commands' CPU
+    included) in checks.json, so `ttp stats` can show CPU-hours per landed change."""
+    from ttp import cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    burn = "python3 -c 'import time; t=time.process_time()\nwhile time.process_time()-t<0.3: pass'"
+    cli.main(["checks", "--fresh", "--", burn])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] and rec["cpu_s"] >= 0.3 and rec["wall_s"] >= rec["cpu_s"] - 0.5, rec
+
+
 def test_ttp_checks_drops_an_extra_command_the_project_checks_already_run(env, tmp_path, monkeypatch, capsys):
     from ttp import cli, push
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -19269,6 +19280,37 @@ def test_a_first_conflict_or_a_capped_rebase_keeps_the_conflict_fix(env, monkeyp
         t = s.p.db.task(s.review)
         assert t["status"] == "queued" and json.loads(t["result"])["conflict_fix"]["n"] == n, t
     assert not s.p.db.q("SELECT id FROM tasks WHERE labels LIKE '%push_rebase:%'")
+
+
+def test_ttp_stats_landing_shows_runs_cpu_hours_and_dollars_per_landed_change(env):
+    """User msg #2220 (#2221): `ttp stats --landing` shows per day test runs and full suites, CPU-hours and $
+    per landed change, and approved to landed median and p90."""
+    import datetime as dt
+    from ttp import timefmt, trainstats
+    p, rid = _pq_rows(env)
+    tz = timefmt.home(p)
+    now = dt.datetime(2026, 11, 8, 12, tzinfo=timefmt.tzinfo(tz)).timestamp()   # noon: one home-zone day
+    for i, mins in enumerate((10, 30)):
+        _pq_batch_row(p, f"b{i}", now, age=3700, outcome="pushed", ended=now - 3600, check_runs=3 - 2 * i,
+                      check_s=1800.0)
+        _pq_row(p, rid, now, status="pushed", batch=f"b{i}", age=3600 + mins * 60)
+    for scope, cpu, cost in ((["c: targeted: 1 case files"], 360.0, 1.5), (["c: full: --full"], 3240.0, 2.5),
+                             (None, None, 1.0)):
+        run = p.db.x("INSERT INTO runs(task, role, started, ended, cost_usd) VALUES(?,?,?,?,?)",
+                     (rid, "worker", now - 1800, now - 1700, cost))
+        if scope is not None:
+            (p.runs / str(run)).mkdir(parents=True, exist_ok=True)
+            (p.runs / str(run) / "checks.json").write_text(json.dumps(
+                {"passed": True, "ts": now - 1700, "purpose": "candidate", "scope": scope, "cpu_s": cpu}))
+    r = trainstats.report(p.db, p.runs, tz, days=1, now=now)
+    (d,) = r["days"]
+    assert (d["day"], d["landed"], d["checks_runs"], d["full_runs"], d["trains"], d["train_check_runs"]) == (
+        timefmt.today(now, tz), 2, 2, 1, 2, 4), d
+    assert d["runs_per_landed"] == 3.0 and d["full_per_landed"] == 1.5 and d["cpu_h_per_landed"] == 0.5, d
+    assert d["usd_per_landed"] == 2.5 and d["landing_median_h"] == 0.3 and d["landing_p90_h"] == 0.5, d
+    out = trainstats.text(r, p.name)
+    assert "2 landed" in out and "$2.5/landed" in out and "0.5 CPU-h/landed" in out, out
+    p.db.x("DELETE FROM push_queue")
 
 
 def test_the_daily_audit_shows_approval_to_landed_median_and_p90(env):

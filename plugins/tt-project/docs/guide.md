@@ -2428,13 +2428,18 @@ session and stateless coordinators on every provider.
   A targeted pass counts only for that narrowed run: it never counts as the full check's pass and
   sets no verified-through marker. `ttp push` and the push queue never narrow: every batch runs the
   full required checks. `delivery.checks_targeted: false` (or `ttp checks --full`) restores full
-  runs. With the push queue on, the batch's full run on the merged tree (bisected to the changes at
-  fault when it fails) is the full-suite gate, so a task's own checks run in full only where the
-  whole suite is affected (a conftest, a shared test helper or fixture, the checks runner's own
-  files, a manifest, `__init__.py` or config file, a test file's module-level code); a selection of
-  half the suite or more stays targeted. A change only the full suite covers (a module's module-level code, the checks functions in
-  a module, something no test names) adds the tests it can place, and the scope line ends `; the push
-  batch runs the rest: <reasons>`. Checks already waiting for a slot re-execute on the new runtime
+  runs. With the push queue on, the push train's full run on the merged tree (bisected to the changes
+  at fault when it fails) is the only full suite, so a task's or review's own checks never run in
+  full: a change that would widen to the whole suite (a conftest, a shared test helper or fixture,
+  the checks runner's own files, a manifest, `__init__.py` or config file, a test file's module-level
+  code) runs only the units importing or naming the changed file, plus those naming a function or
+  fixture it changes, and a selection of half the suite or more stays targeted. A task's
+  `ttp checks --full` is refused with a one-line reason unless the user set
+  `delivery.checks_task_full: true`. A change only the full suite covers adds the tests it can place,
+  and the scope line ends `; the push batch runs the rest: <reasons>`. With the push queue off a
+  task's checks narrow and widen as before. Each checks run records its wall and CPU seconds
+  (`wall_s`, `cpu_s`) in `checks.json`; `ttp stats <name> --landing` shows per day the test runs and
+  full suites, CPU-hours and $ per landed change, and approved to landed (median and p90). Checks already waiting for a slot re-execute on the new runtime
   and pick their scope again.
 - `ttp checks -- <cmd>` adds a check. Several words run as that argv (`ttp checks -- pytest -q`);
   one quoted string runs through the shell (`ttp checks -- 'FOO=1 pytest -q && ruff check .'`);
@@ -2520,15 +2525,15 @@ session and stateless coordinators on every provider.
   pass on. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
   oldest approval waited this long; 0 = at once), `push_batch_max`
-  (default 8: start at once with this many; also the most one batch takes, except that after a
-  clean batch a bigger backlog grows the batch up to three times this), `push_min_gap_s`
+  (default 8: start at once with this many; it caps nothing: one train takes every approval due), `push_min_gap_s`
   (default 1800: after a batch that did not end clean, such as a failing tip or a dead batch, the
   next starts only once it ended at least this long ago, measured
   from its recorded end so a restart never stretches the wait; none after a clean batch, though a
   new batch never starts while the last one's after_push still runs; a full batch, a
   priority 1-2 review's approval, or one the last batch requeued unchecked after a failing change
-  starts at once; 0 = off). Approvals that waited while the last clean batch ran start the next one
-  at once, and priority 1-2 approvals always lead it. Within a priority, an approval an earlier batch
+  starts at once; 0 = off). Approvals that waited while the last batch ran start the next one as
+  it ends, clean or not, and priority 1-2 approvals always lead it; when such fast approvals start a
+  train before the window, every other approval due rides in it. Within a priority, an approval an earlier batch
   sent back as a conflict leads, so a peer ahead of it cannot send it back a second time: an older
   routine approval sharing its files is not independent of it, and a solo-path batch takes it first. `push_solo_paths` (default `[]`, off:
   git pathspecs a batch takes at most one routine approved change touching; the oldest such change
@@ -2934,7 +2939,7 @@ is open raises one `cap_wait` event naming the key.
 | `coordinator.review_stall_s` | 1800 s (old: 14400) | a dependency in review before the coordinator hears of it | convenience |
 | `checks.test_project_max` | from cores and memory, at least 2 (`auto`) | a project's suites at once | convenience |
 | `delivery.push_batch_s` | 300 s, none after a clean batch | changes gathered into one push | convenience |
-| `delivery.push_batch_max` | 8 | most changes in one push batch (a full batch starts at once; a backlog after a clean batch grows it up to 3x) | convenience |
+| `delivery.push_batch_max` | 8 | approvals that start a push train at once; one train takes every approval due, so it caps nothing | convenience |
 | `coordinator.burst_window_s` | 120 s (0: off) | high events after a turn high events woke, until one follow-up turn reads them all; never user messages, critical or safety-class events | convenience |
 | `retry_when` / `start_when` probe (`waiting.poll_s`) | 90 s (20-180 s); only a `start_when` probe of an arbitrary command that keeps saying not-yet backs off, to at most 600 s (`MAX_EVERY_S`) with the wait's length; landing (`landed:#`, ttp landed), job (detach --check), checks --result, push --result, lock --probe, CI, ack-wait, upstream --fixed and date (`test "$(date ...`) probes, and every `retry_when` probe, keep `waiting.poll_s`; a pass wakes the task at once whatever its timer | a waiting or deferred task before its probe runs again | convenience |
 | auth re-probe (`AUTH_PROBE_S`) | 900 s | work for a logged-out provider with no login check, before one run checks it | safety (spend) |

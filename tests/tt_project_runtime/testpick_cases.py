@@ -232,11 +232,11 @@ def test_a_push_queue_project_keeps_a_selection_of_most_of_the_suite_targeted(tm
     assert todo[0].targeted and lines == [f"{_PICK_CMD}: targeted: 1 case files, 1 tests in 1 test files"], lines
     todo, lines = testpick.narrow(repo, base, head, list(own), own, None)
     assert todo == list(own) and lines == [f"{_PICK_CMD}: full: the diff reaches 76% of the tests"], lines
-    # a conftest still runs the whole check with the push queue on
+    # a conftest with the push queue on runs only what it reaches and leaves the rest to the push train (#2220)
     head = _pick_change(repo, base, {"tests/r/other_cases.py": "def test_other_0():\n    pass\n",
                                      "tests/conftest.py": "X = 1\n"})
     todo, lines = testpick.narrow(repo, base, head, list(own), own, _PICK_QUEUE)
-    assert todo == list(own) and "conftest.py" in lines[0], lines
+    assert todo[0].targeted and "the push batch runs the rest: tests/conftest.py changed" in lines[0], lines
 
 
 def test_a_changed_case_file_helper_also_runs_the_case_files_and_tests_calling_it(tmp_path):

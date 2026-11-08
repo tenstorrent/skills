@@ -1927,6 +1927,11 @@ def cmd_stats(a) -> None:
         s["winner"] = effortab.winner(p.config())
         print(json.dumps(s, indent=1) if a.json else effortab.report_text(s))
         return
+    if a.landing:
+        from . import trainstats
+        s = trainstats.report(p.db, p.runs, timefmt.home(p), a.days)
+        print(json.dumps(s, indent=1) if a.json else trainstats.text(s, p.name))
+        return
     if a.coord_session:
         from . import coordstats
         s = coordstats.report(p.db, p.runs, timefmt.home(p), a.days)
@@ -3372,6 +3377,15 @@ def _prestage_skip(a, p: Project | None, top: str, head: str, tree: str, cmds: l
     return ""
 
 
+def _spent(t0) -> dict:
+    """Wall and CPU seconds since `t0` ((monotonic, os.times())): this process plus the check
+    commands it waited for, so `ttp stats` sums CPU-hours per landed change."""
+    w0, c0 = t0
+    c1 = os.times()
+    cpu = sum(getattr(c1, k) - getattr(c0, k) for k in ("user", "system", "children_user", "children_system"))
+    return {"wall_s": round(time.monotonic() - w0, 1), "cpu_s": round(max(cpu, 0.0), 1)}
+
+
 def cmd_checks(a) -> None:
     """(inside a run) Run the local checks on this worktree's commit and record the result in the
     run's directory: the harness's gh opens a PR (even a draft) only after they passed on HEAD. The
@@ -3415,6 +3429,7 @@ def cmd_checks(a) -> None:
     from . import addedtests, checkcap, checkdirs, checkprestage, cleantree, prguard, push, pushpass, slowtests
     from . import gatejudge
     from . import shorttmp
+    spent0 = (time.monotonic(), os.times())   # wall_s, cpu_s in checks.json (ttp stats' CPU-hours per landing)
     if getattr(a, "gap", None):
         from . import checkgaps
         p = here()
@@ -4395,7 +4410,8 @@ def cmd_checks(a) -> None:
                                                      **({"authoring_tree": in_authoring} if in_authoring else {}),
                                                      **({"added_tests": rerun} if rerun else {}),
                                                      **({"excused": excused, "landing_only": True} if excused else {}),
-                                                     **({"release": True} if getattr(a, "release", False) else {})})
+                                                     **({"release": True} if getattr(a, "release", False) else {}),
+                                                     **_spent(spent0)})
     if join_rec:   # the outcome the runs that joined this one report (checkjoin)
         from . import checkjoin, trim
         checkjoin.finish(join_rec, passed=passed, head=head, rc=0 if passed else 1, failed=str(failed or ""),
@@ -12905,6 +12921,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--coord-session", action="store_true",
                    help="the persistent coordinator session instead, per day: wakes, $/wake, context growth and tool "
                         "calls per wake, rollovers, cache-read share, against the stateless baseline and break-even")
+    s.add_argument("--landing", action="store_true",
+                   help="per landed change instead, per day: test runs and full suites, CPU-hours, $, and "
+                        "approved to landed (median, p90)")
     s.add_argument("--runs", action="store_true",
                    help="worker runs instead: provider, model, tier, outcome (with any route fallback), wall time, cost")
     s.add_argument("--tier", help="with --runs: only this tier's runs (implies --runs)")
