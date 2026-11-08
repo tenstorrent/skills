@@ -1048,3 +1048,34 @@ def test_ttp_checks_blocks_a_nested_pytest_test_new_on_the_head(env, tmp_path, m
     out = capsys.readouterr().out
     assert "new on this head" in out and "pre-existing" not in out, out
     assert not json.loads((run / "checks.json").read_text())["passed"]
+
+
+def test_gate_judge_same_failure_ignores_commit_shas_and_pytest_temp_roots(tmp_path):
+    """#7561: one failure on head and base (run 15183) differed only by the pytest temp root (a parallel
+    head run's worker folder `w1`, the base rerun's none) and the short commit sha a push refusal named,
+    so the gate called it 'failed another way' and blocked. Now both are the same; a new failure still blocks."""
+    from ttp import gatejudge
+    a = "tests/test_a.py::test_leak"
+    cmd = ("subprocess.CalledProcessError: Command '['git', '-C', '{root}/test_leak0/leak-repo', 'push']' "
+           "returned non-zero exit status 1.")
+    head = cmd.format(root="/dev/shm/ttp-1/4f2a/pytest-of-u/pytest-0/w1")
+    for root in ("/dev/shm/ttp-1/4f2a/pytest-of-u/pytest-25", "/tmp/pytest-of-u/pytest-3/popen-gw2",
+                 "/tmp/pytest-of-u/pytest-current/gw0"):
+        v = gatejudge.judge([a], lambda at, ids: _fails({a: (head if at == "head" else cmd.format(root=root), "t.py:3")}),
+                            tmp_path / root.replace("/", "_"), "b1", "host-a", 1000.0)
+        assert v["pre_existing"] == [a] and not gatejudge.blocks(v), (root, v)
+    for x, y in (("commit 3eedf5a", "commit 65cdc06"), ("commit 1234567", "commit 7654321"),
+                 ("sha deadbeefcafe", "sha 0123456789ab"), ("tip " + "a" * 40, "tip " + "1" * 40)):
+        m = gatejudge.marks(_fails({a: (f"push refused: {x} holds a token", "t.py:3")})[1], [a])[a]
+        m2 = gatejudge.marks(_fails({a: (f"push refused: {y} holds a token", "t.py:3")})[1], [a])[a]
+        assert gatejudge.same_failure(m, m2), (m, m2)
+    # A real new failure still blocks: another exit status, another file in the temp folder, another word.
+    for other in (head.replace("status 1", "status 128"), head.replace("leak-repo", "clean-repo"),
+                  head.replace("push", "fetch")):
+        v = gatejudge.judge([a], lambda at, ids: _fails({a: (head if at == "head" else other, "t.py:3")}),
+                            tmp_path / str(hash(other)), "b1", "host-a", 1000.0)
+        assert v["other_failure"] == [a] and gatejudge.blocks(v), (other, v)
+    # Plain numbers and words stay: an assert's count is not a sha.
+    assert gatejudge._mark_norm("assert 1234567 == 7654321") == "assert 1234567 == 7654321"
+    assert gatejudge._mark_norm("effaced decade") == "effaced decade"
+    assert gatejudge._mark_norm("stopped at 1000000 bytes") != gatejudge._mark_norm("stopped at 2000000 bytes")
