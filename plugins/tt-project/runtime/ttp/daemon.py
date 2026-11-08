@@ -3840,7 +3840,7 @@ class Daemon:
         prompt = prompt.replace(RUN_DIR_MARK, str(run_dir))
         if prefix_now is not None:   # acknowledged once the wake ends ok (coordsession.ack_prefix)
             run_dir.mkdir(parents=True, exist_ok=True)
-            (run_dir / coordsession.PREFIX_FILE).write_text(json.dumps(prefix_now))
+            durable_write(run_dir / coordsession.PREFIX_FILE, json.dumps(prefix_now))
         # Raising from here on means nothing was launched: the run row must not stay "running".
         tmp_env: dict = {}
         try:

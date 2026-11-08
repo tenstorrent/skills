@@ -83,9 +83,7 @@ from __future__ import annotations
 import difflib
 import hashlib
 import json
-import os
 import re
-import shutil
 import time
 from pathlib import Path
 
@@ -270,11 +268,8 @@ def ack_prefix(p, run_dir) -> None:
     src = Path(run_dir) / PREFIX_FILE
     if not src.is_file():
         return
-    dst = p.state / NOTE_DIR / PREFIX_FILE
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.with_name(f"{dst.name}.{os.getpid()}.tmp")
-    shutil.copyfile(src, tmp)
-    os.replace(tmp, dst)
+    from .project import durable_write
+    durable_write(p.state / NOTE_DIR / PREFIX_FILE, src.read_bytes())
 
 
 def changed_block(before: dict, now: dict, version: str, with_system: bool, last_key: str = "") -> str:
