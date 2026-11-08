@@ -608,11 +608,20 @@ class Codex(Provider):
             except ValueError:
                 pass
         parent_of: dict[str, tuple[str, Path]] = {}
+        heads = self.__dict__.setdefault("_rollout_heads", {})   # a rollout's first line never changes
         for day in days:
             for f in day.glob("rollout-*.jsonl"):
+                if str(f) in heads:
+                    if heads[str(f)]:
+                        parent_of[heads[str(f)][0]] = (heads[str(f)][1], f)
+                    continue
+                heads[str(f)] = None
                 try:
                     with open(f, "rb") as fh:
                         head = fh.readline()
+                    if not head.endswith(b"\n"):
+                        del heads[str(f)]   # still being written: read it next time
+                        continue
                     if b"parent_thread_id" not in head:
                         continue
                     meta = json.loads(head).get("payload") or {}
@@ -620,6 +629,7 @@ class Codex(Provider):
                                                           .get("thread_spawn") or {}).get("parent_thread_id")
                     if up and meta.get("id"):
                         parent_of[str(meta["id"])] = (str(up), f)
+                        heads[str(f)] = (str(meta["id"]), str(up))
                 except (OSError, ValueError, AttributeError):
                     continue
         mine, grew = {sid}, bool(sid)

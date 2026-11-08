@@ -587,6 +587,13 @@ def test_codex_sub_agents_count_in_the_run_cost(monkeypatch, tmp_path):
                  stamp=["2026-11-08T09:00:00.000Z", "2026-11-08T11:00:00.000Z"])
     since = datetime.datetime(2026, 11, 8, 10, tzinfo=datetime.timezone.utc).timestamp()
     assert codex._subagent_tokens(out, since) == (5000 + 1000, 0, 2 + 10)   # the grandchild ran after
+    # A sub-agent whose first line is still being written is read once it is whole.
+    late = str(uuid.uuid4())
+    part = home / "sessions" / "2026" / "11" / "08" / f"rollout-2026-11-08T10-00-00-{late}.jsonl"
+    part.write_text('{"type": "session_meta", "payload": {"id": "' + late + '", "parent_thread_id": "' + root)
+    assert codex._subagent_tokens(out) == (16112 + 5000, 12032, 17 + 2)
+    _sub_rollout(home, "08", late, root, [(7, 0, 1)])
+    assert codex._subagent_tokens(out) == (16112 + 5000 + 7, 12032, 17 + 2 + 1)
     # No thread, no rollouts, or a layout that moved: nothing added, never an error.
     bare = RunUsage()
     (tmp_path / "none.jsonl").write_text("")
