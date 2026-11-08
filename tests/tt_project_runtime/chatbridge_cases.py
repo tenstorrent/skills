@@ -803,8 +803,12 @@ def _route_dispatch(p, d, monkeypatch, **task):
 def test_tier_routing_unset_changes_nothing(env, monkeypatch):
     from ttp import route, web
     from ttp.daemon import Daemon
+    from ttp import configwho
     p = make(env)
     _route_config(p, route=None)
+    # Run-class routing (runclass.py) sends a light run to a configured chat model by default; with
+    # the light class kept on core, an unset tier route changes nothing.
+    p.set_config("route.classes", {"light": "core"}, by=configwho.by("user", via="cli"))
     d = Daemon(p.base)
     prov, tier, note = _route_dispatch(p, d, monkeypatch)
     assert (prov, tier) == (d.cfg.get("core_provider", "claude"), "light") and route.KEY not in note
