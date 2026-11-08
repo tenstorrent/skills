@@ -282,7 +282,7 @@ def main(argv: list[str] | None = None) -> int:
         else:
             b = reveal(Path(a.dir))
             print(json.dumps({"seed": b["seed"], "arms": b["arms"]}))
-    except Refused as e:
+    except (Refused, OSError, ValueError, KeyError) as e:   # a missing folder or a malformed file too
         print(f"benchblind: {e}", file=sys.stderr)
         return 2
     return 0

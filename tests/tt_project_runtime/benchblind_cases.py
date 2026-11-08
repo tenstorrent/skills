@@ -212,3 +212,7 @@ def test_bench_blind_scores_a_head_to_head_run_folder_blind_end_to_end(env, tmp_
     assert shown["seed"] == 3 and set(shown["arms"]) == set(arms)
     b = json.loads((blind / "batch.json").read_text())
     assert b["phase"] == "revealed" and set(b["labels"].values()) == set(arms)
+    for argv in (["prep", str(tmp_path / "none"), "--out", str(tmp_path / "b2")], ["reveal", str(tmp_path / "none")]):
+        with pytest.raises(SystemExit) as e:   # a missing folder is an error line, not a traceback
+            cli.main(["bench", "blind", *argv])
+        assert e.value.code == 2 and "benchblind: " in capsys.readouterr().err
