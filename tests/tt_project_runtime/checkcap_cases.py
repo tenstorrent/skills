@@ -11157,7 +11157,14 @@ def test_checks_park_callers_the_coordinator_and_an_ordered_urgent_worker_only(e
     order = "Do it.\n\nOwner's order (user msg #1972): park routine checks runs with `ttp checks park`."
     cases = [(3, order, "not urgent or priority 1"), (1, "plain spec, nothing about the queue", "gives no order"),
              (1, "park them\n\nper user msg #5", "gives no order"), (1, order, ""),
-             (0, "Cancel the queued runs, as the coordinator ordered.", "")]
+             (0, "Cancel the queued runs, as the coordinator ordered.", ""),
+             # Daemon notes about tasks name the coordinator and park/cancel variants: no order to the queue.
+             (1, "Coordinator note: the coordinator is cancelling #6862.", "gives no order"),
+             (1, "Coordinator note: #6862 was cancelled and its checks run parked (user msg #12).", "gives no order"),
+             (1, "Cancel #6862, as the coordinator ordered.", "gives no order"),
+             (1, "Park the car.\n\nThe coordinator says checks runs are slow.", "gives no order"),
+             (1, "Park the checks runs if they block you.", "gives no order"),
+             (1, "Per user msg #7: run `ttp checks cancel 123 --reason r`.", "")]
     for prio, spec, want in cases:
         tid = p.db.add_task("t", spec, kind="code", priority=prio)
         rid = p.db.x("INSERT INTO runs(task,role,status,started) VALUES(?,'worker','running',?)",
@@ -11203,6 +11210,34 @@ def test_checks_park_task_parks_its_waiting_runs_and_the_queue_lists_them(env, m
     assert checksqueue.main(p, ["resume", "--task", str(tid)]) == 1, "nothing parked any more"
     assert checksqueue.main(p, ["park", "--task", str(tid)]) == 2, "--reason is required"
     assert checksqueue.main(p, ["cancel", "--task", str(tid), "--reason", "r", "--until", "true"]) == 2
+
+
+def test_checks_queue_orders_and_ages_rows_by_first_arrival_not_the_latest_wait(env, capsys):
+    import subprocess
+    from ttp import checkcap, checksqueue, cli
+    from ttp.project import write_json
+    p = make(env)
+    now = time.time()
+    # Detached: checks.pid's arrived is an hour ago, though a re-wait reset the wait's since a minute ago.
+    _, old = _queue_run(p, p.db.add_task("old", "s", kind="code"))
+    write_json(old / cli.CHECKS_PID, {**json.loads((old / cli.CHECKS_PID).read_text()), "arrived": now - 3600})
+    write_json(old / cli.CHECKS_SLOT_WAIT, {"pid": os.getpid(), "since": now - 60, "head": "abc"})
+    # Neither: its wait's since, 2 minutes ago.
+    _, new = _queue_run(p, p.db.add_task("new", "s", kind="code"))
+    write_json(new / cli.CHECKS_SLOT_WAIT, {"pid": os.getpid(), "since": now - 120, "head": "abc"})
+    # Foreground (no checks.pid): the arrival it was handed in its environment, 30 minutes ago.
+    fgp = subprocess.Popen(["sleep", "60"], env={**os.environ, checkcap.ARRIVED_ENV: repr(now - 1800)})
+    try:
+        _, fg = _queue_run(p, p.db.add_task("fg", "s", kind="code"), own=False, wait=False)
+        write_json(fg / cli.CHECKS_SLOT_WAIT, {"pid": fgp.pid, "since": now - 10, "head": "abc"})
+        rows = checksqueue.queued(p)
+        assert [r["run"] for r in rows] == [old.name, fg.name, new.name], rows
+        assert [round(now - r["since"]) for r in rows] == [3600, 1800, 120], rows
+        assert checksqueue.main(p, ["queue"]) == 0
+        assert re.search(r"waiting 36\d\ds", capsys.readouterr().out.splitlines()[0])
+    finally:
+        fgp.kill()
+        fgp.wait()
 
 
 def test_a_precheck_stops_counting_as_read_once_its_review_is_pushing_and_may_then_be_stopped(env, monkeypatch):
