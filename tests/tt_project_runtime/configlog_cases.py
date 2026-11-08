@@ -4,12 +4,12 @@
 # Exec'd into test_tt_project_runtime.py: make and its imports are in scope.
 
 
-def _clear_run_env(monkeypatch):
+def _config_clear_run_env(monkeypatch):
     for k in ("TTP_RUN_ID", "TTP_RUN_DIR", "TTP_TASK_ID", "TTP_TASK"):
         monkeypatch.delenv(k, raising=False)
 
 
-def _events(p, kind):
+def _config_events(p, kind):
     return p.db.q("SELECT * FROM events WHERE kind=? ORDER BY ts", (kind,))
 
 
@@ -18,7 +18,7 @@ def test_config_log_records_each_setter_class_with_old_new_and_undo(env, monkeyp
     migration each leave their role in the key's record and one log line with old, new and undo."""
     from ttp import cli, configwho, coordinator as coord
     p = make(env)
-    _clear_run_env(monkeypatch)
+    _config_clear_run_env(monkeypatch)
     cli.main(["config", "demo", "budget.max_parallel_workers", "6"])
     assert coord.apply(p, [{"type": "config_set", "key": "coordinator.provider_failover_to", "value": ["codex"]}]) == []
     monkeypatch.setattr(configwho, "from_env", lambda: configwho.by("worker", task=7, run="41", via="cli"))
@@ -50,7 +50,7 @@ def test_upgrade_migration_and_worker_never_overwrite_a_user_or_coordinator_valu
     still change it; an automated setter writing the same value changes nothing, not even the record."""
     from ttp import cli, configwho
     p = make(env)
-    _clear_run_env(monkeypatch)
+    _config_clear_run_env(monkeypatch)
     cli.main(["config", "demo", "coordinator.cache_ttl", '""'])   # the user's "" (cli: JSON "" is the string)
     p.set_config("device.max_tasks", 2, by=configwho.by("coordinator", via="config_set"))
     assert cli._auto_cache_ttl(p) == "" and p.raw_config()["coordinator"]["cache_ttl"] == ""
@@ -61,12 +61,12 @@ def test_upgrade_migration_and_worker_never_overwrite_a_user_or_coordinator_valu
         p.unset_config("device.max_tasks", by=configwho.by("migration"))
     with pytest.raises(configwho.Protected):   # a section write reaching a protected key under it
         p.set_config("device", {"max_tasks": 3}, by=configwho.by("harness"))
-    events = _events(p, "config_overwrite_refused")
+    events = _config_events(p, "config_overwrite_refused")
     assert [e["fingerprint"] for e in events] == ["config_overwrite_refused:coordinator.cache_ttl:upgrade",
                                                    "config_overwrite_refused:device.max_tasks:migration",
                                                    "config_overwrite_refused:device:harness"]
     assert all(e["status"] == "queued" for e in events) and "config_set" in events[0]["text"]
-    assert cli._auto_cache_ttl(p) == "" and len(_events(p, "config_overwrite_refused")) == 3, "a retry: no second"
+    assert cli._auto_cache_ttl(p) == "" and len(_config_events(p, "config_overwrite_refused")) == 3, "a retry: no second"
     refused = [r for r in configwho.history(p) if r.get("refused")]
     assert len(refused) == 3 and refused[0]["by"] == "upgrade" and refused[0]["new"] == "auto"
     # A worker's `ttp config` over the coordinator's value is refused, and told who makes it.
@@ -83,7 +83,7 @@ def test_upgrade_migration_and_worker_never_overwrite_a_user_or_coordinator_valu
     monkeypatch.setattr(configwho, "from_env", lambda: configwho.by("user", via="cli"))
     cli.main(["config", "demo", "coordinator.cache_ttl", "auto"])
     assert p.raw_config()["coordinator"]["cache_ttl"] == "auto"
-    assert _events(p, "config_overwrite_refused")[-1]["fingerprint"] == "config_overwrite_refused:device.max_tasks:worker"
+    assert _config_events(p, "config_overwrite_refused")[-1]["fingerprint"] == "config_overwrite_refused:device.max_tasks:worker"
     # A value set by hand or before setters were recorded (unknown) is not protected.
     p.set_config("heal.escalate", "coordinator")
     p.set_config("heal.escalate", "user", by=configwho.by("harness"))
@@ -96,7 +96,7 @@ def test_config_value_with_spaces_and_equals_round_trips_through_set_log_and_und
     import shlex
     from ttp import cli, configwho
     p = make(env)
-    _clear_run_env(monkeypatch)
+    _config_clear_run_env(monkeypatch)
     first = 'env PATH=/opt/example/venv/bin:$PATH A="x y" /opt/example/wrap.sh --flag=1'
     cli.main(["config", "demo", "checks.spill_wrap_cmd", first])
     assert p.raw_config()["checks"]["spill_wrap_cmd"] == first
@@ -127,7 +127,7 @@ def test_config_breakage_watch_raises_one_event_naming_the_change_and_its_undo(e
     from ttp import checkwall, configwho
     from ttp.project import durable_append
     p = make(env)
-    _clear_run_env(monkeypatch)
+    _config_clear_run_env(monkeypatch)
     p.set_config("checks.spill_wrap_cmd", "env A=1 /opt/example/wrap.sh")   # by hand: unknown, not protected
     p.set_config("checks.spill_wrap_cmd", "/opt/example/wrap.sh", by=configwho.by("worker", task=5, via="cli"))
     rows = configwho.history(p, "checks.spill_wrap_cmd")
@@ -151,14 +151,14 @@ def test_config_breakage_watch_raises_one_event_naming_the_change_and_its_undo(e
          (change + 120, False, "spill-a", "5"), (change + 150, True, "", "6"))
     fps = configwho.watch(p, now=change + 300)
     assert fps == [f"config_breakage:checks.spill_wrap_cmd:{change}"]
-    ev = _events(p, "config_breakage")
+    ev = _config_events(p, "config_breakage")
     assert len(ev) == 1 and ev[0]["status"] == "queued"
     text = ev[0]["text"]
     for part in ("checks.spill_wrap_cmd", '"env A=1 /opt/example/wrap.sh" -> "/opt/example/wrap.sh"',
                  "worker (task #5)", "spill-a, spill-b",
                  "undo: ttp config demo checks.spill_wrap_cmd 'env A=1 /opt/example/wrap.sh'"):
         assert part in text, (part, text)
-    assert configwho.watch(p, now=change + 300) == [] and len(_events(p, "config_breakage")) == 1, "raised once per change"
+    assert configwho.watch(p, now=change + 300) == [] and len(_config_events(p, "config_breakage")) == 1, "raised once per change"
     assert configwho.watch(p, now=change + configwho.WATCH_S + 1) == [], "an old change is not watched"
 
 
