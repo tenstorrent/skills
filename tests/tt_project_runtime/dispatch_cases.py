@@ -2173,3 +2173,52 @@ def test_a_continue_or_push_rework_requeue_restarts_the_done_count(env):
     assert dispatchguard.refusal(p.db, p.db.task(tid))
     dispatchguard.record_requeue(p.db, tid, "done", "continue")
     assert dispatchguard.done_closes(p.db, tid) == 0 and dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def test_a_done_task_with_a_start_when_probe_past_its_attempt_limit_is_not_redispatched(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Regression (upstream fp ad88895e4aa49dda): a plan closed done (once by its last run, other closes
+    leaving no task_done event) kept a start_when probe from an old machine hold and was queued again
+    without a requeue, attempt 9 of 3. Its probe passing only makes it ready: dispatch refuses it, puts it
+    back to done and says why; an explicit requeue runs it again."""
+    from ttp.db import deferral
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        held = _closed_done(p, "a plan held on a machine probe", 1)
+        now = time.time()
+        p.db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(?,?,?,?,?)",
+               (held, "worker", now - 60, now - 1, "ok"))
+        p.db.update_task(held, attempts=9, labels=["start_when:true", f"deferred_since:{now:.0f}"])
+        fresh = _closed_done(p, "a plan done once, under its limit", 1)   # a rework re-queue still runs
+        d._start_verdict(p.db.task(held), 0, time.time())   # its start_when passed
+        assert not deferral(p.db.task(held))
+        d.dispatch()
+        assert _slot_tasks(p) == [fresh], "a done task past its attempt limit started again on its probe"
+        t = p.db.task(held)
+        assert (t["status"], t["attempts"]) == ("done", 9)
+        ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (held,))
+        assert ev and "attempts 9 of 3" in ev["text"]
+        settle(d)
+        assert p.db.requeue(held) == ""   # the user's decision: it runs again
+        d.dispatch()
+        assert held in _slot_tasks(p), "an explicit requeue did not run the task again"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_run_that_queued_its_task_again_itself_is_not_refused_past_its_attempt_limit(env):
+    """The attempts branch needs a done end: a last run whose end queued the task again with no task_done
+    event after it (a push rework, a busy resource), or a done close followed by an explicit requeue, is
+    left to run."""
+    from ttp import dispatchguard
+    p = make(env)
+    tid = _closed_done(p, "a review re-run by the push queue", 1)
+    p.db.update_task(tid, attempts=5)
+    now = time.time()
+    p.db.x("INSERT INTO runs(task,role,started,ended,status) VALUES(?,?,?,?,?)", (tid, "worker", now, now + 600, "ok"))
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == "", "a later run's own requeue was refused"
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (now - 600, tid))
+    assert "attempts 5 of 3" in dispatchguard.refusal(p.db, p.db.task(tid))
+    dispatchguard.record_requeue(p.db, tid, "done", "requeue")
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""

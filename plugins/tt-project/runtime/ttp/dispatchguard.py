@@ -9,7 +9,10 @@ over-limit task back to its last hand-off status and records why, model-free.
 
 Every explicit requeue records a `task_requeued` event (`ttp task requeue`, the web app, the coordinator's
 status queued on an ended task, a chain continue, the push queue's review re-runs, the daemon's lost-run
-requeues): the done hand-offs before it no longer count."""
+requeues): the done hand-offs before it no longer count. A task past its attempt limit whose last hand-off
+was done (its last run ended in a task_done event) is refused too
+unless an explicit requeue came after that hand-off, start_when probe or not: a deferral that passes
+only makes it ready, never a reason to run it again."""
 from __future__ import annotations
 
 import time
@@ -18,6 +21,7 @@ from .db import load_result
 
 REQUEUED = "task_requeued"   # event kind of an explicit requeue: the done count starts again after it
 REFUSED = "dispatch_refused"
+DONE_EVENT_SLACK_S = 60   # a run's end and its task_done event are written apart, within this
 
 
 def done_closes(db, task_id: int) -> int:
@@ -28,6 +32,19 @@ def done_closes(db, task_id: int) -> int:
     return int((row or {}).get("n") or 0)
 
 
+def ended_done_unrequeued(db, task_id: int) -> bool:
+    """Whether the task's last run ended in a done hand-off (its task_done event at or after that run's
+    end) and no explicit requeue came after it. A run whose end queued the task again for its own
+    reasons (a push rework, a busy resource) writes no task_done event and is not this."""
+    ev = db.one("SELECT MAX(ts) AS ts FROM events WHERE task=? AND kind='task_done'", (task_id,))
+    run = db.one("SELECT MAX(ended) AS ts FROM runs WHERE task=?", (task_id,))
+    done_ts, run_ts = float((ev or {}).get("ts") or 0), float((run or {}).get("ts") or 0)
+    if not done_ts or done_ts < run_ts - DONE_EVENT_SLACK_S:
+        return False
+    return not db.one("SELECT 1 FROM events WHERE task=? AND kind=? AND ts>=?",
+                      (task_id, REQUEUED, max(done_ts, run_ts)))
+
+
 def refusal(db, task: dict) -> str:
     """Why `task` must not start now ('' when it may), from a fresh read of its row."""
     t = db.task(task["id"])
@@ -36,9 +53,13 @@ def refusal(db, task: dict) -> str:
     if t["status"] != "queued":
         return f"it is {t['status']} now (picked while queued)"
     limit = int(t.get("max_attempts") or 3)
-    if load_result(t.get("result")).get("status") == "done" and (n := done_closes(db, t["id"])) >= limit:
+    done = load_result(t.get("result")).get("status") == "done"
+    if done and (n := done_closes(db, t["id"])) >= limit:
         return (f"it was already closed done {n} times (attempt limit {limit}) and was queued again "
                 f"without an explicit requeue; attempts {int(t.get('attempts') or 0)} of {limit}")
+    if done and (n := int(t.get("attempts") or 0)) > limit and ended_done_unrequeued(db, t["id"]):
+        return (f"its last hand-off was done and it is past its attempt limit (attempts {n} of {limit}), "
+                f"queued again without an explicit requeue")
     return ""
 
 
