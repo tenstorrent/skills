@@ -101,8 +101,9 @@ def stopped_early(output: str) -> bool:
     return bool(_STOPPED.search(output or ""))
 
 
-_HEADER = re.compile(r"^_{3,} (?:ERROR at (?:setup|teardown) of )?(\S.*?) _{3,}$", re.M)
-_BLOCK_END = re.compile(r"^(?:_{3,} \S.*? _{3,}|={3,}.*)$", re.M)
+# pytest pads a long test's header with one '_' a side; '_ _ _ _' (a traceback's frame separator) is none.
+_HEADER = re.compile(r"^_+ (?:ERROR at (?:setup|teardown) of )?([^\s_].*?) _+$", re.M)
+_BLOCK_END = re.compile(r"^(?:_+ [^\s_].*? _+|={3,}.*)$", re.M)
 _SUMMARY_MSG = re.compile(r"^(?:FAILED|ERROR) (\S+::[^\s\[]*(?:\[.*?\])?) - (.*)$", re.M)
 
 

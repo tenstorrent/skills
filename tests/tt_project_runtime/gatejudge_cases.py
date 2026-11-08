@@ -962,6 +962,42 @@ def test_gate_judge_calls_a_failure_pre_existing_only_when_base_and_head_fail_th
         assert v["new"] == [a] and v["pre_existing"] == [] and gatejudge.blocks(v)
 
 
+
+def test_gate_judge_same_failure_ignores_a_venv_path_and_reads_long_pytest_headers(tmp_path):
+    """#7330: the same assertion on head and base differed only by the checks env folder in a CompletedProcess
+    repr, and pytest's header of a long test name has one '_' a side, so its block was not read and the
+    saved base mark was empty: the failure was judged 'another way' and blocked. Now both are the same."""
+    from ttp import gatejudge, sharedchecks
+    a = "tests/test_a.py::test_" + "a_very_long_name" * 6
+    name = a.rpartition("::")[2]
+
+    def run(env, pid, secs):
+        line = (f"AssertionError: CompletedProcess(args=['/opt/ci/.tt-project/checks-env/{env}/bin/python3'], "
+                f"pid {pid}, took {secs}s)")
+        out = (f"=== FAILURES ===\n_ {name} _\n\n    def {name}():\n        helper()\n\n"
+               f"tests/test_a.py:3: \n_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _\n\n"
+               f"    def helper():\n>       assert r.returncode == 0, r\nE       {line}\n\n"
+               f"tests/test_a.py:9: AssertionError\n=== short test summary info ===\nFAILED {a}\n=== 1 failed in 0.1s ===\n")
+        return 1, out
+    head, base = run("0c594e2e7d0528a0.d8e44f94", 4101, "1.52"), run("9ab31f07c2d4e5a6.0f1e2d3c", 77, "0.98")
+    block = sharedchecks.failure_blocks(head[1], [a])[a]
+    assert "E       AssertionError" in block, "the block runs past the frame separator to the failing frame"
+    m, m2 = gatejudge.marks(head[1], [a])[a], gatejudge.marks(base[1], [a])[a]
+    assert m["line"] and m["src"] == "assert r.returncode == 0, r" and gatejudge.same_failure(m, m2), (m, m2)
+    v = gatejudge.judge([a], lambda at, ids: head if at == "head" else base, tmp_path / "s", "b1", "host-a", 1000.0)
+    assert v["pre_existing"] == [a] and not gatejudge.blocks(v), v
+    # Another assertion still differs; a word made of hex letters or a plain number is not a hash.
+    assert not gatejudge.same_failure(m, gatejudge.marks(run("0c594e2e7d0528a0", 1, "1")[1].replace(
+        "returncode == 0", "returncode == 2"), [a])[a])
+    assert gatejudge._mark_norm("decade facade 123456") == "decade facade 123456"
+    # A base failure saved with an empty mark (an output its parser could not read) proves nothing: the base reruns.
+    gatejudge.save_base(tmp_path / "e", "host-a", "b1", {a: True}, 1000.0, {a: {"line": "", "msg": "", "src": "", "at": ""}})
+    calls = []
+    v = gatejudge.judge([a], lambda at, ids: calls.append(at) or (head if at == "head" else base),
+                        tmp_path / "e", "b1", "host-a", 1001.0)
+    assert calls == ["head", "base"] and v["pre_existing"] == [a], (calls, v)
+
+
 _NESTED = '''import json, os, subprocess, sys
 
 
