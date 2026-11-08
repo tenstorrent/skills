@@ -112,7 +112,8 @@ Every project cuts its queue times with the resources its charter allows (the te
   workers run builds on other allowed hosts rather than wait on a long local queue.
 - A worker or checks queue that is the bottleneck grows, within the spend caps: `ttp throughput
   --apply` raises the sizing limits that were full while work waited, and the coordinator queues a
-  fix for any other slow lane it names.
+  fix for any other slow lane it names. When the user asked for speed, the coordinator applies a
+  worker's proposal to raise such a sizing limit at once; a spend cap rises only on the user's word.
 - Before using a box that clearly belongs to the user, the coordinator asks once and does not wait
   for the answer. Only the user's own holds and allowlists stop work on a machine.
 - Urgency sets the pace: full speed when the user asked for speed or priority, calmer otherwise.
