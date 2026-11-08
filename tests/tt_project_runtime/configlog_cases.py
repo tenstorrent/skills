@@ -169,3 +169,31 @@ def test_check_runs_record_their_spill_host_and_task(env):
     checkwall.record_run(p.state, 12.0, True, scratch="disk")
     a, b = [json.loads(x) for x in (p.state / checkwall.RUNS_LOG).read_text().splitlines()]
     assert (a["host"], a["task"]) == ("spill-a", "9") and "host" not in b and "task" not in b
+
+
+def test_a_worker_runs_config_of_a_coordinator_set_spill_wrap_cmd_is_refused_and_recorded(env, monkeypatch, capsys):
+    """Replays the lost pinned env: a coordinator set checks.spill_wrap_cmd to a wrapper plus an env part;
+    a worker run's `ttp config` of the wrapper alone is refused, the value stays whole, the refusal is
+    logged with the worker's task and run, the coordinator gets one event, and the worker is told how to
+    propose the change instead."""
+    from ttp import cli, configwho
+    p = make(env)
+    _config_clear_run_env(monkeypatch)
+    whole = "/opt/example/spill-wrap.sh env PATH=/opt/example/venv/bin:/usr/bin PYTHONNOUSERSITE=1"
+    monkeypatch.setenv("TTP_RUN_ID", "15290")   # the coordinator's own run: `ttp config` from its shell
+    cli.main(["config", "demo", "checks.spill_wrap_cmd", whole])
+    assert configwho.history(p, "checks.spill_wrap_cmd")[-1]["by"] == "coordinator"
+    monkeypatch.setenv("TTP_RUN_ID", "15316")   # a worker run of task 7492
+    monkeypatch.setenv("TTP_TASK_ID", "7492")
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "checks.spill_wrap_cmd", "/opt/example/spill-wrap.sh"])
+    err = capsys.readouterr().err
+    assert "worker may not change" in err and "propose it in your hand-off" in err
+    assert p.raw_config()["checks"]["spill_wrap_cmd"] == whole
+    assert configwho.role(configwho.lookup(p.db, "checks.spill_wrap_cmd", p.raw_config())) == "coordinator"
+    refused = [r for r in configwho.history(p, "checks.spill_wrap_cmd") if r.get("refused")]
+    assert len(refused) == 1 and (refused[0]["by"], refused[0]["task"], refused[0]["run"]) == ("worker", 7492, "15316")
+    assert (refused[0]["old"], refused[0]["new"]) == (whole, "/opt/example/spill-wrap.sh")
+    events = _config_events(p, "config_overwrite_refused")
+    assert [e["fingerprint"] for e in events] == ["config_overwrite_refused:checks.spill_wrap_cmd:worker"]
+    assert events[0]["status"] == "queued" and "set by" in events[0]["text"]

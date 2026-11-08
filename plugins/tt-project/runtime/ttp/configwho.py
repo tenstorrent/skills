@@ -313,6 +313,8 @@ def guard(p, key: str, setter: dict | None, before, after) -> bool:
         return at(before, key) == at(after, key) and role(lookup(p.db, key, before)) in OWNERS
     why = (f"{who} may not change a value the user or a coordinator set: {', '.join(hits)}; the coordinator "
            f"(config_set) or the user makes this change")
+    if who == "worker":
+        why += "; propose it in your hand-off (summary or a followup: key, value, why) for the coordinator to make"
     fp = f"config_overwrite_refused:{key}:{who}"
     if _event(p, "config_overwrite_refused", fp,
               f"Config change refused: {line(_row(p, key, setter, before, after, time.time()), p)}. {why}. "
