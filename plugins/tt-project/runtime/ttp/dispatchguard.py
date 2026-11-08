@@ -8,11 +8,13 @@ each run handing off done once more. `refusal` re-reads the row just before the 
 over-limit task back to its last hand-off status and records why, model-free.
 
 Every explicit requeue records a `task_requeued` event (`ttp task requeue`, the web app, the coordinator's
-status queued on an ended task, a chain continue, the push queue's review re-runs, the daemon's lost-run
-requeues): the done hand-offs before it no longer count. A task past its attempt limit whose last hand-off
+status queued on an ended task once the update is written, a chain continue, the push queue's re-runs):
+the done hand-offs before it no longer count. A task past its attempt limit whose last hand-off
 was done (its last run ended in a task_done event) is refused too
 unless an explicit requeue came after that hand-off, start_when probe or not: a deferral that passes
-only makes it ready, never a reason to run it again."""
+only makes it ready, never a reason to run it again. A cancel (`ttp task cancel`, the web app, the
+coordinator's status cancelled) records a `task_cancelled` event and sticks the same way: a cancelled task
+queued again with no explicit requeue after the cancel is refused and put back to cancelled."""
 from __future__ import annotations
 
 import time
@@ -21,6 +23,7 @@ from .db import load_result
 
 REQUEUED = "task_requeued"   # event kind of an explicit requeue: the done count starts again after it
 REFUSED = "dispatch_refused"
+CANCELLED = "task_cancelled"   # event kind of an explicit cancel: only an explicit requeue undoes it
 DONE_EVENT_SLACK_S = 60   # a run's end and its task_done event are written apart, within this
 
 
@@ -45,6 +48,13 @@ def ended_done_unrequeued(db, task_id: int) -> bool:
                       (task_id, REQUEUED, max(done_ts, run_ts)))
 
 
+def cancelled_unrequeued(db, task_id: int) -> bool:
+    """The task's last explicit cancel came after its last explicit requeue."""
+    row = db.one("SELECT MAX(CASE WHEN kind=? THEN id END) AS c, MAX(CASE WHEN kind=? THEN id END) AS r "
+                 "FROM events WHERE task=? AND kind IN (?,?)", (CANCELLED, REQUEUED, task_id, CANCELLED, REQUEUED))
+    return bool((row or {}).get("c")) and (row["c"] or 0) > (row["r"] or 0)
+
+
 def refusal(db, task: dict) -> str:
     """Why `task` must not start now ('' when it may), from a fresh read of its row."""
     t = db.task(task["id"])
@@ -53,6 +63,9 @@ def refusal(db, task: dict) -> str:
     if t["status"] != "queued":
         return f"it is {t['status']} now (picked while queued)"
     limit = int(t.get("max_attempts") or 3)
+    if cancelled_unrequeued(db, t["id"]):
+        return (f"it was cancelled and queued again without an explicit requeue; "
+                f"attempts {int(t.get('attempts') or 0)} of {limit}")
     done = load_result(t.get("result")).get("status") == "done"
     if done and (n := done_closes(db, t["id"])) >= limit:
         return (f"it was already closed done {n} times (attempt limit {limit}) and was queued again "
@@ -64,16 +77,18 @@ def refusal(db, task: dict) -> str:
 
 
 def refuse(db, task_id: int, why: str) -> None:
-    """Put an over-limit queued task back to done (its last hand-off) and record why. A task no longer
-    queued is left as it is: its status already keeps it from starting."""
+    """Put a refused queued task back to cancelled (its last explicit decision) or else done (its last
+    hand-off) and record why. A task no longer queued is left as it is: its status already keeps it from
+    starting."""
     now = time.time()
     with db.tx():
         t = db.task(task_id)
         if t and t["status"] == "queued":
-            db.x("UPDATE tasks SET status='done', updated=? WHERE id=? AND status='queued'", (now, task_id))
+            back = "cancelled" if cancelled_unrequeued(db, task_id) else "done"
+            db.x("UPDATE tasks SET status=?, updated=? WHERE id=? AND status='queued'", (back, now, task_id))
             db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                  (now, f"task:{task_id}", REFUSED, "low",
-                  f"#{task_id} not dispatched: {why}. Put back to done; `ttp task requeue` runs it again.",
+                  f"#{task_id} not dispatched: {why}. Put back to {back}; `ttp task requeue` runs it again.",
                   "handled", task_id))
 
 
@@ -82,3 +97,9 @@ def record_requeue(db, task_id: int, prev: str, by: str) -> None:
     db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
          (time.time(), by, REQUEUED, "low", f"#{task_id} requeued from {prev} by {by}", "handled", task_id))
 
+
+
+def record_cancel(db, task_id: int, prev: str, by: str) -> None:
+    """An explicit cancel: logged, and dispatch refuses the task until an explicit requeue."""
+    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+         (time.time(), by, CANCELLED, "low", f"#{task_id} cancelled from {prev} by {by}", "handled", task_id))

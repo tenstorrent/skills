@@ -2164,15 +2164,84 @@ def test_a_task_cancelled_after_the_ready_read_is_not_started(env, monkeypatch, 
         assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
-def test_a_continue_or_push_rework_requeue_restarts_the_done_count(env):
-    """The daemon's own re-queues of a done task (a chain continue, a push conflict rework) and the
-    coordinator's status queued are explicit: dispatch's done count starts again after each."""
+def test_a_recorded_requeue_restarts_the_done_count(env):
+    """A recorded explicit requeue resets dispatch's done count: the guard then lets the task run."""
     from ttp import dispatchguard
     p = make(env)
     tid = _closed_done(p, "a chained code task", 3)
     assert dispatchguard.refusal(p.db, p.db.task(tid))
     dispatchguard.record_requeue(p.db, tid, "done", "continue")
     assert dispatchguard.done_closes(p.db, tid) == 0 and dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def _requeues(p, tid):
+    return p.db.q("SELECT source FROM events WHERE task=? AND kind='task_requeued'", (tid,))
+
+
+def test_a_rejected_coordinator_requeue_records_nothing_and_an_accepted_one_does(env):
+    """Review #7495: the coordinator's status queued logs its requeue only once the update is written. A
+    rejected update (a start_when on a done task) leaves no task_requeued event, so the guard still
+    refuses the task after an unlogged re-queue; an accepted status queued records one and the task runs."""
+    from ttp import coordinator as coord, dispatchguard
+    p = make(env)
+    tid = _closed_done(p, "a plan done three times", 3)
+    p.db.update_task(tid, status="done")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued", "start_when": "true"}])
+    assert p.db.task(tid)["status"] == "done" and _requeues(p, tid) == []
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (tid,))   # an unlogged write
+    assert "closed done 3 times" in dispatchguard.refusal(p.db, p.db.task(tid))
+    p.db.update_task(tid, status="done")
+    assert coord.apply(p, [{"type": "task_update", "id": tid, "status": "queued"}]) == []
+    assert p.db.task(tid)["status"] == "queued" and len(_requeues(p, tid)) == 1
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+
+
+def test_a_chain_continue_and_a_push_queue_re_run_record_a_requeue(env):
+    """chaincap.requeue (a continue hop) and pushq._requeue (a push conflict re-run) each record
+    task_requeued, so dispatch's done count restarts after them."""
+    from ttp import chaincap, dispatchguard, pushq
+    p = make(env)
+    tid = _closed_done(p, "a chained code task", 3)
+    p.db.update_task(tid, status="done", kind="code", branch="b")
+    p.set_config("chains.requeue", True)
+    assert chaincap.requeue(p, p.config(), p.db.task(tid), {"title": "continue: more", "spec": "x"}, "progress", 0)
+    assert [r["source"] for r in _requeues(p, tid)] == ["continue"]
+    assert dispatchguard.refusal(p.db, p.db.task(tid)) == ""
+    rv = _closed_done(p, "a review re-run by the push queue", 3)
+    p.db.update_task(rv, status="done")
+    pushq._requeue(p.db, p.db.task(rv), "conflict")
+    assert p.db.task(rv)["status"] == "queued" and [r["source"] for r in _requeues(p, rv)] == ["push queue"]
+    assert dispatchguard.refusal(p.db, p.db.task(rv)) == ""
+
+
+def test_a_cancelled_task_queued_again_without_a_requeue_is_not_dispatched(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Regression (upstream fp aed18d8ef1b1ecc7): a task cancelled for good (`ttp task cancel`, or the
+    coordinator's status cancelled) was put back in the queue by an unlogged write and dispatched at
+    attempt 35 of 3. Dispatch refuses it and puts it back to cancelled; an explicit requeue runs it."""
+    from ttp import coordinator as coord
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=3)
+    try:
+        by_cli = p.db.add_task("cancelled by the user", "s", kind="work", tier="light", origin="user")
+        by_coord = p.db.add_task("cancelled by the coordinator", "s", kind="work", tier="light", origin="user")
+        live = p.db.add_task("still wanted", "s", kind="work", tier="light", origin="user")
+        assert p.db.cancel(by_cli) == ""
+        assert coord.apply(p, [{"type": "task_update", "id": by_coord, "status": "cancelled"}]) == []
+        for tid in (by_cli, by_coord):   # an unlogged write puts it back, far past its limit
+            p.db.x("UPDATE tasks SET status='queued', attempts=35 WHERE id=?", (tid,))
+        d.dispatch()
+        assert _slot_tasks(p) == [live], "a cancelled task was started again"
+        for tid in (by_cli, by_coord):
+            assert p.db.task(tid)["status"] == "cancelled"
+            ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (tid,))
+            assert ev and "cancelled and queued again" in ev["text"] and "attempts 35 of 3" in ev["text"]
+        settle(d)
+        assert p.db.requeue(by_cli) == ""   # the user's decision: it runs again
+        d.dispatch()
+        assert by_cli in _slot_tasks(p) and by_coord not in _slot_tasks(p)
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
 
 
 def test_a_done_task_with_a_start_when_probe_past_its_attempt_limit_is_not_redispatched(

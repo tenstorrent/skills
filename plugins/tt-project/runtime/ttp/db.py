@@ -1151,6 +1151,8 @@ END""")
                                      "AND status NOT IN ('done','failed','cancelled')",
                                      (time.time(), task_id)).rowcount:
                 return f"task #{task_id} is already {t['status']}"
+            from . import dispatchguard   # the cancel sticks: dispatch refuses it until a requeue
+            dispatchguard.record_cancel(self, task_id, t["status"], "cancel")
         return ""
 
     def task(self, task_id: int) -> dict | None:

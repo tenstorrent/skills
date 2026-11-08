@@ -3059,8 +3059,6 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["status"] = a["status"]
                     if a["status"] == "queued":
                         upd["blocked_reason"] = None
-                        if task["status"] != "queued":   # an explicit requeue: dispatch's done count restarts
-                            dispatchguard.record_requeue(db, task["id"], task["status"], "coordinator")
                         prev = load_result(task["result"])
                         if task["status"] != "queued" and ("waiting_since" in prev or "stale_wakes" in prev):
                             # A requeue is a decision to run it, not to sleep on its probe, and its
@@ -3258,6 +3256,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                          (time.time(), "coordinator", STEP_REPLACED_KIND, "low",
                           f"#{task['id']}: {'the whole spec' if whole else 'a spec step'} replaced", json.dumps(h),
                           "handled", task["id"]))
+                if upd.get("status") == "queued" and task["status"] != "queued":
+                    # an explicit requeue, logged once the update is written: dispatch's done count restarts
+                    dispatchguard.record_requeue(db, task["id"], task["status"], "coordinator")
+                elif upd.get("status") == "cancelled" and task["status"] != "cancelled":
+                    dispatchguard.record_cancel(db, task["id"], task["status"], "coordinator")
                 if upd.get("spec"):
                     userorder.respec(db, task["id"])
                 if upd.get("status", task["status"]) not in TERMINAL_TASK_STATES \
