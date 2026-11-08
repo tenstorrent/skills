@@ -2860,6 +2860,35 @@ def test_a_push_batch_spills_its_checks_first_and_a_spill_host_fault_reruns_them
     assert checkspill.holders(s.p.name) == [], "the claim ends with the batch"
 
 
+
+@pytest.mark.parametrize("kind", ["pre_existing", "flaky"])
+def test_a_spilled_push_batch_suite_is_judged_as_its_local_original(env, tmp_path, monkeypatch, kind):
+    """A spilled suite's failing test reruns here at the head, then on the tip, as the local check's do
+    (Batch._judged): one failing on the tip too is pre-existing and one passing on its rerun is flaky
+    (quarantined); neither blocks the batch."""
+    from ttp import batch, push, pushq
+    count = tmp_path / "runs.txt"
+    body = "assert False" if kind == "pre_existing" else (
+        f"import pathlib\n    c = pathlib.Path({str(count)!r})\n    n = len(c.read_text()) if c.exists() else 0\n"
+        "    c.write_text('x' * (n + 1))\n    assert n")
+    s = _spill_batch(env, tmp_path, monkeypatch, "python3 -m pytest -q -p no:cacheprovider test_g.py")
+    (s.other / "test_g.py").write_text(f"def test_g():\n    {body}\n")
+    _git_out(s.other, "add", "test_g.py")
+    _git_out(s.other, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "g")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    _pq_hand_off(env, s)
+    marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    assert batch.run_batch(s.p, marker) == 0
+    m = push._read(marker)
+    assert m["outcome"] == "pushed", m
+    [got] = m[{"flaky": "flaky_tests"}.get(kind, kind)]
+    assert got["ids"] == ["test_g.py::test_g"], got
+    if kind == "flaky":
+        assert count.read_text() == "xx", "the spilled run failed it and its one rerun here passed"
+
 def test_push_hard_tests_is_a_known_delivery_key_the_batch_reads():
     """delivery.push_hard_tests sets which failing tests a batch never excuses as the tip's own."""
     from ttp import batch, project
