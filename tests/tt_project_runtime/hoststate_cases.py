@@ -283,3 +283,50 @@ def test_a_nested_run_reuses_its_inherited_stand_ins_without_writing_to_their_fo
     again = hoststate.fake_env(dict(env))
     assert again[hoststate.MARKER] == str(store) and again["PATH"].split(os.pathsep)[0] == str(store / "bin")
     assert calls == []
+
+
+def _shim_layers(tmp_path, project_shim: str):
+    """hoststate's stand-ins plus a project's own stand-in folder (no .ttp-shims marker) ahead of them
+    and a real systemctl after them; returns (env, store, project folder, real folder)."""
+    from ttp import hoststate
+    store, proj, real = tmp_path / "store", tmp_path / "proj", tmp_path / "real"
+    proj.mkdir()
+    real.mkdir()
+    bin_dir = hoststate.make(store)
+    (proj / "systemctl").write_text("#!/bin/sh\n" + project_shim)
+    (real / "systemctl").write_text(f"#!/bin/sh\necho real >> {shlex.quote(str(tmp_path / 'hops'))}\nexit 3\n")
+    for f in (proj / "systemctl", real / "systemctl"):
+        f.chmod(0o755)
+    env = {k: v for k, v in os.environ.items() if not k.startswith("TTP_SHIM_")}
+    env["PATH"] = os.pathsep.join([str(proj), str(bin_dir), str(real), "/usr/bin", "/bin"])
+    return env, store, proj, real
+
+
+def test_a_read_through_two_stand_in_layers_without_a_marker_reaches_the_real_command_in_one_hop_each(tmp_path):
+    """A project's stand-in folder without the marker first on PATH, passing a read to the next systemctl
+    on PATH: each layer runs once and the real command's exit code comes back (it once looped forever)."""
+    hops = shlex.quote(str(tmp_path / "hops"))
+    env, store, proj, real = _shim_layers(tmp_path, f'echo proj >> {hops}\nself=$(cd "$(dirname "$0")" && pwd)\n'
+                                          'IFS=:; for d in $PATH; do [ "$d" = "$self" ] && continue; '
+                                          '[ -x "$d/systemctl" ] && exec "$d/systemctl" "$@"; done; exit 127\n')
+    r = subprocess.run(["systemctl", "status", "x.service"], env=env, timeout=30, capture_output=True, text=True)
+    assert r.returncode == 3, r.stderr
+    assert (tmp_path / "hops").read_text().split() == ["proj", "real"]
+    assert len((store / "calls.jsonl").read_text().splitlines()) == 1
+
+
+def test_the_hop_limit_ends_a_deliberate_stand_in_loop_fast(tmp_path):
+    """A stand-in that wipes the passed-folder list and calls hoststate's stand-in by path forever still
+    stops after MAX_HOPS: the read goes to the system folders' command (or fails with a clear error)."""
+    from ttp import hostshim
+    hops = shlex.quote(str(tmp_path / "hops"))
+    env, store, proj, real = _shim_layers(tmp_path, f'echo proj >> {hops}\n'
+                                          f'exec env -u TTP_SHIM_SEEN {shlex.quote(str(tmp_path / "store" / "bin" / "systemctl"))} "$@"\n')
+    real.joinpath("systemctl").unlink()
+    env["PATH"] = os.pathsep.join([str(store / "bin"), str(proj), "/usr/bin", "/bin"])
+    start = time.monotonic()
+    r = subprocess.run(["systemctl", "--version"], env=env, timeout=30, capture_output=True, text=True)
+    assert time.monotonic() - start < 20
+    assert len((tmp_path / "hops").read_text().split()) == hostshim.MAX_HOPS
+    assert len((store / "calls.jsonl").read_text().splitlines()) == hostshim.MAX_HOPS + 1
+    assert r.returncode == 0 or "passed it on" in r.stderr, r.stderr

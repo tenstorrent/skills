@@ -137,15 +137,41 @@ def _save(store, name, doc):
     os.replace(tmp, os.path.join(store, name))
 
 
+SEEN = "TTP_SHIM_SEEN"   # the folders a read already passed on to: never again, so two stand-in layers cannot loop
+HOPS = "TTP_SHIM_HOPS"
+MAX_HOPS = 8
+SYSTEM_DIRS = ("/usr/local/sbin", "/usr/local/bin", "/usr/sbin", "/usr/bin", "/sbin", "/bin")
+
+
 def _real(store, name, args):
-    """Pass a read on to the real command (never this folder's stand-in)."""
+    """Pass a read on to the real command (never this folder's stand-in). A stand-in folder without the
+    .ttp-shims marker could hand the call back here: folders after this one on PATH come first, each
+    folder is taken once (SEEN), and past MAX_HOPS only the system folders are searched, so a loop
+    ends at once."""
     mine = os.path.realpath(os.path.join(store, "bin"))
-    path = os.pathsep.join(d for d in os.environ.get("PATH", "").split(os.pathsep)
-                           if d and os.path.realpath(d) != mine and not os.path.exists(os.path.join(d, ".ttp-shims")))
-    real = shutil.which(name, path=path)
+    seen = {d for d in os.environ.get(SEEN, "").split(os.pathsep) if d}
+    try:
+        hops = int(os.environ.get(HOPS) or 0)
+    except ValueError:
+        hops = MAX_HOPS
+    hops = hops if hops >= 0 else MAX_HOPS
+    dirs = [d for d in os.environ.get("PATH", "").split(os.pathsep) if d]
+    keys = [os.path.realpath(d) for d in dirs]
+    if mine in keys:   # after this folder first: one before it was already passed by a PATH lookup
+        i = keys.index(mine) + 1
+        dirs, keys = dirs[i:] + dirs[:i], keys[i:] + keys[:i]
+    ok = [d for d, k in zip(dirs, keys) if k != mine and not os.path.exists(os.path.join(d, ".ttp-shims"))]
+    real = None if hops >= MAX_HOPS else shutil.which(name, path=os.pathsep.join(
+        d for d in ok if os.path.realpath(d) not in seen))
     if not real:
-        print(f"{name}: command not found", file=sys.stderr)
+        real = shutil.which(name, path=os.pathsep.join(
+            d for d in SYSTEM_DIRS if os.path.realpath(d) != mine and not os.path.exists(os.path.join(d, ".ttp-shims"))))
+    if not real:
+        print(f"{name}: command not found" + (f" (stand-ins passed it on {hops} times)" if hops else ""), file=sys.stderr)
         return 127
+    seen.add(os.path.realpath(os.path.dirname(real)))
+    os.environ[SEEN] = os.pathsep.join(sorted(seen))
+    os.environ[HOPS] = str(hops + 1)
     os.execv(real, [name, *args])
 
 
