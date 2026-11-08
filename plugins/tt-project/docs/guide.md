@@ -1326,7 +1326,7 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
    model is served again. With a ranking set, a queued or running task that pins a model on `chat`
    also keeps the check running, and a check over two hours old counts as none: nothing is
-   swapped or held on it. Each switch is one low alert; once the model is served again (the hold ends
+   swapped or held on it. Each switch (per tier, routes rule or picked model) is one low alert; once the model is served again (the hold ends
    or the check lists it) the next start runs it. A served model ranked above a route's own model
    (tier, rule or run class; never a task's pin) is tried at once: light starts run it until 3 of its
    runs end without a fallback, then every tier does. A run on it that fails on the model itself

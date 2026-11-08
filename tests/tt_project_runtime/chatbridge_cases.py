@@ -1631,6 +1631,21 @@ def test_rule_routes_of_one_tier_keep_their_own_model_ranking_switch(env, monkey
     assert p.db.kv(modelrank.SWITCH + "light:rule0") is None and p.db.kv(modelrank.SWITCH + "light")
 
 
+def test_a_model_pick_routing_one_tier_to_an_up_and_a_down_model_keeps_one_switch(env, monkeypatch):
+    """#7258: a model pick keyed by tier alone ended the down model's switch with a false 'back' on a
+    start on the up model, and the next start on the down model alerted again."""
+    from ttp import modelrank
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-a", "up-model"])
+    task = {"id": None, "kind": "work"}
+    for model, runs in ((_RT_MODEL, "rank-a"), ("up-model", "up-model"), (_RT_MODEL, "rank-a")):
+        assert d._route_entry(task, "light", "chat", model, time.time(), pick=True)["model"] == runs
+    assert len(alerts) == 1 and p.db.kv(modelrank.SWITCH + "light:pick:" + _RT_MODEL)["to"] == "rank-a"
+    assert p.db.kv(modelrank.SWITCH + "light") is None and "back on" not in (p.logs / "daemon.log").read_text()
+
+
 def test_a_model_left_out_of_the_served_list_is_ranked_and_an_empty_ranking_changes_nothing(env, monkeypatch):
     from ttp import modelrank, route
     from ttp.daemon import Daemon
@@ -1741,6 +1756,30 @@ def test_a_stale_served_list_holds_and_swaps_nothing_and_a_pinned_chat_task_keep
     _route_config(p, route=None)
     d._load_config()
     assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no ranking: as before
+
+
+def test_a_preference_pins_refused_stand_in_is_skipped_on_the_next_start(env, monkeypatch):
+    """#7258: a pinned chat run has no route entry, so its refused stand-in was picked again each retry."""
+    from ttp import modelrank, route
+    from ttp.daemon import Daemon
+    p = make(env)
+    d = Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-a", "rank-b"])
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, time.time())[0] == "rank-a"
+    tid = p.db.add_task("pinned", "s", kind="work", tier="light", priority=3, provider="chat", model=_RT_MODEL,
+                        labels=[])
+    p.db.update_task(tid, status="running")
+    note = {modelrank.KEY: {"from": _RT_MODEL, "why": "not listed"}}
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                 "VALUES(?,'worker','chat','rank-a',?,'running',?,?)", (tid, time.time() - 30, d.boot, json.dumps(note)))
+    rd = p.runs / str(rid)
+    rd.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(rd), rid))
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 1, "started": time.time() - 30, "ended": time.time(), "bridge": {"last_fault": "model_missing"}})
+    assert route.of(p.db.one("SELECT note FROM runs WHERE id=?", (rid,))["note"]) is None   # never routed
+    assert modelrank.down(p.db, d.cfg, p.state, "rank-a", time.time()) == "refused"
+    assert modelrank.pick(p.db, d.cfg, p.state, _RT_MODEL, time.time())[0] == "rank-b"
 
 
 def test_a_model_down_with_no_ranked_model_served_keeps_its_switch(env, monkeypatch):

@@ -6023,6 +6023,11 @@ class Daemon:
                                    f"`ttp status`.", severity="normal", every_s=0)
             elif fell and not own:   # an endpoint fault cools the endpoint; a run's own end only its task
                 route.cool(db, self.cfg, routed["to"], fell, r["id"], time.time())
+        elif r["provider"] == modelrank.TO and isinstance(note.get(modelrank.KEY), dict) and r["model"] and \
+                route.fell_back(status, exit_info, usage.error) == "model_missing":
+            # A preference pin's ranked stand-in (start_run) refused, as a routed one: skip it
+            modelrank.refused(db, r["model"], r["id"], time.time())
+            log(self.p, f"model ranking: {r['provider']} refused {r['model']} (run {r['id']})")
         if "split" not in note:   # the split steer may have fired after `r` was read
             split = json.loads((db.one("SELECT note FROM runs WHERE id=?", (r["id"],)) or {}).get("note") or "{}")
             if isinstance(split.get("split"), dict):
@@ -11978,7 +11983,7 @@ class Daemon:
             return None
         name, model = to["to"], to["model"]
         if dp is not None:
-            return {**self._route_entry(task, tier, name, model, now), "model_pick": True,
+            return {**self._route_entry(task, tier, name, model, now, pick=True), "model_pick": True,
                     **({"pick_effort": got["effort"]} if got["effort"] else {})}
         return self._route_entry(task, tier, name, model, now, to["rule"], cls)
 
@@ -11998,7 +12003,7 @@ class Daemon:
             return None
 
     def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None,
-                     cls: str | None = None) -> dict:
+                     cls: str | None = None, pick: bool = False) -> dict:
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
@@ -12012,6 +12017,8 @@ class Daemon:
             return {"tier": tier, "to": name, "model": model, **rule, "fallback": route.ESCALATED, **esc}
         why = "model_missing" if route.held(self.p.db, self.cfg, tier) == model else route.cooling(self.p.db, name, now)
         where, key = (f"tier {tier}", tier) if rule_i is None else (f"tier {tier} rule {rule_i}", f"{tier}:rule{rule_i}")
+        if pick:   # a model pick routes one tier to several models (modelpick.py): one switch per model
+            key = f"{tier}:pick:{model}"
         ranked = self._rank_pick(where, key, model, now) \
             if name == modelrank.TO and why in ("", "model_missing") else None   # one switch record per rule
         if ranked:   # its model is down: the smartest model still served (modelrank.py)
