@@ -300,3 +300,36 @@ def test_the_overseer_wakes_a_due_look_the_stuck_loop_missed_and_the_paths_never
         assert mine
         Daemon(p.base).maybe_coordinate()
     assert len(starts) == 1, "two paths started two turns"
+
+
+def test_a_step_that_keeps_overrunning_sits_out_ticks_is_one_incident_and_wakes_the_coordinator(env, monkeypatch):
+    from ttp import looks
+    from ttp import overseer as ov
+    from ttp.daemon import DEGRADE_AFTER, DEGRADE_TICKS, Daemon
+    p = make(env)
+    _no_events(p)
+    d = Daemon(p.base)
+    monkeypatch.setattr(d, "_step_budget", lambda: 0.01)
+    ran = []
+
+    def slow():
+        ran.append(1)
+        time.sleep(0.03)
+    for _ in range(DEGRADE_AFTER + DEGRADE_TICKS):
+        d._run_step(slow, "slow_step")
+        d._run_step(lambda: None, "quick_step")
+    assert len(ran) == DEGRADE_AFTER, "the degraded step was not skipped for its ticks"
+    d._run_step(slow, "slow_step")
+    assert len(ran) == DEGRADE_AFTER + 1, "the step did not come back after its ticks"
+    for _ in range(DEGRADE_AFTER):
+        d._run_step(slow, "reap_runs")
+    assert d._degraded.get("reap_runs") is None, "a step the loop needs was degraded"
+    incs = [json.loads(x) for x in (p.state / ov.INCIDENTS_FILE).read_text().splitlines()]
+    assert [i["step"] for i in incs] == ["slow_step"], incs
+    assert incs[0]["overruns"]["slow_step"] == DEGRADE_AFTER and Path(incs[0]["stacks"]).read_text()
+    [look] = looks.pending(p.db)
+    assert look["by"] == "daemon" and "slow_step" in look["text"]
+    starts = []
+    monkeypatch.setattr(d, "start_run", lambda *a, **k: starts.append(k.get("note")))
+    d.maybe_coordinate()
+    assert len(starts) == 1 and starts[0]["looks"] == [look["id"]], starts

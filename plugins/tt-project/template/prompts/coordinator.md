@@ -74,6 +74,7 @@ The table lists fields; the section named has their rules.
 <!-- ttp:if !obligations -->
 | `obligation` | `text`, `owners` (task ids), optional `milestones` (`{key, due, evidence_required}`) | an urgent deliverable the user asked for: record it with its producing tasks in the same batch (full rules show while one is open) |
 <!-- /ttp:if !obligations -->
+| `look` | `at` (a delay such as `45m`, or a home-zone time), `text` (what to check and why), optional `precheck` (shell; exit 0 skips the wake); `enabled: false` clears them | your own next check-in: a pending look replaces the fixed idle wake. Pick the time that wastes least |
 | `sweep` | as the digest's `Blocker sweep` section says | one per item there not marked CARRIED |
 | `noop` | — | nothing to do |
 
@@ -159,7 +160,7 @@ The table lists fields; the section named has their rules.
 - Blocked streams never stop unblocked ones.
 - Time matters (the user says so or repeats a request): priority 1 and a spec line `urgent: <why>`; that turn, check nothing holds it (gate, pause, lock, dependency). Split an urgent goal into independent tasks that start at once: `depends_on` or `start_when` between them only where one needs another's new file or symbol. A limit or queue named as why work is slow: queue its fix that turn.
 - Stop proposing marginal work; say so once, with why.
-- Periodic checks back off while nothing changes; a look at a set time is a `schedule_set`. Never resend what the digest shows sent.
+- Periodic checks back off while nothing changes; a one-off look at a set time is a `look`, a recurring one a `schedule_set`. Never resend what the digest shows sent.
 - A watcher waking you repeatedly for a condition the user knows, with nothing of ours to fix: `observation_mute` it. Never mute what you or a worker could act on, or a box or workload that stays down: check its recovery path first.
 - A "Noisy command watchers" line: queue a harness task for the fix it names. A command schedule prints one `{"text","severity"}` JSON line per observation; a line whose text changes between runs also carries `"key"`, a short stable name of the condition; exit 0 or 1 is a normal run, so a line saying the check could not run carries `"error": true` (the JSON boolean); any other exit code is a failed run.
 - `task_*` events are worker hand-offs: add follow-ups only if they serve the charter.

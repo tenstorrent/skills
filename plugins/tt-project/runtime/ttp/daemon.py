@@ -339,6 +339,12 @@ STEP_HARD_SLACK_S = 5
 # add/remove/prune, cleantree, checkreap, harnesstree's merge): killing one midway can leave a lock or a
 # half-removed tree. Every git helper takes the cap or is allowlisted (test_every_git_helper_takes_gitmemos_cap).
 STEP_SLOW_EVERY_S = 3600
+# A tick step over its budget DEGRADE_AFTER of its last DEGRADE_WINDOW runs sits out DEGRADE_TICKS ticks
+# (_step_degrade); the steps that reap, start turns, dispatch or deliver never do.
+DEGRADE_WINDOW, DEGRADE_AFTER, DEGRADE_TICKS = 10, 3, 10
+DEGRADE_KEEP = frozenset({"lift_boot_pause", "reap_runs", "maybe_coordinate", "dispatch", "deliver_outbound",
+                          "update_gates", "settling", "net_held", "host_cycle_held", "check_overseer",
+                          "check_integrity"})
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
 # in the tick that started them and a slow one never holds it.
@@ -1151,6 +1157,9 @@ class Daemon:
         self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
         self._overseer_kicked = 0.0   # when check_overseer last started the overseer
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
+        self._overruns: dict[str, list[bool]] = {}   # step -> over its budget, its last DEGRADE_WINDOW runs
+        self._degraded: dict[str, int] = {}   # step -> ticks it still sits out
+        self._degrade_said: dict[str, float] = {}   # step -> when its last degrade incident was recorded
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
@@ -1735,6 +1744,9 @@ class Daemon:
         if self.stopping:   # a stop skips the tick's remaining steps; each is its own transaction
             self._stop_skipped.append(name)
             return default
+        if self._degraded.get(name):   # it kept overrunning: it sits out a few ticks (_step_degrade)
+            self._degraded[name] -= 1
+            return default
         self._step_name = name
         self._step_began = self._step_mark = time.monotonic()
         self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
@@ -1772,6 +1784,7 @@ class Daemon:
                     log(self.p, "tick step clear error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:
             self._step_slow(name)
+            self._step_degrade(name)
         except Exception:
             log(self.p, "tick step slow error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self._step_holder, self._step_began = "", None
@@ -1802,6 +1815,34 @@ class Daemon:
         at = self._step_cursor.pop(step, 0)
         rows = sorted(rows, key=lambda r: r["id"])
         return _Resumable([r for r in rows if r["id"] > at] + [r for r in rows if r["id"] <= at], self._step_at, step)
+
+    def _step_degrade(self, name: str) -> None:
+        """Degrade the step that keeps overrunning: one at a time, it sits out DEGRADE_TICKS ticks. Once
+        per STEP_SLOW_EVERY_S it is one overseer incident with this daemon's stacks, and a look
+        (looks.py) wakes the coordinator with the evidence; the overseer starts that turn if the loop is stuck."""
+        took = 0.0 if self._step_began is None else time.monotonic() - self._step_began
+        runs = self._overruns[name] = (self._overruns.get(name, []) + [took >= self._step_budget()])[-DEGRADE_WINDOW:]
+        if name in DEGRADE_KEEP or sum(runs) < DEGRADE_AFTER or any(self._degraded.values()):
+            return
+        self._degraded[name] = DEGRADE_TICKS
+        counts = {k: sum(v) for k, v in self._overruns.items() if sum(v)}
+        self._overruns[name] = []
+        why = (f"tick step {name} ran past its {self._step_budget():g} s budget in {counts[name]} of its last "
+               f"{DEGRADE_WINDOW} runs: it sits out the next {DEGRADE_TICKS} ticks")
+        log(self.p, why)
+        now = time.time()
+        if now - self._degrade_said.get(name, 0.0) < STEP_SLOW_EVERY_S:
+            return
+        self._degrade_said[name] = now
+        stacks = self.p.logs / f"degraded-{name}-{int(now)}.txt"
+        stacks.parent.mkdir(parents=True, exist_ok=True)
+        with open(stacks, "w") as f:
+            faulthandler.dump_traceback(f, all_threads=True)
+        from .overseer import INCIDENTS_FILE
+        durable_append(self.p.state / INCIDENTS_FILE, json.dumps(
+            {"at": now, "why": why, "step": name, "overruns": counts, "stacks": str(stacks)}) + "\n")
+        looks.add(self.p.db, now, f"Degraded: {why}. Overruns per step: {counts}. Stacks: {stacks}. "
+                  "Fix the step or change its budget.", by="daemon")
 
     def _step_slow(self, name: str) -> None:
         """One handled tick_step_slow event when step `name` ran past STEP_BUDGET_S, naming the item that
