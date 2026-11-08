@@ -15,14 +15,16 @@ leaving out every route a user pause, a cap the user set or missing config forbi
 A wait whose cause an open task already owns (an active throughput-class mute's owner, or the fix task an earlier
 item on the same queue was acted on with) folds into it: one act per queue cause, not per waiting task.
 The coordinator acts in that turn (mustact.acted: a config_set, a task_add or task_update naming the item's
-key or updating the task, or a reply or notify naming the key and the safety rule that holds it). Not acted
-on, a later threshold mark raises it again (fingerprint per mark), only once what it says changed (its
-holders, cap or options: sig()) or REPEAT_MARKS marks after its last raise. With no option left the user is told
-once. Once the wait ends its open events are settled. daily_line() is the daily review's metric.
+key or updating the task, or a reply or notify naming the key and the safety rule that holds it). A task and
+queue is one episode (`<task>:<queue>`) from its earliest start, so a start that flips between two sources
+never reopens it; it ends only after GRACE_S with no sign of the wait. Not acted on, it is raised again only
+when its cause (queue, resource, host-held, options left) changes or the wait has doubled since the last raise.
+A checks wait the host-wide checks slots hold (host_held: no coordinator action lifts it) is raised at normal
+and rides along (pagesev.RIDE_ALONG). With no option left the user is told once. Once the episode ends its
+open events are settled. daily_line() is the daily review's metric.
 Each event's data carries `fold` (FOLD): the parts the coordinator's NEW EVENTS joins into one line per queue."""
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import time
@@ -31,12 +33,12 @@ from pathlib import Path
 from . import msgparts, obligations
 
 KIND = "queue_wait"
-KV = "queue_wait"   # {"open": {episode: {task, queue, since, acted}}, "hist": [ended episodes], "told": [episode]}
+KV = "queue_wait"   # {"open": {episode: {task, queue, since, seen, acted, raise}}, "hist": [ended], "told": [episode]}
 DEFAULT_MIN = 30.0
+GRACE_S = 1800.0   # a wait not seen this long ends its episode; a shorter gap is the same wait
 HIST_KEEP_S = 7 * 86400.0
 HIST_MAX = 300
 MAX_RAISE = 3   # new items per scan, so a long queue never floods the coordinator with wakes
-REPEAT_MARKS = 4   # an unchanged, unacted wait is raised again at most every this many marks
 FOLD = "fold"   # in event data: {"group", "item", "ctx", "opts"} (coordinator.fold_events)
 NAMES = {"checks": "checks queue", "push": "push queue", "workers": "worker slots", "device": "device queue",
          "lock": "lock", "pool": "outside batch pool", "cpu": "CPU admission"}
@@ -340,34 +342,70 @@ def fold(w: dict, opts: list[str], now: float, note: str = "") -> dict:
     return {"group": f"the {name}", "item": item, "ctx": ctx, "opts": list(opts) or [NO_OPTION]}
 
 
-def sig(w: dict, opts: list[str]) -> str:
-    """What a raise says that matters: the queue, its cap, who holds it and the options. Not the queued
-    count or the minutes waited, which change every scan."""
-    raw = json.dumps([w["queue"], w.get("res"), w.get("cap"), sorted(w.get("running") or []), opts])
-    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+def episode(w: dict) -> str:
+    """The episode key of wait `w`: one per task and queue, whatever start time a scan saw."""
+    return f"{w['task']}:{w['queue']}"
+
+
+def host_held(w: dict) -> bool:
+    """A checks wait held host-wide: every host checks slot is taken (or no host view, so the account's test
+    pool or test-worker budget holds it). No coordinator action lifts it; a wait with a slot free is a fault."""
+    cap = w.get("cap")
+    return w["queue"] == "checks" and (not cap or len(w.get("running") or []) >= int(cap))
+
+
+def _rekey(opened: dict) -> None:
+    """Open episodes recorded under the old `<task>:<queue>:<since>` key merge into `<task>:<queue>`; their
+    raise state is unknown, so the current cause is adopted without a raise."""
+    for ep in [e for e in opened if e.count(":") >= 2]:
+        rec = opened.pop(ep)
+        cur = opened.get(f"{rec['task']}:{rec['queue']}")
+        if cur is not None:
+            cur["since"] = min(float(cur["since"]), float(rec["since"]))
+            cur["acted"] = cur.get("acted") or rec.get("acted")
+            continue
+        rec.setdefault("raise", {"cause": None, "len": None, "n": 0})
+        opened[f"{rec['task']}:{rec['queue']}"] = rec
+
+
+def _settle(db, ep: str) -> None:
+    db.x("UPDATE events SET status='handled' WHERE kind=? AND status='queued' AND (data LIKE ? OR data LIKE ?)",
+         (KIND, f'%"episode": "{ep}"%', f'%"episode": "{ep}:%'))
 
 
 def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, device: set | None = None,
          cores: int = 0, hold=None) -> list[str]:
     """Raise, re-raise and clear queue-wait items; returns the fingerprints raised. `hold`: collect's."""
+    from . import pagesev
     now = time.time() if now is None else now
     db, thr = p.db, threshold_s(cfg)
     if thr <= 0:
         return []
-    waits = sorted((w for w in collect(p, cfg, now, host, device, hold) if now - w["since"] >= thr),
-                   key=lambda w: w["since"])
-    paused = db.paused_resources()
-    raised, live, spill = [], set(), None
     st = db.kv(KV) or {}
     opened, told = st.setdefault("open", {}), st.setdefault("told", [])
+    _rekey(opened)
+    waits, live = [], set()
+    for w in collect(p, cfg, now, host, device, hold):
+        ep = episode(w)
+        if (rec := opened.get(ep)) is not None:   # the same wait: its earliest start, seen now
+            live.add(ep)
+            rec["since"], rec["seen"] = min(float(rec["since"]), w["since"]), now
+            if parked := rec.pop("parked", None):   # back within the grace: its unread item is queued again
+                db.x("UPDATE events SET status='queued' WHERE id=? AND status='handled'", (parked,))
+            w = {**w, "since": rec["since"]}
+        if now - w["since"] >= thr:
+            waits.append(w)
+    waits.sort(key=lambda w: w["since"])
+    paused = db.paused_resources()
+    raised, spill = [], None
     for w in waits:
-        ep = f"{w['task']}:{w['queue']}:{w['since']:.0f}"
+        ep = episode(w)
         live.add(ep)
         rec = opened.setdefault(ep, {"task": w["task"], "queue": w["queue"], "res": w["res"], "since": w["since"],
-                                     "acted": None})
+                                     "seen": now, "acted": None})
         if rec.get("acted"):
             continue
-        k, mark = key(w), int((now - w["since"]) // thr)
+        k = key(w)
         if spill is None and w["queue"] in ("checks", "cpu", "pool"):
             spill = spill_ready(p, cfg)   # once a scan, only when a wait could spill
         sp = spill if w["queue"] in ("checks", "cpu", "pool") else None
@@ -383,26 +421,43 @@ def scan(p, cfg: dict, now: float | None = None, host: dict | None = None, devic
             continue
         if _cause_owner(db, st, w, now) is not None:
             continue   # one act per queue cause: its fix is already owned; raised again once that owner ends
-        said = sig(w, opts)
-        if rec.get("sig") == said and mark - int(rec.get("mark") or 0) < REPEAT_MARKS:
-            continue   # raised before and nothing it says changed: no new wake for the same words
+        held, age = host_held(w), now - w["since"]
+        cause = [w["queue"], w["res"], held, bool(opts)]
+        last = rec.get("raise") or {}
+        if last and last.get("cause") is None:   # an episode carried over from the old key: adopt, no raise
+            last.update(cause=cause, len=last.get("len") or age)
+        if last and last.get("cause") == cause and age < 2 * float(last.get("len") or age):
+            continue   # raised already: again only on a changed cause or a doubled wait
+        n = int(last.get("n") or 0) + 1
         data = {"must_act": {"key": k, "chat": "all", "tasks": [w["task"]], "kind": KIND, "episode": ep},
                 FOLD: fold(w, opts, now, spill_note(sp, cfg))}
-        fp = f"{KIND}:{ep}:{mark}"
-        if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data):
+        if held:
+            data[pagesev.RIDE_ALONG] = True   # no coordinator action lifts it: joins the next turn
+        fp = f"{KIND}:{ep}:{n}"
+        if len(raised) < MAX_RAISE and obligations._raise(db, now, fp, KIND, msg, w["task"], data,
+                                                          severity="normal" if held else "high"):
             raised.append(fp)   # the longest waits first; the rest at a later scan
-            rec.update(sig=said, mark=mark)
+            rec["raise"] = {"cause": cause, "len": age, "n": n}
         if not opts and ep not in told:
             told.append(ep)
             msgparts.post(db, f"#{w['task']} has waited {(now - w['since']) / 60:.0f} min on the "
                               f"{NAMES.get(w['queue'], w['queue'])} and only you can clear it: {msg}",
                           kind="info", severity="normal")
     for ep in [e for e in opened if e not in live]:
-        rec = opened.pop(ep)
-        rec["end"] = now
+        rec = opened[ep]
+        if now - float(rec.get("seen") or rec["since"]) < GRACE_S and _open(db, rec["task"]):
+            # a gap shorter than the grace: the same wait if it shows again; its unread item waits parked
+            if not rec.get("parked") and (ev := db.one(
+                    "SELECT id FROM events WHERE kind=? AND status='queued' AND data LIKE ?",
+                    (KIND, f'%"episode": "{ep}"%'))):
+                db.x("UPDATE events SET status='handled' WHERE id=?", (ev["id"],))
+                rec["parked"] = ev["id"]
+            continue
+        opened.pop(ep)
+        rec.pop("parked", None)
+        rec["end"] = float(rec.get("seen") or now)
         st.setdefault("hist", []).append(rec)
-        db.x("UPDATE events SET status='handled' WHERE kind=? AND status='queued' AND data LIKE ?",
-             (KIND, f'%"episode": "{ep}"%'))
+        _settle(db, ep)
     st["hist"] = [h for h in st.get("hist", []) if now - float(h.get("end") or now) <= HIST_KEEP_S][-HIST_MAX:]
     st["told"] = [e for e in told if e in opened][-HIST_MAX:]
     db.set_kv(KV, st)
@@ -490,7 +545,8 @@ def record_act(db, ep: str, now: float | None = None, owner: int | None = None) 
     `owner` (fix_owner): the task that owns the cause, so other waits on that queue fold into it."""
     with db.tx():
         st = db.kv(KV) or {}
-        rec = (st.get("open") or {}).get(ep)
+        opened = st.get("open") or {}
+        rec = opened.get(ep) or opened.get(":".join(ep.split(":")[:2]))   # an item raised under the old key
         if rec is not None and not rec.get("acted"):
             rec["acted"] = time.time() if now is None else now
             if owner is not None:

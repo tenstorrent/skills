@@ -11614,8 +11614,9 @@ class Daemon:
             if now - newest < debounce and now - oldest < 4 * debounce:
                 return
             own = [e for e in queued if not pagesev.rides_along(e)]   # ride-alongs neither hold nor start a turn
-            # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py).
-            urgent = any(e["kind"] in mustact.KINDS for e in evs)
+            # An overdue promise or order, or a failed claim, wakes the coordinator at once (mustact.py);
+            # a must-act item that rides along (a host-held queue wait) holds like any other ride-along.
+            urgent = any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs)
             # Relayed messages with no order or question wait out the relay window, so a burst is one turn.
             if msgs and not rerun and not any(eventhold.immediate(e) for e in evs) and self._relay_hold(msgs, now):
                 return
@@ -11693,7 +11694,7 @@ class Daemon:
         # or a must-act item wakes it at once; worker dispatch is not held by it.
         hold = (getattr(gate, "coord_hold", None) or {}) if gate else {}
         if hold and not msgs and now < float(hold.get("until") or 0) \
-                and not any(e["kind"] in mustact.KINDS for e in evs):
+                and not any(e["kind"] in mustact.KINDS and not pagesev.rides_along(e) for e in evs):
             if getattr(self, "_coord_hold_logged", None) != hold.get("until"):
                 self._coord_hold_logged = hold.get("until")
                 log(self.p, f"coordinator turn held {(float(hold['until']) - now) / 60:.0f} min by the turn guard "

@@ -202,3 +202,25 @@ def test_pagesev_a_relayed_copy_of_a_page_this_project_has_is_filed_handled(env)
     upstream.ingest(p, p.config())
     again = p.db.one("SELECT severity, status FROM events WHERE source='upstream' AND text LIKE '%again%'")
     assert (again["severity"], again["status"]) == ("low", "handled")
+
+
+def test_pagesev_a_ride_along_must_act_item_does_not_skip_the_batch_hold(env, monkeypatch):
+    """A host-held queue wait is a must-act kind that rides along: next to a young routine event it holds
+    like any ride-along (batch_s), never as an urgent item; the mutation `urgent = any(e['kind'] in
+    mustact.KINDS ...)` starts the turn at once. A high queue wait still starts one at once."""
+    from ttp import mustact
+    p, d, clock, starts = _batch_setup(env, monkeypatch, busy=2)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    _ride(p, clock[0], kind=mustact.QUEUE_KIND)
+    _event(p, clock, "task_notes")
+    assert not _turn_within(d, clock, starts, batch - 120, step=30), "the ride-along wait skipped the hold"
+    clock[0] += batch + 120
+    d.maybe_coordinate()
+    assert len(starts) == 1
+    p.db.x("UPDATE events SET status='handled'")
+    clock[0] += 3600
+    p.db.set_kv("last_coordinator_turn", clock[0])
+    _event(p, clock, "task_notes")
+    _event(p, clock, mustact.QUEUE_KIND, "high")
+    assert _turn_within(d, clock, starts, 120, step=5), "a high queue wait did not start its turn"

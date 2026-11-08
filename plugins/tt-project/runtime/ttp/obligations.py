@@ -960,11 +960,12 @@ def _retire(db, now: float, why: str, *fps: str, prefix: str | None = None) -> i
                            (json.dumps({"retired": why, "at": now}), *args)).rowcount
 
 
-def _raise(db, now: float, fp: str, kind: str, text: str, task: int | None, data: dict | None = None) -> bool:
+def _raise(db, now: float, fp: str, kind: str, text: str, task: int | None, data: dict | None = None,
+           severity: str = "high") -> bool:
     if db.one("SELECT id FROM events WHERE fingerprint=?", (fp,)):
         return False
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task,data) VALUES(?,?,?,?,?,?,?,?,?)",
-         (now, "daemon", kind, fp, "high", text[:4000], "queued", task, json.dumps(data) if data else None))
+         (now, "daemon", kind, fp, severity, text[:4000], "queued", task, json.dumps(data) if data else None))
     return True
 
 

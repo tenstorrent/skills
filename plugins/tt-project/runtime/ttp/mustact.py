@@ -22,7 +22,7 @@ import time
 from . import obligations
 
 REWAKE_KIND = "must_act_rewake"
-QUEUE_KIND = "queue_wait"   # queuewait.KIND: a wait on a queue or cap past its threshold, re-raised per mark
+QUEUE_KIND = "queue_wait"   # queuewait.KIND: a wait on a queue or cap past its threshold, re-raised on a new cause or a doubled wait
 KINDS = (*obligations.MUST_ACT_KINDS, REWAKE_KIND, QUEUE_KIND)
 KV = "must_act"                 # {"told": {fingerprint: at}}: the model-free updates already posted
 TOLD_KEPT = 200
@@ -70,7 +70,7 @@ def block(db, ids) -> str:
             again = (" (queue wait: queue its fix now (config_set, task_add or task_update naming the key or "
                      "updating the task), or a noop whose `why` names the key and the safety rule that holds it; "
                      "else it "
-                     "comes back at the next mark)")
+                     "comes back once its cause changes or the wait doubles)")
         owners = f"; owners #{', #'.join(map(str, it.get('tasks') or []))}" if it.get("tasks") else "; no owner task"
         out.append(f"- {it['key']} in chat {it['chat']}{owners}{again}: {first}")
     if not out:
@@ -159,7 +159,7 @@ def settle(p, ids, actions, applied, now: float | None = None) -> list[tuple[str
         it = item(ev)
         if not it or not isinstance(actions, list):
             continue
-        if it.get("kind") == QUEUE_KIND:   # acted: no more raises for this wait; else the next mark raises it
+        if it.get("kind") == QUEUE_KIND:   # acted: no more raises for this wait; else a new cause or doubled wait does
             if acted(it, actions, applied):
                 from . import queuewait
                 queuewait.record_act(db, str(it.get("episode") or ""), now,

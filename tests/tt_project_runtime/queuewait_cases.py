@@ -32,7 +32,7 @@ def test_queue_wait_fires_on_a_full_checks_queue_with_options_then_clears(env):
     """Criterion: '4 running (cap 4), 20 queued' with a task of this project queued 40 min raises one must-act
     item naming the queue, cap, occupancy, holders and options; the same mark never raises twice; an end
     of the wait settles it and the daily metric counts it."""
-    from ttp import mustact, queuewait
+    from ttp import mustact, pagesev, queuewait
     p = make(env)
     now = time.time()
     host = _qw_host(p, now, now - 40 * 60)
@@ -40,7 +40,8 @@ def test_queue_wait_fires_on_a_full_checks_queue_with_options_then_clears(env):
     fps = queuewait.scan(p, QW_CFG, now, host, cores=64)
     assert len(fps) == 1 and queuewait.scan(p, QW_CFG, now + 60, host, cores=64) == []
     ev = _qw_events(p)[0]
-    assert ev["kind"] in mustact.KINDS and ev["severity"] == "high" and ev["task"] == 7
+    assert ev["kind"] in mustact.KINDS and ev["task"] == 7
+    assert ev["severity"] == "normal" and pagesev.rides_along(ev)   # every host slot taken: host-held
     t = ev["text"]
     assert "qwait-7-checks" in t and "41 min" in t and "4 running (cap 4), 20 queued" in t, t   # as of the rescan
     assert "other task #90" in t and "raise the host-wide checks cap from 4 to 6 (host limit 8)" in t, t
@@ -79,9 +80,10 @@ def test_queue_wait_options_leave_out_forbidden_routes(env):
     assert any(f"qwait-{tid}-device" in e["text"] for e in _qw_events(p))
 
 
-def test_queue_wait_settle_records_an_act_or_raises_again_at_the_next_mark(env):
-    """No acting action (a plain reply to every chat counts not): no immediate re-wake, the next 30-minute
-    mark raises it again. A config_set or a reply naming the key settles it for this wait."""
+def test_queue_wait_settle_records_an_act_or_raises_again_once_the_wait_doubles(env):
+    """No acting action (a plain reply to every chat counts not): no immediate re-wake, nor at the next
+    30-minute mark; the wait doubling since the raise (40 to 80 min) raises it again. A config_set or a reply
+    naming the key settles it for this wait."""
     from ttp import mustact, queuewait
     p = make(env)
     now = time.time()
@@ -91,17 +93,17 @@ def test_queue_wait_settle_records_an_act_or_raises_again_at_the_next_mark(env):
     p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev["id"],))
     mustact.settle(p, [ev["id"]], [{"type": "reply", "chat": "all", "text": "ok"}], [0], now)
     assert not p.db.q("SELECT id FROM events WHERE kind='must_act_rewake'")
-    assert queuewait.scan(p, QW_CFG, now + 5 * 60, host) == []   # the same mark
-    assert queuewait.scan(p, QW_CFG, now + 30 * 60, host) == []   # the next mark, nothing it says changed
-    moved = {**host, "running": host["running"][1:] + ["other task #99 (run 2)"]}
-    assert len(queuewait.scan(p, QW_CFG, now + 31 * 60, moved)) == 1   # a holder changed: raised again
+    assert queuewait.scan(p, QW_CFG, now + 5 * 60, host) == []
+    assert queuewait.scan(p, QW_CFG, now + 31 * 60, host) == []   # the next mark: same cause, not doubled
+    assert len(queuewait.scan(p, QW_CFG, now + 40 * 60, host)) == 1   # 80 min: doubled
+    assert queuewait.scan(p, QW_CFG, now + 41 * 60, host) == []
     ev2 = _qw_events(p)[-1]
     p.db.x("UPDATE events SET status='handled' WHERE id=?", (ev2["id"],))
     act = {"type": "reply", "chat": "all", "text": "qwait-7-checks: held by the host checks cap, a safety cap"}
-    mustact.settle(p, [ev2["id"]], [act], [0], now + 32 * 60)
-    assert queuewait.scan(p, QW_CFG, now + 70 * 60, host) == []
-    line = queuewait.daily_line(p.db, QW_CFG, now + 70 * 60)
-    assert "median 42" in line and "0 with none" in line, line
+    mustact.settle(p, [ev2["id"]], [act], [0], now + 42 * 60)
+    assert queuewait.scan(p, QW_CFG, now + 200 * 60, host) == []
+    line = queuewait.daily_line(p.db, QW_CFG, now + 200 * 60)
+    assert "median 52" in line and "0 with none" in line, line
     it = {"key": "qwait-7-checks", "chat": "all", "tasks": [7], "kind": mustact.QUEUE_KIND}
     assert mustact.acted(it, [{"type": "config_set", "key": "x", "value": 1}], [0]) == "config_set"
     assert mustact.acted(it, [{"type": "notify", "text": "busy"}], [0]) is None
@@ -250,12 +252,13 @@ def test_queue_wait_folds_into_an_active_mute_with_an_open_owner(env):
     p.db.update_task(fix, status="done")
     assert len(queuewait.scan(p, QW_CFG, now + 60, host, cores=64)) == 1
     p.db.x("UPDATE events SET status='handled' WHERE kind='queue_wait'")   # the turn handled it
-    f2 = p.db.add_task("fix again", "s", kind="code")   # the next mark, with the mute ending instead of its owner
+    f2 = p.db.add_task("fix again", "s", kind="code")   # the wait doubling, with the mute ending instead of its owner
     p.db.set_kv(screen.MUTES_KEY, [{"source": "wait_stale", "match": "host-wide checks slot", "below": "high",
                                     "why": f"#{f2}", "since": now, "until": now + 35 * 60, "count": 0,
                                     "throughput": {"owner": {"task": f2}, "max_h": 12}}])
-    assert queuewait.scan(p, QW_CFG, now + 31 * 60, host) == []
-    assert len(queuewait.scan(p, QW_CFG, now + 36 * 60, host)) == 1
+    assert queuewait.scan(p, QW_CFG, now + 34 * 60, host) == []   # 74 min, the mute holds
+    assert queuewait.scan(p, QW_CFG, now + 36 * 60, host) == []   # mute over, 76 min: not doubled
+    assert len(queuewait.scan(p, QW_CFG, now + 42 * 60, host)) == 1
 
 
 def test_queue_wait_mute_matches_only_the_queue_and_the_task_itself(env):
@@ -478,29 +481,111 @@ def test_queue_wait_item_shows_the_holders_when_read_not_when_raised(env):
     f = json.loads(evs[0]["data"])[queuewait.FOLD]   # NEW EVENTS folds by this data: it is rewritten too
     assert "other task #500" in f["ctx"] and "other task #90" not in f["ctx"] and "42 min" in f["item"], f
 
-def test_queue_wait_unchanged_is_raised_again_only_after_repeat_marks_and_carries_fold_data(env):
-    """An unacted wait whose queue, cap, holders and options are unchanged is not raised at each mark: only
-    REPEAT_MARKS marks after its last raise. A change in the queued count or minutes is no change. Each
-    raise's data carries the parts NEW EVENTS folds by queue (coordinator.fold_events): the key, the
-    options and the queue's state."""
+
+def test_queue_wait_start_flip_keeps_one_episode_and_a_short_gap_does_not_end_it(env):
+    """The checks queue's queued_at and the hand-off's waiting_since name the same wait 60 s apart: a scan
+    seeing only one of them never reopens the episode or raises again. A gap under GRACE_S parks the unread
+    item and revives it when the wait shows again; a gap past it ends the episode and settles the item."""
     from ttp import queuewait
     p = make(env)
     now = time.time()
-    host = _qw_host(p, now, now - 40 * 60)   # mark 1 now; 30-minute marks
+    tid = p.db.add_task("t", "s", kind="code")
+    p.db.update_task(tid, not_before=now + 600)
+    hand = {"status": "waiting", "retry_when": "ttp checks --result /x", "waiting_since": now - 40 * 60}
+    q = {"limit": 4, "running": [], "priority": [], "urgent": [], "parked": [],
+         "queued": [f"{p.name} task #{tid} (run 1)"], "queued_at": [now - 39 * 60]}
+    p.db.update_task(tid, result=json.dumps(hand))
+    assert len(queuewait.scan(p, QW_CFG, now, {})) == 1   # the hand-off's start
+    p.db.update_task(tid, result=json.dumps({"status": "waiting"}))
+    for i in range(1, 6):   # only the queue's start, 60 s later, then the hand-off's again
+        p.db.update_task(tid, result=json.dumps(hand if i % 2 == 0 else {"status": "waiting"}))
+        assert queuewait.scan(p, QW_CFG, now + i * 60, q) == []
+    st = p.db.kv(queuewait.KV)
+    assert list(st["open"]) == [f"{tid}:checks"] and st["open"][f"{tid}:checks"]["since"] == now - 40 * 60
+    assert len(_qw_events(p, "queued")) == 1 and not st.get("hist")
+    p.db.update_task(tid, result=json.dumps({"status": "waiting"}))
+    queuewait.scan(p, QW_CFG, now + 11 * 60, {})   # gone for a while: its unread item is parked
+    assert _qw_events(p, "queued") == [] and f"{tid}:checks" in p.db.kv(queuewait.KV)["open"]
+    assert queuewait.scan(p, QW_CFG, now + 20 * 60, q) == []   # back within the grace: no new raise
+    assert len(_qw_events(p, "queued")) == 1 and len(_qw_events(p)) == 1
+    queuewait.scan(p, QW_CFG, now + 21 * 60, {})
+    queuewait.scan(p, QW_CFG, now + 20 * 60 + queuewait.GRACE_S + 1, {})   # past the grace: ended
+    st = p.db.kv(queuewait.KV)
+    assert st["open"] == {} and len(st["hist"]) == 1 and _qw_events(p, "queued") == []
+
+
+def test_queue_wait_raises_again_only_on_a_changed_cause_or_a_doubled_wait(env):
+    """Same cause: no raise at the next marks; the options running out (a user pause) is a new cause; a wait
+    that doubles since its last raise is raised again."""
+    from ttp import queuewait
+    from ttp.db import PAUSED_RESOURCES_KEY
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("dev run", "s", kind="work", origin="user")
+    p.db.update_task(tid, priority=1, not_before=now + 600, result=json.dumps(
+        {"status": "waiting", "retry_when": "ttp lock --probe dev0", "waiting_since": now - 40 * 60}))
+    seen = lambda t: [e for e in _qw_events(p) if e["ts"] == t]   # noqa: E731
+    handle = lambda: p.db.x("UPDATE events SET status='handled' WHERE kind='queue_wait'")   # noqa: E731
+    assert len(queuewait.scan(p, QW_CFG, now, {}, {"dev0", "dev1"})) == 1
+    assert seen(now)[0]["severity"] == "high"   # not a checks wait: no ride-along
+    handle()
+    assert queuewait.scan(p, QW_CFG, now + 31 * 60, {}, {"dev0", "dev1"}) == []
+    p.db.set_kv(PAUSED_RESOURCES_KEY, {"dev0": {"by": "user", "reason": "hold", "since": now}})
+    assert len(queuewait.scan(p, QW_CFG, now + 32 * 60, {}, {"dev0", "dev1"})) == 1   # no option left now
+    handle()
+    assert queuewait.scan(p, QW_CFG, now + 60 * 60, {}, {"dev0", "dev1"}) == []   # 100 min: under 2 x 72
+    fps = queuewait.scan(p, QW_CFG, now + 105 * 60, {}, {"dev0", "dev1"})   # 145 min: doubled
+    assert [fp.rsplit(":", 1)[1] for fp in fps] == ["3"]
+
+
+def test_queue_wait_checks_wait_with_a_free_slot_is_not_host_held(env):
+    """A checks wait while a host slot is free is no host hold: it is raised high and starts a turn; with
+    every slot taken it is raised at normal and rides along."""
+    from ttp import pagesev, queuewait
+    p = make(env)
+    now = time.time()
+    tid = p.db.add_task("t", "s", kind="code")
+    lab = [f"{p.name} task #{tid} (run 1)"]
+    free = {"limit": 4, "running": ["other task #1 (run 1)"], "priority": [], "urgent": [], "parked": [],
+            "queued": lab, "queued_at": [now - 40 * 60]}
+    queuewait.scan(p, QW_CFG, now, free)
+    ev = _qw_events(p)[0]
+    assert ev["severity"] == "high" and not pagesev.rides_along(ev)
+    assert not queuewait.host_held({"queue": "checks", "cap": 4, "running": ["a"]})
+    assert queuewait.host_held({"queue": "checks", "cap": 4, "running": ["a"] * 4})
+    assert queuewait.host_held({"queue": "checks", "cap": None, "running": []})
+    assert not queuewait.host_held({"queue": "push", "cap": 1, "running": ["a"]})
+
+
+def test_queue_wait_old_episode_key_carries_over_without_a_raise(env):
+    """An open episode recorded under the old `<task>:<queue>:<since>` key merges into the new key and adopts
+    the current cause without a raise; an act recorded on the old key still lands."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    host = _qw_host(p, now, now - 40 * 60)
+    old = f"7:checks:{now - 40 * 60:.0f}"
+    p.db.set_kv(queuewait.KV, {"open": {old: {"task": 7, "queue": "checks", "res": "", "since": now - 40 * 60,
+                                              "acted": None}}})
+    assert queuewait.scan(p, QW_CFG, now, host) == []
+    assert list(p.db.kv(queuewait.KV)["open"]) == ["7:checks"]
+    queuewait.record_act(p.db, old, now + 60)
+    assert p.db.kv(queuewait.KV)["open"]["7:checks"]["acted"] == now + 60
+
+def test_queue_wait_raise_carries_fold_data(env):
+    """Each raise's data carries the parts NEW EVENTS folds by queue (coordinator.fold_events): the key, the
+    options and the queue's state; the event text is the item, the queue, the state and the numbered options."""
+    from ttp import queuewait
+    p = make(env)
+    now = time.time()
+    host = _qw_host(p, now, now - 40 * 60)
     assert len(queuewait.scan(p, QW_CFG, now, host, cores=64)) == 1
-    p.db.x("UPDATE events SET status='handled' WHERE kind='queue_wait'")
-    fewer = _qw_host(p, now, now - 40 * 60, queued=12)
-    for k in range(1, queuewait.REPEAT_MARKS):   # marks 2..4: the same words, no wake
-        assert queuewait.scan(p, QW_CFG, now + k * 30 * 60, fewer, cores=64) == [], k
-    assert len(queuewait.scan(p, QW_CFG, now + queuewait.REPEAT_MARKS * 30 * 60, host, cores=64)) == 1
-    first, last = _qw_events(p)[0], _qw_events(p)[-1]
+    first = _qw_events(p)[0]
     f = json.loads(first["data"])[queuewait.FOLD]
     assert f["group"] == "the checks queue" and f["item"] == "qwait-7-checks: #7 has waited 40 min", f
     assert f["ctx"].startswith("4 running (cap 4), 20 queued. Holding: other task #90"), f
     assert any("raise the host-wide checks cap from 4 to 6" in o for o in f["opts"]), f
-    # The event text is unchanged by the split: item, queue, state and numbered options.
     assert first["text"].startswith(f"{f['item']} on the checks queue: {f['ctx']} Options: (1) "), first["text"]
-    assert "has waited 160 min" in last["text"]
 
 
 def test_queue_wait_counts_a_detached_push_lock_holder_and_raises_nothing_while_it_lives(env):
