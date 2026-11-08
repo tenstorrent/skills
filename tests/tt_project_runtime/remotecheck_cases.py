@@ -726,7 +726,9 @@ def test_a_rerun_after_a_spill_host_keeps_off_only_the_host_it_failed_on(env, tm
     assert rec["passed"] is True and rec["spilled_to"] == "check-host-b", rec
     text = (run / "checks.log").read_text()
     assert "did not pass on spill host check-host-a (exit 1)" in text and "spilling to check-host-b" in text, text
-    assert "check-host-a (these checks did not pass there in this run)" in text, text
+    # The host it failed on goes last in pick()'s order and stays off: never back to it.
+    assert "spilling to check-host-a" not in text.split("did not pass on spill host check-host-a")[1], text
+    assert "check-host-a" in checkspill.kept_off(checkspill.spill_off_add("", "check-host-a", False))
     assert all("/ttp-check." in w for w in log.read_text().splitlines()), "both runs were on spill hosts"
     # Failing everywhere: a, then b (a kept off), then here once the lane frees, whose result counts.
     mark.unlink()
@@ -3033,3 +3035,49 @@ def test_a_parked_run_re_executed_for_an_upgrade_tries_every_spill_host_again(en
         cli._checks_reexec("2" if rerank else "99.0.0", time.time(), 3, True, lambda _l: None, io.StringIO(),
                            rerank=rerank, spill_off=off)
     assert e.value.args[0] == (off if rerank else None)
+
+
+def test_the_same_import_failing_on_every_spill_host_is_one_config_fault_told_once_not_hosts_kept_off(
+        env, tmp_path, monkeypatch):
+    """A package the spill hosts' checks env lacks fails the checks at collection on each spill host: that is
+    one fault of the spill env config, never of the hosts or the change. The first failure keeps no host off;
+    once it fails the same way on a second host the run says so once and waits here, and every spill host is
+    tried again once the checks config changes or ENV_RETRY_S passes."""
+    import threading
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    script = tmp_path / "check.sh"
+    script.write_text('case "$(pwd)" in */ttp-check.*)\n'
+                      "  printf 'ERROR collecting tests/test_x.py\\nE   ModuleNotFoundError: No module named '"
+                      "\\''nosuchpkg'\\''\\n'; exit 2;;\nesac\n")
+    cmd = f"sh {script}"
+    p.set_config("delivery.push_checks", [cmd])
+    lane = _spill_lane(p, repo)
+    threading.Timer(6, lane.close).start()
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    text = (run / "checks.log").read_text()
+    assert "spilling to check-host-a" in text and "spilling to check-host-b" in text, text
+    assert "nosuchpkg not installed for the python the check ran with, a fault of the spill env" in text, text
+    assert text.count("one fault of the spill hosts' checks env") == 1, text
+    assert "these checks did not pass there" not in text, "no host kept off for it"
+    ev = p.db.q("SELECT severity, text FROM events WHERE fingerprint LIKE 'checkspill:env:%'")
+    assert len(ev) == 1 and "failing at import" in ev[0]["text"], ev   # the coordinator is told at once, once
+    # Unit level: the marks and their release.
+    cfg = p.config()
+    off = checkspill.spill_off_add("", "check-host-a", False, cfg)
+    assert checkspill.kept_off(off) == set() and checkspill.env_off(off, cfg) == "", "one host: not yet"
+    off = checkspill.spill_off_add(off, "check-host-b", False, cfg)
+    assert checkspill.kept_off(off) == set() and "check-host-a, check-host-b" in checkspill.env_off(off, cfg)
+    told = []
+    assert checkspill.pick(p, cfg, told.append, "pytest -q", off) is None and len(told) == 1, told
+    assert any("took no run: the checks failed at import" in x for x in checkspill.pick_lines(p.name))
+    assert checkspill.env_off(off, cfg, now=time.time() + checkspill.ENV_RETRY_S + 1) == "", "time passed"
+    p.set_config("checks.spill_wrap_cmd", "env FIXED=1")
+    assert checkspill.env_off(off, p.config()) == "", "the checks config changed"
+    got = checkspill.pick(p, p.config(), told.append, "pytest -q", off)
+    try:
+        assert got is not None
+    finally:
+        got and got.close()

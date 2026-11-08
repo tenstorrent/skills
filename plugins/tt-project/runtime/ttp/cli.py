@@ -4308,11 +4308,24 @@ def cmd_checks(a) -> None:
         elif spilled and not passed and (executed or timed_out) and not _CHECK_STOP.get("stopped") \
                 and not (failed in todo and not getattr(failed, "spill_host", "")):
             how = f"past the {timed_out['cap_s']:g} s wall-time cap" if timed_out else f"exit {rc}"
-            no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out)
-            said = (f"the checks did not pass on spill host {spilled.host} ({how}); running them again on "
-                    "this machine, whose result counts, or on a free spill host "
+            env_why = ""
+            if not timed_out:   # a package missing there: a fault of the spill env config (checkspill.env_off)
+                try:
+                    with open(log, "rb") as f:
+                        f.seek(start)
+                        env_why = push.env_problem(f.read().decode("utf-8", errors="replace"), top) or ""
+                except OSError:
+                    pass
+            no_spill = checkspill.spill_off_add(no_spill, spilled.host, rc == 75 and not timed_out,
+                                                p.config() if env_why else None)
+            if env_why:
+                checkspill.env_event(p.db, no_spill, p.config())
+            said = (f"the checks did not pass on spill host {spilled.host} ({how}"
+                    + (f": {env_why.partition(';')[0]}, a fault of the spill env, not the change" if env_why else "")
+                    + "); running them again on this machine, whose result counts, or on a free spill host "
                     + ("they did not fail on" if spilled.host in checkspill.kept_off(no_spill)
-                       else "(that one again once free: the fault was the host's)"))
+                       else "(that one again once free: the fault was the host's)" if not env_why
+                       else "(any one, until the same import fails on another)"))
             out.write(f"ttp checks: {said}\n")
             out.flush()
             print(f"ttp checks: {said}", flush=True)

@@ -111,6 +111,8 @@ FIRST_KEY = "checks_spill_first"   # delivery.checks_spill_first: a spillable ru
 SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the hosts a rerun keeps off (spill_off_add)
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
+ENV_FAULT_HOSTS = 2   # the checks failed at import this often on spill hosts: one fault of the spill env config
+ENV_RETRY_S = 900   # after which (or once the checks config changes) a run tries the spill hosts again
 PROBE_TIMEOUT_S = 30
 DEVICE_SUFFIX = "-device"
 DEVICE_WHY = "a device job runs there: "   # how a device-busy reason starts (device_busy, _device_holders)
@@ -940,18 +942,64 @@ def all_off(off: str) -> bool:
     return off == "1"
 
 
-def spill_off_add(off: str, host: str, fault: bool) -> str:
+def spill_off_add(off: str, host: str, fault: bool, env_cfg: dict | None = None) -> str:
     """OFF_ENV's value after the checks did not pass on spill host `host`: `fault` when the host's own fault
-    ended them (exit 75), else they failed or timed out there."""
-    return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{'fault' if fault else 'fail'}"])
+    ended them (exit 75), else they failed or timed out there. `env_cfg`: they failed at import for want of a
+    package (push.env_problem), a fault of the spill env config `env_cfg` (env_off), never of the host."""
+    mark = (f"env.{_env_key(env_cfg)}.{int(time.time())}" if env_cfg is not None
+            else "fault" if fault else "fail")
+    return ",".join([*(e for e in off.split(",") if e and e != "1"), f"{host}:{mark}"])
 
 
 def kept_off(off: str) -> set[str]:
     """The spill hosts OFF_ENV's value `off` keeps a rerun off: each its checks failed on, and each whose own
-    fault ended them HOST_FAULT_TRIES times."""
+    fault ended them HOST_FAULT_TRIES times. An import failure keeps no host off (env_off)."""
     seen = [e.rpartition(":") for e in off.split(",") if e and e != "1"]
-    return {h for h, _, why in seen if why != "fault"
-            or sum(1 for h2, _, w2 in seen if h2 == h and w2 == "fault") >= HOST_FAULT_TRIES}
+    return {h for h, _, why in seen if not why.startswith("env.") and (why != "fault"
+            or sum(1 for h2, _, w2 in seen if h2 == h and w2 == "fault") >= HOST_FAULT_TRIES)}
+
+
+def _env_key(cfg: dict | None) -> str:
+    import hashlib
+    checks = (cfg or {}).get("checks")
+    return hashlib.sha1(json.dumps(checks if isinstance(checks, dict) else {}, sort_keys=True,
+                                   default=str).encode()).hexdigest()[:10]
+
+
+def env_off(off: str, cfg: dict, now: float | None = None) -> str:
+    """Why OFF_ENV's value `off` keeps the checks off every spill host: they failed at import on
+    ENV_FAULT_HOSTS times under the checks config `cfg` still has, in the last ENV_RETRY_S. One fault of
+    the spill env config, told once; "" once that config changes or the time passes, when all are tried again."""
+    now = time.time() if now is None else now
+    key, hit = _env_key(cfg), []
+    for h, _, why in (e.rpartition(":") for e in off.split(",") if e and e != "1"):
+        _, k, at = (why.split(".") + ["", ""])[:3] if why.startswith("env.") else ("", "", "")
+        if k == key and at.isdigit() and now - int(at) <= ENV_RETRY_S:
+            hit.append(h)
+    if len(hit) < ENV_FAULT_HOSTS:
+        return ""
+    return (f"the checks failed at import on spill hosts {', '.join(dict.fromkeys(hit))}: one fault of the spill hosts' checks "
+            f"env (checks.spill_wrap_cmd or the pinned checks env), not of a host or the change; every spill "
+            f"host is tried again once the checks config changes or in {ENV_RETRY_S // 60} min")
+
+
+def env_event(db, off: str, cfg: dict) -> bool:
+    """Raise one coordinator event when OFF_ENV's value `off` shows the spill env config fault (env_off): a
+    checks config change that breaks every spilled run within minutes is told at once, once per config."""
+    if not (why := env_off(off, cfg)):
+        return False
+    import sqlite3
+    fp = f"checkspill:env:{_env_key(cfg)}"
+    try:
+        if db.q("SELECT 1 FROM events WHERE fingerprint=? LIMIT 1", (fp,)):
+            return False
+        db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
+             (time.time(), "daemon", "observation", fp, "high",
+              f"Spilled checks are failing at import: {why}. Check what last changed the checks config "
+              f"(checks.spill_wrap_cmd, the pinned checks env) and restore a working value.", "queued"))
+    except (OSError, sqlite3.Error):   # an event is a courtesy: never a reason for the checks run to fail
+        return False
+    return True
 
 
 def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") -> Claim | None:
@@ -963,8 +1011,14 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") 
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
     skipped, keep = [], kept_off(off)
+    if env := env_off(off, cfg):
+        tell(f"no spill host could take the checks, waiting here: {env}")
+        _note_pick(p.name, "", [f"{alias} ({env})" for alias in hosts(cfg)])
+        return None
     mine = [r.get("host") for r in holders()]
-    for alias in sorted(hosts(cfg), key=mine.count):   # spread: hosts running fewer of this machine's checks first
+    tried = [e.rpartition(":")[0] for e in off.split(",")]
+    # Spread: hosts these checks did not fail on yet, then those running fewer of this machine's checks, first.
+    for alias in sorted(hosts(cfg), key=lambda h: (h in tried, mine.count(h))):
         machine, host = target(alias)
         if alias in keep or host in keep:
             skipped.append(f"{alias} (these checks did not pass there in this run)")
