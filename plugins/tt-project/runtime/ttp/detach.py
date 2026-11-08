@@ -107,7 +107,11 @@ def last_progress(probe: str, cwd=None) -> float | None:
     if "--host" in (probe or ""):
         return None
     best = None
-    for rc in _checked(probe, cwd):
+    try:
+        rcs = _checked(probe, cwd)
+    except ValueError:   # unbalanced quotes: no job to read, the wait counts as before
+        return None
+    for rc in rcs:
         if rc.exists() or lost(rc).exists():
             continue
         e = _entry(rc)

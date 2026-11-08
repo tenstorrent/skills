@@ -3198,4 +3198,5 @@ def test_last_progress_reads_a_live_jobs_newest_log_and_skips_ended_lost_and_rem
     assert detach.last_progress(f"ttp detach --check {ended}") is None
     assert detach.last_progress(f"ttp detach --check --host box-a {live}") is None
     assert detach.last_progress("test -e state/out-ready || exit 1") is None
+    assert detach.last_progress(f"ttp detach --check '{live}") is None   # unbalanced quote: never raises
     assert abs(detach.last_progress(f"ttp detach --check {live.name}", live.parent) - (now - 120)) < 2
