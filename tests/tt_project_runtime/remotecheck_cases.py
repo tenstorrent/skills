@@ -378,7 +378,7 @@ def test_check_host_settings_are_validated_and_local_keeps_a_check_here():
 
 
 def _spill_setup(env, tmp_path, monkeypatch, hosts, charter=("check-host-a", "check-host-b", "down")):
-    """A checks repo whose project allows `charter` (charter text and machines list), spills to `hosts`
+    """A checks repo whose machines list has `charter` (also written as charter text, which no gate reads), spills to `hosts`
     after 0.3 s, has one checks lane, and the fake ssh on PATH reporting an idle host."""
     from ttp import checkspill, machines
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -438,14 +438,13 @@ def test_busy_checks_spill_to_the_first_reachable_allowed_host_and_name_it(env, 
 
 
 def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_here(env, tmp_path, monkeypatch):
-    """No listed host can take the run (not in the charter, not in the machines list, paused, unreachable,
-    every slot busy): the run says why for each, keeps its place and runs here once the lane frees."""
+    """No listed host can take the run (not in the machines list, paused, unreachable, every slot busy):
+    the run says why for each, keeps its place and runs here once the lane frees."""
     import threading
     from ttp import checklane, checkspill, cli, db as dbm, machines
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch,
-                                        ["outside", "unlisted", "check-host-c", "down", "check-host-a"],
+                                        ["unlisted", "check-host-c", "down", "check-host-a"],
                                         charter=("check-host-a", "check-host-c", "down", "unlisted"))
-    machines.add("outside")
     machines.remove("unlisted")
     p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-c": {"reason": "user hold", "by": "user", "since": 1}})
     # Remote checks from other machines fill check-host-a: as many as its cores hold (checklane.host_slots).
@@ -460,7 +459,7 @@ def test_spill_skips_hosts_that_are_not_allowed_busy_or_down_and_keeps_waiting_h
     rec = json.loads((run / "checks.json").read_text())
     assert rec["passed"] is True and "spilled_to" not in rec and "hosts" not in rec, rec
     text = (run / "checks.log").read_text()
-    for why in ("outside (not named in the charter)", "unlisted (not in the machines list",
+    for why in ("unlisted (not in the machines list",
                 "check-host-c (paused: user hold)", "down (ssh cannot reach it", "check-host-a (its "):
         assert why in text, (why, text)
     assert "/ttp-check." not in log.read_text(), "it ran here"
@@ -1206,8 +1205,7 @@ def test_no_spill_hosts_keeps_todays_wait_and_unspillable_checks_never_spill(env
 def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_own_list_keeps_it_here(
         env, tmp_path, monkeypatch):
     """checks.spill_hosts in the account settings: a project with no list of its own spills to the pool,
-    which needs no charter line (the account setting is the user's word for every project) but still the
-    machines list; a narrower own list is tried first, then the pool; an own [] keeps every run here."""
+    which needs the machines list; a narrower own list is tried first, then the pool; an own [] keeps every run here."""
     from ttp import checkspill, cli, machines, project
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, [], charter=())
     p.raw_config()
@@ -1219,7 +1217,7 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
     machines.add("pool-b")
     assert checkspill.hosts(p.config()) == ["pool-a", "pool-b"]
     assert checkspill.allowed(p, p.config(), "pool-a").startswith("not in the machines list")
-    assert checkspill.allowed(p, p.config(), "pool-b") == "", "the pool needs no charter line"
+    assert checkspill.allowed(p, p.config(), "pool-b") == "", "the pool alone allows it"
     log = tmp_path / "where.log"
     p.set_config("delivery.push_checks", [f"pwd >> {log}"])
     lane = _spill_lane(p, repo)
@@ -1231,11 +1229,11 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
     assert rec["passed"] is True and rec["spilled_to"] == "pool-b", rec
     text = (run / "checks.log").read_text()
     assert "pool-a (not in the machines list" in text and "checks.spill_hosts, the account's pool" in text, text
-    # A narrower own list goes first and the pool follows it; outside the pool the charter still decides.
+    # A narrower own list goes first and the pool follows it; the own list alone allows its hosts.
     p.set_config("delivery.checks_spill_hosts", ["check-host-a", "pool-b"])
     assert checkspill.hosts(p.config()) == ["check-host-a", "pool-b", "pool-a"]
     machines.add("check-host-a")
-    assert checkspill.allowed(p, p.config(), "check-host-a") == "not named in the charter"
+    assert checkspill.allowed(p, p.config(), "check-host-a") == ""
     assert checkspill._source(p.config(), "pool-b") == "delivery.checks_spill_hosts"
     # An own empty list opts out of the pool; a malformed own list spills nowhere.
     p.set_config("delivery.checks_spill_hosts", [])
@@ -1244,6 +1242,51 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
         assert checkspill.hosts({"delivery": {"checks_spill_hosts": bad}}) == [], bad
     project.set_account_setting(checkspill.ACCOUNT_KEY, "pool-a")   # malformed pool: none
     assert checkspill.account_hosts() == [] and checkspill.hosts({}) == []
+
+
+def test_spill_gate_reads_only_structured_settings_never_charter_wording(env, tmp_path, monkeypatch):
+    """allowed() decides from delivery.checks_spill_hosts, the account's pool and the machines-list `checks`
+    tag, never the charter: a listed host with no charter line is allowed, a host the charter names but no
+    setting lists is refused with the setting to add it to, and the user's pauses still keep a listed host off."""
+    from ttp import checkspill, db as dbm, machines
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"], charter=())
+    machines.add("check-host-a")
+    machines.add("named-only")
+    p.charter_path.write_text("# Charter\n## Resources\n- named-only, NAMED-ONLY: a check host\n")
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "", "the setting alone allows it"
+    why = checkspill.allowed(p, p.config(), "named-only")
+    assert why.startswith("not a spill host of this project") and "charter" not in why, why
+    assert f"ttp config {p.name} delivery.checks_spill_hosts '[\"check-host-a\", \"named-only\"]'" in why, why
+    assert "named-only" not in checkspill.hosts(p.config())
+    # The machines-list tag: allowed for every project, tried after the own list, named as the source.
+    machines.add("tagged-host", tags=["x86", checkspill.CHECKS_TAG])
+    machines.add("retired-host", tags=[checkspill.CHECKS_TAG, "retired"])
+    assert checkspill.tagged_hosts() == ["tagged-host"]
+    assert checkspill.hosts(p.config()) == ["check-host-a", "tagged-host"]
+    assert checkspill.allowed(p, p.config(), "tagged-host") == ""
+    assert checkspill._source(p.config(), "tagged-host") == "tagged checks in the machines list"
+    assert checkspill.allowed(p, p.config(), "retired-host") == "retired in the machines list"
+    # An own [] keeps the tagged hosts off too.
+    p.set_config("delivery.checks_spill_hosts", [])
+    assert checkspill.hosts(p.config()) == []
+    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
+    # A user hold or pause still keeps a listed or tagged host off.
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "user hold", "by": "user", "since": 1},
+                                           "tagged-host": {"reason": "lent out", "by": "user", "since": 1}})
+    assert checkspill.allowed(p, p.config(), "check-host-a") == "paused: user hold"
+    assert checkspill.allowed(p, p.config(), "tagged-host") == "paused: lent out"
+
+
+def test_spill_hosts_accepted_through_the_charter_before_stay_allowed_without_it(env, tmp_path, monkeypatch):
+    """Upgrade: every host the old charter-matching gate accepted was already in the project's own list or
+    the account's pool (only hosts() is tried), so with the charter line gone it stays allowed and the
+    project's settings are left as they were: no seed is needed."""
+    from ttp import checkspill
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    before = p.config()["delivery"]["checks_spill_hosts"]
+    p.charter_path.write_text("# Charter\n")
+    assert [checkspill.allowed(p, p.config(), h) for h in checkspill.hosts(p.config())] == ["", ""]
+    assert p.config()["delivery"]["checks_spill_hosts"] == before
 
 
 def test_ttp_config_account_sets_the_spill_pool_validated_and_a_run_may_only_clear_it(env, capsys, monkeypatch):
