@@ -340,6 +340,10 @@ STEP_HARD_SLACK_S = 5
 # add/remove/prune, cleantree, checkreap, harnesstree's merge): killing one midway can leave a lock or a
 # half-removed tree. Every git helper takes the cap or is allowlisted (test_every_git_helper_takes_gitmemos_cap).
 STEP_SLOW_EVERY_S = 3600
+# STEP_INCIDENT_N overruns of one step within STEP_INCIDENT_WINDOW_S are one tick_step_incident for the
+# coordinator (Daemon._step_incident), raised once per incident.
+STEP_INCIDENT_N = 3
+STEP_INCIDENT_WINDOW_S = 600
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
 # in the tick that started them and a slow one never holds it.
@@ -1138,6 +1142,8 @@ class Daemon:
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
         self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
+        self._step_overruns: dict[str, dict] = {}   # step -> its recent overruns and slowest call (_step_incident)
+        self._step_incident_said: dict[str, float] = {}   # step -> when its last tick_step_incident was raised
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
@@ -1151,6 +1157,7 @@ class Daemon:
         self._push_refs_at = 0.0     # when the push queue's pins were last pruned
         self._review_swept = 0.0     # when sweep_reviews last ran
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
+        self._unreviewed_at = 0   # the task sweep_unreviewed stopped at (time or budget): the next pass resumes after it
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
         self._queue_trimmed = 0.0   # when expire_queue last ran
@@ -1801,9 +1808,11 @@ class Daemon:
         t = time.monotonic()
         took = t - (t if self._step_began is None else self._step_began)
         if took < self._step_budget():
+            self._step_overruns.pop(name, None)   # back in budget: the next overruns start a new count
             return
         self._step_charge(t)
         now = time.time()
+        self._step_incident(name, now)
         if now - self._step_slow_said.get(name, 0.0) < STEP_SLOW_EVERY_S:
             return
         self._step_slow_said[name] = now
@@ -1816,6 +1825,30 @@ class Daemon:
         log(self.p, text)
         self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                     (now, "daemon", "tick_step_slow", "low", text[:500], "handled", task))
+
+    def _step_incident(self, name: str, now: float) -> None:
+        """Count an overrun of step `name`; at STEP_INCIDENT_N within STEP_INCIDENT_WINDOW_S, one queued
+        tick_step_incident event for the coordinator naming the step, its overrun count and the slowest
+        call over them, once per incident (until the step runs within budget again) and at most once per
+        STEP_SLOW_EVERY_S per step: a step that overruns every tick is one incident, not one per tick."""
+        spent, holder, task = self._step_worst
+        killed = getattr(self, "_step_killed", "")
+        o = self._step_overruns.setdefault(name, {"at": [], "worst": (0.0, "", None, ""), "said": False})
+        o["at"] = [a for a in o["at"] if now - a < STEP_INCIDENT_WINDOW_S] + [now]
+        if spent >= o["worst"][0] and (holder or not o["worst"][1]):
+            o["worst"] = (spent, holder, task, killed if killed != "-" else "")
+        if o["said"] or len(o["at"]) < STEP_INCIDENT_N or now - self._step_incident_said.get(name, 0.0) < STEP_SLOW_EVERY_S:
+            return
+        o["said"], self._step_incident_said[name] = True, now
+        spent, holder, task, cmd = o["worst"]
+        slowest = (f"{holder} ({spent:.0f} s" + (f", killed {cmd}" if cmd else "") + ")") if holder else \
+            "it names no item it works on"
+        text = (f"Daemon tick step {name} overran its {self._step_budget():g} s budget {len(o['at'])} times in "
+                f"{STEP_INCIDENT_WINDOW_S // 60:g} min; slowest call: {slowest}. It resumes where it stopped each "
+                f"tick; this is raised once per incident.")
+        log(self.p, text)
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (now, "daemon", "tick_step_incident", "normal", text[:1500], "queued", task))
 
     def _log_step_error(self, label: str, err: Exception, limit: int = 2000) -> None:
         """Log `label error:` and the traceback of `err` (call it in its except block) once per step and
@@ -16063,9 +16096,15 @@ class Daemon:
             log(self.p, "unreviewed sweep failed\n" + traceback.format_exc())
             return []
         hot = 0   # urgent tasks' reviews: counted against no cap, and they wait for no sweep_after_s
-        for t in urgent.first(todo):
-            if len(done) - hot >= cap and not urgent.is_urgent(t) or time.time() - now > UNREVIEWED_PASS_S:
+        # A pass cut off (UNREVIEWED_PASS_S, the step's budget, or stopped mid-task) resumes after the task
+        # it stopped at, wrapping round, so a slow early task never keeps the later ones from their turn.
+        at, last = self._unreviewed_at, None
+        for t in urgent.first([r for r in todo if r["id"] > at] + [r for r in todo if r["id"] <= at]):
+            if len(done) - hot >= cap and not urgent.is_urgent(t) or last is not None and (
+                    time.time() - now > UNREVIEWED_PASS_S or stepclock.over()):   # each pass gets one task further
+                self._unreviewed_at = at if last is None else last
                 break
+            last = self._unreviewed_at = t["id"]   # kept if the step is stopped mid-task
             try:
                 if self._unreviewed_skip(t, reviews, rows, covers, code, live, ref, never,
                                          0 if urgent.is_urgent(t) else waited, now):
@@ -16083,6 +16122,8 @@ class Daemon:
                      (time.time(), "daemon", UNREVIEWED_EVENT, "low",
                       f"#{t['id']} {headline.clip(t['title'], 160)}: its commits had no review and were not landed; "
                       f"review #{review[0]} queued by the daemon.", "handled", t["id"]))
+        else:
+            self._unreviewed_at = 0   # an uncut pass leaves no place to resume at
         return done
 
     def _count_unreviewed(self, todo: list[dict]) -> None:

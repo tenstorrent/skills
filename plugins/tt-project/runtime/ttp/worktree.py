@@ -2340,8 +2340,13 @@ def _named_refs(p: Project, task: dict) -> list[str]:
     from .db import dependency_ids, names_branch
     spec = task.get("spec") or ""
     ids = [i for i in dependency_ids(task) if i is not None]
+    # SQLite narrows the rows to the dependencies and the branches the spec contains (instr, in C), so
+    # the Python check runs on those only: the cost does not grow with the project's task history.
+    deps = ",".join(str(int(i)) for i in ids)
     branches = list(dict.fromkeys(
-        r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!=''")
+        r["branch"] for r in p.db.q("SELECT id, branch FROM tasks WHERE branch IS NOT NULL AND branch!='' AND ("
+                                    + (f"id IN ({deps}) OR " if deps else "") + "instr(?, branch) > 0) ORDER BY id",
+                                    (spec,))
         if r["id"] in ids or names_branch(spec, r["branch"])))
     hashes = list(dict.fromkeys(_HEX.findall(spec)))
     heads = [h for h in (_branch_head(p, b) for b in branches) if h] if hashes else []
@@ -2375,6 +2380,30 @@ def _on(p: Project, commit: str, tip: str) -> bool:
         return False
 
 
+# The code tasks that may carry one of the branches `names` (fix_branches), narrowed in SQLite so the
+# Python check reads only those rows, never the project's whole history: a superset of the carriers,
+# each still checked exactly. A task carries a branch its labels or spec name (carried_branch), or one its
+# continued task has (that task's branch), or one a continued review names (named_refs: a dependency's
+# branch or one its spec contains). Parameters: `names` as a JSON list, then the review's id.
+_CARRIERS_SQL = (
+    "WITH nm(name) AS (SELECT value FROM json_each(?)), "
+    "lb(task, value) AS (SELECT t.id, j.value FROM tasks t, json_each(CASE WHEN json_valid(t.labels) "
+    "  THEN t.labels ELSE '[]' END) j WHERE t.kind='code' AND (t.labels LIKE '%\"pr_branch:%' "
+    "  OR t.labels LIKE '%\"continues:%')) "
+    "SELECT * FROM tasks t WHERE kind='code' AND branch IS NOT NULL AND branch!='' AND id!=? "
+    "AND status NOT IN ('failed','cancelled') AND (labels LIKE '%\"pr_branch:%' OR labels LIKE '%\"continues:%') "
+    "AND (EXISTS (SELECT 1 FROM nm WHERE instr(t.spec, nm.name) > 0) "
+    "  OR EXISTS (SELECT 1 FROM lb, nm WHERE lb.task = t.id AND lb.value = 'pr_branch:' || nm.name) "
+    "  OR EXISTS (SELECT 1 FROM lb JOIN tasks prev ON prev.id = CAST(substr(lb.value, 11) AS INTEGER) "
+    "             WHERE lb.task = t.id AND lb.value LIKE 'continues:%' AND ("
+    "               (prev.kind != 'review' AND prev.branch IN (SELECT name FROM nm)) "
+    "               OR (prev.kind = 'review' AND (EXISTS (SELECT 1 FROM nm WHERE instr(prev.spec, nm.name) > 0) "
+    "                 OR EXISTS (SELECT 1 FROM json_each(CASE WHEN json_valid(prev.depends_on) "
+    "                            THEN prev.depends_on ELSE '[]' END) d JOIN tasks b "
+    "                            ON b.id = CAST(d.value AS INTEGER) WHERE b.branch IN (SELECT name FROM nm)))))))"
+    " ORDER BY id")
+
+
 def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
     """{fix branch: the reviewed branch it builds on}: for each branch in `refs`, the own branch of
     the newest code task that carries it, other than the review itself. A fix or re-plan of a failed
@@ -2388,9 +2417,7 @@ def fix_branches(p: Project, task: dict, refs: list[str]) -> dict[str, str]:
     if not names:
         return {}
     newest: dict[str, tuple[int, str]] = {}
-    for t in p.db.q("SELECT * FROM tasks WHERE kind='code' AND branch IS NOT NULL AND branch!='' AND id!=? "
-                    "AND status NOT IN ('failed','cancelled') AND (labels LIKE '%\"pr_branch:%' "
-                    "OR labels LIKE '%\"continues:%')", (task["id"],)):
+    for t in p.db.q(_CARRIERS_SQL, (json.dumps(sorted(names)), task["id"])):
         if t["branch"] in names:
             continue
         on = {carried_branch(t)} & names

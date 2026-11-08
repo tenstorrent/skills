@@ -131,6 +131,8 @@
   its next item and, a few seconds later, wherever it is; a child it waits on is killed with its whole
   tree, every ssh it starts gets ConnectTimeout and ServerAlive options, and the step resumes after
   that item next tick. Each stop is one handled `tick_step_slow` event naming the step and command.
+  Three overruns of one step within 10 min are one queued `tick_step_incident` for the coordinator,
+  naming the step, its overrun count and its slowest call, once per incident.
 - Daemon not running → its service restarts it. Hung (alive, but its heartbeat untouched for
   `watchdog.hang_s`, 900 s by default, never below 600; 600 s once the daemon itself reported a stall in
   a named tick step, `state/tick-stall.json`) → `ttp.watchdog`, run every 5 min (a systemd

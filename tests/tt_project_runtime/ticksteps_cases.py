@@ -1924,3 +1924,158 @@ def test_every_way_a_step_waits_on_a_child_is_capped_and_the_child_killed_whole(
     assert _grandchild_gone(pidf)
     [ev] = p.db.q("SELECT * FROM events WHERE kind='tick_step_slow'")
     assert f"killed {exe}" in ev["text"]
+
+
+def test_a_cut_off_unreviewed_sweep_resumes_after_the_task_it_stopped_at(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    old = time.time() - dmod.UNREVIEWED_GRACE_S - 60
+    tids = []
+    for n in range(3):
+        tid = p.db.add_task(f"work {n}", "edit it", kind="code", tier="light", origin="coordinator")
+        p.db.update_task(tid, status="done", branch=f"ttp/t{tid}-work-{n}")
+        p.db.x("UPDATE tasks SET updated=? WHERE id=?", (old, tid))
+        tids.append(tid)
+    seen = []
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: seen.append(t["id"]) or "looked")
+    monkeypatch.setattr(dmod, "UNREVIEWED_PASS_S", -1)   # spent after each task: one task a pass
+    for _ in range(4):
+        d.sweep_unreviewed(force=True)
+    assert seen == tids + tids[:1], f"each pass takes the next task, wrapping round: {seen}"
+    monkeypatch.setattr(dmod, "UNREVIEWED_PASS_S", 3600)
+    seen.clear()
+    d.sweep_unreviewed(force=True)
+    assert sorted(seen) == tids and d._unreviewed_at == 0, "an uncut pass looks at all and keeps no place"
+
+    def killed(t, *a):   # stopped at its budget mid-task: the next pass starts after that task
+        seen.append(t["id"])
+        raise dmod.StepBudgetSpent("sweep_unreviewed")
+    monkeypatch.setattr(d, "_unreviewed_skip", killed)
+    seen.clear()
+    with pytest.raises(dmod.StepBudgetSpent):
+        d.sweep_unreviewed(force=True)
+    monkeypatch.setattr(d, "_unreviewed_skip", lambda t, *a: seen.append(t["id"]) or "looked")
+    d.sweep_unreviewed(force=True)
+    assert seen == [tids[0], tids[1], tids[2], tids[0]], seen
+
+
+def test_repeated_overruns_of_one_step_are_one_queued_incident_naming_its_slowest_call(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tid = _due_waiting_task(p, "exit 1")
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    naps = iter([0.06, 0.2, 0.06, 0.06, 0.06, 0.06])
+
+    def step():
+        d._step_over(f"task #{tid}'s retry_when probe", tid)
+        time.sleep(next(naps))
+    for _ in range(2):
+        d._run_step(step, "probe_waiting")
+    assert not p.db.q("SELECT * FROM events WHERE kind='tick_step_incident'"), "two overruns are no incident"
+    for _ in range(4):
+        d._run_step(step, "probe_waiting")
+    rows = p.db.q("SELECT * FROM events WHERE kind='tick_step_incident'")
+    assert len(rows) == 1, "one incident, not one per tick"
+    [ev] = rows
+    assert ev["status"] == "queued" and ev["task"] == tid, "a coordinator event"
+    assert "probe_waiting" in ev["text"] and "3 times" in ev["text"]
+    assert f"slowest call: task #{tid}'s retry_when probe" in ev["text"]
+    d._run_step(lambda: None, "probe_waiting")   # back in budget: the incident is over
+    monkeypatch.setattr(dmod, "STEP_SLOW_EVERY_S", 0)
+    naps = iter([0.06] * 3)
+    for _ in range(3):
+        d._run_step(step, "probe_waiting")
+    assert len(p.db.q("SELECT * FROM events WHERE kind='tick_step_incident'")) == 2, "a new incident after recovery"
+
+
+def _history(p, n: int) -> None:
+    """`n` past tasks, written in one transaction: done code tasks on branches, every 5th reviewed (the
+    review names the branch and depends on the task) and every 3rd a fix continuing a review or a
+    code task on its own branch with a pr_branch label."""
+    now, rows = time.time(), []
+    db = p.db
+    base = (db.one("SELECT max(id) m FROM tasks") or {}).get("m") or 0
+    for i in range(base + 1, base + n + 1):
+        kind, branch, labels, deps, spec = "code", f"ttp/t{i}-work", "[]", "[]", f"edit file {i}"
+        if i % 5 == 0:
+            kind, branch, deps, spec = "review", None, json.dumps([i - 1]), f"Review #{i - 1}: branch ttp/t{i - 1}-work."
+        elif i % 3 == 0:
+            prev = i - (i % 5) if i % 5 and i - (i % 5) > base else i - 1
+            labels = json.dumps([f"continues:{prev}", f"pr_branch:ttp/t{i - 1}-work"])
+        rows.append((i, now - 3600, now - 3600, f"task {i}", spec, kind, "done", branch, deps, labels))
+    with db.conn:
+        db.conn.executemany("INSERT INTO tasks(id,created,updated,title,spec,kind,status,branch,depends_on,labels) "
+                            "VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+
+
+def _per_call(p, monkeypatch, fn) -> tuple[int, int, int, float]:
+    """(db calls, rows they returned, git spawns, seconds) of one fn()."""
+    from ttp import gitmemo
+    calls, spawns = [0, 0], []
+    with pytest.MonkeyPatch.context() as mp:
+        for name in ("q", "one", "task"):
+            real = getattr(type(p.db), name)
+
+            def counted(self, *a, _real=real, **k):
+                out = _real(self, *a, **k)
+                calls[0] += 1
+                calls[1] += len(out) if isinstance(out, list) else int(out is not None)
+                return out
+            mp.setattr(type(p.db), name, counted)
+        real_spawn = gitmemo._spawn
+        mp.setattr(gitmemo, "_spawn", lambda argv, t, kw: spawns.append(argv) or real_spawn(argv, t, kw))
+        t0 = time.perf_counter()
+        fn()
+        took = time.perf_counter() - t0
+    return calls[0], calls[1], len(spawns), took
+
+
+def test_review_ref_lookups_cost_the_same_at_1000_and_10000_tasks(env, monkeypatch):
+    from ttp import worktree
+    p = make(env)
+    _history(p, 1000)
+    rid = p.db.add_task("Review #990: work", "Review #990: branch ttp/t989-work, and ttp/t988-work.",
+                        kind="review", tier="standard", origin="daemon", depends_on=[989])
+    monkeypatch.setattr(worktree, "_NAMED_MEMO", {})
+    # The fixes that carry the reviewed branches: one by its pr_branch label, one continuing a done review
+    # that names the branch, one continuing the code task; a failed one carries nothing.
+    fixes = {}
+    for n, (b, labels) in enumerate((("ttp/t989-work", ["pr_branch:ttp/t989-work"]), ("ttp/t988-work", ["continues:990"]),
+                      ("ttp/t989-work", ["continues:989"]), ("ttp/t988-work", ["pr_branch:ttp/t988-work"]))):
+        f = p.db.add_task(f"fix {b}", "fix it", kind="code", tier="light", origin="daemon")
+        p.db.update_task(f, status="failed" if n == 3 else "done", branch=f"ttp/t{f}-fix")
+        p.db.x("UPDATE tasks SET labels=? WHERE id=?", (json.dumps(labels), f))
+        fixes.setdefault(b, []).append(f"ttp/t{f}-fix")
+    p.db.x("UPDATE tasks SET spec=? WHERE id=990", ("Review #989: branch ttp/t988-work.",))
+    want = {fixes["ttp/t988-work"][0]: "ttp/t988-work", fixes["ttp/t989-work"][1]: "ttp/t989-work"}
+
+    def look():
+        r = p.db.task(rid)
+        refs = worktree.named_refs(p, r)
+        worktree.fix_branches(p, r, refs)
+        worktree.reviewed_refs(p, r)
+    look()   # warm
+    small = _per_call(p, monkeypatch, look)
+    monkeypatch.setattr(worktree, "_NAMED_MEMO", {})
+    _history(p, 9000)
+    look()
+    big = _per_call(p, monkeypatch, look)
+    assert big[:3] == small[:3], f"db calls, rows and git spawns per look grow with history: {small} -> {big}"
+    assert big[3] < 1.0, f"one look took {big[3]:.2f} s at 10,000 tasks"
+    r = p.db.task(rid)
+    assert set(worktree.named_refs(p, r)) == {"ttp/t989-work", "ttp/t988-work"}
+    assert worktree.fix_branches(p, r, worktree.named_refs(p, r)) == want, "the newest carrier of each branch"
+
+
+def test_the_step_budget_is_a_known_watchdog_key_set_alone(env):
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import project
+    assert project.unknown_key_hint("watchdog.step_budget_s") is None, "`ttp config` refuses only unknown keys"
+    assert "unknown key" in (project.unknown_key_hint("watchdog.step_budget") or "")
+    p.set_config("watchdog.step_budget_s", 240)
+    assert not [x for x in project.config_problems(p.raw_config()) if "step_budget_s" in x]
+    assert p.config()["watchdog"]["step_budget_s"] == 240 and p.config()["watchdog"]["hang_s"] == 900
+    assert dmod.Daemon(p.base)._step_budget() == 240
