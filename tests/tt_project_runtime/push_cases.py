@@ -1321,7 +1321,9 @@ def test_push_from_a_tasks_own_branch_lands_only_when_its_spec_asks_or_land_says
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
-    p.set_config("delivery.review_before_pr", False)   # no review step: --land needs no review (unreviewed_landing)
+    # A push_branch is a review step (push.review_required), so --land wants a passed review of HEAD; that
+    # gate has its own test (test_land_needs_a_passed_review_...): this one checks the landing guards only.
+    monkeypatch.setattr(push, "unreviewed_landing", lambda *a: "")
     shared = _git_out(origin, "rev-parse", "proj")
     own_only = p.db.add_task("fix", kind="code", spec="Fix it. Push only your own ttp/* branch; never open PRs.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{own_only}-fix")
@@ -1395,7 +1397,9 @@ def test_a_code_workers_plain_push_lands_only_tested_work_unless_land_overrides_
     from ttp import push
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
-    p.set_config("delivery.review_before_pr", False)   # no review step: --land needs no review (unreviewed_landing)
+    # A push_branch is a review step (push.review_required), so --land wants a passed review of HEAD; that
+    # gate has its own test (test_land_needs_a_passed_review_...): this one checks the landing guards only.
+    monkeypatch.setattr(push, "unreviewed_landing", lambda *a: "")
     shared = _git_out(origin, "rev-parse", "proj")
     tid = p.db.add_task("fix", kind="code", spec="Fix it, then land it with `ttp push`.")
     _git_out(repo, "checkout", "-q", "-b", f"ttp/t{tid}-fix")
@@ -8090,7 +8094,9 @@ def test_a_code_task_whose_title_ends_in_notes_still_delivers_its_own_branch_as_
     from ttp import push, worktree
     p, repo, origin, other = _push_setup(env, monkeypatch, ["true"])
     p.set_config("delivery.code_tasks_may_push", True)   # code tasks land only with it on (code_run_landing)
-    p.set_config("delivery.review_before_pr", False)   # no review step: --land needs no review (unreviewed_landing)
+    # A push_branch is a review step (push.review_required), so --land wants a passed review of HEAD; that
+    # gate has its own test (test_land_needs_a_passed_review_...): this one checks the landing guards only.
+    monkeypatch.setattr(push, "unreviewed_landing", lambda *a: "")
     _git_out(other, "push", "-q", "origin", "HEAD:refs/heads/feature/x")
     for labels in ([], ["pr_branch:feature/x"]):
         tid = p.db.add_task("Update release notes", "s", kind="code", labels=labels)
@@ -20763,7 +20769,7 @@ def test_land_needs_a_passed_review_of_exactly_head_where_delivery_wants_review(
     for args in (["push", "--land"], ["push", "--land", "--detach"]):
         assert _ttp(*args) == 2, args
         err = capsys.readouterr().err
-        assert "needs a passed review of this exact commit" in err and "delivery.review_before_pr" in err, err
+        assert "needs a passed review of this exact commit" in err and "delivery.review_before_pr or delivery.push_branch" in err, err
         monkeypatch.delenv(push.LAND_ENV, raising=False)   # cmd_push sets it in os.environ
     assert not (p.state / "pushes").exists() and _git_out(origin, "rev-parse", "proj") == shared
     # A passed review records the head it accepted (daemon._mark_verified): that exact head may land.
@@ -20782,9 +20788,14 @@ def test_land_needs_a_passed_review_of_exactly_head_where_delivery_wants_review(
     verified.record(p.db, other, "review", head, review=review)
     with pytest.raises(ValueError, match="needs a passed review"):
         push.resolve(p, repo)
-    # With no review step the project lands as before.
+    # A push_branch is a review step too (as the daemon's automatic reviews read it): review_before_pr off
+    # with a push_branch set still refuses the unreviewed head.
     p.set_config("delivery.review_before_pr", False)
-    assert push.resolve(p, repo) == ("origin", "proj", False)
+    with pytest.raises(ValueError, match=r"delivery.review_before_pr or delivery.push_branch"):
+        push.resolve(p, repo)
+    # With no review step (neither set) the gate lets the head through as before.
+    assert not push.review_required({"review_before_pr": False, "push_branch": ""})
+    assert push.unreviewed_landing(p, repo, str(tid), {"review_before_pr": False}) == ""
     p.set_config("delivery.review_before_pr", True)
     # Reviewed at this head, `ttp push --land` lands it.
     verified.record(p.db, tid, "review", head, review=review)

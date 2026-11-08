@@ -2820,9 +2820,10 @@ def code_run_landing(p: Project, task: str, upstream: str, d: dict) -> str:
 
 
 def review_required(d: dict) -> bool:
-    """Whether delivery `d` wants an independent review before each push: delivery.review_before_pr,
-    on unless set off."""
-    return bool(d.get("review_before_pr", True))
+    """Whether delivery `d` has a review step, so each push needs an independent review first: the
+    harness's rule everywhere, delivery.review_before_pr (on unless set off) or a delivery.push_branch.
+    review.auto does not matter: with it off, reviews are queued by hand but still required."""
+    return bool(d.get("review_before_pr", True) or d.get("push_branch"))
 
 
 def unreviewed_landing(p: Project, repo: Path, task: str, d: dict) -> str:
@@ -2848,7 +2849,7 @@ def unreviewed_landing(p: Project, repo: Path, task: str, d: dict) -> str:
     older = (f" The last passed review (#{m.get('review')}) accepted {str(m.get('sha'))[:10]}, not this "
              f"commit; a review of an older head does not cover a newer one." if m else "")
     return (f"task #{task}: `--land` needs a passed review of this exact commit ({head[:10]}), because this "
-            f"project's delivery wants a review before each push (delivery.review_before_pr), and no "
+            f"project's delivery has a review step (delivery.review_before_pr or delivery.push_branch), and no "
             f"passed review covers it.{older} Commit, run `ttp checks` and "
             f"hand off; the review lands the change")
 

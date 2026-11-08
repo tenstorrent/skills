@@ -2887,10 +2887,10 @@ session and stateless coordinators on every provider.
   project); another task's push is refused (exit 2). Exit 1 when it had already pushed.
 - Inside a run, `ttp push --land` lands the task's own branch though its spec has no landing step,
   and skips the guard that wants `ttp checks` passed on HEAD. It never skips a review: when delivery
-  wants one before each push (`delivery.review_before_pr`, on by default), it lands only a commit a
-  passed review accepted for that task (the review marker), exactly HEAD. A review of an older head
-  does not cover a newer one; without one the push is refused (exit 2), naming the missing review.
-  With `delivery.review_before_pr` off, `--land` lands as before.
+  has a review step (`delivery.review_before_pr`, on by default, or a `delivery.push_branch`; with
+  `review.auto` off too), it lands only a commit a passed review accepted for that task (the review
+  marker), exactly HEAD. A review of an older head does not cover a newer one; without one the push
+  is refused (exit 2), naming the missing review. With no review step, `--land` lands as before.
 - `delivery.version_bump` lets `ttp push` own the version bump, so parallel reviews never race for
   one version: `{"files": [...], "changeset_dir": ".changeset"}` (optional `package`, and `paths`,
   default the folder the files share). After each rebase, when the change touches `paths`, it
