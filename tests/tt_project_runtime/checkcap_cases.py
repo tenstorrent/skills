@@ -9994,6 +9994,20 @@ def test_project_max_from_names_the_setting_that_binds_the_test_worker_budget(en
 
 # `ttp checks park|cancel|resume|queue` (checksqueue, #7120).
 
+def _no_push_env(monkeypatch):
+    """This process (each test's queued run) is no push batch whatever runs the tests: the push queue runs
+    them with TTP_PUSH_MODE=target, which checksqueue.push_batch reads from /proc/<pid>/environ, fixed at exec."""
+    from ttp import landmark, procowner
+    real, me, drop = procowner.environ, os.getpid(), ("TTP_PUSH_MODE", landmark.ENV)
+    for k in drop:
+        monkeypatch.delenv(k, raising=False)
+
+    def environ(pid):
+        env = real(pid)
+        return {k: v for k, v in env.items() if k not in drop} if env is not None and pid == me else env
+    monkeypatch.setattr(procowner, "environ", environ)
+
+
 def _queue_run(p, tid, wait=True, own=True):
     """A run folder of task `tid` (a runs row) whose live checks (this process) wait in the queue, or with
     wait=False hold a slot."""
@@ -10016,6 +10030,7 @@ def test_checks_park_frees_the_queue_place_and_resumes_at_its_first_arrival_once
     import threading
     from ttp import checkcap, checksqueue, cli, locks
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _no_push_env(monkeypatch)
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setattr(checksqueue, "PROBE_S", 0)
     monkeypatch.setattr(checksqueue, "POLL_S", 0.05)
@@ -10045,8 +10060,9 @@ def test_checks_park_frees_the_queue_place_and_resumes_at_its_first_arrival_once
         assert tickets()[0] == first, "it queues again at its first arrival, never at the back"
         assert not (run / checksqueue.PARK).exists()
     finally:
+        flag.touch()   # a failed assert never leaves the thread parked or queued past teardown
         held.close()
-    t.join(30)
+        t.join(30)
     assert not t.is_alive() and ran.exists(), "resumed, it took the slot and ran"
     acts = [json.loads(x)["action"] for x in (run / checksqueue.LOG).read_text().splitlines()]
     assert acts == ["park", "resume"], acts
@@ -10057,6 +10073,7 @@ def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path
     import threading
     from ttp import checkcap, checkjoin, checksqueue, cli, locks
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    _no_push_env(monkeypatch)
     monkeypatch.setenv("TTP_TASK", str(p.db.add_task("t", "s", kind="code")))
     monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
     monkeypatch.setattr(checksqueue, "PROBE_S", 0)
@@ -10090,8 +10107,9 @@ def test_a_parked_checks_run_is_no_leader_to_join_until_it_resumes(env, tmp_path
         assert got and got[0]["id"] == a["id"] and got[1] == checkjoin.JOINED, got
         b_path.unlink()
     finally:
+        flag.touch()   # a failed assert never leaves the thread parked or queued past teardown
         held.close()
-    t.join(30)
+        t.join(30)
     assert not t.is_alive() and done in ([0], [None]), done
 
 
@@ -10116,6 +10134,7 @@ def test_checks_resume_lets_a_parked_run_queue_again(env, tmp_path, monkeypatch)
     from ttp import checksqueue
     from ttp.runner import proc_start
     p = make(env)
+    _no_push_env(monkeypatch)
     tid = p.db.add_task("t", "s", kind="code")
     rid, d = _queue_run(p, tid)
     monkeypatch.setattr(checksqueue, "POLL_S", 0.01)
@@ -10131,6 +10150,7 @@ def test_checks_resume_lets_a_parked_run_queue_again(env, tmp_path, monkeypatch)
 def test_checks_cancel_drops_a_queued_run_and_logs_who_and_why(env, monkeypatch):
     from ttp import checksqueue, cli
     p = make(env)
+    _no_push_env(monkeypatch)
     tid = p.db.add_task("t", "s", kind="code")
     rid, d = _queue_run(p, tid)
     assert checksqueue.act(p, d, "cancel", "the coordinator (run 7)", "user msg #2: routine", "")[0] == 0
@@ -10155,6 +10175,7 @@ def test_checks_park_and_cancel_refuse_a_slot_holder_a_push_batch_and_another_pr
                                                                                          monkeypatch):
     from ttp import checksqueue, cli, procowner
     p = make(env)
+    _no_push_env(monkeypatch)
     tid = p.db.add_task("t", "s", kind="code")
     _, held = _queue_run(p, tid, wait=False)
     for action in ("park", "cancel"):
@@ -10224,6 +10245,7 @@ def test_checks_park_callers_the_coordinator_and_an_ordered_urgent_worker_only(e
 def test_checks_park_task_parks_its_waiting_runs_and_the_queue_lists_them(env, monkeypatch, capsys):
     from ttp import checksqueue, coordtools
     p = make(env)
+    _no_push_env(monkeypatch)
     monkeypatch.setattr(coordtools, "coordinator_run", lambda: False)
     spec = "Urgent.\n\nThe coordinator orders: park the routine checks runs (user msg #1972)."
     me = p.db.add_task("me", spec, kind="code", priority=1)
