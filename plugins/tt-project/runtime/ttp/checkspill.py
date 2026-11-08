@@ -1773,7 +1773,7 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
     """`head` passed (on spill host `passed_on`, else here). `passed_on`'s strikes reset. Each spill host whose
     run of `head` failed (strike_fail) takes a strike, unless that failure's signature hit CONFIG_FAULT_HOSTS
     hosts within CONFIG_WINDOW_S with no spilled pass between: a project-wide config fault (one incident, no
-    strike, those hosts' strikes reset). A host at quarantine_after strikes in a row is quarantined until
+    strike, those hosts' strikes reset); a bare `exit <rc>` signature never matches (remotecheck.shared_sig). A host at quarantine_after strikes in a row is quarantined until
     QUARANTINE_MAX_S (pick skips it), with one event and a machine ledger entry whose auto-undo lifts it.
     Returns the hosts quarantined now. Never raises."""
     now = time.time() if now is None else now
@@ -1796,7 +1796,7 @@ def strike_settle(p, cfg: dict | None, head: str, passed_on: str = "", now: floa
                     continue
                 sig = str(f.get("sig") or "")
                 same = {g["host"] for g in fails if g.get("sig") == sig and float(g.get("at") or 0) >= since}
-                if len(same) >= CONFIG_FAULT_HOSTS:
+                if remotecheck.shared_sig(sig) and len(same) >= CONFIG_FAULT_HOSTS:
                     for h in same:
                         hosts.setdefault(h, {})["n"] = 0
                     if sig not in seen:

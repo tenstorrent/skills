@@ -4551,6 +4551,69 @@ def test_fail_sig_reads_the_last_error_line_without_paths_or_numbers():
     assert remotecheck.fail_sig("all quiet", 2) == "exit 2"
 
 
+def test_fail_sig_names_the_failing_test_ids():
+    """Two tests failing with the same error text read differently; the same tests on two hosts read the same;
+    a whole-suite collection error keeps one signature everywhere; a long id list stays under 200 chars."""
+    from ttp import remotecheck
+    x = remotecheck.fail_sig("FAILED tests/a.py::x - AssertionError: assert False\n", 1)
+    y = remotecheck.fail_sig("FAILED tests/b.py::y - AssertionError: assert False\n", 1)
+    assert x != y and "tests/a.py::x" in x and "AssertionError: assert False" in x
+    plain = "tests/a.py F\nE       assert 1 == 2\nFAILED tests/a.py::test_x - assert 1 == 2\n1 failed in 0.12s\n"
+    assert remotecheck.fail_sig(plain, 1) == remotecheck.fail_sig(plain.replace("0.12", "3.4"), 1) != "exit 1"
+    assert "tests/a.py::test_x" in remotecheck.fail_sig(plain, 1)
+    coll = ("E   ModuleNotFoundError: No module named 'yaml'\n"
+            "ERROR tests/a.py - ModuleNotFoundError: No module named 'yaml'\n"
+            "ERROR tests/b.py - ModuleNotFoundError: No module named 'yaml'\n"
+            "!!!!!!! Interrupted: 2 errors during collection !!!!!!!\n")
+    other = coll.replace("ERROR tests/a.py", "ERROR tests/c.py").replace("tests/b.py", "tests/a.py")
+    assert remotecheck.fail_sig(coll, 2) == remotecheck.fail_sig(
+        "conftest '/tmp/ttp-check.9f/x.py'\n" + coll.replace("2 errors", "2 errors in 1.5s"), 2)
+    assert remotecheck.fail_sig(coll, 2) != remotecheck.fail_sig(other, 2)
+    assert remotecheck.fail_sig("ttp checks: FAILED tests/z.py::ours\n", 3) == "exit 3"
+    many = "".join(f"FAILED tests/test_{i}_long_module_name.py::test_case_{i} - assert 0\n" for i in range(40))
+    assert len(remotecheck.fail_sig(many, 1)) <= 200
+    assert remotecheck.fail_sig(many, 1) != remotecheck.fail_sig(many.replace("test_case_7 ", "test_case_x "), 1)
+    assert remotecheck.shared_sig(x) and not remotecheck.shared_sig("exit 1") and not remotecheck.shared_sig("")
+    assert not remotecheck.shared_sig("exit None")
+
+
+def test_failures_without_an_error_line_or_of_different_tests_never_read_as_a_config_fault(
+        env, tmp_path, monkeypatch):
+    """A bare `exit N` signature (no error line, no test id) on two hosts is two strikes, never a config fault;
+    two hosts failing different tests with the same assertion text are two strikes too; a host whose
+    failures carry no error line reaches the strike limit and is quarantined; the same collection-time
+    ImportError on two hosts within the hour is still one config incident."""
+    from ttp import checkspill, remotecheck
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a", "check-host-b"])
+    cfg = p.config()
+
+    def n(host):
+        return checkspill._strikes(p.db)["hosts"].get(host, {}).get("n")
+
+    bare = remotecheck.fail_sig("1 failed in 0.3s\n", 1)
+    assert bare == "exit 1"
+    checkspill.strike_fail(p, "check-host-a", "h1", bare)
+    checkspill.strike_fail(p, "check-host-b", "h2", bare)
+    assert checkspill.strike_settle(p, cfg, "h1") == [] and checkspill.strike_settle(p, cfg, "h2") == []
+    assert n("check-host-a") == 1 and n("check-host-b") == 1
+    checkspill.strike_fail(p, "check-host-a", "h3", remotecheck.fail_sig(
+        "FAILED tests/a.py::x - AssertionError: assert False\n", 1))
+    checkspill.strike_fail(p, "check-host-b", "h3", remotecheck.fail_sig(
+        "FAILED tests/b.py::y - AssertionError: assert False\n", 1))
+    assert checkspill.strike_settle(p, cfg, "h3") == []
+    assert n("check-host-a") == 2 and n("check-host-b") == 2
+    assert not _spill_events(p, "Spill config fault")
+    checkspill.strike_fail(p, "check-host-a", "h4", bare)
+    assert checkspill.strike_settle(p, cfg, "h4") == ["check-host-a"], "no error line: still the host's fault"
+    assert not _spill_events(p, "Spill config fault")
+    coll = ("E   ImportError: libfoo.so: cannot open shared object file\n"
+            "ERROR tests/a.py - ImportError: libfoo.so: cannot open shared object file\n")
+    checkspill.strike_fail(p, "check-host-b", "h5", remotecheck.fail_sig(coll, 2))
+    checkspill.strike_fail(p, "check-host-a", "h6", remotecheck.fail_sig(coll.replace("/x", "/y"), 2))
+    assert checkspill.strike_settle(p, cfg, "h5") == [] and checkspill.strike_settle(p, cfg, "h6") == []
+    assert len(_spill_events(p, "Spill config fault")) == 1 and n("check-host-b") == 0
+
+
 def test_a_spilled_failure_strikes_its_host_once_the_run_passes_here_and_a_host_fault_does_not(
         env, tmp_path, monkeypatch):
     """`ttp checks`: a run failing on the spill host and passing here strikes that host (with the error line

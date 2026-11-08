@@ -176,13 +176,32 @@ _ERROR_LINE = re.compile(r"\b([A-Z][A-Za-z0-9_]*(?:Error|Exception)\b:?[^\n]*)")
 _NOISE = re.compile(r"(?:/[^\s'\"]+)+|0x[0-9a-fA-F]+|\d+")
 
 
+_TEST_LINE = re.compile(r"^(?:FAILED|ERROR) (\S+)")
+SIG_MAX = 200
+
+
 def fail_sig(text: str, rc: Any = None) -> str:
     """A failed check's signature from its output's tail: its last error line (`ModuleNotFoundError: No module
-    named 'yaml'`), paths and numbers cut so the same fault on two hosts reads the same; else `exit <rc>`.
-    The harness's own `ttp ...:` lines never count (checkspill.strike_settle tells a config fault by it)."""
-    hits = [m.group(1) for line in (text or "")[-65536:].splitlines()
-            if not line.lstrip().startswith("ttp ") for m in _ERROR_LINE.finditer(line)]
-    return _NOISE.sub("#", hits[-1]).strip()[:200] if hits else f"exit {rc}"
+    named 'yaml'`), paths and numbers cut so the same fault on two hosts reads the same, then the sorted ids of
+    pytest's `FAILED <id>` / `ERROR <id>` lines in brackets (a long list: its count and hash), under SIG_MAX
+    chars; neither: `exit <rc>`, which never matches another failure (shared_sig). The harness's own `ttp ...:`
+    lines never count (checkspill.strike_settle tells a config fault by it)."""
+    lines = [line for line in (text or "")[-65536:].splitlines() if not line.lstrip().startswith("ttp ")]
+    hits = [m.group(1) for line in lines for m in _ERROR_LINE.finditer(line)]
+    ids = sorted({m.group(1) for line in lines if (m := _TEST_LINE.match(line))})
+    err = _NOISE.sub("#", hits[-1]).strip()[:SIG_MAX] if hits else ""
+    if not ids:
+        return err or f"exit {rc}"
+    tag = f"[{' '.join(ids)}]"
+    if len(err) + len(tag) + 1 > SIG_MAX:
+        tag = f"[{len(ids)} tests {hashlib.sha1(chr(10).join(ids).encode()).hexdigest()[:12]}]"
+    return f"{err[:SIG_MAX - len(tag) - 1]} {tag}".strip()
+
+
+def shared_sig(sig: str) -> bool:
+    """Whether failure signature `sig` may match another host's (a config fault): never a bare `exit <rc>` or
+    an empty one, which say nothing of the cause."""
+    return bool(sig) and not re.fullmatch(r"exit \S*", sig)
 
 
 def _say(msg: str) -> None:
