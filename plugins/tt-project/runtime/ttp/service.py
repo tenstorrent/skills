@@ -271,7 +271,7 @@ def ensure_overseer(p: Project) -> str:
     env = " ".join(f"{k}={shlex.quote(v)}" for k, v in _env(p).items())
     cmd = (f"cd {shlex.quote(str(p.base))} && {env} {' '.join(shlex.quote(a) for a in overseer_argv(p))} "
            f">> {shlex.quote(str(p.logs / 'overseer.out'))} 2>&1")
-    # own session: the overseer must outlive the daemon that starts it (it restarts a stuck daemon)
+    # own session: the overseer must outlive the daemon that starts it (it watches that daemon's loop)
     subprocess.Popen(["sh", "-c", cmd], start_new_session=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return "started a detached overseer"
 

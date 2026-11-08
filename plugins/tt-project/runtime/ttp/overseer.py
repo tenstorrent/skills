@@ -9,10 +9,15 @@ opens project.db read-only with a short busy timeout (a WAL reader never waits o
 lock), reads the run folders and writes RESULTS to state/HEALTH_FILE:
 
 - last_dispatch: when a worker run last started;
-- urgent_wait_s: how long the oldest ready urgent task waits while a worker slot is free;
+- urgent_wait_s: how long the oldest ready urgent task waits while a worker slot is free, counting only
+  the tasks dispatch would start: urgent_held / urgent_hold count and name those a hold keeps out (the
+  project paused, its provider's saved budget gate allowing no new work, a paused resource it names, or
+  a dispatch_hold the daemon recorded since it became ready). Accepted gap: the overseer reads no live
+  lock or slot state, so a hold that ended after its record still reads as held until the task changes;
 - unreaped / unreaped_s: finished runs (exit.json on disk) still `running`, and the oldest one's age;
 - unapplied / unapplied_s: the same for coordinator runs (an answer finished but not applied);
-- undelivered / undelivered_s: events still `new` for the coordinator, and the oldest one's age;
+- undelivered / undelivered_s: events still `queued` for the coordinator (the set its turn receives),
+  and the oldest one's age;
 - overruns_h: tick_step_slow reports in the last hour (the daemon raises at most one per step per
   STEP_SLOW_EVERY_S, so this counts the slow steps, a floor on the overruns);
 - heartbeat_s: the daemon heartbeat's age.
@@ -66,6 +71,26 @@ def _age(now: float, ts) -> float | None:
     return max(0.0, now - float(ts)) if ts else None
 
 
+def _hold(d, task: dict, since: float, cfg: dict) -> str:
+    """What keeps ready `task` out of dispatch, read from the database only (module doc), or ''."""
+    from .coordinator import task_resources
+    if d.kv("paused", False):
+        return "the project is paused"
+    g = (d.kv("gates") or {}).get(task["provider"] or cfg.get("core_provider", "claude"))
+    if isinstance(g, dict) and (g.get("allow_new_work") is False
+                                or (g.get("max_parallel") is not None and int(g["max_parallel"]) <= 0)):
+        return "the budget gate allows no new work"
+    try:
+        paused = d.paused_resources()
+    except Exception:
+        paused = d.paused_resources(shared=False)
+    if task_resources(task) & paused.keys():
+        return "a resource it needs is paused"
+    ev = d.one("SELECT text FROM events WHERE kind='dispatch_hold' AND task=? AND ts>=? ORDER BY ts DESC LIMIT 1",
+               (task["id"], since))
+    return (ev["text"] or "a resource it needs is held")[:80] if ev else ""
+
+
 def measure(p: Project, now: float | None = None) -> dict:
     """The loop's results now (module doc), or {"error": ...} when the database cannot be read."""
     from . import urgent
@@ -84,13 +109,20 @@ def measure(p: Project, now: float | None = None) -> dict:
         running = d.q("SELECT id, role, dir FROM runs WHERE status='running'")
         workers = sum(1 for r in running if r["role"] != "coordinator")
         try:
-            slots = int((p.config().get("budget") or {}).get("max_parallel_workers", 6))
+            cfg = p.config()
+            slots = int((cfg.get("budget") or {}).get("max_parallel_workers", 6))
         except Exception:
-            slots = 6
+            cfg, slots = {}, 6
         h["free_slots"] = max(slots - workers, 0)
-        waits = [_age(now, max(float(t["updated"] or t["created"] or now), float(t["not_before"] or 0)))
-                 for t in d.ready_tasks() if urgent.is_urgent(t)]
-        h["urgent_ready"] = len(waits)
+        waits, holds = [], []
+        for t in d.ready_tasks():
+            if not urgent.is_urgent(t):
+                continue
+            since = max(float(t["updated"] or t["created"] or now), float(t["not_before"] or 0))
+            why = _hold(d, t, since, cfg)
+            (holds if why else waits).append(why or _age(now, since))
+        h["urgent_ready"] = len(waits) + len(holds)
+        h["urgent_held"], h["urgent_hold"] = len(holds), (holds[0] if holds else "")
         h["urgent_wait_s"] = max(waits) if waits and h["free_slots"] else 0.0
         done = {}
         for r in running:
@@ -102,7 +134,7 @@ def measure(p: Project, now: float | None = None) -> dict:
         coord = [ts for role, ts in done.values() if role == "coordinator"]
         h["unreaped"], h["unreaped_s"] = len(done), max((now - ts for _, ts in done.values()), default=0.0)
         h["unapplied"], h["unapplied_s"] = len(coord), max((now - ts for ts in coord), default=0.0)
-        ev = d.one("SELECT COUNT(*) n, MIN(ts) t FROM events WHERE status='new'") or {}
+        ev = d.one("SELECT COUNT(*) n, MIN(ts) t FROM events WHERE status='queued'") or {}
         h["undelivered"], h["undelivered_s"] = int(ev.get("n") or 0), _age(now, ev.get("t")) or 0.0
         h["overruns_h"] = int((d.one("SELECT COUNT(*) n FROM events WHERE kind='tick_step_slow' AND ts>?",
                                      (now - 3600,)) or {}).get("n") or 0)
@@ -144,7 +176,8 @@ def line(h: dict | None, now: float | None = None) -> str:
     last = h.get("last_dispatch")
     parts = [f"last dispatch {_mins(now - float(last))} ago" if last else "no dispatch yet",
              f"urgent ready {h.get('urgent_ready', 0)}" + (f" (waiting {_mins(h['urgent_wait_s'])} with a free slot)"
-                                                           if h.get("urgent_wait_s") else ""),
+                                                           if h.get("urgent_wait_s") else "")
+             + (f" ({h['urgent_held']} held: {h['urgent_hold']})" if h.get("urgent_held") else ""),
              f"unreaped {h.get('unreaped', 0)}", f"unapplied answers {h.get('unapplied', 0)}",
              f"undelivered events {h.get('undelivered', 0)}", f"step overruns {h.get('overruns_h', 0)}/h"]
     text = "loop health: " + ", ".join(parts)

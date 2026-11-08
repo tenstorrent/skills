@@ -19,7 +19,9 @@ def _stalled_loop(env, now):
         d.mkdir(parents=True, exist_ok=True)
         (d / "exit.json").write_text("{}")
         os.utime(d / "exit.json", (old, old))
-    p.db.x("INSERT INTO events(ts, source, kind, text, status) VALUES(?,?,?,?,?)", (old, "daemon", "x", "e", "new"))
+    # Only the queued event is due to the coordinator; a `new` (the schema default) or handled one is not.
+    for status in ("queued", "new", "new", "handled"):
+        p.db.x("INSERT INTO events(ts, source, kind, text, status) VALUES(?,?,?,?,?)", (old, "daemon", "x", "e", status))
     for _ in range(3):
         p.db.x("INSERT INTO events(ts, source, kind, text, status) VALUES(?,?,?,?,?)",
                (now - 60, "daemon", "tick_step_slow", "slow", "handled"))
@@ -45,6 +47,36 @@ def test_the_overseer_reads_results_not_the_heartbeat_and_says_them_in_one_line(
     p.db.x("UPDATE tasks SET status='done'")
     assert overseer.measure(p, now)["failing"] == []
     assert overseer.line(None) == "loop health: no overseer reading yet"
+
+
+def test_a_dispatch_hold_on_urgent_work_is_no_results_failure(env, monkeypatch):
+    """A paused project, a closed budget gate and a resource hold the daemon recorded each keep urgent work
+    out of dispatch on purpose: the line names the hold, with no FAILING, no stacks and no incident."""
+    from ttp import overseer
+    now = time.time()
+    dumps = []
+    monkeypatch.setattr(overseer, "capture_stacks", lambda p, now, why: dumps.append(why))
+    p = _stalled_loop(env, now)
+    p.db.x("UPDATE runs SET status='done'")   # only the urgent wait is left to judge
+    tid, core = p.db.one("SELECT id FROM tasks")["id"], p.config()["core_provider"]
+    hold_ev = ("INSERT INTO events(ts, source, kind, severity, text, status, task) VALUES(?,?,?,?,?,?,?)")
+    holds = (
+        (lambda: p.db.set_kv("paused", True), lambda: p.db.set_kv("paused", False), "the project is paused"),
+        (lambda: p.db.set_kv("gates", {core: {"level": "red", "allow_new_work": False, "max_parallel": 0}}),
+         lambda: p.db.set_kv("gates", {}), "the budget gate allows no new work"),
+        (lambda: p.db.x(hold_ev, (now - 600, "daemon", "dispatch_hold", "low", "lock blx: held by #9", "handled", tid)),
+         lambda: p.db.x("DELETE FROM events WHERE kind='dispatch_hold'"), "lock blx: held by #9"))
+    for on, off, words in holds:
+        on()
+        h = overseer.check(p, now)
+        text = overseer.line(h, now)
+        assert h["failing"] == [] and (h["urgent_ready"], h["urgent_held"]) == (1, 1), (words, h)
+        assert f"urgent ready 1 (1 held: {words})" in text and "FAILING" not in text, text
+        off()
+    assert dumps == [] and not (p.state / overseer.INCIDENTS_FILE).exists()
+    # A hold recorded before the task became ready again holds nothing now: the stalled loop still fails.
+    p.db.x(hold_ev, (now - 2000, "daemon", "dispatch_hold", "low", "old hold", "handled", tid))
+    assert overseer.measure(p, now)["failing"] == ["urgent work ready with a free slot for 15 min"]
 
 
 def test_the_health_line_reaches_the_digest_status_and_deployed(env, monkeypatch):
