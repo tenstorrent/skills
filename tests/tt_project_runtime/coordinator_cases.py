@@ -22509,7 +22509,8 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     """Each coordinator turn's run records the model and effort it ran with and the model its session
     reported; `ttp status` and the daily review show them against the configured ones, flagging a
     mismatch, and the review lists the coordinator's spend per day."""
-    from ttp import audit, cli, coordmodel
+    from datetime import datetime, timedelta
+    from ttp import audit, cli, coordmodel, timefmt
     from ttp.daemon import Daemon
     p = make(env)
     # A finished turn keeps the session's reported model in its note (the fake reports it like claude's init).
@@ -22521,12 +22522,17 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     p.db.x("DELETE FROM runs")
     p.set_config("core_provider", "claude")
     assert coordmodel.line(p.config(), p.db, p) == "coordinator model: configured claude/opus · xhigh; no turn yet"
-    now = time.time()
+    now = time.time()   # the status line's "last turn N min ago" reads the wall clock
+    # The turns and the daily review sit at yesterday's noon in the home zone, so the turns minutes
+    # apart always fall on one day, whatever the wall clock (they split near midnight otherwise).
+    tz = timefmt.tzinfo(p)
+    noon = datetime.fromtimestamp(now, tz).replace(hour=12, minute=0, second=0, microsecond=0) - timedelta(days=1)
+    at = noon.timestamp()
 
     def turn(model, effort, used, usd, ago=60.0):
         return p.db.x("INSERT INTO runs(role,provider,model,effort,started,ended,status,cost_usd,note) "
                       "VALUES('coordinator','claude',?,?,?,?,'ok',?,?)",
-                      (model, effort, now - ago, now - ago + 30, usd, json.dumps({"model_used": used})))
+                      (model, effort, at - ago, at - ago + 30, usd, json.dumps({"model_used": used})))
     turn("sonnet", "high", "", 2.0, ago=86400 * 2 + 60)
     turn("sonnet", "high", "", 9.0, ago=86400 * 9)       # older than the days listed
     turn("opus", "xhigh", "claude-opus-9", 1.5, ago=90)
@@ -22543,10 +22549,10 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     assert "MISMATCH" not in coordmodel.line(p.config(), p.db, p)
     p.set_config("core_provider", "codex")
     assert "MISMATCH: it ran with provider claude" in coordmodel.line(p.config(), p.db, p)
-    days = coordmodel.spend_by_day(p.db, p, now)
+    days = coordmodel.spend_by_day(p.db, p, at)
     assert [round(x["usd"], 2) for x in days] == [3.0, 2.0], days
     assert days[0]["models"] == {"opus": 2, "sonnet": 1} and days[1]["turns"] == 1
-    review = audit.lines(p.db, now=now, p=p)
+    review = audit.lines(p.db, now=at, p=p)
     assert coordmodel.line(p.config(), p.db, p) in review
     spend = next(x for x in review if x.startswith("coordinator spend per day"))
     assert f"{days[0]['day']} $3.00 (3 turns: opus 2, sonnet 1)" in spend, spend
@@ -22579,7 +22585,7 @@ def test_status_and_the_daily_review_show_configured_and_last_used_coordinator_m
     assert "configured" not in one[0]   # the run now matches the configured route
     assert one[0] in cli.status_text(p, verbose=True).splitlines()   # verbose adds, never replaces
     # A day with no coordinator turn adds neither line.
-    assert not [x for x in audit.lines(p.db, now=now + 30 * 86400, p=p) if x.startswith("coordinator model")]
+    assert not [x for x in audit.lines(p.db, now=at + 30 * 86400, p=p) if x.startswith("coordinator model")]
 
 def test_agent_mode_test_scope_on_usable_machines_is_never_class_b_and_refusals_quote_their_words(env):
     """In agent mode a Restrictions edit is classed by the clauses it changes: an edit that only changes
