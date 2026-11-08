@@ -1008,10 +1008,11 @@ def check_env(mode: str, tip: str = "", run_dir: str | None = None, branch: str 
     if pp := check_pythonpath(os.environ):
         env["PYTHONPATH"] = pp
     env = leakfile.with_path(env)   # the account's leak-pattern file, by path, for a check's temp HOME
-    env = runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
-                                               "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}),
-                          lock or check_lock)
-    return hoststate.fake_env(env, Path(output) / "hoststate" if output else None)   # host-state stand-ins first on PATH
+    # host-state stand-ins on PATH, after only the pinned env's bin (which holds none of their commands)
+    env = hoststate.fake_env(env, Path(output) / "hoststate" if output else None)
+    return runnerenv.apply(checkdirs.for_check({**env, "TTP_RUN_DIR": output, "TTP_PUSH_MODE": mode,
+                                                "TTP_PUSH_TIP": tip or "", "TTP_PUSH_BRANCH": short_branch(branch)}),
+                           lock or check_lock)
 
 
 def short_branch(ref: str) -> str:
@@ -4243,6 +4244,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         reader.start()
         try:
             rc = _timed_wait(proc, waits, cmd, say)
+            _end_group(proc.pid)   # what it left running ends first: nothing writes after the compare
             changed, said = guard.end()
             for line in said:
                 say(line)
@@ -4250,6 +4252,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
             proc.kill()
             proc.wait()
+            _end_group(proc.pid)   # the command under checkgroup too, before the compare
             guard.stopped(say)   # a change made before the stop: restored and reported, not the next baseline
             raise
         finally:
