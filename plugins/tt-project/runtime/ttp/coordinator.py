@@ -5362,7 +5362,7 @@ def worker_pinned_line(p: Project, use: dict | None = None) -> str:
     from .prompts import worker_context
     use = use or worker_context(p)[2]
     if not use["pinned_dropped"]:
-        return (f"pinned worker memory over budget: the {use['kept']} restriction, resource and standing entries for "
+        return (f"pinned worker memory over budget: the {use['kept']} restriction and resource entries for "
                 f"workers ({use['kept_chars']} chars) outgrow their {use['memory_limit']} chars of room; every "
                 f"worker prompt still carries them whole; merge or shorten them") if use["kept_over"] else ""
     return (f"pinned worker memory over budget: {use['pinned_chars']} chars for {use['memory_limit']} of room "
