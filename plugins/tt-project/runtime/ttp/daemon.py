@@ -4608,8 +4608,9 @@ class Daemon:
     def renet_fork_runs(self) -> list[tuple[int, float, float]]:
         """Once per project (kv FORK_RENET_KEY): worker and review runs that started as a fork of the
         coordinator's session, booked before _net_of_session covered forks, carry the parent session's
-        cost. Re-book each at its own tokens priced, and take the difference off its task's spend, so
-        spend, the dollar caps, task budgets and top-ups count it once. A row already netted (its note
+        cost. Re-book each at its own tokens priced, take the difference off its task's spend and book it
+        as a negative ledger row at the run's time, so spend, the dollar caps (and the global daily total),
+        task budgets and top-ups count it once. A row already netted (its note
         has session_cost_usd) is left alone, so a second pass changes nothing. Returns (run id, booked
         before, booked after) of each row changed."""
         db = self.p.db
@@ -4633,6 +4634,10 @@ class Daemon:
             db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (usage.cost_usd, json.dumps(note), r["id"]))
             db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?",
                  (before - usage.cost_usd, r["task"]))
+            # The dollar caps and the global daily total sum the ledger, not runs: book the correction
+            # there too, at the run's own time, so the day it was overbooked is the day it comes off.
+            db.spend(r["provider"], -(before - usage.cost_usd), self._source_for(r), account=r["account"] or "",
+                     estimated=usage.estimated, ts=float(r["ended"] or r["started"] or time.time()))
             changed.append((r["id"], before, usage.cost_usd))
         db.set_kv(FORK_RENET_KEY, {"at": time.time(), "runs": len(changed),
                                    "usd_before": round(sum(c[1] for c in changed), 6),

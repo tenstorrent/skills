@@ -49807,10 +49807,14 @@ def test_forked_runs_booked_before_the_fix_are_re_netted_once_with_their_task_sp
     own = _own(20_000)
     tid, r = _fork_run(d, cost=own + 11.89, out_tokens=20_000, status="done")
     _, plain = _fork_run(d, cost=4.0, out_tokens=0, status="done")   # no own tokens: left as booked
+    ledger_before = db.spent_since(0)
     changed = d.renet_fork_runs()
+    assert abs((ledger_before - db.spent_since(0)) - 11.89) < 1e-4, "the caps' ledger kept the phantom"
     assert [c[0] for c in changed] == [r["id"]]
     row = db.one("SELECT cost_usd, note FROM runs WHERE id=?", (r["id"],))
     assert abs(row["cost_usd"] - own) < 1e-6 and "fork_base_usd" in json.loads(row["note"])
     assert abs(db.task(tid)["spent_usd"] - own) < 1e-6, "the task kept the phantom spend"
     assert db.one("SELECT cost_usd FROM runs WHERE id=?", (plain["id"],))["cost_usd"] == 4.0
+    ledger_after = db.spent_since(0)
     assert d.renet_fork_runs() == [], "a second pass changed rows again"
+    assert db.spent_since(0) == ledger_after, "a second pass booked the correction again"
