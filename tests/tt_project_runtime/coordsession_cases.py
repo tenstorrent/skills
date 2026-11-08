@@ -13,7 +13,7 @@ def _cs_state(**over):
             "wakes": 2, "context_tokens": 1000, "failures": [], "last_ok": True, **over}
 
 
-def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
+def test_coordsession_decide_resumes_a_sound_session_and_never_rolls_over_for_context():
     from ttp import coordsession as cs
     now, yes = 1000.0, (lambda s: True)
     assert cs.decide({}, _cs_state(), "k1", "m", "high", yes, now) == ("resume", "continued"), "always on"
@@ -22,7 +22,6 @@ def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
         "no session": (None, "k1", "m", "high", yes),
         "prefix changed": (_cs_state(), "k2", "m", "high", yes),
         "model or effort changed": (_cs_state(), "k1", "m2", "high", yes),
-        "context reached 100000 tokens": (_cs_state(context_tokens=100000, handover=True), "k1", "m", "high", yes),
         "last run not ok": (_cs_state(last_ok=False), "k1", "m", "high", yes),
         "session not saved": (_cs_state(), "k1", "m", "high", lambda s: False),
     }
@@ -30,16 +29,20 @@ def test_coordsession_decide_resumes_a_sound_session_and_names_each_rollover():
         assert cs.decide(_cs_cfg(), state, key, model, effort, saved, now) == ("new", why), why
     assert cs.decide(_cs_cfg(), _cs_state(), "k1", "m", "low", yes, now) == ("new", "model or effort changed")
     assert cs.decide(_cs_cfg(), _cs_state(id=""), "k1", "m", "high", yes, now) == ("new", "no session")
-    # At the limit (no first prompt recorded: rollover_growth_tokens) one handover wake resumes the
-    # session first (its session_note), then a new one.
-    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000), "k1", "m", "high", yes, now) == ("resume", "handover")
-    assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "handover")
-    assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(handover=True), "k1", "m", "high", yes, now)[0] == "new"
-    # A session that cannot resume rolls over at once, without the handover wake.
+    # At the limit (no first prompt recorded: compact_growth_tokens) the session compacts in place:
+    # it resumes, whatever its size, and a legacy handover mark no longer ends it.
+    for size in (100000, 500000, 10**9):
+        for extra in ({}, {"handover": True}):
+            assert cs.decide(_cs_cfg(), _cs_state(context_tokens=size, **extra), "k1", "m", "high", yes, now) == \
+                ("resume", "compact"), (size, extra)
+    assert cs.decide(_cs_cfg(compact_tokens=500), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "compact")
+    assert cs.decide(_cs_cfg(rollover_tokens=500), _cs_state(), "k1", "m", "high", yes, now) == ("resume", "compact"), \
+        "a legacy rollover_tokens sets the compaction point"
+    # A session that cannot resume still starts anew, for its own reason, never for its size.
     assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000, last_ok=False), "k1", "m", "high", yes, now) == \
         ("new", "last run not ok")
     assert cs.decide(_cs_cfg(), _cs_state(context_tokens=100000), "k2", "m", "high", yes, now) == ("new", "prefix changed")
-    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=99999), "k1", "m", "high", yes, now)[0] == "resume"
+    assert cs.decide(_cs_cfg(), _cs_state(context_tokens=99999), "k1", "m", "high", yes, now) == ("resume", "continued")
     # Garbage state never raises: it starts a session.
     for bad in ("x", [], 7, {"id": None}):
         assert cs.decide(_cs_cfg(), bad, "k1", "m", "high", yes, now) == ("new", "no session"), bad
@@ -68,23 +71,39 @@ def test_coordsession_no_config_value_turns_a_stateless_coordinator_turn_back_on
         ("stateless", "no session here")
 
 
-def test_coordsession_a_failed_resume_reruns_as_the_next_session_and_alerts_without_pausing():
+def test_coordsession_a_failed_resume_reruns_in_the_same_session_and_alerts_without_pausing():
     from ttp import coordsession as cs
     cfg, yes = _cs_cfg(), (lambda s: True)
+    # A crash, a lost runner or a timeout: the batch reruns at once, resuming the same session id.
     st, alert = cs.fail(cfg, _cs_state(paused_until=5000.0), 1000.0, "run 7: boom")
-    assert not alert and st["rerun"] and not st["last_ok"] and st["fail_error"] == "run 7: boom"
+    assert not alert and st["rerun"] and st["last_ok"] and st["fail_error"] == "run 7: boom" and not st["rejected"]
     assert "paused_until" not in st, "an older daemon's pause is dropped"
-    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1001.0) == ("new", "resume failed")
-    st = cs.record(st, None, "s2", {"mode": "new", "why": "resume failed", "key": "k1", "model": "m",
+    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1001.0) == ("resume", "rerun")
+    st = cs.record(st, None, "s1", {"mode": "resume", "why": "rerun", "key": "k1", "model": "m",
                                     "effort": "high"}, True, 1002.0)
-    assert "rerun" not in st and "fail_error" not in st
+    assert st["id"] == "s1" and not {"rerun", "fail_error", "rejected", "idle_fails"} & set(st)
     assert cs.decide(cfg, st, "k1", "m", "high", yes, 1003.0) == ("resume", "continued")
-    # A failure older than an hour does not count toward the alert.
+    # A failure older than an hour does not count toward the alert; the third within it alerts.
     st, alert = cs.fail(cfg, {**st, "failures": [1000.0 - 3700, 1000.0]}, 1100.0)
     assert not alert and len(st["failures"]) == 2
     st, alert = cs.fail(cfg, st, 1200.0)
     assert alert and st["failures"] == [] and "paused_until" not in st
-    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1300.0) == ("new", "resume failed"), "never stateless"
+    assert cs.decide(cfg, st, "k1", "m", "high", yes, 1300.0) == ("resume", "rerun"), "never stateless, same id"
+    # Only a resume the provider rejects (the id is unknown or expired) starts the next session.
+    for error in ("run 8: No conversation found with session ID: s1", "run 8: Error: session s1 not found",
+                  "run 8: session expired", "run 8: no rollout found for thread s1"):
+        bad, _ = cs.fail(cfg, _cs_state(), 1400.0, error)
+        assert bad["rejected"] and cs.decide(cfg, bad, "k1", "m", "high", yes, 1401.0) == ("new", "resume failed"), error
+    # Or REJECT_AFTER resumes in a row that did no work at all; a wake with work in between resets the run.
+    st, _ = cs.fail(cfg, _cs_state(), 1500.0, "run 9: exited 1", idle=True)
+    st, _ = cs.fail(cfg, st, 1550.0, "run 9: timeout")   # did work: the idle run starts again
+    assert st["idle_fails"] == 0 and not st["rejected"]
+    for n in range(1, cs.REJECT_AFTER + 1):
+        st, _ = cs.fail(cfg, st, 1500.0 + n, "run 9: exited 1", idle=True)
+        want = ("new", "resume failed") if n == cs.REJECT_AFTER else ("resume", "rerun")
+        assert cs.decide(cfg, st, "k1", "m", "high", yes, 1600.0) == want, n
+    # A transcript the provider no longer keeps (expiry, host move) also starts the next session.
+    assert cs.decide(cfg, _cs_state(), "k1", "m", "high", lambda s: False, 1700.0) == ("new", "session not saved")
 
 
 def test_coordsession_record_counts_wakes_and_context_of_its_session():
@@ -149,31 +168,54 @@ def test_coordsession_a_multi_call_turn_under_the_limit_resumes(tmp_path):
     assert st["base_tokens"] == 30000 and st["wakes"] == 2
 
 
-def test_coordsession_a_last_call_over_the_limit_rolls_over(tmp_path):
+def test_coordsession_a_last_call_over_the_limit_compacts_in_place(tmp_path):
     from ttp import coordsession as cs
     from ttp.providers.claude import Claude
     yes, turn = (lambda s: True), {"mode": "new", "why": "no session", "key": "k1", "model": "m",
                                     "effort": "high", "provider": "claude"}
-    st = cs.record(None, Claude().parse(_cs_stream(tmp_path / "a.jsonl", [(30000, 500)])), "", turn, True, 10.0)
+    st = cs.record(None, Claude().parse(_cs_stream(tmp_path / "a.jsonl", [(30000, 500)])), "s1", turn, True, 10.0)
     grown = Claude().parse(_cs_stream(tmp_path / "b.jsonl", [(60000, 500), (129600, 400)]))
-    st = cs.record(st, grown, "", {**turn, "mode": "resume", "why": "continued"}, True, 20.0)
+    st = cs.record(st, grown, "s1", {**turn, "mode": "resume", "why": "continued"}, True, 20.0)
     assert (st["context_tokens"], st["base_tokens"]) == (130000, 30000)
-    # Over the limit, one handover wake resumes the session (its session_note), then a new one starts.
-    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 30.0) == ("resume", "handover")
-    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "h.jsonl", [(130500, 300)])), "",
-                   {**turn, "mode": "resume", "why": "handover"}, True, 35.0)
-    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 36.0) == ("new", "context reached 130000 tokens")
-    # A rollover starts the next session's base afresh.
-    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "c.jsonl", [(20000, 100)])), "",
-                   {**turn, "why": "context reached 130000 tokens"}, True, 40.0)
+    # Over the limit the same session resumes to compact (a harness summary where the agent has no
+    # switch); the compaction is recorded and the next limit counts from the compacted size.
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 30.0) == ("resume", "compact")
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "h.jsonl", [(40000, 300)])), "s1",
+                   {**turn, "mode": "resume", "why": "compact"}, True, 35.0)
+    assert st["id"] == "s1" and st["wakes"] == 3 and st["restore"] is True
+    assert st["compactions"] == [{"at": 35.0, "session": "s1", "before": 130000, "after": 40300, "how": "summary"}]
+    assert cs.limit(_cs_cfg(), st, "m") == 140300
+    assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 36.0) == ("resume", "continued")
+    # The restoring wake clears the mark; an agent's own compaction (its boundary event) is recorded too.
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "r.jsonl", [(41000, 100)])), "s1",
+                   {**turn, "mode": "resume", "why": "continued", "restore": True}, True, 40.0)
+    assert "restore" not in st and len(st["compactions"]) == 1
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "g.jsonl", [(52000, 100)])), "s1",
+                   {**turn, "mode": "resume", "why": "continued"}, True, 45.0, compacted={"pre_tokens": 151000})
+    assert st["id"] == "s1" and st["restore"] is True and st["compact_floor"] == 52100
+    assert st["compactions"][-1] == {"at": 45.0, "session": "s1", "before": 151000, "after": 52100, "how": "agent"}
+    # A failed run records no compaction; only the last COMPACTIONS_KEPT rows stay.
+    n = len(st["compactions"])
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "f.jsonl", [(53000, 100)])), "s1",
+                   {**turn, "mode": "resume", "why": "compact"}, False, 50.0)
+    assert len(st["compactions"]) == n
+    st = {**st, "last_ok": True, "compactions": [{"at": i} for i in range(cs.COMPACTIONS_KEPT)]}
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "k.jsonl", [(30000, 100)])), "s1",
+                   {**turn, "mode": "resume", "why": "continued"}, True, 55.0, compacted=True)
+    assert len(st["compactions"]) == cs.COMPACTIONS_KEPT and st["compactions"][-1]["before"] == 52100
+    # A new session (prefix changed) drops the old session's floor and restore mark.
+    st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "c.jsonl", [(20000, 100)])), "s2",
+                   {**turn, "why": "prefix changed"}, True, 60.0)
     assert (st["context_tokens"], st["base_tokens"], st["wakes"]) == (20100, 20000, 1)
-    # A known window caps the limit, and a fixed rollover_tokens replaces it.
+    assert "compact_floor" not in st and "restore" not in st
+    # A known window caps the limit, and a fixed compact_tokens replaces it.
     st = {**_cs_state(), "base_tokens": 30000, "context_tokens": 110000}
-    assert cs.decide(_cs_cfg(context_window_tokens=150000), st, "k1", "m", "high", yes, 50.0) == ("resume", "handover")
+    assert cs.decide(_cs_cfg(context_window_tokens=150000), st, "k1", "m", "high", yes, 50.0) == ("resume", "compact")
     assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 50.0) == ("resume", "continued")
-    assert cs.decide(_cs_cfg(rollover_tokens=110000), st, "k1", "m", "high", yes, 50.0) == ("resume", "handover")
+    assert cs.decide(_cs_cfg(compact_tokens=110000), st, "k1", "m", "high", yes, 50.0) == ("resume", "compact")
     assert cs.limit(_cs_cfg(), st, "claude-x[1m]") == 130000, "growth stays the bound under a long window"
-    assert cs.limit(_cs_cfg(rollover_growth_tokens=2000000), st, "claude-x[1m]") == 960000
+    assert cs.limit(_cs_cfg(compact_growth_tokens=2000000), st, "claude-x[1m]") == 960000
+    assert cs.limit(_cs_cfg(rollover_growth_tokens=2000000), st, "claude-x[1m]") == 960000, "legacy key"
     # Without per-call usage (another agent), the turn's sum still bounds it: early, never late.
     from types import SimpleNamespace
     use = SimpleNamespace(session_id="s", input_tokens=60000, cache_read_tokens=50000, cache_write_tokens=0,
@@ -211,8 +253,8 @@ def test_coordsession_the_retired_mode_key_is_refused_and_absent_from_the_defaul
             cli.cmd_chat_settable("coordinator.session.mode", value)
         assert e.value.code == 1 and "refused" in capsys.readouterr().out, value
     p = make(env)
-    assert p.config()["coordinator"]["session"] == {"rollover_tokens": 0, "rollover_growth_tokens": 100000,
-                                                   "context_window_tokens": 0, "rollover_margin_tokens": 40000,
+    assert p.config()["coordinator"]["session"] == {"compact_tokens": 0, "compact_growth_tokens": 100000,
+                                                   "context_window_tokens": 0, "compact_margin_tokens": 40000,
                                                    "row_delta": True}
     assert not {"thread_warm_min", "thread_max_turns"} & set(p.config()["coordinator"])
     assert settable("coordinator.session.row_delta")(" Off ") is False and settable("coordinator.session.row_delta")(True)
@@ -305,7 +347,7 @@ def _cs_wake(p, d, deadline_s=30):
     return row["id"] if row else None
 
 
-def test_coordsession_a_failed_resume_reruns_its_batch_as_a_seeded_session_and_handles_each_message_once(env, monkeypatch):
+def test_coordsession_a_resume_the_provider_rejects_reruns_its_batch_as_a_seeded_session_and_handles_each_message_once(env, monkeypatch):
     from ttp import coordsession
     from ttp.daemon import Daemon
     from ttp.providers import fake
@@ -320,7 +362,7 @@ def test_coordsession_a_failed_resume_reruns_its_batch_as_a_seeded_session_and_h
     note = lambda i: json.loads(p.db.one("SELECT note FROM runs WHERE id=?", (i,))["note"])["turn"]["session"]
     assert rid and note(rid)["mode"] == "new"
     sid = p.db.kv(coordsession.KEY)["id"]
-    # The transcript vanishes after the check: the agent cannot resume it and the run fails.
+    # The transcript vanishes after the check: the agent rejects the session id ("No conversation found").
     (sessions / f"{sid}.jsonl").unlink()
     monkeypatch.setattr(fake.Fake, "session_saved", lambda self, s, cwd, env=None: True)
     p.db.post("in", "second", chat="c1")
@@ -329,14 +371,14 @@ def test_coordsession_a_failed_resume_reruns_its_batch_as_a_seeded_session_and_h
     assert p.db.one("SELECT status FROM runs WHERE id=?", (failed,))["status"] != "ok"
     assert p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0"), "nothing of the failed turn applied"
     assert float(p.db.kv("coordinator_backoff_until", 0)) <= time.time(), "the rerun waits on no backoff"
-    assert p.db.kv(coordsession.KEY)["rerun"] is True
+    assert p.db.kv(coordsession.KEY)["rerun"] is True and p.db.kv(coordsession.KEY)["rejected"] is True
     ev = p.db.q("SELECT text, status FROM events WHERE kind='coord_session_resume_failed'")
     assert len(ev) == 1 and ev[0]["status"] == "handled" and f"run {failed}" in ev[0]["text"], ev
     rerun = _cs_wake(p, d)
     assert rerun == failed + 1 and note(rerun) == {**note(rerun), "mode": "new", "why": "resume failed"}
     assert note(rerun)["error"].startswith(f"run {failed}: "), "the rerun names the failed resume"
     prompt = (p.runs / str(rerun) / "prompt.md").read_text()
-    assert "# NEW COORDINATOR SESSION (why: resume failed)" in prompt and "## Handover from the previous" in prompt
+    assert "# NEW COORDINATOR SESSION (why: resume failed)" in prompt and "## Last note of the previous session" in prompt
     assert (p.state / coordsession.NOTE_DIR / f"{sid}{coordsession.HANDOFF_SUFFIX}").is_file(), "the hand-off is on disk"
     assert p.db.one("SELECT status FROM runs WHERE id=?", (rerun,))["status"] == "ok"
     assert not p.db.q("SELECT id FROM messages WHERE direction='in' AND handled=0")
@@ -393,7 +435,8 @@ def test_coordsession_repeated_failed_resumes_raise_an_issue_and_never_pause(env
     st = p.db.kv(coordsession.KEY)
     assert "paused_until" not in st and len(seen) == 1, seen
     assert seen[0][0] == "daemon:coord-session" and seen[0][2] == "coord-session-resume-failing"
-    assert "boom" in seen[0][1] and "next session with the hand-off" in seen[0][1]
+    assert "boom" in seen[0][1] and "rerun at once" in seen[0][1]
+    # These wakes did no work at all (no tokens, no cost): REJECT_AFTER of them in a row start the next session.
     assert coordsession.decide(d.cfg, st, "k1", "m", "high", lambda s: True, time.time()) == ("new", "resume failed")
     assert len(p.db.q("SELECT id FROM events WHERE kind='coord_session_resume_failed'")) == coordsession.FAIL_ALERT
     # A new session that failed takes the usual backoff path, recorded, and is never a failed resume.
@@ -452,7 +495,7 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
                   "tool_calls_per_wake": 1.0, "tool_call_wakes": 3, "cache_read_ratio": round(168000 / 195000, 3),
                   "coordinator_usd": 1.1, "over_baseline": True, "break_even": True,
                   "reasons": {"resumed": 2, "new: other": 1, "stateless: other": 1}, "fallback_rate": 0.25,
-                  "rollover_tokens": None, "failed_wakes": [], "mode_off": {"off, not recorded": 1}}
+                  "rollover_tokens": None, "failed_wakes": [], "mode_off": {"off, not recorded": 1}, "compactions": []}
     assert d2["day"] == "2026-11-05" and d2["partial"] and (d2["wakes"], d2["resumed"], d2["rollovers"]) == (2, 1, 1)
     assert d2["growth_per_wake"] == 35000.0 and d2["tool_calls_per_wake"] == 4.0 and d2["tool_call_wakes"] == 1
     assert d2["break_even"] is False and d2["over_baseline"] is False and d2["coordinator_usd"] == 0.5
@@ -462,19 +505,30 @@ def test_coord_session_stats_report_each_figure_per_day_against_the_stateless_ba
     assert only["day"] == "2026-11-05" and only["growth_per_wake"] == 35000.0
     out = coordstats.text(s, "demo")
     assert "2.0 turns/day, $0.500/turn, $1.00/day" in out
-    assert ("2026-11-04: 4 wakes (2 resumed, 1 new, 1 rolled over with a hand-off, 1 stateless), $0.175/wake, "
+    assert ("2026-11-04: 4 wakes (2 resumed, 1 new, 1 new with a hand-off, 1 stateless), $0.175/wake, "
             "context growth +12.5k/wake") in out
     assert "1.0 tool calls/wake, cache reads 86%; break-even" in out and ": met; coordinator $1.10" in out
     assert "OVER baseline" in out and "2026-11-05 (so far):" in out and ": missed; coordinator $0.50" in out
     # The day bounds follow the home zone: 01:00 UTC on 11-04 is still 11-03 in Los Angeles.
     assert coordstats.report(p.db, p.runs, "America/Los_Angeles", 7, now=now)["by_day"][0]["day"] == "2026-11-03"
+    # Each in-place compaction coordsession recorded is listed on its day: session, tokens before and after.
+    from ttp import coordsession
+    rows = [{"at": first - 9 * day, "session": "s0", "before": 1, "after": 1, "how": "agent"},   # outside the window
+            {"at": t0 + day + 900, "session": "s1-abcdef-long", "before": 151000, "after": 52100, "how": "agent"},
+            "junk", {"at": "x"}]
+    p.db.set_kv(coordsession.KEY, {"id": "s1", "compactions": rows})
+    s = coordstats.report(p.db, p.runs, "UTC", 7, now=now)
+    assert [d["compactions"] for d in s["by_day"]] == [[], [rows[1]]]
+    out = coordstats.text(s, "demo")
+    assert "1 compactions in place" in out and "0 compactions in place" in out, out
+    assert "    compacted in place: session s1-abcde at " in out and "151k -> 52k tokens (agent)" in out, out
 
 
 def test_coord_session_stats_name_why_each_wake_did_not_resume_and_keep_old_rows_readable(env):
     from ttp import coordstats
     p = make(env)
     t0 = 1793750400.0   # 2026-11-04 00:00 UTC
-    whys = [("resume", "continued"), ("resume", "continued"), ("resume", "handover"),
+    whys = [("resume", "continued"), ("resume", "continued"), ("resume", "handover"), ("resume", "compact"),
             ("new", "context reached 300000 tokens"), ("new", "context reached 200000 tokens"),
             ("new", "prefix changed"), ("new", "last run not ok"), ("new", "no session"), ("new", "odd"),
             ("stateless", "spend guard tripped"), ("stateless", "spend guard tripped"),
@@ -501,20 +555,22 @@ def test_coord_session_stats_name_why_each_wake_did_not_resume_and_keep_old_rows
         p.db.x("INSERT INTO runs(role,provider,started,ended,status,cost_usd,note) VALUES('coordinator','claude',?,?,"
                "'ok',0.5,?)", (t0 + 60 * i, t0 + 60 * i + 30, json.dumps(note)))
     [d] = coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000)["by_day"]
-    assert d["wakes"] == 17 and d["stateless"] == 6 and d["handoffs"] == 6
-    assert d["reasons"] == {"spend guard": 2, "resumed": 2, "rollover": 2, "decide failed": 1,
+    assert d["wakes"] == 18 and d["stateless"] == 6 and d["handoffs"] == 6
+    assert d["reasons"] == {"spend guard": 2, "resumed": 2, "rollover": 2, "decide failed": 1, "compacted in place": 1,
                             "failed resume (rerun)": 1, "handover": 1, "new: last wake failed": 1,
                             "new: no session": 1, "new: other": 2, "new: prompt, charter or schema changed": 1,
                             "paused after failed resumes": 1, "resume failed": 1, "stateless: other": 1}, d["reasons"]
-    assert d["fallback_rate"] == round(6 / 17, 3) and d["rollover_tokens"] == 250000
+    assert d["fallback_rate"] == round(6 / 18, 3) and d["rollover_tokens"] == 250000
     assert d["mode_off"] == {"mode off": 2, "provider codex cannot resume": 1, "off, not recorded": 1}
     assert d["failed_wakes"] == [f"run {bad} (resume, failed): error_max_budget_usd; Reached maximum budget ($1)",
                                  f"run {bare} (new, timeout): no error recorded"]
     out = coordstats.text(coordstats.report(p.db, p.runs, "UTC", 7, now=t0 + 9000))
-    assert "    why: new: other 2, resumed 2, rollover 2 (mean 250k tokens), spend guard 2, decide failed 1," in out, out
-    assert ("stateless 35% of 17 session wakes (expected 0); 4 more stateless turns with no session record "
+    assert ("    why: new: other 2, resumed 2, rollover 2 (mean 250k tokens), spend guard 2, compacted in place 1, "
+            "decide failed 1,") in out, out
+    assert ("stateless 33% of 18 session wakes (expected 0); 4 more stateless turns with no session record "
             "(mode off 2, off, not recorded 1, provider codex cannot resume 1)") in out, out
-    assert coordstats.reason({"mode": "new", "why": "resume failed"}) == "new: failed resume"
+    assert coordstats.reason({"mode": "new", "why": "resume failed"}) == "new: resume rejected"
+    assert coordstats.reason({"mode": "resume", "why": "rerun"}) == "resumed after a failed resume"
     assert f"    failed wake: run {bad} (resume, failed): error_max_budget_usd" in out
     assert coordstats.reason({"mode": "new", "why": "context reached many tokens"}) == "rollover"
     assert coordstats._rollover_tokens({"mode": "new", "why": "context reached many tokens"}) is None
@@ -581,7 +637,10 @@ def _cs_session_project(env, monkeypatch):
     return p, d, sessions, wake
 
 
-def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with_each_part(env, monkeypatch):
+def test_coordsession_compacts_in_place_with_its_summary_and_restores_the_pinned_record(env, monkeypatch):
+    """User msg #2043: a full context compacts inside the running session, never a new one. Where the
+    agent has no compaction switch (the fake without TTP_FAKE_AGENT_COMPACTS, like Cursor) the wake asks
+    for its session_note; the next wake restores the ledger, the note and the chat from disk."""
     from ttp import coordsession, obligations
     from ttp.prompts import restrictions_block
     p, d, sessions, wake = _cs_session_project(env, monkeypatch)
@@ -591,41 +650,96 @@ def test_coordsession_rollover_saves_the_handover_and_seeds_the_new_session_with
     assert "Never push to main (user msg #1)." in rules
     first, system1, prompt1 = wake("first order")
     assert first["mode"] == "new" and rules in system1 and "# Persistent session" in system1
-    assert "## Session handover" not in prompt1
+    assert coordsession.COMPACT_HEAD not in prompt1 and coordsession.RESTORE_HEAD not in prompt1
     sid = p.db.kv(coordsession.KEY)["id"]
     oid = obligations.add(p, "Report the soak result by 17:00 PST")
     second, system2, _ = wake("second order")
     assert second["mode"] == "resume", second
     assert not [x for x in (p.state / coordsession.NOTE_DIR).glob("*.md")
-                if not x.name.endswith(coordsession.HANDOFF_SUFFIX)], "no note outside a handover"
-    # The context reaches its limit: one last resumed wake asks for and saves the handover.
+                if not x.name.endswith(coordsession.HANDOFF_SUFFIX)], "no note outside a compaction"
+    # The context reaches its limit: the same session resumes, asked for its summary, and saves it.
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 150000})
-    last, _, prompt3 = wake("third order")
-    assert (last["mode"], last["why"]) == ("resume", "handover") and coordsession.HANDOVER_HEAD in prompt3
-    note = p.state / coordsession.NOTE_DIR / f"{sid}.md"
-    assert note.read_text().strip() == os.environ["TTP_FAKE_SESSION_NOTE"]
+    third, _, prompt3 = wake("third order")
+    assert (third["mode"], third["why"]) == ("resume", "compact") and coordsession.COMPACT_HEAD in prompt3
     assert coordsession.load_note(p, sid).strip() == os.environ["TTP_FAKE_SESSION_NOTE"]
-    # The next wake starts the new session, seeded with the ledger, the handover and the chat verbatim.
-    new, system4, prompt4 = wake("fourth order")
-    assert (new["mode"], new["why"]) == ("new", "context reached 150000 tokens"), new
     st = p.db.kv(coordsession.KEY)
-    assert st["id"] != sid and st["prev"] == sid and "handover" not in st
-    seed = prompt4.split("# NEW COORDINATOR SESSION", 1)[1]
-    assert "## Order ledger" in seed and "Report the soak result by 17:00 PST" in seed and oid in seed
-    assert f"## Handover from the previous session {sid[:8]}" in seed and os.environ["TTP_FAKE_SESSION_NOTE"] in seed
-    assert "chat exchanges, verbatim" in seed
-    # (b) the hand-off also carries the last wakes' own summaries and is written to disk.
-    assert "## The last coordinator wakes, their own summaries" in seed and "fake coordinator finished" in seed
-    handoff = (p.state / coordsession.NOTE_DIR / f"{sid}{coordsession.HANDOFF_SUFFIX}").read_text()
-    assert os.environ["TTP_FAKE_SESSION_NOTE"] in handoff and "Report the soak result" in handoff
+    assert st["id"] == sid and st["restore"] is True
+    assert [(c["session"], c["before"], c["how"]) for c in st["compactions"]] == [(sid, 150000, "summary")]
+    # The next wake continues the same session, led by the pinned record restored from disk.
+    fourth, system4, prompt4 = wake("fourth order")
+    assert (fourth["mode"], fourth["why"], fourth["restore"]) == ("resume", "continued", True), fourth
+    st = p.db.kv(coordsession.KEY)
+    assert st["id"] == sid and "restore" not in st and len(st["compactions"]) == 1
+    assert coordsession.RESTORE_HEAD in prompt4 and coordsession.COMPACT_HEAD not in prompt4
+    assert "# NEW COORDINATOR SESSION" not in prompt4, "a full context never seeds a new session"
+    pinned = prompt4.split(coordsession.RESTORE_HEAD, 1)[1]
+    assert "## Order ledger" in pinned and "Report the soak result by 17:00 PST" in pinned and oid in pinned
+    assert f"## Latest note of this session {sid[:8]}" in pinned and os.environ["TTP_FAKE_SESSION_NOTE"] in pinned
+    assert "they win" in pinned
+    # The restored record also carries the last wakes' own summaries.
+    assert "## The last coordinator wakes, their own summaries" in pinned and "fake coordinator finished" in pinned
     for text in ("first order", "ack: first order", "second order", "ack: third order"):
-        assert text in seed, text
-    assert seed.index("first order") < seed.index("third order")
-    assert "## Last 3 chat exchanges, verbatim" in seed
-    assert "fourth order" in seed.split("## Last 3 chat exchanges", 1)[1], "the digest follows the seed"
-    # The Restrictions stay verbatim after the rollover, in the same byte-stable system prompt.
+        assert text in pinned, text
+    assert "fourth order" in pinned.split("## Last 3 chat exchanges", 1)[1], "the digest follows the record"
+    # The Restrictions stay verbatim, in the same byte-stable system prompt; later wakes restore nothing.
     assert rules in system4 and system4 == system1 == system2
-    assert coordsession.HANDOVER_HEAD not in prompt4
+    fifth, _, prompt5 = wake("fifth order")
+    assert fifth["mode"] == "resume" and "restore" not in fifth and coordsession.RESTORE_HEAD not in prompt5
+    assert p.db.kv(coordsession.KEY)["id"] == sid
+    for line in (p.state / "daemon.log").read_text().splitlines() if (p.state / "daemon.log").exists() else []:
+        assert "context reached" not in line, line
+
+
+def test_coordsession_an_agent_that_compacts_itself_keeps_its_session_and_the_pinned_record(env, monkeypatch):
+    """Claude Code and Codex compact on their own switch, which every session wake sets below the
+    limit; the harness asks no summary, records the agent's compaction and restores the record."""
+    from ttp import coordsession, obligations
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    monkeypatch.setenv("TTP_FAKE_AGENT_COMPACTS", "1")
+    monkeypatch.setenv("TTP_FAKE_SESSION_NOTE", "never asked")
+    first, _, _ = wake("first order")
+    assert first["mode"] == "new" and first["compact_at"] > 0
+    sid = p.db.kv(coordsession.KEY)["id"]
+    oid = obligations.add(p, "Report the soak result by 17:00 PST")
+    # At the limit the wake resumes with the switch set, and asks for no summary of its own.
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 400000})
+    monkeypatch.setenv("TTP_FAKE_CONTEXT", "400000")
+    second, _, prompt2 = wake("second order")
+    assert (second["mode"], second["why"]) == ("resume", "compact") and coordsession.COMPACT_HEAD not in prompt2
+    assert 0 < second["compact_at"] <= 400000
+    st = p.db.kv(coordsession.KEY)
+    assert st["id"] == sid and st["restore"] is True and not coordsession.load_note(p, sid)
+    assert [(c["session"], c["before"], c["how"]) for c in st["compactions"]] == [(sid, 400000, "agent")]
+    monkeypatch.delenv("TTP_FAKE_CONTEXT")
+    third, _, prompt3 = wake("third order")
+    assert (third["mode"], third["restore"]) == ("resume", True) and coordsession.RESTORE_HEAD in prompt3
+    pinned = prompt3.split(coordsession.RESTORE_HEAD, 1)[1]
+    assert oid in pinned and "second order" in pinned and p.db.kv(coordsession.KEY)["id"] == sid
+    assert len(p.db.kv(coordsession.KEY)["compactions"]) == 1
+    # An agent compaction below the harness limit (its own auto-compact) is recorded the same way.
+    monkeypatch.setenv("TTP_FAKE_CONTEXT", str(third["compact_at"]))
+    wake("fourth order")
+    st = p.db.kv(coordsession.KEY)
+    assert st["id"] == sid and len(st["compactions"]) == 2 and st["compactions"][-1]["how"] == "agent"
+
+
+def test_every_provider_compacts_a_session_in_place():
+    """Claude Code and the chat provider take CLAUDE_CODE_AUTO_COMPACT_WINDOW, Codex its
+    model_auto_compact_token_limit; Cursor has no switch, so the harness asks for its summary."""
+    from ttp import coordsession
+    from ttp.providers import get_provider
+    want = {"claude": True, "chat": True, "codex": True, "cursor": False}
+    for name, own in want.items():
+        prov = get_provider(name)
+        assert coordsession.agent_compacts(prov) is own, name
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" in get_provider("claude").compact_env(200000)
+    assert any("model_auto_compact_token_limit=200000" in a for a in get_provider("codex").compact_args(200000))
+    assert get_provider("cursor").compact_env(200000) == {} and get_provider("cursor").compact_args(200000) == []
+    # No context size, on any configuration, starts a new session.
+    for cfg in ({}, _cs_cfg(), _cs_cfg(compact_tokens=1), _cs_cfg(rollover_tokens=1), _cs_cfg(context_window_tokens=1)):
+        for size in (0, 10**5, 10**6, 10**9):
+            assert coordsession.decide(cfg, _cs_state(context_tokens=size), "k1", "m", "high", lambda s: True, 1.0)[0] \
+                == "resume", (cfg, size)
 
 
 def test_coordsession_system_prompt_is_byte_identical_between_wakes_with_an_unchanged_charter(env, monkeypatch):
@@ -977,23 +1091,38 @@ def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_roll
         assert f"## {label}" not in prompt, label
     assert s["sent_chars"] < full_chars and s["sent_chars"] < size["chars"]
     assert p.db.kv(coordsession.KEY)[coordsession.DIGEST]["sections"] == s["digest"]["sections"]
-    # A daemon restart: the whole digest.
+    # A daemon restart (or a host reboot): a new daemon on the same project state resumes the same session id
+    # from kv, seeds no new session, and sends the whole digest into it.
+    before = p.db.kv(coordsession.KEY)
     d = Daemon(p.base)
     s, prompt, _ = wake()
     assert s["mode"] == "resume" and s["sent"] == "full: daemon restarted" and "Since your last wake" not in prompt
+    assert s["why"] == "continued" and "# NEW COORDINATOR SESSION" not in prompt
+    after = p.db.kv(coordsession.KEY)
+    assert after["id"] == before["id"] and after["wakes"] == before["wakes"] + 1 and after["started"] == before["started"]
     assert wake()[0]["sent"].startswith("delta: ")
-    # A rollover: a new session with the whole digest.
-    p.set_config("coordinator.session.rollover_tokens", 1)
+    # A compaction in place: the same session, its next wake with the whole digest.
+    sid = p.db.kv(coordsession.KEY)["id"]
+    p.set_config("coordinator.session.compact_tokens", 1)
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 5})
-    s, prompt, _ = wake()   # the handover wake resumes the session first, its digest a delta
-    assert s["mode"] == "resume" and s["why"] == "handover" and s["sent"].startswith("delta: ")
-    assert coordsession.HANDOVER_HEAD in prompt
+    s, prompt, _ = wake()   # the compaction wake resumes the session, its digest a delta
+    assert s["mode"] == "resume" and s["why"] == "compact" and s["sent"].startswith("delta: ")
+    assert coordsession.COMPACT_HEAD in prompt
+    p.set_config("coordinator.session.compact_tokens", 0)
     s, prompt, _ = wake()
-    assert s["mode"] == "new" and s["sent"] == "full: new session" and "Since your last wake" not in prompt
-    p.set_config("coordinator.session.rollover_tokens", 140000)
+    assert s["mode"] == "resume" and s["sent"] == "full: context compacted" and "Since your last wake" not in prompt
+    assert p.db.kv(coordsession.KEY)["id"] == sid
     assert wake()[0]["sent"].startswith("delta: ")
-    # A failed resume: its batch reruns as the next session, seeded, with the whole digest.
-    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "rerun": True})
+    # A failed resume: its batch reruns at once in the same session, with the whole digest.
+    st, _ = coordsession.fail(d.cfg, p.db.kv(coordsession.KEY), time.time(), "run 1: timeout")
+    p.db.set_kv(coordsession.KEY, st)
+    s, prompt, _ = wake()
+    assert (s["mode"], s["why"]) == ("resume", "rerun") and s["sent"] == "full: no acknowledged digest", s
+    assert "Since your last wake" not in prompt and p.db.kv(coordsession.KEY)["id"] == sid
+    assert wake()[0]["sent"].startswith("delta: ")
+    # A resume the provider rejected: its batch reruns as the next session, seeded, with the whole digest.
+    st, _ = coordsession.fail(d.cfg, p.db.kv(coordsession.KEY), time.time(), "run 2: No conversation found")
+    p.db.set_kv(coordsession.KEY, st)
     s, prompt, _ = wake()
     assert (s["mode"], s["why"]) == ("new", "resume failed") and s["sent"] == "full: new session", s
     assert "Since your last wake" not in prompt
@@ -1386,7 +1515,7 @@ def test_coordsession_cache_ttl_follows_the_sessions_own_writes_on_a_fake_clock(
     right after a 5m wake stays at 5m while that wake's write is warm (a 1h request never reads a 5m
     write: #6327 measured every 5m->1h wake re-writing the 5m tail); any other wake goes at 1h when a
     next wake is likely, also with the session's 1h write warm behind gone 5m wakes (recorded resumes
-    there read only the system prefix and re-wrote the whole history); the handover wake goes at 5m."""
+    there read only the system prefix and re-wrote the whole history); a compaction wake is no exception."""
     from ttp import cachettl
     t0 = 1_000_000.0
     likely = lambda: {"running": [7], "due": [], "chat": None, "turns": []}
@@ -1440,8 +1569,6 @@ def test_coordsession_cache_ttl_follows_the_sessions_own_writes_on_a_fake_clock(
     assert choose(_cs_state(cache="junk"), "resume", t0)[1].startswith("cold: no 1h write of this session")
     assert choose(_cs_state(), "resume", t0, quiet)[0] == "5m", "a quiet project's cold resume"
     assert choose(_cs_state(), "resume", t0, lambda: 1 / 0)[0] == "1h", "a failed estimate goes at 1h"
-    assert cachettl.choose_session(st, "resume", t0 + 1000, cachettl.WARM_MIN, likely, handover=True) == \
-        ("5m", "the session's handover wake: the next wake starts a new session"), "no later wake reads it"
     # A new session starts its own record: the old session's writes are not its history.
     fresh = cachettl.session_record(st1, "new", "1h", t0 + 4000)
     assert fresh["cache"] == {"h1": t0 + 4000, "ttl": "1h", "ts": t0 + 4000}
@@ -1489,10 +1616,10 @@ def test_coordsession_wakes_pick_their_cache_ttl_from_the_session_and_a_sessionl
     assert ttls(r)[1].startswith("cold: the session last wrote at 1h 120 min ago; next turn likely"), ttls(r)
     spec = json.loads((p.runs / str(r["id"]) / "run.json").read_text())
     assert spec["env"]["FAKE_CACHE_TTL"] == "1h"
-    # The handover wake: the next wake starts a new session, so nothing reads what it adds.
+    # A compaction wake: the same session goes on, so its writes are read again and it keeps its lifetime.
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 10 ** 9})
     r, _, _, session = turn("EVENTS 3b")
-    assert session["why"] == "handover" and ttls(r)[0] == "5m" and "handover wake" in ttls(r)[1], ttls(r)
+    assert (session["mode"], session["why"]) == ("resume", "compact") and ttls(r)[0] == "1h", ttls(r)
     # Back to a sessionless provider: the stateless prefix's warm 1h turn still decides.
     monkeypatch.setattr(fake.Fake, "coord_session", "")
     r = turn("EVENTS 4")[0]

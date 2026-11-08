@@ -91,8 +91,9 @@ DEFAULT_CONFIG: dict[str, Any] = {
         # accepts 100k to 1M (smaller values become 100k) and compacts about 33k below the window.
         "compact_window_tokens": {"light": 100000, "standard": 150000, "deep": 200000},
         # A worker whose run has re-read this many context tokens (cache reads, summed over its calls)
-        # is told once to finish its step and hand the rest on as a follow-up (0 = never).
-        "split_reread_tokens": {"light": 2000000, "standard": 4000000, "deep": 8000000},
+        # is told once to finish its step and hand the rest on as a follow-up (0 = never, the default:
+        # a worker compacts its own context in place instead of ending its run as it grows).
+        "split_reread_tokens": {"light": 0, "standard": 0, "deep": 0},
         # Claude Code keeps a Bash command's output inline up to this many characters (it accepts
         # 4000-128000; its own default is 30000); longer output goes to a file, and the worker gets a
         # short preview and the path. 0 leaves the agent's default.
@@ -281,14 +282,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
                     # own choice, and charter and memory stay in the system prompt).
                     "cache_ttl": "auto", "cache_warm_min": 50,
                     # The persistent coordinator session (coordsession.py), always on with no
-                    # setting to turn it off: every wake resumes one agent session; a failed resume
-                    # reruns as the next session seeded with the hand-off. A session rolls over
-                    # (a new one, seeded with the hand-off) once its last call's context reaches its
-                    # first prompt plus rollover_growth_tokens, at most context_window_tokens (0: by
-                    # model) less rollover_margin_tokens (rollover_tokens above 0: a fixed limit instead);
+                    # setting to turn it off: every wake resumes one agent session, also after a
+                    # daemon restart or a reboot; a failed resume reruns in the same session (a new
+                    # one, seeded with the hand-off, only once the provider rejected it). The session
+                    # never rolls over as its context grows: it compacts in place once its last call's
+                    # context reaches its first prompt (or its size after the last compaction) plus
+                    # compact_growth_tokens, at most context_window_tokens (0: by model) less
+                    # compact_margin_tokens (compact_tokens above 0: a fixed size instead);
                     # row_delta false sends each changed digest section whole (else keyed lists go by row).
-                    "session": {"rollover_tokens": 0, "rollover_growth_tokens": 100000,
-                                "context_window_tokens": 0, "rollover_margin_tokens": 40000, "row_delta": True},
+                    "session": {"compact_tokens": 0, "compact_growth_tokens": 100000,
+                                "context_window_tokens": 0, "compact_margin_tokens": 40000, "row_delta": True},
                     "turn_budget_usd": 1.0,
                     # The most the daemon raises one turn's cap to, once, for a single item that went
                     # over turn_budget_usd alone (0: twice turn_budget_usd); never above the hourly

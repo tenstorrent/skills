@@ -35,6 +35,11 @@ class Fake(Provider):
     def binary(self):
         return sys.executable
 
+    def compact_env(self, tokens: int) -> dict[str, str]:
+        # With TTP_FAKE_AGENT_COMPACTS set, it has a compaction switch like Claude Code's: a context
+        # past `tokens` (TTP_FAKE_CONTEXT) compacts in place (a compact_boundary in its output).
+        return {"TTP_FAKE_COMPACT_AT": str(int(tokens))} if tokens and os.environ.get("TTP_FAKE_AGENT_COMPACTS") else {}
+
     def build(self, *, role, model, effort, cwd, budget_usd, read_only, schema, restrictions,
               disallowed_tools=(), denied_reads=(), web=True):
         return [sys.executable, "-m", "ttp.providers.fake", role], {}
@@ -92,8 +97,11 @@ def _main(role: str, args: list[str] | None = None) -> int:
                     actions.append({"type": "task_add", "title": f"do: {text}"[:80], "spec": text, "tier": "light",
                                     "reply_chat": chat})
             out = {"actions": actions or [{"type": "noop"}]}
-        if os.environ.get("TTP_FAKE_SESSION_NOTE") and "## Session handover" in prompt:
-            out["session_note"] = os.environ["TTP_FAKE_SESSION_NOTE"]   # a persistent session's handover
+        if os.environ.get("TTP_FAKE_SESSION_NOTE") and "## Session compaction" in prompt:
+            out["session_note"] = os.environ["TTP_FAKE_SESSION_NOTE"]   # a session's own summary
+        at, size = int(os.environ.get("TTP_FAKE_COMPACT_AT") or 0), int(os.environ.get("TTP_FAKE_CONTEXT") or 0)
+        if at and size >= at:
+            out.update({"subtype": "compact_boundary", "compact_metadata": {"trigger": "auto", "pre_tokens": size}})
         if os.environ.get("TTP_FAKE_SUMMARY"):   # the turn's own summary (a session keeps the last ones)
             out["summary"] = os.environ["TTP_FAKE_SUMMARY"]
     else:

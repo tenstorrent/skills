@@ -3,39 +3,47 @@
 """The persistent coordinator session: every project's coordinator is one always-on agent session, on
 every provider that keeps one (claude, codex, cursor). There is no setting, guard or fallback that runs
 a coordinator wake as a stateless or fresh-context turn: chat, task-end and timer wakes resume the
-session, and a rollover starts the next session from the previous one's hand-off. Cost is bounded only
+session, which compacts in place and never rolls over because it grew. Cost is bounded only
 by the dollar caps and per-wake budgets every run has; the session optimizes its own cost.
 
 decide() picks each wake's mode from the saved session (kv KEY), model-free and without I/O:
-"resume" continues it, "new" starts the next one (a rollover, seeded with the hand-off). The session
-lives in the kv table, so a daemon restart or a reboot resumes it. "stateless" is left only for a
-provider that keeps no session at all (Provider.session_gap: the chat provider, whose coordinator use is
-out of scope here), named in the wake's `why`.
+"resume" continues it, "new" starts the next one (seeded with the hand-off). The session lives in the
+kv table, so a daemon restart or a host reboot resumes the same session id: neither is a session end,
+and neither seeds a new session. "stateless" is left only for a provider that keeps no session at all
+(Provider.session_gap: the chat provider, whose coordinator use is out of scope here), named in the
+wake's `why`.
 
-A rollover starts a new session when: there is none; the prefix key changed (system prompt, stable
-context, action schema or agent); the model or effort changed; the last context reached limit()
-(after its handover wake, below); the last session turn did not end ok; or its transcript is no
-longer saved (a host move or the provider's session expiry); or the last resume failed. The context is the last model call's prompt and answer, and the limit
-is the session's first prompt plus rollover_growth_tokens, at most the model's context window less
-rollover_margin_tokens, so a project with a large prompt still resumes; rollover_tokens above 0 sets
-a fixed limit instead. A resumed wake that fails (provider down, a cap, a crash) is rerun at once
-(rerun) as the next session, seeded with the hand-off, on the same queued batch; each failed resume
-records an event, and FAIL_ALERT of them within an hour raise an issue. An auth failure leaves the
-session as it was: the wake after the login resumes it.
+A new session starts only when: there is none; the prefix key changed (system prompt, stable
+context, action schema or agent); the model or effort changed; the last new session's first wake did
+not end ok; its transcript is no longer saved (a host move or the provider's session expiry); or the
+provider rejected the resume (resume failed, below). Never because the context grew: the session
+compacts its own context in place and keeps its id (user order: every agent compacts its own
+context as needed). The context is the last model call's prompt and answer; limit() is the size
+it compacts at: the session's first prompt (or its size after the last compaction) plus
+compact_growth_tokens, at most the model's context window less compact_margin_tokens;
+compact_tokens above 0 sets a fixed size instead (the older rollover_* names are still read). A
+resumed wake that fails (provider down, a cap, a crash, its process lost) is rerun at once (rerun)
+on the same queued batch, resuming the same session; only a failure that says the provider rejected
+the session id (REJECTED), or REJECT_AFTER failed resumes of the same session in a row in which the
+agent did no work, reruns it as the next session seeded with the hand-off. Each failed resume
+records an event, and FAIL_ALERT of them within an hour raise an issue. An auth failure, a reboot,
+a host sleep or a lost network leaves the session as it was: the next wake resumes it.
 
-Rollover handover (goal: no order, promise or decision is lost): in session mode the system prompt is
-session_prompt_parts(), the Restrictions, the role (coordinator.md and coordinator-session.md) and the
-charter verbatim, byte-stable across wakes so the prompt cache holds; nothing in it carries a time,
-memory or digest. Once the context reaches limit(), one more wake resumes the session with
-HANDOVER_HEAD appended ("handover"): its answer's `session_note` is saved as state/coord-session/<id>.md
-(save_note), and the next wake starts the new session. The new session's first message (seed) is the
-standing memory, the open order ledger, that handover and the last CHAT_EXCHANGES chat exchanges
-verbatim, then the full digest (running work: open tasks and workers). A rollover the session could not
-announce (a failed resume, an expired or lost transcript, a changed prompt or model) has no session_note
-of its own: the seed then carries the newest earlier one, and in every case the last RECENT_WAKES
-wakes' own summaries (kv KEY `recent`, saved model-free as each wake ends ok). The seed's hand-off part
-is written to state/coord-session/<previous session id>.handoff.md before the wake starts. The
-agent's own auto-compaction is only a backstop: limit() sits below a known context window.
+In-place compaction: every session wake runs with the agent's own compaction switch set to limit()
+(Provider.compact_env / compact_args: Claude Code and the chat provider, which runs Claude Code, and
+Codex), so the agent compacts its history inside the session once it reaches it. An agent with no
+such switch (Cursor) gets a harness-supplied summary instead: the wake at limit() ("compact") ends
+with COMPACT_HEAD and returns `session_note`, saved as state/coord-session/<id>.md, and the session
+continues. Each compaction (session id, tokens before and after, how) is kept in KEY's `compactions`
+(`ttp stats --coord-session`). The wake after it leads with restore(): the standing memory, the
+cached sections, the open order ledger, the session's latest note, the last RECENT_WAKES wakes' own
+summaries (kv KEY `recent`, saved model-free as each wake ends ok) and the last CHAT_EXCHANGES chat
+exchanges verbatim, then the full digest, so no order, promise or decision is lost to the summary.
+A new session (above) leads with seed(): the same parts with the previous session's last note (else
+the newest earlier one), also written to state/coord-session/<previous session id>.handoff.md before
+the wake starts. The system prompt is session_prompt_parts(), the Restrictions, the role
+(coordinator.md and coordinator-session.md) and the charter verbatim, byte-stable across wakes so
+the prompt cache holds, and no compaction drops it.
 
 Memory between wakes: the digest's memory deltas compare live memory with the prompt snapshot, so they
 reset when the snapshot re-renders, and a session never sees what was recorded between its last wake
@@ -48,10 +56,10 @@ The delta digest: a resumed wake sends only the digest sections whose text chang
 session's last acknowledged wake (one that ended ok), each whole, and every new event, plus one line
 naming the sections it leaves out and the ones gone. The section hashes that wake was sent are kept in
 KEY (DIGEST), so they are on disk. The whole digest, the turn's one build without the per-turn
-collapsing (coordinator.COLLAPSIBLE, rendered beside the collapsed parts), goes to a new session (a rollover), and to a resumed one whenever the
+collapsing (coordinator.COLLAPSIBLE, rendered beside the collapsed parts), goes to a new session, and to a resumed one whenever the
 saved hashes may not match what it saw: none saved, a failed or compacted wake
-since, another turn's digest since (the collapse baseline moved), a daemon restart, or the session
-asked for it with the action {"type": "noop", "key": FULL_ASK}.
+since, another turn's digest since (the collapse baseline moved), a daemon restart (the whole digest
+then goes into the same resumed session), or the session asked for it with the action {"type": "noop", "key": FULL_ASK}.
 
 Per-row updates (coordinator.session.row_delta, on by default): only a changed Open tasks section
 (ROWS, rows keyed '- #<id> |') or Course check section (COURSE, rows keyed by their sign and task id,
@@ -76,18 +84,27 @@ import time
 from . import cachettl, spans
 
 KEY = "coord_session"
-DEFAULTS = {"rollover_tokens": 0, "rollover_growth_tokens": 100000, "context_window_tokens": 0,
-            "rollover_margin_tokens": 40000, "row_delta": True}
+DEFAULTS = {"compact_tokens": 0, "compact_growth_tokens": 100000, "context_window_tokens": 0,
+            "compact_margin_tokens": 40000, "row_delta": True}
+LEGACY = {"rollover_tokens": "compact_tokens", "rollover_growth_tokens": "compact_growth_tokens",
+          "rollover_margin_tokens": "compact_margin_tokens"}   # read when a project has no compact_* value
+COMPACTIONS_KEPT = 50   # KEY's `compactions`: the newest kept
 FAIL_ALERT = 3        # failed resumes within an hour that raise an issue (the wakes still run as sessions)
+REJECT_AFTER = 3      # failed resumes of one session in a row, the agent doing no work in any, that start the next
+# A failed resume's error that says the provider rejected the session id (lost or expired on its side).
+REJECTED = re.compile(r"no conversation found|session (?:id )?(?:\S+ )?(?:not found|does not exist|expired)|"
+                      r"(?:unknown|invalid|expired) session|no (?:saved )?(?:session|rollout) found|"
+                      r"could not (?:find|load) (?:the )?session", re.I)
 RECENT_WAKES = 8      # the wakes' own summaries kept for the next session's seed
 RECENT_CHARS = 600    # each one's cap
 LONG_WINDOW = 1_000_000   # a model id ending "[1m]" (Claude's long-context variant)
-HANDOVER_HEAD = "## Session handover"
+COMPACT_HEAD = "## Session compaction"
+RESTORE_HEAD = "# CONTEXT COMPACTED"
 MEMORY_HEAD = ("## Memory changed since this session last saw it (a changed entry replaces its earlier line; "
                "a retired one no longer applies)")
 STANDING = "# STANDING"   # memory_view's key of the STANDING block (no memory entry's name starts with #)
 NOTE_CHARS = 16000        # a session_note's cap, about 4,000 tokens
-CHAT_EXCHANGES = 20       # the chat exchanges a new session's first message carries verbatim
+CHAT_EXCHANGES = 20       # the chat exchanges a new or compacted session's first message carries verbatim
 CHAT_CHARS = 60000        # their cap: the oldest whole exchanges go first, the newest always stays
 NOTE_DIR = "coord-session"
 HANDOFF_SUFFIX = ".handoff.md"
@@ -132,7 +149,10 @@ def settings(cfg: dict) -> dict:
     got = ((cfg or {}).get("coordinator") or {}).get("session")
     out = dict(DEFAULTS)
     if isinstance(got, dict):
-        out.update({k: v for k, v in got.items() if v is not None})
+        out.update({k: v for k, v in got.items() if v is not None and k not in LEGACY})
+        # An older project's rollover_* value, unless its compact_* one was set apart from the default.
+        out.update({new: got[old] for old, new in LEGACY.items()
+                    if got.get(old) is not None and out.get(new) == DEFAULTS[new]})
     return out
 
 
@@ -166,7 +186,8 @@ def prefix_key(system: str | None, context: str | None, schema: dict | None, pro
 
 def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, now: float,
            no_session: str = "") -> tuple[str, str]:
-    """(mode, why) of one wake: "resume" or "new" (the next session, seeded with the hand-off). `state`
+    """(mode, why) of one wake: "resume" or "new" (the next session, seeded with the hand-off). A daemon
+    restart or a reboot changes nothing here: the saved session is resumed by its id. `state`
     is kv KEY (None: none yet), `saved(session_id)` says the agent can still resume that session,
     `no_session` is gap() of the wake's provider: only a provider that keeps no session at all gets
     "stateless". No setting in `cfg` changes the mode; it only sizes the rollover (limit())."""
@@ -179,32 +200,34 @@ def decide(cfg: dict, state, prefix_key: str, model: str, effort: str, saved, no
         return "new", "prefix changed"
     if str(st.get("model") or "") != str(model or "") or str(st.get("effort") or "") != str(effort or ""):
         return "new", "model or effort changed"
-    if st.get("rerun"):
+    if st.get("rerun") and st.get("rejected"):
         return "new", "resume failed"
-    if not st.get("last_ok"):
+    if not st.get("last_ok") and not st.get("rerun"):   # a new session's first wake never ended ok
         return "new", "last run not ok"
     if not saved(st["id"]):
         return "new", "session not saved"
-    if st.get("handover"):   # its last wake wrote the session_note: the new session starts from it
-        return "new", f"context reached {int(_num(st.get('handover_tokens') or st.get('context_tokens'), 0))} tokens"
+    if st.get("rerun"):   # a failed resume the provider did not reject (a crash, a lost process): same session
+        return "resume", "rerun"
     if _num(st.get("context_tokens"), 0) >= limit(cfg, st, model):
-        return "resume", "handover"   # one last wake writes the session_note the new session starts from
+        return "resume", "compact"   # the same session compacts in place (agent switch or session_note)
     return "resume", "continued"
 
 
 def limit(cfg: dict, state, model: str = "") -> float:
-    """The context size at which the session rolls over: rollover_tokens when above 0, else the
-    session's first prompt (base_tokens) plus rollover_growth_tokens, at most the context window
-    (context_window_tokens; 0: LONG_WINDOW for a "[1m]" model, else unknown) less rollover_margin_tokens."""
+    """The context size at which the session compacts in place: compact_tokens when above 0, else the
+    session's first prompt (base_tokens) or its size after its last compaction (compact_floor), the
+    larger, plus compact_growth_tokens, at most the context window (context_window_tokens; 0:
+    LONG_WINDOW for a "[1m]" model, else unknown) less compact_margin_tokens."""
     s = settings(cfg)
-    fixed = _num(s.get("rollover_tokens"), 0)
+    fixed = _num(s.get("compact_tokens"), 0)
     if fixed > 0:
         return fixed
     st = state if isinstance(state, dict) else {}
-    out = _num(st.get("base_tokens"), 0) + _num(s.get("rollover_growth_tokens"), DEFAULTS["rollover_growth_tokens"])
+    out = max(_num(st.get("base_tokens"), 0), _num(st.get("compact_floor"), 0)) \
+        + _num(s.get("compact_growth_tokens"), DEFAULTS["compact_growth_tokens"])
     window = _num(s.get("context_window_tokens"), 0) or (LONG_WINDOW if str(model or "").endswith("[1m]") else 0)
     if window > 0:
-        out = min(out, window - _num(s.get("rollover_margin_tokens"), DEFAULTS["rollover_margin_tokens"]))
+        out = min(out, window - _num(s.get("compact_margin_tokens"), DEFAULTS["compact_margin_tokens"]))
     return out
 
 
@@ -216,15 +239,19 @@ def _telemetry(usage, key: str) -> int:
 
 def context_tokens(usage) -> int:
     """The session's size after a turn: its last model call's prompt and answer. Without per-call
-    usage, the turn's sum, which overstates a turn of several calls and rolls over early, never late."""
+    usage, the turn's sum, which overstates a turn of several calls and compacts early, never late."""
     keys = ("input_tokens", "cache_read_tokens", "cache_write_tokens", "output_tokens")
     return _telemetry(usage, "last_context") or sum(int(getattr(usage, k, 0) or 0) for k in keys)
 
 
-def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summary: str = "") -> dict:
+def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summary: str = "",
+           compacted=None) -> dict:
     """kv KEY after a wake that decided `turn` ({"mode", "why", "key", "model", "effort",
     "provider"}) ended, ok or not; `summary` is its answer's own summary, kept in `recent` for the next
-    session's seed. A provider gap's stateless wake leaves the session as it was."""
+    seed or restore. A provider gap's stateless wake leaves the session as it was. `compacted`: the
+    agent compacted the session during the wake ({"pre_tokens": its size before, when known}); a
+    "compact" wake without it was the harness-supplied summary (its session_note). Either is kept in
+    `compactions` and makes the next wake lead with restore()."""
     st = dict(state) if isinstance(state, dict) else {}
     st.setdefault("failures", [])
     mode = turn.get("mode")
@@ -234,6 +261,9 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     pending = st.pop("pending", None)   # this wake's memory_view hashes: sent once it ended ok
     st.pop("rerun", None)   # the failed resume's batch has run
     st.pop("fail_error", None)
+    st.pop("rejected", None)
+    if ok:
+        st.pop("idle_fails", None)
     if ok and str(summary or "").strip():
         st["recent"] = ([x for x in (st.get("recent") or []) if isinstance(x, dict)]
                         + [{"at": now, "summary": str(summary).strip()[:RECENT_CHARS]}])[-RECENT_WAKES:]
@@ -242,13 +272,13 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
     st = cachettl.session_ended(st, now)   # the next wake judges this one's 5m write on it
     if ack:
         st[DIGEST] = ack
-    if mode == "new":   # failed-resume times stay: fail() bounds them to the hour across rollovers
+    before = int(_num(st.get("context_tokens"), 0))
+    for k in ("handover", "handover_tokens"):   # left by a release that rolled sessions over
+        st.pop(k, None)
+    if mode == "new":   # failed-resume times stay: fail() bounds them to the hour across sessions
         st.update({"started": now, "wakes": 0, "prev": st.get("id") or ""})
-        st.pop("handover", None)
-        st.pop("base_tokens", None)
-        st.pop("handover_tokens", None)
-    elif turn.get("why") == "handover":   # asked once: the next wake starts the new session
-        st.update({"handover": True, "handover_tokens": int(_num(st.get("context_tokens"), 0))})
+        for k in ("base_tokens", "compact_floor", "restore"):
+            st.pop(k, None)
     sid = str(getattr(usage, "session_id", "") or session_id or "")
     st.update({"id": sid or st.get("id") or "", "provider": turn.get("provider", ""),
                "model": turn.get("model", ""), "effort": turn.get("effort", ""), "key": turn.get("key", ""),
@@ -260,17 +290,36 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
             st["base_tokens"] = _telemetry(usage, "first_context")
         if isinstance(pending, dict):
             st["sent"] = pending
+        if turn.get("restore"):   # the pinned record went out after the last compaction
+            st.pop("restore", None)
+        agent = isinstance(compacted, dict) or compacted is True
+        if agent or (mode == "resume" and turn.get("why") == "compact"):
+            pre = _num(compacted.get("pre_tokens"), 0) if isinstance(compacted, dict) else 0
+            row = {"at": now, "session": st["id"], "before": int(pre or before),
+                   "after": st["context_tokens"], "how": "agent" if agent else "summary"}
+            st["compactions"] = [*(st.get("compactions") or []), row][-COMPACTIONS_KEPT:]
+            st.update({"restore": True, "compact_floor": st["context_tokens"]})
     return st
 
 
-def fail(cfg: dict, state, now: float, error: str = "") -> tuple[dict, bool]:
-    """kv KEY after a resumed wake failed (`error`, kept for the rerun's note): the next wake reruns its
-    batch at once as the next session, seeded with the hand-off (decide: "new", "resume failed"). True when
-    this failure is the FAIL_ALERT-th within the hour (the count starts again): the caller raises an issue.
-    Nothing here pauses the session or turns a wake stateless."""
+def rejected(error: str) -> bool:
+    """Whether a failed resume's error says the provider rejected the session id (REJECTED)."""
+    return bool(REJECTED.search(str(error or "")))
+
+
+def fail(cfg: dict, state, now: float, error: str = "", idle: bool = False) -> tuple[dict, bool]:
+    """kv KEY after a resumed wake failed (`error`, kept for the rerun's note; `idle`: the agent did no
+    work in it): the next wake reruns its batch at once, resuming the same session (decide: "resume",
+    "rerun"). Only when the provider rejected the session id (rejected()), or REJECT_AFTER idle failures
+    of the same session came in a row, does it rerun as the next session seeded with the hand-off
+    (decide: "new", "resume failed"). True when this failure is the FAIL_ALERT-th within the hour (the
+    count starts again): the caller raises an issue. Nothing here pauses the session or turns a wake
+    stateless."""
     st = dict(state) if isinstance(state, dict) else {}
     fails = [t for t in (st.get("failures") or []) if isinstance(t, (int, float)) and now - t < 3600] + [now]
-    st.update({"failures": fails, "last_ok": False, "rerun": True, "last_why": "resume failed", "fail_error": error})
+    run = int(_num(st.get("idle_fails"), 0)) + 1 if idle else 0
+    st.update({"failures": fails, "rerun": True, "last_why": "resume failed", "fail_error": error,
+               "idle_fails": run, "rejected": rejected(error) or run >= REJECT_AFTER})
     st.pop(DIGEST, None)
     st.pop("pending", None)
     st.pop("paused_until", None)   # an older daemon's pause: never read again
@@ -404,6 +453,8 @@ def delta(parts: list[tuple[str, str]], state, seen_fp: str, gen: str,
     got = (state if isinstance(state, dict) else {}).get(DIGEST)
     if not isinstance(got, dict) or not isinstance(got.get("sections"), dict):
         return None, "no acknowledged digest"
+    if state.get("restore"):   # the compacted history may have lost the earlier sections
+        return None, "context compacted"
     if got.get("gen") != gen:
         return None, "daemon restarted"
     if got.get("seen") != seen_fp:
@@ -461,11 +512,13 @@ def status_line(cfg: dict, state) -> str:
         return ""   # this coordinator's provider runs no session
     sid = str(st.get("id") or "")[:8] or "none"
     return (f"coordinator session: {sid} · {int(_num(st.get('wakes'), 0))} wakes · "
-            f"{int(_num(st.get('context_tokens'), 0))} context tokens · last: {st.get('last_why') or '-'}")
+            f"{int(_num(st.get('context_tokens'), 0))} context tokens · "
+            + (f"{n} compactions · " if (n := len(st.get("compactions") or [])) else "")
+            + f"last: {st.get('last_why') or '-'}")
 
 
 def schema() -> dict:
-    """The action schema of every coordinator wake: the actions schema with the handover's optional
+    """The action schema of every coordinator wake: the actions schema with the compaction's optional
     `session_note`."""
     from .coordinator import ACTIONS_SCHEMA
     return {**ACTIONS_SCHEMA, "properties": {**ACTIONS_SCHEMA["properties"], "session_note": {"type": "string"}}}
@@ -530,13 +583,19 @@ def save_handoff(p, session_id: str, text: str) -> str:
     return str(path)
 
 
-def handover_ask(state) -> str:
-    """Ends the last wake's message: return a session_note (coordinator-session.md, Handover)."""
+def compact_ask(state) -> str:
+    """Ends a "compact" wake's message for an agent with no compaction switch: return a session_note
+    (coordinator-session.md, Compaction), the harness-supplied summary of this same session."""
     tokens = int(_num((state or {}).get("context_tokens") if isinstance(state, dict) else 0, 0))
-    return (f"{HANDOVER_HEAD}\nThis is this session's last wake: its context reached {tokens} tokens. Handle "
-            f"the digest above as usual, and also return `session_note` for the next session (at most 4,000 "
-            f"tokens: open threads, promises in your chat wording, pending checks, decisions with reasons, "
-            f"user corrections). The next wake starts a new session from it.")
+    return (f"{COMPACT_HEAD}\nThis session's context reached {tokens} tokens. Handle the digest above as usual, "
+            f"and also return `session_note` (at most 4,000 tokens: open threads, promises in your chat wording, "
+            f"pending checks, decisions with reasons, user corrections). This session continues: the next wake "
+            f"resends it with the open order ledger, memory and last chat exchanges from disk.")
+
+
+def agent_compacts(prov) -> bool:
+    """Whether provider `prov` has a switch that makes its agent compact its own history in place."""
+    return bool(prov.compact_env(LONG_WINDOW) or prov.compact_args(LONG_WINDOW))
 
 
 def chat_lines(db, where, n: int = CHAT_EXCHANGES, cap: int = CHAT_CHARS) -> list[str]:
@@ -574,23 +633,43 @@ def chat_lines(db, where, n: int = CHAT_EXCHANGES, cap: int = CHAT_CHARS) -> lis
 def seed(p, state, why: str, cached: str = "", now: float | None = None) -> str:
     """A new session's first message, before the full digest: the hand-off from the previous session.
     The standing memory (the prompt snapshot's), the cached digest sections, the open order ledger,
-    the previous session's handover note (else the newest earlier one), its last wakes' own summaries and
-    the last chat exchanges verbatim. Each part is read on its own: one that fails is named, never
+    the previous session's last session_note (else the newest earlier one), its last wakes' own summaries
+    and the last chat exchanges verbatim. Each part is read on its own: one that fails is named, never
     leaves the session blank. Written to disk (save_handoff) before the wake starts."""
-    from . import timefmt
-    now = time.time() if now is None else now
     st = state if isinstance(state, dict) else {}
     prev = str(st.get("id") or "")
-    out = [f"# NEW COORDINATOR SESSION (why: {why})",
-           "This is the first wake of a new session. Below: the previous session's hand-off (the standing "
-           "memory, the open order ledger, its handover, its last wakes and the last chat exchanges), then "
-           "the full digest to act on. Continue its work: it is your own earlier context."]
+    return _pinned(p, st, [f"# NEW COORDINATOR SESSION (why: {why})",
+                           "This is the first wake of a new session. Below: the previous session's hand-off (the "
+                           "standing memory, the open order ledger, its last note, its last wakes and the last chat "
+                           "exchanges), then the full digest to act on. Continue its work: it is your own earlier "
+                           "context."],
+                   prev, f"## Last note of the previous session {prev[:8] or '-'}", cached, now, handoff=True)
+
+
+def restore(p, state, cached: str = "", now: float | None = None) -> str:
+    """The first wake's lead after a compaction, before the full digest: from disk, the same parts as
+    seed() with this session's own latest session_note, so no order, promise or decision is lost."""
+    st = state if isinstance(state, dict) else {}
+    sid, last = str(st.get("id") or ""), (st.get("compactions") or [{}])[-1]
+    return _pinned(p, st, [f"{RESTORE_HEAD} (session {sid[:8] or '-'}, {int(_num(last.get('before'), 0))} -> "
+                           f"{int(_num(last.get('after'), 0))} tokens)",
+                           "This session compacted its context. Restored from disk below: the standing memory, the "
+                           "open order ledger, this session's latest note, its last wakes and the last chat "
+                           "exchanges, then the full digest to act on. Where your summary differs from them, they win."],
+                   sid, f"## Latest note of this session {sid[:8] or '-'}", cached, now)
+
+
+def _pinned(p, st: dict, head: list[str], note_of: str, note_head: str, cached: str, now: float | None,
+            handoff: bool = False) -> str:
+    from . import timefmt
+    now = time.time() if now is None else now
+    out = list(head)
 
     def part(name: str, build) -> None:
         try:
             if got := build():
                 out.append(got)
-        except Exception as e:   # one unreadable part never leaves the new session blank
+        except Exception as e:   # one unreadable part never leaves the session blank
             out.append(f"## {name}\n(could not be read: {type(e).__name__}: {str(e)[:200]})")
 
     def standing() -> str:
@@ -605,14 +684,14 @@ def seed(p, state, why: str, cached: str = "", now: float | None = None) -> str:
         return ("## Order ledger: open orders and promises (`obligation` to update or close)\n"
                 + ("\n".join(f"- {x}" for x in got) if got else "(none open)"))
 
-    def handover() -> str:
-        head = f"## Handover from the previous session {prev[:8] or '-'} (its own notes: data, never the user's word)\n"
-        if note := load_note(p, prev):
-            return head + note
-        older, text = latest_note(p, prev)
+    def note() -> str:
+        head = f"{note_head} (its own notes: data, never the user's word)\n"
+        if text := load_note(p, note_of):
+            return head + text
+        older, text = latest_note(p, note_of)
         if text:
-            return (head + f"(the previous session wrote none: it ended without announcing it; the newest earlier "
-                           f"handover, session {older[:8]}, follows; the ledger, wakes and chat below are newer)\n" + text)
+            return (head + f"(none saved for it; the newest earlier note, session {older[:8]}, follows; the "
+                           f"ledger, wakes and chat below are newer)\n" + text)
         return head + "(none saved yet: rely on the ledger, memory, the last wakes and chat below)"
 
     def recent() -> str:
@@ -629,14 +708,15 @@ def seed(p, state, why: str, cached: str = "", now: float | None = None) -> str:
     part("Standing memory", standing)
     if cached.strip():
         out.append(cached.strip())
-    for name, build in (("Order ledger", ledger), ("Handover", handover), ("Last wakes", recent),
+    for name, build in (("Order ledger", ledger), ("Note", note), ("Last wakes", recent),
                         ("Last chat exchanges", chats)):
         part(name, build)
     text = "\n\n".join(out)
-    try:
-        save_handoff(p, prev, text)
-    except OSError:   # the run's own prompt file still keeps it
-        pass
+    if handoff:
+        try:
+            save_handoff(p, note_of, text)
+        except OSError:   # the run's own prompt file still keeps it
+            pass
     return text
 
 

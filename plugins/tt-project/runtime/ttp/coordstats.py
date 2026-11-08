@@ -4,21 +4,24 @@
 in the project's home zone, against the stateless coordinator it replaced.
 
 The session is always on: every coordinator wake resumes it ("resume") or starts the next one ("new",
-seeded with the hand-off: a rollover, a failed resume's rerun, a changed prompt or model). A wake
-counts as rolled over with a hand-off when it is "new" for any reason but "no session" (the first one).
-0 stateless wakes is the expected state; "stateless" stays only for a provider that keeps no session
-and for history rows from before the session was always on (a guard trip, a failed resume's stateless
-rerun, a pause), so old rows stay readable. Per day: wakes, $/wake, context growth per resumed wake (its
-first call's prompt less the previous wake's of the same session), rollovers, tool calls per wake
-(tool_use blocks in its transcript; any provider), and the cache-read share of its prompt tokens. The
-baseline is every coordinator run of the 7 days before the first "resume" or "new" wake: turns/day,
-$/turn and $/day. A day breaks even at <= 2 tool calls and <= 20k context growth per wake; it is over
-the baseline when all its coordinator runs cost more than the baseline's $/day (today: so far).
+seeded with the hand-off: a resume the provider rejected, an expired transcript, a changed prompt or
+model). It never rolls over because it grew: it compacts in place. A wake counts as a new session with
+a hand-off when it is "new" for any reason but "no session" (the first one). 0 stateless wakes is the
+expected state; "stateless" stays only for a provider that keeps no session and for history rows from
+before the session was always on (a guard trip, a failed resume's stateless rerun, a pause), so old
+rows stay readable. Per day: wakes, $/wake, context growth per resumed wake (its first call's prompt
+less the previous wake's of the same session), new sessions, in-place compactions (session id, tokens
+before and after, from coordsession's `compactions`), tool calls per wake (tool_use blocks in its
+transcript; any provider), and the cache-read share of its prompt tokens. The baseline is every
+coordinator run of the 7 days before the first "resume" or "new" wake: turns/day, $/turn and $/day. A
+day breaks even at <= 2 tool calls and <= 20k context growth per wake; it is over the baseline when
+all its coordinator runs cost more than the baseline's $/day (today: so far).
 
 Why each session wake did or did not resume (reason(), from the mode and why the daemon recorded at
-its decision, coordsession.decide): resumed, handover, a rollover at its context size, a new session
-for another cause, or (history and session-less providers only) a stateless wake. Coordinator wakes
-with no session record (turn.session_off, or none at all) are older stateless turns, counted apart."""
+its decision, coordsession.decide): resumed, compacted in place (older releases: handover, a rollover
+at its context size), a new session for another cause, or (history and session-less providers only) a
+stateless wake. Coordinator wakes with no session record (turn.session_off, or none at all) are older
+stateless turns, counted apart."""
 from __future__ import annotations
 
 import json
@@ -83,7 +86,7 @@ def tool_calls(r, runs_dir: Path) -> int | None:
 
 NEW_WHY = {"no session": "new: no session", "prefix changed": "new: prompt, charter or schema changed",
            "model or effort changed": "new: model or effort changed", "last run not ok": "new: last wake failed",
-           "session not saved": "new: transcript gone", "resume failed": "new: failed resume"}
+           "session not saved": "new: transcript gone", "resume failed": "new: resume rejected"}
 
 
 def _provider_gaps() -> set:
@@ -97,7 +100,11 @@ def reason(s: dict, status: str = "ok") -> str:
     """The reason label of one session wake (its turn.session) for the per-day counts."""
     mode, why = s.get("mode"), str(s.get("why") or "")
     if mode == "resume":
-        return "resume failed" if status not in ("ok", "running") else "handover" if why == "handover" else "resumed"
+        if status not in ("ok", "running"):
+            return "resume failed"
+        # "handover" and "context reached" (below) are older releases' rollovers, kept for their days.
+        return ("handover" if why == "handover" else "compacted in place" if why == "compact"
+                else "resumed after a failed resume" if why == "rerun" else "resumed")
     if mode == "new":
         return "rollover" if why.startswith("context reached") else NEW_WHY.get(why, "new: other")
     if why == "spend guard tripped":
@@ -177,6 +184,14 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
                 d["growth"].append(fc - last)
         if sid and s.get("mode") in ("resume", "new"):
             prev[sid] = fc
+    from . import coordsession
+    kept = db.kv(coordsession.KEY)
+    kept = kept.get("compactions") if isinstance(kept, dict) else None
+    compactions: dict = {}   # coordsession.record's rows in the window, by day
+    for c in kept if isinstance(kept, list) else []:
+        if isinstance(c, dict) and isinstance(c.get("at"), (int, float)) and c["at"] >= since:
+            compactions.setdefault(timefmt.today(c["at"], tz), []).append(
+                {k: c.get(k) for k in ("at", "session", "before", "after", "how")})
     out = []
     today = timefmt.today(now, tz)
     for day, d in sorted(by_day.items()):
@@ -205,6 +220,7 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
                     "fallback_rate": round(modes.count("stateless") / len(rs), 3),
                     "rollover_tokens": round(sum(sizes) / len(sizes)) if sizes else None,
                     "failed_wakes": errors[:5], "mode_off": off.get(day, {}),
+                    "compactions": compactions.get(day, []),
                     "growth_per_wake": growth, "growth_wakes": len(d["growth"]),
                     "tool_calls_per_wake": tc, "tool_call_wakes": len(calls),
                     "cache_read_ratio": round(read / prompt, 3) if prompt else None,
@@ -237,9 +253,10 @@ def text(s: dict, name: str = "") -> str:
         over = {None: "no baseline", True: "OVER baseline", False: "under baseline"}[d["over_baseline"]]
         lines.append(
             f"  {d['day']}{' (so far)' if d['partial'] else ''}: {d['wakes']} wakes ({d['resumed']} resumed, "
-            f"{d['rollovers']} new, {d['handoffs']} rolled over with a hand-off, {d['stateless']} stateless), "
+            f"{d['rollovers']} new, {d['handoffs']} new with a hand-off, {d['stateless']} stateless), "
             f"${d['usd_per_wake']:.3f}/wake, "
-            f"context growth {'n/a' if g is None else f'{g / 1000:+.1f}k'}/wake, {d['rollovers']} rollovers, "
+            f"context growth {'n/a' if g is None else f'{g / 1000:+.1f}k'}/wake, {len(d.get('compactions') or [])} "
+            f"compactions in place, "
             f"{f(d['tool_calls_per_wake'], '.1f')} tool calls/wake, cache reads "
             f"{'n/a' if d['cache_read_ratio'] is None else format(d['cache_read_ratio'], '.0%')}; "
             f"break-even (<= {BREAK_EVEN_TOOL_CALLS} tool calls, <= {BREAK_EVEN_GROWTH // 1000}k growth/wake): "
@@ -253,4 +270,7 @@ def text(s: dict, name: str = "") -> str:
                                    + ", ".join(f"{k} {v}" for k, v in sorted(d["mode_off"].items())) + ")"
                                    if offs else ""))
         lines.extend(f"    failed wake: {e}" for e in d["failed_wakes"])
+        lines.extend(f"    compacted in place: session {str(c['session'] or '-')[:8]} at {timefmt.short(c['at'], s['zone'])}, "
+                     f"{int(c['before'] or 0) / 1000:.0f}k -> {int(c['after'] or 0) / 1000:.0f}k tokens ({c['how']})"
+                     for c in d.get("compactions") or [])
     return "\n".join(lines)

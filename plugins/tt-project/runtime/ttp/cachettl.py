@@ -199,8 +199,6 @@ def record(state, fp: dict, now: float | None = None) -> dict:
 # whole history even with the session's 1h write warm (recorded wakes read only the system prefix).
 # A missed resume re-writes the whole history (~$0.8 at 150k tokens), a 1h write costs ~$0.09 more
 # than a 5m one on the delta: 1h pays once over a third of the gaps run past 5 min, and about half do.
-# The handover wake goes at 5m: the next wake starts a new session, which reads none of this one's
-# history.
 SESSION = "cache"
 TAIL_WARM_S = 300        # a 5m write unread this long is gone
 
@@ -214,12 +212,8 @@ def _tail_age(c: dict, now: float) -> float | None:
     return age if 0 <= age < TAIL_WARM_S else None
 
 
-def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, signals=None,
-                   handover: bool = False) -> tuple[str, str]:
-    """(ttl, reason) for a session wake of `mode` ("new" or "resume"), given the session's kv state;
-    `handover`: the session's last wake (coordsession.decide's "handover")."""
-    if handover:
-        return "5m", "the session's handover wake: the next wake starts a new session"
+def choose_session(state, mode: str, now: float, warm_min: float = WARM_MIN, signals=None) -> tuple[str, str]:
+    """(ttl, reason) for a session wake of `mode` ("new" or "resume"), given the session's kv state."""
     st = state if isinstance(state, dict) else {}
     c = st.get(SESSION) if isinstance(st.get(SESSION), dict) else {}
     h1 = c.get("h1")

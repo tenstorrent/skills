@@ -39,8 +39,9 @@ sent. A failure to read replies is reported on stderr and never stops the messag
 - **Coordinator**: always the project's hands-on manager: one persistent session (Claude Code,
   Codex, Cursor), woken by chat, task ends and timers, that corrects workers mid-run and fixes the
   project's own prompts, scripts and config, while heavy work still goes to workers. No setting
-  turns it into a stateless turn; a session that fails or rolls over hands its context to the next
-  one. Only the chat provider, which keeps no session yet, runs a short, tool-less stateless
+  turns it into a stateless turn; a daemon restart or host reboot resumes the same session, a full
+  context compacts in place, and only a resume the provider rejects (or a provider-side expiry)
+  hands the context to a new session. Only the chat provider, which keeps no session yet, runs a short, tool-less stateless
   decision over a digest of the project. It reads orders by their intent (a Restriction binds
   as written), decides on its own unless a step could hurt people or speak or pass as a human,
   and asks rarely, never waiting on the answer.
@@ -454,39 +455,51 @@ only in the feed and never under "needs you".
   to turn it off: each coordinator wake (chat, task end, timer) resumes one agent session (Claude
   Code, Codex and Cursor, with per-provider tools and guards in providers.md). An old
   `coordinator.session.mode` value in a project's config is ignored, and `config_set` refuses it. A
-  new session starts when there is none, the system prompt, stable context or action schema changed,
-  the model or effort changed, the context reached its limit, the last session turn did not end ok,
-  a resume failed, or its transcript is gone (a host move). The context is the last model call's
-  prompt and answer; the limit is the session's first prompt plus `rollover_growth_tokens` (100000),
-  at most the model's context window (`context_window_tokens`; 0 reads it from a `[1m]` model id,
-  else no cap) less `rollover_margin_tokens` (40000). `rollover_tokens` above 0 (default 0) sets a
-  fixed limit instead. A resumed wake that fails is recorded as an event (`coord_session_resume_failed`)
-  and its batch reruns at once as the next session, seeded with the hand-off, so each message and
-  event is handled once; 3 failed resumes within an hour also raise an issue, and nothing pauses the
-  session. A new session that cannot start is recorded (`coord_session_start_failed`) and retried
-  after the usual backoff, again as a seeded session. There is no session spend guard: the project
-  and account dollar caps and the per-task budgets are the only limits on its spend. A coordinator on a
-provider that runs no session (the chat provider, for now) keeps stateless turns, with no session line in `ttp status`. `ttp status --verbose` shows the session's
+  daemon restart or a host reboot resumes the same session id (kept in the project's kv table) and
+  never starts a new session. A new session starts only when there is none, the system prompt,
+  stable context or action schema changed, the model or effort changed, a new session's first wake
+  did not end ok, its transcript is gone (a host move or a provider-side expiry), or the provider
+  rejected a resume. A full context never starts a new session: the session compacts in place and
+  keeps its id. The context is the last model call's prompt and answer; the compaction point is the
+  session's first prompt (or its size after its last compaction, the larger) plus
+  `compact_growth_tokens` (100000), at most the model's context window (`context_window_tokens`; 0
+  reads it from a `[1m]` model id, else no cap) less `compact_margin_tokens` (40000).
+  `compact_tokens` above 0 (default 0) sets a fixed point instead. The older `rollover_tokens`,
+  `rollover_growth_tokens` and `rollover_margin_tokens` names are still read for a project that sets
+  no `compact_*` value. A resumed wake that fails is recorded as an event
+  (`coord_session_resume_failed`) and its batch reruns at once in the same session, so each message
+  and event is handled once. Only when the provider rejects the session id (no such session, or it
+  expired), or 3 resumes in a row fail without a model call, does the batch rerun as the next
+  session, seeded with the hand-off. 3 failed resumes within an hour also raise an issue, and nothing
+  pauses the session. A new session that cannot start is recorded (`coord_session_start_failed`) and
+  retried after the usual backoff, again as a seeded session. There is no session spend guard: the
+  project and account dollar caps and the per-task budgets are the only limits on its spend. A
+  coordinator on a provider that runs no session (the chat provider, for now) keeps stateless turns,
+  with no session line in `ttp status`. `ttp status --verbose` shows the session's
   short id, wakes, context size and last decision. `ttp stats <name> --coord-session` reports each
-  day's wakes, $/wake, context growth and tool calls per wake, rollovers and cache-read share beside
+  day's wakes, $/wake, context growth and tool calls per wake, in-place compactions (session id,
+  tokens before and after, how) and cache-read share beside
   the stateless baseline (the 7 days before the first session wake: turns/day, $/turn), and flags
   the break-even (at most 2 tool calls and 20k context growth per wake) and a day costing more
-  than the baseline's $/day. Each day counts wakes resumed, new, rolled over with a hand-off (new for
-  any reason but the first session) and stateless (expected 0; older history rows keep their own
-  labels, such as spend guard or pause), names why wakes did not resume (handover, rollover with its
-  mean context size, a new session and its cause, a failed resume, a provider that keeps no session,
-  decide failed), and lists failed session wakes with their transcript's error. In session mode the system prompt is the
+  than the baseline's $/day. Each day counts wakes resumed, new, new with a hand-off (new for any
+  reason but the first session) and stateless (expected 0; older history rows keep their own labels,
+  such as handover, rollover, spend guard or pause), names why wakes did not resume (a new session and
+  its cause, a rejected resume, a provider that keeps no session, decide failed), counts compactions
+  in place, and lists failed session wakes with their transcript's error. In session mode the system prompt is the
   Restrictions, the coordinator role with `prompts/coordinator-session.md` and the charter verbatim:
-  the same bytes every wake while the charter is unchanged, so the prompt cache holds. Once the
-  context reaches its limit, one last resumed wake also returns a `session_note` (at most
-  4,000 tokens: open threads, promises in their chat wording, pending checks, decisions with their
-  reasons, user corrections), saved as `state/coord-session/<session id>.md`. The next session's
-  first message carries the hand-off: the standing memory, the open order ledger, that handover note
-  (or, after a failure, a restart or a reboot with none, the newest earlier one), the last 8 wakes'
-  own summaries and the last 20 chat exchanges verbatim, then the full digest. The hand-off is also
-  written to `state/coord-session/<previous session id>.handoff.md`; a part that cannot be read is
-  named, never left out silently. The agent's own auto-compaction is only a
-  backstop. A resumed wake sends only the digest sections
+  the same bytes every wake while the charter is unchanged, so the prompt cache holds. Every
+  session wake sets the agent's own compaction switch at the compaction point (Claude Code and the
+  chat provider: `CLAUDE_CODE_AUTO_COMPACT_WINDOW`; Codex: `model_auto_compact_token_limit`), so it
+  compacts its history inside the same session. Only where the agent has no such switch (Cursor),
+  the wake at the compaction point also asks for a `session_note` (at most 4,000 tokens: open
+  threads, promises in their chat wording, pending checks, decisions with their reasons, user
+  corrections), saved as `state/coord-session/<session id>.md`; it is the harness's summary of the
+  same session. Each compaction is recorded, and the next wake starts with `# CONTEXT COMPACTED`:
+  the standing memory, the open order ledger, the session's latest note, the last 8 wakes' own
+  summaries and the last 20 chat exchanges verbatim, restored from disk, then the full digest. A
+  new session (only for the causes above, never a restart or a full context) leads with the same
+  parts as its hand-off, also written to `state/coord-session/<previous session id>.handoff.md`; a
+  part that cannot be read is named, never left out silently. A resumed wake sends only the digest sections
   that changed since the session's last wake that ended ok, each whole, plus the new events and one
   line naming the sections left out. Only the Open tasks section, keyed by task id, and the Course
   check, keyed by sign and task id (`- costly: #<id>`), go row by row (`row_delta`, default on; `false` sends every changed section whole): the added and changed rows,
@@ -497,8 +510,8 @@ provider that runs no session (the chat provider, for now) keeps stateless turns
   resources and the like) is compared as raw text and sent whole on any change, so one changed
   line there resends the section. Accepted gap: a chats or promises section whose only change is an
   age is resent whole too.
-  A new session, a daemon restart, a failed or
-  compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
+  A new session, a daemon restart (the digest then goes whole into the same resumed session), a
+  failed or compacted wake since, or the action `{"type": "noop", "key": "full_digest"}` sends the whole
   digest on the next wake. A session wake's answer is checked before its turn ends: an action the
   daemon would refuse (an unknown task id, a dependency that failed, a task cap reached, a field a
   running or finished task keeps) comes back as the answer tool's result, so the coordinator fixes
@@ -3130,9 +3143,10 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   `coordinator.cache_ttl`. Codex and Cursor have no such switch.
 - Long command output stays out of a worker's context: `ttp clip -- <cmd>` and `ttp checks` keep
   it in a file and show a test run's failures (else head and tail). On Claude Code, Bash output
-  past `budget.bash_output_max_chars` also goes to a file. A worker whose run re-reads more than
-  `budget.split_reread_tokens` of context is told once to hand the rest on as a follow-up; its run
-  note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
+  past `budget.bash_output_max_chars` also goes to a file. A worker compacts its own context inside
+  its run (`budget.compact_window_tokens`) and is never ended or restarted because its context grew.
+  `budget.split_reread_tokens` is off (0) by default; a project that sets it tells a worker whose
+  run re-reads more than that once to hand the rest on as a follow-up; its run note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
 - `ttp killscan <script>` flags kills by name or pattern (`pkill`, `killall`, any `pgrep` or
   `pidof`, `ps | grep` feeding a kill) before a worker runs a script; `--shim <dir>` writes
   stand-ins for `pkill`, `killall`, `pgrep` and `pidof` that only log the call (`ps | grep` and calls
