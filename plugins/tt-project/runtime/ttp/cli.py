@@ -3017,8 +3017,9 @@ def _commands_hash(cmds: list) -> str:
     return hashlib.sha256(json.dumps([_command_key(c) for c in cmds]).encode()).hexdigest()
 
 
-def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
-    """`todo` run on spill host `host` (checkspill, push.spill_to), each local check marked `spilled`: its
+def _spill_to(todo: list, host: str, cfg: dict | None = None, workers: int = 0) -> list:
+    """`todo` run on spill host `host` (checkspill, push.spill_to), with `workers` test workers there when
+    given (checkspill.workers_env, exported as is and no part of the pass key), each local check marked `spilled`: its
     pass is recorded, and found, under the same key as a run here (_command_key), so a later local `ttp checks`
     of the same tree (a review's pre-started checks, the reviewer's own) reuses it instead of running
     the suite again. A check that may not spill (it runs an agent CLI or says "host": "local":
@@ -3035,6 +3036,8 @@ def _spill_to(todo: list, host: str, cfg: dict | None = None) -> list:
         c = push.spill_to([was], host, cfg)[0]
         if not push.remote_host(was) and isinstance(c, push.Check):
             c.spilled = True
+            if grant := checkspill.workers_env(workers):   # the check's own literal env wins
+                c.literal_env = tuple(sorted({**grant, **dict(getattr(c, "literal_env", ()) or ())}.items()))
         out.append(c)
     return out
 
@@ -3887,7 +3890,7 @@ def cmd_checks(a) -> None:
         if spilled:
             if slurm := getattr(spilled, "slurm", None):   # one batch job per check, --time from the run's median
                 minutes = slurmcheck.time_min(checklane.median_s(p.state, _commands_hash(todo)), slurm)
-            todo = _spill_to(todo, spilled.host, cfg)
+            todo = _spill_to(todo, spilled.host, cfg, getattr(spilled, "workers", 0))
             for c in todo if slurm else []:
                 if getattr(c, "spill_host", ""):   # a check split off to run here stays off Slurm
                     c.slurm, c.time_min = slurm, minutes
@@ -5019,15 +5022,21 @@ def _checks_slot(p: Project | None, run_dir: Path, out, head: str, detached: boo
     while True:
         limit = max(0.0, checkcap.FOREGROUND_WAIT_S - (time.time() - start)) if foreground and p else None
         spill_cfg = p.config() if spill_to else {}
-        # A disk saturated by writes holds new local runs (diskgate): the spill hosts are tried before any
-        # wait here; after it, each bound below tries them again.
-        if spill_to and first and checkspill.hosts(spill_cfg) and (disk := diskgate.saturated()):
-            tell(f"{disk}: trying the spill hosts first")
+        # Spill first (checkspill.first), and while this host's disk is saturated by writes (diskgate, which
+        # holds new local runs): the spill hosts are tried before any place here; after it, each bound below
+        # tries them again, so a run held here by the load guard or a cap still goes to a host with room.
+        if spill_to and first and checkspill.hosts(spill_cfg) and (
+                (disk := diskgate.saturated()) or checkspill.first(spill_cfg)):
+            why_here = (f"{disk}: trying the spill hosts first" if disk else
+                        f"spill first (delivery.{checkspill.FIRST_KEY}): this machine keeps only checks that cannot spill")
+            if disk:
+                tell(why_here)
             if (claim := checkspill.pick(p, spill_cfg, lambda line: line in told or (told.add(line), tell(line)),
-                                         what, spill_off)) is not None:
+                                         what, spill_off, why_here)) is not None:
                 slot = checkcap.Slot()
                 slot.spill = claim
                 return slot
+            pool_first = False   # the pool was just tried: an urgent run takes its urgent slot here next
         first = False
         if spill_to:   # a bounded wait here, then the spill hosts, then wait again in the same place
             bound = 0.0 if pool_first else checkspill.after_s(spill_cfg)

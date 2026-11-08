@@ -770,7 +770,7 @@ def test_an_urgent_rerun_after_a_spill_host_still_takes_a_free_pool_host_at_once
     monkeypatch.setenv("TTP_RUN_DIR", str(run_dir))
     monkeypatch.setattr(checkcap, "task_rank", lambda _p: (0, []))
     asked = []
-    monkeypatch.setattr(checkspill, "pick", lambda _p, _c, _t, _w="", off="": asked.append(off) or (
+    monkeypatch.setattr(checkspill, "pick", lambda _p, _c, _t, _w="", off="", _why="": asked.append(off) or (
         {"host": "check-host-b"} if "check-host-b" not in checkspill.kept_off(off) else None))
     monkeypatch.setattr(slurmcheck, "pick", lambda *_a, **_k: pytest.fail("no Slurm overflow for a rerun"))
     held = checkcap.acquire("routine", priority=3)
@@ -2626,3 +2626,110 @@ def test_a_spilled_failure_whose_head_rerun_there_cannot_tell_is_not_counted_the
 
 def test_a_spilled_failure_whose_base_rerun_there_cannot_tell_is_not_counted_there(env, tmp_path, monkeypatch):
     _spill_gate_unproven(env, tmp_path, monkeypatch, "base")
+
+
+def test_spill_first_sends_a_run_to_an_idle_spill_host_with_its_lane_here_free_and_off_waits_here_first(
+        env, tmp_path, monkeypatch):
+    """#2210: delivery.checks_spill_first (default true) tries the spill hosts before a place here, even with the
+    lane here free and a long checks_spill_after_s, and the spill line says why; set false, a run with its lane
+    free runs here without trying them."""
+    from ttp import checkcap, checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.checks_spill_after_s", 3600)
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"pwd >> {log}"])
+    real_acquire = checkcap.acquire
+    monkeypatch.setattr(checkcap, "acquire", lambda *a, **k: pytest.fail("no place here before the spill hosts"))
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert "/ttp-check." in log.read_text(), "it ran on the spill host's copy"
+    text = (run / "checks.log").read_text()
+    assert "spilling to check-host-a: spill first (delivery.checks_spill_first)" in text, text
+    monkeypatch.setattr(checkcap, "acquire", real_acquire)
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: pytest.fail("spill first is off and the lane is free"))
+    p.set_config("delivery.checks_spill_first", False)
+    log.write_text("")
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and "spilled_to" not in rec, rec
+    assert log.read_text().strip() and "/ttp-check." not in log.read_text(), "it ran here"
+
+
+def test_a_run_held_here_by_the_load_guard_or_a_cap_goes_to_a_spill_host_at_its_next_bound(env, tmp_path, monkeypatch):
+    """No spill host had room at first; the wait here is held (the load guard or a cap: its bounded take gets
+    no place): at the bound the spill hosts are tried again and the run goes to the one with room."""
+    from ttp import checkspill, cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    p.set_config("delivery.push_checks", [f"pwd >> {tmp_path / 'where.log'}"])
+    real_pick, picks, takes = checkspill.pick, [], []
+    monkeypatch.setattr(checkspill, "pick", lambda *a, **k: None if not picks.append(1) and len(picks) == 1
+                        else real_pick(*a, **k))
+    monkeypatch.setattr(cli, "_checks_slot_take", lambda *a, **k: takes.append(k.get("urgent")) or None)
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert len(picks) == 2 and len(takes) == 1, (picks, takes)
+
+
+def test_a_spilled_run_gets_test_workers_sized_to_the_hosts_idle_cores_outside_its_pass_key(env, tmp_path, monkeypatch):
+    """#2210: -n is sized per run to the spill host's idle cores (cores less its 1-minute load, less a run's
+    cores per other claim of ours there, within one run's limit), exported as the test-slot grant the suite's
+    conftest reads; the grant is no part of the pass key, so a run here of the same tree reuses the pass."""
+    from ttp import checkspill, cli, push, testslots
+    assert checkspill.workers(16, 3.5) == 12 and checkspill.workers(16, 3.5, cap=8) == 8
+    assert checkspill.workers(16, None) == 0 and checkspill.workers(0, 1.0) == 0
+    assert checkspill.workers(4, 9.0) == 1, "an overloaded host still runs one worker"
+    assert checkspill.workers(32, 0.0, others=1) < 32
+    assert checkspill.workers_env(0) == {}
+    assert checkspill.workers_env(3) == {testslots.SLOTS_ENV: "3", testslots.HELD_ENV: "3", testslots.XDIST_ENV: "3"}
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    monkeypatch.setattr(checkspill, "_PROBE", checkspill._PROBE.replace("c=$(nproc", "c=$(echo 64 || nproc"))
+    seen = tmp_path / "seen"
+    p.set_config("delivery.push_checks", [f"printf %s \"${testslots.SLOTS_ENV}\" > {seen}"])
+    p.set_config("checks.test_run_max", 4)
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    assert seen.read_text() == "4", "64 idle cores, but one run's limit (test_run_max 4)"
+    assert "with 4 test worker(s), its idle cores (load 0 of 64)" in (run / "checks.log").read_text()
+    plain = push.Check("pytest -q")
+    granted = cli._spill_to([push.Check("pytest -q")], "check-host-a", p.config(), 5)[0]
+    assert dict(granted.literal_env)[testslots.SLOTS_ENV] == "5"
+    assert cli._command_key(granted) == cli._command_key(plain)
+    own = push.Check("pytest -q")
+    own.literal_env = ((testslots.SLOTS_ENV, "2"),)
+    assert dict(cli._spill_to([own], "check-host-a", p.config(), 5)[0].literal_env)[testslots.SLOTS_ENV] == "2"
+
+
+def test_a_check_reading_git_history_stays_here_and_the_rest_of_its_run_spills(env, tmp_path, monkeypatch):
+    """Upstream note 92664c3b34114013: a spill host's copy has one commit, so `git diff --check <base>` exited 128
+    there. A check that runs a git command reading commits (any form: options, an env prefix, a shell -c, an
+    unclosed quote) stays here unless it says "spill": true; `git status` and pytest still spill."""
+    from ttp import checkspill, cli, push
+    for cmd in ("git diff --check origin/main", "git -C plugins log -1", "env A=1 git --no-pager diff HEAD~1",
+                "true && git merge-base HEAD main", "bash -c 'git rev-list --count HEAD'", "git log 'unclosed"):
+        assert checkspill.needs_history(push.Check(cmd)), cmd
+        assert not checkspill.check_spills(push.Check(cmd)), cmd
+    for cmd in ("git status --porcelain", "pytest -q tests", "python3 -m pytest -n 4", "git -c a=b rev-parse HEAD"):
+        assert not checkspill.needs_history(push.Check(cmd)), cmd
+    assert checkspill.check_spills(push.check_list([{"run": "git diff --check HEAD", "spill": True}])[0])
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    log = tmp_path / "where.log"
+    p.set_config("delivery.push_checks", [f"git diff --check HEAD && pwd >> {log}", f"pwd >> {log}"])
+    cli.main(["checks", "--fresh"])
+    rec = json.loads((run / "checks.json").read_text())
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", rec
+    where = log.read_text().splitlines()
+    assert len(where) == 2 and sum("/ttp-check." in w for w in where) == 1, where
+
+
+def test_spill_first_setting_is_validated(env):
+    from ttp import checkspill, coordinator, project
+    assert checkspill.first({}) is True and checkspill.first({"delivery": {"checks_spill_first": False}}) is False
+    assert not project.config_problems({"delivery": {"checks_spill_first": False}})
+    assert any("delivery.checks_spill_first" in x for x in project.config_problems({"delivery": {"checks_spill_first": "maybe"}}))
+    settable = coordinator.USER_SETTABLE["delivery.checks_spill_first"]
+    assert settable("off") is False and settable("true") is True
+    with pytest.raises(ValueError, match="nothing was changed"):
+        settable("sometimes")

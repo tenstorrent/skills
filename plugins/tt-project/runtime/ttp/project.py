@@ -620,7 +620,7 @@ EXTRA_KEYS = {
                  "checks_fast_globs", "checks_fast_exclude",   # these two: `ttp checks` fast path (push.FAST_GLOBS),
                  "checks_targeted", "checks_targeted_always",   # a task's `ttp checks` runs the tests its diff reaches (testpick)
                  "checks_host",   # where checks run (remotecheck)
-                 "checks_spill_hosts", "checks_spill_after_s",   # where busy checks may spill to (checkspill)
+                 "checks_spill_hosts", "checks_spill_after_s", "checks_spill_first",   # where busy checks may spill to (checkspill)
                  "check_prestage",   # a short foreground run before `ttp checks --detach` (checkprestage)
                  "pr_body_check",   # a project's own PR body check before gh pr create/edit (prbody)
                  "ai_tag",   # the AI-authorship tag a post to others ends with (aitag)

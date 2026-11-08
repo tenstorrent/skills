@@ -6,12 +6,14 @@ A project may list, in order, the ssh aliases of other machines its checks may r
 pool, `checks.spill_hosts` in the account settings (`ttp config --account checks.spill_hosts '["pool-a"]'`,
 which a run may only clear), follows that list in every project on this machine, so each spills
 without a list of its own. A project's own empty list (`[]`) keeps its checks here, the pool too;
-with neither, checks never leave this machine. A `ttp checks` run that has waited `delivery.checks_spill_after_s`
-(default SPILL_AFTER_S) for a slot here (its project's lane, a host-wide checks slot, test-worker
-slots) tries the listed hosts in order and runs on the first that is allowed, reachable and has a
-free slot, as a check with a check host does (remotecheck: a copy of exactly the commit, its output
-streamed back). With none, it keeps its place in the queue here and tries them again after the same
-bound. The run says where it went, checks.json records it (`hosts`, `spilled_to`), and `ttp status`
+with neither, checks never leave this machine. A `ttp checks` run that may spill tries the listed hosts in
+order before it takes a place here (`delivery.checks_spill_first`, default true: first), so this machine keeps
+only the checks that cannot spill, and runs on the first that is allowed, reachable and has a free slot, as a
+check with a check host does (remotecheck: a copy of exactly the commit, its output streamed back), with the
+test workers that host's idle cores give it (workers: cores less the 1-minute load, never a fixed count). With
+none, it queues here and, while it waits (its project's lane, a host-wide checks slot, the load guard,
+test-worker slots), tries them again after each `delivery.checks_spill_after_s` (default SPILL_AFTER_S). With
+checks_spill_first false it tries them only after that first wait. The run says where it went, checks.json records it (`hosts`, `spilled_to`), and `ttp status`
 and `ttp checks status` show it while it runs (status_lines).
 
 Allowed: named in the project's charter (a host of the account's pool needs no charter line: the
@@ -61,7 +63,8 @@ With none left it runs here, whose result counts.
 
 A check that runs an agent CLI (AGENT_CLIS, the claude CLI among them, in command position after its
 wrappers: needs_cli), which a spill host neither has nor is logged in to, never spills unless it says
-`"spill": true`. Such a check, and one with `"host": "local"`, does not keep the rest of its run here: the
+`"spill": true`. Nor does one that reads commits with git (needs_history: `git diff --check <base>`, `git log`),
+which the host's one-commit copy lacks. Such a check, and one with `"host": "local"`, does not keep the rest of its run here: the
 run splits (stays_here). Its other checks go to the spill host and it runs on this machine in the same run,
 whose one verdict needs every part to pass; a failure here counts at once (it never reruns elsewhere). Only
 a check that is no test suite or build (checklane.run_class), unwrapped and in a clean checkout splits off
@@ -88,6 +91,7 @@ ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS)
 BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
 NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
 AFTER_KEY = "checks_spill_after_s"
+FIRST_KEY = "checks_spill_first"   # delivery.checks_spill_first: a spillable run tries the spill hosts before a place here (first)
 SPILL_AFTER_S = 60.0
 OFF_ENV = "TTP_CHECKS_NO_SPILL"   # "1": these checks never spill; else the hosts a rerun keeps off (spill_off_add)
 HOST_FAULT_TRIES = 2   # a spill host whose own fault (exit 75) ended a run this often is kept off its rerun
@@ -198,6 +202,11 @@ def problems(delivery: dict) -> list[str]:
     a = (delivery or {}).get(AFTER_KEY)
     if a is not None and (isinstance(a, bool) or not isinstance(a, (int, float)) or a < 0):
         out.append(f"delivery.{AFTER_KEY}: {a!r} is not a number of seconds")
+    if (f := (delivery or {}).get(FIRST_KEY)) is not None:
+        try:
+            first_of(f)
+        except ValueError as e:
+            out.append(str(e).replace("; nothing was changed", ""))
     return out
 
 
@@ -306,6 +315,81 @@ def after_s(cfg: dict | None) -> float:
     return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else SPILL_AFTER_S
 
 
+def first_of(v: Any) -> bool:
+    """A `delivery.checks_spill_first` value set by `ttp config`: true or false."""
+    if isinstance(v, bool):
+        return v
+    t = str(v).strip().lower()
+    if t in ("1", "true", "yes", "on"):
+        return True
+    if t in ("0", "false", "no", "off"):
+        return False
+    raise ValueError(f"delivery.{FIRST_KEY}: {v!r} is not true or false; nothing was changed")
+
+
+def first(cfg: dict | None) -> bool:
+    """Whether a run that may spill tries the spill hosts before it takes a place here (delivery.checks_spill_first,
+    default true): this machine keeps only the checks that cannot spill. False: it spills only after waiting
+    after_s() here."""
+    v = ((cfg or {}).get("delivery") or {}).get(FIRST_KEY)
+    try:
+        return True if v is None else first_of(v)
+    except ValueError:
+        return True
+
+
+def workers(cores: int, load: float | None, others: int = 0, cap: int = 0) -> int:
+    """The test workers a run spilled to a host of `cores` takes: the cores its 1-minute `load` leaves idle,
+    less one run's cores (checklane.run_cores) for each of this machine's `others` claims there whose load
+    may not show yet, at most `cap` (one run's limit, testslots.sizes) and its cores, at least 1; 0 when the
+    load did not read (the run then sizes itself)."""
+    from . import checklane
+    if load is None or cores <= 0:
+        return 0
+    idle = int(cores - load) - others * checklane.run_cores(None, cores)
+    return max(1, min(cap or cores, cores, idle))
+
+
+def workers_env(n: int) -> dict:
+    """The grant a spilled run's commands see for `n` workers (testslots: what xdist's `-n auto` and a held
+    grant read); {} for 0."""
+    from . import testslots
+    return {testslots.SLOTS_ENV: str(n), testslots.HELD_ENV: str(n), testslots.XDIST_ENV: str(n)} if n > 0 else {}
+
+
+_HISTORY_GIT = ("diff", "log", "rev-list", "merge-base", "show", "range-diff", "cherry", "describe", "shortlog",
+                "whatchanged", "blame")
+
+
+def needs_history(c: Any) -> bool:
+    """Whether a simple command of check `c` runs a git command that reads commits (_HISTORY_GIT: `git diff
+    --check <base>`, `git log`), after its wrappers or in a shell's -c script, which a spill host's copy (one commit,
+    remotecheck) lacks; a line that does not parse counts."""
+    from . import testslots
+    try:
+        segs = testslots._segments(str(c))
+    except (ValueError, IndexError):
+        return True
+    for seg in segs:
+        words = [w for _, _, w in seg]
+        i = 0
+        while i < len(words) and (re.match(r"[A-Za-z_]\w*=|-|\d", words[i])
+                                  or testslots._base(words[i]) in testslots._WRAPPERS):
+            i += 1
+        if i < len(words) and testslots._base(words[i]) in _SHELLS:   # a shell's -c script, as needs_cli
+            opt = next((j for j in range(i + 1, len(words)) if re.fullmatch(r"-[a-z]*c[a-z]*", words[j])), None)
+            if opt is not None and opt + 1 < len(words) and needs_history(words[opt + 1]):
+                return True
+        if i >= len(words) or testslots._base(words[i]) != "git":
+            continue
+        i += 1
+        while i < len(words) and words[i].startswith("-"):   # git's own options; -C and -c take a value
+            i += 2 if words[i] in ("-C", "-c", "--git-dir", "--work-tree", "--namespace") else 1
+        if i < len(words) and words[i] in _HISTORY_GIT:
+            return True
+    return False
+
+
 def check_spills(c: Any, cfg: dict | None = None) -> bool:
     """Whether check `c` may run on a spill host: it would run on this machine (its host "local", or an agent
     CLI it runs (needs_cli), only with `"spill": true`), in a clean checkout, does not say `"spill": false`, and is unwrapped unless it
@@ -315,7 +399,7 @@ def check_spills(c: Any, cfg: dict | None = None) -> bool:
     opt = getattr(c, "spill", None)
     if opt is False or getattr(c, "keep_here", False) or push.remote_host(c) or cleantree.authoring(c):
         return False
-    if (getattr(c, "host", "") == remotecheck.LOCAL or needs_cli(c)) and opt is not True:
+    if (getattr(c, "host", "") == remotecheck.LOCAL or needs_cli(c) or needs_history(c)) and opt is not True:
         return False
     try:
         remote_wrap = push.spill_wrap_of(c, cfg)
@@ -358,7 +442,7 @@ def stays_here(c: Any, cfg: dict | None = None) -> bool:
     if getattr(c, "spill", None) is not None or getattr(c, "keep_here", False) or push.remote_host(c) \
             or cleantree.authoring(c) or getattr(c, "wrap", ()):
         return False
-    if getattr(c, "host", "") != remotecheck.LOCAL and not needs_cli(c):
+    if getattr(c, "host", "") != remotecheck.LOCAL and not needs_cli(c) and not needs_history(c):
         return False
     return checklane.run_class([c], cfg) != checklane.SUITE
 
@@ -459,12 +543,16 @@ def probe(alias: str, beside_device: bool = False) -> tuple[int, str, str]:
     note = busy or note
     cores, mem_kib, running = (int(x) for x in m.groups()[:3])
     load = float(m[4]) if m[4] and m[4] != "-" else None
+    _READ[alias] = (cores, load)
     n = checklane.host_slots(cores, mem_kib / (1024 * 1024) if mem_kib else None, load, running)
     if n > 0:
         return n, "", note
     return 0, (f"its {running} running check(s) fill it" if load is None
                else f"its idle cores and memory fit no check now (load {load:g} of {cores} cores, "
                     f"{running} check(s) running)"), note
+
+
+_READ: dict[str, tuple[int, float | None]] = {}   # the last probe's (cores, load) per host: pick sizes a run's workers from it
 
 
 def claim_dir() -> Path:
@@ -666,6 +754,7 @@ class Claim:
         self.host = host
         self.f = f
         self.lock = lock
+        self.workers = 0   # the test workers the run takes there (workers); 0: it sizes itself
 
     def close(self) -> None:
         if self.lock is not None:
@@ -722,9 +811,11 @@ def kept_off(off: str) -> set[str]:
             or sum(1 for h2, _, w2 in seen if h2 == h and w2 == "fault") >= HOST_FAULT_TRIES}
 
 
-def pick(p, cfg: dict, tell, what: str = "", off: str = "") -> Claim | None:
+def pick(p, cfg: dict, tell, what: str = "", off: str = "", why_here: str = "") -> Claim | None:
     """The first spill host that is allowed, reachable and has a free slot, claimed; None when none is.
-    Each host skipped is told with why. `off`: OFF_ENV's value, whose hosts (kept_off) are skipped."""
+    Each host skipped is told with why. `off`: OFF_ENV's value, whose hosts (kept_off) are skipped.
+    `why_here`: why the run tries them now (default: the slots here stayed busy). The claim's `workers` are
+    sized to the host's idle cores at its probe (workers)."""
     rec = {"project": p.name, "task": os.environ.get("TTP_TASK") or "", "run": os.environ.get("TTP_RUN_ID") or "",
            "pid": os.getpid(), "since": time.time(), "what": what[:300]}
     skipped, keep = [], kept_off(off)
@@ -755,8 +846,15 @@ def pick(p, cfg: dict, tell, what: str = "", off: str = "") -> Claim | None:
                 got.close()
                 skipped.append(f"{alias} (busy: its lock was taken just now)")
                 continue
-            tell(f"spilling to {alias}: the slots here stayed busy for {after_s(cfg):g} s "
-                 f"({_source(cfg, alias)}); the checks run there on a copy of the commit"
+            cores, load = _READ.pop(alias, (0, None))
+            from . import testslots
+            top = testslots.sizes(cfg, cores) if cores > 0 else None   # one run's limit, sized to that host
+            got.workers = workers(cores, load, max(0, _ours(alias) - 1), top[1] if top else 0)
+            tell(f"spilling to {alias}: "
+                 + (why_here or f"the slots here stayed busy for {after_s(cfg):g} s")
+                 + f" ({_source(cfg, alias)}); the checks run there on a copy of the commit"
+                 + (f" with {got.workers} test worker(s), its idle cores (load {load:g} of {cores})"
+                    if got.workers else "")
                  + (f"; {note}, so its device locks alone decided" if note else "")
                  + (f"; beside a device job (checks.{BESIDE_KEY} lists it): {dev}" if dev else "")
                  + (f"; skipped: {'; '.join(skipped)}" if skipped else ""))

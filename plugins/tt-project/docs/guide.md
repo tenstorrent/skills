@@ -1984,7 +1984,9 @@ session and stateless coordinators on every provider.
   `daemon:checks_slot_wait` covers these events too (recorded `muted`); coalescing already keeps a long queue
   to one wake, so a mute is only for a queue the coordinator has already decided to leave alone.
   `delivery.checks_spill_hosts` (an ordered list of ssh aliases, default empty: checks never leave this machine)
-  lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
+  lets a run that may spill try those hosts before it takes a place here (`delivery.checks_spill_first`, default
+  true; false: only after waiting `delivery.checks_spill_after_s`, default 60 s, here) and run, with the test
+  workers that host's idle cores give it (cores less its 1-minute load), on the first listed host the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
   holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
   are skipped with the reason and the run keeps its place here. A check that runs an agent CLI (`claude`, `codex`,
@@ -2021,8 +2023,9 @@ session and stateless coordinators on every provider.
   entries too), `"spill": true` lets it spill even with `"host": "local"`, `"spill": false` keeps it here (left out:
   a check with host `local` stays here, others follow the pool rules), and `"spill_wrap_cmd"` overrides the
   project's remote wrapper. A remote wrapper missing or not executable on the host is a host fault: the check never
-  runs unwrapped. The order when the slots here are full (the project's lanes or the host-wide checks cap): an
-  urgent run asks the spill hosts at once, others after `delivery.checks_spill_after_s`; the first listed host
+  runs unwrapped. The order: a run asks the spill hosts first (with `delivery.checks_spill_first` false, only
+  once the slots here are full: an urgent run at once, others after `delivery.checks_spill_after_s`); a run
+  waiting here (its lanes, the host-wide checks cap or the load guard) asks again after each such bound; the first listed host
   that is allowed, free and reachable takes the run; only when every one is full, paused or unreachable does it
   wait here (and try them again after the same bound). A run that does not pass on a spill host runs again in
   the same order, keeping off the hosts its checks failed on (one whose own fault ended them, such as a pause
