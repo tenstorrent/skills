@@ -45,7 +45,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkspill, checkwait, checklane, cleantree, coordtools, envfault, gatejudge, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, outscan, pooladmit, prguard, prhead, remotecheck, remoteload, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, verified, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -5646,7 +5646,6 @@ def _cancel_refusal(p: Project, marker: Path, m: dict) -> str:
         return f"{marker} is not a detached push of this project"
     if m.get("kind") == "batch":
         return "that is the push queue's batch process; cancel the task whose entry it carries instead"
-    from . import coordtools
     if coordtools.coordinator_run():
         return ""
     me, owner = os.environ.get("TTP_TASK") or "", str(m.get("task") or "")
@@ -5719,7 +5718,6 @@ def cancel(p: Project, marker: Path) -> int:
     if why := _cancel_refusal(p, marker, m):
         print(f"ttp push: --cancel refused: {why}", file=sys.stderr)
         return REFUSED
-    from . import coordtools
     me = os.environ.get("TTP_TASK")
     by = "the coordinator" if coordtools.coordinator_run() else f"task #{me}" if me else "hand"
     say = lambda s: print(s, file=sys.stderr)   # noqa: E731
