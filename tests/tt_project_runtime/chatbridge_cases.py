@@ -1726,7 +1726,9 @@ def test_a_stale_served_list_holds_and_swaps_nothing_and_a_pinned_chat_task_keep
     assert route.models_due(d.cfg, p.state, now, p.db) == "placeholder"
     p.db.x("UPDATE tasks SET status='done' WHERE id=?", (req,))
     assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no pinned chat task left
-    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (req,))
+    p.db.x("UPDATE tasks SET status='queued', provider=NULL WHERE id=?", (req,))
+    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # an unset provider runs on the core one
+    assert route.models_due({**d.cfg, "core_provider": "chat"}, p.state, now, p.db) == "placeholder"
     _route_config(p, route=None)
     d._load_config()
     assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no ranking: as before
