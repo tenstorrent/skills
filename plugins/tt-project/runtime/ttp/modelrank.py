@@ -5,7 +5,8 @@
 `providers.chat.model_ranking` lists the chat endpoint's model ids, smartest first (a list, or "a,b").
 Unset or empty, the shipped default, nothing changes. Set, a model is down (down()) while a run was
 refused it (route.py's model_missing hold for a tier, or a ranked model's own refusal here, kept for
-route.RETRY_QUIET_S) or while the last good model-free /models check (route.MODELS_FILE) leaves it out.
+route.RETRY_QUIET_S) or while the last good model-free /models check (route.MODELS_FILE) leaves it out; a check over STALE_S
+old counts as none (route.models_due keeps it fresh while a ranking is set and chat may run).
 
 A routed start (a tier route or a model pick to chat, route.py) whose model is down runs the
 highest-ranked model that check lists and that is not down itself (pick); with none, it falls back
@@ -49,10 +50,16 @@ def ranking(cfg: dict) -> list[str]:
         return []
 
 
-def served(state: Path) -> list[str] | None:
-    """The ids the last /models check listed, or None when it failed or never ran (nothing is known)."""
+STALE_S = 2 * route.MODELS_EVERY_S   # an older served list is unknown: no swap or hold rests on it
+
+
+def served(state: Path, now: float) -> list[str] | None:
+    """The ids the last /models check listed, or None when it failed, never ran or is over STALE_S old
+    (nothing is known)."""
     rec = route.read_served(state).get(route.TO) or {}
-    return list(rec.get("ids") or []) if rec.get("ok") else None
+    if not rec.get("ok") or now - float(rec.get("checked") or 0) > STALE_S:
+        return None
+    return list(rec.get("ids") or [])
 
 
 def down(db, cfg: dict, state: Path, model: str, now: float) -> str:
@@ -63,7 +70,7 @@ def down(db, cfg: dict, state: Path, model: str, now: float) -> str:
         return "refused"
     if now - float((db.kv(REFUSED + model) or {}).get("at") or 0) < route.RETRY_QUIET_S:
         return "refused"
-    ids = served(state)
+    ids = served(state, now)
     return "not listed" if ids is not None and model not in ids else ""
 
 
@@ -71,7 +78,7 @@ def pick(db, cfg: dict, state: Path, model: str, now: float) -> tuple[str, str] 
     """(the model to run in place of `model`, why `model` is down), or None: it is up, no ranking is
     set, or no ranked model is served now."""
     why = down(db, cfg, state, model, now)
-    ids = served(state) if why else None
+    ids = served(state, now) if why else None
     for m in ranking(cfg) if ids else ():
         if m != model and m in ids and not down(db, cfg, state, m, now):
             return m, why

@@ -354,15 +354,25 @@ def refresh_served(state: Path, alias: str) -> bool:
     return True
 
 
-def models_due(cfg: dict, state: Path, now: float) -> str:
-    """The endpoint alias whose /models check is due (a tier routes to it and the last check is
-    MODELS_EVERY_S old), else ''."""
+def models_due(cfg: dict, state: Path, now: float, db=None) -> str:
+    """The endpoint alias whose /models check is due (a tier routes to it, or with a model ranking set
+    a queued or running task pins a model on it, and the last check is MODELS_EVERY_S old), else ''."""
     entry = (cfg.get("providers") or {}).get(TO) or {}
     alias = str(entry.get("endpoint") or "") if isinstance(entry, dict) else ""
-    if not alias or not any(target(cfg, t) for t in (entry.get("tiers") or {})):
+    if not alias or not (any(target(cfg, t) for t in (entry.get("tiers") or {})) or _ranked_pin(cfg, db)):
         return ""
     last = read_served(state).get(TO) or {}
     return alias if now - float(last.get("checked") or 0) >= MODELS_EVERY_S else ""
+
+
+def _ranked_pin(cfg: dict, db) -> bool:
+    """A model ranking is set and a queued or running task pins a model on the endpoint (modelrank.py)."""
+    from . import modelrank
+    if db is None or not modelrank.ranking(cfg):
+        return False
+    core = (cfg.get("core_provider") or "claude") == TO
+    return bool(db.q("SELECT 1 FROM tasks WHERE status IN ('queued','running') AND COALESCE(model,'')!='' "
+                     "AND (provider=? OR (? AND provider IS NULL)) LIMIT 1", (TO, int(core))))
 
 
 def model_lines(db, cfg: dict, state: Path, now: float, at) -> list[str]:

@@ -3835,7 +3835,7 @@ class Daemon:
             log(self.p, f"route: tier {tier} routes again ({model}: {why})")
         if os.environ.get("TTP_TEST_NO_MODELS_PROBE") or (self._models_probe and self._models_probe.is_alive()):
             return
-        if now - self._models_tried < 300 or not (alias := route.models_due(self.cfg, self.p.state, now)):
+        if now - self._models_tried < 300 or not (alias := route.models_due(self.cfg, self.p.state, now, self.p.db)):
             return
         self._models_tried = now
         state, where = self.p.state, self.p
@@ -10239,8 +10239,9 @@ class Daemon:
         served, with one low alert per switch of `key`; else None, and a switch kept for `key` ends."""
         try:
             got = modelrank.pick(self.p.db, self.cfg, self.p.state, model, now)
-            if not got:
-                if last := modelrank.back(self.p.db, key):
+            if not got:   # up again ends its switch; still down with none ranked served keeps it
+                if not modelrank.down(self.p.db, self.cfg, self.p.state, model, now) and (
+                        last := modelrank.back(self.p.db, key)):
                     log(self.p, f"model ranking: {where} back on {last.get('from')} (was {last.get('to')})")
                 return None
             if modelrank.switch(self.p.db, key, model, got[0], now):

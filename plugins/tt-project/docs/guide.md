@@ -1128,7 +1128,9 @@ Messages calls into `<base url>/chat/completions` calls and back, and ends with 
    tier's effort; its run's `route` record names the model it stands in for (`model_rank`). A stand-in
    that is refused too is skipped for a day and the next one runs. A task's own model pin on `chat`
    is swapped the same way, unless the pin is required (`pin_required`): such a task waits until its
-   model is served again. Each switch is one low alert; once the model is served again (the hold ends
+   model is served again. With a ranking set, a queued or running task that pins a model on `chat`
+   also keeps the hourly check running, and a check over two hours old counts as none: nothing is
+   swapped or held on it. Each switch is one low alert; once the model is served again (the hold ends
    or the check lists it) the next start runs it. With no ranked model served, or the whole endpoint
    cooling down, runs start on the core provider as before. Only `chat` has a served list: Claude
    Code, Codex and Cursor models are not ranked (provider failover covers a provider that cannot start

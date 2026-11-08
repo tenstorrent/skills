@@ -1701,6 +1701,50 @@ def test_a_required_model_pin_that_is_down_waits_and_a_preference_pin_is_swapped
     assert p.db.kv(modelrank.SWITCH + "pin:" + _RT_MODEL) is None
 
 
+def test_a_stale_served_list_holds_and_swaps_nothing_and_a_pinned_chat_task_keeps_it_fresh(env, monkeypatch):
+    """A /models check over modelrank.STALE_S old is unknown: no required-pin hold, no swap; with a
+    ranking set, a queued pinned chat task makes the check due though no tier routes to chat."""
+    from ttp import daemon as dmod
+    from ttp import failover, modelrank, route
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    alerts = _ranked(p, d, monkeypatch, ["rank-a"])
+    req = p.db.add_task("required", "s", kind="work", tier="light", priority=3, provider="chat", model=_RT_MODEL,
+                        labels=[failover.REQUIRED_LABEL])
+    now = time.time()
+    assert d._required_model_down(p.db.task(req), "chat", now)   # a fresh 'not listed' holds it
+    old = now - modelrank.STALE_S - 60
+    route.write_served(p.state, "chat", True, "HTTP 200", ["rank-a"], old)
+    assert modelrank.served(p.state, now) is None and modelrank.down(p.db, d.cfg, p.state, _RT_MODEL, now) == ""
+    assert d._required_model_down(p.db.task(req), "chat", now) == ""
+    assert d._rank_pick("tier light", "light", _RT_MODEL, now) is None and alerts == []
+    # No tier routes to chat: due only with the ranking set and a pinned chat task queued.
+    _route_config(p, route=None, model_ranking=["rank-a"])
+    d._load_config()
+    assert not any(route.target(d.cfg, t) for t in ("light", "standard", "deep"))
+    assert route.models_due(d.cfg, p.state, now) == ""                 # the daemon's db not given
+    assert route.models_due(d.cfg, p.state, now, p.db) == "placeholder"
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (req,))
+    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no pinned chat task left
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (req,))
+    _route_config(p, route=None)
+    d._load_config()
+    assert route.models_due(d.cfg, p.state, now, p.db) == ""           # no ranking: as before
+
+
+def test_a_model_down_with_no_ranked_model_served_keeps_its_switch(env, monkeypatch):
+    from ttp import daemon as dmod
+    from ttp import modelrank
+    p = make(env)
+    d = dmod.Daemon(p.base)
+    _ranked(p, d, monkeypatch, ["rank-a"])
+    now = time.time()
+    assert d._rank_pick("tier light", "light", _RT_MODEL, now)[0] == "rank-a"
+    modelrank.refused(p.db, "rank-a", None, now)   # the stand-in refused too: none served
+    assert d._rank_pick("tier light", "light", _RT_MODEL, now) is None
+    assert p.db.kv(modelrank.SWITCH + "light") and "back on" not in (p.logs / "daemon.log").read_text()
+
+
 def test_a_routed_run_with_a_refused_key_goes_through_the_auth_gate_then_falls_back(env, monkeypatch):
     from ttp import alerts, route
     from ttp.daemon import Daemon
