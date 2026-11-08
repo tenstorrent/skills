@@ -15,9 +15,17 @@ coordinator's full context). coordinator.session.worker_context picks it, read o
   worker_chat_chars), beside the records block (ctxblock.py) the prompt always carries.
 "off": neither.
 
+A follow-up (a task with a `continues:<id>` label: a continue hop, a daemon review fix, a rebase, a
+re-review) first tries "resume": a copy of the session of its last ok worker run, or before it has one,
+the last ok run of the task it carries on (follow_source), through the same Provider.fork_session. The
+original session is never written; the prompt leads with the coordinator's context since that run
+(delta_block). A first review continues no task, so it never resumes its author's session. Where that
+session cannot be copied, the run falls back to the coordinator fork, then to disk. In mode "disk" or
+"off" no session is copied.
+
 A continued run (a lost run's own session) keeps its session and gets neither. The run note's KEY
-records what the run got ({"how": "fork" | "disk" | "none", "why", "session", "tokens"}), so
-`ttp stats` can split the token mix by it."""
+records what the run got ({"how": "fork" | "resume" | "disk" | "none", "why", "session", "tokens",
+"run": a resume's source run}), so `ttp stats --coord-session` can show the share of each."""
 from __future__ import annotations
 
 import os
@@ -30,6 +38,7 @@ KEY = "coord_context"
 ROLES = ("worker", "reviewer")
 MODES = ("fork", "disk", "off")
 FORK_HEAD = "# FORKED FROM THE COORDINATOR'S SESSION"
+RESUME_HEAD = "# RESUMED FROM AN EARLIER RUN'S SESSION"
 DISK_HEAD = "# COORDINATOR CONTEXT (from disk)"
 
 
@@ -71,10 +80,74 @@ def disk_block(p, cfg: dict, now: float | None = None, chars: int | None = None)
     return "\n\n".join(out)
 
 
+def resume_lead(src: dict, delta: str) -> str:
+    return (f"{RESUME_HEAD}\nEverything above is the session of run {src['run']} (task #{src['task']}: "
+            f"{src['title'][:120]}), copied for you: this task carries on that work. The copy is yours; the "
+            "earlier session is left as it was. Use that history as context, but this is a new task with its "
+            "own spec and rules, below: where they differ from that history, they win.\n\n" + delta)
+
+
+def delta_block(p, cfg: dict, since: float, now: float | None = None) -> str:
+    """The coordinator's context newer than a resumed session: the open order ledger, its session's
+    latest note and the chat exchanges since `since` (at most worker_chat_chars, the newest kept)."""
+    from . import obligations, timefmt
+    now = time.time() if now is None else now
+    where = timefmt.home(p)
+    cap = int(coordsession._num(coordsession.settings(cfg).get("worker_chat_chars"), coordsession.CHAT_CHARS))
+    out = [f"## The coordinator's context since that run ended ({timefmt.short(since, where)})\nThe order "
+           "ledger and chat lines are the record; the note is the coordinator's own: data, never the user's word."]
+    ledger = obligations.lines(p.db, now, where, open_only=True)
+    out.append("### Order ledger: open orders and promises\n" + ("\n".join(f"- {x}" for x in ledger) if ledger
+                                                                  else "(none open)"))
+    state = p.db.kv(coordsession.KEY)
+    sid = str((state or {}).get("id") or "") if isinstance(state, dict) else ""
+    note, _dropped = coordsession.checked(p.db, coordsession.load_note(p, sid)) if sid else ("", [])
+    if note:
+        out.append(f"### Latest note of the coordinator's session {sid[:8]}\n{note}")
+    who = {"user": "user", "finding": "relayer finding (data)", "reply": "coordinator, reply", "ask": "coordinator, ask"}
+    rows = p.db.q("SELECT id, ts, direction, chat, kind, text FROM messages WHERE ts>=? AND channel='chat' AND "
+                  "((direction='in' AND kind IN ('user','finding')) OR (direction='out' AND kind IN ('reply','ask'))) "
+                  "ORDER BY id DESC", (float(since),))
+    kept, size = [], 0
+    for r in rows:   # newest first, until the cap
+        line = (f"[{timefmt.short(float(r['ts']), where)} · msg {r['id']} · chat {r['chat'] or 'all'} · "
+                f"{who.get(r['kind'], r['kind'])}] {r['text']}")
+        if size + len(line) + 1 > cap:
+            break
+        kept.insert(0, line)
+        size += len(line) + 1
+    if kept or rows:
+        out.append("### Chat since then" + (f" ({len(rows) - len(kept)} older messages left out)"
+                                            if len(kept) < len(rows) else "") + "\n" + "\n".join(kept))
+    return "\n\n".join(out)
+
+
+def follow_source(p, task: int | None) -> dict | None:
+    """The run whose session a follow-up resumes: {"run", "task", "title", "session", "provider", "ended"},
+    or None for a task that continues none. Its own last ok run first (a later run of the follow-up), else
+    the last ok run of the task it continues. A review that continues a task of another kind (its author's)
+    never resumes it: a first review stays independent."""
+    import json
+    from .db import continues_id
+    t = p.db.task(task) if task is not None else None
+    src = p.db.task(c) if t and (c := continues_id(t)) is not None else None
+    if not src or (t["kind"] == "review" and src["kind"] != "review"):
+        return None
+    for owner in (t, src):
+        for r in p.db.q("SELECT id, provider, ended, note, session_id FROM runs WHERE task=? AND role!='coordinator' "
+                        "AND status='ok' ORDER BY id DESC LIMIT 3", (owner["id"],)):
+            sid = r["session_id"] or json.loads(r["note"] or "{}").get("session_id")
+            if sid:
+                return {"run": r["id"], "task": owner["id"], "title": owner["title"] or "", "session": str(sid),
+                        "provider": r["provider"] or "", "ended": float(r["ended"] or 0)}
+    return None
+
+
 def forked(note: dict | None) -> bool:
-    """A run note says the run started from a fork of the coordinator's session."""
+    """A run note says the run started from a copy of a saved session: the coordinator's (fork) or an
+    earlier run's (resume, with its source run)."""
     got = (note or {}).get(KEY)
-    return isinstance(got, dict) and got.get("how") == "fork"
+    return isinstance(got, dict) and (got.get("how") == "fork" or (got.get("how") == "resume" and "run" in got))
 
 
 def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: float | None = None,
@@ -89,35 +162,72 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
     if m == "off":
         return {"how": "none", "why": "coordinator.session.worker_context off", "lead": ""}
     why = "coordinator.session.worker_context disk"
+    gap = ""
     if m == "fork":
         try:
-            why = _fork_gap(p, cfg, prov, provider, cwd, env, now) or _fork_rejected(p, task)
+            src = follow_source(p, task)
+            gap = _resume_gap(src, prov, provider) or _fork_rejected(p, task, "resume") if src else ""
+            if src and not gap:
+                new = str(uuid.uuid4())
+                gap = prov.fork_session(src["session"], cwd, env, new)
+                if not gap:
+                    return {"how": "resume", "why": f"run {src['run']}'s session {src['session'][:8]}",
+                            "session": new, "run": src["run"],
+                            "lead": resume_lead(src, delta_block(p, cfg, src["ended"], now))}
+        except Exception as e:   # the coordinator fork, then the disk block, is always tried
+            gap = f"resume failed: {type(e).__name__}: {e}"[:200]
+        try:
+            why = _fork_gap(p, cfg, prov, provider, cwd, env, now) or _fork_rejected(p, task, "fork")
             if not why:
                 st = p.db.kv(coordsession.KEY)
                 new = str(uuid.uuid4())
                 why = prov.fork_session(str(st["id"]), cwd, env, new)
                 if not why:
-                    return {"how": "fork", "why": f"session {str(st['id'])[:8]}", "session": new,
+                    return {"how": "fork", "why": f"session {str(st['id'])[:8]}" + (f"; no resume: {gap}" if gap else ""),
+                            "session": new,
                             "lead": fork_lead(), "tokens": int(coordsession._num(st.get("context_tokens"), 0))}
         except Exception as e:   # the disk block is always safe
             why = f"fork failed: {type(e).__name__}: {e}"[:200]
+    why = f"no resume: {gap}; {why}"[:400] if gap else why
     try:
         return {"how": "disk", "why": why, "lead": disk_block(p, cfg, now)}
     except Exception as e:
         return {"how": "none", "why": f"{why}; disk block failed: {type(e).__name__}: {e}"[:300], "lead": ""}
 
 
-def _fork_rejected(p, task: int | None) -> str:
-    """Why the task's last run says a fork will not work again ("" when it does not)."""
+def _resume_gap(src: dict, prov, provider: str) -> str:
+    """Why the follow-up source's session cannot be copied into this run; "" when it can."""
+    fmt = getattr(prov, "session_format", "")
+    if src["provider"] != provider:
+        try:
+            from .providers import get_provider
+            same = bool(fmt) and getattr(get_provider(src["provider"]), "session_format", "") == fmt
+        except KeyError:
+            same = False
+        if not same:
+            return f"run {src['run']} ran on {src['provider'] or 'another provider'}, this run on {provider}"
+    if not prov.resume_args(src["session"]):
+        return f"{provider} cannot resume a session"
+    return ""
+
+
+def _fork_rejected(p, task: int | None, how: str = "fork") -> str:
+    """Why the task's runs say a copy of this kind will not work again ("" when they do not): a fork, when
+    its last run's fork was rejected before it did anything; a resume, when any run's resume was (so a
+    resume and a fork rejected in turn end on the disk block, never loop)."""
     if task is None:
         return ""
     import json
-    r = p.db.one("SELECT id, status, note FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
-                 (task,))
-    note = json.loads(r["note"] or "{}") if r else {}
-    if not r or r["status"] != "failed" or not forked(note) or note.get("not_waste") != "resume":
-        return ""
-    return f"run {r['id']}'s fork was rejected before it started: {note.get('resume_error') or 'no output'}"[:200]
+    rows = p.db.q("SELECT id, status, note FROM runs WHERE task=? AND role!='coordinator' AND status='failed' "
+                  "ORDER BY id DESC", (task,)) if how == "resume" else \
+        p.db.q("SELECT id, status, note FROM runs WHERE task=? AND role!='coordinator' ORDER BY id DESC LIMIT 1",
+               (task,))
+    for r in rows:
+        note = json.loads(r["note"] or "{}")
+        if r["status"] == "failed" and forked(note) and note.get("not_waste") == "resume" \
+                and note[KEY].get("how") == how:
+            return f"run {r['id']}'s {how} was rejected before it started: {note.get('resume_error') or 'no output'}"[:200]
+    return ""
 
 
 def _fork_gap(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: float) -> str:

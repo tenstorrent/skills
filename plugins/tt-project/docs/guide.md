@@ -3450,7 +3450,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   (default 0: no cap). The coordinator's own session is never written. Otherwise, and on Codex, Cursor and
   the chat provider, the prompt leads with the coordinator's context on disk: the open order ledger, its
   latest session note and the last chat exchanges (`worker_chat_chars`). `disk` skips the fork, `off`
-  both. The run note's `coord_context` says which one a run got. Workers run independent parts in
+  both. A follow-up (a task labelled `continues:<id>`: a continue hop, a daemon review fix, a rebase, a
+  re-review) first resumes a copy of the session of its own last ok run, or before it has one, of the
+  last ok run of the task it carries on, with the coordinator's context since that run (open orders,
+  its latest note, the chat since) leading its prompt; that session is never written. A first review
+  continues no task, so it stays independent of its author's session. Where that session cannot be
+  copied (another provider's format, a missing transcript, an earlier rejected copy), the run takes the
+  coordinator fork, then the disk block. The run note's `coord_context` says which one a run got
+  (`resume` names its source `run`), and `ttp stats --coord-session` shows the share of each per day
+  and how many follow-ups resumed. Workers run independent parts in
   parallel subagents; their spend counts in the run's cost.
 - `ttp killscan <script>` flags kills by name or pattern (`pkill`, `killall`, any `pgrep` or
   `pidof`, `ps | grep` feeding a kill) before a worker runs a script; `--shim <dir>` writes

@@ -228,7 +228,26 @@ def report(db, runs_dir, tz: str, days: float = 7, now: float | None = None) -> 
                     "over_baseline": None if baseline["usd_per_day"] is None else day_usd > baseline["usd_per_day"],
                     "break_even": None if growth is None or tc is None else
                     tc <= BREAK_EVEN_TOOL_CALLS and growth <= BREAK_EVEN_GROWTH})
-    return {"zone": tz, "days": days, "first_session_wake": first, "baseline": baseline, "by_day": out}
+    return {"zone": tz, "days": days, "first_session_wake": first, "baseline": baseline, "by_day": out,
+            "worker_context": worker_context(db, tz, since)}
+
+
+def worker_context(db, tz: str, since: float) -> list[dict]:
+    """Per day, how worker and review runs started (ctxfork.KEY's how: fork, resume, disk, none, or
+    unrecorded), and of the follow-ups among them (a task with a continues: label), how many resumed."""
+    from . import ctxfork
+    days: dict = {}
+    for r in db.q("SELECT r.started, r.note, t.labels FROM runs r LEFT JOIN tasks t ON t.id=r.task "
+                  "WHERE r.role IN ('worker','reviewer') AND r.started>=? ORDER BY r.started", (since,)):
+        got = _note(r["note"]).get(ctxfork.KEY)
+        how = str(got.get("how") or "unrecorded") if isinstance(got, dict) else "unrecorded"
+        d = days.setdefault(timefmt.today(r["started"], tz), {"runs": 0, "how": {}, "follow_ups": 0, "resumed": 0})
+        d["runs"] += 1
+        d["how"][how] = d["how"].get(how, 0) + 1
+        if '"continues:' in (r["labels"] or ""):
+            d["follow_ups"] += 1
+            d["resumed"] += how == "resume"
+    return [{"day": k, **v} for k, v in sorted(days.items())]
 
 
 def _day_bounds(day: str, tz: str) -> tuple[float, float]:
@@ -273,4 +292,8 @@ def text(s: dict, name: str = "") -> str:
         lines.extend(f"    compacted in place: session {str(c['session'] or '-')[:8]} at {timefmt.short(c['at'], s['zone'])}, "
                      f"{int(c['before'] or 0) / 1000:.0f}k -> {int(c['after'] or 0) / 1000:.0f}k tokens ({c['how']})"
                      for c in d.get("compactions") or [])
+    for d in s.get("worker_context") or []:
+        lines.append(f"  worker and review runs {d['day']}: {d['runs']} started, "
+                     + ", ".join(f"{k} {v} ({v / d['runs']:.0%})" for k, v in sorted(d["how"].items(), key=lambda kv: -kv[1]))
+                     + f"; follow-ups resumed {d['resumed']} of {d['follow_ups']}")
     return "\n".join(lines)

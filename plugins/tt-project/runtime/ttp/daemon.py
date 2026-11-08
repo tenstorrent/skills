@@ -3294,7 +3294,7 @@ class Daemon:
                     resume, resume_extra = got["session"], prov.resume_args(got["session"])
                 if got.get("lead"):
                     prompt = got["lead"] + "\n\n" + prompt
-                note = {**(note or {}), ctxfork.KEY: {k: got[k] for k in ("how", "why", "session", "tokens")
+                note = {**(note or {}), ctxfork.KEY: {k: got[k] for k in ("how", "why", "session", "tokens", "run")
                                                       if k in got}}
         if thread:
             resume, resume_extra = thread, prov.resume_args(thread)
@@ -5941,8 +5941,9 @@ class Daemon:
             # The lost run's session could not be continued after all: nothing ran, so the task starts
             # fresh at once, no attempt spent. This run ended 'failed', so it is not resumed again; a
             # rejected fork of the coordinator's session starts from its context on disk instead.
-            what = "fork of the coordinator's session" if ctxfork.forked(json.loads(r["note"] or "{}")) \
-                else "lost session"
+            got = json.loads(r["note"] or "{}")
+            what = ("copy of an earlier run's session" if (got.get(ctxfork.KEY) or {}).get("how") == "resume"
+                    else "fork of the coordinator's session") if ctxfork.forked(got) else "lost session"
             with db.tx():
                 db.update_task(task["id"], status="queued", blocked_reason=None, not_before=None)
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
