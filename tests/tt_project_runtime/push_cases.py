@@ -3691,9 +3691,10 @@ def _pq_alone(s, name, priority=3, text=None):
     return row
 
 
-def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_window(env, monkeypatch):
+def test_an_independent_approval_starts_a_train_at_once_through_the_gap_and_the_window(env, monkeypatch):
     """user msg #1221: an approval sharing no file with an earlier unlanded one, or of priority 1-2, starts a
-    batch of its own at once; routine ones that overlap still wait the gap (here 1200 s) or the window."""
+    train at once through the gap (here 1200 s) and the window, and leads it; every routine approval rides in
+    it (one train, user msg #2220). With no fast one the routine ones still wait the gap."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=900)
     s.p.db.update_task(s.review, status="running")   # a review is at work: routine approvals wait for it
@@ -3704,14 +3705,15 @@ def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_wind
     assert pushq.due(s.p, now) == ([], "1200 s left of the 1800 s gap since the last batch ended")
     alone = _pq_alone(s, "other.txt")
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [alone] and "share no file with an earlier unlanded one" in why, why
+    assert [r["id"] for r in got] == [alone, routine] and "share no file with an earlier unlanded one" in why \
+        and "1 more ride in the train" in why, why
     stacked = _pq_alone(s, "feature.txt", text="another feature\n")   # same file as the earlier ones
     assert pushq.fast_ids(s.p, pushq._approved(s.p.db, "origin/proj"),
                           pushq._tracking_tip(s.p, "origin", "proj")) == {alone}, "overlap never goes fast"
     p2 = _pq_alone(s, "feature.txt", priority=2, text="a p2 fix\n")
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [p2, alone] and "priority 1-2" in why, "priority first; routine ones wait"
-    assert routine not in {r["id"] for r in got} and stacked not in {r["id"] for r in got}
+    assert [r["id"] for r in got] == [p2, alone, routine, stacked] and "priority 1-2" in why, \
+        "priority first, then the independent one; the routine ones ride in the train"
     tip = pushq._tracking_tip(s.p, "origin", "proj")
     assert alone not in pushq.fast_ids(s.p, pushq._approved(s.p.db, "origin/proj"), tip, skip={alone}), \
         "an approval already tried on a failing tip is never fast"
@@ -4455,8 +4457,8 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
     """Replays a push branch tip whose checks fail only in the batch's own checkout (a path-dependent
     failure: they passed in the task's worktree) while more approvals wait than a batch takes. After
     TIP_FAILS tip_failed batches on that tip, one keyed alert is raised and the approvals already tried
-    on it wait, not run again and again. A new approval goes first; the tip with it passes, so it is
-    pushed, which clears the alert, and the waiting approval then lands on the fixed tip."""
+    on it wait, not run again and again. A new approval starts a train and leads it, the waiting approval
+    rides in it (one train); the tip with the fix passes, so both are pushed, which clears the alert."""
     from ttp import alerts, pushq
     check = 'case "$(pwd -P)" in */push) test -e fix.txt ;; esac'
     s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=1, push_checks=[check])
@@ -4482,7 +4484,7 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
                       depends_on=[code])
     _pq_hand_off(env, s, task=fix, push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
     rows, why = pushq.due(s.p, time.time() + 60)
-    assert [r["task"] for r in rows] == [fix], why
+    assert [r["task"] for r in rows] == [fix, s.review], why
     bid = _pq_batch(s)
     m = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())
     assert m["bad_tip"] == {"tip": tip, "fresh": 1, "cmd": check, "ids": []}, m
@@ -4490,8 +4492,6 @@ def test_a_tip_failing_only_where_the_queue_checks_it_stops_being_retried_and_a_
     _pq_tend(s)
     assert db.task(fix)["status"] == "done" and _git_out(s.origin, "show", "proj:fix.txt") == "fix"
     assert "bad_tip" not in db.kv("push_queue") and not alerts.holds(db, pushq.BAD_TIP_ALERT, 0, time.time())
-    bid = _pq_batch(s)
-    _pq_tend(s)
     assert db.task(s.review)["status"] == "done", log(bid)
     assert len(alerted()) == 1
 
@@ -17437,7 +17437,7 @@ def test_a_push_claim_on_the_fork_head_is_confirmed_without_reading_its_default_
 
 def test_an_approval_from_the_review_of_an_urgent_task_starts_its_batch_at_once(env, monkeypatch):
     """The review is routine priority, but the task it reviews is urgent (an `urgent:` spec line): its
-    approval goes first and starts a batch while another review still runs; routine ones wait."""
+    approval starts a train at once while another review still runs and leads it; routine ones ride in it."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=900)
     s.p.db.update_task(s.review, status="running")   # a review is still at work: approvals may wait for it
@@ -17453,7 +17453,8 @@ def test_an_approval_from_the_review_of_an_urgent_task_starts_its_batch_at_once(
         [row] = pushq.approve(s.p, rid, None, {"entries": [{"branch": s.branch, "head": s.head}],
                                                "target": "origin/proj"})
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == [row] and "an urgent review" in why, "alone: the routine one waits " + why
+    assert [r["id"] for r in rows] == [row, routine] and "an urgent review" in why and "1 more ride in the train" in why, \
+        "the urgent one leads, the routine one rides in its train: " + why
     s.p.db.update_task(hot, spec="Fix it.")   # no longer urgent: it waits like the rest
     assert pushq.due(s.p, now)[0] == []
 
