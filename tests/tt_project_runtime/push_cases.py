@@ -2019,8 +2019,9 @@ def _approved_mid_search(p, monkeypatch, after, priority):
     return ran
 
 
-def _bad_sixth(env, monkeypatch, wait_s=0, restarts=1):
-    """Eight entries, the sixth breaks the checks. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
+def _bad_first(env, monkeypatch, wait_s=0, restarts=1):
+    """Eight entries, the first breaks the checks, so the search runs prefixes 4, 2 and 1 (none passes:
+    a prefix that passed would push at once, user msg #2317) and then the rescue checks 2-8 without it. `wait_s` sets delivery.push_yield_wait_s (0: an urgent
     approval never waits for the search's verdict; None: the default, which these millisecond checks meet),
     `restarts` delivery.push_yield_restarts (1: a search may stop once; None: the default, never)."""
     p, repo, origin, other = _bump_setup(env, monkeypatch, ["test ! -e plugins/p/bad.txt"])
@@ -2028,49 +2029,49 @@ def _bad_sixth(env, monkeypatch, wait_s=0, restarts=1):
         p.set_config("delivery.push_yield_wait_s", wait_s)
     if restarts is not None:
         p.set_config("delivery.push_yield_restarts", restarts)
-    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 6 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 1 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
     return p, repo, origin, heads
 
 
-@pytest.mark.parametrize("after,priority", [(2, 1), (4, 1), (2, 3)])
+@pytest.mark.parametrize("after,priority", [(2, 1), (5, 1), (2, 3)])
 def test_an_urgent_approval_arriving_mid_bisect_stops_the_search_after_the_check_it_is_on(env, monkeypatch, after,
                                                                                          priority):
-    """Eight entries, the sixth breaks the checks. An urgent (priority 1) approval arrives right after
-    the full head failed and the first probe (prefix 4) passed: the batch runs no further check, pushes
-    the 4 entries that passed and requeues the rest "yielded" (none blamed), so the urgent one waits
-    for the one check in flight, not the whole bisect. Arriving after the blame (the full head and
-    prefixes 4, 6 and 5 ran), entry 6 stays blamed and only the check of 7-8 without it is skipped. A
-    routine (priority 3) approval changes nothing: the search runs to the end and blames entry 6."""
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    """Eight entries, the first breaks the checks. An urgent (priority 1) approval arriving right after
+    the full head and prefix 4 failed stops the search: no further check runs and all eight are requeued
+    "yielded" (none blamed), so the urgent one waits for the one check in flight, not the whole bisect.
+    Arriving after the blame (the full head, prefixes 4, 2 and 1 and the tip ran), entry 1 stays blamed
+    and only the check of 2-8 without it is skipped. A routine (priority 3) approval changes nothing:
+    the search runs to the end, blames entry 1 and lands the rest."""
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     ran = _approved_mid_search(p, monkeypatch, after, priority)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    pushed = [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in range(1, 5)]
-    assert rc == 0 and m["outcome"] == "pushed" and pushed == ["1", "2", "3", "4"], m
+    assert rc == 0, m
     if priority == 1 and after == 2:
         assert len(ran) == m["checks"]["runs"] == 2, "the full head and prefix 4: nothing after the approval"
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
         assert all({**r["detail"], "known_fail": None} == {"yielded": True, "restarts": 1, "known_fail": None}
-                   for r in m["results"][4:]), "requeued, never blamed"
+                   for r in m["results"]), "requeued, never blamed"
     elif priority == 1:
-        assert len(ran) == m["checks"]["runs"] == 4, "no check of entries 7-8 without entry 6"
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "requeued", "requeued"], m
-        assert [r["detail"] for r in m["results"][6:]] == [{"yielded": True, "restarts": 1}] * 2 and m["yielded_to"] == [99], m
+        assert len(ran) == m["checks"]["runs"] == 5, "no check of entries 2-8 without entry 1"
+        assert _statuses(m) == ["check_failed"] + ["requeued"] * 7 and m["yielded_to"] == [99], m
+        assert [r["detail"] for r in m["results"][1:]] == [{"yielded": True, "restarts": 1}] * 7, m
     else:
-        # full head, prefixes 4, 6 and 5, then entries 7-8 checked without entry 6 (the rescue)
-        assert len(ran) == m["checks"]["runs"] == 5 and not m.get("yielded_to"), m
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
+        # full head, prefixes 4, 2 and 1, the tip, then entries 2-8 checked without entry 1 (the rescue)
+        assert len(ran) == m["checks"]["runs"] == 6 and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+        assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (2, 8)] == ["2", "8"]
 
 
 def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_next_batch(env, monkeypatch, capsys):
     """delivery.push_yield_wait_s (default 900 s): an urgent approval arriving mid-search, with the
-    search's verdict expected that soon, does not stop it. No entry loses its checks: entry 6 is blamed,
+    search's verdict expected that soon, does not stop it. No entry loses its checks: entry 1 is blamed,
     the rest land, nothing is requeued, and the urgent one, still approved, goes in the next batch."""
     from ttp import pushq
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=None)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None)
     ran = _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert rc == 0 and _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
-    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 5, m
+    assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "urgent approval 99 joins this batch's next split" in (out := capsys.readouterr().out), out
     assert "after its verdict, expected in about 0 min" in out, out
     assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one still waits, approved"
@@ -2082,15 +2083,15 @@ def test_an_urgent_approval_mid_search_waits_for_a_near_verdict_and_leads_the_ne
 def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monkeypatch, capsys):
     """With checks far longer than delivery.push_yield_wait_s (30 min each here) and the default
     delivery.push_yield_restarts, an urgent approval arriving after the full head failed does not stop
-    the search: every check runs once, entry 6 is blamed, the rest land, and the urgent one, still
+    the search: every check runs once, entry 1 is blamed, the rest land, and the urgent one, still
     approved, lands first in the next batch."""
     from ttp import batch, pushq
     monkeypatch.setattr(batch.Batch, "_verdict_s", lambda self, left: left * 1800.0)
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=None, restarts=None)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=None, restarts=None)
     ran = _approved_mid_search(p, monkeypatch, 1, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert rc == 0 and _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
-    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 5, m
+    assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert not m.get("yielded_to") and len(ran) == m["checks"]["runs"] == 6, m
     assert "after its next check once the search ends" in capsys.readouterr().out
     assert pushq.yields_to(p, "origin/proj") == [99], "the urgent one leads the next batch"
     hot = _entry(repo, "hot", {"plugins/p/hot.txt": "h\n"})
@@ -2099,20 +2100,20 @@ def test_an_urgent_approval_joins_a_long_search_instead_of_stopping_it(env, monk
 
 
 def test_a_stopped_search_hands_its_full_head_failure_to_the_next_batch(env, monkeypatch, capsys):
-    """A forced stop (delivery.push_yield_restarts 1) after the full head failed and prefix 4 passed:
-    entries 5-8 are requeued with that failure ("known_fail"), and the next batch of exactly them runs
-    no full-head check: prefixes 5-6 and 5, entry 6 blamed, then 7-8 without it (3 checks, not 4). The
-    same failure on another set of entries, or one entry alone, is checked as usual."""
+    """A forced stop (delivery.push_yield_restarts 1) after the full head and prefix 4 failed: all eight
+    entries are requeued with the full head's failure ("known_fail"), and the next batch of exactly them
+    runs no full-head check: prefixes 4, 2 and 1 and the tip, entry 1 blamed, then 2-8 without it (5
+    checks, not 6). The same failure on another set of entries, or one entry alone, is checked as usual."""
     from ttp import batch, push
     from ttp.project import write_json
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=1e-9, restarts=1)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=1e-9, restarts=1)
     real, ran = batch.Batch._check, []
     _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert m["yielded_to"] == [99] and _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4, m
-    kf = m["results"][4]["detail"]["known_fail"]
-    assert kf["heads"] == [[n, heads[n - 1]] for n in range(5, 9)] and kf["cmd"], kf
-    assert all(r["detail"]["known_fail"] == kf for r in m["results"][4:]), m
+    assert m["yielded_to"] == [99] and _statuses(m) == ["requeued"] * 8, m
+    kf = m["results"][0]["detail"]["known_fail"]
+    assert kf["heads"] == [[n, heads[n - 1]] for n in range(1, 9)] and kf["cmd"], kf
+    assert all(r["detail"]["known_fail"] == kf for r in m["results"]), m
     p.db.x("DELETE FROM push_queue WHERE id=99")
     monkeypatch.setattr(batch.Batch, "_check", lambda self, head, checks: ran.append(head) or real(self, head, checks))
 
@@ -2123,20 +2124,20 @@ def test_a_stopped_search_hands_its_full_head_failure_to_the_next_batch(env, mon
             e["id"] = n
         write_json(marker, {**mk, "known_fail": kf})
         return marker
-    rc, m2 = _run_batch(p, resumed("b2", [5, 6, 7, 8]), monkeypatch)
-    assert rc == 0 and _statuses(m2) == ["pushed", "check_failed", "pushed", "pushed"], m2
-    assert len(ran) == m2["checks"]["runs"] == 3, "no full-head check it already knew the result of"
+    rc, m2 = _run_batch(p, resumed("b2", list(range(1, 9))), monkeypatch)
+    assert rc == 0 and _statuses(m2) == ["check_failed"] + ["pushed"] * 7, m2
+    assert len(ran) == m2["checks"]["runs"] == 5, "no full-head check it already knew the result of"
     assert "the search resumes without checking it again" in capsys.readouterr().out
     b = batch.Batch.__new__(batch.Batch)
-    b.m, b.entries = {"known_fail": kf}, [{"id": n, "head": heads[n - 1]} for n in range(5, 9)]
-    assert b._known_fail([(i, "h") for i in range(4)]) == (kf["cmd"], kf["tail"])
-    assert b._known_fail([(i, "h") for i in range(3)]) is None, "another set of entries"
-    assert b._known_fail([(1, "h"), (0, "h"), (2, "h"), (3, "h")]) is None, "another order"
+    b.m, b.entries = {"known_fail": kf}, [{"id": n, "head": heads[n - 1]} for n in range(1, 9)]
+    assert b._known_fail([(i, "h") for i in range(8)]) == (kf["cmd"], kf["tail"])
+    assert b._known_fail([(i, "h") for i in range(7)]) is None, "another set of entries"
+    assert b._known_fail([(1, "h"), (0, "h")] + [(i, "h") for i in range(2, 8)]) is None, "another order"
     b.m = {"known_fail": {**kf, "heads": kf["heads"][:1]}}
     assert b._known_fail([(0, "h")]) is None, "one entry alone is checked on its tip"
     b.entries[0]["head"] = "f" * 40
     b.m = {"known_fail": kf}
-    assert b._known_fail([(i, "h") for i in range(4)]) is None, "a new head of an entry"
+    assert b._known_fail([(i, "h") for i in range(8)]) is None, "a new head of an entry"
 
 
 def test_a_batch_marker_carries_a_stopped_searchs_failure_only_for_its_own_rows(env, monkeypatch):
@@ -2164,22 +2165,22 @@ def test_a_batch_marker_carries_a_stopped_searchs_failure_only_for_its_own_rows(
 def test_the_restarts_an_urgent_approval_causes_are_capped(env, monkeypatch, cap, before, stops):
     """delivery.push_yield_restarts (default 0) caps how often one set of approvals has its search
     stopped for urgent ones: a batch whose rows were requeued that often already finishes its search
-    (entry 6 blamed). A search whose verdict is further off than delivery.push_yield_wait_s stops, and
+    (entry 1 blamed). A search whose verdict is further off than delivery.push_yield_wait_s stops, and
     its requeued entries carry the count up by one."""
     from ttp import push
     from ttp.project import write_json
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch, wait_s=1e-9, restarts=cap)
+    p, repo, origin, heads = _bad_first(env, monkeypatch, wait_s=1e-9, restarts=cap)
     _approved_mid_search(p, monkeypatch, 2, 1)
     marker = _batch_marker(p, heads)
     if before:
         write_json(marker, {**push._read(marker), "restarts": before})
     rc, m = _run_batch(p, marker, monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed", m
+    assert rc == 0, m
     if stops:
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
-        assert [(r["detail"]["yielded"], r["detail"]["restarts"]) for r in m["results"][4:]] == [(True, before + 1)] * 4, m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
+        assert [(r["detail"]["yielded"], r["detail"]["restarts"]) for r in m["results"]] == [(True, before + 1)] * 8, m
     else:
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7 and not m.get("yielded_to"), m
 
 
 def test_the_daily_audit_names_the_time_from_approval_to_landing(env, monkeypatch):
@@ -2244,27 +2245,27 @@ def test_the_entries_an_urgent_approval_stopped_a_search_for_are_searched_again_
     """Blame stays right: the entries a search stopped for an urgent approval go in a later batch of
     their own (the urgent one is never among them), whose search blames the entry that broke the checks."""
     from ttp import batch
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4, m
+    assert _statuses(m) == ["requeued"] * 8, m
     p.db.x("DELETE FROM push_queue WHERE id=99")   # the urgent one went in its own batch
-    rc, m = _run_batch(p, _batch_marker(p, heads[4:], bid="b2"), monkeypatch)
-    assert rc == 0 and _statuses(m) == ["pushed", "check_failed", "pushed", "pushed"], m
-    assert m["results"][1]["id"] == 2 and not m.get("yielded_to"), "entry 6, and only it, is blamed"
+    rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert m["results"][0]["id"] == 1 and not m.get("yielded_to"), "entry 1, and only it, is blamed"
     assert batch.EXIT["yielded"] == 0
 
 
 @pytest.mark.parametrize("why", ["after_yield", "restarts", "yield_skip", "all_urgent", "skip_other_tip"])
 def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_would_not_take(env, monkeypatch, why):
     """No yield loop: a batch stops its search only for an urgent approval the queue takes next, alone.
-    It finishes its search (entry 6 blamed) when it carries entries a batch before it requeued for an
+    It finishes its search (entry 1 blamed) when it carries entries a batch before it requeued for an
     urgent one ("after_yield"), when the waiting one was already tried on the failing tip it searches on
     (pushq.due leaves those out while the tip is unchanged: "yield_skip"), or when every entry is urgent
     itself. A "yield_skip" for another tip does not apply: the search stops as before."""
     from ttp import push
     from ttp.project import write_json
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     _approved_mid_search(p, monkeypatch, 2, 1)
     marker = _batch_marker(p, heads)
     m = push._read(marker)
@@ -2280,11 +2281,11 @@ def test_a_batch_never_stops_its_search_for_an_urgent_approval_the_next_batch_wo
             e["task"] = p.db.add_task(f"fix {e['id']}", "s", kind="code", origin="coordinator", priority=1)
     write_json(marker, m)
     rc, m = _run_batch(p, marker, monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed", m
+    assert rc == 0, m
     if why == "skip_other_tip":
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
     else:
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7 and not m.get("yielded_to"), m
 
 
 @pytest.mark.parametrize("detail,restarts", [({"yielded": True}, 1), ({"yielded": True, "restarts": 2}, 2),
@@ -2331,17 +2332,17 @@ def test_after_a_batch_stopped_its_search_the_urgent_approval_goes_alone_then_th
 @pytest.mark.parametrize("grace", [None, 0])
 def test_an_urgent_approval_past_the_yield_grace_never_stops_the_batch(env, monkeypatch, grace):
     """delivery.push_yield_grace_s: an urgent approval made within it of the batch's first check stops
-    the search (default 300 s); one made later never does, so the batch blames entry 6 and lands the rest."""
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    the search (default 300 s); one made later never does, so the batch blames entry 1 and lands the rest."""
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     if grace is not None:
         p.set_config("delivery.push_yield_grace_s", grace)
     _approved_mid_search(p, monkeypatch, 2, 1)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
-    assert rc == 0 and m["outcome"] == "pushed", m
+    assert rc == 0, m
     if grace is None:
-        assert _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4 and m["yielded_to"] == [99], m
+        assert m["outcome"] == "yielded" and _statuses(m) == ["requeued"] * 8 and m["yielded_to"] == [99], m
     else:
-        assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"] and not m.get("yielded_to"), m
+        assert m["outcome"] == "pushed" and _statuses(m) == ["check_failed"] + ["pushed"] * 7 and not m.get("yielded_to"), m
 
 
 def test_a_stream_of_urgent_approvals_every_few_minutes_still_lets_a_batch_land(env, monkeypatch):
@@ -2349,7 +2350,7 @@ def test_a_stream_of_urgent_approvals_every_few_minutes_still_lets_a_batch_land(
     the default grace): none stops the batch, which finishes its search and lands every entry but the
     culprit; the urgent ones wait for the next batch."""
     from ttp import batch
-    p, repo, origin, heads = _bad_sixth(env, monkeypatch)
+    p, repo, origin, heads = _bad_first(env, monkeypatch)
     real, ran = batch.Batch._check, []
 
     def check(self, head, checks):
@@ -2364,8 +2365,8 @@ def test_a_stream_of_urgent_approvals_every_few_minutes_still_lets_a_batch_land(
     monkeypatch.setattr(batch.Batch, "_check", check)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
     assert rc == 0 and m["outcome"] == "pushed" and not m.get("yielded_to"), m
-    assert _statuses(m) == ["pushed"] * 5 + ["check_failed", "pushed", "pushed"], m
-    assert len(ran) == 5, "the full head, three probes and the rescue: never cut short"
+    assert _statuses(m) == ["check_failed"] + ["pushed"] * 7, m
+    assert len(ran) == 6, "the full head, three probes, the tip and the rescue: never cut short"
 
 
 def test_after_a_stopped_search_its_own_urgent_entries_never_take_the_place_of_the_ones_it_stopped_for(env, monkeypatch):
@@ -19537,3 +19538,4 @@ def test_the_daily_audit_shows_approval_to_landed_median_and_p90(env):
     assert audit.report(p.db, now)["approval_to_landed"]["n"] == 4
     p.db.x("DELETE FROM push_queue")
     assert not [x for x in audit.lines(p.db, now) if "approval to landed" in x]
+
