@@ -26,6 +26,7 @@ The list is DEFAULT_PATHS plus guards.protected_paths of the account settings an
 """
 from __future__ import annotations
 
+import ast
 import json
 import os
 import pwd
@@ -61,6 +62,28 @@ STR_RE = re.compile(r"'((?:[^'\\\n]|\\.)*)'|\"((?:[^\"\\\n]|\\.)*)\"|`([^`]*)`")
 ARGV_WRITERS = WRITE_ALL | DEST_LAST | set(OUTPUT_OPTS) | {"dd", "sed", "perl"}
 STORE_TOOLS = {"gh", "docker", "aws", "kubectl", "git", "ssh-keygen"}
 HOME_REF_RE = re.compile(r"~|\bHOME\b|home\(\)|expanduser|homedir|getpwuid|Dir\.home|\$ENV\{|os\.homedir")
+# Python code is parsed: a write call checks only its target, so a script that reads a protected path
+# and writes elsewhere passes (_py_refusal)
+PY_WRITER_RE = re.compile(
+    r"write\w*|unlink\w*|remove\w*|rename\w*|replace|l?chmod\w*|l?chown\w*|chflags|rmtree|copy\w*|move|symlink\w*"
+    r"|link\w*|hardlink\w*|mkdirs?\w*|makedirs|truncate\w*|rmdir\w*|removedirs|touch|dump|save\w*|mkfifo|mknod|utime"
+    r"|setxattr|unpack_archive|extract\w*|make_archive|to_\w+|connect|mk[sd]temp|rm\w*|cp|mv|ln|"
+    + "|".join(sorted(WRITE_ALL | DEST_LAST | set(OUTPUT_OPTS) | {"dd", "sed", "perl"})))
+PY_OPENERS = {"open", "fdopen", "FileIO", "NamedTemporaryFile", "TemporaryFile", "SpooledTemporaryFile"}
+PY_DATA_WRITES = {"write", "writelines", "write_text", "write_bytes", "truncate"}
+PY_CONTAINER = {"append", "extend", "insert", "add", "update", "setdefault", "appendleft", "put", "put_nowait"}
+PY_READS = {"read", "read_text", "read_bytes", "readline", "readlines", "load", "read_csv", "read_json", "read_table",
+            "read_parquet", "exists", "isfile", "isdir", "islink", "is_file", "is_dir", "is_symlink", "getsize",
+            "getmtime", "getctime", "getatime", "stat", "lstat", "len", "access"}
+PY_INPUT = {"argv", "orig_argv", "stdin", "environ", "environb", "getenv", "input", "fileinput"}
+PY_DYNAMIC = {"exec", "eval", "compile", "getattr", "setattr", "__import__", "globals", "locals", "vars"}
+PY_DYNAMIC_ATTR = {"import_module", "__dict__", "__builtins__", "__getattribute__"}
+MODE_RE = re.compile(r"[rbtU]*[wax+][rwabxtU+]*")
+PY_TEXT_MAX = 2_000_000
+# Code that reads what the command line gives it (argv, stdin, the environment, a shell `$` word):
+# the line's words outside the code count as the code's
+INPUT_RE = re.compile(r"argv|ARGV|stdin|STDIN|environ|ENV|getenv|\binput\s*\(|fileinput|<>|\$|process\.env|\bgets\b"
+                      r"|readline")
 # Codex patches: the files one adds, changes, deletes or moves to (Codex trims a header line, so blanks
 # around it and its path do not hide one)
 PATCH_FILE_RE = re.compile(r"^\s*\*\*\* (?:Add File|Update File|Delete File|Move to):\s*(.+?)\s*$", re.M)
@@ -223,15 +246,23 @@ def _argv_refusal(argv: list[str], ctx, cmd_env=None) -> str | None:
     return None
 
 
-def _code_refusal(code: str, ctx, depth: int = 0) -> str | None:
-    """Interpreter code that writes a protected path: a write call or mode with one named in the code
-    (anywhere: a variable may carry it), a redirect or open mode with one as its target, or a command
-    the code runs (os.system, subprocess, exec, backticks) that writes one. Reads pass."""
-    if WRITE_CODE_RE.search(code) and (h := _names(code, ctx)):
-        return h
-    for m in TARGET_RE.finditer(code):
-        if h := _names(m[1], ctx):
+def _code_refusal(code: str, ctx, depth: int = 0, outside: str = "", py: bool = False) -> str | None:
+    """Interpreter code that writes a protected path: Python's write calls by their target (_py_refusal);
+    other code (or Python it cannot read) a write call or mode with one named in the code (anywhere: a
+    variable may carry it), a redirect or open mode with one as its target, or a command the code runs
+    (os.system, subprocess, exec, backticks) that writes one. Code that reads its input (argv, stdin,
+    the environment) gets the command line `outside` it too. Reads pass, and so do mentions in data."""
+    fed = outside if outside and INPUT_RE.search(code) else ""
+    got = _py_refusal(code, ctx, _names(fed, ctx) if fed else None) if py else False
+    code = code + "\n" + fed if fed else code
+    if got:
+        return got
+    if got is False:
+        if WRITE_CODE_RE.search(code) and (h := _names(code, ctx)):
             return h
+        for m in TARGET_RE.finditer(code):
+            if h := _names(m[1], ctx):
+                return h
     if not RUN_CODE_RE.search(code):
         return None
     ms = list(STR_RE.finditer(code))
@@ -289,6 +320,169 @@ def _names(code: str, ctx) -> str | None:
     return None
 
 
+def _py_leaf(n) -> str:
+    return n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else ""
+
+
+def _py_refusal(code: str, ctx, fed: str | None = None):
+    """Python code read for what it writes: the protected path a write call's target holds, None when
+    no write targets one, False when the code cannot be read this way (a syntax error, dynamic code,
+    a write function passed as a value). A target holds what its words name, expanded with every
+    value its variables (attributes, function parameters and results) are given anywhere; a file's
+    content (what read, load and a read-mode open return) names no path. `fed`: a protected path the
+    command line names outside the code, held by argv, stdin, the environment and `$` words."""
+    try:
+        tree = ast.parse(code)
+    except (SyntaxError, ValueError, RecursionError, MemoryError):
+        return False
+    parent, defs, funcs, mods = {}, {}, {}, set()
+    for n in ast.walk(tree):
+        for c in ast.iter_child_nodes(n):
+            parent[c] = n
+        if isinstance(n, ast.Import):
+            mods.update((a.asname or a.name).split(".")[0] for a in n.names)
+        elif isinstance(n, ast.ImportFrom) and any(a.asname and PY_WRITER_RE.fullmatch(a.name) for a in n.names):
+            return False
+        elif isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            funcs.setdefault(n.name, []).append(n)
+        elif isinstance(n, ast.Name) and n.id in PY_DYNAMIC or isinstance(n, ast.Attribute) and n.attr in PY_DYNAMIC_ATTR:
+            return False
+
+    def bind(t, v):
+        if isinstance(t, (ast.Tuple, ast.List)):
+            for e in t.elts:
+                bind(e, v)
+        elif isinstance(t, (ast.Starred, ast.Subscript)):
+            bind(t.value, v)
+        elif isinstance(t, ast.arguments):
+            for a in t.posonlyargs + t.args + t.kwonlyargs + [x for x in (t.vararg, t.kwarg) if x]:
+                if a.arg not in ("self", "cls"):
+                    defs.setdefault(a.arg, []).append(v)
+        elif k := _py_leaf(t):
+            defs.setdefault(k, []).append(v)
+
+    def params(f, v):
+        for g in [m for m in f.body if getattr(m, "name", "") == "__init__"] if isinstance(f, ast.ClassDef) else [f]:
+            bind(g.args, v)
+
+    for n in ast.walk(tree):
+        if isinstance(n, (ast.Name, ast.Attribute)) and PY_WRITER_RE.fullmatch(_py_leaf(n)) and not (
+                isinstance(parent.get(n), ast.Call) and parent[n].func is n) and not isinstance(n.ctx, ast.Store):
+            return False   # a write function as a value: an alias, a callback
+        if isinstance(n, ast.Assign):
+            for t in n.targets:
+                bind(t, n.value)
+        elif isinstance(n, (ast.AnnAssign, ast.AugAssign, ast.NamedExpr)) and n.value is not None:
+            bind(n.target, n.value)
+        elif isinstance(n, (ast.For, ast.AsyncFor, ast.comprehension)):
+            bind(n.target, n.iter)
+        elif isinstance(n, ast.withitem) and n.optional_vars is not None:
+            bind(n.optional_vars, n.context_expr)
+        elif isinstance(n, (ast.Return, ast.Yield, ast.YieldFrom)) and n.value is not None:
+            f = n
+            while f in parent and not isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                f = parent[f]
+            defs.setdefault(getattr(f, "name", ""), []).append(n.value)
+        elif isinstance(n, ast.Call):
+            args = n.args + [k.value for k in n.keywords]
+            if _py_leaf(n.func) in PY_CONTAINER and isinstance(n.func, ast.Attribute):
+                for a in args:
+                    bind(n.func.value, a)
+            for f in funcs.get(_py_leaf(n.func), []):
+                for a in args:
+                    params(f, a)
+            for a in args:   # a function handed to a call (map, submit, a callback) gets its other arguments
+                for f in [a] if isinstance(a, ast.Lambda) else funcs.get(_py_leaf(a), []):
+                    for b in args:
+                        if b is not a:
+                            params(f, b)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            for d in n.args.defaults + [d for d in n.args.kw_defaults if d is not None]:
+                bind(n.args, d)
+
+    def is_mod(n) -> bool:
+        while isinstance(n, ast.Attribute):
+            n = n.value
+        return isinstance(n, ast.Name) and n.id in mods
+
+    def opens(n) -> bool | None:
+        """For an open-like call: whether it writes (None: not one)."""
+        if _py_leaf(n.func) not in PY_OPENERS:
+            return None
+        own = isinstance(n.func, ast.Attribute) and not is_mod(n.func.value)   # Path(p).open('w')
+        modes = n.args[0 if own else 1:][:1] + [k.value for k in n.keywords if k.arg in ("mode", "flags", None)]
+        return any(not isinstance(m, ast.Constant) or isinstance(m.value, str) and MODE_RE.fullmatch(m.value)
+                   for m in modes)
+
+    def content(n) -> bool:
+        """A call whose value is a file's content, a handle to read or a fact about it: no path."""
+        if not isinstance(n, ast.Call) or any(_py_leaf(x) in PY_INPUT for x in ast.walk(n)):
+            return False
+        return _py_leaf(n.func) in PY_READS or opens(n) is False
+
+    memo, busy, size = {}, set(), [0]
+
+    def text(n) -> str:
+        """`n`'s words, each variable's with the text of every value it is given (a cycle cut once)."""
+        out, todo = [], [n]
+        while todo:
+            x = todo.pop()
+            if content(x):
+                continue
+            todo += ast.iter_child_nodes(x)
+            k = _py_leaf(x) or (x.arg if isinstance(x, ast.arg) else "")
+            if isinstance(x, ast.Constant) and isinstance(x.value, str):
+                out.append(repr(x.value) + (" " + repr(fed) if fed and "$" in x.value else ""))
+            elif k in PY_INPUT and fed:
+                out.append(repr(fed))
+            elif k:
+                out.append(k + ("()" if k == "home" else ""))
+            if k and k in defs and k not in busy:
+                if k in memo:
+                    out.append(memo[k])
+                    continue
+                busy.add(k)
+                got = " ".join(text(v) for v in defs[k])
+                busy.discard(k)
+                if not busy:   # one computed inside a cycle may miss a value: kept only at the top
+                    memo[k] = got
+                out.append(got)
+        size[0] += sum(map(len, out))
+        if size[0] > PY_TEXT_MAX:
+            raise OverflowError
+        return " ".join(out)
+
+    try:
+        for n in ast.walk(tree):
+            if not isinstance(n, ast.Call):
+                continue
+            name, args = _py_leaf(n.func), n.args + [k.value for k in n.keywords]
+            recv = n.func.value if isinstance(n.func, ast.Attribute) and not is_mod(n.func.value) else None
+            if (w := opens(n)) is not None:
+                path = [k.value for k in n.keywords if k.arg in ("file", "path", "name")] + n.args[:0 if recv else 1]
+                targets = [recv] + path if w else []
+            elif name in PY_DATA_WRITES and recv is not None:   # f.write(data), p.write_text(data)
+                targets = [recv]
+            elif name == "print":
+                targets = [k.value for k in n.keywords if k.arg == "file"]
+            elif recv is not None and (name in PY_CONTAINER or name == "replace" and len(n.args) != 1
+                                       or name == "copy" and not args):
+                targets = []
+            elif PY_WRITER_RE.fullmatch(name):
+                targets = [recv] + (args[1:] if name == "dump" else args)
+            elif name[:1].isupper() or "open" in name.lower() or name.endswith("File"):   # ZipFile(p, 'w')
+                targets = [recv] + n.args[:1] if any(isinstance(m, ast.Constant) and isinstance(m.value, str)
+                                                     and MODE_RE.fullmatch(m.value) for m in args[1:]) else []
+            else:
+                targets = []
+            for t in targets:
+                if t is not None and (h := _names(text(t), ctx)):
+                    return h
+    except (OverflowError, RecursionError):
+        return False
+    return None
+
+
 def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> str | None:
     """The protected path a shell command line (or script) writes, as far as its words show."""
     from . import hook
@@ -323,10 +517,27 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
             return h
     names = {os.path.basename(a[0]) for a in segments}
     if any(INTERPRETER_RE.match(n) for n in names):
-        # The line (heredocs too), and each -c/-e code as the interpreter gets it (its string literals unquoted)
-        inline = [a[i + 1] for a in segments if INTERPRETER_RE.match(os.path.basename(a[0]))
-                  for i in range(1, len(a) - 1) if a[i] in ("-c", "-e", "-E", "--eval", "-p", "--print")]
-        if h := next((h for c in [scan, *inline] if (h := _code_refusal(c, ctx, depth))), None):
+        # Each -c/-e code as the interpreter gets it (its string literals unquoted), and the heredocs it
+        # reads on stdin; the line's other words are data unless the code reads its input. An interpreter
+        # whose code does not show (-m, a pipe) gets the whole line.
+        lines, bodies = hook._heredocs(cmd)
+        fed = ["\n".join(b) for i, b, pos in bodies if INTERPRETER_RE.match(hook._first_word(hook._piece_at(lines[i], pos)[0]))]
+        chunks = []
+        for a in segments:
+            name = os.path.basename(a[0])
+            if not INTERPRETER_RE.match(name):
+                continue
+            py = bool(re.match(r"python|pypy", name))
+            code = [a[i + 1] for i in range(1, len(a) - 1) if a[i] in ("-c", "-e", "-E", "--eval", "-p", "--print")]
+            if code:
+                chunks += [(c, py) for c in code]
+            elif (how := hook._interpreter_args(a)) == "-" and fed:
+                chunks.append((fed.pop(0), py))
+            elif how != "-" and how and not how.startswith("-"):
+                continue   # a script file: read below
+            else:
+                chunks.append((scan, False))
+        if h := next((h for c, py in chunks if (h := _code_refusal(c, ctx, depth, scan, py))), None):
             return h
     if depth < 2:
         for f in hook._scripts(segments, cwd):
@@ -338,7 +549,8 @@ def shell_refusal(cmd: str, env, cwd: str, rts: list[str], depth: int = 0) -> st
                 continue
             first = text.split("\n", 1)[0]
             h = (shell_refusal(text, env, cwd, rts, depth + 1) if f.suffix == ".sh" or any(s in first for s in SHELLS)
-                 else _code_refusal(text, ctx, depth + 1))
+                 else _code_refusal(text, ctx, depth + 1, scan,
+                                    f.suffix == ".py" or bool(re.search(r"python|pypy", first))))
             if h:
                 return h
     return None

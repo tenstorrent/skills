@@ -493,10 +493,8 @@ def _data_only(piece: str, sep: str, commands: str) -> bool:
     return not any(os.path.basename(m[2]) in _ran(commands) for m in REDIRECT_RE.finditer(piece))
 
 
-def _split(text: str) -> tuple[str, str]:
-    """(what runs as shell commands, what to scan) for a command line or a script. Heredoc bodies
-    are commands only when a shell reads them; bodies an echo/cat only writes to a file are
-    dropped from both, and so are the quoted arguments of echo, printf and cat: data, not run."""
+def _heredocs(text: str) -> tuple[list[str], list[tuple[int, list[str], int]]]:
+    """(the lines that are not heredoc bodies, each body as (its line's index, its lines, the `<<` column))."""
     lines, bodies, pending = [], [], []
     for line in text.replace("\\\n", " ").split("\n"):
         if pending:
@@ -512,6 +510,14 @@ def _split(text: str) -> tuple[str, str]:
             if not flags[m.start()][0]:
                 pending.append((m[3], m[1] == "-", len(bodies)))
                 bodies.append((len(lines) - 1, [], m.start()))
+    return lines, bodies
+
+
+def _split(text: str) -> tuple[str, str]:
+    """(what runs as shell commands, what to scan) for a command line or a script. Heredoc bodies
+    are commands only when a shell reads them; bodies an echo/cat only writes to a file are
+    dropped from both, and so are the quoted arguments of echo, printf and cat: data, not run."""
+    lines, bodies = _heredocs(text)
     commands = "\n".join(lines)
     scan = list(lines)
     for i, line in enumerate(lines):
