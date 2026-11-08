@@ -185,7 +185,7 @@ def prepare(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now: 
             if not why:
                 st = p.db.kv(coordsession.KEY)
                 new = str(uuid.uuid4())
-                why = prov.fork_session(str(st["id"]), cwd, env, new)
+                why = prov.start_from_session(str(st.get("provider") or provider), str(st["id"]), cwd, env, new)
                 if not why:
                     return {"how": "fork", "why": f"session {str(st['id'])[:8]}" + (f"; no resume: {gap}" if gap else ""),
                             "session": new, "from": str(st.get("provider") or provider),
@@ -241,17 +241,8 @@ def _fork_gap(p, cfg: dict, prov, provider: str, cwd: str, env: dict | None, now
     sid = str((st or {}).get("id") or "") if isinstance(st, dict) else ""
     if not sid:
         return "no coordinator session saved"
-    if (src := str(st.get("provider") or "")) != provider:
-        try:
-            from .providers import get_provider
-            same = prov.session_format and get_provider(src).session_format == prov.session_format
-        except KeyError:
-            same = False
-        if not same:
-            return (f"the coordinator session runs on {src or 'another provider'}, this run on {provider}, "
-                    "which cannot resume its sessions")
-    if not prov.resume_args(sid):
-        return f"{provider} cannot resume a session"
+    if gap := prov.fork_gap(str(st.get("provider") or "")):
+        return gap.replace("the session runs", "the coordinator session runs")
     paths = [x for x in prov.session_paths(sid, str(p.base), env) if x.name.endswith(f"{sid}.jsonl")]
     if not paths:
         return "the coordinator session's transcript is not on disk"

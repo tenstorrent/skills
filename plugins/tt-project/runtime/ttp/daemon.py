@@ -4870,6 +4870,12 @@ class Daemon:
                 log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
+        try:   # sub-agents booked apart from the run's stream (Codex rollouts) count in its cost
+            prov.add_subagent_usage(usage, run_dir / "output.jsonl", float(exit_info.get("started") or 0) or None,
+                                    (json.loads((run_dir / "run.json").read_text()).get("env") or {})
+                                    if (run_dir / "run.json").exists() else None)
+        except Exception:
+            log(p, f"run {r['id']}: sub-agent usage not read\n" + traceback.format_exc())
         if exit_info.get("launch_auth"):
             # The chat bridge had no usable key (none saved, or saved for another URL): the provider's
             # auth gate holds it like a logout, never a launch failure that costs attempts.

@@ -3,6 +3,7 @@
 # (a worker or reviewer run starting from a fork of the coordinator's session, else its context on disk) here.
 from __future__ import annotations
 
+import datetime
 import uuid
 
 
@@ -492,9 +493,10 @@ def test_ctxfork_forks_across_providers_only_into_the_same_session_format(env, m
     assert got["how"] == "fork" and got["from"] == "claude" and got["tokens"] == 9000, got
     assert get("chat").resume_args(got["session"]) == ["--resume", got["session"]]
     assert list((cfg_dir / "projects").glob(f"*/{got['session']}.jsonl"))
-    for name in ("codex", "cursor"):
-        got = ctxfork.prepare(p, cfg, get(name), name, str(p.root), None)
-        assert got["how"] == "disk" and "cannot resume its sessions" in got["why"], got
+    got = ctxfork.prepare(p, cfg, get("codex"), "codex", str(p.root), None)
+    assert got["how"] == "disk" and "cannot resume its sessions" in got["why"], got
+    got = ctxfork.prepare(p, cfg, get("cursor"), "cursor", str(p.root), None)
+    assert got["how"] == "disk" and "has no fork" in got["why"], got
     csid = str(uuid.uuid4())
     _fork_codex_rollout(home, csid)
     p.db.set_kv(coordsession.KEY, {"id": csid, "provider": "codex", "context_tokens": 7000})
@@ -515,3 +517,78 @@ def test_a_continued_run_records_that_it_resumed_its_own_session(env, monkeypatc
     argv, prompt, got, session = run(resume=own)
     assert got == {"how": "resume", "why": "continues its own session", "session": own}
     assert "--resume" in argv and not prompt.startswith(("# FORKED", "# COORDINATOR CONTEXT"))
+
+
+def test_each_provider_reports_its_start_mode_through_one_method(monkeypatch, tmp_path):
+    """fork_gap says, per provider and session source, whether a run forks or takes the disk block, and
+    start_from_session is the one call that does it: claude and chat fork a Claude Code session, codex a
+    Codex rollout, cursor none (it resumes only its own chats); an unknown source is another format."""
+    from ttp.providers import claude as claude_mod, get_provider as get
+    monkeypatch.setattr(claude_mod, "_FLAGS", {"--resume": True, "--session-id": True})
+    _fork_fake_codex(tmp_path, monkeypatch)
+    for run, src in (("claude", "claude"), ("chat", "claude"), ("claude", "chat"), ("codex", "codex")):
+        assert get(run).fork_gap(src) == "", (run, src)
+    assert "cannot resume its sessions" in get("codex").fork_gap("claude")
+    assert "cannot resume its sessions" in get("claude").fork_gap("codex")
+    assert "runs on gone" in get("chat").fork_gap("gone")
+    for src in ("cursor", "claude", "codex"):
+        assert "has no fork" in get("cursor").fork_gap(src)
+    gap = get("cursor").start_from_session("cursor", str(uuid.uuid4()), "/run", None, str(uuid.uuid4()))
+    assert "has no fork" in gap
+    gap = get("codex").start_from_session("claude", str(uuid.uuid4()), "/run", None, str(uuid.uuid4()))
+    assert "cannot resume its sessions" in gap   # never reaches the copy
+    monkeypatch.setattr(claude_mod, "_FLAGS", {"--resume": False, "--session-id": True})
+    assert "cannot resume a session" in get("claude").fork_gap("claude")
+
+
+def _sub_rollout(home, day, sid, parent, totals, stamp="2026-11-08T10:00:00.000Z"):
+    folder = home / "sessions" / "2026" / "11" / day
+    folder.mkdir(parents=True, exist_ok=True)
+    meta = {"id": sid, "session_id": parent or sid}
+    if parent:
+        meta.update(parent_thread_id=parent,
+                    source={"subagent": {"thread_spawn": {"parent_thread_id": parent, "depth": 1}}})
+    rows = [{"type": "session_meta", "payload": meta}]
+    for t, (i, c, o) in zip([stamp] * len(totals) if isinstance(stamp, str) else stamp, totals):
+        rows.append({"timestamp": t, "type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": i, "cached_input_tokens": c, "output_tokens": o}}}})
+    (folder / f"rollout-2026-11-{day}T10-00-00-{sid}.jsonl").write_text("".join(json.dumps(r) + "\n" for r in rows))
+
+
+def test_codex_sub_agents_count_in_the_run_cost(monkeypatch, tmp_path):
+    """A Codex worker's sub-agents (multi_agent, on in 0.160) write their own rollouts and are not in
+    turn.completed: their tokens, at any depth and past midnight, are added to the run's usage and to
+    the runner's cost_so_far; another thread's sub-agents are not; a resumed run counts only since."""
+    from ttp.providers import get_provider as get
+    from ttp.providers.base import RunUsage
+    home = tmp_path / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    codex = get("codex").use("gpt-5.5", None)
+    root, child, grand, other, stranger = (str(uuid.uuid4()) for _ in range(5))
+    _sub_rollout(home, "08", root, None, [(46268, 42752, 88)])
+    _sub_rollout(home, "08", child, root, [(15112, 12032, 7)])
+    _sub_rollout(home, "09", grand, child, [(1000, 0, 10)])   # started past midnight UTC
+    _sub_rollout(home, "08", other, None, [(5, 0, 5)])
+    _sub_rollout(home, "08", stranger, other, [(99999, 0, 999)])   # another thread's sub-agent
+    out = tmp_path / "output.jsonl"
+    out.write_text(json.dumps({"type": "thread.started", "thread_id": root}) + "\n" + json.dumps(
+        {"type": "turn.completed", "usage": {"input_tokens": 46268, "cached_input_tokens": 42752,
+                                             "output_tokens": 88}}) + "\n")
+    u = codex.parse(out)
+    own = u.cost_usd
+    assert (u.input_tokens, u.cache_read_tokens, u.output_tokens) == (46268 - 42752, 42752, 88)
+    codex.add_subagent_usage(u, out)
+    assert u.extra["subagent_tokens"] == [16112, 12032, 17]
+    assert (u.input_tokens, u.cache_read_tokens, u.output_tokens) == (46268 - 42752 + 4080, 42752 + 12032, 105)
+    assert u.cost_usd == own + codex._price(16112, 12032, 17) > own
+    assert codex.cost_so_far(out) == u.cost_usd
+    # A resumed run: a sub-agent's tokens before the run started are not its own.
+    _sub_rollout(home, "08", child, root, [(15112, 12032, 7), (20112, 12032, 9)],
+                 stamp=["2026-11-08T09:00:00.000Z", "2026-11-08T11:00:00.000Z"])
+    since = datetime.datetime(2026, 11, 8, 10, tzinfo=datetime.timezone.utc).timestamp()
+    assert codex._subagent_tokens(out, since) == (5000 + 1000, 0, 2 + 10)   # the grandchild ran after
+    # No thread, no rollouts, or a layout that moved: nothing added, never an error.
+    bare = RunUsage()
+    (tmp_path / "none.jsonl").write_text("")
+    codex.add_subagent_usage(bare, tmp_path / "none.jsonl")
+    assert bare.cost_usd == 0 and "subagent_tokens" not in bare.extra

@@ -124,6 +124,9 @@ class Cursor(Provider):
     # `--resume <chatId>`, once session_saved finds the chat's store (a resume of a lost chat may start an
     # empty one). The session's size is the run's summed usage (no per-call usage): it compacts early, never late.
     coord_session = "agent"
+    # 2026.10.22: `--resume [chatId]` and `create-chat`, no fork; a copy of a chat's store.db would rest
+    # on an undocumented layout, so its runs take the disk block (ctxfork.py) and only a lost run resumes.
+    no_fork_why = "cursor-agent resumes its own chats (--resume) but has no fork, and its chat store is undocumented"
     binaries = ("agent", "cursor-agent")
     api_host = "api2.cursor.sh"
     login_hint = "run `agent login` there"

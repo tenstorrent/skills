@@ -52,7 +52,7 @@ import re
 import shlex
 import subprocess
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import register
@@ -575,11 +575,65 @@ class Codex(Provider):
         # Codex prints usage only on turn.completed, and `codex exec` is one turn; its rollout has
         # running token totals, so a run stopped mid-turn is priced at the tokens it spent.
         got = self._rollout_tokens(Path(output_path), since, env)
-        return self._price(*got) if got else None
+        return self._price(*got) + self._price(*self._subagent_tokens(output_path, since, env)) if got else None
 
     def cost_so_far(self, output_path, since=None, env=None):
         inp, cached, out, _ = self._tokens(output_path)
         return max(self._price(inp, cached, out), self.cut_off_cost(output_path, since, env) or 0.0)
+
+    def add_subagent_usage(self, usage, output_path, since=None, env=None) -> None:
+        sub = self._subagent_tokens(output_path, since, env)
+        if any(sub):
+            usage.input_tokens += sub[0] - sub[1]
+            usage.cache_read_tokens += sub[1]
+            usage.output_tokens += sub[2]
+            usage.cost_usd += self._price(*sub)
+            usage.extra["subagent_tokens"] = list(sub)
+
+    def _subagent_tokens(self, output_path, since=None, env=None) -> tuple[int, int, int]:
+        """(input, cached, output) tokens of the sub-agents the run's thread spawned (the multi_agent
+        feature), at any depth: `turn.completed` counts only the run's own thread, and each sub-agent
+        writes its own rollout whose session_meta names its parent_thread_id. Each one's newest
+        total_token_usage, less its last total before `since` (a sub-agent a resumed run continues).
+        Read from the parent rollout's day folder and the next (a sub-agent started past midnight UTC);
+        priced at the run's model. The layout is not in the official docs: if it moves, this finds none."""
+        sid = next((str(ev.get("thread_id") or "") for ev in self._events(Path(output_path))
+                    if ev.get("type") == "thread.started"), "")
+        days: set[Path] = set()
+        for f in self.session_paths(sid, "", env):
+            days.add(f.parent)
+            try:
+                nxt = datetime.strptime("/".join(f.parent.parts[-3:]), "%Y/%m/%d") + timedelta(days=1)
+                days.add(f.parent.parent.parent.parent / nxt.strftime("%Y/%m/%d"))
+            except ValueError:
+                pass
+        parent_of: dict[str, tuple[str, Path]] = {}
+        for day in days:
+            for f in day.glob("rollout-*.jsonl"):
+                try:
+                    with open(f, "rb") as fh:
+                        head = fh.readline()
+                    if b"parent_thread_id" not in head:
+                        continue
+                    meta = json.loads(head).get("payload") or {}
+                    up = meta.get("parent_thread_id") or (((meta.get("source") or {}).get("subagent") or {})
+                                                          .get("thread_spawn") or {}).get("parent_thread_id")
+                    if up and meta.get("id"):
+                        parent_of[str(meta["id"])] = (str(up), f)
+                except (OSError, ValueError, AttributeError):
+                    continue
+        mine, grew = {sid}, bool(sid)
+        while grew:
+            grew = False
+            for child, (up, _) in parent_of.items():
+                if up in mine and child not in mine:
+                    mine.add(child)
+                    grew = True
+        total = [0, 0, 0]
+        for child in mine - {sid}:
+            got = _rollout_total(parent_of[child][1], since)
+            total = [a + b for a, b in zip(total, got)]
+        return tuple(total)
 
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         inp, cached, out, last = self._tokens(output_path)
@@ -697,6 +751,29 @@ class Codex(Provider):
             return {"error": "thread/start: " + json.dumps(msg.get("error") or msg.get("result"))[:300]}
         res = msg["result"]
         return {"model": str(res.get("model") or ""), "effort": str(res.get("reasoningEffort") or "")}
+
+
+def _rollout_total(path: Path, since: float | None) -> tuple[int, int, int]:
+    """A rollout's newest (input, cached, output) total_token_usage, less its last total before `since`."""
+    base, last = (0, 0, 0), (0, 0, 0)
+    try:
+        with open(path, "rb") as f:
+            for raw in f:
+                if b"token_count" not in raw or not raw.endswith(b"\n"):
+                    continue
+                try:
+                    rec = json.loads(raw)
+                    total = rec["payload"]["info"]["total_token_usage"]
+                    tok = tuple(int(total.get(k) or 0) for k in ("input_tokens", "cached_input_tokens", "output_tokens"))
+                except (ValueError, TypeError, KeyError, AttributeError):
+                    continue
+                if since is not None and _stamp(rec.get("timestamp")) < since:
+                    base = tok
+                else:
+                    last = tok
+    except OSError:
+        return (0, 0, 0)
+    return tuple(max(a - b, 0) for a, b in zip(last, base)) if last != (0, 0, 0) else (0, 0, 0)
 
 def codex_home() -> Path:
     """Where Codex keeps its login and saved sessions."""

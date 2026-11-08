@@ -352,12 +352,45 @@ class Provider:
     # run of another with the same format (the chat provider runs Claude Code, so it forks a Claude
     # session; ctxfork.py). "" for none.
     session_format = ""
+    no_fork_why = ""   # why this provider has no fork_session, for fork_gap's report
 
     def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
         """Copy the saved session `session_id` to a new session `new_id` that a run in `cwd` with the
         environment `env` resumes (resume_args(new_id)), so the run starts from its history and never
         writes into it (ctxfork.py); "" once done, else why not."""
         return f"{self.name} cannot fork a saved session"
+
+    def fork_gap(self, src_provider: str) -> str:
+        """Why a run on this provider cannot start from a session a `src_provider` run saved; "" when it
+        can (the same session format, and it resumes sessions). The report of each provider's start mode
+        (fork, else the disk block) and the check every caller makes before start_from_session."""
+        if type(self).fork_session is Provider.fork_session:
+            return self.no_fork_why or f"{self.name} cannot fork a saved session"
+        if src_provider != self.name:
+            from . import get_provider
+            try:
+                other = get_provider(src_provider).session_format
+            except KeyError:
+                other = ""
+            if not other or other != self.session_format:
+                return (f"the session runs on {src_provider or 'another provider'}, this run on {self.name}, "
+                        "which cannot resume its sessions")
+        if not self.resume_args("x"):
+            return f"{self.name} cannot resume a session"
+        return ""
+
+    def start_from_session(self, src_provider: str, session_id: str, cwd: str, env: dict | None,
+                           new_id: str) -> str:
+        """The one way any caller (a worker forking the coordinator, a follow-up resuming its worker's
+        session) starts a run on this provider from a saved session: copy `session_id`, saved by a
+        `src_provider` run, to `new_id`, which resume_args(new_id) continues; the source is never
+        written. "" once done, else why not (the caller then takes the disk block)."""
+        return self.fork_gap(src_provider) or self.fork_session(session_id, cwd, env, new_id)
+
+    def add_subagent_usage(self, usage: "RunUsage", output_path: Path, since: float | None = None,
+                           env: dict | None = None) -> None:
+        """Add to `usage` (parse's) what the run's sub-agents spent where the agent books them apart from
+        the run's own stream (Codex: each in its own rollout). Default: nothing apart."""
 
     def coord_tools(self, argv: list[str], cwd: str, settings: dict, full: bool,
                     web: bool = True) -> tuple[list[str], dict]:
