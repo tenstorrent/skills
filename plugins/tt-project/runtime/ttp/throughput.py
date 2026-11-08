@@ -87,6 +87,7 @@ import re
 import time
 from pathlib import Path
 
+from . import loadcaps
 from .db import DB, deferral
 
 KV = "throughput_changes"   # kv: [{"id", "ts", "key", "old", "new", "why", "undo", "trigger", "undone"}], newest last
@@ -651,7 +652,7 @@ def measure(db: DB, cfg: dict, since_s: float = DAY, now: float | None = None, g
     # Reviews: a code task's last run ending to its review queued (sweep) and started (stall). A wait the
     # checks held is measured but judges neither limit (the swept and free lists plan() reads).
     sweep_s = float(_cfg(cfg, "review.sweep_after_s", 1800) or 0)
-    per_pass = int(_cfg(cfg, "review.unreviewed_per_pass", 2) or 0)
+    per_pass = loadcaps.unreviewed_per_pass(cfg)   # as the daemon reads it: unset is the worker slots, not off
     stall_s = float(_cfg(cfg, "coordinator.review_stall_s", 14400) or 0)
     rs, rt = lane("review_sweep", "review.sweep_after_s", sweep_s), lane("review_stall", "coordinator.review_stall_s", stall_s)
     queued_by = {kind: {int(m.group(1)) for e in db.q("SELECT text FROM events WHERE kind=? AND ts>?", (kind, t0))

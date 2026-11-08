@@ -681,6 +681,7 @@ UNREVIEWED_MAX_AGE_H = 72      # review.unreviewed_max_age_h: tasks last updated
 UNREVIEWED_GRACE_S = 120       # a task updated more recently than this is still settling
 UNREVIEWED_WAIT_S = 1800.0     # review.unreviewed_wait_s: an external wait (a busy lock too) this long gets its head reviewed
 UNREVIEWED_PASS_S = 20         # the pass stops looking after this long, so the tick stays short
+UNREVIEWED_BACKLOG_EVERY_S = 100   # after a cut pass that queued a review (a backlog): the next pass this soon
 KV_UNREVIEWED_COUNTED = "unreviewed_counted"   # kv: the runtime version whose first sweep logged its count
 PUSH_REFS_EVERY_S = 600   # how often the push queue's pins (refs/ttp/push/<id>) of settled rows are pruned
 
@@ -1168,6 +1169,7 @@ class Daemon:
         self._review_swept = 0.0     # when sweep_reviews last ran
         self._unreviewed_swept = 0.0   # when sweep_unreviewed last ran
         self._unreviewed_at = 0   # the task sweep_unreviewed stopped at (time or budget): the next pass resumes after it
+        self._unreviewed_every = float(REVIEW_SWEEP_EVERY_S)   # until its next pass (UNREVIEWED_BACKLOG_EVERY_S on a backlog)
         self._continues_checked = 0.0   # when check_unqueued_continues last ran
         self._stale_checked = 0.0   # when check_stale_duplicates last ran
         self._queue_trimmed = 0.0   # when expire_queue last ran
@@ -16274,14 +16276,15 @@ class Daemon:
         head its PR carries, a push branch no push can reach, a landing `ttp landed` records). At most
         review.unreviewed_per_pass reviews per pass, only tasks updated within
         review.unreviewed_max_age_h, and one head gets one review (_auto_review's own check).
-        Every REVIEW_SWEEP_EVERY_S from the tick, and at once (`force`) in the blocker sweep's data
-        pass; returns the tasks it queued a review for. The first pass after an upgrade (a runtime version
+        Every REVIEW_SWEEP_EVERY_S from the tick (UNREVIEWED_BACKLOG_EVERY_S after a pass cut short that
+        queued a review: a backlog drains at more than two reviews per five minutes), and at once (`force`)
+        in the blocker sweep's data pass; returns the tasks it queued a review for. The first pass after an upgrade (a runtime version
         it has not counted for: KV_UNREVIEWED_COUNTED) also logs how many done code tasks in the window
         have no landing, push-queue entry or superseded record, so a backlog of finished changes shows."""
         now = time.time()
-        if not force and now - self._unreviewed_swept < REVIEW_SWEEP_EVERY_S:
+        if not force and now - self._unreviewed_swept < self._unreviewed_every:
             return []
-        self._unreviewed_swept = now
+        self._unreviewed_swept, self._unreviewed_every = now, float(REVIEW_SWEEP_EVERY_S)
         cfg, db, done = self.cfg, self.p.db, []
         rules, d = cfg.get("review") or {}, cfg.get("delivery") or {}
         try:
@@ -16328,6 +16331,8 @@ class Daemon:
             if len(done) - hot >= cap and not urgent.is_urgent(t) or last is not None and (
                     time.time() - now > UNREVIEWED_PASS_S or stepclock.over()):   # each pass gets one task further
                 self._unreviewed_at = at if last is None else last
+                if done:   # cut with more to look at after queuing one: a backlog, so look again sooner
+                    self._unreviewed_every = float(UNREVIEWED_BACKLOG_EVERY_S)
                 break
             last = self._unreviewed_at = t["id"]   # kept if the step is stopped mid-task
             try:
