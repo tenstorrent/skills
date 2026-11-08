@@ -93,8 +93,47 @@ def test_waits_line_gives_checks_wait_to_start_and_approved_to_landed_and_a_chec
     # A full `ttp checks` run keeps how long it waited from its arrival to its start.
     p2, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
     before = len(gatetime._rows(p2.state, gatetime.WAIT_LOG))
-    monkeypatch.setenv("TTP_CHECKS_WAIT_KEPT", "")   # restored after: the run sets it
+    monkeypatch.delenv("TTP_CHECKS_WAIT_KEPT", raising=False)   # never inherited; the run keeps it to itself
     monkeypatch.setattr(cli, "_checks_arrived", lambda: time.time() - 120)
     cli.main(["checks", "--", "true"])
     rows = gatetime._rows(p2.state, gatetime.WAIT_LOG)
     assert len(rows) == before + 1 and 119 <= rows[-1][1] < 200, rows
+
+
+def test_slow_landing_check_advice_never_moves_tests_to_post_land_checks_while_nothing_runs_them(env):
+    # Until this release runs delivery.post_land_checks after landing, no advice (the gate_slow observation,
+    # the `ttp status` line, the guide) tells a coordinator to move tests there: they would not run at all.
+    from ttp import gatetime
+    runs = getattr(gatetime, "POST_LAND_RUNS", False)
+    p = make(env)
+    now = time.time()
+    for i in range(10):
+        gatetime.record(p.state, 700 + i, now=now - 100 + i)
+    line = gatetime.status_line(p.state, p.config(), now)
+    text = gatetime.flag(p.db, p.state, p.config(), p.state / "no-logs", now)
+    guide = (RUNTIME.parent / "docs" / "guide.md").read_text()
+    smoke = guide[guide.index("- Smoke before landing:"):]
+    smoke = smoke[:smoke.index("\n- ")]
+    for said in (line, text, smoke):
+        assert "post_land_checks" in said, said
+        assert ("not run" in said or "nothing runs" in said) != runs, said
+        assert runs or "which run after landing" not in said, said
+    # The flag tells the truth: while it is off, no runtime module but the setting's own reads the list.
+    readers = sorted(f.name for f in (RUNTIME / "ttp").glob("*.py")
+                     if "post_land_checks" in f.read_text() and f.name not in ("project.py", "gatetime.py"))
+    assert runs or not readers, readers
+
+
+def test_ttp_checks_keeps_its_wait_recorded_flag_out_of_check_commands_and_later_runs(env, tmp_path, monkeypatch):
+    # The flag that a rerun's wait was recorded is never inherited: not by the check commands, and not by a
+    # later `ttp checks` in the same process, which records its own wait.
+    from ttp import cli, gatetime
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    monkeypatch.delenv("TTP_CHECKS_WAIT_KEPT", raising=False)
+    monkeypatch.setattr(cli, "_checks_arrived", lambda: time.time() - 60)
+    seen = tmp_path / "seen"
+    cli.main(["checks", "--", f"sh -c 'echo \"[${{TTP_CHECKS_WAIT_KEPT:-}}]\" >> {seen}'"])
+    assert "TTP_CHECKS_WAIT_KEPT" not in os.environ
+    cli.main(["checks", "--", f"sh -c 'echo \"<${{TTP_CHECKS_WAIT_KEPT:-}}>\" >> {seen}'"])
+    assert seen.read_text().split() == ["[]", "<>"], seen.read_text()
+    assert len(gatetime._rows(p.state, gatetime.WAIT_LOG)) == 2

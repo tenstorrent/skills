@@ -3892,6 +3892,9 @@ def cmd_checks(a) -> None:
         if p:
             envfault.recheck(p)   # a runner back: its open fault closes
         arrived = _checks_arrived()
+        # This run's wait was already recorded by the run it reruns (set again only for that rerun),
+        # taken out of the environment so no check command or later in-process run inherits it.
+        wait_kept = os.environ.pop(_WAIT_KEPT_ENV, "")
         from . import checkjoin, checklane, checkspill
         # A rerun of checks that did not pass on a spill host keeps off that host (checkspill.kept_off);
         # "1" keeps them off every spill host.
@@ -3962,10 +3965,10 @@ def cmd_checks(a) -> None:
                 print(f"ttp checks: {said}", flush=True)
                 out.write(f"ttp checks: {said}\n")
         # How long it queued (`ttp status` waits), once per run: a rerun here after a spill host keeps its arrival.
-        if p and todo and not hit and not handover and not light and not os.environ.get("TTP_CHECKS_WAIT_KEPT"):
+        if p and todo and not hit and not handover and not light and not wait_kept:
             from . import gatetime
             gatetime.record_wait(p.state, time.time() - arrived)
-            os.environ["TTP_CHECKS_WAIT_KEPT"] = "1"
+            wait_kept = "1"
         if join_rec and todo and not hit and not handover:
             checkjoin.update(join_rec, phase=checkjoin.RUNNING, run_since=time.time())
         child_env = {"PWD": top, **venv_vars, **(slot.env() if slot else {})}
@@ -4281,6 +4284,8 @@ def cmd_checks(a) -> None:
             if slot:
                 slot.close()
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+            if wait_kept:
+                os.environ[_WAIT_KEPT_ENV] = wait_kept
             if no_spill:
                 os.environ[checkspill.OFF_ENV] = no_spill
             if join_rec:
@@ -4340,6 +4345,8 @@ def cmd_checks(a) -> None:
             out.flush()
             print(f"ttp checks: {said}", flush=True)
             os.environ[checkcap.ARRIVED_ENV] = str(arrived)
+            if wait_kept:
+                os.environ[_WAIT_KEPT_ENV] = wait_kept
             os.environ[checkspill.OFF_ENV] = no_spill
             if join_rec:   # the run here registers again; its followers queue again and join that one (checkjoin)
                 checkjoin.forget(p.state)
@@ -4729,6 +4736,9 @@ CHECKS_SLOT_CANCEL = "checks-slot.cancel"
 # Written with a non-zero checks.rc, so `--result` answers and the run's owner wakes (_checks_drop).
 CHECKS_DROPPED = "checks.dropped"
 # (not "checks.queued": detach.queued(checks.rc) is the daemon's launch marker)
+
+
+_WAIT_KEPT_ENV = "TTP_CHECKS_WAIT_KEPT"   # a rerun's wait is its first run's (cmd_checks; never inherited)
 
 
 def _checks_arrived() -> float:

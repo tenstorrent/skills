@@ -3,7 +3,8 @@
 """Each project's landing check time: how long its push checks (delivery.push_checks) take before a change lands.
 
 A landing waits for the project's push checks, so they are a smoke suite: under 10 minutes on their host,
-aim 5. Slower tests belong in delivery.post_land_checks, which run after landing and never hold the queue.
+aim 5. Slower tests belong in delivery.post_land_checks, after landing, never holding the queue; until this
+release runs that list itself (POST_LAND_RUNS), the advice says so: moving tests there would stop them.
 
 - Record: each passing push check run's wall time is one row of LOG under the project's state (record(),
   from push.record_check_s), the newest KEEP rows kept.
@@ -30,6 +31,9 @@ from .project import durable_append, durable_write
 
 LOG = "push-check-times.jsonl"
 WAIT_LOG = "checks-wait-times.jsonl"
+# Whether this release runs delivery.post_land_checks after each landing. Until it does, the advice
+# (status_line, flag) never tells a coordinator to move tests there: nothing would run them.
+POST_LAND_RUNS = False
 KEEP = 200
 DAY_S = 86400.0
 LAST_N = 10
@@ -110,6 +114,21 @@ def _m(s: float) -> str:
     return f"{s / 60:.1f} min"
 
 
+def split_advice(short: bool = False) -> str:
+    """How to split slow push checks: into delivery.post_land_checks once this release runs them after
+    landing (POST_LAND_RUNS), else keep the slower tests running elsewhere, as nothing runs that list yet."""
+    if POST_LAND_RUNS:
+        return ("move slow tests to delivery.post_land_checks" if short else
+                "Split them: keep a smoke subset in delivery.push_checks and move the slower tests to "
+                "delivery.post_land_checks, which run after landing.")
+    if short:
+        return ("split off a smoke subset only once the slower tests run elsewhere "
+                "(delivery.post_land_checks is not run yet)")
+    return ("Split them: keep a smoke subset in delivery.push_checks, but this release does not run "
+            "delivery.post_land_checks yet, so tests moved there would not run at all: keep the slower "
+            "tests running elsewhere (a schedule on the push branch tip) before you shorten push_checks.")
+
+
 def status_line(state: Path | None, cfg: dict | None, now: float | None = None) -> str:
     """One line for `ttp status`: the landing check time, and whether it is over the smoke limit; '' with no runs."""
     st = stats(state, now)
@@ -118,7 +137,7 @@ def status_line(state: Path | None, cfg: dict | None, now: float | None = None) 
     parts = [f"{label} median {_m(v['median_s'])}, p90 {_m(v['p90_s'])} ({v['n']} runs)"
              for label, v in (("24 h", st["day"]), ("last runs", st["last"])) if v]
     lim = max_s(cfg)
-    over = f"; over the {_m(lim)} smoke limit (checks.smoke_max_s): move slow tests to delivery.post_land_checks" \
+    over = f"; over the {_m(lim)} smoke limit (checks.smoke_max_s): " + split_advice(short=True) \
         if lim and st["last"]["median_s"] > lim else ""
     return "landing checks: " + "; ".join(parts) + over
 
@@ -175,8 +194,7 @@ def flag(db, state: Path | None, cfg: dict | None, log_dir: Path | None = None, 
         else "Add --durations=30 to the pytest push check to see the slowest tests. "
     text = (f"Landing checks are slow: median {_m(last['median_s'])} over the last {last['n']} push check runs, "
             f"over the {_m(lim)} smoke limit (checks.smoke_max_s; aim {_m(AIM_S)}). " + named
-            + "Split them: keep a smoke subset in delivery.push_checks and move the slower tests to "
-            "delivery.post_land_checks, which run after landing.")
+            + split_advice())
     db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status) VALUES(?,?,?,?,?,?,?)",
          (now, "daemon", "observation", fp, "normal", text[:4000], "queued"))
     return text
