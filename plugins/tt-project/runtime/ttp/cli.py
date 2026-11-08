@@ -2149,7 +2149,7 @@ def cmd_echoes(a) -> None:
             h = echoes.acknowledge(p, *a.ack)
         except ValueError as e:
             die(str(e))
-        print(f"acknowledged: {h['label']} (retirement {h['retirement']}): hidden while that line is unchanged")
+        print(f"acknowledged: {h['label']} (retirement {h['retirement']}): hidden while that place holds the same phrases")
         return
     if a.ack_phrase:
         try:

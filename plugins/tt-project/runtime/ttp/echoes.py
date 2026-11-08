@@ -46,8 +46,9 @@ suffix ('max-ratio-1.5') counts as weak; a version joined by '_', '=' or '+' cou
 
 A false positive (code using a name the retired text also holds) can be acknowledged: `ttp echoes --ack
 <retirement> <place>` (acknowledge, ACK_KEY) keeps that one match out of the digest's fix orders while the
-matched line's text is unchanged; it is still counted and listed as acknowledged, and a changed line lists
-it again. `ttp echoes --ack-phrase <retirement> <phrase>` (acknowledge_phrase) covers one phrase of one
+place holds the same phrases of that retirement (_line_sha): lines that only re-quote an acked phrase keep
+it; it is still counted and listed as acknowledged, and a new or changed phrase lists it again.
+`ttp echoes --ack-phrase <retirement> <phrase>` (acknowledge_phrase) covers one phrase of one
 retirement at every place it matches, while the retirement lives. The strong/weak rules are untouched by it.
 
 A coordinator's own decision (a memory decision entry citing no user words) retired without the user's
@@ -73,7 +74,7 @@ SEEN_KEY = "retired_echo_seen"       # kv: {"turn": last_coordinator_turn, "hits
                                      #      "historical": hits declared historical, not listed,
                                      #      "advisory": advisory hits, counted, not listed}
 WITHDRAWN, COMPACTED, SUPERSEDED = "withdrawn", "compacted", "superseded"   # retirement kinds (see the top)
-ACK_KEY = "retired_echo_acks"       # kv: {hit key: sha256 of the matched line when acknowledged}
+ACK_KEY = "retired_echo_acks"       # kv: {hit key: sha256 of the phrases the place held when acknowledged}
 ACK_KEEP = 200
 ACK_PHRASE = "phrase"                # ACK_KEY value of "<retirement>:phrase:<phrase>": that phrase, at every place
 UNVERIFIED = "unverified"
@@ -422,9 +423,16 @@ def _line(text: str, phrase: str) -> str:
 
 
 def _line_sha(text: str, phrases_: list[str]) -> str:
-    """The sha256 of every line of `text` holding one of `phrases_`, whitespace collapsed, in order (all of it
-    when none does: a phrase across lines): an acknowledgement holds while they are unchanged, so an edited
-    line or a new copy elsewhere in the place lists the match again. Moving them keeps it."""
+    """The sha256 of which of `phrases_` `text` holds (a phrase across lines too), not of the lines: an
+    acknowledgement holds while that set is unchanged, so an added line or edit that only re-quotes an acked
+    phrase keeps it, and a new or changed phrase of the retirement in the place lists the match again."""
+    flat = _flat(text)
+    return hashlib.sha256("\n".join(sorted({ph for ph in phrases_ if ph in flat})).encode()).hexdigest()
+
+
+def _legacy_line_sha(text: str, phrases_: list[str]) -> str:
+    """The sha256 an ack stored before acks were keyed by phrase (every line holding a phrase, in order),
+    so those acks hold until their place changes; new acks store _line_sha."""
     lines = [" ".join(ln.split()) for ln in text.splitlines() if any(ph in _flat(ln) for ph in phrases_)]
     return hashlib.sha256("\n".join(lines or [" ".join(text.split())]).encode()).hexdigest()
 
@@ -657,8 +665,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
     phrase: fix it) or "advisory" (another kind, only a _weak or _fragment phrase matched, or a dropped
     unsourced Restrictions item the Brief or a sourced item still states: `why` says which). A hit on
     a file the historical index declares historical for that retirement, with its bytes still hashing to
-    the recorded value, goes to `historical` instead (class "historical"); an acknowledged hit whose line is
-    unchanged (ACK_KEY) to `acked` (class "acknowledged")."""
+    the recorded value, goes to `historical` instead (class "historical"); an acknowledged hit whose place
+    holds the same phrases (ACK_KEY) to `acked` (class "acknowledged")."""
     recs = records(p, now)
     if not recs:
         return []
@@ -711,7 +719,7 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 hit = {"key": f"{rec['id']}:{key}", "label": label, "line": _line(text, ph), "phrase": ph,
                        "source": rec.get("source") or "", "retirement": rec["id"], "kind": rec["kind"],
                        "class": "advisory" if why else "directive", "why": why, "sha": _line_sha(text, own)}
-                if acks.get(hit["key"]) == hit["sha"] or ph in okd:
+                if acks.get(hit["key"]) in (hit["sha"], _legacy_line_sha(text, own)) or ph in okd:
                     if acked is not None:
                         acked.append(dict(hit, **{"class": "acknowledged"}))
                     continue
@@ -771,7 +779,7 @@ def digest_lines(p, now: float | None = None) -> list[str]:
         lines.append(f"- {len(hist)} historical line{'s' if len(hist) != 1 else ''} not shown (declared in {where})")
     if acked:   # acknowledged as false positives: counted, never silently dropped
         lines.append(f"- {len(acked)} acknowledged match{'es' if len(acked) != 1 else ''} not shown (`ttp echoes --ack`;"
-                     f" listed again once its line changes)")
+                     f" listed again once a new phrase shows there)")
     if advisory:   # counted, never a fix order
         lines.append(f"- {advisory} advisory match{'es' if advisory != 1 else ''} not shown: a compacted fact, a "
                      f"coordinator's own decision, a retirement of unknown origin, a name a current cited "
@@ -783,8 +791,8 @@ def digest_lines(p, now: float | None = None) -> list[str]:
 
 def acknowledge(p, retirement: str, where: str, now: float | None = None) -> dict:
     """Acknowledge retirement `retirement`'s current match at `where` (a file's `<path>:<line>`, a place as
-    `ttp echoes` names it, or its key) as no echo: hidden while that line's text is unchanged, listed again
-    once it changes. Stored in the project's kv (ACK_KEY); acks of retirements no longer live are dropped.
+    `ttp echoes` names it, or its key) as no echo: hidden while that place holds the same phrases of it, listed
+    again once a new or changed one shows there. Stored in the project's kv (ACK_KEY); acks of retirements no longer live are dropped.
     Raises ValueError when no current match fits."""
     where = " ".join(where.split())
     acked: list[dict] = []

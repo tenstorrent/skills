@@ -951,10 +951,12 @@ def test_an_acknowledged_false_positive_is_hidden_counted_and_listed_again_once_
     assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
     code.write_text(before)
     assert classes()[(rec["id"], "file src/client.py:3")] == "acknowledged"
-    # The line's text changes: listed again as a directive.
+    # The line's text changes but holds the same phrase: still acknowledged; a changed phrase lists it again.
     code.write_text(code.read_text().replace("return payload", "return  dict(payload)"))
-    assert classes()[(rec["id"], "file src/client.py:3")] == "directive"
+    assert classes()[(rec["id"], "file src/client.py:3")] == "acknowledged"
     p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Wait for the alpha_gate_flag before every release.", task))
+    assert classes()[(rec["id"], f"task #{task} spec")] == "acknowledged"
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Hold every release for the `alpha_gate_flag` sign-off.", task))
     assert classes()[(rec["id"], f"task #{task} spec")] == "directive"
 
 
@@ -1089,3 +1091,40 @@ def test_a_phrase_the_live_superseding_entry_still_carries_is_no_echo_whatever_t
     other = echoes.record(p.db, f"memory [merge-older] superseded by [{plain.stem}]", f'Old: "{phrase}"',
                           found=[phrase], skip=[f"memory:{plain.stem}"])
     assert f"task #{copy} spec" in hits(other["id"])
+
+
+def test_an_ack_survives_an_appended_line_that_re_quotes_the_acked_phrase(env):
+    """Upstream note a1e73e1389d71a3a: a note appended to a task spec quoting an acked phrase kept every ack
+    on it lapsing; a different new phrase of the retirement is still listed, and a legacy ack still holds."""
+    import hashlib
+    from ttp import echoes
+    p = make(env)
+    src = "charter 'Policies' quote replaced"
+    rec = echoes.record(p.db, src, "Hold every release for the `alpha_gate_flag` sign-off.")
+    other = echoes.record(p.db, src, "Route each build through `beta_field_name` first.")
+    spec = "Wait for the alpha_gate_flag and beta_field_name before each release."
+    task = p.db.add_task("t", spec)
+    where = f"task #{task} spec"
+
+    def cls(r):
+        return {(m["retirement"], m["where"]): m["class"] for m in echoes.export(p)["matches"]}[(r["id"], where)]
+    echoes.acknowledge(p, rec["id"], where)
+    echoes.acknowledge(p, other["id"], where)
+    assert cls(rec) == cls(other) == "acknowledged"
+    # Appended notes that only re-quote the acked phrases keep both acks.
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?",
+           (spec + "\n\nNote: the alpha_gate_flag check stays.\nAlso beta_field_name, as before.", task))
+    assert cls(rec) == cls(other) == "acknowledged"
+    # A different phrase of one retirement appended: that one is listed again, the other ack holds.
+    p.db.x("UPDATE tasks SET spec=spec || ? WHERE id=?",
+           ("\nRoute each build through `beta_field_name` first.", task))
+    assert cls(other) == "directive" and cls(rec) == "acknowledged"
+    # The phrase leaves the place: nothing to list.
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", ("Wait for the release.", task))
+    assert not [m for m in echoes.export(p)["matches"] if m["where"] == where]
+    # An ack stored before acks were keyed by phrase (the matched lines' hash) still holds.
+    p.db.x("UPDATE tasks SET spec=? WHERE id=?", (spec, task))
+    own = [ph for ph in rec["phrases"]]
+    lines = [" ".join(ln.split()) for ln in spec.splitlines() if any(ph in echoes._flat(ln) for ph in own)]
+    p.db.set_kv(echoes.ACK_KEY, {f"{rec['id']}:task:{task}:spec": hashlib.sha256("\n".join(lines).encode()).hexdigest()})
+    assert cls(rec) == "acknowledged" and cls(other) == "directive"
