@@ -899,9 +899,10 @@ def _git_op_in_progress(path: str) -> bool:
     d = path if os.path.isdir(path) else os.path.dirname(path)
     while d and not os.path.isdir(d):
         d = os.path.dirname(d)
+    from . import gitmemo
     try:
-        gdir = subprocess.run(["git", "-C", d or "/", "rev-parse", "--absolute-git-dir"], capture_output=True,
-                              text=True, timeout=5).stdout.strip()
+        gdir = gitmemo.run(["git", "-C", d or "/", "rev-parse", "--absolute-git-dir"], capture_output=True,
+                           text=True, timeout=5).stdout.strip()
     except (OSError, subprocess.SubprocessError):
         return False
     return bool(gdir) and any(os.path.exists(os.path.join(gdir, n)) for n in
