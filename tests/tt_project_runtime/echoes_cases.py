@@ -600,13 +600,15 @@ def test_a_user_withdrawal_quoting_a_current_restriction_heading_flags_only_the_
 
 
 def test_a_phrase_a_live_memory_entry_states_whole_is_advisory_never_a_fix_order(env):
-    """A user-withdrawn memory entry's phrase that another live entry still holds whole is an older copy of
-    current words: advisory wherever it is quoted. A phrase only the retired entry holds, or one a live entry
+    """A user-withdrawn memory entry's phrase another live entry still holds whole is an older copy of current
+    words: advisory wherever it is quoted but in that entry itself (its own copy is the one to fix), and
+    anywhere at all when the superseder holds it. A phrase only the retired entry holds, or one a live entry
     holds only inside a longer name, keeps its fix order; a charter replacement keeps its fix orders even
-    where a live memory entry holds the phrase (that entry is the copy to fix)."""
+    where a live memory entry holds the phrase."""
     from ttp import coordinator as coord, echoes
     p = make(env)
-    p.add_memory("Release notes: run `ship-it --canary` in staging; see roll-back-faster for drills.", kind="fact")
+    fact = p.add_memory("Release notes: run `ship-it --canary` in staging; see roll-back-faster for drills.",
+                        kind="fact")
     old = p.add_memory("Deploy with `ship-it --canary` and `roll-back-fast` before each job.", kind="decision")
     said = _echo_said(p, "Stop using roll-back-fast, deploy with ship-fast.")
     assert coord.apply(p, [{"type": "memory_add", "memory_kind": "decision", "supersedes": [old.stem],
@@ -620,7 +622,21 @@ def test_a_phrase_a_live_memory_entry_states_whole_is_advisory_never_a_fix_order
     assert hits[f"task:{both}:spec"]["why"] == "a live memory entry states it: no action"
     assert hits[f"task:{retired}:spec"]["class"] == "directive", hits
     assert hits[f"task:{retired}:spec"]["phrase"] == "roll-back-fast"
-    assert [h["key"] for h in echoes.scan(p) if h["class"] == "directive"] == [hits[f"task:{retired}:spec"]["key"]]
+    assert hits[f"memory:{fact.stem}"]["class"] == "directive", hits   # the live entry's own stale copy
+    assert sorted(h["key"] for h in echoes.scan(p) if h["class"] == "directive") == sorted(
+        hits[k]["key"] for k in (f"task:{retired}:spec", f"memory:{fact.stem}"))
+    # A superseder that still holds a retired phrase whole (not in the retirement's replacing text, nor skipped)
+    # makes it current everywhere, in the superseder itself too.
+    sup = p.add_memory("Deploys: keep the `pre-flight-gate` step.", kind="decision")
+    echoes.record(p.db, f"memory [{old.stem}] superseded by [{sup.stem}]", "Run the `pre-flight-gate` step.",
+                  "", found=["pre-flight-gate"])
+    kept = p.db.add_task("kept", "Do the pre-flight-gate step.")
+    gate = [h for h in echoes.scan(p) if h["phrase"] == "pre-flight-gate"]
+    assert {h["key"].split(":", 1)[1] for h in gate} == {f"task:{kept}:spec", f"memory:{sup.stem}"}, gate
+    assert {h["class"] for h in gate} == {"advisory"}, gate
+    # A second live entry holding the phrase makes each one's copy current too.
+    p.add_memory("Staging checklist: `ship-it --canary` before the demo.", kind="fact")
+    assert hits[f"memory:{fact.stem}"]["key"] not in {h["key"] for h in echoes.scan(p) if h["class"] == "directive"}
     echoes.record(p.db, "charter 'Deploys' quote replaced", "Deploy with `ship-it --canary` before each job.")
     charter = [h for h in echoes.scan(p) if h["source"].startswith("charter")]
     assert charter and all(h["class"] == "directive" for h in charter), charter

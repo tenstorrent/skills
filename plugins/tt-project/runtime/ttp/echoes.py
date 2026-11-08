@@ -37,9 +37,12 @@ that rule still binds, so its copies are right. Likewise a memory entry's retire
 never retires a phrase a current Restrictions item with its source (a user cite, origin: Brief or harness gate)
 or its heading states (_states: holds it whole, or as one run of its words apart from naming words and cites,
 such as 'the X restriction' or a heading quoted with its item): a hit on it is advisory (_current), wherever it
-stands. So is a phrase any live memory entry (its superseder or another, the matched entry too) holds whole: an
-older copy of current words; one only part of it holds, or only the retired entry, keeps its class. Accepted
-gap: a stale live copy of a memory entry the user withdrew gets no fix order from that retirement. A user Correction or a charter replacement keeps its fix orders. A supersede whose only user cite names
+stands. So is a phrase a live memory entry holds whole (_live_holds): its superseder anywhere, itself included,
+or another entry anywhere but in that entry itself (an older copy of current words). One only part of it holds,
+or only the retired entry, keeps its class, and so does a live entry's own copy of words the user withdrew,
+unless it is the superseder (that copy is the one to fix). Accepted gap: while such a stale live copy stands,
+other places quoting the same words get no fix order from that retirement. A user Correction or a charter
+replacement keeps its fix orders. A supersede whose only user cite names
 messages older than the entry it retires (where a rule came from, such as a current item's source) is one
 coordinator entry replacing another: SUPERSEDED (coordinator._withdrawn `since`). One the coordinator dropped on its own is SUPERSEDED, never
 WITHDRAWN, and one a record stored before the flag holds is UNVERIFIED (_unsourced). `export` is the read-only full list
@@ -598,6 +601,16 @@ def _superseders(rec: dict, recs: list[dict], live: dict[str, str]) -> str:
     return " ".join(out)
 
 
+def _live_holds(live: dict[str, str], ph: str, rec: dict) -> set[str]:
+    """The live memory entries (place keys; `live` maps entry names to their flattened text) holding `ph`
+    whole that make it current for memory retirement `rec`: the superseder its source names counts everywhere
+    ("*"); any other entry counts everywhere but in itself, so the result is that entry's key alone when it is
+    the only one."""
+    m = re.search(r"superseded by \[([^\]]+)\]", rec.get("source") or "")
+    keys = {f"memory:{name}" for name, flat in live.items() if _hit({}, flat, [ph])}
+    return {"*"} if m and f"memory:{m.group(1)}" in keys else keys
+
+
 def _current(charter: str) -> list[str]:
     """The flattened text of each current Restrictions item that binds (restriction_source.sourced: a user
     cite, the Brief or a harness gate, its own or its sub-heading's), with the heading (section or
@@ -698,8 +711,10 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
             stated = still_stated(charter, rec.get("old") or "")
         weak = {ph for ph in own if _weak(ph) or _fragment(ph, rec.get("old") or "")}
         # A memory entry's retirement never retires what a current cited Restrictions item or a live entry states.
-        cur = ({ph for ph in own if _states(units, ph) or any(_hit({}, flat, [ph]) for flat in live.values())}
-               if _MEMORY_RETIRED.match(rec.get("source") or "") else set())
+        mem = bool(_MEMORY_RETIRED.match(rec.get("source") or ""))
+        stated_now = {ph for ph in own if _states(units, ph)} if mem else set()
+        held = {ph: _live_holds(live, ph, rec) for ph in own if ph not in stated_now} if mem else {}
+        cur = stated_now | {ph for ph, keys in held.items() if keys}
         own.sort(key=lambda ph: ph in weak or ph in cur)   # a governing phrase first: a hit rests on it when it can
         skip = set(rec.get("skip") or ())
         mine = _own_decision(rec)
@@ -713,8 +728,8 @@ def scan(p, now: float | None = None, historical: list[dict] | None = None,
                 if key.startswith("file:"):
                     label += f":{_lineno(text, ph)}"
                 why = (f"still stated in {stated}: no action" if stated else
-                       ("a current Restrictions item with its source states it: no action" if _states(units, ph)
-                        else "a live memory entry states it: no action") if ph in cur else
+                       "a current Restrictions item with its source states it: no action" if ph in stated_now else
+                       "a live memory entry states it: no action" if held.get(ph, set()) - {key} else
                        "a coordinator's own decision retired, no user rule withdrawn: no action" if mine else
                        "" if rec["kind"] == WITHDRAWN and ph not in weak else
                        "origin not recorded: nothing shows the user withdrew this rule" if rec["kind"] == UNVERIFIED
