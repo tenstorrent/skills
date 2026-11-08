@@ -428,21 +428,26 @@ def test_a_narrowed_check_spills_and_runs_its_selection_on_a_spill_host_or_the_s
     """A targeted check may spill as a full one does: spill_to ships the select plugin with the copy of
     the commit and points its PYTHONPATH entry there, never at this host's folder, so on a stand-in spill
     host (fake ssh), and as a Slurm overflow job, only its selection runs."""
-    from ttp import checkspill, push, pushpass, remotecheck, slurmcheck, testpick
+    from ttp import checkspill, cli, push, pushpass, remotecheck, slurmcheck, testpick
     repo, base = _pick_repo(tmp_path)
     head = _pick_change(repo, base, {"plugins/x/runtime/ttp/foo.py": "def foo_one():\n    return 2\n"})
     own = push.check_list([_PICK_CMD])
     c = testpick.narrow(repo, base, head, list(own), own, None)[0][0]
     assert c.targeted and checkspill.check_spills(c) and checkspill.spillable([c])
-    s = push.spill_to([c], "box1", {})[0]
-    env = dict(s.env)
+    s = cli._spill_to([c], "box1", {})[0]
+    assert s.spilled and cli._command_key(s) == cli._command_key(c), "a spilled pass is reused by a run here"
+    argv = push.check_argv(s, commit=head)
+    env = json.loads(argv[argv.index("--env") + 1])
     assert str(pushpass.PLUGIN_DIR) not in json.dumps(env), "never this host's path there"
     assert env["PYTHONPATH"].startswith(f"$PWD/{remotecheck.SHIP_DIR}")
-    assert env[testpick.FILES_ENV] == dict(c.env)[testpick.FILES_ENV] and env["PYTEST_ADDOPTS"] == dict(c.env)["PYTEST_ADDOPTS"]
-    assert str(pushpass.PLUGIN_DIR / f"{pushpass.SELECT_PLUGIN}.py") in s.ship_py
-    assert push.spill_to([s], "box1", {})[0].ship_py == s.ship_py, "spilled again: shipped once"
-    plain = push.spill_to(list(own), "box1", {})[0]
-    assert not getattr(plain, "ship_py", ()) and not getattr(plain, "env", ()), "a full check ships nothing"
+    assert {k: v for k, v in env.items() if k != "PYTHONPATH"} == {k: v for k, v in c.env if k != "PYTHONPATH"}
+    py = json.loads(argv[argv.index("--py") + 1])
+    assert str(pushpass.PLUGIN_DIR / f"{pushpass.SELECT_PLUGIN}.py") in py and len(py) == len(set(py))
+    s.ship_py = (py[0],)   # one already shipped (a tests gate rerun, cli._remote_select) is shipped once
+    assert json.loads((a := push.check_argv(s, commit=head))[a.index("--py") + 1]) == py[:1] + sorted(set(py) - {py[0]})
+    s.ship_py = ()
+    a = push.check_argv(push.spill_to(list(own), "box1", {})[0], commit=head)
+    assert "--py" not in a and json.loads(a[a.index("--env") + 1]) == {}, "a full check ships nothing"
     fake, _ = _slurm_fakes(tmp_path)
     run = {**os.environ, **fake}
     r = subprocess.run(push.check_argv(s, commit=head), cwd=repo, env=run, capture_output=True, text=True, timeout=120)
