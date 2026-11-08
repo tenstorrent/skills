@@ -313,6 +313,31 @@ def test_a_review_diff_has_only_its_branch_files_not_a_commit_its_spec_quotes(en
     assert worktree.reviewed_head(p, review) == later
 
 
+
+def test_a_finished_reviews_named_refs_are_computed_once_and_an_open_ones_every_time(env, monkeypatch):
+    from ttp import worktree
+    p = make(env)
+    tid, path, branch = _code_task(p, "the change")
+    head = _commit_files(path, {"daemon.py": "a\n"}, "change")
+    spec = f"Review the change of code task #{tid}: branch {branch}, head {head[:12]}."
+    calls = []
+    real = worktree._named_refs
+    monkeypatch.setattr(worktree, "_named_refs", lambda p, t: calls.append(t["id"]) or real(p, t))
+    monkeypatch.setattr(worktree, "_NAMED_MEMO", {})
+    review = p.db.task(_quoting_review(p, spec, (tid,)))
+    first = worktree.named_refs(p, review)
+    assert worktree.named_refs(p, review) == first and len(calls) == 2, "an open review is never remembered"
+    p.db.x("UPDATE tasks SET status='done' WHERE id=?", (review["id"],))
+    done = p.db.task(review["id"])
+    assert worktree.named_refs(p, done) == first and worktree.named_refs(p, done) == first
+    assert len(calls) == 3, "a finished review is computed once"
+    # A changed spec is a different entry; an expired one is computed again.
+    worktree.named_refs(p, {**done, "spec": spec + " More."})
+    assert len(calls) == 4
+    monkeypatch.setattr(worktree, "_NAMED_MEMO_S", 0.0)
+    worktree.named_refs(p, done)
+    assert len(calls) == 5
+
 def test_the_head_a_review_is_said_to_review_counts_even_off_its_branch(env):
     from ttp import worktree
     p = make(env)

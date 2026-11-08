@@ -2303,7 +2303,34 @@ def reviewed_refs(p: Project, task: dict) -> list[str]:
 _SAID_HEAD = re.compile(r"(?:,?\s*head:?|\s+(?:rebased\s+)?(?:at|as))\s+([0-9a-f]{7,40})\b")
 
 
+# A finished task's named refs, kept for _NAMED_MEMO_S: fix_branches asks for those of every earlier
+# review a code task continues, on each dispatch and review sweep. With thousands of tasks, recomputing
+# each one (a scan of the task table plus git ancestry calls) every tick ran every daemon step past its
+# budget, so nothing was dispatched or reaped. A task that is still open is always computed afresh.
+_NAMED_MEMO: dict[tuple, tuple[float, list[str]]] = {}
+_NAMED_MEMO_S = 900.0
+_NAMED_MEMO_MAX = 20000
+_FINISHED = frozenset({"done", "failed", "cancelled", "superseded"})
+
+
 def named_refs(p: Project, task: dict) -> list[str]:
+    """_named_refs, remembered for a finished task (see _NAMED_MEMO)."""
+    if task.get("status") not in _FINISHED or task.get("id") is None:
+        return _named_refs(p, task)
+    key = (str(getattr(p, "root", "")), task["id"], task.get("status"), task.get("spec") or "",
+           str(task.get("depends_on") or ""), str(task.get("labels") or ""))
+    now = time.monotonic()
+    hit = _NAMED_MEMO.get(key)
+    if hit and now - hit[0] < _NAMED_MEMO_S:
+        return list(hit[1])
+    refs = _named_refs(p, task)
+    if len(_NAMED_MEMO) >= _NAMED_MEMO_MAX:
+        _NAMED_MEMO.clear()
+    _NAMED_MEMO[key] = (now, list(refs))
+    return refs
+
+
+def _named_refs(p: Project, task: dict) -> list[str]:
     """The branches of the tasks a review depends on, and the task branches and commit hashes its
     spec names. With such a branch, a spec-quoted hash counts only when it is on one of them (an
     ancestor of its head), builds on one (a descendant: a fix or a settled push conflict), or is the
