@@ -265,31 +265,41 @@ def test_alias_priced_fork_rows_are_re_booked_once_at_their_runs_time(env):
     at = datetime.datetime(2026, 11, 8, 10, 0, tzinfo=timefmt.zone(p)).timestamp()
     wrong, right = 20_000 * 75.0 / 1e6, 20_000 * 20.0 / 1e6
 
-    def booked(lines, ended=at):
+    def booked(lines, ended=at, renet=True, model_used=None):
         tid, r = _fork_run(d, cost=wrong, out_tokens=20_000, status="done")
-        note = {**json.loads(r["note"]), "session_cost_usd": 12.0, "fork_base_usd": 12.0 - wrong}
+        note = json.loads(r["note"])
+        if renet:   # re-booked by the 0.2.978 fork re-net, at the dearest row
+            note.update(session_cost_usd=12.0, fork_base_usd=12.0 - wrong)
+        if model_used:
+            note["model_used"] = model_used
         db.x("UPDATE runs SET model='opus', ended=?, note=? WHERE id=?", (ended, json.dumps(note), r["id"]))
         run_dir = d.p.runs / str(r["id"])
         run_dir.mkdir(parents=True)
         (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
         return tid, r["id"]
 
+    no_model = [{"type": "system", "subtype": "init", "session_id": "F1"}]
     tid, fixed = booked(_alias_lines(["claude-opus-5-5"]))
-    _, bare = booked(_alias_lines([])[:1])   # no modelUsage: keeps its booking
-    _, old = booked(_alias_lines(["claude-opus-5-5"]), ended=at - 3 * 86400)   # before the window
+    _, init_only = booked(_alias_lines([])[:1], renet=False)   # 'opus' asked, the init event names claude-opus-5-5
+    _, noted = booked(no_model, model_used="claude-opus-5-5")   # only the note's model_used names it
+    _, renet_old = booked(_alias_lines(["claude-opus-5-5"]), ended=at - 3 * 86400)   # re-net row before the window
+    _, bare = booked(no_model)   # names no model: keeps its booking
+    _, old = booked(_alias_lines(["claude-opus-5-5"]), ended=at - 3 * 86400, renet=False)   # before the window
     changed = d.reprice_alias_runs()
-    assert [c[0] for c in changed] == [fixed] and abs(changed[0][2] - right) < 1e-6
+    assert [c[0] for c in changed] == [fixed, init_only, noted, renet_old]
+    assert all(abs(c[2] - right) < 1e-6 for c in changed), changed
     row = db.one("SELECT cost_usd, note FROM runs WHERE id=?", (fixed,))
     note = json.loads(row["note"])
     assert abs(row["cost_usd"] - right) < 1e-6 and note["repriced_model"] == "claude-opus-5-5"
     assert abs(note["fork_base_usd"] - (12.0 - right)) < 1e-6
     assert abs(db.task(tid)["spent_usd"] - right) < 1e-6, "the task kept the phantom spend"
-    fix = db.q("SELECT ts, usd FROM ledger WHERE usd<0")
-    assert len(fix) == 1 and fix[0]["ts"] == at and abs(fix[0]["usd"] + (wrong - right)) < 1e-6
+    fix = db.q("SELECT ts, usd FROM ledger WHERE usd<0 ORDER BY id")
+    assert [f["ts"] for f in fix] == [at, at, at, at - 3 * 86400], "a correction not at its run's own time"
+    assert all(abs(f["usd"] + (wrong - right)) < 1e-6 for f in fix)
     for rid in (bare, old):
         assert abs(db.one("SELECT cost_usd FROM runs WHERE id=?", (rid,))["cost_usd"] - wrong) < 1e-9
-    assert db.kv(dmod.MODEL_REPRICE_KEY)["runs"] == 1
+    assert db.kv(dmod.MODEL_REPRICE_KEY)["runs"] == 4
     assert d.reprice_alias_runs() is None, "a second pass ran again"
     db.set_kv(dmod.MODEL_REPRICE_KEY, None)
     assert d.reprice_alias_runs() == [], "a re-priced row was re-booked again"
-    assert len(db.q("SELECT 1 FROM ledger WHERE usd<0")) == 1
+    assert len(db.q("SELECT 1 FROM ledger WHERE usd<0")) == 4

@@ -4844,11 +4844,12 @@ class Daemon:
         return changed
 
     def reprice_alias_runs(self) -> list[tuple[int, float, float]] | None:
-        """Once per project (kv MODEL_REPRICE_KEY): forked runs booked from MODEL_REPRICE_SINCE on had their
-        own tokens priced at the run's model alias ('opus'), which no price row names, so at the dearest
-        row. Re-price each at the model its output's modelUsage names (_list_cost), the way
+        """Once per project (kv MODEL_REPRICE_KEY): forked runs booked from MODEL_REPRICE_SINCE on, and any
+        row renet_fork_runs re-booked (note fork_base_usd), had their own tokens priced at the run's model
+        alias ('opus'), which no price row names, so at the dearest row. Re-price each at the model its
+        output's modelUsage or init event names, else the note's model_used (_list_cost), the way
         _net_of_session books one now; take the difference off its task's spend and book it as a negative
-        ledger row at the run's time. A run whose output names no model keeps its booking; a re-priced row
+        ledger row at the run's time. A run that names no model keeps its booking; a re-priced row
         is marked (note repriced_model), so a second pass changes nothing. Returns (run id, booked before,
         booked after) of each row changed, or None when it already ran."""
         db = self.p.db
@@ -4857,13 +4858,13 @@ class Daemon:
         since = datetime.datetime(*MODEL_REPRICE_SINCE, tzinfo=timefmt.zone(self.p)).timestamp()
         changed = []
         for r in db.q("SELECT * FROM runs WHERE provider='claude' AND task IS NOT NULL AND status!='running' "
-                      "AND cost_usd>0 AND COALESCE(ended, started)>=? AND note LIKE ? ORDER BY id",
-                      (since, f'%{ctxfork.KEY}%')):
+                      "AND cost_usd>0 AND (COALESCE(ended, started)>=? OR note LIKE '%fork_base_usd%') "
+                      "AND note LIKE ? ORDER BY id", (since, f'%{ctxfork.KEY}%')):
             note = json.loads(r["note"] or "{}")
             if "repriced_model" in note or not ctxfork.forked(note) or (note.get("resumes") or {}).get("session"):
                 continue
             extra = self._output_models(r)
-            if not extra.get("model_usage"):
+            if not extra.get("model_usage") and not extra.get("model"):
                 continue
             before = float(r["cost_usd"])
             usage = RunUsage(cost_usd=float(note.get("session_cost_usd") or before),
@@ -4887,9 +4888,11 @@ class Daemon:
         return changed
 
     def _output_models(self, r: dict) -> dict:
-        """A booked Claude run's model ids from its output (RunUsage.extra keys model_usage and model)."""
+        """A booked Claude run's model ids from its output, else its note's model_used (RunUsage.extra keys
+        model_usage and model)."""
         from .providers import claude
         ids, init = claude.result_models(self._run_dir(r) / "output.jsonl")
+        init = init or str(json.loads(r["note"] or "{}").get("model_used") or "")   # the model the run booked beside it
         return {k: v for k, v in (("model_usage", ids), ("model", init)) if v}
 
     def _unpriced_model(self, model: str) -> None:
