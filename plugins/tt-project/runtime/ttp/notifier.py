@@ -30,7 +30,7 @@ import sys
 import time
 from pathlib import Path
 
-from . import headline, sshcmd, timefmt
+from . import headline, hoststate, sshcmd, timefmt
 from .db import DB, SEVERITY_RANK
 from .project import HOME_DIR, Project, durable_write, hostname, load_registry, write_json
 
@@ -775,7 +775,7 @@ def agent_file() -> Path | None:
     if os.environ.get("TTP_TEST_NO_NOTIFIER"):
         return None
     f = Path.home() / "Library" / "LaunchAgents" / f"{LABEL}.plist" if sys.platform == "darwin" else \
-        Path.home() / ".config" / "systemd" / "user" / UNIT
+        hoststate.unit_dir() / UNIT   # a test run's fake under its marker
     return f if f.exists() else None
 
 
@@ -787,7 +787,7 @@ def _service_on() -> bool:
     if sys.platform == "darwin":
         cmd = ["launchctl", "print", f"gui/{os.getuid()}/{LABEL}"]
     else:
-        cmd = ["systemctl", "--user", "is-enabled", UNIT]
+        cmd = hoststate.argv(["systemctl", "--user", "is-enabled", UNIT])
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
@@ -813,7 +813,7 @@ def uninstall() -> str:
     line or `ttp setup`/`ttp upgrade` brings it back; `ttp notifier install` does."""
     def quiet(*cmd):
         try:
-            subprocess.run(list(cmd), capture_output=True, timeout=30)
+            subprocess.run(hoststate.argv(cmd), capture_output=True, timeout=30)
         except (OSError, subprocess.SubprocessError):
             pass
     f = agent_file()
@@ -1012,7 +1012,7 @@ def install() -> str:
         subprocess.run(["launchctl", "bootout", f"gui/{os.getuid()}/{LABEL}"], capture_output=True)
         r = subprocess.run(["launchctl", "bootstrap", f"gui/{os.getuid()}", str(plist)], capture_output=True, text=True)
         return "installed and started (launchd)" if r.returncode == 0 else f"launchd failed: {r.stderr.strip()[:200]}"
-    unit_dir = Path.home() / ".config" / "systemd" / "user"
+    unit_dir = hoststate.unit_dir()   # a test run's fake under its marker
     unit_dir.mkdir(parents=True, exist_ok=True)
     envs = "\n".join(f"Environment={k}={v}" for k, v in env.items())
     durable_write(
@@ -1020,9 +1020,9 @@ def install() -> str:
         f"[Unit]\nDescription=tt-project desktop notifier\n\n[Service]\nWorkingDirectory={HOME_DIR}\n"
         f"ExecStart={' '.join(shlex.quote(a) for a in argv)}\n{envs}\nRestart=always\nRestartSec=15\n\n"
         f"[Install]\nWantedBy=default.target\n")
-    subprocess.run(["systemctl", "--user", "daemon-reload"], capture_output=True)
+    subprocess.run(hoststate.argv(["systemctl", "--user", "daemon-reload"]), capture_output=True)
     for step in (["enable", UNIT], ["restart", UNIT]):   # restart: `enable --now` leaves a running one on old code
-        r = subprocess.run(["systemctl", "--user", *step], capture_output=True, text=True)
+        r = subprocess.run(hoststate.argv(["systemctl", "--user", *step]), capture_output=True, text=True)
         if r.returncode != 0:
             return f"systemd failed: {r.stderr.strip()[:200]}"
     return "installed and started (systemd user unit)"

@@ -5727,6 +5727,13 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
     if (slot := _CHECK_YIELD["slot"]) is not None:   # a slot a yield gave up: held again before more work
         slot.hold_again(_checks_slot_told(kw.get("stdout")))
     _CHECK_STOP.update(defer=True, pending=None)
+    guard = None
+
+    def tell(line: str) -> None:
+        if (out := kw.get("stdout")) is not None and hasattr(out, "write"):
+            out.write(f"{line}\n")
+            out.flush()
+        print(f"ttp checks: {line}", flush=True)
     try:
         if _CHECK_STOP["stopped"]:   # stopped checks start no further command
             raise SystemExit(_CHECK_STOP["stopped"])
@@ -5741,11 +5748,8 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
                             extend=extend)
         _reap_check(proc, group, kw)
         changed, said = guard.end()
-        if said and (out := kw.get("stdout")) is not None and hasattr(out, "write"):
-            out.write("".join(f"{line}\n" for line in said))
-            out.flush()
         for line in said:
-            print(f"ttp checks: {line}", flush=True)
+            tell(line)
         return 1 if changed and rc == 0 else rc
     except BaseException:
         _CHECK_STOP["defer"] = True
@@ -5756,6 +5760,8 @@ def _run_check(argv: list, group: bool, record=None, timeout: float | None = Non
                 _end_check(proc, group=False)
             if proc is not None:
                 _reap_check(proc, group, kw)
+            if guard is not None:   # a change made before the stop: restored and reported, not the next baseline
+                guard.stopped(tell)
         finally:
             _CHECK_STOP["defer"] = False
         if _CHECK_STOP["pending"]:

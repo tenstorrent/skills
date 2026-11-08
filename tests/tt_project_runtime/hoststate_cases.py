@@ -173,3 +173,96 @@ def test_this_test_session_runs_with_the_host_stand_ins_first_on_path():
     store = os.environ.get("TTP_HOSTSTATE_FAKE")
     assert store and os.environ["PATH"].split(os.pathsep)[0] == os.path.join(store, "bin")
     assert shutil.which("crontab") == os.path.join(store, "bin", "crontab")
+
+
+def test_the_notifier_and_tunnel_installers_write_their_units_to_the_fake_store_under_the_marker(tmp_path, monkeypatch):
+    from ttp import hoststate, notifier, tunnel
+    home, store = tmp_path / "home", tmp_path / "store"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv(hoststate.MARKER, str(store))
+    monkeypatch.setattr(hoststate, "real_home", lambda: home)   # a run with the account's real HOME
+    monkeypatch.delenv("TTP_TEST_NO_NOTIFIER", raising=False)
+    monkeypatch.setattr(notifier.sys, "platform", "linux")
+    notifier.install()
+    unit = store / "systemd" / "user" / notifier.UNIT
+    assert unit.is_file() and not (home / ".config" / "systemd").exists()
+    assert notifier.agent_file() == unit
+    calls = [json.loads(ln) for ln in (store / "calls.jsonl").read_text().splitlines()]
+    assert any(c.get("cmd") == "systemctl" for c in calls), calls   # the stand-in, never the real one
+    assert notifier.uninstall() == "removed" and not unit.exists()
+    assert tunnel.service_file("x", "linux") == store / "systemd" / "user" / f"{tunnel.label('x')}.service"
+    assert tunnel._run("systemctl", "--user", "daemon-reload").returncode == 0
+    assert not (home / ".config" / "systemd").exists()
+
+
+def _stopped_after_write(tabf):
+    """A wait that stops the check (an urgent preemption, run_detached's SIGTERM) once it wrote the crontab."""
+    def wait(proc, *a, **kw):
+        for _ in range(200):
+            if tabf.exists() and "evil" in tabf.read_text():
+                break
+            time.sleep(0.05)
+        raise SystemExit(143)
+    return wait
+
+
+def test_a_push_check_stopped_mid_run_still_restores_and_reports_a_host_change(tmp_path, monkeypatch):
+    from ttp import push
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    _ledger(monkeypatch)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    monkeypatch.setattr(push, "_timed_wait", _stopped_after_write(tabf))
+    said = []
+    with pytest.raises(SystemExit):
+        push._run_one(f"echo '@reboot evil' | {shlex.quote(str(cron))} - ; exec sleep 30", tmp_path, env, said.append)
+    assert tabf.read_text() == "0 1 * * * keep\n"
+    assert any("host guard: FAILED" in s for s in said), said
+
+
+def test_a_ttp_checks_command_stopped_mid_run_still_restores_and_reports_a_host_change(tmp_path, monkeypatch):
+    from ttp import checkwall, cli, push
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    _ledger(monkeypatch)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    monkeypatch.setattr(checkwall, "wait", _stopped_after_write(tabf))
+    log = tmp_path / "checks.log"
+    with open(log, "w") as out, pytest.raises(SystemExit):
+        cli._run_check(["sh", "-c", f"echo '@reboot evil' | {shlex.quote(str(cron))} - ; exec sleep 30"], True,
+                       cwd=tmp_path, stdout=out, stderr=subprocess.STDOUT, env=env)
+    assert tabf.read_text() == "0 1 * * * keep\n"
+    assert "host guard: FAILED" in log.read_text()
+
+
+def test_a_stopped_guard_reports_once_and_never_masks_the_stop(monkeypatch):
+    from ttp import hoststate
+    monkeypatch.setattr(hoststate, "snapshot", lambda: {"crontab": None, "units": {}})
+    g = hoststate.Guard({})
+    g.end()
+    monkeypatch.setattr(hoststate, "snapshot", lambda: 1 / 0)
+    said = []
+    g.stopped(said.append)   # already ended: nothing twice
+    g2 = hoststate.Guard.__new__(hoststate.Guard)
+    g2.done, g2.store, g2.since, g2.before = False, None, 0, {}
+    g2.stopped(said.append)   # its compare fails: swallowed
+    assert said == []
+
+
+def test_a_batch_check_stopped_mid_run_still_restores_and_reports_a_host_change(tmp_path, monkeypatch, capsys):
+    from ttp import batch, push
+    cron, tabf, _ = _fake_host(tmp_path, monkeypatch, "0 1 * * * keep\n")
+    _ledger(monkeypatch)
+    env = push.check_env("checks", run_dir=str(tmp_path / "run"))
+    stop = _stopped_after_write(tabf)
+
+    class Stopped(subprocess.Popen):
+        def wait(self, timeout=None):
+            if timeout is None or timeout > 60:   # the run's own wait, not the kill's grace
+                stop(self)
+            return super().wait(timeout)
+    monkeypatch.setattr(batch.subprocess, "Popen", Stopped)
+    with pytest.raises(SystemExit):
+        batch._streamed(f"echo '@reboot evil' | {shlex.quote(str(cron))} - ; exec sleep 30", tmp_path, env, 3600,
+                        True, (), None)
+    assert tabf.read_text() == "0 1 * * * keep\n"
+    assert "host guard: FAILED" in capsys.readouterr().out

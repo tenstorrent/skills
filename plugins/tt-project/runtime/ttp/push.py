@@ -4250,6 +4250,7 @@ def _run_one(cmd: Any, repo: Path, env: dict, say: Callable[[str], None]) -> int
         except BaseException:   # stopped (run_detached's SIGTERM): the check ends with it, as run() did
             proc.kill()
             proc.wait()
+            guard.stopped(say)   # a change made before the stop: restored and reported, not the next baseline
             raise
         finally:
             _end_group(proc.pid)

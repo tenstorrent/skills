@@ -22,7 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import sshcmd
+from . import hoststate, sshcmd
 from .project import HOME_DIR, durable_write
 
 # The forward's own connection, never a shared master's (an agent without both is replaced).
@@ -72,7 +72,7 @@ def launchd_plist(name: str, argv: list[str]) -> dict:
 def service_file(name: str, platform: str | None = None) -> Path:
     if (platform or sys.platform) == "darwin":
         return Path.home() / "Library" / "LaunchAgents" / f"{label(name)}.plist"
-    return Path.home() / ".config" / "systemd" / "user" / f"{label(name)}.service"
+    return hoststate.unit_dir() / f"{label(name)}.service"   # a test run's fake under its marker
 
 
 def installed(name: str, platform: str | None = None) -> dict | None:
@@ -97,7 +97,7 @@ def installed(name: str, platform: str | None = None) -> dict | None:
 
 
 def _run(*argv: str) -> subprocess.CompletedProcess:
-    return subprocess.run(list(argv), capture_output=True, text=True, timeout=60)
+    return subprocess.run(hoststate.argv(argv), capture_output=True, text=True, timeout=60)
 
 
 def _stop(name: str, platform: str) -> None:

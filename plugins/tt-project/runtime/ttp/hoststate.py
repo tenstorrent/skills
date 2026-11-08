@@ -280,9 +280,11 @@ class Guard:
         self.store = (env if env is not None else os.environ).get(MARKER)
         self.since = time.time()
         self.before = snapshot()
+        self.done = False
 
     def end(self) -> tuple[bool, list[str]]:
         """(the real state changed, the lines to report)."""
+        self.done = True
         said = []
         if writes := faked_writes(self.store, self.since):
             said.append("host guard: these calls went to the run's fake store, never the host: " + "; ".join(writes[:10]))
@@ -296,3 +298,15 @@ class Guard:
                         + (f"Restore problems: {'; '.join(errors)}" if errors else "Restored as it was before the run")
                         + f"; {ledger}")
         return bool(d), said
+
+    def stopped(self, say) -> None:
+        """end() on a stopped or failed run's path, once its command is killed and reaped: each line to
+        `say`. Without it a change made before the stop would be the next run's baseline. A fault here
+        never masks the stop."""
+        if self.done:
+            return
+        try:
+            for line in self.end()[1]:
+                say(line)
+        except Exception:
+            pass

@@ -270,6 +270,15 @@ def _streamed(cmd, cwd: Path, env: dict | None, timeout: float | None, group: bo
     except subprocess.TimeoutExpired:
         timed_out = True
         _kill(proc)
+    except BaseException:   # stopped: the command ends with it, and a change it made is still put back
+        _kill(proc) if group else proc.kill()
+        try:
+            proc.wait(timeout=10)
+        except BaseException:
+            pass
+        if guard is not None:
+            guard.stopped(lambda line: print(line, flush=True))
+        raise
     reader.join(timeout=10)      # a child that left the group may keep the pipe open; do not wait on it
     rc = proc.returncode
     if guard is not None:
