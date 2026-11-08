@@ -611,6 +611,10 @@ def test_checks_alive_finished_or_stopped_on_this_boot_are_not_restarted(env, tm
     p.db.x("INSERT INTO events(ts,source,kind,fingerprint,severity,text,status,task) VALUES(?,?,?,?,?,?,?,?)",
            (time.time(), "daemon", "checks_stopped", f"checks_stopped:{run_dir}:{info['pid']}:{info['started']}",
             "low", "stopped", "handled", stopped))
+    unjudged = p.db.add_task("no start time", "s", kind="code", tier="light", origin="user")
+    run_dir = _crashed_checks(p, tmp_path, d, unjudged)   # a pid with no start time cannot be judged dead
+    info = json.loads((run_dir / cli.CHECKS_PID).read_text())
+    (run_dir / cli.CHECKS_PID).write_text(json.dumps({k: v for k, v in info.items() if k != "started"}))
     earlier = p.db.add_task("earlier boot", "s", kind="code", tier="light", origin="user")
     _checks_killed_by_reboot(p, tmp_path, earlier)   # the reboot path's, not this one's
     d.relaunch_dead_checks()
