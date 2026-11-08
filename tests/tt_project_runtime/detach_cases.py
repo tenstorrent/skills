@@ -3304,3 +3304,49 @@ def test_detach_stop_ends_the_jobs_helpers_in_other_groups_of_its_session_and_th
                 os.kill(x, signal.SIGKILL)
             except OSError:
                 pass
+
+
+def test_guard_or_lets_a_failed_detach_check_exit_4_past_its_fallback_and_leaves_other_probes_alone():
+    """`ttp detach --check x.rc || test "$(date +%s)" -ge <t>` would hide the check's exit 4 (jobs ended,
+    one failed) behind the fallback: guard_or makes a 4 exit 4, keeps 0 and "still running" as before."""
+    from ttp import detach
+    g = detach.guard_or
+    assert g('ttp detach --check a.rc || test "$(date +%s)" -ge 9') == \
+        'ttp detach --check a.rc || { [ $? -eq 4 ] && exit 4; test "$(date +%s)" -ge 9; }'
+    for same in ("ttp detach --check a.rc", "ttp lock --probe x || true", "ttp detach --check a.rc && true",
+                 "(ttp detach --check a.rc || true); x", "echo 'detach --check a || b'", None):
+        assert g(same) == same
+    # `||` in quotes is not an operator; a chain guards each fallback; a second pass changes nothing.
+    assert g('ttp detach --check "a || b.rc" || false && x') == \
+        'ttp detach --check "a || b.rc" || { [ $? -eq 4 ] && exit 4; false; } && x'
+    chain = g("ttp detach --check a.rc || ttp detach --check b.rc || true")
+    assert chain.count("exit 4") == 2 and g(chain) == chain
+    run = lambda probe: subprocess.run(["sh", "-c", probe], capture_output=True, text=True)
+    for a, b, rc, out in ((0, 0, 0, ""), (1, 0, 0, ""), (4, 0, 4, ""), (1, 4, 4, ""), (1, 1, 0, "fb")):
+        r = run(g(f'sh -c "exit {a}" detach --check || sh -c "exit {b}" detach --check || echo fb'))
+        assert (r.returncode, r.stdout.strip()) == (rc, out), (a, b, r)
+
+
+def test_a_hand_offs_detach_check_feeding_a_fallback_is_stored_guarded_with_its_own_text_kept(env, monkeypatch,
+                                                                                              tmp_path):
+    """The daemon stores a waiting hand-off's `detach --check x.rc || <time>` guarded (retry_when_orig keeps
+    the worker's text), so a failed job exits 4 and wakes the task as a failed job, not at the fallback."""
+    p = make(env)
+    from ttp import daemon as dmod
+    from ttp import detach
+    monkeypatch.setattr(dmod, "PROBE_EVERY_S", 0)
+    d = dmod.Daemon(p.base)
+    rc = tmp_path / "job.rc"
+    probe = f'ttp detach --check {rc} || test "$(date +%s)" -ge 4102444800'
+    monkeypatch.setenv("TTP_FAKE_RESULT", json.dumps({
+        "status": "waiting", "summary": "job running", "waiting_for": "the job", "retry_after_s": 900,
+        "retry_when": probe}))
+    tid = p.db.add_task("waits on a job", "s", kind="work", tier="light", origin="user")
+    assert _run_until(d, p, lambda: p.db.one("SELECT id FROM events WHERE kind='task_waiting' AND task=?", (tid,)))
+    res = json.loads(p.db.task(tid)["result"])
+    assert res["retry_when"] == detach.guard_or(probe) != probe and res["retry_when_orig"] == probe, res
+    rc.write_text("3\n")
+    stored = res["retry_when"].replace("ttp detach", f"{sys.executable} -m ttp detach", 1)
+    r = subprocess.run(["sh", "-c", stored], capture_output=True, text=True,
+                       env={**os.environ, "PYTHONPATH": str(Path(dmod.__file__).parent.parent)})
+    assert r.returncode == detach.FAILED_RC and detach.failed_check(res["retry_when"], r.returncode), r

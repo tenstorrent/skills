@@ -85,6 +85,60 @@ def failed_check(probe: str, rc) -> bool:
     that the probe itself is broken: the daemon then runs the hand-off's on_pass_cmd or wakes the task
     with the job's exit code, never as a passed probe."""
     return rc == FAILED_RC and bool(CHECK_RE.search(probe or ""))
+def _top_ops(text: str) -> list[tuple[int, str]]:
+    """(index, operator) of each `||`, `&&`, `;`, `&`, newline and closing `)`/`}` of `text` outside
+    quotes, backslash escapes and nested parentheses or braces; a closer ends the list."""
+    out, depth, i, q = [], 0, 0, ""
+    while i < len(text):
+        c = text[i]
+        if q:
+            if c == "\\" and q == '"':
+                i += 1
+            elif c == q:
+                q = ""
+        elif c == "\\":
+            i += 1
+        elif c in "'\"":
+            q = c
+        elif c in "({":
+            depth += 1
+        elif c in ")}":
+            if depth == 0:
+                out.append((i, c))
+                return out
+            depth -= 1
+        elif depth == 0 and text.startswith(("||", "&&"), i):
+            out.append((i, text[i:i + 2]))
+            i += 1
+        elif depth == 0 and c in ";&\n":
+            out.append((i, c))
+        i += 1
+    return out
+
+
+def guard_or(probe: str) -> str:
+    """`probe` with the fallback of each top-level `<... detach --check ...> || <fallback>` rewritten so
+    the check's FAILED_RC (jobs ended, one failed) exits FAILED_RC instead of running the fallback:
+    written as `ttp detach --check x.rc || test "$(date +%s)" -ge <t>`, a failed job would sleep until
+    <t>. Other exits reach the fallback as before. Checks inside parentheses or braces stay as written;
+    a probe with no such `||` comes back unchanged."""
+    if not isinstance(probe, str) or not CHECK_RE.search(probe):
+        return probe
+    ops = _top_ops(probe)
+    stop = ops[-1][0] if ops and ops[-1][1] in ")}" else len(probe)
+    ops = [o for o in ops if o[1] not in ")}"]
+    cuts = [0] + [i + len(op) for i, op in ops]
+    ends = [i for i, _ in ops] + [stop]
+    parts, wrap = [], False
+    for n, (lo, hi) in enumerate(zip(cuts, ends)):
+        word = probe[lo:hi]
+        if wrap and word.strip() and not word.strip().startswith(f"{{ [ $? -eq {FAILED_RC} ]"):
+            word = f" {{ [ $? -eq {FAILED_RC} ] && exit {FAILED_RC}; {word.strip()}; }}" + (" " if n < len(ops) else "")
+        parts.append(word + (ops[n][1] if n < len(ops) else ""))
+        wrap = n < len(ops) and ops[n][1] == "||" and bool(CHECK_RE.search(probe[lo:hi]))
+    return "".join(parts) + probe[stop:]
+
+
 def _checked(probe: str, cwd=None) -> list[Path]:
     """The local .rc paths a probe's `detach --check` names, relative to `cwd` (none for a --host one)."""
     words = shlex.split(probe or "")

@@ -220,6 +220,7 @@ No `result.json`, no credit.
   A known sequence of waits (checks, then `landed:#<id>`): list the later ones in `then` (up to 4,
   each may add `on_pass_cmd`, `retry_after_s`); the daemon moves through them model-free.
   An exit-0 probe's `probe_match` (`pass`/`fail`/`wait` substrings) and `on_pass` (`{probe_out}` ok) settle clear hits model-free.
+  Never feed a `detach --check` to `||` (a fallback hides its exit 4); put a time limit in `then`.
 <!-- ttp:if remote -->
   For a job on another machine (a device job uses a listed device runner instead), start its driver there with `ttp detach --remote <ssh alias> <name> -- <command...>`
   (also a chain that only drives it over ssh), set `"survives_reboot": true` and use the `retry_when` it

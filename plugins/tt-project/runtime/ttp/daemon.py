@@ -7667,6 +7667,13 @@ class Daemon:
                       "retry_when_refused": result["retry_when"][:200]}
         if rstatus == "waiting" and isinstance(result.get("retry_when"), str):
             result = self._pin_handoff_probe(task, r, run_dir, result)
+            if isinstance(result.get("retry_when"), str) \
+                    and (guarded := detach.guard_or(result["retry_when"])) != result["retry_when"]:
+                # `detach --check x.rc || <fallback>` would hide a failed job behind the fallback.
+                log(self.p, f"task {task['id']} hand-off: a failed detach check now exits "
+                            f"{detach.FAILED_RC} past its || fallback: {guarded[:300]}")
+                result = {**result, "retry_when": guarded,
+                          "retry_when_orig": result.get("retry_when_orig", result["retry_when"])}
             result, how = checks_settle_fill(task, result, run_dir, push._own_ttp(self.p))
             if how:
                 log(self.p, f"task {task['id']} hand-off: its checks wait {how}")
