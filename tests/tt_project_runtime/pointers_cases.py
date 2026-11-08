@@ -22,11 +22,12 @@ def test_a_reply_pointing_below_with_nothing_after_it_is_refused_naming_the_phra
     assert _out(p) == []
 
 
-def test_a_pointer_as_the_last_line_or_a_bare_trailing_colon_is_refused():
+def test_a_pointer_as_the_last_line_is_refused_and_a_bare_trailing_colon_is_not():
     from ttp import pointers
     assert pointers.dangling("All three landed.\n\nFollow-up below") == ["Follow-up below"]
     assert pointers.dangling("Done.\nMore on the cost below:\n\n") == ["below"]
-    assert pointers.dangling("Here is what is left:") == ["Here is what is left:"]
+    assert pointers.dangling("Here is what is left:") == []   # no pointer phrase: not refused
+    assert pointers.dangling("ack: Project created. Brief:") == []
     assert pointers.dangling("Follow-up below. Status is green.") == ["Follow-up below"]   # same line: no section
     assert pointers.dangling("follow-up below, and again: follow-up below.") == ["follow-up below"]   # once
 

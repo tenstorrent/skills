@@ -10,8 +10,8 @@ persistent session's alike, whatever the provider. A pointer is (POINTER):
   or after a word naming a section ("details below", "follow-up below", "steps below"), unless a
   number, an article or a comparison word follows it ("below the cap", "below 30 GB");
 - any other "below" at a clause end ("it is below.", "more on that below:") or a line end;
-- "as follows", and "the following" with at most three words then a colon;
-- a colon ending the text.
+- "as follows", and "the following" with at most three words then a colon.
+A bare colon ending the text is no pointer by itself ("ack: Brief:" quotes a line).
 A "below" pointer is answered by a later non-empty line (a paragraph, a list item, a heading) or by
 text right after its colon on the same line ("follow-up below: #12 lands today"); "as follows" and
 "the following ...:" by any text after them. A line that is only the AI-authorship tag is no content.
@@ -84,9 +84,6 @@ def dangling(text: str, later: list[str] | tuple = ()) -> list[str]:
             ok = _has_content(line_rest) or _has_content(after)
         if not ok and (phrase := " ".join(m.group(0).split())) not in out:
             out.append(phrase)
-    stripped = text.rstrip()
-    if stripped.endswith(":") and not _has_content(tail) and not out:
-        out.append(stripped.splitlines()[-1].strip())
     return out
 
 
