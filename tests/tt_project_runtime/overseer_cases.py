@@ -79,6 +79,46 @@ def test_a_dispatch_hold_on_urgent_work_is_no_results_failure(env, monkeypatch):
     assert overseer.measure(p, now)["failing"] == ["urgent work ready with a free slot for 15 min"]
 
 
+def test_an_urgent_review_held_on_its_running_prechecks_is_no_results_failure(env, monkeypatch):
+    """The daemon keeps a review out of dispatch while the checks it started on its head run (no rc,
+    pid alive), for up to PRECHECK_HOLD_S: the overseer reads the same hold, so no FAILING and no
+    incident. Once the checks ended or the hold ran out, the waiting review fails as before."""
+    from ttp import overseer
+    from ttp.cli import CHECKS_PID, CHECKS_RC
+    from ttp.daemon import PRECHECK_HOLD_S, PRECHECKS_DIR, Daemon
+    from ttp.runner import proc_start
+    now = time.time()
+    dumps = []
+    monkeypatch.setattr(overseer, "capture_stacks", lambda p, now, why: dumps.append(why))
+    p = _stalled_loop(env, now)
+    p.db.x("UPDATE runs SET status='done'")   # only the urgent wait is left to judge
+    tid = p.db.one("SELECT id FROM tasks")["id"]
+    name = f"t{tid - 1}-0123456789ab"
+    p.db.x("UPDATE tasks SET kind='review', labels=? WHERE id=?", (json.dumps([f"precheck:{name}"]), tid))
+    out = p.state / PRECHECKS_DIR / name
+    out.mkdir(parents=True)
+
+    def started(ts):
+        (out / CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": proc_start(os.getpid()), "ts": ts}))
+
+    started(now - 600)
+    assert Daemon(p.base)._precheck_holds(p.db.task(tid), now), "the daemon holds it: the same test"
+    h = overseer.check(p, now)
+    text = overseer.line(h, now)
+    assert h["failing"] == [] and (h["urgent_ready"], h["urgent_held"]) == (1, 1), h
+    assert "urgent ready 1 (1 held: its review's prechecks are running)" in text and "FAILING" not in text, text
+    assert dumps == [] and not (p.state / overseer.INCIDENTS_FILE).exists()
+    stalled = ["urgent work ready with a free slot for 15 min"]
+    (out / CHECKS_RC).write_text("0\n")   # the checks ended: the reviewer should have started
+    assert overseer.measure(p, now)["failing"] == stalled
+    (out / CHECKS_RC).unlink()
+    started(now - PRECHECK_HOLD_S - 1)   # still running, but the daemon no longer waits for them
+    assert overseer.measure(p, now)["failing"] == stalled
+    started(now - 600)
+    (out / CHECKS_PID).write_text(json.dumps({"pid": os.getpid(), "started": "not this process", "ts": now - 600}))
+    assert overseer.measure(p, now)["failing"] == stalled   # their process is gone
+
+
 def test_the_health_line_reaches_the_digest_status_and_deployed(env, monkeypatch):
     from ttp import cli, coordinator, overseer
     now = time.time()

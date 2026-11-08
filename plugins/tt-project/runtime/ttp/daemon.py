@@ -374,6 +374,22 @@ def precheck_run_id(out: Path) -> str:
     so labels built from it (checkcap.label) name the folder, as checklane.open_precheck reads them."""
     return f"precheck-{Path(out).name}"
 PRECHECK_HOLD_S, PRECHECK_KEEP_S = 3600, 7 * 86400
+
+
+def precheck_holds(state: Path, task: dict, now: float) -> bool:
+    """Review `task` waits for the checks the daemon started on its head (Daemon._precheck) while they
+    run, at most PRECHECK_HOLD_S after they started. Read-only: files under `state` only, so the
+    overseer reads the same hold (Daemon._precheck_holds)."""
+    if task["kind"] != "review":
+        return False
+    name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
+    if not name or "/" in name:
+        return False
+    from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
+    out = Path(state) / PRECHECKS_DIR / name
+    info = _read_checks_pid(out)
+    return (not (out / CHECKS_RC).exists() and _checks_alive(info)
+            and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
 # A failed review with fix specs gets its fix and re-review from the daemon this many rounds per stack;
 # the re-review repeats the failed review's spec (its push and after-push steps) up to this length.
 AUTO_FIX_ROUNDS, REVIEW_FIX_SPEC_CHARS = 2, 8000
@@ -16487,16 +16503,7 @@ class Daemon:
     def _precheck_holds(self, task: dict, now: float) -> bool:
         """A review waits for the checks the daemon started on its head (_precheck) while they run,
         at most PRECHECK_HOLD_S after they started: the reviewer then reads their result at once."""
-        if task["kind"] != "review":
-            return False
-        name = next((x[len(PRECHECK_LABEL):] for x in push._labels(task) if x.startswith(PRECHECK_LABEL)), "")
-        if not name or "/" in name:
-            return False
-        from .cli import CHECKS_RC, _checks_alive, _read_checks_pid
-        out = self.p.state / PRECHECKS_DIR / name
-        info = _read_checks_pid(out)
-        return (not (out / CHECKS_RC).exists() and _checks_alive(info)
-                and now - float(info.get("ts") or 0) < PRECHECK_HOLD_S)
+        return precheck_holds(self.p.state, task, now)
 
     def _precheck_words(self, task: dict) -> str:
         """What the checks _precheck_holds waits for are doing, in words: waiting for a host checks slot

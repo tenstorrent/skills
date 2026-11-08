@@ -11,8 +11,9 @@ lock), reads the run folders and writes RESULTS to state/HEALTH_FILE:
 - last_dispatch: when a worker run last started;
 - urgent_wait_s: how long the oldest ready urgent task waits while a worker slot is free, counting only
   the tasks dispatch would start: urgent_held / urgent_hold count and name those a hold keeps out (the
-  project paused, its provider's saved budget gate allowing no new work, a paused resource it names, or
-  a dispatch_hold the daemon recorded since it became ready). Accepted gap: the overseer reads no live
+  project paused, its provider's saved budget gate allowing no new work, a paused resource it names, a
+  review held while the checks the daemon started on its head run (daemon.precheck_holds, the daemon's
+  own test), or a dispatch_hold the daemon recorded since it became ready). Accepted gap: the overseer reads no live
   lock or slot state, so a hold that ended after its record still reads as held until the task changes;
 - unreaped / unreaped_s: finished runs (exit.json on disk) still `running`, and the oldest one's age;
 - unapplied / unapplied_s: the same for coordinator runs (an answer finished but not applied);
@@ -71,9 +72,11 @@ def _age(now: float, ts) -> float | None:
     return max(0.0, now - float(ts)) if ts else None
 
 
-def _hold(d, task: dict, since: float, cfg: dict) -> str:
-    """What keeps ready `task` out of dispatch, read from the database only (module doc), or ''."""
+def _hold(d, task: dict, since: float, cfg: dict, state: Path, now: float) -> str:
+    """What keeps ready `task` out of dispatch, read from the database and the precheck folders only
+    (module doc), or ''."""
     from .coordinator import task_resources
+    from .daemon import precheck_holds
     if d.kv("paused", False):
         return "the project is paused"
     g = (d.kv("gates") or {}).get(task["provider"] or cfg.get("core_provider", "claude"))
@@ -86,6 +89,8 @@ def _hold(d, task: dict, since: float, cfg: dict) -> str:
         paused = d.paused_resources(shared=False)
     if task_resources(task) & paused.keys():
         return "a resource it needs is paused"
+    if precheck_holds(state, task, now):
+        return "its review's prechecks are running"
     ev = d.one("SELECT text FROM events WHERE kind='dispatch_hold' AND task=? AND ts>=? ORDER BY ts DESC LIMIT 1",
                (task["id"], since))
     return (ev["text"] or "a resource it needs is held")[:80] if ev else ""
@@ -119,7 +124,7 @@ def measure(p: Project, now: float | None = None) -> dict:
             if not urgent.is_urgent(t):
                 continue
             since = max(float(t["updated"] or t["created"] or now), float(t["not_before"] or 0))
-            why = _hold(d, t, since, cfg)
+            why = _hold(d, t, since, cfg, p.state, now)
             (holds if why else waits).append(why or _age(now, since))
         h["urgent_ready"] = len(waits) + len(holds)
         h["urgent_held"], h["urgent_hold"] = len(holds), (holds[0] if holds else "")
