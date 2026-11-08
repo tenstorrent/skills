@@ -935,6 +935,15 @@ def test_gate_judge_calls_a_failure_pre_existing_only_when_base_and_head_fail_th
     m = gatejudge.marks(_fails({a: ("assert '/tmp/pytest-of-u/pytest-41/t0' at 0x7f01", "t.py:3")})[1], [a])[a]
     m2 = gatejudge.marks(_fails({a: ("assert '/tmp/pytest-of-u/pytest-42/t0' at 0x7f99", "t.py:3")})[1], [a])[a]
     assert gatejudge.same_failure(m, m2) and m["at"] == "t.py:3: AssertionError"
+    # The random part of a temp name (mkdtemp's, mktemp's) is not a difference either: one failure on the
+    # head and the base of a spill host differs only by it.
+    for x, y in (("homes/home-y7h9wyh0", "homes/home-w56a_m92"), ("homes/home-biknwoxz", "homes/home-q3k_0zz1"),
+                 ("/tmp/ttp-check.T6w5cg3S/out", "/tmp/ttp-check.a8Zq01bX/out")):
+        m = gatejudge.marks(_fails({a: (f"AssertionError: '/tmp/pytest-of-u/pytest-350/t0/{x}' left", "t.py:3")})[1], [a])[a]
+        m2 = gatejudge.marks(_fails({a: (f"AssertionError: '/tmp/pytest-of-u/pytest-351/t0/{y}' left", "t.py:3")})[1], [a])[a]
+        assert gatejudge.same_failure(m, m2), (m, m2)
+    m2 = gatejudge.marks(_fails({a: ("AssertionError: '/tmp/pytest-of-u/pytest-351/t0/homes/home-y7h9wyh0' gone", "t.py:3")})[1], [a])[a]
+    assert not gatejudge.same_failure(m, m2)
     # A base rerun that errors (exit 4) or selects nothing (exit 5, a test the base does not have) never
     # makes the failure pre-existing.
     for n, rc in enumerate((4, 5)):

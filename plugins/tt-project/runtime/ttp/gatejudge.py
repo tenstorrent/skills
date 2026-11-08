@@ -148,12 +148,17 @@ def failed_of(rc: int | None, output: str, ids: list[str], at: str = "base") -> 
     return set(ids) & set(got) if complete else None
 
 
+# The random end of a temp name inside a path: 6 to 12 name characters after a "-" or ".", ending the path part.
+_TEMP_SUFFIX = re.compile(r"(?<=[-.])[A-Za-z0-9_]{6,12}(?=[/'\"]|$)")
+
+
 def _mark_norm(text: str) -> str:
-    """`text` with what differs between two runs of one failure left out: addresses, temp names and the
-    numbers in paths (pytest's numbered temp folders). Other numbers stay: `assert 5 == 0` (a run that
-    selected nothing) is not `assert 1 == 0`."""
+    """`text` with what differs between two runs of one failure left out: addresses, temp names, the random
+    part of a temp name in a path (mkdtemp's `home-y7h9wyh0`, mktemp's `check.T6w5cg3S`) and the numbers
+    in paths (pytest's numbered temp folders). Other numbers stay: `assert 5 == 0` (a run that selected
+    nothing) is not `assert 1 == 0`."""
     text = re.sub(r"0x[0-9a-fA-F]+", "N", re.sub(r"\btmp[\w-]+", "tmp", text or ""))
-    text = re.sub(r"\S*/\S*", lambda m: re.sub(r"\d+", "N", m.group(0)), text)
+    text = re.sub(r"\S*/\S*", lambda m: re.sub(r"\d+", "N", re.sub(_TEMP_SUFFIX, "X", m.group(0))), text)
     return re.sub(r"\s+", " ", text).strip()[:MARK_MAX]
 
 
