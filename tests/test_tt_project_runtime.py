@@ -49738,3 +49738,79 @@ def test_startcheck_reports_a_dangling_worktrees_symlink(env, monkeypatch):
     startcheck.check(p, task)
     obs = p.db.q("SELECT * FROM events WHERE kind='observation' AND fingerprint LIKE 'dangling-root:%'")
     assert len(obs) == 1 and obs[0]["severity"] == "high"
+
+
+# Forks of the coordinator's session: book only the run's own cost ------------------------------------
+
+def _fork_run(d, *, cost=None, out_tokens=0, status="running"):
+    """A task run that started as a fork of the coordinator's session S0."""
+    db = d.p.db
+    tid = db.add_task("fix", "", kind="code", tier="standard", priority=1, budget_usd=8.0, labels=[])
+    note = {"coord_context": {"how": "fork", "why": "", "session": "S0", "tokens": 240000}, "session_id": "F1"}
+    rid = db.x("INSERT INTO runs(task,role,provider,model,started,ended,status,cost_usd,output_tokens,session_id,note) "
+               "VALUES(?,'worker','claude','claude-opus-4-1',?,?,?,?,?,'F1',?)",
+               (tid, time.time() - 600, None if status == "running" else time.time() - 60, status, cost,
+                out_tokens, json.dumps(note)))
+    if cost:
+        db.x("UPDATE tasks SET spent_usd=? WHERE id=?", (cost, tid))
+    return tid, db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def _own(out_tokens):
+    from ttp import localspend
+    return round(localspend.price("claude-opus-4-1", {"output_tokens": out_tokens}, overrides=localspend.overrides())[0], 6)
+
+
+def test_a_forked_run_books_only_its_own_tokens_not_the_coordinator_session(env):
+    """Claude Code's total_cost_usd for a fork includes the parent session's cost: book this run's own
+    tokens at list price; with no tokens book the report (over-booking is the safe failure)."""
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    _, r = _fork_run(d)
+    own = _own(20_000)
+    u = _reported(own + 11.89, output_tokens=20_000)
+    assert abs(d._net_of_session(r, u) - own) < 1e-6, "a fork booked the coordinator session's cost"
+    assert abs(u.extra["fork_base_usd"] - 11.89) < 1e-6 and "session_cost_usd" in u.extra
+    u = _reported(12.89)   # no own tokens to price: the report stands
+    assert d._net_of_session(r, u) == 12.89 and "session_cost_usd" not in u.extra
+    u = _reported(own / 2, output_tokens=20_000)   # a report below its own tokens is its own cost
+    assert d._net_of_session(r, u) == own / 2
+    plain = dict(r, note=json.dumps({"coord_context": {"how": "disk"}}))
+    assert d._net_of_session(plain, _reported(30.0, output_tokens=20_000)) == 30.0, "a disk-context run was netted"
+
+
+def test_a_resume_of_a_forked_session_nets_against_its_reported_total(env):
+    """A later resume of a forked session nets against the highest total an earlier run of it
+    reported (which includes the parent's cost), not only against what it booked."""
+    p = make(env)
+    p.set_config("budget.estimate_usd_per_mtok", 1.0)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db = d.p.db
+    tid, r = _fork_run(d, cost=1.0, out_tokens=200_000, status="lost")
+    db.x("UPDATE runs SET note=? WHERE id=?",
+         (json.dumps({**json.loads(r["note"]), "session_cost_usd": 12.89, "fork_base_usd": 11.89}), r["id"]))
+    rid = db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+               "VALUES(?,'worker','claude','opus',?,'running',?,?)",
+               (tid, time.time() - 60, d.boot, json.dumps({"resumes": {"run": r["id"], "session": "F1"}})))
+    again = db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    u = _reported(14.89, output_tokens=400_000)   # the session added $2.00; its tokens price near it
+    assert abs(d._net_of_session(again, u) - 2.0) < 1e-6, "the resume re-booked the parent's cost"
+
+
+def test_forked_runs_booked_before_the_fix_are_re_netted_once_with_their_task_spend(env):
+    p = make(env)
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    db = d.p.db
+    own = _own(20_000)
+    tid, r = _fork_run(d, cost=own + 11.89, out_tokens=20_000, status="done")
+    _, plain = _fork_run(d, cost=4.0, out_tokens=0, status="done")   # no own tokens: left as booked
+    changed = d.renet_fork_runs()
+    assert [c[0] for c in changed] == [r["id"]]
+    row = db.one("SELECT cost_usd, note FROM runs WHERE id=?", (r["id"],))
+    assert abs(row["cost_usd"] - own) < 1e-6 and "fork_base_usd" in json.loads(row["note"])
+    assert abs(db.task(tid)["spent_usd"] - own) < 1e-6, "the task kept the phantom spend"
+    assert db.one("SELECT cost_usd FROM runs WHERE id=?", (plain["id"],))["cost_usd"] == 4.0
+    assert d.renet_fork_runs() == [], "a second pass changed rows again"

@@ -626,6 +626,7 @@ NET_LOST_RE = re.compile(r"Can't reach the API server|ENOTFOUND|EAI_AGAIN")
 SESSION_NET_AGREE = 0.5
 SESSION_NET_SLACK_USD = 0.05
 COORD_RENET_KEY = "coord_session_renet"   # Daemon.renet_coord_sessions ran (once per project)
+FORK_RENET_KEY = "fork_run_renet"   # Daemon.renet_fork_runs ran (once per project)
 REACH_EVERY_S = 30      # while a provider is held offline, how often its API host is resolved again
 REACH_TIMEOUT_S = 5
 NET_HOLD_MAX_S = 900    # a held provider still lets one run try this often: a lookup that keeps failing never holds forever
@@ -1325,6 +1326,13 @@ class Daemon:
                             + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
         except Exception:   # a spend correction must never keep the daemon from starting
             log(self.p, "coordinator session re-net error: " + traceback.format_exc().replace("\n", " | ")[:2000])
+        try:   # forked worker and review runs booked with the coordinator session's cost, once
+            if changed := self.renet_fork_runs():
+                log(self.p, f"re-netted {len(changed)} forked run(s): "
+                            f"${sum(c[1] for c in changed):.2f} booked -> ${sum(c[2] for c in changed):.2f} ("
+                            + ", ".join(f"run {i} ${a:.2f}->${b:.2f}" for i, a, b in changed[:40]) + ")")
+        except Exception:   # a spend correction must never keep the daemon from starting
+            log(self.p, "forked run re-net error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         try:   # push batch files left `running` by a batch whose row is final (pushq.close_strays)
             if closed := pushq.close_strays(self.p):
                 log(self.p, f"closed {len(closed)} stray push batch file(s)")
@@ -4500,24 +4508,53 @@ class Daemon:
         coordinator session wake (note.turn.session.mode 'resume') is netted the same way, over the
         session's earlier wakes (runs.session_id, task IS NULL). Its token counts need no netting:
         they come from the result's own usage, which covers this run only (the cumulative
-        modelUsage and duration_api_ms are not read)."""
+        modelUsage and duration_api_ms are not read).
+        A run that started as a fork of the coordinator's session (note coord_context.how 'fork') reports
+        the parent session's total too: its first run books its own tokens priced (fork_base_usd keeps the
+        rest), and a later resume of that session nets against the highest total an earlier run of it
+        reported, so the parent's cost is never booked again."""
         note = json.loads(r["note"] or "{}")
         session = (note.get("resumes") or {}).get("session") or _resumed_coord_session(r, note)
         reported = float(usage.cost_usd or 0)
         basis = usage.extra.get("cost_basis")   # chat runs (providers/chat.py)
-        if not session or reported <= 0 or basis == "pricing" or (usage.estimated and basis != "fallback"):
-            return usage.cost_usd
-        booked = self._session_booked(session, r["task"], r["id"])
-        if booked <= 0:
+        forked = ctxfork.forked(note) and not session
+        if (not session and not forked) or reported <= 0 or basis == "pricing" or (usage.estimated and basis != "fallback"):
             return usage.cost_usd
         own = bud.estimate_cost(self.p.db, self.cfg, r["provider"], r["model"] or "", {
             "input": usage.input_tokens, "output": usage.output_tokens,
             "cache_read": usage.cache_read_tokens, "cache_write": usage.cache_write_tokens})
+        if forked:
+            # The fork's report carries the coordinator session's whole cost up to the fork: book this
+            # run's own tokens at list price (the project's measured rate is itself inflated by forks
+            # booked before this fix). With no priced tokens nothing is netted (over-booking is safe).
+            own = _list_cost(r, usage) or own
+            if own > 0 and reported > own:
+                usage.extra["session_cost_usd"] = reported
+                usage.extra["fork_base_usd"] = round(reported - own, 6)
+                usage.cost_usd = round(own, 6)
+            return usage.cost_usd
+        booked = max(self._session_booked(session, r["task"], r["id"]),
+                     self._session_reported(session, r["task"], r["id"]))
+        if booked <= 0:
+            return usage.cost_usd
         delta = reported - booked
         if delta >= -1e-6 and delta >= own * SESSION_NET_AGREE - SESSION_NET_SLACK_USD:
             usage.extra["session_cost_usd"] = reported
             usage.cost_usd = round(max(delta, own, 0.0), 6)
         return usage.cost_usd
+
+    def _session_reported(self, session: str, task, before: int) -> float:
+        """The highest session total an earlier run of `session` (of `task`) reported (note
+        session_cost_usd): for a session forked from the coordinator's it includes the parent's cost,
+        which no run of it booked."""
+        best = 0.0
+        for o in self.p.db.q("SELECT note FROM runs WHERE id<? AND task IS ? AND session_id=? AND note LIKE ?",
+                             (before, task, session, '%session_cost_usd%')):
+            try:
+                best = max(best, float(json.loads(o["note"] or "{}").get("session_cost_usd") or 0))
+            except (ValueError, TypeError):
+                continue
+        return best
 
     def _session_booked(self, session: str, task, before: int | None = None) -> float:
         """What the runs of `session` (of `task`, None for the coordinator's) booked, those before run
@@ -4566,6 +4603,40 @@ class Daemon:
         db.set_kv(COORD_RENET_KEY, {"at": time.time(), "runs": len(changed),
                                     "usd_before": round(sum(c[1] for c in changed), 6),
                                     "usd_after": round(sum(c[2] for c in changed), 6)})
+        return changed
+
+    def renet_fork_runs(self) -> list[tuple[int, float, float]]:
+        """Once per project (kv FORK_RENET_KEY): worker and review runs that started as a fork of the
+        coordinator's session, booked before _net_of_session covered forks, carry the parent session's
+        cost. Re-book each at its own tokens priced, and take the difference off its task's spend, so
+        spend, the dollar caps, task budgets and top-ups count it once. A row already netted (its note
+        has session_cost_usd) is left alone, so a second pass changes nothing. Returns (run id, booked
+        before, booked after) of each row changed."""
+        db = self.p.db
+        if db.kv(FORK_RENET_KEY):
+            return []
+        changed = []
+        for r in db.q("SELECT * FROM runs WHERE task IS NOT NULL AND status!='running' AND cost_usd>0 "
+                      "AND note LIKE ? ORDER BY id", (f'%{ctxfork.KEY}%',)):
+            note = json.loads(r["note"] or "{}")
+            if "session_cost_usd" in note or not ctxfork.forked(note) or (note.get("resumes") or {}).get("session"):
+                continue
+            usage = RunUsage(cost_usd=float(r["cost_usd"]), input_tokens=r["input_tokens"] or 0,
+                             output_tokens=r["output_tokens"] or 0, cache_read_tokens=r["cache_read_tokens"] or 0,
+                             cache_write_tokens=r["cache_write_tokens"] or 0,
+                             estimated=bool(r["cost_estimated"]) or (r["cost_basis"] or "reported") != "reported")
+            before = usage.cost_usd
+            if self._net_of_session(r, usage) >= before or "session_cost_usd" not in usage.extra:
+                continue
+            note["session_cost_usd"] = usage.extra["session_cost_usd"]
+            note["fork_base_usd"] = usage.extra["fork_base_usd"]
+            db.x("UPDATE runs SET cost_usd=?, note=? WHERE id=?", (usage.cost_usd, json.dumps(note), r["id"]))
+            db.x("UPDATE tasks SET spent_usd=MAX(COALESCE(spent_usd,0)-?,0) WHERE id=?",
+                 (before - usage.cost_usd, r["task"]))
+            changed.append((r["id"], before, usage.cost_usd))
+        db.set_kv(FORK_RENET_KEY, {"at": time.time(), "runs": len(changed),
+                                   "usd_before": round(sum(c[1] for c in changed), 6),
+                                   "usd_after": round(sum(c[2] for c in changed), 6)})
         return changed
 
     def _outside_writes(self, r: dict, run_dir: Path) -> None:
@@ -17998,6 +18069,22 @@ def _resumed_coord_session(r: dict, note: dict) -> str:
     turn = note.get("turn") if isinstance(note.get("turn"), dict) else {}
     session = turn.get("session") if isinstance(turn.get("session"), dict) else {}
     return str(r["session_id"] or "") if session.get("mode") == "resume" else ""
+
+
+def _list_cost(r: dict, usage) -> float:
+    """A Claude run's own tokens at list price (localspend's table; an unknown model gets the dearest
+    row, so it over-books), or 0 for another provider or no tokens."""
+    if (r["provider"] or "") != "claude" or not _has_tokens(usage):
+        return 0.0
+    from . import localspend
+    try:
+        usd, _ = localspend.price(r["model"] or "", {
+            "input_tokens": usage.input_tokens, "output_tokens": usage.output_tokens,
+            "cache_read_input_tokens": usage.cache_read_tokens,
+            "cache_creation_input_tokens": usage.cache_write_tokens}, overrides=localspend.overrides())
+    except Exception:
+        return 0.0
+    return round(float(usd), 6)
 
 
 def _has_tokens(usage) -> bool:
