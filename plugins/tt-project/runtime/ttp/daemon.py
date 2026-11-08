@@ -1190,6 +1190,7 @@ class Daemon:
         self._kv_bad_seen: set[tuple[str, str]] = set()   # (kv key, bad value) already observed (_kv_map)
         self.p.db.set_kv(STEP_FAILING_KEY, {})   # counts start again with this daemon (an episode then clears)
         self._probes: dict[int, tuple[subprocess.Popen, float, str]] = {}   # running: proc, started, probe
+        self._probe_left: list[tuple] = []   # finished probes a cut-off tick left unhandled, with their texts
         self._probed: dict[int, float] = {}
         # task -> (what its probe runs: command, directory, environment; when its latest run started):
         # which runs another task may share (_start_probe)
@@ -12297,7 +12298,17 @@ class Daemon:
         self._check_hosts([h for _, proc, probe, rc in done if rc == netwait.UNREACHABLE_RC
                            for h in netwait.hosts(probe, outs[id(proc)])[:netwait.HOSTS_MAX]], now)
         self._end_down_episodes()
-        for tid, proc, probe, rc in done:
+        # Each verdict can finish a task (and review it), so the loop keeps its place: past the step's
+        # budget the rest wait, texts and all, for the next tick, which handles them first.
+        self._probe_left += [(tid, proc, probe, rc, outs[id(proc)], lines[id(proc)], raws.get(id(proc), ""))
+                             for tid, proc, probe, rc in done]
+        first = True
+        while self._probe_left:
+            tid, proc, probe, rc, outs[id(proc)], lines[id(proc)], raws[id(proc)] = self._probe_left[0]
+            if not first and self._step_over(f"task #{tid}'s probe result", tid):
+                break
+            first = False
+            del self._probe_left[0]   # before its verdict: a step stopped mid-verdict never repeats it
             task = db.task(tid)
             if task and _current_probe(task) != probe:
                 continue   # re-pointed (`set-when`) while it ran: its verdict is not the new probe's
@@ -12355,7 +12366,8 @@ class Daemon:
                 # A gh logout sleeps on to its timer (_hold_waiting folds it into the host's gh-auth alert).
                 self._wake_waiting(task, f"its probe's answer changed (exit {rc})", now)
         for gone_tid in [t for t in self._probe_ctx.keys() | self._probe_diag.keys()
-                         if t not in self._probes and t not in self._probe_rc]:
+                         if t not in self._probes and t not in self._probe_rc
+                         and all(t != left[0] for left in self._probe_left)]:
             self._probe_ctx.pop(gone_tid, None)
             self._probe_diag.pop(gone_tid, None)
         rows = self._resume_order("probe_waiting", db.q("SELECT * FROM tasks WHERE status='queued' AND not_before IS NOT NULL"))

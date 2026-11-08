@@ -2079,3 +2079,66 @@ def test_the_step_budget_is_a_known_watchdog_key_set_alone(env):
     assert not [x for x in project.config_problems(p.raw_config()) if "step_budget_s" in x]
     assert p.config()["watchdog"]["step_budget_s"] == 240 and p.config()["watchdog"]["hang_s"] == 900
     assert dmod.Daemon(p.base)._step_budget() == 240
+
+
+def test_finished_probes_a_cut_off_tick_leaves_are_handled_first_next_tick(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    tids = [_due_waiting_task(p, f"exit 1 # {n}") for n in range(3)]
+    d._run_step(d.probe_waiting)
+    assert sorted(d._probes) == tids
+    for proc, _, _ in list(d._probes.values()):
+        proc.wait(_load_scaled(30))
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0)   # spent at once: one verdict a tick
+    handled = []
+    for _ in range(3):
+        d._run_step(d.probe_waiting)
+        handled.append(sorted(d._probe_rc))
+    assert handled == [tids[:1], tids[:2], tids], "each tick handles one more verdict, none lost or repeated"
+    assert not d._probe_left and {d._probe_rc[t][0] for t in tids} == {1}
+    assert all(d._probe_diag.get(t) for t in tids), "a left verdict keeps what its run did"
+
+
+def test_probe_verdicts_cost_the_same_at_1000_and_10000_tasks(env, monkeypatch):
+    from ttp import daemon as dmod
+    p = make(env)
+    d = dmod.Daemon(p.base)
+
+    def checks_passed(task):   # a passed checks wait: its on_pass is recorded through the normal finish
+        if task["kind"] != "code":
+            return None
+        (run := p.base / "runs" / f"t{task['id']}").mkdir(parents=True, exist_ok=True)
+        rid = _run_row(p, task["id"], status="ok", run_dir=str(run))
+        return "pass", p.db.one("SELECT * FROM runs WHERE id=?", (rid,)), run, {"status": "done", "summary": "landed"}, "0" * 40
+    monkeypatch.setattr(d, "_checks_wait", checks_passed)
+
+    def verdict_tick():
+        # Passed ones record their on_pass through the normal finish, which reviews a code task.
+        tids = [_due_waiting_task(p, f"exit {n % 2} # {time.time()}", **({} if n % 2 else {
+            "on_pass": {"status": "done", "summary": "landed"}})) for n in range(4)]
+        for t in tids[::2]:
+            p.db.update_task(t, kind="code", branch=f"ttp/t{t}-work")
+        d._run_step(d.probe_waiting)
+        for proc, _, _ in list(d._probes.values()):
+            proc.wait(_load_scaled(30))
+        got = _per_call(p, monkeypatch, d.probe_waiting)
+        assert all(p.db.task(t)["status"] == "done" for t in tids[::2]), [(p.db.task(t)["status"], p.db.task(t)["result"][-400:]) for t in tids[::2]]
+        assert len(named) >= 2 * 3, "and each finish looked at every open review's refs"
+        named.clear()
+        assert not getattr(d, "_probe_left", None) and {t for t in tids if t % 2 == 0} <= set(d._probe_rc), "every verdict is handled"
+        p.db.x(f"UPDATE tasks SET status='done', not_before=NULL WHERE id IN ({','.join(map(str, tids))})")
+        d._probe_rc.clear()   # only history grows between the two measures, not the waiting set
+        return got
+    from ttp import worktree
+    named, real_named = [], worktree.named_refs
+    monkeypatch.setattr(worktree, "named_refs", lambda p_, t, *a, **k: named.append(t["id"]) or real_named(p_, t, *a, **k))
+    _history(p, 1000)
+    p.db.x("UPDATE tasks SET status='queued' WHERE id IN (990, 995, 1000)")   # open reviews the finishes look at
+    verdict_tick()   # warm
+    small = verdict_tick()
+    _history(p, 9000)
+    verdict_tick()
+    big = verdict_tick()
+    assert big[:3] == small[:3], f"db calls, rows and git spawns per verdict tick grow with history: {small} -> {big}"
+    assert big[3] < 1.0, f"one verdict tick took {big[3]:.2f} s at 10,000 tasks"
