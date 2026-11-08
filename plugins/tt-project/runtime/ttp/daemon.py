@@ -3856,8 +3856,11 @@ class Daemon:
         """For coordinator run r's coord.apply: the action indexes to skip, and the on_action callback that
         writes the index applied now to its run dir's COORD_JOURNAL. An "on" left there by an earlier reap
         means it was cut off on that action (a hang restart, a kill): counted, and an action cut off
-        COORD_CUT_SKIP times is skipped, so a turn whose one action hangs still applies all the others once."""
+        COORD_CUT_SKIP times is skipped, so a turn whose one action hangs still applies all the others once.
+        A run with no run dir on disk keeps no journal: the reap never creates one."""
         path = self._run_dir(r) / COORD_JOURNAL
+        if not path.parent.is_dir():
+            return set(), None
         j = self._coord_journal_read(r)
         cuts = {str(k): int(v) for k, v in (j.get("cuts") or {}).items() if str(v).isdigit()}
         if j.get("on") is not None:

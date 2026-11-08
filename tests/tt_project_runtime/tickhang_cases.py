@@ -432,3 +432,14 @@ def test_a_step_stopped_on_the_same_item_three_times_in_a_row_raises_one_stuck_e
     for _ in range(3):
         d._run_step(on("run 2's end"), "rows")
     assert len(stuck()) == 2
+
+
+def test_a_coordinator_turn_whose_run_dir_is_missing_writes_no_apply_journal(env, tmp_path, monkeypatch):
+    from ttp import daemon as dm
+    from types import SimpleNamespace
+    p = make(env)
+    monkeypatch.chdir(tmp_path)
+    turn = SimpleNamespace(structured={"actions": _adds("only"), "summary": ""}, error="", final_text="")
+    dm.Daemon(p.base)._finish_coordinator({"dir": "gone"}, turn, "ok", {})
+    assert _titles(p, "only") == [1]
+    assert not (tmp_path / "gone").exists(), "the reap created a run dir to journal into"
