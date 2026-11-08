@@ -146,6 +146,10 @@ _MSG_RE = re.compile(r"\b(?:(?:user|msgs?|messages?)\s*#|msgs?\s+|messages?\s+)(
                      re.I)
 _QUOTE_RE = re.compile(r'"([^"\n]{3,})"|“([^”\n]{3,})”|(?<!\w)[\'‘]([^\n]{3,}?)[\'’](?!\w)')
 DROPPED = "order_claim_dropped"   # the event kind of a claimed user order that failed the verbatim check
+# What replaces the user's-words label of a line that failed the verbatim check and is kept (as_data): it
+# names no user or owner, so no reader (CLAIM_RE, a handover, the memory loader) takes it for their words.
+DATA_LABEL = "[unverified quote, kept as data]"
+_PUNCT_RE = re.compile(r"[^\w\s]+")
 
 
 def _row_key(section: str, line: str) -> str | None:
@@ -593,7 +597,6 @@ def order_claim(db, line: str, agent: bool = False, strict: bool = True) -> str:
     `agent`) hold each of its quotes. A labelled line without a quote fails when `strict` (a handover
     line), else passes (a memory entry's paraphrase is data). Unlabelled lines are data, never checked."""
     from . import relay
-    from .restriction_source import _loose
     if not CLAIM_RE.search(line or ""):
         return ""
     quotes = [" ".join(next(g for g in m.groups() if g).split()) for m in _QUOTE_RE.finditer(line)]
@@ -610,10 +613,39 @@ def order_claim(db, line: str, agent: bool = False, strict: bool = True) -> str:
             said += [own, ctx if agent else ""]
     if not any(said):
         return f"msg #{', #'.join(map(str, ids))} is no logged message from the user"
-    words = _loose("\n".join(said))
-    if bad := next((q for q in quotes if _loose(q) not in words), None):
+    words = _plain("\n".join(said))
+    if bad := next((q for q in quotes if not _plain(q) or _plain(q) not in words), None):
         return f"{bad[:120]!r} is not in the user's own words of msg #{', #'.join(map(str, ids))}"
     return ""
+
+
+def _plain(text: str) -> str:
+    """`text` compared for the verbatim check: case, whitespace, quote style and punctuation aside."""
+    from .restriction_source import _loose
+    return " ".join(_PUNCT_RE.sub(" ", _loose(text)).split())
+
+
+def relabel(line: str) -> str:
+    """`line` with each user's-words label (CLAIM_RE) replaced by DATA_LABEL, the quote it opens kept."""
+    for _ in range(5):   # a replacement may expose another label ("user's user's words")
+        if not CLAIM_RE.search(line):
+            break
+        line = CLAIM_RE.sub(lambda m: DATA_LABEL + (" " + m.group(0)[-1] if m.group(0)[-1] in "\"“‘'" else ""),
+                            line)
+    return line if not CLAIM_RE.search(line) else CLAIM_RE.sub(" ", line)
+
+
+def as_data(db, text: str, agent: bool = False, strict: bool = True) -> tuple[str, list[tuple[str, str]]]:
+    """(`text` with each line whose claimed user order fails order_claim relabelled as data (relabel),
+    [(line, why)] relabelled). For a memory entry: the rest of it still stands, and a relabelled line
+    never counts as the user's words anywhere."""
+    out, bad = [], []
+    for line in str(text or "").splitlines():
+        if why := order_claim(db, line, agent, strict):
+            bad.append((line.strip(), why))
+            line = relabel(line)
+        out.append(line)
+    return "\n".join(out), bad
 
 
 def checked(db, text: str, agent: bool = False, strict: bool = True) -> tuple[str, list[tuple[str, str]]]:

@@ -7931,6 +7931,12 @@ def _ask(p, text="Option A or B?", **fields):
     return problems, p.db.one("SELECT * FROM messages WHERE kind='ask' ORDER BY id DESC LIMIT 1")
 
 
+def _flagged(p) -> str:
+    """The last turn's notes on actions applied with a change: an ask sent with a flag names it there."""
+    from ttp import coordinator as coord
+    return "\n".join(p.db.kv(coord.NOTES_KEY, []) or [])
+
+
 def _legacy_ask(p, rec="use option A", text="Option A or B?", severity="high"):
     """An ask registered with a default before new asks stopped getting one."""
     from ttp import coordinator as coord

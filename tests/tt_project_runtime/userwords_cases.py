@@ -122,7 +122,7 @@ def test_the_ask_gate_refuses_leave_the_users_newer_request_gave_naming_it(env):
     p = make(env)
     old, new = _said_fixture(p)
     problems, sent = _ask(p, _RE_ASK, **_OWN_ACCESS)
-    assert problems and f"already settled by user msg #{new}:" in problems[0], problems
+    assert problems == [] and f"already settled by user msg #{new}:" in _flagged(p), problems
     assert "Fix the stale nightly report watcher on box-a1 yourself" in problems[0]
     # Other forms of asking leave: refused too.
     for ask in ("Can we fix the stale nightly report watcher on box-a1?",

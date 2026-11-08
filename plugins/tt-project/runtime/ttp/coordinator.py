@@ -3352,6 +3352,11 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                                      f"coordinator.ask_timeout_h unless only the user can answer it")
                 least = str(a.get("least_disruptive") or "").strip()
                 text = a["text"].strip()
+                # Gates that judge only the form or a likely overlap send the ask with a flag (a note and
+                # the daily audit), never a refusal: the coordinator decides on what they found (#2116).
+                flags: list[tuple[str, str]] = []
+                if fixed := _classify_fixed(a):
+                    flags.append(("classify corrected", fixed))
                 if (a["blocking"] == "restriction" or a.get("classify") == "restriction_change") and (
                         item := restriction_source.cited_unsourced(
                             p.charter_path.read_text() if p.charter_path.exists() else "",
@@ -3365,10 +3370,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if why:
                     _count_refusal(db, key, why[0], text)
                     raise ValueError(f"ask_user rejected: {why[1]}")
-                why = orderedask.refusal(p, cfg, a, text, least, NOT_COVERED_MIN)   # agent mode: ordered already
-                if why:
-                    _count_refusal(db, key, why[0], text)
-                    raise ValueError(f"ask_user rejected: {why[1]}")
+                if why := orderedask.refusal(p, cfg, a, text, least, NOT_COVERED_MIN):   # agent mode: ordered already
+                    flags.append(why)
                 if a["blocking"] == "restriction" and len(least) < LEAST_DISRUPTIVE_MIN:
                     raise ValueError("ask_user rejected: first answer what is a reasonably non-disruptive way to "
                                      "proceed. If it fits the restrictions, take it (task_add) and memory_add the "
@@ -3438,11 +3441,10 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     seen = reask.settled_by(p, cfg, text, change=a.get("classify") == "restriction_change",
                                             question=_ask_question) or correction.repeated(p, text)
                     if seen and len(nc) < NOT_COVERED_MIN:
-                        _count_refusal(db, key, "already settled", text)
-                        raise ValueError(f"ask_user rejected: already settled by {seen}. Act on that answer, and "
-                                         "`resolve` or cite it instead of asking. A new question on that subject "
-                                         "(new evidence, changed facts): resend with not_covered saying what is new "
-                                         f"(at least {NOT_COVERED_MIN} characters)")
+                        flags.append(("already settled", f"it may be already settled by {seen}. If that answers "
+                                      "it, act on it and `resolve` this ask; next time cite it instead of asking, "
+                                      "or say in not_covered what is new"))
+                        seen = None
                 if a["blocking"] in PRIOR_APPROVAL_REASONS and len(str(a.get("not_covered") or "").strip()) < NOT_COVERED_MIN:
                     prior = _prior_approval(p, text)
                     if prior:
@@ -3478,8 +3480,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 if own:   # sent on its not_own_call override: counted for the daily audit
                     _count_refusal(db, key, f"{own[0]} (not_own_call)", a["text"].strip(), kind=ASK_FLAGGED_KIND)
                 flag = None if own else _reversible_ask(a, a["text"].strip(), least)
-                if flag:   # sent anyway: a flag is feedback for the next turn and the daily review, never a refusal
-                    _count_refusal(db, key, flag[0], a["text"].strip(), kind=ASK_FLAGGED_KIND)
+                for flag in flags + [flag] * bool(flag):   # sent anyway: feedback for the next turn and the
+                    _count_refusal(db, key, flag[0], a["text"].strip(), kind=ASK_FLAGGED_KIND)   # daily review
                     notes.append(f"ask_user: ask {turn_asks[-1][1]} was sent; flagged ({flag[0]}): {flag[1]}")
             elif t == "resolve":
                 said = db.q(f"SELECT id, ts, text, context, chat, ref, direction, kind FROM messages WHERE id IN "
@@ -3521,12 +3523,17 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                 notes.append(f"memory_add: settled area {rec['id']} added to {settled.FILE} "
                              f"({', '.join(rec['files']) or 'no file named: it reaches no task prompt'})")
             elif t == "memory_add":
-                if forged := coordsession.checked(db, a["text"], relay.agent_orders(cfg), strict=False)[1]:
+                a["text"], forged = coordsession.as_data(db, a["text"], relay.agent_orders(cfg), strict=False)
+                if forged:   # the entry stands; only the label goes: never stored as the user's words (#2116)
                     coordsession.log_dropped(db, "memory_add", forged)
-                    raise ValueError(f"memory_add rejected: a line labelled as the user's words fails the verbatim "
-                                     f"check: {forged[0][1]}. Quoted text on such a line must be that message's own "
-                                     f"words, with its msg #N; put names and terms in backticks, or record it as "
-                                     f"your own decision or a fact, without the user's-words label")
+                    binding = (a.get("memory_kind") or "") in ("preference", "restriction") or a.get("standing") is True
+                    if binding:   # an unverified quote binds nothing: a user rule needs their own words
+                        a["memory_kind"], a["standing"] = "fact", False
+                    notes.append(f"memory_add: {len(forged)} line(s) labelled as the user's words failed the "
+                                 f"verbatim check ({forged[0][1]}) and were stored as data, marked "
+                                 f"{coordsession.DATA_LABEL}" + (", the entry as a fact, not standing" if binding
+                                                                 else "") + ". Quote that message's own words "
+                                 f"with its msg #N, or write it as your own decision or a fact")
                 text = _unapplied_config_note(a["text"], cfg_refused)
                 if text != a["text"]:
                     notes.append("memory_add: noted in the entry that a config_set it names was rejected")
@@ -6880,26 +6887,30 @@ def _needless_ask(a: dict, text: str) -> str:
 _CLASS_FOR = {"irreversible": "irreversible", "restriction": "restriction_change"}
 
 
+def _classify_fixed(a: dict) -> str:
+    """Sets a missing or mismatched `classify` of an irreversible or restriction ask to the class its
+    `blocking` implies and says so; "" when it already agrees, is `neither` (_unclassified_ask) or
+    needs none. Only the form is wrong there: `blocking` already says why it blocks."""
+    want, cls = _CLASS_FOR.get(a.get("blocking")), a.get("classify")
+    if not want or cls in (want, "neither"):
+        return ""
+    a["classify"] = want
+    return (f"`classify` {cls!r} did not match blocking `{a['blocking']}`; it was set to `{want}`, the class "
+            f"that blocking implies. Set it yourself next time, or change `blocking` if it was wrong")
+
+
 def _unclassified_ask(a: dict, least: str) -> tuple[str, str] | None:
-    """(refusal label, why) for an irreversible or restriction ask whose `classify` is missing, is
-    `neither`, or does not agree with `blocking`, or an irreversible ask that does not name the
-    reversible alternative it considered; else None. Access, funds, spend, review, merge and human
-    asks carry a reason only the user or another person can clear, so they need no class."""
+    """(refusal label, why) for an irreversible or restriction ask classified `neither` (a judgment
+    call), or an irreversible ask that does not name the reversible alternative it considered; else
+    None. A missing or mismatched class is corrected first (_classify_fixed). Access, funds, spend,
+    review, merge and human asks carry a reason only the user or another person can clear, so they
+    need no class."""
     blocking = a.get("blocking")
-    want = _CLASS_FOR.get(blocking)
-    if not want:
+    if not _CLASS_FOR.get(blocking):
         return None
-    cls = a.get("classify")
-    if cls not in ASK_CLASSES:
-        return ("unclassified", f"classify it first: set `classify` to `{want}` for blocking `{blocking}`. "
-                "`irreversible`: the step cannot be undone; `restriction_change`: it breaks or changes a "
-                "restriction; `neither`: decide it yourself")
-    if cls == "neither":
+    if a.get("classify") == "neither":
         return ("neither", "decide it yourself. A step that is neither irreversible nor a restriction change is a "
                 "judgment call: act on it, memory_add a decision and notify at severity low")
-    if cls != want:
-        return ("classify mismatch", f"`classify` {cls} does not match blocking `{blocking}`: set `classify` to "
-                f"`{want}`, or change `blocking` to the reason that is true")
     if blocking == "irreversible" and len(least) < LEAST_DISRUPTIVE_MIN:
         return ("no reversible alternative", "name the reversible alternative you considered in least_disruptive, "
                 "and why it does not do. If one does, take it (task_add) and memory_add the decision instead of "
