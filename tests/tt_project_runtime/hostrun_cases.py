@@ -207,8 +207,13 @@ def test_a_worker_cannot_change_the_host_run_allowlist(env, monkeypatch, capfd):
     monkeypatch.delenv("TTP_TASK")
     cli.main(["config", "demo", "runner.host_commands", '["/bin/true", "/usr/bin/id -u"]'])
     assert hostrun.allowlist(p)[0] == [["/bin/true"], ["/usr/bin/id", "-u"]]
-    # A list a worker wrote anyway (provenance says worker) runs nothing.
-    p.set_config("runner.host_commands", ["/bin/sh"], by=configwho.by("worker", task="12"))
+    # set_config itself refuses a worker's write over the coordinator's list (configwho.guard).
+    with pytest.raises(configwho.Protected):
+        p.set_config("runner.host_commands", ["/bin/sh"], by=configwho.by("worker", task="12"))
+    assert hostrun.allowlist(p)[0] == [["/bin/true"], ["/usr/bin/id", "-u"]]
+    # A list a worker wrote anyway (provenance says worker: a write from before the guard) runs nothing.
+    p.set_config("runner.host_commands", ["/bin/sh"], by=configwho.by("user"))
+    configwho.record(p.db, "runner.host_commands", configwho.by("worker", task="12"), after=p.raw_config())
     allow, why = hostrun.allowlist(p)
     assert allow == [] and "set by a worker" in why
     assert hostrun.request(p, ["/bin/sh"]) == hostrun.REFUSED

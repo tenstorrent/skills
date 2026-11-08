@@ -297,17 +297,29 @@ def _event(p, kind: str, fp: str, text: str, every_s: float | None = None) -> bo
     return True
 
 
+def _safe_way(key: str, new) -> bool:
+    """Whether writing `new` at `key` turns a switch its safe way, which any setter may (as the
+    coordinator's and `ttp config`'s own gates read it): a sandbox key to anything but on, removing it
+    too, or a SAFE_WHEN_OFF switch to false, '' or []."""
+    from .coordinator import SAFE_WHEN_OFF, SANDBOX_KEYS, sandbox_on
+    value = None if new is _ABSENT else new
+    if key in SANDBOX_KEYS:
+        return not sandbox_on(value)
+    return key in SAFE_WHEN_OFF and new is not _ABSENT and value in (False, "", [])
+
+
 def guard(p, key: str, setter: dict | None, before, after) -> bool:
     """Before set_config or unset_config writes `after` over `before`: True when there is nothing to
     write (an automated setter writing what an owner's value already is: the owner's record stays).
     An automated setter changing a value under `key` whose setter is the user or a coordinator raises
-    Protected, logged and raised to the coordinator (once a day per key and role)."""
+    Protected (turning a switch its safe way, _safe_way, aside), logged and raised to the coordinator (once a day per key and role)."""
     who = role(setter)
     if who not in AUTOMATED:
         return False
     hits = []
     for k in [key] + sorted(k for k in _all(p.db) if k.startswith(key + ".")):
-        if at(before, k) != at(after, k) and role(rec := lookup(p.db, k, before)) in OWNERS:
+        if at(before, k) != at(after, k) and not _safe_way(k, at(after, k)) \
+                and role(rec := lookup(p.db, k, before)) in OWNERS:
             hits.append(f"{k} (set by {describe(rec, p)})")
     if not hits:
         return at(before, key) == at(after, key) and role(lookup(p.db, key, before)) in OWNERS
