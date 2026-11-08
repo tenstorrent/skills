@@ -142,10 +142,25 @@ def row_for(model: str, rows: dict) -> tuple[tuple, bool]:
     return max(rows.values(), key=lambda r: (r[1], r[0])), True
 
 
+# A row whose prompts over a token count bill at a multiple of every rate: {row key: (tokens, multiple)}.
+# The prompt is the call's input, cache read and cache write tokens.
+LONG_PROMPT: dict[str, tuple[int, float]] = {"claude-haiku-5-5": (100_000, 5.0)}
+
+
 def price(model: str, usage: dict, overrides: dict | None = None, rows=None) -> tuple[float, bool]:
-    """List price in $ of one API call's `usage`, and whether it is estimated (unknown model)."""
+    """List price in $ of one API call's `usage`, and whether it is estimated (unknown model). Usage summed
+    over a run's calls (daemon._list_cost) is priced as one call: a long-prompt tier then applies once the
+    run's total prompt is over its count, which over-books a run of short prompts (the safe direction for
+    the dollar caps), never under-books one with a long one."""
     rows, fee = rows or table(overrides)
     r, est = row_for(model, rows)
+    tier = LONG_PROMPT.get(row_key(model, rows) or "")
+    prompt = sum(int(usage.get(k) or 0) for k in ("input_tokens", "cache_read_input_tokens",
+                                                   "cache_creation_input_tokens"))
+    if isinstance(usage.get("cache_creation"), dict) and not usage.get("cache_creation_input_tokens"):
+        prompt += sum(int(v or 0) for v in usage["cache_creation"].values() if isinstance(v, (int, float)))
+    if tier and prompt > tier[0]:
+        r = tuple(x * tier[1] for x in r)
     cc = usage.get("cache_creation") if isinstance(usage.get("cache_creation"), dict) else None
     if cc is not None:
         w5, w1 = int(cc.get("ephemeral_5m_input_tokens") or 0), int(cc.get("ephemeral_1h_input_tokens") or 0)
