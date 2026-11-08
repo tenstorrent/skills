@@ -3464,6 +3464,10 @@ def cmd_checks(a) -> None:
               "`retry_when` that exits 0 once this host is back, and run them after the cycle", file=sys.stderr)
         sys.exit(75)
     purpose = getattr(a, "purpose", None) or "candidate"
+    if a.full and purpose == "candidate":
+        from . import testpick
+        if why := testpick.full_refusal(cfg):   # the push train is the only full run
+            die(f"ttp checks: {why}")
     d = cfg.get("delivery") or {}
     checks_host = d.get("checks_host")   # where checks without a host run
     # The checks run at the top of the worktree being checked, as `ttp push` runs them, wherever in
