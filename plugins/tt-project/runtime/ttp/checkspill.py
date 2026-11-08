@@ -5,9 +5,8 @@
 A project may list, in order, the ssh aliases of other machines its checks may run on. The account's
 pool, `checks.spill_hosts` in the account settings (`ttp config --account checks.spill_hosts '["pool-a"]'`,
 which a run may only clear), follows that list in every project on this machine, so each spills
-without a list of its own, and then the machines the user's machines list tags `checks` (CHECKS_TAG:
-`ttp machines add <alias> --tags checks`). A project's own empty list (`[]`) keeps its checks here, the
-pool and the tagged machines too; with none of them, checks never leave this machine. A `ttp checks` run that has waited `delivery.checks_spill_after_s`
+without a list of its own. No machines-list tag adds a host. A project's own empty list (`[]`) keeps its
+checks here, the pool too; with neither, checks never leave this machine. A `ttp checks` run that has waited `delivery.checks_spill_after_s`
 (default SPILL_AFTER_S) for a slot here (its project's lane, a host-wide checks slot, test-worker
 slots) tries the listed hosts in order and runs on the first that is allowed, reachable and has a
 free slot, as a check with a check host does (remotecheck: a copy of exactly the commit, its output
@@ -15,8 +14,8 @@ streamed back). With none, it keeps its place in the queue here and tries them a
 bound. The run says where it went, checks.json records it (`hosts`, `spilled_to`), and `ttp status`
 and `ttp checks status` show it while it runs (status_lines).
 
-Allowed: listed in one of those structured settings (the project's own list, the account's pool or the
-`checks` tag), never by charter wording, and in the user's machines list (not retired), and not
+Allowed: listed in one of those structured settings (the project's own list or the account's pool),
+never by charter wording or a machines-list tag, and in the user's machines list (not retired), and not
 paused (a pause of its alias, or a fleet hold of the machine, or a pause of its alias or host name that any
 of the user's projects here set, shared or not: paused_elsewhere), and its machine lock (`ttp lock <alias>`)
 neither held nor reserved by anyone else. The run holds that lock while it runs, shared where the
@@ -85,7 +84,6 @@ from typing import Any
 from . import remotecheck
 
 KEY = "checks_spill_hosts"
-CHECKS_TAG = "checks"   # a machines-list tag: the machine takes spilled checks of every project (tagged_hosts)
 ACCOUNT_KEY = "checks.spill_hosts"   # the account's pool (project.ACCOUNT_KEYS), after a project's own list
 BESIDE_KEY = "spill_beside_device"   # checks.spill_beside_device: hosts a device job keeps no spill off (beside_device)
 NO_DEVICE_KEY = "wrap_needs_device"   # checks.wrap_needs_device false: a wrapped run needs no device and may spill
@@ -212,25 +210,8 @@ def account_hosts() -> list[str]:
         return []
 
 
-def tagged_hosts(known: dict | None = None) -> list[str]:
-    """The machines the user's machines list tags CHECKS_TAG (not retired), by alias; [] when unreadable."""
-    from . import machines
-    try:
-        known = machines.load() if known is None else known
-    except Exception:
-        return []
-    out = []
-    for alias, m in sorted(known.items()):
-        try:
-            if CHECKS_TAG in machines.tag_list((m or {}).get("tags")) and not machines.retired(m):
-                out.append(alias)
-        except (ValueError, AttributeError):
-            continue
-    return out
-
-
 def hosts(cfg: dict | None) -> list[str]:
-    """The project's spill hosts in order, then the account's pool, then the machines tagged CHECKS_TAG;
+    """The project's spill hosts in order, then the account's pool;
     [] when the project's own list is empty (it keeps its checks here) or malformed (config_problems names it)."""
     own = ((cfg or {}).get("delivery") or {}).get(KEY)
     try:
@@ -239,7 +220,7 @@ def hosts(cfg: dict | None) -> list[str]:
         return []
     if own is not None and not mine:
         return []
-    return list(dict.fromkeys([*mine, *account_hosts(), *tagged_hosts()]))
+    return list(dict.fromkeys([*mine, *account_hosts()]))
 
 
 def _own(cfg: dict | None) -> list[str]:
@@ -250,12 +231,10 @@ def _own(cfg: dict | None) -> list[str]:
 
 
 def _source(cfg: dict | None, alias: str) -> str:
-    """Which setting lists `alias`: the project's own list, else the account's pool, else the machines-list tag."""
+    """Which setting lists `alias`: the project's own list, else the account's pool."""
     if alias in _own(cfg):
         return f"delivery.{KEY}"
-    if alias in account_hosts():
-        return f"{ACCOUNT_KEY}, the account's pool"
-    return f"tagged {CHECKS_TAG} in the machines list"
+    return f"{ACCOUNT_KEY}, the account's pool"
 
 
 def wrapped_ok(cfg: dict | None) -> bool:
@@ -398,7 +377,7 @@ def spillable(cmds: list, cfg: dict | None = None) -> bool:
 
 def allowed(p, cfg: dict, alias: str) -> str:
     """"" when the project may run checks on `alias`, else why not. Only structured settings decide (the
-    project's own list, the account's pool, the machines-list tag), never charter wording; the user's
+    project's own list, the account's pool), never charter wording or a machines-list tag; the user's
     pauses and holds still keep a listed host off."""
     from . import lockprobe, machines
     known = machines.load()
@@ -406,7 +385,7 @@ def allowed(p, cfg: dict, alias: str) -> str:
         return "not in the machines list (ttp machines add)"
     if machines.retired(known.get(alias)):
         return "retired in the machines list"
-    if alias not in _own(cfg) and alias not in account_hosts() and alias not in tagged_hosts(known):
+    if alias not in _own(cfg) and alias not in account_hosts():
         name = getattr(p, "name", "") or "<project>"
         return (f"not a spill host of this project (add it with `ttp config {name} delivery.{KEY} "
                 f"'{json.dumps([*_own(cfg), alias])}'`)")

@@ -1245,9 +1245,9 @@ def test_the_account_pool_spills_every_project_after_its_own_list_and_an_empty_o
 
 
 def test_spill_gate_reads_only_structured_settings_never_charter_wording(env, tmp_path, monkeypatch):
-    """allowed() decides from delivery.checks_spill_hosts, the account's pool and the machines-list `checks`
-    tag, never the charter: a listed host with no charter line is allowed, a host the charter names but no
-    setting lists is refused with the setting to add it to, and the user's pauses still keep a listed host off."""
+    """allowed() decides from delivery.checks_spill_hosts and the account's pool, never the charter: a listed
+    host with no charter line is allowed, a host the charter names but no setting lists is refused with the
+    setting to add it to, and the user's pauses still keep a listed host off."""
     from ttp import checkspill, db as dbm, machines
     p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"], charter=())
     machines.add("check-host-a")
@@ -1258,23 +1258,23 @@ def test_spill_gate_reads_only_structured_settings_never_charter_wording(env, tm
     assert why.startswith("not a spill host of this project") and "charter" not in why, why
     assert f"ttp config {p.name} delivery.checks_spill_hosts '[\"check-host-a\", \"named-only\"]'" in why, why
     assert "named-only" not in checkspill.hosts(p.config())
-    # The machines-list tag: allowed for every project, tried after the own list, named as the source.
-    machines.add("tagged-host", tags=["x86", checkspill.CHECKS_TAG])
-    machines.add("retired-host", tags=[checkspill.CHECKS_TAG, "retired"])
-    assert checkspill.tagged_hosts() == ["tagged-host"]
-    assert checkspill.hosts(p.config()) == ["check-host-a", "tagged-host"]
-    assert checkspill.allowed(p, p.config(), "tagged-host") == ""
-    assert checkspill._source(p.config(), "tagged-host") == "tagged checks in the machines list"
-    assert checkspill.allowed(p, p.config(), "retired-host") == "retired in the machines list"
-    # An own [] keeps the tagged hosts off too.
-    p.set_config("delivery.checks_spill_hosts", [])
-    assert checkspill.hosts(p.config()) == []
-    p.set_config("delivery.checks_spill_hosts", ["check-host-a"])
-    # A user hold or pause still keeps a listed or tagged host off.
-    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "user hold", "by": "user", "since": 1},
-                                           "tagged-host": {"reason": "lent out", "by": "user", "since": 1}})
+    # A user hold or pause still keeps a listed host off.
+    p.db.set_kv(dbm.PAUSED_RESOURCES_KEY, {"check-host-a": {"reason": "user hold", "by": "user", "since": 1}})
     assert checkspill.allowed(p, p.config(), "check-host-a") == "paused: user hold"
-    assert checkspill.allowed(p, p.config(), "tagged-host") == "paused: lent out"
+
+
+def test_a_machines_list_checks_tag_admits_no_spill_host(env, tmp_path, monkeypatch):
+    """Any run may tag a machine (`ttp machines add <alias> --tags checks`), so no tag widens spill hosts:
+    a host tagged `checks` in neither the project's list nor the account's pool is neither tried nor allowed."""
+    from ttp import checkspill, machines
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"], charter=())
+    machines.add("check-host-a")
+    machines.add("tagged-host", tags=["x86", "checks"])
+    machines.add("tagged-upper", tags="CHECKS,x86")
+    assert checkspill.hosts(p.config()) == ["check-host-a"]
+    for host in ("tagged-host", "tagged-upper"):
+        why = checkspill.allowed(p, p.config(), host)
+        assert why.startswith("not a spill host of this project") and "delivery.checks_spill_hosts" in why, why
 
 
 def test_spill_hosts_accepted_through_the_charter_before_stay_allowed_without_it(env, tmp_path, monkeypatch):
