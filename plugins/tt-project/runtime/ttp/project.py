@@ -2979,7 +2979,8 @@ ACCOUNT_KEYS = {"budget": {"global_daily_usd", "daily_target_usd", "day_start", 
                            "push_priority_wait_s",   # a push's longest wait behind another priority holder (checkcap.priority_wait_s)
                            "dirty_max_mb", "io_full_max",   # the disk gate on new local runs (diskgate)
                            "spill_hosts",   # the spill pool every project's checks may use (checkspill.account_hosts)
-                           "slurm_overflow"}}   # a Slurm cluster the pool's overflow runs on (slurmcheck)
+                           "slurm_overflow",   # a Slurm cluster the pool's overflow runs on (slurmcheck)
+                           "smoke_max_s"}}   # the landing check time limit (gatetime.max_s), project first
 # Account keys a run may only clear (ttp config --account refuses setting them inside a run): remove them
 # ('') or set them to their off value (ACCOUNT_OFF_VALUE), which only reduces their reach.
 # The ranking's source and key file too: the key goes to that source, so only the user names either.

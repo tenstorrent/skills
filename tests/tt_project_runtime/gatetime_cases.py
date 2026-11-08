@@ -60,6 +60,14 @@ def test_post_land_checks_and_smoke_max_s_are_known_settings_and_post_land_check
     assert gatetime_default_is_ten_minutes()
 
 
+def test_smoke_max_s_is_an_account_key_the_project_value_overrides(env):
+    from ttp import cli, gatetime
+    cli.main(["config", "--account", "checks.smoke_max_s", "900"])
+    assert gatetime.max_s({}) == 900, "unset in the project: the account's"
+    assert gatetime.max_s({"checks": {"smoke_max_s": 120}}) == 120, "project first"
+    assert gatetime.max_s({"checks": {"smoke_max_s": "x"}}) == 900, "malformed: the account's"
+
+
 def gatetime_default_is_ten_minutes() -> bool:
     from ttp import gatetime
     return gatetime.max_s({}) == 600 == gatetime.max_s({"checks": {"smoke_max_s": "x"}}) and gatetime.AIM_S == 300

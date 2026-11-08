@@ -96,10 +96,13 @@ def stats(state: Path | None, now: float | None = None) -> dict:
 
 
 def max_s(cfg: dict | None) -> float:
-    """checks.smoke_max_s in seconds (DEFAULT_MAX_S when unset or malformed; 0: no flag)."""
-    v = ((cfg or {}).get("checks") or {}).get("smoke_max_s")
-    if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
-        return float(v)
+    """checks.smoke_max_s in seconds: the project's, else the account's (DEFAULT_MAX_S when unset or
+    malformed; 0: no flag)."""
+    from . import project
+    for got in (cfg, project.load_account_settings()):
+        v = ((got or {}).get("checks") or {}).get("smoke_max_s")
+        if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0:
+            return float(v)
     return DEFAULT_MAX_S
 
 
