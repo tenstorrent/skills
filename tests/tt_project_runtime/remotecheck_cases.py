@@ -1541,6 +1541,26 @@ def test_an_agent_cli_or_host_local_check_splits_off_to_run_here_while_the_rest_
     assert not any(x in checkspill._probe_script() for x in checkspill.AGENT_CLIS)
 
 
+def test_a_check_chaining_tests_and_the_claude_cli_never_sends_either_to_a_spill_host():
+    """A single check that runs a test suite and then the claude CLI (`pytest ... && claude plugin validate
+    ...`) never spills: it needs the CLI, and as a test suite it may not split off to run here, so its whole
+    run stays on this machine and neither part ever runs on a spill host, nor is labelled with one."""
+    from ttp import checkspill, cli, push
+    test = "python3 -m pytest -q tests/a.py"
+    for chain in (f"{test} && claude plugin validate plugins/x --strict",
+                  f"{test}; claude plugin validate plugins/x --strict",
+                  f"sh -c '{test} && claude plugin validate plugins/x --strict'"):
+        for c in (push.check_list([chain])[0], chain):   # configured, or a plain command after `--`
+            assert checkspill.needs_cli(c) and not checkspill.check_spills(c) and not checkspill.spillable([c]), chain
+            if not chain.startswith("sh -c"):   # a shell script's suite is not seen: it splits off to run here
+                assert not checkspill.stays_here(c) and not checkspill.spillable([test, c]), chain
+                assert not checkspill.spillable(push.check_list(["make lint", test]) + [c]), chain
+            # In a split run the chain still runs here, unlabelled, beside the spilled test.
+            out = cli._spill_to([push.check_list([test])[0], c], "check-host-a")
+            assert push.remote_host(out[0]) == "check-host-a" and push.remote_host(out[1]) == "", chain
+            assert push.where(out[1]) == "" and str(out[1]) not in push.hosts_of(out), chain
+
+
 def _split_run(env, tmp_path, monkeypatch, cli_rc: int, extra: bool = False, cli_check="claude plugin validate . --strict",
                sleep_s: int = 0):
     """A spilled run of a spilled check and a claude CLI check (a fake one here, sleeping `sleep_s`, then exiting
@@ -1580,6 +1600,10 @@ def test_a_split_run_spills_its_tests_and_runs_its_agent_cli_check_here_for_one_
     assert len(ran) == 1 and "/ttp-check." in ran[0], ran
     assert len(here) == 1 and "/ttp-check." not in here[0], here
     assert "did not pass on spill host" not in text, text
+    # The log and the record name the host each check really ran on: the claude check, run here, none.
+    assert f"$ pwd >> {tmp_path / 'spilled.log'} (on check-host-a)" in text, text
+    assert "$ claude plugin validate . --strict\n" in text and "claude plugin validate . --strict (on" not in text, text
+    assert list(rec["hosts"].values()) == ["check-host-a"] and not any("claude" in k for k in rec["hosts"]), rec
 
 
 def test_a_split_runs_failing_agent_cli_check_here_fails_it_without_a_rerun(env, tmp_path, monkeypatch):
