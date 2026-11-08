@@ -2961,6 +2961,47 @@ def test_guard_flags_a_conditional_lift_and_another_verb_on_the_same_target(env)
 
 
 
+def test_guard_keeps_a_ban_on_every_item_of_a_listed_restriction(env):
+    """A Restrictions item that bans an action on a list of objects, or a list of actions on one object,
+    bans each listed part: the guard reads the whole item, never one comma-split clause of it, so text
+    ordering the banned action on the last listed object is refused without the user's word and a lift
+    of it is refused with it. Text about none of the item's actions or objects goes in beside it."""
+    p = make(env)
+    from ttp import coordinator as coord
+    turn = iter(range(40, 200))
+    for ban, texts in (
+            ("Never reboot host-a, host-b or host-c.", ("Reboot host-c tonight.", "Reboot host-b now.")),
+            ("Never reboot host-a, host-b and host-c.", ("Reboot host-c tonight.",)),
+            ("Never reboot host-a, host-b, or host-c.", ("Reboot host-c tonight.",)),
+            ("Do not reset, reboot or flash the demo box.", ("Reboot the demo box now.", "Flash the demo box now.")),
+            ("Never push to main, the release branch.", ("Push the fix to the release branch.",)),
+            ("Never reboot host-a. Do not reflash host-b, host-c or host-d.",
+             ("Reflash host-d tonight.", "Reboot host-a now."))):
+        charter = f"# demo\n\n## Restrictions\n- {ban}\n"
+        for text in texts:
+            # A multi-sentence item is read per sentence: the hit is the sentence that bans it.
+            hit = next(x for x in (ban, *[y + "." for y in ban.rstrip(".").split(". ")])
+                       if coord._append_conflicts(charter, "Policies", text) == [(x, "Restrictions")])
+            p.charter_path.write_text(charter)
+            err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                              turn=next(turn), user_turn=False)
+            assert len(err) == 1 and f"\"{hit}\" (section 'Restrictions')" in err[0], (ban, text, err)
+            assert text not in p.charter_path.read_text()
+    p.charter_path.write_text("# demo\n\n## Restrictions\n- Never reboot host-a, host-b or host-c.\n")
+    err = coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": "Rebooting host-c is fine."}],
+                      turn=next(turn), user_turn=True)
+    assert len(err) == 1 and "Never reboot host-a, host-b or host-c." in err[0], err
+    # Unrelated work beside a listed ban goes in, on any turn: the guard flags a real conflict only.
+    for user_turn in (False, True):
+        for text in ("Write the weekly report on Fridays.", "Run the test suite on every change."):
+            charter = "# demo\n\n## Restrictions\n- Never reboot host-a, host-b or host-c.\n"
+            assert coord._append_conflicts(charter, "Policies", text) == [], text
+            p.charter_path.write_text(charter)
+            assert coord.apply(p, [{"type": "charter_update", "section": "Policies", "text": text}],
+                               turn=next(turn), user_turn=user_turn) == [], (text, user_turn)
+            assert text in p.charter_path.read_text()
+
+
 # The 2026-10-13 refusals, names replaced: an exception added to a Policies or Resources item was
 # refused as contradicting every Restrictions item that shared a word with it ("names", "msg", a
 # branch named like the skills, a generic verb). An item contradicts another only when both are
