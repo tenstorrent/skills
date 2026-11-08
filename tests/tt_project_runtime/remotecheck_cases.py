@@ -1786,6 +1786,16 @@ def test_a_check_naming_a_path_of_this_machine_never_spills_and_splits_off_to_ru
     assert push.remote_host(out[0]) == "check-host-a" and push.remote_host(out[1]) == "" and push.where(out[1]) == ""
 
 
+def test_a_shell_c_script_running_a_test_suite_counts_as_a_test_suite():
+    """checklane.run_class reads a shell's -c script as checkspill.needs_cli does: `sh -c 'pytest ... &&
+    claude ...'` is a test suite, as the same chain is unwrapped."""
+    from ttp import checklane
+    for c in ("sh -c 'python3 -m pytest -q tests/a.py && claude plugin validate . --strict'",
+              "env A=1 bash -lc 'cd x; pytest -q'", "nice sh -c \"sh -c 'make test'\""):
+        assert checklane.run_class([c]) == checklane.SUITE, c
+    assert checklane.run_class(["sh -c 'echo hi; ls'"]) == checklane.OTHER
+
+
 def test_a_check_chaining_tests_and_the_claude_cli_never_sends_either_to_a_spill_host():
     """A single check that runs a test suite and then the claude CLI (`pytest ... && claude plugin validate
     ...`) never spills: it needs the CLI, and as a test suite it may not split off to run here, so its whole
@@ -1797,9 +1807,8 @@ def test_a_check_chaining_tests_and_the_claude_cli_never_sends_either_to_a_spill
                   f"sh -c '{test} && claude plugin validate plugins/x --strict'"):
         for c in (push.check_list([chain])[0], chain):   # configured, or a plain command after `--`
             assert checkspill.needs_cli(c) and not checkspill.check_spills(c) and not checkspill.spillable([c]), chain
-            if not chain.startswith("sh -c"):   # a shell script's suite is not seen: it splits off to run here
-                assert not checkspill.stays_here(c) and not checkspill.spillable([test, c]), chain
-                assert not checkspill.spillable(push.check_list(["make lint", test]) + [c]), chain
+            assert not checkspill.stays_here(c) and not checkspill.spillable([test, c]), chain
+            assert not checkspill.spillable(push.check_list(["make lint", test]) + [c]), chain
             # In a split run the chain still runs here, unlabelled, beside the spilled test.
             out = cli._spill_to([push.check_list([test])[0], c], "check-host-a")
             assert push.remote_host(out[0]) == "check-host-a" and push.remote_host(out[1]) == "", chain

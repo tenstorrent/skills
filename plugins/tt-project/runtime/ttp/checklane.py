@@ -590,17 +590,36 @@ def all_light(cmds: list, cfg: dict | None, declared=()) -> bool:
 
 
 def run_class(cmds: list, cfg: dict | None = None) -> int:
-    """LIGHT, OTHER or SUITE: the costliest of `cmds` (a test runner or build word anywhere is SUITE)."""
+    """LIGHT, OTHER or SUITE: the costliest of `cmds` (a test runner or build word anywhere, a shell's -c
+    script included, is SUITE)."""
     pats, out = light_patterns(cfg), LIGHT
     for c in cmds:
         if is_light(str(c), pats):
             continue
-        try:
-            words = [_word(w) for seg in testslots._segments(str(c)) for _, _, w in seg]
-        except (ValueError, IndexError):
-            words = []
-        out = max(out, SUITE if _SUITE_WORDS & set(words) else OTHER)
+        out = max(out, SUITE if _SUITE_WORDS & _words(str(c)) else OTHER)
     return out
+
+
+def _words(c: str, depth: int = 0) -> set[str]:
+    """The words of command line `c`, with those of a shell's -c script (`sh -c "pytest ... && claude ..."`,
+    `bash -lc ...`) read the same way checkspill.needs_cli reads them."""
+    from .checkspill import _SHELLS
+    try:
+        segs = testslots._segments(c)
+    except (ValueError, IndexError):
+        return set()
+    got = set()
+    for seg in segs:
+        words = [w for _, _, w in seg]
+        got.update(map(_word, words))
+        i = 0
+        while i < len(words) and (re.match(r"[A-Za-z_]\w*=|-|\d", words[i]) or testslots._base(words[i]) in testslots._WRAPPERS):
+            i += 1
+        if depth < 3 and i < len(words) and testslots._base(words[i]) in _SHELLS:
+            opt = next((j for j in range(i + 1, len(words)) if re.fullmatch(r"-[a-z]*c[a-z]*", words[j])), None)
+            if opt is not None and opt + 1 < len(words):
+                got |= _words(words[opt + 1], depth + 1)
+    return got
 
 
 def median_s(state: Path | None, key: str) -> float | None:
