@@ -11784,9 +11784,13 @@ def _upgrade_probe(p) -> int:
 def test_a_restart_helper_that_cannot_start_is_reaped_with_a_failed_result(env, monkeypatch):
     from ttp import service
     p = make(env)
-    broken = env["tmp"] / "broken-runtime"
+    broken, gate = env["tmp"] / "broken-runtime", env["tmp"] / "helper-may-fail"
     (broken / "ttp").mkdir(parents=True)
-    (broken / "ttp" / "__init__.py").write_text("raise ImportError('the new runtime is broken')\n")
+    # The helper fails only once the test lets it: a helper that died before the first reap is no race.
+    (broken / "ttp" / "__init__.py").write_text(
+        f"import os, time\nend = time.time() + 120\n"
+        f"while not os.path.exists({str(gate)!r}) and time.time() < end:\n    time.sleep(0.02)\n"
+        f"raise ImportError('the new runtime is broken')\n")
     monkeypatch.setattr(service, "_env", lambda p: {"PYTHONPATH": str(broken)})
     started = time.time() - 3600
     at = time.time()
@@ -11794,6 +11798,7 @@ def test_a_restart_helper_that_cannot_start_is_reaped_with_a_failed_result(env, 
     assert service.take_restart_request(p, started)
     assert _upgrade_probe(p) != 0, "the probe must keep waiting while the restart runs"
     assert service.reap_restart_request(p, started) is None, "a running helper is left alone"
+    gate.touch()
     assert service._helpers[str(p.base)].wait(timeout=60) != 0
     assert service.reap_restart_request(p, started) == "failed"
     res = service._restart_result(p, at)
@@ -36391,13 +36396,29 @@ def test_probe_env_finds_ttp(env):
 
 
 def _supervise_with_wait(tmp_path, monkeypatch, wait_start):
+    """Supervise a run with a 2 s limit whose awake time is a test clock (FileClock): the child moves it to
+    3 s, past the plain limit and short of the 4 s a lock wait extends it to, then runs until the watch
+    thread looked 3 more times, so no scheduling delay decides the outcome."""
     from ttp import locks as lk
     from ttp import runner
     monkeypatch.setattr(runner, "POLL_S", 0.2)
+    clock, looked = tmp_path / "awake-clock", tmp_path / "looked"
+    monkeypatch.setenv(runner.TEST_CLOCK_ENV, str(clock))
+    looks, real_stop = [], runner.stop_reason
+
+    def stop_reason(rd):   # once per watch look, after its limit check
+        if clock.exists():
+            looks.append(1)
+            if len(looks) >= 3:
+                looked.touch()
+        return real_stop(rd)
+    monkeypatch.setattr(runner, "stop_reason", stop_reason)
+    child = (f"import pathlib, time\npathlib.Path({str(clock)!r}).write_text('3')\nend = time.time() + 60\n"
+             f"while time.time() < end and not pathlib.Path({str(looked)!r}).exists():\n    time.sleep(0.05)\n")
     run_dir = tmp_path / "run"
     run_dir.mkdir()
     (run_dir / "prompt.md").write_text("")
-    (run_dir / "run.json").write_text(json.dumps({"argv": ["sh", "-c", "sleep 3"], "cwd": str(tmp_path),
+    (run_dir / "run.json").write_text(json.dumps({"argv": [sys.executable, "-c", child], "cwd": str(tmp_path),
                                                   "timeout_s": 2, "provider": "fake"}))
     if wait_start is not None:
         # An open wait by a live process (this one): the run is queued for a lock right now.
