@@ -122,6 +122,41 @@ def test_probe_waiting_over_its_budget_stops_and_resumes_in_order_next_tick(env,
     assert all(not _ready(p, t) for t in tids)
 
 
+def test_dispatch_cut_at_its_budget_reaches_the_tasks_it_did_not_walk_next_tick(env, monkeypatch):
+    """A dispatch walk the step budget cuts after one task each tick (a held task first) still starts the
+    tasks behind it on later ticks, instead of walking the same held task every tick; a whole walk goes
+    back to plain priority order."""
+    p = make(env)
+    from ttp import daemon as dmod
+    p.db.x("UPDATE tasks SET status='done'")
+    d = dmod.Daemon(p.base)
+    held = p.db.add_task("held", "s", kind="code", tier="light", origin="user", priority=1)
+    b = p.db.add_task("b", "s", kind="code", tier="light", origin="user", priority=2)
+    c = p.db.add_task("c", "s", kind="code", tier="light", origin="user", priority=3)
+    monkeypatch.setattr(d, "_workdir_for", lambda t: (str(p.base), None))
+    started = []
+
+    def start(*a, **k):
+        started.append(k["task"]["id"])
+        p.db.update_task(k["task"]["id"], status="running")
+        return 0
+    monkeypatch.setattr(d, "start_run", start)
+    orig = d._start_hold
+    monkeypatch.setattr(d, "_start_hold", lambda t, *a, **k: (orig(t, *a, **k), "held")[1] if t["id"] == held
+                        else orig(t, *a, **k))
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0)   # spent at once: one task a tick
+    d._run_step(d.dispatch)
+    assert started == [] and d._dispatch_walked == [held], "the held task first, then the cut"
+    d._run_step(d.dispatch)
+    assert started == [b], "the next tick starts with the task not reached yet"
+    d._run_step(d.dispatch)
+    assert started == [b, c] and d._dispatch_walked == [], "every task reached: plain order again"
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 30)
+    late = p.db.add_task("late", "s", kind="code", tier="light", origin="user", priority=3)
+    d._run_step(d.dispatch)
+    assert started == [b, c, late] and d._dispatch_walked == []
+
+
 def test_retire_ended_over_its_budget_resumes_after_the_last_entry_done(env, monkeypatch):
     p = make(env)
     from ttp import daemon as dmod

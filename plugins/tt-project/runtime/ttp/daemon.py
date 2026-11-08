@@ -11276,9 +11276,21 @@ class Daemon:
         fate: dict[int, str] = {}   # task id -> a schedlog reason, "full" or "picked" (_log_slot_fill)
         probing, probe_tried = None, False   # the task whose start retries an open run-start breaker this tick
         ready = startbreaker.probe_first(db, ready, now)   # a due retry goes to a task its cause has not failed
-        for task in ready:
+        # Tasks walked since the last whole walk (ticks cut short at the step budget, e.g. by slow git reads
+        # under load) go after the ones not reached yet, so every ready task is reached in turn.
+        ids = {t["id"] for t in ready}
+        walked = self._dispatch_walked = [i for i in self.__dict__.get("_dispatch_walked") or () if i in ids]
+        fresh = [t for t in ready if t["id"] not in walked]
+        ready = fresh + [t for t in ready if t["id"] in walked]
+        for i, task in enumerate(ready):
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
+            # Stopped between tasks at the step budget: the ones not reached go first next tick (a stop
+            # instead lets dispatch finish what it began: _run_step).
+            if self._step_over(f"task #{task['id']}'s start", task["id"]) and i and not self._stopping:
+                break
+            if task["id"] not in walked:
+                walked.append(task["id"])   # kept as it grows: a step killed mid-task resumes past it
             if why := dispatchguard.refusal(db, task):   # ended since the read, or done again and again
                 log(self.p, f"task {task['id']} not dispatched: {why}")
                 dispatchguard.refuse(db, task["id"], why)   # still queued: back to done, on record
@@ -11554,6 +11566,8 @@ class Daemon:
             busy[run_prov] = busy.get(run_prov, 0) + 1
             if gate.regime == "caps":
                 ctx["committed"] += cost
+        if all(t["id"] in walked for t in fresh):
+            self._dispatch_walked = []   # every task was reached: next tick goes in plain order again
         if any(f == "full" for f in fate.values()) and preempt.enabled(self.cfg):
             try:
                 self._preempt_for_urgent(ready, fate, ctx, core)
