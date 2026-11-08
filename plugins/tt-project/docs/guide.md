@@ -3327,6 +3327,32 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   mutations), `gh release` create, edit, delete, upload and delete-asset, `gh pr update-branch` and
   `gh repo sync` of a named repo; reads of the same endpoints pass, and the hook refuses the same
   requests sent by curl and the like. PR merges follow the charter's merge policy.
+- A run whose task carries the `untrusted_input` label (its input, such as a PR comment, an issue body
+  or a CI log, may carry planted instructions) gets three more guards, model-free (untrusted.py). The
+  label is read from the task's record; `TTP_UNTRUSTED_INPUT=1` also turns them on (a benchmark cell
+  without a project) and nothing turns them off. A run without the label is unchanged.
+  - Pushes: git's pre-push hook refuses every ref but the task's own branch (its recorded branch) and
+    the push branch, so a new branch, a tag or a delete is refused, and the hook refuses a raw
+    `git push` naming the push branch: that branch is reached only through `ttp push`.
+  - Writes: `gh api` with a write method, a field or input body or a GraphQL mutation; every other gh
+    subcommand but reads (`view`, `list`, `diff`, `checks`, `status` and the like), so `gh pr comment`,
+    `gh issue create` and `gh pr review`; curl with a method other than GET, HEAD or OPTIONS, a data
+    or form body or an upload; wget with a post body or `--method`. A task that must post carries the
+    label `untrusted_write` too, set by whoever writes the task and never read from its wording;
+    pushes and credential reads stay refused with it.
+  - Credential reads outside the run's worktree, in a Bash command's words (also inside `sh -c`) or a
+    Read, Grep or Glob path: a file in a credential folder (`~/.ssh`, `~/.aws`, `~/.azure`, `~/.gnupg`,
+    `~/.docker`, `~/.kube`, `~/.password-store`, gh's and gcloud's config, the keyrings), a known
+    credential file (`.netrc`, `.git-credentials`, `.npmrc`, `.pypirc`, `.pgpass`, `.my.cnf`, `.env`,
+    `auth.json`, `hosts.yml`, `shadow`), a private key or certificate (`.pem`, `.key`, `.p12`, `.pfx`,
+    `.jks`, `.ppk`, `.gpg`, `.asc`, `id_*` but `.pub`), a name with token, secret, credential,
+    password or API key in it, a process's `environ`, and environment dumps (`printenv`, a bare `env`,
+    `export` or `set`).
+  The hook (Claude Code, Codex, Cursor and the stream guard) and the run's `bin/git` and `bin/gh`, which
+  scripts reach too, apply them on every provider. Known gaps: a path or command a script or inline code
+  builds at run time (git and gh stay guarded), other HTTP clients, a GET carrying data in its URL and
+  connector (MCP) writes, which keep the AI-tag guard. `ttp.untrusted.guards_live()` tells routing code
+  that these guards ship.
 - A session coordinator's Read, Grep and Glob calls are refused on the credential files listed at
   its launch and on what the worker hook's file tool check refuses.
 - Guards in the harness are a second line. Give the account the harness uses a fine-grained token

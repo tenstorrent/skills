@@ -1108,6 +1108,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
         from . import credguard
         why = credguard.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
                                      str(payload.get("cwd") or os.getcwd()))
+        if not why:   # a run reading untrusted input: a credential file outside its worktree
+            from . import untrusted
+            why = untrusted.tool_refusal(str(payload["tool_name"]), payload.get("tool_input") or {},
+                                         str(payload.get("cwd") or os.getcwd()))
         why = why or local_guard(payload)
         return (_deny(why) if why else None), None
     if str(payload.get("tool_name") or "").startswith("mcp__"):   # a connector post to others (aitag)
@@ -1143,6 +1147,10 @@ def pre_tool_use(payload: dict) -> tuple[dict | None, None]:
     if not why:
         from . import credguard
         why = credguard.bash_refusal(cmd, _all_segments(commands))
+    if not why:   # a run reading untrusted input: no foreign push, write or credential read
+        from . import untrusted
+        why = untrusted.bash_refusal(_all_segments(commands), _segments(commands, strip=False),
+                                     str(payload.get("cwd") or os.getcwd()))
     if not why:
         why = git_push_bypass(segments)
     if not why:
