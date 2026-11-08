@@ -10,7 +10,10 @@ landed commits on the push branch. Excluded, with the reason: a spec that quotes
 added lines verbatim), held-out tests that use a repository symbol the base lacks and the spec does
 not name, and (unless validation is off) a task none of whose added tests fails on the base with the
 head's test files in place and passes ROUNDS of ROUNDS runs on the head: only those fail-to-pass
-tests are kept. Each kept task gets <out>/<id>/workspace, `git archive` of the base in a fresh
+tests are kept. A task whose spec says its branch starts from another task's branch (PARENT) replays
+from that parent's recorded head (the spec's, else the parent's latest push queue head) up to its own
+branch head; it is excluded when the repository lacks that head or it is not under the branch head,
+since a workspace at the push branch base would lack the parent's work. Each kept task gets <out>/<id>/workspace, `git archive` of the base in a fresh
 repository with one commit and no remotes, tags or reflog, and <out>/<id>/heldout, the head's copy
 of each test file the change adds or changes. manifest.json names them with their sha256;
 manifest.sha256 pins it. The bench names no model: what it compares is the runner's choice."""
@@ -41,6 +44,7 @@ ROUNDS = 3         # runs on the head each kept test must pass
 TEST_CMD = "python3 -m pytest -q -p no:cacheprovider"
 TEST_TIMEOUT = 900  # seconds one validation run may take
 BUILDERS = 4        # workspaces built at once, beside the scan
+PARENT = re.compile(r"This task's branch starts from #(\d+)'s branch(?: \S+ \(head ([0-9a-f]{7,40})\))?")
 _EPOCH = {"GIT_AUTHOR_DATE": "2000-01-01T00:00:00+0000", "GIT_COMMITTER_DATE": "2000-01-01T00:00:00+0000"}
 
 
@@ -72,6 +76,22 @@ def landing(repo: Path, rows: list[dict]) -> tuple[str, str, str]:
     same = base and _out(repo, "rev-list", "--count", "--merges", f"{base}..{land}") == "0" and (
         _out(repo, "diff", "--name-only", fork, head) == _out(repo, "diff", "--name-only", base, land))
     return (base, land, "") if same else ("", "", "its landed commits do not match its branch")
+
+
+def from_parent(db, repo: Path, parent: int, recorded: str, head: str) -> tuple[str, str, str]:
+    """(base, head, "") of a task whose branch starts from task `parent`'s branch: base is the parent's
+    `recorded` head (else its latest push queue head under `head`, the task's branch head) when the
+    repository has it under `head`; else ("", "", why)."""
+    heads = [recorded] if recorded else [r["head"] for r in db.q(
+        "SELECT head FROM push_queue WHERE task=? AND head IS NOT NULL AND head != '' ORDER BY id DESC", (parent,))]
+    tip = _out(repo, "rev-parse", "--verify", "-q", f"{head}^{{commit}}") if head else ""
+    shas = [s for h in heads if (s := _out(repo, "rev-parse", "--verify", "-q", f"{h}^{{commit}}"))]
+    for sha in shas:
+        if tip and _git(repo, "merge-base", "--is-ancestor", sha, tip).returncode == 0:
+            return sha, tip, ""
+    what = ("not recorded" if not heads else "not in the repository" if not shas else
+            "not under its branch head")
+    return "", "", f"its branch starts from #{parent}'s branch, whose head is {what}"
 
 
 def _held(path: str) -> bool:
@@ -294,6 +314,19 @@ def workspace(repo: Path, base: str, dest: Path) -> str:
     return _out(dest, "rev-parse", "HEAD^{tree}")
 
 
+def seal(dest: Path) -> str:
+    """Make the files in `dest` a fresh repository with one commit and no remotes, tags or reflog;
+    returns its tree id."""
+    env = {**os.environ, **_EPOCH}
+    git = ["git", "-C", str(dest), "-c", "user.name=bench", "-c", "user.email=bench@localhost",
+           "-c", "core.logAllRefUpdates=false", "-c", "commit.gpgsign=false"]
+    subprocess.run(["git", "init", "-q", "-b", "main", str(dest)], check=True, capture_output=True)
+    subprocess.run([*git, "add", "-A", "-f"], check=True, capture_output=True)
+    subprocess.run([*git, "commit", "-q", "--no-verify", "-m", "base"], check=True, capture_output=True, env=env)
+    shutil.rmtree(dest / ".git" / "logs", ignore_errors=True)
+    return _out(dest, "rev-parse", "HEAD^{tree}")
+
+
 def _passes(where: Path, tests: list[tuple[str, str]], rounds: int, cmd: str, timeout: float) -> dict[str, int]:
     """{path::name: rounds passed} of `tests` run `rounds` times by pytest `cmd` in `where`, through
     the rerun plugin (spread off) in a process sandbox where the host has one (ttp sandbox)."""
@@ -377,13 +410,15 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
         for t in tasks:
             if limit and len(kept) >= limit:
                 break
-            why = ""
+            mine = []
             if t["id"] in reach:
                 carry = landed.carriers(db, t["id"], rows)
                 branches = {v[0] for v in carry.values() if v[0]}
-                base, head, why = landing(repo, [r for r in pushed if r["task"] in carry or r["branch"] in branches])
-            else:
-                base, head, why = landing(repo, [])
+                mine = [r for r in pushed if r["task"] in carry or r["branch"] in branches]
+            base, head, why = landing(repo, mine)
+            parent = PARENT.search(t["spec"] or "")
+            if not why and parent:
+                base, head, why = from_parent(db, repo, int(parent[1]), parent[2] or "", mine[0]["head"])
             tests = addedtests.added(repo, base, head, _tests_of(repo)) if base else []
             if not why and not tests:
                 why = "its landed change adds or changes no test"
@@ -407,12 +442,13 @@ def prep(db, repo: Path, out: Path, since: float, limit: int = 0, test_cmd: str 
                 durable_write(dest, _blob(repo, _blobs(repo, head)[path]), sync=False)
                 sums[path] = _sha(dest)
             kept.append({"task": t["id"], "kind": t["kind"], "title": t["title"], "spec": t["spec"],
-                         "created": t["created"], "base": base, "head": head, "tree": tree,
+                         "created": t["created"],
+                         "parent": int(parent[1]) if parent else None, "base": base, "head": head, "tree": tree,
                          "stratum": "small" if lines <= SMALL else "large", "changed_lines": lines,
                          "tests": [f"{p}::{n}" for p, n in tests], "heldout": sums})
         for k in kept:
             k["tree"] = k["tree"].result()
-    manifest = {"since": since, "made": time.time(), "validated": validated,
+    manifest = {"since": since, "made": time.time(), "repo": str(repo.resolve()), "validated": validated,
                 **({"test_cmd": test_cmd, "rounds": ROUNDS} if validated else {}), "tasks": kept,
                 "excluded": excluded, "counts": {s: sum(k["stratum"] == s for k in kept) for s in ("small", "large")}}
     durable_write(out / "manifest.json", json.dumps(manifest, indent=1) + "\n")
