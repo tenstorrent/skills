@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: every project now cuts queue times by default. The coordinator and worker prompts, the template charter's new `Queue times` policy and the operate guide say to spread CPU-only work to other usable hosts, to grow worker or checks queues that are the bottleneck (within the spend caps), to ask at most once, without waiting, before using a box that clearly belongs to the user, and to go full speed when the user asked for speed or priority. A dollar cap's yellow or orange now says which cap it is, with its figures, the slot cut and the setting that lifts it (for example `88% of cap used ($176.00/7d of $200): one light-tier worker until that spend falls under 85% or the user raises budget.weekly_usd`), so the cut is no longer silent. A daily or 7-day cap change the user ordered in chat can be applied inside a run with `ttp config budget.weekly_usd <n> --user-msg <id>`. This works only when that message is the user's own, from the last 14 days, and its own words name the cap and the exact value. Every other user-only setting still needs a coordinator turn that carries the user's yes.
