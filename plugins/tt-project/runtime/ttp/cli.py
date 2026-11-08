@@ -11409,12 +11409,14 @@ def _no_spill_run_refusal(key: str, value: str) -> str:
 
 
 def _refuse_user_only_in_run(key: str) -> None:
+    from . import capword
     from .coordinator import SANDBOX_KEYS, sandbox_refusal
     if key in SANDBOX_KEYS:
         die(sandbox_refusal(key) + "; `ttp config` refuses turning it on inside a run")
     die(f"{key} is a setting only the user may change, and `ttp config` refuses to set it inside a run; "
         f"reading it still works. Name the value you need in the hand-off (a followup or the question) "
-        f"so the coordinator can ask the user")
+        f"so the coordinator can ask the user"
+        + ("; a cap the user already set in chat: add --user-msg <their message id>" if key in capword.KEYS else ""))
 
 
 def cmd_chat_settable(key: str, value: str | None) -> None:
@@ -11552,13 +11554,25 @@ def cmd_config(a) -> None:
                 raise ValueError(f"{a.key} {json.dumps(val)[:160]}: {err}")
         except ValueError as e:
             die(str(e), 2)
+    from . import configwho
+    setter = configwho.from_env()
     if run and (k := _user_only_change(p.raw_config(), a.key, val, p)):
         # A run can be steered by text it reads; these change only in a coordinator turn that carries
-        # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run.
-        _refuse_user_only_in_run(k)
+        # the user's yes (coordinator.NEEDS_USER), as `ttp say` is refused inside a run, or for a dollar
+        # cap, on the user's own logged words naming it and the value (capword).
+        from . import capword
+        why = capword.problem(p.db, k, val, a.user_msg) if a.user_msg and k == a.key else None
+        if not a.user_msg or why:
+            if why:
+                die(f"{k}: --user-msg refused: {why}")
+            _refuse_user_only_in_run(k)
+        mid = int(str(a.user_msg).lstrip("#"))
+        setter = configwho.by("user", msgs=[mid], task=setter.get("task"), run=setter.get("run"), via="user-msg")
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,data,status) VALUES(?,?,?,?,?,?,?)",
+               (time.time(), "cli", "config_grant", "low", f"ttp config {k} {json.dumps(val)} on the user's word "
+                f"in message #{mid}", json.dumps({"key": k, "value": val, "messages": [mid]}), "handled"))
     try:
-        from . import configwho
-        p.set_config(a.key, val, by=configwho.from_env())
+        p.set_config(a.key, val, by=setter)
     except (RuntimeError, ValueError) as e:   # project.json unreadable with no last good copy; a section given
         # one value; a list- or object-typed key given another form (key_type_problem)
         die(str(e))
@@ -15468,6 +15482,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--chat-settable", action="store_true",
                    help="check, without setting it, whether a coordinator config_set accepts KEY (and VALUE): "
                         "ttp config --chat-settable KEY [VALUE]; KEY `list` prints every accepted key")
+    s.add_argument("--user-msg", metavar="ID",
+                   help="inside a run: set budget.daily_usd or budget.weekly_usd to the value the user's own "
+                        "chat message ID names (its verbatim words must name the cap and the exact value)")
     s.add_argument("--why", metavar="KEY",
                    help="who set KEY (user with the message id, coordinator, worker task, harness, default, upgrade "
                         "or migration) and when, then its logged changes (old -> new, setter, undo); keys set before "

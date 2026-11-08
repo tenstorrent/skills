@@ -408,3 +408,52 @@ def test_upgrade_drops_retired_keys_once_and_keeps_the_rest(env):
     assert rec and rec.get("h") == "-" and "retired" in rec.get("via", ""), rec
     text = p.config_path.read_text()
     assert cli._drop_retired_keys(p) == [] and p.config_path.read_text() == text, "a rerun is a no-op"
+
+
+def test_a_run_sets_a_dollar_cap_only_on_the_users_own_logged_words_naming_it_and_its_value(env, monkeypatch, capsys):
+    """A cap change the user ordered in chat is applied by a run with --user-msg, recorded as the user's
+    with the message id, only when that message is the user's own and its verbatim words name the cap
+    and the exact value; a harness post, a relayer's context, another value or cap, an old message, a
+    later user set and every other user-only key are refused (capword)."""
+    from ttp import capword, cli, configwho
+    p = make(env)
+    p.set_config("budget.weekly_usd", 200.0)
+    now = time.time()
+
+    def msg(text, ts=now - 60, kind="user", provenance=""):
+        p.db.x("INSERT INTO messages(ts,direction,chat,kind,text,provenance) VALUES(?,?,?,?,?,?)",
+               (ts, "in", "c", kind, text, provenance))
+        return p.db.one("SELECT MAX(id) i FROM messages")["i"]
+
+    ok = msg("raise the weekly cap to $400 please")
+    harness = msg("raise the weekly cap to $400", provenance="system")
+    relayed = msg("go faster\n" + __import__("ttp.relay", fromlist=["MARK"]).MARK + "\nraise the weekly cap to 400")
+    other_value = msg("raise the weekly cap to $500")
+    other_cap = msg("raise the global daily cap to $400")
+    old = msg("weekly cap $400", ts=now - capword.MAX_AGE_S - 60)
+    monkeypatch.setattr(cli, "in_run", lambda: True)
+    monkeypatch.setenv("TTP_TASK_ID", "7")
+    monkeypatch.setenv("TTP_RUN_DIR", str(p.state / "runs" / "1"))
+    monkeypatch.setattr(configwho, "from_env", lambda: {"by": "worker", "task": 7})
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "budget.weekly_usd", "400"])
+    assert "--user-msg" in capsys.readouterr().err   # the refusal names the path
+    for mid, why in ((harness, "not the user's own"), (relayed, "do not name"), (other_value, "the value"),
+                     (other_cap, "do not name"), (old, "older than"), (99999, "not the user's own")):
+        with pytest.raises(SystemExit):
+            cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(mid)])
+        assert why in capsys.readouterr().err, mid
+    with pytest.raises(SystemExit):   # another user-only key never takes this path
+        cli.main(["config", "demo", "delivery.code_tasks_may_push", "true", "--user-msg", str(ok)])
+    assert "applies only" in capsys.readouterr().err
+    assert p.raw_config()["budget"]["weekly_usd"] == 200.0
+    cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", f"#{ok}"])
+    assert p.raw_config()["budget"]["weekly_usd"] == 400
+    rec = configwho.get(p.db, "budget.weekly_usd")
+    assert rec["by"] == "user" and rec["msgs"] == [ok] and rec["task"] == 7, rec
+    assert p.db.one("SELECT COUNT(*) n FROM events WHERE kind='config_grant'")["n"] == 1
+    p.db.x("UPDATE messages SET ts=? WHERE id=?", (now - 3600, ok))   # the user set it after that message
+    p.set_config("budget.weekly_usd", 300.0, by=configwho.by("user", via="chat"))
+    with pytest.raises(SystemExit):
+        cli.main(["config", "demo", "budget.weekly_usd", "400", "--user-msg", str(ok)])
+    assert "later value stands" in capsys.readouterr().err

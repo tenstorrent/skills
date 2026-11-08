@@ -5272,3 +5272,25 @@ def test_plan_billed_codex_dollars_never_trip_a_dollar_cap(env):
     g = bud.evaluate(p.db, p.config(), "codex", wins, now)
     assert g.regime in ("windows", "plan") and g.numbers["billing"] == "plan" and g.level == "green", g.reasons
     assert not any("cap" in r for r in g.reasons), g.reasons
+
+
+def test_a_dollar_caps_orange_and_yellow_name_the_cap_the_cut_and_what_lifts_it(env):
+    """A 7-day cap's orange drops the project to one light-tier worker: its reason (the status and web
+    slot line) names the cap's figures, the cut and the setting that lifts it, never a bare share."""
+    p = make(env)
+    from ttp import budget as bud
+    p.set_config("budget.daily_usd", 1000.0)
+    p.set_config("budget.weekly_usd", 200.0)
+    p.db.spend("claude", 176.0, "task:1", ts=time.time() - 3 * 86400)   # outside the runaway guard's hour
+    g = bud.evaluate(p.db, p.config(), "claude", [])
+    assert g.level == "orange" and g.max_parallel == 1 and g.max_tier == "light"
+    assert g.cause == ("88% of cap used ($176.00/7d of $200): one light-tier worker until that spend falls "
+                       "under 85% or the user raises budget.weekly_usd"), g.cause
+    line = bud.gate_slots(g, 6)
+    assert "budget.weekly_usd" in line and "$176.00/7d of $200" in line and "daily_usd" not in line
+    p.db.x("UPDATE ledger SET usd=130")
+    g = bud.evaluate(p.db, p.config(), "claude", [])
+    assert g.level == "yellow" and g.cause.startswith("65% of cap used ($130.00/7d of $200): half the worker "
+                                                      "slots, standard tier at most until"), g.cause
+    p.set_config("budget.weekly_usd", 0)   # unset: no 7-day figure, and a daily share under its line
+    assert bud.evaluate(p.db, p.config(), "claude", []).level == "green"

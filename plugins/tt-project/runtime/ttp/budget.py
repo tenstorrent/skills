@@ -201,7 +201,7 @@ def gate_slots(gate: Gate | dict | None, configured: int) -> str:
     why = g.get("cause") or next(iter(g.get("reasons") or []), "")
     lane = g.get("lane") or {}
     return (f"the budget gate allows {allowed or 'none'} at {g.get('level') or 'green'}"
-            + (f": {why[:160]}" if why else "")
+            + (f": {why[:240]}" if why else "")
             + (f"; {lane_words(lane)}" if lane.get("max_parallel") else ""))
 
 
@@ -626,10 +626,25 @@ def _caps(db: DB, g: Gate, b: dict, provider: str, windows: list[Window], last: 
                    ([f"${w7:.2f}/7d of ${week_cap:.0f}"] if week_cap else [])
         _raise(g, "red", "cap reached: " + ", ".join(set_caps))
     elif ratio >= 0.85:
-        _raise(g, "orange", f"{ratio:.0%} of cap used")
+        _raise(g, "orange", f"{ratio:.0%} of cap used" + _cap_cut_words(
+            "one light-tier worker", 0.85, (today, day_cap, label, "daily_usd"), (w7, week_cap, "7d", "weekly_usd")))
     elif ratio >= yellow_ratio(b):
-        _raise(g, "yellow", f"{ratio:.0%} of cap used")
+        _raise(g, "yellow", f"{ratio:.0%} of cap used" + _cap_cut_words(
+            "half the worker slots, standard tier at most", yellow_ratio(b),
+            (today, day_cap, label, "daily_usd"), (w7, week_cap, "7d", "weekly_usd")))
     _global(db, g, b, provider, day, now, extra)
+
+
+def _cap_cut_words(cut: str, line: float, *caps: tuple) -> str:
+    """What a dollar cap's yellow or orange holds and what lifts it, for the gate's reason, so a slot cut
+    is never silent: ' ($172.00/7d of $200): one light-tier worker until that spend falls under 85% or
+    the user raises budget.weekly_usd'. `caps` are (spent, cap, period, key); only caps set and at or
+    over `line` are named."""
+    near = [(spent, cap, period, key) for spent, cap, period, key in caps if cap and spent / cap >= line]
+    if not near:
+        return ""
+    return (" (" + ", ".join(f"${s:.2f}/{p} of ${c:.0f}" for s, c, p, _ in near) + f"): {cut} until that spend "
+            f"falls under {line:.0%} or the user raises " + " or ".join(f"budget.{k}" for *_, k in near))
 
 
 def yellow_ratio(b: dict) -> float:
