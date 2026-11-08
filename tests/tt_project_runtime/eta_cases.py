@@ -550,3 +550,5 @@ def test_expected_finish_names_tasks_with_no_estimate_for_one_reason_on_one_line
     c = p.db.add_task("third new work", "s", kind="work", priority=1)
     lines = eta.state_lines(p.db, p)
     assert lines[1:] == [f"- #{a}, #{b}, #{c}: ETA: no estimate yet (no measured work run yet)"], lines
+    assert eta.state_lines(p.db, p, skip={a, b})[1:] == [f"- #{c} third new work: ETA: no estimate yet (no measured work run yet)"]
+    assert eta.state_lines(p.db, p, skip={a, b, c}) == [], "ids shown elsewhere leave no shared line naming them"

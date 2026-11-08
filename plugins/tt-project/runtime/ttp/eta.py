@@ -541,14 +541,15 @@ def justify(p, oid: str, why: str, now: float | None = None) -> str:
     return f"obligation {oid}: long due justified ({why[:120]})"
 
 
-def state_lines(db, where, now: float | None = None, host=None) -> list[str]:
+def state_lines(db, where, now: float | None = None, host=None, skip=()) -> list[str]:
     """The STATE section: each urgent open task and each open promise with its expected finish. `host`:
-    a task's started-on-host state (onhost.line), shown after its estimate."""
+    a task's started-on-host state (onhost.line), shown after its estimate. `skip`: task ids shown
+    elsewhere, left out before tasks with one reason share a line."""
     from . import urgent
     from .obligations import open_promises
     now = time.time() if now is None else now
     hot = [t for t in db.q("SELECT * FROM tasks WHERE status NOT IN ('done','failed','cancelled') "
-                           "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t)]
+                           "ORDER BY priority, id LIMIT 60") if urgent.is_urgent(t) and t["id"] not in skip]
     proms = open_promises(db)
     if not hot and not proms:
         return []

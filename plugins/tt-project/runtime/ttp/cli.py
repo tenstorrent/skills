@@ -1691,8 +1691,7 @@ def status_text(p: Project, verbose: bool = False) -> str:
     from . import eta
     try:   # urgent tasks and open promises with their expected finish (critical path)
         lane = {t["id"] for t in db.q("SELECT id FROM tasks WHERE status IN ('queued','review')")}
-        got = ["  " + x[2:] for x in eta.state_lines(db, p, now)[1:]   # the urgent lane below shows its own
-               if not (m := re.match(r"- #(\d+) ", x)) or int(m[1]) not in lane]
+        got = ["  " + x[2:] for x in eta.state_lines(db, p, now, skip=lane)[1:]]   # the urgent lane below shows its own
         if got:
             lines += ["expected finish (critical path, measured medians):"] + got
     except Exception as e:
