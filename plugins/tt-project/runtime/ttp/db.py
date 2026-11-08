@@ -1129,6 +1129,9 @@ END""")
                 prev.pop("waiting_since", None)
                 prev.pop("stale_wakes", None)
                 self.x("UPDATE tasks SET result=? WHERE id=?", (dump_result(prev), task_id))
+            if t["status"] != "queued":   # logged; dispatch's done count restarts (dispatchguard)
+                from . import dispatchguard
+                dispatchguard.record_requeue(self, task_id, t["status"], "requeue")
             for key in (WORKSPACE_TRIES_KEY, WORKSPACE_LOCK_TRIES_KEY):
                 tries = self.kv(key, {}) or {}
                 if str(task_id) in tries:

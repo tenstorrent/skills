@@ -39,6 +39,7 @@ from pathlib import Path
 from . import runtimeload   # first of its own: its LOADED_AT is when the daemon imported its code
 from . import ackwait
 from . import claimcheck
+from . import dispatchguard
 from . import sidefx
 from . import cursorhook
 from . import pausegone
@@ -10191,6 +10192,11 @@ class Daemon:
         for task in ready:
             if not self.lease_held():   # lapsed during this tick (a slow start or store): start nothing more
                 break
+            if why := dispatchguard.refusal(db, task):   # ended since the read, or done again and again
+                log(self.p, f"task {task['id']} not dispatched: {why}")
+                dispatchguard.refuse(db, task["id"], why)   # still queued: back to done, on record
+                fate[task["id"]] = "other"
+                continue
             # Before _start_hold, which may reserve the task's resource.
             if holds and self._setting_hold(task, holds, now):
                 fate[task["id"]] = "hold"

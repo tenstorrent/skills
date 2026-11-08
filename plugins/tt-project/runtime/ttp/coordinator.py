@@ -50,6 +50,7 @@ from . import (   # one name per line: two changes adding names merge without a 
     coursecheck,
     credits,
     deploy,
+    dispatchguard,
     echoes,
     eta,
     effort,
@@ -3058,6 +3059,8 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     upd["status"] = a["status"]
                     if a["status"] == "queued":
                         upd["blocked_reason"] = None
+                        if task["status"] != "queued":   # an explicit requeue: dispatch's done count restarts
+                            dispatchguard.record_requeue(db, task["id"], task["status"], "coordinator")
                         prev = load_result(task["result"])
                         if task["status"] != "queued" and ("waiting_since" in prev or "stale_wakes" in prev):
                             # A requeue is a decision to run it, not to sleep on its probe, and its

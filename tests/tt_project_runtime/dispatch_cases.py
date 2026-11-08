@@ -2100,3 +2100,76 @@ def test_preemption_never_picks_urgent_work_a_review_a_harness_task_a_pushing_ta
     assert preempt.pick(p.db, "claude", {}, set())["task"]["id"] == holder[0], "only its lock spared the p5 run"
     p.db.x("UPDATE tasks SET status='done' WHERE id IN (?,?,?)", (holder[0], owner[0], p2[0]))
     assert preempt.pick(p.db, "claude", {}, set()) is None, f"never one of {spared}"
+
+
+def _closed_done(p, title, closes):
+    """A task that handed off done `closes` times (task_done events), then put back in the queue by an
+    unlogged write, as a stale row written back would."""
+    tid = p.db.add_task(title, "s", kind="plan", tier="light", origin="user", priority=2)
+    p.db.update_task(tid, status="done", attempts=closes, result=json.dumps({"status": "done", "summary": "done"}))
+    for _ in range(closes):
+        p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+               (time.time(), f"task:{tid}", "task_done", "normal", "done", "handled", tid))
+    p.db.x("UPDATE tasks SET status='queued' WHERE id=?", (tid,))
+    return tid
+
+
+def test_a_done_task_queued_again_without_a_requeue_is_not_dispatched_past_its_attempt_limit(
+        env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Regression (upstream fp 6c6d0d95639c46a6): a plan closed done again and again was put back in the
+    queue by an unlogged write and redispatched each time (attempt 14 of 3). Dispatch refuses it, puts it
+    back to done and says why; an explicit requeue runs it again."""
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        again = _closed_done(p, "a plan done three times", 3)
+        once = _closed_done(p, "a plan done once", 1)   # under its limit: a rework re-queue still runs
+        d.dispatch()
+        assert _slot_tasks(p) == [once], "a task closed done as often as its attempt limit was started again"
+        t = p.db.task(again)
+        assert t["status"] == "done" and t["attempts"] == 3
+        ev = p.db.one("SELECT text FROM events WHERE task=? AND kind='dispatch_refused'", (again,))
+        assert ev and "closed done 3 times" in ev["text"] and "attempts 3 of 3" in ev["text"]
+        assert f"task {again} not dispatched: it was already closed done 3 times" in \
+            (p.logs / "daemon.log").read_text()
+        settle(d)
+        assert p.db.requeue(again) == ""   # the user's decision: its done count starts again
+        assert p.db.one("SELECT id FROM events WHERE task=? AND kind='task_requeued'", (again,))
+        d.dispatch()
+        assert again in _slot_tasks(p), "an explicit requeue did not run the task again"
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_task_cancelled_after_the_ready_read_is_not_started(env, monkeypatch, tmp_path, reap_tmp_processes):
+    """Dispatch reads the ready list once per tick; a task cancelled or closed done after that read
+    (a stale queued row in the list) is not started."""
+    from ttp import db as dbmod
+    p, d, drain, settle = _slot_setup(env, monkeypatch, tmp_path, slots=2)
+    try:
+        gone = p.db.add_task("cancelled after the read", "s", kind="work", tier="light", origin="user")
+        done = p.db.add_task("done after the read", "s", kind="work", tier="light", origin="user")
+        stale = [p.db.task(gone), p.db.task(done)]
+        p.db.update_task(gone, status="cancelled")
+        p.db.update_task(done, status="done")
+        monkeypatch.setattr(dbmod.DB, "ready_tasks", lambda self, later=False: [dict(t) for t in stale])
+        d.dispatch()
+        assert _slot_tasks(p) == []
+        assert (p.db.task(gone)["status"], p.db.task(done)["status"]) == ("cancelled", "done")
+        log_text = (p.logs / "daemon.log").read_text()
+        assert f"task {gone} not dispatched: it is cancelled now" in log_text
+        assert f"task {done} not dispatched: it is done now" in log_text
+    finally:
+        drain(d)
+        assert reap_tmp_processes(tmp_path) == [], "a stand-in run outlived the test"
+
+
+def test_a_continue_or_push_rework_requeue_restarts_the_done_count(env):
+    """The daemon's own re-queues of a done task (a chain continue, a push conflict rework) and the
+    coordinator's status queued are explicit: dispatch's done count starts again after each."""
+    from ttp import dispatchguard
+    p = make(env)
+    tid = _closed_done(p, "a chained code task", 3)
+    assert dispatchguard.refusal(p.db, p.db.task(tid))
+    dispatchguard.record_requeue(p.db, tid, "done", "continue")
+    assert dispatchguard.done_closes(p.db, tid) == 0 and dispatchguard.refusal(p.db, p.db.task(tid)) == ""
