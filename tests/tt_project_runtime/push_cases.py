@@ -12929,9 +12929,9 @@ def _cap_suite_batch(env, monkeypatch):
 def test_a_batch_that_breaks_only_a_cap_finds_the_entry_on_cap_probes_and_runs_one_full_suite(env, monkeypatch, capsys):
     """A 5-entry batch that fails only a prompt size cap test: cap probes (only the cap tests) of the
     full head and each prefix find entry 4, one full suite runs on entries 1..3, which push; entry 4
-    is check_failed with a cap-only tail (pushq sends it back to be trimmed), and entry 5, which breaks
-    the cap without it too, is requeued after one more probe. Before, each of those heads ran the full
-    suite: five full runs."""
+    is check_failed with a cap-only tail (pushq sends it back to be trimmed), and entry 5 is requeued
+    untested for the next train: a prefix passed, so no probe or check runs after it (user msg #2317).
+    Before, each of those heads ran the full suite: five full runs."""
     from ttp import conflictfix, pushpass
     p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
     rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
@@ -12939,18 +12939,20 @@ def test_a_batch_that_breaks_only_a_cap_finds_the_entry_on_cap_probes_and_runs_o
     assert _statuses(m) == ["pushed"] * 3 + ["check_failed", "requeued"], m
     ran = log.read_text().split()
     assert ran.count("full") == m["checks"]["runs"] == 1, ran
-    assert m["checks"]["cap_probes"] == 5 and ran.count("cap") == 6, (m["checks"], ran)   # 5 probes + the full run
+    assert m["checks"]["cap_probes"] == 4 and ran.count("cap") == 5, (m["checks"], ran)   # 4 probes + the full run
+    assert m["results"][4]["detail"] == {"untested": True}, m
     trim = conflictfix.cap_failure(m["results"][3]["detail"]["tail"])
     assert trim and trim["over"][0]["size"] == 8 and trim["over"][0]["cap"] == 7, m["results"][3]
     out = capsys.readouterr().out
-    assert "searching on the cap tests alone" in out and "they break a prompt size cap too" in out
-    assert len(json.loads((p.state / pushpass.CAPS).read_text())["probes"]) == 5
+    assert "searching on the cap tests alone" in out and "without it" not in out
+    assert len(json.loads((p.state / pushpass.CAPS).read_text())["probes"]) == 4
 
 
 def test_a_batch_rerun_after_a_reboot_reuses_the_cap_probes_it_already_ran(env, monkeypatch, capsys):
     """A batch dies in its full suite after the cap probes found the entry that breaks the cap (a
     reboot); the rerun, a new batch of the same entries on the same tip, reads the probes of those
-    prefixes back, failing ones included, and runs only the full suite and the one probe it never got to."""
+    prefixes back, failing ones included, and runs only the full suite: no probe is left to run, since a
+    passed prefix sends the entry after the culprit to the next train unchecked (user msg #2317)."""
     from ttp import batch
     p, origin, heads, log = _cap_suite_batch(env, monkeypatch)
 
@@ -12968,7 +12970,7 @@ def test_a_batch_rerun_after_a_reboot_reuses_the_cap_probes_it_already_ran(env, 
     monkeypatch.setattr(batch.Batch, "_check", real)
     rc, m = _run_batch(p, _batch_marker(p, heads, bid="b2"), monkeypatch)
     assert rc == 0 and _statuses(m) == ["pushed"] * 3 + ["check_failed", "requeued"], m
-    assert m["checks"]["cap_reused"] == 4 and m["checks"]["cap_probes"] == 1, m["checks"]
+    assert m["checks"]["cap_reused"] == 4 and not m["checks"].get("cap_probes"), m["checks"]
     assert log.read_text().split().count("full") == 1
     assert "failed in b1" in capsys.readouterr().out
 
