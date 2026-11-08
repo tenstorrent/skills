@@ -190,3 +190,21 @@ def test_an_id_after_the_claim_verb_or_a_hedge_in_its_clause_is_not_judged_as_it
     coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=9)
     assert _cc_sent(p)[-1] == f"{claimcheck.FALSE_MARK} (#{done} is done): {text}", _cc_sent(p)[-1]
     assert len(_cc_false_events(p)) == 1
+
+
+def test_an_id_after_the_verb_with_a_noun_subject_is_never_false_but_a_start_on_a_task_that_never_ran_is(env):
+    from ttp import claimcheck, coordinator as coord
+    p = make(env)
+    done = p.db.add_task("a", "s", kind="code", status="done")
+    p.db.x("INSERT INTO runs(task,role,status) VALUES(?,'worker','done')", (done,))
+    texts = (f"A review is running for #{done}.", f"Checks are running on #{done}.",
+             f"Tests passed on #{done}.", f"A worker restarted on #{done}.", f"A review started for #{done}.")
+    for turn, text in enumerate(texts, 1):
+        coord.apply(p, [{"type": "reply", "text": text, "chat": "c1"}], turn=turn)
+        assert not _cc_sent(p)[-1].startswith(claimcheck.FALSE_MARK), _cc_sent(p)[-1]
+    assert not _cc_false_events(p)
+    # The one exception: a start on a task that never ran stays false.
+    never = p.db.add_task("b", "s", kind="work", status="queued")
+    coord.apply(p, [{"type": "reply", "text": f"Long runs started on #{never}.", "chat": "c1"}], turn=9)
+    assert _cc_sent(p)[-1].startswith(f"{claimcheck.FALSE_MARK} (#{never} is queued)"), _cc_sent(p)[-1]
+    assert len(_cc_false_events(p)) == 1

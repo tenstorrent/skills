@@ -15,8 +15,8 @@ check() judges each claim sentence, first backing that applies:
 - a config key it names (`budget.daily_usd`, or an ALIASES phrase such as 'daily cap') with 'to <value>':
   the live config must hold that value;
 - the tasks (#id) and runs ('run 123') it names as a claim's subject, each by the claim of its own clause
-  (_bound; an id after the verb or a hedge word is left out, a binding that is ambiguous is unverified,
-  never false): a task running for 'running'/'restarted', started for
+  (_bound; an id after the verb, but a start verb's target, or after a hedge word is left out, a binding
+  that is ambiguous is unverified, never false): a task running for 'running'/'restarted', started for
   'started', not running for 'stopped', done for the rest; a run running, any run for 'started', ended for
   the rest. A worker notify's own task and run (relayed after its run ended) count as running then.
 A claim that does not hold is not sent as written: it goes prefixed with what is true (FALSE_MARK), and
@@ -84,7 +84,7 @@ def _verbs(s: str) -> list:
 def _bound(sentence: str) -> list[tuple[str, int, str | None]]:
     """Each task ('task') and run ('run') id of `sentence` that a claim is about, with the class of the
     claim verb after it in its own clause (split on ',', ';', ' and ', ' but '), or of the first verb after
-    it when its clause holds ids alone ('#1, #2 and #3 landed'), or of the verb before it in a clause with
+    it when its clause holds ids alone ('#1, #2 and #3 landed'), or of a start verb before it in a clause with
     no id before that verb when only small words stand between ('runs started on #1'); None where its own
     clause holds several classes. Any other id after a verb or a hedge word in its clause (the verb's
     object, 'after #1 landed'), or whose clause verb is hedged, is not claimed and left out."""
@@ -102,9 +102,10 @@ def _bound(sentence: str) -> list[tuple[str, int, str | None]]:
             if _HEDGE.search(before):
                 continue   # 'after #1 landed', 'once #1 lands': a condition, not a claim about it
             if _VERB.search(before) or _ENDED.search(before):
-                # Bound to that verb only as its subject-less target; otherwise the verb's object: left out.
+                # Bound only as a start verb's subject-less target ('runs started on #1'); any other id
+                # after a verb ('A review is running for #1') is its object: left out, never false.
                 pre = [v for v in verbs if lo <= v[0] < m.start()]
-                if not pre or _TASK.search(s[lo:pre[-1][0]]) or _RUN.search(s[lo:pre[-1][0]]) \
+                if not pre or pre[-1][2] != "start" or _TASK.search(s[lo:pre[-1][0]]) or _RUN.search(s[lo:pre[-1][0]]) \
                         or not set(re.findall(r"[a-z]+", s[pre[-1][1]:m.start()].lower())) <= _ATTACH:
                     continue
                 out.append((kind, int(m.group(1)), pre[-1][2]))
