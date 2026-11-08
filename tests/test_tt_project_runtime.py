@@ -38640,6 +38640,7 @@ _forbid = os.path.realpath(os.environ["TTP_TEST_FORBID_ROOT"])
 _allow = [os.path.realpath(x) for x in os.environ["TTP_TEST_ALLOW_ROOT"].split(os.pathsep) if x]
 _log = os.environ["TTP_TEST_FORBID_LOG"]
 _WRITE = os.O_WRONLY | os.O_RDWR | os.O_CREAT
+_busy = []   # set while the hook logs: its own log write must not re-enter it
 
 
 def _under(path, root):
@@ -38647,6 +38648,8 @@ def _under(path, root):
 
 
 def _hook(event, args):
+    if _busy:
+        return
     if event == "open":
         path, mode, flags = args
         if not (isinstance(flags, int) and flags & _WRITE) and not any(c in str(mode or "") for c in "wax+"):
@@ -38661,8 +38664,12 @@ def _hook(event, args):
         return
     real = os.path.realpath(path)
     if _under(real, _forbid) and not any(_under(real, a) for a in _allow):
-        with open(_log, "a") as f:
-            f.write(f"{event} {real}\\n")
+        _busy.append(1)
+        try:
+            with open(_log, "a") as f:
+                f.write(f"{event} {real}\\n")
+        finally:
+            _busy.clear()
 
 
 sys.addaudithook(_hook)
@@ -38678,7 +38685,9 @@ def _forbid_audit_plugin(where: pathlib.Path) -> pathlib.Path:
 def test_the_forbidden_root_audit_logs_writes_outside_the_allowed_root(tmp_path):
     # Negative control for the audit the isolation regression relies on, with a forbidden root of its
     # own (never /tmp): writes outside the allowed roots are logged, writes inside either are not.
-    forbid, log = tmp_path / "forbid", tmp_path / "audit.log"
+    # The log itself sits under the forbidden root: logging a write must not re-enter the hook.
+    forbid = tmp_path / "forbid"
+    log = forbid / "audit.log"
     allow, allow2 = forbid / "allow", forbid / "checkout"
     allow.mkdir(parents=True)
     allow2.mkdir()
@@ -38736,9 +38745,10 @@ def test_checks_isolate_run_local_tmpdir_from_enclosing_git_and_project(env, tmp
     plugin = _forbid_audit_plugin(tmp_path / "audit-plugin")
     monkeypatch.setenv("PYTHONPATH", os.pathsep.join(filter(None, [str(plugin), os.environ.get("PYTHONPATH")])))
     monkeypatch.setenv("TTP_TEST_FORBID_ROOT", "/tmp")
-    # The child pytest's own bytecode and cache in the checkout are not temp files: allow the checkout,
-    # so a checkout under /tmp audits exactly what one elsewhere does.
-    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", os.pathsep.join([str(nested_tmp), str(RUNTIME.parents[2])]))
+    # The child pytest's own bytecode and cache in the checkout are not temp files, nor is the run
+    # folder (the durable record, e.g. slowest-tests.json): allow both, so a checkout or suite tmp
+    # under /tmp audits exactly what one elsewhere does.
+    monkeypatch.setenv("TTP_TEST_ALLOW_ROOT", os.pathsep.join([str(nested_tmp), str(RUNTIME.parents[2]), str(run)]))
     monkeypatch.setenv("TTP_TEST_FORBID_LOG", str(audit_log))
     monkeypatch.setenv("TTP_TEST_SHORT_TMP_ROOT", str(nested_tmp))   # the child suite's own short-dir folder
     for var in ("TMPDIR", "TMP", "TEMP"):
