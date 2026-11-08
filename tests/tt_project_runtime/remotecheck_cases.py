@@ -3718,7 +3718,7 @@ def test_a_parked_run_re_executed_for_an_upgrade_tries_every_spill_host_again(en
     monkeypatch.setattr(cli.os, "execv", fake_exec)
     off = "host-a:fail,host-b:fail"
     with pytest.raises(_Exec) as e:
-        cli._checks_reexec("2" if rerank else "99.0.0", time.time(), 3, True, lambda _l: None, io.StringIO(),
+        cli._checks_reexec("2" if rerank else "99.0.0", time.time(), 3, lambda _l: None, io.StringIO(),
                            rerank=rerank, spill_off=off)
     assert e.value.args[0] == (off if rerank else None)
 

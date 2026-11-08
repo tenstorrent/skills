@@ -4888,6 +4888,66 @@ def test_a_waiting_detached_checks_run_reexecutes_with_an_upgraded_runtime_and_k
         t.join(30)
 
 
+class _SlotAsked(BaseException):
+    """What the stand-in for _checks_slot raises once it saw the re-executed run's spill decision."""
+
+
+@pytest.mark.parametrize("caller_off", ["", "1", "om-x"])
+def test_a_reexecuted_checks_run_decides_spill_again_and_keeps_only_the_callers_no_spill(
+        env, tmp_path, monkeypatch, caller_off):
+    # #7419: a run the old code would not spill set OFF_ENV "1" on its re-exec, so after an upgrade that
+    # lets it spill it never tried a spill host (66 waiters stalled up to 10 h). Only the caller's OFF_ENV
+    # carries over ("1" always; an upgrade drops the hosts a rerun kept off); the new code decides
+    # spillability again.
+    import inspect
+    import threading
+    from ttp import checkcap, checkspill, cli
+    p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
+    params = inspect.signature(cli._checks_slot).parameters
+    new = []
+    execs = _upgrade_child_checks(monkeypatch, lambda: new[0] if new else "", handover=True)
+    monkeypatch.setenv(checkcap.ARRIVED_ENV, repr(time.time() - 600))
+    monkeypatch.setenv(checkspill.OFF_ENV, caller_off)
+    verdict = [False]   # the old code's: these checks may not spill
+    monkeypatch.setattr(checkspill, "spillable", lambda cmds, cfg=None: verdict[0])
+    monkeypatch.setenv("TTP_CHECKS_HOST_MAX", "1")
+    held = checkcap.acquire("other")
+    ran, ended = tmp_path / "ran", []
+
+    def go():
+        try:
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        except _ReExec:
+            ended.append("exec")
+    t = threading.Thread(target=go)
+    t.start()
+    try:
+        assert _wait_for(lambda: "queued for a host-wide checks slot" in (
+            (run / "checks.log").read_text() if (run / "checks.log").exists() else ""))
+        new.append("99.0.0")
+        t.join(30)
+        assert not t.is_alive() and ended == ["exec"] and not ran.exists()
+        (_, _, envs, _), = execs
+        kept = caller_off if checkspill.all_off(caller_off) else ""   # an upgrade drops the hosts kept off
+        assert (envs[checkspill.OFF_ENV] or "") == kept, envs
+        # The re-executed run, under code that lets these checks spill, decides again from what it was handed.
+        verdict[0] = True
+        new.clear()
+        asked = []
+
+        def slot(*a, **k):
+            args = dict(zip(params, a), **k)
+            asked.append((args.get("spill"), args.get("spill_off")))
+            raise _SlotAsked()
+        monkeypatch.setattr(cli, "_checks_slot", slot)
+        with pytest.raises(_SlotAsked):
+            cli.main(["checks", "--", "sh", "-c", f"touch {ran}"])
+        assert asked == [(not checkspill.all_off(caller_off), kept)], asked
+    finally:
+        held.close()
+        t.join(30)
+
+
 def test_a_detached_checks_run_that_got_its_slots_runs_its_commands_and_is_never_reexecuted(env, tmp_path, monkeypatch):
     from ttp import cli
     p, repo, run, git = _checks_repo(env, tmp_path, monkeypatch)
@@ -10153,7 +10213,7 @@ def test_a_waiting_routine_checks_run_whose_task_turns_urgent_re_executes_once_a
     monkeypatch.setattr(os, "execv", execv)
     monkeypatch.setenv(checkcap.ARRIVED_ENV, "")
     told = []
-    cli._checks_reexec("1", 1234.5, 3, True, told.append, io.StringIO(), rerank=True)
+    cli._checks_reexec("1", 1234.5, 3, told.append, io.StringIO(), rerank=True)
     assert seen == {"rerank": "1", "reexec": "", "arrived": "1234.5"}, seen
     assert told[0].startswith("its task turned urgent (priority 1) while these checks waited at priority 3"), told
     assert checkcap.reranked(p, 3, now=9000.0) is None, "once per priority"
@@ -10183,7 +10243,7 @@ def test_a_waiting_checks_run_re_ranks_whenever_its_task_priority_changes_so_a_s
     monkeypatch.setattr(os, "execv", lambda *a: (_ for _ in ()).throw(OSError("no exec in a test")))
     monkeypatch.setenv(checkcap.ARRIVED_ENV, "")
     told = []
-    cli._checks_reexec("2", 1234.5, 1, True, told.append, io.StringIO(), rerank=True)
+    cli._checks_reexec("2", 1234.5, 1, told.append, io.StringIO(), rerank=True)
     assert told[0].startswith("its task changed priority (priority 2) while these checks waited at priority 1"), told
     assert "queueing again at their arrival" in told[0] and os.environ[checkcap.RERANK_ENV] == "2", told
     monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
