@@ -67,6 +67,43 @@ def test_checks_scratch_home_false_runs_a_check_with_the_real_home(env, tmp_path
     assert out.read_text() == str(home)
 
 
+def test_ttp_land_honours_checks_scratch_home_and_home_files(env, tmp_path, monkeypatch):
+    """`ttp land` reads the project's checks settings itself: no `ttp push` or `ttp checks` in its
+    process sets push.check_cfg, so a default would ignore the project's opt-out."""
+    from ttp import push
+    out = tmp_path / "out"
+    land, p, repo, t, head = _land_setup(env, monkeypatch, [f'printf "%s\\n" "$HOME" >> {out}; ls -A "$HOME" >> {out}'])
+    home = _real_home(tmp_path, monkeypatch)
+    (home / ".extra").write_text("x\n")
+    monkeypatch.setattr(push, "check_cfg", None)
+    p.set_config("checks.scratch_home", False)
+    said = []
+    assert land.land(p, repo, head, t, said.append) == 0, said
+    assert out.read_text().splitlines()[0] == str(home), said
+    out.unlink()
+    p.set_config("checks.scratch_home", True)
+    p.set_config("checks.home_files", [".extra"])
+    _git_out(repo, "checkout", "-q", "work")
+    _commit(repo, "b.txt", "b\n")
+    assert land.land(p, repo, _git_out(repo, "rev-parse", "HEAD"), t, said.append) == 0, said
+    lines = out.read_text().splitlines()
+    assert lines[0] != str(home) and lines[0].endswith("/home"), lines
+    assert ".extra" in lines and ".gitconfig" not in lines, lines
+
+
+def test_every_check_env_caller_passes_the_project_config_or_runs_where_check_cfg_is_set():
+    """Only `ttp push` (push._run) and `ttp checks` (cli.cmd_checks) set push.check_cfg for their
+    process; a check_env call in any other module names cfg, or it gets the default scratch HOME."""
+    import re
+    from pathlib import Path
+    from ttp import push
+    for f in Path(push.__file__).parent.glob("*.py"):
+        if f.name in ("push.py", "cli.py"):
+            continue
+        for call in re.findall(r"push\.check_env\((.*)", f.read_text()):
+            assert "cfg=" in call, f"{f.name}: push.check_env({call}"
+
+
 def test_checks_home_files_refuses_credentials_ssh_gh_and_paths_outside_home(tmp_path, monkeypatch):
     # (c) a credential store (also by a symlink or a folder holding one), ~/.ssh, gh's config and a path
     # leaving HOME are refused by the setting and never copied by apply, given one anyway.
