@@ -3711,6 +3711,7 @@ class Daemon:
             if session_mode == "resume" and (n := (state or {}).get("salvaged")):
                 prompt = coordsession.salvaged_line(n) + "\n\n" + prompt
             restoring = session_mode == "resume" and bool((state or {}).get("restore"))
+            asked = False   # this wake asks for the harness-supplied summary (compact_ask)
             if session_mode in ("new", "resume") and session_prompt:
                 system, context = session_prompt["system"], session_prompt["context"]
                 try:   # a new or compacted session's pinned record (coordsession.py): no order, promise or decision is lost
@@ -3727,7 +3728,7 @@ class Daemon:
                         prompt = f"{changed}\n\n{prompt}" if changed else prompt
                     self.p.db.set_kv(coordsession.KEY, {**(state or {}), "pending": pending})   # record() keeps it once ok
                     if why == "compact" and not coordsession.agent_compacts(prov):   # the harness-supplied summary
-                        prompt = prompt + "\n\n" + coordsession.compact_ask(state)
+                        prompt, asked = prompt + "\n\n" + coordsession.compact_ask(state), True
                 except Exception:   # the digest alone still runs the wake
                     log(self.p, "coordinator session seed failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
                 try:   # a changed prompt, charter or schema: the session continues, told what changed
@@ -3772,6 +3773,7 @@ class Daemon:
                 **({"error": str((state or {}).get("fail_error") or "")}   # the failed resume this reruns
                    if (state or {}).get("rerun") else {}),
                 **({"restore": True} if restoring else {}),
+                **({"compact_ask": True} if asked else {}),
                 **({"compact_at": compact_at} if compact_at else {}),
                 **({"seed_chars": seed_chars} if session_mode == "new" else {}),
                 **({"sent": sent_why, "sent_chars": len(prompt)} if sent_why else {})}}}
@@ -6748,17 +6750,20 @@ class Daemon:
                       f"coordinator run {r['id']}: a new session could not start "
                       f"({str(getattr(usage, 'error', '') or '')[:200] or 'no error recorded'}); the next wake "
                       f"starts it again, seeded with the hand-off", json.dumps({"run": r["id"]}), "handled"))
+            noted = False   # the wake asked for its summary returned it: a "summary" compaction
             if ok and session.get("mode") in ("new", "resume") and isinstance(out, dict) and out.get("session_note"):
                 sid = str(getattr(usage, "session_id", "") or r.get("session_id") or "")
                 from .relay import agent_orders
                 if path := coordsession.save_note(self.p, sid, out.get("session_note"), agent_orders(self.cfg)):
                     log(self.p, f"coordinator run {r['id']}: session note saved to {path}")
+                    noted = bool(session.get("compact_ask"))
             compacted = None
             if session.get("mode") in ("new", "resume"):
                 pre = self._compaction(r)
                 compacted = pre if pre is not None else {"pre_tokens": 0} if (ctx or {}).get("compacted") else None
             state = coordsession.record(state, usage, r.get("session_id") or "", session, ok, now,
-                                        summary=str((out or {}).get("summary") or ""), compacted=compacted)
+                                        summary=str((out or {}).get("summary") or ""), compacted=compacted,
+                                        noted=noted)
             if ok and session.get("mode") in ("new", "resume"):
                 coordsession.ack_prefix(self.p, r.get("dir") or self.p.runs / str(r["id"]))
             if ok and (state.get("compactions") or [{}])[-1].get("at") == now:

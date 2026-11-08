@@ -191,8 +191,18 @@ def test_coordsession_a_last_call_over_the_limit_compacts_in_place(tmp_path):
     # Over the limit the same session resumes to compact (a harness summary where the agent has no
     # switch); the compaction is recorded and the next limit counts from the compacted size.
     assert cs.decide(_cs_cfg(), st, "k1", "m", "high", yes, 30.0) == ("resume", "compact")
+    # A compact wake that was asked for no summary and saw no agent compaction (the agent's switch
+    # did not fire) records none: no restore, the compaction point stays.
+    small = Claude().parse(_cs_stream(tmp_path / "n.jsonl", [(131000, 300)]))
+    for noted in (False, None, 0):
+        quiet = cs.record(st, small, "s1", {**turn, "mode": "resume", "why": "compact"}, True, 33.0, None, noted)
+        assert not quiet.get("compactions") and "restore" not in quiet and "compact_floor" not in quiet
+        assert cs.limit(_cs_cfg(), quiet, "m") == cs.limit(_cs_cfg(), st, "m")
+    # Only a summary on a compact wake counts: a note on another wake is no compaction.
+    quiet = cs.record(st, small, "s1", {**turn, "mode": "resume", "why": "continued"}, True, 33.0, None, True)
+    assert not quiet.get("compactions") and "restore" not in quiet
     st = cs.record(st, Claude().parse(_cs_stream(tmp_path / "h.jsonl", [(40000, 300)])), "s1",
-                   {**turn, "mode": "resume", "why": "compact"}, True, 35.0)
+                   {**turn, "mode": "resume", "why": "compact"}, True, 35.0, noted=True)
     assert st["id"] == "s1" and st["wakes"] == 3 and st["restore"] is True
     assert st["compactions"] == [{"at": 35.0, "session": "s1", "before": 130000, "after": 40300, "how": "summary"}]
     assert cs.limit(_cs_cfg(), st, "m") == 140300
@@ -714,6 +724,7 @@ def test_coordsession_compacts_in_place_with_its_summary_and_restores_the_pinned
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 150000})
     third, _, prompt3 = wake("third order")
     assert (third["mode"], third["why"]) == ("resume", "compact") and coordsession.COMPACT_HEAD in prompt3
+    assert third["compact_ask"] is True
     assert coordsession.load_note(p, sid).strip() == os.environ["TTP_FAKE_SESSION_NOTE"]
     st = p.db.kv(coordsession.KEY)
     assert st["id"] == sid and st["restore"] is True
@@ -759,7 +770,7 @@ def test_coordsession_an_agent_that_compacts_itself_keeps_its_session_and_the_pi
     monkeypatch.setenv("TTP_FAKE_CONTEXT", "400000")
     second, _, prompt2 = wake("second order")
     assert (second["mode"], second["why"]) == ("resume", "compact") and coordsession.COMPACT_HEAD not in prompt2
-    assert 0 < second["compact_at"] <= 400000
+    assert 0 < second["compact_at"] <= 400000 and "compact_ask" not in second
     st = p.db.kv(coordsession.KEY)
     assert st["id"] == sid and st["restore"] is True and not coordsession.load_note(p, sid)
     assert [(c["session"], c["before"], c["how"]) for c in st["compactions"]] == [(sid, 400000, "agent")]
@@ -774,6 +785,30 @@ def test_coordsession_an_agent_that_compacts_itself_keeps_its_session_and_the_pi
     wake("fourth order")
     st = p.db.kv(coordsession.KEY)
     assert st["id"] == sid and len(st["compactions"]) == 2 and st["compactions"][-1]["how"] == "agent"
+
+
+def test_coordsession_a_compact_wake_whose_agent_switch_did_not_fire_records_no_compaction(env, monkeypatch):
+    """Review #7250: on a provider that compacts itself the harness asks no summary, so a compact
+    wake whose context stayed below the switch (compact_at above the agent's size) compacted
+    nothing: no row, no restore, the compaction point stays."""
+    from ttp import coordsession
+    p, d, sessions, wake = _cs_session_project(env, monkeypatch)
+    monkeypatch.setenv("TTP_FAKE_AGENT_COMPACTS", "1")
+    monkeypatch.setenv("TTP_FAKE_SESSION_NOTE", "never asked")
+    wake("first order")
+    sid = p.db.kv(coordsession.KEY)["id"]
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 400000})
+    before = p.db.kv(coordsession.KEY)
+    monkeypatch.setenv("TTP_FAKE_CONTEXT", "1000")
+    second, _, prompt2 = wake("second order")
+    assert (second["mode"], second["why"]) == ("resume", "compact") and "compact_ask" not in second
+    assert 1000 < second["compact_at"] and coordsession.COMPACT_HEAD not in prompt2
+    st = p.db.kv(coordsession.KEY)
+    assert st["id"] == sid and not st.get("compactions") and "restore" not in st
+    assert st.get("compact_floor") == before.get("compact_floor")
+    third, _, prompt3 = wake("third order")
+    assert "restore" not in third and coordsession.RESTORE_HEAD not in prompt3
+    assert not p.db.kv(coordsession.KEY).get("compactions")
 
 
 def test_every_provider_compacts_a_session_in_place():
@@ -1225,9 +1260,14 @@ def test_coordsession_wakes_send_a_delta_and_the_whole_digest_after_restart_roll
     sid = p.db.kv(coordsession.KEY)["id"]
     p.set_config("coordinator.session.compact_tokens", 1)
     p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 5})
+    s, prompt, _ = wake()   # asked for its summary, the agent returned none: nothing compacted
+    assert s["why"] == "compact" and s["compact_ask"] and coordsession.COMPACT_HEAD in prompt
+    assert not p.db.kv(coordsession.KEY).get("compactions") and "restore" not in p.db.kv(coordsession.KEY)
+    monkeypatch.setenv("TTP_FAKE_SESSION_NOTE", "1. Open threads: none.")
+    p.db.set_kv(coordsession.KEY, {**p.db.kv(coordsession.KEY), "context_tokens": 5})
     s, prompt, _ = wake()   # the compaction wake resumes the session, its digest a delta
     assert s["mode"] == "resume" and s["why"] == "compact" and s["sent"].startswith("delta: ")
-    assert coordsession.COMPACT_HEAD in prompt
+    assert coordsession.COMPACT_HEAD in prompt and p.db.kv(coordsession.KEY)["compactions"][-1]["how"] == "summary"
     p.set_config("coordinator.session.compact_tokens", 0)
     s, prompt, _ = wake()
     assert s["mode"] == "resume" and s["sent"] == "full: context compacted" and "Since your last wake" not in prompt

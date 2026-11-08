@@ -347,14 +347,14 @@ def context_tokens(usage) -> int:
 
 
 def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summary: str = "",
-           compacted=None) -> dict:
+           compacted=None, noted: bool = False) -> dict:
     """kv KEY after a wake that decided `turn` ({"mode", "why", "key", "model", "effort",
     "provider"}) ended, ok or not; `summary` is its answer's own summary, kept in `recent` for the next
     seed or restore. A provider gap's stateless wake leaves the session as it was. `compacted`: the
     agent compacted the session during the wake ({"pre_tokens": its size before, "post_tokens": its history
-    right after, when known}); a
-    "compact" wake without it was the harness-supplied summary (its session_note). Either is kept in
-    `compactions` and makes the next wake lead with restore()."""
+    right after, when known}); `noted`: the wake was asked for the harness-supplied summary (compact_ask)
+    and returned its session_note. Either is kept in `compactions` and makes the next wake lead with
+    restore(); a "compact" wake with neither (the agent's switch did not fire) records no compaction."""
     st = dict(state) if isinstance(state, dict) else {}
     st.setdefault("failures", [])
     mode = turn.get("mode")
@@ -399,7 +399,7 @@ def record(state, usage, session_id: str, turn: dict, ok: bool, now: float, summ
         if turn.get("restore"):   # the pinned record went out after the last compaction
             st.pop("restore", None)
         agent = isinstance(compacted, dict) or compacted is True
-        if agent or (mode == "resume" and turn.get("why") == "compact"):
+        if agent or (noted and mode == "resume" and turn.get("why") == "compact"):
             pre = _num(compacted.get("pre_tokens"), 0) if isinstance(compacted, dict) else 0
             row = {"at": now, "session": st["id"], "before": int(pre or before),
                    "after": st["context_tokens"], "how": "agent" if agent else "summary"}
