@@ -5506,7 +5506,6 @@ def test_claude_workers_get_the_update_hook_but_decisions_do_not(env):
 def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypatch):
     from ttp.providers import claude, get_provider
     build = get_provider("claude").build
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools: the denylist
     worker, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={"no_internet": True})
     settings = json.loads(worker[worker.index("--settings") + 1])
@@ -5517,15 +5516,11 @@ def test_claude_workers_get_a_lean_context_but_keep_plugin_skills(env, monkeypat
     assert settings["autoMemoryEnabled"] is False
     assert worker.count("--disallowedTools") == 1, "a second flag would hide part of the deny list"
     i = worker.index("--disallowedTools") + 1
-    denied = worker[i:worker.index("--settings", i)]
-    assert {"Workflow", "ScheduleWakeup", "CronCreate", "CronDelete", "CronList", "RemoteTrigger",
-            "PushNotification", "DesignSync", "NotebookEdit", "EnterWorktree", "ExitWorktree", "ListAgents",
-            "ReportFindings", "Task", "Agent", "SendMessage", "WebFetch", "WebSearch"} == set(denied)
-    # The tools workers do use stay, ToolSearch included (it loads deferred and MCP tools).
-    assert not {"Bash", "Read", "Edit", "Write", "Skill", "ToolSearch", "Monitor", "TaskStop"} & set(denied)
+    # The full tool set (user msg #2302): no_internet withholds only the web tools.
+    assert worker[i:worker.index("--settings", i)] == ["WebFetch", "WebSearch"] and "--tools" not in worker
     online, _ = build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, read_only=False,
                       schema=None, restrictions={})
-    assert "WebFetch" not in online and "Workflow" in online
+    assert "--disallowedTools" not in online and "--tools" not in online
     # Plugin skills (tt-project's own, a project's plugin dirs) are never overridden; of the namespaced
     # ones only the Anthropic skills a claude.ai account brings are.
     argv = online + get_provider("claude").plugin_args(["/p/plugin"])
@@ -6428,7 +6423,6 @@ def test_a_claude_worker_is_denied_reading_the_web_token(env, monkeypatch):
 
 def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators(env, monkeypatch):
     from ttp.providers import claude, get_provider
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: False})   # a CLI without --tools
     kw = dict(role="worker", model="opus", effort="low", cwd=".", budget_usd=None, schema=None,
               restrictions={"no_internet": True})
 
@@ -6436,19 +6430,19 @@ def test_disallowed_tools_extend_the_workers_denylist_and_never_the_coordinators
         i = argv.index("--disallowedTools")
         return argv[i + 1:argv.index("--settings")]
     worker, _ = get_provider("claude").build(read_only=False, **kw)
-    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch"], "unset: the defaults only"
+    assert denied(worker) == ["WebFetch", "WebSearch"], "unset: no_internet's web tools only"
     worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*", "Task",
                                                                                 "mcp__docs__write_page"], **kw)
-    assert denied(worker) == [*claude.WORKER_DENIED_TOOLS, "WebFetch", "WebSearch", "mcp__mail__*",
-                              "mcp__docs__write_page"], "the defaults stay, each tool once"
+    assert denied(worker) == ["WebFetch", "WebSearch", "mcp__mail__*", "Task",
+                              "mcp__docs__write_page"], "the web tools stay, each tool once"
     assert worker.count("--disallowedTools") == 1
     turn, _ = get_provider("claude").build(read_only=True, disallowed_tools=["mcp__mail__*"], **kw)
     assert "mcp__mail__*" not in turn
     for name in ("codex", "cursor", "fake"):
         get_provider(name).build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
-    # With the --tools allowlist, only the project's own list is denied (MCP tools are not built-in).
-    monkeypatch.setattr(claude, "_FLAGS", {claude.TOOLS: True})
-    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*"], **kw)
+    # Online, only the project's own list is denied.
+    worker, _ = get_provider("claude").build(read_only=False, disallowed_tools=["mcp__mail__*"],
+                                             **{**kw, "restrictions": {}})
     assert denied(worker) == ["mcp__mail__*"]
 
 
@@ -29558,7 +29552,7 @@ def test_claude_hook_denies_ways_around_the_gh_guard(env, monkeypatch, tmp_path)
     worker, _ = get_provider("claude").build(role="worker", model="opus", effort="low", cwd=".", budget_usd=None,
                                              read_only=False, schema=None, restrictions={})
     pre = json.loads(worker[worker.index("--settings") + 1])["hooks"]["PreToolUse"][0]
-    assert pre["matcher"] == "Bash|Edit|Write|MultiEdit|NotebookEdit|Read|Grep|Glob|mcp__.*"
+    assert pre["matcher"] == "*", "every tool, subagents' calls included"
     assert pre["hooks"][0]["command"].endswith("ttp.hook PreToolUse")
 
 
