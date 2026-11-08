@@ -778,9 +778,10 @@ _RT_URL, _RT_MODEL = "https://example.invalid/v1", "placeholder-model"
 
 
 def _route_config(p, route=True, **extra):
+    from ttp import configwho
     p.set_config("providers.chat", {"endpoint": "placeholder", "base_url": _RT_URL,
                                     "tiers": {"light": {"model": _RT_MODEL, **({"route": route} if route is not None else {})}},
-                                    **extra})
+                                    **extra}, by=configwho.by("user", via="cli"))   # the user's own config
 
 
 def _route_dispatch(p, d, monkeypatch, **task):
