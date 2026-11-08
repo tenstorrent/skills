@@ -254,6 +254,7 @@ from .project import (
     disk_resume_gb,
     durable_append,
     durable_write,
+    write_json,
     open_append,
     git_fsync_env,
     file_tail,
@@ -338,6 +339,7 @@ STEP_HARD_SLACK_S = 5
 # add/remove/prune, cleantree, checkreap, harnesstree's merge): killing one midway can leave a lock or a
 # half-removed tree. Every git helper takes the cap or is allowlisted (test_every_git_helper_takes_gitmemos_cap).
 STEP_SLOW_EVERY_S = 3600
+STEP_STUCK_N = 3   # a tick step stopped at its budget on the same item this often in a row: one tick_step_stuck event
 WATCHER_MAX_S = HEARTBEAT_STALE_S - 60   # a command watcher's timeout_s is capped here, well below WATCHDOG_S
 # Schedule runs go on off the tick (schedrun); a tick waits this long for them, so quick ones are recorded
 # in the tick that started them and a slow one never holds it.
@@ -594,6 +596,11 @@ STALL_KEY = "stall"   # kv: {"run": the last worker run when a stall was raised}
 # kv: run id -> {pid, started, lean} of a reap in progress (Daemon._reap_mark). One an earlier daemon
 # left was cut off (a hang the watchdog restarted, a kill): reaped once more lean, then quarantined.
 REAP_KEY = "reaping"
+# In a coordinator run's dir: the action index its reap is applying ("on") and how often a reap was cut off
+# on each action ("cuts"; Daemon._coord_journal). The finish transaction commits the turn whole, so a cut-off
+# reap applied nothing; the next one applies the turn again, skipping an action cut off COORD_CUT_SKIP times.
+COORD_JOURNAL = "apply.json"
+COORD_CUT_SKIP = 2
 dbmod.DICT_KV.add(REAP_KEY)
 REAP_CHECKS_WINDOW_S = 7 * 86400   # reap_waiting_checks looks at the runs started this recently
 STALL_SETTLE_S = 600   # after a daemon start, dispatch gets this long before a stall is raised
@@ -1133,6 +1140,7 @@ class Daemon:
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
         self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
+        self._step_stuck: dict[str, tuple[str, int]] = {}   # step -> (item it was stopped on, times in a row)
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
         self._last_leftovers = 0.0   # when prune_leftovers last ran
@@ -1735,6 +1743,10 @@ class Daemon:
             if name in self._step_at:
                 self._step_cursor[name] = self._step_at[name]
             log(self.p, f"tick step {name} stopped at its budget ({e})")
+            try:
+                self._step_stuck_on(name)
+            except Exception:
+                log(self.p, "tick step stuck record error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         except StopRequested as e:   # a stop ended it at a safe point: the next daemon picks it up
             log(self.p, f"stop: tick step {name} ended at a safe point ({e})")
         except Exception as e:  # one bad step must not stop the rest of the tick
@@ -1747,6 +1759,7 @@ class Daemon:
                 except Exception:
                     log(self.p, "tick step alert error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         else:
+            self._step_stuck.pop(name, None)
             if self._step_fails.pop(name, None):
                 try:
                     self._clear_step(name)
@@ -1774,6 +1787,21 @@ class Daemon:
         self._step_charge(t)
         self._step_holder, self._step_task, self._step_mark = holder, task, t
         return self._stopping or (self._step_began is not None and t - self._step_began >= self._step_budget())
+
+    def _step_stuck_on(self, name: str) -> None:
+        """Step `name` was stopped at its budget: one handled tick_step_stuck event naming the item when
+        that was the same item STEP_STUCK_N times in a row (each such run of stops raises it once)."""
+        item = self._step_holder or ""
+        was, n = self._step_stuck.get(name, ("", 0))
+        n = n + 1 if item and item == was else 1
+        self._step_stuck[name] = (item, n)
+        if n != STEP_STUCK_N:
+            return
+        text = (f"Daemon tick step {name} was stopped at its budget ({self._step_budget():g} s) on {item} "
+                f"{n} times in a row.")
+        log(self.p, text)
+        self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                    (time.time(), "daemon", "tick_step_stuck", "normal", text[:500], "handled", self._step_task))
 
     def _step_charge(self, t: float) -> None:
         if self._step_holder and t - self._step_mark > self._step_worst[0]:
@@ -3735,7 +3763,11 @@ class Daemon:
                 alive = self._run_alive(r)
                 exit_file = self._run_dir(r) / "exit.json"
                 if exit_file.exists():
-                    self._reap(r, _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()})
+                    info = _read_result(exit_file) or {"rc": -1, "stopped": "lost", "ended": time.time()}
+                    # A coordinator answer is applied whole in one go: the step budget never cuts it off
+                    # (its finish transaction rolls back whole, so a cut-off one would start over each tick).
+                    with stepclock.critical() if r["role"] == "coordinator" else contextlib.nullcontext():
+                        self._reap(r, info)
                 elif not alive:
                     self._end_orphan(r)
                     self._reap(r, {"rc": -1, "stopped": "lost", "ended": self._last_sign_of_life(r), "orphan": True})
@@ -3769,6 +3801,10 @@ class Daemon:
             self.finish_run(r, exit_info)
         except StopRequested:   # rolled back at a safe point, not cut off: the next daemon reaps it in full
             self._reap_unmark(r["id"])
+            self._coord_journal_off(r)
+            raise
+        except Exception:   # a reap error, not a cut-off: no action is blamed for it
+            self._coord_journal_off(r)
             raise
         finally:
             self._lean_reap = False
@@ -3782,8 +3818,8 @@ class Daemon:
         marks = db.kv(REAP_KEY) or {}
         was = marks.get(str(r["id"])) or {}
         mine = was and int(was.get("pid") or 0) == me["pid"] and was.get("started") == me["started"]
-        if was and not mine and was.get("lean"):
-            return "quarantine"
+        if was and not mine and was.get("lean") and self._coord_journal_read(r).get("on") is None:
+            return "quarantine"   # a coordinator run cut off inside its actions retries (_coord_journal)
         lean = bool(was.get("lean")) if mine else bool(was)
         db.set_kv(REAP_KEY, {**marks, str(r["id"]): {**me, "lean": lean, "at": time.time()}})
         if lean and not mine:
@@ -3802,6 +3838,48 @@ class Daemon:
         if was is not None:
             self.p.db.set_kv(REAP_KEY, marks)
         return bool((was or {}).get("lean"))
+
+    def _coord_answered(self, r: dict) -> bool:
+        """Coordinator run r exited 0 (its exit.json), so it ended with its answer."""
+        try:
+            return (_read_result(self._run_dir(r) / "exit.json") or {}).get("rc") == 0
+        except Exception:
+            return False
+
+    def _coord_journal_read(self, r: dict) -> dict:
+        if r.get("role", "coordinator") != "coordinator":
+            return {}
+        j = _read_result(self._run_dir(r) / COORD_JOURNAL) or {}
+        return j if isinstance(j.get("on"), int) or j.get("on") is None else {}
+
+    def _coord_journal(self, r: dict):
+        """For coordinator run r's coord.apply: the action indexes to skip, and the on_action callback that
+        writes the index applied now to its run dir's COORD_JOURNAL. An "on" left there by an earlier reap
+        means it was cut off on that action (a hang restart, a kill): counted, and an action cut off
+        COORD_CUT_SKIP times is skipped, so a turn whose one action hangs still applies all the others once."""
+        path = self._run_dir(r) / COORD_JOURNAL
+        j = self._coord_journal_read(r)
+        cuts = {str(k): int(v) for k, v in (j.get("cuts") or {}).items() if str(v).isdigit()}
+        if j.get("on") is not None:
+            cuts[str(j["on"])] = cuts.get(str(j["on"]), 0) + 1
+            log(self.p, f"coordinator run {r['id']}: an earlier reap was cut off on action {j['on']} "
+                        f"({cuts[str(j['on'])]} time(s)); applying the turn again")
+        state = {"on": None, "cuts": cuts}
+
+        def on_action(i: int | None) -> None:
+            state["on"] = i
+            write_json(path, state)
+
+        on_action(None)
+        return {int(k) for k, n in cuts.items() if n >= COORD_CUT_SKIP}, on_action
+
+    def _coord_journal_off(self, r: dict) -> None:
+        """A reap that ended without a cut-off (an error, a stop at a safe point) blames no action."""
+        try:
+            if (j := self._coord_journal_read(r)).get("on") is not None:
+                write_json(self._run_dir(r) / COORD_JOURNAL, {**j, "on": None})
+        except Exception:
+            log(self.p, f"run {r['id']}: clearing its apply journal failed\n" + traceback.format_exc())
 
     def _quarantine_run(self, r: dict, how: str) -> None:
         """A run whose reap was cut off and whose lean retry failed too: closed by _abandon_run instead of
@@ -4119,6 +4197,19 @@ class Daemon:
                     self._reap_errors.pop(r["id"], None)
                     return
                 db.x("UPDATE runs SET status='failed', ended=? WHERE id=?", (now, r["id"]))
+                if answered := (r.get("role") == "coordinator" and self._coord_answered(r)):
+                    # It ended with its answer: a reap fault, not a loop, so never runaway waste (budget.wasted).
+                    try:
+                        note = json.loads(cur["note"] or "{}")
+                    except ValueError:
+                        note = {}
+                    note = note if isinstance(note, dict) else {}
+                    db.x("UPDATE runs SET note=? WHERE id=?",
+                         (json.dumps({**note, "not_waste": "coordinator answered; its reap failed"}), r["id"]))
+                    db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
+                         (now, "daemon", "coordinator_reap_failed", "normal",
+                          f"Coordinator run {r['id']} answered (exit 0) but processing its answer failed: {why}"[:500],
+                          "handled", None))
                 cost = cur["cost_usd"] or 0
                 if cost:
                     db.spend(r["provider"], cost, source, account=r["account"] or "",
@@ -4133,7 +4224,8 @@ class Daemon:
                          (now, f"task:{r['task']}", "task_failed", "normal", f"#{r['task']}: {why}", "queued",
                           r["task"]))
             self._reap_errors.pop(r["id"], None)
-            log(self.p, f"run {r['id']} abandoned after repeated reap errors")
+            log(self.p, f"run {r['id']} abandoned after repeated reap errors"
+                        + (" (coordinator answered: not counted as waste)" if answered else ""))
         except Exception:
             log(self.p, f"run {r['id']} could not be abandoned: " + traceback.format_exc().replace("\n", " | ")[:2000])
 
@@ -5125,9 +5217,10 @@ class Daemon:
         db.set_kv("coordinator_failures", 0)
         default_chat = note.get("default_chat")
         applied: list = []
+        skip, on_action = self._coord_journal(r)
         problems = coord.apply(self.p, actions, default_chat=default_chat, user_turn=coord.user_turn(db, note.get("messages") or []),
                                turn=r.get("id"), messages=note.get("messages") or [], lean=self._lean_reap,
-                               applied=applied)
+                               applied=applied, skip_actions=skip, on_action=on_action)
         chaincap.clear_notices(db, float(r.get("started") or 0))   # this turn's digest showed them
         ids = note.get("messages", [])
         problems = list(problems)

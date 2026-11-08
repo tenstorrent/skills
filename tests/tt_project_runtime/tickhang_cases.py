@@ -305,3 +305,130 @@ def test_finish_rounds_learning_hung_git_end_at_their_wall_and_the_last_round_st
     assert time.monotonic() - t0 < 1.5, "the finish ran past its wall"
     assert spawned and max(spawned) <= 0.5 + 0.01, spawned
     assert len(finals) == 1 and d.p.db.task(tid)["status"] == "done", "the last round did not apply"
+
+
+def _titles(p, *titles):
+    return [len(p.db.q("SELECT id FROM tasks WHERE title=?", (t,))) for t in titles]
+
+
+def _adds(*titles):
+    return [{"type": "task_add", "title": t, "spec": "s", "kind": "work", "tier": "light"} for t in titles]
+
+
+def test_a_coordinator_reap_past_the_step_budget_is_never_cut_off_and_applies_every_action_once(env, tmp_path,
+                                                                                               monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("first", "second", "third"))
+    monkeypatch.setattr(dm, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dm, "STEP_HARD_SLACK_S", 0.05)
+    real, slow = coord.apply, []
+
+    def apply(*a, **kw):
+        inner = kw["on_action"]
+
+        def on(i):
+            inner(i)
+            if i is not None:
+                slow.append(i)
+                time.sleep(0.2)   # each action alone runs past the budget and its slack
+        return real(*a, **{**kw, "on_action": on})
+    monkeypatch.setattr(coord, "apply", apply)
+    d = dm.Daemon(p.base)
+    d._run_step(d.reap_runs)
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    assert slow == [0, 1, 2] and _titles(p, "first", "second", "third") == [1, 1, 1]
+    assert json.loads((tmp_path / "coord-run" / dm.COORD_JOURNAL).read_text())["on"] is None
+    d._run_step(d.reap_runs)   # nothing is applied twice
+    assert _titles(p, "first", "second", "third") == [1, 1, 1]
+
+
+def test_a_coordinator_reap_cut_off_twice_on_one_action_skips_only_it_and_is_never_quarantined(env, tmp_path,
+                                                                                              monkeypatch):
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("before", "hangs", "after"))
+    real, seen = coord.apply, []
+
+    def apply(*a, **kw):
+        inner = kw["on_action"]
+
+        def on(i):
+            inner(i)
+            seen.append(i)
+            if i == 1:
+                raise _CutOff()   # the daemon is killed while applying action 1
+        return real(*a, **{**kw, "on_action": on})
+    monkeypatch.setattr(coord, "apply", apply)
+    for _ in range(2):
+        with pytest.raises(_CutOff):
+            dm.Daemon(p.base).reap_runs()
+        assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "running"
+        assert _titles(p, "before", "hangs", "after") == [0, 0, 0], "a cut-off reap committed part of the turn"
+    dm.Daemon(p.base).reap_runs()   # a lean retry cut off too: retried, not quarantined
+    assert p.db.one("SELECT status FROM runs WHERE id=?", (rid,))["status"] == "ok"
+    assert _titles(p, "before", "hangs", "after") == [1, 0, 1] and seen == [0, 1, 0, 1, 0, 2, None]
+    assert not p.db.one("SELECT id FROM messages WHERE ref=?", (f"reap-quarantine:{rid}",))
+    assert json.loads((tmp_path / "coord-run" / dm.COORD_JOURNAL).read_text())["cuts"] == {"1": 2}
+    assert any("cut off twice" in x for x in p.db.kv(coord.REJECTED_KEY, [])), "refused back to the coordinator"
+
+
+def test_a_coordinator_run_that_answered_is_never_runaway_waste_when_its_reap_fails(env, tmp_path, monkeypatch):
+    from ttp import budget as bud
+    from ttp import coordinator as coord
+    from ttp import daemon as dm
+    p = make(env)
+    rid = _coordinator_run(p, tmp_path, _adds("x"))
+    p.db.x("UPDATE runs SET cost_usd=10.69 WHERE id=?", (rid,))
+    monkeypatch.setattr(coord, "apply", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("bad state")))
+    d = dm.Daemon(p.base)
+    for _ in range(3):
+        d.reap_runs()
+    run = p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+    assert run["status"] == "failed" and not bud.wasted(run)
+    [ev] = p.db.q("SELECT * FROM events WHERE kind='coordinator_reap_failed'")
+    assert ev["status"] == "handled" and str(rid) in ev["text"]
+    # One that did not answer (rc 1) still counts.
+    (tmp_path / "coord-run" / "exit.json").write_text(json.dumps({"rc": 1, "ended": time.time()}))
+    rid2 = p.db.x("INSERT INTO runs(role,provider,started,status,dir,boot_id,note,cost_usd) VALUES(?,?,?,?,?,?,?,?)",
+                  ("coordinator", "fake", time.time(), "running", str(tmp_path / "coord-run"), "x", "{}", 3.0))
+    d._abandon_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid2,)))
+    assert bud.wasted(p.db.one("SELECT * FROM runs WHERE id=?", (rid2,)))
+    assert len(p.db.q("SELECT id FROM events WHERE kind='coordinator_reap_failed'")) == 1
+
+
+def test_watchdog_step_budget_s_is_a_known_config_key():
+    from ttp import project
+    assert project.unknown_key_hint("watchdog.step_budget_s") is None
+    assert project.unknown_key_hint("watchdog.step_budget") is not None
+
+
+def test_a_step_stopped_on_the_same_item_three_times_in_a_row_raises_one_stuck_event(env, monkeypatch):
+    p = make(env)
+    from ttp import daemon as dmod
+    d = dmod.Daemon(p.base)
+    monkeypatch.setattr(dmod, "STEP_BUDGET_S", 0.05)
+    monkeypatch.setattr(dmod, "STEP_HARD_SLACK_S", 0.05)
+
+    def on(item):
+        def step():
+            d._step_over(item, 7)
+            time.sleep(30)
+        return step
+
+    def stuck():
+        return p.db.q("SELECT * FROM events WHERE kind='tick_step_stuck'")
+    for item in ("run 1's end", "run 1's end", "run 2's end", "run 2's end"):
+        d._run_step(on(item), "rows")
+    assert not stuck(), "two in a row, then another item: not stuck"
+    d._run_step(on("run 2's end"), "rows")
+    [ev] = stuck()
+    assert "run 2's end" in ev["text"] and "rows" in ev["text"] and ev["status"] == "handled" and ev["task"] == 7
+    d._run_step(on("run 2's end"), "rows")
+    assert len(stuck()) == 1, "raised once per run of stops"
+    d._run_step(lambda: None, "rows")   # a step that finishes resets it
+    for _ in range(3):
+        d._run_step(on("run 2's end"), "rows")
+    assert len(stuck()) == 2

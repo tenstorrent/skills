@@ -126,7 +126,10 @@
 - Each tick step runs within `watchdog.step_budget_s` (30 s by default): past it a step stops before
   its next item and, a few seconds later, wherever it is; a child it waits on is killed with its whole
   tree, every ssh it starts gets ConnectTimeout and ServerAlive options, and the step resumes after
-  that item next tick. Each stop is one handled `tick_step_slow` event naming the step and command.
+  that item next tick. Each stop is one handled `tick_step_slow` event naming the step and command;
+  a step stopped on the same item 3 times in a row adds one handled `tick_step_stuck` event naming it.
+  Set it with `ttp config <project> watchdog.step_budget_s <seconds>`. Reaping a coordinator run is
+  never stopped by this budget: its answer is applied whole in one go, however long that takes.
 - Daemon not running → its service restarts it. Hung (alive, but its heartbeat untouched for
   `watchdog.hang_s`, 900 s by default, never below 600; 600 s once the daemon itself reported a stall in
   a named tick step, `state/tick-stall.json`) → `ttp.watchdog`, run every 5 min (a systemd
@@ -138,7 +141,11 @@
   restart's outcome (low when it worked, high when not); it clears once a daemon ticks again. A run
   whose reap the hang cut off is reaped once more with its optional checks skipped (a low
   `reap-lean:` line), and quarantined (failed, its output kept, a low `reap-quarantine:` line) if that
-  is cut off or fails too. Each restart within `watchdog.window_s` (6 h) doubles
+  is cut off or fails too. A coordinator run cut off while applying its actions is never quarantined:
+  its run dir's `apply.json` names the action it was on, and an action cut off twice is skipped (refused
+  back to the coordinator) while the rest of its answer applies once. A coordinator run that exited 0
+  never counts as waste in the runaway guard; if its reap still fails, one `coordinator_reap_failed`
+  event says so. Each restart within `watchdog.window_s` (6 h) doubles
   the next wait; the `watchdog.restarts`-th (3) sends one high alert. systemd's `WatchdogSec` is only
   the backstop. Only a service installed before the watchdog needs `ttp restart <name>` (which adds
   it); still down → `ttp logs <name>`.
