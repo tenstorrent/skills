@@ -161,13 +161,17 @@ class Babysitter:
 
     def decide(self, state: str, questions: dict[str, Any], purpose: str = "decide",
                timeout: float = TIMEOUT_S) -> dict[str, Any] | None:
-        """Jev's answer shape ({name: {"noul": score}}): 1.0 for a wake or flag, 0.0 for a skip."""
-        if self._chat_on():
+        """Jev's answer shape ({name: {"noul": score}}): 1.0 for a wake or flag, 0.0 for a skip.
+        Only yes/no (noul) questions go to the chat provider; any other set (score, choice) goes to the
+        wrapped Jev, or answers None when Jev is off (the caller's no-answer path)."""
+        wake_only = bool(questions) and all(isinstance(q, dict) and q.get("type") == "noul"
+                                            for q in questions.values())
+        if wake_only and self._chat_on():
             try:
                 out = {}
                 for name, q in questions.items():
-                    q = q if isinstance(q, dict) else {"instructions": str(q)}
                     crit = q.get("criteria") or {}
+                    crit = crit if isinstance(crit, dict) else {}
                     text = (f"{q.get('instructions', '')}\nwake if: {crit.get('true', 'yes')}\n"
                             f"skip if: {crit.get('false', 'no')}")
                     d = ask(self.cfg, state, text, post=self.post, db=self.db, purpose=purpose)
@@ -175,12 +179,15 @@ class Babysitter:
                     out[name] = {"noul": 0.0 if d["verb"] == "skip" else 1.0}
                 self.last_cost = 0.0
                 return out
-            except Unavailable:
+            except Exception:   # down, cut off or malformed: cool down and fall back like Unavailable
                 self.pause.until = time.time() + COOL_S
         if self.jev is not None and self.jev.enabled():
             ans = self.jev.decide(state=state, questions=questions, purpose=purpose, timeout=timeout)
             self.last_cost = getattr(self.jev, "last_cost", 0.0)
             return ans
+        if not wake_only:
+            self.last_cost = 0.0
+            return None
         raise Unavailable("chat provider down and Jev off")
 
 

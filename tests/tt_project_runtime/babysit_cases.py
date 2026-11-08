@@ -163,3 +163,70 @@ def test_the_daily_target_shows_claude_spend_today_against_it(env):
     p.set_config("budget.daily_target_usd", 330.0, by={"by": "user"})
     assert audit.target_line(p.db, p.config()) == "daily target $330: Claude $400.00 today, $70.00 over"
     assert audit.lines(p.db, p=p)[0] == "daily target $330: Claude $400.00 today, $70.00 over"
+
+
+class _BsTypedJev(_BsJev):
+    """Answers each question in its own type's shape, as the live Jev does."""
+
+    def decide(self, state, questions, purpose="decide", timeout=20.0):
+        self.calls += 1
+        out = {}
+        for k, q in questions.items():
+            t = q.get("type")
+            out[k] = ({"noul": 0.9} if t == "noul" else {"score": 3.0} if t == "score"
+                      else {"choice": next(iter(q["criteria"])), "probabilities": {}})
+        return out
+
+
+def _bs_counting(text):
+    seen = []
+
+    def post(s, messages, timeout):
+        seen.append(messages)
+        return _bs_reply(text)(s, messages, timeout)
+    return post, seen
+
+
+def test_only_yes_no_questions_go_to_the_chat_provider(env):
+    """Score and choice questions (effort pick, A/B, model pick, screen severity) go to Jev, or answer
+    None when Jev is off: never a chat call, never a crash."""
+    from ttp import babysit, effort, effortab
+    cfg = {"providers": {"chat": _BS_CHAT}}
+    score = {"effort": {"type": "score", "criteria": effort.CRITERIA, "instructions": "effort?"}}
+    ab = {"effort": {"type": "score", "criteria": effortab.JEV_CRITERIA, "instructions": "effort?"}}
+    choice = {"model": {"type": "choice", "criteria": {"a": "x", "b": "y"}, "instructions": "which?"}}
+    for qs in (score, ab, choice):
+        post, seen = _bs_counting("skip")
+        jev = _BsTypedJev()
+        assert babysit.Babysitter(cfg, jev, post=post).decide("s", qs) == jev.decide("s", qs)
+        assert seen == [] and jev.calls == 2
+        post, seen = _bs_counting("skip")
+        assert babysit.Babysitter(cfg, _BsJev(on=False), post=post).decide("s", qs) is None and seen == []
+    post, seen = _bs_counting("skip")                                # the wait gate's yes/no still goes to chat
+    jev = _BsTypedJev()
+    assert babysit.Babysitter(cfg, jev, post=post).decide("s", _BS_Q) == {"needed": {"noul": 0.0}}
+    assert len(seen) == 1 and jev.calls == 0
+
+
+def test_a_screen_with_a_babysitter_still_applies_jev_severity(env):
+    from ttp import babysit, screen
+    p = make(env)
+    cfg = {"providers": {"chat": _BS_CHAT}}
+    post, seen = _bs_counting("skip")
+    sev, src, _, _ = screen._judge(p.db, cfg, "w", "the job crashed", None,
+                                   babysit.Babysitter(cfg, _BsTypedJev(), post=post), floor=2)
+    assert (sev, src, seen) == ("critical", "jev", [])
+
+
+def test_any_chat_error_cools_down_and_falls_back_to_jev(env):
+    import http.client
+    from ttp import babysit
+    for err in (http.client.IncompleteRead(b"x"), KeyError("verb"), ValueError("bad json")):
+        def broken(s, messages, timeout, err=err):
+            raise err
+        jev = _BsJev()
+        b = babysit.Babysitter({"providers": {"chat": _BS_CHAT}}, jev, post=broken)
+        assert b.decide("s", _BS_Q) == {"needed": {"noul": 0.5}} and jev.calls == 1, err
+        assert not b._chat_on()
+    malformed = babysit.Babysitter({"providers": {"chat": _BS_CHAT}}, None, post=lambda s, m, t: ["junk"])
+    assert malformed.decide("s", _BS_Q) == {"needed": {"noul": 1.0}}   # unparsed: a light wake
