@@ -1388,7 +1388,8 @@ def test_the_reboot_record_and_host_line_say_when_in_the_home_zone_and_why(env, 
     from ttp import timefmt
     p = make(env)
     p.set_config(timefmt.KEY, "America/Los_Angeles")
-    oom = "Oct 25 21:59:30 testhost kernel: Out of memory: Killed process 4242 (python3)\n"
+    # the kernel read is JSON: a fault counts only with its time, in the window before the shutdown
+    oom = _j(-30, "Out of memory: Killed process 4242 (python3)", ident="kernel") + "\n"
     feed, record, got = _initiator_reboot(p, tmp_path, monkeypatch, (0, oom + _SUDO_REBOOT, ""))
     assert got["kernel"].startswith("out of memory: ") and "someuser ran `reboot`" in got["text"], got
     boot = p.db.boots(0)[-1]
