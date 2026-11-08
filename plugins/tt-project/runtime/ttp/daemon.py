@@ -4870,12 +4870,6 @@ class Daemon:
                 log(p, f"run {r['id']}: credential change observation failed\n" + traceback.format_exc())
         prov = get_provider(r["provider"]).use(r["model"] or "", (self.cfg.get("pricing") or {}).get(r["provider"]))
         usage = prov.parse(run_dir / "output.jsonl", run_dir / "stderr.log")
-        try:   # sub-agents booked apart from the run's stream (Codex rollouts) count in its cost
-            prov.add_subagent_usage(usage, run_dir / "output.jsonl", float(exit_info.get("started") or 0) or None,
-                                    (json.loads((run_dir / "run.json").read_text()).get("env") or {})
-                                    if (run_dir / "run.json").exists() else None)
-        except Exception:
-            log(p, f"run {r['id']}: sub-agent usage not read\n" + traceback.format_exc())
         if exit_info.get("launch_auth"):
             # The chat bridge had no usable key (none saved, or saved for another URL): the provider's
             # auth gate holds it like a logout, never a launch failure that costs attempts.
@@ -4900,15 +4894,27 @@ class Daemon:
         # One a host sleep cut is lost to the sleep instead, and keeps its session.
         failed_resume = not stopped and not slept and (exit_info.get("rc") != 0 or usage.error) \
             and not _has_tokens(usage) and _resume_never_started(json.loads(r["note"] or "{}"), usage)
+        priced_tokens = None
         if usage.estimated and not usage.cost_usd and not failed_resume:
             # a run cut off mid-turn is priced from the tokens its rollout still counted (Codex's
             # running totals); only a real elapsed-time guess is booked as an "elapsed" guess
             priced_tokens = _priced_from_tokens(run_dir, exit_info, usage, prov)
-            if priced_tokens:
+            if priced_tokens:   # Provider.cut_off_cost: its own thread and its sub-agents
                 usage.cost_usd, basis = priced_tokens, "tokens"
             else:
                 usage.cost_usd = _cut_off_cost(run_dir, exit_info, usage, prov)
                 basis = "elapsed" if usage.cost_usd else basis
+        if not priced_tokens:
+            # Sub-agents booked apart from the run's stream (Codex rollouts) count in its cost, added
+            # only after the run's own thread is priced: added first, they would make a cut-off run
+            # look priced and skip the gate above. A rollout-priced run already holds them.
+            try:
+                prov.add_subagent_usage(usage, run_dir / "output.jsonl",
+                                        float(exit_info.get("started") or 0) or None,
+                                        (json.loads((run_dir / "run.json").read_text()).get("env") or {})
+                                        if (run_dir / "run.json").exists() else None)
+            except Exception:
+                log(p, f"run {r['id']}: sub-agent usage not read\n" + traceback.format_exc())
         # A run routed to another provider (route.py): booked at its pricing rows, else zero and unpriced.
         routed = route.of(r["note"]) if r["role"] == "worker" else None
         on_route = bool(routed) and r["provider"] == routed.get("to")

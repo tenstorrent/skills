@@ -569,7 +569,9 @@ class Provider:
 
     def cut_off_cost(self, output_path: Path, since: float | None = None, env: dict | None = None) -> float | None:
         """The price of the tokens a run spent before it was cut off without reporting usage, when
-        the provider can tell (None: the daemon books the elapsed share of the budget instead)."""
+        the provider can tell (None: the daemon books the elapsed share of the budget instead). It
+        includes what add_subagent_usage would add: the daemon adds that only when this did not price
+        the run."""
         return None
 
     def windows_so_far(self, output_path: Path, since: float | None = None, env: dict | None = None,

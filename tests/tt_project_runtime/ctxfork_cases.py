@@ -599,3 +599,47 @@ def test_codex_sub_agents_count_in_the_run_cost(monkeypatch, tmp_path):
     (tmp_path / "none.jsonl").write_text("")
     codex.add_subagent_usage(bare, tmp_path / "none.jsonl")
     assert bare.cost_usd == 0 and "subagent_tokens" not in bare.extra
+
+
+def _finish_codex_run(p, home, lines, started):
+    """A Codex worker run with CODEX_HOME at `home`, finished through Daemon.finish_run; its row."""
+    from ttp.daemon import Daemon
+    d = Daemon(p.base)
+    tid = p.db.add_task("build", "", kind="work", tier="standard", priority=3, budget_usd=8.0, labels=[])
+    p.db.update_task(tid, status="running")
+    rid = p.db.x("INSERT INTO runs(task,role,provider,model,started,status,boot_id,note) "
+                 "VALUES(?,'worker','codex','opus',?,'running',?,'{}')", (tid, started, d.boot))
+    run_dir = p.runs / str(rid)
+    run_dir.mkdir(parents=True)
+    p.db.x("UPDATE runs SET dir=? WHERE id=?", (str(run_dir), rid))
+    (run_dir / "output.jsonl").write_text("".join(json.dumps(x) + "\n" for x in lines))
+    (run_dir / "stderr.log").write_text("")
+    (run_dir / "run.json").write_text(json.dumps({"budget_usd": 4.0, "timeout_s": 1200, "argv": [],
+                                                  "env": {"CODEX_HOME": str(home)}}))
+    d.finish_run(p.db.one("SELECT * FROM runs WHERE id=?", (rid,)),
+                 {"rc": 0, "started": started, "ended": time.time(), "stopped": "budget", "slept_s": 0})
+    return p.db.one("SELECT * FROM runs WHERE id=?", (rid,))
+
+
+def test_a_cut_off_codex_run_with_sub_agents_books_its_own_thread_and_theirs_once(env, monkeypatch):
+    """A Codex run cut off mid-turn (no turn.completed) that spawned a sub-agent: its own thread is
+    priced from its rollout and the sub-agent added once; the sub-agent's cost alone must not make
+    the run look priced and skip the cut-off pricing. A completed run books turn.completed plus its
+    sub-agents once."""
+    home = env["tmp"] / "codex-home"
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    started = time.time() - 600
+    stamp = time.strftime("%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(started + 30))
+    root, child = str(uuid.uuid4()), str(uuid.uuid4())
+    _sub_rollout(home, "08", root, None, [(2_000_000, 0, 50_000)], stamp=stamp)
+    _sub_rollout(home, "08", child, root, [(10_000, 0, 100)], stamp=stamp)
+    p = make(env)
+    p.set_config("pricing", {"codex": {"opus": [1.0, 0.1, 2.0]}})
+    own, sub = 2_000_000 / 1e6 + 50_000 * 2.0 / 1e6, 10_000 / 1e6 + 100 * 2.0 / 1e6
+    run = _finish_codex_run(p, home, [{"type": "thread.started", "thread_id": root}], started)
+    assert run["cost_basis"] == "tokens", dict(run)
+    assert run["cost_usd"] == pytest.approx(own + sub), dict(run)
+    done = _finish_codex_run(p, home, [{"type": "thread.started", "thread_id": root}, {
+        "type": "turn.completed", "usage": {"input_tokens": 300_000, "cached_input_tokens": 0,
+                                            "output_tokens": 1_000}}], started)
+    assert done["cost_usd"] == pytest.approx(0.3 + 0.002 + sub), dict(done)
