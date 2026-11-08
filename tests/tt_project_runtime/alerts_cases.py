@@ -5501,8 +5501,8 @@ def test_an_orphan_user_machine_page_reaches_no_unrelated_chat_and_shows_in_stat
     Daemon(b.base).route_machines(every_s=0)   # proj-b's charter does not list box-1
     assert not b.db.one("SELECT id FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%'")
     assert "undelivered machine page (no project here may deliver it" in status_text(b)
-    c.charter_path.write_text("# proj-c\n\n## Goals\nGo.\n\n## Resources\n- box-1: a device machine.\n")
-    Daemon(c.base).route_machines(every_s=0)   # a project whose charter lists the machine may deliver it
+    c.set_config("machines.allowed", ["box-1"])
+    Daemon(c.base).route_machines(every_s=0)   # a project whose config lists the machine may deliver it
     got = c.db.one("SELECT text FROM messages WHERE kind='alert' AND text LIKE 'A risky machine change%#1 %'")
     assert got, "the listing project's chat gets it"
     assert ml.orphan_lines() == []
