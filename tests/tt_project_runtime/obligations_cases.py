@@ -751,3 +751,16 @@ def test_a_claim_that_names_an_outcome_stays_tracked_as_ending_done(env):
         out = p.db.post("out", text, chat="c1", kind="reply")
         [note] = ob.record_claims(p, [(out, "c1", [c])], {})
         assert f"#{tid} ends done" in note, (text, note)
+
+
+def test_a_claim_on_a_superseded_review_holds_through_the_review_that_covers_it(env, monkeypatch):
+    """A superseded task (a review a later passing one covers) is closed: the claim on it holds with a
+    receipt naming the covering review, no 'does not hold' is raised, and it counts as closed elsewhere."""
+    from ttp import obligations as ob
+    from ttp.db import SUPERSEDED, SUPERSEDED_KEY
+    p, check, now, tid, oid, events = _claim_on_task(env, monkeypatch)
+    p.db.update_task(tid, status=SUPERSEDED, result=json.dumps({SUPERSEDED_KEY: {"by_review": 99}}))
+    check(now + 7300)
+    o = ob.get(p.db, oid)
+    assert o["receipt"]["task"] == tid and "superseded by review #99" in o["receipt"]["evidence"], o
+    assert events() == [] and SUPERSEDED in ob.CLOSED

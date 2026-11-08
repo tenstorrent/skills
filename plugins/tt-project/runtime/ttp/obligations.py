@@ -105,7 +105,8 @@ CHECK_EVERY_S = 300
 REOWN_LABEL = "reown:"        # + obligation id: the owner task the daemon started for it
 RUN_FILES_DAYS = 7            # run records are looked for in runs started this recently (or still running)
 RUN_IDS_PER_QUERY = 500       # kept run offsets checked per query (SQLite caps the variables in one)
-CLOSED = ("done", "failed", "cancelled")
+CLOSED = ("done", "failed", "cancelled", "superseded")   # superseded: a review a later passing one covers (db.SUPERSEDED)
+_CLOSED_QS = ",".join("?" * len(CLOSED))
 DEFER_MAX_DAYS = 14.0         # coordinator.defer_max_days: a sleep this old no longer covers its owner
 TEXT_MAX = 500
 EVIDENCE_MAX = 300
@@ -386,7 +387,7 @@ def _attach_carriers(p, st: dict, now: float, tids=None) -> list[tuple[str, int]
            and not o.get("delivered")]
     if not obs:
         return []
-    sql = "SELECT id, title, labels, parent FROM tasks WHERE status NOT IN (?,?,?)"
+    sql = f"SELECT id, title, labels, parent FROM tasks WHERE status NOT IN ({_CLOSED_QS})"
     args: list = [*CLOSED]
     if tids is not None:
         ids = [int(t) for t in tids]
@@ -432,7 +433,7 @@ def _candidates(db, o: dict, limit: int = 10) -> list[dict]:
     if not ids:
         return []
     like = " OR ".join(["title LIKE ? OR spec LIKE ?"] * len(ids))
-    rows = db.q(f"SELECT id, title, spec, status FROM tasks WHERE status NOT IN (?,?,?) AND ({like}) ORDER BY id",
+    rows = db.q(f"SELECT id, title, spec, status FROM tasks WHERE status NOT IN ({_CLOSED_QS}) AND ({like}) ORDER BY id",
                 [*CLOSED, *(x for t in ids for x in (f"%#{t}%",) * 2)])
     out = []
     for r in rows:
@@ -2030,6 +2031,13 @@ def _check_claim(p, o: dict, now: float, raised: list[str]) -> bool:
         status = t["status"] if t else "gone"
         if status == "done":
             o["receipt"] = {"at": now, "task": int(c["task"]), "evidence": f"#{c['task']} ended done"}
+            _retire(db, now, "claim held", prefix=fp)
+            return True
+        if status == "superseded":   # a later passing review covers it: closed, held through that one
+            from .db import SUPERSEDED_KEY, load_result
+            by = (load_result(t["result"]).get(SUPERSEDED_KEY) or {}).get("by_review")
+            o["receipt"] = {"at": now, "task": int(c["task"]), "evidence": f"#{c['task']} was superseded"
+                            + (f" by review #{by}, which passed" if by else " by a later passing review")}
             _retire(db, now, "claim held", prefix=fp)
             return True
         if status in ("failed", "cancelled", "gone"):
