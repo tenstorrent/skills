@@ -32,7 +32,7 @@ def test_gate_time_over_smoke_max_raises_one_coordinator_observation_a_day_namin
     logs = p.state / "pushes"
     logs.mkdir(exist_ok=True)
     (logs / "t1-a.log").write_text("== slowest durations ==\n95.10s call     tests/a.py::test_slow\n"
-                                   "3.00s setup    tests/a.py::test_slow\n40.00s call     tests/b.py::test_mid\n")
+                                   "3.00s setup    tests/a.py::test_slow\nttp-suite:    40.00s tests/b.py::test_mid\n")
     assert "over the 10.0 min smoke limit" in gatetime.status_line(p.state, p.config(), now)
     d = Daemon(p.base)
     d.check_gate_time(every_s=0, now=now)

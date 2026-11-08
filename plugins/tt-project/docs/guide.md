@@ -1756,6 +1756,11 @@ session and stateless coordinators on every provider.
   changes raises an alert naming it. Before a worktree is made, a root left detached or off its
   branch (`worktree.root_branch`, else the one it was last seen on) is put back when it has no
   uncommitted changes, else alerted; worktrees never start from such a HEAD.
+- Smoke before landing: `delivery.push_checks` gate every landing, so keep them under 10 min on
+  their host (aim 5) and put slower tests in `delivery.post_land_checks`. `ttp status` and the daily
+  review show the landing check time (median and p90, last 24 h and last 10 runs); over
+  `checks.smoke_max_s` (default 600 s) the project's coordinator gets one observation a day naming the
+  slowest tests (push-checks reference, "Smoke before landing").
 - Where reviewed changes go straight to a shared branch, `ttp push` publishes them guarded: it
   refuses uncommitted changes, rebases onto the latest tip, runs `delivery.push_checks` on the
   exact commit it pushes, starts over if the branch moved meanwhile, and never forces. A

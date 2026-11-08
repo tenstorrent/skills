@@ -33,8 +33,9 @@ DEFAULT_MAX_S = 600.0
 AIM_S = 300.0
 EVENT = "gate_slow"
 SLOWEST = 10
-# A pytest --durations line: "12.34s call     tests/x.py::test_y"
-_DURATION = re.compile(r"^\s*(\d+(?:\.\d+)?)s\s+(?:call|setup|teardown)\s+(\S+::\S+)", re.M)
+# A pytest --durations line ("12.34s call     tests/x.py::test_y") or a test suite's own slowest-call line
+# ("ttp-suite:    61.20s tests/x.py::test_y", the plugin's test runner's)
+_DURATION = re.compile(r"^(?:ttp-suite:)?\s*(\d+(?:\.\d+)?)s\s+(?:(?:call|setup|teardown)\s+)?(\S+::\S+)", re.M)
 
 
 def record(state: Path | None, seconds: float, now: float | None = None) -> None:
