@@ -41,6 +41,7 @@ Features:
 - Changes are reviewed by a review agent before they're pushed.
 - Each project has a Web UI dashboard that you can check to see progress, critical messages, token budget, etc.
 - It keeps going when you close your computer (if it's running on an always-on box), or even if you close the chat.
+- It never keeps your Mac awake by default: keep it awake yourself as needed, or tell the project to set `runner.prevent_idle_sleep` to `on`, so it holds the Mac awake (on AC power) while there is work.
 - Any later chat can reconnect to it by project name.
 - The chat runs on your Mac (though it can run on a remote box as well), but the coordinator can run on a remote always-on box (or on your Mac as well).
 - You can also tell it to move the coordinator from the box to your Mac or vice versa, or to any other box, if needed.

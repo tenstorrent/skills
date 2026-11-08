@@ -1526,12 +1526,15 @@ session and stateless coordinators on every provider.
   changelogs, changesets, manifests, `__init__.py`), `hub_bytes` (tracked files larger than this,
   150000, touched by most changes, never count), `branch_days` (14) and `settled_days` (14). Folders and the files the
   check commands (`delivery.push_checks`) name never count either: specs cite those as the required suite.
-- On macOS, while the project has work (a running run or push, or queued work that can start now)
+- tt-project never keeps a machine awake by default: `runner.prevent_idle_sleep` is `off`, and you
+  keep your Mac awake yourself as needed. Set it to `on` (or `auto`, on for a Mac) with
+  `ttp config <name> runner.prevent_idle_sleep on`; a value you set stays across upgrades. Then,
+  on macOS, while the project has work (a running run or push, or queued work that can start now)
   and the machine is on AC power, the daemon keeps it from idle and maintenance sleep with
   `caffeinate -i -s`, tied to the daemon's process so it ends with it. A closed lid without an
   external display, or a sleep you ask for, still sleeps the machine; the harness never changes
-  `pmset` settings. It lets go when the work ends, on battery, or with `runner.prevent_idle_sleep` set
-  to `off` (`auto`, the default, is on for a Mac; other platforms never hold one). `ttp status` and
+  `pmset` settings. It lets go when the work ends, on battery, or with the key set back to `off`;
+  other platforms never hold one. `ttp status` and
   the web app say when it is held, or why not while there is work, and say "the lid is closed: work
   pauses while the Mac sleeps" while a closed lid will sleep it.
 - A shared device or machine is taken per command, through its own queue (for example a device

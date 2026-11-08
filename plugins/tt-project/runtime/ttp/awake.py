@@ -2,7 +2,8 @@
 
 On macOS only, the daemon holds a sleep assertion (`caffeinate -i -s -w <daemon pid>`) while all of
 these hold: the project has work (a running run or task, or queued work that can start now), the
-machine is on AC power, and `runner.prevent_idle_sleep` allows it. It lets go as soon as one stops
+machine is on AC power, and `runner.prevent_idle_sleep` is set to on or auto (the default, off, never
+holds one: the user keeps the Mac awake themselves as needed). It lets go as soon as one stops
 holding, and on shutdown. `-i` blocks idle sleep; `-s` (PreventSystemSleep, honoured on AC power only)
 also blocks the system sleep that follows a maintenance (dark) wake. Neither overrides the user's own
 sleep or a closed lid without clamshell mode (an external display on AC power): only a root `pmset`
@@ -34,19 +35,19 @@ LID_BATTERY_LINE = f"the lid is closed {BATTERY}: work pauses while the Mac slee
 
 
 def mode(cfg: dict) -> str:
-    """runner.prevent_idle_sleep as auto/on/off (true/false accepted). The older power.keep_awake set
-    to off still turns it off."""
-    v = (cfg.get("runner") or {}).get("prevent_idle_sleep", "auto")
+    """runner.prevent_idle_sleep as auto/on/off (true/false accepted); unset or unreadable is off. The
+    older power.keep_awake set to off still turns it off."""
+    v = (cfg.get("runner") or {}).get("prevent_idle_sleep", "off")
     v = {True: "on", False: "off"}.get(v, v) if isinstance(v, bool) else str(v).strip().lower()
     legacy = (cfg.get("power") or {}).get("keep_awake")
     if legacy is False or str(legacy).lower() in ("off", "never", "false"):
         return "off"
-    return v if v in MODES else "auto"
+    return v if v in MODES else "off"
 
 
 def enabled(cfg: dict, platform: str | None = None) -> bool:
-    """Whether the config allows holding the assertion here. auto: on for workstations; a macOS host
-    counts as one, and no other platform is ever asked."""
+    """Whether the config allows holding the assertion here: only when set to on or auto (auto: on for
+    workstations; a macOS host counts as one), and no other platform is ever asked."""
     if (platform or sys.platform) != "darwin":
         return False
     return mode(cfg) != "off"

@@ -519,9 +519,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     # prevent_idle_sleep (auto/on/off): on macOS, while the project has work and the machine is on AC
     # power, the daemon keeps the machine from idle and maintenance sleep (`caffeinate -i -s`; a closed lid
     # without an external display, or a sleep the user asks for, still sleeps it). auto = on for
-    # workstations (a Mac is one); other platforms never.
+    # workstations (a Mac is one); other platforms never. off (the default): never held; the user keeps
+    # the machine awake themselves as needed.
     # pin_verify: strict refuses an explicit task model/effort pin that cannot be verified before a turn.
-    "runner": {"nice": 10, "prevent_idle_sleep": "auto", "pin_verify": "lenient"},
+    "runner": {"nice": 10, "prevent_idle_sleep": "off", "pin_verify": "lenient"},
     # `ttp bench run` (benchrun.py): arms {name: {provider, model, effort}} (none shipped) and the
     # limits every cell gets alike.
     "bench": {"arms": {}, "reps": 1, "timeout_s": 3600, "stall_s": 900, "budget_usd": 8.0, "test_timeout_s": 900},
@@ -1253,7 +1254,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         out += [why for why in [nice_level(raw["runner"])[1]] if why]
     v = (raw.get("runner") or {}).get("prevent_idle_sleep") if isinstance(raw.get("runner"), dict) else None
     if v is not None and not isinstance(v, bool) and str(v).strip().lower() not in ("auto", "on", "off"):
-        out.append(f"runner.prevent_idle_sleep: {v!r} is not auto, on or off; auto is used")
+        out.append(f"runner.prevent_idle_sleep: {v!r} is not auto, on or off; off is used")
     v = (raw.get("runner") or {}).get("pin_verify") if isinstance(raw.get("runner"), dict) else None
     if v is not None and v not in ("strict", "lenient"):
         out.append(f"runner.pin_verify: {v!r} is not strict or lenient")
