@@ -304,6 +304,16 @@ def test_runs_git_push_refuses_a_leak_in_a_message_an_added_line_or_a_tag_messag
     assert hook.git_push_bypass([["/usr/bin/git", "push", "origin", "work"]]) is None
 
 
+def test_tests_run_outside_the_role_of_the_run_running_them(env, tmp_path, monkeypatch):
+    """Suites run inside a live run (every run sets TTP_ROLE), the coordinator's too: its role never reaches
+    a test, or the harness git wrapper first on PATH refuses every push a test makes (coordtools)."""
+    assert not {"TTP_ROLE", "TTP_COORD_FULL_TOOLS", "TTP_TASK"} & set(os.environ)
+    p, repo, push = _push_run(env, tmp_path, monkeypatch)
+    _git_out(repo, "checkout", "-q", "-b", "clean")
+    _commit(repo, "a.txt", "the build passed\n")
+    assert push("origin", "clean").returncode == 0 and "refs/heads/clean" in _remote_refs(repo)
+
+
 def test_runs_git_push_passes_clean_and_already_pushed_commits_and_keeps_refusing_a_removed_leak(
         env, tmp_path, monkeypatch, capsys):
     p, repo, push = _push_run(env, tmp_path, monkeypatch)
