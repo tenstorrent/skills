@@ -899,8 +899,8 @@ def code_tasks_may_push(cfg: dict) -> bool:
 # delivery.push_queue on: reviews approve into the daemon's queue, which pushes approved heads in
 # batches (a batch starts at once when no review is running or ready, else once the oldest approval
 # waited push_batch_s, push_batch_max are waiting or approvals waited out the last batch; after a batch
-# that did not end clean, not before push_min_gap_s passed since it ended unless it is full or priority
-# 1-2; after a clean one a backlog grows a batch up to pushq.BATCH_GROW times push_batch_max)
+# that did not end clean, not before push_min_gap_s passed since it ended unless it is full, priority
+# 1-2 or they waited it out; a batch, one train, takes every approval due, push_batch_max caps none)
 # and then runs after_push (commands like push_checks), killed after after_push_timeout_s.
 # push_landing_alert_h: approvals waiting this long with nothing landed raise a high alert (0 = off).
 # push_script_torn_escalate_after: batches held script_torn on one check this many times in a row raise a

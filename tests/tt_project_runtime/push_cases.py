@@ -3537,7 +3537,8 @@ def test_a_batch_is_due_after_the_window_at_the_cap_for_priority_one_or_with_no_
     s.p.db.x("DELETE FROM push_queue WHERE id IN (?,?,?)", (*first, later[0]))
     urgent = _pq_review(s, priority=1)[1]
     rows, why = pushq.due(s.p, now)
-    assert [r["id"] for r in rows] == [urgent] and "priority 1-2" in why, "priority 1 goes alone, ahead of routine ones"
+    assert [r["id"] for r in rows] == [urgent, later[1]] and "priority 1-2" in why and "1 more ride" in why, \
+        "priority 1 starts a train at once and leads it; the waiting routine one rides in it"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (urgent,))
     assert pushq.due(s.p, now)[0] == []
     s.p.db.update_task(s.review, status="done")
@@ -3562,7 +3563,8 @@ def test_a_batch_waits_push_min_gap_s_after_the_last_one_ended_unless_full_or_pr
     assert [r["id"] for r in pushq.due(s.p, now + 10 ** 6)[0]] == rows
     rows.append(_pq_review(s, priority=1)[1])
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == rows[1:] and "1 an urgent review" in why, "an urgent approval starts at once, alone"
+    assert [r["id"] for r in got] == rows[::-1] and "1 an urgent review" in why, \
+        "an urgent approval starts a train at once and leads it"
     s.p.db.x("DELETE FROM push_queue WHERE id=?", (rows.pop(),))
     rows += [_pq_review(s)[1], _pq_review(s)[1]]
     got, why = pushq.due(s.p, now)
@@ -3676,9 +3678,8 @@ def test_an_independent_approval_goes_alone_at_once_through_the_gap_and_the_wind
 
 
 def test_a_priority_one_approval_in_a_backlog_of_twenty_goes_in_the_next_batch_and_leads_it(env, monkeypatch):
-    """A backlog bigger than push_batch_max grows the batch after a clean one (up to BATCH_GROW times it),
-    and a priority 1-2 approval leads it whatever its age; after a batch that did not end clean the cap
-    stays push_batch_max, and the priority 1 one still leads."""
+    """One train takes the whole backlog, clean last batch or not (push_batch_max caps none), and a
+    priority 1-2 approval leads it whatever its age."""
     from ttp import pushq
     s = _pq(env, monkeypatch, push_batch_s=0, push_batch_max=4)
     s.p.db.update_task(s.review, status="done")
@@ -3688,11 +3689,11 @@ def test_a_priority_one_approval_in_a_backlog_of_twenty_goes_in_the_next_batch_a
     routine = [_pq_review(s)[1] for _ in range(19)]
     hot = _pq_review(s, priority=1)[1]
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [hot] + routine[:4 * pushq.BATCH_GROW - 1], why
+    assert [r["id"] for r in got] == [hot] + routine, why
     s.p.db.x("UPDATE push_batches SET outcome='died', ended=?, finalized=?, after_finalized=?",
              (now - 4000, now - 4000, now - 4000))
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [hot] + routine[:3], "no growth after a batch that did not end clean"
+    assert [r["id"] for r in got] == [hot] + routine, "the whole backlog after a batch that did not end clean too"
 
 
 def test_an_approval_sent_back_by_a_conflict_leads_its_priority_in_the_next_batch(env, monkeypatch):
@@ -3742,12 +3743,12 @@ def test_an_approval_sent_back_by_a_conflict_keeps_its_lead_over_an_older_peer_s
     got, why = pushq.due(s.p, now)
     assert [r["id"] for r in got] == [other, back], "_one_solo: the sent-back head leads, the peer waits"
     s.p.set_config("delivery.push_solo_paths", [])
-    s.p.db.update_task(s.review, status="running")   # the wait path sends only fast rows: never the peer
+    s.p.db.update_task(s.review, status="running")   # the wait path: the fast row leads, the peer stays behind
     s.p.db.x("DELETE FROM push_batches")
     _pq_last_batch(s, "tip_failed", now - 1)
     s.p.set_config("delivery.push_batch_s", 900)
     got, why = pushq.due(s.p, now)
-    assert [r["id"] for r in got] == [other], why
+    assert [r["id"] for r in got] == [other, back, peer], why
 
 
 def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, monkeypatch):
@@ -3768,15 +3769,34 @@ def test_approvals_that_waited_out_the_last_batch_start_the_next_at_once(env, mo
     assert got == [] and "waiting for more approvals" in why, "approved after the batch: the window applies"
 
 
-def test_batch_max_still_caps_a_batch_started_at_once(env, monkeypatch):
+def test_one_train_takes_every_approval_and_push_batch_max_only_starts_one(env, monkeypatch):
+    """Rule 1 of the one train (user msg #2220): every approval due at a train's start is in it;
+    delivery.push_batch_max (kept for compatibility) starts one at once and caps nothing."""
     from ttp import pushq
-    s = _pq(env, monkeypatch, push_batch_max=2)
-    s.p.db.update_task(s.review, status="done")
+    s = _pq(env, monkeypatch, push_batch_max=2, push_batch_s=10 ** 6)
+    s.p.db.update_task(s.review, status="running")
     _pq_last_batch(s, "pushed", time.time() - 60)
     _pq_earlier(s)
-    rows = [_pq_review(s)[1] for _ in range(2 * pushq.BATCH_GROW + 1)]
+    rows = [_pq_review(s)[1] for _ in range(7)]
     got, why = pushq.due(s.p)
-    assert [r["id"] for r in got] == rows[:2 * pushq.BATCH_GROW], "a backlog grows it up to BATCH_GROW times the max"
+    assert [r["id"] for r in got] == rows and "7 approvals" in why, why
+
+
+def test_approvals_that_waited_out_a_failed_train_start_the_next_as_it_ends(env, monkeypatch):
+    """Rule 1: approvals that arrived while a train ran join the next, which starts as soon as that
+    train ends, with no push_min_gap_s wait even when it did not end clean; one approved after it
+    still waits the gap."""
+    from ttp import pushq
+    s = _pq(env, monkeypatch, push_batch_s=0, push_min_gap_s=1800)
+    now = time.time()
+    _pq_last_batch(s, "tip_failed", now + 5)   # freed in 5 s: the approval below waited it out
+    _pq_earlier(s)
+    rid = _pq_review(s)[1]
+    got, why = pushq.due(s.p, now + 10)
+    assert [r["id"] for r in got] == [rid] and "waited out b1" in why, why
+    s.p.db.x("UPDATE push_batches SET ended=?, finalized=?, after_finalized=?", (now - 60, now - 60, now - 60))
+    got, why = pushq.due(s.p, now + 10)
+    assert got == [] and "gap" in why, why
 
 
 def test_the_next_batch_waits_for_the_last_ones_after_push_deploy(env, monkeypatch):
