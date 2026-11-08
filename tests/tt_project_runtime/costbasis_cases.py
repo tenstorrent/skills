@@ -244,9 +244,10 @@ def test_an_opus_alias_fork_books_the_rates_of_the_model_its_result_names(env):
     u = _reported(12.0, output_tokens=20_000)
     u.extra.update(model="claude-opus-5-5")
     assert abs(d._net_of_session(r, u) - want) < 1e-6
-    usd, est = localspend.price("claude-haiku-5-5", {"input_tokens": 1_000_000, "output_tokens": 1_000_000,
-                                                    "cache_read_input_tokens": 1_000_000})
-    assert not est and abs(usd - 0.61) < 1e-9
+    # a prompt under the 100K long-prompt tier: the base Haiku 5.5 row
+    usd, est = localspend.price("claude-haiku-5-5", {"input_tokens": 60_000, "output_tokens": 1_000_000,
+                                                    "cache_read_input_tokens": 30_000})
+    assert not est and abs(usd - 0.5063) < 1e-9
     for _ in range(2):
         u = _reported(30.0, output_tokens=20_000)
         u.extra.update(model_usage=["claude-unheard-9"])
