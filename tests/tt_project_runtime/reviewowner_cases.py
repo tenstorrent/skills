@@ -148,3 +148,43 @@ def test_a_failed_review_with_no_cancel_still_queues_one_fix_and_one_re_review_p
                       labels=[f"continues:{cid}", f"start_when:landed:#{cid}"])
     out = d._fix_failed_review(p.db.task(rev["id"]), fups, "bug")
     assert out and len(_owner_descendants(p, rev)) == 2 and "fix it" not in p.db.task(w)["spec"]
+
+
+def test_an_open_continuation_in_the_project_root_owns_nothing_so_the_done_task_is_reviewed(env):
+    """A continuation that gets no worktree of its own (a work task while worktree.kinds lists no
+    'work') runs in the project root, never on the done task's branch: its review would not cover
+    that work, so the done task gets its own review. Once work tasks get worktrees, it owns the work."""
+    from ttp.daemon import Daemon
+    p = _owner_project(env)
+    d = Daemon(p.base)
+    a, _ = _owner_unreviewed(env, p, "rooted")
+    w = p.db.add_task("carry rooted on", "s", kind="work", origin="coordinator", labels=[f"continues:{a}"])
+    assert d._continuation_owner(p.db.task(a)) is None and d._stale_source(p.db.task(a)) == ""
+    rid, added = d._auto_review(p.db.task(a), "made it")
+    assert added and [r["id"] for r in _owner_reviews_of(p, a)] == [rid]
+    p.set_config("worktree.kinds", ["work"])
+    assert d._continuation_owner(p.db.task(a))["id"] == w
+
+
+def test_o424_a_done_code_task_whose_review_enqueue_timed_out_gets_its_review_from_the_backstop(env, monkeypatch):
+    """Replay of o424 (fix tasks #7413, #7418): the hand-off's diff read hit an expired git deadline
+    ('timed out after 0 seconds'), so no review was queued and the task ended done. The model-free
+    backstop (sweep_unreviewed) queues exactly one review on a later pass."""
+    import subprocess
+    from ttp import worktree
+    from ttp import daemon as dm
+    p = _owner_project(env)
+    real = worktree.diff_lines
+    def expired(*a, **k):
+        raise subprocess.TimeoutExpired(["git", "rev-parse", "--verify", "--quiet", "x^{commit}"], 0)
+    monkeypatch.setattr(worktree, "diff_lines", expired)
+    tid, branch, _, reviews = _finish_code(env, p, "timed out", {"timed_out.py": 20})
+    assert not reviews and p.db.task(tid)["status"] == "done"
+    monkeypatch.setattr(worktree, "diff_lines", real)
+    when = time.time() - 600
+    p.db.x("UPDATE tasks SET updated=? WHERE id=?", (when, tid))
+    p.db.x("UPDATE runs SET ended=? WHERE task=?", (when, tid))
+    d = dm.Daemon(p.base)
+    assert d.sweep_unreviewed() == [tid]
+    assert len(_owner_reviews_of(p, tid)) == 1 and branch in _owner_reviews_of(p, tid)[0]["spec"]
+    assert d.sweep_unreviewed(force=True) == []

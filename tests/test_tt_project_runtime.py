@@ -38565,6 +38565,9 @@ def test_a_work_task_with_its_own_worktree_is_guarded_like_a_code_task(env, monk
     head = _git_out(path, "rev-parse", "HEAD")
     more = p.db.add_task("more", "s", kind="work", tier="light", origin="user", labels=[f"continues:{work}"])
     assert worktree.continued_head(p, p.db.task(more)) == head
+    # While open it owns the work, as for a code task (Daemon._stale_source); cancelled, it owns nothing.
+    assert d._stale_source(p.db.task(work)) == f"open task #{more} continues it"
+    p.db.update_task(more, status="cancelled")
     # A done one is lined up for the backup push; an unfinished one's worktree is in the integrity check.
     p.set_config("delivery.backup_remote", "origin")
     d.cfg = p.config()

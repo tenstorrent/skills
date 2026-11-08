@@ -16084,12 +16084,15 @@ class Daemon:
         """The open task, oldest first, that continues task `task` (its `continues:` label names it): the
         sole owner of its work from here, whose own finished work gets its own review. A review, a task
         that waits on `task` landing (it carries none of its work) and a stalled hop (chaincap.hop_stall)
-        own nothing. None when there is none."""
+        own nothing, nor does one that works in the project root (no worktree of its own: worktree.gets_worktree,
+        carried_branch), which never starts from its branch, so its review would not cover that work. None when
+        there is none."""
         tid, now = task["id"], time.time()
         return next((x for x in self.p.db.q(
             "SELECT * FROM tasks WHERE kind!='review' AND status NOT IN (?,?,?) AND id!=? AND labels LIKE ? ORDER BY id",
             (*TERMINAL_TASK_STATES, tid, f'%"continues:{tid}"%'))
-            if continues_id(x) == tid and not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)), None)
+            if continues_id(x) == tid and not self._waits_landing(x, tid) and not chaincap.hop_stall(x, now)
+            and (worktree.gets_worktree(self.p, x["kind"]) or worktree.carried_branch(x))), None)
 
     def _stale_source(self, task: dict) -> str:
         """Why no review of task `task` may be queued now, read live from the records ('' when one may):
