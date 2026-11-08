@@ -307,7 +307,7 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         d = Decision(True, "event", "its spec changed since the last turn")
     elif gate.get("seen") and seen and gate["seen"] != seen and not matchwait:
         d = Decision(True, "event", "its probe's answer changed since the gate's last skip")
-    elif len(skips) >= int(s["max_skips"]) or now - ended >= float(s["max_skip_h"]) * 3600:
+    elif len(skips) - int(gate.get("plan_skips") or 0) >= int(s["max_skips"]) or now - ended >= float(s["max_skip_h"]) * 3600:
         d = Decision(True, "cap", f"{len(skips)} skip(s), {(now - ended) / 3600:.1f} h since its last turn")
     elif woke == "probe passed":
         lg = last.get("wake_gate") if isinstance(last.get("wake_gate"), dict) else {}
@@ -328,9 +328,19 @@ def decide(p, cfg: dict, task: dict, prev: dict, now: float, probe: tuple | None
         if why:
             d = Decision(False, "rule", why)
         else:
-            d = _ask_jev(db, cfg, s, jev, task, prev, probe, last_run, now) or Decision(True, "fallback", "no rule or Jev decided")
-            if d.extra.get("pending") and gate.get("pending"):   # one wait for an answer per wait, never a loop
+            d = None if planby == "plain" else _ask_jev(db, cfg, s, jev, task, prev, probe, last_run, now)
+            if d and d.extra.get("pending") and gate.get("pending"):   # one wait for an answer per wait, never a loop
                 d = Decision(True, "fallback", "Haiku gave no answer within a minute")
+            if planby and (d is None or d.by == "fallback"):
+                # A planned check is no event: with no Jev verdict it takes the plain rule, and with
+                # no rule either it sleeps; the probe's pass or failure still wakes it on its own path.
+                try:
+                    why = None if planby == "plain" else pending(p, cfg, prev.get("retry_when"))
+                except Exception:
+                    why = None
+                d = Decision(False, "rule", why or "a planned check no rule or Jev judged: no event, so it sleeps"
+                             + (f" ({d.reason})" if d else ""))
+            d = d or Decision(True, "fallback", "no rule or Jev decided")
     d.seen = seen
     if not d.wake:
         base = min(max(bud_retry_s(prev), float(s["backoff_s"])), float(s["max_backoff_s"]) or 3600)
@@ -375,6 +385,8 @@ def skipped(prev: dict, d: Decision, now: float) -> dict:
                         "since": gate.get("since") or now, "by": d.by, "reason": d.reason[:200]}
     if pending:
         out["wake_gate"]["pending"] = True
+    if prev.get("plan_by") or gate.get("plan_skips"):   # a planned check's skip brings no cap wake closer
+        out["wake_gate"]["plan_skips"] = int(gate.get("plan_skips") or 0) + bool(prev.get("plan_by"))
     return out
 
 

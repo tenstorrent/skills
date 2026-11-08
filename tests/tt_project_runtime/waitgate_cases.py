@@ -680,6 +680,7 @@ def test_a_planned_check_wakes_once_at_its_tier_and_the_same_wait_keeps_its_plan
     assert t["not_before"] <= time.time() and res[wt.KEY] == "plan_check" and res[wt.PLAN]["done"] == 1, res
     assert res[wt.PLAN_BY] == "jev" and "planned interim check (1 of 2)" in res["woke"]
     assert bud.wake_tier("deep", res) == "light"
+    d.jev = _GateJev(needed=0.9)   # Jev judges the check worth a turn (with no verdict it would sleep)
     assert _run_until(d, p, lambda: runs() == 2 and idle()), "the planned check did not run and sleep again"
     res = json.loads(p.db.task(tid)["result"])
     assert res[wt.PLAN]["done"] == 1 and res[wt.PLAN]["at"][1] == cp["at"][1], "the same wait keeps its plan"
@@ -719,6 +720,50 @@ def test_the_wake_gate_judges_a_planned_check_by_its_plan(env, tmp_path, by, wak
     from ttp import waitgate
     assert not {"plan_by", "plan_tier", "woke"} & set(waitgate.skipped(json.loads(p.db.task(tid)["result"]), d, time.time()))
     lk.close()
+
+
+class _NoKeyJev(_GateJev):
+    def enabled(self):
+        return False
+
+
+@pytest.mark.parametrize("jev, off", [(None, False), (_NoKeyJev(needed=0.9), False), (_GateJev(needed=0.9), True),
+                                      (_GateJev(error=RuntimeError("down")), False), (_GateJev(), False)])
+def test_a_jev_planned_check_without_a_jev_verdict_takes_the_plain_rule(env, tmp_path, jev, off):
+    """No Jev (no key, its use switched off, an error, no answer): a planned check is no event, so a
+    running job is a skip by rule, never the gate's paid always-wake fallback."""
+    from ttp import jevuse, waitgate
+    p = make(env)
+    rc, lk = _running_job(tmp_path)
+    tid = _gate_task(p, tmp_path, f"ttp detach --check {rc}")
+    if off:
+        p.db.set_kv(jevuse.OFF_KEY, {waitgate.USE: {"at": time.time(), "why": "test"}})
+    _gate_set(p, tid, woke="its planned interim check (1 of 2): ...", wake_reason="plan_check", plan_by="jev", plan_tier="light")
+    d = _gate_decide(p, tid, jev=jev)
+    assert (d.wake, d.by) == (False, "rule") and "still runs" in d.reason, d
+    lk.close()
+
+
+@pytest.mark.parametrize("by", ["jev", "plain"])
+def test_a_planned_check_no_rule_or_jev_judged_sleeps_and_brings_no_cap_closer(env, tmp_path, by):
+    """A probe no rule reads and no Jev: a planned check sleeps (its pass or failure still wakes the
+    task), and its skips do not count toward max_skips; a plain due wake still takes the fallback."""
+    from ttp import waitgate
+    p = make(env)
+    tid = _gate_task(p, tmp_path, "test -e /nonexistent/marker")
+    _gate_set(p, tid, wake_gate={"log": [1, 2, 3], "plan_skips": 0})
+    plan = dict(woke="its planned end check (2 of 2): ...", wake_reason="plan_check", plan_by=by, plan_tier="light")
+    _gate_set(p, tid, **plan)
+    d = _gate_decide(p, tid, jev=None)
+    assert (d.wake, d.by) == (False, "rule") and "sleeps" in d.reason, d
+    _gate_set(p, tid, **waitgate.skipped(json.loads(p.db.task(tid)["result"]), d, time.time()))
+    gate = json.loads(p.db.task(tid)["result"])["wake_gate"]
+    assert len(gate["log"]) == 4 and gate["plan_skips"] == 1, gate
+    _gate_set(p, tid, woke="", wake_reason="", plan_by=None, plan_tier=None)
+    d = _gate_decide(p, tid, jev=None)
+    assert (d.wake, d.by) == (True, "fallback"), "3 counted skips: below the cap, and no plan: the fallback"
+    _gate_set(p, tid, wake_gate={**gate, "plan_skips": 0})
+    assert _gate_decide(p, tid, jev=None).by == "cap"
 
 
 def test_the_coordinator_sets_and_clears_a_tasks_check_plan(env, tmp_path):

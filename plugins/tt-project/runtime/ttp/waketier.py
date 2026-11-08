@@ -30,7 +30,9 @@ measured median wait of its kind (wait_kind: own checks, a detached job, a push,
 record_wait keeps them as probes pass, END_FALLBACK_S while fewer than `min_samples` are measured). In
 between, only a changed probe answer wakes it (the probe loop and waitgate). Each check wakes at the
 plan's tier, `by`: "model" (always a run), "jev" (the wake gate's Jev step judges it, its mechanical
-"still pending" rules skipped) or "plain" (the whole wake gate: a job still running is no turn). The
+"still pending" rules skipped; with no Jev verdict it takes them) or "plain" (the whole wake gate: a
+job still running is no turn). A planned check is no event: one that no rule or Jev judged sleeps,
+since the probe's pass or failure still wakes the task on its own path. The
 coordinator's task_update `check_plan` (PLAN_SET: checks, at_s, tier, by) overrides the defaults for
 that task's waits; `waiting.check_plan` holds the defaults the daily review tunes (plan_lines).
 """

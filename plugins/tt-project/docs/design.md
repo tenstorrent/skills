@@ -172,7 +172,11 @@ disk untouched, with no migration; nothing else is reclaimed by check recovery.
    at the expected end, the measured median wait of its kind (own checks, a detached job, a push,
    another probe; a fallback below `min_samples`). In between only a changed probe answer wakes it.
    A check wakes at the plan's `tier` (light), `by` `jev` (the wake gate's Jev step judges it),
-   `plain` (the whole gate: a job still running is no turn) or `model` (always a run). The same wait
+   `plain` (the whole gate: a job still running is no turn) or `model` (always a run). A planned
+   check is no event: when Jev gives no verdict (no key, paused, its use off, an error) a `jev` check
+   takes the plain rule, and a check that no rule or Jev judged sleeps rather than taking the gate's
+   always-wake fallback, since the probe's pass or failure still wakes the task on its own path.
+   Its skips do not count toward `waiting.wake_gate.max_skips`. The same wait
    handed back keeps its plan, and a planned check never counts as a stale wake. The coordinator's
    `task_update` `check_plan` overrides a task's plan; the daily review gets `Check plans` lines to
    tune the defaults.
