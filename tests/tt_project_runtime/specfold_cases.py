@@ -53,6 +53,26 @@ def test_a_grown_spec_is_folded_keeping_every_order_restriction_and_the_latest_u
     assert "step 49: tune" not in older and "## Obligation" not in older
 
 
+def test_a_folded_update_keeps_every_line_citing_a_user_or_owner_order_whole():
+    from ttp import specfold
+    spec = _grown_spec(n=20)
+    cites = ["Per user msg #2329: move reviews to the tt models.",
+             "(user msg #2271, owner's agent: 'cut the prompt')",
+             "owner's agent: 'cut the prompt'",
+             "User's order: rebase onto the push branch first.",
+             "Relayer: the push batch is retesting its first 14 changes.",
+             "As the user messages #2310 and #2317 say, hold routine work.",
+             "User #2330: report runs per class per model per hour.",
+             "Done with the owner's word via the owner's agent.",
+             "The user said to keep GLM for screening."]
+    spec = spec.replace("step 1: tune the cache knob 1. ", "step 1: tune the cache knob 1. \n" + "\n".join(cites) + "\n", 1)
+    shown, older = specfold.fold(spec)
+    assert "step 1: tune" not in shown   # the update itself is folded
+    for c in cites:
+        assert c in shown, c
+        assert c in older, c
+
+
 def test_a_short_or_rarely_updated_spec_is_shown_as_it_is():
     from ttp import specfold
     small = _grown_spec(n=5, pad=10)
@@ -75,3 +95,18 @@ def test_a_worker_prompt_reads_the_folded_spec_and_the_older_updates_file(env):
     assert specfold.FOLD_HEAD in prompt and str(path) in prompt and "step 0: tune" not in prompt
     assert "step 0: tune the cache knob 0." in path.read_text()
     assert p.db.task(tid)["spec"] == _grown_spec()   # the record keeps every update
+
+
+def test_a_resume_re_sending_a_changed_grown_spec_folds_it_too(env):
+    from ttp import specfold
+    from ttp.prompts import spec_digest, worker_resume
+    p = make(env)
+    tid = p.db.add_task("build it", "build the thing", kind="work", tier="light", origin="user")
+    old = spec_digest(p.db.task(tid))
+    p.db.update_task(tid, spec=_grown_spec())
+    t = p.db.task(tid)
+    for cause in ("handoff", "reboot"):   # both resume prompts re-send the changed spec folded
+        text = worker_resume(p, t, {"cause": cause, "handoff": "no result.json", "dir": "/old/run", "spec_sha": old})
+        assert "The spec changed:\nGoal: make the loader fast." in text and specfold.FOLD_HEAD in text, cause
+        assert "step 3: tune" not in text and "'keep order 3 open'" in text, cause
+    assert "step 3: tune the cache knob 3." in (p.state / "spec-updates" / f"{tid}.md").read_text()

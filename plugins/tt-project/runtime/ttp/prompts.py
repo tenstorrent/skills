@@ -1177,7 +1177,7 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
                      f"under {lost['dir']}.\n")
         if lost.get("spec_sha") and lost["spec_sha"] != spec_digest(task):
             text += ("\nUpdate for your task from the project coordinator. Where it differs from the spec, it wins:\n"
-                     f"The spec changed:\n{task['spec'] or task['title']}\n")
+                     f"The spec changed:\n{specfold.for_prompt(p.state, task)}\n")
         return "\n\n".join(x for x in (text, restrictions_pointer(p)) if x.strip())
     why = {"reboot": "the host rebooted", "sleep": "the host slept",
            "network": "the network went away", "crash": "its process died without a result (a crash)"}.get(
@@ -1196,7 +1196,7 @@ def worker_resume(p: Project, task: dict, lost: dict) -> str:
                  f"$TTP_RUN_DIR/result.json, not under {old_dir} or any run dir named in earlier context.\n")
     update = []
     if lost.get("spec_sha") and lost["spec_sha"] != spec_digest(task):
-        update.append(f"The spec changed:\n{task['spec'] or task['title']}")
+        update.append(f"The spec changed:\n{specfold.for_prompt(p.state, task)}")
     steer = unread_update(Path(old_dir))[0] if old_dir else ""
     if steer:
         update.append(steer)

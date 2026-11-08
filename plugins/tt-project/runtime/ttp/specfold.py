@@ -5,10 +5,11 @@ update whole into each run's first call. Past SPEC_FOLD_CHARS and SPEC_FOLD_KEEP
 prompt keeps the original spec, the latest updates whole (at least the latest one, more while they fit
 SPEC_FOLD_CHARS, at most SPEC_FOLD_KEEP), every `## Obligation` block the harness appended (in place,
 whole), and from each older update every line that binds: safety lines (a Restrictions or guards
-block, never, no_push and the like), lines quoting a user's or owner's words, urgent lines,
-must-lines and the `pr_branch:`/`start_when:` style fields. `retire:` effects are already applied to the
-stored spec (coordinator.spec_edits), so a "Retired:" notice adds nothing. The older updates go whole
-to a file the worker reads on demand. The task's stored spec is never changed: only its prompt."""
+block, never, no_push and the like), lines quoting or citing a user's or owner's words or orders
+("user msg #N", "owner's agent", "relayer"), urgent lines, must-lines and the
+`pr_branch:`/`start_when:` style fields. `retire:` effects are already applied to the stored spec
+(coordinator.spec_edits), so a "Retired:" notice adds nothing. The older updates go whole to a file
+the worker reads on demand. The task's stored spec is never changed: only its prompt."""
 from __future__ import annotations
 
 import re
@@ -19,7 +20,10 @@ SPEC_FOLD_KEEP = 3
 FOLD_HEAD = "## Earlier updates, folded"
 _SECTION = re.compile(r"(?m)^(?=#{2,3} (?:Update|Obligation)\b)")
 _UPDATE = re.compile(r"^## Update\b")
-_WHOLE = re.compile(r"\b(?:user|owner)'s\s+words\b|verbatim|"
+_WHOLE = re.compile(r"\b(?:user|owner)'s\s+words?\b|verbatim|\b(?:user|owner)(?:'s)?\s+#\d+|"
+                    r"\b(?:user|owner)\s+(?:said|asked|ordered)\b|"
+                    r"\b(?:user|owner)(?:'s)?\s+(?:msg|message|order)s?\b|\bowner's\s+agent\b|"
+                    r"\brelayer\b|"
                     r"^\s*[-*]?\s*(?:pr_branch|no_push|start_when|retry_when|depends_on):", re.I)
 _KEEP = re.compile(r"\burgent\b|\bmust\b|\bnever\b|\bdo not\b|\bdon't\b|\bonly\b", re.I)
 
