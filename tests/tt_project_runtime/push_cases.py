@@ -1997,6 +1997,44 @@ def test_entries_after_a_blamed_one_are_requeued_untested_without_an_extra_round
     assert [r["detail"] for r in m["results"][1:]] == [{"untested": True}] * 2, m
 
 
+def test_a_push_batch_pushes_the_first_prefix_that_passes_at_once_and_sends_the_rest_to_the_next_train(env, monkeypatch,
+                                                                                                         capsys):
+    """User msg #2317: a batch that passed every check lands at once. Eight entries, the seventh breaks the
+    checks: the full head fails and the first prefix tried (4) passes, so it pushes with no further
+    check (2 runs). Entries 5-8 are requeued untested and unblamed for the next train on the new tip; no
+    entry joins the passed head and it is not checked again."""
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 7 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 9)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and m["outcome"] == "pushed" and _statuses(m) == ["pushed"] * 4 + ["requeued"] * 4, m
+    assert len(log.read_text().split()) == m["checks"]["runs"] == 2, "the full head and prefix 4, nothing after"
+    assert [r["detail"] for r in m["results"][4:]] == [{"untested": True}] * 4, "requeued, never blamed"
+    assert _git_out(origin, "rev-parse", "proj") == m["pushed_sha"], m
+    assert [_git_out(origin, "show", f"proj:plugins/p/f{n}.txt") for n in (1, 4)] == ["1", "4"]
+    out = capsys.readouterr().out
+    assert "passed every push check: pushing its 4 entries now; the other 4 go in the next train" in out, out
+    assert "without it" not in out and "checking again" not in out
+
+
+def test_a_push_batch_never_rescues_after_a_blamed_entry_once_a_prefix_passed(env, monkeypatch, capsys):
+    """User msg #2317, the rescue path: five entries, the third breaks the checks. Prefix 2 passes and
+    pushes at once: prefix 3 is never checked, no entry is blamed, and entries 3-5 are never checked
+    without one ("checking the 3 entries after ... without it" built a bigger head after a pass). With
+    a blamed entry after a passed prefix (the cap probes' verdict), _rescue checks nothing."""
+    from ttp import batch
+    log = env["tmp"] / "checks.log"
+    p, repo, origin, other = _bump_setup(env, monkeypatch, [f"echo run >> {log}", "test ! -e plugins/p/bad.txt"])
+    heads = [_entry(repo, f"e{n}", {f"plugins/p/{'bad' if n == 3 else f'f{n}'}.txt": f"{n}\n"}) for n in range(1, 6)]
+    rc, m = _run_batch(p, _batch_marker(p, heads), monkeypatch)
+    assert rc == 0 and _statuses(m) == ["pushed", "pushed", "requeued", "requeued", "requeued"], m
+    assert len(log.read_text().split()) == m["checks"]["runs"] == 2 and "without it" not in capsys.readouterr().out
+    b = batch.Batch.__new__(batch.Batch)
+    b.detail_tip, b.rescues = None, 0
+    monkeypatch.setattr(batch.Batch, "_check", lambda *a: pytest.fail("a check after a passed prefix"))
+    assert b._rescue("t" * 40, [(i, f"{i}" * 40) for i in range(5)], 2, ["true"]) is None
+
+
 def _approved_mid_search(p, monkeypatch, after, priority):
     """Approve another change for the batch's target (a review of `priority`, queue row 99) right after
     the batch's `after`-th full check: an approval that arrives while the batch searches for the entry
@@ -18172,9 +18210,12 @@ def test_a_push_batch_settles_tests_both_sides_append_to_one_case_file_and_keeps
         assert got.index("def test_tip") < got.index("def test_change") and got.count("@pytest.mark.slow") == 2
         __import__("ast").parse(got)
     elif case == "check_fails":
-        # its detail names the failing checks: pushq._settle sends it to a standard conflict fix (no kept approval)
-        assert _statuses(m) == ["pushed", "conflict"], m
-        d = m["results"][1]["detail"]
+        # e1 passed alone and pushed at once (user msg #2317); e2 meets it in the next train, where its
+        # detail names the failing checks: pushq._settle sends it to a standard conflict fix (no kept approval)
+        assert _statuses(m) == ["pushed", "requeued"], m
+        rc, m = _run_batch(p, _batch_marker(p, heads[1:], bid="b2"), monkeypatch)
+        assert _statuses(m) == ["conflict"], m
+        d = m["results"][0]["detail"]
         assert d["settled"] == [_APPEND_FILE] and d["cmd"] == both and d["files"] == [_APPEND_FILE], d
         assert "test_change" not in _git_out(origin, "show", f"proj:{_APPEND_FILE}")
     else:
