@@ -15355,6 +15355,33 @@ def test_never_held_events_wake_as_they_did_without_the_plain_done_hold(env, mon
     assert ev in turns[0][0] and p.db.kv("plain_done_held") is None
 
 
+@pytest.mark.parametrize("case", ["solo", "overflow", "parked_message"])
+def test_the_plain_done_hold_judges_every_queued_event_not_only_the_sized_batch(env, monkeypatch, case):
+    """A never-held item outside the sized turn batch (a solo turnsize record, more plain hand-offs than
+    max_events_per_turn ahead of it, or a message sizing parked) still wakes as before: the hold reads
+    every queued event and message."""
+    from ttp import turnsize
+    p, d, clock, turns = _plain_hold_setup(env, monkeypatch)
+    batch = float(p.config()["coordinator"]["batch_s"])
+    if case == "solo":
+        ev, _ = _plain_done_event(p, clock)
+        p.db.set_kv(turnsize.STATE_KEY, {turnsize.item_key("e", ev): {"size": 1, "cap": 0.01}})
+    else:
+        p.set_config("coordinator.max_events_per_turn", 3)
+        d.cfg = p.config()
+        for _ in range(5):
+            _plain_done_event(p, clock)
+    if case == "parked_message":
+        _plain_done_event(p, clock)
+        m = p.db.x("INSERT INTO messages(ts,direction,chat,text,handled) VALUES(?,?,?,?,0)",
+                   (clock[0], "in", "web", "hi"))
+        p.db.set_kv(turnsize.STATE_KEY, {turnsize.item_key("m", m): {"size": 1, "cap": 1e9}})
+    else:
+        _event(p, clock, "task_failed", "high")
+    assert _turn_within(d, clock, turns, batch + 60, step=15), "a failure outside the sized batch was held"
+    assert p.db.kv("plain_done_held") is None
+
+
 
 def test_blocker_sweep_carries_a_valid_not_yet_due_still_blocked_forward_until_the_item_changes(env):
     p = make(env)

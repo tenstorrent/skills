@@ -9888,6 +9888,7 @@ class Daemon:
             log(self.p, "wait_stale queued gate failed: " + traceback.format_exc().replace("\n", " | ")[:1000])
         max_evs = int(c.get("max_events_per_turn", 40))
         budget = float(c.get("turn_budget_usd", 1.0))
+        unsized = (bool(msgs), queued)   # the plain-done hold judges all of them, not the sized batch
         # Items whose turn went over its cap are split, raised once or parked, never retried as is (turnsize.py).
         try:
             g = self.gates.get(self.cfg.get("core_provider", "claude"))
@@ -9911,7 +9912,8 @@ class Daemon:
         # starts, or start one themselves RIDE_ALONG_MAX_S after the oldest was raised.
         rides = [e for e in evs if pagesev.rides_along(e)]
         # So do plain hand-offs (_plain_done_held), up to coordinator.plain_done_hold_max_s.
-        held = [] if msgs or rerun or len(rides) == len(evs) else self._plain_done_held(evs, now)
+        held = [] if msgs or unsized[0] or rerun or len(rides) == len(evs) else \
+            self._plain_done_held(evs, now, unsized[1])
         if not msgs and len(rides) + len(held) == len(evs) and (
                 not rides or now - min(e["ts"] for e in rides) < pagesev.RIDE_ALONG_MAX_S):
             if coord.rejection_due(db, now):
@@ -10146,16 +10148,21 @@ class Daemon:
                                                                      BRANCH_HELD_NOTE))
                    and not self._precheck_holds(t, now))
 
-    def _plain_done_held(self, evs: list[dict], now: float) -> list[dict]:
-        """The events of `evs` that are not ride-alongs, when each is a plain hand-off (_plain_done) of
-        a task that is no review, names no Restriction and asks the turn nothing, raised less than
-        coordinator.plain_done_hold_max_s ago (default the idle_wake_s default; 0: off); else []. They
-        start no turn: they join the next one any other cause starts, or the idle wake. They stay
-        queued, so a restart keeps them and their clock."""
+    def _plain_done_held(self, evs: list[dict], now: float, queued: list[dict]) -> list[dict]:
+        """The events of the sized batch `evs` that are not ride-alongs, when each non-ride-along event
+        of `queued` (every queued one after the rejection and stale screens, not only the sized batch)
+        is a plain hand-off (_plain_done) of a task that is no review, names no Restriction and asks the
+        turn nothing, raised less than coordinator.plain_done_hold_max_s ago (default the idle_wake_s
+        default; 0: off); else []. They start no turn: they join the next one any other cause starts,
+        or the idle wake. They stay queued, so a restart keeps them and their clock. Any other queued
+        event, even one turn sizing set aside or parked, releases the hold (the batch_s wake as before)."""
         try:
             cap = float(self.cfg["coordinator"].get("plain_done_hold_max_s", 3600) or 0)
-            own = [e for e in evs if not pagesev.rides_along(e)]
-            if cap <= 0 or not own or now - min(e["ts"] for e in own) >= cap:
+            own = [e for e in queued if not pagesev.rides_along(e)]
+            mine = [e for e in evs if not pagesev.rides_along(e)]
+            ids_all = {e.get("id") for e in own}
+            if cap <= 0 or not own or not mine or any(e.get("id") not in ids_all for e in mine) \
+                    or now - min(e["ts"] for e in own) >= cap:
                 return []
             for e in own:
                 if not self._plain_done(e) or (self.p.db.task(e["task"]) or {}).get("kind") == "review":
@@ -10169,7 +10176,7 @@ class Daemon:
                 self.p.db.set_kv(PLAIN_DONE_HELD_KEY, ids)
                 log(self.p, f"coordinator turn held (plain done): events {ids} wait for the next wake "
                     f"of another cause or the idle wake, at most {cap:.0f} s")
-            return own
+            return mine
         except Exception:   # the hold only saves money: a failure runs the turn
             log(self.p, "coordinator plain done hold failed: " + traceback.format_exc().replace("\n", " | ")[:1500])
             return []
