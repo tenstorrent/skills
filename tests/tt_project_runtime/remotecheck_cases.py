@@ -1512,6 +1512,82 @@ def test_spill_device_gate_never_counts_a_pool_check_runs_hold_on_a_bare_alias_a
         h.close()
 
 
+def test_an_agent_cli_or_host_local_check_splits_off_to_run_here_while_the_rest_spills(env):
+    """A check running an agent CLI (the claude CLI, after any wrapper or in any simple command) never spills
+    unless it says `spill: true`; it and a host "local" check that is no test suite, unwrapped and in a clean
+    checkout stay here while the run's other checks spill. Anything else that may not spill keeps the whole
+    run here; a run of such checks alone never spills. Spill admission asks the host for no agent CLI."""
+    from ttp import checkspill, push
+    for cli_cmd in ("claude plugin validate plugins/x --strict", "env A=1 claude plugin validate .",
+                    "timeout 60 /usr/local/bin/claude plugin validate .", "nice -n 19 claude -p hi",
+                    "true && claude plugin validate .", "make lint; codex exec x", "cursor-agent --help | cat",
+                    'sh -c "claude plugin validate ."', "bash -lc 'cd x && claude -p hi'"):
+        assert checkspill.needs_cli(cli_cmd), cli_cmd
+        assert not checkspill.check_spills(push.check_list([cli_cmd])[0]), cli_cmd
+    for cmd in ("python3 -m pytest -q -k claude tests/", "echo claude", "pytest tests/test_claude.py", "make t",
+                'sh -c "echo claude"', "bash tools/claude.sh"):
+        assert not checkspill.needs_cli(cmd), cmd
+    test, cli = "python3 -m pytest -q tests/", "claude plugin validate plugins/x --strict"
+    c = push.check_list([test, cli, {"run": "sh tools/lint.sh", "host": "local"}, {"run": cli, "spill": True}])
+    assert checkspill.stays_here(c[1]) and checkspill.stays_here(c[2]) and not checkspill.stays_here(c[0])
+    assert checkspill.spillable(c[:3]) and checkspill.spillable([c[1], c[0]]), "a split run spills"
+    assert checkspill.check_spills(c[3]) and checkspill.spillable(c[3:]), "spill: true sends it too"
+    assert not checkspill.spillable(c[1:3]), "nothing left to spill: it all runs here"
+    keep = push.check_list([{"run": "python3 -m pytest -q tests/b", "host": "local"},   # a test suite
+                            {"run": cli, "spill": False}, {"run": cli, "cwd": "authoring"}])
+    keep.append(push.with_wrap(push.check_list([cli]), ("/opt/devwrap",))[0])
+    for k in keep:
+        assert not checkspill.stays_here(k) and not checkspill.spillable([c[0], k]), k
+    assert not any(x in checkspill._probe_script() for x in checkspill.AGENT_CLIS)
+
+
+def _split_run(env, tmp_path, monkeypatch, cli_rc: int):
+    """A spilled run of a spilled check and a claude CLI check (a fake one here, exiting `cli_rc`) whose spill
+    host drops any script naming the claude command, as a host without it would fail it: (checks.json,
+    checks.log, where the spilled check ran, where the claude check ran)."""
+    import threading
+    from ttp import cli
+    p, repo, run, remote = _spill_setup(env, tmp_path, monkeypatch, ["check-host-a"])
+    agent = tmp_path / "agentbin"
+    agent.mkdir()
+    ran, here = tmp_path / "spilled.log", tmp_path / "here.log"
+    (agent / "claude").write_text(f"#!/bin/sh\npwd >> {here}\nexit {cli_rc}\n")
+    (agent / "claude").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{agent}{os.pathsep}{os.environ['PATH']}")
+    monkeypatch.setenv("FAKE_SSH_FAIL", "claude plugin validate")
+    p.set_config("delivery.push_checks", [f"pwd >> {ran}", "claude plugin validate . --strict"])
+    lane = _spill_lane(p, repo)
+    late = threading.Timer(20.0, lane.close)
+    late.start()
+    try:
+        cli.main(["checks", "--fresh"])
+    except SystemExit as e:   # a failing run exits 1
+        assert e.code == 1 and cli_rc, e.code
+    finally:
+        late.cancel()
+        lane.close()
+    return (json.loads((run / "checks.json").read_text()), (run / "checks.log").read_text(),
+            ran.read_text().splitlines(), here.read_text().splitlines())
+
+
+def test_a_split_run_spills_its_tests_and_runs_its_agent_cli_check_here_for_one_verdict(env, tmp_path, monkeypatch):
+    """The lane here busy, the run spills: its plain check runs on the spill host and its claude CLI check
+    (which that host lacks) runs on this machine in the same run, both in one passing verdict."""
+    rec, text, ran, here = _split_run(env, tmp_path, monkeypatch, 0)
+    assert rec["passed"] is True and rec["spilled_to"] == "check-host-a", (rec, text)
+    assert len(ran) == 1 and "/ttp-check." in ran[0], ran
+    assert len(here) == 1 and "/ttp-check." not in here[0], here
+    assert "did not pass on spill host" not in text, text
+
+
+def test_a_split_runs_failing_agent_cli_check_here_fails_it_without_a_rerun(env, tmp_path, monkeypatch):
+    """The check split off to run here fails: that failure is the run's verdict at once, never a spill host
+    fault that reruns the checks."""
+    rec, text, ran, here = _split_run(env, tmp_path, monkeypatch, 1)
+    assert rec["passed"] is False and rec["spilled_to"] == "check-host-a", (rec, text)
+    assert "did not pass on spill host" not in text and len(ran) == len(here) == 1, (text, ran, here)
+
+
 def test_a_check_opts_in_to_spilling_and_runs_behind_its_remote_wrapper_there(env):
     """`spill: true` lets a check with host "local" spill, `false` keeps any check here; a check behind
     checks.wrap_cmd (a device wrapper) spills only with a remote wrapper (its own spill_wrap_cmd, else

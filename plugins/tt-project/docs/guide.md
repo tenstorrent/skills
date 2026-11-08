@@ -1901,7 +1901,12 @@ session and stateless coordinators on every provider.
   lets a run that has waited `delivery.checks_spill_after_s` (default 60 s) here run on the first listed host the
   charter names, the machines list holds, no pause covers and whose `ttp lock <alias>` nobody else holds (the run
   holds it shared while it runs), where no device job runs, that ssh reaches and that has a free slot; others
-  are skipped with the reason and the run keeps its place here. A device job means one of the host's device
+  are skipped with the reason and the run keeps its place here. A check that runs an agent CLI (`claude`, `codex`,
+  `cursor-agent`, also inside `sh -c`), such as `claude plugin validate --strict`, or says `"host": "local"`, stays
+  on this machine while the run's other checks (pytest) spill, and the run gives one verdict for both parts. A
+  failure of the part kept here counts at once. Only a check that is not a test suite or build splits off this
+  way, so a spill host needs git, tar and what its checks run (python3 and the checks env for pytest), never an
+  agent CLI or its sign-in. A check whose script file calls one says `"host": "local"`. A device job means one of the host's device
   locks (`<alias>-device`, the device names of its machines-list `shared` entry, `device.locks` names on it)
   is held, reserved or waited for (a pool check run's own hold of the host's lock is none, even when `device.locks`
   lists the bare alias), or a broker heal check (preset broker) of the project on that machine
