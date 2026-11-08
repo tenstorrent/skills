@@ -374,11 +374,45 @@ LS_REMOTE_S = 120   # listing the refs of the remote a push goes to
 
 # What a push sends, never a replace ref's stand-in (pack-objects ignores replace refs; git log would not)
 _GIT_ENV = {"GIT_NO_REPLACE_OBJECTS": "1"}
+# Its lookups never fetch a partial clone's missing objects one at a time (git 2.45+ reads this): checking
+# the many objects a remote advertises would run past the time limit. git log -p fetches what it lacks,
+# after _prefetch fetched the sent range's blobs in one batch.
+_LOOKUP_ENV = {**_GIT_ENV, "GIT_NO_LAZY_FETCH": "1"}
+_HEX = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 
 
 def _git(*args: str, **kw) -> subprocess.CompletedProcess:
     return subprocess.run(["git", *args], capture_output=True, text=True, errors="replace", timeout=60,
-                          env={**os.environ, **_GIT_ENV}, **kw)
+                          env={**os.environ, **_LOOKUP_ENV}, **kw)
+
+
+def _prefetch(revs: str) -> None:
+    """In a partial clone, fetch in one batch the blobs `git log -p` reads for the commits `revs` names
+    (`git log --stdin` input) that the repository lacks, so the scan does not fetch them commit by
+    commit. Does nothing outside a partial clone; on any failure git log fetches what it still lacks."""
+    try:
+        remotes = [_git("config", "--get", "extensions.partialClone").stdout.strip()]
+        remotes += [w[0][len("remote."):-len(".promisor")] for line in
+                    _git("config", "--get-regexp", r"^remote\..*\.promisor$").stdout.splitlines()
+                    if len(w := line.split()) == 2 and w[1].lower() in ("true", "yes", "on", "1")]
+        remotes = list(dict.fromkeys(r for r in remotes if r))
+        if not remotes:
+            return
+        raw = _git("log", "--stdin", "--raw", "--no-abbrev", "--root", "--cc", "--no-renames", "--format=",
+                   input=revs).stdout
+        blobs = {w for line in raw.splitlines() if line.startswith(":")
+                 for w in line.split() if _HEX.fullmatch(w) and w.strip("0")}
+        if not blobs:
+            return
+        out = _git("cat-file", "--batch-check", input="".join(f"{b}\n" for b in sorted(blobs))).stdout
+        missing = [w[0] for line in out.splitlines() if len(w := line.split()) == 2 and w[1] == "missing"]
+        if missing:   # as git's own lazy fetch asks a promisor remote, but for all of them at once
+            subprocess.run(["git", "-c", "fetch.negotiationAlgorithm=noop", "fetch", remotes[0], "--no-tags",
+                            "--no-write-fetch-head", "--recurse-submodules=no", "--filter=blob:none", "--stdin"],
+                           input="".join(f"{m}\n" for m in missing), capture_output=True, text=True,
+                           errors="replace", timeout=LS_REMOTE_S, env={**os.environ, **_LOOKUP_ENV})
+    except (OSError, subprocess.SubprocessError):
+        return
 
 
 def _remote_has(url: str) -> dict[str, str]:
@@ -386,7 +420,7 @@ def _remote_has(url: str) -> dict[str, str]:
     repository has: what a push never sends again. Read from the remote itself, not from
     remote-tracking refs a run can set to anything. Raises ValueError when it cannot be listed."""
     r = subprocess.run(["git", "ls-remote", url], capture_output=True, text=True, errors="replace",
-                       timeout=LS_REMOTE_S, stdin=subprocess.DEVNULL, env={**os.environ, **_GIT_ENV})
+                       timeout=LS_REMOTE_S, stdin=subprocess.DEVNULL, env={**os.environ, **_LOOKUP_ENV})
     if r.returncode:
         raise ValueError(f"could not list what the remote has (git ls-remote exited {r.returncode})")
     shas = {w[0] for line in r.stdout.splitlines() if (w := line.split())}
@@ -449,6 +483,8 @@ def _log_problem(revs_text: str, hit: Callable[[str], str | None], cwd: str | No
     with tempfile.TemporaryFile("w+") as revs:
         revs.write(revs_text)
         revs.flush()
+        revs.seek(0)
+        _prefetch(revs.read())
         revs.seek(0)
         # %B stops at a NUL, so no message can forge the \0 lines; --cc shows what a merge adds itself
         # --root: a root commit's lines too, whatever log.showRoot says

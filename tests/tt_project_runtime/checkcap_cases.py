@@ -7177,6 +7177,22 @@ def test_a_run_that_gets_no_test_slots_within_its_wait_is_told_why_even_on_its_f
         a.close()
 
 
+def test_checks_test_run_min_and_delivery_push_hard_tests_are_known_keys(env, monkeypatch):
+    """Both are read (testslots.run_min, batch's hard-test rule): setting either gives no unknown-key
+    hint, and checks.test_run_min also takes effect from the account settings."""
+    from ttp import project, testslots
+    monkeypatch.delenv("TTP_TEST_RUN_MIN", raising=False)
+    p = make(env)
+    for key, value in (("checks.test_run_min", 3), ("delivery.push_hard_tests", "leak|secret")):
+        assert project.unknown_key_hint(key) is None, key
+        p.set_config(key, value)
+        assert not [x for x in project.config_problems(json.loads(p.config_path.read_text())) if key in x], key
+    assert testslots.run_min(p.config(), 8) == 3
+    p.set_config("checks.test_run_min", None)
+    project.set_account_setting("checks.test_run_min", 5)
+    assert testslots.run_min(p.config(), 8) == 5
+
+
 def test_a_project_can_set_its_own_test_run_max(env):
     from ttp import project, testslots
     p = make(env)
