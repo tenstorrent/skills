@@ -1568,6 +1568,10 @@ class Batch:
             return self._all("refused", "refused", why)
         if why:
             return self._all("requeued", "error", why)
+        if isinstance(r := self.m.get("resumes"), dict):   # pushq.start: a rerun of a batch a reboot cut short
+            say(f"resuming {r.get('batch')}, cut short by a reboot: entries {r.get('kept')} in its order"
+                + (f", {r.get('left_out')} no longer approved left out" if r.get("left_out") else "")
+                + "; a check that passed or a test file that passed on the same tree is not run again")
         rnd = 0
         while rnd < rounds:
             rnd += 1

@@ -1113,7 +1113,8 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
     start the next one at once (not the ones it held itself). Fast approvals (fast_ids: urgent, priority 1-2, or sharing no file
     with an earlier unlanded approval) wait for neither: while the routine ones wait they start a
     batch of their own at once; when the routine ones are due too, they lead it. After a clean batch
-    a backlog bigger than push_batch_max grows the batch up to BATCH_GROW times it."""
+    a backlog bigger than push_batch_max grows the batch up to BATCH_GROW times it. After a batch a
+    reboot cut short its members still approved go again at once, alone and in its order (_cut_members)."""
     now = time.time() if now is None else now
     if not enabled(p, cfg):
         return [], "the push queue is off"
@@ -1179,9 +1180,11 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         return hot[:cap], (f"{len(hot)} urgent or priority-1 approval{'s' if len(hot) != 1 else ''} that "
                            f"{last['id']} stopped its search for; its {len(yielded)} requeued approval"
                            f"{'s' if len(yielded) != 1 else ''} go next")
+    if last and last["outcome"] == "rebooted" and (cut := _cut_members(db, last, rows)):
+        return cut
     fast = fast_ids(p, rows, _tracking_tip(p, remote, branch), skip=tried)
     why = wait = ""
-    if last and last["outcome"] == "rebooted":
+    if last and last["outcome"] == "rebooted":   # none of its members is still approved
         why = f"a rerun of {last['id']}, cut short by a reboot"
     elif len(rows) >= cap:
         why = f"{len(rows)} approvals"
@@ -1224,6 +1227,34 @@ def due(p: Project, now: float | None = None, cfg: dict | None = None) -> tuple[
         why += (f"; {len(held)} more approval{'s' if len(held) != 1 else ''} touching delivery.push_solo_paths "
                 f"wait{'s' if len(held) == 1 else ''} for a later batch (one per batch)")
     return taken, why
+
+
+def _members(marker) -> list[int]:
+    """The entry ids of a batch marker, in its order."""
+    return [e["id"] for e in (_read(Path(marker)).get("entries") or []) if isinstance(e, dict)
+            and isinstance(e.get("id"), int)] if marker else []
+
+
+def _cut_members(db, last: dict, rows: list[dict]) -> tuple[list[dict], str] | None:
+    """The rerun of `last`, a batch a reboot cut short: its members still approved, in its order, and why.
+    The same entries on the same tip make the same merged tree, so the passes and per-file resumes it
+    recorded there (pushpass) count and only its unfinished steps run; on a moved tip verdictcarry
+    decides. A withdrawn, cancelled or held member is not in `rows` and stays out; approvals that came
+    after it wait for the next batch. None when no member is left."""
+    b = db.one("SELECT marker FROM push_batches WHERE id=?", (last["id"],))
+    mine = {r["id"]: r for r in rows if r["batch"] == last["id"]}
+    order = _members(b["marker"] if b else None)
+    kept = [mine[i] for i in order if i in mine] + [r for i, r in mine.items() if i not in order]
+    if not kept:
+        return None
+    n, gone, later = len(kept), len([i for i in order if i not in mine]), len(rows) - len(kept)
+    why = (f"a rerun of {last['id']}, cut short by a reboot: its {n} approval{'s' if n != 1 else ''} again, "
+           f"resuming from its finished steps")
+    if gone:
+        why += f"; {gone} no longer approved (withdrawn, cancelled or held) left out"
+    if later:
+        why += f"; {later} newer approval{'s' if later != 1 else ''} wait{'s' if later == 1 else ''} for the next batch"
+    return kept, why
 
 
 def _changed(p: Project, tip: str, head: str) -> frozenset | None:
@@ -1420,6 +1451,11 @@ def start(p: Project, rows: list[dict], name: str, now: float | None = None) -> 
             m["yield_skip"] = {"tip": st_bad["tip"], "ids": list(st_bad["tried"])}
         if iso := _setup_isolate(db):
             m["setup_isolate"] = iso    # alerted setup_fault checks: their next setup fault isolates an entry
+        last = db.one("SELECT id, outcome, marker FROM push_batches ORDER BY started DESC LIMIT 1")
+        if last and last["outcome"] == "rebooted" and last["marker"] and not _read(Path(last["marker"])).get("rerun_by"):
+            was, ids = _members(last["marker"]), [r["id"] for r in rows]
+            m["resumes"] = {"batch": last["id"], "kept": [i for i in was if i in ids],
+                            "left_out": [i for i in was if i not in ids], "added": [i for i in ids if i not in was]}
         if any(_detail(r).get("yielded") for r in rows):
             m["after_yield"] = True     # requeued by a batch that stopped for an urgent one: never again
         m["check_run_dir"] = str(checkdirs.new(p.state, marker, push.scratch_need(p, p.root)))

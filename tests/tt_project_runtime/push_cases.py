@@ -4459,7 +4459,7 @@ def test_a_batch_cut_short_by_a_reboot_runs_again_at_once_without_backoff(env, m
         assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 0}
         assert not st.get("deaths") and not st.get("backoff_until")
         rows, why = pushq.due(s.p, time.time())
-        assert rows and why == f"a rerun of {bid}, cut short by a reboot"
+        assert rows and why.startswith(f"a rerun of {bid}, cut short by a reboot: its 1 approval again"), why
         mk = json.loads(__import__("pathlib").Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (bid,))["marker"]).read_text())
         assert mk["status"] == "finished" and mk["outcome"] == "rebooted" and mk["ended"]
         again = _pq_batch(s)
@@ -4471,6 +4471,84 @@ def test_a_batch_cut_short_by_a_reboot_runs_again_at_once_without_backoff(env, m
         assert s.p.db.one("SELECT status, tries FROM push_queue") == {"status": "approved", "tries": 1}
         assert st["deaths"] == 1 and st["backoff_until"] > time.time()
         assert pushq.due(s.p, time.time())[0] == []
+
+
+@pytest.mark.parametrize("withdraw", [False, True])
+def test_a_reboot_cut_batch_resumes_its_members_at_once_and_reruns_only_its_unfinished_check(env, monkeypatch,
+                                                                                              withdraw):
+    """A real batch of two approvals is cut by a reboot in its second check, after its first passed.
+    At the next tick (the daemon back) the rerun starts at once with the same members in the same
+    order, so the first check's pass on that tree is reused and only the second check runs, once; an
+    approval that came after waits for the next batch. A member withdrawn meanwhile is left out and
+    never lands. Each resume decision is in the daemon log line, the marker and the batch log."""
+    import signal
+    from ttp import pushq
+    t = env["tmp"]
+    ran, go, pidf = t / "ran.log", t / "go", t / "sleeper.pid"
+    one = f"sh -c 'echo one >> {ran}'"
+    two = f"sh -c 'test -e {go} || {{ echo $$ > {pidf}; exec sleep 60; }}; echo two >> {ran}'"
+    s = _pq_real(env, monkeypatch, push_min_gap_s=0, push_batch_max=5, push_checks=[one, two])
+    monkeypatch.setattr(pushq.runner, "boot_time", lambda: None)
+    db = s.p.db
+    _pq_hand_off(env, s)
+    revs = {}
+    for name in ("second", "late"):
+        code, path, branch = _code_task(s.p, name)
+        _commit(path, f"{name}.txt", f"{name}\n")
+        revs[name] = db.add_task(f"review {name}", "r", kind="review", tier="standard", origin="coordinator",
+                                 depends_on=[code])
+        if name == "second":
+            _pq_hand_off(env, s, task=revs[name], push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
+        else:
+            late = {"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}
+    bid = _pq_batch(s, wait=False)
+    child = pushq._children[bid]
+    end = time.time() + 120
+    while not (pidf.exists() and pidf.read_text().strip()) and child.poll() is None and time.time() < end:
+        time.sleep(0.1)
+    assert pidf.exists(), (s.p.state / "pushes" / f"{bid}.log").read_text()
+    os.killpg(child.pid, signal.SIGKILL)       # the batch's own session: the host went down
+    child.wait(timeout=30)
+    try:
+        os.kill(int(pidf.read_text()), signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    assert ran.read_text().split() == ["one"]
+    _pq_boot(s.p, time.time())
+    _pq_tend(s)
+    assert db.one("SELECT outcome FROM push_batches WHERE id=?", (bid,))["outcome"] == "rebooted"
+    rows = {r["task"]: r["id"] for r in db.q("SELECT id, task FROM push_queue")}
+    order = json.loads((s.p.state / "pushes" / f"{bid}.json").read_text())["entries"]
+    _pq_hand_off(env, s, task=revs["late"], push=[late])
+    if withdraw:
+        db.update_task(revs["second"], status="cancelled")
+        pushq.cancel_orphans(s.p)
+    go.touch()
+    said = []
+    again = pushq.schedule(s.p, log=said.append)   # the daemon's tick: no window, gap or new approval waited for
+    assert again and again != bid, said
+    pushq._children[again].wait(timeout=120)
+    kept = [e["id"] for e in order if not (withdraw and e["id"] == rows[revs["second"]])]
+    left = [rows[revs["second"]]] if withdraw else []
+    [line] = said
+    assert f"a rerun of {bid}, cut short by a reboot: its {len(kept)} approval" in line, line
+    assert "1 newer approval waits for the next batch" in line and ("1 no longer approved" in line) == withdraw, line
+    m = json.loads((s.p.state / "pushes" / f"{again}.json").read_text())
+    assert [e["id"] for e in m["entries"]] == kept
+    assert m["resumes"] == {"batch": bid, "kept": kept, "left_out": left, "added": []}, m.get("resumes")
+    log = (s.p.state / "pushes" / f"{again}.log").read_text()
+    assert m["outcome"] == "pushed" and f"resuming {bid}, cut short by a reboot" in log, log
+    if withdraw:   # another merged tree: the first check runs again, the second once
+        assert ran.read_text().split() == ["one", "one", "two"], log
+        assert _git_out(s.origin, "ls-tree", "--name-only", "proj").split().count("second.txt") == 0
+    else:
+        assert ran.read_text().split() == ["one", "two"], log
+        assert "reused pass from " + bid in log and m["checks"].get("reused") == 1, log
+        assert _git_out(s.origin, "show", "proj:second.txt") == "second"
+    _pq_tend(s)
+    assert db.task(s.review)["status"] == "done" and db.task(revs["late"])["status"] == "pushing"
+    assert db.one("SELECT status FROM push_queue WHERE task=?", (revs["late"],))["status"] == "approved"
+    assert db.task(revs["second"])["status"] == ("cancelled" if withdraw else "done")
 
 
 def test_reboot_cut_batches_alone_raise_no_dying_alert(env, monkeypatch):
