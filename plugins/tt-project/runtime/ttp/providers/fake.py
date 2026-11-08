@@ -51,6 +51,18 @@ class Fake(Provider):
         d = os.environ.get("TTP_FAKE_SESSIONS")
         return bool(d and session_id and (Path(d) / f"{session_id}.jsonl").is_file())
 
+    def session_paths(self, session_id: str, cwd: str, env: dict | None = None) -> list[Path]:
+        d = os.environ.get("TTP_FAKE_SESSIONS")
+        path = Path(d) / f"{session_id}.jsonl" if d and session_id else None
+        return [path] if path and path.is_file() else []
+
+    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
+        src = self.session_paths(session_id, cwd, env)
+        if not src:
+            return "no saved session"
+        (src[0].parent / f"{new_id}.jsonl").write_text(src[0].read_text())
+        return ""
+
     def parse(self, output_path, stderr_path=None) -> RunUsage:
         u = RunUsage(cost_usd=0.0)
         try:

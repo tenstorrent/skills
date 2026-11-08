@@ -488,6 +488,7 @@ def env(tmp_path, monkeypatch, _git_session, _short_tmp):
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))   # `ttp setup` never writes the user's own skills
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "codexhome"))   # nor repoints or refreshes the user's own Codex plugins
     monkeypatch.setenv("TTP_TEST_NO_SYNC", "1")   # setup and upgrades skip the host-wide flush (minutes on a busy host)
+    monkeypatch.setenv("TTP_TEST_WORKER_CONTEXT", "off")   # worker prompts carry no coordinator context (ctxfork_cases tests it)
     monkeypatch.setenv("TTP_TEST_NO_MCP_PROBE", "1")   # daemons never run the real `claude mcp list` (mcpgap.py)
     monkeypatch.setenv("TTP_TEST_NO_MODELS_PROBE", "1")   # nor the routed endpoint's /models check (route.py)
     monkeypatch.setenv("TTP_TEST_NO_NOTIFIER", "1")   # setup, upgrade and status never restart or test the account's own notifier
@@ -17359,7 +17360,7 @@ def test_a_charter_and_memory_heavy_project_keeps_the_worker_prompt_under_its_ca
     mem_chars = sum(len(e["line"]) + 1 for e in p._memory_entries())
     assert len(charter) > 11_000 and mem_chars > 9_000, (len(charter), mem_chars)
     spec = "SPEC-MARKER: follow up on fact-03 and fact-07"
-    for kind, cap in (("code", 31_638), ("question", 24_505)):   # code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`)
+    for kind, cap in (("code", 31_800), ("question", 24_670)):   # code: +45 for where the harness hook runs; code: +128 for `probe_match` waits; code: +120 for the hand-off's measured `eta`; code: +135 for the `context_gaps` hand-off field; code: +265 for `then` wait stages; +155 both: a wake at the `ttp eta` expected finish; code: +20 for `ttp checks --result --passed`; +55 both: a fix confirmed by its ack alone; +265 both: relayed findings citing records; +30 both: the charter's source cites; code: +50 for the Galaxy reset rescan and recount, +15 for wait_kind user, +100 for `ttp detach --lock`, +150 for atomic script writes, +175 for `published`, +35 for the $TTP_TEST_SLOTS cap, +80 for the home-zone date, +400 for paid-model-API job guards, +125 for its spend cap, +110 for evidence manifests naming only immutable artifacts, +30 for the root .ignore line, +150 for one standing item per user step (`ttp notify --step`); +162 both: the Threads line (parallel subagents)
         tid = p.db.add_task(f"{kind} task", spec, kind=kind, tier="light", origin="user")
         prompt = worker_prompt(p, p.db.task(tid), str(p.root), "ttp/t1-x" if kind == "code" else None)
         assert spec in prompt and str(tmp_path) in prompt
@@ -27296,6 +27297,7 @@ DURABLE_EXEMPT = {
     ("codex.py", "tmp.write_text(text)"): "a cache, rewritten whenever its content differs",
     ("codex.py", "os.replace(tmp, path)"): "a cache, rewritten whenever its content differs",
     ("fake.py", '"result.json").write_text'): "the test provider",
+    ("fake.py", '{new_id}.jsonl").write_text'): "the test provider",
     ("schedcheck.py", "out.write_text(printed)"): "a scratch project's watcher output, removed when the check ends",
     ("loopcheck.py", '(repo / "NOTES.md").write_text'): "the scratch repository's seed file, committed at once and removed when the check ends",
     ("archive.py", '"changes.patch").write_bytes'): "a scratch patch for `git apply --check`, in a temporary directory removed after",

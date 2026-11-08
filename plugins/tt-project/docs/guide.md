@@ -3360,6 +3360,15 @@ Workers can read Slack links you paste, using your Slack connector if you have o
   its run (`budget.compact_window_tokens`) and is never ended or restarted because its context grew.
   `budget.split_reread_tokens` is off (0) by default; a project that sets it tells a worker whose
   run re-reads more than that once to hand the rest on as a follow-up; its run note records when, and `ttp stats` shows what steered runs re-read after it and how they handed off.
+- Every worker and reviewer run starts from the coordinator's context (`coordinator.session.worker_context`,
+  default `fork`). On Claude Code it continues a copy of the coordinator's saved session (same provider,
+  written within `worker_fork_max_age_h` hours) at any size, with its own prompt as the first new turn,
+  and compacts in place inside that session if it must; `worker_fork_max_tokens` above 0 caps the size
+  (default 0: no cap). The coordinator's own session is never written. Otherwise, and on Codex, Cursor and
+  the chat provider, the prompt leads with the coordinator's context on disk: the open order ledger, its
+  latest session note and the last chat exchanges (`worker_chat_chars`). `disk` skips the fork, `off`
+  both. The run note's `coord_context` says which one a run got. Workers run independent parts in
+  parallel subagents; their spend counts in the run's cost.
 - `ttp killscan <script>` flags kills by name or pattern (`pkill`, `killall`, any `pgrep` or
   `pidof`, `ps | grep` feeding a kill) before a worker runs a script; `--shim <dir>` writes
   stand-ins for `pkill`, `killall`, `pgrep` and `pidof` that only log the call (`ps | grep` and calls

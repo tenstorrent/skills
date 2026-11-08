@@ -45,6 +45,7 @@ from . import gatejudge
 from . import urgentfup
 from . import topup
 from . import cursortiers
+from . import ctxfork
 from . import credwatch
 from . import seedcap
 from . import turnrules
@@ -3223,6 +3224,14 @@ class Daemon:
             # arguments go last: Codex takes them as a subcommand that must follow every option.
             resume_extra = prov.resume_args(resume) if resume else []
             argv = _before_stdin(argv, extra)
+            if task and role in ctxfork.ROLES and not resume:   # the coordinator's context (ctxfork.py)
+                got = ctxfork.prepare(self.p, self.cfg, prov, provider, str(cwd), env, task=task["id"])
+                if got.get("session"):
+                    resume, resume_extra = got["session"], prov.resume_args(got["session"])
+                if got.get("lead"):
+                    prompt = got["lead"] + "\n\n" + prompt
+                note = {**(note or {}), ctxfork.KEY: {k: got[k] for k in ("how", "why", "session", "tokens")
+                                                      if k in got}}
         if thread:
             resume, resume_extra = thread, prov.resume_args(thread)
             prompt = coord.THREAD_CONTINUED + "\n\n" + prompt
@@ -4762,6 +4771,8 @@ class Daemon:
             note.update(lost_to_crash=True)   # still a failure to the runaway guard
         elif status == "failed" and _resume_never_started(note, usage) and not refused:
             note["not_waste"] = "resume"   # nothing ran: the task starts fresh (_finish_worker)
+            if ctxfork.forked(note):   # its next start skips the fork (ctxfork.prepare)
+                note["resume_error"] = str(usage.error or f"exit {exit_info.get('rc')}")[:200]
         if status == "lost" and not note.get("session_id") and (note.get("resumes") or {}).get("session"):
             # A resume the sleep or network cut keeps its session for the next resume, not a fresh start.
             note["session_id"] = note["resumes"]["session"]
@@ -4868,7 +4879,8 @@ class Daemon:
         if (r["provider"] != "claude" or usage.estimated or not usage.cost_usd or not usage.session_id
                 or float((self.cfg.get("budget") or {}).get("global_daily_usd") or 0) <= 0
                 or getattr(self.gates.get("claude"), "regime", "caps") != "caps"   # plan runs never count
-                or json.loads(r.get("note") or "{}").get("resumes")):
+                or json.loads(r.get("note") or "{}").get("resumes")
+                or ctxfork.forked(json.loads(r.get("note") or "{}"))):   # its log also holds the coordinator's
             return
         try:
             # A resumed coordinator wake's log holds its whole session: compared with the session's total.
@@ -5779,12 +5791,15 @@ class Daemon:
             return
         if status == "failed" and _resume_never_started(json.loads(r["note"] or "{}"), usage) and not handoff:
             # The lost run's session could not be continued after all: nothing ran, so the task starts
-            # fresh at once, no attempt spent. This run ended 'failed', so it is not resumed again.
+            # fresh at once, no attempt spent. This run ended 'failed', so it is not resumed again; a
+            # rejected fork of the coordinator's session starts from its context on disk instead.
+            what = "fork of the coordinator's session" if ctxfork.forked(json.loads(r["note"] or "{}")) \
+                else "lost session"
             with db.tx():
                 db.update_task(task["id"], status="queued", blocked_reason=None, not_before=None)
                 db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
-                     (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its lost "
-                      f"session could not be resumed; starts fresh, no attempt spent", "handled", task["id"]))
+                     (time.time(), "daemon", "task_requeued", "low", f"#{task['id']} {task['title']}: its {what} "
+                      f"could not be resumed; starts fresh, no attempt spent", "handled", task["id"]))
             return
         if status == "resource_busy":
             # The run lost the race for its resource and never started its agent: not an attempt.
@@ -17760,8 +17775,9 @@ def _has_tokens(usage) -> bool:
 
 
 def _resume_never_started(note: dict, usage) -> bool:
-    """A run that was to continue a lost session ended before its agent did anything."""
-    return bool(note.get("resumes")) and not usage.cost_usd and not usage.output_tokens
+    """A run that was to continue a lost session, or a fork of the coordinator's (ctxfork.py), ended
+    before its agent did anything."""
+    return bool(note.get("resumes") or ctxfork.forked(note)) and not usage.cost_usd and not usage.output_tokens
 
 
 # `metrics.verdict` values that make a review handed off `done` one that asked for changes (see review_rejects).

@@ -255,7 +255,9 @@ def test_coordsession_the_retired_mode_key_is_refused_and_absent_from_the_defaul
     p = make(env)
     assert p.config()["coordinator"]["session"] == {"compact_tokens": 0, "compact_growth_tokens": 100000,
                                                    "context_window_tokens": 0, "compact_margin_tokens": 40000,
-                                                   "row_delta": True}
+                                                   "row_delta": True,
+                                                   "worker_context": "fork", "worker_fork_max_tokens": 0,
+                                                   "worker_fork_max_age_h": 12, "worker_chat_chars": 30000}
     assert not {"thread_warm_min", "thread_max_turns"} & set(p.config()["coordinator"])
     assert settable("coordinator.session.row_delta")(" Off ") is False and settable("coordinator.session.row_delta")(True)
     with pytest.raises(ValueError):
@@ -612,9 +614,10 @@ def test_coord_session_stats_without_session_wakes_or_baseline_say_so(env, capsy
 # prompts/coordinator-session.md (2900, +100 for its Context-block line, user msg #1785), plus the
 # session-only `self_change` row of coordinator.md's action table (1300, selfimprove.py), plus the
 # session prompt's Tools section (800, coordtools.py), plus its Running workers line (140, #6311),
-# plus handover item 5's verbatim-check rule (130, #6502).
+# plus handover item 5's verbatim-check rule (130, #6502), plus the workers' start-context line (270,
+# ctxfork.py, user msgs #2116, #2119).
 # Session mode only; it never widens coordinator_role(p)'s cap.
-SESSION_ROLE_ROOM = 2900 + 100 + 1300 + 800 + 140 + 130
+SESSION_ROLE_ROOM = 2900 + 100 + 1300 + 800 + 140 + 130 + 270
 
 _CS_CHARTER = ("# demo\n\n## Goals\nShip v1.\n\n## Restrictions\n- Never push to main (user msg #1).\n\n"
                "## Policies\nLabel every number.\n")
@@ -783,7 +786,7 @@ def test_both_coordinator_modes_and_the_planner_pass_the_worker_the_context_it_c
         assert all(i in role for i in items), [i for i in items if i not in role]
         assert "self-contained: goal, context, acceptance criteria" not in role, "the older line is replaced"
     session = " ".join(coordinator_session_role(p).split())
-    assert "Workers and planners see none of this session: each spec's `Context:` block carries" in session
+    assert "Planners see none of this session, and a worker may get only its record on disk: each spec's `Context:` block carries" in session
     assert "see none of this session" not in " ".join(coordinator_role(p).split())
     plan = " ".join((RUNTIME.parent / "template" / "prompts" / "kind-plan.md").read_text().split())
     assert "Its worker sees only its spec: give each a short `Context:` block" in plan

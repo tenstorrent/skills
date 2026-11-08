@@ -340,6 +340,12 @@ class Provider:
         own, which may point the agent at another config directory), is still on disk to resume."""
         return False
 
+    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
+        """Copy the saved session `session_id` to a new session `new_id` that a run in `cwd` with the
+        environment `env` resumes (resume_args(new_id)), so the run starts from its history and never
+        writes into it (ctxfork.py); "" once done, else why not."""
+        return f"{self.name} cannot fork a saved session"
+
     def coord_tools(self, argv: list[str], cwd: str, settings: dict, full: bool,
                     web: bool = True) -> tuple[list[str], dict]:
         """A session coordinator's tools on an agent without tool_hooks: `argv` changed to give them

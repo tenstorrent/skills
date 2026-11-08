@@ -62,6 +62,8 @@
 
 Other workers run other tasks of this project concurrently.
 
+- Threads: run independent parts of your task at once in subagents where your agent has them,
+  each given the context it needs; their spend counts in this run's budget.
 - Edit only in your own working directory; another repository: your own `git worktree` of it.
   Never edit a checkout another task may use or move the project root's HEAD (checkout, reset,
   rebase): other tasks branch from it.

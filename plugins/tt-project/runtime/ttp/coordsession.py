@@ -85,7 +85,10 @@ from . import cachettl, spans
 
 KEY = "coord_session"
 DEFAULTS = {"compact_tokens": 0, "compact_growth_tokens": 100000, "context_window_tokens": 0,
-            "compact_margin_tokens": 40000, "row_delta": True}
+            "compact_margin_tokens": 40000, "row_delta": True,
+            # what a worker or reviewer run starts with (ctxfork.py); worker_fork_max_tokens 0: no cap
+            "worker_context": "fork", "worker_fork_max_tokens": 0, "worker_fork_max_age_h": 12,
+            "worker_chat_chars": 30000}
 LEGACY = {"rollover_tokens": "compact_tokens", "rollover_growth_tokens": "compact_growth_tokens",
           "rollover_margin_tokens": "compact_margin_tokens"}   # read when a project has no compact_* value
 COMPACTIONS_KEPT = 50   # KEY's `compactions`: the newest kept

@@ -400,6 +400,46 @@ class Claude(Provider):
             out += [*projects.glob(f"*/{session_id}.jsonl"), *projects.glob(f"*/{session_id}/**/*.jsonl")]
         return out
 
+    def fork_session(self, session_id: str, cwd: str, env: dict | None, new_id: str) -> str:
+        # A copy, not `--fork-session`: Claude Code looks a session up under the run's working directory
+        # (and its config directory), and the coordinator runs elsewhere. The copy starts at the session's
+        # last compaction and ends at its last whole answer with no tool call open (a wake still running
+        # leaves a partial tail), every line carries the new id, and it is written owner-only beside the
+        # run's other transcripts.
+        if not re.fullmatch(r"[A-Za-z0-9-]+", new_id or ""):
+            return "bad session id"
+        slug = re.sub(r"[^a-zA-Z0-9]", "-", cwd)
+        if len(slug) > 200:   # Claude Code shortens such a folder's name with a hash
+            return "the run's working directory path is too long to place a session copy"
+        src = [x for x in self.session_paths(session_id, cwd, env) if x.name == f"{session_id}.jsonl"]
+        if not src:
+            return "the session's transcript is not on disk"
+        raw = max(src, key=lambda x: x.stat().st_mtime).read_text(errors="replace")
+        lines = raw.split("\n")[:-1]   # a line not yet ended by a newline is partial
+        rows: list[dict] = []
+        for line in lines:
+            try:
+                row = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(row, dict):
+                rows.append(row)
+        while rows and not _whole_answer(rows[-1]):
+            rows.pop()
+        # From the last compaction on: the agent resumes from there anyway, and the copy stays small.
+        cut = [i for i, r in enumerate(rows) if r.get("type") == "system" and r.get("subtype") == "compact_boundary"]
+        rows = rows[cut[-1]:] if cut else rows
+        if not rows:
+            return "the session has no finished answer to start from"
+        for row in rows:
+            if "sessionId" in row:
+                row["sessionId"] = new_id
+        own = (env or {}).get("CLAUDE_CONFIG_DIR")
+        folder = (Path(own).expanduser() if own else claude_config_dir()) / "projects" / slug
+        from ..project import durable_write
+        durable_write(folder / f"{new_id}.jsonl", "".join(json.dumps(r) + "\n" for r in rows), mode=0o600)
+        return ""
+
     def plugin_args(self, dirs: list[str]) -> list[str]:
         out: list[str] = []
         for d in dirs:
@@ -561,6 +601,22 @@ class Claude(Provider):
         except (OSError, ValueError):
             return ""
         return str((data.get("oauthAccount") or {}).get("billingType") or data.get("billingType") or "")
+
+
+def _whole_answer(row: dict) -> bool:
+    """A transcript line that is the assistant's answer with no tool call left open after it: a text
+    answer, or a --json-schema run's StructuredOutput call (the coordinator's every answer; it gets no
+    tool result, and a resume continues from exactly there)."""
+    if row.get("type") != "assistant":
+        return False
+    content = (row.get("message") or {}).get("content")
+    if not isinstance(content, list):
+        return isinstance(content, str) and bool(content.strip())
+    blocks = [b for b in content if isinstance(b, dict)]
+    calls = {b.get("name") for b in blocks if b.get("type") == "tool_use"}
+    if calls:
+        return calls == {"StructuredOutput"}
+    return any(b.get("type") == "text" for b in blocks)
 
 
 def claude_config_dir() -> Path:
