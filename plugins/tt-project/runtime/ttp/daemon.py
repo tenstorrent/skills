@@ -40,6 +40,7 @@ from . import runtimeload   # first of its own: its LOADED_AT is when the daemon
 from . import ackwait
 from . import claimcheck
 from . import dispatchguard
+from . import runclass
 from . import sidefx
 from . import cursorhook
 from . import pausegone
@@ -10388,8 +10389,11 @@ class Daemon:
             if need and wake:   # a wake whose wait is over may write the answer the user reads
                 wake = max(wake, need["tier"], key=bud.TIER_ORDER.index)
             tier = bud.clamp_tier(wake or task["tier"], gate)
+            run_cls = runclass.classify(task, {"role": "worker", "note": {
+                "wake": bool(wake), "tier": tier, "review_tier": review_pick or {},
+                conflictfix.KEY: (review_pick or {}).get(conflictfix.KEY)}}, self.cfg)
             # A tier routed to another provider (route.py) runs there unless it is cooling down.
-            routed = self._route(task, tier, picked, now)
+            routed = self._route(task, tier, picked, now, cls=run_cls)
             lease = None
             if routed and routed["fallback"] == "none":
                 why = self._no_room(routed["to"], ctx)
@@ -10436,7 +10440,7 @@ class Daemon:
             probe_tried = probe_tried or probing == task["id"]   # this tick's one retry: the rest stay held
             try:
                 system = worker_system(self.p, task)
-                note = {"spec_sha": spec_digest(task)}
+                note = {"spec_sha": spec_digest(task), runclass.KEY: run_cls}
                 if found:
                     note["start_checks"] = found
                 if wake:
@@ -10812,16 +10816,22 @@ class Daemon:
             log(self.p, f"task {task['id']}: tier floor not applied: {e}")
             return None
 
-    def _route(self, task: dict, tier: str, picked: dict | None, now: float, peek: bool = False) -> dict | None:
+    def _route(self, task: dict, tier: str, picked: dict | None, now: float, peek: bool = False,
+               cls: str | None = None) -> dict | None:
         """The run note's `route` entry for a worker run of a tier routed to another provider
         (route.py), or None: `fallback` is none when it starts there, else why it starts on the core
-        provider (a cool-down after a fallback, or the auth gate holding the endpoint)."""
+        provider (a cool-down after a fallback, or the auth gate holding the endpoint). With no tier,
+        rule or pick route, its run class `cls` routes it (runclass.target): a review or floor run too."""
         dp = self._model_pick(task, tier, peek=peek)
         if dp is not None:   # the model pick (modelpick.py) decides this tier's route
             got = modelpick.target(self.cfg, dp)
             to = {"to": got["provider"], "model": got["model"], "rule": None} if got else None
         else:
             to = route.match(self.cfg, task, tier)
+        if not to and dp is None and cls:
+            to = runclass.target(self.cfg, task, tier, cls, picked)
+            if to:
+                return self._route_entry(task, tier, to["to"], to["model"], now, to["rule"])
         if not to or not route.eligible(task, picked) or (dp is None and self._floor_keeps_core(task, tier, picked)):
             return None
         name, model = to["to"], to["model"]
@@ -10845,7 +10855,7 @@ class Daemon:
             log(self.p, f"task {task.get('id')}: model not picked: {e}")
             return None
 
-    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | None = None) -> dict:
+    def _route_entry(self, task: dict, tier: str, name: str, model: str, now: float, rule_i: int | str | None = None) -> dict:
         rule = {} if rule_i is None else {"rule": rule_i}   # the providers.chat.routes rule it matched
         after = route.fell_back_before(self.p.db, task["id"]) if task.get("id") else None
         if after:   # the task fell back on its own once: the rest of its runs stay on the core provider
@@ -10905,7 +10915,9 @@ class Daemon:
         (_route at the task's tier) when that can take a run now, else `provider`."""
         if provider != (task["provider"] or self.cfg.get("core_provider", "claude")):
             return provider
-        routed = self._route(task, task["tier"], None, ctx["now"], peek=True)
+        cls = runclass.classify(task, {"role": "worker", "note": {
+            "wake": load_result(task["result"]).get("status") == "waiting"}}, self.cfg)
+        routed = self._route(task, task["tier"], None, ctx["now"], peek=True, cls=cls)
         if not routed or routed["fallback"] != "none":
             return provider
         why = self._no_room(routed["to"], ctx)

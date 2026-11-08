@@ -1936,6 +1936,14 @@ def cmd_stats(a) -> None:
         s = waketier.stats(p.db, timefmt.home(p), a.days)
         print(json.dumps(s, indent=1) if a.json else waketier.text(s))
         return
+    if a.by_class:
+        from . import runclass
+        tz = timefmt.home(p)
+        since = _stats_time(a.since, tz, "--since") if a.since and not re.fullmatch(r"\d+(\.\d+)?h", a.since) \
+            else time.time() - float((a.since or "24h")[:-1]) * 3600
+        s = runclass.by_class(p.db, p.config(), since, _stats_time(a.until, tz, "--until"))
+        print(json.dumps(s, indent=1) if a.json else runclass.text(s))
+        return
     if a.tools:
         s = bud.tool_output_stats(p.db, p.runs, a.days)
         print(json.dumps(s, indent=1) if a.json else bud.tool_output_text(s))
@@ -13096,6 +13104,9 @@ def main(argv: list[str] | None = None) -> None:
     s.add_argument("--split-at", help="compare runs before and after this time (a change landing)")
     s.add_argument("--top", type=int, default=10, help="how many of the costliest runs to list (default 10)")
     s.add_argument("--tools", action="store_true", help="tool output by category instead: the file-read share")
+    s.add_argument("--by-class", action="store_true",
+                   help="runs per run class per model per hour with real cost instead (runclass.py); "
+                        "--since 1h or 24h (the default) or a time")
     s.add_argument("--wakes", action="store_true",
                    help="task wakes per day by reason instead: runs, $, re-waits and who chose the tier")
     s.add_argument("--effort-ab", action="store_true",
