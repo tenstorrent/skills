@@ -1,0 +1,231 @@
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+# SPDX-License-Identifier: Apache-2.0
+"""One time budget for the daemon tick step running now, kept by every step and every child it waits on.
+
+Daemon._run_step opens each step with begin(name, budget_s, slack_s) and closes it with end(). While a
+step is open, on the thread that opened it:
+
+- over() says it spent its budget: a step looping over items stops before the next one, keeps its place
+  and resumes there next tick (Daemon._step_over).
+- at budget + slack a step still running is stopped where it is: SIGALRM raises StepBudgetSpent in it
+  (main thread only), so a pure Python loop or a blocking wait ends too. Inside critical() (a db
+  transaction's commit or rollback, a git write) the stop waits until the section ends.
+- every child it waits on (subprocess.run, call, check_output, Popen.wait and communicate) waits at
+  most until then: no timeout, or a longer one, gets the time left. On expiry the child's whole tree is
+  killed and StepBudgetSpent names the command. A wait inside critical() keeps its own timeout.
+
+Every ssh started in an installed process gets ConnectTimeout and ServerAlive options unless it names
+its own. install() patches subprocess.Popen once per process (the daemon, at start); off a step, or on
+another thread, a wait is left as it is.
+"""
+from __future__ import annotations
+
+import contextlib
+import os
+import signal
+import subprocess
+import threading
+import time
+from typing import Iterator
+
+SSH_OPTS = ("-o", "ConnectTimeout=15", "-o", "ServerAliveInterval=15", "-o", "ServerAliveCountMax=4")
+MIN_WAIT_S = 0.5   # a wait past the deadline still gets this long, so a child that already ended is reaped
+
+
+class StepBudgetSpent(BaseException):
+    """A tick step ran past its budget and was stopped; `cmd` names the child it waited on, if any.
+    A BaseException, so a step's own `except Exception` never swallows it."""
+
+    def __init__(self, step: str, cmd: str = "") -> None:
+        super().__init__(f"tick step {step} ran past its budget" + (f" waiting on {cmd}" if cmd else ""))
+        self.step, self.cmd = step, cmd
+
+
+class _State:
+    step = ""
+    soft: float | None = None
+    hard: float | None = None
+    thread: int | None = None
+    depth = 0
+    pending = fired = armed = False
+    prev = None
+
+
+_s = _State()
+_orig: dict = {}
+
+
+def begin(name: str, budget_s: float, slack_s: float) -> None:
+    now = time.monotonic()
+    _s.step, _s.soft, _s.hard, _s.thread = name, now + budget_s, now + budget_s + slack_s, threading.get_ident()
+    _s.depth, _s.pending, _s.fired = 0, False, False
+    _arm(budget_s + slack_s)
+
+
+def end() -> None:
+    _disarm()
+    _s.step, _s.soft, _s.hard, _s.thread, _s.depth, _s.pending = "", None, None, None, 0, False
+
+
+def active() -> bool:
+    return _s.hard is not None and threading.get_ident() == _s.thread
+
+
+def over() -> bool:
+    return active() and time.monotonic() >= _s.soft
+
+
+def left() -> float | None:
+    """Seconds until the open step is stopped, None off a step."""
+    return _s.hard - time.monotonic() if active() else None
+
+
+def _arm(t: float) -> None:
+    if threading.current_thread() is not threading.main_thread() or not hasattr(signal, "setitimer"):
+        return
+    try:
+        if not _s.armed:
+            _s.prev = signal.signal(signal.SIGALRM, _on_alarm)
+        _s.armed = True
+        signal.setitimer(signal.ITIMER_REAL, max(t, 0.001))
+    except (ValueError, OSError):
+        pass
+
+
+def _disarm() -> None:
+    if not _s.armed:
+        return
+    _s.armed = False
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, _s.prev if _s.prev is not None else signal.SIG_DFL)
+    except (ValueError, OSError):
+        pass
+
+
+def _on_alarm(signum, frame) -> None:
+    if not active() or _s.fired:
+        return
+    if _s.depth:   # a commit or a git write: stop once it ends (release)
+        _s.pending = True
+        return
+    _s.fired = True
+    raise StepBudgetSpent(_s.step)
+
+
+def hold() -> None:
+    if active():
+        _s.depth += 1
+
+
+def release() -> None:
+    """End a hold(); a stop that came during it fires right after, outside the section."""
+    if not active() or not _s.depth:
+        return
+    _s.depth -= 1
+    if not _s.depth and _s.pending and not _s.fired:
+        _s.pending = False
+        _arm(0.001)
+
+
+@contextlib.contextmanager
+def critical() -> Iterator[None]:
+    hold()
+    try:
+        yield
+    finally:
+        release()
+
+
+def ssh_argv(argv):
+    """`argv` with SSH_OPTS after `ssh`, for each option it does not name itself."""
+    if not isinstance(argv, (list, tuple)) or not argv or os.path.basename(str(argv[0])) != "ssh":
+        return argv
+    named = " ".join(map(str, argv[1:])).lower()
+    extra = [x for k, v in zip(SSH_OPTS[::2], SSH_OPTS[1::2]) if v.split("=")[0].lower() not in named
+             for x in (k, v)]
+    return type(argv)([argv[0], *extra, *argv[1:]]) if extra else argv
+
+
+def _init(self, args, *a, **kw):
+    if not kw.get("shell"):
+        args = ssh_argv(args)
+    _orig["init"](self, args, *a, **kw)
+
+
+def _bounded(proc, call, timeout):
+    if not active() or (_s.depth and timeout is not None):
+        return call(timeout)
+    room = max(_s.hard - time.monotonic(), MIN_WAIT_S)
+    capped = timeout is None or timeout > room
+    try:
+        return call(room if capped else timeout)
+    except subprocess.TimeoutExpired:
+        if not capped:
+            raise
+        kill_tree(proc)
+        _s.fired = True
+        raise StepBudgetSpent(_s.step, _cmd(proc)) from None
+    except StepBudgetSpent as e:
+        kill_tree(proc)
+        e.cmd = e.cmd or _cmd(proc)
+        raise
+
+
+def _wait(self, timeout=None):
+    return _bounded(self, lambda t: _orig["wait"](self, timeout=t), timeout)
+
+
+def _communicate(self, input=None, timeout=None):
+    return _bounded(self, lambda t: _orig["communicate"](self, input, timeout=t), timeout)
+
+
+def install() -> None:
+    if _orig:
+        return
+    P = subprocess.Popen
+    _orig.update(init=P.__init__, wait=P.wait, communicate=P.communicate)
+    P.__init__, P.wait, P.communicate = _init, _wait, _communicate
+
+
+def uninstall() -> None:
+    if _orig:
+        P = subprocess.Popen
+        P.__init__, P.wait, P.communicate = _orig.pop("init"), _orig.pop("wait"), _orig.pop("communicate")
+
+
+def _cmd(proc) -> str:
+    a = proc.args
+    return (a if isinstance(a, str) else " ".join(map(str, a)))[:200]
+
+
+def _children() -> dict[int, list[int]]:
+    kids: dict[int, list[int]] = {}
+    for d in os.listdir("/proc") if os.path.isdir("/proc") else ():
+        if d.isdigit():
+            try:
+                with open(f"/proc/{d}/stat") as fh:
+                    ppid = int(fh.read().rsplit(")", 1)[1].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            kids.setdefault(ppid, []).append(int(d))
+    return kids
+
+
+def kill_tree(proc) -> None:
+    """SIGKILL `proc`, every descendant and, when it leads a group of its own, that whole group."""
+    if proc.returncode is not None:
+        return
+    kids, tree, todo = _children(), [], [proc.pid]
+    while todo:
+        pid = todo.pop()
+        tree.append(pid)
+        todo.extend(kids.get(pid, ()))
+    try:
+        if os.getpgid(proc.pid) == proc.pid != os.getpgrp():
+            os.killpg(proc.pid, signal.SIGKILL)
+    except OSError:
+        pass
+    for pid in reversed(tree):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)

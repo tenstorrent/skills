@@ -118,6 +118,8 @@ from . import slowcomplaint
 from . import credits
 from . import gatewake
 from . import gitmemo
+from . import stepclock
+from .stepclock import StepBudgetSpent
 from . import gitreplay
 from . import globalcap as gcap
 from . import coordinator as coord
@@ -317,11 +319,15 @@ TICK_OVERRUN_S = 900
 # A tick with no progress this long gets its stacks written too: well before the watchdogs restart it
 # (WATCHDOG_S after the last progress they saw), so a step blocked in a call with no timeout leaves them.
 TICK_STALL_S = HEARTBEAT_STALE_S
-# A tick step's time budget. A step that loops over items (reap_runs, probe_waiting, probe_deferred, retire_ended)
+# A tick step's time budget (config watchdog.step_budget_s), kept by every step _run_step runs
+# (stepclock). A step that loops over items (reap_runs, probe_waiting, probe_deferred, retire_ended)
 # stops at the first item past it and resumes there next tick, so message handling and worker starts
-# always run. A step that took longer raises one model-free tick_step_slow event naming the item that
-# held it longest, at most once per STEP_SLOW_EVERY_S per step.
-STEP_BUDGET_S = 60
+# always run. One still running STEP_HARD_SLACK_S later is stopped where it is (StepBudgetSpent, a
+# child it waits on killed whole) and resumes after the item it was on next tick. A step that took
+# longer raises one model-free tick_step_slow event naming the item that held it longest (and the
+# command it killed), at most once per STEP_SLOW_EVERY_S per step.
+STEP_BUDGET_S = 30
+STEP_HARD_SLACK_S = 5
 # Git a step runs is capped by time, not per call site (gitmemo.bounded): each read under
 # gitmemo.TICK_GIT_S, and all git inside a finish transaction within gitmemo.TX_GIT_S. The library reads
 # that had 120-300 s timeouts take the cap through gitmemo.run(), git's one choke point: worktree._git, inspect, _ignored,
@@ -473,7 +479,7 @@ CLAIM_EVERY_S = 30   # check_claims: how often due claim checks are re-run
 LANDED_REPROBE_S = 30   # a landing gate reruns after a recorded push at most this often (_start_probe_due)
 # A child the tick itself waits on (a device runner start, `ttp checks --detach`) runs in a session of
 # its own and is killed whole after this: under a minute, so one never holds a step past STEP_BUDGET_S.
-INLINE_CHILD_S = 50
+INLINE_CHILD_S = 25
 HARNESS_HEAD_S = 10
 # A task asleep on its retry_when whose spec changes sleeps on: the change applies when its wait ends (its
 # probe passes or another wake), at the task's own tier, priority 1 too. Only an update that adds an `urgent:`
@@ -992,6 +998,20 @@ def disk_guard_bytes(disk: dict, path: Path) -> float:
 FINISH_STRICT = True   # finish transactions run as strict rounds (Daemon._finish_rounds)
 
 
+class _Resumable(list):
+    """_resume_order's rows: iterating notes the row it is on (Daemon._step_at), so a step stopped at its
+    budget mid-row resumes after it next tick."""
+
+    def __init__(self, rows: list, at: dict, step: str) -> None:
+        super().__init__(rows)
+        self._at, self._step = at, step
+
+    def __iter__(self):
+        for r in list.__iter__(self):
+            self._at[self._step] = r["id"]
+            yield r
+
+
 class StopRequested(BaseException):
     """The daemon is stopping: a finish ends at a safe point (a round rolled back, nothing applied) and
     is left to the next daemon. A BaseException, so a step's `except Exception` cannot swallow it;
@@ -1110,6 +1130,7 @@ class Daemon:
         self._step_worst: tuple[float, str, int | None] = (0.0, "", None)   # its slowest item so far
         self._sandbox_due = 0.0   # sweep_sandbox_trees: its first pass is at start
         self._step_cursor: dict[str, object] = {}   # step -> the last item done before its budget ran out
+        self._step_at: dict[str, object] = {}   # step -> the _resume_order item it is on now
         self._step_slow_said: dict[str, float] = {}   # step -> when its last tick_step_slow was raised
         self._overrun: dict | None = None   # the running or last tick that passed TICK_OVERRUN_S or stalled
         self._last_prune = 0.0
@@ -1686,10 +1707,21 @@ class Daemon:
         self._step_name = name
         self._step_began = self._step_mark = time.monotonic()
         self._step_holder, self._step_task, self._step_worst = "", None, (0.0, "", None)
+        self._step_killed = ""
+        self._step_at.pop(name, None)
         result = default
         try:
-            with gitmemo.bounded(gitmemo.TICK_GIT_S):   # one slow git read never holds the step long
-                result = step()
+            try:
+                stepclock.begin(name, self._step_budget(), STEP_HARD_SLACK_S)
+                with gitmemo.bounded(gitmemo.TICK_GIT_S):   # one slow git read never holds the step long
+                    result = step()
+            finally:
+                stepclock.end()
+        except StepBudgetSpent as e:   # stopped where it was: next tick resumes after the item it was on
+            self._step_killed = e.cmd or "-"
+            if name in self._step_at:
+                self._step_cursor[name] = self._step_at[name]
+            log(self.p, f"tick step {name} stopped at its budget ({e})")
         except StopRequested as e:   # a stop ended it at a safe point: the next daemon picks it up
             log(self.p, f"stop: tick step {name} ended at a safe point ({e})")
         except Exception as e:  # one bad step must not stop the rest of the tick
@@ -1712,8 +1744,14 @@ class Daemon:
         except Exception:
             log(self.p, "tick step slow error: " + traceback.format_exc().replace("\n", " | ")[:2000])
         self._step_holder, self._step_began = "", None
+        self._step_at.pop(name, None)
         self._progress()
         return result
+
+    def _step_budget(self) -> float:
+        """Seconds a tick step may run: config watchdog.step_budget_s, else STEP_BUDGET_S."""
+        v = (self.cfg.get("watchdog") or {}).get("step_budget_s") if isinstance(getattr(self, "cfg", None), dict) else None
+        return float(v) if isinstance(v, (int, float)) and not isinstance(v, bool) and v >= 0 else STEP_BUDGET_S
 
     def _step_over(self, holder: str, task: int | None = None) -> bool:
         """For a step that loops over items: name the item it starts on now (for tick_step_slow and the
@@ -1722,7 +1760,7 @@ class Daemon:
         t = time.monotonic()
         self._step_charge(t)
         self._step_holder, self._step_task, self._step_mark = holder, task, t
-        return self._stopping or (self._step_began is not None and t - self._step_began >= STEP_BUDGET_S)
+        return self._stopping or (self._step_began is not None and t - self._step_began >= self._step_budget())
 
     def _step_charge(self, t: float) -> None:
         if self._step_holder and t - self._step_mark > self._step_worst[0]:
@@ -1732,14 +1770,14 @@ class Daemon:
         """`rows` by id, from the first after where `step` stopped on its budget last tick, wrapping round."""
         at = self._step_cursor.pop(step, 0)
         rows = sorted(rows, key=lambda r: r["id"])
-        return [r for r in rows if r["id"] > at] + [r for r in rows if r["id"] <= at]
+        return _Resumable([r for r in rows if r["id"] > at] + [r for r in rows if r["id"] <= at], self._step_at, step)
 
     def _step_slow(self, name: str) -> None:
         """One handled tick_step_slow event when step `name` ran past STEP_BUDGET_S, naming the item that
         held it longest (or the one it was on), at most once per STEP_SLOW_EVERY_S per step."""
         t = time.monotonic()
         took = t - (t if self._step_began is None else self._step_began)
-        if took < STEP_BUDGET_S:
+        if took < self._step_budget():
             return
         self._step_charge(t)
         now = time.time()
@@ -1749,7 +1787,9 @@ class Daemon:
         spent, holder, task = self._step_worst
         held = (f"held longest by {holder} ({spent:.0f} s)" if holder
                 else "it names no item it works on")
-        text = f"Daemon tick step {name} took {took:.0f} s (budget {STEP_BUDGET_S} s): {held}."
+        killed = getattr(self, "_step_killed", "")
+        held += ("; stopped at its budget" + (f", killed {killed}" if killed != "-" else "")) if killed else ""
+        text = f"Daemon tick step {name} took {took:.0f} s (budget {self._step_budget():g} s): {held}."
         log(self.p, text)
         self.p.db.x("INSERT INTO events(ts,source,kind,severity,text,status,task) VALUES(?,?,?,?,?,?,?)",
                     (now, "daemon", "tick_step_slow", "low", text[:500], "handled", task))
@@ -18626,6 +18666,7 @@ def _alive(pid: int) -> bool:
 
 
 def main() -> int:
+    stepclock.install()   # every child a tick step waits on keeps the step's budget; every ssh its options
     return Daemon(sys.argv[1] if len(sys.argv) > 1 else os.getcwd()).run()
 
 

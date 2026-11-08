@@ -744,12 +744,21 @@ END""")
         began = time.monotonic()
         outer = getattr(_tx_local, "spawns", None)   # another connection's transaction on this thread
         spawns = _tx_local.spawns = []
+        from . import stepclock
         try:
             yield
+            stepclock.hold()   # a tick step's budget never stops a commit or a rollback midway
         except BaseException:
-            _tx_local.spawns = outer
-            self._rolled_back()
+            with stepclock.critical():
+                _tx_local.spawns = outer
+                self._rolled_back()
             raise
+        try:
+            self._commit(outer, began, spawns)
+        finally:
+            stepclock.release()
+
+    def _commit(self, outer, began: float, spawns: list) -> None:
         _tx_local.spawns = outer
         try:
             self.conn.execute("COMMIT")

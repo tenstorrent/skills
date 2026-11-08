@@ -40,6 +40,8 @@ import time
 from pathlib import Path
 from typing import Any, Callable, Iterator
 
+from . import stepclock
+
 _memo: contextvars.ContextVar[dict | None] = contextvars.ContextVar("ttp_gitmemo", default=None)
 # (per-call seconds for a read, monotonic deadline for every call or None) of the bounded() scope
 _cap: contextvars.ContextVar[tuple[float, float | None] | None] = contextvars.ContextVar("ttp_gitcap", default=None)
@@ -249,8 +251,11 @@ def _pure(args: tuple) -> bool:
 
 def _spawn(argv, t: float | None, kw: dict) -> subprocess.CompletedProcess:
     token = _own.set(True)
+    args = git_args(argv)   # a write keeps its own timeout: a tick step's budget never cuts it midway
+    hold = stepclock.critical() if args and not is_read(args) and not _pure(args) else contextlib.nullcontext()
     try:
-        return subprocess.run(argv, timeout=t, **kw)
+        with hold:
+            return subprocess.run(argv, timeout=t, **kw)
     finally:
         _own.reset(token)
 
