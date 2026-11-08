@@ -1355,6 +1355,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     # Once, not per provider: the caps bound every usage-billed provider's spend together.
     lines.append("- project caps (usage-billed providers together): " + bud.caps_line(db, gates, b, now, home))
     lines.append(f"- per-task default budgets: {b.get('task_default_usd')}")
+    lines += task_cap_lines(db, p.config(), now, p)
     section("budget", lines)
     lines = []
     boots = db.boots(now - 86400)
@@ -1487,6 +1488,7 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
     held_on = {k: ts for k, ts in held_on.items() if len(ts) > 1}
     grouped = {t["id"]: k for k, ts in held_on.items() for t in ts}
     host_est = safe_eta(lambda: eta._Est(db, now, core=eta.core_of(p)), None) if any(onhost.resources(t) for t in rows) else None
+    owns = obligations.open_keys_by_task(db)   # the open keys a task_update spec may name as its own
     for t in rows:
         if setting_held and settinghold.held_key(t):
             continue
@@ -1507,7 +1509,8 @@ def digest_parts(p: Project, gates: dict, event_ids: list[int], msg_ids: list[in
         if host := onhost.line(p, t, now, host_est):   # what may be said of its work on the host
             note = f"{host}; {note}" if note else host
         cont = continues_id(t)
-        title = clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
+        title = (clip(t["title"], TITLE_CHARS) + (f" (continues #{cont})" if cont else "")
+                 + (f" (owns {', '.join(owns[t['id']])})" if owns.get(t["id"]) else ""))
         starts = (starts_text(t, now, where=p, db=db) if t["status"] == "queued" else
                   f"{(now - in_review[t['id']]) / 3600:.1f}h in review" if t["id"] in in_review else "")
         lines.append(f"- #{t['id']} | {t['status']}{f' ({starts})' if starts else ''} | {t['tier']} | p{t['priority']} | "
@@ -1824,6 +1827,40 @@ def task_cap(cfg: dict, review: bool = False) -> int:
     if review:
         cap = int(c["max_review_tasks_per_day"]) if c.get("max_review_tasks_per_day") is not None else 2 * cap
     return max(0, cap)
+
+
+def slot_wake(db, free_at: float, review: bool, why: str) -> None:
+    """Wake the coordinator when the task cap's next slot frees (daemon.retry_rejected), the earliest
+    asked for winning, so a task_add refused on a full cap is added then without a resend."""
+    wake = db.kv(RETRY_WAKE_KEY) or {}
+    if not wake.get("at") or free_at < float(wake["at"]):
+        db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "review": review, "why": why})
+
+
+# task_cap_lines shows a cap once this share of it is used in the rolling 24 h (or it is full).
+CAP_NEAR = 0.8
+
+
+def task_cap_lines(db, cfg: dict, now: float, where=None) -> list[str]:
+    """STATE's lines for the rolling 24 h task caps (max_new_tasks_per_day, max_review_tasks_per_day):
+    nothing while far below a cap; used of limit once near it; and when full, when the next slot frees,
+    so a task_add is held back instead of learned by refusal."""
+    out = []
+    for review in (False, True):
+        cap = task_cap(cfg, review)
+        what = "review tasks" if review else "new tasks"
+        key = "max_review_tasks_per_day" if review else "max_new_tasks_per_day"
+        if cap <= 0:
+            out.append(f"- 24 h cap on {what} ({key}): 0, none can be added until it is raised")
+            continue
+        used = len(tasks_made(db, now - 86400, review))
+        if used < cap * CAP_NEAR:
+            continue
+        line = f"- 24 h cap on {what} ({key}): {min(used, cap)} of {cap} used"
+        free_at = next_task_slot(db, cap, now, review)
+        out.append(line + (f", FULL: the next slot frees at {_clock(free_at, where)}; hold a task_add until then"
+                           if free_at is not None else f", {cap - used} left"))
+    return out
 
 
 # How far off next_task_slot puts the next slot when the cap is 0: no new tasks until it is raised.
@@ -2699,10 +2736,7 @@ def apply(p: Project, actions: list[dict], default_chat: str | None = None, user
                     else:
                         why = (f"cap of {cap} {what} in 24 h reached; the next slot frees at "
                                f"{_clock(free_at, p)}, when you are woken to add it again")
-                    wake = db.kv(RETRY_WAKE_KEY) or {}
-                    if not wake.get("at") or free_at < float(wake["at"]):
-                        db.set_kv(RETRY_WAKE_KEY, {"at": free_at, "review": review,
-                                                   "why": f"task_add {title!r}: {why}"})
+                    slot_wake(db, free_at, review, f"task_add {title!r}: {why}")
                     raise ValueError(why)
                 tier = a.get("tier") if a.get("tier") in ("light", "standard", "deep") else "standard"
                 tier_source = "task_add" if a.get("tier") == tier else "default"

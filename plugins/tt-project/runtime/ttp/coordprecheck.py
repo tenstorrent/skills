@@ -9,6 +9,9 @@ reason as the tool result, so the model fixes or drops it in the same turn inste
 the next wake. `problems` only reads: it writes no task, kv row or file of the project. Actions that
 pass are applied after the turn as before, and coord.apply still runs every check: this one is a
 subset, and a refusal it misses is carried to the next wake as before (coordinator.REJECTED_KEY).
+Its one write to the project: a task_add denied on a full 24 h task cap asks the same retry wake at the
+cap's next free slot as apply's refusal does (coordinator.slot_wake), so the denial says to drop it, not
+to resend it.
 
 It never stops a turn from ending. An action resent unchanged after a denial goes through (apply
 refuses it with its usual side effects, such as the retry wake of a task cap), at most MAX_DENIALS
@@ -31,9 +34,10 @@ def _key(a: dict) -> str:
     return hashlib.sha256(json.dumps(a, sort_keys=True, ensure_ascii=False, default=str).encode()).hexdigest()[:16]
 
 
-def problems(p, actions: list) -> list[tuple[int, str]]:
+def problems(p, actions: list, wakes: list | None = None) -> list[tuple[int, str]]:
     """(action index, why) of each action coord.apply would refuse, by the checks it can make without
-    a side effect; [] when it finds none. Reads the project's tasks and config only."""
+    a side effect; [] when it finds none. Reads the project's tasks and config only. `wakes` (a list):
+    gets (free_at, review, why) of each task_add refused on a full cap, for refusal to ask the retry wake."""
     from . import coordinator as coord
     from .db import TERMINAL_TASK_STATES, _first_dead, dependency_ids
     from .providers.base import normalize_action
@@ -122,13 +126,23 @@ def problems(p, actions: list) -> list[tuple[int, str]]:
                                      f"drop or replace depends_on")
                 if caps:
                     review = a.get("kind") == "review"
+                    cap = coord.task_cap(cfg, review)
                     if review not in left:
-                        cap = coord.task_cap(cfg, review)
                         left[review] = cap - len(coord.tasks_made(db, time.time() - 86400, review)) if cap > 0 else 0
                     if left[review] <= 0:
                         what = "review tasks" if review else "new tasks (reviews have their own cap)"
-                        raise ValueError(f"the 24 h cap on {what} is reached; drop it, or resend it unchanged and "
-                                         f"you are woken when a slot frees to add it again")
+                        if cap <= 0:
+                            raise ValueError(f"the cap on {what} is 0: none can be added until it is raised; "
+                                             f"drop it")
+                        free_at = coord.next_task_slot(db, cap, review=review)
+                        if free_at is None:   # this batch's own task_adds fill it: no slot time yet
+                            raise ValueError(f"the 24 h cap of {cap} {what} is full with this batch's earlier "
+                                             f"task_adds; drop it or one of them")
+                        why = f"the 24 h cap of {cap} {what} is full; the next slot frees at {coord._clock(free_at, p)}"
+                        if wakes is not None:
+                            wakes.append((free_at, review, f"task_add {title!r}: {why}"))
+                        raise ValueError(f"{why}: drop it from this answer; you are woken then to add it if it is "
+                                         f"still needed (STATE's budget lines show the caps)")
                     left[review] -= 1
         except ValueError as e:
             out.append((i, str(e).replace(f" {coord.INFO_MARK}", "")))
@@ -156,10 +170,14 @@ def refusal(payload: dict) -> str | None:
         proj = Project(base)
         if not (proj.state / "project.db").is_file():   # opening one would create it
             return None
-        found = [(i, why) for i, why in problems(proj, actions)
+        wakes: list = []
+        found = [(i, why) for i, why in problems(proj, actions, wakes)
                  if _key(actions[i]) not in seen]   # resent unchanged: apply decides (module doc)
         if not found:
             return None
+        if wakes:   # a task_add denied on a full cap: woken at the next slot as apply's refusal would
+            from . import coordinator as coord
+            coord.slot_wake(proj.db, *min(wakes))
         seen |= {_key(actions[i]) for i, _ in found}
         from .project import durable_write
         durable_write(state_path, json.dumps({"denials": denials + 1, "seen": sorted(seen)}))

@@ -23292,3 +23292,52 @@ def test_an_answer_without_nulls_parses_to_the_same_actions_as_a_padded_one(tmp_
     # A sparse answer outside any schema (text) keeps its legacy explicit-null clear, as before.
     from ttp.providers.base import drop_nulls
     assert drop_nulls({"type": "schedule_set", "debounce_h": None}) == {"type": "schedule_set", "debounce_h": None}
+
+
+def test_a_spec_naming_a_closed_delivered_or_order_owned_key_is_a_citation(env, monkeypatch):
+    """18 of 51 rejected actions in a day were 'its spec names obligation oN, which #N does not own', most on
+    done tasks naming keys no one owed any more: closed and delivered keys are citations, an order's own
+    tasks own it, and STATE's open-task rows show the open keys each task owns."""
+    from ttp import coordinator as coord
+    from ttp import obligations as ob
+    p, d, now, tid, check = _ob_setup(env, monkeypatch)
+    other = p.db.add_task("other work", "s", origin="coordinator")
+    gone, kept, sent, owed = (ob.add(p, f"report {i}", now=now) for i in range(4))
+    ob.drop(p, gone, "no longer wanted")
+    ob.record(p, kept, "receipt", "docs/report.md", None)
+    assert ob.get(p.db, kept)["receipt"]
+    st = ob._load(p.db)
+    st["items"][sent]["delivered"] = {"message": 1, "chat": "c", "at": now}
+    st["items"][owed]["promise"] = {"tasks": [other], "chat": "c", "message": 2, "due": now + 3600, "timed": True}
+    p.db.set_kv(ob.KV, st)
+    for key in (gone, kept, sent):
+        spec = f"Background: obligation {key} was settled earlier."
+        assert coord.apply(p, [{"type": "task_update", "id": tid, "spec": spec}]) == [], key
+    assert coord.apply(p, [{"type": "task_update", "id": other, "spec": f"Record obligation {owed} progress."}]) == []
+    out = coord.apply(p, [{"type": "task_update", "id": tid, "spec": f"Also obligation {owed}."}])
+    assert len(out) == 1 and "does not own" in out[0], "an open key still needs its owner"
+    assert ob.open_keys_by_task(p.db) == {other: [owed]}
+    row = next(x for x in coord.digest(p, {}, [], []).splitlines() if x.startswith(f"- #{other} |"))
+    assert f"(owns {owed})" in row
+
+
+def test_state_shows_the_24h_task_caps_near_and_at_the_limit(env):
+    """13 cap refusals in a day were learned only by refusal: STATE's budget lines show each rolling 24 h
+    cap once it is near, and the next free slot once it is full."""
+    from ttp import coordinator as coord
+    p = make(env)
+    p.set_config("coordinator.max_new_tasks_per_day", 5)
+    p.set_config("coordinator.max_review_tasks_per_day", 10)
+    now = time.time()
+    assert coord.task_cap_lines(p.db, p.config(), now, p) == [], "far below the caps: no line"
+    for i in range(4):
+        p.db.add_task(f"made {i}", "s", origin="coordinator")
+    (line,) = coord.task_cap_lines(p.db, p.config(), now, p)
+    assert "max_new_tasks_per_day): 4 of 5 used, 1 left" in line
+    p.db.add_task("made 4", "s", origin="coordinator")
+    (line,) = coord.task_cap_lines(p.db, p.config(), time.time(), p)
+    assert "5 of 5 used, FULL: the next slot frees at" in line
+    assert "24 h cap on new tasks" in coord.digest(p, {}, [], [])
+    p.set_config("coordinator.max_review_tasks_per_day", 0)
+    assert any("review tasks (max_review_tasks_per_day): 0" in x
+               for x in coord.task_cap_lines(p.db, p.config(), time.time(), p))

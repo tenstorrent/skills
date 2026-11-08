@@ -83,7 +83,9 @@ Specs naming one (spec_check): a coordinator task_add or task_update spec that n
 (`o6` on a line that says "obligation") must name one that exists. A new task is attached as an owner of
 each open one it names; an updated task must already own it, or an `obligation` action of the same batch
 attach it, else the action is refused, so no worker is told it owns an obligation its records refuse.
-Keys of closed obligations (receipt or dropped) are history and pass.
+Keys of closed obligations (receipt or dropped) and delivered ones are citations and pass: only an open key
+claims ownership. An order's or promise's owner tasks (its `tasks`) own it as its attached owners do. The
+coordinator's STATE shows each open task's open keys (open_keys_by_task), so it sees what a task owns.
 """
 from __future__ import annotations
 
@@ -138,11 +140,11 @@ def spec_check(db, text: str, tid: int | None = None, attaching=()) -> list[str]
         o = st["items"].get(oid)
         if not o:
             unknown.append(oid)
-        elif o["receipt"] or o.get("dropped"):
-            continue
+        elif not _open(o) or o.get("delivered"):
+            continue   # a closed or delivered key is a citation: no owner is told to work on it
         elif tid is None:
             attach.append(oid)
-        elif str(tid) not in o["owners"] and (oid, int(tid)) not in attaching:
+        elif int(tid) not in _owner_ids(o) and (oid, int(tid)) not in attaching:
             unowned.append(oid)
     if unknown:
         raise ValueError(f"its spec names obligation {', '.join(unknown)}, which does not exist: record it first "
@@ -1261,6 +1263,17 @@ def owned_open(db, tid: int) -> list[str]:
     """The open obligations task `tid` is a required owner of: its checks go ahead of its project's other
     waiters for a host-wide checks slot (checkcap.task_priority) until each has its receipt or is dropped."""
     return [o["id"] for o in items(db) if _open(o) and str(tid) in o["owners"]]
+
+
+def open_keys_by_task(db) -> dict[int, list[str]]:
+    """Task id -> the open, undelivered obligation keys it owns (attached, or an order's or promise's
+    task), in key order: the keys a task_update spec may name as its own (spec_check)."""
+    out: dict[int, list[str]] = {}
+    for o in items(db):
+        if _open(o) and not o.get("delivered"):
+            for t in _owner_ids(o):
+                out.setdefault(t, []).append(o["id"])
+    return out
 
 
 def owner_due(db) -> dict[int, float]:
