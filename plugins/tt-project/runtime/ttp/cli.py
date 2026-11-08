@@ -1906,6 +1906,9 @@ def cmd_status(a) -> None:
         from . import throughput
         if ln := throughput.status_line(p.db):
             print(ln)
+        from . import gatetime
+        if ln := gatetime.status_line(p.state, p.config()):
+            print(ln)
         from . import notifier
         for ln in notifier.status_lines():   # this machine's notifier: on old code, or failing to deliver
             print(ln)

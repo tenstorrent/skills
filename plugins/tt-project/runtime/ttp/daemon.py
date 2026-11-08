@@ -1998,6 +1998,7 @@ class Daemon:
                 self.check_checks_owner,
                 self.reap_leftover_checks,
                 self.check_checks_stall,
+                self.check_gate_time,
                 self.check_cap_wait,
                 self.check_progress,
                 self.check_churn,
@@ -9287,6 +9288,17 @@ class Daemon:
                 log(self.p, text[:300])
             if h["stop"] and (r := checklane.stop_finished(self.p, h)):
                 log(self.p, r["text"])
+
+    def check_gate_time(self, every_s: float = 600, now: float | None = None) -> None:
+        """Model-free: once a day while the median of the project's last push check runs is over
+        checks.smoke_max_s, one `gate_slow` observation to its coordinator (gatetime.flag)."""
+        now = time.time() if now is None else now
+        if now - getattr(self, "_gate_time_checked", 0.0) < every_s:
+            return
+        self._gate_time_checked = now
+        from . import gatetime
+        if text := gatetime.flag(self.p.db, self.p.state, self.cfg, self.p.state / "pushes", now):
+            log(self.p, text[:300])
 
     def check_checks_stall(self, every_s: float = 60, now: float | None = None, cpu=None) -> None:
         """Model-free: a running `ttp checks` whose log has not grown for its stall threshold

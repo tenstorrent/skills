@@ -42,7 +42,7 @@ from pathlib import Path
 from typing import Any, Callable
 from urllib.parse import quote, unquote
 
-from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
+from . import (checkcap, checkdirs, checkwait, checklane, cleantree, envfault, gatetime, gitcache, gitmemo, hoststate, landed, landmark, leakfile, locks, machines, pooladmit, prguard, prhead, remotecheck, repoid, runner, runnerenv,
                sandbox, scriptwatch, settinghold, setupfault, shorttmp, slurmcheck, syntaxfault, testslots, timefmt, workerloss, worktree)
 from .budget import DOC_SUFFIXES
 from .db import continues_id, dependency_ids, load_result
@@ -3301,6 +3301,7 @@ def record_check_s(p: Project, seconds: float) -> None:
     """Runs between passing checks and the push, so a failed write is logged and never stops it."""
     try:
         write_json(p.state / TIMINGS, {"last_s": round(seconds, 1), "at": time.time()})
+        gatetime.record(p.state, seconds)
     except OSError as e:
         print(f"ttp push: could not record the check time in {p.state / TIMINGS}: {e}", file=sys.stderr)
 

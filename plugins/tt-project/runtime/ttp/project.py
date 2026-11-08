@@ -622,7 +622,7 @@ EXTRA_KEYS = {
     # push_pool_wait_s: how long one push check may wait for test-pool slots in all (push.pool_wait_of; 0: no bound).
     # push_retries: how often a detached push retries a cause it clears itself, a non-fast-forward
     # (--own) or a reboot that cut it short (push.retries_of; default 2, 0: never).
-    "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
+    "delivery": {"base_ref", "push_branch", "landed_probe", "push_checks", "post_land_checks", "push_checks_by_repo", "push_exclude_paths", "push_rounds", "push_wait_s",
                  "push_checks_timeout_s", "push_pool_wait_s", "push_retries",
                  "version_bump", "push_queue", "push_batch_s", "push_batch_max", "push_min_gap_s", "push_age_s", "push_landing_alert_h", "push_script_torn_escalate_after",
                  "push_setup_fault_escalate_after", "after_push",
@@ -752,7 +752,8 @@ def _known_keys(path: list[str]) -> set[str] | None:
                 "spill_beside_device", "spill_pre_cmd", "fallback_lane", "no_device_cmds", "slots", "light_cmds", "max_wait_s", "wait_event_s",
                 "wait_escalate_s", "wait_hang_factor", "priority_age_s", "test_project_max", "test_project_slots",
                 "test_project_workers", "test_run_max", "test_run_min",
-                "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s"}
+                "done_holder_flag_s", "done_holder_grace_s", "stall_s", "push_load_wait_s",
+                "smoke_max_s"}   # the landing check time limit (gatetime.max_s; default 600 s, 0: off)
     if len(path) == 1 and isinstance(DEFAULT_CONFIG.get(path[0]), dict):
         return set(DEFAULT_CONFIG[path[0]]) | EXTRA_KEYS.get(path[0], set())
     return None
@@ -1161,6 +1162,7 @@ def config_problems(raw: dict, root: Path | None = None) -> list[str]:
         out.append(str(e))
     out += [f"delivery.push_checks: {p}" for p in check_problems(delivery.get("push_checks"))]
     out += [f"delivery.push_checks: {p}" for p in applicability_problems(delivery.get("push_checks"), root)]
+    out += [f"delivery.post_land_checks: {p}" for p in check_problems(delivery.get("post_land_checks"))]
     out += [f"delivery.push_checks_by_repo: {p}" for p in by_repo_problems(delivery.get("push_checks_by_repo"))]
     if delivery.get("checks_targeted") not in (None, True, False):
         out.append("delivery.checks_targeted: not true or false")
