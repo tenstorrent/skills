@@ -669,18 +669,20 @@ def cost(state: Path | None, key: str, cmds: list, cfg: dict | None = None, full
     """What a run costs, as its lane label keeps it: {"cls": run_class, "est_s": median_s or absent}, and
     for a targeted run (scope) its "tests" and "of". A targeted run's est_s is its own recorded median
     (`key` keeps its selection), else the median of the full checks it narrows (`full_key`) times its share
-    of their tests, the whole median while another of `cmds` is a full suite."""
+    of their tests, the whole median while another of `cmds` is a full suite. A targeted run beside such a
+    full suite also keeps "whole": true, so it is neither short (checkcap.is_small) nor targeted-only."""
     est, sc = median_s(state, key), scope(cmds)
+    full = sc and any(not getattr(c, "targeted", False) and run_class([c], cfg) == SUITE for c in cmds)
     if est is None and sc and full_key and (whole := median_s(state, full_key)) is not None:
-        full = [c for c in cmds if not getattr(c, "targeted", False) and run_class([c], cfg) == SUITE]
         est = whole if full else whole * sc["tests"] / max(1, sc["of"])
-    return {"cls": run_class(cmds, cfg), **({"est_s": round(est, 1)} if est is not None else {}), **(sc or {})}
+    return {"cls": run_class(cmds, cfg), **({"est_s": round(est, 1)} if est is not None else {}), **(sc or {}),
+            **({"whole": True} if full else {})}
 
 
 def _targeted_only(mine: dict, theirs: dict) -> bool:
     """Whether `mine` is a targeted run (its "tests") and `theirs` a full one of its class or costlier."""
     t = theirs.get("cls")
-    return (isinstance(mine.get("tests"), int) and not theirs.get("tests")
+    return (isinstance(mine.get("tests"), int) and not mine.get("whole") and not theirs.get("tests")
             and int(mine.get("cls", SUITE)) <= (int(t) if isinstance(t, int) else SUITE))
 
 

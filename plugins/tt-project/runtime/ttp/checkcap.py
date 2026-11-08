@@ -581,9 +581,11 @@ def small_tests() -> int:
 def is_small(cost: dict | None) -> bool:
     """Whether a run of `cost` (checklane.cost) is a short targeted one: fewer than small_tests() tests. Such a
     run goes first among its project's waiters at its priority (locks.SMALL_TICKET) and is held by no parked
-    longer one at its priority or a less urgent one (starved_ahead); the host cap (limit) still holds it."""
+    longer one at its priority or a less urgent one (starved_ahead); the host cap (limit) still holds it. One
+    that also runs an unnarrowed full suite (checklane.cost's "whole") costs a full run: never short."""
     n = (cost or {}).get("tests")
-    return isinstance(n, int) and not isinstance(n, bool) and 0 <= n < small_tests()
+    return (isinstance(n, int) and not isinstance(n, bool) and 0 <= n < small_tests()
+            and not (cost or {}).get("whole"))
 
 
 def order() -> dict:

@@ -8554,6 +8554,38 @@ def test_a_short_targeted_run_is_not_held_by_parked_full_runs_and_queues_first_w
             w.join(20)
         assert [g[0] for g in got] == want and all(n == 1 for _, n in got), "one at a time: the cap holds"
 
+def test_a_targeted_run_beside_an_unnarrowed_full_suite_is_not_short_and_waits_behind_aged_full_runs(
+        env, monkeypatch):
+    # #7329: checkcap.is_small read only the targeted commands' "tests", so a 13-test targeted check run with a
+    # full pytest after `--` was short: it queued first and skipped aged parked full runs at a full run's cost.
+    # checklane.cost marks such a run "whole": never short (is_small) and never targeted-only (much_cheaper).
+    from ttp import checkcap, checklane, locks, push
+    monkeypatch.setenv(checkcap.STARVE_ENV, "3600")
+    own = push.check_list(["python3 -m pytest -q tests/test_a.py"])
+    c = push.Check(str(own[0]))   # as testpick.narrow writes a targeted check
+    c.__dict__.update(own[0].__dict__)
+    c.targeted, c.scope, c.full = True, {"tests": 13, "of": 9000}, own[0]
+    extra = push.check_list(["python3 -m pytest -q tests/test_b.py"])
+    tiny = checklane.cost(None, "k1", [c])
+    mixed = checklane.cost(None, "k2", [c] + list(extra))
+    assert tiny == {"cls": checklane.SUITE, "tests": 13, "of": 9000} and checkcap.is_small(tiny)
+    assert mixed == tiny | {"whole": True} and not checkcap.is_small(mixed)
+    assert checklane.cost(None, "k3", [c] + list(push.check_list(["true"]))) == tiny, "a light command: still short"
+    full = {"cls": checklane.SUITE}
+    assert checklane.much_cheaper(tiny, full) and not checklane.much_cheaper(mixed, full)
+    assert not checklane.cheaper(mixed, full), "no medians: by class, as a full run"
+    now = time.time()
+    d, P = checkcap.slot_dir(), checkcap.PARKED
+    parked = [locks.enqueue(d, P, f"pa task #{60 + i} (run {60 + i})", since=now - 9000 + i, group="pa", priority=2)
+              for i in range(3)]
+    try:
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=tiny) == []
+        assert checkcap.starved_ahead("pa", now, now, priority=2, cost=mixed) == parked, "held as a full run"
+    finally:
+        for t in parked:
+            locks.dequeue(t)
+
+
 def test_aged_routine_waiters_take_routine_turns_and_nothing_changes_without_a_backlog(tmp_path):
     # #6033 on the host queue (locks.fair_order): aged routine waiters go ahead of later routine ones only;
     # urgent ones stay first until `aged_turns` urgent turns went in a row (mark_turn's streak). With no
