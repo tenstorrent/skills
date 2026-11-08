@@ -1,0 +1,5 @@
+---
+"tt-project": patch
+---
+
+`tt-project`: babysitting decisions run on the chat provider. With `providers.chat.endpoint` set, the daemon's wake decisions (a waiting task due for a wake, the wake's tier, Jev's other screening uses) go to the cheap served model first (`providers.chat.babysit`, default on; false turns it off, or `{"model", "timeout_s"}`; the model defaults to the light tier's). Its answer is a decision only, parsed against a fixed schema (`wake <coordinator|task id> <tier>`, `skip`, `flag <reason>`), with no tools; anything else is a light wake, so a planted instruction can at worst cause one needless wake. When the endpoint is down it cools down and Jev, then the model-free path, decide. Only the user's own `ttp config` turns a provider route off: a coordinator, worker or harness write that would turn off a tier route, a routes rule list or babysitting is refused, since the harness already holds a failing endpoint and resumes it. New account setting `budget.daily_target_usd` (unset by default): `ttp status` and the daily review show today's whole-account Claude spend against it.
