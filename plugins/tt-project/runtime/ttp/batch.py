@@ -2522,6 +2522,7 @@ class Batch:
         """Run only `ids` of check `cmd` once at commit `at`: the check's own command, its other tests
         deselected by name (pushpass.select_env), killed after delivery.push_rerun_s. (pytest's exit
         code, None when it ran out of time; the output tail)."""
+        cmd = _here(cmd)   # only a check's first full run spills: every rerun runs here
         self.reran.setdefault(where, set()).update(ids)
         self._checkout(at)
         self.checks["reruns"] = self.checks.get("reruns", 0) + 1
@@ -2673,7 +2674,7 @@ class Batch:
         full checks decide then."""
         cmd = fail[0]
         env = push.check_env("target", self.tip, self.check_run_dir, self.branch)
-        self._runners([cmd], env)
+        self._runners([_here(cmd)], env)
         slot = self._slot(head)
         started = time.time()
         try:
@@ -2715,7 +2716,7 @@ class Batch:
         say(f"rerunning the {len(ids)} failing test(s) on the tip {tip[:10]} alone, up to {TIP_RERUNS} times: "
             f"{' '.join(ids)}")
         env = self._check_env()
-        self._runners([cmd], env)
+        self._runners([_here(cmd)], env)
         slot = self._slot(tip)
         try:
             for n in range(1, TIP_RERUNS + 1):

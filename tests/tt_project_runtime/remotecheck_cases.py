@@ -2889,6 +2889,41 @@ def test_a_spilled_push_batch_suite_is_judged_as_its_local_original(env, tmp_pat
     if kind == "flaky":
         assert count.read_text() == "xx", "the spilled run failed it and its one rerun here passed"
 
+
+
+def test_a_spilled_push_batch_check_reruns_only_here_with_its_selection(env, tmp_path, monkeypatch):
+    """Only a check's first full run spills: every rerun after it (the judge's, the search's split probe:
+    _ids_check) runs here, as its local original, with its selection env (_run_ids)."""
+    from ttp import batch, push, pushq
+    log = tmp_path / "where.log"
+    s = _spill_batch(env, tmp_path, monkeypatch, f'echo "$(pwd) ${{TTP_PYTEST_SELECT:-none}}" >> {log}; '
+                                                 "python3 -m pytest -q -p no:cacheprovider")
+    (s.other / "test_ok.py").write_text("def test_ok():\n    pass\n")
+    _git_out(s.other, "add", "test_ok.py")
+    _git_out(s.other, "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "ok")
+    _git_out(s.other, "push", "-q", "origin", "HEAD:proj")
+    monkeypatch.setattr(pushq, "batch_argv", lambda marker: [sys.executable, "-c", "pass"])
+    _pq_hand_off(env, s)
+    code, path, branch = _code_task(s.p, "bad")
+    _commit(path, "test_g.py", "def test_g():\n    assert False\n")
+    review = s.p.db.add_task("review bad", "r", kind="review", tier="standard", origin="coordinator",
+                             depends_on=[code])
+    _pq_hand_off(env, s, task=review, push=[{"branch": branch, "head": _git_out(path, "rev-parse", "HEAD")}])
+    marker = pathlib.Path(s.p.db.one("SELECT marker FROM push_batches WHERE id=?", (_pq_batch(s),))["marker"])
+    monkeypatch.setattr(sys, "stdin", io.StringIO(""))
+    monkeypatch.setenv("TTP_RUN_DIR", push._read(marker)["check_report_dir"])
+    batch.run_batch(s.p, marker)
+    m = push._read(marker)
+    assert m["checks"].get("id_probes"), m
+    lines = log.read_text().splitlines()
+    first = next(n for n, ln in enumerate(lines) if "/ttp-check." in ln)
+    spilled = [ln for ln in lines if "/ttp-check." in ln]
+    assert len(spilled) == 2 and all(ln.endswith(" none") for ln in spilled), lines   # the two full runs only
+    reruns = [ln for ln in lines[first + 1:] if not ln.endswith(" none")]
+    assert len(reruns) >= 3, lines   # the judge's at the head and on the tip, the split probe's at entry 1
+    assert all("/ttp-check." not in ln and "test_g" in ln.split(" ", 1)[1] for ln in reruns), lines
+
+
 def test_push_hard_tests_is_a_known_delivery_key_the_batch_reads():
     """delivery.push_hard_tests sets which failing tests a batch never excuses as the tip's own."""
     from ttp import batch, project

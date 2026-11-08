@@ -2579,7 +2579,8 @@ session and stateless coordinators on every provider.
   `delivery.checks_spill_hosts` set and spill first on, each check that may spill runs on the first free
   spill host with that host's worker grant (a fixed `-n N` above it is lowered to it), the rest here; a
   spill host's own fault (ssh, the host) reruns that check on the next free spill host, else here, and
-  never fails or holds the batch. `ttp checks status` shows each run on a spill host, and each run that
+  never fails or holds the batch. Only a check's first full run spills: every rerun of its failing tests
+  (the judge's, the search's) runs here, with its test selection. `ttp checks status` shows each run on a spill host, and each run that
   stayed on the project host with why. The search runs only the new failing tests at each prefix and the full suite once, at the prefix they
   pass on. Keys, all under `delivery`: `push_batch_s` (default 300: with
   no review running or ready an approval starts a batch at once; otherwise the batch starts once the
